@@ -1126,7 +1126,7 @@ function renderOrganizationPicker(): void {
   if (!picker) {
     picker = document.createElement('select')
     picker.className = 'organization-filter behavior-organization'
-    picker.setAttribute('aria-label', 'Behavior organization')
+    picker.setAttribute('aria-label', 'Behavior account')
     picker.addEventListener('change', () => { void switchOrganization(picker!.value) })
     host.appendChild(picker)
   }

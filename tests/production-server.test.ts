@@ -390,7 +390,7 @@ describe('production server', () => {
       expect(response.status, JSON.stringify(body)).toBe(400)
     }
     expect((await (await fetch(url, { method: 'POST', headers, body: JSON.stringify({ repos: ['Vaquum/Unknown'] }) })).json()).error)
-      .toBe('not a repository of the organization: Vaquum/Unknown')
+      .toBe('not a repository of the account: Vaquum/Unknown')
     // Repositories and authors belong to this behavior only.
     expect((await fetch(`${baseUrl}/api/behaviors/review-new-prs`, { method: 'POST', headers, body: JSON.stringify({ repos: ['Vaquum/Origo'] }) })).status).toBe(400)
     expect(await read()).toMatchObject({ enabled: false, repos: [] })

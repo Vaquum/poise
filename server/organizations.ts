@@ -72,7 +72,7 @@ const jobs = new Map<string, { controller: AbortController, promise: Promise<voi
 export function normalizeOrganizationLogin(value: unknown): string {
   const login = typeof value === 'string' ? value.trim().toLowerCase() : ''
   if (!/^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/.test(login) || login.includes('--')) {
-    throw new Error('Use a GitHub organization name (1–39 letters, numbers, or single hyphens).')
+    throw new Error('Use a GitHub organization name or personal username (1–39 letters, numbers, or single hyphens).')
   }
   return login
 }
@@ -162,7 +162,7 @@ export function addOrganization(value: unknown): Organization {
 export function retryOrganization(value: string): Organization {
   const login = normalizeOrganizationLogin(value)
   const row = rowFor(login)
-  if (!row) throw new Error('Organization is not configured.')
+  if (!row) throw new Error('GitHub account is not configured.')
   if (!row.managed) return fromRow(row)
   if (row.status === 'error') {
     db.prepare("UPDATE organizations SET status = 'initializing', stage = 'queued', error = NULL WHERE login = ?").run(login)
@@ -178,7 +178,7 @@ function stage(login: string, value: string): void {
 }
 
 async function githubEnvironment(me: string | undefined, signal: AbortSignal): Promise<NodeJS.ProcessEnv> {
-  if (!me) throw new Error('Set your GitHub username in Settings before adding an organization.')
+  if (!me) throw new Error('Set your GitHub username in Settings before adding an account.')
   let token: string
   try {
     token = (await runFile('gh', ['auth', 'token', '--hostname', 'github.com', '--user', me], {
@@ -235,7 +235,7 @@ function databaseState(path: string): { login: string | null, complete: boolean 
 function assertOrganization(path: string, login: string): void {
   const state = databaseState(path)
   if (state.login?.toLowerCase() !== login.toLowerCase() || !state.complete) {
-    throw new Error('Datastore does not contain a completed index for this organization.')
+    throw new Error('Datastore does not contain a completed index for this account.')
   }
 }
 

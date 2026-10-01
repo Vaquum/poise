@@ -27,11 +27,11 @@ export function mountOrganizationFilter(container: HTMLElement): void {
   if (container.querySelector('.organization-filter')) return
   const select = document.createElement('select')
   select.className = 'organization-filter'
-  select.setAttribute('aria-label', 'Organization filter')
+  select.setAttribute('aria-label', 'Account filter')
   const refresh = () => {
     const organizations = getOrganizations().filter((org) => org.status === 'ready')
     const selected = getSelectedOrganization()
-    select.replaceChildren(new Option('All organizations', ''), ...organizations.map((org) => new Option(org.login, org.login)))
+    select.replaceChildren(new Option('All accounts', ''), ...organizations.map((org) => new Option(org.login, org.login)))
     select.value = selected
     select.hidden = organizations.length < 2
   }
@@ -45,6 +45,6 @@ export function mountOrganizationFilter(container: HTMLElement): void {
 
 export function organizationErrors(data: { errors?: Array<{ org: string, error: string }> }): string {
   return Array.isArray(data.errors) && data.errors.length
-    ? `Some organizations are unavailable: ${data.errors.map((entry) => `${entry.org}: ${entry.error}`).join('; ')}. Showing available results.`
+    ? `Some GitHub accounts are unavailable: ${data.errors.map((entry) => `${entry.org}: ${entry.error}`).join('; ')}. Showing available results.`
     : ''
 }

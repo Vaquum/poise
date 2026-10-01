@@ -1,5 +1,5 @@
 import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } from './model-refresh'
-// Settings panel — two tabs: General (organizations, username, timezone, refresh rate,
+// Settings panel — two tabs: General (GitHub accounts, username, timezone, refresh rate,
 // theme) and Models (which model each place in Poise launches, with a
 // fallback). Slides in from the right, same pattern as the typography panel.
 //
@@ -137,7 +137,7 @@ const ORGANIZATION_STAGES: Record<string, string> = {
   'building-user': 'Preparing your issues and pull requests…',
   syncing: 'Syncing repositories…',
   checking: 'Checking the datastore…',
-  reconciling: 'Preparing organization…',
+  reconciling: 'Preparing account…',
 }
 
 function organizationStatus(text: string, failed = false): void {
@@ -157,9 +157,9 @@ function renderOrganizations(): void {
   list.innerHTML = organizations.map((org) => `
     <div class="st-organization" data-org="${escapeHtml(org.login)}">
       <div class="st-organization-name">${escapeHtml(org.login)}<span class="st-org-state st-org-state-${org.error ? 'error' : org.status}">${org.status === 'ready' ? org.error ? 'Sync failed' : 'Ready' : org.status === 'error' ? 'Activation failed' : 'Activating…'}</span></div>
-      ${org.status === 'initializing' ? `<div class="st-help st-help-info">${escapeHtml(ORGANIZATION_STAGES[org.stage] || org.stage || 'Preparing organization…')}</div>` : ''}
+      ${org.status === 'initializing' ? `<div class="st-help st-help-info">${escapeHtml(ORGANIZATION_STAGES[org.stage] || org.stage || 'Preparing account…')}</div>` : ''}
       ${org.status === 'error' || org.error ? `<div class="st-help st-help-error">${escapeHtml(org.error || 'Activation failed. Try again.')}</div><button type="button" class="st-clear" data-retry-org="${escapeHtml(org.login)}"${organizationAdding ? ' disabled' : ''}>Retry</button>` : ''}
-    </div>`).join('') || '<div class="st-help st-help-info">No organizations added yet.</div>'
+    </div>`).join('') || '<div class="st-help st-help-info">No GitHub accounts added yet.</div>'
 }
 
 async function pollOrganizations(): Promise<void> {
@@ -168,7 +168,7 @@ async function pollOrganizations(): Promise<void> {
   organizationsPollTimer = null
   try {
     const res = await fetch('/api/organizations')
-    if (!res.ok) throw new Error(`Could not refresh organizations (HTTP ${res.status}).`)
+    if (!res.ok) throw new Error(`Could not refresh GitHub accounts (HTTP ${res.status}).`)
     const data = await res.json() as { organizations?: Organization[] }
     if (generation !== organizationsPollGeneration) return
     if (Array.isArray(data.organizations)) {
@@ -188,14 +188,14 @@ async function addOrganization(retry?: string): Promise<void> {
   if (!orgInput || organizationAdding || saving) return
   const org = retry || orgInput.value.trim()
   if (!GITHUB_NAME.test(org) || org.includes('--')) {
-    organizationStatus('Enter a GitHub organization name, not a URL.', true)
+    organizationStatus('Enter an organization name or personal GitHub username, not a URL.', true)
     orgInput.focus()
     return
   }
   if (!getCachedSettings().me || meInput?.value.trim() !== getCachedSettings().me) {
     await saveAll()
     if (!getCachedSettings().me || meInput?.value.trim() !== getCachedSettings().me) {
-      organizationStatus('Save a valid username before adding an organization.', true)
+      organizationStatus('Save your valid GitHub username before adding an account.', true)
       return
     }
   }
@@ -533,13 +533,13 @@ function buildPanel(): HTMLElement {
         <div class="tp-group-label">GitHub</div>
 
         <div class="tp-section">
-          <label class="tp-label" for="st-organization">Organizations</label>
+          <label class="tp-label" for="st-organization">GitHub accounts</label>
           <div class="st-organizations" aria-live="polite"></div>
           <div class="st-org-add-row">
-            <input id="st-organization" type="text" class="st-input st-input-org" aria-label="New organization" autocomplete="off" spellcheck="false" placeholder="acme-corp" />
+            <input id="st-organization" type="text" class="st-input st-input-org" aria-label="New GitHub account" autocomplete="off" spellcheck="false" placeholder="acme-corp or octocat" />
             <button type="button" class="st-clear st-add-organization">Add</button>
           </div>
-          <div class="st-help st-help-info">Adding an organization activates its datastore. Initial sync may take a few minutes; existing organizations keep working. New organizations start with automations off.</div>
+          <div class="st-help st-help-info">Add an organization name or personal username. Poise activates its datastore; initial sync may take a few minutes. Existing accounts keep working. New accounts start with automations off.</div>
           <div class="st-help st-help-info st-org-status" role="status"></div>
         </div>
 
@@ -623,7 +623,7 @@ function buildPanel(): HTMLElement {
       </div>
 
       <div class="tp-hint">
-        Organizations, username, timezone and model choices are stored in
+        GitHub accounts, username, timezone and model choices are stored in
         <code>~/.poise/cache.db</code>. Refresh rate and theme are kept by this
         browser, so they do not follow you to another one.
       </div>
@@ -722,7 +722,7 @@ export function openSettingsPanel() {
   const openingFocus = document.activeElement
   focusTimer = setTimeout(() => {
     focusTimer = null
-    // The entrance must not redirect typing into Organization after the
+    // The entrance must not redirect typing into the account field after the
     // person has already selected another field or returned to the console.
     if (!panelEl?.classList.contains('open')) return
     if (document.activeElement !== openingFocus && document.activeElement !== document.body) return

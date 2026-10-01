@@ -217,7 +217,7 @@ describe('organization activation', () => {
     database!.db.prepare("UPDATE organizations SET status = 'initializing', activated_at = NULL WHERE login = 'acme'").run()
     organizations!.retryOrganization('acme')
     await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.status).toBe('error'))
-    expect(organizations!.getOrganizations()[0]!.error).toContain('this organization')
+    expect(organizations!.getOrganizations()[0]!.error).toContain('this account')
     expect(operations('init-org')).toHaveLength(1)
   })
 

@@ -202,13 +202,13 @@ describe('Review New Issues triggers', () => {
   it('restores the previous choice and passes the server\'s reason on when a save is refused', async () => {
     vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
       if (init?.method === 'POST') {
-        return Promise.resolve({ ok: false, status: 400, json: async () => ({ error: 'not a repository of the organization: Vaquum/Nope' }) })
+        return Promise.resolve({ ok: false, status: 400, json: async () => ({ error: 'not a repository of the account: Vaquum/Nope' }) })
       }
       return Promise.resolve({ ok: true, status: 200, json: async () => payload({ 'review-new-issues': { repos: ['Vaquum/Origo'], authors: ['mikkokotila'] } }) })
     })
     await behaviors.refreshState()
     await expect(behaviors.setTriggers('review-new-issues', { repos: ['Vaquum/Nope'] }))
-      .rejects.toThrow('not a repository of the organization: Vaquum/Nope')
+      .rejects.toThrow('not a repository of the account: Vaquum/Nope')
     expect(behaviors.getRepos('review-new-issues')).toEqual(['Vaquum/Origo'])
   })
 })

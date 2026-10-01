@@ -123,7 +123,7 @@ export function moveCard(id: number, lane: Lane, index: number, organization?: s
   const tx = db.transaction(() => {
     if (organization) {
       const visible = (entry: CurrentCard) => !entry.repo || entry.repo.split('/')[0].toLowerCase() === organization.toLowerCase()
-      if (!visible(card)) throw new Error('Card does not belong to the selected organization')
+      if (!visible(card)) throw new Error('Card does not belong to the selected account')
       const all = listCards().filter((entry) => entry.lane === lane && entry.id !== id)
       const shown = all.filter(visible)
       const position = Math.max(0, Math.min(index, shown.length))
