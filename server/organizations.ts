@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { chmodSync, existsSync, mkdirSync, renameSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { db, getMeta } from './db'
@@ -15,6 +15,7 @@ export interface Organization {
   stage: string
   error: string | null
   activatedAt: string | null
+  retryAt: string | null
 }
 
 interface OrganizationRow {
@@ -63,7 +64,9 @@ db.transaction(() => {
 
 const RUNTIME_TICK_MS = 5_000
 const SYNC_INTERVAL_MS = 60_000
-const RECONCILE_INTERVAL_MS = 60 * 60_000
+// Match Caller's daily full reconciliation; incremental freshness stays per minute.
+const RECONCILE_INTERVAL_MS = 24 * 60 * 60_000
+const MAX_SYNC_RETRY_MS = 60 * 60_000
 const CLI_TIMEOUT_MS = 30 * 60_000
 let timer: ReturnType<typeof setInterval> | undefined
 let stopping = false
@@ -77,16 +80,62 @@ export function normalizeOrganizationLogin(value: unknown): string {
   return login
 }
 
+function cooldownKey(me: string): string {
+  return `github_rate_limit:${me.toLowerCase()}:reset_at`
+}
+
+function cooldownUntil(me: string | undefined): number {
+  if (!me) return 0
+  const value = Number(getMeta(cooldownKey(me)))
+  return Number.isSafeInteger(value) && value > Date.now() && value <= 8.64e15 ? value : 0
+}
+
+function rateLimitMessage(me: string, resetAt: number): string {
+  return `GitHub API rate limit reached for ${me}. Account indexing resumes automatically at ${new Date(resetAt).toISOString()}.`
+}
+
+class GitHubRateLimitError extends Error {
+  constructor(readonly me: string, readonly resetAt: number) {
+    super(rateLimitMessage(me, resetAt))
+  }
+}
+
+function requireQuota(me: string): void {
+  const resetAt = cooldownUntil(me)
+  if (resetAt) throw new GitHubRateLimitError(me, resetAt)
+}
+
+function observeRateLimit(error: unknown, me: string): GitHubRateLimitError | null {
+  const details = [error instanceof Error ? error.message : String(error), (error as { stderr?: unknown })?.stderr]
+    .filter((value): value is string => typeof value === 'string').join('\n')
+  const resets = [...details.matchAll(/\bGITHUB_RATE_LIMIT_RESET=(\d+)\b/g)]
+    .map((match) => Number(match[1]) * 1000)
+    .filter((reset) => Number.isSafeInteger(reset) && reset > 0 && reset <= 8.64e15)
+  if (resets.length === 0) return null
+  const resetAt = Math.max(...resets)
+  // The quota belongs to the authenticated identity. Concurrent account jobs
+  // and server processes can only extend its cooldown, never shorten it.
+  db.prepare(`
+    INSERT INTO meta(key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)
+  `).run(cooldownKey(me), String(resetAt))
+  return new GitHubRateLimitError(me, cooldownUntil(me) || resetAt)
+}
+
 function fromRow(row: OrganizationRow): Organization {
-  const pendingUser = row.status === 'ready' && row.managed && row.indexed_user !== getMeta('me')?.trim()
+  const me = getMeta('me')?.trim()
+  const pendingUser = row.status === 'ready' && row.managed && row.indexed_user !== me
+  const resetAt = row.managed && row.status !== 'error' ? cooldownUntil(me) : 0
   return {
     login: row.login,
     ...(row.datastore_path ? { datastorePath: row.datastore_path } : {}),
     managed: !!row.managed,
     status: pendingUser ? 'initializing' : row.status,
-    stage: pendingUser ? 'building-user' : row.stage,
-    error: row.error,
+    stage: resetAt ? 'rate-limited' : pendingUser ? 'building-user' : row.stage,
+    error: resetAt ? rateLimitMessage(me!, resetAt) : row.error,
     activatedAt: row.activated_at,
+    retryAt: resetAt ? new Date(resetAt).toISOString() : null,
   }
 }
 
@@ -101,6 +150,7 @@ function legacyOrganization(): Organization | null {
     stage: 'ready',
     error: null,
     activatedAt: null,
+    retryAt: null,
   }
 }
 
@@ -214,11 +264,16 @@ function safeError(error: unknown, env?: NodeJS.ProcessEnv): string {
     .replace(/(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/g, '[redacted]').slice(0, 1_000)
 }
 
-async function caller(path: string, args: readonly string[], env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<string> {
-  const { stdout } = await runFile('github-datastore', ['--db', path, ...args], {
-    env, signal, timeoutMs: CLI_TIMEOUT_MS, maxOutputBytes: 4 * 1024 * 1024,
-  })
-  return stdout
+async function caller(path: string, args: readonly string[], me: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<string> {
+  requireQuota(me)
+  try {
+    const { stdout } = await runFile('github-datastore', ['--db', path, ...args], {
+      env, signal, timeoutMs: CLI_TIMEOUT_MS, maxOutputBytes: 4 * 1024 * 1024,
+    })
+    return stdout
+  } catch (error) {
+    throw observeRateLimit(error, me) ?? error
+  }
 }
 
 function databaseState(path: string): { login: string | null, complete: boolean } {
@@ -239,8 +294,8 @@ function assertOrganization(path: string, login: string): void {
   }
 }
 
-async function checkHealth(path: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<void> {
-  const result = JSON.parse(await caller(path, ['health', '--max-age-seconds', '120'], env, signal)) as Record<string, unknown>
+async function checkHealth(path: string, me: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<void> {
+  const result = JSON.parse(await caller(path, ['health', '--max-age-seconds', '120'], me, env, signal)) as Record<string, unknown>
   if (result.healthy !== true || result.status !== 'healthy' || result.action !== 'health'
     || typeof result.database !== 'string' || resolve(result.database) !== resolve(path)) {
     throw new Error('Datastore health check did not confirm a fresh index.')
@@ -267,18 +322,22 @@ async function activate(row: OrganizationRow, me: string, signal: AbortSignal, e
     // the exact organization's completed database; never reinitialize it.
     assertOrganization(path, row.login)
   } else {
-    let resumable = false
     if (existsSync(tempPath)) {
-      try {
-        const state = databaseState(tempPath)
-        resumable = state.login?.toLowerCase() === row.login.toLowerCase() && state.complete
-      } catch { resumable = false }
+      let state: ReturnType<typeof databaseState>
+      try { state = databaseState(tempPath) } catch {
+        throw new Error('Cannot read the staging datastore. Its contents were preserved; repair the database before retrying.')
+      }
+      // Initial repository discovery can fail before Caller records the owner.
+      // Its --resume validator accepts only a truly empty unidentified index.
+      if ((state.login !== null && state.login.toLowerCase() !== row.login.toLowerCase())
+        || (state.login === null && state.complete)) {
+        throw new Error('Staging datastore does not identify this account. Its contents were preserved; verify the database before retrying.')
+      }
+      reused = state.complete
     }
-    reused = resumable
-    if (!resumable) {
-      for (const suffix of ['', '-wal', '-shm']) rmSync(`${tempPath}${suffix}`, { force: true })
+    if (!reused) {
       stage(row.login, 'indexing')
-      await caller(tempPath, ['init-org', row.login], env, signal)
+      await caller(tempPath, ['init-org', row.login, '--resume'], me, env, signal)
       assertOrganization(tempPath, row.login)
     }
   }
@@ -287,19 +346,19 @@ async function activate(row: OrganizationRow, me: string, signal: AbortSignal, e
   // issues created remotely since that attempt, without reinitializing it.
   if (reused) {
     stage(row.login, 'syncing')
-    await caller(sourcePath, ['sync'], env, signal)
+    await caller(sourcePath, ['sync'], me, env, signal)
   }
   stage(row.login, 'building-user')
-  await caller(sourcePath, ['build-user', me], env, signal)
+  await caller(sourcePath, ['build-user', me], me, env, signal)
   stage(row.login, 'syncing')
-  await caller(sourcePath, ['sync'], env, signal)
+  await caller(sourcePath, ['sync'], me, env, signal)
   stage(row.login, 'checking')
-  await checkHealth(sourcePath, env, signal)
+  await checkHealth(sourcePath, me, env, signal)
   signal.throwIfAborted()
   if (sourcePath === tempPath) publishDatabase(tempPath, path)
   db.prepare(`
     UPDATE organizations SET status = 'ready', stage = 'ready', error = NULL,
-      activated_at = COALESCE(activated_at, ?), last_sync_at = ?, last_reconcile_at = ?, indexed_user = ?
+      activated_at = COALESCE(activated_at, ?), last_sync_at = ?, last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0
     WHERE login = ?
   `).run(new Date().toISOString(), Date.now(), Date.now(), me, row.login)
 }
@@ -309,18 +368,18 @@ async function synchronize(row: OrganizationRow, me: string, signal: AbortSignal
   assertOrganization(path, row.login)
   if (row.indexed_user !== me) {
     stage(row.login, 'building-user')
-    await caller(path, ['build-user', me], env, signal)
+    await caller(path, ['build-user', me], me, env, signal)
   }
   stage(row.login, 'syncing')
-  await caller(path, ['sync'], env, signal)
+  await caller(path, ['sync'], me, env, signal)
   const reconcile = Date.now() - row.last_reconcile_at >= RECONCILE_INTERVAL_MS
   if (reconcile) {
     stage(row.login, 'reconciling')
-    await caller(path, ['sync', '--reconcile'], env, signal)
+    await caller(path, ['sync', '--reconcile'], me, env, signal)
     // Reconciliation does not advance Caller's last_sync_at freshness marker.
-    await caller(path, ['sync'], env, signal)
+    await caller(path, ['sync'], me, env, signal)
   }
-  await checkHealth(path, env, signal)
+  await checkHealth(path, me, env, signal)
   db.prepare(`
     UPDATE organizations SET stage = 'ready', error = NULL, last_sync_at = ?,
       last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0 WHERE login = ?
@@ -329,7 +388,7 @@ async function synchronize(row: OrganizationRow, me: string, signal: AbortSignal
 
 function launch(login: string): void {
   const key = login.toLowerCase()
-  if (stopping || jobs.has(key) || releaseBackgroundPaused()) return
+  if (stopping || jobs.has(key) || releaseBackgroundPaused() || cooldownUntil(getMeta('me')?.trim())) return
   const releaseOperation = trackReleaseBackground()
   const controller = new AbortController()
   const promise = Promise.resolve().then(async () => {
@@ -347,6 +406,7 @@ function launch(login: string): void {
         // completed this work while we waited for ownership.
         if (row.status === 'error') return
         const me = getMeta('me')?.trim()
+        if (me) requireQuota(me)
         if (row.status === 'ready' && row.next_sync_at > Date.now()) return
         if (row.status === 'ready' && row.indexed_user === me && Date.now() - row.last_sync_at < SYNC_INTERVAL_MS) return
         if (row.status === 'initializing') stage(login, 'authenticating')
@@ -357,8 +417,15 @@ function launch(login: string): void {
     } catch (error) {
       if (controller.signal.aborted || error instanceof ProcessLockError) return
       const failed = rowFor(login)!
+      if (error instanceof GitHubRateLimitError) {
+        db.prepare(`
+          UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'initializing' ELSE 'ready' END,
+            stage = 'rate-limited', error = ?, next_sync_at = 0 WHERE login = ?
+        `).run(error.message, login)
+        return
+      }
       const failures = failed.activated_at ? failed.sync_failures + 1 : 0
-      const retryAt = failures ? Date.now() + Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(failures - 1, 6), RECONCILE_INTERVAL_MS) : 0
+      const retryAt = failures ? Date.now() + Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(failures - 1, 6), MAX_SYNC_RETRY_MS) : 0
       db.prepare(`
         UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'error' ELSE 'ready' END,
           stage = CASE WHEN activated_at IS NULL THEN stage ELSE 'sync-error' END, error = ?,

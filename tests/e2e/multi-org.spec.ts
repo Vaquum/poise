@@ -192,6 +192,29 @@ test('shows synchronization failures on previously activated organizations with 
 })
 
 
+for (const status of ['initializing', 'ready'] as const) {
+  test(`waits for GitHub quota reset during ${status} and resumes automatically`, async ({ page }) => {
+    const limited = {
+      ...organization('beta', status), stage: 'rate-limited',
+      error: 'GitHub API rate limit reached.', retryAt: '2026-10-01T08:30:00Z',
+    }
+    const state = await setup(page, [organization('acme'), limited])
+    await page.goto('/')
+    await openSettings(page)
+    const row = page.locator('.st-organization[data-org="beta"]')
+    await expect(row).toContainText('Waiting for GitHub')
+    await expect(row).toContainText(`${status === 'ready' ? 'Sync' : 'Activation'} resumes automatically at`)
+    await expect(row).toContainText('08:30:00')
+    await expect(row.getByRole('button', { name: 'Retry' })).toBeDisabled()
+    await expect(row.locator('.st-help-error')).toHaveCount(0)
+    state.organizations = [organization('acme'), organization('beta')]
+    await expect(row).toContainText('Ready')
+    await expect(row.getByRole('button', { name: 'Retry' })).toHaveCount(0)
+    expect(state.retries).toEqual([])
+  })
+}
+
+
 test('continues Archive pagination when an organization is missing only from the count', async ({ page }) => {
   await setup(page, [organization('acme'), organization('beta')])
   const records = Array.from({ length: 25 }, (_, i) => ({ ...record('acme'), number: i + 1, title: `Issue ${i + 1}`, url: `https://github.com/acme/same-repo/issues/${i + 1}` }))

@@ -90,7 +90,8 @@ Poise indexes the account’s repositories, builds your user involvement view, s
 checks freshness before marking it Ready. Progress and retryable errors appear
 in Settings; closing the panel does not stop activation. Large repository
 histories can take longer than a few minutes. Interrupted activation resumes
-when Poise restarts, and completed databases are reused without reinitialization.
+when Poise restarts. Completed item work is retained across activation retries;
+completed databases are reused without reinitialization.
 Your GitHub username configured in Settings must be signed in through `gh` and
 able to read those repositories. Caller currently requires visible repositories
 and indexed issues or PRs; an empty account reports an activation error until it
@@ -114,8 +115,11 @@ and appearance remain shared.
 
 Each added account has a separate datastore under
 `~/.poise/datastores/<account>/github.sqlite` (beside a custom `POISE_DB` when set).
-Poise syncs these databases every minute and reconciles hourly while running.
-Failed syncs back off from one minute to one hour; Retry runs immediately.
+Poise syncs these databases every minute and reconciles daily while running.
+Failed syncs back off from one minute to one hour. When GitHub exhausts the
+authenticated user’s API quota, all managed accounts wait until GitHub’s reset
+time, including after a restart. Settings shows that time and resumes activation
+or sync automatically; Retry cannot bypass the quota wait.
 The existing account's externally managed datastore keeps its existing
 sync service. `POISE_DATASTORE_DB` selects that legacy database explicitly.
 Activation never initializes over the existing account's database.

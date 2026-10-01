@@ -150,7 +150,7 @@ describe('organizations API', () => {
     const registry = await request('/api/organizations')
     expect(registry.status).toBe(200)
     expect(registry.body.organizations).toEqual([{
-      login: 'Legacy', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null,
+      login: 'Legacy', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null, retryAt: null,
     }])
     const settings = await request('/api/settings')
     expect(settings.body).toMatchObject({ org: 'Legacy', me: 'octocat', organizations: registry.body.organizations })
@@ -185,6 +185,37 @@ describe('organizations API', () => {
     expect(result.body.error).toContain('GitHub organization name')
     expect((await request('/api/organizations')).body.organizations).toHaveLength(1)
     expect(mocks.runFile.mock.calls.filter(([command]) => command === 'github-datastore')).toEqual([])
+  })
+
+  it('exposes the shared quota reset and refuses to bypass it through the retry API', async () => {
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org') {
+        throw Object.assign(new Error('GitHub API rate limit exceeded'), {
+          stderr: `GITHUB_RATE_LIMIT_RESET=${reset}`,
+        })
+      }
+      return cli(command, args, options)
+    })
+    await request('/api/organizations', { org: 'acme' })
+    await vi.waitFor(async () => {
+      const result = await request('/api/organizations')
+      expect(result.body.organizations[1]).toMatchObject({
+        login: 'acme', status: 'initializing', stage: 'rate-limited',
+        retryAt: new Date(reset * 1000).toISOString(), error: expect.stringContaining('automatically'),
+      })
+    })
+    const requests = () => mocks.runFile.mock.calls.filter(([command]) => command === 'github-datastore' || command === 'gh')
+    const count = requests().length
+    const retry = await request('/api/organizations/acme/retry', {})
+    expect(retry.status).toBe(202)
+    expect(retry.body.organizations[1]!.retryAt).toBe(new Date(reset * 1000).toISOString())
+    const added = await request('/api/organizations', { org: 'beta' })
+    expect(added.body.organizations[2]).toMatchObject({ login: 'beta', stage: 'rate-limited', retryAt: new Date(reset * 1000).toISOString() })
+    const settings = await request('/api/settings')
+    expect(settings.body.organizations[1]!.retryAt).toBe(new Date(reset * 1000).toISOString())
+    expect(requests()).toHaveLength(count)
+    expect(settings.body.organizations[0]!.retryAt).toBeNull()
   })
 
   it('persists an activation error and recovers through its explicit retry endpoint', async () => {
