@@ -60,6 +60,7 @@ export interface BehaviorDiagnostics {
     error: string | null
   }
   failures: Array<{
+    org?: string
     behavior: BehaviorKey
     kind: string
     consecutiveFailures: number
@@ -87,7 +88,6 @@ export function isReviewerCount(value: unknown): value is ReviewerCount {
   return value === 1 || value === 2 || value === 3
 }
 
-function createBehaviorClient(org: string) {
 // In-memory mirror of the server's state, kept in sync via
 // /api/behaviors GET on view init and every successful POST.
 const enabledByKey: Partial<Record<BehaviorKey, boolean>> = {}
@@ -100,32 +100,32 @@ const reposByKey: Partial<Record<BehaviorKey, string[]>> = {}
 const authorsByKey: Partial<Record<BehaviorKey, string[]>> = {}
 let diagnostics: BehaviorDiagnostics | null = null
 
-function isEnabled(key: BehaviorKey): boolean {
+export function isEnabled(key: BehaviorKey): boolean {
   return !!enabledByKey[key]
 }
 
-function getSetting(key: BehaviorKey): BehaviorSetting {
+export function getSetting(key: BehaviorKey): BehaviorSetting {
   return settingByKey[key] || 'p2'
 }
 
-function getReviewers(key: BehaviorKey): ReviewerCount {
+export function getReviewers(key: BehaviorKey): ReviewerCount {
   return reviewersByKey[key] || 1
 }
 
 
-function getLastTriggered(key: BehaviorKey): LastTriggered | null {
+export function getLastTriggered(key: BehaviorKey): LastTriggered | null {
   return lastByKey[key] || null
 }
 
-function getScratchpad(key: BehaviorKey): string {
+export function getScratchpad(key: BehaviorKey): string {
   return scratchpadByKey[key] || ''
 }
 
-function getRepos(key: BehaviorKey): string[] {
+export function getRepos(key: BehaviorKey): string[] {
   return reposByKey[key] ?? []
 }
 
-function getAuthors(key: BehaviorKey): string[] {
+export function getAuthors(key: BehaviorKey): string[] {
   return authorsByKey[key] ?? []
 }
 
@@ -133,12 +133,12 @@ function stringList(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : null
 }
 
-function getBehaviorDiagnostics(): BehaviorDiagnostics | null {
+export function getBehaviorDiagnostics(): BehaviorDiagnostics | null {
   return diagnostics
 }
 
 async function postBehavior(key: BehaviorKey, body: { enabled?: boolean, setting?: BehaviorSetting, reviewers?: ReviewerCount, repos?: string[], authors?: string[], scratchpad?: string, scratchpadPrevious?: string }) {
-  const res = await fetch(`/api/behaviors/${encodeURIComponent(key)}${org ? `?org=${encodeURIComponent(org)}` : ''}`, {
+  const res = await fetch(`/api/behaviors/${encodeURIComponent(key)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -187,7 +187,7 @@ function readIsCurrentFor(key: BehaviorKey, startedAt: number, wasBusy: boolean)
   return !wasBusy && (writesStarted[key] ?? 0) === startedAt && (writesInFlight[key] ?? 0) === 0
 }
 
-async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<void> {
+export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<void> {
   // Optimistic local update so the toggle UI doesn't flicker; the
   // server is authoritative and a re-fetch on next view-mount will
   // correct any drift.
@@ -202,7 +202,7 @@ async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<void> {
   } finally {
     endWrite(key)
   }
-  window.dispatchEvent(new CustomEvent('poise:behaviors-changed', { detail: { org, key, enabled: enabledByKey[key] } }))
+  window.dispatchEvent(new CustomEvent('poise:behaviors-changed', { detail: { key, enabled: enabledByKey[key] } }))
 }
 
 // Setting writes are serialized per behaviour. The server stores whichever
@@ -211,7 +211,7 @@ async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<void> {
 // requests the automation acts on.
 const settingWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
 
-function setSetting(key: BehaviorKey, setting: BehaviorSetting): Promise<void> {
+export function setSetting(key: BehaviorKey, setting: BehaviorSetting): Promise<void> {
   const run = async () => {
     const previous = settingByKey[key] ?? 'p2'
     settingByKey[key] = setting
@@ -237,7 +237,7 @@ function setSetting(key: BehaviorKey, setting: BehaviorSetting): Promise<void> {
 // reason: the last request to arrive is what the server keeps.
 const reviewersWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
 
-function setReviewers(key: BehaviorKey, reviewers: ReviewerCount): Promise<void> {
+export function setReviewers(key: BehaviorKey, reviewers: ReviewerCount): Promise<void> {
   const run = async () => {
     const previous = reviewersByKey[key] ?? 1
     reviewersByKey[key] = reviewers
@@ -261,7 +261,7 @@ function setReviewers(key: BehaviorKey, reviewers: ReviewerCount): Promise<void>
 // for the same reason as the ceiling: the last request to arrive is kept.
 const triggersWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
 
-function setTriggers(key: BehaviorKey, triggers: { repos?: string[], authors?: string[] }): Promise<void> {
+export function setTriggers(key: BehaviorKey, triggers: { repos?: string[], authors?: string[] }): Promise<void> {
   const run = async () => {
     const previous = { repos: reposByKey[key], authors: authorsByKey[key] }
     if (triggers.repos) reposByKey[key] = [...triggers.repos]
@@ -287,7 +287,7 @@ function setTriggers(key: BehaviorKey, triggers: { repos?: string[], authors?: s
 // `loaded` is what the caller believed was stored when it began editing. The
 // server refuses the write if that no longer matches, so a second window
 // cannot silently overwrite the first one's memory.
-async function setScratchpad(key: BehaviorKey, text: string, loaded?: string): Promise<void> {
+export async function setScratchpad(key: BehaviorKey, text: string, loaded?: string): Promise<void> {
   const previous = scratchpadByKey[key] ?? ''
   scratchpadByKey[key] = text
   beginWrite(key)
@@ -312,11 +312,11 @@ async function setScratchpad(key: BehaviorKey, text: string, loaded?: string): P
 // that write to real pull requests, so the view needs to know when what it is
 // showing is a guess rather than the server's answer.
 let stateLoadOk = false
-function isBehaviorStateLoaded(): boolean { return stateLoadOk }
+export function isBehaviorStateLoaded(): boolean { return stateLoadOk }
 
 // Owner of each behaviour, from the same payload as everything else.
 const ownerByKey: Partial<Record<BehaviorKey, string | null>> = {}
-function getBehaviorOwner(key: BehaviorKey): string | null {
+export function getBehaviorOwner(key: BehaviorKey): string | null {
   return ownerByKey[key] ?? null
 }
 
@@ -328,7 +328,7 @@ function getBehaviorOwner(key: BehaviorKey): string | null {
 // just-saved memory reverted to its pre-save text.
 let refreshSequence = 0
 
-async function refreshState(): Promise<void> {
+export async function refreshState(): Promise<void> {
   const mine = ++refreshSequence
   const keys = BEHAVIORS.map((behavior) => behavior.key)
   // Snapshot the write counters before asking, so the answer can be checked
@@ -338,7 +338,7 @@ async function refreshState(): Promise<void> {
     busy: (writesInFlight[k] ?? 0) > 0,
   }]))
   try {
-    const res = await fetch(`/api/behaviors${org ? `?org=${encodeURIComponent(org)}` : ''}`)
+    const res = await fetch('/api/behaviors')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     // A newer refresh already answered; this one is history.
@@ -384,38 +384,3 @@ async function refreshState(): Promise<void> {
     }
   }
 }
-
-  return { isEnabled, getSetting, getReviewers, getLastTriggered, getScratchpad, getRepos, getAuthors, getBehaviorDiagnostics, setEnabled, setSetting, setReviewers, setTriggers, setScratchpad, isBehaviorStateLoaded, getBehaviorOwner, refreshState }
-}
-
-type BehaviorClient = ReturnType<typeof createBehaviorClient>
-const organizationClients = new Map<string, BehaviorClient>()
-let selectedOrganization = ''
-
-export function setBehaviorOrganization(org: string): void { selectedOrganization = org }
-export function getBehaviorOrganization(): string { return selectedOrganization }
-function client(): BehaviorClient {
-  let state = organizationClients.get(selectedOrganization)
-  if (!state) {
-    state = createBehaviorClient(selectedOrganization)
-    organizationClients.set(selectedOrganization, state)
-  }
-  return state
-}
-
-export const isEnabled: BehaviorClient['isEnabled'] = (...args) => client().isEnabled(...args)
-export const getSetting: BehaviorClient['getSetting'] = (...args) => client().getSetting(...args)
-export const getReviewers: BehaviorClient['getReviewers'] = (...args) => client().getReviewers(...args)
-export const getLastTriggered: BehaviorClient['getLastTriggered'] = (...args) => client().getLastTriggered(...args)
-export const getScratchpad: BehaviorClient['getScratchpad'] = (...args) => client().getScratchpad(...args)
-export const getRepos: BehaviorClient['getRepos'] = (...args) => client().getRepos(...args)
-export const getAuthors: BehaviorClient['getAuthors'] = (...args) => client().getAuthors(...args)
-export const getBehaviorDiagnostics: BehaviorClient['getBehaviorDiagnostics'] = (...args) => client().getBehaviorDiagnostics(...args)
-export const setEnabled: BehaviorClient['setEnabled'] = (...args) => client().setEnabled(...args)
-export const setSetting: BehaviorClient['setSetting'] = (...args) => client().setSetting(...args)
-export const setReviewers: BehaviorClient['setReviewers'] = (...args) => client().setReviewers(...args)
-export const setTriggers: BehaviorClient['setTriggers'] = (...args) => client().setTriggers(...args)
-export const setScratchpad: BehaviorClient['setScratchpad'] = (...args) => client().setScratchpad(...args)
-export const isBehaviorStateLoaded: BehaviorClient['isBehaviorStateLoaded'] = (...args) => client().isBehaviorStateLoaded(...args)
-export const getBehaviorOwner: BehaviorClient['getBehaviorOwner'] = (...args) => client().getBehaviorOwner(...args)
-export const refreshState: BehaviorClient['refreshState'] = (...args) => client().refreshState(...args)

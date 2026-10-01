@@ -12,7 +12,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 // verbatim: the same string the Swarm log records and the CLI takes. The
 // panel never invents a label for one.
 
-import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, type Organization } from './config'
+import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
 import { productionSummary, type ProductionUpdate } from './production-status'
 
 interface CatalogModel { identity: string, provider: string, selector: string, effort: string }
@@ -151,15 +151,24 @@ function renderOrganizations(): void {
   const list = panelEl?.querySelector<HTMLElement>('.st-organizations')
   if (!list) return
   const organizations = getOrganizations()
-  const rendered = JSON.stringify([organizations, organizationAdding])
+  const waiting = organizations.map((org) => org.stage === 'rate-limited' && !!org.retryAt && Date.parse(org.retryAt) > Date.now())
+  const rendered = JSON.stringify([organizations, organizationAdding, waiting])
   if (organizationsRendered === rendered) return
   organizationsRendered = rendered
-  list.innerHTML = organizations.map((org) => `
+  list.innerHTML = organizations.map((org, index) => {
+    const paused = waiting[index]
+    const resetTime = paused ? new Date(org.retryAt!).toLocaleTimeString([], {
+      timeZone: effectiveTimezone(), hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }) : ''
+    const state = paused ? 'Waiting for GitHub' : org.status === 'ready' ? org.error ? 'Sync failed' : 'Ready' : org.status === 'error' ? 'Activation failed' : 'Activating…'
+    return `
     <div class="st-organization" data-org="${escapeHtml(org.login)}">
-      <div class="st-organization-name">${escapeHtml(org.login)}<span class="st-org-state st-org-state-${org.error ? 'error' : org.status}">${org.status === 'ready' ? org.error ? 'Sync failed' : 'Ready' : org.status === 'error' ? 'Activation failed' : 'Activating…'}</span></div>
-      ${org.status === 'initializing' ? `<div class="st-help st-help-info">${escapeHtml(ORGANIZATION_STAGES[org.stage] || org.stage || 'Preparing account…')}</div>` : ''}
-      ${org.status === 'error' || org.error ? `<div class="st-help st-help-error">${escapeHtml(org.error || 'Activation failed. Try again.')}</div><button type="button" class="st-clear" data-retry-org="${escapeHtml(org.login)}"${organizationAdding ? ' disabled' : ''}>Retry</button>` : ''}
-    </div>`).join('') || '<div class="st-help st-help-info">No GitHub accounts added yet.</div>'
+      <div class="st-organization-name">${escapeHtml(org.login)}<span class="st-org-state st-org-state-${paused ? 'initializing' : org.error ? 'error' : org.status}">${state}</span></div>
+      ${paused ? `<div class="st-help st-help-info">GitHub API limit reached. ${org.activatedAt ? 'Sync' : 'Activation'} resumes automatically at ${escapeHtml(resetTime)}.</div>` : org.status === 'initializing' ? `<div class="st-help st-help-info">${escapeHtml(ORGANIZATION_STAGES[org.stage] || org.stage || 'Preparing account…')}</div>` : ''}
+      ${!paused && (org.status === 'error' || org.error) ? `<div class="st-help st-help-error">${escapeHtml(org.error || 'Activation failed. Try again.')}</div>` : ''}
+      ${org.status === 'error' || org.error || paused ? `<button type="button" class="st-clear" data-retry-org="${escapeHtml(org.login)}"${organizationAdding || paused ? ' disabled' : ''}>Retry</button>` : ''}
+    </div>`
+  }).join('') || '<div class="st-help st-help-info">No GitHub accounts added yet.</div>'
 }
 
 async function pollOrganizations(): Promise<void> {
@@ -539,7 +548,7 @@ function buildPanel(): HTMLElement {
             <input id="st-organization" type="text" class="st-input st-input-org" aria-label="New GitHub account" autocomplete="off" spellcheck="false" placeholder="acme-corp or octocat" />
             <button type="button" class="st-clear st-add-organization">Add</button>
           </div>
-          <div class="st-help st-help-info">Add an organization name or personal username. Poise activates its datastore; initial sync may take a few minutes. Existing accounts keep working. New accounts start with automations off.</div>
+          <div class="st-help st-help-info">Add an organization name or personal username. Poise activates its datastore; initial sync may take a few minutes. Existing accounts keep working. Shared behavior settings apply when the new account is ready.</div>
           <div class="st-help st-help-info st-org-status" role="status"></div>
         </div>
 

@@ -9,12 +9,12 @@ import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository, setReviewAgentUsername } from './gh'
-import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
+import { getOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentResponse, fetchAgentReasoning, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, getOrCreateChatSession, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
-import { withBehaviorOrganization, setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
+import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { ContentLaunchPendingError, getContentJobResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
 import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders } from './http'
@@ -139,12 +139,6 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         const mutating = req.method !== 'GET' && req.method !== 'HEAD'
         const release = selfUpdate && mutating && !isSelfUpdateControlRoute(path) ? selfUpdate.beginApiWrite() : null
         try {
-          if (path === '/api/behaviors' || path.startsWith('/api/behaviors/')) {
-            setApiHeaders(res)
-            enforceApiRequest(req, { allowedHosts: opts.allowedHosts })
-            const login = new URLSearchParams(url.split('?')[1] || '').get('org') || readyOrganizations()[0]?.login
-            return await withBehaviorOrganization(login, () => handleApi(req, res, next, url, path, mutating))
-          }
           return await handleApi(req, res, next, url, path, mutating)
         } catch (error) {
           return json(res, httpStatus(error, 400), { error: (error as Error).message })
@@ -156,7 +150,6 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
       async function handleApi(req: Parameters<Connect.NextHandleFunction>[0], res: ServerResponse, next: Connect.NextFunction, url: string, path: string, mutating: boolean): Promise<void> {
         setApiHeaders(res)
         const selectedOrg = new URLSearchParams(url.split('?')[1] || '').get('org') || undefined
-        const behaviorOrg = selectedOrg || readyOrganizations()[0]?.login
         try {
           enforceApiRequest(req, { allowedHosts: opts.allowedHosts })
         } catch (err) {
@@ -193,10 +186,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             const enabled = getEnabledMap()
             return enabled['review-new-prs'] || enabled['approve-prs'] || enabled['review-new-issues']
           }
-          const ready = readyOrganizations()
-          const claudeBackedEnabled = ready.length
-            ? ready.some((org) => withBehaviorOrganization(org.login, requiresClaude))
-            : requiresClaude()
+          const claudeBackedEnabled = requiresClaude()
           const healthy = scheduler.status === 'ok'
             && (!claudeBackedEnabled || claudeAuthState.status === 'authenticated')
             && callerRelease.status !== 'invalid'
@@ -369,12 +359,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           // fetchAgentLogs returns newest-first, so .find() picks the
           // most recent matching row. We only consider rows that have
           // both a repo and pr_id so the link to Swarm works.
+          const accounts = getOrganizations()
           const lastFor = (cliBehavior: string, source: string) => {
             const r = logs.find((e) =>
               e.behavior === cliBehavior
               && e.source === source
               && e.repo
-              && (!behaviorOrg || repoBelongsTo(e.repo, behaviorOrg))
+              && accounts.some((account) => repoBelongsTo(e.repo!, account.login))
               && e.pr_id)
             return r ? {
               at: r.started_at_precise || r.started_at,
@@ -482,14 +473,16 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               if (!Array.isArray(body.repos) || body.repos.length > 200 || !body.repos.every(isValidRepository)) {
                 return json(res, 400, { error: 'repos must be a list of owner/name repositories' })
               }
-              // Only a repository being added needs proving: it must be one
-              // the configured organization has.
+              // Validate newly selected repositories against their own
+              // account; existing selections keep their original start dates.
               const selected = new Set(getIssueRepositories().map((entry) => entry.repo))
               const added = (body.repos as string[]).filter((repo) => !selected.has(repo))
               if (added.length) {
                 let known: Set<string>
                 try {
-                  known = new Set(await listOrgRepos(behaviorOrg))
+                  const owners = [...new Set(added.map((repo) => repo.split('/')[0]!.toLowerCase()))]
+                  const inventories = await Promise.all(owners.map((owner) => listOrgRepos(owner)))
+                  known = new Set(inventories.flat())
                 } catch (err: any) {
                   return json(res, 502, { error: 'could not list the account repositories: ' + (err.message || String(err)) })
                 }

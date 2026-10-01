@@ -15,11 +15,6 @@ vi.mock('../server/process', async (original) => ({
   runFile: mocks.runFile,
   spawnDetached: vi.fn(async () => { throw new Error('unexpected agent launch') }),
 }))
-vi.mock('../server/behaviors', async (original) => ({
-  ...(await original<typeof import('../server/behaviors')>()),
-  startBehaviorsRuntime: vi.fn(),
-  stopBehaviorsRuntime: vi.fn(async () => undefined),
-}))
 vi.mock('../server/content-jobs', async (original) => ({
   ...(await original<typeof import('../server/content-jobs')>()),
   startContentFinalizer: vi.fn(),
@@ -50,6 +45,7 @@ let cache: typeof import('../server/cache-plugin') | undefined
 let pendingIndex: Promise<void> | undefined
 let releaseIndex: (() => void) | undefined
 let failIndex = false
+let behaviorLogs: unknown[] = []
 const envKeys = ['POISE_DB', 'POISE_EDITOR_DIR', 'POISE_CHAT_ATTACHMENTS_DIR', 'POISE_LOCK_DIR', 'AGENT_INTERFACE_ROOT', 'POISE_ESPANSO_MATCH_DIR', 'POISE_DATASTORE_DB']
 const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
 
@@ -65,6 +61,10 @@ function writeIndex(path: string, login: string) {
 
 async function cli(command: string, args: string[], options: RunFileOptions) {
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
+  if (command === 'agent-interface' && args[0] === '--logs') return { stdout: JSON.stringify(behaviorLogs), stderr: '' }
+  if (command === 'github-interface' && args[0] === '--view-repos') {
+    return { stdout: JSON.stringify({ repos: [{ full_name: `${args[1]}/same-repo` }] }), stderr: '' }
+  }
   if (command === 'gh') return { stdout: 'test-secret-token', stderr: '' }
   if (command !== 'github-datastore') throw new Error(`Unexpected test command: ${command}`)
   if (args[2] === 'init-org') {
@@ -109,11 +109,15 @@ beforeEach(async () => {
   pendingIndex = undefined
   releaseIndex = undefined
   failIndex = false
+  behaviorLogs = []
   mocks.runFile.mockReset().mockImplementation(cli)
   vi.resetModules()
   database = await import('../server/db')
   database.setMeta('org', 'Legacy')
   database.setMeta('me', 'octocat')
+  const behaviors = await import('../server/behaviors')
+  vi.spyOn(behaviors, 'startBehaviorsRuntime').mockImplementation(() => undefined)
+  vi.spyOn(behaviors, 'stopBehaviorsRuntime').mockResolvedValue(undefined)
   cache = await import('../server/cache-plugin')
   const middleware = cache.createPoiseMiddleware({ claudeAuth: createAuthenticatedClaudeAuth(), selfUpdateBridge: null })
   server = createServer((req, res) => {
@@ -146,7 +150,7 @@ describe('organizations API', () => {
     const registry = await request('/api/organizations')
     expect(registry.status).toBe(200)
     expect(registry.body.organizations).toEqual([{
-      login: 'Legacy', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null,
+      login: 'Legacy', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null, retryAt: null,
     }])
     const settings = await request('/api/settings')
     expect(settings.body).toMatchObject({ org: 'Legacy', me: 'octocat', organizations: registry.body.organizations })
@@ -183,6 +187,37 @@ describe('organizations API', () => {
     expect(mocks.runFile.mock.calls.filter(([command]) => command === 'github-datastore')).toEqual([])
   })
 
+  it('exposes the shared quota reset and refuses to bypass it through the retry API', async () => {
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org') {
+        throw Object.assign(new Error('GitHub API rate limit exceeded'), {
+          stderr: `GITHUB_RATE_LIMIT_RESET=${reset}`,
+        })
+      }
+      return cli(command, args, options)
+    })
+    await request('/api/organizations', { org: 'acme' })
+    await vi.waitFor(async () => {
+      const result = await request('/api/organizations')
+      expect(result.body.organizations[1]).toMatchObject({
+        login: 'acme', status: 'initializing', stage: 'rate-limited',
+        retryAt: new Date(reset * 1000).toISOString(), error: expect.stringContaining('automatically'),
+      })
+    })
+    const requests = () => mocks.runFile.mock.calls.filter(([command]) => command === 'github-datastore' || command === 'gh')
+    const count = requests().length
+    const retry = await request('/api/organizations/acme/retry', {})
+    expect(retry.status).toBe(202)
+    expect(retry.body.organizations[1]!.retryAt).toBe(new Date(reset * 1000).toISOString())
+    const added = await request('/api/organizations', { org: 'beta' })
+    expect(added.body.organizations[2]).toMatchObject({ login: 'beta', stage: 'rate-limited', retryAt: new Date(reset * 1000).toISOString() })
+    const settings = await request('/api/settings')
+    expect(settings.body.organizations[1]!.retryAt).toBe(new Date(reset * 1000).toISOString())
+    expect(requests()).toHaveLength(count)
+    expect(settings.body.organizations[0]!.retryAt).toBeNull()
+  })
+
   it('persists an activation error and recovers through its explicit retry endpoint', async () => {
     failIndex = true
     expect((await request('/api/organizations', { org: 'acme' })).status).toBe(202)
@@ -206,5 +241,74 @@ describe('organizations API', () => {
     const valid = await request('/api/settings', { org: 'Legacy', timezone: 'UTC' })
     expect(valid.status).toBe(200)
     expect(valid.body.organizations[0]!.login).toBe('Legacy')
+  })
+})
+
+
+describe('global behavior settings API', () => {
+  async function addSecondAccount() {
+    expect((await request('/api/organizations', { org: 'beta' })).status).toBe(202)
+    await orgStatus('beta', 'ready')
+  }
+
+  async function state(query = '') {
+    const response = await fetch(`${base}/api/behaviors${query}`)
+    const data = await response.json() as Record<string, Record<string, unknown>>
+    expect(response.status, JSON.stringify(data)).toBe(200)
+    return data
+  }
+
+  it('shares preferences and memory conflict checks across legacy account query parameters', async () => {
+    await addSecondAccount()
+    database!.setMeta('behavior_review_new_prs_enabled', '1')
+    const updated = await request('/api/behaviors/review-new-prs?org=beta', {
+      setting: 'p3', reviewers: 3, scratchpad: 'Shared instructions',
+    })
+    expect(updated.status, JSON.stringify(updated.body)).toBe(200)
+    for (const query of ['', '?org=Legacy', '?org=beta', '?org=not-configured']) {
+      expect((await state(query))['review-new-prs']).toMatchObject({
+        enabled: true, setting: 'p3', reviewers: 3, scratchpad: 'Shared instructions',
+      })
+    }
+    expect(database!.getMeta('org:beta:behavior_review_new_prs_setting')).toBeNull()
+    expect((await request('/api/behaviors/review-new-prs?org=Legacy', {
+      scratchpad: 'Stale overwrite', scratchpadPrevious: '',
+    })).status).toBe(409)
+    expect((await state())['review-new-prs']!.scratchpad).toBe('Shared instructions')
+    expect((await request('/api/behaviors/review-new-prs?org=beta', { enabled: false })).status).toBe(200)
+    expect((await state('?org=Legacy'))['review-new-prs']!.enabled).toBe(false)
+    expect((await state('?org=beta'))['review-new-prs']!.enabled).toBe(false)
+  })
+
+  it('keeps one issue repository selection across accounts and validates each repository owner', async () => {
+    await addSecondAccount()
+    const repos = ['beta/same-repo', 'Legacy/same-repo']
+    const added = await request('/api/behaviors/review-new-issues', { repos })
+    expect(added.status, JSON.stringify(added.body)).toBe(200)
+    expect((await state())['review-new-issues']!.repos).toEqual(repos)
+    expect((await state('?org=beta'))['review-new-issues']!.repos).toEqual(repos)
+    expect(mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-interface' && args[0] === '--view-repos')
+      .map(([, args]) => args[1]).sort()).toEqual(['Legacy', 'beta'])
+    const before = database!.getMeta('behavior_review_new_issues_repos')
+    expect((await request('/api/behaviors/review-new-issues', { enabled: true, repos: [...repos, 'beta/unknown'] })).status).toBe(400)
+    expect(database!.getMeta('behavior_review_new_issues_repos')).toBe(before)
+    expect((await state())['review-new-issues']!.enabled).toBe(false)
+  })
+
+  it('shows latest behavior activity across configured accounts', async () => {
+    await addSecondAccount()
+    behaviorLogs = ['Legacy', 'beta', 'unconfigured'].map((owner, index) => ({
+      id: String(index + 1).repeat(32), behavior: 'pr_review',
+      source: 'poise:review-new-prs', repo: `${owner}/same-repo`, pr_id: '1',
+      started_at: `2026-10-01T12:0${index}:00Z`, completed_at: `2026-10-01T12:0${index}:01Z`, status: 'completed',
+      actor: 'review-bot', expected_head: 'a'.repeat(40), head_sha: 'a'.repeat(40),
+      correlation_id: `review-${index}`, action: 'reviewed_clean', outcome: 'clean',
+      model: 'test', prompt: '', time_elapsed: '1s',
+    }))
+    for (const query of ['', '?org=Legacy']) {
+      expect((await state(query))['review-new-prs']!.lastTriggered).toEqual({
+        at: '2026-10-01T12:01:00Z', target: 'beta/same-repo#1',
+      })
+    }
   })
 })

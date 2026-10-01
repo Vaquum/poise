@@ -14,6 +14,7 @@ export interface Organization {
   stage: string
   error: string | null
   activatedAt: string | null
+  retryAt?: string | null
 }
 
 export interface AppSettings {

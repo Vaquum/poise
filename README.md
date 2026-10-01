@@ -90,7 +90,8 @@ Poise indexes the account’s repositories, builds your user involvement view, s
 checks freshness before marking it Ready. Progress and retryable errors appear
 in Settings; closing the panel does not stop activation. Large repository
 histories can take longer than a few minutes. Interrupted activation resumes
-when Poise restarts, and completed databases are reused without reinitialization.
+when Poise restarts. Completed item work is retained across activation retries;
+completed databases are reused without reinitialization.
 Your GitHub username configured in Settings must be signed in through `gh` and
 able to read those repositories. Caller currently requires visible repositories
 and indexed issues or PRs; an empty account reports an activation error until it
@@ -101,17 +102,24 @@ filter. Repository labels include their owner. Repository-free manual cards,
 Editor, Snippets, and local chats remain personal. If one account's reads
 fail, available results remain visible with an explicit error.
 
-Behaviors has its own account selector: each account has independent
-enabled flags, review settings, repository selections, memory, and retry state.
-New accounts start with automation disabled. Enabling PR review records a
-baseline first, so existing PRs are not treated as newly opened work. Your
-existing account's settings and review history are preserved. GitHub user,
-review-agent identity, model choices, and appearance remain shared.
+Behaviors uses one shared set of enabled flags, review settings, repository
+selections, trusted authors, and memory across all ready GitHub accounts.
+Account filters in Current, Archive, and Swarm do not change automation scope.
+The Review New Issues repository picker lists full `owner/repo` names across
+all ready accounts. Newly activated accounts use the same behavior settings.
+Enabling PR review for the first time records a baseline for existing accounts.
+Accounts added while PR review is already enabled process eligible existing open
+PRs when they become ready. Review history, onboarding baselines, and retry state
+remain separate per account. GitHub user, review-agent identity, model choices,
+and appearance remain shared.
 
 Each added account has a separate datastore under
 `~/.poise/datastores/<account>/github.sqlite` (beside a custom `POISE_DB` when set).
-Poise syncs these databases every minute and reconciles hourly while running.
-Failed syncs back off from one minute to one hour; Retry runs immediately.
+Poise syncs these databases every minute and reconciles daily while running.
+Failed syncs back off from one minute to one hour. When GitHub exhausts the
+authenticated user’s API quota, all managed accounts wait until GitHub’s reset
+time, including after a restart. Settings shows that time and resumes activation
+or sync automatically; Retry cannot bypass the quota wait.
 The existing account's externally managed datastore keeps its existing
 sync service. `POISE_DATASTORE_DB` selects that legacy database explicitly.
 Activation never initializes over the existing account's database.
