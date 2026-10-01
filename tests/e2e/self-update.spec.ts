@@ -550,7 +550,7 @@ test.describe('on a release build', () => {
     await expect(banner).toContainText('did not pick up')
     await input(page).fill('explicit draft')
     await openSettings(page)
-    const org = page.getByLabel('New organization')
+    const org = page.getByLabel('New GitHub account')
     await expect(org).toHaveValue('')
     await expect(page.locator('.st-organization[data-org="acme"]')).toContainText('Ready')
     await org.fill('acme-typed')

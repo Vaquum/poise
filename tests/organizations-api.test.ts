@@ -199,7 +199,7 @@ describe('organizations API', () => {
   it('rejects a settings update that would bypass organization activation before saving any fields', async () => {
     const result = await request('/api/settings', { org: 'uninitialized', me: 'different-user' })
     expect(result.status).toBe(400)
-    expect(result.body.error).toContain('organization setup')
+    expect(result.body.error).toContain('account setup')
     expect(database!.getMeta('org')).toBe('Legacy')
     expect(database!.getMeta('me')).toBe('octocat')
     expect((await request('/api/organizations')).body.organizations).toHaveLength(1)

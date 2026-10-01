@@ -266,7 +266,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             const body = await readJson<any>(req)
             const catalog = body && typeof body === 'object' && 'models' in body ? await loadCatalog() : undefined
             if (typeof body?.org === 'string' && body.org.trim() !== getSettings().org) {
-              return json(res, 400, { error: 'Add organizations through organization setup.' })
+              return json(res, 400, { error: 'Add GitHub accounts through account setup.' })
             }
             const settings = setSettings(body, catalog)
             return json(res, 200, { ...settings, organizations: getOrganizations() })
@@ -491,10 +491,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
                 try {
                   known = new Set(await listOrgRepos(behaviorOrg))
                 } catch (err: any) {
-                  return json(res, 502, { error: 'could not list the organization repositories: ' + (err.message || String(err)) })
+                  return json(res, 502, { error: 'could not list the account repositories: ' + (err.message || String(err)) })
                 }
                 const unknown = added.filter((repo) => !known.has(repo))
-                if (unknown.length) return json(res, 400, { error: 'not a repository of the organization: ' + unknown.join(', ') })
+                if (unknown.length) return json(res, 400, { error: 'not a repository of the account: ' + unknown.join(', ') })
               }
             }
             if ('authors' in body && !isValidAuthorList(body.authors)) {

@@ -133,10 +133,10 @@ describe('organization-filtered positions', () => {
     expect(laneOrder('idea')).toEqual(['alpha first', 'moving', 'hidden'])
   })
 
-  it('rejects a card outside the selected organization without changing order', () => {
+  it('rejects a card outside the selected account without changing order', () => {
     const hidden = current.createCard('hidden', 'idea', 'beta/repo')
     current.createCard('shown', 'idea', 'alpha/repo')
-    expect(() => current.moveCard(hidden.id, 'plan', 0, 'alpha')).toThrow('selected organization')
+    expect(() => current.moveCard(hidden.id, 'plan', 0, 'alpha')).toThrow('selected account')
     expect(laneOrder('idea')).toEqual(['hidden', 'shown'])
     expect(laneOrder('plan')).toEqual([])
   })

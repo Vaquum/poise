@@ -171,9 +171,9 @@ export function repoBelongsTo(repo: string, org: string): boolean {
 /** The browser's filter never changes which orgs background workers monitor. */
 export function selectOrganizations(login?: unknown): Organization[] {
   if (login !== undefined && login !== null && login !== '') {
-    if (typeof login !== 'string') throw new HttpError(400, 'org must be an organization name')
+    if (typeof login !== 'string') throw new HttpError(400, 'org must be a GitHub organization name or personal username')
     const org = getOrganizations().find((entry) => entry.login.toLowerCase() === login.toLowerCase())
-    if (!org) throw new HttpError(400, 'organization is not configured')
+    if (!org) throw new HttpError(400, 'GitHub account is not configured')
     if (org.status !== 'ready') throw new HttpError(409, `${org.login} is not ready`)
     return [org]
   }
@@ -183,7 +183,7 @@ export function selectOrganizations(login?: unknown): Organization[] {
 export function requireConfiguredRepository(repo: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/.test(repo)
     || !readyOrganizations().some((org) => repoBelongsTo(repo, org.login))) {
-    throw new HttpError(400, 'repository must belong to a ready organization')
+    throw new HttpError(400, 'repository must belong to a ready GitHub account')
   }
 }
 

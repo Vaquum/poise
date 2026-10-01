@@ -91,7 +91,7 @@ export function withBehaviorOrganization<T>(orgLogin: string | undefined, operat
   const org = orgLogin === undefined
     ? currentOrganization()
     : getOrganizations().find((candidate) => candidate.login.toLowerCase() === orgLogin.toLowerCase())
-  if (orgLogin !== undefined && !org) throw new HttpError(404, 'Organization is not configured')
+  if (orgLogin !== undefined && !org) throw new HttpError(404, 'GitHub account is not configured')
   return behaviorOrganization.run(org ?? null, operation)
 }
 
@@ -869,7 +869,7 @@ async function requireFreshDatastore(): Promise<void> {
     }
     const org = currentOrganization()
     if (org?.datastorePath && data.database !== resolve(org.datastorePath)) {
-      throw new Error('github-datastore health returned a different organization database')
+      throw new Error('github-datastore health returned a different account database')
     }
     const ageSeconds = safeInteger(data.age_seconds, 'datastore age_seconds')
     const lastSuccessAt = String(data.last_success_at || '')
@@ -2102,7 +2102,7 @@ export function getIssueRepositories(): IssueRepository[] {
 // A repository that stays selected keeps its date; a newly selected one starts
 // now, so selecting it never reviews what was already open.
 export function setIssueRepositories(repos: readonly string[]): IssueRepository[] {
-  if (repos.some((repo) => !organizationOwns(repo))) throw new HttpError(400, 'Issue repositories must belong to the selected organization')
+  if (repos.some((repo) => !organizationOwns(repo))) throw new HttpError(400, 'Issue repositories must belong to the selected account')
   const current = new Map(getIssueRepositories().map((entry) => [entry.repo, entry.since]))
   const now = new Date().toISOString()
   const next = [...new Set(repos)].sort((a, b) => a.localeCompare(b))
@@ -2743,7 +2743,7 @@ async function reconcileIssueReviewClaims(): Promise<void> {
 
 export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<void> {
   if (enabled && currentOrganization()?.status !== 'ready') {
-    throw new HttpError(409, 'Wait for the organization datastore to become ready before enabling automation')
+    throw new HttpError(409, 'Wait for the account datastore to become ready before enabling automation')
   }
   const lifecycle = behaviorAbortController?.signal
   if (!enabled) {

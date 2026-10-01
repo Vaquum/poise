@@ -2420,7 +2420,7 @@ describe('multiple organization behavior isolation', () => {
       runtime.setSetting('review-new-prs', 'p4')
       runtime.setReviewers(2)
       runtime.setScratchpad('review-new-prs', 'beta note')
-      expect(() => runtime.setIssueRepositories(['Vaquum/poise-test'])).toThrow('selected organization')
+      expect(() => runtime.setIssueRepositories(['Vaquum/poise-test'])).toThrow('selected account')
       runtime.setIssueRepositories(['beta/poise-test'])
     })
     const entered = deferred<void>()
@@ -2540,7 +2540,7 @@ describe('multiple organization behavior isolation', () => {
     })
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
-    expect(runtime.withBehaviorOrganization('beta', () => runtime.getBehaviorsRuntimeHealth()).datastore.error).toContain('different organization database')
+    expect(runtime.withBehaviorOrganization('beta', () => runtime.getBehaviorsRuntimeHealth()).datastore.error).toContain('different account database')
     expect(runtime.withBehaviorOrganization('Vaquum', () => runtime.getBehaviorsRuntimeHealth()).datastore.status).toBe('healthy')
   })
 
