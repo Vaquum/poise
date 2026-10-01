@@ -20,6 +20,8 @@ import { mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getMeta } from './db'
+import { HttpError } from './http'
+import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { MAX_PROCESS_ARG_BYTES, runFile } from './process'
 
 const CLI = 'github-datastore'
@@ -122,14 +124,19 @@ interface GhRecord {
   owner_avatar: string | null
 }
 
-async function runCli(args: string[]): Promise<DatastoreRecord[]> {
-  const { stdout } = await runFile(CLI, args, {
+async function runCli(org: Organization, args: string[]): Promise<DatastoreRecord[]> {
+  const { stdout } = await runFile(CLI, organizationArgs(org, args), {
     timeoutMs: 30_000,
     maxOutputBytes: 32 * 1024 * 1024,
   })
   const trimmed = stdout.trim()
-  if (!trimmed) return []
-  return JSON.parse(trimmed)
+  if (!trimmed) throw new Error('datastore returned empty output')
+  const records = JSON.parse(trimmed)
+  if (!Array.isArray(records)) throw new Error('datastore returned a non-array')
+  if (records.some((row) => !row || typeof row.repo !== 'string' || !repoBelongsTo(row.repo, org.login))) {
+    throw new Error(`datastore contains records outside ${org.login}`)
+  }
+  return records
 }
 
 function toLegacy(r: DatastoreRecord, kind: 'pr' | 'issue'): GhRecord {
@@ -155,53 +162,80 @@ function toLegacy(r: DatastoreRecord, kind: 'pr' | 'issue'): GhRecord {
   }
 }
 
-// Org-wide list of every repo. Used to populate Current's repo
-// dropdowns (manual cards + issue composer) — the user picks from the
-// entire Vaquum org, not just repos they've personally touched.
-// Cached 5 min so the dropdowns open instantly on subsequent edits.
-//
-// Source is `github-interface --view-repos ORG` — that's where org-
-// level metadata belongs. Returns every repo (including ones with no
-// PRs or issues), unlike a derivation from views.pr/views.issue.
-let repoListCache: { repos: string[], expiry: number } | null = null
+export interface OrganizationReadError { org: string, error: string }
 
-// The list is scoped to the configured organization, so changing that
-// organization invalidates it. Without this the repo pickers in Current kept
-// offering the previous org's repos for up to the TTL — and opening an issue
-// against one of them would have gone to the wrong place entirely.
+export function repoBelongsTo(repo: string, org: string): boolean {
+  return repo.split('/', 1)[0].toLowerCase() === org.toLowerCase()
+}
+
+/** The browser's filter never changes which orgs background workers monitor. */
+export function selectOrganizations(login?: unknown): Organization[] {
+  if (login !== undefined && login !== null && login !== '') {
+    if (typeof login !== 'string') throw new HttpError(400, 'org must be an organization name')
+    const org = getOrganizations().find((entry) => entry.login.toLowerCase() === login.toLowerCase())
+    if (!org) throw new HttpError(400, 'organization is not configured')
+    if (org.status !== 'ready') throw new HttpError(409, `${org.login} is not ready`)
+    return [org]
+  }
+  return readyOrganizations()
+}
+
+export function requireConfiguredRepository(repo: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/.test(repo)
+    || !readyOrganizations().some((org) => repoBelongsTo(repo, org.login))) {
+    throw new HttpError(400, 'repository must belong to a ready organization')
+  }
+}
+
+// Cache by owner, including a generation so an old in-flight read cannot
+// repopulate the cache after settings invalidation.
+const repoListCache = new Map<string, { repos: string[], expiry: number }>()
+let repoCacheGeneration = 0
 export function invalidateRepoListCache(): void {
-  repoListCache = null
+  repoCacheGeneration += 1
+  repoListCache.clear()
 }
 const REPO_LIST_TTL_MS = 5 * 60 * 1000
 
-function shortRepo(full: string): string {
-  return full.includes('/') ? full.split('/', 2)[1] : full
-}
-
-export async function listOrgRepos(): Promise<string[]> {
+async function discoverOrgRepos(org: Organization): Promise<string[]> {
+  const key = org.login.toLowerCase()
   const now = Date.now()
-  if (repoListCache && repoListCache.expiry > now) return repoListCache.repos
-
-  const me = getMeta('me') || ''
-  const org = getMeta('org') || ''
-  if (!org) {
-    // Without an org configured we can't ask github-interface; return
-    // empty so the front-end falls back to the involvement-derived set.
-    void me
-    return []
-  }
-
-  const { stdout } = await runFile(GH_INTERFACE, ['--view-repos', org], {
-    timeoutMs: 30_000,
-    maxOutputBytes: 32 * 1024 * 1024,
+  const cached = repoListCache.get(key)
+  if (cached && cached.expiry > now) return cached.repos
+  const generation = repoCacheGeneration
+  const { stdout } = await runFile(GH_INTERFACE, ['--view-repos', org.login], {
+    timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024,
   })
   const data = JSON.parse(stdout)
-  const fullNames: string[] = (data.repos || [])
-    .map((r: any) => String(r.full_name || ''))
-    .filter((s: string) => s.length > 0)
-  const repos = fullNames.sort((a, b) => shortRepo(a).localeCompare(shortRepo(b)))
-  repoListCache = { repos, expiry: now + REPO_LIST_TTL_MS }
-  return repos
+  if (!Array.isArray(data.repos)) throw new Error('repository discovery returned no repository list')
+  const repos: string[] = data.repos.map((r: any) => String(r.full_name || ''))
+  if (repos.some((repo) => !repo.includes('/') || !repoBelongsTo(repo, org.login))) {
+    throw new Error(`repository discovery returned repositories outside ${org.login}`)
+  }
+  const sorted = [...new Set(repos)].sort((a, b) => a.localeCompare(b))
+  if (generation === repoCacheGeneration) repoListCache.set(key, { repos: sorted, expiry: now + REPO_LIST_TTL_MS })
+  return sorted
+}
+
+export async function listOrganizationsRepos(login?: string): Promise<{ repos: string[], errors: OrganizationReadError[] }> {
+  const orgs = selectOrganizations(login)
+  const results = await Promise.allSettled(orgs.map(discoverOrgRepos))
+  const repos: string[] = []
+  const errors: OrganizationReadError[] = []
+  results.forEach((result, i) => {
+    if (result.status === 'fulfilled') repos.push(...result.value)
+    else errors.push({ org: orgs[i].login, error: result.reason instanceof Error ? result.reason.message : String(result.reason) })
+  })
+  if (orgs.length && errors.length === orgs.length) throw new HttpError(502, errors.map((entry) => `${entry.org}: ${entry.error}`).join('; '))
+  return { repos: [...new Set(repos)].sort((a, b) => a.localeCompare(b)), errors }
+}
+
+// Validation needs complete discovery; read-only pickers can show partial
+// results with the explicit per-org errors from listOrganizationsRepos.
+export async function listOrgRepos(login?: string): Promise<string[]> {
+  const result = await listOrganizationsRepos(login)
+  if (result.errors.length) throw new HttpError(502, result.errors.map((entry) => `${entry.org}: ${entry.error}`).join('; '))
+  return result.repos
 }
 
 // Resolve the local checkout path for a repo via
@@ -296,8 +330,9 @@ async function checkMergeable(owner: string, repo: string, number: number): Prom
 // Resolve mergeable-true PRs across the user's open-PR set. Concurrency
 // capped to be polite to GitHub's REST endpoint — typical involvement
 // only has a handful of open PRs at once.
-async function fetchGreenPrs(me: string): Promise<{ repo: string, number: number }[]> {
-  const openPrs = await fetchKind('pr', { record_state: 'open', limit: 200 }, me)
+async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promise<{ records: { repo: string, number: number }[], errors: OrganizationReadError[] }> {
+  const read = await fetchKind('pr', { ...body, record_state: 'open', count_only: true }, me, orgs)
+  const openPrs = read.records
 
   const results: { repo: string, number: number }[] = []
   for (let i = 0; i < openPrs.length; i += GREEN_CONCURRENCY) {
@@ -312,17 +347,12 @@ async function fetchGreenPrs(me: string): Promise<{ repo: string, number: number
       if (green) results.push({ repo: pr.repo, number: pr.number })
     }
   }
-  return results
+  return { records: results, errors: read.errors }
 }
 
-// One CLI call for one kind. The datastore CLI doesn't support offset
-// or `q` or `updated_until`, so we pull a wider window than the caller
-// asked for whenever those proxy-side filters or count_only are in play
-// — otherwise the slice happens before the filter and we wrongly return
-// few-or-zero results. The full user-footprint view tops out around
-// ~1200 rows and the CLI does that under 150ms, so a generous ceiling
-// is cheap.
-async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string): Promise<GhRecord[]> {
+// Query each ready organization's own datastore. Full repository identities
+// survive merging; the final pagination applies only after the combined sort.
+async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: Organization[]): Promise<{ records: GhRecord[], errors: OrganizationReadError[] }> {
   // Scope(s) selecting WHICH records — the leading CLI args that differ
   // per query. The common filters (status / since / limit / format) are
   // appended identically to each scope below.
@@ -359,15 +389,28 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string): Promi
   if (body.record_state === 'open') common.push('--status', 'open')
   if (body.updated_since)            common.push('--updated-since-datetime', body.updated_since)
 
+  // Each org must contribute enough rows for the global page. Searches and
+  // counts read the full view: a pre-filter limit silently loses matches.
   const needsWide = !!(body.q || body.updated_until || body.count_only)
-  const want = needsWide
-    ? 5000
-    : (Number(body.offset) || 0) + (Number(body.limit) || 200)
-  common.push('--limit', String(Math.min(Math.max(want, 1), 5000)))
+  if (!needsWide) {
+    const want = Math.max(1, (Number(body.offset) || 0) + (Number(body.limit) || 200))
+    if (!Number.isSafeInteger(want)) throw new HttpError(400, 'invalid pagination')
+    common.push('--limit', String(want))
+  }
   common.push('--format', 'json')
-
-  const batches = await Promise.all(scopes.map((scope) => runCli(['view', ...scope, ...common])))
-
+  const results = await Promise.allSettled(orgs.map(async (org) => {
+    const rows = await Promise.all(scopes.map((scope) => runCli(org, ['view', ...scope, ...common])))
+    return rows.flat()
+  }))
+  const batches: DatastoreRecord[][] = []
+  const errors: OrganizationReadError[] = []
+  results.forEach((result, i) => {
+    if (result.status === 'fulfilled') {
+      batches.push(result.value)
+      // A readable cache can still be stale after synchronization failed.
+      if (orgs[i].error) errors.push({ org: orgs[i].login, error: orgs[i].error! })
+    } else errors.push({ org: orgs[i].login, error: result.reason instanceof Error ? result.reason.message : String(result.reason) })
+  })
   // Merge + dedupe by repo#number: the same item can land in both the
   // user's and the agent's involvement (one opened it, the other reviewed).
   //
@@ -389,7 +432,7 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string): Promi
     }
   }
   out.sort((a, b) => b.updated_at.localeCompare(a.updated_at))
-  return out
+  return { records: out, errors }
 }
 
 export async function handleGhBody(body: any): Promise<{ status: number, body: unknown }> {
@@ -397,19 +440,23 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
   const me = getMeta('me') || ''
 
   if (op === 'list') {
+    const orgs = selectOrganizations(body.org)
     let records: GhRecord[]
+    let errors: OrganizationReadError[]
     const recordType = body.record_type
-    if (recordType === 'pull_request') {
-      records = await fetchKind('pr', body, me)
-    } else if (recordType === 'issue') {
-      records = await fetchKind('issue', body, me)
+    if (recordType === 'pull_request' || recordType === 'issue') {
+      const result = await fetchKind(recordType === 'issue' ? 'issue' : 'pr', body, me, orgs)
+      records = result.records
+      errors = result.errors
     } else {
-      // 'all' or undefined — both kinds, merged and re-sorted by updated_at desc.
       const [prs, issues] = await Promise.all([
-        fetchKind('pr', body, me),
-        fetchKind('issue', body, me),
+        fetchKind('pr', body, me, orgs), fetchKind('issue', body, me, orgs),
       ])
-      records = [...prs, ...issues].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+      records = [...prs.records, ...issues.records].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+      errors = [...new Map([...prs.errors, ...issues.errors].map((error) => [error.org, error])).values()]
+    }
+    if (orgs.length && errors.length === orgs.length && records.length === 0) {
+      throw new HttpError(502, errors.map((entry) => `${entry.org}: ${entry.error}`).join('; '))
     }
 
     // Filters the CLI doesn't support — applied in the proxy.
@@ -428,12 +475,12 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
     }
 
     if (body.count_only) {
-      return { status: 200, body: { count: records.length } }
+      return { status: 200, body: { count: records.length, errors } }
     }
 
     const offset = Math.max(0, Number(body.offset) || 0)
     const limit = Math.max(0, Number(body.limit) || records.length)
-    return { status: 200, body: { records: records.slice(offset, offset + limit) } }
+    return { status: 200, body: { records: records.slice(offset, offset + limit), errors } }
   }
 
   if (op === 'green_pr') {
@@ -441,8 +488,8 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
     // `github-interface --mergeable '#<n>'` across the user's open PRs.
     // Results are cached ~60s so subsequent ticks within a refresh
     // window are instant.
-    const records = await fetchGreenPrs(me)
-    return { status: 200, body: { records } }
+    const result = await fetchGreenPrs(me, body, selectOrganizations(body.org))
+    return { status: 200, body: result }
   }
 
   if (op === 'open_issue') {
@@ -468,6 +515,8 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
     if (issueBody && !fitsProcessArgument(ISSUE_BODY_PREFIX, issueBody)) {
       return { status: 413, body: { error: `body exceeds ${MAX_PROCESS_ARG_BYTES - ISSUE_BODY_PREFIX.length} UTF-8 bytes` } }
     }
+    try { requireConfiguredRepository(repoFull) }
+    catch (error) { return { status: 400, body: { error: (error as Error).message } } }
     const [owner, repo] = repoFull.split('/', 2)
 
     // Resolve `me`'s gh credential. With no `me` configured, fall back to

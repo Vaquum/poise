@@ -280,7 +280,7 @@ test('chooses how many reviewers each new pull request gets from Behaviors', asy
   const behavior = (extra: Record<string, unknown>) => ({
     owner: 'review-bot', enabled: false, setting: null, reviewers: null, scratchpad: '', lastTriggered: null, ...extra,
   })
-  await page.route('**/api/behaviors', async (route) => {
+  await page.route(/\/api\/behaviors(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: {
       'review-new-prs': behavior({ setting: 'p2', reviewers }),
       'approve-prs': behavior({}),
@@ -288,7 +288,7 @@ test('chooses how many reviewers each new pull request gets from Behaviors', asy
       diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'review-bot', error: null }, failures: [], deadLetters: [] },
     } })
   })
-  await page.route('**/api/behaviors/review-new-prs', async (route) => {
+  await page.route('**/api/behaviors/review-new-prs*', async (route) => {
     const body = route.request().postDataJSON() as Record<string, unknown>
     writes.push(body)
     if (typeof body.reviewers === 'number') reviewers = body.reviewers
@@ -314,7 +314,7 @@ test('opts repositories and trusted authors into Review New Issues from Behavior
   const behavior = (extra: Record<string, unknown>) => ({
     owner: 'bit-mis', enabled: false, setting: null, reviewers: null, scratchpad: '', lastTriggered: null, ...extra,
   })
-  await page.route('**/api/behaviors', async (route) => {
+  await page.route(/\/api\/behaviors(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: {
       'review-new-prs': behavior({ setting: 'p2', reviewers: 1 }),
       'approve-prs': behavior({}),
@@ -323,13 +323,13 @@ test('opts repositories and trusted authors into Review New Issues from Behavior
       diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [] },
     } })
   })
-  await page.route('**/api/behaviors/review-new-issues', async (route) => {
+  await page.route('**/api/behaviors/review-new-issues*', async (route) => {
     const body = route.request().postDataJSON() as Record<string, unknown>
     writes.push(body)
     state = { ...state, ...body }
     await route.fulfill({ json: { ok: true, enabled: false, setting: null, scratchpad: '', ...state } })
   })
-  await page.route('**/api/repos', async (route) => {
+  await page.route(/\/api\/repos(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: { repos: ['Vaquum/Limen', 'Vaquum/Origo', 'Vaquum/Praxis'] } })
   })
   await page.goto('/')
@@ -389,8 +389,8 @@ test('opts repositories and trusted authors into Review New Issues from Behavior
 
   // With the state unreadable, what the pill shows may be a guess: it cannot be
   // opened, so nothing can be saved over the stored list.
-  await page.unroute('**/api/behaviors')
-  await page.route('**/api/behaviors', (route) => route.fulfill({ status: 500, json: { error: 'down' } }))
+  await page.unroute(/\/api\/behaviors(?:\?.*)?$/)
+  await page.route(/\/api\/behaviors(?:\?.*)?$/, (route) => route.fulfill({ status: 500, json: { error: 'down' } }))
   await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
   await expect(pill).toBeDisabled()
 })
@@ -399,7 +399,7 @@ test('lists a repository created while the tab was open in the Review New Issues
   const behavior = (extra: Record<string, unknown>) => ({
     owner: 'bit-mis', enabled: false, setting: null, reviewers: null, scratchpad: '', lastTriggered: null, ...extra,
   })
-  await page.route('**/api/behaviors', async (route) => {
+  await page.route(/\/api\/behaviors(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: {
       'review-new-prs': behavior({ setting: 'p2', reviewers: 1 }),
       'approve-prs': behavior({}),
@@ -410,7 +410,7 @@ test('lists a repository created while the tab was open in the Review New Issues
   })
   let repos = ['Vaquum/Limen', 'Vaquum/Origo']
   let answered: Promise<void> = Promise.resolve()
-  await page.route('**/api/repos', async (route) => {
+  await page.route(/\/api\/repos(?:\?.*)?$/, async (route) => {
     const listed = [...repos]
     await answered
     await route.fulfill({ json: { repos: listed } })
@@ -429,7 +429,7 @@ test('lists a repository created while the tab was open in the Review New Issues
   repos = ['Vaquum/Limen', 'Vaquum/Market-State-Cube-Explorer', 'Vaquum/Origo']
   let answer!: () => void
   answered = new Promise((resolve) => { answer = resolve })
-  const asked = page.waitForRequest('**/api/repos')
+  const asked = page.waitForRequest(/\/api\/repos(?:\?.*)?$/)
   await pill.click()
   await asked
   await expect(dialog.locator('.bt-repo')).toHaveCount(2)

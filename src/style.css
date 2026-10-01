@@ -6275,3 +6275,27 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 
 /* Short rubrics stay compact, but preserve line breaks from Request JSON. */
 .jev-field textarea[rows="2"] { min-height: 52px; }
+
+/* Organization scope follows the shared controls and settings tokens. */
+.organization-filter {
+  min-width: 150px;
+  max-width: 240px;
+  height: 30px;
+  padding: var(--sp-1) var(--sp-2);
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+.organization-filter[hidden] { display: none; }
+.st-org-add-row { display: flex; align-items: center; gap: var(--sp-2); }
+.st-org-add-row .st-input { min-width: 0; flex: 1; }
+.st-organizations { display: grid; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+.st-organization { padding: var(--sp-3); border: var(--b-base); border-radius: var(--r-sm); }
+.st-organization-name { display: flex; justify-content: space-between; align-items: center; gap: var(--sp-2); }
+.st-org-state { font-size: 11px; color: var(--text-secondary); }
+.st-org-state-ready { color: var(--a3); }
+.st-org-state-error { color: var(--a5); }
+.st-org-state-initializing { color: var(--a4); }
+.st-org-status:empty { display: none; }

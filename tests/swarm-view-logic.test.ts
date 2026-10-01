@@ -79,7 +79,7 @@ describe('a run with no pull request is identified by its session', () => {
   })
 
   it('prefers the pull request when the run has one', () => {
-    expect(helpers.targetText(entry({ repo: 'owner/poise', pr_id: '42' }))).toBe('poise#42')
+    expect(helpers.targetText(entry({ repo: 'owner/poise', pr_id: '42' }))).toBe('owner/poise#42')
   })
 })
 

@@ -110,6 +110,7 @@ async function start(options: {
   process.env.POISE_DB = join(tempRoot, 'cache.db')
   vi.resetModules()
   database = await import('../server/db')
+  database.setMeta('org', 'Vaquum')
   behaviors = await import('../server/behaviors')
   const gh = await import('../server/gh')
   gh.setReviewAgentUsername('bit-mis')

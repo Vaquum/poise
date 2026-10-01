@@ -1,6 +1,7 @@
 // Main table view — reads through /api/gh from the unified /github API.
 
 import { midnightInZone, startOfWeekInZone } from '../config'
+import { mountOrganizationFilter, organizationPayload, organizationErrors } from '../organizations'
 
 const STORAGE_KEY = 'poise-filters'
 const REVIEWED_KEY = 'poise-reviewed'
@@ -50,6 +51,7 @@ let searchQuery = ''
 let items: PrRow[] = []
 let offset = 0
 let total = 0
+let partialResults = false
 let done = false
 let fetching = false
 let initialized = false
@@ -257,7 +259,7 @@ function paintRow(tr: HTMLTableRowElement, item: PrRow): void {
 }
 
 function updateCount() {
-  countEl.textContent = total > 0 ? `${Math.min(items.length, total)} / ${total}` : ''
+  countEl.textContent = partialResults ? `${items.length} available` : total > 0 ? `${Math.min(items.length, total)} / ${total}` : ''
 }
 
 function renderAll() {
@@ -398,9 +400,8 @@ interface GhRecord {
 }
 
 function recordToRow(r: GhRecord): PrRow {
-  const shortRepo = r.repo.includes('/') ? r.repo.split('/', 2)[1] : r.repo
   return {
-    repo: shortRepo,
+    repo: r.repo,
     number: r.number,
     title: r.title,
     html_url: r.url,
@@ -418,6 +419,7 @@ function buildListPayload(): Record<string, unknown> {
   const win = timeWindow()
   const payload: Record<string, unknown> = {
     operation: 'list',
+    ...organizationPayload(),
     record_type: typeFilter === 'both' ? 'all' : (typeFilter === 'pr' ? 'pull_request' : 'issue'),
     record_state: statusFilter === 'open' ? 'open' : 'all',
     limit: PAGE_SIZE,
@@ -480,14 +482,16 @@ async function fetchPage(): Promise<void> {
     // The filters moved while this was out; these rows answer a question
     // nobody is asking any more.
     if (mine !== queryGeneration) return
+    const countComplete = countRes.ok && typeof countData.count === 'number' && !organizationErrors(countData)
+    partialResults = !countComplete || !!organizationErrors(pageData)
     const newItems: PrRow[] = (pageData.records as GhRecord[] || []).map(recordToRow)
     total = typeof countData.count === 'number' ? countData.count : items.length + newItems.length
     items.push(...newItems)
     offset += newItems.length
-    if (newItems.length < PAGE_SIZE || items.length >= total) done = true
+    if (newItems.length < PAGE_SIZE || (countComplete && items.length >= total)) done = true
 
     consecutiveFailures = 0
-    showLoadError('')
+    showLoadError(organizationErrors(pageData) || organizationErrors(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
     loader.hidden = done
     appendRows(newItems)
   } catch (err) {
@@ -527,6 +531,7 @@ function resetAndFetch() {
   items = []
   offset = 0
   total = 0
+  partialResults = false
   done = false
   fetching = false
   tbody.innerHTML = ''
@@ -683,6 +688,8 @@ export function initMainView() {
   statusFilter = saved.status
   timeFilter = saved.time
 
+  mountOrganizationFilter(clusterEl)
+  window.addEventListener('poise:organization-filter-changed', resetAndFetch)
   initFilterButtons()
   attachHandlers()
 
@@ -715,6 +722,7 @@ async function refreshMainSoft() {
     const win = timeWindow()
     const payload: Record<string, unknown> = {
       operation: 'list',
+    ...organizationPayload(),
       record_type: typeFilter === 'both' ? 'all' : (typeFilter === 'pr' ? 'pull_request' : 'issue'),
       record_state: statusFilter === 'open' ? 'open' : 'all',
       limit: PAGE_SIZE,
@@ -739,10 +747,12 @@ async function refreshMainSoft() {
     // A bare `return` here left an HTTP failure of the background refresh
     // silent, which is the case that most needs saying.
     if (!pageRes.ok)  throw new Error(`Github ${pageRes.status}`)
-    if (!countRes.ok) throw new Error(`Github ${countRes.status}`)
     if (mine !== queryGeneration) return
     const pageData  = await pageRes.json()
-    const countData = await countRes.json()
+    const countData = countRes.ok ? await countRes.json().catch(() => ({})) : {}
+    if (mine !== queryGeneration) return
+    const countComplete = countRes.ok && typeof countData.count === 'number' && !organizationErrors(countData)
+    partialResults = !countComplete || !!organizationErrors(pageData)
     const newTop: PrRow[] = (pageData.records as GhRecord[] || []).map(recordToRow)
 
     // Stitch: the refreshed top, then every row already held that is not in
@@ -758,7 +768,7 @@ async function refreshMainSoft() {
     items = next
     offset = items.length
     const wasDone = done
-    done = items.length >= total
+    done = countComplete ? items.length >= total : newTop.length < PAGE_SIZE
     loader.hidden = done
     // When a refresh reopens paging — new rows arrived, so there is more to
     // load again — the IntersectionObserver does not re-fire on its own: it
@@ -780,7 +790,7 @@ async function refreshMainSoft() {
       applyMainFlip(next)
     }
     updateCount()
-    showLoadError('')
+    showLoadError(organizationErrors(pageData) || organizationErrors(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
   } catch (err) {
     // A failing background refresh was completely invisible once the table had
     // rows: it froze on the last good page while the relative times kept

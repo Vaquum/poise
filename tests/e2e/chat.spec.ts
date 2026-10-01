@@ -2973,7 +2973,8 @@ test('settings: opening autofocus never steals a field the person already chose'
   await page.clock.runFor(300)
   await expect(prefix).toBeFocused()
   await prefix.fill('agent/')
-  await expect(page.locator('.st-input-org')).toHaveValue('acme')
+  await expect(page.getByLabel('New organization')).toHaveValue('')
+  await expect(page.locator('.st-organization[data-org="acme"]')).toContainText('Ready')
   await expect(prefix).toHaveValue('agent/')
 })
 

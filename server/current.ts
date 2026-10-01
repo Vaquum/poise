@@ -114,13 +114,25 @@ export function setCardRepo(id: number, repo: unknown): CurrentCard {
 // Move a card to (lane, index). The index is the desired final 0-based position
 // among cards in `lane` after the move. Re-numbers positions in the affected
 // lane(s) so they stay contiguous integers.
-export function moveCard(id: number, lane: Lane, index: number): CurrentCard {
+export function moveCard(id: number, lane: Lane, index: number, organization?: string): CurrentCard {
   if (!isValidLane(lane)) throw new Error(`Invalid lane: ${lane}`)
   const card = getCard(id)
   if (!card) throw new Error('Card not found')
 
   const now = new Date().toISOString()
   const tx = db.transaction(() => {
+    if (organization) {
+      const visible = (entry: CurrentCard) => !entry.repo || entry.repo.split('/')[0].toLowerCase() === organization.toLowerCase()
+      if (!visible(card)) throw new Error('Card does not belong to the selected organization')
+      const all = listCards().filter((entry) => entry.lane === lane && entry.id !== id)
+      const shown = all.filter(visible)
+      const position = Math.max(0, Math.min(index, shown.length))
+      // Anchor in the unfiltered lane; the browser only knows its org's
+      // cards (including personal cards). Hidden orgs retain their order.
+      index = position < shown.length
+        ? all.findIndex((entry) => entry.id === shown[position].id)
+        : shown.length ? all.findIndex((entry) => entry.id === shown[shown.length - 1].id) + 1 : all.length
+    }
     const sourceLane = card.lane as Lane
     if (sourceLane === lane) {
       // Same-lane reorder: pull the moving card out, splice it in.

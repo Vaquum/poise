@@ -212,3 +212,51 @@ describe('Review New Issues triggers', () => {
     expect(behaviors.getRepos('review-new-issues')).toEqual(['Vaquum/Origo'])
   })
 })
+
+
+describe('organization isolation', () => {
+  it('keeps delayed reads and writes attached to the organization that started them', async () => {
+    const writes: string[] = []
+    let finishWrite!: (value: unknown) => void
+    vi.stubGlobal('fetch', (url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        writes.push(url)
+        return new Promise((resolve) => { finishWrite = resolve })
+      }
+      return deferGet().then((body) => ({ ok: true, status: 200, json: async () => body }))
+    })
+    behaviors.setBehaviorOrganization('acme')
+    const read = behaviors.refreshState()
+    const write = behaviors.setEnabled('review-new-prs', true)
+    behaviors.setBehaviorOrganization('beta')
+    expect(behaviors.isEnabled('review-new-prs')).toBe(false)
+    expect(behaviors.isBehaviorStateLoaded()).toBe(false)
+    finishWrite({ ok: true, status: 200, json: async () => ({ enabled: true }) })
+    await write
+    respond(payload({ 'review-new-prs': { enabled: false, scratchpad: 'acme memory' } }))
+    await read
+    expect(behaviors.isEnabled('review-new-prs')).toBe(false)
+    expect(behaviors.getScratchpad('review-new-prs')).toBe('')
+    expect(writes).toEqual(['/api/behaviors/review-new-prs?org=acme'])
+    behaviors.setBehaviorOrganization('acme')
+    expect(behaviors.isEnabled('review-new-prs')).toBe(true)
+  })
+
+  it('does not redirect a queued setting write after switching organizations', async () => {
+    const writes: string[] = []
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      writes.push(url)
+      const body = JSON.parse(String(init?.body))
+      return { ok: true, status: 200, json: async () => body }
+    })
+    behaviors.setBehaviorOrganization('acme')
+    const first = behaviors.setSetting('review-new-prs', 'p1')
+    const second = behaviors.setSetting('review-new-prs', 'p3')
+    behaviors.setBehaviorOrganization('beta')
+    await Promise.all([first, second])
+    expect(behaviors.getSetting('review-new-prs')).toBe('p2')
+    expect(writes).toEqual(['/api/behaviors/review-new-prs?org=acme', '/api/behaviors/review-new-prs?org=acme'])
+    behaviors.setBehaviorOrganization('acme')
+    expect(behaviors.getSetting('review-new-prs')).toBe('p3')
+  })
+})

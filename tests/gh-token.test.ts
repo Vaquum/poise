@@ -65,6 +65,7 @@ describe('GitHub issue identity', () => {
       })
     database = await import('../server/db')
     database.setMeta('me', 'octocat')
+    database.setMeta('org', 'acme')
     const { handleGhBody } = await import('../server/gh')
 
     const result = await handleGhBody({
