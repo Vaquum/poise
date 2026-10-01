@@ -150,6 +150,38 @@ describe('organization activation', () => {
     expect(organizations!.readyOrganizations()).toHaveLength(2)
   })
 
+  it('refreshes retained empty staging on retry before rebuilding the user projection', async () => {
+    let remoteIssueExists = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await cli(command, args, options)
+      if (command !== 'github-datastore') return result
+      const fixture = new Database(args[1])
+      try {
+        fixture.exec('CREATE TABLE IF NOT EXISTS items (item_id INTEGER PRIMARY KEY)')
+        if (args[2] === 'sync' && remoteIssueExists) {
+          fixture.prepare('INSERT OR IGNORE INTO items(item_id) VALUES (1)').run()
+        }
+        if (args[2] === 'build-user' && !fixture.prepare('SELECT item_id FROM items LIMIT 1').get()) {
+          throw new Error('no indexed items; run init-org first')
+        }
+      } finally { fixture.close() }
+      return result
+    })
+    const org = organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.status).toBe('error'))
+    expect(organizations!.getOrganizations()[0]!.error).toContain('no indexed items')
+    expect(existsSync(org.datastorePath!)).toBe(false)
+    expect(existsSync(`${org.datastorePath}.initializing`)).toBe(true)
+    remoteIssueExists = true
+    organizations!.retryOrganization('acme')
+    await ready('acme')
+    expect(operations('init-org')).toHaveLength(1)
+    const fixture = new Database(org.datastorePath!, { readonly: true })
+    try {
+      expect(fixture.prepare('SELECT item_id FROM items').all()).toEqual([{ item_id: 1 }])
+    } finally { fixture.close() }
+  })
+
   it('resumes completed staging work after shutdown without initializing twice', async () => {
     mocks.runFile.mockImplementation(async (command, args, options) => {
       if (command === 'github-datastore' && args[2] === 'build-user') {

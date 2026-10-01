@@ -261,6 +261,7 @@ async function activate(row: OrganizationRow, me: string, signal: AbortSignal, e
   const tempPath = `${path}.initializing`
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
   let sourcePath = existsSync(path) ? path : tempPath
+  let reused = sourcePath === path
   if (sourcePath === path) {
     // A crash after publication can leave status at initializing. Adopt only
     // the exact organization's completed database; never reinitialize it.
@@ -273,12 +274,20 @@ async function activate(row: OrganizationRow, me: string, signal: AbortSignal, e
         resumable = state.login?.toLowerCase() === row.login.toLowerCase() && state.complete
       } catch { resumable = false }
     }
+    reused = resumable
     if (!resumable) {
       for (const suffix of ['', '-wal', '-shm']) rmSync(`${tempPath}${suffix}`, { force: true })
       stage(row.login, 'indexing')
       await caller(tempPath, ['init-org', row.login], env, signal)
       assertOrganization(tempPath, row.login)
     }
+  }
+  // Completed staging may have been empty when build-user first failed.
+  // Refresh retained data before rebuilding the user so Retry can discover
+  // issues created remotely since that attempt, without reinitializing it.
+  if (reused) {
+    stage(row.login, 'syncing')
+    await caller(sourcePath, ['sync'], env, signal)
   }
   stage(row.login, 'building-user')
   await caller(sourcePath, ['build-user', me], env, signal)
