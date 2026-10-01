@@ -75,6 +75,7 @@ async function loadModules() {
   process.env.POISE_DB = join(tempRoot, 'cache.db')
   vi.resetModules()
   database = await import('../server/db')
+  database.setMeta('org', 'Vaquum')
   behaviors = await import('../server/behaviors')
   return { database, behaviors }
 }
@@ -2366,5 +2367,233 @@ describe('scheduled review model selection', () => {
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--model', 'gpt-6-astra-ultra']))
+  })
+})
+
+describe('multiple organization behavior isolation', () => {
+  async function arrangeOrganizations() {
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const loaded = await loadModules()
+    const { database: db, behaviors: runtime } = loaded
+    db.setMeta('me', 'poise-user')
+    const betaPath = join(tempRoot, 'beta.sqlite')
+    db.db.prepare(`
+      INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES ('beta', ?, 1, 'ready', 'ready', 'poise-user')
+    `).run(betaPath)
+    const original = mocks.runFile.getMockImplementation()!
+    const rows = new Map<string, typeof listedPrs>([['Vaquum', []], ['beta', []]])
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command !== 'github-datastore') return original(command, args, options)
+      const explicit = args[0] === '--db'
+      const scoped = explicit ? args.slice(2) : args
+      if (scoped[0] === 'health') {
+        const response = datastoreHealthOutput()
+        const health = JSON.parse(response.stdout)
+        health.database = explicit ? args[1] : join(tempRoot, 'github.sqlite')
+        return { ...response, stdout: JSON.stringify(health) }
+      }
+      return { stdout: JSON.stringify(rows.get(explicit ? 'beta' : 'Vaquum')), stderr: '' }
+    })
+    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    return { ...loaded, betaPath, rows }
+  }
+
+  function pull(owner: string, number: number): typeof pr {
+    const repo = `${owner}/poise-test`
+    return { ...pr, repo, number, url: `https://github.com/${repo}/pull/${number}` }
+  }
+
+  it('preserves legacy configuration and gives added organizations independent disabled defaults', async () => {
+    const { database: db, behaviors: runtime } = await arrangeOrganizations()
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.setMeta('behavior_review_new_prs_setting', 'p0')
+    db.setMeta('behavior_review_new_prs_reviewers', '3')
+    db.setMeta('behavior_review_new_prs_scratchpad', 'legacy note')
+    expect(runtime.withBehaviorOrganization('Vaquum', () => runtime.getEnabledMap())['review-new-prs']).toBe(true)
+    runtime.withBehaviorOrganization('beta', () => {
+      expect(Object.values(runtime.getEnabledMap())).toEqual([false, false, false, false])
+      expect(runtime.getSetting('review-new-prs')).toBe('p2')
+      expect(runtime.getReviewers()).toBe(1)
+      expect(runtime.getScratchpad('review-new-prs')).toBe('')
+      runtime.setSetting('review-new-prs', 'p4')
+      runtime.setReviewers(2)
+      runtime.setScratchpad('review-new-prs', 'beta note')
+      expect(() => runtime.setIssueRepositories(['Vaquum/poise-test'])).toThrow('selected organization')
+      runtime.setIssueRepositories(['beta/poise-test'])
+    })
+    const entered = deferred<void>()
+    const resume = deferred<void>()
+    const betaWrite = runtime.withBehaviorOrganization('beta', async () => {
+      entered.resolve()
+      await resume.promise
+      runtime.setScratchpad('approve-prs', 'beta async note')
+    })
+    await entered.promise
+    runtime.withBehaviorOrganization('VAQUUM', () => runtime.setScratchpad('approve-prs', 'legacy async note'))
+    resume.resolve()
+    await betaWrite
+    runtime.withBehaviorOrganization('Vaquum', () => {
+      expect(runtime.getSetting('review-new-prs')).toBe('p0')
+      expect(runtime.getReviewers()).toBe(3)
+      expect(runtime.getScratchpad('review-new-prs')).toBe('legacy note')
+      expect(runtime.getScratchpad('approve-prs')).toBe('legacy async note')
+      expect(runtime.getIssueRepositories()).toEqual([])
+    })
+    expect(runtime.withBehaviorOrganization('beta', () => runtime.getScratchpad('approve-prs'))).toBe('beta async note')
+    expect(() => runtime.withBehaviorOrganization('missing', () => runtime.getEnabledMap())).toThrow('not configured')
+  })
+
+  it('refuses to enable automation during datastore activation', async () => {
+    const { database: db, behaviors: runtime } = await arrangeOrganizations()
+    db.db.prepare("UPDATE organizations SET status = 'initializing' WHERE login = 'beta'").run()
+    await expect(runtime.withBehaviorOrganization('beta', () => runtime.setEnabled('review-new-prs', true)))
+      .rejects.toMatchObject({ statusCode: 409 })
+    expect(runtime.withBehaviorOrganization('beta', () => runtime.isEnabled('review-new-prs'))).toBe(false)
+    expect(db.getMeta('org:beta:behavior_review_new_prs_enabled')).toBeNull()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('baselines each organization, filters foreign rows, and deduplicates equal repository names independently', async () => {
+    const { database: db, behaviors: runtime, betaPath, rows } = await arrangeOrganizations()
+    rows.set('Vaquum', [pull('Vaquum', 17)])
+    rows.set('beta', [pull('beta', 17)])
+    await runtime.withBehaviorOrganization('Vaquum', () => runtime.setEnabled('review-new-prs', true))
+    await runtime.withBehaviorOrganization('beta', () => runtime.setEnabled('review-new-prs', true))
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.hasSeen('review-new-prs', '__snapshot_v3__')).toBe(true)
+    expect(db.hasSeen('review-new-prs', '__snapshot_v3__:org:beta')).toBe(true)
+    rows.set('Vaquum', [pull('Vaquum', 17), pull('Vaquum', 18), pull('beta', 19)])
+    rows.set('beta', [pull('beta', 17), pull('beta', 18), pull('Vaquum', 19)])
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(db.hasSeen('review-new-prs', 'Vaquum/poise-test#18')).toBe(true)
+    expect(db.hasSeen('review-new-prs', 'beta/poise-test#18')).toBe(true)
+    expect(db.hasSeen('review-new-prs', 'Vaquum/poise-test#19')).toBe(false)
+    expect(db.hasSeen('review-new-prs', 'beta/poise-test#19')).toBe(false)
+    const betaReads = mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-datastore' && args[0] === '--db')
+    expect(betaReads.length).toBeGreaterThan(0)
+    expect(betaReads.every(([, args]) => args[1] === betaPath)).toBe(true)
+    expect(betaReads.some(([, args]) => args[2] === 'health')).toBe(true)
+    expect(betaReads.some(([, args]) => args[2] === 'view')).toBe(true)
+  })
+
+  it('preserves a managed baseline and its settings over restart while catching work opened during downtime', async () => {
+    const { behaviors: runtime, rows } = await arrangeOrganizations()
+    rows.set('beta', [pull('beta', 17)])
+    await runtime.withBehaviorOrganization('beta', () => runtime.setEnabled('review-new-prs', true))
+    runtime.withBehaviorOrganization('beta', () => {
+      runtime.setSetting('review-new-prs', 'p1')
+      runtime.setScratchpad('review-new-prs', 'persistent beta note')
+    })
+    const restarted = await restartModules()
+    rows.set('beta', [pull('beta', 17), pull('beta', 18)])
+    restarted.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    await restarted.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+    const args = mocks.spawnDetached.mock.calls[0][1] as string[]
+    expect(args[args.indexOf('--pr-review') + 1]).toBe('#18')
+    expect(args[args.indexOf('--p') + 1]).toBe('p1')
+    expect(args[args.indexOf('--note') + 1]).toBe('persistent beta note')
+    expect(restarted.database.hasSeen('review-new-prs', '__snapshot_v3__:org:beta')).toBe(true)
+  })
+
+  it('continues a healthy organization while another is blocked, and attributes its eventual failure correctly', async () => {
+    const { behaviors: runtime, rows } = await arrangeOrganizations()
+    await runtime.withBehaviorOrganization('Vaquum', () => runtime.setEnabled('review-new-prs', true))
+    await runtime.withBehaviorOrganization('beta', () => runtime.setEnabled('review-new-prs', true))
+    rows.set('Vaquum', [pull('Vaquum', 18)])
+    rows.set('beta', [pull('beta', 18)])
+    const original = mocks.runFile.getMockImplementation()!
+    const held = deferred<{ stdout: string, stderr: string }>()
+    mocks.runFile.mockImplementation((command: string, args: string[], options: unknown) => {
+      if (command === 'github-datastore' && args[0] === 'health') return held.promise
+      return original(command, args, options)
+    })
+    const scan = runtime.runEnabledBehaviorsOnce()
+    await vi.waitFor(() => expect(mocks.spawnDetached).toHaveBeenCalledTimes(1))
+    held.resolve({ stdout: JSON.stringify({ healthy: false }), stderr: '' })
+    await scan
+    expect(runtime.withBehaviorOrganization('beta', () => runtime.getBehaviorsRuntimeHealth())).toMatchObject({
+      status: 'ok', failures: [], datastore: { status: 'healthy' },
+    })
+    expect(runtime.withBehaviorOrganization('Vaquum', () => runtime.getBehaviorsRuntimeHealth())).toMatchObject({
+      status: 'degraded', failures: [{ behavior: 'review-new-prs', consecutiveFailures: 1 }],
+      datastore: { status: 'unavailable' },
+    })
+    expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({
+      status: 'degraded', failures: [{ org: 'Vaquum', behavior: 'review-new-prs' }],
+    })
+  })
+
+  it('rejects freshness reported for a different database without affecting legacy health', async () => {
+    const { behaviors: runtime, rows } = await arrangeOrganizations()
+    await runtime.withBehaviorOrganization('Vaquum', () => runtime.setEnabled('review-new-prs', true))
+    await runtime.withBehaviorOrganization('beta', () => runtime.setEnabled('review-new-prs', true))
+    rows.set('beta', [pull('beta', 18)])
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation((command: string, args: string[], options: unknown) => {
+      if (command === 'github-datastore' && args[0] === '--db' && args[2] === 'health') return datastoreHealthOutput()
+      return original(command, args, options)
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.withBehaviorOrganization('beta', () => runtime.getBehaviorsRuntimeHealth()).datastore.error).toContain('different organization database')
+    expect(runtime.withBehaviorOrganization('Vaquum', () => runtime.getBehaviorsRuntimeHealth()).datastore.status).toBe('healthy')
+  })
+
+  it('stops a removed organization during an in-flight scan and never falls back to the default database', async () => {
+    const { database: db, behaviors: runtime, rows } = await arrangeOrganizations()
+    await runtime.withBehaviorOrganization('beta', () => runtime.setEnabled('review-new-prs', true))
+    rows.set('beta', [pull('beta', 18)])
+    const original = mocks.runFile.getMockImplementation()!
+    const entered = deferred<void>()
+    const held = deferred<void>()
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-datastore' && args[0] === '--db' && args[2] === 'health') {
+        entered.resolve()
+        await held.promise
+      }
+      return original(command, args, options)
+    })
+    const scan = runtime.runEnabledBehaviorsOnce()
+    await entered.promise
+    db.db.prepare("DELETE FROM organizations WHERE login = 'beta'").run()
+    held.resolve()
+    await scan
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.hasSeen('review-new-prs', 'beta/poise-test#18')).toBe(false)
+    db.setMeta('org', '')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    mocks.runFile.mockClear()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('does not disable, reconcile or retire another organization’s claims and incidents', async () => {
+    const { database: db, behaviors: runtime } = await arrangeOrganizations()
+    for (const owner of ['Vaquum', 'beta']) {
+      const target = `${owner}/poise-test#17`
+      db.recordSeen('approve-prs', target)
+      const claimId = db.claimSeenOwned('review-new-prs', target)!
+      db.markBehaviorLaunchIntentOwned({
+        key: 'review-new-prs', target, claimId, launchBehavior: 'pr_review', repo: `${owner}/poise-test`,
+        pr: 17, requestedAt: new Date(Date.now() - runtime.BEHAVIOR_REGISTRATION_GRACE_MS - 1).toISOString(),
+        expectedHead: HEAD_SHA, actor: 'review-bot', source: 'poise:review-new-prs', correlationId: claimId,
+      })
+      db.recordBehaviorDeadLetter(db.listBehaviorLaunchClaims('review-new-prs').find((claim) => claim.target === target)!, 'old error')
+    }
+    await runtime.withBehaviorOrganization('beta', () => runtime.setEnabled('approve-prs', false))
+    expect(db.hasSeen('approve-prs', 'Vaquum/poise-test#17')).toBe(true)
+    expect(db.hasSeen('approve-prs', 'beta/poise-test#17')).toBe(false)
+    const legacyBefore = db.listBehaviorLaunchClaims('review-new-prs').find((claim) => claim.launchRepo === 'Vaquum/poise-test')
+    await runtime.withBehaviorOrganization('beta', () => runtime.setEnabled('review-new-prs', true))
+    expect(db.listBehaviorLaunchClaims('review-new-prs').find((claim) => claim.launchRepo === 'Vaquum/poise-test')).toEqual(legacyBefore)
+    expect(db.listBehaviorDeadLetters().map((letter) => letter.repo)).toContain('Vaquum/poise-test')
+    expect(runtime.withBehaviorOrganization('beta', () => runtime.getBehaviorsRuntimeHealth()).deadLetters.every((letter) => letter.repo?.startsWith('beta/'))).toBe(true)
+    expect(db.listBehaviorDeadLetters(1, 'Vaquum')[0]?.repo).toBe('Vaquum/poise-test')
   })
 })

@@ -10,10 +10,9 @@ import { releaseBackgroundPaused, trackReleaseBackground } from './release-backg
 // behavior runs its check; the seen ledger lives in SQLite so claims are
 // atomic across overlapping ticks and multiple server processes.
 //
-// Today's only behavior is "review-new-prs": list open PRs by the
-// configured Poise user, find any not in the snapshot, spawn
-// `agent-interface --pr-review '#<n>' --pwd <local-checkout>`
-// directly — no HTTP roundtrip, no /api/pr-review hop.
+// Every ready organization has independent settings and a datastore scope.
+// Repository-qualified targets preserve the existing durable launch ledger;
+// snapshots and process locks are isolated by organization.
 
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
@@ -35,13 +34,13 @@ import {
   hasExpiredPreLaunchClaim,
   completeSeenOwned,
   getFailedBehaviorLaunch,
-  getMeta,
+  getMeta as databaseGetMeta,
   hasSeen,
   latestApprovalBasisLaunch,
   linkBehaviorLaunchCallOwned,
-  listBehaviorLaunchClaims,
-  listBehaviorDeadLetters,
-  listBehaviorIncidents,
+  listBehaviorLaunchClaims as databaseListBehaviorLaunchClaims,
+  listBehaviorDeadLetters as databaseListBehaviorDeadLetters,
+  listBehaviorIncidents as databaseListBehaviorIncidents,
   listSeenTargets,
   listSnapshotOnlySeen,
   markBehaviorLaunchIntentOwned,
@@ -57,7 +56,7 @@ import {
   renewSeenOwned,
   renewPrOperationOwned,
   setBehaviorLaunchErrorOwned,
-  setMeta,
+  setMeta as databaseSetMeta,
   type BehaviorAgentLaunch,
   type BehaviorLaunchClaim,
 } from './db'
@@ -65,6 +64,7 @@ import { HttpError } from './http'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
 import { withProcessLock } from './process-lock'
 import { getReviewAgentUsername, setReviewAgentUsername } from './gh'
+import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 
 const DATASTORE = 'github-datastore'
 const GH_INTERFACE = 'github-interface'
@@ -75,6 +75,69 @@ const BEHAVIOR_AUTH_FRESHNESS_MS = 60_000
 const DATASTORE_MAX_AGE_SECONDS = 120
 const SHA_PATTERN = /^[0-9a-f]{40}$/
 const GITHUB_USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
+
+// The organization is captured for an entire asynchronous operation: settings,
+// datastore reads, process locks and callbacks must agree on the same owner.
+const behaviorOrganization = new AsyncLocalStorage<Organization | null>()
+
+function currentOrganization(): Organization | null {
+  const scoped = behaviorOrganization.getStore()
+  if (scoped !== undefined) return scoped
+  const organizations = getOrganizations()
+  return organizations.find((org) => !org.managed) ?? organizations[0] ?? null
+}
+
+export function withBehaviorOrganization<T>(orgLogin: string | undefined, operation: () => T): T {
+  const org = orgLogin === undefined
+    ? currentOrganization()
+    : getOrganizations().find((candidate) => candidate.login.toLowerCase() === orgLogin.toLowerCase())
+  if (orgLogin !== undefined && !org) throw new HttpError(404, 'Organization is not configured')
+  return behaviorOrganization.run(org ?? null, operation)
+}
+
+function organizationOwns(repoOrTarget: string): boolean {
+  const org = currentOrganization()
+  return !org || repoOrTarget.split('/')[0].toLowerCase() === org.login.toLowerCase()
+}
+
+function scopedMetaKey(key: string): string {
+  const org = currentOrganization()
+  return org?.managed && key.startsWith('behavior_') ? `org:${org.login.toLowerCase()}:${key}` : key
+}
+
+function getMeta(key: string): string | null {
+  return databaseGetMeta(scopedMetaKey(key))
+}
+
+function setMeta(key: string, value: string): void {
+  databaseSetMeta(scopedMetaKey(key), value)
+}
+
+function operationKey(key: BehaviorKey): string {
+  return `${currentOrganization()?.login.toLowerCase() ?? 'legacy'}:${key}`
+}
+
+function snapshotTarget(): string {
+  const org = currentOrganization()
+  return org?.managed ? `${REVIEW_SNAPSHOT_TARGET}:org:${org.login.toLowerCase()}` : REVIEW_SNAPSHOT_TARGET
+}
+
+function datastoreArgs(args: string[]): string[] {
+  const org = currentOrganization()
+  return org ? organizationArgs(org, args) : args
+}
+
+function listBehaviorLaunchClaims(key: string): BehaviorLaunchClaim[] {
+  return databaseListBehaviorLaunchClaims(key).filter((claim) => organizationOwns(claim.launchRepo ?? claim.target))
+}
+
+function listBehaviorDeadLetters(limit = 50) {
+  return databaseListBehaviorDeadLetters(limit, currentOrganization()?.login)
+}
+
+function listBehaviorIncidents(limit = 50) {
+  return databaseListBehaviorIncidents(limit, currentOrganization()?.login)
+}
 
 // Same cwd hack agent.ts uses — agent-interface infers the repo from
 // cwd's last two path parts when no git remote is found.
@@ -89,7 +152,9 @@ function behaviorProcessLockPath(behavior: BehaviorKey): string {
   const directory = configuredDb && configuredDb !== ':memory:'
     ? dirname(resolve(configuredDb))
     : join(homedir(), '.poise')
-  return join(directory, `.poise-${behavior}-runtime-lock.sqlite3`)
+  const org = currentOrganization()
+  const prefix = org?.managed ? `${org.login.toLowerCase()}-` : ''
+  return join(directory, `.poise-${prefix}${behavior}-runtime-lock.sqlite3`)
 }
 
 const BEHAVIOR_LOCK_BUSY_MESSAGE = 'behavior operation is already running in another process'
@@ -163,6 +228,9 @@ function enabledKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/
 function settingKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_setting' }
 
 export function isEnabled(key: BehaviorKey): boolean {
+  const org = currentOrganization()
+  if (org && !readyOrganizations().some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
+    && candidate.datastorePath === org.datastorePath)) return false
   return getMeta(enabledKey(key)) === '1'
 }
 
@@ -743,12 +811,18 @@ interface DatastoreFreshness {
   error: string | null
 }
 
-let datastoreFreshness: DatastoreFreshness = {
+const initialDatastoreFreshness: DatastoreFreshness = {
   status: 'unchecked',
   checkedAt: new Date(0).toISOString(),
   ageSeconds: null,
   lastSuccessAt: null,
   error: null,
+}
+
+const datastoreFreshnessByOrganization = new Map<string, DatastoreFreshness>()
+
+function datastoreFreshness(): DatastoreFreshness {
+  return datastoreFreshnessByOrganization.get(operationKey('review-new-prs')) ?? initialDatastoreFreshness
 }
 
 function configuredReviewer(): string {
@@ -783,7 +857,7 @@ async function requireFreshDatastore(): Promise<void> {
   try {
     const { stdout } = await runFile(
       DATASTORE,
-      ['health', '--max-age-seconds', String(DATASTORE_MAX_AGE_SECONDS)],
+      datastoreArgs(['health', '--max-age-seconds', String(DATASTORE_MAX_AGE_SECONDS)]),
       { timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() },
     )
     const data = objectValue(parseJson(stdout, 'github-datastore health'), 'github-datastore health')
@@ -793,27 +867,31 @@ async function requireFreshDatastore(): Promise<void> {
       || safeInteger(data.max_age_seconds, 'datastore max_age_seconds') !== DATASTORE_MAX_AGE_SECONDS) {
       throw new Error('github-datastore health returned a malformed or stale result')
     }
+    const org = currentOrganization()
+    if (org?.datastorePath && data.database !== resolve(org.datastorePath)) {
+      throw new Error('github-datastore health returned a different organization database')
+    }
     const ageSeconds = safeInteger(data.age_seconds, 'datastore age_seconds')
     const lastSuccessAt = String(data.last_success_at || '')
     if (ageSeconds > DATASTORE_MAX_AGE_SECONDS || !Number.isFinite(Date.parse(lastSuccessAt))) {
       throw new Error('github-datastore health returned invalid freshness metadata')
     }
-    datastoreFreshness = {
+    datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
       status: 'healthy',
       checkedAt,
       ageSeconds,
       lastSuccessAt,
       error: null,
-    }
+    })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    datastoreFreshness = {
+    datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
       status: 'unavailable',
       checkedAt,
       ageSeconds: null,
       lastSuccessAt: null,
       error: message,
-    }
+    })
     throw new Error(`github-datastore freshness gate failed: ${message}`, { cause: error })
   }
 }
@@ -823,7 +901,7 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
   await requireFreshDatastore()
   const { stdout } = await runFile(
     DATASTORE,
-    ['view', 'pr', '--status', 'open', '--format', 'json'],
+    datastoreArgs(['view', 'pr', '--status', 'open', '--format', 'json']),
     { timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024, signal: behaviorSignal() },
   )
   const parsed = parseJson(stdout, 'github-datastore view pr')
@@ -849,8 +927,8 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
     seen.add(key)
     return { repo, number, url, draft: draft === 1, author: prAuthor }
   })
-  retireBehaviorDeadLettersForClosedPrs(seen)
-  return prs.filter((pr) => pr.author === author && !pr.draft)
+  retireBehaviorDeadLettersForClosedPrs(seen, undefined, currentOrganization()?.login)
+  return prs.filter((pr) => organizationOwns(pr.repo) && pr.author === author && !pr.draft)
 }
 
 async function localCheckoutPath(owner: string, repo: string): Promise<string> {
@@ -1030,7 +1108,7 @@ async function snapshotReviewNewPrs(): Promise<void> {
   // A missing marker is the sole readiness predicate. Clear it before work so
   // a concurrent tick (including one in another local server process) takes
   // the safe snapshot path instead of firing against a partial snapshot.
-  releaseSeen('review-new-prs', REVIEW_SNAPSHOT_TARGET)
+  releaseSeen('review-new-prs', snapshotTarget())
   const author = getMeta('me') || ''
   if (!author) return
   try {
@@ -1045,9 +1123,9 @@ async function snapshotReviewNewPrs(): Promise<void> {
     // "snapshot has never completed". Without it, the first PR created in
     // an initially empty repository was silently absorbed by a later
     // snapshot instead of triggering the behavior.
-    recordSeen('review-new-prs', REVIEW_SNAPSHOT_TARGET)
+    recordSeen('review-new-prs', snapshotTarget())
   } catch (err) {
-    releaseSeen('review-new-prs', REVIEW_SNAPSHOT_TARGET)
+    releaseSeen('review-new-prs', snapshotTarget())
     console.error('[behaviors] snapshot failed:', err)
     throw err
   }
@@ -1061,13 +1139,13 @@ function migrateReviewNewPrsLedger(): void {
   // Copy its per-head targets to PR-level targets and retain the originals:
   // launch metadata on those rows is downstream approval evidence.
   if (version === '2') {
-    const legacyTargets = listSeenTargets('review-new-prs')
+    const legacyTargets = listSeenTargets('review-new-prs').filter((target) => target === LEGACY_REVIEW_SNAPSHOT_TARGET || organizationOwns(target))
     if (legacyTargets.includes(LEGACY_REVIEW_SNAPSHOT_TARGET)) {
       for (const target of legacyTargets) {
         const separator = target.indexOf('@')
         if (separator > 0) recordSeen('review-new-prs', target.slice(0, separator))
       }
-      recordSeen('review-new-prs', REVIEW_SNAPSHOT_TARGET)
+      recordSeen('review-new-prs', snapshotTarget())
     }
   }
   setMeta('behavior_review_new_prs_keyver', '3')
@@ -1080,11 +1158,11 @@ async function recoverSnapshotReviews(
   prs: DatastorePr[],
   reviewer: string,
 ): Promise<void> {
-  if (getMeta(SNAPSHOT_RECOVERY_META) === '1') return
+  if (currentOrganization()?.managed || getMeta(SNAPSHOT_RECOVERY_META) === '1') return
   const previousRecoveryComplete = getMeta(FAILED_SNAPSHOT_RECOVERY_META) === '1'
   const open = new Set(prs.map((pr) => `${pr.repo}#${pr.number}`))
   const candidates = listSnapshotOnlySeen('review-new-prs')
-    .filter((row) => row.target !== REVIEW_SNAPSHOT_TARGET && open.has(row.target))
+    .filter((row) => row.target !== snapshotTarget() && open.has(row.target))
   if (candidates.length > 0) {
     const logs = await fetchAgentLogs({ signal: behaviorSignal() })
     for (const candidate of candidates) {
@@ -1125,7 +1203,7 @@ async function tickReviewNewPrs(): Promise<void> {
   migrateReviewNewPrsLedger()
 
   // First tick after boot/enable with no snapshot — take one and bail.
-  if (!hasSeen('review-new-prs', REVIEW_SNAPSHOT_TARGET)) {
+  if (!hasSeen('review-new-prs', snapshotTarget())) {
     await snapshotReviewNewPrs()
     return
   }
@@ -2018,12 +2096,13 @@ export function getIssueRepositories(): IssueRepository[] {
   const value = parseJsonMeta(ISSUE_REPOS_KEY)
   if (!Array.isArray(value)) return []
   return value.filter((entry): entry is IssueRepository =>
-    !!entry && isValidRepository(entry.repo) && typeof entry.since === 'string' && Number.isFinite(Date.parse(entry.since)))
+    !!entry && isValidRepository(entry.repo) && organizationOwns(entry.repo) && typeof entry.since === 'string' && Number.isFinite(Date.parse(entry.since)))
 }
 
 // A repository that stays selected keeps its date; a newly selected one starts
 // now, so selecting it never reviews what was already open.
 export function setIssueRepositories(repos: readonly string[]): IssueRepository[] {
+  if (repos.some((repo) => !organizationOwns(repo))) throw new HttpError(400, 'Issue repositories must belong to the selected organization')
   const current = new Map(getIssueRepositories().map((entry) => [entry.repo, entry.since]))
   const now = new Date().toISOString()
   const next = [...new Set(repos)].sort((a, b) => a.localeCompare(b))
@@ -2090,7 +2169,7 @@ interface DatastoreIssue {
 async function listOpenIssues(repo: string, since: string): Promise<DatastoreIssue[]> {
   const { stdout } = await runFile(
     DATASTORE,
-    ['view', 'issue', '--repo', repo, '--status', 'open', '--created-since-datetime', since, '--limit', '500', '--format', 'json'],
+    datastoreArgs(['view', 'issue', '--repo', repo, '--status', 'open', '--created-since-datetime', since, '--limit', '500', '--format', 'json']),
     { timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024, signal: behaviorSignal() },
   )
   const parsed = parseJson(stdout, 'github-datastore view issue')
@@ -2476,7 +2555,7 @@ async function tickReviewNewIssues(): Promise<void> {
   }
   // Every selected repository was read, so what is not open is closed or no
   // longer selected; its incidents are settled.
-  retireBehaviorDeadLettersForClosedPrs(open, [ISSUES_KEY])
+  retireBehaviorDeadLettersForClosedPrs(open, [ISSUES_KEY], currentOrganization()?.login)
   candidates.sort((a, b) => a.order - b.order)
   let logs: Promise<LogEntry[]> | null = null
   const readLogs = () => (logs ??= fetchAgentLogs({ signal: behaviorSignal() }))
@@ -2663,6 +2742,9 @@ async function reconcileIssueReviewClaims(): Promise<void> {
 // ── Public API ──────────────────────────────────────────────────────────
 
 export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<void> {
+  if (enabled && currentOrganization()?.status !== 'ready') {
+    throw new HttpError(409, 'Wait for the organization datastore to become ready before enabling automation')
+  }
   const lifecycle = behaviorAbortController?.signal
   if (!enabled) {
     // Publish the stop flag immediately so an in-flight tick exits at its
@@ -2680,12 +2762,12 @@ export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<vo
             // A first-ever enable needs an anti-flood baseline. Re-enabling is
             // a resume: preserving the ledger lets the next tick process PRs
             // that appeared while the behavior was paused.
-            if (!hasSeen(key, REVIEW_SNAPSHOT_TARGET)) await snapshotReviewNewPrs()
+            if (!hasSeen(key, snapshotTarget())) await snapshotReviewNewPrs()
             await reconcileBehaviorLaunchClaims(key)
           }
         } else if (key === 'approve-prs') {
           if (enabled) await reconcileBehaviorLaunchClaims(key)
-          else clearSeenExceptLaunched(key)
+          else clearSeenExceptLaunched(key, currentOrganization()?.login)
         } else if (key === 'review-new-issues') {
           // No snapshot: each repository's selection date is the baseline.
           if (enabled) await reconcileIssueReviewClaims()
@@ -2725,18 +2807,19 @@ let lastTickCompletedAtMs: number | null = null
 // Startup snapshots, enable snapshots, and ticks must not overtake each
 // other. The database marker covers multiple processes; this tail also avoids
 // needless duplicate CLI work inside one process.
-const behaviorOperationTails = new Map<BehaviorKey, Promise<void>>()
-const behaviorOperationStartedAt = new Map<BehaviorKey, number>()
+const behaviorOperationTails = new Map<string, Promise<void>>()
+const behaviorOperationStartedAt = new Map<string, number>()
 
 function serializeBehaviorOperation<T>(
   key: BehaviorKey,
   operation: () => Promise<T>,
 ): Promise<T> {
+  const scopeKey = operationKey(key)
   const releaseOperation = trackReleaseBackground()
-  const previous = behaviorOperationTails.get(key) || Promise.resolve()
+  const previous = behaviorOperationTails.get(scopeKey) || Promise.resolve()
   const execute = async () => {
     const startedAt = Date.now()
-    behaviorOperationStartedAt.set(key, startedAt)
+    behaviorOperationStartedAt.set(scopeKey, startedAt)
     const deadline = AbortSignal.timeout(BEHAVIOR_OPERATION_TIMEOUT_MS)
     const lifecycle = behaviorAbortController?.signal
     const signal = lifecycle ? AbortSignal.any([lifecycle, deadline]) : deadline
@@ -2745,16 +2828,16 @@ function serializeBehaviorOperation<T>(
       if (signal.aborted) throw signal.reason
       return result
     } finally {
-      if (behaviorOperationStartedAt.get(key) === startedAt) {
-        behaviorOperationStartedAt.delete(key)
+      if (behaviorOperationStartedAt.get(scopeKey) === startedAt) {
+        behaviorOperationStartedAt.delete(scopeKey)
       }
     }
   }
   const run = previous.then(execute, execute).finally(releaseOperation)
   const tail = run.then(() => undefined, () => undefined)
-  behaviorOperationTails.set(key, tail)
+  behaviorOperationTails.set(scopeKey, tail)
   void tail.finally(() => {
-    if (behaviorOperationTails.get(key) === tail) behaviorOperationTails.delete(key)
+    if (behaviorOperationTails.get(scopeKey) === tail) behaviorOperationTails.delete(scopeKey)
   })
   return run
 }
@@ -2788,9 +2871,17 @@ export async function runEnabledBehaviorsOnce(
   options: RunEnabledBehaviorsOptions = {},
 ): Promise<void> {
   if (releaseBackgroundPaused()) return
+  if (behaviorOrganization.getStore() === undefined) {
+    await Promise.allSettled(readyOrganizations().map((org) =>
+      behaviorOrganization.run(org, () => runEnabledBehaviorsOnce(options))))
+    return
+  }
+  const org = currentOrganization()
+  if (!org || !readyOrganizations().some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
+    && candidate.datastorePath === org.datastorePath)) return
   const operations: Promise<void>[] = []
   if (isEnabled('review-new-prs')
-    && (!options.skipBusy || !behaviorOperationTails.has('review-new-prs'))) {
+    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('review-new-prs')))) {
     operations.push(runBehaviorCycle('review-new-prs', async () => {
       return await withBehaviorProcessLock('review-new-prs', async () => {
         await reconcileBehaviorLaunchClaims('review-new-prs')
@@ -2802,7 +2893,7 @@ export async function runEnabledBehaviorsOnce(
     }))
   }
   if (isEnabled('approve-prs')
-    && (!options.skipBusy || !behaviorOperationTails.has('approve-prs'))) {
+    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('approve-prs')))) {
     operations.push(runBehaviorCycle('approve-prs', async () => {
       return await withBehaviorProcessLock('approve-prs', async () => {
         await reconcileBehaviorLaunchClaims('approve-prs')
@@ -2814,7 +2905,7 @@ export async function runEnabledBehaviorsOnce(
     }))
   }
   if (isEnabled('review-new-issues')
-    && (!options.skipBusy || !behaviorOperationTails.has('review-new-issues'))) {
+    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('review-new-issues')))) {
     operations.push(runBehaviorCycle('review-new-issues', async () => {
       return await withBehaviorProcessLock('review-new-issues', async () => {
         await reconcileIssueReviewClaims()
@@ -2826,7 +2917,7 @@ export async function runEnabledBehaviorsOnce(
     }))
   }
   if (isEnabled('resolve-unblocking')
-    && (!options.skipBusy || !behaviorOperationTails.has('resolve-unblocking'))) {
+    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('resolve-unblocking')))) {
     operations.push(runBehaviorCycle('resolve-unblocking', async () => {
       return await withBehaviorProcessLock('resolve-unblocking', async () => {
         await tickResolveUnblocking()
@@ -2871,8 +2962,9 @@ export interface BehaviorsRuntimeHealth {
   startedAt: string | null
   lastTickAt: string | null
   lastTickCompletedAt: string | null
-  busy: Array<{ behavior: BehaviorKey, since: string }>
+  busy: Array<{ behavior: BehaviorKey, since: string, org?: string }>
   failures: Array<{
+    org?: string
     behavior: BehaviorKey
     kind: BehaviorFailureKind
     consecutiveFailures: number
@@ -2889,17 +2981,18 @@ export interface BehaviorsRuntimeHealth {
   deadLetters: ReturnType<typeof listBehaviorIncidents>
 }
 
-export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
+function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   const now = Date.now()
-  const busy = [...behaviorOperationStartedAt.entries()].map(([behavior, since]) => ({
-    behavior,
+  const busyEntries = [...behaviorOperationStartedAt.entries()].filter(([key]) => key.startsWith(`${currentOrganization()?.login.toLowerCase() ?? 'legacy'}:`))
+  const busy = busyEntries.map(([key, since]) => ({
+    behavior: key.slice(key.indexOf(':') + 1) as BehaviorKey,
     since: new Date(since).toISOString(),
   }))
   const heartbeatAt = lastTickAtMs ?? runtimeStartedAtMs
   const heartbeatStale = heartbeatAt === null
     || now - heartbeatAt > (2 * BEHAVIOR_TICK_MS) + BEHAVIOR_HEALTH_GRACE_MS
-  const operationStale = [...behaviorOperationStartedAt.values()]
-    .some((startedAt) => now - startedAt > BEHAVIOR_OPERATION_TIMEOUT_MS + BEHAVIOR_HEALTH_GRACE_MS)
+  const operationStale = busyEntries
+    .some(([, startedAt]) => now - startedAt > BEHAVIOR_OPERATION_TIMEOUT_MS + BEHAVIOR_HEALTH_GRACE_MS)
   const failures = BEHAVIOR_KEYS.flatMap((behavior) => {
     if (!isEnabled(behavior)) return []
     const failure = readBehaviorFailure(behavior)
@@ -2943,7 +3036,7 @@ export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     actor: reviewer,
     error: identityError,
   }
-  const datastoreUnavailable = anyEnabled && datastoreFreshness.status === 'unavailable'
+  const datastoreUnavailable = anyEnabled && datastoreFreshness().status === 'unavailable'
   return {
     status: tickerStarted
       && !heartbeatStale
@@ -2961,9 +3054,29 @@ export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
       : new Date(lastTickCompletedAtMs).toISOString(),
     busy,
     failures,
-    datastore: { ...datastoreFreshness },
+    datastore: { ...datastoreFreshness() },
     identity,
     deadLetters: listBehaviorIncidents(),
+  }
+}
+
+export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
+  if (behaviorOrganization.getStore() !== undefined) return scopedBehaviorsRuntimeHealth()
+  const health = readyOrganizations().map((org) => ({
+    org: org.login,
+    health: behaviorOrganization.run(org, scopedBehaviorsRuntimeHealth),
+  }))
+  if (health.length === 0) return scopedBehaviorsRuntimeHealth()
+  const first = health[0].health
+  if (health.length === 1) return first
+  return {
+    ...first,
+    status: health.some((entry) => entry.health.status === 'degraded') ? 'degraded' : 'ok',
+    busy: health.flatMap((entry) => entry.health.busy.map((item) => ({ ...item, org: entry.org }))),
+    failures: health.flatMap((entry) => entry.health.failures.map((item) => ({ ...item, org: entry.org }))),
+    deadLetters: health.flatMap((entry) => entry.health.deadLetters),
+    datastore: health.find((entry) => entry.health.datastore.status === 'unavailable')?.health.datastore ?? first.datastore,
+    identity: health.find((entry) => entry.health.identity.status === 'invalid')?.health.identity ?? first.identity,
   }
 }
 
@@ -2983,38 +3096,42 @@ export function startBehaviorsRuntime(config: BehaviorsRuntimeConfig = {}): void
   runtimeStartedAtMs = Date.now()
   lastTickAtMs = null
   lastTickCompletedAtMs = null
-  // Preserve an existing completed ledger across restart. Otherwise a PR
-  // opened while Poise was down is absorbed into a new snapshot and never
-  // reviewed. A genuinely missing marker still takes the anti-flood snapshot.
-  if (isEnabled('review-new-prs')) {
-    void runBehaviorCycle('review-new-prs', async () => {
-      return await withBehaviorProcessLock('review-new-prs', async () => {
-        migrateReviewNewPrsLedger()
-        if (!hasSeen('review-new-prs', REVIEW_SNAPSHOT_TARGET)) {
-          await snapshotReviewNewPrs()
-        }
-        await reconcileBehaviorLaunchClaims('review-new-prs')
-        // Startup reconciliation can clear a breaker only by observing an
-        // owned worker completion. An empty claim list does not prove that a
-        // previously failing model has recovered.
-        return false
-      })
-    })
-  }
-  if (isEnabled('approve-prs')) {
-    void runBehaviorCycle('approve-prs', async () => {
-      return await withBehaviorProcessLock('approve-prs', async () => {
-        await reconcileBehaviorLaunchClaims('approve-prs')
-        return false
-      })
-    })
-  }
-  if (isEnabled('review-new-issues')) {
-    void runBehaviorCycle('review-new-issues', async () => {
-      return await withBehaviorProcessLock('review-new-issues', async () => {
-        await reconcileIssueReviewClaims()
-        return false
-      })
+  for (const org of readyOrganizations()) {
+    behaviorOrganization.run(org, () => {
+      // Preserve an existing completed ledger across restart. Otherwise a PR
+      // opened while Poise was down is absorbed into a new snapshot and never
+      // reviewed. A genuinely missing marker still takes the anti-flood snapshot.
+      if (isEnabled('review-new-prs')) {
+        void runBehaviorCycle('review-new-prs', async () => {
+          return await withBehaviorProcessLock('review-new-prs', async () => {
+            migrateReviewNewPrsLedger()
+            if (!hasSeen('review-new-prs', snapshotTarget())) {
+              await snapshotReviewNewPrs()
+            }
+            await reconcileBehaviorLaunchClaims('review-new-prs')
+            // Startup reconciliation can clear a breaker only by observing an
+            // owned worker completion. An empty claim list does not prove that a
+            // previously failing model has recovered.
+            return false
+          })
+        })
+      }
+      if (isEnabled('approve-prs')) {
+        void runBehaviorCycle('approve-prs', async () => {
+          return await withBehaviorProcessLock('approve-prs', async () => {
+            await reconcileBehaviorLaunchClaims('approve-prs')
+            return false
+          })
+        })
+      }
+      if (isEnabled('review-new-issues')) {
+        void runBehaviorCycle('review-new-issues', async () => {
+          return await withBehaviorProcessLock('review-new-issues', async () => {
+            await reconcileIssueReviewClaims()
+            return false
+          })
+        })
+      }
     })
   }
   scheduleNextTick(generation)

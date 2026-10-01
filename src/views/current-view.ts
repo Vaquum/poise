@@ -7,6 +7,7 @@
 // that opens a real GitHub issue via the proxy.
 
 import { midnightInZone, startOfWeekInZone, getSettings } from '../config'
+import { mountOrganizationFilter, organizationPayload, organizationUrl, getSelectedOrganization, organizationErrors } from '../organizations'
 
 type Lane = 'idea' | 'concept' | 'plan' | 'issue' | 'pr'
 type LaneType = 'manual' | 'live'
@@ -192,11 +193,6 @@ function liveStateLabel(item: LiveItem): { text: string; cls: string } | null {
 function prKey(item: LiveItem): string {
   // repo is now the full owner/name, matching the /github record shape
   return `${item.repo}#${item.number}`
-}
-
-function shortRepo(fullRepo: string): string {
-  const i = fullRepo.indexOf('/')
-  return i < 0 ? fullRepo : fullRepo.slice(i + 1)
 }
 
 function isFresh(item: LiveItem): boolean {
@@ -412,7 +408,7 @@ function renderManualCard(card: ManualCard): HTMLElement {
   // the top-right strip hosts the non-destructive tool icons (chat,
   // copy, …) — see the chrome strategy comment near cardActions().
   const repoTag = card.repo
-    ? `<span class="card-repo">${escapeHtml(shortRepo(card.repo))}</span>`
+    ? `<span class="card-repo">${escapeHtml(card.repo)}</span>`
     : ''
   el.innerHTML = `
     <div class="card-text">${escapeHtml(card.text).replace(/\n/g, '<br>')}</div>
@@ -463,7 +459,7 @@ function paintLiveItem(el: HTMLElement, item: LiveItem): void {
     <a class="card-link" href="${safeHttpsUrl(item.url)}" target="_blank" rel="noopener">
       <div class="card-text">${escapeHtml(item.title)}</div>
       <div class="card-meta">
-        <span class="card-repo">${escapeHtml(shortRepo(item.repo))}</span>
+        <span class="card-repo">${escapeHtml(item.repo)}</span>
         <span class="card-num">#${item.number}</span>
         ${stateBadge}
         <span class="card-time">${relativeTime(item.updated_at)}</span>
@@ -471,7 +467,7 @@ function paintLiveItem(el: HTMLElement, item: LiveItem): void {
     </a>
     ${cardActions({
       sessionId: liveSessionId(item),
-      label: `${shortRepo(item.repo)}#${item.number}`,
+      label: `${item.repo}#${item.number}`,
       copyText: `${item.title}\n${item.url}`,
       tools: chatSessionButton(item),
       primary,
@@ -678,9 +674,11 @@ async function api<T>(method: string, path: string, body?: unknown): Promise<T> 
 }
 
 async function fetchManual() {
-  const res = await fetch('/api/current')
+  const org = getSelectedOrganization()
+  const res = await fetch(organizationUrl('/api/current'))
   if (!res.ok) throw new Error(`/api/current ${res.status}`)
   const data = await res.json()
+  if (org !== getSelectedOrganization()) return
   manualCards = data.cards.filter((c: ManualCard) => c.lane === 'idea' || c.lane === 'concept' || c.lane === 'plan')
 }
 
@@ -688,10 +686,13 @@ async function fetchManual() {
 // every view init. Silently swallows errors — composers fall back to
 // the involvement-derived list.
 async function fetchAllRepos() {
+  const org = getSelectedOrganization()
   try {
-    const res = await fetch('/api/repos')
+    const res = await fetch(organizationUrl('/api/repos'))
     if (!res.ok) return
     const data = await res.json()
+    if (org !== getSelectedOrganization()) return
+    repoLoadWarning = organizationErrors(data)
     allRepos = Array.isArray(data.repos) ? data.repos : []
   } catch { /* ignore */ }
 }
@@ -700,8 +701,9 @@ async function fetchAllRepos() {
 // alongside fetchLive on each refresh tick. Errors are swallowed —
 // the breathing accent simply doesn't show.
 async function fetchAgentActive() {
+  const org = getSelectedOrganization()
   try {
-    const res = await fetch('/api/agent-logs')
+    const res = await fetch(organizationUrl('/api/agent-logs'))
     if (!res.ok) return
     const data = await res.json()
     const next = new Set<string>()
@@ -710,6 +712,7 @@ async function fetchAgentActive() {
         next.add(`${e.repo}#${e.pr_id}`)
       }
     }
+    if (org !== getSelectedOrganization()) return
     agentActiveKeys = next
   } catch { /* ignore */ }
 }
@@ -725,6 +728,7 @@ function applyActiveClasses() {
 }
 
 async function fetchPrStatus() {
+  const org = getSelectedOrganization()
   if (liveItems.filter((i) => i.is_pr === 1).length === 0) {
     if (prStatus.size > 0) { prStatus.clear(); applyPrStatusClasses() }
     return
@@ -733,7 +737,7 @@ async function fetchPrStatus() {
     const res = await fetch('/api/gh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ operation: 'green_pr' }),
+      body: JSON.stringify({ operation: 'green_pr', ...organizationPayload() }),
     })
     if (!res.ok) return
     const data = await res.json()
@@ -743,6 +747,7 @@ async function fetchPrStatus() {
     for (const r of data.records || []) {
       next.set(`${r.repo}#${r.number}`, 'mergeable')
     }
+    if (org !== getSelectedOrganization()) return
     const changed = next.size !== prStatus.size
       || [...next.entries()].some(([k, v]) => prStatus.get(k) !== v)
     if (changed) {
@@ -785,7 +790,7 @@ async function pollLiveTick() {
     // A refresh that starts working again has to clear the notice it left —
     // otherwise the first failure's message stays on screen for the rest of
     // the session, outliving the problem it described.
-    showLoadError('')
+    showLoadError(liveLoadWarning || repoLoadWarning)
   } catch (err) {
     // Swallowed entirely before, so a GitHub cache that had gone away left the
     // lanes frozen on the last good data with no indication: the board looked
@@ -807,12 +812,15 @@ async function pollLiveTick() {
 // seconds later — leaving the header highlighting one filter while the lanes
 // show another. The newest read wins.
 let liveSequence = 0
+let liveLoadWarning = ''
+let repoLoadWarning = ''
 
 async function fetchLive() {
   const mine = ++liveSequence
   const win = timeWindow()
   const payload: Record<string, unknown> = {
     operation: 'list',
+    ...organizationPayload(),
     record_type: 'all',
     record_state: statusFilter === 'open' ? 'open' : 'all',
     // One request covers issues and pull requests together, so they compete
@@ -834,6 +842,7 @@ async function fetchLive() {
   // A read from before the current filter is history; applying it would put
   // the lanes and the header out of step.
   if (mine !== liveSequence) return
+  liveLoadWarning = organizationErrors(data)
   const records: GhRecord[] = data.records || []
   liveTruncated = records.length > LIVE_LIMIT
   liveItems = records.slice(0, LIVE_LIMIT).map((r) => ({
@@ -865,6 +874,8 @@ let liveTruncated = false
 // prepended anyway, into a lane whose filter excludes it, and sat there
 // unreconcilable until its TTL expired.
 function withinActiveWindow(item: LiveItem): boolean {
+  const org = getSelectedOrganization()
+  if (org && item.repo.split('/')[0].toLowerCase() !== org.toLowerCase()) return false
   if (statusFilter === 'open' && item.state !== 'open') return false
   const win = timeWindow()
   const t = new Date(item.updated_at || item.created_at).getTime()
@@ -887,12 +898,11 @@ function reconcilePending() {
   }
 }
 
-// Full repo names ("Vaquum/foo") seen in the loaded live set, sorted by
-// the short name so the issue dropdown reads cleanly.
+// Full repository identities disambiguate matching names across organizations.
 function distinctRepos(): string[] {
   const set = new Set<string>()
   for (const i of liveItems) set.add(i.repo)
-  return [...set].sort((a, b) => shortRepo(a).localeCompare(shortRepo(b)))
+  return [...set].sort((a, b) => a.localeCompare(b))
 }
 
 // ── Composers ────────────────────────────────────────────────────────────────
@@ -916,7 +926,7 @@ function manualRepoOptionsHtml(selected: string | null = null): string {
   const opts = ['<option value="">— no repo —</option>']
   for (const r of repos) {
     const sel = selected === r ? ' selected' : ''
-    opts.push(`<option value="${escapeHtml(r)}"${sel}>${escapeHtml(shortRepo(r))}</option>`)
+    opts.push(`<option value="${escapeHtml(r)}"${sel}>${escapeHtml(r)}</option>`)
   }
   return opts.join('')
 }
@@ -1020,7 +1030,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
   const addBtn = laneNode.querySelector<HTMLButtonElement>('.lane-add')!
   addBtn.hidden = true
 
-  // Show short names in the dropdown but submit the full owner/name as the
+  // Show full names in the dropdown and submit owner/name as the
   // value so the API call doesn't have to reassemble it. Sources from
   // /api/repos (every org repo); falls back to the involvement set only
   // if that hasn't loaded yet. If the dropped card carries a repo, we
@@ -1029,7 +1039,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
   const wantRepo = prefill?.repo || ''
   const repoOptions = repos.length === 0
     ? '<option value="">(no repos available)</option>'
-    : repos.map((r) => `<option value="${escapeHtml(r)}"${r === wantRepo ? ' selected' : ''}>${escapeHtml(shortRepo(r))}</option>`).join('')
+    : repos.map((r) => `<option value="${escapeHtml(r)}"${r === wantRepo ? ' selected' : ''}>${escapeHtml(r)}</option>`).join('')
 
   const composer = document.createElement('div')
   composer.className = 'composer composer-issue'
@@ -1063,7 +1073,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
       if (!composer.isConnected || allRepos.length === 0) return
       const chosen = repoSel.value
       repoSel.innerHTML = allRepos
-        .map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(shortRepo(r))}</option>`)
+        .map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`)
         .join('')
       // Keep whatever was already picked if it survived into the real list.
       if (chosen && allRepos.includes(chosen)) repoSel.value = chosen
@@ -1450,7 +1460,7 @@ function attachDragHandlers() {
       renderAll()
 
       try {
-        await api('PATCH', `/api/current/${movingId}`, { lane: targetLane, position: idx })
+        await api('PATCH', `/api/current/${movingId}`, { lane: targetLane, position: idx, ...organizationPayload() })
       } catch (err) {
         console.error('move failed:', err)
         try { await fetchManual(); renderAll() } catch { /* ignore */ }
@@ -1698,6 +1708,7 @@ function attachFilterHandlers() {
 // ── Init ────────────────────────────────────────────────────────────────────
 
 export async function initCurrentView() {
+  const org = getSelectedOrganization()
   viewEl = document.getElementById('view-current')!
   if (!initialized) {
     initialized = true
@@ -1707,6 +1718,19 @@ export async function initCurrentView() {
     attachDragHandlers()
     attachCardClickHandlers()
     attachFilterHandlers()
+    mountOrganizationFilter(viewEl.querySelector<HTMLElement>('#current-filters')!)
+    window.addEventListener('poise:organization-filter-changed', () => {
+      liveSequence++
+      manualCards = []
+      liveItems = []
+      allRepos = []
+      agentActiveKeys.clear()
+      prStatus.clear()
+      liveLoadWarning = ''
+      repoLoadWarning = ''
+      renderAll()
+      if (!viewEl.hidden) void initCurrentView()
+    })
   }
   // Promise.all rejects on the first failure, so a single unreachable GitHub
   // cache skipped renderAll entirely and the board stayed blank — including
@@ -1715,6 +1739,7 @@ export async function initCurrentView() {
   const [manual, live, repos, active] = await Promise.allSettled([
     fetchManual(), fetchLive(), fetchAllRepos(), fetchAgentActive(),
   ])
+  if (org !== getSelectedOrganization()) return
   renderAll()
   const failures: string[] = []
   if (manual.status === 'rejected') failures.push('your cards')
@@ -1723,7 +1748,7 @@ export async function initCurrentView() {
   if (active.status === 'rejected') failures.push('agent activity')
   showLoadError(failures.length
     ? `Could not load ${failures.join(', ')}. Showing what is available.`
-    : '')
+    : liveLoadWarning || repoLoadWarning)
   fetchPrStatus()                    // first PR-status pull, intentionally not awaited
   // Combined refresh at the user-chosen cadence (1m or 5m, from
   // Settings). Re-fetch live items + PR-status, re-render the live

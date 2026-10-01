@@ -8,12 +8,13 @@ import { claudeAuth, type ClaudeAuthSnapshot } from './claude-auth'
 import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
-import { handleGhBody, listOrgRepos, setReviewAgentUsername } from './gh'
+import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository, setReviewAgentUsername } from './gh'
+import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentResponse, fetchAgentReasoning, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, getOrCreateChatSession, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
-import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
+import { withBehaviorOrganization, setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { ContentLaunchPendingError, getContentJobResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
 import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders } from './http'
@@ -85,6 +86,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   activeClaudeAuthRuntimes.add(auth)
   auth.start()
   setReviewAgentUsername(opts.reviewAgentUsername || '')
+  startOrganizationsRuntime()
   startBehaviorsRuntime({ reviewAgentUsername: opts.reviewAgentUsername })
   startContentFinalizer()
   if (!chatRuntime) {
@@ -119,7 +121,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   chatRuntime = null
   chatSockets = null
   selfUpdate = null
-  await Promise.all([stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, ...authStops])
 }
 
 export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.NextHandleFunction {
@@ -137,7 +139,15 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         const mutating = req.method !== 'GET' && req.method !== 'HEAD'
         const release = selfUpdate && mutating && !isSelfUpdateControlRoute(path) ? selfUpdate.beginApiWrite() : null
         try {
+          if (path === '/api/behaviors' || path.startsWith('/api/behaviors/')) {
+            setApiHeaders(res)
+            enforceApiRequest(req, { allowedHosts: opts.allowedHosts })
+            const login = new URLSearchParams(url.split('?')[1] || '').get('org') || readyOrganizations()[0]?.login
+            return await withBehaviorOrganization(login, () => handleApi(req, res, next, url, path, mutating))
+          }
           return await handleApi(req, res, next, url, path, mutating)
+        } catch (error) {
+          return json(res, httpStatus(error, 400), { error: (error as Error).message })
         } finally {
           release?.()
         }
@@ -145,6 +155,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
 
       async function handleApi(req: Parameters<Connect.NextHandleFunction>[0], res: ServerResponse, next: Connect.NextFunction, url: string, path: string, mutating: boolean): Promise<void> {
         setApiHeaders(res)
+        const selectedOrg = new URLSearchParams(url.split('?')[1] || '').get('org') || undefined
+        const behaviorOrg = selectedOrg || readyOrganizations()[0]?.login
         try {
           enforceApiRequest(req, { allowedHosts: opts.allowedHosts })
         } catch (err) {
@@ -176,11 +188,19 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             getCallerReleaseHealth(),
             getProductionUpdateHealth(),
           ])
-          const enabled = getEnabledMap()
-          const claudeBackedEnabled = enabled['review-new-prs'] || enabled['approve-prs'] || enabled['review-new-issues']
+          const organizations = getOrganizations()
+          const requiresClaude = () => {
+            const enabled = getEnabledMap()
+            return enabled['review-new-prs'] || enabled['approve-prs'] || enabled['review-new-issues']
+          }
+          const ready = readyOrganizations()
+          const claudeBackedEnabled = ready.length
+            ? ready.some((org) => withBehaviorOrganization(org.login, requiresClaude))
+            : requiresClaude()
           const healthy = scheduler.status === 'ok'
             && (!claudeBackedEnabled || claudeAuthState.status === 'authenticated')
             && callerRelease.status !== 'invalid'
+            && !organizations.some((org) => org.status === 'error' || org.error)
           // `production` is informational: a stalled updater leaves the
           // running service healthy, so it does not turn this degraded — the
           // health monitor raises that on its own and Settings shows it.
@@ -190,6 +210,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           return json(res, healthy ? 200 : 503, {
             status: healthy ? 'ok' : 'degraded',
             scheduler,
+            organizations,
             claudeAuth: claudeAuthState,
             callerRelease,
             production,
@@ -210,18 +231,45 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           return json(res, before.status === 'authenticated' ? 200 : 202, state)
         }
 
+        // Activation returns immediately; progress survives closing Settings
+        // and restarting Poise. Only server-generated datastore paths are used.
+        if (path === '/api/organizations' && req.method === 'GET') {
+          return json(res, 200, { organizations: getOrganizations() })
+        }
+        if (path === '/api/organizations' && req.method === 'POST') {
+          try {
+            const body = await readJson<any>(req)
+            addOrganization(body?.org)
+            return json(res, 202, { organizations: getOrganizations() })
+          } catch (error) {
+            return json(res, httpStatus(error, 400), { error: (error as Error).message })
+          }
+        }
+        const organizationRetry = path.match(/^\/api\/organizations\/([^/]+)\/retry$/)
+        if (organizationRetry && req.method === 'POST') {
+          try {
+            retryOrganization(decodeURIComponent(organizationRetry[1]))
+            return json(res, 202, { organizations: getOrganizations() })
+          } catch (error) {
+            return json(res, httpStatus(error, 400), { error: (error as Error).message })
+          }
+        }
+
         // ── Settings ──
         // Org / username / timezone (the few user-facing knobs Poise still
         // needs locally). Persisted in ~/.poise/cache.db meta table.
         if (url.startsWith('/api/settings') && req.method === 'GET') {
-          return json(res, 200, getSettings())
+          return json(res, 200, { ...getSettings(), organizations: getOrganizations() })
         }
         if (url.startsWith('/api/settings') && req.method === 'POST') {
           try {
             const body = await readJson<any>(req)
             const catalog = body && typeof body === 'object' && 'models' in body ? await loadCatalog() : undefined
+            if (typeof body?.org === 'string' && body.org.trim() !== getSettings().org) {
+              return json(res, 400, { error: 'Add organizations through organization setup.' })
+            }
             const settings = setSettings(body, catalog)
-            return json(res, 200, settings)
+            return json(res, 200, { ...settings, organizations: getOrganizations() })
           } catch (err: any) {
             return json(res, httpStatus(err, 400), { error: err.message || String(err) })
           }
@@ -283,9 +331,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // Wraps `agent-interface --logs`. Returns the JSON array as-is
         // under a `logs` envelope so the front-end can extend it later
         // without a breaking change.
-        if (url === '/api/agent-logs' && req.method === 'GET') {
+        if (path === '/api/agent-logs' && req.method === 'GET') {
           try {
-            const logs = await fetchAgentLogs()
+            const orgs = selectedOrg ? selectOrganizations(selectedOrg) : null
+            const logs = (await fetchAgentLogs()).filter((entry) => !orgs || (!!entry.repo && orgs.some((org) => repoBelongsTo(entry.repo!, org.login))))
             return json(res, 200, { logs })
           } catch (err: any) {
             return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })
@@ -307,7 +356,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // no log surface (github-interface doesn't persist its calls)
         // so its lastTriggered stays null — the dash in the Behaviors
         // view reflects the actual state of the world.
-        if (url === '/api/behaviors' && req.method === 'GET') {
+        if (path === '/api/behaviors' && req.method === 'GET') {
           const enabled = getEnabledMap()
           const settings = getSettingMap()
           const scratch = getScratchpadMap()
@@ -325,6 +374,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               e.behavior === cliBehavior
               && e.source === source
               && e.repo
+              && (!behaviorOrg || repoBelongsTo(e.repo, behaviorOrg))
               && e.pr_id)
             return r ? {
               at: r.started_at_precise || r.started_at,
@@ -439,7 +489,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               if (added.length) {
                 let known: Set<string>
                 try {
-                  known = new Set(await listOrgRepos())
+                  known = new Set(await listOrgRepos(behaviorOrg))
                 } catch (err: any) {
                   return json(res, 502, { error: 'could not list the organization repositories: ' + (err.message || String(err)) })
                 }
@@ -494,10 +544,9 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // Cached 5 min server-side. Used by Current's repo selectors so
         // the user can pick from every Vaquum repo, not just the ones
         // they've personally touched.
-        if (url === '/api/repos' && req.method === 'GET') {
+        if (path === '/api/repos' && req.method === 'GET') {
           try {
-            const repos = await listOrgRepos()
-            return json(res, 200, { repos })
+            return json(res, 200, await listOrganizationsRepos(selectedOrg))
           } catch (err: any) {
             return json(res, 502, { error: 'listOrgRepos failed: ' + (err.message || String(err)) })
           }
@@ -839,12 +888,14 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
 
         // ── Current (kanban) — manual cards (idea / concept / plan) ──
         // Stays Poise-local. The Issue + PR lanes pull from /api/gh.
-        if (url === '/api/current' && req.method === 'GET') {
-          return json(res, 200, { cards: listCards() })
+        if (path === '/api/current' && req.method === 'GET') {
+          const orgs = selectedOrg ? selectOrganizations(selectedOrg) : null
+          return json(res, 200, { cards: listCards().filter((card) => !orgs || !card.repo || orgs.some((org) => repoBelongsTo(card.repo!, org.login))) })
         }
         if (url === '/api/current' && req.method === 'POST') {
           try {
             const parsed = await readJson<any>(req)
+            if (typeof parsed.repo === 'string' && parsed.repo.trim()) requireConfiguredRepository(parsed.repo.trim())
             const card = createCard(String(parsed.text ?? ''), parsed.lane as Lane, parsed.repo)
             return json(res, 200, card)
           } catch (err: any) {
@@ -860,11 +911,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               // PATCH accepts any combination of {text}, {repo}, or
               // {lane, position}. Multiple fields in one call apply in
               // order so the edit form can save text + repo together.
+              if (typeof parsed.repo === 'string' && parsed.repo.trim()) requireConfiguredRepository(parsed.repo.trim())
               let card = null
               if (typeof parsed.text === 'string') card = setCardText(id, parsed.text)
               if ('repo' in parsed)                card = setCardRepo(id, parsed.repo)
               if (typeof parsed.lane === 'string' && typeof parsed.position === 'number') {
-                card = moveCard(id, parsed.lane as Lane, parsed.position)
+                const organization = parsed.org ? selectOrganizations(parsed.org)[0]?.login : undefined
+                card = moveCard(id, parsed.lane as Lane, parsed.position, organization)
               }
               if (card) return json(res, 200, card)
               return json(res, 400, { error: 'Provide one or more of { text }, { repo }, { lane, position }' })

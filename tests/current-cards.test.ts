@@ -112,3 +112,32 @@ describe('positions stay a dense sequence', () => {
     expect(laneOrder('idea')).toEqual(['b', 'a'])
   })
 })
+
+
+describe('organization-filtered positions', () => {
+  it('anchors a move to visible cards without reordering hidden organizations', () => {
+    current.createCard('hidden first', 'idea', 'beta/repo')
+    current.createCard('alpha first', 'idea', 'alpha/repo')
+    current.createCard('personal', 'idea')
+    current.createCard('hidden second', 'idea', 'beta/repo')
+    const moving = current.createCard('alpha second', 'idea', 'alpha/repo')
+    current.moveCard(moving.id, 'idea', 1, 'ALPHA')
+    expect(laneOrder('idea')).toEqual(['hidden first', 'alpha first', 'alpha second', 'personal', 'hidden second'])
+  })
+
+  it('keeps an end drop after the last visible card, before hidden trailing cards', () => {
+    const moving = current.createCard('moving', 'concept', 'alpha/repo')
+    current.createCard('alpha first', 'idea', 'alpha/repo')
+    current.createCard('hidden', 'idea', 'beta/repo')
+    current.moveCard(moving.id, 'idea', 1, 'alpha')
+    expect(laneOrder('idea')).toEqual(['alpha first', 'moving', 'hidden'])
+  })
+
+  it('rejects a card outside the selected organization without changing order', () => {
+    const hidden = current.createCard('hidden', 'idea', 'beta/repo')
+    current.createCard('shown', 'idea', 'alpha/repo')
+    expect(() => current.moveCard(hidden.id, 'plan', 0, 'alpha')).toThrow('selected organization')
+    expect(laneOrder('idea')).toEqual(['hidden', 'shown'])
+    expect(laneOrder('plan')).toEqual([])
+  })
+})

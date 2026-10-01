@@ -38,8 +38,8 @@ npm run doctor
 ```
 
 GitHub credentials stay in `gh`. Poise resolves the selected account's token
-through `gh` only for the lifetime of an issue-creation subprocess; it does not
-persist or expose that token. On upgrade, the schema migration removes the
+through `gh` for issue creation and organization datastore activation and sync;
+it does not persist or expose that token. On upgrade, the schema migration removes the
 retired plaintext `github_token` row while preserving legacy content tables.
 
 Claude credentials stay in Claude Code's local credential store. Poise checks
@@ -78,8 +78,40 @@ chmod 600 .env
 npm run dev
 ```
 
-Open <http://localhost:5555>. Configure the GitHub organization, username,
-timezone, refresh interval, and theme in Settings.
+Open <http://localhost:5555>. Configure your GitHub username, timezone,
+refresh interval, and theme in Settings. Add each GitHub organization there.
+
+### Multiple organizations
+
+Settings → General → Organizations → Add starts datastore activation immediately.
+Poise indexes the organization, builds your user involvement view, syncs, and
+checks freshness before marking it Ready. Progress and retryable errors appear
+in Settings; closing the panel does not stop activation. Large repository
+histories can take longer than a few minutes. Interrupted activation resumes
+when Poise restarts, and completed databases are reused without reinitialization.
+The selected GitHub account must be signed in through `gh` and able to read the
+organization. Caller currently requires visible repositories and indexed issues
+or PRs; an empty organization reports an activation error until it has data.
+
+Current, Archive, and Swarm combine organizations and offer an organization
+filter. Repository labels include their owner. Repository-free manual cards,
+Editor, Snippets, and local chats remain personal. If one organization's reads
+fail, available results remain visible with an explicit error.
+
+Behaviors has its own organization selector: each organization has independent
+enabled flags, review settings, repository selections, memory, and retry state.
+New organizations start with automation disabled. Enabling PR review records a
+baseline first, so existing PRs are not treated as newly opened work. Your
+existing organization's settings and review history are preserved. GitHub user,
+review-agent identity, model choices, and appearance remain shared.
+
+Each added organization has a separate datastore under
+`~/.poise/datastores/<org>/github.sqlite` (beside a custom `POISE_DB` when set).
+Poise syncs these databases every minute and reconciles hourly while running.
+Failed syncs back off from one minute to one hour; Retry runs immediately.
+The existing organization's externally managed datastore keeps its existing
+sync service. `POISE_DATASTORE_DB` selects that legacy database explicitly.
+Activation never initializes over the existing organization's database.
 
 Models have one name everywhere: the identity `<family>-<version>-<effort>`
 from Caller's catalog (`opus-5-max`, `gpt-6-astra-ultra`, …), the same string
@@ -142,6 +174,10 @@ npm ci
 npm run install:production
 ```
 
+A new installation can start without an initialized datastore; add the first
+organization in Settings. Existing databases and their sync services are retained.
+An explicitly configured `POISE_DATASTORE_DB` must point to an existing file.
+
 The macOS installer builds Poise, resolves the tracked Caller ref in
 `config/caller-release.json` to an immutable release, installs the Claude and
 Codex stop gates, and registers three per-user launchd services. They keep
@@ -177,6 +213,7 @@ unmanaged or mismatched Caller release.
 | `POISE_HOST` | Production bind address; loopback only | `127.0.0.1` |
 | `POISE_PORT` | Production port | `5555` |
 | `POISE_DB` | SQLite path | `~/.poise/cache.db` |
+| `POISE_DATASTORE_DB` | Existing organization’s Caller datastore | Caller default |
 | `POISE_EDITOR_DIR` | Markdown and annotation directory | `~/.poise/editor` |
 | `POISE_CHAT_ATTACHMENTS_DIR` | Durable chat attachments | `~/.poise/chat-attachments` |
 | `POISE_ESPANSO_MATCH_DIR` | Espanso match directory override | macOS Espanso default |

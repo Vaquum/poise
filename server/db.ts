@@ -909,13 +909,15 @@ export function retireBehaviorDeadLetter(id: string): boolean {
 export function retireBehaviorDeadLettersForClosedPrs(
   openTargets: ReadonlySet<string>,
   behaviors: readonly string[] = ['review-new-prs', 'approve-prs'],
+  organization?: string,
 ): number {
   const rows = (db.prepare(`
     SELECT id, behavior, repo, pr
     FROM behavior_dead_letters
     WHERE retired_at IS NULL AND repo IS NOT NULL AND pr IS NOT NULL
   `).all() as Array<{ id: string, behavior: string, repo: string, pr: number }>)
-    .filter((row) => behaviors.includes(row.behavior))
+    .filter((row) => behaviors.includes(row.behavior)
+      && (organization === undefined || row.repo.split('/')[0].toLowerCase() === organization.toLowerCase()))
   const retire = db.prepare(`
     UPDATE behavior_dead_letters SET retired_at = ?
     WHERE id = ? AND retired_at IS NULL
@@ -927,15 +929,15 @@ export function retireBehaviorDeadLettersForClosedPrs(
   }, 0))()
 }
 
-export function listBehaviorDeadLetters(limit = 50): BehaviorDeadLetter[] {
-  return readBehaviorDeadLetters(limit, false)
+export function listBehaviorDeadLetters(limit = 50, organization?: string): BehaviorDeadLetter[] {
+  return readBehaviorDeadLetters(limit, false, organization)
 }
 
-export function listBehaviorIncidents(limit = 50): BehaviorDeadLetter[] {
-  return readBehaviorDeadLetters(limit, true)
+export function listBehaviorIncidents(limit = 50, organization?: string): BehaviorDeadLetter[] {
+  return readBehaviorDeadLetters(limit, true, organization)
 }
 
-function readBehaviorDeadLetters(limit: number, grouped: boolean): BehaviorDeadLetter[] {
+function readBehaviorDeadLetters(limit: number, grouped: boolean, organization?: string): BehaviorDeadLetter[] {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
     throw new Error('dead-letter limit must be between 1 and 500')
   }
@@ -944,6 +946,7 @@ function readBehaviorDeadLetters(limit: number, grouped: boolean): BehaviorDeadL
     SELECT dead.*
     FROM behavior_dead_letters AS dead
     WHERE dead.retired_at IS NULL
+      AND (? IS NULL OR lower(substr(COALESCE(dead.repo, dead.target), 1, instr(COALESCE(dead.repo, dead.target), '/') - 1)) = ?)
       AND NOT EXISTS (
       SELECT 1
       FROM behavior_seen AS recovered
@@ -968,7 +971,7 @@ function readBehaviorDeadLetters(limit: number, grouped: boolean): BehaviorDeadL
     SELECT * FROM ranked WHERE ? = 0 OR rank = 1
     ORDER BY created_at DESC, id DESC
     LIMIT ?
-  `).all(Number(grouped), limit) as Array<{
+  `).all(organization ?? null, organization?.toLowerCase() ?? null, Number(grouped), limit) as Array<{
     id: string
     behavior: string
     target: string
@@ -1090,12 +1093,13 @@ export function clearSeen(key: string): void {
 // Disabling removes snapshots/skips but retains every accepted detached launch.
 // Otherwise disable/re-enable could duplicate completed work or erase the proof
 // that approval must wait for a successful initial review.
-export function clearSeenExceptLaunched(key: string): void {
+export function clearSeenExceptLaunched(key: string, organization?: string): void {
   db.prepare(`
     DELETE FROM behavior_seen
     WHERE key = ?
       AND launch_requested_at IS NULL
-  `).run(key)
+      AND (? IS NULL OR lower(substr(target, 1, instr(target, '/') - 1)) = ?)
+  `).run(key, organization ?? null, organization?.toLowerCase() ?? null)
 }
 
 // Production servers call this during graceful shutdown. Kept explicit

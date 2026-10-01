@@ -14,6 +14,7 @@ import { initEditorView, stopEditorRefresh } from './views/editor-view'
 import { toggle as toggleChat, close as closeChatPane } from './views/chat-pane'
 import { loadSettings, startRefreshTicker, applyTheme, getTheme } from './config'
 import { initClaudeAuth } from './claude-auth'
+import { getSelectedOrganization, setSelectedOrganization } from './organizations'
 
 const viewMainEl = document.getElementById('view-main')!
 const viewCurrentEl = document.getElementById('view-current')!
@@ -210,6 +211,8 @@ window.addEventListener('poise:open-chat-session', (ev) => {
 window.addEventListener('poise:goto-swarm-row', (ev) => {
   const detail = (ev as CustomEvent<{ repo: string, pr_id: string }>).detail
   if (!detail) return
+  const owner = detail.repo.split('/')[0]
+  if (getSelectedOrganization() && getSelectedOrganization().toLowerCase() !== owner.toLowerCase()) setSelectedOrganization(owner)
   menu.switchTo('swarm')
   // Defer one frame so showView's animation classes have applied and
   // initSwarmView() has run before we ask for a focus.

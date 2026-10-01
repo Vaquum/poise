@@ -1,3 +1,4 @@
+import { mountOrganizationFilter, organizationUrl, getSelectedOrganization } from '../organizations'
 // Swarm — log of agent calls. One row per call: model, prompt
 // (truncated), status, time elapsed, response (View → expand row to
 // reveal the full response text underneath).
@@ -296,7 +297,7 @@ function targetText(e: LogEntry): string {
   const repo = e.repo || ''
   const pr = e.pr_id ? String(e.pr_id) : ''
   if (repo || pr) {
-    const short = repo ? (repo.includes('/') ? repo.split('/')[1] : repo) : ''
+    const short = repo || ''
     return short && pr ? `${short}#${pr}` : (short || `#${pr}`)
   }
   return e.session_id ? sessionLabel(e.session_id) : ''
@@ -436,6 +437,7 @@ function renderShell() {
       <div id="swarm-loader" class="loader" hidden><span></span><span></span><span></span></div>
     </main>
   `
+  mountOrganizationFilter(viewEl.querySelector<HTMLElement>('#swarm-filters')!)
   bodyEl = viewEl.querySelector<HTMLElement>('#swarm-tbody')!
   searchEl = viewEl.querySelector<HTMLInputElement>('#swarm-search')!
   searchEl.addEventListener('input', () => {
@@ -858,12 +860,17 @@ function notFocusable(message: string): void {
 // deep-link of a session silently did nothing and only worked on the second
 // click. Callers now join the request that is already running.
 let pollInFlight: Promise<void> | null = null
+let pollOrganization = ''
+let pollSequence = 0
 
 function pollOnce(): Promise<void> {
-  if (pollInFlight) return pollInFlight
+  const org = getSelectedOrganization()
+  if (pollInFlight && pollOrganization === org) return pollInFlight
+  pollOrganization = org
+  const mine = ++pollSequence
   const run = (async () => {
     try {
-      const res = await fetch('/api/agent-logs')
+      const res = await fetch(organizationUrl('/api/agent-logs', org))
       if (!res.ok) {
         const text = await res.text().catch(() => '')
         let detail = ''
@@ -871,6 +878,7 @@ function pollOnce(): Promise<void> {
         throw new Error(detail ? `${res.status}: ${detail}` : `/api/agent-logs ${res.status}`)
       }
       const data = await res.json()
+      if (mine !== pollSequence || org !== getSelectedOrganization()) return
       entries = (data.logs || []) as LogEntry[]
       lastLoadError = null
       lastLoadedAt = Date.now()
@@ -882,6 +890,7 @@ function pollOnce(): Promise<void> {
       }
       renderStaleBanner()
     } catch (err) {
+      if (mine !== pollSequence || org !== getSelectedOrganization()) return
       lastLoadError = (err as Error).message
       if (entries.length === 0) {
         const empty = viewEl?.querySelector<HTMLElement>('#swarm-empty')
@@ -892,7 +901,7 @@ function pollOnce(): Promise<void> {
       }
       renderStaleBanner()
     } finally {
-      pollInFlight = null
+      if (mine === pollSequence) pollInFlight = null
     }
   })()
   pollInFlight = run
@@ -972,6 +981,12 @@ export async function initSwarmView() {
     initialized = true
     renderShell()
     attachClicks()
+    window.addEventListener('poise:organization-filter-changed', () => {
+      entries = []
+      expanded.clear()
+      render()
+      if (!viewEl.hidden) void pollOnce()
+    })
   }
   await pollOnce()
   startSwarmPolling()

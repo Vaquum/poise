@@ -1,5 +1,5 @@
 import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } from './model-refresh'
-// Settings panel — two tabs: General (org, username, timezone, refresh rate,
+// Settings panel — two tabs: General (organizations, username, timezone, refresh rate,
 // theme) and Models (which model each place in Poise launches, with a
 // fallback). Slides in from the right, same pattern as the typography panel.
 //
@@ -12,7 +12,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 // verbatim: the same string the Swarm log records and the CLI takes. The
 // panel never invents a label for one.
 
-import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme } from './config'
+import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, type Organization } from './config'
 import { productionSummary, type ProductionUpdate } from './production-status'
 
 interface CatalogModel { identity: string, provider: string, selector: string, effort: string }
@@ -66,8 +66,15 @@ let modelsGeneration = 0
 let lastModels: ModelsResponse | null = null
 
 async function refreshStatus(): Promise<void> {
+  const before = getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login).join(',')
   await loadSettings()
   syncFieldsFromCache()
+  renderOrganizations()
+  const after = getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login).join(',')
+  if (before !== after) {
+    window.dispatchEvent(new CustomEvent('poise:organizations-changed'))
+    window.dispatchEvent(new CustomEvent('poise:synced'))
+  }
 }
 
 function syncFieldsFromCache() {
@@ -77,7 +84,6 @@ function syncFieldsFromCache() {
   // first characters someone has already typed into an empty field. Only fill
   // a field the person is not currently in.
   const active = document.activeElement
-  if (orgInput && orgInput !== active) orgInput.value = s.org
   if (meInput && meInput !== active) meInput.value = s.me
   if (tzSelect && tzSelect !== active) {
     const fallback = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return 'UTC' } })()
@@ -118,6 +124,107 @@ function setHelp(text: string, cls: 'info' | 'error' | 'ok' = 'info') {
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
+}
+
+let organizationsPollTimer: ReturnType<typeof setTimeout> | null = null
+let organizationsPollGeneration = 0
+let organizationAdding = false
+let organizationsRendered = ''
+const ORGANIZATION_STAGES: Record<string, string> = {
+  queued: 'Waiting to activate…',
+  authenticating: 'Checking GitHub access…',
+  indexing: 'Indexing repositories…',
+  'building-user': 'Preparing your issues and pull requests…',
+  syncing: 'Syncing repositories…',
+  checking: 'Checking the datastore…',
+  reconciling: 'Preparing organization…',
+}
+
+function organizationStatus(text: string, failed = false): void {
+  const status = panelEl?.querySelector<HTMLElement>('.st-org-status')
+  if (!status) return
+  status.textContent = text
+  status.className = `st-help st-help-${failed ? 'error' : 'info'} st-org-status`
+}
+
+function renderOrganizations(): void {
+  const list = panelEl?.querySelector<HTMLElement>('.st-organizations')
+  if (!list) return
+  const organizations = getOrganizations()
+  const rendered = JSON.stringify([organizations, organizationAdding])
+  if (organizationsRendered === rendered) return
+  organizationsRendered = rendered
+  list.innerHTML = organizations.map((org) => `
+    <div class="st-organization" data-org="${escapeHtml(org.login)}">
+      <div class="st-organization-name">${escapeHtml(org.login)}<span class="st-org-state st-org-state-${org.error ? 'error' : org.status}">${org.status === 'ready' ? org.error ? 'Sync failed' : 'Ready' : org.status === 'error' ? 'Activation failed' : 'Activating…'}</span></div>
+      ${org.status === 'initializing' ? `<div class="st-help st-help-info">${escapeHtml(ORGANIZATION_STAGES[org.stage] || org.stage || 'Preparing organization…')}</div>` : ''}
+      ${org.status === 'error' || org.error ? `<div class="st-help st-help-error">${escapeHtml(org.error || 'Activation failed. Try again.')}</div><button type="button" class="st-clear" data-retry-org="${escapeHtml(org.login)}"${organizationAdding ? ' disabled' : ''}>Retry</button>` : ''}
+    </div>`).join('') || '<div class="st-help st-help-info">No organizations added yet.</div>'
+}
+
+async function pollOrganizations(): Promise<void> {
+  const generation = ++organizationsPollGeneration
+  if (organizationsPollTimer) clearTimeout(organizationsPollTimer)
+  organizationsPollTimer = null
+  try {
+    const res = await fetch('/api/organizations')
+    if (!res.ok) throw new Error(`Could not refresh organizations (HTTP ${res.status}).`)
+    const data = await res.json() as { organizations?: Organization[] }
+    if (generation !== organizationsPollGeneration) return
+    if (Array.isArray(data.organizations)) {
+      setOrganizations(data.organizations)
+      renderOrganizations()
+    }
+  } catch (error) {
+    if (generation === organizationsPollGeneration) organizationStatus((error as Error).message, true)
+  } finally {
+    if (generation === organizationsPollGeneration && panelEl?.classList.contains('open')) {
+      organizationsPollTimer = setTimeout(() => { void pollOrganizations() }, 1500)
+    }
+  }
+}
+
+async function addOrganization(retry?: string): Promise<void> {
+  if (!orgInput || organizationAdding || saving) return
+  const org = retry || orgInput.value.trim()
+  if (!GITHUB_NAME.test(org) || org.includes('--')) {
+    organizationStatus('Enter a GitHub organization name, not a URL.', true)
+    orgInput.focus()
+    return
+  }
+  if (!getCachedSettings().me || meInput?.value.trim() !== getCachedSettings().me) {
+    await saveAll()
+    if (!getCachedSettings().me || meInput?.value.trim() !== getCachedSettings().me) {
+      organizationStatus('Save a valid username before adding an organization.', true)
+      return
+    }
+  }
+  organizationAdding = true
+  const button = panelEl?.querySelector<HTMLButtonElement>('.st-add-organization')
+  if (button) button.disabled = true
+  renderOrganizations()
+  organizationStatus(retry ? `Retrying ${org}…` : `Adding ${org}…`)
+  // An earlier poll must not restore the list from before this addition.
+  organizationsPollGeneration++
+  if (organizationsPollTimer) clearTimeout(organizationsPollTimer)
+  organizationsPollTimer = null
+  try {
+    const res = await fetch(retry ? `/api/organizations/${encodeURIComponent(org)}/retry` : '/api/organizations', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ org }),
+    })
+    const data = await res.json() as { organizations?: Organization[], error?: string }
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    if (Array.isArray(data.organizations)) setOrganizations(data.organizations)
+    if (!retry) orgInput.value = ''
+    organizationStatus('Activation continues if you close Settings.')
+  } catch (error) {
+    organizationStatus((error as Error).message, true)
+  } finally {
+    organizationAdding = false
+    if (button) button.disabled = false
+    renderOrganizations()
+    if (panelEl?.classList.contains('open')) void pollOrganizations()
+  }
 }
 
 // ── Production ──────────────────────────────────────────────────────────
@@ -315,20 +422,15 @@ async function saveAll() {
   if (!saveBtn || !orgInput || !meInput || !tzSelect) return
   if (saving) return
 
-  const org = orgInput.value.trim()
+  const org = getCachedSettings().org
   const me = meInput.value.trim()
   const tz = tzSelect.value
   const models = collectModels()
   const branchPrefix = (branchPrefixInput?.value ?? CHAT_DEFAULTS.branchPrefix).trim() || CHAT_DEFAULTS.branchPrefix
   const idleTimeoutMinutes = Number(idleTimeoutInput?.value ?? CHAT_DEFAULTS.idleTimeoutMinutes)
 
-  if (!org || !me) {
-    setHelp('Org and username are required.', 'error')
-    return
-  }
-  if (!GITHUB_NAME.test(org)) {
-    setHelp('Organization must be a GitHub org name, not a URL.', 'error')
-    orgInput.focus()
+  if (!me) {
+    setHelp('Username is required.', 'error')
     return
   }
   if (!GITHUB_NAME.test(me)) {
@@ -378,6 +480,7 @@ async function saveAll() {
     }
     dirtyModels.clear()
     setLocalSettings(data)
+    renderOrganizations()
     setHelp('Saved.', 'ok')
     window.dispatchEvent(new CustomEvent('poise:synced'))
     window.dispatchEvent(new CustomEvent('poise:models-changed'))
@@ -430,13 +533,19 @@ function buildPanel(): HTMLElement {
         <div class="tp-group-label">GitHub</div>
 
         <div class="tp-section">
-          <label class="tp-label">Organization</label>
-          <input type="text" class="st-input st-input-org" autocomplete="off" spellcheck="false" placeholder="acme-corp" />
+          <label class="tp-label" for="st-organization">Organizations</label>
+          <div class="st-organizations" aria-live="polite"></div>
+          <div class="st-org-add-row">
+            <input id="st-organization" type="text" class="st-input st-input-org" aria-label="New organization" autocomplete="off" spellcheck="false" placeholder="acme-corp" />
+            <button type="button" class="st-clear st-add-organization">Add</button>
+          </div>
+          <div class="st-help st-help-info">Adding an organization activates its datastore. Initial sync may take a few minutes; existing organizations keep working. New organizations start with automations off.</div>
+          <div class="st-help st-help-info st-org-status" role="status"></div>
         </div>
 
         <div class="tp-section">
-          <label class="tp-label">Username (you)</label>
-          <input type="text" class="st-input st-input-me" autocomplete="off" spellcheck="false" placeholder="octocat" />
+          <label class="tp-label" for="st-username">Username (you)</label>
+          <input id="st-username" type="text" class="st-input st-input-me" autocomplete="off" spellcheck="false" placeholder="octocat" />
           <div class="st-help st-help-info">Scopes Current and Archive to your user-footprint (PRs and issues you're involved in). GitHub auth is handled by the local <code>github-datastore</code> CLI.</div>
         </div>
 
@@ -514,7 +623,7 @@ function buildPanel(): HTMLElement {
       </div>
 
       <div class="tp-hint">
-        Organization, username, timezone and model choices are stored in
+        Organizations, username, timezone and model choices are stored in
         <code>~/.poise/cache.db</code>. Refresh rate and theme are kept by this
         browser, so they do not follow you to another one.
       </div>
@@ -544,7 +653,13 @@ function buildPanel(): HTMLElement {
   tzSelect.value = browserTz
 
   saveBtn.addEventListener('click', saveAll)
-  for (const inp of [orgInput, meInput, branchPrefixInput, idleTimeoutInput]) {
+  panel.querySelector<HTMLButtonElement>('.st-add-organization')!.addEventListener('click', () => { void addOrganization() })
+  orgInput.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); void addOrganization() } })
+  panel.querySelector('.st-organizations')!.addEventListener('click', (event) => {
+    const retry = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-retry-org]')
+    if (retry?.dataset.retryOrg) void addOrganization(retry.dataset.retryOrg)
+  })
+  for (const inp of [meInput, branchPrefixInput, idleTimeoutInput]) {
     inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveAll() })
   }
 
@@ -586,6 +701,11 @@ export function initSettings() {
   panelEl.setAttribute('aria-hidden', 'true')
   document.body.appendChild(panelEl)
   void refreshStatus()
+  // Closed Settings releases its rapid timer; the app's regular refresh clock
+  // still reconciles pending activation so filters catch up without reopening.
+  window.addEventListener('poise:refresh-tick', () => {
+    if (!panelEl?.classList.contains('open') && getOrganizations().some((org) => org.status === 'initializing')) void pollOrganizations()
+  })
 }
 
 export function openSettingsPanel() {
@@ -597,6 +717,7 @@ export function openSettingsPanel() {
   void refreshStatus()
   void loadModels()
   void loadProduction()
+  void pollOrganizations()
   if (focusTimer) clearTimeout(focusTimer)
   const openingFocus = document.activeElement
   focusTimer = setTimeout(() => {
@@ -607,13 +728,15 @@ export function openSettingsPanel() {
     if (document.activeElement !== openingFocus && document.activeElement !== document.body) return
     // Focus the first empty required field
     if (!orgInput || !meInput) return
-    if (!orgInput.value) orgInput.focus()
-    else if (!meInput.value) meInput.focus()
+    if (!meInput.value) meInput.focus()
     else orgInput.focus()
   }, 200)
 }
 
 export function closeSettingsPanel() {
+  organizationsPollGeneration++
+  if (organizationsPollTimer) clearTimeout(organizationsPollTimer)
+  organizationsPollTimer = null
   if (focusTimer) clearTimeout(focusTimer)
   focusTimer = null
   if (!panelEl) return
@@ -646,6 +769,5 @@ export function toggleSettingsPanel() {
 export async function isFullyConfigured(): Promise<boolean> {
   await refreshStatus()
   if (!settingsLoadOk()) return true
-  const s = getCachedSettings()
-  return !!s.org && !!s.me
+  return settingsReady()
 }

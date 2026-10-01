@@ -7,8 +7,18 @@ export interface ModelChoice {
   fallback: string
 }
 
+export interface Organization {
+  login: string
+  managed: boolean
+  status: 'initializing' | 'ready' | 'error'
+  stage: string
+  error: string | null
+  activatedAt: string | null
+}
+
 export interface AppSettings {
   org: string
+  organizations?: Organization[]
   me: string
   timezone: string
   // Per place that launches a model (chat, editor, pr_review, pr_approve):
@@ -61,13 +71,26 @@ export function settingsLoaded(): boolean {
 }
 
 export function settingsReady(): boolean {
-  return !!(current.org && current.me)
+  return !!(getOrganizations().some((org) => org.status === 'ready') && current.me)
 }
 
 export function setLocalSettings(s: AppSettings) {
   savedRevision += 1
   loadOk = true
   current = s
+}
+
+export function getOrganizations(): Organization[] {
+  if (Array.isArray(current.organizations)) return current.organizations
+  return current.org ? [{ login: current.org, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }] : []
+}
+
+export function setOrganizations(organizations: Organization[]): void {
+  const before = getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login).join(',')
+  setLocalSettings({ ...current, organizations })
+  window.dispatchEvent(new CustomEvent('poise:organizations-changed'))
+  const after = organizations.filter((org) => org.status === 'ready').map((org) => org.login).join(',')
+  if (before !== after) window.dispatchEvent(new CustomEvent('poise:synced'))
 }
 
 // Default to the browser's timezone if the user hasn't picked one yet.
@@ -165,7 +188,7 @@ export function startRefreshTicker() {
   scheduleNextTick()
 }
 
-window.addEventListener('poise:refresh-rate-changed', () => {
+if (typeof window !== 'undefined') window.addEventListener('poise:refresh-rate-changed', () => {
   if (tickerStarted) scheduleNextTick()
 })
 

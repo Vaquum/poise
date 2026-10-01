@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url'
 import { config as loadDotenv } from 'dotenv'
 import { installStopGate } from './stop-gate-runtime.mjs'
 import { servicePath } from './production-path.mjs'
+import { legacyDatastoreServices, resolveLegacyDatastore } from './legacy-datastore.mjs'
 
 import { selfUpdateEnabled } from './self-update-bridge.mjs'
 
@@ -52,16 +53,10 @@ const serviceLabel = 'com.vaquum.poise'
 const monitorLabel = 'com.vaquum.poise.health'
 const updaterLabel = 'com.vaquum.poise.caller-update'
 const catalogLabel = 'com.vaquum.poise.model-catalog'
-const datastoreSyncLabel = 'com.vaquum.github-datastore.sync'
-const datastoreReconcileLabel = 'com.vaquum.github-datastore.reconcile'
-const datastoreHealthLabel = 'com.vaquum.github-datastore.health'
 const servicePlist = join(launchAgents, `${serviceLabel}.plist`)
 const monitorPlist = join(launchAgents, `${monitorLabel}.plist`)
 const updaterPlist = join(launchAgents, `${updaterLabel}.plist`)
 const catalogPlist = join(launchAgents, `${catalogLabel}.plist`)
-const datastoreSyncPlist = join(launchAgents, `${datastoreSyncLabel}.plist`)
-const datastoreReconcilePlist = join(launchAgents, `${datastoreReconcileLabel}.plist`)
-const datastoreHealthPlist = join(launchAgents, `${datastoreHealthLabel}.plist`)
 const logRoot = join(stateRoot, 'logs')
 const domain = `gui/${process.getuid()}`
 const dotenvPath = join(projectRoot, '.env')
@@ -383,23 +378,12 @@ async function main() {
     process.env.REVIEW_AGENT_USERNAME || '',
   )) throw new Error('REVIEW_AGENT_USERNAME must be configured before production installation')
 
-  const datastoreDb = process.env.POISE_DATASTORE_DB
-    || join(home, 'dev', 'caller', 'github_datastore', 'github_datastore.sqlite')
-  let datastoreStat
-  try {
-    datastoreStat = await stat(datastoreDb)
-  } catch (error) {
-    throw new Error(
-      `POISE_DATASTORE_DB does not exist: ${datastoreDb}`,
-      { cause: error },
-    )
-  }
-  if (!datastoreStat.isFile()) {
-    throw new Error('POISE_DATASTORE_DB must point to an initialized github-datastore database')
-  }
-  const githubUser = process.env.POISE_GITHUB_USER
-    || await commandOutput('gh', ['api', 'user', '--jq', '.login'])
-  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/.test(githubUser)) {
+  const datastoreDb = await resolveLegacyDatastore({ home, configuredPath: process.env.POISE_DATASTORE_DB })
+  const datastoreServices = legacyDatastoreServices(datastoreDb, launchAgents)
+  const githubUser = datastoreDb
+    ? process.env.POISE_GITHUB_USER || await commandOutput('gh', ['api', 'user', '--jq', '.login'])
+    : null
+  if (datastoreDb && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/.test(githubUser)) {
     throw new Error('POISE_GITHUB_USER must be a GitHub username')
   }
 
@@ -451,6 +435,7 @@ async function main() {
     NODE_ENV: 'production',
     PATH: path,
     POISE_ENFORCE_CALLER_RELEASE: '1',
+    ...(datastoreDb ? { POISE_DATASTORE_DB: datastoreDb } : {}),
     ...(process.env.POISE_DB ? { POISE_DB: process.env.POISE_DB } : {}),
     TMPDIR: process.env.TMPDIR || '/tmp',
   }
@@ -514,59 +499,63 @@ async function main() {
     key('StandardOutPath', `<string>${xml(join(logRoot, 'model-catalog.out.log'))}</string>`),
     key('StandardErrorPath', `<string>${xml(join(logRoot, 'model-catalog.err.log'))}</string>`),
   ])
-  const datastoreCommand = (args) => [
-    'set -euo pipefail',
-    `export PATH=${shell(path)}`,
-    `GH_TOKEN="$(gh auth token --user ${shell(githubUser)})"`,
-    '[[ -n "$GH_TOKEN" ]]',
-    'export GH_TOKEN',
-    `exec ${shell(join(binRoot, 'github-datastore'))} --db ${shell(datastoreDb)} ${args.map(shell).join(' ')}`,
-  ].join('; ')
-  const datastoreSync = plist([
-    key('Label', `<string>${datastoreSyncLabel}</string>`),
-    key('ProgramArguments', array([
-      '/bin/zsh', '-lc', datastoreCommand(['sync', '--workers', '12']),
-    ])),
-    key('WorkingDirectory', `<string>${xml(dirname(datastoreDb))}</string>`),
-    key('RunAtLoad', '<true/>'),
-    key('StartInterval', '<integer>60</integer>'),
-    key('StandardOutPath', `<string>${xml(join(logRoot, 'datastore-sync.out.log'))}</string>`),
-    key('StandardErrorPath', `<string>${xml(join(logRoot, 'datastore-sync.err.log'))}</string>`),
-  ])
-  const datastoreReconcile = plist([
-    key('Label', `<string>${datastoreReconcileLabel}</string>`),
-    key('ProgramArguments', array([
-      '/bin/zsh', '-lc', datastoreCommand([
-        'sync', '--workers', '1', '--reconcile', '--reconcile-sleep', '17',
-      ]),
-    ])),
-    key('WorkingDirectory', `<string>${xml(dirname(datastoreDb))}</string>`),
-    key('StartCalendarInterval', '<dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>'),
-    key('StandardOutPath', `<string>${xml(join(logRoot, 'datastore-reconcile.out.log'))}</string>`),
-    key('StandardErrorPath', `<string>${xml(join(logRoot, 'datastore-reconcile.err.log'))}</string>`),
-  ])
-  const datastoreHealth = plist([
-    key('Label', `<string>${datastoreHealthLabel}</string>`),
-    key('ProgramArguments', array([
-      join(binRoot, 'github-datastore'),
-      '--db', datastoreDb,
-      'health', '--max-age-seconds', '120',
-    ])),
-    key('WorkingDirectory', `<string>${xml(dirname(datastoreDb))}</string>`),
-    key('EnvironmentVariables', dictionary({ HOME: home, PATH: path })),
-    key('RunAtLoad', '<true/>'),
-    key('StartInterval', '<integer>60</integer>'),
-    key('StandardOutPath', `<string>${xml(join(logRoot, 'datastore-health.out.log'))}</string>`),
-    key('StandardErrorPath', `<string>${xml(join(logRoot, 'datastore-health.err.log'))}</string>`),
-  ])
+  // The empty plan on a clean install must not write, unload, or start any
+  // pre-existing datastore launchd job owned outside this Poise installation.
+  if (datastoreDb) {
+    const datastoreCommand = (args) => [
+      'set -euo pipefail',
+      `export PATH=${shell(path)}`,
+      `GH_TOKEN="$(gh auth token --user ${shell(githubUser)})"`,
+      '[[ -n "$GH_TOKEN" ]]',
+      'export GH_TOKEN',
+      `exec ${shell(join(binRoot, 'github-datastore'))} --db ${shell(datastoreDb)} ${args.map(shell).join(' ')}`,
+    ].join('; ')
+    const datastoreSync = plist([
+      key('Label', `<string>com.vaquum.github-datastore.sync</string>`),
+      key('ProgramArguments', array([
+        '/bin/zsh', '-lc', datastoreCommand(['sync', '--workers', '12']),
+      ])),
+      key('WorkingDirectory', `<string>${xml(dirname(datastoreDb))}</string>`),
+      key('RunAtLoad', '<true/>'),
+      key('StartInterval', '<integer>60</integer>'),
+      key('StandardOutPath', `<string>${xml(join(logRoot, 'datastore-sync.out.log'))}</string>`),
+      key('StandardErrorPath', `<string>${xml(join(logRoot, 'datastore-sync.err.log'))}</string>`),
+    ])
+    const datastoreReconcile = plist([
+      key('Label', `<string>com.vaquum.github-datastore.reconcile</string>`),
+      key('ProgramArguments', array([
+        '/bin/zsh', '-lc', datastoreCommand([
+          'sync', '--workers', '1', '--reconcile', '--reconcile-sleep', '17',
+        ]),
+      ])),
+      key('WorkingDirectory', `<string>${xml(dirname(datastoreDb))}</string>`),
+      key('StartCalendarInterval', '<dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>'),
+      key('StandardOutPath', `<string>${xml(join(logRoot, 'datastore-reconcile.out.log'))}</string>`),
+      key('StandardErrorPath', `<string>${xml(join(logRoot, 'datastore-reconcile.err.log'))}</string>`),
+    ])
+    const datastoreHealth = plist([
+      key('Label', `<string>com.vaquum.github-datastore.health</string>`),
+      key('ProgramArguments', array([
+        join(binRoot, 'github-datastore'),
+        '--db', datastoreDb,
+        'health', '--max-age-seconds', '120',
+      ])),
+      key('WorkingDirectory', `<string>${xml(dirname(datastoreDb))}</string>`),
+      key('EnvironmentVariables', dictionary({ HOME: home, PATH: path })),
+      key('RunAtLoad', '<true/>'),
+      key('StartInterval', '<integer>60</integer>'),
+      key('StandardOutPath', `<string>${xml(join(logRoot, 'datastore-health.out.log'))}</string>`),
+      key('StandardErrorPath', `<string>${xml(join(logRoot, 'datastore-health.err.log'))}</string>`),
+    ])
+    const contents = { sync: datastoreSync, reconcile: datastoreReconcile, health: datastoreHealth }
+    for (const job of datastoreServices) job.content = contents[job.kind]
+  }
   await Promise.all([
     atomicWrite(servicePlist, service),
     atomicWrite(monitorPlist, monitor),
     atomicWrite(updaterPlist, updater),
     atomicWrite(catalogPlist, catalog),
-    atomicWrite(datastoreSyncPlist, datastoreSync),
-    atomicWrite(datastoreReconcilePlist, datastoreReconcile),
-    atomicWrite(datastoreHealthPlist, datastoreHealth),
+    ...datastoreServices.map((job) => atomicWrite(job.path, job.content)),
   ])
   const selfUpdating = process.env.POISE_RUNTIME_RECONCILER === '1'
     || process.env.POISE_CALLER_UPDATER === '1'
@@ -574,20 +563,15 @@ async function main() {
   await bootout(monitorLabel)
   await bootout(serviceLabel)
   await bootout(catalogLabel)
-  await bootout(datastoreReconcileLabel)
-  await bootout(datastoreSyncLabel)
-  await bootout(datastoreHealthLabel)
+  for (const job of datastoreServices) await bootout(job.label)
   await run('/bin/launchctl', ['enable', `${domain}/${serviceLabel}`])
   await run('/bin/launchctl', ['enable', `${domain}/${monitorLabel}`])
   await run('/bin/launchctl', ['enable', `${domain}/${updaterLabel}`])
   await run('/bin/launchctl', ['enable', `${domain}/${catalogLabel}`])
-  await run('/bin/launchctl', ['enable', `${domain}/${datastoreSyncLabel}`])
-  await run('/bin/launchctl', ['enable', `${domain}/${datastoreReconcileLabel}`])
-  await run('/bin/launchctl', ['enable', `${domain}/${datastoreHealthLabel}`])
-  await bootstrap(datastoreSyncPlist)
+  for (const job of datastoreServices) await run('/bin/launchctl', ['enable', `${domain}/${job.label}`])
+  for (const job of datastoreServices.filter((job) => job.kind === 'sync')) await bootstrap(job.path)
   await bootstrap(catalogPlist)
-  await bootstrap(datastoreReconcilePlist)
-  await bootstrap(datastoreHealthPlist)
+  for (const job of datastoreServices.filter((job) => job.kind !== 'sync')) await bootstrap(job.path)
   await bootstrap(servicePlist)
   const health = await waitForHealthyProduction()
   // The service is up either way at this point, so the monitor and the updater
@@ -596,6 +580,7 @@ async function main() {
   await bootstrap(monitorPlist)
   if (!selfUpdating) await bootstrap(updaterPlist)
   console.log(`Installed ${serviceLabel} with Caller ${manifest.commit}`)
+  if (!datastoreDb) console.log('Add your first GitHub organization in Settings to initialize its datastore.')
   if (!health.healthy) {
     console.warn('\nThe service is installed and running, but reports degraded:')
     console.warn(`  ${describeDegraded(health.body)}`)

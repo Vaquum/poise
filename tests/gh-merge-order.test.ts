@@ -7,6 +7,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), getMeta: vi.fn() }))
 
 vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
+vi.mock('../server/organizations', () => ({
+  getOrganizations: () => [{ login: 'owner', status: 'ready', managed: false }],
+  readyOrganizations: () => [{ login: 'owner', status: 'ready', managed: false }],
+  organizationArgs: (_org: unknown, args: string[]) => args,
+}))
 vi.mock('../server/db', () => ({
   getMeta: mocks.getMeta,
   setMeta: vi.fn(),
