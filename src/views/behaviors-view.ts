@@ -9,16 +9,15 @@
 // runtime — the view is just a UI for state, not the place where
 // agent automations actually run.
 
-import { BEHAVIORS, isEnabled, setEnabled, getSetting, setSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, setTriggers, getLastTriggered, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, isBehaviorStateLoaded, getBehaviorOwner, setBehaviorOrganization, getBehaviorOrganization } from '../behaviors'
-import { getOrganizations } from '../config'
-import { organizationUrl } from '../organizations'
+import { BEHAVIORS, isEnabled, setEnabled, getSetting, setSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, setTriggers, getLastTriggered, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
+import { organizationErrors } from '../organizations'
 
 let viewEl: HTMLElement
 let initialized = false
 // Owner per behavior, fetched once from /api/behaviors. Server-side
 // values come from env vars (REVIEW_AGENT_USERNAME, etc.) — these are
 // the actual GitHub usernames the automations act as.
-let behaviorOwners: Partial<Record<BehaviorKey, string | null>> = {}
+const behaviorOwners: Partial<Record<BehaviorKey, string | null>> = {}
 // Tick listener — installed on view init, removed on view leave by
 // stopBehaviorsRefresh(). Single shared clock, same pattern as the
 // three other views. See startRefreshTicker() in src/config.ts.
@@ -268,8 +267,8 @@ function writeReviewers(key: BehaviorKey, value: ReviewerCount): void {
 
 // ── Triggers (Review New Issues) ────────────────────────────────────────
 // Review New Issues is opt-in per repository. Its Setting cell is one pill
-// that opens a dropdown: a filterable checkbox list of the organization's
-// repositories and, below it, the trusted authors whose new issues count.
+// that opens a dropdown: a filterable checkbox list across all ready accounts
+// and, below it, the trusted authors whose new issues count.
 // Like the memory panel, every way of closing it — Done, Escape, a click
 // outside, leaving the view — saves what changed; a save that fails keeps it
 // open next to the error rather than closing over the choice.
@@ -336,17 +335,15 @@ function refreshTriggersCell(key: BehaviorKey) {
 }
 
 function loadOrgRepos(): Promise<void> {
-  const org = getBehaviorOrganization()
-  orgReposLoading ??= fetch(organizationUrl('/api/repos', org))
+  orgReposLoading ??= fetch('/api/repos')
     .then(async (res) => {
       const data = await res.json().catch(() => ({}))
       if (!res.ok || !Array.isArray(data.repos)) throw new Error(data?.error || `HTTP ${res.status}`)
-      if (org !== getBehaviorOrganization()) return
       orgRepos = data.repos.filter((repo: unknown): repo is string => typeof repo === 'string')
-      orgReposError = ''
+      orgReposError = organizationErrors(data)
     })
-    .catch((err: unknown) => { if (org === getBehaviorOrganization()) orgReposError = (err as Error).message || 'unavailable' })
-    .finally(() => { if (org === getBehaviorOrganization()) orgReposLoading = null })
+    .catch((err: unknown) => { orgReposError = (err as Error).message || 'unavailable' })
+    .finally(() => { orgReposLoading = null })
   return orgReposLoading
 }
 
@@ -365,7 +362,7 @@ function renderTriggerRepos() {
     list.innerHTML = '<div class="st-help st-help-info">Loading repositories…</div>'
     return
   }
-  // A selected repository the organization no longer lists stays visible, so
+  // A selected repository an account no longer lists stays visible, so
   // it can still be turned off.
   const all = [...new Set([...(orgRepos ?? []), ...triggersDraft])]
     .sort((a, b) => shortRepo(a).localeCompare(shortRepo(b)))
@@ -485,7 +482,7 @@ function openTriggersPanel(key: BehaviorKey) {
   triggersPanelEl.querySelector<HTMLInputElement>('.bt-filter')!.value = ''
   triggersPanelEl.querySelector<HTMLInputElement>('.bt-authors')!.value = triggersLoaded.authors.join(', ')
   setTriggersStatus('')
-  // The organization gains repositories while a tab stays open, so every
+  // Accounts gain repositories while a tab stays open, so every
   // opening asks again; the list already held shows until the answer lands.
   void loadOrgRepos().then(() => { if (triggersKey === key) renderTriggerRepos() })
   renderTriggerRepos()
@@ -693,8 +690,8 @@ function openMemoryPanel(key: BehaviorKey) {
   const meta = BEHAVIORS.find((b) => b.key === key)
   if (memoryTitleEl) memoryTitleEl.textContent = `Memory for ${meta?.label ?? key}`
   memoryLoadedValue = getScratchpad(key)
-  const draft = unsavedDrafts.get(memoryDraftKey(key))
-  if (draft !== undefined) unsavedDrafts.delete(memoryDraftKey(key))
+  const draft = unsavedDrafts.get(key)
+  if (draft !== undefined) unsavedDrafts.delete(key)
   if (memoryTextarea) memoryTextarea.value = draft ?? memoryLoadedValue
   setMemoryStatus(
     draft !== undefined ? 'This is an unsaved draft from earlier — it was never stored. Save to keep it.' : '',
@@ -731,11 +728,10 @@ function closeMemoryPanel(force = false) {
   if (memoryKey && memoryTextarea && memoryTextarea.value !== memoryLoadedValue) {
     const key = memoryKey
     const draft = memoryTextarea.value
-    const draftKey = memoryDraftKey(key)
     void saveMemory().then((saved) => {
       if (saved) finishClosingMemoryPanel()
       else if (force) {
-        unsavedDrafts.set(draftKey, draft)
+        unsavedDrafts.set(key, draft)
         finishClosingMemoryPanel()
       }
     })
@@ -747,8 +743,7 @@ function closeMemoryPanel(force = false) {
 // Text that could not be stored when the view went away. Held in memory only:
 // it is a draft, and pretending otherwise by persisting it would make it look
 // saved when the server never accepted it.
-const unsavedDrafts = new Map<string, string>()
-function memoryDraftKey(key: BehaviorKey): string { return `${getBehaviorOrganization()}:${key}` }
+const unsavedDrafts = new Map<BehaviorKey, string>()
 
 function finishClosingMemoryPanel() {
   if (!memoryPanelEl) return
@@ -871,7 +866,7 @@ function refreshMemoryCell(key: BehaviorKey) {
 function renderShell(): string {
   return `
     <header class="view-header">
-      <div class="filter-cluster" id="behaviors-filters"></div>
+      <div class="filter-cluster" id="behaviors-filters"><span class="st-help st-help-info">Behavior settings apply to all ready GitHub accounts.</span></div>
     </header>
     <main>
       <div id="behavior-diagnostics" class="behavior-diagnostics" hidden></div>
@@ -919,9 +914,7 @@ function renderRow(meta: typeof BEHAVIORS[number]): HTMLTableRowElement {
 // no diagnostics, while the runtime carried on spawning agents. refreshState
 // records the failure, so it must always run.)
 async function fetchBehaviorOwners() {
-  const org = getBehaviorOrganization()
   await refreshState()
-  if (org !== getBehaviorOrganization()) return
   for (const key of BEHAVIORS.map((behavior) => behavior.key)) {
     behaviorOwners[key as BehaviorKey] = getBehaviorOwner(key) ?? null
   }
@@ -956,7 +949,7 @@ function renderDiagnostics() {
     diagnostics.datastore.error ? `Datastore: ${diagnostics.datastore.error}` : '',
     diagnostics.identity.error ? `Identity: ${diagnostics.identity.error}` : '',
     ...diagnostics.failures.map((failure) =>
-      `${failure.behavior}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s)${failure.error ? ` — ${diagnosticCause(failure.error)}` : ''}`),
+      `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s)${failure.error ? ` — ${diagnosticCause(failure.error)}` : ''}`),
     ...diagnostics.deadLetters.slice(0, DEAD_LETTERS_SHOWN).map((letter) =>
       `${letter.behavior} ${letter.target}: ${diagnosticCause(letter.error)}${(letter.attemptCount ?? 1) > 1 ? ` (${letter.attemptCount} attempts)` : ''}`),
     // A dead letter is a target the behaviour permanently gave up on. Showing
@@ -1075,9 +1068,7 @@ function attachHandlers() {
 // authoritative for controls: another tab or a rejected request must be
 // reflected on the next tick instead of leaving a dangerous false state.
 async function tickRefresh() {
-  const org = getBehaviorOrganization()
   await refreshState()
-  if (org !== getBehaviorOrganization()) return
   renderDiagnostics()
   for (const meta of BEHAVIORS) {
     const tr = viewEl.querySelector<HTMLTableRowElement>(`tr[data-behavior="${meta.key}"]`)
@@ -1109,72 +1100,6 @@ export function stopBehaviorsRefresh() {
   tickListening = false
 }
 
-let organizationSwitching = false
-
-function renderOrganizationPicker(): void {
-  const host = viewEl.querySelector<HTMLElement>('#behaviors-filters')!
-  const organizations = getOrganizations()
-  let org = getBehaviorOrganization()
-  // Readiness can disappear during reindexing. Keep the selected scope: every
-  // open editor and queued write belongs to it until an explicit switch saves
-  // or preserves those drafts under the original organization.
-  if (!org) {
-    org = organizations.find((entry) => entry.status === 'ready')?.login || organizations[0]?.login || ''
-    setBehaviorOrganization(org)
-  }
-  let picker = host.querySelector<HTMLSelectElement>('.behavior-organization')
-  if (!picker) {
-    picker = document.createElement('select')
-    picker.className = 'organization-filter behavior-organization'
-    picker.setAttribute('aria-label', 'Behavior account')
-    picker.addEventListener('change', () => { void switchOrganization(picker!.value) })
-    host.appendChild(picker)
-  }
-  picker.replaceChildren(...organizations.map((entry) => {
-    const option = new Option(entry.status === 'ready' ? entry.login : `${entry.login} (${entry.status === 'error' ? 'unavailable' : 'activating…'})`, entry.login)
-    option.disabled = entry.status !== 'ready'
-    return option
-  }))
-  if (org && !organizations.some((entry) => entry.login === org)) {
-    const unavailable = new Option(`${org} (unavailable)`, org)
-    unavailable.disabled = true
-    picker.appendChild(unavailable)
-  }
-  picker.value = org
-  picker.hidden = organizations.length < 2
-  picker.disabled = organizationSwitching
-}
-
-async function switchOrganization(org: string): Promise<void> {
-  const previous = getBehaviorOrganization()
-  if (organizationSwitching || org === previous) return
-  organizationSwitching = true
-  const picker = viewEl.querySelector<HTMLSelectElement>('.behavior-organization')!
-  picker.disabled = true
-  try {
-    // Save draft controls against their original organization before changing
-    // scope. A refused save leaves that organization selected for correction.
-    if (memoryKey && !(await saveMemory())) return
-    finishClosingMemoryPanel()
-    if (!(await closeTriggersPanel())) return
-    flushSettingWrites()
-    setBehaviorOrganization(org)
-    orgRepos = null
-    orgReposError = ''
-    orgReposLoading = null
-    behaviorOwners = {}
-    renderRows()
-    renderDiagnostics()
-    await fetchBehaviorOwners()
-    renderRows()
-    renderDiagnostics()
-  } finally {
-    organizationSwitching = false
-    picker.value = getBehaviorOrganization()
-    picker.disabled = false
-  }
-}
-
 export async function initBehaviorsView() {
   viewEl = document.getElementById('view-behaviors')!
   if (!initialized) {
@@ -1183,11 +1108,8 @@ export async function initBehaviorsView() {
     attachHandlers()
     // Re-render when behavior state changes from elsewhere (e.g. boot
     // re-snapshot, programmatic toggle) so the UI never drifts.
-    window.addEventListener('poise:behaviors-changed', (event) => {
-      if ((event as CustomEvent<{ org?: string }>).detail?.org === getBehaviorOrganization()) renderRows()
-    })
+    window.addEventListener('poise:behaviors-changed', () => renderRows())
   }
-  renderOrganizationPicker()
   // Fetch the server-provided owner map first so the very first paint
   // shows the right username/avatar instead of a flash of "—".
   await fetchBehaviorOwners()

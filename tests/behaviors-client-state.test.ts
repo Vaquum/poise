@@ -214,49 +214,36 @@ describe('Review New Issues triggers', () => {
 })
 
 
-describe('organization isolation', () => {
-  it('keeps delayed reads and writes attached to the organization that started them', async () => {
-    const writes: string[] = []
-    let finishWrite!: (value: unknown) => void
-    vi.stubGlobal('fetch', (url: string, init?: RequestInit) => {
-      if (init?.method === 'POST') {
-        writes.push(url)
-        return new Promise((resolve) => { finishWrite = resolve })
-      }
-      return deferGet().then((body) => ({ ok: true, status: 200, json: async () => body }))
+describe('global behavior configuration', () => {
+  it('saves repository choices across accounts through the same unscoped endpoint', async () => {
+    const calls: string[] = []
+    const selected = ['acme/project', 'mikkokotila/project']
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      calls.push(url)
+      if (init?.method === 'POST') return { ok: true, status: 200, json: async () => JSON.parse(String(init.body)) }
+      return { ok: true, status: 200, json: async () => payload({ 'review-new-issues': { repos: selected, authors: ['octocat'] } }) }
     })
-    behaviors.setBehaviorOrganization('acme')
-    const read = behaviors.refreshState()
-    const write = behaviors.setEnabled('review-new-prs', true)
-    behaviors.setBehaviorOrganization('beta')
-    expect(behaviors.isEnabled('review-new-prs')).toBe(false)
-    expect(behaviors.isBehaviorStateLoaded()).toBe(false)
-    finishWrite({ ok: true, status: 200, json: async () => ({ enabled: true }) })
-    await write
-    respond(payload({ 'review-new-prs': { enabled: false, scratchpad: 'acme memory' } }))
-    await read
-    expect(behaviors.isEnabled('review-new-prs')).toBe(false)
-    expect(behaviors.getScratchpad('review-new-prs')).toBe('')
-    expect(writes).toEqual(['/api/behaviors/review-new-prs?org=acme'])
-    behaviors.setBehaviorOrganization('acme')
-    expect(behaviors.isEnabled('review-new-prs')).toBe(true)
+    await behaviors.setTriggers('review-new-issues', { repos: selected, authors: ['octocat'] })
+    await behaviors.refreshState()
+    expect(behaviors.getRepos('review-new-issues')).toEqual(selected)
+    expect(calls).toEqual(['/api/behaviors/review-new-issues', '/api/behaviors'])
   })
 
-  it('does not redirect a queued setting write after switching organizations', async () => {
-    const writes: string[] = []
+  it('serializes settings into one shared configuration', async () => {
+    const writes: Array<{ url: string, setting: string }> = []
     vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
-      writes.push(url)
       const body = JSON.parse(String(init?.body))
+      writes.push({ url, setting: body.setting })
       return { ok: true, status: 200, json: async () => body }
     })
-    behaviors.setBehaviorOrganization('acme')
-    const first = behaviors.setSetting('review-new-prs', 'p1')
-    const second = behaviors.setSetting('review-new-prs', 'p3')
-    behaviors.setBehaviorOrganization('beta')
-    await Promise.all([first, second])
-    expect(behaviors.getSetting('review-new-prs')).toBe('p2')
-    expect(writes).toEqual(['/api/behaviors/review-new-prs?org=acme', '/api/behaviors/review-new-prs?org=acme'])
-    behaviors.setBehaviorOrganization('acme')
+    await Promise.all([
+      behaviors.setSetting('review-new-prs', 'p1'),
+      behaviors.setSetting('review-new-prs', 'p3'),
+    ])
+    expect(writes).toEqual([
+      { url: '/api/behaviors/review-new-prs', setting: 'p1' },
+      { url: '/api/behaviors/review-new-prs', setting: 'p3' },
+    ])
     expect(behaviors.getSetting('review-new-prs')).toBe('p3')
   })
 })

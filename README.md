@@ -101,12 +101,16 @@ filter. Repository labels include their owner. Repository-free manual cards,
 Editor, Snippets, and local chats remain personal. If one account's reads
 fail, available results remain visible with an explicit error.
 
-Behaviors has its own account selector: each account has independent
-enabled flags, review settings, repository selections, memory, and retry state.
-New accounts start with automation disabled. Enabling PR review records a
-baseline first, so existing PRs are not treated as newly opened work. Your
-existing account's settings and review history are preserved. GitHub user,
-review-agent identity, model choices, and appearance remain shared.
+Behaviors uses one shared set of enabled flags, review settings, repository
+selections, trusted authors, and memory across all ready GitHub accounts.
+Account filters in Current, Archive, and Swarm do not change automation scope.
+The Review New Issues repository picker lists full `owner/repo` names across
+all ready accounts. Newly activated accounts use the same behavior settings.
+Enabling PR review for the first time records a baseline for existing accounts.
+Accounts added while PR review is already enabled process eligible existing open
+PRs when they become ready. Review history, onboarding baselines, and retry state
+remain separate per account. GitHub user, review-agent identity, model choices,
+and appearance remain shared.
 
 Each added account has a separate datastore under
 `~/.poise/datastores/<account>/github.sqlite` (beside a custom `POISE_DB` when set).

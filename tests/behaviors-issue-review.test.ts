@@ -202,6 +202,45 @@ afterEach(async () => {
 })
 
 describe('Review New Issues', () => {
+  it('shares issue preferences while each account reads and launches only its own selected repositories', async () => {
+    const betaRepo = 'beta/Origo'
+    const since = ago(60 * MINUTE)
+    const { behaviors, database } = await start({
+      reviewers: 2, note: 'Global issue note', repos: [{ repo: REPO, since }, { repo: betaRepo, since }],
+    })
+    const betaPath = join(tempRoot, 'beta.sqlite')
+    database.setMeta('me', 'mikkokotila')
+    database.db.prepare(`
+      INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES ('beta', ?, 1, 'ready', 'ready', 'mikkokotila')
+    `).run(betaPath)
+    issues = [issue(452), issue(452, { repo: betaRepo, url: `https://github.com/${betaRepo}/issues/452` })]
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command !== 'github-datastore') return original(command, args)
+      const explicit = args[0] === '--db'
+      const scoped = explicit ? args.slice(2) : args
+      if (scoped[0] === 'health') {
+        const result = await original(command, scoped)
+        const value = JSON.parse(result.stdout)
+        value.database = explicit ? args[1] : join(tempRoot, 'github.sqlite')
+        return { ...result, stdout: JSON.stringify(value) }
+      }
+      expect(scoped[scoped.indexOf('--repo') + 1]).toBe(explicit ? betaRepo : REPO)
+      return original(command, scoped)
+    })
+    expect(behaviors.getIssueRepositories()).toEqual([{ repo: REPO, since }, { repo: betaRepo, since }])
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(4)
+    expect(launches().map((args) => flag(args, '--issue-review')).sort()).toEqual([
+      `${REPO}#452`, `${REPO}#452`, `${betaRepo}#452`, `${betaRepo}#452`,
+    ].sort())
+    expect(launches().every((args) => flag(args, '--note') === 'Global issue note')).toBe(true)
+    await behaviors.setEnabled('review-new-issues', false)
+    expect(behaviors.getEnabledMap()['review-new-issues']).toBe(false)
+    expect(database.listBehaviorLaunchClaims(KEY)).toHaveLength(4)
+  })
+
   it('launches every reviewer the panel asks for on a trusted new issue, with full provenance', async () => {
     const { behaviors, database } = await start({ reviewers: 2, note: 'Check the charts.' })
     issues = [issue(452)]

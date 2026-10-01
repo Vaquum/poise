@@ -10,7 +10,7 @@ import { releaseBackgroundPaused, trackReleaseBackground } from './release-backg
 // behavior runs its check; the seen ledger lives in SQLite so claims are
 // atomic across overlapping ticks and multiple server processes.
 //
-// Every ready organization has independent settings and a datastore scope.
+// Behavior preferences are global; each ready account has its own datastore scope.
 // Repository-qualified targets preserve the existing durable launch ledger;
 // snapshots and process locks are isolated by organization.
 
@@ -76,8 +76,8 @@ const DATASTORE_MAX_AGE_SECONDS = 120
 const SHA_PATTERN = /^[0-9a-f]{40}$/
 const GITHUB_USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
 
-// The organization is captured for an entire asynchronous operation: settings,
-// datastore reads, process locks and callbacks must agree on the same owner.
+// The account is captured for an entire asynchronous operation: datastore reads,
+// runtime state, process locks and callbacks must agree on the same owner.
 const behaviorOrganization = new AsyncLocalStorage<Organization | null>()
 
 function currentOrganization(): Organization | null {
@@ -100,13 +100,50 @@ function organizationOwns(repoOrTarget: string): boolean {
   return !org || repoOrTarget.split('/')[0].toLowerCase() === org.login.toLowerCase()
 }
 
+function isGlobalPreference(key: string): boolean {
+  return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|review_new_issues)_(?:enabled|setting|reviewers|scratchpad)$/.test(key)
+    || /^behavior_review_new_issues_(?:repos|authors|slot_since)$/.test(key)
+}
+
 function scopedMetaKey(key: string): string {
   const org = currentOrganization()
-  return org?.managed && key.startsWith('behavior_') ? `org:${org.login.toLowerCase()}:${key}` : key
+  return org?.managed && key.startsWith('behavior_') && !isGlobalPreference(key)
+    ? `org:${org.login.toLowerCase()}:${key}` : key
+}
+
+function globalPreference(key: string): string | null {
+  const existing = databaseGetMeta(key)
+  if (existing !== null) return existing
+  const organizations = getOrganizations()
+  // Legacy preferences, including unset defaults, remain authoritative. A
+  // managed-only installation adopts its old preferences once, independently
+  // of which account happens to make the first settings request.
+  if (organizations.some((org) => !org.managed)) return null
+  const values = organizations.map((org) => databaseGetMeta(`org:${org.login.toLowerCase()}:${key}`))
+    .filter((value): value is string => value !== null)
+  if (values.length === 0) return null
+  let value = values[0]
+  if (key === 'behavior_review_new_issues_repos') {
+    const repositories = new Map<string, IssueRepository>()
+    for (const raw of values) {
+      try {
+        const entries = JSON.parse(raw)
+        if (!Array.isArray(entries)) continue
+        for (const entry of entries) {
+          if (!entry || !isValidRepository(entry.repo) || typeof entry.since !== 'string' || !Number.isFinite(Date.parse(entry.since))) continue
+          const previous = repositories.get(entry.repo.toLowerCase())
+          if (!previous || Date.parse(entry.since) < Date.parse(previous.since)) repositories.set(entry.repo.toLowerCase(), entry)
+        }
+      } catch { /* Ignore corrupt account preferences. */ }
+    }
+    value = JSON.stringify([...repositories.values()].sort((a, b) => a.repo.localeCompare(b.repo)))
+  }
+  db.prepare('INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)').run(key, value)
+  return databaseGetMeta(key)
 }
 
 function getMeta(key: string): string | null {
-  return databaseGetMeta(scopedMetaKey(key))
+  return isGlobalPreference(key) ? globalPreference(key) : databaseGetMeta(scopedMetaKey(key))
 }
 
 function setMeta(key: string, value: string): void {
@@ -228,7 +265,7 @@ function enabledKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/
 function settingKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_setting' }
 
 export function isEnabled(key: BehaviorKey): boolean {
-  const org = currentOrganization()
+  const org = behaviorOrganization.getStore()
   if (org && !readyOrganizations().some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
     && candidate.datastorePath === org.datastorePath)) return false
   return getMeta(enabledKey(key)) === '1'
@@ -1104,6 +1141,35 @@ async function fireReview(
   return true
 }
 
+const INITIAL_REVIEW_BASELINE_KEY = 'behavior_review_new_prs_initial_baseline'
+
+function prepareInitialReviewBaselines(): void {
+  if (getMeta(enabledKey('review-new-prs')) !== '1') return
+  db.transaction(() => {
+    const completed = listSeenTargets('review-new-prs').some((target) =>
+      target === REVIEW_SNAPSHOT_TARGET || target === LEGACY_REVIEW_SNAPSHOT_TARGET
+      || target.startsWith(`${REVIEW_SNAPSHOT_TARGET}:org:`))
+    if (completed) return
+    // Reserve every initial account before any asynchronous snapshot can finish.
+    // A partial first enable must still baseline its failed account on retry.
+    for (const org of readyOrganizations()) {
+      behaviorOrganization.run(org, () => setMeta(INITIAL_REVIEW_BASELINE_KEY, '1'))
+    }
+  }).immediate()
+}
+
+async function initializeReviewBaseline(): Promise<boolean> {
+  if (hasSeen('review-new-prs', snapshotTarget())) return false
+  if (getMeta(INITIAL_REVIEW_BASELINE_KEY) === '1') {
+    await snapshotReviewNewPrs()
+    return true
+  }
+  // Coverage expanded after automation was established: open PRs in the newly
+  // covered account are eligible, rather than silently absorbed into a baseline.
+  recordSeen('review-new-prs', snapshotTarget())
+  return false
+}
+
 async function snapshotReviewNewPrs(): Promise<void> {
   // A missing marker is the sole readiness predicate. Clear it before work so
   // a concurrent tick (including one in another local server process) takes
@@ -1113,6 +1179,7 @@ async function snapshotReviewNewPrs(): Promise<void> {
   if (!author) return
   try {
     const prs = await listOpenPrsByAuthor(author)
+    if (!isEnabled('review-new-prs')) return
     for (const p of prs) {
       if (behaviorAborted()) {
         throw behaviorSignal()?.reason ?? new Error('review snapshot aborted')
@@ -1124,6 +1191,7 @@ async function snapshotReviewNewPrs(): Promise<void> {
     // an initially empty repository was silently absorbed by a later
     // snapshot instead of triggering the behavior.
     recordSeen('review-new-prs', snapshotTarget())
+    setMeta(INITIAL_REVIEW_BASELINE_KEY, '')
   } catch (err) {
     releaseSeen('review-new-prs', snapshotTarget())
     console.error('[behaviors] snapshot failed:', err)
@@ -1202,11 +1270,7 @@ async function tickReviewNewPrs(): Promise<void> {
   // snapshot, while historical launch evidence remains available to approval.
   migrateReviewNewPrsLedger()
 
-  // First tick after boot/enable with no snapshot — take one and bail.
-  if (!hasSeen('review-new-prs', snapshotTarget())) {
-    await snapshotReviewNewPrs()
-    return
-  }
+  if (await initializeReviewBaseline()) return
   try {
     const prs = await listOpenPrsByAuthor(author)
     await recoverSnapshotReviews(prs, reviewer)
@@ -1885,11 +1949,16 @@ const RESOLVE_LAST_FIRED_KEY = 'behavior_resolve_unblocking_last_fired'
 // can't be reconstructed). Shape matches the lastTriggered envelope
 // the Behaviors view already consumes for the other two behaviors.
 export function getResolveUnblockingLastFired(): { at: string, target: string } | null {
+  if (behaviorOrganization.getStore() === undefined) {
+    const events = readyOrganizations().map((org) => behaviorOrganization.run(org, getResolveUnblockingLastFired))
+      .filter((event): event is { at: string, target: string } => event !== null)
+    return events.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0] ?? null
+  }
   const raw = getMeta(RESOLVE_LAST_FIRED_KEY)
   if (!raw) return null
   try {
     const p = JSON.parse(raw)
-    if (typeof p.at === 'string' && typeof p.target === 'string') {
+    if (typeof p.at === 'string' && Number.isFinite(Date.parse(p.at)) && typeof p.target === 'string') {
       return { at: p.at, target: p.target }
     }
   } catch { /* corrupt value — treat as never-fired */ }
@@ -2096,13 +2165,12 @@ export function getIssueRepositories(): IssueRepository[] {
   const value = parseJsonMeta(ISSUE_REPOS_KEY)
   if (!Array.isArray(value)) return []
   return value.filter((entry): entry is IssueRepository =>
-    !!entry && isValidRepository(entry.repo) && organizationOwns(entry.repo) && typeof entry.since === 'string' && Number.isFinite(Date.parse(entry.since)))
+    !!entry && isValidRepository(entry.repo) && typeof entry.since === 'string' && Number.isFinite(Date.parse(entry.since)))
 }
 
 // A repository that stays selected keeps its date; a newly selected one starts
 // now, so selecting it never reviews what was already open.
 export function setIssueRepositories(repos: readonly string[]): IssueRepository[] {
-  if (repos.some((repo) => !organizationOwns(repo))) throw new HttpError(400, 'Issue repositories must belong to the selected account')
   const current = new Map(getIssueRepositories().map((entry) => [entry.repo, entry.since]))
   const now = new Date().toISOString()
   const next = [...new Set(repos)].sort((a, b) => a.localeCompare(b))
@@ -2522,7 +2590,7 @@ async function launchIssueReview(
 
 async function tickReviewNewIssues(): Promise<void> {
   if (!isEnabled(ISSUES_KEY)) return
-  const repositories = getIssueRepositories()
+  const repositories = getIssueRepositories().filter((entry) => organizationOwns(entry.repo))
   if (repositories.length === 0) return
   const authors = new Set(getIssueAuthors().map((author) => author.toLowerCase()))
   const slots = (await reviewPanel(getReviewers(ISSUES_KEY), 'issue_review')).reviewers.map((entry) => entry.slot)
@@ -2741,49 +2809,53 @@ async function reconcileIssueReviewClaims(): Promise<void> {
 
 // ── Public API ──────────────────────────────────────────────────────────
 
+const enabledChanges = new Map<BehaviorKey, number>()
+
 export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<void> {
-  if (enabled && currentOrganization()?.status !== 'ready') {
-    throw new HttpError(409, 'Wait for the account datastore to become ready before enabling automation')
-  }
   const lifecycle = behaviorAbortController?.signal
-  if (!enabled) {
-    // Publish the stop flag immediately so an in-flight tick exits at its
-    // next await boundary. Waiting on its operation tail below guarantees
-    // the API cannot acknowledge disable while a later launch is possible.
-    setPersistedEnabled(key, false)
-    clearBehaviorFailure(key)
-  }
-  try {
-    await serializeBehaviorOperation(key, async () => {
-      const update = async () => {
-        setPersistedEnabled(key, enabled)
-        if (key === 'review-new-prs') {
-          if (enabled) {
-            // A first-ever enable needs an anti-flood baseline. Re-enabling is
-            // a resume: preserving the ledger lets the next tick process PRs
-            // that appeared while the behavior was paused.
-            if (!hasSeen(key, snapshotTarget())) await snapshotReviewNewPrs()
+  const change = (enabledChanges.get(key) ?? 0) + 1
+  enabledChanges.set(key, change)
+  // Publish globally before waiting: every account's in-flight tick must see
+  // disable at its next launch gate. A queued enable never republishes its
+  // stale value after a newer settings request.
+  setPersistedEnabled(key, enabled)
+  if (enabled && key === 'review-new-prs') prepareInitialReviewBaselines()
+  const organizations = enabled ? readyOrganizations() : getOrganizations()
+  const pending = [...behaviorOperationTails.entries()]
+    .filter(([scope]) => scope.endsWith(`:${key}`)).map(([, tail]) => tail)
+  const updates = organizations.map((org) => behaviorOrganization.run(org, async () => {
+    if (!enabled) clearBehaviorFailure(key)
+    try {
+      await serializeBehaviorOperation(key, async () => {
+        await withBehaviorProcessLock(key, async () => {
+          if (enabledChanges.get(key) !== change) return
+          if (enabled && !isEnabled(key)) return
+          if (key === 'review-new-prs' && enabled) {
+            // Re-enabling resumes the completed ledger, including work opened
+            // during the pause. Only a missing baseline needs initialization.
+            migrateReviewNewPrsLedger()
+            await initializeReviewBaseline()
             await reconcileBehaviorLaunchClaims(key)
+          } else if (key === 'approve-prs') {
+            if (enabled) await reconcileBehaviorLaunchClaims(key)
+            else clearSeenExceptLaunched(key, org.login)
+          } else if (key === 'review-new-issues' && enabled) {
+            await reconcileIssueReviewClaims()
           }
-        } else if (key === 'approve-prs') {
-          if (enabled) await reconcileBehaviorLaunchClaims(key)
-          else clearSeenExceptLaunched(key, currentOrganization()?.login)
-        } else if (key === 'review-new-issues') {
-          // No snapshot: each repository's selection date is the baseline.
-          if (enabled) await reconcileIssueReviewClaims()
-        }
-        // resolve-unblocking has no seen ledger — github-interface is
-        // idempotent so the tick handler can safely fire every minute.
-      }
-      await withBehaviorProcessLock(key, update)
-    })
-  } catch (error) {
-    if (lifecycle?.aborted === true) throw error
-    if (error instanceof BehaviorProcessLockContentionError) throw error
-    if (!enabled || !isEnabled(key)) throw error
-    recordBehaviorFailure(key, 'operation', error)
-    console.error(`[behaviors] ${key} enable reconciliation failed:`, error)
-  }
+        })
+      })
+    } catch (error) {
+      if (lifecycle?.aborted === true || error instanceof BehaviorProcessLockContentionError || !enabled) throw error
+      if (!isEnabled(key)) return
+      recordBehaviorFailure(key, 'operation', error)
+      console.error(`[behaviors] ${org.login} ${key} enable reconciliation failed:`, error)
+    }
+  }))
+  // Include removed accounts' existing work too. Disable is acknowledged only
+  // once every operation that could have observed the old flag has settled.
+  const results = await Promise.allSettled([...pending, ...updates])
+  const failure = results.find((result) => result.status === 'rejected')
+  if (failure?.status === 'rejected') throw failure.reason
 }
 
 export function setSetting(key: BehaviorKey, setting: BehaviorSetting): void {
@@ -2871,6 +2943,7 @@ export async function runEnabledBehaviorsOnce(
   options: RunEnabledBehaviorsOptions = {},
 ): Promise<void> {
   if (releaseBackgroundPaused()) return
+  prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
     await Promise.allSettled(readyOrganizations().map((org) =>
       behaviorOrganization.run(org, () => runEnabledBehaviorsOnce(options))))
@@ -3096,18 +3169,17 @@ export function startBehaviorsRuntime(config: BehaviorsRuntimeConfig = {}): void
   runtimeStartedAtMs = Date.now()
   lastTickAtMs = null
   lastTickCompletedAtMs = null
+  prepareInitialReviewBaselines()
   for (const org of readyOrganizations()) {
     behaviorOrganization.run(org, () => {
       // Preserve an existing completed ledger across restart. Otherwise a PR
       // opened while Poise was down is absorbed into a new snapshot and never
-      // reviewed. A genuinely missing marker still takes the anti-flood snapshot.
+      // reviewed. Pending initial baselines survive failed startup snapshots.
       if (isEnabled('review-new-prs')) {
         void runBehaviorCycle('review-new-prs', async () => {
           return await withBehaviorProcessLock('review-new-prs', async () => {
             migrateReviewNewPrsLedger()
-            if (!hasSeen('review-new-prs', snapshotTarget())) {
-              await snapshotReviewNewPrs()
-            }
+            await initializeReviewBaseline()
             await reconcileBehaviorLaunchClaims('review-new-prs')
             // Startup reconciliation can clear a breaker only by observing an
             // owned worker completion. An empty claim list does not prove that a

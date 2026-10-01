@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import type { Organization } from '../../src/config'
+import type { BehaviorDiagnostics } from '../../src/behaviors'
 
 function organization(login: string, status: Organization['status'] = 'ready'): Organization {
   return { login, managed: true, status, stage: status === 'initializing' ? 'syncing' : status, error: null, activatedAt: status === 'ready' ? '2026-10-01T08:00:00Z' : null }
@@ -18,7 +19,8 @@ async function setup(page: Page, initial = [organization('acme')], me = 'octocat
     polls: 0,
     reads: [] as Array<{ path: string, org: string }>,
     behaviorWrites: [] as Array<{ org: string, body: Record<string, unknown> }>,
-    enabled: { acme: true, beta: false } as Record<string, boolean>,
+    behaviors: { 'review-new-prs': { enabled: true } } as Record<string, Record<string, unknown>>,
+    diagnostics: null as BehaviorDiagnostics | null,
     partial: false,
   }
   await page.clock.setFixedTime(new Date('2026-10-01T08:00:10Z'))
@@ -65,14 +67,15 @@ async function setup(page: Page, initial = [organization('acme')], me = 'octocat
     }
     if (url.pathname.startsWith('/api/behaviors/')) {
       state.behaviorWrites.push({ org, body })
-      if (typeof body.enabled === 'boolean') state.enabled[org] = body.enabled
-      return route.fulfill({ json: { ...body, enabled: state.enabled[org] } })
+      const key = url.pathname.split('/').pop()!
+      state.behaviors[key] = { ...state.behaviors[key], ...body }
+      return route.fulfill({ json: state.behaviors[key] })
     }
     if (url.pathname === '/api/behaviors') {
-      if (state.organizations.find((entry) => entry.login === org)?.status !== 'ready') return route.fulfill({ status: 503, json: { error: 'Organization is not ready' } })
       const behavior = { enabled: false, setting: 'p2', reviewers: 1, scratchpad: '', repos: [], authors: [], owner: 'octocat', lastTriggered: null }
       return route.fulfill({ json: {
-        'review-new-prs': { ...behavior, enabled: !!state.enabled[org] }, 'approve-prs': behavior, 'resolve-unblocking': behavior, 'review-new-issues': behavior,
+        ...Object.fromEntries(['review-new-prs', 'approve-prs', 'resolve-unblocking', 'review-new-issues'].map((key) => [key, { ...behavior, ...state.behaviors[key] }])),
+        diagnostics: state.diagnostics,
       } })
     }
     if (url.pathname === '/api/models') return route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } })
@@ -145,26 +148,26 @@ test('shares organization scope across Archive, Current and Swarm with full repo
   expect(state.reads).toEqual(expect.arrayContaining([{ path: '/api/current', org: 'beta' }, { path: '/api/agent-logs', org: 'beta' }]))
 })
 
-test('scopes behavior changes to the explicit organization and reports partial results', async ({ page }) => {
+test('uses one global behavior configuration regardless of the dashboard account filter', async ({ page }) => {
   const state = await setup(page, [organization('acme'), organization('beta')])
   state.partial = true
   await page.goto('/')
   await expect(page.locator('#main-load-error')).toContainText('beta: Sync unavailable')
   await expect(page.locator('#tbody tr')).toHaveCount(2)
+  await page.locator('#main-filters').getByLabel('Account filter').selectOption('beta')
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  const picker = page.getByLabel('Behavior account')
+  await expect(page.getByLabel('Behavior account')).toHaveCount(0)
+  await expect(page.locator('#behaviors-filters')).toContainText('Behavior settings apply to all ready GitHub accounts.')
   const toggle = page.locator('input[data-behavior="review-new-prs"]')
-  await expect(picker).toHaveValue('acme')
   await expect(toggle).toBeChecked()
-  await picker.selectOption('beta')
-  await expect(toggle).not.toBeChecked()
   await page.locator('tr[data-behavior="review-new-prs"] label.toggle').click()
-  await expect.poll(() => state.behaviorWrites).toEqual([{ org: 'beta', body: { enabled: true } }])
-  await picker.selectOption('acme')
-  await expect(toggle).toBeChecked()
-  expect(state.enabled).toEqual({ acme: true, beta: true })
+  await expect.poll(() => state.behaviorWrites).toEqual([{ org: '', body: { enabled: false } }])
+  await page.getByRole('button', { name: 'Archive', exact: true }).click()
+  await page.locator('#main-filters').getByLabel('Account filter').selectOption('acme')
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  await expect(toggle).not.toBeChecked()
+  expect(state.reads.filter((read) => read.path === '/api/behaviors').every((read) => read.org === '')).toBe(true)
 })
-
 
 test('updates organization filters after activation finishes while Settings is closed', async ({ page }) => {
   const state = await setup(page, [organization('acme'), organization('beta', 'initializing')])
@@ -207,36 +210,27 @@ test('continues Archive pagination when an organization is missing only from the
 })
 
 
-test('keeps an open behavior memory bound to its organization when readiness disappears', async ({ page }) => {
+test('keeps shared behavior memory editable when one account loses readiness', async ({ page }) => {
   const state = await setup(page, [organization('acme'), organization('beta')])
   await page.goto('/')
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  await page.getByLabel('Behavior account').selectOption('beta')
   await page.getByLabel('Edit memory for review-new-prs').click()
-  await page.locator('.behavior-memory-textarea').fill('Beta-only instructions')
+  await page.locator('.behavior-memory-textarea').fill('Shared review instructions')
   state.organizations = [organization('acme'), organization('beta', 'initializing')]
-  // Keyboard navigation opens Settings without clicking outside the memory,
-  // leaving its draft open while the settings refresh reports readiness loss.
+  // Keyboard navigation preserves the open memory draft while Settings reloads.
   await page.getByRole('button', { name: 'Menu', exact: true }).focus()
   await page.keyboard.press('Enter')
   await page.locator('[data-action="settings"]').focus()
   await page.keyboard.press('Enter')
   await expect(page.locator('#settings-panel')).toHaveClass(/open/)
-  await expect(page.getByLabel('Behavior account')).toHaveValue('beta')
-  await expect(page.locator('#behavior-diagnostics')).toContainText('Behaviors API unavailable')
+  await expect(page.locator('.st-organization[data-org="beta"]')).toContainText('Activating…')
   await page.keyboard.press('Escape')
+  await expect.poll(() => state.behaviorWrites).toEqual([{ org: '', body: { scratchpad: 'Shared review instructions', scratchpadPrevious: '' } }])
   await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)
-  await expect(page.locator('.behavior-memory-textarea')).toHaveValue('Beta-only instructions')
-  await page.locator('.behavior-memory-save').click()
-  await expect(page.locator('.behavior-memory-status')).toContainText('Not saved')
-  expect(state.behaviorWrites).toEqual([])
-  state.organizations = [organization('acme'), organization('beta')]
-  await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
-  await expect(page.locator('#behavior-diagnostics')).toBeHidden()
-  await page.locator('.behavior-memory-save').click()
-  await expect.poll(() => state.behaviorWrites).toEqual([{ org: 'beta', body: { scratchpad: 'Beta-only instructions', scratchpadPrevious: '' } }])
+  await page.getByLabel('Edit memory for review-new-prs').click()
+  await expect(page.locator('.behavior-memory-textarea')).toHaveValue('Shared review instructions')
+  await expect(page.getByLabel('Behavior account')).toHaveCount(0)
 })
-
 
 test('discards a background Archive response whose JSON arrives after switching organization', async ({ page }) => {
   await setup(page, [organization('acme'), organization('beta')])
@@ -276,7 +270,7 @@ test('discards a background Archive response whose JSON arrives after switching 
 })
 
 
-test('adds a personal GitHub account alongside an organization with separate filtering and behaviors', async ({ page }) => {
+test('adds a personal GitHub account alongside an organization with shared behavior settings', async ({ page }) => {
   const state = await setup(page)
   await page.goto('/')
   await openSettings(page)
@@ -303,12 +297,63 @@ test('adds a personal GitHub account alongside an organization with separate fil
   await expect(page.locator('#swarm-tbody .agent-row')).toHaveCount(1)
   await expect(page.locator('#swarm-tbody')).toContainText('mikkokotila/same-repo#1')
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  const account = page.getByLabel('Behavior account')
-  await account.selectOption('mikkokotila')
-  await expect(page.locator('input[data-behavior="review-new-prs"]')).not.toBeChecked()
-  await page.locator('tr[data-behavior="review-new-prs"] label.toggle').click()
-  await expect.poll(() => state.behaviorWrites).toEqual([{ org: 'mikkokotila', body: { enabled: true } }])
-  await account.selectOption('acme')
+  await expect(page.getByLabel('Behavior account')).toHaveCount(0)
   await expect(page.locator('input[data-behavior="review-new-prs"]')).toBeChecked()
-  expect(state.enabled.acme).toBe(true)
+  await expect(page.locator('#behaviors-filters')).toContainText('all ready GitHub accounts')
+  expect(state.behaviorWrites).toEqual([])
+})
+
+
+test('lists repositories from every ready account for global issue review despite an active account filter', async ({ page }) => {
+  const state = await setup(page, [organization('acme'), organization('mikkokotila'), organization('pending', 'initializing')])
+  await page.goto('/')
+  await page.locator('#main-filters').getByLabel('Account filter').selectOption('mikkokotila')
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  await page.locator('tr[data-behavior="review-new-issues"] .behavior-triggers-btn').click()
+  const dialog = page.getByRole('dialog', { name: /Review New Issues/ })
+  await expect(dialog.locator('.bt-repo')).toHaveCount(2)
+  await dialog.getByRole('checkbox', { name: 'acme/same-repo', exact: true }).check()
+  await dialog.getByRole('checkbox', { name: 'mikkokotila/same-repo', exact: true }).check()
+  await dialog.getByRole('button', { name: 'Done' }).click()
+  await expect.poll(() => state.behaviorWrites).toEqual([{ org: '', body: { repos: ['acme/same-repo', 'mikkokotila/same-repo'] } }])
+  await page.locator('tr[data-behavior="review-new-issues"] .behavior-triggers-btn').click()
+  await expect(dialog.getByRole('checkbox', { name: 'acme/same-repo', exact: true })).toBeChecked()
+  await expect(dialog.getByRole('checkbox', { name: 'mikkokotila/same-repo', exact: true })).toBeChecked()
+  expect(state.reads.filter((read) => read.path === '/api/repos').every((read) => read.org === '')).toBe(true)
+})
+
+test('reports failures across accounts in global behavior diagnostics', async ({ page }) => {
+  const state = await setup(page, [organization('acme'), organization('mikkokotila')])
+  state.diagnostics = {
+    status: 'degraded', agentLogsError: null,
+    datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+    identity: { status: 'valid', actor: 'octocat', error: null },
+    failures: [
+      { org: 'acme', behavior: 'review-new-prs', kind: 'review', consecutiveFailures: 1, lastFailureAt: '', nextRetryAt: '', error: 'First account error' },
+      { org: 'mikkokotila', behavior: 'review-new-issues', kind: 'review', consecutiveFailures: 2, lastFailureAt: '', nextRetryAt: '', error: 'Personal account error' },
+    ], deadLetters: [],
+  }
+  await page.goto('/')
+  await page.locator('#main-filters').getByLabel('Account filter').selectOption('mikkokotila')
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  await expect(page.locator('#behavior-diagnostics')).toContainText('acme: review-new-prs: 1 consecutive review failure(s) — First account error')
+  await expect(page.locator('#behavior-diagnostics')).toContainText('mikkokotila: review-new-issues: 2 consecutive review failure(s) — Personal account error')
+  expect(state.reads.filter((read) => read.path === '/api/behaviors').every((read) => read.org === '')).toBe(true)
+})
+
+test('preserves selected repositories when one account cannot be listed', async ({ page }) => {
+  const state = await setup(page, [organization('acme'), organization('mikkokotila')])
+  state.behaviors['review-new-issues'] = { repos: ['mikkokotila/same-repo'] }
+  await page.route(/\/api\/repos(?:\?.*)?$/, (route) => route.fulfill({ json: {
+    repos: ['acme/same-repo'], errors: [{ org: 'mikkokotila', error: 'Sync unavailable' }],
+  } }))
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  await page.locator('tr[data-behavior="review-new-issues"] .behavior-triggers-btn').click()
+  const dialog = page.getByRole('dialog', { name: /Review New Issues/ })
+  await expect(dialog).toContainText('mikkokotila: Sync unavailable')
+  await expect(dialog.getByRole('checkbox', { name: 'mikkokotila/same-repo', exact: true })).toBeChecked()
+  await dialog.getByRole('checkbox', { name: 'acme/same-repo', exact: true }).check()
+  await dialog.getByRole('button', { name: 'Done' }).click()
+  await expect.poll(() => state.behaviorWrites).toEqual([{ org: '', body: { repos: ['acme/same-repo', 'mikkokotila/same-repo'] } }])
 })

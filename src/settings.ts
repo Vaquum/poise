@@ -539,7 +539,7 @@ function buildPanel(): HTMLElement {
             <input id="st-organization" type="text" class="st-input st-input-org" aria-label="New GitHub account" autocomplete="off" spellcheck="false" placeholder="acme-corp or octocat" />
             <button type="button" class="st-clear st-add-organization">Add</button>
           </div>
-          <div class="st-help st-help-info">Add an organization name or personal username. Poise activates its datastore; initial sync may take a few minutes. Existing accounts keep working. New accounts start with automations off.</div>
+          <div class="st-help st-help-info">Add an organization name or personal username. Poise activates its datastore; initial sync may take a few minutes. Existing accounts keep working. Shared behavior settings apply when the new account is ready.</div>
           <div class="st-help st-help-info st-org-status" role="status"></div>
         </div>
 
