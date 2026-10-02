@@ -21,7 +21,7 @@ import { join, resolve, isAbsolute, sep } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
 import { chmod, lstat, mkdir, open, writeFile, readdir, rename, rmdir, stat, unlink } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
-import { fetchAgentLogs, type LogEntry } from './agent'
+import { fetchAgentLogs, fetchAgentLogSnapshot, scopedAgentLogs, type LogEntry } from './agent'
 import { db } from './db'
 import { readDoc, slugFromEditorSession } from './editor'
 import { HttpError } from './http'
@@ -372,8 +372,12 @@ export function mergeAuthorContentJobState(row: ChatLogEntry): ChatLogEntry {
 
 export async function listChatHistory(sessionId: string): Promise<ChatLogEntry[]> {
   if (!sessionId) return []
-  const all = await fetchAgentLogs()
-  // The proxy's fetchAgentLogs already returns newest-first; flip back
+  const snapshot = await fetchAgentLogSnapshot()
+  // A review row has no session ID. Scope both transcript behaviors so its
+  // missing session cannot make unrelated review corruption block every chat.
+  scopedAgentLogs(snapshot, { sessionId, behavior: 'chat' })
+  const all = scopedAgentLogs(snapshot, { sessionId, behavior: 'author_content' })
+  // The snapshot already returns newest-first; flip back
   // for chat (oldest-first reads top-to-bottom like a transcript).
   // We include both `chat` and `author_content` behaviors — author_content
   // calls now carry session_id (agent-interface --author-content
@@ -563,9 +567,10 @@ export async function runDebate(topic: string, rounds: number = 1): Promise<Deba
   const t = String(topic || '').trim()
   if (!t) throw new Error('topic is required')
   assertHttpArgumentSize(t, 'debate topic')
-  await claudeAuth.requireReady()
   const catalog = await loadCatalog()
-  await prepareModelClis(catalog, [catalog.behaviors.debate_moderator, ...catalog.debate_participants])
+  const models = [catalog.behaviors.debate_moderator, ...catalog.debate_participants]
+  if (models.some((model) => isClaudeModel(catalog, model))) await claudeAuth.requireReady()
+  await prepareModelClis(catalog, models)
   const r = Math.min(Math.max(Number.isFinite(rounds) ? rounds : 1, 1), DEBATE_MAX_ROUNDS)
   let stdout: string
   try {
@@ -668,19 +673,20 @@ export async function startAuthorContent(topic: string, sessionId: string): Prom
   const normalizedSessionId = String(sessionId || '').trim()
   if (!normalizedSessionId) throw new HttpError(400, 'session is required')
   assertHttpArgumentSize(normalizedSessionId, 'session')
-  await claudeAuth.requireReady()
   const catalog = await loadCatalog()
+  const claude = isClaudeModel(catalog, catalog.behaviors.author_content)
+  if (claude) await claudeAuth.requireReady()
   await prepareModelClis(catalog, [catalog.behaviors.author_content])
   // Snapshot every existing id in this session. Exact topic matching prevents
   // an unrelated delayed call from being attributed to this launch.
-  const beforeIds = new Set((await fetchAgentLogs())
+  const beforeIds = new Set((await fetchAgentLogs({ identity: { sessionId: normalizedSessionId, behavior: 'author_content' } }))
     .filter((entry: any) => entry.behavior === 'author_content' && entry.session_id === normalizedSessionId)
     .map((entry: any) => String(entry.id || '')))
 
   // --session-id ties this call to the chat session, so the chat
   // history can include this turn (listChatHistory filters by
   // session_id across both behaviors).
-  await claudeAuth.requireReady()
+  if (claude) await claudeAuth.requireReady()
   await spawnDetached(
     AGENT_INTERFACE,
     ['--author-content', trimmed, '--session-id', normalizedSessionId],
@@ -697,7 +703,7 @@ export async function startAuthorContent(topic: string, sessionId: string): Prom
     await new Promise((r) => setTimeout(r, 200))
     let fresh: LogEntry[]
     try {
-      fresh = (await fetchAgentLogs()).filter((entry: any) => {
+      fresh = (await fetchAgentLogs({ identity: { sessionId: normalizedSessionId, behavior: 'author_content' } })).filter((entry: any) => {
         const id = String(entry.id || '')
         return entry.behavior === 'author_content'
           && entry.session_id === normalizedSessionId
@@ -727,7 +733,7 @@ export async function authorContentStatus(callId: string): Promise<{
   body?: string,
   error?: string,
 }> {
-  const all = await fetchAgentLogs()
+  const all = await fetchAgentLogs({ identity: { id: callId } })
   const row = all.find((e: any) => e.id === callId)
   if (!row) return { status: 'unknown' }
   return {
@@ -745,7 +751,7 @@ export async function authorContentStatus(callId: string): Promise<{
 // the chat down.
 async function readArticleContextForSession(sessionId: string, maxBytes: number): Promise<string[]> {
   if (!sessionId) return []
-  const all = await fetchAgentLogs()
+  const all = await fetchAgentLogs({ identity: { sessionId, behavior: 'author_content' } })
   // fetchAgentLogs is newest-first; reverse for chronological injection.
   const rows = all
     .filter((e: any) =>

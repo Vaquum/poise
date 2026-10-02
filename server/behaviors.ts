@@ -15,10 +15,11 @@ import { releaseBackgroundPaused, trackReleaseBackground } from './release-backg
 // snapshots and process locks are isolated by organization.
 
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
 import { mkdir } from 'node:fs/promises'
-import { ISSUE_REVIEW_BEHAVIOR, fetchAgentLogs, type LogEntry } from './agent'
+import { ISSUE_REVIEW_BEHAVIOR, fetchAgentLogSnapshot, quarantinedLogMayMatch, type LogEntry } from './agent'
 import { claudeAuth } from './claude-auth'
 import { REVIEW_POLICY, needsClaude, reviewChoice, reviewPanel, type ReviewPlace } from './review-model'
 import { type Catalog, type ReviewerSlot, REVIEWER_SLOTS, loadCatalog } from './models'
@@ -28,6 +29,7 @@ import {
   claimSeenOwned,
   claimSeenOwnedAs,
   clearSeenExceptLaunched,
+  clearUnreadableBehaviorLaunchOwned,
   completeBehaviorLaunchOwned,
   completeIssueReviewLaunchOwned,
   countBehaviorDeadLetters,
@@ -45,6 +47,7 @@ import {
   listSnapshotOnlySeen,
   markBehaviorLaunchIntentOwned,
   recordBehaviorDeadLetter,
+  quarantineBehaviorLaunchOwned,
   retireBehaviorDeadLetter,
   retireBehaviorDeadLettersForClosedPrs,
   retireBehaviorDeadLettersForTarget,
@@ -289,12 +292,12 @@ interface PersistedBehaviorFailure {
   error?: string
 }
 
-function failureKey(key: BehaviorKey): string {
-  return `${META_PREFIX}${key.replace(/-/g, '_')}_failure`
+function failureKey(key: BehaviorKey, target?: string): string {
+  return `${META_PREFIX}${key.replace(/-/g, '_')}_failure${target ? `:${target}` : ''}`
 }
 
-function readBehaviorFailure(key: BehaviorKey): PersistedBehaviorFailure | null {
-  const raw = getMeta(failureKey(key))
+function readBehaviorFailure(key: BehaviorKey, target?: string): PersistedBehaviorFailure | null {
+  const raw = getMeta(failureKey(key, target))
   if (!raw) return null
   try {
     const value = JSON.parse(raw) as Partial<PersistedBehaviorFailure>
@@ -319,9 +322,11 @@ function readBehaviorFailure(key: BehaviorKey): PersistedBehaviorFailure | null 
   }
 }
 
-function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown): void {
+function recordBehaviorFailure(key: BehaviorKey, kind: 'worker', cause: unknown, target: string): void
+function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string): void
+function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string): void {
   if (!isEnabled(key)) return
-  const previous = readBehaviorFailure(key)
+  const previous = readBehaviorFailure(key, target)
   const consecutiveFailures = Math.min((previous?.consecutiveFailures ?? 0) + 1, 31)
   const delayMs = Math.min(
     BEHAVIOR_RETRY_BASE_MS * (2 ** Math.min(consecutiveFailures - 1, 20)),
@@ -329,7 +334,7 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
   )
   const now = Date.now()
   const error = cause === undefined ? undefined : (cause instanceof Error ? cause.message : String(cause)).slice(0, 300)
-  setMeta(failureKey(key), JSON.stringify({
+  setMeta(failureKey(key, target), JSON.stringify({
     kind,
     consecutiveFailures,
     lastFailureAtMs: now,
@@ -338,15 +343,34 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
   } satisfies PersistedBehaviorFailure))
 }
 
-function clearBehaviorFailure(key: BehaviorKey): void {
-  setMeta(failureKey(key), '')
+function clearBehaviorFailure(key: BehaviorKey, target?: string): void {
+  setMeta(failureKey(key, target), '')
 }
 
-function behaviorRetryDue(key: BehaviorKey): boolean {
-  const failure = readBehaviorFailure(key)
-  return failure === null
-    || failure.kind === 'operation'
-    || Date.now() >= failure.nextRetryAtMs
+// Retry delays belong to one PR/issue and reviewer. Legacy behavior-wide
+// summaries are retired on the next cycle; they never block reconciliation.
+function behaviorRetryDue(key: BehaviorKey, target: string): boolean {
+  const failure = readBehaviorFailure(key, target)
+  return failure === null || Date.now() >= failure.nextRetryAtMs
+}
+
+function behaviorFailureTargets(key: BehaviorKey): string[] {
+  const prefix = `${scopedMetaKey(failureKey(key))}:`
+  const rows = db.prepare(
+    "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
+  ).all(prefix.length, prefix) as Array<{ key: string }>
+  return rows.map((row) => row.key.slice(prefix.length))
+}
+
+function retireClosedTargetFailures(open: ReadonlySet<string>, behaviors: readonly BehaviorKey[], unreadRepositories?: ReadonlySet<string>): void {
+  for (const behavior of behaviors) {
+    for (const target of behaviorFailureTargets(behavior)) {
+      const ref = target.match(/^[^#]+#\d+/)?.[0]
+      if (ref && !unreadRepositories?.has(ref.split('#')[0]) && !open.has(ref)) {
+        clearBehaviorFailure(behavior, target)
+      }
+    }
+  }
 }
 
 // Per-behavior setting (the priority ceiling for review-new-prs:
@@ -561,7 +585,7 @@ function markLaunchIntent(
 }
 
 function retainClaimSafely(claim: BehaviorLaunchClaim, error: string): void {
-  setBehaviorLaunchErrorOwned(claim.key, claim.target, claim.claimId, error)
+  if (!claim.launchQuarantine) setBehaviorLaunchErrorOwned(claim.key, claim.target, claim.claimId, error)
   renewSeenOwned(
     claim.key,
     claim.target,
@@ -583,26 +607,306 @@ function deadLetterClaim(claim: BehaviorLaunchClaim, error: string): boolean {
   return completeClaimSafely(claim, error)
 }
 
-function agentCallStartedAt(call: Awaited<ReturnType<typeof fetchAgentLogs>>[number]): string {
+function recordQuarantineIncident(claim: BehaviorLaunchClaim, error: string, callId: string | null): void {
+  if (claim.launchQuarantine === 'invalid_result') return
+  const updated = db.prepare(`
+    UPDATE behavior_dead_letters SET error = ?, call_id = COALESCE(call_id, ?)
+    WHERE behavior = ? AND target = ? AND correlation_id = ? AND retired_at IS NULL
+  `).run(error, callId, claim.key, claim.target, claim.launchCorrelationId)
+  if (!updated.changes) recordBehaviorDeadLetter(claim, error, callId)
+}
+
+function retireQuarantineIncident(claim: BehaviorLaunchClaim): void {
+  db.prepare(`
+    UPDATE behavior_dead_letters SET retired_at = ?
+    WHERE behavior = ? AND target = ? AND correlation_id = ? AND retired_at IS NULL
+  `).run(new Date().toISOString(), claim.key, claim.target, claim.launchCorrelationId)
+}
+
+function terminalAgentStatus(status?: string | null): boolean {
+  const value = status?.toLowerCase() || ''
+  return ['completed', 'superseded', 'invalid'].includes(value) || FAILED_AGENT_STATUSES.has(value)
+}
+
+// Unreadable evidence cannot later become proof that nothing ran. A result
+// attributable to this launch is held for a person once it contradicts the
+// launch contract; rewriting or rotating Caller logs cannot clear that fact.
+function quarantineClaim(
+  claim: BehaviorLaunchClaim,
+  kind: NonNullable<BehaviorLaunchClaim['launchQuarantine']>,
+  error: string,
+  callId: string | null = claim.launchCallId,
+  mayRun = true,
+): void {
+  db.transaction(() => {
+    if (!quarantineBehaviorLaunchOwned(claim.key, claim.target, claim.claimId, kind, error, mayRun)) return
+    if (kind === 'invalid_result' && !claim.launchCallId && callId) {
+      linkBehaviorLaunchCallOwned(claim.key, claim.target, claim.claimId, callId)
+    }
+    recordQuarantineIncident(claim, error, callId)
+    clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
+  })()
+  retainClaimSafely({ ...claim, launchQuarantine: kind }, error)
+}
+
+function quarantineBlocksLogCorrection(behavior: string, target: string): boolean {
+  return !!db.prepare(`
+    SELECT 1 FROM behavior_seen
+    WHERE key = ? AND target = ? AND (launch_quarantine = 'invalid_result'
+      OR (launch_quarantine = 'unreadable' AND claim_id <> ''))
+  `).get(behavior, target)
+}
+
+// Approval keys change with commits and author responses. A durable hold
+// belongs to the PR, even if an earlier runtime closed its owned claim.
+function invalidPrResultHeld(repo: string, pr: number): boolean {
+  return !!db.prepare(`
+    SELECT 1 FROM behavior_seen
+    WHERE key IN ('review-new-prs', 'approve-prs') AND (
+      (launch_repo = ? AND launch_pr = ? AND launch_quarantine = 'invalid_result')
+      OR (target = ? AND launch_requested_at IS NULL AND launch_quarantine IS NOT NULL)
+    )
+    LIMIT 1
+  `).get(repo, pr, `${repo}#${pr}`)
+}
+
+// Invalid terminal results keep ownership and coverage without using a
+// worker slot. Unreadable evidence can still hide a running worker.
+function runningIssueReviewCount(): number {
+  return listBehaviorLaunchClaims(ISSUES_KEY).filter((claim) => !claim.launchQuarantine || claim.launchQuarantineMayRun).length
+    + failedBehaviorLaunches(ISSUES_KEY).filter((claim) => claim.launchQuarantine && claim.launchQuarantineMayRun).length
+}
+
+type AgentLogSnapshot = Awaited<ReturnType<typeof fetchAgentLogSnapshot>>
+
+class BehaviorLogFeedError extends Error {}
+
+async function readBehaviorLogSnapshot(): Promise<AgentLogSnapshot> {
+  try {
+    return await fetchAgentLogSnapshot({ signal: behaviorSignal() })
+  } catch (cause) {
+    throw new BehaviorLogFeedError(cause instanceof Error ? cause.message : String(cause), { cause })
+  }
+}
+type AgentLogIdentity = Parameters<typeof quarantinedLogMayMatch>[1]
+
+// A malformed duplicate makes even a valid row with that identity uncertain.
+// An unidentifiable row prevents absence proofs, but does not invalidate a
+// separately validated, authoritative result.
+function logQuarantine(snapshot: AgentLogSnapshot, identity: AgentLogIdentity, authoritative = false) {
+  return snapshot.quarantined.find((row) =>
+    (identity.id && row.id === identity.id)
+    || (identity.correlationId && row.correlationId === identity.correlationId)
+    || (!authoritative && quarantinedLogMayMatch(row, identity)))
+}
+
+// Contradictory duplicates can connect multiple call IDs through one
+// correlation. A terminal result never proves those other workers stopped.
+function quarantineEvidence(snapshot: AgentLogSnapshot, claim: BehaviorLaunchClaim, observed?: LogEntry) {
+  const rows = [
+    ...snapshot.entries.map((row) => ({ id: row.id, correlationId: row.correlation_id, status: row.status, error: null as string | null })),
+    ...snapshot.quarantined,
+  ]
+  const ids = new Set([claim.launchCallId, observed?.id].filter((id): id is string => !!id))
+  const correlations = new Set([claim.launchCorrelationId])
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const row of rows) {
+      if (!(row.id && ids.has(row.id)) && !(row.correlationId && correlations.has(row.correlationId))) continue
+      if (row.id && !ids.has(row.id)) { ids.add(row.id); changed = true }
+      if (row.correlationId && !correlations.has(row.correlationId)) { correlations.add(row.correlationId); changed = true }
+    }
+  }
+  const matching = rows.filter((row) => (row.id && ids.has(row.id)) || (row.correlationId && correlations.has(row.correlationId)))
+  return {
+    terminal: matching.find((row) => row.error !== null && terminalAgentStatus(row.status)),
+    mayRun: matching.length === 0 || matching.some((row) => !terminalAgentStatus(row.status)),
+    hasLiveEvidence: matching.some((row) => !terminalAgentStatus(row.status)),
+  }
+}
+
+function claimLogIdentity(claim: BehaviorLaunchClaim): AgentLogIdentity {
+  return { id: claim.launchCallId, correlationId: claim.launchCorrelationId,
+    repo: claim.launchRepo, prId: String(claim.launchPr), behavior: claim.launchBehavior }
+}
+
+// A closed failed claim has no owner token. Its call, correlation, and
+// launch watermark jointly prevent a late read from changing a newer launch.
+function quarantineFailedClaim(
+  claim: BehaviorLaunchClaim,
+  kind: NonNullable<BehaviorLaunchClaim['launchQuarantine']>,
+  error: string,
+  mayRun = false,
+): void {
+  db.transaction(() => {
+    const changed = db.prepare(`
+      UPDATE behavior_seen
+      SET launch_quarantine_may_run = CASE WHEN launch_quarantine IS NULL THEN ? ELSE MAX(launch_quarantine_may_run, ?) END,
+          launch_quarantine = CASE WHEN launch_quarantine = 'invalid_result' THEN launch_quarantine ELSE ? END,
+          launch_error = CASE WHEN launch_quarantine = 'invalid_result' THEN launch_error ELSE ? END
+      WHERE key = ? AND target = ? AND claim_id = '' AND launch_outcome IS NULL
+        AND launch_call_id = ? AND launch_correlation_id = ? AND launch_requested_at = ?
+    `).run(Number(mayRun), Number(mayRun), kind, error, claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
+    if (changed.changes) {
+      recordQuarantineIncident(claim, error, claim.launchCallId)
+      clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
+    }
+  })()
+}
+
+function quarantineFailedLog(snapshot: AgentLogSnapshot, claim: BehaviorLaunchClaim, observed?: LogEntry): boolean {
+  const quarantine = logQuarantine(snapshot, claimLogIdentity(claim), observed !== undefined)
+  if (!quarantine) return false
+  const attributable = quarantine.correlationId === claim.launchCorrelationId
+    || (!!quarantine.id && quarantine.id === claim.launchCallId)
+  quarantineFailedClaim(claim, attributable ? 'invalid_result' : 'unreadable',
+    `agent log row quarantined: ${quarantine.error}`, quarantineEvidence(snapshot, claim, observed).hasLiveEvidence)
+  return true
+}
+
+// Exact readable evidence restores normal reconciliation; absence and
+// conflicting identities do not. The linked call remains in the launch ledger.
+function unambiguousAgentCall(snapshot: AgentLogSnapshot, call: LogEntry): boolean {
+  return !logQuarantine(snapshot, { id: call.id, correlationId: call.correlation_id }, true)
+    && snapshot.entries.filter((row) => row.id === call.id || row.correlation_id === call.correlation_id).length === 1
+}
+
+function restoreReadableClaim(claim: BehaviorLaunchClaim, call: LogEntry, snapshot: AgentLogSnapshot): boolean {
+  if (!unambiguousAgentCall(snapshot, call)) return false
+  return db.transaction(() => {
+    if (!clearUnreadableBehaviorLaunchOwned(claim.key, claim.target, claim.claimId, call.id)) return false
+    retireQuarantineIncident(claim)
+    return true
+  })()
+}
+
+// A previously failed launch may also encounter a transient feed outage.
+// Restore only its exact terminal failure, leaving ordinary no-action policy
+// to decide whether it can retry. Running rows cannot revive closed ownership.
+function restoreReadableFailedClaim(claim: BehaviorLaunchClaim, call: LogEntry | undefined, snapshot: AgentLogSnapshot): void {
+  if (claim.launchQuarantine !== 'unreadable' || !call
+    || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase())
+    || call.error_code === 'invalid_agent_result'
+    || !unambiguousAgentCall(snapshot, call)
+    || call.id !== claim.launchCallId
+    || call.behavior !== claim.launchBehavior
+    || call.repo !== claim.launchRepo
+    || String(call.pr_id || '') !== String(claim.launchPr)
+    || String(call.actor || '').toLowerCase() !== claim.launchActor.toLowerCase()
+    || call.source !== claim.launchSource
+    || call.correlation_id !== claim.launchCorrelationId
+    || (call.expected_head || '') !== claim.launchExpectedHead
+    || !Number.isFinite(Date.parse(claim.launchRequestedAt))
+    || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
+    || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)) return
+  const message = call.error || `agent call terminated with status ${call.status.toLowerCase()}`
+  db.transaction(() => {
+    const changed = db.prepare(`
+      UPDATE behavior_seen SET launch_quarantine = NULL, launch_error = ?, launch_quarantine_may_run = 1
+      WHERE key = ? AND target = ? AND claim_id = '' AND launch_quarantine = 'unreadable'
+        AND launch_call_id = ? AND launch_correlation_id = ? AND launch_requested_at = ?
+        AND launch_outcome IS NULL
+    `).run(message, claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
+    if (!changed.changes) return
+    retireQuarantineIncident(claim)
+    recordBehaviorDeadLetter(claim, message, call.id)
+    const retryFailure = claim.key === ISSUES_KEY
+      ? call.error_code !== 'stopped' && (call.receipts != null || !HELD_ISSUE_REVIEW_ERRORS.has(call.error_code || ''))
+      : !boundedReviewFailure(call) && call.error_code !== 'review_packet_too_large'
+    if (retryFailure) recordBehaviorFailure(claim.key as BehaviorKey, 'worker', message, claim.target)
+  })()
+}
+
+function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry, snapshot: AgentLogSnapshot): boolean {
+  if (claim.launchQuarantine === 'invalid_result') return false
+  const actions = claim.launchBehavior === 'issue_review'
+    ? new Map([['commented', 'commented']])
+    : claim.launchBehavior === 'pr_review'
+      ? new Map([['reviewed_clean', 'clean'], ['requested_changes', 'changes_requested']])
+      : new Map([['approved', 'approved'], ['requested_changes', 'changes_requested']])
+  if (!unambiguousAgentCall(snapshot, call)
+    || call.id !== claim.launchCallId
+    || call.behavior !== claim.launchBehavior
+    || call.repo !== claim.launchRepo
+    || String(call.pr_id || '') !== String(claim.launchPr)
+    || String(call.actor || '').toLowerCase() !== claim.launchActor.toLowerCase()
+    || call.source !== claim.launchSource
+    || call.correlation_id !== claim.launchCorrelationId
+    || (call.expected_head || '') !== claim.launchExpectedHead
+    || !Number.isFinite(Date.parse(claim.launchRequestedAt))
+    || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
+    || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)
+    || call.status.toLowerCase() !== 'completed'
+    || actions.get(call.action || '') !== call.outcome
+    || !Number.isFinite(Date.parse(call.completed_at || ''))
+    || (claim.launchBehavior !== 'issue_review' && call.head_sha !== claim.launchExpectedHead)) {
+    quarantineFailedClaim(claim, 'invalid_result',
+      'completed agent evidence is ambiguous or contradicts the persisted launch contract',
+      quarantineEvidence(snapshot, claim, call).hasLiveEvidence)
+    return false
+  }
+  db.prepare(`
+    UPDATE behavior_seen SET launch_quarantine = NULL
+    WHERE key = ? AND target = ? AND claim_id = '' AND launch_quarantine = 'unreadable'
+      AND launch_call_id = ? AND launch_correlation_id = ? AND launch_requested_at = ?
+  `).run(claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
+  return true
+}
+
+function failedBehaviorLaunches(behavior: string): BehaviorLaunchClaim[] {
+  const rows = db.prepare(`
+    SELECT target FROM behavior_seen AS launch
+    WHERE key = ? AND claim_id = '' AND launch_call_id IS NOT NULL
+      AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
+      AND (launch_quarantine IS NOT NULL OR EXISTS (
+        SELECT 1 FROM behavior_dead_letters AS incident
+        WHERE incident.behavior = launch.key AND incident.target = launch.target
+          AND incident.correlation_id = launch.launch_correlation_id AND incident.retired_at IS NULL
+          AND (incident.call_id IS NULL OR incident.call_id = launch.launch_call_id)
+      ))
+  `).all(behavior) as Array<{ target: string }>
+  return rows.map(({ target }) => getFailedBehaviorLaunch(behavior, target))
+    .filter((claim): claim is BehaviorLaunchClaim => claim !== null && organizationOwns(claim.launchRepo))
+}
+
+function quarantinedIssueReviews(): BehaviorLaunchClaim[] {
+  const active = listBehaviorLaunchClaims(ISSUES_KEY).filter((claim) => claim.launchQuarantine)
+  return [...active, ...failedBehaviorLaunches(ISSUES_KEY).filter((claim) => claim.launchQuarantine)]
+}
+
+function agentCallStartedAt(call: LogEntry): string {
   return String(call.started_at_precise || call.started_at || '')
 }
 
 async function reconcileBehaviorLaunchClaims(
   behavior: 'review-new-prs' | 'approve-prs',
 ): Promise<void> {
-  const claims = listBehaviorLaunchClaims(behavior)
+  const claims = listBehaviorLaunchClaims(behavior).filter((claim) => {
+    if (claim.launchQuarantine !== 'invalid_result') return true
+    retainClaimSafely(claim, claim.launchError || 'invalid agent result remains held')
+    return false
+  })
   const deadLetters = listBehaviorDeadLetters(500).filter(
-    (letter) => letter.behavior === behavior && letter.callId !== null,
+    (letter) => letter.behavior === behavior && letter.callId !== null
+      && !quarantineBlocksLogCorrection(letter.behavior, letter.target),
   )
-  if (claims.length === 0 && deadLetters.length === 0) return
+  const failedClaims = failedBehaviorLaunches(behavior).filter((claim) => claim.launchQuarantine !== 'invalid_result')
+  if (claims.length === 0 && deadLetters.length === 0 && failedClaims.length === 0) return
 
-  let logs: Awaited<ReturnType<typeof fetchAgentLogs>>
+  let snapshot: AgentLogSnapshot
   try {
-    logs = await fetchAgentLogs({ signal: behaviorSignal() })
+    snapshot = await readBehaviorLogSnapshot()
   } catch (error) {
     const message = `agent log reconciliation unavailable: ${error instanceof Error ? error.message : String(error)}`
-    for (const claim of claims) retainClaimSafely(claim, message)
+    for (const claim of claims) quarantineClaim(claim, 'unreadable', message)
+    for (const failed of failedClaims) quarantineFailedClaim(failed, 'unreadable', message)
     throw error
+  }
+  const logs = snapshot.entries
+  for (const failed of failedClaims) {
+    const call = logs.find((row) => row.id === failed.launchCallId)
+    if (!quarantineFailedLog(snapshot, failed, call)) restoreReadableFailedClaim(failed, call, snapshot)
   }
   // Which sign-in a failed call counts against is decided by its model's
   // provider; a log row can name a model the catalog has since retired.
@@ -613,11 +917,20 @@ async function reconcileBehaviorLaunchClaims(
     ? new Map([['reviewed_clean', 'clean'], ['requested_changes', 'changes_requested']])
     : new Map([['approved', 'approved'], ['requested_changes', 'changes_requested']])
   for (const letter of deadLetters) {
-    const call = logs.find((row) => row.id.toLowerCase() === letter.callId)
+    const call = logs.find((row) => row.status.toLowerCase() === 'completed'
+      && (row.id.toLowerCase() === letter.callId || (!!letter.correlationId && row.correlation_id === letter.correlationId)))
+      ?? logs.find((row) => row.id.toLowerCase() === letter.callId)
+    const failed = getFailedBehaviorLaunch(letter.behavior, letter.target)
+    if (failed?.launchCallId === letter.callId && failed.launchCorrelationId === letter.correlationId
+      && quarantineFailedLog(snapshot, failed, call)) continue
+    if (call?.status.toLowerCase() === 'completed' && failed?.launchCallId === letter.callId
+      && failed.launchCorrelationId === letter.correlationId
+      && !clearCompletedUnreadableHold(failed, call, snapshot)) continue
     const completedAt = String(call?.completed_at || '')
     const action = String(call?.action || '')
     const outcome = String(call?.outcome || '')
     if (call?.status.toLowerCase() === 'completed'
+      && !logQuarantine(snapshot, { id: call.id, correlationId: call.correlation_id }, true)
       && call.behavior === upstreamBehavior(behavior)
       && call.repo === letter.repo
       && String(call.pr_id || '') === String(letter.pr)
@@ -627,7 +940,10 @@ async function reconcileBehaviorLaunchClaims(
       && expectedActions.get(action) === outcome
       && SHA_PATTERN.test(String(call.head_sha || '').toLowerCase())
       && Number.isFinite(Date.parse(completedAt))) {
-      recoveredDeadLetter = retireBehaviorDeadLetter(letter.id) || recoveredDeadLetter
+      if (retireBehaviorDeadLetter(letter.id)) {
+        clearBehaviorFailure(behavior, letter.target)
+        recoveredDeadLetter = true
+      }
     }
   }
   if (recoveredDeadLetter
@@ -660,6 +976,34 @@ async function reconcileBehaviorLaunchClaims(
     let call = claim.launchCallId
       ? candidates.find((row) => row.id.toLowerCase() === claim.launchCallId)
       : undefined
+    const observed = call ?? (candidates.length === 1 ? candidates[0] : undefined)
+    const quarantine = logQuarantine(snapshot, {
+      ...claimLogIdentity(claim), id: claim.launchCallId ?? observed?.id ?? null,
+    }, observed !== undefined)
+    const ambiguousCompletion = claim.launchQuarantine === 'unreadable'
+      ? logs.find((row) => row.status.toLowerCase() === 'completed'
+        && (row.correlation_id === claim.launchCorrelationId || row.id === claim.launchCallId)
+        && (!unambiguousAgentCall(snapshot, row)
+          || (!!claim.launchCallId && row.id !== claim.launchCallId)
+          || row.correlation_id !== claim.launchCorrelationId))
+      : undefined
+    if (ambiguousCompletion) {
+      quarantineClaim(claim, 'invalid_result',
+        'completed agent evidence conflicts with another record for the same launch',
+        claim.launchCallId ?? ambiguousCompletion.id, quarantineEvidence(snapshot, claim, ambiguousCompletion).mayRun)
+      continue
+    }
+    if (quarantine) {
+      const evidence = quarantineEvidence(snapshot, claim, observed)
+      quarantineClaim(claim, evidence.terminal ? 'invalid_result' : 'unreadable',
+        `agent log row quarantined: ${evidence.terminal?.error || quarantine.error}`,
+        claim.launchCallId ?? observed?.id ?? evidence.terminal?.id ?? null, evidence.mayRun)
+      continue
+    }
+    if (claim.launchQuarantine === 'unreadable' && !observed) {
+      retainClaimSafely(claim, claim.launchError || 'agent evidence remains unreadable')
+      continue
+    }
 
     if (!call) {
       if (claim.launchCallId) {
@@ -689,7 +1033,7 @@ async function reconcileBehaviorLaunchClaims(
           const message = 'agent call did not register before the launch deadline'
           recordBehaviorDeadLetter(claim, message)
           if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
-            recordBehaviorFailure(behavior, 'worker')
+            recordBehaviorFailure(behavior, 'worker', message, claim.target)
           }
         }
         continue
@@ -699,6 +1043,7 @@ async function reconcileBehaviorLaunchClaims(
       if (!linkBehaviorLaunchCallOwned(claim.key, claim.target, claim.claimId, call.id)) {
         continue
       }
+      claim.launchCallId = call.id
     }
 
     const linkedStartedAtMs = Date.parse(agentCallStartedAt(call))
@@ -711,20 +1056,35 @@ async function reconcileBehaviorLaunchClaims(
       || call.expected_head !== claim.launchExpectedHead
       || !Number.isFinite(linkedStartedAtMs)
       || linkedStartedAtMs < requestedAtMs) {
-      deadLetterClaim(
-        claim,
-        'linked agent call does not match the persisted launch contract; retained to prevent duplicate launch',
-      )
+      quarantineClaim(claim, terminalAgentStatus(call.status) ? 'invalid_result' : 'unreadable',
+        'linked agent call does not match the persisted launch contract; retained to prevent duplicate launch', call.id,
+        quarantineEvidence(snapshot, claim, call).mayRun)
       continue
     }
 
     const status = call.status.toLowerCase()
+    if (status === 'invalid' || call.error_code === 'invalid_agent_result') {
+      quarantineClaim(claim, 'invalid_result', call.error || 'agent result is invalid', call.id,
+        quarantineEvidence(snapshot, claim, call).mayRun)
+      continue
+    }
+    if (claim.launchQuarantine === 'unreadable' && !unambiguousAgentCall(snapshot, call)) {
+      retainClaimSafely(claim, claim.launchError || 'agent evidence remains ambiguous')
+      continue
+    }
+    if (claim.launchQuarantine === 'unreadable' && status !== 'completed') {
+      const recognized = RUNNING_AGENT_STATUSES.has(status) || FAILED_AGENT_STATUSES.has(status) || status === 'superseded'
+      if (!recognized || !restoreReadableClaim(claim, call, snapshot)) {
+        retainClaimSafely(claim, claim.launchError || 'agent evidence remains unreadable')
+        continue
+      }
+    }
     const superseded = status === 'superseded'
       || String(call.outcome || '') === 'superseded'
       || call.error === SUPERSEDED_AGENT_ERROR
     if (superseded) {
       if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
-        clearBehaviorFailure(behavior)
+        clearBehaviorFailure(behavior, claim.target)
       }
       console.log(
         `[behaviors] ${behavior} superseded for ${claim.launchRepo}#${claim.launchPr}; current head will be reconsidered`,
@@ -752,7 +1112,7 @@ async function reconcileBehaviorLaunchClaims(
       } else {
         recordBehaviorDeadLetter(claim, message, call.id)
         if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
-          recordBehaviorFailure(behavior, 'worker')
+          recordBehaviorFailure(behavior, 'worker', message, claim.target)
         }
       }
       continue
@@ -761,7 +1121,7 @@ async function reconcileBehaviorLaunchClaims(
     if (!terminal && Date.now() - requestedAtMs >= BEHAVIOR_CLAIM_RENEWAL_MS) {
       const message = `behavior launch exceeded ${BEHAVIOR_CLAIM_RENEWAL_MS}ms running limit`
       if (deadLetterClaim(claim, message)) {
-        recordBehaviorFailure(behavior, 'worker')
+        recordBehaviorFailure(behavior, 'worker', message, claim.target)
         if (needsClaude(catalogForCalls, call.model)) claudeAuth.observeProcessFailure({ code: 1, signal: null, error: new Error(message) })
       }
       continue
@@ -778,7 +1138,7 @@ async function reconcileBehaviorLaunchClaims(
         || !Number.isFinite(Date.parse(completedAt))
         || headSha !== claim.launchExpectedHead) {
         const error = 'completed agent call is missing authoritative action/outcome/head metadata'
-        if (deadLetterClaim(claim, error)) recordBehaviorFailure(behavior, 'worker')
+        quarantineClaim(claim, 'invalid_result', error, call.id, quarantineEvidence(snapshot, claim, call).mayRun)
         console.error(`[behaviors] ${error} for ${claim.launchRepo}#${claim.launchPr}`)
         continue
       }
@@ -792,8 +1152,9 @@ async function reconcileBehaviorLaunchClaims(
         headSha,
       })
       if (completed) {
+        if (claim.launchQuarantine === 'unreadable') retireQuarantineIncident(claim)
         activeClaims.delete(claim.claimId)
-        clearBehaviorFailure(behavior)
+        clearBehaviorFailure(behavior, claim.target)
       } else {
         activeClaims.delete(claim.claimId)
         const current = listBehaviorLaunchClaims(behavior).find(
@@ -802,13 +1163,13 @@ async function reconcileBehaviorLaunchClaims(
         )
         if (current) {
           const error = 'terminal agent outcome could not complete its owned launch claim'
-          if (deadLetterClaim(current, error)) recordBehaviorFailure(behavior, 'worker')
+          if (deadLetterClaim(current, error)) recordBehaviorFailure(behavior, 'worker', error, claim.target)
         }
       }
     } else if (FAILED_AGENT_STATUSES.has(status)) {
       const message = call.error || `agent call terminated with status ${status}`
       if (deadLetterClaim(claim, message)) {
-        recordBehaviorFailure(behavior, 'worker')
+        recordBehaviorFailure(behavior, 'worker', message, claim.target)
         // A run the user stopped from Swarm says nothing about the provider.
         if (call.error_code !== 'stopped' && needsClaude(catalogForCalls, call.model)) claudeAuth.observeProcessFailure(message)
       }
@@ -824,7 +1185,7 @@ async function reconcileBehaviorLaunchClaims(
     } else {
       const message = `unrecognized agent call status "${status || 'missing'}"`
       if (deadLetterClaim(claim, message)) {
-        recordBehaviorFailure(behavior, 'worker')
+        recordBehaviorFailure(behavior, 'worker', message, claim.target)
         if (needsClaude(catalogForCalls, call.model)) claudeAuth.observeProcessFailure(message)
       }
     }
@@ -965,6 +1326,7 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
     return { repo, number, url, draft: draft === 1, author: prAuthor }
   })
   retireBehaviorDeadLettersForClosedPrs(seen, undefined, currentOrganization()?.login)
+  retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking'])
   return prs.filter((pr) => organizationOwns(pr.repo) && pr.author === author && !pr.draft)
 }
 
@@ -1232,7 +1594,9 @@ async function recoverSnapshotReviews(
   const candidates = listSnapshotOnlySeen('review-new-prs')
     .filter((row) => row.target !== snapshotTarget() && open.has(row.target))
   if (candidates.length > 0) {
-    const logs = await fetchAgentLogs({ signal: behaviorSignal() })
+    const snapshot = await readBehaviorLogSnapshot()
+    const logs = snapshot.entries
+    let uncertain = false
     for (const candidate of candidates) {
       const separator = candidate.target.lastIndexOf('#')
       const repo = candidate.target.slice(0, separator)
@@ -1242,7 +1606,43 @@ async function recoverSnapshotReviews(
         && entry.repo === repo
         && entry.pr_id === prId
         && entry.actor?.toLowerCase() === reviewer.toLowerCase())
+      if (logQuarantine(snapshot, { repo, prId, behavior: 'pr_review' })
+        || matching.some((entry) => logQuarantine(snapshot, {
+          id: entry.id, correlationId: entry.correlation_id,
+        }, true))) {
+        db.transaction(() => {
+          const changed = db.prepare(`
+            UPDATE behavior_seen SET launch_quarantine = 'unreadable', launch_error = 'snapshot review evidence is unreadable'
+            WHERE key = 'review-new-prs' AND target = ? AND seen_at = ?
+              AND claim_id = '' AND launch_requested_at IS NULL AND launch_quarantine IS NULL
+          `).run(candidate.target, candidate.seenAt)
+          if (changed.changes) db.prepare(`
+            INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, actor, source, correlation_id, error, created_at)
+            VALUES(?, 'review-new-prs', ?, ?, ?, ?, 'poise:snapshot-recovery', ?, 'snapshot review evidence is unreadable', ?)
+          `).run(randomUUID(), candidate.target, repo, Number(prId), reviewer,
+            `snapshot:${candidate.target}:${candidate.seenAt}`, new Date().toISOString())
+        })()
+        uncertain = true
+        continue
+      }
       const completed = matching.some((entry) => entry.status === 'completed')
+      const previouslyUnreadable = db.prepare(`
+        SELECT 1 FROM behavior_seen WHERE key = 'review-new-prs' AND target = ? AND seen_at = ?
+          AND claim_id = '' AND launch_requested_at IS NULL AND launch_quarantine IS NOT NULL
+      `).get(candidate.target, candidate.seenAt)
+      if (previouslyUnreadable) {
+        if (!completed) { uncertain = true; continue }
+        db.prepare(`
+          UPDATE behavior_seen SET launch_quarantine = NULL, launch_error = NULL
+          WHERE key = 'review-new-prs' AND target = ? AND seen_at = ?
+            AND claim_id = '' AND launch_requested_at IS NULL AND launch_quarantine = 'unreadable'
+        `).run(candidate.target, candidate.seenAt)
+        db.prepare(`
+          UPDATE behavior_dead_letters SET retired_at = ?
+          WHERE behavior = 'review-new-prs' AND target = ? AND source = 'poise:snapshot-recovery'
+            AND correlation_id = ? AND retired_at IS NULL
+        `).run(new Date().toISOString(), candidate.target, `snapshot:${candidate.target}:${candidate.seenAt}`)
+      }
       const failedBeforeSnapshot = matching.some((entry) =>
         entry.status === 'failed'
         && Date.parse(entry.started_at) <= Date.parse(candidate.seenAt))
@@ -1255,6 +1655,7 @@ async function recoverSnapshotReviews(
         releaseSeen('review-new-prs', candidate.target)
       }
     }
+    if (uncertain) return
   }
   setMeta(SNAPSHOT_RECOVERY_META, '1')
 }
@@ -1272,29 +1673,45 @@ async function tickReviewNewPrs(): Promise<void> {
 
   if (await initializeReviewBaseline()) return
   try {
+    const panel = await reviewPanel(getReviewers('review-new-prs'))
+    const slots = availableReviewSlots(panel)
+    if (slots.length === 0) return
     const prs = await listOpenPrsByAuthor(author)
     await recoverSnapshotReviews(prs, reviewer)
-    const slots = (await reviewPanel(getReviewers('review-new-prs'))).reviewers.map((entry) => entry.slot)
     let failure: unknown
     await Promise.all(prs.flatMap((pr) => {
       const key = `${pr.repo}#${pr.number}`
-      // A pull request is new to the panel when its primary is: the extra
-      // reviewers ride with a fresh primary and otherwise fire only to
-      // recover their own failed launch, never for a pull request the
-      // primary already handled before the panel grew.
+      // A fresh primary admits the current panel; already handled PRs do
+      // not gain new reviewers when the configured panel grows.
       const primaryFresh = !hasSeen('review-new-prs', key) || !!getFailedBehaviorLaunch('review-new-prs', key)
+      // Remember the original panel even if one provider cannot start yet.
+      // Its admitted reviewers still run after a sibling finishes; increasing
+      // the panel later must not add reviewers to historical PRs.
+      const panelKey = `${META_PREFIX}review_new_prs_panel:${key}`
+      let admitted = parseJsonMeta(panelKey)
+      if (!Array.isArray(admitted)) {
+        admitted = primaryFresh ? panel.reviewers.map(({ slot }) => slot) : []
+        if (primaryFresh) setMeta(panelKey, JSON.stringify(admitted))
+      }
+      const admittedSlots = new Set(admitted as ReviewerSlot[])
       return slots.filter((slot) => {
         const target = reviewSlotTarget(key, slot)
         if (slot === 'primary') return primaryFresh
-        return (primaryFresh && !hasSeen('review-new-prs', target)) || !!getFailedBehaviorLaunch('review-new-prs', target)
+        return (admittedSlots.has(slot) && !hasSeen('review-new-prs', target)) || !!getFailedBehaviorLaunch('review-new-prs', target)
       }).map((slot) => [pr, key, slot] as const)
     }).map(async ([pr, key, slot]) => {
       if (!isEnabled('review-new-prs') || behaviorAborted()) return
       const target = reviewSlotTarget(key, slot)
+      const checkTarget = `${target}:check`
+      if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) return
       let operationId: string | null = null
       let launched = false
+      let checked = false
       try {
-        if (await packetBlocked('review-new-prs', pr.repo, pr.number)) return
+        if (await packetBlocked('review-new-prs', pr.repo, pr.number)) {
+          checked = true
+          return
+        }
         operationId = await claimEligiblePrOperation('review-new-prs', target)
         if (!operationId) {
           console.log(`[behaviors] review-new-prs deferred for ${key}: PR operation busy`)
@@ -1329,6 +1746,7 @@ async function tickReviewNewPrs(): Promise<void> {
                 return
               }
               if (ch.hasChangeRequest) {
+                checked = true
                 completeOwnedClaim('review-new-prs', target, claimId)
                 console.log(`[behaviors] review-new-prs skipped for ${pr.repo}#${pr.number} — outstanding CHANGES_REQUESTED, approve-prs owns it`)
                 return
@@ -1349,6 +1767,7 @@ async function tickReviewNewPrs(): Promise<void> {
             return
           }
           launched = true
+          checked = true
           console.log(`[behaviors] review-new-prs fired for ${pr.repo}#${pr.number} (p=${getSetting('review-new-prs')}, ${slot})`)
         } catch (err) {
           // Pre-launch work and spawn acknowledgement are part of the claim.
@@ -1357,10 +1776,13 @@ async function tickReviewNewPrs(): Promise<void> {
           throw err
         }
       } catch (err) {
+        checked = false
         if (behaviorAborted()) return
         console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
-        failure ??= err
+        if (err instanceof BehaviorLogFeedError) failure ??= err
+        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
       } finally {
+        if (checked && !behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
         if (!launched && operationId) releasePrOperationOwned(operationId)
       }
     }))
@@ -1560,13 +1982,16 @@ async function releaseFailedBehaviorIfNoAction(
   const source = `poise:${behavior}`
   const failed = getFailedBehaviorLaunch(behavior, target)
   if (!failed?.launchCallId
+    || failed.launchQuarantine
     || failed.launchBehavior !== launchBehavior
     || failed.launchRepo !== repo
     || failed.launchPr !== number
     || failed.launchSource !== source) {
     return false
   }
-  const logs = await fetchAgentLogs({ signal: behaviorSignal() })
+  const snapshot = await readBehaviorLogSnapshot()
+  if (quarantineFailedLog(snapshot, failed)) return false
+  const logs = snapshot.entries
   const call = logs.find((row) => row.id === failed.launchCallId)
   if (!call
     || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase())
@@ -1784,25 +2209,28 @@ async function tickApprovePrs(): Promise<void> {
     await Promise.all(prs.map(async (pr) => {
       if (!isEnabled('approve-prs') || behaviorAborted()) return
       const prTarget = `${pr.repo}#${pr.number}`
-      let check: ChangesAddressedResult
-      try {
-        check = await checkChangesAddressed(pr.repo, pr.number, reviewer)
-        if (await packetBlocked('approve-prs', pr.repo, pr.number, check.headSha)) return
-      } catch (err) {
-        if (behaviorAborted()) return
-        console.error(`[behaviors] approve-prs check failed for ${pr.repo}#${pr.number}:`, err)
-        failure ??= err
-        return
-      }
-      if (!check.hasChangeRequest && !latestApprovalBasisLaunch(pr.repo, pr.number)) return
-      if (hasActiveAgentLaunchForPr(pr.repo, pr.number)) return
-      const operationId = await claimEligiblePrOperation('approve-prs', prTarget)
-      if (!operationId) {
-        console.log(`[behaviors] approve-prs deferred for ${prTarget}: PR operation busy`)
-        return
-      }
+      if (invalidPrResultHeld(pr.repo, pr.number)) return
+      const checkTarget = `${prTarget}:check`
+      if (!behaviorRetryDue('approve-prs', checkTarget)) return
+      let operationId: string | null = null
       let launched = false
+      let checked = false
       try {
+        const check = await checkChangesAddressed(pr.repo, pr.number, reviewer)
+        if (await packetBlocked('approve-prs', pr.repo, pr.number, check.headSha)) {
+          checked = true
+          return
+        }
+        if (!check.hasChangeRequest && !latestApprovalBasisLaunch(pr.repo, pr.number)) {
+          checked = true
+          return
+        }
+        if (hasActiveAgentLaunchForPr(pr.repo, pr.number)) return
+        operationId = await claimEligiblePrOperation('approve-prs', prTarget)
+        if (!operationId) {
+          console.log(`[behaviors] approve-prs deferred for ${prTarget}: PR operation busy`)
+          return
+        }
         if (!isEnabled('approve-prs')) return
         // Follow-up trigger: reviewer has at least one CHANGES_REQUESTED review
         // on the PR, AND the author has engaged with it at least once
@@ -1822,7 +2250,10 @@ async function tickApprovePrs(): Promise<void> {
         let firedReason = ''
         let expectedHead = ''
         if (check.hasChangeRequest) {
-          if (check.responseCount < 1 || check.latestRequestAt === null) return
+          if (check.responseCount < 1 || check.latestRequestAt === null) {
+            checked = true
+            return
+          }
           const activity = await checkReviewActivity(
             pr.repo,
             pr.number,
@@ -1836,13 +2267,19 @@ async function tickApprovePrs(): Promise<void> {
             || activity.headSha !== check.headSha
             || activity.unresolvedLiveConversationAuthors.some(
               (author) => author.toLowerCase() !== reviewer.toLowerCase(),
-            )) return
+            )) {
+            checked = true
+            return
+          }
           expectedHead = check.headSha
           seenTarget = `${pr.repo}#${pr.number}@req=${check.latestRequestAt}/r=${check.responseCount}/head=${check.headSha}`
           firedReason = `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}reply, head=${check.headSha.slice(0, 8)}`
         } else {
           const review = latestApprovalBasisLaunch(pr.repo, pr.number)
-          if (!review) return
+          if (!review) {
+            checked = true
+            return
+          }
           const activity = await checkReviewActivity(
             pr.repo,
             pr.number,
@@ -1863,7 +2300,10 @@ async function tickApprovePrs(): Promise<void> {
             || (activity.unresolvedLiveConversationCount > 0
               && !reapprovalOwnsEveryUnresolvedConversation)
             || (activity.reviewerLatestState === 'APPROVED'
-              && activity.reviewerLatestCommit === activity.headSha)) return
+              && activity.reviewerLatestCommit === activity.headSha)) {
+            checked = true
+            return
+          }
           if (activity.headSha !== review.headSha && activity.latestActivityAt === null) {
             throw new Error(`head changed without an activity watermark for ${pr.repo}#${pr.number}`)
           }
@@ -1871,6 +2311,7 @@ async function tickApprovePrs(): Promise<void> {
           seenTarget = `${pr.repo}#${pr.number}@head=${activity.headSha}`
           firedReason = `clean review ${review.callId.slice(0, 8)}, head=${activity.headSha.slice(0, 8)}`
         }
+        if (!behaviorRetryDue('approve-prs', seenTarget)) return
         let claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
         if (!claimId) {
           const recovered = await releaseFailedBehaviorIfNoAction(
@@ -1891,17 +2332,21 @@ async function tickApprovePrs(): Promise<void> {
             return
           }
           launched = true
+          checked = true
         } catch (err) {
           releaseOwnedClaim('approve-prs', seenTarget, claimId)
           throw err
         }
         console.log(`[behaviors] approve-prs fired for ${pr.repo}#${pr.number} (${firedReason})`)
       } catch (err) {
+        checked = false
         if (behaviorAborted()) return
         console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
-        failure ??= err
+        if (err instanceof BehaviorLogFeedError) failure ??= err
+        else recordBehaviorFailure('approve-prs', 'operation', err, checkTarget)
       } finally {
-        if (!launched) releasePrOperationOwned(operationId)
+        if (checked && !behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget)
+        if (!launched && operationId) releasePrOperationOwned(operationId)
       }
     }))
     if (failure) throw failure
@@ -2053,16 +2498,21 @@ async function tickResolveUnblocking(): Promise<void> {
   if (!author) return
   try {
     const prs = await listOpenPrsByAuthor(author)
-    let failure: unknown
     await Promise.all(prs.map(async (pr) => {
       if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
       const key = `${pr.repo}#${pr.number}`
+      const checkTarget = `${key}:check`
+      if (!behaviorRetryDue('resolve-unblocking', checkTarget)) return
+      let checked = false
       let operationId: string | null = null
       try {
         // A read cannot resolve anything. Avoid occupying the mutation lock
         // when the PR has no unresolved conversations to act on.
         const activity = await checkReviewActivity(pr.repo, pr.number, configuredReviewer(), '1970-01-01T00:00:00Z')
-        if (activity.state !== 'OPEN' || activity.draft || activity.unresolvedConversationCount === 0) return
+        if (activity.state !== 'OPEN' || activity.draft || activity.unresolvedConversationCount === 0) {
+          checked = true
+          return
+        }
         if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
         operationId = claimPrOperationOwned(key, PR_OPERATION_EVALUATION_LEASE_MS)
         if (!operationId) return
@@ -2071,6 +2521,7 @@ async function tickResolveUnblocking(): Promise<void> {
         // starting another resolve operation.
         if (!isEnabled('resolve-unblocking')) return
         const result = await resolveNonblockingIfReady(pr.repo, pr.number)
+        checked = true
         if (result.superseded) {
           console.log(`[behaviors] resolve-unblocking superseded on ${pr.repo}#${pr.number} by head ${result.headSha}`)
         } else if (result.resolved_count > 0) {
@@ -2090,14 +2541,15 @@ async function tickResolveUnblocking(): Promise<void> {
           )
         }
       } catch (err) {
+        checked = false
         if (behaviorAborted()) return
         console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, err)
-        failure ??= err
+        recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget)
       } finally {
+        if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
         if (operationId) releasePrOperationOwned(operationId)
       }
     }))
-    if (failure) throw failure
   } catch (err) {
     console.error('[behaviors] resolve-unblocking tick failed:', err)
     throw err
@@ -2292,22 +2744,23 @@ const SUB_ISSUE_READS_AT_ONCE = 4
 const subIssueReadErrors = new Map<string, string>()
 
 // The sub-issues of each issue that could be read. An issue whose read fails
-// covers nothing and waits. Only several reads all failing, which is GitHub or
-// the token rather than one issue, stops the minute.
+// covers nothing and waits on its own retry timer; other issues keep running.
 async function readSubIssues(entries: readonly EligibleIssue[]): Promise<Map<string, string[]>> {
   const subIssues = new Map<string, string[]>()
-  const failures: unknown[] = []
   let next = 0
   const reader = async () => {
     while (next < entries.length) {
       const { issue } = entries[next++]
       const ref = issueRef(`${issue.repo}#${issue.number}`)
+      const checkTarget = `${issue.repo}#${issue.number}:sub-issues`
+      if (!behaviorRetryDue(ISSUES_KEY, checkTarget)) continue
       try {
         subIssues.set(ref, await listSubIssues(issue.repo, issue.number))
         subIssueReadErrors.delete(ref)
+        clearBehaviorFailure(ISSUES_KEY, checkTarget)
       } catch (error) {
         if (behaviorAborted()) throw error
-        failures.push(error)
+        recordBehaviorFailure(ISSUES_KEY, 'operation', error, checkTarget)
         const message = error instanceof Error ? error.message : String(error)
         if (subIssueReadErrors.get(ref) !== message) {
           console.error(`[behaviors] review-new-issues cannot read the sub-issues of ${issue.repo}#${issue.number}: ${message}`)
@@ -2317,7 +2770,6 @@ async function readSubIssues(entries: readonly EligibleIssue[]): Promise<Map<str
     }
   }
   await Promise.all(Array.from({ length: Math.min(SUB_ISSUE_READS_AT_ONCE, entries.length) }, reader))
-  if (failures.length > 1 && subIssues.size === 0) throw failures[0]
   return subIssues
 }
 
@@ -2397,15 +2849,61 @@ interface IssueReviewPlan {
 async function planIssueReviews(
   candidates: readonly IssueCandidate[],
   eligible: readonly EligibleIssue[],
-  logs: () => Promise<LogEntry[]>,
+  logs: () => Promise<AgentLogSnapshot>,
 ): Promise<IssueReviewPlan> {
   const plan: IssueReviewPlan = { launch: new Map(), reviewed: [] }
   const due = [...new Set(candidates.map(({ issue }) => issueRef(`${issue.repo}#${issue.number}`)))]
   if (due.length === 0) return plan
 
+  const snapshot = await logs()
+  const uncertainRefs = new Set<string>()
+  const quarantinedClaims = quarantinedIssueReviews()
+  for (const claim of quarantinedClaims) {
+    // Absence is not a new running signal; only identified conflicting rows are.
+    if (!claim.launchQuarantineMayRun && quarantineEvidence(snapshot, claim).hasLiveEvidence) {
+      if (claim.claimId) quarantineClaim(claim, claim.launchQuarantine!, claim.launchError || 'agent result remains held', claim.launchCallId, true)
+      else quarantineFailedClaim(claim, claim.launchQuarantine!, claim.launchError || 'agent result remains held', true)
+    }
+
+    uncertainRefs.add(issueRef(`${claim.launchRepo}#${claim.launchPr}`))
+    for (const ref of claim.launchCovers) uncertainRefs.add(issueRef(ref))
+  }
+  for (const row of snapshot.quarantined) {
+    // A review may comment across repositories. Only its durable launch
+    // coverage bounds that uncertainty; its own repository alone cannot.
+    // A valid duplicate may expose the correlation before reconciliation
+    // can link its call ID. Include that identity without accepting its result.
+    const identities = [row, ...snapshot.entries
+      .filter((call) => (row.id && call.id === row.id)
+        || (row.correlationId && call.correlation_id === row.correlationId))
+      .map((call) => ({ id: call.id, correlationId: call.correlation_id }))]
+    const launches = identities.flatMap((identity) => db.prepare(`
+      SELECT launch_repo AS repo, launch_pr AS number, launch_covers AS covers
+      FROM behavior_seen WHERE launch_behavior = 'issue_review'
+        AND ((? IS NOT NULL AND launch_call_id = ?) OR (? IS NOT NULL AND launch_correlation_id = ?))
+    `).all(identity.id, identity.id, identity.correlationId, identity.correlationId) as Array<{ repo: string, number: number, covers: string | null }>)
+    if (launches.length === 0) {
+      if (!quarantinedLogMayMatch(row, { behavior: ISSUE_REVIEW_BEHAVIOR })) continue
+      throw new Error(`Issue review coverage is uncertain: ${row.error}`)
+    }
+    for (const launch of launches) {
+      uncertainRefs.add(issueRef(`${launch.repo}#${launch.number}`))
+      let covers: unknown
+      try { covers = JSON.parse(launch.covers || '[]') } catch {
+        throw new Error(`Issue review coverage is invalid for ${launch.repo}#${launch.number}`)
+      }
+      if (!Array.isArray(covers) || covers.some((ref) => typeof ref !== 'string')) {
+        throw new Error(`Issue review coverage is invalid for ${launch.repo}#${launch.number}`)
+      }
+      for (const ref of covers as string[]) uncertainRefs.add(issueRef(ref))
+    }
+  }
   // What reviews have commented on besides their own issue.
   const commentedBy = new Map<string, string>()
-  for (const call of await logs()) {
+  for (const call of snapshot.entries) {
+    if (quarantinedClaims.some((claim) => claim.launchCallId === call.id
+      || claim.launchCorrelationId === call.correlation_id)) continue
+    if (logQuarantine(snapshot, { id: call.id, correlationId: call.correlation_id }, true)) continue
     if (call.behavior !== ISSUE_REVIEW_BEHAVIOR || !call.receipts) continue
     const reviewed = `${call.repo}#${call.pr_id}`
     for (const receipt of call.receipts) {
@@ -2422,7 +2920,7 @@ async function planIssueReviews(
   }
   for (const ref of due) {
     const by = commentedBy.get(ref)
-    if (by) plan.reviewed.push({ ref, by })
+    if (by && !uncertainRefs.has(ref)) plan.reviewed.push({ ref, by })
   }
 
   // Every issue whose own review is still to come, settled or not, may cover
@@ -2431,7 +2929,7 @@ async function planIssueReviews(
   const pendingRefs = new Set<string>()
   for (const entry of eligible) {
     const ref = issueRef(`${entry.issue.repo}#${entry.issue.number}`)
-    if (commentedBy.has(ref) || runningFor.has(ref)) continue
+    if (uncertainRefs.has(ref) || commentedBy.has(ref) || runningFor.has(ref)) continue
     for (const target of entry.targets) {
       if (await issueTargetLaunchable(target, logs)) {
         pending.push(entry)
@@ -2443,7 +2941,7 @@ async function planIssueReviews(
   // A due issue held after a failure launches nothing, and while every
   // reviewer is busy nothing can launch: neither asks anything of GitHub.
   const open = due.filter((ref) => pendingRefs.has(ref))
-  if (open.length === 0 || listBehaviorLaunchClaims(ISSUES_KEY).length >= MAX_ISSUE_REVIEW_RUNS) return plan
+  if (open.length === 0 || runningIssueReviewCount() >= MAX_ISSUE_REVIEW_RUNS) return plan
   pending.sort((a, b) => Date.parse(a.issue.createdAt) - Date.parse(b.issue.createdAt)
     || a.issue.repo.localeCompare(b.issue.repo)
     || a.issue.number - b.issue.number)
@@ -2528,14 +3026,17 @@ async function fireIssueReview(
 // tick, and each read of the agent log is a subprocess.
 async function releasableIssueReviewFailure(
   target: string,
-  logs: () => Promise<LogEntry[]>,
+  logs: () => Promise<AgentLogSnapshot>,
 ): Promise<BehaviorLaunchClaim | null> {
   const failed = getFailedBehaviorLaunch(ISSUES_KEY, target)
   if (!failed?.launchCallId
+    || failed.launchQuarantine
     || failed.launchBehavior !== 'issue_review'
     || failed.launchSource !== ISSUE_REVIEW_SOURCE
     || countBehaviorDeadLetters(ISSUES_KEY, target) >= ISSUE_REVIEW_ATTEMPTS) return null
-  const call = (await logs()).find((row) => row.id === failed.launchCallId)
+  const snapshot = await logs()
+  if (quarantineFailedLog(snapshot, failed)) return null
+  const call = snapshot.entries.find((row) => row.id === failed.launchCallId)
   if (!call
     || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase())
     || call.behavior !== ISSUE_REVIEW_BEHAVIOR
@@ -2547,13 +3048,13 @@ async function releasableIssueReviewFailure(
 
 // Whether a reviewer's launch is still to come: never claimed, claimed by a
 // process that died before launching, or failed in a way that runs once more.
-async function issueTargetLaunchable(target: string, logs: () => Promise<LogEntry[]>): Promise<boolean> {
+async function issueTargetLaunchable(target: string, logs: () => Promise<AgentLogSnapshot>): Promise<boolean> {
   if (!hasSeen(ISSUES_KEY, target)) return countBehaviorDeadLetters(ISSUES_KEY, target) < ISSUE_REVIEW_ATTEMPTS
   if (hasExpiredPreLaunchClaim(ISSUES_KEY, target)) return true
   return !!await releasableIssueReviewFailure(target, logs)
 }
 
-async function releaseFailedIssueReviewIfSafe(target: string, logs: () => Promise<LogEntry[]>): Promise<boolean> {
+async function releaseFailedIssueReviewIfSafe(target: string, logs: () => Promise<AgentLogSnapshot>): Promise<boolean> {
   const failed = await releasableIssueReviewFailure(target, logs)
   if (!failed?.launchCallId) return false
   const released = releaseFailedBehaviorLaunch(ISSUES_KEY, target, failed.launchCallId, failed.launchExpectedHead)
@@ -2565,27 +3066,29 @@ async function launchIssueReview(
   issue: DatastoreIssue,
   slot: ReviewerSlot,
   target: string,
-  logs: () => Promise<LogEntry[]>,
+  logs: () => Promise<AgentLogSnapshot>,
   covers: readonly string[],
-): Promise<void> {
-  if (countBehaviorDeadLetters(ISSUES_KEY, target) >= ISSUE_REVIEW_ATTEMPTS && !hasSeen(ISSUES_KEY, target)) return
+): Promise<boolean> {
+  if (!behaviorRetryDue(ISSUES_KEY, target)) return false
+  if (countBehaviorDeadLetters(ISSUES_KEY, target) >= ISSUE_REVIEW_ATTEMPTS && !hasSeen(ISSUES_KEY, target)) return false
   let claimId = claimSeenOwned(ISSUES_KEY, target, ISSUE_PRE_LAUNCH_LEASE_MS)
   if (!claimId) {
-    if (!await releaseFailedIssueReviewIfSafe(target, logs)) return
+    if (!await releaseFailedIssueReviewIfSafe(target, logs)) return false
     claimId = claimSeenOwned(ISSUES_KEY, target, ISSUE_PRE_LAUNCH_LEASE_MS)
-    if (!claimId) return
+    if (!claimId) return false
   }
   trackClaim(ISSUES_KEY, target, claimId)
   try {
     if (!await fireIssueReview(issue, target, claimId, slot, covers)) {
       releaseOwnedClaim(ISSUES_KEY, target, claimId)
-      return
+      return false
     }
   } catch (error) {
     releaseOwnedClaim(ISSUES_KEY, target, claimId)
     throw error
   }
   console.log(`[behaviors] review-new-issues fired for ${issue.repo}#${issue.number} (${slot})`)
+  return true
 }
 
 async function tickReviewNewIssues(): Promise<void> {
@@ -2593,15 +3096,33 @@ async function tickReviewNewIssues(): Promise<void> {
   const repositories = getIssueRepositories().filter((entry) => organizationOwns(entry.repo))
   if (repositories.length === 0) return
   const authors = new Set(getIssueAuthors().map((author) => author.toLowerCase()))
-  const slots = (await reviewPanel(getReviewers(ISSUES_KEY), 'issue_review')).reviewers.map((entry) => entry.slot)
+  const slots = availableReviewSlots(await reviewPanel(getReviewers(ISSUES_KEY), 'issue_review'))
+  if (slots.length === 0) return
   const slotSince = getIssueSlotSince()
   await requireFreshDatastore()
   const open = new Set<string>()
   const eligible: EligibleIssue[] = []
   const candidates: IssueCandidate[] = []
   const now = Date.now()
+  const unreadRepositories = new Set<string>()
   for (const { repo, since } of repositories) {
-    for (const issue of await listOpenIssues(repo, since)) {
+    const scanTarget = `${repo}:scan`
+    if (!behaviorRetryDue(ISSUES_KEY, scanTarget)) {
+      unreadRepositories.add(repo)
+      continue
+    }
+    let issues: DatastoreIssue[]
+    try {
+      issues = await listOpenIssues(repo, since)
+      clearBehaviorFailure(ISSUES_KEY, scanTarget)
+    } catch (error) {
+      if (behaviorAborted()) return
+      unreadRepositories.add(repo)
+      console.error(`[behaviors] review-new-issues cannot list ${repo}:`, error)
+      recordBehaviorFailure(ISSUES_KEY, 'operation', error, scanTarget)
+      continue
+    }
+    for (const issue of issues) {
       const key = `${issue.repo}#${issue.number}`
       open.add(key)
       const created = Date.parse(issue.createdAt)
@@ -2621,19 +3142,25 @@ async function tickReviewNewIssues(): Promise<void> {
       if (targets.length > 0) eligible.push({ issue, targets })
     }
   }
-  // Every selected repository was read, so what is not open is closed or no
-  // longer selected; its incidents are settled.
-  retireBehaviorDeadLettersForClosedPrs(open, [ISSUES_KEY], currentOrganization()?.login)
+  // An unread repository is unknown, not empty: preserve its incidents.
+  retireBehaviorDeadLettersForClosedPrs(open, [ISSUES_KEY], currentOrganization()?.login, unreadRepositories)
+  retireClosedTargetFailures(open, [ISSUES_KEY], unreadRepositories)
   candidates.sort((a, b) => a.order - b.order)
-  let logs: Promise<LogEntry[]> | null = null
-  const readLogs = () => (logs ??= fetchAgentLogs({ signal: behaviorSignal() }))
+  let logs: Promise<AgentLogSnapshot> | null = null
+  const readLogs = () => (logs ??= readBehaviorLogSnapshot())
   const plan = await planIssueReviews(candidates, eligible, readLogs)
   for (const { ref, by } of plan.reviewed) {
     let settled: string | null = null
     for (const { issue, target } of candidates) {
       if (issueRef(`${issue.repo}#${issue.number}`) !== ref) continue
+      // Exact parent receipts settle both launch and eligibility diagnostics.
+      clearBehaviorFailure(ISSUES_KEY, `${target}:check`)
+      clearBehaviorFailure(ISSUES_KEY, `${issue.repo}#${issue.number}:sub-issues`)
       // Its own review failing earlier is no longer an incident: it was reviewed.
-      if (retireBehaviorDeadLettersForTarget(ISSUES_KEY, target) > 0) settled = `${issue.repo}#${issue.number}`
+      if (retireBehaviorDeadLettersForTarget(ISSUES_KEY, target) > 0) {
+        clearBehaviorFailure(ISSUES_KEY, target)
+        settled = `${issue.repo}#${issue.number}`
+      }
       // A claim whose process died before launching gives way to the marker.
       if (hasExpiredPreLaunchClaim(ISSUES_KEY, target)) releaseSeen(ISSUES_KEY, target)
       if (hasSeen(ISSUES_KEY, target)) continue
@@ -2642,37 +3169,52 @@ async function tickReviewNewIssues(): Promise<void> {
     }
     if (settled) console.log(`[behaviors] review-new-issues: ${settled} was reviewed as a sub-issue of ${by}`)
   }
-  let failure: unknown
   for (const { issue, slot, target } of candidates) {
     if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return
     const covers = plan.launch.get(issueRef(`${issue.repo}#${issue.number}`))
     if (!covers) continue
-    if (listBehaviorLaunchClaims(ISSUES_KEY).length >= MAX_ISSUE_REVIEW_RUNS) break
+    if (runningIssueReviewCount() >= MAX_ISSUE_REVIEW_RUNS) break
+    const checkTarget = `${target}:check`
+    if (!behaviorRetryDue(ISSUES_KEY, checkTarget)) continue
     try {
-      await launchIssueReview(issue, slot, target, readLogs, covers)
+      if (await launchIssueReview(issue, slot, target, readLogs, covers)) {
+        clearBehaviorFailure(ISSUES_KEY, checkTarget)
+      }
     } catch (error) {
       if (behaviorAborted()) return
       console.error(`[behaviors] review-new-issues step failed for ${target}:`, error)
-      failure ??= error
+      if (error instanceof BehaviorLogFeedError) throw error
+      recordBehaviorFailure(ISSUES_KEY, 'operation', error, checkTarget)
     }
   }
-  if (failure) throw failure
 }
 
 async function reconcileIssueReviewClaims(): Promise<void> {
-  const claims = listBehaviorLaunchClaims(ISSUES_KEY)
+  const claims = listBehaviorLaunchClaims(ISSUES_KEY).filter((claim) => {
+    if (claim.launchQuarantine !== 'invalid_result') return true
+    retainClaimSafely(claim, claim.launchError || 'invalid agent result remains held')
+    return false
+  })
   const deadLetters = listBehaviorDeadLetters(500).filter(
-    (letter) => letter.behavior === ISSUES_KEY && letter.callId !== null,
+    (letter) => letter.behavior === ISSUES_KEY && letter.callId !== null
+      && !quarantineBlocksLogCorrection(letter.behavior, letter.target),
   )
-  if (claims.length === 0 && deadLetters.length === 0) return
+  const failedClaims = failedBehaviorLaunches(ISSUES_KEY).filter((claim) => claim.launchQuarantine !== 'invalid_result')
+  if (claims.length === 0 && deadLetters.length === 0 && failedClaims.length === 0) return
 
-  let logs: LogEntry[]
+  let snapshot: AgentLogSnapshot
   try {
-    logs = await fetchAgentLogs({ signal: behaviorSignal() })
+    snapshot = await readBehaviorLogSnapshot()
   } catch (error) {
     const message = `agent log reconciliation unavailable: ${error instanceof Error ? error.message : String(error)}`
-    for (const claim of claims) retainClaimSafely(claim, message)
+    for (const claim of claims) quarantineClaim(claim, 'unreadable', message)
+    for (const failed of failedClaims) quarantineFailedClaim(failed, 'unreadable', message)
     throw error
+  }
+  const logs = snapshot.entries
+  for (const failed of failedClaims) {
+    const call = logs.find((row) => row.id === failed.launchCallId)
+    if (!quarantineFailedLog(snapshot, failed, call)) restoreReadableFailedClaim(failed, call, snapshot)
   }
   const catalogForCalls: Catalog | null = await loadCatalog().catch(() => null)
   const commented = (call: LogEntry | undefined) => call?.status.toLowerCase() === 'completed'
@@ -2684,12 +3226,24 @@ async function reconcileIssueReviewClaims(): Promise<void> {
   // A dead letter whose exact call finished after all was a false alarm.
   let recoveredDeadLetter = false
   for (const letter of deadLetters) {
-    const call = logs.find((row) => row.id === letter.callId)
+    const call = logs.find((row) => row.status.toLowerCase() === 'completed'
+      && (row.id === letter.callId || (!!letter.correlationId && row.correlation_id === letter.correlationId)))
+      ?? logs.find((row) => row.id === letter.callId)
+    const failed = getFailedBehaviorLaunch(letter.behavior, letter.target)
+    if (failed?.launchCallId === letter.callId && failed.launchCorrelationId === letter.correlationId
+      && quarantineFailedLog(snapshot, failed, call)) continue
+    if (call?.status.toLowerCase() === 'completed' && failed?.launchCallId === letter.callId
+      && failed.launchCorrelationId === letter.correlationId
+      && !clearCompletedUnreadableHold(failed, call, snapshot)) continue
     if (commented(call)
+      && !logQuarantine(snapshot, { id: call!.id, correlationId: call!.correlation_id }, true)
       && call!.repo === letter.repo
       && String(call!.pr_id || '') === String(letter.pr)
       && call!.correlation_id === letter.correlationId) {
-      recoveredDeadLetter = retireBehaviorDeadLetter(letter.id) || recoveredDeadLetter
+      if (retireBehaviorDeadLetter(letter.id)) {
+        clearBehaviorFailure(ISSUES_KEY, letter.target)
+        recoveredDeadLetter = true
+      }
     }
   }
   if (recoveredDeadLetter && !listBehaviorDeadLetters(500).some((letter) => letter.behavior === ISSUES_KEY)) {
@@ -2718,6 +3272,34 @@ async function reconcileIssueReviewClaims(): Promise<void> {
     let call = claim.launchCallId
       ? candidates.find((row) => row.id.toLowerCase() === claim.launchCallId)
       : undefined
+    const observed = call ?? (candidates.length === 1 ? candidates[0] : undefined)
+    const quarantine = logQuarantine(snapshot, {
+      ...claimLogIdentity(claim), id: claim.launchCallId ?? observed?.id ?? null,
+    }, observed !== undefined)
+    const ambiguousCompletion = claim.launchQuarantine === 'unreadable'
+      ? logs.find((row) => row.status.toLowerCase() === 'completed'
+        && (row.correlation_id === claim.launchCorrelationId || row.id === claim.launchCallId)
+        && (!unambiguousAgentCall(snapshot, row)
+          || (!!claim.launchCallId && row.id !== claim.launchCallId)
+          || row.correlation_id !== claim.launchCorrelationId))
+      : undefined
+    if (ambiguousCompletion) {
+      quarantineClaim(claim, 'invalid_result',
+        'completed agent evidence conflicts with another record for the same launch',
+        claim.launchCallId ?? ambiguousCompletion.id, quarantineEvidence(snapshot, claim, ambiguousCompletion).mayRun)
+      continue
+    }
+    if (quarantine) {
+      const evidence = quarantineEvidence(snapshot, claim, observed)
+      quarantineClaim(claim, evidence.terminal ? 'invalid_result' : 'unreadable',
+        `agent log row quarantined: ${evidence.terminal?.error || quarantine.error}`,
+        claim.launchCallId ?? observed?.id ?? evidence.terminal?.id ?? null, evidence.mayRun)
+      continue
+    }
+    if (claim.launchQuarantine === 'unreadable' && !observed) {
+      retainClaimSafely(claim, claim.launchError || 'agent evidence remains unreadable')
+      continue
+    }
     if (!call) {
       if (claim.launchCallId) {
         if (Date.now() - requestedAtMs < BEHAVIOR_CLAIM_RENEWAL_MS) {
@@ -2743,13 +3325,14 @@ async function reconcileIssueReviewClaims(): Promise<void> {
           // again, once.
           recordBehaviorDeadLetter(claim, 'agent call did not register before the launch deadline')
           if (releaseOwnedClaim(ISSUES_KEY, claim.target, claim.claimId)) {
-            recordBehaviorFailure(ISSUES_KEY, 'worker', 'agent call did not register before the launch deadline')
+            recordBehaviorFailure(ISSUES_KEY, 'worker', 'agent call did not register before the launch deadline', claim.target)
           }
         }
         continue
       }
       call = candidates[0]
       if (!linkBehaviorLaunchCallOwned(claim.key, claim.target, claim.claimId, call.id)) continue
+      claim.launchCallId = call.id
     }
 
     const startedAtMs = Date.parse(agentCallStartedAt(call))
@@ -2761,15 +3344,33 @@ async function reconcileIssueReviewClaims(): Promise<void> {
       || call.correlation_id !== claim.launchCorrelationId
       || !Number.isFinite(startedAtMs)
       || startedAtMs < requestedAtMs) {
-      deadLetterClaim(claim, 'linked agent call does not match the persisted launch contract; retained to prevent duplicate launch')
+      quarantineClaim(claim, terminalAgentStatus(call.status) ? 'invalid_result' : 'unreadable',
+        'linked agent call does not match the persisted launch contract; retained to prevent duplicate launch', call.id,
+        quarantineEvidence(snapshot, claim, call).mayRun)
       continue
     }
 
     const status = call.status.toLowerCase()
+    if (status === 'invalid' || call.error_code === 'invalid_agent_result') {
+      quarantineClaim(claim, 'invalid_result', call.error || 'agent result is invalid', call.id,
+        quarantineEvidence(snapshot, claim, call).mayRun)
+      continue
+    }
+    if (claim.launchQuarantine === 'unreadable' && !unambiguousAgentCall(snapshot, call)) {
+      retainClaimSafely(claim, claim.launchError || 'agent evidence remains ambiguous')
+      continue
+    }
+    if (claim.launchQuarantine === 'unreadable' && status !== 'completed') {
+      const recognized = RUNNING_AGENT_STATUSES.has(status) || FAILED_AGENT_STATUSES.has(status) || status === 'superseded'
+      if (!recognized || !restoreReadableClaim(claim, call, snapshot)) {
+        retainClaimSafely(claim, claim.launchError || 'agent evidence remains unreadable')
+        continue
+      }
+    }
     if (status === 'completed') {
       if (!commented(call)) {
         const error = 'completed agent call is missing its commented outcome'
-        if (deadLetterClaim(claim, error)) recordBehaviorFailure(ISSUES_KEY, 'worker', error)
+        quarantineClaim(claim, 'invalid_result', error, call.id, quarantineEvidence(snapshot, claim, call).mayRun)
         continue
       }
       activeClaims.delete(claim.claimId)
@@ -2778,7 +3379,10 @@ async function reconcileIssueReviewClaims(): Promise<void> {
         target: claim.target,
         claimId: claim.claimId,
         completedAt: String(call.completed_at),
-      })) clearBehaviorFailure(ISSUES_KEY)
+      })) {
+        if (claim.launchQuarantine === 'unreadable') retireQuarantineIncident(claim)
+        clearBehaviorFailure(ISSUES_KEY, claim.target)
+      }
       continue
     }
     if (FAILED_AGENT_STATUSES.has(status)) {
@@ -2786,7 +3390,7 @@ async function reconcileIssueReviewClaims(): Promise<void> {
       if (deadLetterClaim(claim, message)) {
         const posted = call.receipts !== null && call.receipts !== undefined
         if (call.error_code !== 'stopped' && (posted || !HELD_ISSUE_REVIEW_ERRORS.has(call.error_code || ''))) {
-          recordBehaviorFailure(ISSUES_KEY, 'worker', message)
+          recordBehaviorFailure(ISSUES_KEY, 'worker', message, claim.target)
         }
         if (call.error_code !== 'stopped' && needsClaude(catalogForCalls, call.model)) claudeAuth.observeProcessFailure(message)
       }
@@ -2795,7 +3399,7 @@ async function reconcileIssueReviewClaims(): Promise<void> {
     if (RUNNING_AGENT_STATUSES.has(status)) {
       if (Date.now() - requestedAtMs >= BEHAVIOR_CLAIM_RENEWAL_MS) {
         const message = `behavior launch exceeded ${BEHAVIOR_CLAIM_RENEWAL_MS}ms running limit`
-        if (deadLetterClaim(claim, message)) recordBehaviorFailure(ISSUES_KEY, 'worker', message)
+        if (deadLetterClaim(claim, message)) recordBehaviorFailure(ISSUES_KEY, 'worker', message, claim.target)
         continue
       }
       setBehaviorLaunchErrorOwned(claim.key, claim.target, claim.claimId, null)
@@ -2803,7 +3407,7 @@ async function reconcileIssueReviewClaims(): Promise<void> {
       continue
     }
     const message = `unrecognized agent call status "${status || 'missing'}"`
-    if (deadLetterClaim(claim, message)) recordBehaviorFailure(ISSUES_KEY, 'worker', message)
+    if (deadLetterClaim(claim, message)) recordBehaviorFailure(ISSUES_KEY, 'worker', message, claim.target)
   }
 }
 
@@ -2923,8 +3527,8 @@ async function runBehaviorCycle(
   key: BehaviorKey,
   operation: () => Promise<boolean>,
 ): Promise<void> {
-  if (!behaviorRetryDue(key)) return
   const lifecycle = behaviorAbortController?.signal
+  if (readBehaviorFailure(key)?.kind === 'worker') clearBehaviorFailure(key)
   try {
     const recovered = await serializeBehaviorOperation(key, operation)
     if (recovered || readBehaviorFailure(key)?.kind === 'operation') {
@@ -2958,8 +3562,6 @@ export async function runEnabledBehaviorsOnce(
     operations.push(runBehaviorCycle('review-new-prs', async () => {
       return await withBehaviorProcessLock('review-new-prs', async () => {
         await reconcileBehaviorLaunchClaims('review-new-prs')
-        if (!behaviorRetryDue('review-new-prs')) return false
-        if (await reviewHeldByClaudeAuth('pr_review')) return false
         await tickReviewNewPrs()
         return listBehaviorLaunchClaims('review-new-prs').length === 0
       })
@@ -2970,7 +3572,6 @@ export async function runEnabledBehaviorsOnce(
     operations.push(runBehaviorCycle('approve-prs', async () => {
       return await withBehaviorProcessLock('approve-prs', async () => {
         await reconcileBehaviorLaunchClaims('approve-prs')
-        if (!behaviorRetryDue('approve-prs')) return false
         if (await reviewHeldByClaudeAuth('pr_approve')) return false
         await tickApprovePrs()
         return listBehaviorLaunchClaims('approve-prs').length === 0
@@ -2982,8 +3583,6 @@ export async function runEnabledBehaviorsOnce(
     operations.push(runBehaviorCycle('review-new-issues', async () => {
       return await withBehaviorProcessLock('review-new-issues', async () => {
         await reconcileIssueReviewClaims()
-        if (!behaviorRetryDue('review-new-issues')) return false
-        if (await reviewHeldByClaudeAuth('issue_review')) return false
         await tickReviewNewIssues()
         return listBehaviorLaunchClaims('review-new-issues').length === 0
       })
@@ -3039,6 +3638,7 @@ export interface BehaviorsRuntimeHealth {
   failures: Array<{
     org?: string
     behavior: BehaviorKey
+    target?: string
     kind: BehaviorFailureKind
     consecutiveFailures: number
     lastFailureAt: string
@@ -3068,15 +3668,18 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     .some(([, startedAt]) => now - startedAt > BEHAVIOR_OPERATION_TIMEOUT_MS + BEHAVIOR_HEALTH_GRACE_MS)
   const failures = BEHAVIOR_KEYS.flatMap((behavior) => {
     if (!isEnabled(behavior)) return []
-    const failure = readBehaviorFailure(behavior)
-    return failure ? [{
-      behavior,
-      kind: failure.kind,
-      consecutiveFailures: failure.consecutiveFailures,
-      lastFailureAt: new Date(failure.lastFailureAtMs).toISOString(),
-      nextRetryAt: new Date(failure.nextRetryAtMs).toISOString(),
-      ...(failure.error ? { error: failure.error } : {}),
-    }] : []
+    return [undefined, ...behaviorFailureTargets(behavior)].flatMap((target) => {
+      const failure = readBehaviorFailure(behavior, target)
+      return failure ? [{
+        behavior,
+        ...(target ? { target } : {}),
+        kind: failure.kind,
+        consecutiveFailures: failure.consecutiveFailures,
+        lastFailureAt: new Date(failure.lastFailureAtMs).toISOString(),
+        nextRetryAt: new Date(failure.nextRetryAtMs).toISOString(),
+        ...(failure.error ? { error: failure.error } : {}),
+      }] : []
+    })
   })
   const anyEnabled = BEHAVIOR_KEYS.some(isEnabled)
   let reviewer: string | null = null
@@ -3114,7 +3717,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     status: tickerStarted
       && !heartbeatStale
       && !operationStale
-      && failures.length === 0
+      && !failures.some((failure) => !failure.target)
       && (!anyEnabled || identityValid)
       && !datastoreUnavailable
       ? 'ok'
@@ -3259,4 +3862,10 @@ async function reviewHeldByClaudeAuth(place: ReviewPlace): Promise<boolean> {
     // An unavailable catalog is reported by the tick itself.
     return false
   }
+}
+
+function availableReviewSlots(panel: Awaited<ReturnType<typeof reviewPanel>>): ReviewerSlot[] {
+  return panel.reviewers.filter(({ model }) =>
+    !needsClaude(panel.catalog, model) || claudeAuth.snapshot().status === 'authenticated',
+  ).map(({ slot }) => slot)
 }
