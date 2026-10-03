@@ -11,6 +11,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { runFile } from './process'
+import { agentInterfaceRoot } from '../scripts/caller.mjs'
 
 export interface CatalogModel {
   identity: string
@@ -41,7 +42,7 @@ const CATALOG_PROBE_TIMEOUT_MS = 30_000
 const RETIRED_CLAUDE_PREFIXES = ['opus-', 'fable-', 'sonnet-', 'haiku-']
 
 export function agentInterfaceCwd(): string {
-  return process.env.AGENT_INTERFACE_ROOT || join(homedir(), 'dev', 'caller', 'agent_interface')
+  return agentInterfaceRoot()
 }
 
 let cached: { at: number, catalog: Catalog } | null = null
