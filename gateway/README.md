@@ -25,7 +25,7 @@ Everything comes from the environment and is validated at startup. Every problem
 | `POISE_WORKSPACE_PIDS` | | `4096` | Process limit per workspace |
 | `POISE_WORKSPACE_RUNTIME` | | | OCI runtime for workspaces, for example `runsc` |
 | `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` | | | `1` passes `POISE_SKIP_CLI_BOOTSTRAP=1` to new workspaces, so they install no provider CLIs; for end-to-end tests, which need no CLIs |
-| `POISE_DRAIN_TIMEOUT` | | `1800` | Seconds to wait for a workspace to go idle before it is recreated |
+| `POISE_DRAIN_TIMEOUT` | | `1800` | Seconds to wait for a workspace to go idle before it is recreated, at most `604800` (a week); passed to every workspace, and a workspace created with another value is recreated, drained, like one on an outdated image |
 | `POISE_GATEWAY_DATA` | | `/data` | Data directory |
 | `POISE_DOCKER_SOCKET` | | `/var/run/docker.sock` | Docker Engine socket |
 | `PORT` | | `8080` | Listening port |
@@ -77,7 +77,7 @@ One JSON object per line on standard output, with an `event` name. Every contain
 
 ## Container
 
-The gateway drives the Docker Engine through its mounted socket and joins each workspace network. The socket is root-equivalent on the host whatever user the process runs as, so the image does not switch to an unprivileged user. Build it with `docker build gateway/`.
+The gateway drives the Docker Engine through its mounted socket and joins each workspace network: all of them when it starts, before it answers, because a recreated container is on none of them, and any one it is not on before it calls that workspace. The socket is root-equivalent on the host whatever user the process runs as, so the image does not switch to an unprivileged user. Build it with `docker build gateway/`.
 
 ## Development
 
@@ -91,4 +91,4 @@ npm test
 npm run build
 ```
 
-The tests run in-process with no Docker: a fake GitHub, a fake Docker Engine API on a unix socket, and a real upstream that echoes HTTP and WebSocket traffic. The one exception is `tests/docker.integration.test.ts`. With `POISE_GATEWAY_DOCKER_TESTS=1` it creates, reaches and upgrades a workspace on the local Docker Engine, which CI does after building the image. Otherwise it is skipped.
+The tests run in-process with no Docker: a fake GitHub, a fake Docker Engine API on a unix socket, and a real upstream that echoes HTTP and WebSocket traffic. The one exception is `tests/docker.integration.test.ts`. With `POISE_GATEWAY_DOCKER_TESTS=1` it creates and reaches a workspace on the local Docker Engine, recreates the gateway's container, which must join the workspace's network again to drain it before an upgrade, and recreates the workspace for a new drain timeout. CI runs it after building the image; otherwise it is skipped.

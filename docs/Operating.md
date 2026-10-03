@@ -229,6 +229,15 @@ workspace is recreated without being started. Follow it in the gateway's log:
 docker logs --follow poise-gateway 2>&1 | grep workspace.
 ```
 
+When Compose recreates the gateway, the new container is on none of the
+workspace networks the old one had joined. The gateway joins them all as it
+starts, before it answers or upgrades anything, so it reaches each running
+workspace to drain it; `deploy/upgrade.sh` and `deploy/install.sh` check that
+it did, and stop with a message if not. If the gateway cannot join a
+workspace's network, that workspace's upgrade fails with the reason
+(`workspace.upgrade.failed`) and is tried again five minutes later, rather
+than recreating the workspace undrained.
+
 To roll back, check out the earlier commit and apply it without pulling;
 return to the branch the same way:
 
@@ -248,6 +257,13 @@ containers the gateway creates from then on. To apply them to an existing
 workspace, stop it on the admin page and remove its container with
 `docker rm poise-ws-<handle>`; its home volume stays, and its next visit
 creates it again.
+
+`POISE_DRAIN_TIMEOUT` is different: the gateway passes it to every workspace,
+which lets a drain the gateway stopped renewing lapse by the same value, so
+the two must agree. After you change it and run `deploy/install.sh`, the
+gateway recreates every workspace the way it does for a new image: a running
+one drained first, a stopped one without starting it. It may be at most
+604800 seconds, a week.
 
 ## Backups
 
@@ -363,7 +379,12 @@ a limit for every container, workspaces included, in
   If the workspace image is missing, run `deploy/install.sh`.
 - **A workspace still runs the old image after an upgrade.** The gateway
   waits up to `POISE_DRAIN_TIMEOUT` for a busy workspace. Look for
-  `workspace.drain` and `workspace.upgrade` events in its log.
+  `workspace.drain`, `workspace.upgrade` and `workspace.network` events in its
+  log.
+- **`install.sh` or `upgrade.sh` says the gateway is not on a workspace's
+  network.** The gateway joins every workspace's network as it starts, and
+  `docker logs poise-gateway 2>&1 | grep workspace.network` says why it could
+  not. Fix that, then run `docker compose restart gateway` from `deploy/`.
 - **The disk fills up.** Remove old images and build cache (see
   [Upgrades](#upgrades)); `docker system df` shows where the space goes.
 

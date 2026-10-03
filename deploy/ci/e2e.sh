@@ -2,7 +2,7 @@
 # The deployment bundle end to end, on a Linux host with Docker, as
 # .github/workflows/deploy-e2e.yml runs it:
 #
-#   deploy/ci/e2e.sh run    install, sign in, use a workspace and Poise Link, check TLS, back up and restore, upgrade, reinstall
+#   deploy/ci/e2e.sh run    install, sign in, use a workspace and Poise Link, check TLS, back up and restore, recreate the gateway, upgrade
 #   deploy/ci/e2e.sh logs   print what the stack and the workspaces logged
 #
 # It drives the real stack, deploy/compose.yaml, through deploy/install.sh,
@@ -424,13 +424,18 @@ check_upgrade() {
 }
 
 # A gateway container Compose recreates is on Compose's network alone; the
-# install script joins it to the workspace networks again, so alice's running
-# workspace answers at once rather than after a start.
+# gateway joins the workspace networks again itself as it starts, before it
+# answers, so alice's running workspace answers at once rather than after a
+# start, and the upgrade after this drains it through the new container.
 check_gateway_recreated() {
   compose up --detach --force-recreate gateway
-  "$deploy/install.sh" | tee "$work/reinstall.log"
-  grep --quiet --fixed-strings 'The gateway joined poise-net-alice again.' "$work/reinstall.log" \
-    || fail "install.sh did not join the recreated gateway to alice's network"
+  "$deploy/install.sh"
+  docker logs poise-gateway 2>&1 | awk '
+    /"event":"workspace.network.connected"/ && /"handle":"alice"/ { joined = NR }
+    /"event":"gateway.listening"/ { listening = NR }
+    END { exit !(joined && listening && joined < listening) }' \
+    || fail "the recreated gateway did not join alice's network before it answered"
+  pass "the recreated gateway joined alice's network before it answered"
   expect 200 "alice's workspace, right after the gateway was recreated" "$alice" "http://alice.$domain/" "${navigate[@]}"
 }
 
@@ -446,8 +451,8 @@ run() {
   check_chat_socket
   revoke_link
   backup_and_restore
-  check_upgrade
   check_gateway_recreated
+  check_upgrade
   echo "The deployment works end to end."
 }
 

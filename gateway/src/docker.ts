@@ -22,6 +22,8 @@ export interface ContainerDetails {
   Id: string
   /** The image ID the container was created from. */
   Image: string
+  /** Env is the image's environment with the container's own on top, as the container was created. */
+  Config: { Env: string[] | null }
   State: { Status: string; Running: boolean }
   NetworkSettings: { Networks: Record<string, unknown> }
 }
