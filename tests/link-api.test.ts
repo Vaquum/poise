@@ -59,6 +59,13 @@ afterAll(async () => {
   await rm(root, { recursive: true, force: true })
 })
 
+/** A Link API whose long polls only a change, an abort or closing can
+ *  answer: the hold outlasts every wait in these tests, even on a slow runner. */
+function holdingLongPolls(): void {
+  link.close()
+  link = new api.LinkApi({ service: null, longPollMs: 60_000, pingMs: 100, maxStreams: 2, maxWaiters: 1 })
+}
+
 async function currentVersion(): Promise<string> {
   const reply = await send(target, 'GET', '/api/link/snippets')
   expect(reply.status).toBe(200)
@@ -108,6 +115,7 @@ describe('GET /api/link/snippets', () => {
   })
 
   it('holds ?wait= until the version changes, and answers at once when it does', async () => {
+    holdingLongPolls()
     const version = await currentVersion()
     const started = Date.now()
     const held = start(target, `/api/link/snippets?wait=${version}`, { 'if-none-match': `"${version}"` })
@@ -117,7 +125,7 @@ describe('GET /api/link/snippets', () => {
     expect(reply.status).toBe(200)
     expect(reply.json.version).not.toBe(version)
     expect(reply.json.yaml).toContain('";new"')
-    expect(Date.now() - started).toBeLessThan(LONG_POLL_MS)
+    expect(Date.now() - started).toBeLessThan(10_000)
     expect(link.feed.waiting).toBe(0)
   })
 
@@ -142,9 +150,7 @@ describe('GET /api/link/snippets', () => {
   })
 
   it('lets go of a long poll whose client went away', async () => {
-    // A hold far longer than the wait below: only the abort can release it.
-    link.close()
-    link = new api.LinkApi({ service: null, longPollMs: 30_000, maxWaiters: 1, maxStreams: 2 })
+    holdingLongPolls()
     const version = await currentVersion()
     const held = start(target, `/api/link/snippets?wait=${version}`)
     held.done.catch(() => undefined)
@@ -155,6 +161,7 @@ describe('GET /api/link/snippets', () => {
   })
 
   it('refuses more long polls than it holds, and answers those it holds when it closes', async () => {
+    holdingLongPolls()
     const version = await currentVersion()
     const held = start(target, `/api/link/snippets?wait=${version}`)
     await vi.waitFor(() => expect(link.feed.waiting).toBe(1))
