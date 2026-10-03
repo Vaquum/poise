@@ -51,7 +51,7 @@ describe('sign-in alerts from Connected accounts', () => {
     expect(rows()).toEqual([{
       kind: 'sign_in_needed', key: 'sign-in:codex', resolved: null, url: '/?settings=accounts',
       title: 'Codex needs you to sign in',
-      body: 'Codex is not signed in, so work that runs it cannot start. Connect it in Settings → Connected accounts.',
+      body: 'Codex is not signed in, so work that runs it cannot start. Connect it in Settings → Accounts.',
     }])
     producers.accountsChecked([cli('codex', false)], nobody)
     expect(rows()).toHaveLength(1)
@@ -81,12 +81,12 @@ describe('sign-in alerts from Connected accounts', () => {
       {
         kind: 'sign_in_needed', key: 'sign-in:gh:you', resolved: null, url: '/?settings=accounts',
         title: 'Your GitHub account is not signed in to gh',
-        body: 'Poise reads GitHub as OctoCat, which gh does not hold signed in. Connect GitHub in Settings → Connected accounts and sign in as OctoCat.',
+        body: 'Poise reads GitHub as OctoCat, which gh does not hold signed in. Connect GitHub in Settings → Accounts and sign in as OctoCat.',
       },
       {
         kind: 'sign_in_needed', key: 'sign-in:gh:agent', resolved: null, url: '/?settings=accounts',
         title: 'The agent account is not signed in to gh',
-        body: 'Reviews and comments are posted as octo-agent, which gh does not hold signed in. Connect GitHub in Settings → Connected accounts and sign in as octo-agent.',
+        body: 'Reviews and comments are posted as octo-agent, which gh does not hold signed in. Connect GitHub in Settings → Accounts and sign in as octo-agent.',
       },
     ])
     // GitHub logins are case-insensitive.

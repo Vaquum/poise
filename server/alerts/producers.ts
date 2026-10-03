@@ -80,13 +80,13 @@ const GH_ROLES = [
     key: 'sign-in:gh:you',
     login: (identities: GitHubIdentities) => identities.me,
     title: 'Your GitHub account is not signed in to gh',
-    body: (login: string) => `Poise reads GitHub as ${login}, which gh does not hold signed in. Connect GitHub in Settings → Connected accounts and sign in as ${login}.`,
+    body: (login: string) => `Poise reads GitHub as ${login}, which gh does not hold signed in. Connect GitHub in Settings → Accounts and sign in as ${login}.`,
   },
   {
     key: 'sign-in:gh:agent',
     login: (identities: GitHubIdentities) => identities.agentAccount,
     title: 'The agent account is not signed in to gh',
-    body: (login: string) => `Reviews and comments are posted as ${login}, which gh does not hold signed in. Connect GitHub in Settings → Connected accounts and sign in as ${login}.`,
+    body: (login: string) => `Reviews and comments are posted as ${login}, which gh does not hold signed in. Connect GitHub in Settings → Accounts and sign in as ${login}.`,
   },
 ]
 
@@ -113,7 +113,7 @@ export function accountsChecked(accounts: readonly ConnectedAccount[], identitie
       kind: 'sign_in_needed',
       dedupeKey,
       title: `${name} needs you to sign in`,
-      body: `${name} is not signed in, so work that runs it cannot start. Connect it in Settings → Connected accounts.`,
+      body: `${name} is not signed in, so work that runs it cannot start. Connect it in Settings → Accounts.`,
       path: CONNECTED_ACCOUNTS_PATH,
     }))
   }
