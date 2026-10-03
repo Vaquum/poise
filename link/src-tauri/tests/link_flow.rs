@@ -97,12 +97,16 @@ impl Autostart for LoginItem {
     }
 }
 
-/// An environment with nothing in it: the tests never read the real one.
+/// An environment holding only a home folder (and Windows' APPDATA beneath
+/// it): the tests never read the real one.
 struct EmptyEnv(Option<PathBuf>);
 
 impl Environment for EmptyEnv {
-    fn var(&self, _name: &str) -> Option<OsString> {
-        None
+    fn var(&self, name: &str) -> Option<OsString> {
+        match (name, &self.0) {
+            ("APPDATA", Some(home)) => Some(home.join("AppData").join("Roaming").into()),
+            _ => None,
+        }
     }
     fn home_dir(&self) -> Option<PathBuf> {
         self.0.clone()
@@ -149,6 +153,32 @@ fn timing() -> Timing {
         idle_timeout: Duration::from_secs(10),
         snippet_interval: Duration::from_millis(300),
     }
+}
+
+/// A controller that finds itself already paired with `fake`, as after a
+/// restart. `espanso` is not on PATH and `home` has no Espanso folder.
+fn already_paired(
+    fake: &FakePoise,
+    config: &Path,
+    home: &Path,
+    timing: Timing,
+) -> (Arc<Controller>, Probes) {
+    SettingsStore::open(config)
+        .unwrap()
+        .update(|settings| {
+            settings.endpoint = Some(fake.url.to_string());
+            settings.login = Some(support::LOGIN.to_owned());
+        })
+        .unwrap();
+    let probes = Probes::default();
+    *probes.secret.lock().unwrap() = Some(support::TOKEN.to_owned());
+    let locator = Locator::new(
+        Os::current(),
+        Box::new(EmptyEnv(Some(home.into()))),
+        Box::new(NoEspanso),
+    );
+    let controller = Controller::new(platform(&probes, locator), config, timing).unwrap();
+    (controller, probes)
 }
 
 fn snippets_yaml(pairs: &[(&str, &str)]) -> String {
@@ -409,23 +439,8 @@ async fn pairs_then_syncs_snippets_and_delivers_alerts_until_revoked() {
 async fn a_saved_pairing_resumes_and_says_when_espanso_is_missing() {
     let fake = FakePoise::start(Config::default(), "v1", &snippets_yaml(&[(";a", "b")])).await;
     let config = tempfile::tempdir().unwrap();
-    SettingsStore::open(config.path())
-        .unwrap()
-        .update(|settings| {
-            settings.endpoint = Some(fake.url.to_string());
-            settings.login = Some(support::LOGIN.to_owned());
-        })
-        .unwrap();
-    let probes = Probes::default();
-    *probes.secret.lock().unwrap() = Some(support::TOKEN.to_owned());
-    // No espanso on PATH, and no Espanso folder in this (empty) home.
     let home = tempfile::tempdir().unwrap();
-    let locator = Locator::new(
-        Os::current(),
-        Box::new(EmptyEnv(Some(home.path().into()))),
-        Box::new(NoEspanso),
-    );
-    let controller = Controller::new(platform(&probes, locator), config.path(), timing()).unwrap();
+    let (controller, probes) = already_paired(&fake, config.path(), home.path(), timing());
 
     assert!(controller.start());
 
@@ -454,7 +469,6 @@ async fn a_saved_pairing_resumes_and_says_when_espanso_is_missing() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_token_never_follows_a_redirect() {
-    let config_dir = tempfile::tempdir().unwrap();
     let fake = FakePoise::start(
         Config {
             redirect_events: true,
@@ -464,20 +478,9 @@ async fn the_token_never_follows_a_redirect() {
         &snippets_yaml(&[]),
     )
     .await;
-    SettingsStore::open(config_dir.path())
-        .unwrap()
-        .update(|settings| settings.endpoint = Some(fake.url.to_string()))
-        .unwrap();
-    let probes = Probes::default();
-    *probes.secret.lock().unwrap() = Some(support::TOKEN.to_owned());
+    let config = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let locator = Locator::new(
-        Os::current(),
-        Box::new(EmptyEnv(Some(home.path().into()))),
-        Box::new(NoEspanso),
-    );
-    let controller =
-        Controller::new(platform(&probes, locator), config_dir.path(), timing()).unwrap();
+    let (controller, _probes) = already_paired(&fake, config.path(), home.path(), timing());
 
     assert!(controller.start());
 
