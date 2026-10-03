@@ -73,17 +73,17 @@ function isLoopbackPeer(req: IncomingMessage): boolean {
 
 /** The gateway's request: the workspace's public host, its exact origin when
  *  one is sent, and a valid identity assertion whose scope covers the path.
- *  The assertion header is removed once checked, so nothing downstream can
- *  echo, log or forward it. */
+ *  The assertion header is removed before anything can refuse the request,
+ *  so nothing downstream can echo, log or forward it. */
 function enforceGatewayRequest(req: IncomingMessage, service: ServiceConfig, api: boolean): RequestAuthority {
+  const token = header(req, IDENTITY_HEADER)
+  delete req.headers[IDENTITY_HEADER]
   if (urlFromHost(header(req, 'host'), service.publicProtocol)?.host !== service.publicHost) throw new HttpError(403, 'host is not allowed')
   if (api && header(req, 'sec-fetch-site').toLowerCase() === 'cross-site') {
     throw new HttpError(403, 'cross-site API requests are not allowed')
   }
   const origin = header(req, 'origin')
   if (origin && origin !== service.publicOrigin) throw new HttpError(403, 'request origin is not allowed')
-  const token = header(req, IDENTITY_HEADER)
-  delete req.headers[IDENTITY_HEADER]
   if (!token) throw new HttpError(401, 'an identity assertion from the gateway is required')
   const result = verifyIdentityAssertion(token, { key: service.gatewayKey, handle: service.handle, owner: service.owner }, Date.now() / 1000)
   if (!result.ok) throw new HttpError(401, result.reason)

@@ -110,12 +110,21 @@ describe('service mode: the gateway\'s requests', () => {
     }
   })
 
-  it('removes the assertion header even when it is refused', () => {
-    const req = request({ host: 'elsewhere.example', identity: browser() })
-    expect(refusal(() => enforceApiRequest(req, policy))).toMatchObject({ status: 403 })
-    const expired = request({ identity: browser({ iat: 1, exp: 61 }) })
-    expect(refusal(() => enforceApiRequest(expired, policy))).toMatchObject({ status: 401 })
-    expect(expired.headers['x-poise-identity']).toBeUndefined()
+  it('removes the assertion header before any check can refuse the request', () => {
+    const refusals: Array<[string, () => IncomingMessage, (req: IncomingMessage) => unknown, number]> = [
+      ['wrong Host', () => request({ host: 'elsewhere.example', identity: browser() }), (req) => enforceApiRequest(req, policy), 403],
+      ['wrong Host on a document', () => request({ url: '/', host: 'elsewhere.example', identity: browser() }), (req) => enforceDocumentRequest(req, policy), 403],
+      ['wrong Origin', () => request({ origin: 'https://attacker.example', identity: browser() }), (req) => enforceApiRequest(req, policy), 403],
+      ['wrong Origin on a document', () => request({ url: '/', origin: 'https://attacker.example', identity: browser() }), (req) => enforceDocumentRequest(req, policy), 403],
+      ['cross-site API call', () => request({ fetchSite: 'cross-site', identity: browser() }), (req) => enforceApiRequest(req, policy), 403],
+      ['expired assertion', () => request({ identity: browser({ iat: 1, exp: 61 }) }), (req) => enforceApiRequest(req, policy), 401],
+      ['scope that does not reach the route', () => request({ url: '/api/settings', identity: signAssertion(gateway.privateKey, { scope: 'link' }) }), (req) => enforceApiRequest(req, policy), 403],
+    ]
+    for (const [name, make, check, status] of refusals) {
+      const req = make()
+      expect(refusal(() => check(req)), name).toMatchObject({ status })
+      expect(req.headers['x-poise-identity'], name).toBeUndefined()
+    }
   })
 })
 
