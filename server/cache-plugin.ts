@@ -23,6 +23,7 @@ import { ChatSocketServer, handleChatApi } from './chat/transport'
 import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
 import { SelfUpdateService, createSelfUpdateBridge, drainAllowsPath, handleSelfUpdateApi, isSelfUpdateControlRoute, resolveSelfUpdateRoot, unconfiguredSelfUpdateBridge, type SelfUpdateBridge } from './self-update'
+import { readServiceConfig, type ServiceConfig } from './service/config'
 import type { Server } from 'node:http'
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -47,6 +48,8 @@ export interface CachePluginOptions {
    *  POISE_SELF_UPDATE_ROOT / the production default root. `null`: never
    *  configured (tests). */
   selfUpdateBridge?: SelfUpdateBridge | null
+  /** Service mode. Omitted: read from the environment; `null`: off. */
+  service?: ServiceConfig | null
 }
 
 // Chat v1: one runtime per server process. Sessions are keyed by instance
@@ -55,6 +58,10 @@ export interface CachePluginOptions {
 let chatRuntime: ChatRuntime | null = null
 let chatSockets: ChatSocketServer | null = null
 let selfUpdate: SelfUpdateService | null = null
+
+function serviceOf(opts: CachePluginOptions): ServiceConfig | null {
+  return opts.service === undefined ? readServiceConfig() : opts.service
+}
 
 export function getChatRuntime(): ChatRuntime {
   if (!chatRuntime) throw new Error('the chat runtime is not started')
@@ -82,6 +89,7 @@ export interface ClaudeAuthRuntime {
 const activeClaudeAuthRuntimes = new Set<ClaudeAuthRuntime>()
 
 export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
+  const service = serviceOf(opts)
   const auth = opts.claudeAuth ?? claudeAuth
   activeClaudeAuthRuntimes.add(auth)
   auth.start()
@@ -104,7 +112,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       selfUpdate: bridge,
     })
     chatRuntime.on('log', (line: string) => console.log(line))
-    chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts })
+    chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
     selfUpdate = new SelfUpdateService(chatRuntime, bridge)
     void chatRuntime.recover().catch((error: unknown) => {
       console.error('[chat] startup reconciliation failed:', error)
@@ -125,7 +133,8 @@ export async function stopPoiseRuntime(): Promise<void> {
 }
 
 export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.NextHandleFunction {
-      startPoiseRuntime(opts)
+      const service = serviceOf(opts)
+      startPoiseRuntime({ ...opts, service })
       const auth = opts.claudeAuth ?? claudeAuth
       return async (req, res, next) => {
         const url = req.url || ''
@@ -151,7 +160,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         setApiHeaders(res)
         const selectedOrg = new URLSearchParams(url.split('?')[1] || '').get('org') || undefined
         try {
-          enforceApiRequest(req, { allowedHosts: opts.allowedHosts })
+          enforceApiRequest(req, { allowedHosts: opts.allowedHosts, service })
         } catch (err) {
           return json(res, httpStatus(err, 403), { error: (err as Error).message })
         }
