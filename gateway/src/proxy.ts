@@ -25,6 +25,24 @@ export class UpstreamResponseError extends Error {
   }
 }
 
+/**
+ * The largest request body relayed to a workspace. Poise's largest accepted body is an editor document's
+ * 30 MiB envelope; anything bigger is refused before it costs the shared gateway more.
+ */
+export const MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
+
+/** A declined WebSocket upgrade is a short refusal; a workspace sending more is not relayed. */
+export const MAX_DECLINED_UPGRADE_BYTES = 64 * 1024
+
+/** The client sent a body larger than the gateway relays. */
+export class RequestTooLargeError extends Error {
+  readonly code = 'E_REQUEST_TOO_LARGE'
+  constructor(readonly limit: number) {
+    super(`the request body is larger than ${limit} bytes`)
+    this.name = 'RequestTooLargeError'
+  }
+}
+
 /** A status Node can send on: an owner-controlled workspace may answer with anything, e.g. `HTTP/1.1 099`. */
 function relayableStatus(status: number | undefined): number {
   if (status === undefined || !Number.isInteger(status) || status < 100 || status > 599) {
@@ -113,11 +131,15 @@ export function proxyRequest(
   headers: OutgoingHttpHeaders,
   agent: http.Agent,
   onError: (error: NodeJS.ErrnoException) => void,
+  maxBodyBytes = MAX_REQUEST_BODY_BYTES,
 ): void {
   let clientGone = false
+  // The first failure decides the answer: destroying the upstream to stop a body raises errors of its own.
+  let failed = false
   const upstream = http.request({ host: target.host, port: target.port, method: req.method, path: req.url, headers, agent })
   const fail = (error: NodeJS.ErrnoException) => {
-    if (clientGone) return
+    if (clientGone || failed) return
+    failed = true
     if (res.headersSent) {
       res.destroy()
       return
@@ -145,6 +167,15 @@ export function proxyRequest(
     if (res.writableFinished) return
     clientGone = true
     upstream.destroy()
+  })
+  // Node already holds a Content-Length body to its declared size; a chunked body is counted as it streams.
+  let received = 0
+  req.on('data', (chunk: Buffer) => {
+    received += chunk.length
+    if (failed || received <= maxBodyBytes) return
+    req.unpipe(upstream)
+    upstream.destroy()
+    fail(new RequestTooLargeError(maxBodyBytes))
   })
   req.pipe(upstream)
 }
@@ -190,6 +221,13 @@ export function proxyUpgrade(
     clientGone = true
     upstream.destroy()
   }
+  // Destroying the upstream after a refusal raises errors of its own; only the first failure is reported.
+  let reported = false
+  const report = (error: NodeJS.ErrnoException) => {
+    if (clientGone || reported) return
+    reported = true
+    onError(error)
+  }
   socket.once('close', abandon)
   upstream.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
     try {
@@ -217,11 +255,21 @@ export function proxyUpgrade(
     } catch (error) {
       upstreamRes.destroy()
       upstream.destroy()
-      if (!clientGone) onError(error as NodeJS.ErrnoException)
+      report(error as NodeJS.ErrnoException)
       return
     }
     const chunks: Buffer[] = []
-    upstreamRes.on('data', (chunk: Buffer) => chunks.push(chunk))
+    let size = 0
+    upstreamRes.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > MAX_DECLINED_UPGRADE_BYTES) {
+        upstreamRes.destroy()
+        upstream.destroy()
+        report(new UpstreamResponseError(`the workspace declined the upgrade with more than ${MAX_DECLINED_UPGRADE_BYTES} bytes`))
+        return
+      }
+      chunks.push(chunk)
+    })
     upstreamRes.on('error', () => socket.destroy())
     upstreamRes.on('end', () => {
       const body = Buffer.concat(chunks)
@@ -230,8 +278,6 @@ export function proxyUpgrade(
       socket.end(Buffer.concat([Buffer.from(responseHead(status, raw)), body]))
     })
   })
-  upstream.on('error', (error) => {
-    if (!clientGone) onError(error)
-  })
+  upstream.on('error', report)
   upstream.end()
 }

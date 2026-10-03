@@ -28,6 +28,8 @@ export interface WorkspaceStub {
   /** The status /api/service/health and /api/service/drain answer with. */
   healthStatus: number
   health: StubHealth
+  /** Bytes of filler added to every health and drain answer, as a hostile workspace could. */
+  healthPadding: number
   requests: SeenRequest[]
   serviceRequests: SeenRequest[]
   /** Every request line the stub parsed, including any a client smuggled past the gateway. */
@@ -51,6 +53,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
     reachable: true,
     healthStatus: 200,
     health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, draining: false },
+    healthPadding: 0,
     requests: [],
     serviceRequests: [],
     requestLines: [],
@@ -60,6 +63,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
     version: 'test',
     ...stub.health,
     idle: stub.health.activeChatTurns === 0 && stub.health.runningCallerCalls === 0 && stub.health.backgroundWork === 0,
+    ...(stub.healthPadding > 0 ? { padding: 'x'.repeat(stub.healthPadding) } : {}),
   })
 
   const server = http.createServer((req, res) => {
@@ -117,6 +121,14 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
   server.on('upgrade', (req, socket, head) => {
     stub.requestLines.push(`${req.method} ${req.url}`)
     if (req.url === '/ws/status/099') return rawAnswer(socket, 'HTTP/1.1 099 Odd\r\n\r\n')
+    if (req.url === '/ws/declined-large') {
+      // A refusal with a megabyte of body: the gateway must not hold it all to relay it.
+      const body = 'x'.repeat(1024 * 1024)
+      // The gateway hangs up partway through, as it should; the write then fails with EPIPE.
+      socket.on('error', () => socket.destroy())
+      socket.write(`HTTP/1.1 403 Forbidden\r\ncontent-length: ${body.length}\r\n\r\n${body}`)
+      return
+    }
     if (req.url === '/ws/declined') {
       return rawAnswer(socket, 'HTTP/1.1 403 Forbidden\r\nset-cookie: poise_gw=planted; Domain=poise.test\r\ncontent-length: 4\r\n\r\nnope')
     }

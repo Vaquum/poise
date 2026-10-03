@@ -101,11 +101,22 @@ function parseHealth(text: string, what: string): ServiceHealth {
   }
 }
 
+/** A health or drain answer is a few hundred bytes; a workspace sending more is not read further. */
+export const MAX_SERVICE_ANSWER_BYTES = 64 * 1024
+
 function request(target: Upstream, method: string, path: string, headers: http.OutgoingHttpHeaders): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: target.host, port: target.port, method, path, headers, agent: false }, (res) => {
       const chunks: Buffer[] = []
-      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      let size = 0
+      res.on('data', (chunk: Buffer) => {
+        size += chunk.length
+        if (size > MAX_SERVICE_ANSWER_BYTES) {
+          req.destroy(new WorkspaceAnswerError(`the workspace answered ${method} ${path} with more than ${MAX_SERVICE_ANSWER_BYTES} bytes`))
+          return
+        }
+        chunks.push(chunk)
+      })
       res.on('error', reject)
       res.on('end', () => resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') }))
     })
