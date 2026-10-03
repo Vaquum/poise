@@ -387,7 +387,7 @@ function sentinelNeedsFetch(): boolean {
 // the legacy envelope; we only pluck what the table needs.
 interface GhRecord {
   kind: 'pr' | 'issue'
-  repo: string                      // "Vaquum/foo"
+  repo: string                      // "acme/foo"
   number: number
   state: 'open' | 'closed' | 'merged'
   title: string
