@@ -38,6 +38,7 @@ export interface ContainerSpec {
     Memory: number
     NanoCpus: number
     PidsLimit: number
+    RestartPolicy: { Name: 'unless-stopped' }
     Runtime?: string
     Mounts: Array<{ Type: 'volume'; Source: string; Target: string }>
     NetworkMode: string

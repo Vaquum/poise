@@ -54,13 +54,15 @@ export interface Harness {
   port: number
   advance(ms: number): void
   request(options: RequestOptions): Promise<Reply>
-  signIn(login: string, next?: string): Promise<{ reply: Reply; apexCookie: string }>
-  openWorkspace(login: string): Promise<{ apexCookie: string; workspaceCookie: string }>
+  /** Signs in through the fake GitHub; the cookies come back as `name=value`, or '' when not set. */
+  signIn(login: string, next?: string): Promise<{ reply: Reply; apexCookie: string; bindCookie: string }>
+  openWorkspace(login: string): Promise<{ apexCookie: string; workspaceCookie: string; bindCookie: string }>
   close(): Promise<void>
 }
 
 export interface HarnessOptions {
   env?: Record<string, string | undefined>
+  drainRenewMs?: number
 }
 
 export function workspaceHost(handle: string): string {
@@ -167,7 +169,9 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   const keys = loadOrCreateKeys(dataDir, log)
   const upstream = (): Upstream => ({ host: '127.0.0.1', port: workspace.reachable ? workspace.port : unreachablePort })
   const dockerClient = new DockerClient(config.dockerSocket)
-  const orchestrator = new Orchestrator({ config, docker: dockerClient, store, keys, log, now, upstream, drainPollMs: 10 })
+  const orchestrator = new Orchestrator({
+    config, docker: dockerClient, store, keys, log, now, upstream, drainPollMs: 10, drainRenewMs: options.drainRenewMs,
+  })
   const gateway: Gateway = createGateway({
     config, store, keys, github: new GitHubClient(config), docker: dockerClient, orchestrator, log, now, upstream,
   })
@@ -188,18 +192,26 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       path: `${callback.pathname}${callback.search}`,
       headers: { cookie: start.cookie('poise_oauth') },
     })
-    return { reply, apexCookie: reply.setCookie('poise_gw') ? reply.cookie('poise_gw') : '' }
+    return {
+      reply,
+      apexCookie: reply.setCookie('poise_gw') ? reply.cookie('poise_gw') : '',
+      bindCookie: reply.setCookie('poise_bind') ? reply.cookie('poise_bind') : '',
+    }
   }
 
   const openWorkspace = async (login: string) => {
     const handle = login.toLowerCase()
-    const { reply, apexCookie } = await signIn(login, `https://${workspaceHost(handle)}/`)
+    const { reply, apexCookie, bindCookie } = await signIn(login, `https://${workspaceHost(handle)}/`)
     expect(reply.status).toBe(302)
     const ticketUrl = new URL(reply.headers.location ?? '')
     expect(ticketUrl.host).toBe(workspaceHost(handle))
-    const session = await request({ host: workspaceHost(handle), path: `${ticketUrl.pathname}${ticketUrl.search}` })
+    const session = await request({
+      host: workspaceHost(handle),
+      path: `${ticketUrl.pathname}${ticketUrl.search}`,
+      headers: { cookie: bindCookie },
+    })
     expect(session.status).toBe(302)
-    return { apexCookie, workspaceCookie: session.cookie('poise_ws') }
+    return { apexCookie, workspaceCookie: session.cookie('poise_ws'), bindCookie }
   }
 
   return {

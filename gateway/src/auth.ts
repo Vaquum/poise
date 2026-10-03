@@ -1,7 +1,7 @@
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http'
 import { RESERVED_HANDLES } from './config.js'
 import {
-  APEX_COOKIE, APEX_SESSION_TTL_MS, OAUTH_COOKIE, OAUTH_STATE_TTL_MS, TICKET_TTL_MS,
+  APEX_COOKIE, APEX_SESSION_TTL_MS, BIND_COOKIE, OAUTH_COOKIE, OAUTH_STATE_TTL_MS, TICKET_TTL_MS,
   type Context, type Principal,
 } from './context.js'
 import { cookieValues } from './cookies.js'
@@ -10,8 +10,11 @@ import { classifyHost } from './hosts.js'
 import { HttpError, readForm, redirect, safeEqual, sendHtml } from './http.js'
 import { errorMessage } from './log.js'
 import { homePage, messagePage, signInPage, signOutPage } from './pages.js'
+import { newSecret } from './store.js'
 
 export type ReturnTo = { kind: 'apex'; path: string } | { kind: 'workspace'; handle: string; path: string }
+
+const BINDING = /^[A-Za-z0-9_-]{43}$/
 
 type Access =
   | { allowed: true; via: 'admin' | 'allow list' | 'organisation'; org: string | null }
@@ -40,6 +43,11 @@ export function parseReturnTo(ctx: Context, value: string): ReturnTo | null {
   if (host.kind === 'apex') return { kind: 'apex', path }
   if (host.kind === 'workspace') return { kind: 'workspace', handle: host.handle, path }
   return null
+}
+
+/** The well-formed poise_bind values this browser sent. */
+export function heldBindings(req: IncomingMessage): string[] {
+  return cookieValues(req.headers.cookie, BIND_COOKIE).filter((value) => BINDING.test(value))
 }
 
 /** The signed-in principal for a page, or null after answering with a redirect to sign-in. */
@@ -80,7 +88,7 @@ export function login(ctx: Context, req: IncomingMessage, res: ServerResponse, u
   }
   const principal = ctx.apexPrincipal(req)
   if (principal) {
-    continueTo(ctx, res, principal, returnTo)
+    continueTo(ctx, res, principal, returnTo, [], heldBindings(req)[0] ?? null)
     return
   }
   const state = ctx.deps.store.createOAuthState(next, OAUTH_STATE_TTL_MS)
@@ -90,14 +98,28 @@ export function login(ctx: Context, req: IncomingMessage, res: ServerResponse, u
   })
 }
 
-/** Sends a signed-in person on: to an apex path, or into their own workspace through a single-use ticket. */
-function continueTo(ctx: Context, res: ServerResponse, principal: Principal, returnTo: ReturnTo | null, headers: OutgoingHttpHeaders = {}): void {
+function setCookies(cookies: string[]): OutgoingHttpHeaders {
+  return cookies.length > 0 ? { 'set-cookie': cookies } : {}
+}
+
+/**
+ * Sends a signed-in person on: to an apex path, or into their own workspace through a single-use
+ * ticket that only this browser can redeem, because it is bound to the browser's poise_bind value.
+ */
+function continueTo(
+  ctx: Context,
+  res: ServerResponse,
+  principal: Principal,
+  returnTo: ReturnTo | null,
+  cookies: string[],
+  binding: string | null,
+): void {
   if (returnTo === null) {
-    redirect(res, '/', 302, headers)
+    redirect(res, '/', 302, setCookies(cookies))
     return
   }
   if (returnTo.kind === 'apex') {
-    redirect(res, returnTo.path, 302, headers)
+    redirect(res, returnTo.path, 302, setCookies(cookies))
     return
   }
   if (returnTo.handle !== principal.user.handle) {
@@ -106,14 +128,19 @@ function continueTo(ctx: Context, res: ServerResponse, principal: Principal, ret
       'Not your workspace',
       `${returnTo.handle}.${ctx.deps.config.domain} belongs to someone else. You are signed in as ${principal.user.login}.`,
       { href: '/', label: 'Go to your own workspace' },
-    ), { ...ctx.pageHeaders, ...headers })
+    ), { ...ctx.pageHeaders, ...setCookies(cookies) })
     return
   }
-  const ticket = ctx.deps.store.createTicket(principal.session, returnTo.handle, TICKET_TTL_MS)
+  let bind = binding
+  if (bind === null) {
+    bind = newSecret()
+    cookies.push(ctx.bindCookie(bind))
+  }
+  const ticket = ctx.deps.store.createTicket(principal.session, returnTo.handle, bind, TICKET_TTL_MS)
   const target = new URL('/_poise/session', ctx.workspaceOrigin(returnTo.handle))
   target.searchParams.set('ticket', ticket)
   target.searchParams.set('next', returnTo.path)
-  redirect(res, target.href, 302, headers)
+  redirect(res, target.href, 302, setCookies(cookies))
 }
 
 async function decideAccess(ctx: Context, login: string, membership: (org: string) => Promise<OrgMembership>): Promise<Access> {
@@ -125,6 +152,9 @@ async function decideAccess(ctx: Context, login: string, membership: (org: strin
       reason: 'reserved handle',
       message: `The GitHub login ${login} cannot sign in here: ${handle}.${config.domain} is one of this Poise's own addresses.`,
     }
+  }
+  if (store.getUser(handle)?.disabledAt) {
+    return { allowed: false, reason: 'disabled', message: `${login} has been disabled by an admin of this Poise.` }
   }
   if (config.admins.includes(handle)) return { allowed: true, via: 'admin', org: null }
   if (store.isOnAllowList(handle)) return { allowed: true, via: 'allow list', org: null }
@@ -214,9 +244,13 @@ export async function callback(ctx: Context, req: IncomingMessage, res: ServerRe
   const { id, session } = store.createApexSession(handle, APEX_SESSION_TTL_MS)
   log.info('auth.signed_in', { login: identity.login, via: access.via })
   const returnTo = pending.returnTo === null ? null : parseReturnTo(ctx, pending.returnTo)
-  continueTo(ctx, res, { session, user, isAdmin: ctx.isAdmin(handle) }, returnTo, {
-    'set-cookie': [clearState, ctx.cookie(APEX_COOKIE, id, APEX_SESSION_TTL_MS / 1000)],
-  })
+  // Each sign-in starts a fresh binding for this browser.
+  const binding = newSecret()
+  continueTo(ctx, res, { session, user, isAdmin: ctx.isAdmin(handle) }, returnTo, [
+    clearState,
+    ctx.cookie(APEX_COOKIE, id, APEX_SESSION_TTL_MS / 1000),
+    ctx.bindCookie(binding),
+  ], binding)
 }
 
 export function logoutPage(ctx: Context, req: IncomingMessage, res: ServerResponse): void {
@@ -231,7 +265,7 @@ export function logoutPage(ctx: Context, req: IncomingMessage, res: ServerRespon
 export async function logout(ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const form = await readForm(req)
   const principal = ctx.apexPrincipal(req)
-  const clear = ctx.cookie(APEX_COOKIE, '', 0)
+  const clear = [ctx.cookie(APEX_COOKIE, '', 0), ctx.bindCookie('', 0)]
   if (!principal) {
     redirect(res, '/', 303, { 'set-cookie': clear })
     return

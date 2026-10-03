@@ -3,13 +3,32 @@ import { pagePrincipal, postPrincipal } from './auth.js'
 import type { Context } from './context.js'
 import { header, HttpError, readBody, readForm, redirect, sendHtml, sendJson } from './http.js'
 import { devicesPage, linkPage } from './pages.js'
-import { normalizeUserCode } from './store.js'
+import { deviceState, normalizeUserCode } from './store.js'
 
 export const DEVICE_CODE_TTL_SECONDS = 15 * 60
 export const DEVICE_POLL_INTERVAL_SECONDS = 5
 // RFC 8628 section 3.5: every slow_down adds five seconds to the polling interval.
 const SLOW_DOWN_STEP_SECONDS = 5
 const LABEL_MAX_LENGTH = 200
+// User codes are short enough to guess, so each signed-in session may try only a few.
+const CODE_ATTEMPTS_PER_WINDOW = 10
+const CODE_ATTEMPT_WINDOW_MS = 15 * 60_000
+
+/** Counts a code submission; returns the seconds to wait when the session has used up its attempts. */
+function codeAttemptWait(ctx: Context, sessionHash: string): number {
+  const now = ctx.deps.now()
+  for (const [key, times] of ctx.codeAttempts) {
+    if (times.every((time) => now - time >= CODE_ATTEMPT_WINDOW_MS)) ctx.codeAttempts.delete(key)
+  }
+  const recent = (ctx.codeAttempts.get(sessionHash) ?? []).filter((time) => now - time < CODE_ATTEMPT_WINDOW_MS)
+  if (recent.length >= CODE_ATTEMPTS_PER_WINDOW) {
+    ctx.codeAttempts.set(sessionHash, recent)
+    return Math.ceil((recent[0] + CODE_ATTEMPT_WINDOW_MS - now) / 1000)
+  }
+  recent.push(now)
+  ctx.codeAttempts.set(sessionHash, recent)
+  return 0
+}
 
 /** POST /link/device/code: starts an RFC 8628 device authorization. */
 export async function deviceCode(ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -64,8 +83,18 @@ export async function decide(ctx: Context, req: IncomingMessage, res: ServerResp
   ctx.verifyForm(req, form, principal.session, ctx.apexOrigin)
   const decision = form.get('decision')
   if (decision !== 'approve' && decision !== 'deny') throw new HttpError(400, 'Choose Approve or Deny.')
-  const userCode = normalizeUserCode(form.get('user_code') ?? '')
   const csrf = principal.session.csrf
+  const wait = codeAttemptWait(ctx, principal.session.idHash)
+  if (wait > 0) {
+    ctx.deps.log.warn('device.code.rate_limited', { login: principal.user.login })
+    const minutes = Math.ceil(wait / 60)
+    sendHtml(res, 429, linkPage(csrf, {
+      text: `Too many codes were tried. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+      error: true,
+    }), { ...ctx.pageHeaders, 'retry-after': String(wait) })
+    return
+  }
+  const userCode = normalizeUserCode(form.get('user_code') ?? '')
   if (!userCode || !ctx.deps.store.decideDeviceCode(userCode, principal.user.handle, decision === 'approve')) {
     sendHtml(res, 400, linkPage(csrf, {
       text: 'That code is not valid or has expired. Start pairing again in Poise Link.',
@@ -86,7 +115,8 @@ export async function decide(ctx: Context, req: IncomingMessage, res: ServerResp
 export function devices(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL): void {
   const principal = pagePrincipal(ctx, req, res, url)
   if (!principal) return
-  sendHtml(res, 200, devicesPage(ctx.deps.store.listDevices(principal.user.handle), principal.session.csrf), ctx.pageHeaders)
+  const devices = ctx.deps.store.listDevices(principal.user.handle)
+  sendHtml(res, 200, devicesPage(devices.map((device) => ({ ...device, state: deviceState(device, ctx.deps.now()) })), principal.session.csrf), ctx.pageHeaders)
 }
 
 export async function revoke(ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void> {

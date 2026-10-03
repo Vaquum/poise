@@ -190,6 +190,49 @@ describe('device pairing', () => {
     expect(h.store.listDevices('alice')[0].revokedAt).toBeNull()
   })
 
+  it('expires a device after 30 days unused and a year after pairing, so Poise Link pairs again', async () => {
+    const day = 24 * 60 * 60_000
+    const token = await pair(h, alice.apexCookie)
+    const hello = () => h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })
+    for (let month = 0; month < 12; month += 1) {
+      h.advance(29 * day)
+      expect((await hello()).status, `after ${(month + 1) * 29} days`).toBe(200)
+    }
+    // Still in use, but 365 days old.
+    h.advance(17 * day)
+    const old = await hello()
+    expect(old.status).toBe(401)
+    expect(old.json()).toMatchObject({ error: 'invalid_token' })
+
+    // A year on, alice signs in again to pair a second device, then leaves it unused.
+    const { apexCookie } = await h.signIn('Alice')
+    const idle = await pair(h, apexCookie)
+    h.advance(30 * day)
+    expect((await h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: `Bearer ${idle}` } })).status).toBe(401)
+    const list = await h.request({ host: APEX, path: '/link/devices', headers: { cookie: (await h.signIn('Alice')).apexCookie } })
+    expect(list.body.match(/Expired; pair it again/g)).toHaveLength(2)
+  })
+
+  it('lets a session try only ten codes in fifteen minutes', async () => {
+    const page = await h.request({ host: APEX, path: '/link', headers: { cookie: alice.apexCookie } })
+    const attempt = (userCode: string) => h.request({
+      host: APEX, method: 'POST', path: '/link',
+      headers: { cookie: alice.apexCookie, origin: `https://${APEX}`, 'content-type': FORM },
+      body: new URLSearchParams({ csrf: csrfOf(page), user_code: userCode, decision: 'approve' }).toString(),
+    })
+    const code = await requestCode(h)
+    for (let guess = 0; guess < 10; guess += 1) expect((await attempt('BCDF-GHJK')).status).toBe(400)
+    const limited = await attempt(code.user_code)
+    expect(limited.status).toBe(429)
+    expect(Number(limited.headers['retry-after'])).toBeGreaterThan(890)
+    expect((await poll(h, code.device_code)).json()).toEqual({ error: 'authorization_pending' })
+    expect(h.logs.filter((entry) => entry.event === 'device.code.rate_limited')).toHaveLength(1)
+
+    h.advance(15 * 60_000)
+    const fresh = await requestCode(h)
+    expect((await attempt(fresh.user_code)).status).toBe(200)
+  })
+
   it('stores only hashes of device codes and tokens', async () => {
     const code = await requestCode(h)
     await decide(h, alice.apexCookie, code.user_code, 'approve')

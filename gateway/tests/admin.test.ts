@@ -137,6 +137,66 @@ describe('admin', () => {
     ])
   })
 
+  it('disables anyone at once, organisation members included, and enables them again', async () => {
+    await h.close()
+    h = await startHarness({ env: { POISE_ALLOWED_ORGS: 'acme' } })
+    root = (await h.signIn('root')).apexCookie
+    csrf = csrfOf(await h.request({ host: APEX, path: '/admin', headers: { cookie: root } }))
+    const carol = await h.openWorkspace('carol')
+    const workspace = workspaceHost('carol')
+    expect((await h.request({ host: workspace, path: '/api/state', headers: { cookie: carol.workspaceCookie } })).status).toBe(200)
+    // carol came in through her organisation, so the allow list cannot remove her.
+    expect((await post('/admin/allow/remove', { csrf, login: 'carol' })).status).toBe(404)
+    h.docker.addContainer({
+      name: 'poise-ws-carol', imageId: CURRENT_IMAGE_ID, imageRef: 'poise-runtime:latest', running: true,
+      labels: { 'poise.managed': 'true', 'poise.workspace': 'carol' }, networks: new Set(['poise-net-carol']), spec: {},
+    })
+    const deviceToken = h.store.createDeviceCode(null, 60_000, 5)
+    h.store.decideDeviceCode(deviceToken.userCode, 'carol', true)
+    const issued = h.store.pollDeviceCode(deviceToken.deviceCode, 5)
+    const token = issued.issued ? issued.token : ''
+
+    expect((await post('/admin/users/disable', { csrf, handle: 'carol' })).status).toBe(303)
+    expect(h.store.getUser('carol')).toMatchObject({ disabledBy: 'root' })
+    expect((await h.request({ host: workspace, path: '/api/state', headers: { cookie: carol.workspaceCookie } })).status).toBe(401)
+    expect((await h.request({ host: APEX, path: '/', headers: { cookie: carol.apexCookie } })).body).toContain('Sign in with GitHub')
+    expect((await h.request({ host: workspace, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })).status).toBe(401)
+    expect(h.docker.containers.get('poise-ws-carol')?.running).toBe(false)
+    expect(h.logs.find((entry) => entry.event === 'workspace.container.stopped')).toMatchObject({ handle: 'carol', reason: 'disabled' })
+    const page = await h.request({ host: APEX, path: '/admin', headers: { cookie: root } })
+    expect(page.body).toMatch(/<strong>carol<\/strong>[\s\S]*disabled by root/)
+
+    // Signing in again is refused, even though she is still an organisation member.
+    const refused = await h.signIn('carol')
+    expect(refused.reply.status).toBe(403)
+    expect(refused.reply.body).toContain('carol has been disabled by an admin')
+    expect((await post('/admin/workspaces/start', { csrf, handle: 'carol' })).status).toBe(409)
+
+    expect((await post('/admin/users/enable', { csrf, handle: 'carol' })).status).toBe(303)
+    expect(h.store.getUser('carol')?.disabledAt).toBeNull()
+    expect((await h.signIn('carol')).reply.status).toBe(302)
+    // Her old device stays revoked: Poise Link pairs again.
+    expect((await h.request({ host: workspace, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })).status).toBe(401)
+    expect(events(h.logs, 'admin.user')).toEqual(['admin.user.disabled', 'admin.user.enabled'])
+  })
+
+  it('checks the disabled flag on every request, not only when disabling', async () => {
+    await h.openWorkspace('alice')
+    h.store.disableUser('alice', 'root')
+    // Credentials minted after the disable (none can be, short of a bug) are refused by the flag itself.
+    const { id, session } = h.store.createApexSession('alice', 60_000)
+    const { id: workspaceId } = h.store.createWorkspaceSession(session, 'alice')
+    expect((await h.request({ host: APEX, path: '/', headers: { cookie: `poise_gw=${id}` } })).body).toContain('Sign in with GitHub')
+    expect((await h.request({ host: workspaceHost('alice'), path: '/api/state', headers: { cookie: `poise_ws=${workspaceId}` } })).status).toBe(403)
+    expect(h.workspace.requests).toHaveLength(0)
+  })
+
+  it('does not let an admin disable themselves', async () => {
+    const reply = await post('/admin/users/disable', { csrf, handle: 'root' })
+    expect(reply.status).toBe(409)
+    expect(h.store.getUser('root')?.disabledAt).toBeNull()
+  })
+
   it('reports a failed action with the Docker Engine\'s reason', async () => {
     await h.openWorkspace('alice')
     const stop = await post('/admin/workspaces/stop', { csrf, handle: 'alice' }, { accept: 'text/html' })

@@ -29,6 +29,8 @@ const APEX_ROUTES: Record<string, Record<string, Handler>> = {
   '/admin/workspaces/start': { POST: admin.workspaceAction('start') },
   '/admin/workspaces/stop': { POST: admin.workspaceAction('stop') },
   '/admin/workspaces/restart': { POST: admin.workspaceAction('restart') },
+  '/admin/users/disable': { POST: admin.setDisabled(true) },
+  '/admin/users/enable': { POST: admin.setDisabled(false) },
 }
 
 export interface Gateway {
@@ -71,6 +73,11 @@ function fail(ctx: Context, req: IncomingMessage, res: ServerResponse, error: un
   else answer(ctx, req, res, 500, 'Something went wrong. The gateway log has the details.')
 }
 
+/** The address Caddy uses inside the deployment; no public host ever matches it. */
+function isInternalAddress(ctx: Context, req: IncomingMessage): boolean {
+  return (req.headers.host ?? '').toLowerCase() === `gateway:${ctx.deps.config.port}`
+}
+
 /** Caddy's on-demand TLS check: certificates only for the apex and the hosts of known people. */
 function tlsAsk(ctx: Context, res: ServerResponse, url: URL): void {
   const host = classifyHost(url.searchParams.get('domain') ?? '', ctx.deps.config.domain)
@@ -95,8 +102,7 @@ async function handle(ctx: Context, req: IncomingMessage, res: ServerResponse): 
   if (host.kind === 'workspace') {
     const owner = ctx.deps.store.getUser(host.handle)
     if (owner) return workspaceRequest(ctx, req, res, url, owner)
-  } else if (url.pathname === '/_gateway/tls-ask' && req.method === 'GET') {
-    // Caddy asks over the internal network under its own Host header; public hosts never answer this.
+  } else if (isInternalAddress(ctx, req) && url.pathname === '/_gateway/tls-ask' && req.method === 'GET') {
     return tlsAsk(ctx, res, url)
   }
   answer(ctx, req, res, 404, 'There is nothing at this address.')
@@ -115,7 +121,15 @@ async function upgrade(ctx: Context, req: IncomingMessage, socket: Duplex, head:
 export function createGateway(deps: GatewayDeps): Gateway {
   const ctx = new Context(deps)
   const server = http.createServer((req, res) => {
-    handle(ctx, req, res).catch((error: unknown) => fail(ctx, req, res, error))
+    handle(ctx, req, res).catch((error: unknown) => {
+      try {
+        fail(ctx, req, res, error)
+      } catch (failure) {
+        // Answering failed too: a rejection escaping here would stop the gateway for everyone.
+        deps.log.error('request.failure.unanswered', { error: errorMessage(failure) })
+        res.destroy()
+      }
+    })
   })
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     // A browser dropping its connection mid-handshake is routine, not a gateway failure.

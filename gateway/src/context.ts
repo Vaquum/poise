@@ -12,7 +12,10 @@ import type { Session, Store, User } from './store.js'
 
 export const APEX_COOKIE = 'poise_gw'
 export const WORKSPACE_COOKIE = 'poise_ws'
+export const BIND_COOKIE = 'poise_bind'
 export const OAUTH_COOKIE = 'poise_oauth'
+/** The gateway's own cookies. None of them is ever forwarded to a workspace. */
+export const GATEWAY_COOKIES: ReadonlySet<string> = new Set([APEX_COOKIE, WORKSPACE_COOKIE, BIND_COOKIE, OAUTH_COOKIE])
 export const APEX_SESSION_TTL_MS = 14 * 24 * 60 * 60_000
 export const TICKET_TTL_MS = 60_000
 export const OAUTH_STATE_TTL_MS = 10 * 60_000
@@ -41,6 +44,8 @@ export class Context {
   readonly apexOrigin: string
   readonly pageHeaders: Record<string, string>
   readonly agent = new http.Agent({ keepAlive: true })
+  /** Recent user-code submissions per apex session, for the /link rate limit. */
+  readonly codeAttempts = new Map<string, number[]>()
 
   constructor(readonly deps: GatewayDeps) {
     this.scheme = deps.config.insecureHttp ? 'http' : 'https'
@@ -62,9 +67,14 @@ export class Context {
     return this.deps.config.admins.includes(handle)
   }
 
-  /** Checked on every request, so a login removed from the allow list loses access at once. */
+  /**
+   * Checked on every request, so disabling a person or removing them from the allow list cuts them off at
+   * once. Organisation membership can only be read with the person's own GitHub token, so it is verified
+   * at each sign-in; an admin cuts an organisation member off at once by disabling them.
+   */
   isAllowed(user: User): boolean {
     const { config, store } = this.deps
+    if (user.disabledAt !== null) return false
     return config.admins.includes(user.handle)
       || store.isOnAllowList(user.handle)
       || (user.accessOrg !== null && config.allowedOrgs.includes(user.accessOrg))
@@ -90,6 +100,15 @@ export class Context {
 
   cookie(name: string, value: string, maxAgeSeconds: number, path = '/'): string {
     return serializeCookie(name, value, { maxAgeSeconds, secure: !this.deps.config.insecureHttp, path })
+  }
+
+  /** poise_bind is shared with every workspace host, so a ticket can be checked against the browser it was minted for. */
+  bindCookie(value: string, maxAgeSeconds = APEX_SESSION_TTL_MS / 1000): string {
+    return serializeCookie(BIND_COOKIE, value, {
+      maxAgeSeconds,
+      secure: !this.deps.config.insecureHttp,
+      domain: this.deps.config.domain,
+    })
   }
 
   /** Every state-changing form carries the session's CSRF token and comes from the expected origin. */

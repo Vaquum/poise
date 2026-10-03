@@ -5,9 +5,19 @@ import type { Context, Principal } from './context.js'
 import { HttpError, readForm, redirect, sendHtml } from './http.js'
 import { errorMessage } from './log.js'
 import { adminPage, type AdminWorkspaceView } from './pages.js'
-import type { WorkspaceRecord } from './store.js'
+import type { User, WorkspaceRecord } from './store.js'
 
 export type WorkspaceAction = 'start' | 'stop' | 'restart'
+
+/** How a person gets in today, as the admin page shows it. */
+function accessOf(ctx: Context, user: User): string {
+  const { config, store } = ctx.deps
+  if (user.disabledAt !== null) return `disabled by ${user.disabledBy ?? 'an admin'}`
+  if (ctx.isAdmin(user.handle)) return 'admin'
+  if (store.isOnAllowList(user.handle)) return 'allow list'
+  if (user.accessOrg !== null && config.allowedOrgs.includes(user.accessOrg)) return `member of ${user.accessOrg}`
+  return 'no access'
+}
 
 export async function overview(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const principal = pagePrincipal(ctx, req, res, url)
@@ -32,9 +42,11 @@ export async function overview(ctx: Context, req: IncomingMessage, res: ServerRe
   }
   const users = store.listUsers()
   const records = new Map<string, WorkspaceRecord>()
+  const access = new Map<string, string>()
   for (const user of users) {
     const record = store.getWorkspace(user.handle)
     if (record) records.set(user.handle, record)
+    access.set(user.handle, accessOf(ctx, user))
   }
   sendHtml(res, 200, adminPage({
     csrf: principal.session.csrf,
@@ -44,6 +56,7 @@ export async function overview(ctx: Context, req: IncomingMessage, res: ServerRe
     allowedOrgs: config.allowedOrgs,
     workspaces,
     records,
+    access,
     dockerError,
   }), ctx.pageHeaders)
 }
@@ -87,6 +100,9 @@ export function workspaceAction(action: WorkspaceAction) {
     const handle = form.get('handle') ?? ''
     const user = store.getUser(handle)
     if (!user) throw new HttpError(404, `Nobody with the handle "${handle}" has signed in.`)
+    if (user.disabledAt !== null && action !== 'stop') {
+      throw new HttpError(409, `${user.login} is disabled. Enable them before starting their workspace.`)
+    }
     log.info('admin.workspace.action', { action, handle, by: principal.user.login })
     try {
       if (action === 'start') await orchestrator.ensureStarted(handle, user.login)
@@ -95,6 +111,36 @@ export function workspaceAction(action: WorkspaceAction) {
     } catch (error) {
       log.error('admin.workspace.action.failed', { action, handle, error: errorMessage(error) })
       throw new HttpError(502, `Could not ${action} the workspace of ${user.login}: ${errorMessage(error)}`)
+    }
+    redirect(res, '/admin', 303)
+  }
+}
+
+/**
+ * Disabling cuts a person off at once, whichever way they got in: sessions end, paired devices are
+ * revoked, sign-in is refused and their workspace stops. Enabling lets them sign in and pair again.
+ */
+export function setDisabled(disable: boolean) {
+  return async (ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const { principal, form } = await adminForm(ctx, req)
+    const { log, orchestrator, store } = ctx.deps
+    const handle = form.get('handle') ?? ''
+    const user = store.getUser(handle)
+    if (!user) throw new HttpError(404, `Nobody with the handle "${handle}" has signed in.`)
+    if (!disable) {
+      if (store.enableUser(handle)) log.info('admin.user.enabled', { login: user.login, by: principal.user.login })
+      redirect(res, '/admin', 303)
+      return
+    }
+    if (handle === principal.user.handle) throw new HttpError(409, 'You cannot disable yourself.')
+    if (store.disableUser(handle, principal.user.login)) {
+      log.info('admin.user.disabled', { login: user.login, by: principal.user.login })
+    }
+    try {
+      await orchestrator.stopForDisabled(handle)
+    } catch (error) {
+      log.error('admin.user.disable.stop.failed', { handle, error: errorMessage(error) })
+      throw new HttpError(502, `${user.login} is disabled, but their workspace could not be stopped: ${errorMessage(error)}`)
     }
     redirect(res, '/admin', 303)
   }

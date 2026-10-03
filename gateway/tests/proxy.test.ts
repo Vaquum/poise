@@ -1,5 +1,8 @@
 import http from 'node:http'
+import net from 'node:net'
+import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import WebSocket from 'ws'
 import { events, startHarness, verifyAssertion, workspaceHost, type Harness } from './harness.js'
 
 const ALICE = workspaceHost('alice')
@@ -32,6 +35,39 @@ function collect(stream: http.IncomingMessage): Collected {
   }
 }
 
+/** Sends raw bytes and collects everything the gateway answers until it closes the connection. */
+function rawExchange(port: number, text: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let answer = ''
+    const socket = net.connect(port, '127.0.0.1', () => socket.write(text))
+    socket.on('data', (chunk: Buffer) => {
+      answer += chunk.toString('latin1')
+    })
+    socket.on('close', () => resolve(answer))
+    socket.on('error', reject)
+    socket.setTimeout(3000, () => socket.destroy())
+  })
+}
+
+function chunked(body: string): string {
+  return `${Buffer.byteLength(body).toString(16)}\r\n${body}\r\n0\r\n\r\n`
+}
+
+function upgradeAnswer(h: Harness, path: string, cookie: string): Promise<{ status: number; setCookie: string[] | undefined }> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${h.port}${path}`, { headers: { host: ALICE, cookie } })
+    socket.on('upgrade', (res) => {
+      resolve({ status: 101, setCookie: res.headers['set-cookie'] })
+      socket.close()
+    })
+    socket.on('unexpected-response', (_req, res) => {
+      resolve({ status: res.statusCode ?? 0, setCookie: res.headers['set-cookie'] })
+      res.resume()
+    })
+    socket.on('error', reject)
+  })
+}
+
 describe('proxy', () => {
   let h: Harness
   let cookie: string
@@ -48,7 +84,7 @@ describe('proxy', () => {
       host: ALICE,
       path: '/api/echo',
       headers: {
-        cookie: `a=1; ${cookie}; b=2`,
+        cookie: `a=1; ${cookie}; poise_bind=b; poise_gw=g; poise_oauth=o; b=2`,
         origin: `https://${ALICE}`,
         'X-Poise-Identity': 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJyb290Iiwic2NvcGUiOiJhZG1pbiJ9.',
         'x-forwarded-proto': 'http',
@@ -78,12 +114,62 @@ describe('proxy', () => {
     expect(verifyAssertion(headers['x-poise-identity'], h.keys.publicKeyBase64)).toMatchObject({ sub: 'Alice', scope: 'browser', aud: 'workspace:alice' })
   })
 
-  it('passes status, body and repeated response headers through unchanged', async () => {
+  it('passes status, body and headers through, but never a cookie the workspace tries to set', async () => {
     const reply = await h.request({ host: ALICE, path: '/created', headers: { cookie } })
     expect(reply.status).toBe(201)
     expect(reply.body).toBe('created')
     expect(reply.headers['x-workspace']).toBe('yes')
-    expect(reply.headers['set-cookie']).toEqual(['a=1; Path=/', 'b=2; Path=/'])
+    // The workspace tried poise_gw for the whole domain with a longer Path, to swap a visitor's apex identity.
+    expect(reply.headers['set-cookie']).toBeUndefined()
+  })
+
+  it('answers 502 for a status Node cannot relay, and keeps serving everyone', async () => {
+    for (const path of ['/status/099', '/status/999']) {
+      const reply = await h.request({ host: ALICE, path, headers: { cookie } })
+      expect(reply.status, path).toBe(502)
+      expect(reply.json()).toMatchObject({ error: 'bad_gateway' })
+    }
+    expect(h.logs.filter((entry) => entry.event === 'proxy.failed').map((entry) => entry.error)).toEqual([
+      'the workspace answered with status 99',
+      'the workspace answered with status 999',
+    ])
+    expect((await h.request({ host: ALICE, path: '/api/state', headers: { cookie } })).status).toBe(200)
+  })
+
+  it('keeps cookies and odd statuses out of WebSocket answers too', async () => {
+    expect(await upgradeAnswer(h, '/ws/chat', cookie)).toEqual({ status: 101, setCookie: undefined })
+    expect(await upgradeAnswer(h, '/ws/declined', cookie)).toEqual({ status: 403, setCookie: undefined })
+    expect(await upgradeAnswer(h, '/ws/status/099', cookie)).toEqual({ status: 502, setCookie: undefined })
+    expect((await h.request({ host: ALICE, path: '/api/state', headers: { cookie } })).status).toBe(200)
+  })
+
+  it('refuses a body on a bodiless method instead of smuggling it to the workspace', async () => {
+    await h.request({ host: ALICE, path: '/api/state', headers: { cookie } })
+    const smuggled = `GET /smuggled HTTP/1.1\r\nHost: ${ALICE}\r\nX-Poise-Identity: forged\r\n\r\n`
+    const attempts = [
+      `GET /api/echo HTTP/1.1\r\nHost: ${ALICE}\r\nCookie: ${cookie}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n${chunked(smuggled)}`,
+      `GET /api/echo HTTP/1.1\r\nHost: ${ALICE}\r\nCookie: ${cookie}\r\nContent-Length: ${smuggled.length}\r\nConnection: close\r\n\r\n${smuggled}`,
+      ...['HEAD', 'OPTIONS', 'DELETE', 'TRACE'].map((method) =>
+        `${method} /api/echo HTTP/1.1\r\nHost: ${ALICE}\r\nCookie: ${cookie}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n${chunked(smuggled)}`),
+      `POST /api/echo HTTP/1.1\r\nHost: ${ALICE}\r\nCookie: ${cookie}\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n${chunked(smuggled)}`,
+    ]
+    for (const attempt of attempts) {
+      expect((await rawExchange(h.port, attempt)).split('\r\n')[0], attempt.split('\r\n')[0]).toBe('HTTP/1.1 400 Bad Request')
+    }
+    await delay(50)
+    expect(h.workspace.requestLines).not.toContain('GET /smuggled')
+    expect(h.workspace.requests.map((request) => request.url)).toEqual(['/api/state'])
+  })
+
+  it('forwards a chunked body with explicit framing, so it stays one request', async () => {
+    const inner = `GET /smuggled HTTP/1.1\r\nHost: ${ALICE}\r\n\r\n`
+    const answer = await rawExchange(h.port,
+      `POST /api/echo HTTP/1.1\r\nHost: ${ALICE}\r\nCookie: ${cookie}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n${chunked(inner)}`)
+    expect(answer.split('\r\n')[0]).toBe('HTTP/1.1 200 OK')
+    await delay(50)
+    expect(h.workspace.requests.at(-1)).toMatchObject({ method: 'POST', url: '/api/echo', body: inner })
+    expect(h.workspace.requests.at(-1)?.headers['transfer-encoding']).toBe('chunked')
+    expect(h.workspace.requestLines).not.toContain('GET /smuggled')
   })
 
   it('streams request and response bodies in both directions without buffering', async () => {

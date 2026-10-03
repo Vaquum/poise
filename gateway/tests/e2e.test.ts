@@ -18,15 +18,17 @@ describe('end to end', () => {
     const visit = await h.request({ host: alice, path: '/projects?tab=open', headers: { 'sec-fetch-mode': 'navigate' } })
     expect(visit.status).toBe(404) // nobody has signed in as alice yet, so the host is unknown
 
-    const { reply: callback, apexCookie } = await h.signIn('Alice', `https://${alice}/projects?tab=open`)
+    const { reply: callback, apexCookie, bindCookie } = await h.signIn('Alice', `https://${alice}/projects?tab=open`)
     expect(callback.status).toBe(302)
     expect(apexCookie).toMatch(/^poise_gw=/)
+    expect(bindCookie).toMatch(/^poise_bind=/)
     const ticketUrl = new URL(callback.headers.location ?? '')
     expect(ticketUrl.origin).toBe(`https://${alice}`)
     expect(ticketUrl.pathname).toBe('/_poise/session')
     expect(ticketUrl.searchParams.get('next')).toBe('/projects?tab=open')
 
-    const session = await h.request({ host: alice, path: `${ticketUrl.pathname}${ticketUrl.search}` })
+    // The browser holds poise_bind for the whole domain, so the workspace host sees it too.
+    const session = await h.request({ host: alice, path: `${ticketUrl.pathname}${ticketUrl.search}`, headers: { cookie: bindCookie } })
     expect(session.status).toBe(302)
     expect(session.headers.location).toBe('/projects?tab=open')
     const workspaceCookie = session.cookie('poise_ws')
@@ -41,7 +43,7 @@ describe('end to end', () => {
       method: 'POST',
       path: '/api/echo?x=1',
       headers: {
-        cookie: `theme=dark; ${workspaceCookie}`,
+        cookie: `theme=dark; ${workspaceCookie}; ${bindCookie}`,
         origin: `https://${alice}`,
         'content-type': 'application/json',
         'x-poise-identity': 'forged',

@@ -12,6 +12,8 @@ export const UPGRADE_INTERVAL_MS = 5 * 60_000
 
 const SERVICE_TIMEOUT_MS = 5_000
 const DRAIN_POLL_MS = 5_000
+// A workspace lets a drain lapse unless it is renewed within five minutes; renew well inside that.
+const DRAIN_RENEW_MS = 60_000
 
 export interface Upstream {
   host: string
@@ -33,6 +35,9 @@ export interface ServiceHealth {
   ok: boolean
   activeChatTurns: number
   runningCallerCalls: number
+  backgroundWork: number
+  /** True only when activeChatTurns, runningCallerCalls and backgroundWork are all 0. */
+  idle: boolean
   draining: boolean
 }
 
@@ -55,10 +60,7 @@ export interface OrchestratorDeps {
   now: () => number
   upstream: UpstreamResolver
   drainPollMs?: number
-}
-
-function isIdle(health: ServiceHealth): boolean {
-  return health.activeChatTurns === 0 && health.runningCallerCalls === 0
+  drainRenewMs?: number
 }
 
 function parseHealth(text: string, what: string): ServiceHealth {
@@ -73,14 +75,20 @@ function parseHealth(text: string, what: string): ServiceHealth {
     typeof value.ok !== 'boolean'
     || typeof value.activeChatTurns !== 'number'
     || typeof value.runningCallerCalls !== 'number'
+    || typeof value.backgroundWork !== 'number'
+    || typeof value.idle !== 'boolean'
     || typeof value.draining !== 'boolean'
   ) {
-    throw new WorkspaceAnswerError(`the workspace answered ${what} without ok, activeChatTurns, runningCallerCalls and draining`)
+    throw new WorkspaceAnswerError(
+      `the workspace answered ${what} without ok, activeChatTurns, runningCallerCalls, backgroundWork, idle and draining`,
+    )
   }
   return {
     ok: value.ok,
     activeChatTurns: value.activeChatTurns,
     runningCallerCalls: value.runningCallerCalls,
+    backgroundWork: value.backgroundWork,
+    idle: value.idle,
     draining: value.draining,
   }
 }
@@ -105,10 +113,12 @@ export class Orchestrator {
   private readonly starts = new Map<string, Promise<void>>()
   private readonly locks = new Map<string, Promise<void>>()
   private readonly drainPollMs: number
+  private readonly drainRenewMs: number
   private upgrading = false
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.drainPollMs = deps.drainPollMs ?? DRAIN_POLL_MS
+    this.drainRenewMs = deps.drainRenewMs ?? DRAIN_RENEW_MS
   }
 
   containerSpec(handle: string, login: string): ContainerSpec {
@@ -136,6 +146,7 @@ export class Orchestrator {
         Memory: config.workspaceMemoryBytes,
         NanoCpus: config.workspaceNanoCpus,
         PidsLimit: config.workspacePids,
+        RestartPolicy: { Name: 'unless-stopped' },
         ...(config.workspaceRuntime ? { Runtime: config.workspaceRuntime } : {}),
         Mounts: [{ Type: 'volume', Source: volume, Target: '/home/poise' }],
         NetworkMode: network,
@@ -193,6 +204,17 @@ export class Orchestrator {
       this.ready.delete(handle)
       await this.deps.docker.stopContainer(container)
       this.lifecycle('workspace.container.stopped', handle, { reason: 'admin' })
+    })
+  }
+
+  /** Stops the workspace of a disabled person, if it is running. */
+  async stopForDisabled(handle: string): Promise<void> {
+    await this.withLock(handle, async () => {
+      const { container } = workspaceNames(handle)
+      this.ready.delete(handle)
+      if (!(await this.deps.docker.inspectContainer(container))?.State.Running) return
+      await this.deps.docker.stopContainer(container)
+      this.lifecycle('workspace.container.stopped', handle, { reason: 'disabled' })
     })
   }
 
@@ -298,29 +320,39 @@ export class Orchestrator {
     }
   }
 
-  /** Asks the workspace to stop admitting work, then waits for it to go idle or for POISE_DRAIN_TIMEOUT. */
+  /**
+   * Asks the workspace to stop admitting work, then waits until it reports idle or POISE_DRAIN_TIMEOUT
+   * passes. The workspace lets a drain lapse unless it is renewed, so it is re-requested while waiting.
+   */
   private async drain(handle: string, login: string): Promise<void> {
     const { config, log, now } = this.deps
     const deadline = now() + config.drainTimeoutSeconds * 1000
+    let requestedAt = now()
     try {
-      const counters = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
+      const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
       this.lifecycle('workspace.drain.requested', handle, {
-        activeChatTurns: counters.activeChatTurns,
-        runningCallerCalls: counters.runningCallerCalls,
+        activeChatTurns: health.activeChatTurns,
+        runningCallerCalls: health.runningCallerCalls,
+        backgroundWork: health.backgroundWork,
       })
-      if (isIdle(counters)) return
+      if (health.idle) return
     } catch (error) {
       log.error('workspace.drain.request.failed', { handle, error: errorMessage(error) })
     }
     while (now() < deadline) {
       await delay(this.drainPollMs)
+      const renew = now() - requestedAt >= this.drainRenewMs
       try {
-        if (isIdle(await this.serviceCall(handle, login, 'GET', '/api/service/health'))) {
+        const health = renew
+          ? await this.serviceCall(handle, login, 'POST', '/api/service/drain')
+          : await this.serviceCall(handle, login, 'GET', '/api/service/health')
+        if (renew) requestedAt = now()
+        if (health.idle) {
           this.lifecycle('workspace.drain.idle', handle)
           return
         }
       } catch (error) {
-        log.warn('workspace.drain.health.failed', { handle, error: errorMessage(error) })
+        log.warn(renew ? 'workspace.drain.renew.failed' : 'workspace.drain.health.failed', { handle, error: errorMessage(error) })
       }
     }
     log.warn('workspace.drain.timeout', { handle, timeoutSeconds: config.drainTimeoutSeconds })

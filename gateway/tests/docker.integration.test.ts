@@ -17,7 +17,7 @@ const enabled = process.env.POISE_GATEWAY_DOCKER_TESTS === '1'
 
 const HEALTH_SERVER = `require('node:http').createServer((req, res) => {
   res.setHeader('content-type', 'application/json')
-  res.end(JSON.stringify({ ok: true, mode: 'service', version: 'ci', activeChatTurns: 0, runningCallerCalls: 0, draining: false }))
+  res.end(JSON.stringify({ ok: true, mode: 'service', version: 'ci', activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, idle: true, draining: false }))
 }).listen(5555)`
 
 function docker(...args: string[]): string {
@@ -117,6 +117,7 @@ describe.skipIf(!enabled)('workspaces on a real Docker Engine', () => {
       Memory: 512 * 1024 ** 2,
       NanoCpus: 1_000_000_000,
       PidsLimit: 256,
+      RestartPolicy: expect.objectContaining({ Name: 'unless-stopped' }),
       NetworkMode: 'poise-net-ci',
     })
     expect(workspace.HostConfig.PortBindings ?? {}).toEqual({})
@@ -136,6 +137,7 @@ describe.skipIf(!enabled)('workspaces on a real Docker Engine', () => {
     const upgraded = inspect('poise-ws-ci')
     expect(upgraded.Image).toBe(inspect('poise-runtime-ci:second').Id)
     expect(upgraded.State.Running).toBe(true)
+    expect(upgraded.HostConfig.RestartPolicy).toMatchObject({ Name: 'unless-stopped' })
     expect(upgraded.Mounts).toEqual([expect.objectContaining({ Type: 'volume', Name: 'poise-home-ci', Destination: '/home/poise' })])
     expect(logs.map((entry) => entry.event)).toEqual(expect.arrayContaining([
       'workspace.drain.requested',

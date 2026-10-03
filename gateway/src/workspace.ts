@@ -1,11 +1,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
-import { isSafePath } from './auth.js'
-import { WORKSPACE_COOKIE, type Context } from './context.js'
-import { header, HttpError, isNavigation, readForm, redirect, sendHtml, sendJson } from './http.js'
+import { heldBindings, isSafePath } from './auth.js'
+import { GATEWAY_COOKIES, WORKSPACE_COOKIE, type Context } from './context.js'
+import { header, HttpError, isNavigation, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
+import { errorMessage } from './log.js'
 import { messagePage, signOutPage, startingPage } from './pages.js'
 import { forwardHeaders, isUnreachable, proxyRequest, proxyUpgrade, rejectUpgrade } from './proxy.js'
-import type { Session, User } from './store.js'
+import { deviceState, hashSecret, type Session, type User } from './store.js'
 
 type Authentication =
   | { kind: 'ok'; scope: 'browser' | 'link' }
@@ -13,6 +14,21 @@ type Authentication =
   | { kind: 'forbidden'; message: string }
 
 const ACCESS_REMOVED = 'Your access to this Poise has been removed. Ask an admin.'
+const BODILESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'DELETE', 'TRACE'])
+
+/**
+ * Why a request's body framing is refused, if it is. A body on a bodiless method would reach the
+ * workspace unframed and be read as a second request, smuggled past the gateway.
+ */
+function framingProblem(req: IncomingMessage): string | null {
+  const transferEncoding = req.headers['transfer-encoding']
+  if (transferEncoding !== undefined && transferEncoding.trim().toLowerCase() !== 'chunked') {
+    return 'Only the chunked transfer coding is accepted.'
+  }
+  const hasBody = transferEncoding !== undefined || Number(req.headers['content-length'] ?? 0) > 0
+  if (hasBody && BODILESS_METHODS.has(req.method ?? '')) return `A ${req.method} request cannot carry a body.`
+  return null
+}
 const STARTING = { error: 'workspace_starting', message: 'Your workspace is starting. Try again in a moment.' }
 
 /** /api/link/* exactly as written: no dot segments or backslashes that a URL parser would resolve elsewhere. */
@@ -38,8 +54,8 @@ function authenticate(ctx: Context, req: IncomingMessage, owner: User): Authenti
       return { kind: 'unauthenticated', bearer: true, message: 'Device tokens are accepted only for /api/link/*.' }
     }
     const device = store.findDeviceByToken(authorization.slice('bearer'.length).trim())
-    if (!device || device.revokedAt !== null) {
-      return { kind: 'unauthenticated', bearer: true, message: 'This device token is not valid. Pair the device again.' }
+    if (!device || deviceState(device, ctx.deps.now()) !== 'active') {
+      return { kind: 'unauthenticated', bearer: true, message: 'This device token is not valid or has expired. Pair the device again.' }
     }
     if (device.handle !== owner.handle) return { kind: 'forbidden', message: 'This device is paired with another workspace.' }
     if (!ctx.isAllowed(owner)) return { kind: 'forbidden', message: ACCESS_REMOVED }
@@ -87,7 +103,7 @@ function starting(ctx: Context, req: IncomingMessage, res: ServerResponse, owner
   }), { ...ctx.pageHeaders, 'retry-after': '2' })
 }
 
-function redeemTicket(ctx: Context, res: ServerResponse, url: URL, owner: User): void {
+function redeemTicket(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL, owner: User): void {
   const { log, store } = ctx.deps
   const next = url.searchParams.get('next') ?? '/'
   if (!isSafePath(next)) throw new HttpError(400, 'The address to continue to is not a path on this workspace.')
@@ -104,6 +120,9 @@ function redeemTicket(ctx: Context, res: ServerResponse, url: URL, owner: User):
   const result = store.consumeTicket(ticket)
   if (!result.ok) return reject(result.reason)
   if (result.host !== owner.handle || result.handle !== owner.handle) return reject('the ticket is for another workspace')
+  if (!heldBindings(req).some((value) => safeEqual(hashSecret(value), result.bindHash))) {
+    return reject('the ticket was issued to another browser')
+  }
   const apexSession = store.sessionByHash(result.apexSessionHash)
   if (!apexSession) return reject('the apex session has ended')
   if (!ctx.isAllowed(owner)) return reject('access removed')
@@ -127,7 +146,7 @@ function signOutConfirmation(ctx: Context, req: IncomingMessage, res: ServerResp
 async function signOut(ctx: Context, req: IncomingMessage, res: ServerResponse, owner: User): Promise<void> {
   const form = await readForm(req)
   const session = ownSession(ctx, req, owner)
-  const clear = ctx.cookie(WORKSPACE_COOKIE, '', 0)
+  const clear = [ctx.cookie(WORKSPACE_COOKIE, '', 0), ctx.bindCookie('', 0)]
   if (!session) {
     redirect(res, `${ctx.apexOrigin}/`, 303, { 'set-cookie': clear })
     return
@@ -141,13 +160,15 @@ async function signOut(ctx: Context, req: IncomingMessage, res: ServerResponse, 
 
 /** Paths under /_poise/ belong to the gateway on every workspace host. */
 async function gatewayPath(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL, owner: User): Promise<void> {
-  if (url.pathname === '/_poise/session' && req.method === 'GET') return redeemTicket(ctx, res, url, owner)
+  if (url.pathname === '/_poise/session' && req.method === 'GET') return redeemTicket(ctx, req, res, url, owner)
   if (url.pathname === '/_poise/logout' && req.method === 'GET') return signOutConfirmation(ctx, req, res, owner)
   if (url.pathname === '/_poise/logout' && req.method === 'POST') return signOut(ctx, req, res, owner)
   throw new HttpError(404, 'There is nothing at this address.')
 }
 
 export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL, owner: User): Promise<void> {
+  const problem = framingProblem(req)
+  if (problem) throw new HttpError(400, problem)
   if (url.pathname === '/_poise' || url.pathname.startsWith('/_poise/')) return gatewayPath(ctx, req, res, url, owner)
   if (!req.url?.startsWith('/')) throw new HttpError(400, 'The request target must be a path.')
   const auth = authenticate(ctx, req, owner)
@@ -159,20 +180,26 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
     assertion: ctx.assertion(owner, auth.scope),
     proto: ctx.scheme,
     dropAuthorization: auth.scope === 'link',
-    sessionCookie: WORKSPACE_COOKIE,
+    stripCookies: GATEWAY_COOKIES,
   })
   proxyRequest(req, res, ctx.deps.upstream(owner.handle), headers, ctx.agent, (error) => {
-    if (isUnreachable(error)) {
-      orchestrator.markNotReady(owner.handle)
-      log.warn('workspace.unreachable', { handle: owner.handle, error: error.message })
-      starting(ctx, req, res, owner, null)
-      return
-    }
-    log.error('proxy.failed', { handle: owner.handle, error: error.message })
-    if (isNavigation(req)) {
-      sendHtml(res, 502, messagePage('Your workspace did not answer', 'The connection to your workspace failed. Reload to try again.'), ctx.pageHeaders)
-    } else {
-      sendJson(res, 502, { error: 'bad_gateway', message: 'The connection to the workspace failed.' })
+    // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
+    try {
+      if (isUnreachable(error)) {
+        orchestrator.markNotReady(owner.handle)
+        log.warn('workspace.unreachable', { handle: owner.handle, error: error.message })
+        starting(ctx, req, res, owner, null)
+        return
+      }
+      log.error('proxy.failed', { handle: owner.handle, error: error.message })
+      if (isNavigation(req)) {
+        sendHtml(res, 502, messagePage('Your workspace did not answer', 'The connection to your workspace failed. Reload to try again.'), ctx.pageHeaders)
+      } else {
+        sendJson(res, 502, { error: 'bad_gateway', message: 'The connection to the workspace failed.' })
+      }
+    } catch (failure) {
+      log.error('proxy.failure.unanswered', { handle: owner.handle, error: errorMessage(failure) })
+      res.destroy()
     }
   })
 }
@@ -185,6 +212,11 @@ export async function workspaceUpgrade(ctx: Context, req: IncomingMessage, socke
   }
   if (header(req, 'upgrade').toLowerCase() !== 'websocket') {
     rejectUpgrade(socket, 400, { error: 'unsupported_upgrade', message: 'Only WebSocket upgrades are proxied.' })
+    return
+  }
+  const problem = framingProblem(req)
+  if (problem) {
+    rejectUpgrade(socket, 400, { error: 'bad_request', message: problem })
     return
   }
   const auth = authenticate(ctx, req, owner)
@@ -208,17 +240,23 @@ export async function workspaceUpgrade(ctx: Context, req: IncomingMessage, socke
     assertion: ctx.assertion(owner, auth.scope),
     proto: ctx.scheme,
     dropAuthorization: auth.scope === 'link',
-    sessionCookie: WORKSPACE_COOKIE,
+    stripCookies: GATEWAY_COOKIES,
   })
   proxyUpgrade(req, socket, head, ctx.deps.upstream(owner.handle), headers, (error) => {
-    if (isUnreachable(error)) {
-      orchestrator.markNotReady(owner.handle)
-      orchestrator.startInBackground(owner.handle, owner.login)
-      log.warn('workspace.unreachable', { handle: owner.handle, error: error.message })
-      rejectUpgrade(socket, 503, STARTING, { 'retry-after': '2' })
-      return
+    // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
+    try {
+      if (isUnreachable(error)) {
+        orchestrator.markNotReady(owner.handle)
+        orchestrator.startInBackground(owner.handle, owner.login)
+        log.warn('workspace.unreachable', { handle: owner.handle, error: error.message })
+        rejectUpgrade(socket, 503, STARTING, { 'retry-after': '2' })
+        return
+      }
+      log.error('proxy.upgrade.failed', { handle: owner.handle, error: error.message })
+      rejectUpgrade(socket, 502, { error: 'bad_gateway', message: 'The connection to the workspace failed.' })
+    } catch (failure) {
+      log.error('proxy.failure.unanswered', { handle: owner.handle, error: errorMessage(failure) })
+      socket.destroy()
     }
-    log.error('proxy.upgrade.failed', { handle: owner.handle, error: error.message })
-    rejectUpgrade(socket, 502, { error: 'bad_gateway', message: 'The connection to the workspace failed.' })
   })
 }

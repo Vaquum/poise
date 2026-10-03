@@ -11,7 +11,9 @@ const SCHEMA = `
     github_id INTEGER NOT NULL,
     access_org TEXT,
     created_at INTEGER NOT NULL,
-    last_login_at INTEGER NOT NULL
+    last_login_at INTEGER NOT NULL,
+    disabled_at INTEGER,
+    disabled_by TEXT
   );
 
   CREATE TABLE IF NOT EXISTS allowed_logins (
@@ -45,6 +47,7 @@ const SCHEMA = `
     apex_session_hash TEXT NOT NULL REFERENCES sessions(id_hash) ON DELETE CASCADE,
     handle TEXT NOT NULL,
     host TEXT NOT NULL,
+    bind_hash TEXT NOT NULL,
     expires_at INTEGER NOT NULL,
     used_at INTEGER
   );
@@ -114,6 +117,8 @@ export interface User {
   accessOrg: string | null
   createdAt: number
   lastLoginAt: number
+  disabledAt: number | null
+  disabledBy: string | null
 }
 
 export interface Session {
@@ -135,7 +140,7 @@ export interface AllowedLogin {
 }
 
 export type TicketResult =
-  | { ok: true; handle: string; host: string; apexSessionHash: string }
+  | { ok: true; handle: string; host: string; apexSessionHash: string; bindHash: string }
   | { ok: false; reason: 'unknown' | 'used' | 'expired' }
 
 export type DevicePoll =
@@ -167,6 +172,8 @@ interface UserRow {
   access_org: string | null
   created_at: number
   last_login_at: number
+  disabled_at: number | null
+  disabled_by: string | null
 }
 
 interface SessionRow {
@@ -184,6 +191,7 @@ interface TicketRow {
   apex_session_hash: string
   handle: string
   host: string
+  bind_hash: string
   expires_at: number
   used_at: number | null
 }
@@ -224,6 +232,8 @@ function toUser(row: UserRow): User {
     accessOrg: row.access_org,
     createdAt: row.created_at,
     lastLoginAt: row.last_login_at,
+    disabledAt: row.disabled_at,
+    disabledBy: row.disabled_by,
   }
 }
 
@@ -256,6 +266,16 @@ function isUniqueViolation(error: unknown): boolean {
 }
 
 const DEVICE_TOUCH_INTERVAL_MS = 60_000
+export const DEVICE_IDLE_LIMIT_MS = 30 * 24 * 60 * 60_000
+export const DEVICE_LIFETIME_MS = 365 * 24 * 60 * 60_000
+
+/** A device token works until it is revoked, goes unused for 30 days, or turns 365 days old. */
+export function deviceState(device: Device, now: number): 'active' | 'revoked' | 'expired' {
+  if (device.revokedAt !== null) return 'revoked'
+  if (now - device.createdAt >= DEVICE_LIFETIME_MS) return 'expired'
+  if (now - (device.lastUsedAt ?? device.createdAt) >= DEVICE_IDLE_LIMIT_MS) return 'expired'
+  return 'active'
+}
 // Expired device codes linger so a late poll still hears expired_token rather than invalid_grant.
 const EXPIRED_DEVICE_CODE_RETENTION_MS = 60 * 60_000
 
@@ -296,6 +316,28 @@ export class Store {
     const user = this.getUser(input.handle)
     if (!user) throw new Error(`user ${input.handle} vanished while signing in`)
     return user
+  }
+
+  /**
+   * Disables a person: every session ends, every paired device is revoked and approved but unredeemed
+   * device codes are denied, so re-enabling means signing in and pairing again.
+   */
+  disableUser(handle: string, by: string): boolean {
+    const now = this.now()
+    return this.db.transaction(() => {
+      const changed = this.db.prepare('UPDATE users SET disabled_at = ?, disabled_by = ? WHERE handle = ? AND disabled_at IS NULL')
+        .run(now, by, handle).changes === 1
+      if (!changed) return false
+      this.db.prepare('DELETE FROM sessions WHERE handle = ?').run(handle)
+      this.db.prepare('UPDATE devices SET revoked_at = ? WHERE handle = ? AND revoked_at IS NULL').run(now, handle)
+      this.db.prepare("UPDATE device_codes SET status = 'denied' WHERE handle = ? AND status = 'approved'").run(handle)
+      return true
+    })()
+  }
+
+  enableUser(handle: string): boolean {
+    return this.db.prepare('UPDATE users SET disabled_at = NULL, disabled_by = NULL WHERE handle = ? AND disabled_at IS NOT NULL')
+      .run(handle).changes === 1
   }
 
   /** Makes the env-sourced part of the allow list equal POISE_ALLOWED_USERS; admin additions stay. */
@@ -394,11 +436,13 @@ export class Store {
     this.db.prepare('DELETE FROM sessions WHERE id_hash = ?').run(idHash)
   }
 
-  createTicket(apexSession: Session, host: string, ttlMs: number): string {
+  /** A ticket redeemable only by the browser holding `bindValue` in its poise_bind cookie. */
+  createTicket(apexSession: Session, host: string, bindValue: string, ttlMs: number): string {
     const ticket = newSecret()
     this.db.prepare(`
-      INSERT INTO tickets (ticket_hash, apex_session_hash, handle, host, expires_at, used_at) VALUES (?, ?, ?, ?, ?, NULL)
-    `).run(hashSecret(ticket), apexSession.idHash, apexSession.handle, host, this.now() + ttlMs)
+      INSERT INTO tickets (ticket_hash, apex_session_hash, handle, host, bind_hash, expires_at, used_at)
+      VALUES (?, ?, ?, ?, ?, ?, NULL)
+    `).run(hashSecret(ticket), apexSession.idHash, apexSession.handle, host, hashSecret(bindValue), this.now() + ttlMs)
     return ticket
   }
 
@@ -412,7 +456,7 @@ export class Store {
       const now = this.now()
       this.db.prepare('UPDATE tickets SET used_at = ? WHERE ticket_hash = ?').run(now, ticketHash)
       if (row.expires_at <= now) return { ok: false, reason: 'expired' }
-      return { ok: true, handle: row.handle, host: row.host, apexSessionHash: row.apex_session_hash }
+      return { ok: true, handle: row.handle, host: row.host, apexSessionHash: row.apex_session_hash, bindHash: row.bind_hash }
     })()
   }
 

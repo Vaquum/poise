@@ -167,6 +167,7 @@ describe('sign-in', () => {
     })
     expect(done.status).toBe(303)
     expect(done.setCookie('poise_gw')).toBe('poise_gw=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure')
+    expect(done.setCookie('poise_bind')).toBe('poise_bind=; Domain=poise.test; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure')
 
     const after = await h.request({ host: APEX, path: '/', headers: { cookie: apexCookie } })
     expect(after.body).toContain('Sign in with GitHub')

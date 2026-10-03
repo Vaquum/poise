@@ -121,6 +121,7 @@ describe('lazy start', () => {
         Memory: 2 * 1024 ** 3,
         NanoCpus: 1_500_000_000,
         PidsLimit: 512,
+        RestartPolicy: { Name: 'unless-stopped' },
         Runtime: 'runsc',
         Mounts: [{ Type: 'volume', Source: 'poise-home-alice', Target: '/home/poise' }],
         NetworkMode: 'poise-net-alice',
@@ -268,6 +269,34 @@ describe('image upgrades', () => {
       'workspace.container.started',
       'workspace.upgrade.finished',
     ])
+  })
+
+  it('keeps waiting while background work runs, even with no Chat turns or Caller calls', async () => {
+    await start()
+    h.workspace.health.backgroundWork = 1
+    let finishedAt = 0
+    setTimeout(() => {
+      h.workspace.health.backgroundWork = 0
+      finishedAt = Date.now()
+    }, 80)
+    await h.orchestrator.upgradePass()
+    expect(finishedAt).toBeGreaterThan(0)
+    expect(events(h.logs, 'workspace.drain')).toEqual(['workspace.drain.requested', 'workspace.drain.idle'])
+    expect(h.logs.find((entry) => entry.event === 'workspace.drain.requested')).toMatchObject({ backgroundWork: 1 })
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('renews the drain while it waits, because the workspace lets an unrenewed drain lapse', async () => {
+    await start({ drainRenewMs: 40 })
+    h.workspace.health.activeChatTurns = 1
+    setTimeout(() => {
+      h.workspace.health.activeChatTurns = 0
+    }, 200)
+    await h.orchestrator.upgradePass()
+    const calls = h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)
+    expect(calls.filter((call) => call === 'POST /api/service/drain').length).toBeGreaterThanOrEqual(3)
+    expect(calls.filter((call) => call === 'GET /api/service/health').length).toBeGreaterThanOrEqual(3)
+    expect(h.docker.containers.get('poise-ws-alice')?.imageId).toBe(CURRENT_IMAGE_ID)
   })
 
   it('recreates a busy workspace once POISE_DRAIN_TIMEOUT has passed', async () => {

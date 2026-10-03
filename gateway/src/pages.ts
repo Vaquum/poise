@@ -147,21 +147,24 @@ function when(ms: number | null): string {
   return ms === null ? 'never' : new Date(ms).toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
 }
 
-export function devicesPage(devices: Device[], csrf: string): string {
+export function devicesPage(devices: Array<Device & { state: 'active' | 'revoked' | 'expired' }>, csrf: string): string {
   const rows = devices.map((device) => html`<tr>
 <td>${device.label ?? 'Poise Link'}</td>
 <td>${when(device.createdAt)}</td>
 <td>${when(device.lastUsedAt)}</td>
-<td>${device.revokedAt === null
+<td>${device.state === 'active'
     ? html`<form class="inline" method="post" action="/link/devices/revoke">
 <input type="hidden" name="csrf" value="${csrf}">
 <input type="hidden" name="id" value="${device.id}">
 <button class="danger" type="submit">Revoke</button>
 </form>`
-    : html`<span class="muted">Revoked ${when(device.revokedAt)}</span>`}</td>
+    : device.state === 'expired'
+      ? html`<span class="muted">Expired; pair it again</span>`
+      : html`<span class="muted">Revoked ${when(device.revokedAt)}</span>`}</td>
 </tr>`)
   return page('Paired devices', html`<div class="card">
 <h1>Paired devices</h1>
+<p class="muted">A device stays paired until it goes unused for 30 days or turns a year old.</p>
 ${devices.length === 0
     ? html`<p class="muted">No devices are paired with your workspace.</p>`
     : html`<table><tr><th>Device</th><th>Paired</th><th>Last used</th><th></th></tr>${rows}</table>`}
@@ -182,11 +185,12 @@ export interface AdminView {
   allowedOrgs: string[]
   workspaces: Map<string, AdminWorkspaceView> | null
   records: Map<string, WorkspaceRecord>
+  access: Map<string, string>
   dockerError: string | null
 }
 
 function actionButton(csrf: string, action: string, handle: string, label: string, style = 'secondary'): Html {
-  return html`<form class="inline" method="post" action="/admin/workspaces/${action}">
+  return html`<form class="inline" method="post" action="/admin/${action}">
 <input type="hidden" name="csrf" value="${csrf}">
 <input type="hidden" name="handle" value="${handle}">
 <button class="${style}" type="submit">${label}</button>
@@ -198,11 +202,14 @@ export function adminPage(view: AdminView): string {
     const workspace = view.workspaces?.get(user.handle)
     const record = view.records.get(user.handle)
     return html`<tr>
-<td><strong>${user.login}</strong>${view.admins.includes(user.handle) ? html` <span class="muted">admin</span>` : ''}<br><span class="muted">last sign-in ${when(user.lastLoginAt)}</span></td>
+<td><strong>${user.login}</strong>${view.admins.includes(user.handle) ? html` <span class="muted">admin</span>` : ''}<br><span class="muted">${view.access.get(user.handle) ?? ''} · last sign-in ${when(user.lastLoginAt)}</span></td>
 <td>${view.workspaces === null ? html`<span class="muted">unknown</span>` : workspace ? workspace.state : 'not created'}
 ${record?.lastError ? html`<br><span class="error">${record.lastError}</span>` : ''}</td>
 <td>${workspace ? html`<code>${workspace.image}</code>` : ''}</td>
-<td>${actionButton(view.csrf, 'start', user.handle, 'Start')} ${actionButton(view.csrf, 'stop', user.handle, 'Stop')} ${actionButton(view.csrf, 'restart', user.handle, 'Restart')}</td>
+<td>${actionButton(view.csrf, 'workspaces/start', user.handle, 'Start')} ${actionButton(view.csrf, 'workspaces/stop', user.handle, 'Stop')} ${actionButton(view.csrf, 'workspaces/restart', user.handle, 'Restart')}
+${user.disabledAt === null
+    ? actionButton(view.csrf, 'users/disable', user.handle, 'Disable', 'danger')
+    : actionButton(view.csrf, 'users/enable', user.handle, 'Enable')}</td>
 </tr>`
   })
   const allowRows = view.allowed.map((entry) => html`<tr>
