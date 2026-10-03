@@ -12,11 +12,12 @@ import { prepareModelClis } from './provider-clis'
 import { parseProgress, type ModelProgress } from '../src/agent-progress'
 import { randomUUID } from 'node:crypto'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
-import { getHeadSha, getReviewAgentUsername, localCheckoutPath } from './gh'
+import { getHeadSha, localCheckoutPath } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
 import { needsClaude, reviewChoice } from './review-model'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
+import { requireAgentAccount } from './settings'
 
 const CLI = 'agent-interface'
 
@@ -425,7 +426,7 @@ export async function triggerPrReview(
   const m = String(prUrl || '').match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url')
   const [, owner, repo, num] = m
-  const actor = getReviewAgentUsername()
+  const actor = requireAgentAccount()
   const repoFullName = `${owner}/${repo}`
   const { model, recovery, catalog } = await reviewChoice('pr_review')
   const claude = needsClaude(catalog, model)
@@ -496,7 +497,7 @@ export async function replayAgentJob(input: {
   const [owner, repoName] = repo.split('/', 2)
   await prepareModelClis(catalog, [model, recovery])
   const pwd = await localCheckoutPath(owner, repoName)
-  const actor = getReviewAgentUsername()
+  const actor = requireAgentAccount()
   const expectedHead = await getHeadSha(repo, Number(prId))
   const source = 'poise:replay'
   const correlationId = randomUUID()
@@ -535,7 +536,7 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   await prepareModelClis(catalog, [model, recovery])
-  const actor = getReviewAgentUsername()
+  const actor = requireAgentAccount()
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()

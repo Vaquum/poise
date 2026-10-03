@@ -17,7 +17,7 @@ vi.mock('../server/db', () => ({
   setMeta: vi.fn(),
 }))
 
-const { handleGhBody, setReviewAgentUsername } = await import('../server/gh')
+const { handleGhBody } = await import('../server/gh')
 
 function record(number: number, updatedAt: string, author: string) {
   return {
@@ -31,9 +31,7 @@ function record(number: number, updatedAt: string, author: string) {
 beforeEach(() => {
   mocks.runFile.mockReset()
   mocks.getMeta.mockReset()
-  mocks.getMeta.mockImplementation((k: string) => (k === 'me' ? 'mikkokotila' : ''))
-  // Not read from the database — cachePlugin threads it in at server start.
-  setReviewAgentUsername('bit-mis')
+  mocks.getMeta.mockImplementation((k: string) => ({ me: 'mikkokotila', agentAccount: 'bit-mis' } as Record<string, string>)[k] ?? '')
 })
 
 describe('a merged scope comes back newest-first', () => {

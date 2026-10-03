@@ -3,9 +3,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   runFile: vi.fn(),
   models: {} as Record<string, { default: string, fallback: string }>,
+  agentAccount: 'bit-mis',
 }))
 
-vi.mock('../server/settings', () => ({ getModelSettings: () => mocks.models }))
+vi.mock('../server/settings', () => ({
+  getModelSettings: () => mocks.models,
+  requireAgentAccount: () => {
+    if (!mocks.agentAccount) throw new Error('No agent account is set. Set it in Settings → GitHub: it is the GitHub user your reviews and comments are posted as.')
+    return mocks.agentAccount
+  },
+}))
 
 vi.mock('../server/process', () => ({
   claudeSubscriptionEnvironment: vi.fn(),
@@ -20,7 +27,6 @@ vi.mock('../server/claude-auth', () => ({
 }))
 vi.mock('../server/gh', () => ({
   getHeadSha: vi.fn(),
-  getReviewAgentUsername: vi.fn(),
   localCheckoutPath: vi.fn(),
 }))
 
@@ -320,7 +326,7 @@ describe('manual review model selection', () => {
     invalidateCatalog()
     const gh = await import('../server/gh')
     vi.mocked(gh.getHeadSha).mockResolvedValue('a'.repeat(40))
-    vi.mocked(gh.getReviewAgentUsername).mockReturnValue('bit-mis')
+    mocks.agentAccount = 'bit-mis'
     vi.mocked(gh.localCheckoutPath).mockResolvedValue('/repo')
     const { spawnDetached } = await import('../server/process')
     vi.mocked(spawnDetached).mockReset().mockResolvedValue(undefined)
@@ -368,6 +374,16 @@ describe('manual review model selection', () => {
     const { triggerPrReview } = await import('../server/agent')
     const { spawnDetached } = await import('../server/process')
     await expect(triggerPrReview('https://github.com/o/r/pull/12')).rejects.toThrow(/Update Caller/)
+    expect(spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('launches nothing without an agent account and says where to set it', async () => {
+    mocks.agentAccount = ''
+    const { triggerPrReview, replayAgentJob } = await import('../server/agent')
+    const { spawnDetached } = await import('../server/process')
+    await expect(triggerPrReview('https://github.com/o/r/pull/12')).rejects.toThrow('Set it in Settings → GitHub')
+    await expect(replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 })).rejects.toThrow('No agent account is set')
+    await expect(replayAgentJob({ behavior: 'issue_review', repo: 'o/r', pr_id: '4' })).rejects.toThrow('No agent account is set')
     expect(spawnDetached).not.toHaveBeenCalled()
   })
 })
@@ -503,7 +519,7 @@ describe('issue review rows', () => {
     const { invalidateCatalog } = await import('../server/models')
     invalidateCatalog()
     const gh = await import('../server/gh')
-    vi.mocked(gh.getReviewAgentUsername).mockReturnValue('bit-mis')
+    mocks.agentAccount = 'bit-mis'
     const { spawnDetached } = await import('../server/process')
     vi.mocked(spawnDetached).mockReset().mockResolvedValue(undefined)
     const { replayAgentJob } = await import('../server/agent')

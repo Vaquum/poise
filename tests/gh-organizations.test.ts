@@ -2,19 +2,20 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   runFile: vi.fn(),
+  meta: {} as Record<string, string>,
   orgs: [
     { login: 'alpha', datastorePath: '/alpha.sqlite', status: 'ready', error: null as string | null },
     { login: 'beta', datastorePath: '/beta.sqlite', status: 'ready', error: null as string | null },
   ],
 }))
-vi.mock('../server/db', () => ({ getMeta: (key: string) => key === 'me' ? 'octocat' : '' }))
+vi.mock('../server/db', () => ({ getMeta: (key: string) => mocks.meta[key] ?? null, setMeta: vi.fn() }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, MAX_PROCESS_ARG_BYTES: 64 * 1024 }))
 vi.mock('../server/organizations', () => ({
   getOrganizations: () => mocks.orgs,
   readyOrganizations: () => mocks.orgs.filter((org) => org.status === 'ready'),
   organizationArgs: (org: { datastorePath: string }, args: string[]) => ['--db', org.datastorePath, ...args],
 }))
-const { handleGhBody, invalidateRepoListCache, listOrganizationsRepos, listOrgRepos, setReviewAgentUsername } = await import('../server/gh')
+const { handleGhBody, invalidateRepoListCache, listOrganizationsRepos, listOrgRepos } = await import('../server/gh')
 
 function record(org: string, number: number, day: number) {
   const date = `2026-09-${String(day).padStart(2, '0')}T00:00:00Z`
@@ -22,9 +23,9 @@ function record(org: string, number: number, day: number) {
 }
 
 beforeEach(() => {
+  mocks.meta = { me: 'octocat' }
   mocks.runFile.mockReset()
   mocks.orgs.forEach((org) => { org.status = 'ready'; org.error = null })
-  setReviewAgentUsername('')
   invalidateRepoListCache()
   mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({
     stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', 1, 5), record('alpha', 2, 1)] : [record('beta', 1, 6), record('beta', 2, 3)]), stderr: '',
@@ -82,6 +83,45 @@ describe('organization data aggregation', () => {
     mocks.runFile.mockClear()
     const result = await handleGhBody({ operation: 'open_issue', repository_full_name: 'beta/same', title: 'Must not post' })
     expect(result.status).toBe(400)
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+})
+
+describe('the accounts GitHub is read as', () => {
+  it('lists repositories as your own account and not without it', async () => {
+    mocks.runFile.mockImplementation(async (_cmd: string, args: string[]) => ({ stdout: JSON.stringify({ repos: [{ full_name: `${args[1]}/same` }] }), stderr: '' }))
+    await listOrgRepos()
+    expect(mocks.runFile.mock.calls.map(([command, args]) => [command, ...args])).toEqual([
+      ['github-interface', '--view-repos', 'alpha', '--token-user', 'octocat'],
+      ['github-interface', '--view-repos', 'beta', '--token-user', 'octocat'],
+    ])
+    invalidateRepoListCache()
+    mocks.runFile.mockClear()
+    mocks.meta = {}
+    await expect(listOrgRepos()).rejects.toThrow('Set your GitHub account in Settings → GitHub to list repositories')
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('checks which pull requests are green as the agent account', async () => {
+    mocks.meta = { me: 'octocat', agentAccount: 'review-bot' }
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => command === 'github-interface'
+      ? { stdout: JSON.stringify({ mergeable: args[1] === '#1' }), stderr: '' }
+      : { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', 1, 5)] : []), stderr: '' })
+    const result = await handleGhBody({ operation: 'green_pr' })
+    expect(result.body).toEqual({ records: [{ repo: 'alpha/same', number: 1 }], errors: [] })
+    const checks = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')
+    expect(checks.map(([, args]) => args)).toEqual([['--mergeable', '#1', '--token-user', 'review-bot']])
+  })
+
+  it('says the agent account is missing instead of reporting nothing green', async () => {
+    await expect(handleGhBody({ operation: 'green_pr' })).rejects.toThrow('No agent account is set')
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('opens an issue only as your own account, never as gh\'s active one', async () => {
+    mocks.meta = {}
+    const result = await handleGhBody({ operation: 'open_issue', repository_full_name: 'alpha/same', title: 'Mine' })
+    expect(result).toEqual({ status: 400, body: { error: 'Set your GitHub account in Settings → GitHub before creating issues' } })
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
 })

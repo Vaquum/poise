@@ -402,9 +402,11 @@ describe('production server', () => {
     const url = `${baseUrl}/api/behaviors/review-new-issues`
     const headers = { 'Content-Type': 'application/json' }
     const read = async () => (await (await fetch(`${baseUrl}/api/behaviors`)).json() as Record<string, Record<string, unknown>>)['review-new-issues']
+    // REVIEW_AGENT_USERNAME seeded the agent account; with no account of
+    // your own saved yet, it is the one trusted author by default.
     expect(await read()).toMatchObject({
       owner: 'bit-mis', enabled: false, setting: null, reviewers: 1,
-      repos: [], authors: ['mikkokotila', 'zero-bang', 'bit-mis'], lastTriggered: null,
+      repos: [], authors: ['bit-mis'], lastTriggered: null,
     })
     for (const body of [
       { repos: 'Vaquum/Origo' },
@@ -433,6 +435,22 @@ describe('production server', () => {
 
     const cleared = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ repos: [] }) })
     expect(await cleared.json()).toMatchObject({ repos: [] })
+  })
+
+  it('keeps the agent account REVIEW_AGENT_USERNAME seeded as a setting that Settings then owns', async () => {
+    const url = `${baseUrl}/api/settings`
+    const headers = { 'Content-Type': 'application/json' }
+    const owner = async () => ((await (await fetch(`${baseUrl}/api/behaviors`)).json()) as Record<string, { owner: string | null }>)['review-new-prs'].owner
+    expect(await (await fetch(url)).json()).toMatchObject({ me: '', agentAccount: 'bit-mis' })
+    const saved = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ agentAccount: 'other-bot' }) })
+    expect(saved.status).toBe(200)
+    expect(await saved.json()).toMatchObject({ agentAccount: 'other-bot' })
+    expect(await owner()).toBe('other-bot')
+    const refused = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ agentAccount: 'https://github.com/other-bot' }) })
+    expect(refused.status).toBe(400)
+    expect((await refused.json()).error).toMatch(/agentAccount must be a GitHub name/)
+    expect(await owner()).toBe('other-bot')
+    await fetch(url, { method: 'POST', headers, body: JSON.stringify({ agentAccount: 'bit-mis' }) })
   })
 
   // Two Poise windows open on the same behavior used to mean the later save

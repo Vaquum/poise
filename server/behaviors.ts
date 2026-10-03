@@ -70,7 +70,7 @@ import { resolveReviewCheckout } from './review-checkout'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
 import { withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
-import { getReviewAgentUsername, setReviewAgentUsername } from './gh'
+import { agentAccount, requireAgentAccount } from './settings'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 
 const DATASTORE = 'github-datastore'
@@ -1227,7 +1227,7 @@ function datastoreFreshness(): DatastoreFreshness {
 }
 
 function configuredReviewer(): string {
-  return getReviewAgentUsername()
+  return requireAgentAccount()
 }
 
 function parseJson(value: string, operation: string): unknown {
@@ -1745,8 +1745,8 @@ async function tickReviewNewPrs(): Promise<void> {
         trackClaim('review-new-prs', target, claimId)
 
         try {
-          // Guard against double-firing with approve-prs: if bit-mis has
-          // an outstanding CHANGES_REQUESTED on this PR, the follow-up
+          // Guard against double-firing with approve-prs: if the agent account
+          // has an outstanding CHANGES_REQUESTED on this PR, the follow-up
           // loop is approve-prs's job. This is an intentional terminal skip,
           // so its claim is retained.
           if (reviewer) {
@@ -2215,10 +2215,7 @@ async function tickApprovePrs(): Promise<void> {
   if (!isEnabled('approve-prs')) return
   const author = getMeta('me') || ''
   // The reviewer is whoever left the change-requests we're checking
-  // against — that's the bot identity threaded through from
-  // cachePlugin.opts.reviewAgentUsername. Reading process.env here is
-  // a trap: Vite's loadEnv populates the config-time options object
-  // but doesn't propagate to process.env at runtime.
+  // against: the agent account (Settings → GitHub).
   if (!author) return
   const reviewer = configuredReviewer()
   try {
@@ -2608,7 +2605,6 @@ const HELD_ISSUE_REVIEW_ERRORS = new Set([
   'review_packet_too_large',
   'posting_failed',
 ])
-export const DEFAULT_ISSUE_AUTHORS = ['mikkokotila', 'zero-bang', 'bit-mis']
 const MAX_ISSUE_AUTHORS = 20
 const REPOSITORY_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/
 const ISSUE_REPOS_KEY = `${META_PREFIX}review_new_issues_repos`
@@ -2655,9 +2651,16 @@ export function isValidAuthorList(value: unknown): value is string[] {
     && value.every((author) => typeof author === 'string' && GITHUB_USERNAME_PATTERN.test(author))
 }
 
+// Until the person saves a list: their own account and the agent account,
+// whichever are set.
+export function defaultIssueAuthors(): string[] {
+  const accounts = [getMeta('me') || '', agentAccount()].filter((account) => GITHUB_USERNAME_PATTERN.test(account))
+  return accounts.filter((account, index) => accounts.findIndex((other) => other.toLowerCase() === account.toLowerCase()) === index)
+}
+
 export function getIssueAuthors(): string[] {
   const value = parseJsonMeta(ISSUE_AUTHORS_KEY)
-  return isValidAuthorList(value) ? value : [...DEFAULT_ISSUE_AUTHORS]
+  return isValidAuthorList(value) ? value : defaultIssueAuthors()
 }
 
 export function setIssueAuthors(authors: readonly string[]): string[] {
@@ -2734,7 +2737,7 @@ async function listOpenIssues(repo: string, since: string): Promise<DatastoreIss
 async function listSubIssues(repo: string, number: number): Promise<string[]> {
   const { stdout } = await runFile(
     GH_INTERFACE,
-    ['--sub-issues', `#${number}`, '--repository', repo],
+    ['--sub-issues', `#${number}`, '--repository', repo, '--token-user', configuredReviewer()],
     { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() },
   )
   const data = objectValue(parseJson(stdout, 'github-interface --sub-issues'), 'github-interface --sub-issues')
@@ -3701,10 +3704,11 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   })
   const anyEnabled = BEHAVIOR_KEYS.some(isEnabled)
   let reviewer: string | null = null
+  let reviewerError: string | null = null
   try {
-    reviewer = getReviewAgentUsername()
-  } catch {
-    reviewer = null
+    reviewer = requireAgentAccount()
+  } catch (error) {
+    reviewerError = error instanceof Error ? error.message : String(error)
   }
   // Every behaviour reads `me` to know whose pull requests to act on, and each
   // returns immediately when it is unset. So an enabled behaviour with no `me`
@@ -3721,7 +3725,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   const needsMe = BEHAVIOR_KEYS.some((key) => key !== 'review-new-issues' && isEnabled(key))
   const identityValid = reviewer !== null
   const identityError = reviewer === null
-    ? 'REVIEW_AGENT_USERNAME is missing or invalid'
+    ? reviewerError
     : (needsMe && author === ''
       ? 'No GitHub username set in Settings — enabled behaviours cannot act until it is'
       : null)
@@ -3774,14 +3778,7 @@ export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   }
 }
 
-export interface BehaviorsRuntimeConfig {
-  reviewAgentUsername?: string
-}
-
-export function startBehaviorsRuntime(config: BehaviorsRuntimeConfig = {}): void {
-  if (config.reviewAgentUsername !== undefined) {
-    setReviewAgentUsername(config.reviewAgentUsername)
-  }
+export function startBehaviorsRuntime(): void {
   if (tickerStarted) return
   tickerStarted = true
   behaviorAbortController = new AbortController()
