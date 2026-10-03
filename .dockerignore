@@ -1,0 +1,26 @@
+# The context of images built from the repository root, such as
+# deploy/runtime/Dockerfile. Dependencies and builds are made inside the
+# image, never copied from a checkout; local state and secrets stay out.
+.git
+**/node_modules
+dist
+dist.previous
+gateway/dist
+**/coverage
+playwright-report
+test-results
+.playwright-mcp
+.poise-dev
+.poise-chat
+.claude
+**/.env
+**/.env.*
+caller/.venv
+caller/agent_interface/data
+caller/*/build
+caller/*/*.egg-info
+**/__pycache__
+**/.pytest_cache
+link/src-tauri/target
+link/src-tauri/gen/schemas
+**/.DS_Store
