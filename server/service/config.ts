@@ -19,6 +19,8 @@ export interface ServiceConfig {
   publicHost: string
   /** The gateway's Ed25519 key that signs identity assertions. */
   gatewayKey: KeyObject
+  /** How long the gateway waits for a drain (POISE_DRAIN_TIMEOUT), in seconds. */
+  drainTimeoutSeconds: number
 }
 
 // GitHub logins as settings.ts accepts them; a handle is one in lower case.
@@ -27,6 +29,9 @@ const HANDLE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/
 const DOMAIN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
 const SPKI_PEM = /^-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+-----END PUBLIC KEY-----\r?\n?$/
+const DEFAULT_DRAIN_TIMEOUT_SECONDS = 1800
+// A week: far beyond any drain, and well inside what a timer can hold.
+const MAX_DRAIN_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 
 /** Whether this process runs in service mode. Any POISE_MODE other than
  *  `service` is a configuration error, never a silent personal computer. */
@@ -59,6 +64,15 @@ function gatewayKey(value: string | undefined, problems: string[]): KeyObject | 
     return null
   }
   return key
+}
+
+function drainTimeout(value: string | undefined, problems: string[]): number {
+  if (value === undefined) return DEFAULT_DRAIN_TIMEOUT_SECONDS
+  const seconds = Number(value)
+  if (!/^[1-9][0-9]*$/.test(value) || seconds > MAX_DRAIN_TIMEOUT_SECONDS) {
+    problems.push(`POISE_DRAIN_TIMEOUT must be a whole number of seconds from 1 to ${MAX_DRAIN_TIMEOUT_SECONDS}; it is "${value}"`)
+  }
+  return seconds
 }
 
 // The gateway serves plain http only for local and CI end-to-end runs
@@ -112,10 +126,14 @@ export function readServiceConfig(env: NodeJS.ProcessEnv = process.env): Service
   }
   const origin = publicOrigin(env.POISE_PUBLIC_ORIGIN, HANDLE.test(handle) ? handle : '', problems)
   const key = gatewayKey(env.POISE_GATEWAY_PUBLIC_KEY, problems)
+  const drainTimeoutSeconds = drainTimeout(env.POISE_DRAIN_TIMEOUT, problems)
   if (problems.length || !origin || !key) {
     throw new Error(`Poise cannot start in service mode: ${problems.join('; ')}`)
   }
-  return { handle, owner, publicOrigin: origin.origin, publicProtocol: origin.protocol === 'http:' ? 'http:' : 'https:', publicHost: origin.host, gatewayKey: key }
+  return {
+    handle, owner, publicOrigin: origin.origin, publicProtocol: origin.protocol === 'http:' ? 'http:' : 'https:',
+    publicHost: origin.host, gatewayKey: key, drainTimeoutSeconds,
+  }
 }
 
 /** Where service mode keeps a piece of state: under ~/.poise in the home volume. */

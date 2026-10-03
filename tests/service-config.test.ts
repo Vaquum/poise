@@ -98,6 +98,16 @@ describe('service-mode configuration', () => {
     }
   })
 
+  it('reads how long the gateway waits for a drain, 1800 seconds when unset', () => {
+    const env = serviceEnvironment(keys)
+    expect(readServiceConfig(env)?.drainTimeoutSeconds).toBe(1800)
+    expect(readServiceConfig({ ...env, POISE_DRAIN_TIMEOUT: '600' })?.drainTimeoutSeconds).toBe(600)
+    for (const value of ['', '0', '-5', '1.5', '30m', '1e3', ' 600', '604801']) {
+      expect(() => readServiceConfig({ ...env, POISE_DRAIN_TIMEOUT: value }), JSON.stringify(value))
+        .toThrow(`POISE_DRAIN_TIMEOUT must be a whole number of seconds from 1 to 604800; it is "${value}"`)
+    }
+  })
+
   it('passes Caller a data directory in the home volume unless one is set', () => {
     const env: NodeJS.ProcessEnv = {}
     applyServiceEnvironment(env)

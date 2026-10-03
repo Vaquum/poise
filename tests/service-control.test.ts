@@ -47,8 +47,23 @@ function fakeRuntime(instance = `poise-production:${randomUUID()}`) {
   return { instance, busyNow: 0, busy() { return this.busyNow }, startDrain: vi.fn(), endDrain: vi.fn() }
 }
 
-function serviceOf(runtime = fakeRuntime()) {
-  return { runtime, service: new control.ServiceControl(runtime as unknown as ChatRuntime) }
+class FakeTimer {
+  timers = new Map<number, { delayMs: number, callback: () => void }>()
+  private ids = 0
+  setTimeout(callback: () => void, delayMs: number): number {
+    this.timers.set(++this.ids, { delayMs, callback })
+    return this.ids
+  }
+  clearTimeout(timer: unknown): void { this.timers.delete(timer as number) }
+  fire(): void {
+    const [id, timer] = [...this.timers.entries()][0]
+    this.timers.delete(id)
+    timer.callback()
+  }
+}
+
+function serviceOf(runtime = fakeRuntime(), timer = new FakeTimer(), log = vi.fn()) {
+  return { runtime, timer, log, service: new control.ServiceControl(runtime as unknown as ChatRuntime, { drainTimeoutSeconds: 1800, timer, log }) }
 }
 
 function response() {
@@ -131,15 +146,30 @@ describe('service drain', () => {
     expect(typeof service.admitLaunch('POST', '/api/pr-review')).toBe('function')
   })
 
-  it('never leaves the background paused after the runtime stops', () => {
-    const { runtime, service } = serviceOf()
-    service.reset()
-    expect(runtime.endDrain).not.toHaveBeenCalled()
+  it('lapses POISE_DRAIN_TIMEOUT plus five minutes after the last drain call', () => {
+    const { runtime, timer, log, service } = serviceOf()
     service.drain()
-    service.reset()
+    expect([...timer.timers.values()].map((entry) => entry.delayMs)).toEqual([(1800 + 300) * 1000])
+    // The gateway renews the drain by calling it again while it waits.
+    service.drain()
+    expect(timer.timers.size).toBe(1)
+    timer.fire()
+    expect(service.draining).toBe(false)
     expect(runtime.endDrain).toHaveBeenCalledTimes(1)
     expect(background.releaseBackgroundPaused()).toBe(false)
+    expect(log).toHaveBeenCalledWith('[service] the drain lapsed: no drain call renewed it within 2100 s, so new work is admitted again')
+  })
+
+  it('stops the lapse when the drain is lifted or the runtime stops', () => {
+    const { timer, service } = serviceOf()
+    service.drain()
+    service.resume()
+    expect(timer.timers.size).toBe(0)
+    service.drain()
+    service.reset()
+    expect(timer.timers.size).toBe(0)
     expect(service.draining).toBe(false)
+    expect(background.releaseBackgroundPaused()).toBe(false)
   })
 })
 
@@ -152,11 +182,15 @@ describe('service endpoints', () => {
     expect(call('POST', '/api/service/resume', { kind: 'local' }, service)).toMatchObject({ status: 200, body: { draining: false } })
   })
 
-  it('refuse a browser or Poise Link assertion', () => {
-    for (const scope of ['browser', 'link'] as const) {
-      for (const [method, path] of [['GET', '/api/service/health'], ['POST', '/api/service/drain'], ['POST', '/api/service/resume']]) {
-        expect(() => call(method, path, { kind: 'gateway', scope }, serviceOf().service), `${scope} ${path}`).toThrow(expect.objectContaining({ statusCode: 403 }))
-      }
+  it('let the owner\'s browser lift a drain, and nothing more', () => {
+    const { service } = serviceOf()
+    service.drain()
+    expect(call('POST', '/api/service/resume', { kind: 'gateway', scope: 'browser' }, service)).toMatchObject({ status: 200, body: { draining: false } })
+    for (const [method, path] of [['GET', '/api/service/health'], ['POST', '/api/service/drain'], ['GET', '/api/service/unknown']]) {
+      expect(() => call(method, path, { kind: 'gateway', scope: 'browser' }, service), path).toThrow(expect.objectContaining({ statusCode: 403 }))
+    }
+    for (const path of ['/api/service/health', '/api/service/drain', '/api/service/resume']) {
+      expect(() => call('POST', path, { kind: 'gateway', scope: 'link' }, service), path).toThrow(expect.objectContaining({ statusCode: 403 }))
     }
   })
 

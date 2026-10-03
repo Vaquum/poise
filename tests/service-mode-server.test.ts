@@ -267,6 +267,13 @@ describe('Poise in service mode', () => {
     expect(await send('POST', '/api/service/resume', fromGateway('admin'))).toMatchObject({ status: 200, json: { draining: false } })
   })
 
+  it('lets the owner lift a drain the gateway left behind', async () => {
+    expect(await send('POST', '/api/service/drain', fromGateway('admin'))).toMatchObject({ json: { draining: true } })
+    expect((await send('POST', '/api/service/drain', fromGateway('browser'))).status).toBe(403)
+    expect(await send('POST', '/api/service/resume', fromGateway('browser'))).toMatchObject({ status: 200, json: { draining: false } })
+    expect((await send('POST', '/api/service/resume', fromGateway('link'))).status).toBe(403)
+  })
+
   it('counts the Caller calls it launched until they finish', async () => {
     const { spawnDetached } = await import('../server/process')
     const release = join(root, 'release-call')

@@ -126,7 +126,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     chatRuntime.on('log', (line: string) => console.log(line))
     chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
     if (service) {
-      serviceControl = new ServiceControl(chatRuntime)
+      serviceControl = new ServiceControl(chatRuntime, { drainTimeoutSeconds: service.drainTimeoutSeconds })
       dailyModelRefresh = new DailyModelRefresh({
         timeZone: () => getSettings().timezone,
         refresh: refreshModelCatalog,
