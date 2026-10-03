@@ -165,10 +165,11 @@ Editor, Snippets, and local chats remain personal. If one account's reads
 fail, available results remain visible with an explicit error.
 
 Behaviors uses one shared set of enabled flags, review settings, repository
-selections, trusted authors, and memory across all ready GitHub accounts.
-Account filters in Current, Archive, and Swarm do not change automation scope.
-The Review New Issues repository picker lists full `owner/repo` names across
-all ready accounts. Newly activated accounts use the same behavior settings.
+selections, skipped repositories, trusted authors, and memory across all ready
+GitHub accounts. Account filters in Current, Archive, and Swarm do not change
+automation scope. The repository pickers list the repositories of all ready
+accounts by their full `owner/repo` names. Newly activated accounts use the
+same behavior settings.
 Enabling PR review for the first time records a baseline for existing accounts.
 Accounts added while PR review is already enabled process eligible existing open
 PRs when they become ready. Review history, onboarding baselines, and retry state
@@ -240,6 +241,33 @@ Issue holds preserve their original child coverage; confirmed terminal holds do 
 consume worker slots. Uncertain live workers still count toward the concurrency limit.
 Swarm identifies unreadable targets and their errors alongside valid live runs, and
 persistent incidents keep holds visible after the source logs disappear.
+
+## Behaviors
+
+Behaviors runs the automations that act as your agent account: Review New Pull
+Requests, Approve Pull Requests, Resolve Unblocking Conversations and Review
+New Issues. Each row's Setting cell opens a dropdown, saved by every way of
+closing it.
+
+The three pull-request behaviors act on your open pull requests in every
+repository of your ready accounts except the ones ticked under **Skip
+repositories**. The list groups repositories by account, with Select all for
+each account and for the whole list; Select all ticks the repositories listed
+now, so one created later is not skipped until it is ticked. The cell shows how
+many are skipped, beside Review New Pull Requests' priority ceiling, which is
+chosen in the same dropdown. Nothing happens in a skipped repository: its pull
+requests are not claimed, read, launched or retried. Untick a repository and
+its open pull requests are picked up on the next run like new ones. The
+baseline Review New Pull Requests took when it was first turned on still
+holds, so the pull requests that were already open then are not reviewed.
+Several people's automations can work in the same repository: each acts only
+as its own agent account.
+
+Replay in Swarm runs only what the scheduler itself would run. A pull request
+must be open, not a draft, yours, and outside that behavior's skipped
+repositories; an issue must be open, by a trusted author, in a repository
+opted in to Review New Issues. Anything else is refused, and Swarm shows why
+under the row. See [Behavior integration contract](docs/Behavior-Contract.md).
 
 ## Review New Issues
 

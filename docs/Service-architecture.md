@@ -352,6 +352,10 @@ scheduler applies, or it is refused with HTTP 409 and the failed check named:
   authored by the person's own GitHub account, and is not in a skipped
   repository.
 
+The facts are read fresh from the datastore the scheduler reads; when they
+cannot be read the replay answers 502 and launches nothing. Swarm shows a
+refusal under the row whose Replay was pressed.
+
 ## Snippets and Poise Link
 
 **Snippets are edited only in Poise:** the Snippets view, Chat's `/create`, and

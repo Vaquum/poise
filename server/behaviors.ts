@@ -111,6 +111,7 @@ function organizationOwns(repoOrTarget: string): boolean {
 function isGlobalPreference(key: string): boolean {
   return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|review_new_issues)_(?:enabled|setting|reviewers|scratchpad)$/.test(key)
     || /^behavior_review_new_issues_(?:repos|authors|slot_since)$/.test(key)
+    || /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking)_skip_repos$/.test(key)
 }
 
 function scopedMetaKey(key: string): string {
@@ -489,6 +490,113 @@ function noteArgs(key: BehaviorKey): string[] {
   // Caller reads a flag value that starts with "--" as the next flag, so a
   // note opening with a Markdown rule stopped every launch before it ran.
   return note ? ['--note', note.startsWith('-') ? ` ${note}` : note] : []
+}
+
+// ── Repository skips ────────────────────────────────────────────────────
+// Review New PRs, Approve PRs and Resolve Unblocking each keep a list of
+// repositories they never act in, shared by every ready account like the other
+// preferences. A skipped repository's pull requests are dropped before any
+// claim, GitHub read or launch, and checked once more just before a launch, so
+// a repository skipped while a scan is under way is left alone too.
+//
+// Review New PRs' anti-flood baseline is deliberately not filtered: it records
+// which of your pull requests were already open when the automation began,
+// wherever they are, and changing a skip list never retakes it. Unskipping a
+// repository makes its open pull requests eligible on the next tick exactly as
+// new ones are — those opened since the baseline are reviewed, the backlog the
+// baseline recorded never is.
+
+export type SkippableBehavior = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking'
+export const SKIPPABLE_BEHAVIORS: readonly SkippableBehavior[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking']
+// "Select all" across large accounts produces long lists; this bound keeps a
+// list inside the API's request body limit.
+export const MAX_SKIPPED_REPOSITORIES = 5000
+const SKIPPABLE_LABELS: Record<SkippableBehavior, string> = {
+  'review-new-prs': 'Review New Pull Requests',
+  'approve-prs': 'Approve Pull Requests',
+  'resolve-unblocking': 'Resolve Unblocking Conversations',
+}
+
+export function isSkippableBehavior(key: string): key is SkippableBehavior {
+  return (SKIPPABLE_BEHAVIORS as readonly string[]).includes(key)
+}
+
+function skipReposKey(key: SkippableBehavior): string {
+  return `${META_PREFIX}${key.replace(/-/g, '_')}_skip_repos`
+}
+
+export function isValidRepositoryList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length <= MAX_SKIPPED_REPOSITORIES && value.every(isValidRepository)
+}
+
+// Only setRepositorySkips writes a list. Anything else found there is refused
+// rather than read as "skip nothing": a lapsed opt-out would let automations
+// act where they were told not to.
+export function getRepositorySkips(key: SkippableBehavior): string[] {
+  const raw = getMeta(skipReposKey(key))
+  if (raw === null) return []
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch (error) {
+    throw new Error(`${skipReposKey(key)} holds an unreadable Skip repositories list`, { cause: error })
+  }
+  if (!isValidRepositoryList(value)) throw new Error(`${skipReposKey(key)} holds a malformed Skip repositories list`)
+  return value
+}
+
+// GitHub repository names are case-insensitive: one entry per repository.
+export function setRepositorySkips(key: SkippableBehavior, repos: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const next = repos.filter((repo) => {
+    const lower = repo.toLowerCase()
+    if (seen.has(lower)) return false
+    seen.add(lower)
+    return true
+  }).sort((a, b) => a.localeCompare(b))
+  setMeta(skipReposKey(key), JSON.stringify(next))
+  return next
+}
+
+export interface PullRequestFacts {
+  repo: string
+  number: number
+  status: string
+  draft: boolean
+  author: string
+}
+
+// Whose pull requests a PR behavior acts on and where it is skipped, read once
+// per scan.
+export interface PullRequestPolicy {
+  behavior: SkippableBehavior
+  me: string
+  skipped: ReadonlySet<string>
+}
+
+export function pullRequestPolicy(behavior: SkippableBehavior): PullRequestPolicy {
+  return {
+    behavior,
+    me: getMeta('me') || '',
+    skipped: new Set(getRepositorySkips(behavior).map((repo) => repo.toLowerCase())),
+  }
+}
+
+// Open, not a draft and yours: what every PR behavior and the baseline require.
+function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | null): string | null {
+  if (pr?.status !== 'open') return `${ref} is not an open pull request`
+  if (pr.draft) return `${ref} is a draft`
+  if (!me) return `${ref} cannot be matched to your GitHub account: none is set in Settings → GitHub`
+  if (pr.author !== me) return `${ref} is authored by ${pr.author}, not by your GitHub account ${me}`
+  return null
+}
+
+// The one check a pull request passes before a PR behavior acts on it, applied
+// by the scheduler and by a replay from Swarm alike. It names what failed;
+// `pr` is null when the datastore does not have the pull request.
+export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, number: number, pr: PullRequestFacts | null): string | null {
+  return ownPullRequestRefusal(policy.me, `${repo}#${number}`, pr)
+    ?? (policy.skipped.has(repo.toLowerCase()) ? `${repo} is in the Skip repositories list of ${SKIPPABLE_LABELS[policy.behavior]}` : null)
 }
 
 // Last-fired info is intentionally NOT persisted here — agent-interface
@@ -1210,11 +1318,8 @@ async function reconcileBehaviorLaunchClaims(
 
 // ── review-new-prs implementation ───────────────────────────────────────
 
-interface DatastorePr {
-  repo: string
-  number: number
+interface DatastorePr extends PullRequestFacts {
   url: string
-  draft: boolean
 }
 
 interface DatastoreFreshness {
@@ -1334,6 +1439,25 @@ async function requireFreshDatastore(): Promise<void> {
   }
 }
 
+function datastorePr(row: unknown, index: number): DatastorePr {
+  const value = objectValue(row, `github-datastore PR row ${index}`)
+  const repo = String(value.repo || '')
+  const number = safeInteger(value.number, `github-datastore PR row ${index} number`)
+  const url = String(value.url || '')
+  const author = String(value.author || '')
+  const draft = safeInteger(value.draft, `github-datastore PR row ${index} draft`)
+  const status = String(value.status || '')
+  if (!/^[^/\s]+\/[^/\s]+$/.test(repo)
+    || number < 1
+    || draft > 1
+    || !['open', 'closed', 'merged'].includes(status)
+    || !author
+    || url !== `https://github.com/${repo}/pull/${number}`) {
+    throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
+  }
+  return { repo, number, url, draft: draft === 1, author, status }
+}
+
 async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
   if (!author) return []
   await requireFreshDatastore()
@@ -1346,28 +1470,47 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
   if (!Array.isArray(parsed)) throw new Error('github-datastore view pr returned a non-array')
   const seen = new Set<string>()
   const prs = parsed.map((row, index) => {
-    const value = objectValue(row, `github-datastore PR row ${index}`)
-    const repo = String(value.repo || '')
-    const number = safeInteger(value.number, `github-datastore PR row ${index} number`)
-    const url = String(value.url || '')
-    const prAuthor = String(value.author || '')
-    const draft = safeInteger(value.draft, `github-datastore PR row ${index} draft`)
-    if (!/^[^/\s]+\/[^/\s]+$/.test(repo)
-      || number < 1
-      || draft > 1
-      || value.status !== 'open'
-      || !prAuthor
-      || url !== `https://github.com/${repo}/pull/${number}`) {
-      throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
-    }
-    const key = `${repo}#${number}`
+    const pr = datastorePr(row, index)
+    if (pr.status !== 'open') throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
+    const key = `${pr.repo}#${pr.number}`
     if (seen.has(key)) throw new Error(`github-datastore returned duplicate PR ${key}`)
     seen.add(key)
-    return { repo, number, url, draft: draft === 1, author: prAuthor }
+    return pr
   })
   retireBehaviorDeadLettersForClosedPrs(seen, undefined, currentOrganization()?.login)
   retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking'])
-  return prs.filter((pr) => organizationOwns(pr.repo) && pr.author === author && !pr.draft)
+  return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(author, `${pr.repo}#${pr.number}`, pr))
+}
+
+// The open pull requests a PR behavior may act on in this scan: yours, and
+// outside its skipped repositories. The baseline reads listOpenPrsByAuthor.
+async function listEligiblePrs(behavior: SkippableBehavior, author: string): Promise<DatastorePr[]> {
+  const prs = await listOpenPrsByAuthor(author)
+  const policy = pullRequestPolicy(behavior)
+  return prs.filter((pr) => !pullRequestRefusal(policy, pr.repo, pr.number, pr))
+}
+
+// Read just before a launch: a skip saved, or your account changed, while the
+// launch was being prepared stops it.
+function stillEligible(behavior: SkippableBehavior, pr: DatastorePr): boolean {
+  return !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
+}
+
+// One pull request as the datastore has it, whatever its state; null when it
+// has no such pull request.
+async function readPullRequest(repo: string, number: number): Promise<DatastorePr | null> {
+  const { stdout } = await runFile(
+    DATASTORE,
+    datastoreArgs(['view', 'pr', '--repo', repo, '--number', String(number), '--format', 'json']),
+    { timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() },
+  )
+  const parsed = parseJson(stdout, 'github-datastore view pr')
+  if (!Array.isArray(parsed)) throw new Error('github-datastore view pr returned a non-array')
+  const rows = parsed.map(datastorePr)
+  if (rows.length > 1 || rows.some((row) => row.repo !== repo || row.number !== number)) {
+    throw new Error(`github-datastore view pr returned rows other than ${repo}#${number}`)
+  }
+  return rows[0] ?? null
 }
 
 async function localCheckoutPath(owner: string, repo: string, number: number, head: string): Promise<string> {
@@ -1473,7 +1616,7 @@ async function fireReview(
   // has a real window to turn the behaviour off while it is out. Nothing
   // re-read the flag between it returning and the spawn below, so a toggle-off
   // in that window still posted on the pull request it was meant to stop.
-  if (!isEnabled('review-new-prs') || behaviorAborted()) return false
+  if (!isEnabled('review-new-prs') || behaviorAborted() || !stillEligible('review-new-prs', pr)) return false
   // Read the ceiling here rather than taking a snapshot from the top of the
   // tick. A tick fans out over every open pull request, and each one waits on
   // auth, a checkout resolve and the head-SHA subprocess above — minutes, in
@@ -1564,6 +1707,8 @@ async function snapshotReviewNewPrs(): Promise<void> {
   const author = getMeta('me') || ''
   if (!author) return
   try {
+    // Skipped repositories included: the baseline is what was already open
+    // when the behavior began (see Repository skips).
     const prs = await listOpenPrsByAuthor(author)
     if (!isEnabled('review-new-prs')) return
     for (const p of prs) {
@@ -1700,7 +1845,7 @@ async function tickReviewNewPrs(): Promise<void> {
     const panel = await reviewPanel(getReviewers('review-new-prs'))
     const slots = availableReviewSlots(panel)
     if (slots.length === 0) return
-    const prs = await listOpenPrsByAuthor(author)
+    const prs = await listEligiblePrs('review-new-prs', author)
     await recoverSnapshotReviews(prs, reviewer)
     let failure: unknown
     await Promise.all(prs.flatMap((pr) => {
@@ -2182,7 +2327,7 @@ async function fireApprove(
     )
   }
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead)
-  if (!isEnabled('approve-prs') || behaviorAborted()) return false
+  if (!isEnabled('approve-prs') || behaviorAborted() || !stillEligible('approve-prs', pr)) return false
   if ((await reviewChoice('pr_approve')).model !== model) return false
   const source = 'poise:approve-prs'
   const args = [
@@ -2232,7 +2377,7 @@ async function tickApprovePrs(): Promise<void> {
   if (!author) return
   const reviewer = configuredReviewer()
   try {
-    const prs = await listOpenPrsByAuthor(author)
+    const prs = await listEligiblePrs('approve-prs', author)
     let failure: unknown
     await Promise.all(prs.map(async (pr) => {
       if (!isEnabled('approve-prs') || behaviorAborted()) return
@@ -2525,7 +2670,7 @@ async function tickResolveUnblocking(): Promise<void> {
   const author = getMeta('me') || ''
   if (!author) return
   try {
-    const prs = await listOpenPrsByAuthor(author)
+    const prs = await listEligiblePrs('resolve-unblocking', author)
     await Promise.all(prs.map(async (pr) => {
       if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
       const key = `${pr.repo}#${pr.number}`
@@ -2544,10 +2689,10 @@ async function tickResolveUnblocking(): Promise<void> {
         if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
         operationId = claimPrOperationOwned(key, PR_OPERATION_EVALUATION_LEASE_MS)
         if (!operationId) return
-        // This CLI performs the mutation itself. The synchronous flag check
-        // immediately before invocation prevents a disabled behavior from
-        // starting another resolve operation.
-        if (!isEnabled('resolve-unblocking')) return
+        // This CLI performs the mutation itself. The synchronous checks
+        // immediately before invocation prevent a disabled behavior, or one
+        // whose repository was just skipped, from starting another resolve.
+        if (!isEnabled('resolve-unblocking') || !stillEligible('resolve-unblocking', pr)) return
         const result = await resolveNonblockingIfReady(pr.repo, pr.number)
         checked = true
         if (result.superseded) {
@@ -2713,11 +2858,56 @@ function setIssueSlotSince(previous: ReviewerCount, next: ReviewerCount): void {
   setMeta(ISSUE_SLOT_SINCE_KEY, JSON.stringify(since))
 }
 
-interface DatastoreIssue {
+export interface IssueFacts {
   repo: string
   number: number
+  status: string
   author: string
+}
+
+// Which repositories are opted in and whose issues count, read once per scan.
+export interface IssueReviewPolicy {
+  repositories: ReadonlySet<string>
+  authors: ReadonlySet<string>
+}
+
+export function issueReviewPolicy(): IssueReviewPolicy {
+  return {
+    repositories: new Set(getIssueRepositories().map((entry) => entry.repo.toLowerCase())),
+    authors: new Set(getIssueAuthors().map((author) => author.toLowerCase())),
+  }
+}
+
+// The one check an issue passes before Review New Issues reviews it, applied by
+// the scheduler and by a replay from Swarm alike. It names what failed; `issue`
+// is null when the datastore does not have the issue.
+export function issueReviewRefusal(policy: IssueReviewPolicy, repo: string, number: number, issue: IssueFacts | null): string | null {
+  const ref = `${repo}#${number}`
+  if (!policy.repositories.has(repo.toLowerCase())) return `${repo} is not opted in to Review New Issues`
+  if (issue?.status !== 'open') return `${ref} is not an open issue`
+  if (!policy.authors.has(issue.author.toLowerCase())) return `${ref} was opened by ${issue.author}, who is not a trusted author of Review New Issues`
+  return null
+}
+
+interface DatastoreIssue extends IssueFacts {
   createdAt: string
+}
+
+function datastoreIssue(row: unknown, index: number, repo: string): DatastoreIssue {
+  const value = objectValue(row, `github-datastore issue row ${index}`)
+  const number = safeInteger(value.number, `github-datastore issue row ${index} number`)
+  const author = String(value.author || '')
+  const createdAt = String(value.created_at || '')
+  const status = String(value.status || '')
+  if (value.repo !== repo
+    || number < 1
+    || !['open', 'closed'].includes(status)
+    || !author
+    || !Number.isFinite(Date.parse(createdAt))
+    || value.url !== `https://github.com/${repo}/issues/${number}`) {
+    throw new Error(`github-datastore issue row ${index} violates the candidate contract`)
+  }
+  return { repo, number, author, createdAt, status }
 }
 
 async function listOpenIssues(repo: string, since: string): Promise<DatastoreIssue[]> {
@@ -2729,20 +2919,27 @@ async function listOpenIssues(repo: string, since: string): Promise<DatastoreIss
   const parsed = parseJson(stdout, 'github-datastore view issue')
   if (!Array.isArray(parsed)) throw new Error('github-datastore view issue returned a non-array')
   return parsed.map((row, index) => {
-    const value = objectValue(row, `github-datastore issue row ${index}`)
-    const number = safeInteger(value.number, `github-datastore issue row ${index} number`)
-    const author = String(value.author || '')
-    const createdAt = String(value.created_at || '')
-    if (value.repo !== repo
-      || number < 1
-      || value.status !== 'open'
-      || !author
-      || !Number.isFinite(Date.parse(createdAt))
-      || value.url !== `https://github.com/${repo}/issues/${number}`) {
-      throw new Error(`github-datastore issue row ${index} violates the candidate contract`)
-    }
-    return { repo, number, author, createdAt }
+    const issue = datastoreIssue(row, index, repo)
+    if (issue.status !== 'open') throw new Error(`github-datastore issue row ${index} violates the candidate contract`)
+    return issue
   })
+}
+
+// One issue as the datastore has it, whatever its state; null when it has no
+// such issue.
+async function readIssue(repo: string, number: number): Promise<DatastoreIssue | null> {
+  const { stdout } = await runFile(
+    DATASTORE,
+    datastoreArgs(['view', 'issue', '--repo', repo, '--number', String(number), '--format', 'json']),
+    { timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() },
+  )
+  const parsed = parseJson(stdout, 'github-datastore view issue')
+  if (!Array.isArray(parsed)) throw new Error('github-datastore view issue returned a non-array')
+  const rows = parsed.map((row, index) => datastoreIssue(row, index, repo))
+  if (rows.length > 1 || rows.some((row) => row.number !== number)) {
+    throw new Error(`github-datastore view issue returned rows other than ${repo}#${number}`)
+  }
+  return rows[0] ?? null
 }
 
 // The issues this one makes its sub-issues, read the way Caller's review reads
@@ -3012,11 +3209,12 @@ async function fireIssueReview(
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
   await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
   // The CLI check and the model read can each take a while; turning the
-  // behavior off, deselecting the repository or changing the panel meanwhile
-  // must stop this launch, so these are the last checks before it.
+  // behavior off, deselecting the repository, untrusting the author or
+  // changing the panel meanwhile must stop this launch, so these are the last
+  // checks before it.
   if ((await waitForBehavior(issueSlotModel(slot)))?.model !== model) return false
   if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return false
-  if (!getIssueRepositories().some((entry) => entry.repo === issue.repo)) return false
+  if (issueReviewRefusal(issueReviewPolicy(), issue.repo, issue.number, issue)) return false
   if (!markBehaviorLaunchIntentOwned({
     key: ISSUES_KEY,
     target,
@@ -3129,7 +3327,7 @@ async function tickReviewNewIssues(): Promise<void> {
   if (!isEnabled(ISSUES_KEY)) return
   const repositories = getIssueRepositories().filter((entry) => organizationOwns(entry.repo))
   if (repositories.length === 0) return
-  const authors = new Set(getIssueAuthors().map((author) => author.toLowerCase()))
+  const policy = issueReviewPolicy()
   const slots = availableReviewSlots(await reviewPanel(getReviewers(ISSUES_KEY), 'issue_review'))
   if (slots.length === 0) return
   const slotSince = getIssueSlotSince()
@@ -3160,7 +3358,7 @@ async function tickReviewNewIssues(): Promise<void> {
       const key = `${issue.repo}#${issue.number}`
       open.add(key)
       const created = Date.parse(issue.createdAt)
-      if (!authors.has(issue.author.toLowerCase()) || created < Date.parse(since)) continue
+      if (issueReviewRefusal(policy, issue.repo, issue.number, issue) || created < Date.parse(since)) continue
       const targets: string[] = []
       slots.forEach((slot, index) => {
         const joined = slot === 'primary' ? undefined : slotSince[slot]
@@ -3443,6 +3641,41 @@ async function reconcileIssueReviewClaims(): Promise<void> {
     const message = `unrecognized agent call status "${status || 'missing'}"`
     if (deadLetterClaim(claim, message)) recordBehaviorFailure(ISSUES_KEY, 'worker', message, claim.target)
   }
+}
+
+// ── Replay checks ───────────────────────────────────────────────────────
+// A replay from Swarm launches only what the scheduler itself would launch.
+// It reads the target fresh, behind the same freshness gate and from the same
+// datastore the scheduler reads, and applies the same check. A refusal names
+// the check that failed; facts that cannot be read launch nothing.
+
+const REPLAY_SKIPS: Record<Exclude<BehaviorAgentLaunch, 'issue_review'>, SkippableBehavior> = {
+  pr_review: 'review-new-prs',
+  pr_approve: 'approve-prs',
+}
+
+export class ReplayRefusedError extends HttpError {
+  constructor(refusal: string) {
+    super(409, `Replay refused: ${refusal}.`)
+    this.name = 'ReplayRefusedError'
+  }
+}
+
+export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<void> {
+  const owner = repo.split('/')[0].toLowerCase()
+  const org = readyOrganizations().find((candidate) => candidate.login.toLowerCase() === owner)
+  if (!org) throw new ReplayRefusedError(`${repo} does not belong to a ready GitHub account`)
+  const refusal = await behaviorOrganization.run(org, async () => {
+    try {
+      await requireFreshDatastore()
+      return behavior === 'issue_review'
+        ? issueReviewRefusal(issueReviewPolicy(), repo, number, await readIssue(repo, number))
+        : pullRequestRefusal(pullRequestPolicy(REPLAY_SKIPS[behavior]), repo, number, await readPullRequest(repo, number))
+    } catch (error) {
+      throw new HttpError(502, `Replay could not check ${repo}#${number}: ${behaviorErrorMessage(error)}`)
+    }
+  })
+  if (refusal) throw new ReplayRefusedError(refusal)
 }
 
 // ── Public API ──────────────────────────────────────────────────────────

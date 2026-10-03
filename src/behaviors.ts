@@ -26,6 +26,9 @@ export interface BehaviorMeta {
   // Whether the Setting cell chooses which repositories trigger it and whose
   // issues count — Review New Issues is opt-in per repository.
   hasTriggers: boolean
+  // Whether the Setting dropdown lists repositories to skip: the PR behaviors
+  // act everywhere except the repositories ticked there.
+  hasSkips: boolean
   // What one review is of, for the Reviewers tooltip.
   reviews?: { place: string, item: string }
 }
@@ -35,10 +38,10 @@ export interface BehaviorMeta {
 // apart from it. Order matters for display since the view renders rows in
 // the listed sequence.
 export const BEHAVIORS: BehaviorMeta[] = [
-  { key: 'review-new-prs',     label: 'Review New Pull Requests',      hasSetting: true,  hasReviewers: true,  hasMemory: true,  hasTriggers: false, reviews: { place: 'PR review', item: 'pull request' } },
-  { key: 'approve-prs',        label: 'Approve Pull Requests',         hasSetting: false, hasReviewers: false, hasMemory: true,  hasTriggers: false },
-  { key: 'resolve-unblocking', label: 'Resolve Unblocking Conversations', hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false },
-  { key: 'review-new-issues',  label: 'Review New Issues',             hasSetting: false, hasReviewers: true,  hasMemory: true,  hasTriggers: true,  reviews: { place: 'Issue review', item: 'issue' } },
+  { key: 'review-new-prs',     label: 'Review New Pull Requests',      hasSetting: true,  hasReviewers: true,  hasMemory: true,  hasTriggers: false, hasSkips: true,  reviews: { place: 'PR review', item: 'pull request' } },
+  { key: 'approve-prs',        label: 'Approve Pull Requests',         hasSetting: false, hasReviewers: false, hasMemory: true,  hasTriggers: false, hasSkips: true },
+  { key: 'resolve-unblocking', label: 'Resolve Unblocking Conversations', hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'review-new-issues',  label: 'Review New Issues',             hasSetting: false, hasReviewers: true,  hasMemory: true,  hasTriggers: true,  hasSkips: false, reviews: { place: 'Issue review', item: 'issue' } },
 ]
 
 export type BehaviorSetting = 'p0' | 'p1' | 'p2' | 'p3' | 'p4'
@@ -99,6 +102,8 @@ const scratchpadByKey: Partial<Record<BehaviorKey, string>> = {}
 // Review New Issues: the repositories that trigger it and the trusted authors.
 const reposByKey: Partial<Record<BehaviorKey, string[]>> = {}
 const authorsByKey: Partial<Record<BehaviorKey, string[]>> = {}
+// The PR behaviors: the repositories each one leaves alone.
+const skipReposByKey: Partial<Record<BehaviorKey, string[]>> = {}
 let diagnostics: BehaviorDiagnostics | null = null
 
 export function isEnabled(key: BehaviorKey): boolean {
@@ -130,6 +135,10 @@ export function getAuthors(key: BehaviorKey): string[] {
   return authorsByKey[key] ?? []
 }
 
+export function getSkipRepos(key: BehaviorKey): string[] {
+  return skipReposByKey[key] ?? []
+}
+
 function stringList(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : null
 }
@@ -138,7 +147,7 @@ export function getBehaviorDiagnostics(): BehaviorDiagnostics | null {
   return diagnostics
 }
 
-async function postBehavior(key: BehaviorKey, body: { enabled?: boolean, setting?: BehaviorSetting, reviewers?: ReviewerCount, repos?: string[], authors?: string[], scratchpad?: string, scratchpadPrevious?: string }) {
+async function postBehavior(key: BehaviorKey, body: { enabled?: boolean, reviewers?: ReviewerCount, scratchpad?: string, scratchpadPrevious?: string } & SettingFields) {
   const res = await fetch(`/api/behaviors/${encodeURIComponent(key)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -206,36 +215,8 @@ export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<vo
   window.dispatchEvent(new CustomEvent('poise:behaviors-changed', { detail: { key, enabled: enabledByKey[key] } }))
 }
 
-// Setting writes are serialized per behaviour. The server stores whichever
-// request arrives last, so two in flight at once could leave the ceiling on a
-// value the person had already moved past — and a ceiling decides which pull
-// requests the automation acts on.
-const settingWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
-
-export function setSetting(key: BehaviorKey, setting: BehaviorSetting): Promise<void> {
-  const run = async () => {
-    const previous = settingByKey[key] ?? 'p2'
-    settingByKey[key] = setting
-    beginWrite(key)
-    try {
-      const data = await postBehavior(key, { setting })
-      if (data.setting) settingByKey[key] = data.setting
-    } catch (err) {
-      settingByKey[key] = previous
-      throw err
-    } finally {
-      endWrite(key)
-    }
-  }
-  const chained = (settingWriteChain[key] ?? Promise.resolve()).then(run, run)
-  // The chain only orders the requests; a rejection belongs to its own caller
-  // and must not be reported twice or left unhandled here.
-  settingWriteChain[key] = chained.catch(() => {})
-  return chained
-}
-
-// The reviewer count is serialized the same way as the ceiling, for the same
-// reason: the last request to arrive is what the server keeps.
+// The reviewer count is serialized the same way as the Setting dropdown, for
+// the same reason: the last request to arrive is what the server keeps.
 const reviewersWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
 
 export function setReviewers(key: BehaviorKey, reviewers: ReviewerCount): Promise<void> {
@@ -258,30 +239,50 @@ export function setReviewers(key: BehaviorKey, reviewers: ReviewerCount): Promis
   return chained
 }
 
-// Repositories and authors are written together, serialized per behaviour
-// for the same reason as the ceiling: the last request to arrive is kept.
-const triggersWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
+// What the Setting dropdown saves: Review New Pull Requests' ceiling, Review
+// New Issues' repositories and trusted authors, and the repositories a PR
+// behavior skips. The changed fields travel in one request, so the server
+// applies all of them or none.
+export interface SettingFields {
+  setting?: BehaviorSetting
+  repos?: string[]
+  authors?: string[]
+  skipRepos?: string[]
+}
 
-export function setTriggers(key: BehaviorKey, triggers: { repos?: string[], authors?: string[] }): Promise<void> {
+// Writes are serialized per behaviour. The server stores whichever request
+// arrives last, so two in flight at once could leave a setting on a value the
+// person had already moved past — and these decide where the automations act.
+const settingFieldsWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
+
+export function setSettingFields(key: BehaviorKey, fields: SettingFields): Promise<void> {
   const run = async () => {
-    const previous = { repos: reposByKey[key], authors: authorsByKey[key] }
-    if (triggers.repos) reposByKey[key] = [...triggers.repos]
-    if (triggers.authors) authorsByKey[key] = [...triggers.authors]
+    const previous = { setting: settingByKey[key], repos: reposByKey[key], authors: authorsByKey[key], skipRepos: skipReposByKey[key] }
+    if (fields.setting) settingByKey[key] = fields.setting
+    if (fields.repos) reposByKey[key] = [...fields.repos]
+    if (fields.authors) authorsByKey[key] = [...fields.authors]
+    if (fields.skipRepos) skipReposByKey[key] = [...fields.skipRepos]
     beginWrite(key)
     try {
-      const data = await postBehavior(key, triggers)
+      const data = await postBehavior(key, fields)
+      if (fields.setting && data.setting) settingByKey[key] = data.setting
       reposByKey[key] = stringList(data.repos) ?? reposByKey[key]
       authorsByKey[key] = stringList(data.authors) ?? authorsByKey[key]
+      skipReposByKey[key] = stringList(data.skipRepos) ?? skipReposByKey[key]
     } catch (err) {
+      settingByKey[key] = previous.setting
       reposByKey[key] = previous.repos
       authorsByKey[key] = previous.authors
+      skipReposByKey[key] = previous.skipRepos
       throw err
     } finally {
       endWrite(key)
     }
   }
-  const chained = (triggersWriteChain[key] ?? Promise.resolve()).then(run, run)
-  triggersWriteChain[key] = chained.catch(() => {})
+  const chained = (settingFieldsWriteChain[key] ?? Promise.resolve()).then(run, run)
+  // The chain only orders the requests; a rejection belongs to its own caller
+  // and must not be reported twice or left unhandled here.
+  settingFieldsWriteChain[key] = chained.catch(() => {})
   return chained
 }
 
@@ -359,6 +360,8 @@ export async function refreshState(): Promise<void> {
       if (repos) reposByKey[k] = repos
       const authors = stringList(data[k]?.authors)
       if (authors) authorsByKey[k] = authors
+      const skipRepos = stringList(data[k]?.skipRepos)
+      if (skipRepos) skipReposByKey[k] = skipRepos
       scratchpadByKey[k] = typeof data[k]?.scratchpad === 'string' ? data[k].scratchpad : ''
     }
     for (const k of keys) {

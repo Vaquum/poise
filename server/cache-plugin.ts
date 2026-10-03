@@ -12,12 +12,12 @@ import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
-import { getOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
+import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, getOrCreateChatSession, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
-import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
+import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { ContentLaunchPendingError, getContentJobResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
 import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders, type RequestAuthority } from './http'
@@ -517,6 +517,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               // How many of the PR review place's reviewers (Settings →
               // Models) review each new pull request, in parallel.
               reviewers: getReviewers('review-new-prs'),
+              // Repositories the behavior never acts in.
+              skipRepos: getRepositorySkips('review-new-prs'),
               scratchpad: scratch['review-new-prs'],
               lastTriggered: lastFor('pr_review', 'poise:review-new-prs'),
             },
@@ -528,6 +530,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               enabled: enabled['approve-prs'],
               setting: null,
               reviewers: null,
+              skipRepos: getRepositorySkips('approve-prs'),
               scratchpad: scratch['approve-prs'],
               lastTriggered: lastFor('pr_approve', 'poise:approve-prs'),
             },
@@ -543,6 +546,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               enabled: enabled['resolve-unblocking'],
               setting: null,
               reviewers: null,
+              skipRepos: getRepositorySkips('resolve-unblocking'),
               scratchpad: null,
               lastTriggered: getResolveUnblockingLastFired(),
             },
@@ -570,7 +574,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           })
         }
 
-        // POST /api/behaviors/<key> { enabled?, setting?, reviewers?: 1|2|3, repos?: string[], authors?: string[], scratchpad? }
+        // POST /api/behaviors/<key> { enabled?, setting?, reviewers?: 1|2|3, repos?: string[], authors?: string[], skipRepos?: string[], scratchpad? }
         // — every field optional; several can be sent in one call.
         const behaviorMatch = url.match(/^\/api\/behaviors\/([a-z0-9-]+)(?:\?|$)/)
         if (behaviorMatch && req.method === 'POST') {
@@ -629,6 +633,23 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             if ('authors' in body && !isValidAuthorList(body.authors)) {
               return json(res, 400, { error: 'authors must be up to 20 GitHub usernames' })
             }
+            if ('skipRepos' in body) {
+              if (!isSkippableBehavior(key)) {
+                return json(res, 400, { error: 'only review-new-prs, approve-prs and resolve-unblocking skip repositories' })
+              }
+              if (!isValidRepositoryList(body.skipRepos)) {
+                return json(res, 400, { error: `skipRepos must be a list of up to ${MAX_SKIPPED_REPOSITORIES} owner/name repositories` })
+              }
+              // A newly skipped repository must belong to a ready account. One
+              // already skipped stays valid after its account stops listing it,
+              // so it can still be removed. Nothing is asked of GitHub: an
+              // opt-out must not depend on a repository listing succeeding.
+              const skipped = new Set(getRepositorySkips(key).map((repo) => repo.toLowerCase()))
+              const accounts = readyOrganizations()
+              const foreign = (body.skipRepos as string[]).filter((repo) => !skipped.has(repo.toLowerCase())
+                && !accounts.some((account) => repoBelongsTo(repo, account.login)))
+              if (foreign.length) return json(res, 400, { error: 'not a repository of a ready GitHub account: ' + foreign.join(', ') })
+            }
             if ('scratchpad' in body) {
               if (typeof body.scratchpad !== 'string') {
                 return json(res, 400, { error: 'scratchpad must be a string' })
@@ -651,6 +672,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             if ('reviewers' in body && isPanelBehavior(key)) setBehaviorReviewers(body.reviewers, key)
             if ('repos' in body) setIssueRepositories(body.repos)
             if ('authors' in body) setIssueAuthors(body.authors)
+            if ('skipRepos' in body && isSkippableBehavior(key)) setRepositorySkips(key, body.skipRepos)
             if ('scratchpad' in body) setBehaviorScratchpad(key, body.scratchpad)
             if ('enabled' in body) await setBehaviorEnabled(key, body.enabled)
             return json(res, 200, {
@@ -662,6 +684,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
                 repos: getIssueRepositories().map((entry) => entry.repo),
                 authors: getIssueAuthors(),
               } : {}),
+              ...(isSkippableBehavior(key) ? { skipRepos: getRepositorySkips(key) } : {}),
               scratchpad: getScratchpadMap()[key],
             })
           } catch (err: any) {
@@ -816,13 +839,17 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // Body: { behavior, repo, pr_id }. Server maps behavior to the
         // CLI flag (--pr-review / --pr-approve) and re-spawns. A new
         // row appears in `agent-interface --logs`; the original row is
-        // untouched. Used by the Swarm view's Replay column.
+        // untouched. Used by the Swarm view's Replay column. A target the
+        // scheduler would not act on is refused with 409.
         if (url === '/api/agent-replay' && req.method === 'POST') {
           try {
             const body = await readJson<any>(req)
-            const result = await replayAgentJob(body)
+            const result = await replayAgentJob(body, admitReplay)
             return json(res, 200, result)
           } catch (err: any) {
+            // A refusal is the answer, not a failure: it names the check the
+            // target failed, as the scheduler would have.
+            if (err instanceof ReplayRefusedError) return json(res, 409, { error: err.message })
             const stderr = err?.stderr?.toString?.() || ''
             const msg = stderr || err?.message || String(err)
             return json(res, httpStatus(err, 400), { error: 'agent-replay failed: ' + msg })

@@ -464,6 +464,12 @@ export async function triggerPrReview(
   return { ok: true, source, correlationId }
 }
 
+// The scheduler's eligibility check for a replay (server/behaviors.ts
+// admitReplay): it reads the target fresh and throws when the scheduler would
+// not act on it. Passed in rather than imported, so this bridge to Caller does
+// not depend on the behavior runtime.
+export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<void>
+
 // Replay an existing agent-interface job — used by the Swarm view's
 // Replay column. The frontend sends the row's `behavior` + `repo` +
 // `pr_id`; we map behavior → CLI flag and re-spawn the same command
@@ -471,25 +477,29 @@ export async function triggerPrReview(
 // `agent-interface --logs` for the new run; the existing row is
 // untouched. pr_review, pr_approve and issue_review are replayable
 // through this path — other behaviors aren't exposed as standalone CLI
-// invocations today.
+// invocations today. Nothing is prepared or launched before `admit` passes.
 export async function replayAgentJob(input: {
   behavior?: string,
   repo?: string,
   pr_id?: string | number,
-}): Promise<{ ok: true, source: string, correlationId: string }> {
+}, admit: ReplayAdmission): Promise<{ ok: true, source: string, correlationId: string }> {
   const behavior = String(input.behavior || '')
   const repo = String(input.repo || '')
   const prId = String(input.pr_id || '')
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) throw new Error('repo must be owner/name')
   if (!/^[1-9]\d*$/.test(prId))          throw new Error('pr_id must be a positive integer')
 
-  if (behavior === ISSUE_REVIEW_BEHAVIOR) return replayIssueReview(repo, prId)
+  if (behavior === ISSUE_REVIEW_BEHAVIOR) {
+    await admit(behavior, repo, Number(prId))
+    return replayIssueReview(repo, prId)
+  }
 
   let flag: string
   if (behavior === 'pr_review')       flag = '--pr-review'
   else if (behavior === 'pr_approve') flag = '--pr-approve'
   else throw new Error(`behavior "${behavior}" is not replayable`)
 
+  await admit(behavior, repo, Number(prId))
   const actor = requireAgentAccount()
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
   const { model, recovery, catalog } = await reviewChoice(place)
