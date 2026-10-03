@@ -310,8 +310,9 @@ export function validateModelSettings(catalog: Catalog, models: unknown): ModelS
   return next
 }
 
-// The daily refresh (scripts/refresh-models.mjs, launchd 07:00) leaves its
-// last report here; the settings pane shows when the catalog was last checked.
+// The daily refresh (scripts/refresh-models.mjs: launchd at 07:00, or Poise
+// itself in service mode) leaves its last report here; the settings pane shows
+// when the catalog was last checked.
 export function catalogReportPath(): string {
   return process.env.POISE_MODEL_CATALOG_REPORT || join(homedir(), '.poise', 'model-catalog.json')
 }

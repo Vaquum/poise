@@ -23,7 +23,9 @@ import { ChatSocketServer, handleChatApi } from './chat/transport'
 import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
 import { SelfUpdateService, createSelfUpdateBridge, drainAllowsPath, handleSelfUpdateApi, handleSelfUpdateTurnedOff, isSelfUpdateControlRoute, resolveSelfUpdateRoot, unconfiguredSelfUpdateBridge, type SelfUpdateBridge } from './self-update'
+import { releaseBackgroundPaused } from './release-background'
 import { applyServiceEnvironment, readServiceConfig, type ServiceConfig } from './service/config'
+import { DailyModelRefresh } from './service/model-refresh'
 import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
 import type { Server } from 'node:http'
 
@@ -59,6 +61,8 @@ export interface CachePluginOptions {
 let chatRuntime: ChatRuntime | null = null
 let chatSockets: ChatSocketServer | null = null
 let selfUpdate: SelfUpdateService | null = null
+// Service mode only: the in-process daily model check.
+let dailyModelRefresh: DailyModelRefresh | null = null
 
 function serviceOf(opts: CachePluginOptions): ServiceConfig | null {
   return opts.service === undefined ? readServiceConfig() : opts.service
@@ -118,7 +122,16 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     })
     chatRuntime.on('log', (line: string) => console.log(line))
     chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
-    if (!service) selfUpdate = new SelfUpdateService(chatRuntime, bridge)
+    if (service) {
+      dailyModelRefresh = new DailyModelRefresh({
+        timeZone: () => getSettings().timezone,
+        refresh: refreshModelCatalog,
+        paused: releaseBackgroundPaused,
+      })
+      dailyModelRefresh.start()
+    } else {
+      selfUpdate = new SelfUpdateService(chatRuntime, bridge)
+    }
     void chatRuntime.recover().catch((error: unknown) => {
       console.error('[chat] startup reconciliation failed:', error)
     })
@@ -131,9 +144,11 @@ export async function stopPoiseRuntime(): Promise<void> {
   const chatStop = chatRuntime?.stop() ?? Promise.resolve()
   const socketStop = chatSockets?.close() ?? Promise.resolve()
   selfUpdate?.reset()
+  dailyModelRefresh?.stop()
   chatRuntime = null
   chatSockets = null
   selfUpdate = null
+  dailyModelRefresh = null
   await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, ...authStops])
 }
 
