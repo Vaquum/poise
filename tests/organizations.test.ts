@@ -407,6 +407,39 @@ describe('managed organization synchronization', () => {
     await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.error).toBeNull())
     await ready('acme')
   })
+
+  it('alerts once syncs have been failing for 15 minutes, until one succeeds', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    const alerts = () => database!.db.prepare('SELECT kind, dedupe_key AS key, resolved_at AS resolved FROM alerts ORDER BY id').all()
+    const streak = () => database!.db.prepare("SELECT sync_failures AS failures, sync_failing_since AS since FROM organizations WHERE login = 'acme'").get() as { failures: number, since: number }
+    let failing = true
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (failing && command === 'github-datastore' && args[2] === 'sync') throw new Error('network unavailable')
+      return cli(command, args, options)
+    })
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(streak().failures).toBe(1))
+    expect(streak().since).toBeGreaterThan(0)
+    expect(alerts()).toEqual([])
+
+    // The run of failures began 15 minutes ago: the next failure alerts, and
+    // the run keeps its start.
+    const since = Date.now() - 15 * 60_000
+    database!.db.prepare("UPDATE organizations SET sync_failing_since = ? WHERE login = 'acme'").run(since)
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(streak().failures).toBe(2))
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(streak().failures).toBe(3))
+    expect(streak().since).toBe(since)
+    expect(alerts()).toEqual([{ kind: 'datastore_sync_failing', key: 'datastore-sync:acme', resolved: null }])
+
+    failing = false
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.error).toBeNull())
+    expect(streak()).toEqual({ failures: 0, since: 0 })
+    expect(alerts()).toEqual([{ kind: 'datastore_sync_failing', key: 'datastore-sync:acme', resolved: expect.any(String) }])
+  })
 })
 
 

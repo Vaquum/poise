@@ -1972,6 +1972,39 @@ describe('behavior launch claims', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
   })
 
+  it('alerts once when a behavior gives up on a pull request, however often it fails there', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+    const launched = await launchReviewBeforeCrash()
+    const alerts = () => launched.database.db.prepare('SELECT kind, title, dedupe_key AS key, resolved_at AS resolved FROM alerts ORDER BY id').all()
+    agentLogs = [agentLog({
+      status: 'failed', error: 'model unavailable',
+      actor: launched.actor, source: launched.source, expected_head: launched.expectedHead,
+      correlation_id: launched.correlationId,
+    })]
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(launched.database.listBehaviorDeadLetters()).toHaveLength(1)
+    expect(alerts()).toEqual([{
+      kind: 'behavior_held', title: `Review New Pull Requests failed on ${launched.target}`,
+      key: `behavior-held:review-new-prs:${launched.target}`, resolved: null,
+    }])
+
+    // Its retry fails too: a second dead letter for the same incident, still one alert.
+    vi.setSystemTime(Date.now() + launched.behaviors.BEHAVIOR_RETRY_BASE_MS)
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    const retry = launched.database.listBehaviorLaunchClaims('review-new-prs').find((claim) => claim.target === launched.target)!
+    expect(retry.launchCorrelationId).not.toBe(launched.correlationId)
+    agentLogs.push(agentLog({
+      id: '8'.repeat(32), status: 'failed', error: 'model unavailable',
+      actor: retry.launchActor, source: retry.launchSource, expected_head: retry.launchExpectedHead,
+      correlation_id: retry.launchCorrelationId,
+    }))
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(launched.database.listBehaviorDeadLetters()).toHaveLength(2)
+    expect(alerts()).toHaveLength(1)
+  })
+
   it('requires an unambiguous failed call before recovering a no-action failure', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))

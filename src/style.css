@@ -5077,10 +5077,16 @@ body.editor-writer-mode .editor-focus-btn:hover { color: var(--text); }
 
 /* Add-snippet — the view's primary action: .st-save fill, trimmed to the
    header's pill rhythm. */
-.snip-add {
+.snip-add,
+.snip-import-open {
   padding: var(--sp-1) var(--sp-3);
   border-radius: var(--r-pill);
 }
+
+/* Import panel — above the table, set apart from it; the list of skipped
+   entries indented like body text. */
+.snip-import { margin-bottom: var(--sp-6); }
+.snip-import-report { margin: 0; padding-left: var(--sp-4); }
 
 /* Empty state — quiet, matches .st-help weight. */
 .snip-empty {

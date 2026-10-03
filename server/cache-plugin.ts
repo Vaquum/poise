@@ -4,7 +4,10 @@ import type { ServerResponse } from 'node:http'
 import { agentAccount, callerAccounts, getModelSettings, getSettings, seedAgentAccount, setSettings } from './settings'
 import { MODEL_PLACES, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
 import { refreshModelCatalog } from './models-refresh'
-import { claudeAuth, type ClaudeAuthSnapshot } from './claude-auth'
+import { claudeAuth, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
+import { claudeAuthStatusChanged } from './alerts/producers'
+import { pruneAlerts } from './alerts/store'
+import { LinkApi } from './link/api'
 import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
@@ -66,6 +69,8 @@ let selfUpdate: SelfUpdateService | null = null
 // Service mode only: the gateway's drain and the in-process daily model check.
 let serviceControl: ServiceControl | null = null
 let dailyModelRefresh: DailyModelRefresh | null = null
+// What paired Poise Link devices read: snippets, alerts and the event stream.
+let linkApi: LinkApi | null = null
 
 function serviceOf(opts: CachePluginOptions): ServiceConfig | null {
   return opts.service === undefined ? readServiceConfig() : opts.service
@@ -92,9 +97,12 @@ export interface ClaudeAuthRuntime {
   stop(): Promise<void>
   snapshot(): ClaudeAuthSnapshot
   startLogin(): ClaudeAuthSnapshot
+  /** Calls `listener` with each new status; returns the unsubscribe. */
+  onStatus(listener: (status: ClaudeAuthStatus) => void): () => void
 }
 
-const activeClaudeAuthRuntimes = new Set<ClaudeAuthRuntime>()
+// Each running auth monitor, with the unsubscribe of the alert it raises.
+const activeClaudeAuthRuntimes = new Map<ClaudeAuthRuntime, () => void>()
 
 export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   // First: a malformed seed stops the start before anything is running.
@@ -102,8 +110,9 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   const service = serviceOf(opts)
   if (service) applyServiceEnvironment()
   const auth = opts.claudeAuth ?? claudeAuth
-  activeClaudeAuthRuntimes.add(auth)
+  if (!activeClaudeAuthRuntimes.has(auth)) activeClaudeAuthRuntimes.set(auth, auth.onStatus(claudeAuthStatusChanged))
   auth.start()
+  pruneAlerts()
   setCallerAccounts(callerAccounts)
   startOrganizationsRuntime()
   startBehaviorsRuntime()
@@ -142,22 +151,29 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       console.error('[chat] startup reconciliation failed:', error)
     })
   }
+  if (!linkApi) linkApi = new LinkApi({ service })
 }
 
 export async function stopPoiseRuntime(): Promise<void> {
-  const authStops = [...activeClaudeAuthRuntimes].map((auth) => auth.stop())
+  const authStops = [...activeClaudeAuthRuntimes].map(([auth, unwatch]) => {
+    unwatch()
+    return auth.stop()
+  })
   activeClaudeAuthRuntimes.clear()
   const chatStop = chatRuntime?.stop() ?? Promise.resolve()
   const socketStop = chatSockets?.close() ?? Promise.resolve()
   selfUpdate?.reset()
   serviceControl?.reset()
   dailyModelRefresh?.stop()
+  // Open event streams and long polls would otherwise hold the server open.
+  linkApi?.close()
   setCallerAccounts(null)
   chatRuntime = null
   chatSockets = null
   selfUpdate = null
   serviceControl = null
   dailyModelRefresh = null
+  linkApi = null
   await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, ...authStops])
 }
 
@@ -213,6 +229,12 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const launch = serviceControl.admitLaunch(req.method, path)
           if (launch === 'draining') return json(res, 503, { error: DRAINING_ERROR, code: 'draining' })
           if (launch) finished.push(launch)
+        }
+
+        // ── /api/link/* — what a paired Poise Link reads (server/link) ──
+        if (path.startsWith('/api/link/')) {
+          if (!linkApi) throw new Error('the Link API is not started')
+          return linkApi.handle(req, res, url)
         }
 
         // ── Self-update: the controller's private endpoints and the public

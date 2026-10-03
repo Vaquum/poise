@@ -40,6 +40,7 @@ import { basename, dirname } from 'node:path'
 import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../models'
 import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
+import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertContext } from '../alerts/producers'
 import { localCheckoutPath } from '../gh'
 import { ensureLocalWorkspace, LOCAL_CHAT_ROOT } from './local-workspace'
 import { catalogueAgents } from './catalog-agents'
@@ -83,6 +84,7 @@ export const DEFAULT_ADAPTERS: Record<AgentId, AdapterFactory> = {
 const PROVIDER_AGENT: Record<string, AgentId> = { claude: 'claude', codex: 'codex', grok: 'grok', muse: 'muse' }
 const AGENT_COMMAND: Record<AgentId, string> = { claude: 'claude', codex: 'codex', grok: 'grok', muse: 'muse' }
 const AGENT_LABEL: Record<AgentId, string> = { claude: 'Claude Code', codex: 'Codex', grok: 'Grok Build', muse: 'Muse' }
+const alertContext = (record: SessionRecord): ChatSessionAlertContext => ({ sessionId: record.id, agent: AGENT_LABEL[record.agent], title: record.title })
 
 export const DEFAULT_IDLE_TIMEOUT_MINUTES = 120
 export const DEFAULT_BRANCH_PREFIX = 'chat/'
@@ -319,6 +321,8 @@ export class ChatRuntime extends EventEmitter {
           ? { type: 'permission.resolved', id: pending.requestId, optionId: '', by: 'cancelled' }
           : { type: 'question.answered', id: pending.requestId, answers: {}, by: 'cancelled' })
       }
+      // No request outlives the process that asked it.
+      if (record.status === 'waiting') chatWaitingEnded(record.id)
       const envelope = storage.finalizeTurn(open.sessionId,
         { type: 'turn.finished', turnId: open.turnId, stopReason: 'interrupted', error: 'Poise restarted while this turn was running' },
         open.callId ? { callId: open.callId, instance: this.instance } : undefined)
@@ -353,6 +357,7 @@ export class ChatRuntime extends EventEmitter {
         this.emit_(record.id, { type: 'error', message: 'Context maintenance was interrupted by restart; it was not replayed.', recoverable: true })
       }
       if (['running', 'waiting', 'stopping', 'queued', 'starting'].includes(record.status)) {
+        if (record.status === 'waiting') chatWaitingEnded(record.id)
         record.status = record.nativeSessionId ? 'interrupted' : 'idle'
         storage.saveSession(record)
       }
@@ -1815,14 +1820,16 @@ export class ChatRuntime extends EventEmitter {
       // but it is not a user Stop. Keep its cause visible in Chat and Caller.
       if (turn.failure && !turn.stopping) { stopReason = 'error'; error = turn.failure }
       let terminalRecorded = false
+      const durationMs = Date.now() - turn.startedAt
       try {
         const envelope = storage.finalizeTurn(record.id,
-          { type: 'turn.finished', turnId: turn.id, stopReason, error, usage, durationMs: Date.now() - turn.startedAt },
+          { type: 'turn.finished', turnId: turn.id, stopReason, error, usage, durationMs },
           turn.callId ? { callId: turn.callId, instance: this.instance } : undefined,
           freed && !turn.stopping && !this.stopped && !session.lifecycle.signal.aborted)
         terminalRecorded = true
         record.lastSeq = envelope.seq
         this.emit('event', envelope)
+        chatTurnFinished(alertContext(record), { id: turn.id, stopReason, durationMs })
       } catch (failure) {
         // Preserve the open turn on storage failure; do not acknowledge a
         // ledger result whose recovery record was never made durable.
@@ -2386,6 +2393,9 @@ export class ChatRuntime extends EventEmitter {
     try {
       this.emit_(session.record.id, event)
       this.setStatus(session, 'waiting')
+      chatWaiting(alertContext(session.record), event.type === 'permission.requested'
+        ? { kind: 'permission', title: event.title }
+        : { kind: 'question', question: event.questions[0]?.question ?? 'answer a question' })
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error))
       session.pending.get(requestId)?.reject(failure)
@@ -2475,6 +2485,7 @@ export class ChatRuntime extends EventEmitter {
   // ── Events ─────────────────────────────────────────────────────────────
 
   private setStatus(session: LiveSession, status: SessionStatus, detail?: string): void {
+    if (session.record.status === 'waiting' && status !== 'waiting') chatWaitingEnded(session.record.id)
     session.record.status = status
     if (status !== 'queued') session.record.queuedBehind = undefined
     this.saveRecord(session)

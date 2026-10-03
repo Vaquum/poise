@@ -21,7 +21,7 @@ and shows Poise alerts as native notifications; see [Poise Link](docs/Poise-Link
 - **Chat** — native coding-agent sessions with streaming, tools, permissions and checkout-bound work.
 - **Archive** — searchable GitHub issue and PR history.
 - **Behaviors** — scheduled review, approval, unblocking, and issue-review automations.
-- **Snippets** — simple Espanso trigger management.
+- **Snippets** — simple Espanso trigger management, and Import from an existing Espanso file.
 - **Editor** — atomic Markdown storage, annotations, and agent-backed chat.
 
 ## Requirements
@@ -340,6 +340,14 @@ storage no longer needs a git checkout of Poise.
   workspace refusing work.
 - `POST /api/service/resume` lifts the drain; the owner's browser may call it
   too.
+
+**Poise Link.** A paired device reads `/api/link/*` with the gateway's `link`
+scope: its snippets (plain pairs only), the workspace's alerts and an event
+stream that announces both. The workspace records an alert when Claude needs a
+new sign-in, a behavior gives up on a pull request or issue, a GitHub account's
+datastore sync has been failing for 15 minutes, a Chat agent waits for a
+permission or an answer, and when a Chat turn longer than two minutes finishes.
+[Poise Link](docs/Poise-Link.md#the-workspace-side) describes the API.
 
 **Daily model check.** At 07:00 in the timezone set in Settings, Poise runs
 the same check as Settings → Models → Check now, in place of the launchd job.

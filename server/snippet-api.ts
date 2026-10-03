@@ -1,13 +1,18 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { readJson, httpStatus } from './http'
 import { ProcessLockError } from './process-lock'
-import { SnippetConflictError, snippetDelivery } from './snippets'
-import { readSkillSnippets, saveSkillSnippets, addSkillSnippet } from './snippet-library'
+import { MAX_SNIPPETS_BYTES, SnippetConflictError, snippetDelivery } from './snippets'
+import { readSkillSnippets, saveSkillSnippets, addSkillSnippet, importEspansoSnippets } from './snippet-library'
+
+// JSON escaping can grow a file's text up to six times; the YAML itself is
+// held to MAX_SNIPPETS_BYTES once decoded.
+const IMPORT_BODY_MAX_BYTES = MAX_SNIPPETS_BYTES * 6 + 1024
 
 /** Shared by the application and isolated browser journeys. The caller applies
  * the normal host/origin policy before dispatching any API route. */
 export async function handleSnippetApi(req: IncomingMessage, res: ServerResponse, url: string): Promise<boolean> {
-  if (url.split('?')[0] !== '/api/snippets') return false
+  const path = url.split('?')[0]
+  if (path !== '/api/snippets' && path !== '/api/snippets/import') return false
   function send(status: number, body: unknown): true {
     res.statusCode = status
     res.setHeader('Content-Type', 'application/json')
@@ -15,6 +20,14 @@ export async function handleSnippetApi(req: IncomingMessage, res: ServerResponse
     return true
   }
   try {
+    if (path === '/api/snippets/import') {
+      if (req.method !== 'POST') {
+        res.setHeader('Allow', 'POST')
+        return send(405, { error: 'Use POST to import snippets.' })
+      }
+      const body = await readJson<{ yaml?: unknown }>(req, IMPORT_BODY_MAX_BYTES)
+      return send(200, await importEspansoSnippets(body?.yaml))
+    }
     if (req.method === 'GET') return send(200, { ...await readSkillSnippets(), ...snippetDelivery() })
     if (req.method === 'PUT') {
       const body = await readJson<{ snippets?: unknown, base_version?: unknown }>(req)
