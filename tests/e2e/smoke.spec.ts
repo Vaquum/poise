@@ -346,6 +346,33 @@ test('chooses how many reviewers each new pull request gets from Behaviors', asy
   await expect(page.getByLabel('Reviewers for review-new-prs')).toHaveValue('3')
 })
 
+test('shows the agent account as the Behaviors owner and follows it when it changes', async ({ page }) => {
+  let owner: string | null = 'review-bot'
+  const missing = 'No agent account is set. Set it in Settings → GitHub: it is the GitHub user your reviews and comments are posted as.'
+  const behavior = (extra: Record<string, unknown>) => ({
+    owner, enabled: false, setting: null, reviewers: null, scratchpad: '', lastTriggered: null, ...extra,
+  })
+  await page.route(/\/api\/behaviors(?:\?.*)?$/, async (route) => {
+    await route.fulfill({ json: {
+      'review-new-prs': behavior({ setting: 'p2', reviewers: 1 }),
+      'approve-prs': behavior({}),
+      'resolve-unblocking': behavior({ scratchpad: null }),
+      diagnostics: { status: owner ? 'ok' : 'degraded', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: owner ? { status: 'valid', actor: owner, error: null } : { status: 'invalid', actor: null, error: missing }, failures: [], deadLetters: [] },
+    } })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  const cell = page.locator('tr[data-behavior="review-new-prs"] .behavior-owner-cell')
+  await expect(cell).toHaveText('review-bot')
+  owner = 'other-bot'
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(cell).toHaveText('other-bot')
+  owner = null
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(cell).toHaveText('—')
+  await expect(page.locator('#behavior-diagnostics')).toContainText(`Identity: ${missing}`)
+})
+
 test('opts repositories and trusted authors into Review New Issues from Behaviors', async ({ page }) => {
   let state: Record<string, unknown> = { repos: [], authors: ['mikkokotila', 'zero-bang', 'bit-mis'], reviewers: 1 }
   const writes: Array<Record<string, unknown>> = []
