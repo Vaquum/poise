@@ -24,6 +24,7 @@ Everything comes from the environment and is validated at startup. Every problem
 | `POISE_WORKSPACE_CPUS` | | `4` | CPU limit per workspace |
 | `POISE_WORKSPACE_PIDS` | | `4096` | Process limit per workspace |
 | `POISE_WORKSPACE_RUNTIME` | | | OCI runtime for workspaces, for example `runsc` |
+| `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` | | | `1` passes `POISE_SKIP_CLI_BOOTSTRAP=1` to new workspaces, so they install no provider CLIs; for end-to-end tests, which need no CLIs |
 | `POISE_DRAIN_TIMEOUT` | | `1800` | Seconds to wait for a workspace to go idle before it is recreated |
 | `POISE_GATEWAY_DATA` | | `/data` | Data directory |
 | `POISE_DOCKER_SOCKET` | | `/var/run/docker.sock` | Docker Engine socket |

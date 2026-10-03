@@ -28,6 +28,8 @@ export interface Config {
   workspaceNanoCpus: number
   workspacePids: number
   workspaceRuntime: string | null
+  /** Workspaces get POISE_SKIP_CLI_BOOTSTRAP=1 and install no provider CLIs; for end-to-end tests. */
+  workspaceSkipCliBootstrap: boolean
   drainTimeoutSeconds: number
   dataDir: string
   dockerSocket: string
@@ -171,6 +173,11 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     problems.push(`POISE_WORKSPACE_RUNTIME is not a valid OCI runtime name; got "${workspaceRuntime}"`)
   }
 
+  const skipBootstrapValue = read('POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP')
+  if (skipBootstrapValue !== undefined && skipBootstrapValue !== '1') {
+    problems.push(`POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP must be 1 or unset; got "${skipBootstrapValue}"`)
+  }
+
   const absolutePath = (name: string, standard: string): string => {
     const value = read(name) ?? standard
     if (!isAbsolute(value)) problems.push(`${name} must be an absolute path; got "${value}"`)
@@ -201,6 +208,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     workspaceNanoCpus: Math.round(cpus * 1e9),
     workspacePids,
     workspaceRuntime,
+    workspaceSkipCliBootstrap: skipBootstrapValue === '1',
     drainTimeoutSeconds,
     dataDir,
     dockerSocket,
