@@ -48,4 +48,9 @@ CI runs the Poise gates on Node 22 for pull requests and on Node 20, 22 and 24 f
 
 - A change to an interface in `docs/Service-architecture.md` updates the document and the tests on both sides of the interface.
 - Service-mode behavior is tested with `POISE_MODE=service` and an isolated `HOME`; nothing in a test may read or write the developer's real `~/.poise`, `~/.claude`, `~/.codex`, gh configuration or Espanso folder.
+- No test reaches a real agent CLI or its login.
+  - **Isolation.** Every vitest process (`tests/home-isolation.ts`) and the end-to-end server (`playwright.config.ts`) run with a temporary `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GH_CONFIG_DIR`, `GROK_HOME` and XDG folders. Replacing `HOME` alone is not enough: Claude Code keeps its macOS Keychain login under `CLAUDE_CONFIG_DIR`.
+  - **Stand-ins.** Stand-ins come first on `PATH` for `claude`, `codex`, `gh`, `grok`, `muse` and `agy`.
+  - **Tests that run a CLI** use the fakes in `tests/fixtures/accounts/fake-clis.ts`, placed ahead of the stand-ins.
+  - **Tests that open a Connect terminal** pass `fakePresetCommand`, which refuses a preset whose CLI is not its fake before anything starts.
 - Security-relevant paths (identity assertions, sessions, device tokens, the terminal, replay checks) carry negative tests: forged, expired, wrong-audience, wrong-scope and missing credentials are each rejected.
