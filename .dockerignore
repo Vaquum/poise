@@ -6,7 +6,7 @@
 dist
 dist.previous
 gateway/dist
-coverage
+**/coverage
 playwright-report
 test-results
 .playwright-mcp
