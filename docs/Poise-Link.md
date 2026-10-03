@@ -95,6 +95,10 @@ tray says "Snippets rejected", and the log names the problem. Poise Link never
 copies the workspace's YAML as it arrived; it writes its own rendering of the
 accepted snippets, with every value double-quoted.
 
+Espanso still fills `{{name}}` placeholders in a replacement from variables
+defined in your own Espanso configuration (`global_vars`), so a snippet from
+Poise can use only the variables you defined yourself.
+
 Writes are atomic: the new content goes to `.poise.yml.tmp` in the same folder,
 is flushed to disk, and is then renamed over `poise.yml`. No other file in the
 folder is touched. If Espanso is not installed, the tray says "Espanso not
@@ -174,3 +178,5 @@ on Start at login for that build.
   Authenticode signing (Windows), once signing keys exist. Until then the
   first-launch steps above apply.
 - Automatic updates; install a newer build over the old one.
+- On Windows, an alert opens its page when clicked while the notification is on
+  screen, but not later from the notification center.
