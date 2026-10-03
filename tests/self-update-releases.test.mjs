@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { readJson, writeJsonAtomic } from '../scripts/self-update/atomic.mjs'
@@ -8,7 +9,7 @@ import {
   adoptInitialRelease, bootstrapReport, configure, ensureBridgeKey, initializeRoot, installControllerCopy, setEnabled,
 } from '../scripts/self-update/bootstrap.mjs'
 import { LaunchError, resolveLaunch } from '../scripts/self-update/launch.mjs'
-import { layout } from '../scripts/self-update/paths.mjs'
+import { REPOSITORY, layout } from '../scripts/self-update/paths.mjs'
 import { createReleaseManager, newReleaseId, readManifest, releaseIsComplete } from '../scripts/self-update/releases.mjs'
 import { openStore } from '../scripts/self-update/store.mjs'
 
@@ -182,7 +183,7 @@ describe('bootstrap helpers', () => {
     const tokenFile = join(root, 'token')
     await writeFile(tokenFile, 'ghp_' + 'a'.repeat(36), { mode: 0o600 })
     const config = await configure(root, { tokenFile, callerSha: 'c'.repeat(40) })
-    expect(config).toMatchObject({ enabled: false, tokenFile, callerSha: 'c'.repeat(40), repository: 'mikkokotila/Poise' })
+    expect(config).toMatchObject({ enabled: false, tokenFile, callerSha: 'c'.repeat(40), repository: REPOSITORY })
     await expect(configure(root, { repository: 'x/y' })).rejects.toThrow(/pinned/)
     const keyPath = await ensureBridgeKey(root)
     expect(keyPath).toBe(paths.bridgeKeyPath)
@@ -198,6 +199,9 @@ describe('bootstrap helpers', () => {
       expect(names).toContain(required)
     }
     expect(await readFile(join(copy.directory, 'policy.mjs'), 'utf8')).toBe(await readFile(join(process.cwd(), 'scripts', 'self-update', 'policy.mjs'), 'utf8'))
+    // No package.json sits beside the copy: it carries the repository fixed.
+    expect(await readFile(join(copy.directory, 'repository.mjs'), 'utf8')).toBe(`export const REPOSITORY = ${JSON.stringify(REPOSITORY)}\n`)
+    expect((await import(pathToFileURL(join(copy.directory, 'repository.mjs')).href)).REPOSITORY).toBe(REPOSITORY)
 
     expect((await setEnabled(root, true)).enabled).toBe(true)
     expect((await setEnabled(root, false)).enabled).toBe(false)

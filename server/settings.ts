@@ -10,7 +10,12 @@ const GITHUB_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/
 
 export interface Settings {
   org: string
+  // Your GitHub account: Current and Archive are scoped to it, and reads done
+  // as you use it.
   me: string
+  // The agent account: the GitHub user reviews, approvals and issue-review
+  // comments are posted as. It must be signed in to gh on this machine.
+  agentAccount: string
   timezone: string
   // Per place: the identity the user picked as default and as fallback. What
   // actually launches is resolved against the live catalog (server/models.ts).
@@ -60,7 +65,8 @@ function validateChatSettings(value: unknown): ChatSettings {
   return next
 }
 
-const TEXT_KEYS = ['org', 'me', 'timezone'] as const
+const TEXT_KEYS = ['org', 'me', 'agentAccount', 'timezone'] as const
+const ACCOUNT_KEYS: ReadonlySet<string> = new Set(['org', 'me', 'agentAccount'])
 
 // Before identities the only choice was `reviewModel` = opus | astra. Read it
 // once as the review places' preference so nobody's setting silently flips.
@@ -95,6 +101,7 @@ export function getSettings(): Settings {
   return {
     org: getMeta('org') || '',
     me: getMeta('me') || '',
+    agentAccount: getMeta('agentAccount') || '',
     timezone: getMeta('timezone') || '',
     models: getModelSettings(),
     chat: getChatSettings(),
@@ -111,7 +118,7 @@ export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Sett
     const v = partial[k]
     if (typeof v !== 'string') continue
     const trimmed = v.trim()
-    if ((k === 'org' || k === 'me') && trimmed && !GITHUB_NAME.test(trimmed)) {
+    if (ACCOUNT_KEYS.has(k) && trimmed && !GITHUB_NAME.test(trimmed)) {
       throw new Error(`${k} must be a GitHub name: letters, digits and single hyphens`)
     }
     next[k] = trimmed
@@ -132,6 +139,41 @@ export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Sett
   if (chat) setMeta('chat_settings', JSON.stringify(chat))
   if (orgChanged) invalidateRepoListCache()
   return getSettings()
+}
+
+/** The agent account, or '' while none is set. */
+export function agentAccount(): string {
+  return getMeta('agentAccount') || ''
+}
+
+/** The agent account, for anything that posts or reviews as it. */
+export function requireAgentAccount(): string {
+  const account = agentAccount()
+  if (!account) {
+    throw new Error('No agent account is set. Set it in Settings → GitHub: it is the GitHub user your reviews and comments are posted as.')
+  }
+  if (!GITHUB_NAME.test(account)) throw new Error('The agent account in Settings → GitHub is not a GitHub username')
+  return account
+}
+
+// REVIEW_AGENT_USERNAME from the environment only seeds the agent account, on
+// the first start without one saved. Once saved, cleared included, Settings is
+// the only source.
+export function seedAgentAccount(value: string | undefined): void {
+  const seed = String(value || '').trim()
+  if (!seed || getMeta('agentAccount') !== null) return
+  if (!GITHUB_NAME.test(seed)) throw new Error('REVIEW_AGENT_USERNAME must be a GitHub username to seed the agent account')
+  setMeta('agentAccount', seed)
+}
+
+/** The accounts every github-interface and agent-interface process acts as. */
+export function callerAccounts(): { GITHUB_INTERFACE_USER?: string, GITHUB_INTERFACE_AGENT_USER?: string } {
+  const me = getMeta('me') || ''
+  const agent = agentAccount()
+  return {
+    ...(me ? { GITHUB_INTERFACE_USER: me } : {}),
+    ...(agent ? { GITHUB_INTERFACE_AGENT_USER: agent } : {}),
+  }
 }
 
 export function isReady(): boolean {

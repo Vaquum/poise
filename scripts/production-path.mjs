@@ -4,7 +4,7 @@
 // what a service finds. The provider CLIs — Claude Code's native install,
 // Grok Build (`grok`), Antigravity (`agy`), Muse (`muse`) — install into
 // ~/.local/bin; Codex and an npm-installed Claude Code into Homebrew's bin.
-// Caller's release comes first so its agent-interface wins over any stale
+// Caller's virtualenv comes first so its agent-interface wins over any stale
 // copy on the user's own PATH.
 import { join } from 'node:path'
 

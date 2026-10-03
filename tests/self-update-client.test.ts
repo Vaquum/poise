@@ -8,6 +8,7 @@ import { DRAFT_SNAPSHOT_KEY, buildDraftSnapshot, cleanDraft, parseDraftSnapshot,
 import { HEALTH_POLL_MAX_MS, HEALTH_POLL_MS, IDLE_BEFORE_RELOAD_MS, OBSERVATION_FRESH_MS, RELOADED_RELEASE_KEY, ReloadController, guardClass } from '../src/self-update-reload'
 import type { SelfChange, SelfUpdateStatus } from '../src/self-update-types'
 import { deployCardHtml } from '../src/views/chat-deploy-card'
+import { POISE_REPOSITORY as REPOSITORY } from '../src/poise-repository'
 
 // The browser half of the self-improvement workflow, minus the DOM: how a
 // typed message becomes (or does not become) a change command, how the deploy
@@ -28,7 +29,7 @@ const SHA_B = 'b'.repeat(40)
 function change(over: Partial<SelfChange> = {}): SelfChange {
   return {
     id: '11111111-1111-4111-8111-111111111111', sessionId: 'src', instance: 'poise-prod:db', request: 'Add a Stop button', title: 'Add a Stop button',
-    repository: 'mikkokotila/Poise', branch: 'poise/change-1111', baseSha: SHA_A, state: 'implementing', createdAt: '2026-09-19T10:00:00.000Z', updatedAt: '2026-09-19T10:00:00.000Z',
+    repository: REPOSITORY, branch: 'poise/change-1111', baseSha: SHA_A, state: 'implementing', createdAt: '2026-09-19T10:00:00.000Z', updatedAt: '2026-09-19T10:00:00.000Z',
     canRevert: false, ...over,
   }
 }
@@ -101,7 +102,7 @@ describe('reading the status endpoint', () => {
       activeRelease: { id: 'r2', sha: SHA_B, root: '/r/r2', createdAt: 'now', callerSha: 'c' },
       previousRelease: { id: 'r1', sha: SHA_A },
       hold: { changeId: 'c1', sha: SHA_B, reason: 'health failed' },
-      changes: [change({ state: 'live', canRevert: true, releaseId: 'r2', prNumber: 12, prUrl: 'https://github.com/mikkokotila/Poise/pull/12' }), { id: 'bad', state: 'nope' }, null, 'x'],
+      changes: [change({ state: 'live', canRevert: true, releaseId: 'r2', prNumber: 12, prUrl: `https://github.com/${REPOSITORY}/pull/12` }), { id: 'bad', state: 'nope' }, null, 'x'],
       recoveryUrl: 'http://127.0.0.1:5556/',
     })!
     expect(s.changes).toHaveLength(1)
@@ -117,7 +118,7 @@ describe('reading the status endpoint', () => {
     expect(parseSelfUpdateStatus(null)).toBeNull()
     expect(parseSelfUpdateStatus('<html>')).toBeNull()
     expect(parseSelfUpdateStatus({ enabled: 'yes', available: true })).toBeNull()
-    expect(parseChange({ id: 'x', state: 'implementing' })?.repository).toBe('mikkokotila/Poise')
+    expect(parseChange({ id: 'x', state: 'implementing' })?.repository).toBe(REPOSITORY)
     expect(parseChange({ id: '', state: 'implementing' })).toBeNull()
   })
 
@@ -185,10 +186,10 @@ describe('what the card shows', () => {
       expect(html).toContain('&lt;b&gt;bold&lt;/b&gt; &amp; co')
       expect(html).not.toContain('<b>bold</b>')
     }
-    const live = change({ state: 'live', canRevert: true, releaseId: 'r2', mergeSha: SHA_B, prNumber: 7, prUrl: 'https://github.com/mikkokotila/Poise/pull/7', headSha: 'c'.repeat(40) })
+    const live = change({ state: 'live', canRevert: true, releaseId: 'r2', mergeSha: SHA_B, prNumber: 7, prUrl: `https://github.com/${REPOSITORY}/pull/7`, headSha: 'c'.repeat(40) })
     const st = status({ activeRelease: { id: 'r2', sha: SHA_B, root: '', createdAt: '', callerSha: '' }, recoveryUrl: 'http://127.0.0.1:5556/' })
     const html = deployCardHtml({ ...base, status: st, change: live })
-    expect(html).toContain('href="https://github.com/mikkokotila/Poise/pull/7"')
+    expect(html).toContain(`href="https://github.com/${REPOSITORY}/pull/7"`)
     expect(html).toContain('PR #7')
     expect(html).toContain('<code>bbbbbbb</code>')
     expect(html).toContain('this tab runs <code>aaaaaaa</code>')

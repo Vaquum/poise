@@ -11,9 +11,10 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, delimiter, join } from 'node:path'
 import { config as loadDotenv } from 'dotenv'
 import { servicePath } from './production-path.mjs'
+import { CALLER_COMMANDS, agentInterfaceRoot, callerBinRoot } from './caller.mjs'
 
 const envPath = join(process.cwd(), '.env')
 const claudeSubscriptionWrapper = join(process.cwd(), 'scripts', 'claude-subscription.mjs')
@@ -42,6 +43,16 @@ if (existsSync(envPath) && process.platform !== 'win32') {
 }
 if (dotenvSecure) loadDotenv({ path: envPath, quiet: true })
 
+// Caller's CLIs are checked where Poise runs them from, not wherever PATH
+// finds a copy, with that directory first on their PATH as Poise runs them.
+const callerBin = callerBinRoot()
+const caller = (command) => join(callerBin, command)
+if (CALLER_COMMANDS.every((command) => existsSync(caller(command)))) console.log(`ok  Caller CLIs in ${callerBin}`)
+else {
+  failed = true
+  console.error(`fail  Caller CLIs are missing from ${callerBin}${process.env.CALLER_BIN_ROOT ? ' (CALLER_BIN_ROOT)' : '; run: npm run caller:setup'}`)
+}
+
 const SAFE_CHILD_ENV = [
   'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC',
   'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
@@ -56,6 +67,9 @@ function diagnosticEnvironment(command) {
   const env = Object.fromEntries(SAFE_CHILD_ENV
     .filter((key) => process.env[key] !== undefined)
     .map((key) => [key, process.env[key]]))
+  if (CALLER_COMMANDS.includes(basename(command))) {
+    env.PATH = [callerBin, ...(env.PATH || '').split(delimiter).filter(Boolean)].join(delimiter)
+  }
   if (command === 'gh') {
     for (const key of ['GH_CONFIG_DIR', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY']) {
       if (process.env[key] !== undefined) env[key] = process.env[key]
@@ -73,7 +87,7 @@ function diagnosticEnvironment(command) {
 // names and checks the selector and effort that reach the Claude wrapper are
 // that row's — the same path a real chat takes, with a stand-in for claude.
 function catalogChatModel() {
-  const probe = spawnSync('agent-interface', ['--models'], {
+  const probe = spawnSync(caller('agent-interface'), ['--models'], {
     encoding: 'utf8',
     env: diagnosticEnvironment('agent-interface'),
     timeout: 10_000,
@@ -149,7 +163,7 @@ const checks = [
     label: 'GitHub CLI authentication',
   },
   {
-    command: 'github-datastore',
+    command: caller('github-datastore'),
     args: ['--help'],
     label: 'github-datastore contract',
     requiredOutput: [
@@ -167,7 +181,7 @@ const checks = [
     ],
   },
   {
-    command: 'github-interface',
+    command: caller('github-interface'),
     args: ['--help'],
     label: 'github-interface contract',
     requiredOutput: [
@@ -181,7 +195,7 @@ const checks = [
     ],
   },
   {
-    command: 'agent-interface',
+    command: caller('agent-interface'),
     args: ['--help'],
     label: 'agent-interface contract',
     requiredOutput: [
@@ -205,7 +219,7 @@ const checks = [
     ],
   },
   {
-    command: 'agent-interface',
+    command: caller('agent-interface'),
     args: ['--models'],
     label: 'agent-interface model catalog',
     validateOutput: () => chatModel !== null,
@@ -226,7 +240,7 @@ const checks = [
     env: { PATH: servicePath(homedir()) },
   })),
   ...(wrapperProbe ? [{
-    command: 'agent-interface',
+    command: caller('agent-interface'),
     args: [
       '--chat',
       'Poise wrapper contract probe',
@@ -297,8 +311,7 @@ for (const check of checks) {
 
 if (wrapperProbeDirectory) rmSync(wrapperProbeDirectory, { recursive: true, force: true })
 
-const agentRoot = process.env.AGENT_INTERFACE_ROOT
-  || join(homedir(), 'dev', 'caller', 'agent_interface')
+const agentRoot = agentInterfaceRoot()
 if (existsSync(agentRoot) && statSync(agentRoot).isDirectory()) console.log(`ok  agent-interface root: ${agentRoot}`)
 else {
   failed = true

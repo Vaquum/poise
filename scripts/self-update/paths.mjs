@@ -5,8 +5,9 @@
 // judge it.
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { REPOSITORY } from './repository.mjs'
 
-export const REPOSITORY = 'mikkokotila/Poise'
+export { REPOSITORY }
 export const BASE_BRANCH = 'main'
 export const REPOSITORY_URL = `https://github.com/${REPOSITORY}.git`
 export const DEFAULT_RECOVERY_PORT = 5556

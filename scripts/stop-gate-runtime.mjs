@@ -1,6 +1,7 @@
 import { constants } from 'node:fs'
 import { access, chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { callerVersions } from './caller.mjs'
 
 function paths(home) {
   const root = join(home, '.local', 'share', 'caller-pr-stop-gate')
@@ -22,33 +23,62 @@ async function executable(path) {
   }
 }
 
+async function exists(path) {
+  try {
+    await access(path)
+    return true
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+/** The Caller a gate is installed from: its source directory, the Poise
+ *  commit that carries it and the package versions. */
+export async function stopGateManifest({ callerRoot, commit }) {
+  return { source: callerRoot, commit, packages: await callerVersions(callerRoot) }
+}
+
 function sameManifest(actual, expected) {
-  return actual?.repository === expected.repository
-    && actual?.ref === expected.ref
+  return actual?.source === expected.source
     && actual?.commit === expected.commit
     && JSON.stringify(actual?.packages) === JSON.stringify(expected.packages)
 }
 
-async function scopeEnvironment(home, run, environment = process.env) {
-  let organization = environment.POISE_GITHUB_ORG?.trim()
-  if (!organization) {
-    try {
-      const result = await run('/usr/bin/sqlite3', [
-        join(home, '.poise', 'cache.db'),
-        "SELECT value FROM meta WHERE key = 'org' LIMIT 1;",
-      ], { capture: true })
-      organization = result.stdout.trim()
-    } catch {
-      // A first install can precede organization setup.
-    }
-  }
-  if (organization
-    && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/.test(organization)) {
-    throw new Error('Configured GitHub organization is invalid')
-  }
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
+
+// Poise's saved settings, read from its database: the gate is configured
+// while Poise may not be running.
+async function savedSettings(home, run) {
+  const database = join(home, '.poise', 'cache.db')
+  // A first install precedes Poise's first start: nothing is saved yet.
+  if (!await exists(database)) return {}
+  const result = await run('/usr/bin/sqlite3', [
+    '-json',
+    database,
+    "SELECT key, value FROM meta WHERE key IN ('org', 'me', 'agentAccount');",
+  ], { capture: true })
+  return Object.fromEntries(JSON.parse(result.stdout.trim() || '[]').map((row) => [row.key, row.value]))
+}
+
+function login(value, label) {
+  const name = value?.trim()
+  if (name && !GITHUB_LOGIN.test(name)) throw new Error(`Configured ${label} is invalid`)
+  return name
+}
+
+async function gateEnvironment(home, run, environment = process.env) {
+  const saved = await savedSettings(home, run)
+  const organization = login(environment.POISE_GITHUB_ORG?.trim() || saved.org, 'GitHub organization')
+  // The gate waits for the agent account saved in Settings; before Poise has
+  // started, for the REVIEW_AGENT_USERNAME that will seed it.
+  const agent = login('agentAccount' in saved ? saved.agentAccount : environment.REVIEW_AGENT_USERNAME, 'agent account')
+  const me = login(saved.me, 'GitHub account')
   return {
     ...environment,
     ...(organization ? { CALLER_PR_GATE_SCOPE: `${organization}/*` } : {}),
+    ...(agent ? { GITHUB_INTERFACE_AGENT_USER: agent } : {}),
+    ...(me ? { CALLER_GITHUB_READER: me } : {}),
   }
 }
 
@@ -72,7 +102,7 @@ export async function configureStopGate({ home, run, environment = process.env }
   }
   await run(hook.agentInterface, ['--install-pr-stop-gate'], {
     capture: true,
-    env: await scopeEnvironment(home, run, environment),
+    env: await gateEnvironment(home, run, environment),
   })
 }
 
@@ -80,7 +110,6 @@ export async function installStopGate({
   home,
   manifest,
   python,
-  releaseRoot,
   run,
   environment = process.env,
 }) {
@@ -96,8 +125,8 @@ export async function installStopGate({
     'install',
     '--disable-pip-version-check',
     '--force-reinstall',
-    join(releaseRoot, 'source', 'github_interface'),
-    join(releaseRoot, 'source', 'agent_interface'),
+    join(manifest.source, 'github_interface'),
+    join(manifest.source, 'agent_interface'),
   ])
   await configureStopGate({ home, run, environment })
   await writeFile(hook.marker, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 })

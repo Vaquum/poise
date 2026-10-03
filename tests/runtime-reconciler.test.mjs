@@ -1,9 +1,12 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { reconcileRuntime } from '../scripts/update-caller.mjs'
+import { datastoreServicesCurrent, reconcileRuntime } from '../scripts/update-caller.mjs'
 
 const A = 'a'.repeat(40)
 const B = 'b'.repeat(40)
-const C = 'c'.repeat(40)
+const PACKAGES = { 'agent-interface': '0.3.0', 'github-interface': '0.2.0', 'github-datastore': '0.2.0' }
 
 function harness(overrides = {}) {
   let head = overrides.localPoise || A
@@ -35,7 +38,7 @@ function harness(overrides = {}) {
     if (operation.startsWith('git rev-list --count')) {
       return { stdout: String(overrides.behind ?? 1), stderr: '' }
     }
-    if (command === 'gh') return { stdout: overrides.remoteCaller || C, stderr: '' }
+    // Caller has no remote of its own any more: a gh call is a failure.
     throw new Error(`Unexpected command: ${operation}`)
   })
   const writeState = vi.fn()
@@ -53,14 +56,10 @@ function harness(overrides = {}) {
       readState: vi.fn().mockResolvedValue(overrides.previous ?? null),
       writeState,
       poiseRepository: 'https://github.com/mikkokotila/Poise.git',
-      callerRelease: {
-        repository: 'mikkokotila/caller',
-        ref: 'main',
-        packages: { 'agent-interface': '0.2.0' },
-      },
+      stopGateManifest: vi.fn(async ({ callerRoot, commit }) => ({ source: callerRoot, commit, packages: PACKAGES })),
       run,
       install: vi.fn(),
-      readHealth: vi.fn().mockResolvedValue(overrides.localCaller ?? C),
+      readHealth: vi.fn().mockResolvedValue(overrides.callerReady ?? true),
       hookCurrent: vi.fn().mockResolvedValue(overrides.hookCurrent ?? true),
       datastoreCurrent: vi.fn().mockResolvedValue(overrides.datastoreCurrent ?? true),
       repairHookConfiguration: vi.fn(),
@@ -70,13 +69,20 @@ function harness(overrides = {}) {
 }
 
 describe('production runtime reconciliation', () => {
-  it('leaves current releases in place and repairs hook configuration', async () => {
+  it('leaves a current runtime in place and repairs hook configuration', async () => {
     const test = harness()
     const result = await reconcileRuntime(test.options)
 
-    expect(result.action).toBe('current')
+    expect(result).toEqual({ action: 'current', poiseCommit: A })
     expect(test.options.install).not.toHaveBeenCalled()
     expect(test.options.repairHookConfiguration).toHaveBeenCalledOnce()
+    // The hooks and datastore services are checked against this checkout's Caller.
+    expect(test.options.hookCurrent).toHaveBeenCalledWith({
+      home: '/home/test',
+      manifest: { source: '/production/caller', commit: A, packages: PACKAGES },
+    })
+    expect(test.options.datastoreCurrent).toHaveBeenCalledWith({ home: '/home/test', binRoot: '/production/caller/.venv/bin' })
+    expect(test.calls.some(([command]) => command === 'gh')).toBe(false)
   })
 
   it('fast-forwards Poise main and installs from the updated checkout', async () => {
@@ -104,13 +110,14 @@ describe('production runtime reconciliation', () => {
     expect(test.options.install).not.toHaveBeenCalled()
   })
 
-  it('installs a changed Caller release', async () => {
-    const test = harness({ localCaller: B, remoteCaller: C })
+  it('reinstalls when the service does not report its Caller ready', async () => {
+    const test = harness({ callerReady: false })
     const result = await reconcileRuntime(test.options)
 
-    expect(result.action).toBe('reconciled-runtime')
+    expect(result).toEqual({ action: 'reconciled-runtime', poiseCommit: A })
     expect(test.options.install).toHaveBeenCalledOnce()
     expect(test.options.repairHookConfiguration).not.toHaveBeenCalled()
+    expect(test.options.log).toHaveBeenCalledWith(`Reconciling the runtime of Poise ${A}: Caller is not ready`)
   })
 
   it('repairs a missing or stale stop-gate runtime', async () => {
@@ -121,12 +128,40 @@ describe('production runtime reconciliation', () => {
     expect(test.options.install).toHaveBeenCalledOnce()
   })
 
-  it('repairs datastore services pinned to a stale Caller release', async () => {
+  it('repairs datastore services that do not run the in-tree Caller', async () => {
     const test = harness({ datastoreCurrent: false })
     const result = await reconcileRuntime(test.options)
 
     expect(result.action).toBe('reconciled-runtime')
     expect(test.options.install).toHaveBeenCalledOnce()
+  })
+})
+
+describe('datastore service currency', () => {
+  const labels = ['sync', 'reconcile', 'health'].map((kind) => `com.vaquum.github-datastore.${kind}`)
+
+  async function services(home, executable) {
+    const launchAgents = join(home, 'Library', 'LaunchAgents')
+    await mkdir(launchAgents, { recursive: true })
+    for (const label of labels) {
+      await writeFile(join(launchAgents, `${label}.plist`), `<string>exec '${executable}' --db x sync</string>`)
+    }
+  }
+
+  it('is current only when every job runs this checkout\'s github-datastore', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'poise-datastore-services-'))
+    try {
+      const binRoot = '/production/caller/.venv/bin'
+      await services(home, join(binRoot, 'github-datastore'))
+      expect(await datastoreServicesCurrent({ home, binRoot })).toBe(true)
+      // A job still on a Caller release from before Caller moved in-tree.
+      await services(home, join(home, '.poise', 'releases', 'caller', A, 'venv', 'bin', 'github-datastore'))
+      expect(await datastoreServicesCurrent({ home, binRoot })).toBe(false)
+      await rm(join(home, 'Library', 'LaunchAgents', `${labels[2]}.plist`))
+      expect(await datastoreServicesCurrent({ home, binRoot })).toBe(false)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
   })
 })
 
@@ -137,23 +172,22 @@ const previousRecord = (overrides = {}) => ({
   error: null,
   failingSince: null,
   poise: { deployed: A, installed: A, remote: A, behind: 0 },
-  caller: C,
   ...overrides,
 })
 
 describe('production update record', () => {
-  it('records a current run with both commits', async () => {
+  it('records a current run with its commits', async () => {
     const test = harness({ previous: previousRecord() })
     await reconcileRuntime(test.options)
 
     expect(test.options.writeState).toHaveBeenCalledWith('/home/test/.poise/production-update.json', expect.anything())
-    expect(test.recorded()).toMatchObject({
+    expect(test.recorded()).toEqual({
+      at: expect.any(String),
       status: 'current',
       action: 'current',
       error: null,
       failingSince: null,
       poise: { deployed: A, installed: A, remote: A, behind: 0 },
-      caller: C,
     })
     expect(Date.parse(test.recorded().at)).not.toBeNaN()
   })

@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawn as spawnProcess } from 'node:child_process'
-import { chmod, link, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import {
@@ -10,7 +10,10 @@ import {
   claudeSubscriptionEnvironment,
   runFile,
   runningCallerLaunches,
+  scrubbedChildEnvironment,
+  setCallerAccounts,
   spawnDetached,
+  type CallerAccounts,
 } from '../server/process'
 
 function processExists(pid: number): boolean {
@@ -986,5 +989,154 @@ if (args.includes('auth') && args.includes('status')) {
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('GitHub accounts for Caller', () => {
+  const probe = ['-e', 'process.stdout.write(JSON.stringify({ person: process.env.GITHUB_INTERFACE_USER, agent: process.env.GITHUB_INTERFACE_AGENT_USER }))']
+  let root = ''
+  let commands = new Map<string, string>()
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'poise-caller-accounts-'))
+    commands = new Map()
+    vi.stubEnv('GITHUB_INTERFACE_USER', 'inherited-person')
+    vi.stubEnv('GITHUB_INTERFACE_AGENT_USER', 'inherited-agent')
+  })
+
+  afterEach(async () => {
+    setCallerAccounts(null)
+    vi.unstubAllEnvs()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  async function accountsOf(name: string, env?: NodeJS.ProcessEnv): Promise<unknown> {
+    if (!commands.has(name)) commands.set(name, await namedNode(root, name))
+    return JSON.parse((await runFile(commands.get(name)!, probe, { env })).stdout)
+  }
+
+  it('gives every github-interface and agent-interface process the accounts saved when it starts', async () => {
+    let accounts: CallerAccounts = { GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }
+    setCallerAccounts(() => accounts)
+    expect(await accountsOf('github-interface')).toEqual({ person: 'octocat', agent: 'review-bot' })
+    expect(await accountsOf('agent-interface')).toEqual({ person: 'octocat', agent: 'review-bot' })
+    accounts = { GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'other-bot' }
+    expect(await accountsOf('agent-interface')).toEqual({ person: 'octocat', agent: 'other-bot' })
+    // The chat runtime's worker gate scrubs with the same rules.
+    expect(scrubbedChildEnvironment('github-interface')).toMatchObject({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'other-bot' })
+  })
+
+  // Behavior runs, manual reviews and replays launch agent-interface detached,
+  // the launches a drain counts.
+  it('gives a detached Caller launch the accounts too, and counts it as one', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }))
+    const caller = await namedNode(root, 'agent-interface')
+    const out = join(root, 'accounts.json')
+    const before = runningCallerLaunches()
+    let exited!: () => void
+    const done = new Promise<void>((resolve) => { exited = resolve })
+    await spawnDetached(caller, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(out)}, JSON.stringify({ person: process.env.GITHUB_INTERFACE_USER, agent: process.env.GITHUB_INTERFACE_AGENT_USER }))`], {
+      onExit: () => exited(),
+    })
+    expect(runningCallerLaunches()).toBe(before + 1)
+    await done
+    expect(JSON.parse(await readFile(out, 'utf8'))).toEqual({ person: 'octocat', agent: 'review-bot' })
+    expect(runningCallerLaunches()).toBe(before)
+  })
+
+  it('never lets an inherited account stand in for one that is not set', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat' }))
+    expect(await accountsOf('github-interface')).toEqual({ person: 'octocat' })
+    setCallerAccounts(() => ({}))
+    expect(await accountsOf('agent-interface')).toEqual({})
+  })
+
+  it('keeps the accounts from every other process', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }))
+    for (const name of ['github-datastore', 'gh', 'claude', 'node-tool']) {
+      expect(await accountsOf(name), name).toEqual({})
+    }
+  })
+
+  it('passes inherited accounts through when no Poise settings are running', async () => {
+    expect(await accountsOf('github-interface')).toEqual({ person: 'inherited-person', agent: 'inherited-agent' })
+    expect(await accountsOf('gh')).toEqual({})
+  })
+
+  it('still lets a call name an account explicitly', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }))
+    expect(await accountsOf('agent-interface', { GITHUB_INTERFACE_AGENT_USER: 'named-bot' })).toEqual({ person: 'octocat', agent: 'named-bot' })
+  })
+})
+
+describe('the /content voice guide', () => {
+  afterEach(() => { vi.unstubAllEnvs() })
+
+  it('reaches agent-interface and no other process', () => {
+    vi.stubEnv('AGENT_INTERFACE_VOICE_GUIDE', '/guides/voice.md')
+    expect(scrubbedChildEnvironment('agent-interface').AGENT_INTERFACE_VOICE_GUIDE).toBe('/guides/voice.md')
+    for (const command of ['github-interface', 'github-datastore', 'claude', 'gh']) {
+      expect(scrubbedChildEnvironment(command).AGENT_INTERFACE_VOICE_GUIDE, command).toBeUndefined()
+    }
+  })
+})
+
+describe('Caller command resolution', () => {
+  let root = ''
+  let bin = ''
+  let decoy = ''
+
+  async function script(directory: string, name: string, body: string): Promise<void> {
+    await writeFile(join(directory, name), `#!/bin/sh\n${body}\n`, { mode: 0o700 })
+  }
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'poise-caller-cli-'))
+    bin = join(root, 'caller-bin')
+    decoy = join(root, 'decoy')
+    await Promise.all([mkdir(bin), mkdir(decoy)])
+    for (const name of ['agent-interface', 'github-interface', 'github-datastore']) {
+      await script(decoy, name, 'printf decoy')
+    }
+    vi.stubEnv('CALLER_BIN_ROOT', bin)
+    vi.stubEnv('PATH', `${decoy}${delimiter}${process.env.PATH || ''}`)
+  })
+
+  afterEach(async () => {
+    vi.unstubAllEnvs()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it.runIf(process.platform !== 'win32')('runs bare Caller commands from the Caller directory, never from PATH', async () => {
+    await script(bin, 'agent-interface', 'printf "caller %s" "$PATH"')
+    const { stdout } = await runFile('agent-interface', ['--logs'])
+    expect(stdout).toBe(`caller ${bin}${delimiter}${decoy}${delimiter}${process.env.PATH!.split(delimiter).slice(1).join(delimiter)}`)
+  })
+
+  it.runIf(process.platform !== 'win32')('fails naming the Caller directory when a CLI is missing instead of using another copy', async () => {
+    await expect(runFile('github-interface', ['--help'])).rejects.toMatchObject({
+      code: 'ENOENT',
+      message: expect.stringContaining(join(bin, 'github-interface')),
+    })
+    await expect(spawnDetached('github-datastore', ['sync'])).rejects.toMatchObject({
+      code: 'ENOENT',
+      message: expect.stringContaining(join(bin, 'github-datastore')),
+    })
+  })
+
+  it('puts the Caller directory first, once, only on the PATH of Caller\'s own processes', async () => {
+    const probe = ['-e', 'process.stdout.write(process.env.PATH || "")']
+    const callerCli = await namedNode(root, 'github-datastore')
+    expect((await runFile(callerCli, probe)).stdout.split(delimiter).slice(0, 2)).toEqual([bin, decoy])
+    expect((await runFile(process.execPath, probe)).stdout).toBe(process.env.PATH)
+    vi.stubEnv('PATH', `${decoy}${delimiter}${bin}`)
+    expect((await runFile(callerCli, probe)).stdout).toBe(`${bin}${delimiter}${decoy}`)
+    // An explicit PATH still wins.
+    expect((await runFile(callerCli, probe, { env: { PATH: decoy } })).stdout).toBe(decoy)
+  })
+
+  it('refuses a relative CALLER_BIN_ROOT instead of resolving it against the working directory', async () => {
+    vi.stubEnv('CALLER_BIN_ROOT', 'caller/.venv/bin')
+    await expect(runFile('agent-interface', ['--logs'])).rejects.toThrow('CALLER_BIN_ROOT must be an absolute path')
   })
 })

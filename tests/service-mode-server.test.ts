@@ -12,7 +12,7 @@ import { delimiter, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
-import { STATUS, script, writeFakeClis } from './fixtures/accounts/fake-clis'
+import { COMMANDS, STATUS, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 import { CATALOG } from './model-catalog-fixture'
 import { PUBLIC_HOST, PUBLIC_ORIGIN, gatewayKeys, serviceEnvironment, signAssertion } from './service-fixture'
 
@@ -66,8 +66,15 @@ else process.stdout.write('[]')
     antigravity: script('antigravity', undefined, { prompt: loginPrompt }),
   })
 
-  for (const [key, value] of Object.entries({ ...serviceEnvironment(gateway), HOME: home, PATH: `${bin}${delimiter}${process.env.PATH}`, AGENT_INTERFACE_ROOT: join(root, 'agent') })) {
+  // Caller's CLIs run from CALLER_BIN_ROOT: here, the stand-in above. The
+  // agent CLIs' fakes come first on PATH.
+  for (const [key, value] of Object.entries({ ...serviceEnvironment(gateway), HOME: home, CALLER_BIN_ROOT: bin, AGENT_INTERFACE_ROOT: join(root, 'agent'), PATH: `${bin}${delimiter}${process.env.PATH}` })) {
     vi.stubEnv(key, value)
+  }
+  // Nothing in this file may reach a real CLI, least of all a real login.
+  for (const name of Object.values(COMMANDS)) {
+    const found = process.env.PATH!.split(delimiter).map((dir) => join(dir, name)).find((path) => existsSync(path))
+    if (found !== join(bin, name)) throw new Error(`${name} resolves to ${found ?? 'nothing'}, not its fake in ${bin}`)
   }
   // Everything else defaults under ~/.poise, as it does in a workspace.
   for (const key of ['POISE_DB', 'POISE_CHAT_ROOT', 'POISE_ESPANSO_MATCH_DIR', 'AGENT_INTERFACE_DATA_DIR', 'POISE_EDITOR_DIR', 'POISE_CHAT_ATTACHMENTS_DIR',

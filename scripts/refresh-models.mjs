@@ -2,9 +2,10 @@
 // Shared by the daily job and Settings: update real CLIs before discovery.
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { agentInterfaceRoot, callerBinRoot } from './caller.mjs'
 import { ensureProviderClis, runUpdateCommand, withModelRefreshLock, terminateUpdateChildren } from './provider-cli-updates.mjs'
 
 const projectRoot = fileURLToPath(new URL('..', import.meta.url))
@@ -19,12 +20,17 @@ const report = await withModelRefreshLock(reportPath, async () => {
     if (Date.parse(prior.completed_at) >= requestedAt && prior.cli_updates && prior.families) return prior
   } catch { /* no completed overlapping check */ }
   const cliUpdates = await ensureProviderClis()
-  const env = { ...process.env, CLAUDE_CLI: join(projectRoot, 'scripts', 'claude-subscription.mjs') }
-  for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN']) delete env[key]
   let result
   try {
-    const { stdout } = await runUpdateCommand('agent-interface', ['--refresh-models'], {
-      cwd: process.env.AGENT_INTERFACE_ROOT || join(homedir(), 'dev', 'caller', 'agent_interface'), env, timeoutMs: 10 * 60_000,
+    const callerBin = callerBinRoot()
+    const env = {
+      ...process.env,
+      CLAUDE_CLI: join(projectRoot, 'scripts', 'claude-subscription.mjs'),
+      PATH: [callerBin, ...(process.env.PATH || '').split(delimiter).filter(Boolean)].join(delimiter),
+    }
+    for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN']) delete env[key]
+    const { stdout } = await runUpdateCommand(join(callerBin, 'agent-interface'), ['--refresh-models'], {
+      cwd: agentInterfaceRoot(), env, timeoutMs: 10 * 60_000,
     })
     result = JSON.parse(stdout)
     if (!result || !result.families || typeof result.families !== 'object' || Array.isArray(result.families) || !Object.keys(result.families).length) throw new Error('Caller returned an invalid model discovery report')

@@ -1,14 +1,14 @@
 import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
 import type { ServerResponse } from 'node:http'
-import { getModelSettings, getSettings, setSettings } from './settings'
+import { agentAccount, callerAccounts, getModelSettings, getSettings, seedAgentAccount, setSettings } from './settings'
 import { MODEL_PLACES, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
 import { refreshModelCatalog } from './models-refresh'
 import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot } from './claude-auth'
 import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
-import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository, setReviewAgentUsername } from './gh'
+import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { getOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
@@ -22,6 +22,7 @@ import { ChatRuntime } from './chat/runtime'
 import { ChatSocketServer, handleChatApi } from './chat/transport'
 import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
+import { setCallerAccounts } from './process'
 import { SelfUpdateService, createSelfUpdateBridge, drainAllowsPath, handleSelfUpdateApi, handleSelfUpdateTurnedOff, isSelfUpdateControlRoute, resolveSelfUpdateRoot, unconfiguredSelfUpdateBridge, type SelfUpdateBridge } from './self-update'
 import { releaseBackgroundPaused } from './release-background'
 import { applyServiceEnvironment, readServiceConfig, type ServiceConfig } from './service/config'
@@ -40,9 +41,8 @@ function json(res: ServerResponse, status: number, body: unknown) {
 }
 
 export interface CachePluginOptions {
-  /** GitHub username the review-agent acts as (from REVIEW_AGENT_USERNAME).
-   *  Surfaced through /api/behaviors so the Behaviors view can show who
-   *  the "Review New Pull Requests" automation will speak as. */
+  /** REVIEW_AGENT_USERNAME: seeds the agent account (Settings → GitHub) on
+   *  the first start without one saved, and is ignored after that. */
   reviewAgentUsername?: string
   /** Additional hostnames allowed to access the local API. */
   allowedHosts?: string[]
@@ -103,14 +103,16 @@ export interface ClaudeAuthRuntime {
 const activeClaudeAuthRuntimes = new Set<ClaudeAuthRuntime>()
 
 export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
+  // First: a malformed seed stops the start before anything is running.
+  seedAgentAccount(opts.reviewAgentUsername)
   const service = serviceOf(opts)
   if (service) applyServiceEnvironment()
   const auth = opts.claudeAuth ?? claudeAuth
   activeClaudeAuthRuntimes.add(auth)
   auth.start()
-  setReviewAgentUsername(opts.reviewAgentUsername || '')
+  setCallerAccounts(callerAccounts)
   startOrganizationsRuntime()
-  startBehaviorsRuntime({ reviewAgentUsername: opts.reviewAgentUsername })
+  startBehaviorsRuntime()
   startContentFinalizer()
   if (!chatRuntime) {
     const label = opts.instanceLabel ?? 'dev'
@@ -164,6 +166,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   selfUpdate?.reset()
   serviceControl?.reset()
   dailyModelRefresh?.stop()
+  setCallerAccounts(null)
   chatRuntime = null
   chatSockets = null
   terminalSockets = null
@@ -361,7 +364,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               providers: placeProviders(catalog, place.key),
             }))
             const fixed = [
-              { key: 'content', label: '/content', model: catalog.behaviors.author_content, why: 'Authors content in your voice; set by the Caller catalog.' },
+              { key: 'content', label: '/content', model: catalog.behaviors.author_content, why: 'Authors content, in the voice guide AGENT_INTERFACE_VOICE_GUIDE names when one is set; set by the Caller catalog.' },
               { key: 'consensus', label: '/consensus', model: catalog.behaviors.debate_moderator, why: `Moderates the debate; participants: ${catalog.debate_participants.join(', ')}.` },
               { key: 'fix_failing_ci', label: 'Fix failing CI', model: catalog.behaviors.fix_failing_ci, why: 'Caller behavior; set by the Caller catalog.' },
               { key: 'issue_simplify', label: 'Simplify issue', model: catalog.behaviors.issue_simplify, why: 'Caller behavior; set by the Caller catalog.' },
@@ -419,7 +422,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         // ── /api/behaviors — state + metadata for behavior automations ──
-        // GET returns owner (from server env), enabled flag, and the
+        // GET returns owner (the agent account), enabled flag, and the
         // per-behavior setting (e.g. "p2") from cache.db meta. Owner is
         // who the agent acts as; enabled is whether the server-side
         // runtime is running this behavior; setting is the threshold
@@ -463,9 +466,11 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             } : null
           }
           const runtime = getBehaviorsRuntimeHealth()
+          // Every behavior acts as the agent account.
+          const owner = agentAccount() || null
           return json(res, 200, {
             'review-new-prs': {
-              owner: opts.reviewAgentUsername || null,
+              owner,
               enabled: enabled['review-new-prs'],
               setting: settings['review-new-prs'],
               // How many of the PR review place's reviewers (Settings →
@@ -478,7 +483,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // the Behaviors view can render an em dash instead of a
             // dropdown for that row.
             'approve-prs': {
-              owner: opts.reviewAgentUsername || null,
+              owner,
               enabled: enabled['approve-prs'],
               setting: null,
               reviewers: null,
@@ -493,7 +498,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // `scratchpad: null` because there's no agent prompt to
             // inject memory into — the view renders no memory control.
             'resolve-unblocking': {
-              owner: opts.reviewAgentUsername || null,
+              owner,
               enabled: enabled['resolve-unblocking'],
               setting: null,
               reviewers: null,
@@ -504,7 +509,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // until `repos` names one. `authors` are the trusted accounts
             // whose issues it reviews.
             'review-new-issues': {
-              owner: opts.reviewAgentUsername || null,
+              owner,
               enabled: enabled['review-new-issues'],
               setting: null,
               reviewers: getReviewers('review-new-issues'),
@@ -625,8 +630,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
 
         // ── /api/repos — every repo in the org with any PR/issue ──
         // Cached 5 min server-side. Used by Current's repo selectors so
-        // the user can pick from every Vaquum repo, not just the ones
-        // they've personally touched.
+        // the user can pick from every repository of their accounts, not
+        // just the ones they've personally touched.
         if (path === '/api/repos' && req.method === 'GET') {
           try {
             return json(res, 200, await listOrganizationsRepos(selectedOrg))

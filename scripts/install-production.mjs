@@ -1,15 +1,11 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { constants } from 'node:fs'
 import {
   access,
   chmod,
   mkdir,
-  mkdtemp,
-  readdir,
-  readFile,
   realpath,
   rename,
-  rm,
   stat,
   writeFile,
 } from 'node:fs/promises'
@@ -17,7 +13,8 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { config as loadDotenv } from 'dotenv'
-import { installStopGate } from './stop-gate-runtime.mjs'
+import { callerPython, setupCaller } from './caller-setup.mjs'
+import { installStopGate, stopGateManifest } from './stop-gate-runtime.mjs'
 import { servicePath } from './production-path.mjs'
 import { legacyDatastoreServices, resolveLegacyDatastore } from './legacy-datastore.mjs'
 
@@ -29,25 +26,13 @@ if (await selfUpdateEnabled()) {
 }
 
 const projectRoot = await realpath(fileURLToPath(new URL('..', import.meta.url)))
-const trackedRelease = JSON.parse(await readFile(
-  join(projectRoot, 'config', 'caller-release.json'),
-  'utf8',
-))
-const resolvedCommit = execFileSync('gh', [
-  'api',
-  `repos/${trackedRelease.repository}/commits/${encodeURIComponent(trackedRelease.ref)}`,
-  '--jq',
-  '.sha',
-], { encoding: 'utf8' }).trim().toLowerCase()
-if (!/^[0-9a-f]{40}$/.test(resolvedCommit)) {
-  throw new Error(`Caller ${trackedRelease.ref} did not resolve to a commit SHA`)
-}
-const manifest = { ...trackedRelease, commit: resolvedCommit }
+// The service runs the Caller this checkout carries, from the virtualenv
+// `npm run caller:setup` builds.
+const callerRoot = join(projectRoot, 'caller')
+const binRoot = join(callerRoot, '.venv', 'bin')
+const agentRoot = join(callerRoot, 'agent_interface')
 const home = homedir()
 const stateRoot = join(home, '.poise')
-const releaseRoot = join(stateRoot, 'releases', 'caller', manifest.commit)
-const binRoot = join(releaseRoot, 'venv', 'bin')
-const agentRoot = join(releaseRoot, 'source', 'agent_interface')
 const launchAgents = join(home, 'Library', 'LaunchAgents')
 const serviceLabel = 'com.vaquum.poise'
 const monitorLabel = 'com.vaquum.poise.health'
@@ -118,131 +103,6 @@ async function supportedNode() {
       || major === 24) return candidate
   }
   throw new Error('Install supported Node.js 20.19+, 22.13+, or 24.x, or set POISE_NODE')
-}
-
-async function python313() {
-  const candidates = [
-    process.env.POISE_PYTHON,
-    '/opt/homebrew/bin/python3.13',
-    '/usr/local/bin/python3.13',
-    'python3.13',
-  ].filter(Boolean)
-  for (const candidate of [...new Set(candidates)]) {
-    try {
-      const version = await commandOutput(candidate, [
-        '-c',
-        'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")',
-      ])
-      if (version === '3.13') return candidate
-    } catch {
-      // Try the next explicit interpreter.
-    }
-  }
-  throw new Error('Python 3.13 is required to install the Caller release')
-}
-
-function isKnownRelease(marker) {
-  return marker.repository === manifest.repository
-    && marker.commit === manifest.commit
-    && (marker.ref === undefined || marker.ref === manifest.ref)
-    && JSON.stringify(marker.packages) === JSON.stringify(manifest.packages)
-}
-
-async function validateExistingRelease() {
-  try {
-    const marker = JSON.parse(await readFile(join(releaseRoot, 'release.json'), 'utf8'))
-    if (!isKnownRelease(marker)) return false
-    for (const command of ['agent-interface', 'github-datastore', 'github-interface']) {
-      const path = join(binRoot, command)
-      await access(path, constants.X_OK)
-      const firstLine = (await readFile(path, 'utf8')).split('\n', 1)[0]
-      if (!firstLine.startsWith('#!')) return false
-      await access(firstLine.slice(2).trim().split(/\s+/, 1)[0], constants.X_OK)
-    }
-    if (marker.ref === undefined) {
-      await writeFile(join(releaseRoot, 'release.json'), `${JSON.stringify(manifest, null, 2)}\n`, {
-        mode: 0o600,
-      })
-    }
-    return true
-  } catch {
-    return false
-  }
-}
-
-async function rewriteVenvEntrypoints(staging) {
-  const stagingBin = join(staging, 'venv', 'bin')
-  const from = `#!${stagingBin}/`
-  const to = `#!${binRoot}/`
-  for (const name of await readdir(stagingBin)) {
-    const path = join(stagingBin, name)
-    let content
-    try {
-      content = await readFile(path, 'utf8')
-    } catch {
-      continue
-    }
-    if (content.startsWith(from)) {
-      await writeFile(path, to + content.slice(from.length))
-    }
-  }
-}
-
-async function installCallerRelease(python) {
-  if (await validateExistingRelease()) return
-  try {
-    await stat(releaseRoot)
-    const marker = JSON.parse(await readFile(join(releaseRoot, 'release.json'), 'utf8'))
-    if (!isKnownRelease(marker)) {
-      throw new Error(`Refusing to replace unknown Caller release at ${releaseRoot}`)
-    }
-    await rm(releaseRoot, { recursive: true })
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error
-  }
-
-  const parent = dirname(releaseRoot)
-  await mkdir(parent, { recursive: true, mode: 0o700 })
-  const staging = await mkdtemp(join(parent, `.${manifest.commit}.`))
-  try {
-    const source = join(staging, 'source')
-    const venv = join(staging, 'venv')
-    await run('gh', ['repo', 'clone', manifest.repository, source, '--', '--filter=blob:none', '--no-checkout'])
-    await run('git', ['-C', source, 'checkout', '--detach', manifest.commit])
-    const actual = await commandOutput('git', ['-C', source, 'rev-parse', 'HEAD'])
-    if (actual !== manifest.commit) throw new Error('Caller checkout did not resolve to the selected commit')
-    await run(python, ['-m', 'venv', venv])
-    const venvPython = join(venv, 'bin', 'python')
-    await run(venvPython, [
-      '-m',
-      'pip',
-      'install',
-      '--disable-pip-version-check',
-      join(source, 'github_datastore'),
-      join(source, 'github_interface'),
-      join(source, 'agent_interface'),
-    ])
-    const expectedVersions = JSON.stringify(manifest.packages)
-    const installedVersions = JSON.parse(await commandOutput(venvPython, [
-      '-c',
-      [
-        'import importlib.metadata, json',
-        `names = ${expectedVersions}`,
-        'print(json.dumps({name: importlib.metadata.version(name) for name in names}, sort_keys=True))',
-      ].join('; '),
-    ]))
-    if (JSON.stringify(installedVersions) !== JSON.stringify(manifest.packages)) {
-      throw new Error('Installed Caller package versions do not match the release manifest')
-    }
-    await rewriteVenvEntrypoints(staging)
-    await writeFile(join(staging, 'release.json'), `${JSON.stringify(manifest, null, 2)}\n`, {
-      mode: 0o600,
-    })
-    await rename(staging, releaseRoot)
-  } catch (error) {
-    await rm(staging, { recursive: true, force: true })
-    throw error
-  }
 }
 
 function xml(value) {
@@ -321,7 +181,7 @@ async function bootstrap(path) {
 
 // Two different outcomes were treated as one. /api/health answers 503 with
 // `status: 'degraded'` for ordinary, fixable reasons — a Claude subscription
-// that needs signing in, a Caller release that needs updating — and the service
+// that needs signing in, a Caller that needs setting up — and the service
 // answering at all means it started. Aborting there left the service
 // bootstrapped and running while telling the operator the install had failed,
 // and the monitor and updater jobs that come after were never bootstrapped.
@@ -359,8 +219,8 @@ function describeDegraded(body) {
   if (body?.claudeAuth?.status && body.claudeAuth.status !== 'authenticated') {
     reasons.push(`Claude subscription: ${body.claudeAuth.status}`)
   }
-  if (body?.callerRelease?.status && body.callerRelease.status !== 'valid') {
-    reasons.push(`Caller release: ${body.callerRelease.status}`)
+  if (body?.callerRelease?.status && body.callerRelease.status !== 'ready') {
+    reasons.push(`Caller: ${body.callerRelease.error || body.callerRelease.status}`)
   }
   return reasons.length ? reasons.join('\n  ') : 'no specific reason reported'
 }
@@ -387,13 +247,14 @@ async function main() {
     throw new Error('POISE_GITHUB_USER must be a GitHub username')
   }
 
-  const [node, python] = await Promise.all([supportedNode(), python313()])
-  await installCallerRelease(python)
+  const [node, python] = await Promise.all([supportedNode(), callerPython()])
+  const commit = await commandOutput('git', ['-C', projectRoot, 'rev-parse', 'HEAD'])
+  await setupCaller({ root: callerRoot, python, run })
+  const manifest = await stopGateManifest({ callerRoot, commit })
   await installStopGate({
     home,
     manifest,
     python,
-    releaseRoot,
     run,
   })
   const nodeEnvironment = {
@@ -428,13 +289,10 @@ async function main() {
     AGENT_INTERFACE_DATA_DIR: agentData,
     AGENT_INTERFACE_ROOT: agentRoot,
     CALLER_BIN_ROOT: binRoot,
-    CALLER_RELEASE_ROOT: releaseRoot,
-    CALLER_RELEASE_SHA: manifest.commit,
     HOME: home,
     LANG: process.env.LANG || 'en_US.UTF-8',
     NODE_ENV: 'production',
     PATH: path,
-    POISE_ENFORCE_CALLER_RELEASE: '1',
     ...(datastoreDb ? { POISE_DATASTORE_DB: datastoreDb } : {}),
     ...(process.env.POISE_DB ? { POISE_DB: process.env.POISE_DB } : {}),
     TMPDIR: process.env.TMPDIR || '/tmp',
@@ -580,7 +438,7 @@ async function main() {
   // install a half-install.
   await bootstrap(monitorPlist)
   if (!selfUpdating) await bootstrap(updaterPlist)
-  console.log(`Installed ${serviceLabel} with Caller ${manifest.commit}`)
+  console.log(`Installed ${serviceLabel} at ${commit} with its Caller (${Object.entries(manifest.packages).map(([name, version]) => `${name} ${version}`).join(', ')})`)
   if (!datastoreDb) console.log('Add your first GitHub organization in Settings to initialize its datastore.')
   if (!health.healthy) {
     console.warn('\nThe service is installed and running, but reports degraded:')

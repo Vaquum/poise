@@ -10,14 +10,14 @@ import { prepareModelClis } from './provider-clis'
 // the agent-interface project owns.
 
 import { parseProgress, type ModelProgress } from '../src/agent-progress'
-import { join } from 'node:path'
-import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
-import { getHeadSha, getReviewAgentUsername, localCheckoutPath } from './gh'
+import { agentInterfaceRoot } from '../scripts/caller.mjs'
+import { getHeadSha, localCheckoutPath } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
 import { needsClaude, reviewChoice } from './review-model'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
+import { requireAgentAccount } from './settings'
 
 const CLI = 'agent-interface'
 
@@ -25,10 +25,9 @@ const CLI = 'agent-interface'
 // (`data/responses/<id>.txt`) and `--read-response` reads them without
 // resolving against the project root — so the CLI must be invoked with
 // cwd at the agent-interface project root for those entries to work.
-// Override via env if your install lives elsewhere.
+// That is caller/agent_interface unless AGENT_INTERFACE_ROOT names another.
 function agentCwd(): string {
-  return process.env.AGENT_INTERFACE_ROOT
-    || join(homedir(), 'dev', 'caller', 'agent_interface')
+  return agentInterfaceRoot()
 }
 
 export interface LogEntry {
@@ -427,7 +426,7 @@ export async function triggerPrReview(
   const m = String(prUrl || '').match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url')
   const [, owner, repo, num] = m
-  const actor = getReviewAgentUsername()
+  const actor = requireAgentAccount()
   const repoFullName = `${owner}/${repo}`
   const { model, recovery, catalog } = await reviewChoice('pr_review')
   const claude = needsClaude(catalog, model)
@@ -491,6 +490,7 @@ export async function replayAgentJob(input: {
   else if (behavior === 'pr_approve') flag = '--pr-approve'
   else throw new Error(`behavior "${behavior}" is not replayable`)
 
+  const actor = requireAgentAccount()
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
   const { model, recovery, catalog } = await reviewChoice(place)
   const claude = needsClaude(catalog, model)
@@ -498,7 +498,6 @@ export async function replayAgentJob(input: {
   const [owner, repoName] = repo.split('/', 2)
   await prepareModelClis(catalog, [model, recovery])
   const pwd = await localCheckoutPath(owner, repoName)
-  const actor = getReviewAgentUsername()
   const expectedHead = await getHeadSha(repo, Number(prId))
   const source = 'poise:replay'
   const correlationId = randomUUID()
@@ -530,14 +529,14 @@ export async function replayAgentJob(input: {
 }
 
 // A replayed issue review is one fresh full-access run by the Issue review
-// default, commenting again as the review agent. It needs no head and no
+// default, commenting again as the agent account. It needs no head and no
 // local checkout: Caller prepares its own.
 async function replayIssueReview(repo: string, issue: string): Promise<{ ok: true, source: string, correlationId: string }> {
+  const actor = requireAgentAccount()
   const { model, recovery, catalog } = await reviewChoice('issue_review')
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   await prepareModelClis(catalog, [model, recovery])
-  const actor = getReviewAgentUsername()
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()

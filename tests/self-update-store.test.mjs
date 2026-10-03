@@ -7,7 +7,7 @@ import {
   acquireLock, appendLineDurable, assertPrivateFile, ensurePrivateDirectory, readJson, writeFileAtomic, writeJsonAtomic,
 } from '../scripts/self-update/atomic.mjs'
 import { assessEnablement, loadReleaseToken, normalizeConfig, readConfig, writeConfig } from '../scripts/self-update/config.mjs'
-import { changeBranch, isReleaseId, isSha, isUuid, layout, selfUpdateRoot } from '../scripts/self-update/paths.mjs'
+import { REPOSITORY, changeBranch, isReleaseId, isSha, isUuid, layout, selfUpdateRoot } from '../scripts/self-update/paths.mjs'
 import { activeChange, emptyState, openStore, publicChange, validPointer } from '../scripts/self-update/store.mjs'
 
 const SHA = 'a'.repeat(40)
@@ -160,13 +160,13 @@ describe('store', () => {
 
 describe('config', () => {
   it('pins the repository and branch and rejects anything else', () => {
-    expect(() => normalizeConfig({ repository: 'someone/else' }, root)).toThrow(/pinned to mikkokotila\/Poise/)
+    expect(() => normalizeConfig({ repository: 'someone/else' }, root)).toThrow(`pinned to ${REPOSITORY}`)
     expect(() => normalizeConfig({ branch: 'develop' }, root)).toThrow(/pinned to branch main/)
     expect(() => normalizeConfig({ tokenFile: 'relative/path' }, root)).toThrow(/absolute path/)
     expect(() => normalizeConfig({ recoveryPort: 70_000 }, root)).toThrow(/TCP port/)
     expect(() => normalizeConfig({ callerSha: 'nope' }, root)).toThrow(/callerSha/)
     const config = normalizeConfig({ enabled: 'yes' }, root)
-    expect(config).toMatchObject({ enabled: false, repository: 'mikkokotila/Poise', branch: 'main', productionPort: 5555, recoveryPort: 5556 })
+    expect(config).toMatchObject({ enabled: false, repository: REPOSITORY, branch: 'main', productionPort: 5555, recoveryPort: 5556 })
     expect(config.tokenFile).toBe(join(root, 'release-token'))
   })
 

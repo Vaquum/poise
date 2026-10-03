@@ -5,6 +5,7 @@ import { openStore } from '../scripts/self-update/store.mjs'
 import {
   BASE, HEAD, HEAD2, INSTANCE, MAIN2, SESSION, SESSION2, UUID, UUID2, createHarness, runToAwaitingCi,
 } from './self-update-harness.test.mjs'
+import { REPOSITORY } from '../scripts/self-update/paths.mjs'
 
 const harnesses = []
 async function harness(overrides) {
@@ -101,7 +102,7 @@ describe('POST /changes', () => {
     expect(result).toEqual({
       change: expect.objectContaining({
         id: UUID, sessionId: SESSION, instance: INSTANCE, request: 'Make the chat header sticky', title: 'Sticky header',
-        repository: 'mikkokotila/Poise', branch: `poise/change-${UUID}`, baseSha: BASE, state: 'implementing', canRevert: false,
+        repository: REPOSITORY, branch: `poise/change-${UUID}`, baseSha: BASE, state: 'implementing', canRevert: false,
       }),
       workspace: h.workspace, branch: `poise/change-${UUID}`, baseSha: BASE,
     })
@@ -184,7 +185,7 @@ describe('check, publish and pull request', () => {
   it('verifies the workspace, runs the checks without credentials, publishes the exact head and opens a linked PR', async () => {
     const h = await harness()
     const { workspace } = await runToAwaitingCi(h)
-    expect(changeOf(h)).toMatchObject({ state: 'awaiting_ci', headSha: HEAD, prNumber: 100, prUrl: 'https://github.com/mikkokotila/Poise/pull/100' })
+    expect(changeOf(h)).toMatchObject({ state: 'awaiting_ci', headSha: HEAD, prNumber: 100, prUrl: `https://github.com/${REPOSITORY}/pull/100` })
     expect(h.runner.log).toEqual([['npm', 'ci', '--include=dev'], ['npm', 'run', 'check']])
     expect(h.git.log).toContainEqual(['push', `poise/change-${UUID}`, HEAD])
     expect(h.git.remoteRefs[`poise/change-${UUID}`]).toBe(HEAD)
@@ -319,7 +320,7 @@ describe('CI gate and merge', () => {
   })
 
   it('refuses to merge a repository identity mismatch', async () => {
-    const identity = await harness({ model: { repository: { full_name: 'mikkokotila/Poise-fork', default_branch: 'main' } } })
+    const identity = await harness({ model: { repository: { full_name: `${REPOSITORY}-fork`, default_branch: 'main' } } })
     await runToAwaitingCi(identity)
     await tickUntil(identity, () => changeOf(identity).state === 'failed')
     expect(changeOf(identity).error).toMatch(/identity mismatch/)
@@ -728,7 +729,7 @@ describe('source revert reconciliation', () => {
     expect(revertClone[2]).toBe(live.mergeSha) // main at the time
     const runsBefore = h.runner.log.length
     await tickUntil(h, () => revert().state === 'awaiting_ci')
-    expect(revert().prUrl).toBe('https://github.com/mikkokotila/Poise/pull/101')
+    expect(revert().prUrl).toBe(`https://github.com/${REPOSITORY}/pull/101`)
     expect(h.runner.log.slice(runsBefore)).toEqual([['npm', 'ci', '--include=dev'], ['npm', 'run', 'check']])
     expect(h.github.pulls[101].title).toBe('Revert: Make the chat header sticky')
     expect(h.github.pulls[101].body).toContain(live.mergeSha)
@@ -873,7 +874,7 @@ describe('crash recovery', () => {
     const h = await harness()
     await h.store.commit('test', (draft) => {
       draft.changes[UUID] = {
-        id: UUID, sessionId: SESSION, sourceSessionId: SESSION, instance: INSTANCE, request: 'r', title: 'r', repository: 'mikkokotila/Poise',
+        id: UUID, sessionId: SESSION, sourceSessionId: SESSION, instance: INSTANCE, request: 'r', title: 'r', repository: REPOSITORY,
         branch: `poise/change-${UUID}`, baseSha: BASE, state: 'implementing', createdAt: '2026-09-19T09:00:00.000Z', updatedAt: '2026-09-19T09:00:00.000Z',
         workspace: h.workspace, prepared: false,
       }

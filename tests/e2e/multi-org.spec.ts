@@ -95,7 +95,7 @@ test('adds an organization, saves the username, shows activation and refreshes t
   const state = await setup(page, [organization('acme')], '')
   await page.goto('/')
   await expect(page.locator('#settings-panel')).toHaveClass(/open/)
-  await page.getByLabel('Username (you)').fill('octocat')
+  await page.getByLabel('Your GitHub account').fill('octocat')
   await page.getByLabel('New GitHub account').fill('beta')
   await page.locator('.st-add-organization').click()
   await expect(page.locator('.st-organization[data-org="beta"]')).toContainText('Syncing repositories…')

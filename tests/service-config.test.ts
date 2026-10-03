@@ -74,6 +74,11 @@ describe('service-mode configuration', () => {
       expect(() => readServiceConfig({ ...env, POISE_PUBLIC_ORIGIN: origin }), origin)
         .toThrow(`POISE_PUBLIC_ORIGIN may use http only on a localhost, *.localhost or *.test host; it is "${origin}"`)
     }
+    // The gateway refuses a single-label domain, so its plain-http runs use
+    // hosts such as these.
+    for (const origin of ['http://octocat.poise.localhost', 'http://octocat.poise.localhost:8080', 'http://octocat.poise.test', 'http://octocat.poise.test:8080']) {
+      expect(readServiceConfig({ ...env, POISE_PUBLIC_ORIGIN: origin }), origin).toMatchObject({ publicOrigin: origin, publicProtocol: 'http:' })
+    }
     // Still the handle followed by a domain, and still exactly an origin.
     expect(() => readServiceConfig({ ...env, POISE_PUBLIC_ORIGIN: 'http://localhost' })).toThrow(/host must be the workspace handle followed by a domain/)
     expect(() => readServiceConfig({ ...env, POISE_PUBLIC_ORIGIN: 'http://octocat.localhost/' })).toThrow(/with no path or trailing slash/)

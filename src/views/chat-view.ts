@@ -50,6 +50,7 @@ import { installSelfUpdateWatch, registerDraftProvider, registerReloadGuard } fr
 import { BUILD_SHA } from '../build-identity'
 import { RELOADED_RELEASE_KEY } from '../self-update-reload'
 import type { SelfChange, SelfUpdateStatus } from '../self-update-types'
+import { POISE_REPOSITORY } from '../poise-repository'
 
 // The build watch is app-wide (it guards every view), but it has to start
 // somewhere main.ts already imports; this module is that place until the
@@ -1344,7 +1345,7 @@ async function sendPrompt(draft: ComposerDraft): Promise<void> {
   const natural = explicit || autoMerge || chain.review || chain.context ? null : recognisePoiseRequest(chain.text, { poiseChangeSession: current?.workspaceKind === 'poise-change' })
   // Vocabulary alone must not reinterpret work on another repository as a
   // Poise request. An explicit Poise target still means what the user wrote.
-  const otherRepository = !!current?.repo && current.repo.toLowerCase() !== 'mikkokotila/poise'
+  const otherRepository = !!current?.repo && current.repo.toLowerCase() !== POISE_REPOSITORY.toLowerCase()
   const poise = explicit || (natural && (!otherRepository || natural.cue === 'explicit') ? natural : null)
   if (poise) {
     if (chain.model && sourceId) {

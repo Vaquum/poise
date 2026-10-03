@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Poise Link</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="main.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>Poise Link</h1>
+
+      <section id="signed-out" hidden>
+        <p class="lead">
+          Pair this computer with Poise to keep Espanso's snippets in sync and get Poise alerts as
+          notifications, even while the browser is closed.
+        </p>
+        <form id="pair-form">
+          <label for="server">Poise address</label>
+          <input
+            id="server"
+            name="server"
+            type="text"
+            inputmode="url"
+            placeholder="https://poise.example.com"
+            autocomplete="url"
+            autocapitalize="off"
+            spellcheck="false"
+            required
+          />
+          <button type="submit">Pair</button>
+        </form>
+        <p id="signed-out-reason" class="error" role="alert" hidden></p>
+      </section>
+
+      <section id="pairing" hidden>
+        <p class="lead">Confirm this code in your browser:</p>
+        <p id="user-code" class="code" aria-live="polite">…</p>
+        <p id="pairing-hint" class="muted"></p>
+        <div class="actions">
+          <button id="reopen" type="button" class="secondary">Open the page again</button>
+          <button id="cancel" type="button" class="secondary">Cancel</button>
+        </div>
+      </section>
+
+      <section id="paired" hidden>
+        <p class="lead">Paired as <strong id="login"></strong></p>
+        <dl>
+          <dt>Workspace</dt>
+          <dd id="endpoint"></dd>
+          <dt>Connection</dt>
+          <dd id="connection-line"></dd>
+          <dt>Snippets</dt>
+          <dd id="snippets-line"></dd>
+        </dl>
+        <p id="paired-detail" class="muted" hidden></p>
+        <button id="open-poise" type="button">Open Poise</button>
+        <p class="muted">
+          Poise Link keeps running in the menu bar or system tray. Closing this window does not stop it.
+        </p>
+      </section>
+
+      <p id="error" class="error" role="alert" hidden></p>
+    </main>
+  </body>
+</html>

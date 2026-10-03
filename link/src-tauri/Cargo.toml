@@ -1,0 +1,46 @@
+[package]
+name = "poise-link"
+version = "0.1.0"
+description = "Poise Link keeps Espanso in sync with Poise snippets and shows Poise alerts as native notifications."
+authors = ["Mikko Kotila"]
+license = "MIT"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[lib]
+name = "poise_link"
+
+[build-dependencies]
+tauri-build = { version = "2.7.1", features = [] }
+
+[dependencies]
+tauri = { version = "2.12.1", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-log = "2.10.0"
+tauri-plugin-notification = "2.5.1"
+tauri-plugin-opener = "2.7.0"
+tauri-plugin-single-instance = "2.5.2"
+# The notification plugin ignores click handling on desktop; alerts use notify-rust directly
+# (the same library the plugin wraps) so that clicking one can open its URL.
+notify-rust = "4.18.1"
+reqwest = { version = "0.13.5", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+url = "2.5.8"
+serde-saphyr = { version = "1.3.0", default-features = false, features = ["deserialize"] }
+keyring = "4.2.0"
+dirs = "7.0.0"
+tokio = { version = "1.53", features = ["macros", "rt", "sync", "time"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+log = "0.4"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+# reqwest's TLS uses aws-lc, whose 64-bit Windows build needs the NASM assembler. Its prebuilt
+# objects let Windows builds (including CI's runners, which lack NASM) work without it.
+[target.'cfg(windows)'.dependencies]
+aws-lc-rs = { version = "1.18.1", features = ["prebuilt-nasm"] }

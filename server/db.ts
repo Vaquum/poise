@@ -172,7 +172,7 @@ function migrateLegacyKanbanOnce() {
 }
 
 // Add the `repo` column if it's not there yet — manual cards can be
-// linked to a repo (full owner/name, e.g. "Vaquum/foo") so the meta
+// linked to a repo (full owner/name, e.g. "acme/foo") so the meta
 // row reads consistently with the live PR/Issue lanes.
 function ensureColumn(table: string, column: string, ddl: string): boolean {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>

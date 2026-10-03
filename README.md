@@ -11,6 +11,9 @@ describes how the gateway, the workspaces, Poise and the Poise Link desktop
 companion fit together. The rest of this README describes the Poise application
 itself, which still runs on a single computer for development.
 
+Poise Link, the desktop companion in `link/`, keeps Espanso's snippets in sync
+and shows Poise alerts as native notifications; see [Poise Link](docs/Poise-Link.md).
+
 ## Capabilities
 
 - **Current** — manual idea/concept/plan cards beside live issues and PRs.
@@ -29,13 +32,14 @@ itself, which still runs on a single computer for development.
 - Claude Code, authenticated to a Claude Pro or Max subscription with
   `claude auth login --claudeai`. Poise does not require an Anthropic API key.
   On Linux/WSL, in-app sign-in requires an active graphical desktop session.
-- `github-datastore`, `github-interface`, and `agent-interface` on `PATH`.
+- Python 3.13 for [Caller](caller/README.md), the three CLIs Poise drives
+  (`agent-interface`, `github-interface`, `github-datastore`). They live in
+  `caller/`, and `npm run caller:setup` builds `caller/.venv`, which Poise runs
+  them from.
 - The other provider CLIs the catalog offers — `codex`, `grok` (Grok Build),
   `agy` (Antigravity), `muse` — each signed in. The production services run
-  with their own `PATH` (Caller's release, then `~/.local/bin`, then Homebrew
+  with their own `PATH` (Caller's virtualenv, then `~/.local/bin`, then Homebrew
   and the system), not the shell's; `npm run doctor` looks each CLI up there.
-- A local checkout of `agent-interface`; set `AGENT_INTERFACE_ROOT` when it is
-  not at `~/dev/caller/agent_interface`.
 - `python3` on Poise's `PATH` for the terminal in Settings → Accounts.
 - Espanso is optional and only required for system-wide snippet expansion.
 
@@ -83,15 +87,42 @@ scan or log-feed failures remain visible until a successful read confirms recove
 
 ```bash
 npm ci
+npm run caller:setup
 cp .env.example .env
 chmod 600 .env
 npm run dev
 ```
 
-Open <http://localhost:5555>. Configure your GitHub username, timezone,
-refresh interval, and theme in Settings. Add GitHub organizations and personal
-accounts there, using the organization name or personal username (for example,
-`mikkokotila`).
+Open <http://localhost:5555>. Configure your GitHub account, your agent
+account, timezone, refresh interval, and theme in Settings. Add GitHub
+organizations and personal accounts there, using the organization name or
+personal username (for example, `octocat`).
+
+### Your GitHub account and your agent account
+
+Settings → General → GitHub holds two accounts, and no GitHub account is fixed
+anywhere in Poise or Caller:
+
+- **Your GitHub account** scopes Current and Archive to what you are involved
+  in. Reads done as you — repository lists and account indexing — and the
+  issues you open from Current or the Editor use it.
+- **Agent account** is the GitHub user your reviews and comments are posted
+  as: PR reviews and approvals, conversation resolution, issue reviews, and
+  the checkouts and reads they need. It is optional to save, but every
+  automation and manual review that posts fails, saying where to set it, while
+  it is missing.
+
+Both must be signed in to `gh` on this machine (`gh auth login` once per
+account); the server and Caller ask `gh` for the named account's token and
+never act as `gh`'s active account. Every `github-interface` and
+`agent-interface` process Poise starts gets your account as
+`GITHUB_INTERFACE_USER` and the agent account as `GITHUB_INTERFACE_AGENT_USER`,
+read from Settings when the process starts, and calls that act as a particular
+account name it with `--token-user`.
+`REVIEW_AGENT_USERNAME` from the environment only seeds the agent account, on
+the first start without one saved; after that Settings is the only source,
+including when you clear it. Review New Issues trusts the authors you list;
+until you save a list, that is your account and the agent account.
 
 ### Multiple GitHub accounts
 
@@ -102,7 +133,7 @@ in Settings; closing the panel does not stop activation. Large repository
 histories can take longer than a few minutes. Interrupted activation resumes
 when Poise restarts. Completed item work is retained across activation retries;
 completed databases are reused without reinitialization.
-Your GitHub username configured in Settings must be signed in through `gh` and
+Your GitHub account configured in Settings must be signed in through `gh` and
 able to read those repositories. Caller currently requires visible repositories
 and indexed issues or PRs; an empty account reports an activation error until it
 has data.
@@ -130,8 +161,8 @@ all ready accounts. Newly activated accounts use the same behavior settings.
 Enabling PR review for the first time records a baseline for existing accounts.
 Accounts added while PR review is already enabled process eligible existing open
 PRs when they become ready. Review history, onboarding baselines, and retry state
-remain separate per account. GitHub user, review-agent identity, model choices,
-and appearance remain shared.
+remain separate per account. Your GitHub account, the agent account, model
+choices, and appearance remain shared.
 
 Each added account has a separate datastore under
 `~/.poise/datastores/<account>/github.sqlite` (beside a custom `POISE_DB` when set).
@@ -162,7 +193,7 @@ from different families than the default). The Reviewers column of the
 Behaviors view decides how many of the three review each new pull request —
 primary only by default, primary + secondary, or all three — and they run at
 the same time, each as its own Swarm row with its own model and Stop button.
-Every review posts as the configured reviewer, so the pull request ends up with
+Every review posts as your agent account, so the pull request ends up with
 the union of their findings; a bug two reviewers find in the same minutes can
 appear twice, since github-interface deduplicates only against threads already
 posted. Each run reports the review it submitted (Caller records the GitHub
@@ -207,9 +238,10 @@ one to three reviewers at once, the Issue review models in Settings → Models.
 A sub-issue that its parent's review covers gets no review of its own.
 Each reviewer is its provider's own CLI with full access to a fresh checkout,
 so it can read the whole repository and run the tests; Caller posts its
-comments as the review agent. Nothing is reviewed until a repository is ticked
-in the row's Setting dropdown, and only issues by the trusted authors listed
-there count. Swarm shows every reviewer like a PR review. See
+comments as your agent account. Nothing is reviewed until a repository is
+ticked in the row's Setting dropdown, and only issues by the trusted authors
+listed there count — your account and the agent account until you save a
+list. Swarm shows every reviewer like a PR review. See
 [Review New Issues](docs/Issue-review.md).
 
 ## Production
@@ -224,13 +256,14 @@ A new installation can start without an initialized datastore; add the first
 GitHub account in Settings. Existing databases and their sync services are retained.
 An explicitly configured `POISE_DATASTORE_DB` must point to an existing file.
 
-The macOS installer builds Poise, resolves the tracked Caller ref in
-`config/caller-release.json` to an immutable release, installs the Claude and
-Codex stop gates, and registers three per-user launchd services. They keep
-Poise alive, check `/api/health`, and reconcile Poise `main`, Caller, and both
-agent hooks from their remote sources every minute. Updates use fast-forward
-only and refuse to overwrite a dirty production checkout; a fast-forward whose
-install did not complete is installed again on the next run. Output is in
+The macOS installer builds Poise and the checkout's Caller virtualenv
+(`caller/.venv`, as `npm run caller:setup` does), installs the Claude and Codex
+stop gates from `caller/`, and registers three per-user launchd services. They
+keep Poise alive, check `/api/health`, and reconcile Poise `main` (which carries
+Caller) and both agent hooks every minute; a Caller that `/api/health` does not
+report ready is reinstalled. Updates use fast-forward only and refuse to
+overwrite a dirty production checkout; a fast-forward whose install did not
+complete is installed again on the next run. Output is in
 `~/.poise/logs/caller-update.out.log` and failures are in
 `~/.poise/logs/caller-update.err.log`. Each run also records its outcome in
 `~/.poise/production-update.json`: Settings → General shows the deployed
@@ -239,6 +272,11 @@ notification when the updater has been failing for five minutes or has not
 run for ten, and again when it recovers. A transition to degraded health
 produces a desktop notification; expired Claude authentication also opens
 Poise's subscription sign-in prompt.
+
+The stop gates wait for the agent account's approval and read pull requests as
+your GitHub account. Installing them fixes both accounts into the hook from
+Settings — before Poise's first start, the agent account is the
+`REVIEW_AGENT_USERNAME` that will seed it — and fails without an agent account.
 
 Keep the production checkout outside `~/dev` (for example
 `~/.poise/production`): the updater needs it permanently on `main` and clean,
@@ -250,8 +288,8 @@ Outside [service mode](#service-mode) Poise refuses non-loopback bindings: its
 API can create GitHub issues, launch agents, and modify local files, so it is
 not a network service.
 Keep `.env` owner-readable only (`chmod 600 .env`) because it may contain the
-Confab API credential; production startup rejects broader permissions and any
-unmanaged or mismatched Caller release.
+Confab API credential; production startup rejects broader permissions and a
+Caller whose CLIs cannot run.
 
 ## Service mode
 
@@ -267,7 +305,6 @@ nothing on this page changes. The gateway passes:
 | `POISE_WORKSPACE_OWNER` | The owner's GitHub login |
 | `POISE_PUBLIC_ORIGIN` | `https://<handle>.<domain>`; plain `http://` only on a `localhost`, `*.localhost` or `*.test` host, for local and CI end-to-end runs |
 | `POISE_GATEWAY_PUBLIC_KEY` | The gateway's Ed25519 public key: its SPKI PEM as single-line base64 |
-| `POISE_DRAIN_TIMEOUT` | Optional: how long the gateway waits for a drain, in seconds (default 1800) |
 
 Startup checks all of them and stops with one message naming each variable
 that is missing or invalid.
@@ -307,9 +344,12 @@ storage no longer needs a git checkout of Poise.
   included), scheduled behavior launches, and launches from the browser
   (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`, `/api/debate`,
   `/api/chat`, `/api/models/refresh`), which answer 503 with code `draining`.
-  Work already running continues. It returns the health body. A drain lapses
-  `POISE_DRAIN_TIMEOUT` plus five minutes after the last drain call, so a
-  gateway that stops renewing it cannot leave the workspace refusing work.
+  Work already running continues. It returns the health body. The gateway
+  renews a drain by calling it again while it waits; one that is not renewed
+  lapses `POISE_DRAIN_TIMEOUT` seconds (default 1800; read from the
+  workspace's environment and validated at startup) plus five minutes after
+  the last drain call, so a gateway that stops renewing it cannot leave the
+  workspace refusing work.
 - `POST /api/service/resume` lifts the drain; the owner's browser may call it
   too.
 
@@ -337,15 +377,18 @@ is reported and nothing runs until it is corrected. A drain skips the run.
 | `POISE_HOST` | Production bind address; loopback only outside service mode | `127.0.0.1` |
 | `POISE_PORT` | Production port | `5555` |
 | `POISE_DB` | SQLite path | `~/.poise/cache.db` |
-| `POISE_DATASTORE_DB` | Existing account’s Caller datastore | Caller default |
+| `POISE_DATASTORE_DB` | Existing account’s Caller datastore | github-datastore's default under `~/.local/share/github-datastore` |
 | `POISE_EDITOR_DIR` | Markdown and annotation directory | `~/.poise/editor` |
 | `POISE_CHAT_ATTACHMENTS_DIR` | Durable chat attachments | `~/.poise/chat-attachments` |
 | `POISE_ESPANSO_MATCH_DIR` | Espanso match directory override | macOS Espanso default; `~/.poise/snippets` in service mode |
-| `AGENT_INTERFACE_ROOT` | `agent-interface` working directory | `~/dev/caller/agent_interface` |
-| `AGENT_INTERFACE_DATA_DIR` | Durable agent-interface calls and responses | package default; `~/.poise/agent-interface` in service mode |
+| `AGENT_INTERFACE_ROOT` | `agent-interface` working directory | `caller/agent_interface` |
+| `CALLER_BIN_ROOT` | Directory Poise runs Caller's CLIs from | `caller/.venv/bin` |
+| `AGENT_INTERFACE_DATA_DIR` | Durable agent-interface calls and responses | `caller/agent_interface/data`; `~/.poise/agent-interface` in service mode |
+| `POISE_PYTHON` | Python 3.13 that builds Caller's virtualenv | Homebrew `python@3.13`, then `python3.13` on `PATH` |
 | `POISE_CHAT_ROOT` | Chat workspace storage | `.poise-chat/` in the installation; `~/.poise/chat` in service mode |
 | `POISE_VOICE_GUIDE_PATH` | Optional editor-chat voice guide | unset |
-| `REVIEW_AGENT_USERNAME` | GitHub identity used by review automation | unset |
+| `AGENT_INTERFACE_VOICE_GUIDE` | Optional voice guide `/content` writes in; without one it writes without | unset |
+| `REVIEW_AGENT_USERNAME` | Seeds the agent account (Settings → GitHub) on the first start without one saved; ignored after that | unset |
 | `CONFAB_URL` | Optional Confab service | `http://localhost:8000` |
 | `CONFAB_API_KEY` | Optional Confab bearer credential | unset |
 
@@ -359,10 +402,12 @@ and automation deduplication state. Editor documents remain plain Markdown.
 npm run check      # typecheck, lint, unit/integration tests, production build
 npm run test:e2e   # Playwright smoke and visual regression tests
 npm run verify     # both suites
+caller/.venv/bin/python -m pytest caller/agent_interface/tests caller/github_interface/tests caller/github_datastore/tests
 ```
 
 CI runs the static, unit, build, and audit gates on Node 20, 22, and 24. Node 22
-also runs the browser suite and uploads its report.
+also runs the browser suite and uploads its report. The Caller workflow runs
+Caller's tests on Python 3.13.
 
 ## Architecture
 
@@ -372,6 +417,7 @@ also runs the browser suite and uploads its report.
 - `server/service/` — service mode: configuration, identity assertions, drain and health, the daily model check.
 - `server/process.ts` — bounded external process execution.
 - `server/db.ts` — SQLite schema, migrations, and automation claims.
+- `caller/` — Caller, the Python CLIs Poise drives ([caller/README.md](caller/README.md)).
 - `tests/` — unit, integration, browser, and visual regression coverage.
 
 See [SECURITY.md](SECURITY.md) for the supported trust boundary.
@@ -442,11 +488,11 @@ See [Queued Chat messages](docs/Queue.md).
 After the one-time release-controller installation, a Poise implementation
 request in Chat can proceed through implementation, checks, CI, automatic PR
 merge, a verified release and safe tab refresh. Natural requests are supported;
-`/poise` is an optional shortcut. Other repositories do not inherit this merge
-authority. The persistent deployment card provides one-click **Revert** for
-the latest eligible change, backed by a retained release rather than another
-agent turn. Caller and persistent application data keep their existing versions
-and locations.
+`/poise` is an optional shortcut. Other repositories, and Caller in `caller/`,
+do not inherit this merge authority. The persistent deployment card provides
+one-click **Revert** for the latest eligible change, backed by a retained
+release rather than another agent turn. Caller and persistent application data
+keep their existing versions and locations.
 
 See [Self-improvement](docs/Self-improvement.md) for the setup commands, release
 boundary, independent recovery, maintenance, and verification record. The

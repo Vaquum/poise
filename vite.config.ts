@@ -7,12 +7,14 @@ import { validateConfabUrl } from './server/runtime-config'
 const RUNTIME_ENV_KEYS = [
   'JEV_API_KEY',
   'AGENT_INTERFACE_ROOT',
+  'CALLER_BIN_ROOT',
   'POISE_CHAT_ATTACHMENTS_DIR',
   'POISE_DB',
   'POISE_DATASTORE_DB',
   'POISE_EDITOR_DIR',
   'POISE_ESPANSO_MATCH_DIR',
   'POISE_VOICE_GUIDE_PATH',
+  'AGENT_INTERFACE_VOICE_GUIDE',
 ] as const
 
 function poiseApiPlugin(env: Record<string, string>): Plugin {

@@ -13,10 +13,11 @@
 //   1. Preflight, no writes. The managed launchd plist is parsed and everything
 //      production runs with today — POISE_DB, the editor/workspace identity, the
 //      pinned Caller release SHA/root/bin, the Node runtime — is read from it,
-//      never re-derived. The checkout it runs from must be a clean
-//      mikkokotila/Poise `main` at exactly the SHA GitHub's `main` is at, and
-//      the running server must already serve that SHA. The release token file
-//      must be private and must be able to push to this one repository.
+//      never re-derived. The checkout it runs from must be a clean Poise
+//      `main` (the repository package.json names) at exactly the SHA GitHub's
+//      `main` is at, and the running server must already serve that SHA. The
+//      release token file must be private and must be able to push to this
+//      one repository.
 //   2. `installed.json` is written before anything else. From that moment
 //      scripts/self-update-bridge.mjs makes the legacy installer and updater
 //      refuse to touch production, so nothing can move the launcher back under
@@ -102,7 +103,8 @@ export const DEFAULT_TIMING = {
 }
 
 const TOKEN_PATTERN = /^[A-Za-z0-9_]{20,255}$/
-const REMOTE_PATTERN = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)mikkokotila\/Poise(?:\.git)?\/?$/
+const ESCAPED_REPOSITORY = REPOSITORY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const REMOTE_PATTERN = new RegExp(String.raw`^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)${ESCAPED_REPOSITORY}(?:\.git)?/?$`)
 const NODE_VERSION_PATTERN = /^v(\d+)\.(\d+)\./
 
 export class BootstrapError extends Error {
@@ -754,13 +756,16 @@ export function createInstaller({
     const checkout = service.mode === 'legacy' ? service.checkout : installed?.checkout || service.checkout
     if (!checkout) throw new BootstrapError('cannot determine the production checkout the managed service was bootstrapped from', { code: 'plist' })
     const legacyEnvironment = service.mode === 'legacy' ? service.environment : installed?.legacyEnvironment || service.environment
-    const callerSha = legacyEnvironment.CALLER_RELEASE_SHA
-    if (!isSha(callerSha)) throw new BootstrapError('the production plist pins no CALLER_RELEASE_SHA; refusing to guess the Caller release', { code: 'plist' })
-    if (!legacyEnvironment.CALLER_RELEASE_ROOT || !await isDirectory(legacyEnvironment.CALLER_RELEASE_ROOT)) {
-      throw new BootstrapError(`pinned Caller release root ${legacyEnvironment.CALLER_RELEASE_ROOT || '(unset)'} is missing`, { code: 'plist' })
+    // Every release runs the Caller the production checkout carries, from the
+    // virtualenv install:production built there; releases do not change it.
+    const callerBin = join(checkout, 'caller', '.venv', 'bin')
+    if (legacyEnvironment.CALLER_BIN_ROOT !== callerBin) {
+      throw new BootstrapError(`the production plist runs Caller from ${legacyEnvironment.CALLER_BIN_ROOT || '(unset)'}, not ${callerBin}; run npm run install:production first`, { code: 'plist' })
     }
+    if (!await isDirectory(callerBin)) throw new BootstrapError(`Caller is not set up at ${callerBin}; run npm run install:production first`, { code: 'plist' })
     const runtime = await verifyNode(service.node)
     const source = await verifySource(checkout)
+    const callerSha = source.sha
     const { config, present: configPresent } = await readConfig(root, {})
     const resolvedTokenFile = tokenFile || env.POISE_RELEASE_TOKEN_FILE || (configPresent ? config.tokenFile : null)
     await verifyToken(resolvedTokenFile)
@@ -1149,8 +1154,8 @@ export function createInstaller({
       const legacy = classifyService(legacyDocument)
       if (legacy.mode !== 'legacy') throw new BootstrapError(`${preserved} is not a legacy service definition`, { code: 'plist' })
       if (!await isFile(join(legacy.checkout, LEGACY_LAUNCHER))) throw new BootstrapError(`${legacy.checkout} no longer has ${LEGACY_LAUNCHER}; cannot hand production back to it`, { code: 'plist' })
-      if (!isSha(legacy.environment.CALLER_RELEASE_SHA) || !await isDirectory(legacy.environment.CALLER_RELEASE_ROOT || '')) {
-        throw new BootstrapError('the preserved plist no longer points at an installed Caller release', { code: 'plist' })
+      if (!await isDirectory(legacy.environment.CALLER_BIN_ROOT || '')) {
+        throw new BootstrapError('the preserved plist no longer points at an installed Caller', { code: 'plist' })
       }
       const store = await openStore(root, { now: iso })
       if (!force) assertNoPendingWork(store.state)

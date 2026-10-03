@@ -51,12 +51,15 @@ workspace can reach another one.
   is their GitHub login in lower case. GitHub logins are already valid DNS
   labels. The handles `www`, `api`, `admin`, `auth`, `link`, `static`,
   `gateway`, `app` and `mail` are reserved; a login that equals one of them is
-  refused at sign-in.
+  refused at sign-in. A handle stays with the GitHub account that first signed
+  in with it, matched by account id, so a login that is renamed and later
+  claimed by someone else cannot take over the workspace.
 - DNS needs two records pointing at the server: `POISE_DOMAIN` and
   `*.POISE_DOMAIN`. Caddy obtains a certificate for each workspace host on first
   use (on-demand TLS); it asks the gateway first
   (`GET http://gateway:8080/_gateway/tls-ask?domain=<host>`), and the gateway
-  answers 200 only for the apex and the handles of known users.
+  answers 200 only for the apex and the handles of known users. It answers this
+  only for requests addressed to `gateway:8080`, never on a public host.
 
 ## Sign-in and sessions
 
@@ -66,18 +69,36 @@ workspace can reach another one.
   discards the GitHub token.
 - Access: a login may sign in when it is on the allow list (seeded from
   `POISE_ALLOWED_USERS`, editable by admins) or is a member of an organisation
-  in `POISE_ALLOWED_ORGS`. Admins come from `POISE_ADMINS`.
+  in `POISE_ALLOWED_ORGS`. Admins come from `POISE_ADMINS` and may always sign
+  in. Organisation membership is verified at each sign-in.
+- An admin can disable anyone, however they got access. That takes effect at
+  once: sign-in is refused, every session ends, every paired device is revoked
+  and the workspace stops. Re-enabling lets the person sign in and pair again.
 - The apex session cookie is `poise_gw` (host-only, `Secure`, `HttpOnly`,
   `SameSite=Lax`, 14 days).
 - A workspace host gets its own host-only cookie, `poise_ws`, through a ticket:
   the apex mints a single-use ticket valid for 60 seconds and redirects to
   `https://<handle>.<POISE_DOMAIN>/_poise/session?ticket=…&next=<path>`, where the
   gateway checks it, sets `poise_ws` and redirects to `next` (a same-host path
-  only).
+  only). `poise_ws` has the same attributes as `poise_gw` and ends with the apex
+  session it came from; signing out on either host ends both.
+- A ticket redeems only in the browser it was minted for. The apex sets
+  `poise_bind` (`Domain=<POISE_DOMAIN>`, `Secure`, `HttpOnly`, `SameSite=Lax`,
+  14 days), each ticket stores a hash of its value, and `/_poise/session`
+  refuses a ticket that arrives without the matching `poise_bind`.
 - A workspace host only ever serves its owner. A session for another person on
   that host is rejected with 403; admins get no implicit access.
-- Paths under `/_poise/` on workspace hosts belong to the gateway (session,
-  sign-out, a "starting your workspace" page). Everything else is proxied.
+- Paths under `/_poise/` on workspace hosts belong to the gateway
+  (`/_poise/session` and `/_poise/logout`). Everything else is proxied. While a
+  workspace starts, the gateway answers navigations itself with a "starting
+  your workspace" page that reloads until the workspace is ready, and other
+  requests with `503`.
+- For local and CI end-to-end runs only, `POISE_INSECURE_HTTP=1` serves plain
+  http: the cookies drop `Secure`, and every address the gateway builds,
+  including `POISE_PUBLIC_ORIGIN` and `X-Forwarded-Proto`, uses `http`. The
+  gateway refuses it unless `POISE_DOMAIN` is `*.localhost` or `*.test`; a
+  single-label domain such as `localhost` is refused in any mode, because
+  `poise_bind` cannot span it.
 
 ## Gateway → workspace identity
 
@@ -110,7 +131,17 @@ client sent.
   - `link`: a paired Poise Link device; only `/api/link/*`.
   - `admin`: the gateway itself; only `/api/service/*`.
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
-  `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers.
+  `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers. Its
+  own credentials stay with it: none of its cookies (`poise_gw`, `poise_ws`,
+  `poise_bind`, `poise_oauth`) and no device token's `Authorization` header is
+  forwarded.
+- Workspaces cannot set cookies: the gateway drops every `Set-Cookie` from
+  their responses. An answer with a status outside 100–599 becomes a 502.
+- A request on a bodiless method (`GET`, `HEAD`, `OPTIONS`, `DELETE`, `TRACE`)
+  that carries a body is refused with 400, and every forwarded body is framed,
+  so nothing can ride along as a second request.
+- The gateway's own calls to `/api/service/*` carry an `admin` assertion and
+  `Host: <handle>.<POISE_DOMAIN>`.
 
 ## Workspace runtime contract
 
@@ -127,7 +158,9 @@ labels `poise.managed=true` and `poise.workspace=<handle>`; no published ports;
 `init` enabled; `no-new-privileges`; all capabilities dropped; memory, CPU and
 process limits from `POISE_WORKSPACE_MEMORY` (default `8g`),
 `POISE_WORKSPACE_CPUS` (default `4`) and `POISE_WORKSPACE_PIDS` (default `4096`);
-optional OCI runtime from `POISE_WORKSPACE_RUNTIME` (for example `runsc`).
+restart policy `unless-stopped`, so a server reboot brings workspaces back
+while one an admin stopped stays stopped; optional OCI runtime from
+`POISE_WORKSPACE_RUNTIME` (for example `runsc`).
 
 Environment the gateway passes:
 
@@ -136,9 +169,8 @@ Environment the gateway passes:
 | `POISE_MODE` | `service` |
 | `POISE_WORKSPACE_HANDLE` | `<handle>` |
 | `POISE_WORKSPACE_OWNER` | the GitHub login |
-| `POISE_PUBLIC_ORIGIN` | `https://<handle>.<POISE_DOMAIN>` (`http://` under `POISE_INSECURE_HTTP`) |
+| `POISE_PUBLIC_ORIGIN` | `https://<handle>.<POISE_DOMAIN>` |
 | `POISE_GATEWAY_PUBLIC_KEY` | see above |
-| `POISE_DRAIN_TIMEOUT` | the gateway's own value, in seconds (optional; default 1800) |
 | `POISE_HOST` | `0.0.0.0` |
 | `POISE_PORT` | `5555` |
 | `HOME` | `/home/poise` |
@@ -166,8 +198,9 @@ computer.
   must equal `POISE_PUBLIC_ORIGIN` exactly. Requests without an Origin are
   accepted only from loopback or with a valid assertion.
 - `POISE_PUBLIC_ORIGIN` is an https origin. It may be plain http only when its
-  host is `localhost` or ends in `.localhost` or `.test`, as under the
-  gateway's `POISE_INSECURE_HTTP`; any other http origin stops startup.
+  host is `localhost` or ends in `.localhost` or `.test` (such as
+  `<handle>.poise.localhost` under the gateway's `POISE_INSECURE_HTTP`); any
+  other http origin stops startup.
 - A missing or invalid assertion is refused with 401; a valid one whose scope
   does not reach the route, a wrong Host or Origin, and a cross-site API call
   with 403.
@@ -182,7 +215,8 @@ computer.
 - Chat workspaces in `~/.poise/chat` (`POISE_CHAT_ROOT`).
 - Snippets in `~/.poise/snippets/poise.yml`.
 - Caller's data in `~/.poise/agent-interface` (`AGENT_INTERFACE_DATA_DIR`).
-- Caller itself runs from the image (`AGENT_INTERFACE_ROOT`).
+- Caller itself runs from the image: its CLIs from `CALLER_BIN_ROOT`,
+  `agent-interface` in `AGENT_INTERFACE_ROOT`.
 
 **Scheduling.** The daily model-catalogue refresh runs inside Poise at 07:00
 in the owner's configured timezone (UTC, logged, when none is set), replacing
@@ -201,8 +235,9 @@ otherwise offer it):
 **Service endpoints** (loopback, or the `admin` scope; the owner's `browser`
 assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
-  runningCallerCalls, backgroundWork, idle, draining }`. It backs the
-  container health check and the gateway's readiness check.
+  runningCallerCalls, backgroundWork, idle, draining }`. `idle` is true only
+  when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
+  It backs the container health check and the gateway's readiness check.
   - `version` is the commit the running bundle was built from, `null` for a
     development build.
   - `activeChatTurns` counts the Chat turns recorded open: reserved before
@@ -214,18 +249,20 @@ assertion may only resume, and anything else is refused with 403):
     runtime's startups, operations and agent processes, process-owned
     background work (behavior ticks, provider CLI updates, the model check),
     and launches from the browser admitted and still in their handler.
-  - `idle` is true only when all three counters are zero.
-- `POST /api/service/drain` stops admitting new Chat turns (queued messages
-  included), behavior launches and launches from the browser (`/api/pr-review`,
-  `/api/agent-replay`, `/api/chat-content`, `/api/debate`, `/api/chat`,
-  `/api/models/refresh`), then returns the same body. Refused work answers 503
-  with code `draining`; work already running continues. The gateway polls
-  health until `idle` is true, or until `POISE_DRAIN_TIMEOUT` (default 30
-  minutes) has passed, before it recreates a container. A drain lapses
-  `POISE_DRAIN_TIMEOUT` plus five minutes after the last drain call; the
-  gateway renews it by calling drain again while it waits.
-- `POST /api/service/resume` lifts a drain. The owner may call it too, to lift
-  a drain a gateway left behind.
+- `POST /api/service/drain` stops admitting new Chat turns and behavior
+  launches, then returns the same fields. A drain lapses unless it is renewed:
+  while the gateway polls health it re-POSTs `/api/service/drain` at least
+  every 5 minutes. It recreates the container once `idle` is true or
+  `POISE_DRAIN_TIMEOUT` seconds (default 1800, 30 minutes) have passed.
+  - New Chat turns include queued messages, and launches include the
+    browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
+    `/api/debate`, `/api/chat`, `/api/models/refresh`). Refused work answers
+    503 with code `draining`; work already running continues.
+  - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
+    1800) plus five minutes after the last drain call, so a gateway that
+    stopped renewing it cannot leave the workspace refusing work.
+- `POST /api/service/resume` lifts a drain. The owner's browser may call it
+  too, to lift a drain a gateway left behind.
 
 ## Accounts, identities and the terminal
 
@@ -320,10 +357,22 @@ trigger/replace pairs, reporting any it skipped.
 3. `POST /link/device/token` with `{ device_code }` returns
    `{ error: "authorization_pending" }` until approved, then
    `{ access_token, endpoint, login }`, where `endpoint` is the workspace
-   address.
+   address. Every refusal follows RFC 8628: HTTP 400 with `{ error }`, where
+   `error` is one of these and nothing else:
+   - `authorization_pending`;
+   - `slow_down`, when polling faster than `interval`, which then grows by 5
+     seconds;
+   - `access_denied`;
+   - `expired_token`, after `expires_in` (15 minutes);
+   - `invalid_grant`, for an unknown or already redeemed code;
+   - `invalid_request`, for a body without a `device_code` string. This one
+     also carries `error_description`.
+
+The approval page takes at most 10 code submissions per session in 15 minutes.
 
 Devices are listed and revoked at `/link/devices`. The gateway stores token
-hashes only.
+hashes only. A device token expires after 30 days without use and 365 days
+after pairing; Poise Link then pairs again.
 
 **Link API** (workspace, `link` scope, `Authorization: Bearer <access_token>`):
 - `GET /api/link/hello` returns `{ login, version }`.
@@ -340,6 +389,18 @@ hashes only.
   - `ping` every 20 seconds.
   - On connect it sends the current snippets version, plus any alerts after
     `Last-Event-ID`.
+- An unusable device token gets HTTP 401 with `{ error, message }` and
+  `WWW-Authenticate: Bearer error="invalid_token"`, never a 403 or a
+  redirect. Poise Link treats any 401 as "sign out and pair again". `error`
+  names why:
+  - `device_unknown`: never issued, or paired with another workspace;
+  - `device_revoked`;
+  - `device_expired`;
+  - `user_disabled`: the owner is disabled;
+  - `access_removed`: the owner no longer has access.
+
+  A device token on a path outside `/api/link/*` gets 401 with
+  `invalid_token`.
 
 **Alerts** are recorded by the workspace:
 - a Claude or other provider sign-in is needed;

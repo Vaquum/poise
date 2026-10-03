@@ -23,9 +23,10 @@ a merge, or a deployment. The same controller policy applies to every model.
 
 Routine frontend and backend changes are eligible. The exceptions are changes
 to the release/rollback controller or its authorization/validation machinery,
-credentials, destructive data migrations, and external-package release
-configuration. Those exceptions require explicit review rather than allowing
-the implementation to alter the mechanism that enforces its own authority.
+Caller (`caller/` and the scripts that build and resolve it), credentials,
+destructive data migrations, and external-package release configuration.
+Those exceptions require explicit review rather than allowing the
+implementation to alter the mechanism that enforces its own authority.
 There is no UI-only whitelist and no per-change administrative setup.
 
 A source or CI failure never authorizes a partial or unverified deployment.
@@ -74,7 +75,8 @@ The bootstrap itself changes release authority, so review and merge its PR
 manually. Let the ordinary managed updater install that version first. It must
 be serving the same compiled SHA as its clean managed source checkout.
 
-Provide a dedicated GitHub credential restricted to **mikkokotila/Poise**, with
+Provide a dedicated GitHub credential restricted to Poise's own repository —
+the one `package.json` names, **autonomio/poise** — with
 repository contents and pull-request write permission, and Actions/checks read
 access. Keep it in a private user-owned file, not in chat, source, an agent
 environment, or a command argument containing the token value. The controller
@@ -86,9 +88,11 @@ npm run self-update:enable -- --token-file "$HOME/.poise/release-token"
 npm run self-update:doctor
 ```
 
-The installer preserves the existing launchd environment and Caller pin,
-stages the baseline without modifying its running bundle, and installs the
-controller and stable launcher under `~/.poise/self-update/controller/`.
+The installer requires the service to run its checkout's Caller
+(`caller/.venv`, built by `npm run install:production`), preserves the existing
+launchd environment, stages the baseline without modifying its running bundle,
+and installs the controller and stable launcher under
+`~/.poise/self-update/controller/`.
 Bootstrap phases and failures are journaled. A failed bootstrap restores the
 preserved service definition. Re-running the command reconciles an interrupted
 attempt rather than guessing that it completed. The legacy updater yields to
