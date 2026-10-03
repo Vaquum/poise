@@ -142,7 +142,8 @@ has data.
 
 Settings → Accounts shows each agent CLI (Claude Code, Codex, gh, Grok, Muse,
 Antigravity) with its version and what its own status command says about its
-sign-in; gh lists every account it holds and marks yours. Connect opens a
+sign-in; gh lists every account it holds, marks your GitHub account and the
+agent account, and says when either is not signed in to gh. Connect opens a
 terminal in Settings running that CLI's own login, and the rows refresh when
 it exits; Open a shell starts your login shell. Poise never reads the CLIs'
 credentials. At most two terminals run at once, and one closes after 15 idle

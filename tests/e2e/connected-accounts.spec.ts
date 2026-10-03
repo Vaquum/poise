@@ -79,8 +79,10 @@ test('connects a CLI from Settings in a terminal and shows its new sign-in', asy
     await expect(row('codex').locator('.st-account-state')).toHaveText('Not signed in')
     await expect(row('codex')).toContainText('Runs codex login --device-auth')
     await expect(row('gh').locator('.st-account-state')).toHaveText('Signed in as octocat')
-    await expect(row('gh').locator('.st-gh-account[data-login="octocat"]')).toContainText('active · you')
-    await expect(row('gh').locator('.st-gh-account[data-login="octo-agent"]')).toBeVisible()
+    // Settings → General names octocat as your account and octo-agent as the agent's.
+    await expect(row('gh').locator('.st-gh-account[data-login="octocat"] .st-gh-notes')).toHaveText('active · your GitHub account')
+    await expect(row('gh').locator('.st-gh-account[data-login="octo-agent"] .st-gh-notes')).toHaveText('agent account')
+    await expect(row('gh').locator('.st-gh-missing')).toHaveCount(0)
     await expect(row('grok').locator('.st-account-state')).toHaveText('Sign-in not reported')
     await expect(row('grok')).toContainText('Grok\'s CLI has no command that reports whether it is signed in.')
     await expect(row('antigravity').locator('.st-account-state')).toHaveText('Not installed')

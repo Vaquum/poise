@@ -19,6 +19,7 @@ import { productionSummary, type ProductionUpdate } from './production-status'
 import { ACCOUNT_LOGINS, type ConnectedAccount } from '../server/accounts/types'
 import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
+import './views/connected-accounts.css'
 import type { TerminalPanel } from './views/terminal-panel'
 
 interface CatalogModel { identity: string, provider: string, selector: string, effort: string }
@@ -85,6 +86,8 @@ async function refreshStatus(): Promise<void> {
   await loadSettings()
   syncFieldsFromCache()
   renderOrganizations()
+  // The gh row marks your account and the agent account as saved now.
+  renderAccounts()
   const after = getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login).join(',')
   if (before !== after) {
     window.dispatchEvent(new CustomEvent('poise:organizations-changed'))
@@ -292,7 +295,8 @@ function terminalBusy(): boolean {
 }
 
 function renderAccounts(): void {
-  if (accountsEl && accounts) accountsEl.innerHTML = accountsHtml(accounts, getCachedSettings().me, terminalBusy())
+  const settings = getCachedSettings()
+  if (accountsEl && accounts) accountsEl.innerHTML = accountsHtml(accounts, { me: settings.me, agentAccount: settings.agentAccount ?? '' }, terminalBusy())
   if (shellBtn) shellBtn.disabled = terminalBusy()
 }
 
@@ -597,6 +601,7 @@ async function saveAll() {
     dirtyModels.clear()
     setLocalSettings(data)
     renderOrganizations()
+    renderAccounts()
     setHelp('Saved.', 'ok')
     window.dispatchEvent(new CustomEvent('poise:synced'))
     window.dispatchEvent(new CustomEvent('poise:models-changed'))

@@ -24,11 +24,11 @@ within 10 seconds, is reported with the reason.
 
 - **Claude** counts as signed in only on a Claude subscription, the only
   sign-in Poise runs Claude on. The row names the account's email.
-- **GitHub** lists every account gh holds for github.com, marks the active one
-  and the one that is you (Settings → General → Username), and names any
-  account whose token gh can no longer use. It reads the stored accounts; a
-  `GH_TOKEN` in Poise's environment is kept out of both the status and the
-  login.
+- **GitHub** lists every account gh holds for github.com and marks the active
+  one, your GitHub account and the agent account (Settings → General). It says
+  when either of those two is not signed in to gh, and names any account whose
+  token gh can no longer use. It reads the stored accounts; a `GH_TOKEN` in
+  Poise's environment is kept out of both the status and the login.
 - **Grok, Muse and Antigravity** have no command that reports sign-in, so their
   rows say so rather than guess.
 

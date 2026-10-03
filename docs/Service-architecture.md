@@ -291,6 +291,8 @@ version, whether it is signed in and as whom.
     `null` and `detail` says so.
   - `identity` is the account name the status command prints (Claude's email,
     gh's active login); no token, key or organisation id is returned.
+  - The gh row marks the person's own account and the agent account among
+    gh's accounts and says when either is not signed in to gh.
   - Each command has 10 seconds. Answers are kept for 15 seconds and dropped
     whenever a terminal exits.
 - Connect opens a terminal in the browser, inside the workspace, running that

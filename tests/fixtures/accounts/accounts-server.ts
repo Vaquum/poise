@@ -27,7 +27,7 @@ const server = createServer((req, res) => {
     if (path.startsWith('/api/')) {
       enforceApiRequest(req)
       if (path === '/api/accounts') return json(res, 200, { accounts: await listAccounts() })
-      if (path === '/api/settings') return json(res, 200, { org: 'acme', me: 'octocat', timezone: 'UTC', models: {} })
+      if (path === '/api/settings') return json(res, 200, { org: 'acme', me: 'octocat', agentAccount: 'octo-agent', timezone: 'UTC', models: {} })
       if (path === '/api/claude-auth') {
         return json(res, 200, { status: 'authenticated', reason: null, checkedAt: null, verifiedAt: null, authMethod: 'claude.ai', subscriptionType: 'max', loginInProgress: false })
       }

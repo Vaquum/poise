@@ -3,7 +3,6 @@
 // login in a terminal.
 
 import type { AccountId, ConnectedAccount } from '../../server/accounts/types'
-import './connected-accounts.css'
 
 const ACCOUNT_NAMES: Record<AccountId, string> = {
   claude: 'Claude',
@@ -34,19 +33,44 @@ function state(account: ConnectedAccount): { text: string, tone: 'on' | 'off' | 
   return { text: 'Sign-in not reported', tone: 'unknown' }
 }
 
-function ghAccounts(account: ConnectedAccount, me: string): string {
-  if (!account.accounts?.length) return ''
-  return `<ul class="st-gh-accounts" aria-label="GitHub accounts gh holds">${account.accounts.map((gh) => {
-    const notes = [gh.active ? 'active' : '', me && gh.login.toLowerCase() === me.toLowerCase() ? 'you' : ''].filter(Boolean)
+/** The two GitHub accounts Settings → General names (`me` and `agentAccount`). */
+export interface GitHubIdentities {
+  me: string
+  agentAccount: string
+}
+
+// GitHub logins are case-insensitive.
+function sameLogin(a: string, b: string): boolean {
+  return !!b && a.toLowerCase() === b.toLowerCase()
+}
+
+/** Every account gh holds, which is active and which are yours, and a line for
+ *  each of your two accounts gh cannot use. Nothing is said about them while
+ *  gh's own status is unknown. */
+function ghAccounts(account: ConnectedAccount, identities: GitHubIdentities): string {
+  if (!account.accounts) return ''
+  const held = account.accounts
+  const list = held.length ? `<ul class="st-gh-accounts" aria-label="GitHub accounts gh holds">${held.map((gh) => {
+    const notes = [
+      gh.active ? 'active' : '',
+      sameLogin(gh.login, identities.me) ? 'your GitHub account' : '',
+      sameLogin(gh.login, identities.agentAccount) ? 'agent account' : '',
+    ].filter(Boolean)
     return `<li class="st-gh-account st-account-state-${gh.signedIn ? 'on' : 'off'}" data-login="${escapeHtml(gh.login)}">
       <span class="st-gh-login">${escapeHtml(gh.login)}</span>${notes.length ? `<span class="st-gh-notes">${notes.join(' · ')}</span>` : ''}
       ${gh.detail ? `<span class="st-gh-problem">${escapeHtml(gh.detail)}</span>` : ''}
     </li>`
-  }).join('')}</ul>`
+  }).join('')}</ul>` : ''
+  const usable = (login: string) => held.some((gh) => gh.signedIn && sameLogin(gh.login, login))
+  const missing = [
+    identities.me && !usable(identities.me) ? `Your GitHub account ${identities.me} is not signed in to gh.` : '',
+    identities.agentAccount && !usable(identities.agentAccount) ? `The agent account ${identities.agentAccount} is not signed in to gh.` : '',
+  ].filter(Boolean)
+  return list + missing.map((text) => `<div class="st-help st-help-error st-gh-missing">${escapeHtml(text)}</div>`).join('')
 }
 
 /** The rows. `busy` while a terminal runs: one login at a time. */
-export function accountsHtml(accounts: ConnectedAccount[], me: string, busy: boolean): string {
+export function accountsHtml(accounts: ConnectedAccount[], identities: GitHubIdentities, busy: boolean): string {
   return accounts.map((account) => {
     const name = ACCOUNT_NAMES[account.id]
     const { text, tone } = state(account)
@@ -61,7 +85,7 @@ export function accountsHtml(accounts: ConnectedAccount[], me: string, busy: boo
       </div>
       <div class="st-account-state st-account-state-${tone}">${escapeHtml(text)}</div>
       ${account.detail ? `<div class="st-help st-help-info st-account-detail">${escapeHtml(account.detail)}</div>` : ''}
-      ${ghAccounts(account, me)}
+      ${ghAccounts(account, identities)}
       <div class="st-help st-help-info st-account-login">Runs <code>${escapeHtml(account.login.label)}</code></div>
     </div>`
   }).join('')
