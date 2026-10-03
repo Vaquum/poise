@@ -12,6 +12,11 @@ WORKDIR /src
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY . .
+# .dockerignore leaves .git out, so the builder declares the commit:
+# deploy/install.sh and deploy/upgrade.sh pass it for a clean checkout, and
+# /api/service/health reports it as `version`. Without it the image is a
+# development build, whose version is null (scripts/build-identity.mjs).
+ARG POISE_SOURCE_SHA
 # The only optional production packages are the Agent SDK's platform builds.
 # Each carries a bundled Claude Code binary (about 230 MB) that Poise never
 # runs: it starts the standalone `claude` through scripts/claude-subscription.mjs.
