@@ -6,6 +6,7 @@
 import { existsSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server } from 'node:http'
+import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -144,6 +145,31 @@ function openChatSocket(caller: Caller): Promise<SocketOutcome> {
   })
 }
 
+/** A WebSocket upgrade over a bare socket: what the server answers, and
+ *  whether it closes the connection rather than leaving it open. */
+function rawUpgrade(path: string, caller: Caller): Promise<{ status: number, closed: boolean }> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, '127.0.0.1')
+    let answer = ''
+    const result = (closed: boolean) => ({ status: Number(/^HTTP\/1\.1 (\d{3})/.exec(answer)?.[1] ?? 0), closed })
+    const deadline = setTimeout(() => { socket.destroy(); resolve(result(false)) }, 3_000)
+    socket.on('data', (chunk: Buffer) => { answer += chunk.toString('latin1') })
+    socket.on('close', () => { clearTimeout(deadline); resolve(result(true)) })
+    socket.on('error', reject)
+    const headers: Record<string, string> = {
+      host: caller.host ?? (caller.peer ? PUBLIC_HOST : `127.0.0.1:${port}`),
+      upgrade: 'websocket',
+      connection: 'Upgrade',
+      'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==',
+      'sec-websocket-version': '13',
+      ...(caller.origin ? { origin: caller.origin } : {}),
+      ...(caller.identity ? { 'x-poise-identity': caller.identity } : {}),
+      ...(caller.peer ? { 'x-test-peer': caller.peer } : {}),
+    }
+    socket.write(`GET ${path} HTTP/1.1\r\n${Object.entries(headers).map(([name, value]) => `${name}: ${value}`).join('\r\n')}\r\n\r\n`)
+  })
+}
+
 async function callerCalls(): Promise<Array<{ args: string[], dataDir: string | null }>> {
   if (!existsSync(callerLog)) return []
   return (await readFile(callerLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
@@ -272,6 +298,18 @@ describe('Poise in service mode', () => {
     expect((await send('POST', '/api/service/drain', fromGateway('browser'))).status).toBe(403)
     expect(await send('POST', '/api/service/resume', fromGateway('browser'))).toMatchObject({ status: 200, json: { draining: false } })
     expect((await send('POST', '/api/service/resume', fromGateway('link'))).status).toBe(403)
+  })
+
+  it('answers and closes an upgrade that nothing serves', async () => {
+    for (const [caller, status] of [
+      [{}, 404],
+      [{ peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN }, 401],
+      [{ ...fromGateway(), host: 'poise-ws-octocat:5555' }, 403],
+      [fromGateway('link'), 403],
+      [fromGateway(), 404],
+    ] as Array<[Caller, number]>) {
+      expect(await rawUpgrade('/ws/terminal', caller)).toEqual({ status, closed: true })
+    }
   })
 
   it('counts the Caller calls it launched until they finish', async () => {

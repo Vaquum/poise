@@ -1,12 +1,14 @@
 import { createReadStream, type Stats } from 'node:fs'
 import { realpath, stat } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { STATUS_CODES, createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import type { Duplex } from 'node:stream'
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { HttpError, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
 import { assertCallerRelease } from './caller-release'
 import { assertSecureDotenv, loadSecureDotenv, validateConfabUrl } from './runtime-config'
 import { readServiceConfig, type ServiceConfig } from './service/config'
+import { WS_PATH } from './chat/protocol'
 import type { ClaudeAuthRuntime } from './cache-plugin'
 
 // Security validation must run before dotenv reads the file and before modules
@@ -283,6 +285,22 @@ async function serveStatic(
   })
 }
 
+// An upgrade nothing serves is answered and closed, never left open: an
+// open one pins a descriptor and holds shutdown until its deadline.
+function refuseUpgrade(req: IncomingMessage, socket: Duplex, service: ServiceConfig | null): void {
+  if ((req.url || '').split('?')[0] === WS_PATH) return
+  let status = 404
+  let message = 'not found'
+  try {
+    enforceDocumentRequest(req, { service })
+  } catch (error) {
+    status = httpStatus(error, 403)
+    message = error instanceof Error ? error.message : 'forbidden'
+  }
+  socket.write(`HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Error'}\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n${message}`)
+  socket.destroy()
+}
+
 let runtimeStopPromise: Promise<void> | null = null
 let databaseClosed = false
 const serverShutdowns = new WeakMap<Server, Promise<void>>()
@@ -409,6 +427,7 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
   })
   // /ws/chat: the same host/origin checks as the API, on the upgrade itself.
   attachChatSockets(server)
+  server.on('upgrade', (req: IncomingMessage, socket: Duplex) => refuseUpgrade(req, socket, service))
   server.headersTimeout = 10_000
   server.requestTimeout = 30_000
   server.keepAliveTimeout = 5_000
