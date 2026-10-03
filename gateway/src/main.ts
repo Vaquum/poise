@@ -7,7 +7,7 @@ import { GitHubClient } from './github.js'
 import { loadOrCreateKeys } from './keys.js'
 import { createLogger, errorMessage } from './log.js'
 import { Orchestrator, workspaceUpstream } from './orchestrator.js'
-import { Store } from './store.js'
+import { startPurgeLoop, Store } from './store.js'
 
 const PURGE_INTERVAL_MS = 10 * 60_000
 
@@ -33,7 +33,6 @@ mkdirSync(config.dataDir, { recursive: true, mode: 0o700 })
 const now = () => Date.now()
 const store = new Store(join(config.dataDir, 'gateway.db'), now)
 store.syncEnvAllowList(config.allowedUsers)
-store.purgeExpired()
 const keys = loadOrCreateKeys(config.dataDir, log)
 const docker = new DockerClient(config.dockerSocket)
 const orchestrator = new Orchestrator({ config, docker, store, keys, log, now, upstream: workspaceUpstream })
@@ -53,12 +52,12 @@ gateway.server.listen(config.port, () => {
   log.info('gateway.listening', { port: config.port, domain: config.domain, image: config.runtimeImage })
 })
 const stopUpgrades = orchestrator.startUpgradeLoop()
-const purge = setInterval(() => store.purgeExpired(), PURGE_INTERVAL_MS)
+const stopPurging = startPurgeLoop(store, log, PURGE_INTERVAL_MS)
 
 function shutdown(signal: string): void {
   log.info('gateway.stopping', { signal })
   stopUpgrades()
-  clearInterval(purge)
+  stopPurging()
   gateway.close().then(
     () => {
       store.close()

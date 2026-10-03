@@ -182,7 +182,12 @@ export class Orchestrator {
     const start = this.ensureStarted(handle, login)
       .catch((error: unknown) => {
         this.deps.log.error('workspace.start.failed', { handle, error: errorMessage(error) })
-        this.deps.store.noteWorkspaceError(handle, errorMessage(error))
+        // A throw here would be an unhandled rejection, which stops the gateway for everyone.
+        try {
+          this.deps.store.noteWorkspaceError(handle, errorMessage(error))
+        } catch (failure) {
+          this.deps.log.error('workspace.start.failure.unrecorded', { handle, error: errorMessage(failure) })
+        }
       })
       .finally(() => this.starts.delete(handle))
     this.starts.set(handle, start)

@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3'
 import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto'
 import { chmodSync } from 'node:fs'
+import { errorMessage, type Logger } from './log.js'
 
 // The gateway's state. Every bearer secret (session ids, tickets, OAuth states,
 // device codes, device tokens) is stored as its SHA-256 hash only.
@@ -575,4 +576,19 @@ export class Store {
         .run(now - EXPIRED_DEVICE_CODE_RETENTION_MS)
     })()
   }
+}
+
+/** Purges expired rows now and on every interval. A failed purge is logged and tried again next time. */
+export function startPurgeLoop(store: Store, log: Logger, intervalMs: number): () => void {
+  const purge = () => {
+    // Runs from a timer: a throw here would be an uncaught exception that stops the gateway.
+    try {
+      store.purgeExpired()
+    } catch (error) {
+      log.error('store.purge.failed', { error: errorMessage(error) })
+    }
+  }
+  purge()
+  const timer = setInterval(purge, intervalMs)
+  return () => clearInterval(timer)
 }

@@ -1,8 +1,9 @@
 import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { DEVICE_IDLE_LIMIT_MS, DEVICE_LIFETIME_MS, deviceState, normalizeUserCode, Store } from '../src/store.js'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createLogger } from '../src/log.js'
+import { DEVICE_IDLE_LIMIT_MS, DEVICE_LIFETIME_MS, deviceState, normalizeUserCode, startPurgeLoop, Store } from '../src/store.js'
 
 describe('store', () => {
   let dir: string
@@ -90,6 +91,19 @@ describe('store', () => {
     expect(deviceState(busy, now + DEVICE_LIFETIME_MS - 1)).toBe('active')
     expect(deviceState(busy, now + DEVICE_LIFETIME_MS)).toBe('expired')
     expect(deviceState({ ...device, revokedAt: now }, now)).toBe('revoked')
+  })
+
+  it('logs a failed purge and keeps purging, instead of throwing from its timer', async () => {
+    const logs: Array<Record<string, unknown>> = []
+    const log = createLogger((line) => logs.push(JSON.parse(line) as Record<string, unknown>))
+    const purge = vi.spyOn(store, 'purgeExpired').mockImplementation(() => {
+      throw new Error('database is locked')
+    })
+    const stop = startPurgeLoop(store, log, 10)
+    await new Promise((resolve) => setTimeout(resolve, 35))
+    stop()
+    expect(purge.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(logs[0]).toMatchObject({ level: 'error', event: 'store.purge.failed', error: 'database is locked' })
   })
 
   it('normalises typed user codes and rejects anything outside the alphabet', () => {

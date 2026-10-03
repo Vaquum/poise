@@ -1,5 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import {
   CURRENT_IMAGE_ID, events, OLD_IMAGE_ID, startHarness, verifyAssertion, workspaceHost,
@@ -180,6 +180,19 @@ describe('lazy start', () => {
     expect(page.body).toContain('The last start failed: Docker Engine POST /containers/create failed with HTTP 404: No such image: poise-runtime:latest')
     expect(h.logs.find((entry) => entry.event === 'workspace.start.failed')).toMatchObject({ handle: 'alice' })
     await h.orchestrator.startInProgress('alice')
+  })
+
+  it('logs a start failure it cannot record instead of crashing on the rejection', async () => {
+    const cookie = await start()
+    h.docker.images.clear()
+    const record = vi.spyOn(h.store, 'noteWorkspaceError').mockImplementation(() => {
+      throw new Error('database is locked')
+    })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    expect(record).toHaveBeenCalled()
+    expect(h.logs.find((entry) => entry.event === 'workspace.start.failure.unrecorded')).toMatchObject({ handle: 'alice', error: 'database is locked' })
+    record.mockRestore()
   })
 
   it('shows a workspace that refuses the health check instead of waiting forever', async () => {
