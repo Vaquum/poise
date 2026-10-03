@@ -131,7 +131,13 @@ impl LinkApi {
             .header(header::ACCEPT, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache");
         if let Some(id) = last_event_id.filter(|id| !id.is_empty()) {
-            request = request.header("Last-Event-ID", id);
+            match header::HeaderValue::from_str(id) {
+                Ok(value) => request = request.header("Last-Event-ID", value),
+                // Sent anyway it would fail every reconnect; without it the stream starts afresh.
+                Err(_) => {
+                    log::warn!("not resuming after event id {id:?}: it is not a valid header value")
+                }
+            }
         }
         let response = request.send().await.map_err(|source| ApiError::Network {
             url: url.clone(),

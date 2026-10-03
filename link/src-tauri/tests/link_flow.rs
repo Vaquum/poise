@@ -642,3 +642,38 @@ async fn a_stalled_event_stream_is_given_up_and_retried() {
         Connection::Reconnecting { error } if error.contains("no data")
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_id_that_cannot_be_a_header_does_not_stop_the_stream() {
+    let fake = FakePoise::start(Config::default(), "v1", &snippets_yaml(&[])).await;
+    let config = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (controller, probes) = already_paired(&fake, config.path(), home.path(), timing());
+    assert!(controller.start());
+    eventually("the connected status", WAIT, || {
+        controller.status().connection == Connection::Connected
+    })
+    .await;
+
+    // A control character is allowed in an event-stream id but not in an HTTP header.
+    fake.push(&alert_frame("bad\u{1}id", "First", "/"));
+    eventually("the resume point to be saved", WAIT, || {
+        saved_last_event_id(config.path()).as_deref() == Some("bad\u{1}id")
+    })
+    .await;
+    fake.drop_stream();
+    eventually("a new stream without Last-Event-ID", WAIT, || {
+        let state = fake.state();
+        state.stream_connections.len() == 2 && state.stream_connections[1].is_none()
+    })
+    .await;
+    eventually("the connected status", WAIT, || {
+        controller.status().connection == Connection::Connected
+    })
+    .await;
+    fake.push(&alert_frame("a2", "Second", "/"));
+    eventually("an alert on the new stream", WAIT, || {
+        probes.notices_titled("Second").len() == 1
+    })
+    .await;
+}
