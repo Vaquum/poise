@@ -4,6 +4,8 @@ const mocks = vi.hoisted(() => ({
   runFile: vi.fn(),
   models: {} as Record<string, { default: string, fallback: string }>,
   agentAccount: 'bit-mis',
+  // The scheduler's replay check; these tests admit everything unless told not to.
+  admit: vi.fn(async () => undefined),
 }))
 
 vi.mock('../server/settings', () => ({
@@ -339,7 +341,7 @@ describe('manual review model selection', () => {
     const { spawnDetached } = await import('../server/process')
     const { claudeAuth } = await import('../server/claude-auth')
     await triggerPrReview('https://github.com/o/r/pull/12')
-    await replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 })
+    await replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 }, mocks.admit)
     expect(spawnDetached).toHaveBeenCalledTimes(2)
     for (const [, args] of vi.mocked(spawnDetached).mock.calls) {
       expect(args).toEqual(expect.arrayContaining(['--model', 'opus-5-xhigh', '--recovery-model', 'gpt-6-astra-ultra', '--actor', 'bit-mis', '--expected-head', 'a'.repeat(40)]))
@@ -354,7 +356,7 @@ describe('manual review model selection', () => {
     const { spawnDetached } = await import('../server/process')
     const { claudeAuth } = await import('../server/claude-auth')
     await triggerPrReview('https://github.com/o/r/pull/12')
-    await replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 })
+    await replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 }, mocks.admit)
     for (const [, args] of vi.mocked(spawnDetached).mock.calls) {
       expect(args).toEqual(expect.arrayContaining(['--model', 'gpt-6-astra-ultra', '--recovery-model', 'opus-5-xhigh']))
     }
@@ -377,13 +379,46 @@ describe('manual review model selection', () => {
     expect(spawnDetached).not.toHaveBeenCalled()
   })
 
+  // A replay launches only what the scheduler would: its check runs first, on
+  // the target as the request names it, and a refusal stops everything after.
+  it.each([
+    ['pr_review', 'o/r', 12, 12],
+    ['pr_approve', 'o/r', '12', 12],
+    ['issue_review', 'Vaquum/Origo', '452', 452],
+  ] as const)('asks the scheduler check before preparing a %s replay, and launches nothing it refuses', async (behavior, repo, prId, number) => {
+    const { replayAgentJob } = await import('../server/agent')
+    const { spawnDetached } = await import('../server/process')
+    const { claudeAuth } = await import('../server/claude-auth')
+    const gh = await import('../server/gh')
+    const refusal = Object.assign(new Error(`Replay refused: ${repo}#${number} is not open.`), { statusCode: 409 })
+    mocks.admit.mockRejectedValueOnce(refusal)
+    mocks.runFile.mockClear()
+    await expect(replayAgentJob({ behavior, repo, pr_id: prId }, mocks.admit)).rejects.toBe(refusal)
+    expect(mocks.admit).toHaveBeenCalledWith(behavior, repo, number)
+    // Refused before the model catalog, the sign-in, the checkout or the head
+    // are read, so a refused replay costs nothing and starts nothing.
+    expect(mocks.runFile).not.toHaveBeenCalled()
+    expect(claudeAuth.requireReady).not.toHaveBeenCalled()
+    expect(gh.localCheckoutPath).not.toHaveBeenCalled()
+    expect(gh.getHeadSha).not.toHaveBeenCalled()
+    expect(spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('checks nothing for a malformed or unreplayable request', async () => {
+    const { replayAgentJob } = await import('../server/agent')
+    await expect(replayAgentJob({ behavior: 'pr_review', repo: 'not-a-repo', pr_id: 1 }, mocks.admit)).rejects.toThrow('repo must be owner/name')
+    await expect(replayAgentJob({ behavior: 'pr_review', repo: 'o/r', pr_id: '0' }, mocks.admit)).rejects.toThrow('pr_id must be a positive integer')
+    await expect(replayAgentJob({ behavior: 'fix_failing_ci', repo: 'o/r', pr_id: 1 }, mocks.admit)).rejects.toThrow('is not replayable')
+    expect(mocks.admit).not.toHaveBeenCalled()
+  })
+
   it('launches nothing without an agent account and says where to set it', async () => {
     mocks.agentAccount = ''
     const { triggerPrReview, replayAgentJob } = await import('../server/agent')
     const { spawnDetached } = await import('../server/process')
     await expect(triggerPrReview('https://github.com/o/r/pull/12')).rejects.toThrow('Set it in Settings → GitHub')
-    await expect(replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 })).rejects.toThrow('No agent account is set')
-    await expect(replayAgentJob({ behavior: 'issue_review', repo: 'o/r', pr_id: '4' })).rejects.toThrow('No agent account is set')
+    await expect(replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 }, mocks.admit)).rejects.toThrow('No agent account is set')
+    await expect(replayAgentJob({ behavior: 'issue_review', repo: 'o/r', pr_id: '4' }, mocks.admit)).rejects.toThrow('No agent account is set')
     expect(spawnDetached).not.toHaveBeenCalled()
   })
 })
@@ -523,7 +558,7 @@ describe('issue review rows', () => {
     const { spawnDetached } = await import('../server/process')
     vi.mocked(spawnDetached).mockReset().mockResolvedValue(undefined)
     const { replayAgentJob } = await import('../server/agent')
-    const result = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '452' })
+    const result = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '452' }, mocks.admit)
     expect(result.source).toBe('poise:replay')
     const [command, args] = vi.mocked(spawnDetached).mock.calls[0]
     expect(command).toBe('agent-interface')

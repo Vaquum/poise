@@ -150,8 +150,8 @@ describe('setting writes are serialized per behaviour', () => {
       return { ok: true, status: 200, json: async () => ({ ok: true, setting: body.setting }) }
     })
 
-    const first = behaviors.setSetting('review-new-prs', 'p1')
-    const second = behaviors.setSetting('review-new-prs', 'p4')
+    const first = behaviors.setSettingFields('review-new-prs', { setting: 'p1' })
+    const second = behaviors.setSettingFields('review-new-prs', { setting: 'p4' })
     await Promise.all([first, second])
 
     expect(maxConcurrent).toBe(1)
@@ -167,8 +167,8 @@ describe('setting writes are serialized per behaviour', () => {
       return { ok: true, status: 200, json: async () => ({ ok: true, setting: 'p4' }) }
     })
 
-    await expect(behaviors.setSetting('review-new-prs', 'p1')).rejects.toThrow()
-    await behaviors.setSetting('review-new-prs', 'p4')
+    await expect(behaviors.setSettingFields('review-new-prs', { setting: 'p1' })).rejects.toThrow()
+    await behaviors.setSettingFields('review-new-prs', { setting: 'p4' })
     expect(behaviors.getSetting('review-new-prs')).toBe('p4')
   })
 })
@@ -191,7 +191,7 @@ describe('Review New Issues triggers', () => {
     expect(behaviors.getReviewers('review-new-issues')).toBe(2)
 
     const stale = behaviors.refreshState()
-    await behaviors.setTriggers('review-new-issues', { repos: ['Vaquum/Origo'], authors: ['mikkokotila'] })
+    await behaviors.setSettingFields('review-new-issues', { repos: ['Vaquum/Origo'], authors: ['mikkokotila'] })
     expect(posted).toEqual([{ repos: ['Vaquum/Origo'], authors: ['mikkokotila'] }])
     respond(payload({ 'review-new-issues': { repos: ['Vaquum/Limen'], authors: ['zero-bang'] } }))
     await stale
@@ -207,9 +207,52 @@ describe('Review New Issues triggers', () => {
       return Promise.resolve({ ok: true, status: 200, json: async () => payload({ 'review-new-issues': { repos: ['Vaquum/Origo'], authors: ['mikkokotila'] } }) })
     })
     await behaviors.refreshState()
-    await expect(behaviors.setTriggers('review-new-issues', { repos: ['Vaquum/Nope'] }))
+    await expect(behaviors.setSettingFields('review-new-issues', { repos: ['Vaquum/Nope'] }))
       .rejects.toThrow('not a repository of the account: Vaquum/Nope')
     expect(behaviors.getRepos('review-new-issues')).toEqual(['Vaquum/Origo'])
+  })
+})
+
+
+describe('Skip repositories', () => {
+  it('mirrors each PR behavior\'s list and keeps a saved change over an older read', async () => {
+    const posted: unknown[] = []
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        posted.push(JSON.parse(String(init.body)))
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, setting: 'p3', skipRepos: ['acme/api', 'acme/web'] }) })
+      }
+      return deferGet().then((body) => ({ ok: true, status: 200, json: async () => body }))
+    })
+    const first = behaviors.refreshState()
+    respond(payload({ 'review-new-prs': { skipRepos: ['acme/web'] }, 'approve-prs': { skipRepos: ['acme/api'] } }))
+    await first
+    expect(behaviors.getSkipRepos('review-new-prs')).toEqual(['acme/web'])
+    expect(behaviors.getSkipRepos('approve-prs')).toEqual(['acme/api'])
+    expect(behaviors.getSkipRepos('resolve-unblocking')).toEqual([])
+
+    // The ceiling and the list travel in one request: all of it or none.
+    const stale = behaviors.refreshState()
+    await behaviors.setSettingFields('review-new-prs', { setting: 'p3', skipRepos: ['acme/api', 'acme/web'] })
+    expect(posted).toEqual([{ setting: 'p3', skipRepos: ['acme/api', 'acme/web'] }])
+    respond(payload({ 'review-new-prs': { setting: 'p2', skipRepos: ['acme/web'] } }))
+    await stale
+    expect(behaviors.getSkipRepos('review-new-prs')).toEqual(['acme/api', 'acme/web'])
+    expect(behaviors.getSetting('review-new-prs')).toBe('p3')
+  })
+
+  it('restores the ceiling and the list together when a save is refused', async () => {
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve({ ok: false, status: 400, json: async () => ({ error: 'not a repository of a ready GitHub account: stranger/app' }) })
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => payload({ 'review-new-prs': { setting: 'p1', skipRepos: ['acme/web'] } }) })
+    })
+    await behaviors.refreshState()
+    await expect(behaviors.setSettingFields('review-new-prs', { setting: 'p4', skipRepos: ['stranger/app'] }))
+      .rejects.toThrow('not a repository of a ready GitHub account: stranger/app')
+    expect(behaviors.getSkipRepos('review-new-prs')).toEqual(['acme/web'])
+    expect(behaviors.getSetting('review-new-prs')).toBe('p1')
   })
 })
 
@@ -223,7 +266,7 @@ describe('global behavior configuration', () => {
       if (init?.method === 'POST') return { ok: true, status: 200, json: async () => JSON.parse(String(init.body)) }
       return { ok: true, status: 200, json: async () => payload({ 'review-new-issues': { repos: selected, authors: ['octocat'] } }) }
     })
-    await behaviors.setTriggers('review-new-issues', { repos: selected, authors: ['octocat'] })
+    await behaviors.setSettingFields('review-new-issues', { repos: selected, authors: ['octocat'] })
     await behaviors.refreshState()
     expect(behaviors.getRepos('review-new-issues')).toEqual(selected)
     expect(calls).toEqual(['/api/behaviors/review-new-issues', '/api/behaviors'])
@@ -237,8 +280,8 @@ describe('global behavior configuration', () => {
       return { ok: true, status: 200, json: async () => body }
     })
     await Promise.all([
-      behaviors.setSetting('review-new-prs', 'p1'),
-      behaviors.setSetting('review-new-prs', 'p3'),
+      behaviors.setSettingFields('review-new-prs', { setting: 'p1' }),
+      behaviors.setSettingFields('review-new-prs', { setting: 'p3' }),
     ])
     expect(writes).toEqual([
       { url: '/api/behaviors/review-new-prs', setting: 'p1' },
