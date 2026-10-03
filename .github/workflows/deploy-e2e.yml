@@ -1,0 +1,61 @@
+name: Deployment
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/**'
+      - 'gateway/**'
+      - '.github/workflows/deploy-e2e.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/**'
+      - 'gateway/**'
+      - '.github/workflows/deploy-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Deployment end to end
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # upgrade.sh pulls a commit the test makes on top of this one.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: deploy/ci/package-lock.json
+
+      - name: Lint the operator scripts
+        run: shellcheck -x deploy/*.sh deploy/ci/*.sh
+
+      - name: Test the volume archive
+        run: python3 -m unittest discover --start-directory deploy/ci --pattern 'test_*.py' --verbose
+
+      - name: Install the WebSocket client
+        run: npm ci --prefix deploy/ci
+
+      - name: Resolve the test hosts to this runner
+        run: echo '127.0.0.1 poise.test alice.poise.test bob.poise.test nobody.poise.test admin.poise.test' | sudo tee -a /etc/hosts
+
+      - name: Install, sign in, use a workspace, back up, restore and upgrade
+        run: deploy/ci/e2e.sh run
+
+      - name: Print the stack's and the workspaces' logs
+        if: failure()
+        run: deploy/ci/e2e.sh logs
