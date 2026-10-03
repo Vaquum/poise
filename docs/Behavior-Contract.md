@@ -38,7 +38,7 @@ to github-interface primitives. At the operator's explicit request each
 reviewer runs its provider's own CLI with full access in a fresh checkout, so
 it can read the whole repository and run the tests. Its GitHub side effect is
 still Caller's: the reviewer writes comments to a file, and Caller posts them
-through github-interface as the review agent, only on the issue and its
+through github-interface as your agent account, only on the issue and its
 sub-issues.
 
 The installed legacy sync service runs Caller’s one-minute loop under launchd
@@ -54,12 +54,11 @@ work before freshness is confirmed.
 If Caller explicitly reports a missing local checkout, Poise can provision an
 owned checkout through Caller's existing checkout primitive, verify its origin,
 commit and clean state, and publish it atomically. Concurrent requests share
-provisioning; changed or existing user checkouts are never replaced. The current
-checkout primitive fixes authentication to bit-mis, so automatic provisioning
-is restricted to that configured reviewer. Other identities need an existing
-checkout until Caller supports explicit checkout identity. CLI errors retain
-bounded, credential-redacted terminal diagnostics. Review receipts and launch
-claims remain authoritative; dependency repair never fabricates a verdict.
+provisioning; changed or existing user checkouts are never replaced. The
+checkout is provisioned as your agent account, the reviewer, which Poise names
+to Caller with `--token-user`. CLI errors retain bounded, credential-redacted
+terminal diagnostics. Review receipts and launch claims remain authoritative;
+dependency repair never fabricates a verdict.
 
 A closed legacy failure can recover when Caller subsequently supplies an exact
 `not_started` / `preflight_failed` result. The same no-action rule applies before

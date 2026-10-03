@@ -23,9 +23,13 @@ Keep `.env` local. Confab credentials are read server-side and are never
 embedded in the browser bundle. GitHub authentication is owned by `gh`. For
 issue creation, Poise resolves the selected account's token through `gh` and
 passes it only to that short-lived `gh api` subprocess; Poise does not persist
-or expose the token. Because upgrades are otherwise non-destructive, schema
-initialization explicitly purges the retired plaintext `github_token` metadata
-row while preserving legacy content tables.
+or expose the token. Every GitHub action the server and Caller take names its
+account — your GitHub account or your agent account from Settings — and none
+falls back to `gh`'s active account, so with several accounts signed in nothing
+posts as the wrong one; a missing account stops the action. Because upgrades
+are otherwise non-destructive, schema initialization explicitly purges the
+retired plaintext `github_token` metadata row while preserving legacy content
+tables.
 
 Claude authentication is owned by Claude Code's local credential store. Poise
 retains only sanitized in-memory health metadata; it never returns tokens,
@@ -110,7 +114,7 @@ with the token passed per git command and stored in neither repository; it
 is not a filesystem boundary. From a reviewer's shell every same-user
 credential is reachable — `gh`'s accounts, SSH keys, provider logins.
 Reviewers are told not to post; Caller posts their comments through
-github-interface as the review agent and only on the issue and its
+github-interface as your agent account and only on the issue and its
 sub-issues, but "comments only" is an instruction to the agent, not a limit
 it cannot break. When a reviewer exits, its process group is killed, and so
 is any process still running in its checkout — including one that detached
@@ -119,11 +123,12 @@ into its own session; a process that also left the checkout is not found.
 ## Poise self-improvement releases
 
 Self-improvement authority is limited to a user-authored Poise change request.
-The independently installed controller fixes the repository to
-`mikkokotila/Poise`; model output cannot select a different repository or grant
-merge authority. A protected change to release/rollback, validation or
-authorization machinery, credentials, destructive migrations, or another
-package's release configuration requires separate review.
+The independently installed controller fixes the repository to the one
+`package.json` names (`autonomio/poise`), a field a change cannot alter; model
+output cannot select a different repository or grant merge authority. A
+protected change to release/rollback, validation or authorization machinery,
+credentials, destructive migrations, or another package's release
+configuration requires separate review.
 
 The controller holds the release credential; it is not forwarded to native
 agents, candidate builds, or the browser. Exact revision checks and CI precede
