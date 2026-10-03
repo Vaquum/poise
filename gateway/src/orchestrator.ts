@@ -2,7 +2,7 @@ import http from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { signAssertion } from './assertion.js'
 import type { Config } from './config.js'
-import type { ContainerSpec, ContainerSummary, DockerClient } from './docker.js'
+import type { ContainerDetails, ContainerSpec, ContainerSummary, DockerClient } from './docker.js'
 import type { GatewayKeys } from './keys.js'
 import { errorMessage, type LogFields, type Logger } from './log.js'
 import type { Store } from './store.js'
@@ -147,6 +147,7 @@ export class Orchestrator {
         'POISE_HOST=0.0.0.0',
         `POISE_PORT=${WORKSPACE_PORT}`,
         'HOME=/home/poise',
+        this.drainTimeoutEnv(),
         ...(config.workspaceSkipCliBootstrap ? ['POISE_SKIP_CLI_BOOTSTRAP=1'] : []),
       ],
       Labels: { 'poise.managed': 'true', 'poise.workspace': handle },
@@ -293,7 +294,10 @@ export class Orchestrator {
     return () => clearInterval(timer)
   }
 
-  /** Drains and recreates every managed container whose image differs from POISE_RUNTIME_IMAGE's current ID. */
+  /**
+   * Drains and recreates every managed container that differs from the one the gateway would create now: its
+   * image is not POISE_RUNTIME_IMAGE's current ID, or it was created with another POISE_DRAIN_TIMEOUT.
+   */
   async upgradePass(): Promise<void> {
     if (this.upgrading) {
       this.deps.log.info('workspace.upgrade.pass.skipped', { reason: 'the previous pass is still running' })
@@ -308,7 +312,10 @@ export class Orchestrator {
         return
       }
       for (const summary of await docker.listManagedContainers()) {
-        if (summary.ImageID === imageId) continue
+        // The list shows a container's image but not its environment, which holds its drain timeout.
+        const details = await docker.inspectContainer(summary.Id)
+        const reason = details && this.outdated(details, imageId)
+        if (!reason) continue
         const handle = summary.Labels['poise.workspace'] ?? ''
         const login = store.getWorkspace(handle)?.login
         if (!login) {
@@ -316,7 +323,7 @@ export class Orchestrator {
           continue
         }
         try {
-          await this.upgrade(handle, login, imageId)
+          await this.upgrade(handle, login, imageId, reason)
         } catch (error) {
           log.error('workspace.upgrade.failed', { handle, error: errorMessage(error) })
           store.noteWorkspaceError(handle, `upgrade failed: ${errorMessage(error)}`)
@@ -327,8 +334,8 @@ export class Orchestrator {
     }
   }
 
-  private async upgrade(handle: string, login: string, imageId: string): Promise<void> {
-    this.lifecycle('workspace.upgrade.started', handle, { image: imageId })
+  private async upgrade(handle: string, login: string, imageId: string, reason: string): Promise<void> {
+    this.lifecycle('workspace.upgrade.started', handle, { image: imageId, reason })
     let drained = false
     for (;;) {
       // Decided under the lock, so a lazy start or an admin action in between cannot be stopped undrained.
@@ -340,8 +347,8 @@ export class Orchestrator {
           this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'the container no longer exists' })
           return 'skipped'
         }
-        if (details.Image === imageId) {
-          this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'already on the current image' })
+        if (!this.outdated(details, imageId)) {
+          this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'already up to date' })
           return 'skipped'
         }
         const running = details.State.Running
@@ -418,10 +425,11 @@ export class Orchestrator {
     await this.ensureVolumeAndNetwork(handle)
     let details = await docker.inspectContainer(container)
     if (details?.State.Running) return
-    if (details && details.Image !== await this.currentImageId()) {
-      // A stopped container on an old image has nothing to drain: recreate it before it starts.
+    const outdated = details && this.outdated(details, await this.currentImageId())
+    if (outdated) {
+      // A stopped container that is out of date has nothing to drain: recreate it before it starts.
       await docker.removeContainer(container)
-      this.lifecycle('workspace.container.removed', handle, { reason: 'outdated image' })
+      this.lifecycle('workspace.container.removed', handle, { reason: outdated })
       details = null
     }
     if (!details) {
@@ -486,6 +494,18 @@ export class Orchestrator {
       }
     }
     this.joined.add(handle)
+  }
+
+  /** The POISE_DRAIN_TIMEOUT a workspace gets: it lets an unrenewed drain lapse by the gateway's own value. */
+  private drainTimeoutEnv(): string {
+    return `POISE_DRAIN_TIMEOUT=${this.deps.config.drainTimeoutSeconds}`
+  }
+
+  /** What makes a workspace container differ from the one the gateway would create now, or null. */
+  private outdated(details: ContainerDetails, imageId: string): string | null {
+    if (details.Image !== imageId) return 'outdated image'
+    if (!(details.Config.Env ?? []).includes(this.drainTimeoutEnv())) return 'changed drain timeout'
+    return null
   }
 
   private async currentImageId(): Promise<string> {

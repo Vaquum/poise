@@ -151,6 +151,13 @@ describe('configuration', () => {
     expect(found).toHaveLength(10)
   })
 
+  it('refuses a POISE_DRAIN_TIMEOUT longer than a week, which workspaces would refuse', () => {
+    expect(loadConfig({ ...BASE, POISE_DRAIN_TIMEOUT: '604800' }).drainTimeoutSeconds).toBe(604800)
+    expect(problems({ ...BASE, POISE_DRAIN_TIMEOUT: '604801' })).toEqual([
+      'POISE_DRAIN_TIMEOUT must be a whole number from 1 to 604800; got "604801"',
+    ])
+  })
+
   it('allows plain-http GitHub URLs only for loopback test servers', () => {
     expect(loadConfig({ ...BASE, POISE_GITHUB_URL: 'http://127.0.0.1:4000/', POISE_GITHUB_API_URL: 'http://localhost:4001' }))
       .toMatchObject({ githubUrl: 'http://127.0.0.1:4000', githubApiUrl: 'http://localhost:4001' })

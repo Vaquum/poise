@@ -16,10 +16,12 @@ function dockerCalls(h: Harness): string[] {
 interface WorkspaceContainerOptions {
   /** Whether the gateway's container is on the workspace's network; a recreated one is on none. */
   gatewayJoined?: boolean
+  /** The environment the container was created with; by default it holds the gateway's drain timeout. */
+  env?: string[]
 }
 
 function addWorkspaceContainer(h: Harness, handle: string, imageId: string, running: boolean, options: WorkspaceContainerOptions = {}): void {
-  const { gatewayJoined = true } = options
+  const { gatewayJoined = true, env = [`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`] } = options
   h.docker.volumes.add(`poise-home-${handle}`)
   h.docker.networks.add(`poise-net-${handle}`)
   if (gatewayJoined) h.docker.containers.get('poise-gateway')?.networks.add(`poise-net-${handle}`)
@@ -30,8 +32,12 @@ function addWorkspaceContainer(h: Harness, handle: string, imageId: string, runn
     running,
     labels: { 'poise.managed': 'true', 'poise.workspace': handle },
     networks: new Set([`poise-net-${handle}`]),
-    spec: {},
+    spec: { Env: env },
   })
+}
+
+function containerEnv(h: Harness, handle: string): string[] {
+  return (h.docker.containers.get(`poise-ws-${handle}`)?.spec as { Env: string[] }).Env
 }
 
 function gatewayNetworks(h: Harness): string[] {
@@ -109,7 +115,9 @@ describe('lazy start', () => {
   })
 
   it('creates the container with exactly the contract settings and environment', async () => {
-    const cookie = await start({ env: { POISE_WORKSPACE_MEMORY: '2g', POISE_WORKSPACE_CPUS: '1.5', POISE_WORKSPACE_PIDS: '512', POISE_WORKSPACE_RUNTIME: 'runsc' } })
+    const cookie = await start({ env: {
+      POISE_WORKSPACE_MEMORY: '2g', POISE_WORKSPACE_CPUS: '1.5', POISE_WORKSPACE_PIDS: '512', POISE_WORKSPACE_RUNTIME: 'runsc', POISE_DRAIN_TIMEOUT: '600',
+    } })
     await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
     await h.orchestrator.startInProgress('alice')
     const create = h.docker.calls.find((call) => call.path.startsWith('/containers/create'))
@@ -125,6 +133,7 @@ describe('lazy start', () => {
         'POISE_HOST=0.0.0.0',
         'POISE_PORT=5555',
         'HOME=/home/poise',
+        'POISE_DRAIN_TIMEOUT=600',
       ],
       Labels: { 'poise.managed': 'true', 'poise.workspace': 'alice' },
       HostConfig: {
@@ -157,6 +166,7 @@ describe('lazy start', () => {
       'POISE_HOST=0.0.0.0',
       'POISE_PORT=5555',
       'HOME=/home/poise',
+      'POISE_DRAIN_TIMEOUT=1800',
       'POISE_SKIP_CLI_BOOTSTRAP=1',
     ])
   })
@@ -255,6 +265,22 @@ describe('lazy start', () => {
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 
+  it('recreates a stopped container with another drain timeout before starting it', async () => {
+    const cookie = await start({ env: { POISE_DRAIN_TIMEOUT: '600' } })
+    addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, false, { env: ['POISE_DRAIN_TIMEOUT=1800'] })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    expect(dockerCalls(h).slice(5)).toEqual([
+      'GET /containers/poise-ws-alice/json',
+      'GET /images/poise-runtime:latest/json',
+      'DELETE /containers/poise-ws-alice',
+      'POST /containers/create',
+      'POST /containers/poise-ws-alice/start',
+    ])
+    expect(h.logs.find((entry) => entry.event === 'workspace.container.removed')).toMatchObject({ handle: 'alice', reason: 'changed drain timeout' })
+    expect(containerEnv(h, 'alice')).toContain('POISE_DRAIN_TIMEOUT=600')
+    expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
+  })
 })
 
 describe('image upgrades', () => {
@@ -274,6 +300,8 @@ describe('image upgrades', () => {
 
   it('drains an outdated running workspace until it is idle, then recreates it on the same volume', async () => {
     await start()
+    const aliceId = h.docker.containers.get('poise-ws-alice')?.id
+    const bobId = h.docker.containers.get('poise-ws-bob')?.id
     h.workspace.health.activeChatTurns = 1
     h.workspace.health.runningCallerCalls = 2
     setTimeout(() => {
@@ -294,6 +322,7 @@ describe('image upgrades', () => {
     expect(dockerCalls(h)).toEqual([
       'GET /images/poise-runtime:latest/json',
       'GET /containers/json',
+      `GET /containers/${aliceId}/json`,
       'GET /containers/poise-ws-alice/json',
       // Before the first call to the workspace, the gateway makes sure it is on its network.
       'GET /networks/poise-net-alice',
@@ -303,7 +332,9 @@ describe('image upgrades', () => {
       'DELETE /containers/poise-ws-alice',
       'POST /containers/create',
       'POST /containers/poise-ws-alice/start',
+      `GET /containers/${bobId}/json`,
     ])
+    expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.started')).toMatchObject({ handle: 'alice', reason: 'outdated image' })
     const recreated = h.docker.containers.get('poise-ws-alice')
     expect(recreated).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
     expect((recreated?.spec as { HostConfig: { Mounts: unknown } }).HostConfig.Mounts)
@@ -357,6 +388,36 @@ describe('image upgrades', () => {
     expect(Date.now() - began).toBeGreaterThanOrEqual(1000)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
     expect(h.logs.find((entry) => entry.event === 'workspace.drain.timeout')).toMatchObject({ handle: 'alice', timeoutSeconds: 1 })
+  })
+
+  it('drains and recreates a running workspace created with another drain timeout, as for a new image', async () => {
+    await start({ env: { POISE_DRAIN_TIMEOUT: '600' } })
+    const bobId = h.docker.containers.get('poise-ws-bob')?.id
+    // carol's workspace was created with another timeout, dave's before the gateway passed one at all.
+    for (const [handle, env] of [['carol', ['POISE_DRAIN_TIMEOUT=1800']], ['dave', []]] as const) {
+      h.store.noteWorkspace(handle, handle)
+      addWorkspaceContainer(h, handle, CURRENT_IMAGE_ID, true, { env: [...env] })
+    }
+    await h.orchestrator.upgradePass()
+    for (const handle of ['carol', 'dave']) {
+      expect(h.logs.filter((entry) => entry.handle === handle).map((entry) => entry.event)).toEqual([
+        'workspace.upgrade.started',
+        'workspace.drain.requested',
+        'workspace.container.stopped',
+        'workspace.container.removed',
+        'workspace.container.created',
+        'workspace.container.started',
+        'workspace.upgrade.finished',
+      ])
+      expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.started' && entry.handle === handle))
+        .toMatchObject({ reason: 'changed drain timeout' })
+      expect(h.workspace.serviceRequests.filter((request) => request.headers.host === workspaceHost(handle)).map((request) => request.url))
+        .toEqual(['/api/service/drain'])
+      expect(containerEnv(h, handle)).toContain('POISE_DRAIN_TIMEOUT=600')
+      expect(h.docker.containers.get(`poise-ws-${handle}`)).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+    }
+    // bob's workspace already has the gateway's timeout and keeps running as it is.
+    expect(h.docker.containers.get('poise-ws-bob')?.id).toBe(bobId)
   })
 
   it('recreates a stopped outdated workspace without draining or starting it', async () => {
