@@ -189,6 +189,26 @@ describe('Poise in service mode', () => {
     expect((await send('GET', '/api/settings', fromGateway('admin'))).status).toBe(403)
   })
 
+  it('accepts the gateway\'s own calls: an admin assertion on the public Host, no Origin', async () => {
+    const gatewayCall: Caller = {
+      peer: GATEWAY_PEER,
+      identity: signAssertion(gateway.privateKey, { scope: 'admin' }),
+      headers: { 'x-forwarded-for': GATEWAY_PEER, 'x-forwarded-proto': 'https', 'x-forwarded-host': PUBLIC_HOST },
+    }
+    expect(await send('GET', '/api/service/health', gatewayCall)).toMatchObject({ status: 200, json: { mode: 'service', draining: false } })
+    expect(await send('POST', '/api/service/drain', { ...gatewayCall, identity: signAssertion(gateway.privateKey, { scope: 'admin' }) })).toMatchObject({ status: 200, json: { draining: true } })
+    expect(await send('POST', '/api/service/resume', { ...gatewayCall, identity: signAssertion(gateway.privateKey, { scope: 'admin' }) })).toMatchObject({ status: 200, json: { draining: false } })
+  })
+
+  it('never takes a cookie or an Authorization header for an identity', async () => {
+    const credentials = { cookie: 'poise_ws=session; poise_gw=apex', authorization: 'Bearer device-token' }
+    for (const [method, path] of [['GET', '/'], ['GET', '/api/settings'], ['GET', '/api/service/health'], ['GET', '/api/link/hello'], ['POST', '/api/service/drain']]) {
+      expect((await send(method, path, { peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN, headers: credentials })).status, `${method} ${path}`).toBe(401)
+    }
+    expect(await openChatSocket({ peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN, headers: credentials })).toEqual({ status: 401 })
+    expect((await send('GET', '/api/service/health')).json).toMatchObject({ draining: false })
+  })
+
   it('drains new Chat work and launches until it is resumed', async () => {
     const background = await import('../server/release-background')
     expect(await send('POST', '/api/service/drain', fromGateway('admin'))).toMatchObject({ status: 200, json: { draining: true, activeChatTurns: 0, runningCallerCalls: 0 } })

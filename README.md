@@ -263,10 +263,11 @@ that is missing or invalid.
 **Requests.** `POISE_HOST=0.0.0.0` is allowed. Every request that does not
 come from loopback, the page and its assets included, needs the gateway's
 identity assertion in `X-Poise-Identity` with a scope that reaches the route,
-the workspace's public host in `Host`, and exactly `POISE_PUBLIC_ORIGIN` when
-it sends `Origin`. The Chat WebSocket applies the same rules. Loopback
-requests keep the local rules, so the container's own health check needs no
-assertion.
+the workspace's public host in `Host`, and exactly `POISE_PUBLIC_ORIGIN`,
+scheme included, when it sends `Origin`. Cookies and `Authorization` headers
+never identify anyone: the gateway keeps its own credentials. The Chat
+WebSocket applies the same rules. Loopback requests keep the local rules, so
+the container's own health check needs no assertion.
 
 **Storage.** Everything lives under `~/.poise` in the home volume: Chat
 workspaces in `~/.poise/chat`, snippets in `~/.poise/snippets/poise.yml` and

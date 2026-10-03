@@ -119,6 +119,38 @@ describe('service mode: the gateway\'s requests', () => {
   })
 })
 
+describe('service mode: the gateway\'s own calls', () => {
+  it('admits an admin assertion with the public Host, as the gateway sends its calls', () => {
+    const admin = signAssertion(gateway.privateKey, { scope: 'admin' })
+    const forwarded = { 'x-forwarded-for': '172.18.0.2', 'x-forwarded-proto': 'https', 'x-forwarded-host': PUBLIC_HOST }
+    for (const url of ['/api/service/health', '/api/service/drain', '/api/service/resume']) {
+      expect(enforceApiRequest(request({ url, identity: admin, headers: forwarded }), policy), url).toEqual({ kind: 'gateway', scope: 'admin' })
+    }
+    expect(refusal(() => enforceApiRequest(request({ url: '/api/service/health', host: 'poise-ws-octocat:5555', identity: admin }), policy)))
+      .toEqual({ status: 403, message: 'host is not allowed' })
+  })
+})
+
+describe('service mode: identity comes from the assertion alone', () => {
+  // The gateway keeps its own credentials: no workspace cookie and no device
+  // token reach a workspace, and neither may stand in for an assertion.
+  const credentials = { cookie: 'poise_ws=session; poise_gw=apex', authorization: 'Bearer device-token' }
+
+  it('never takes a cookie or an Authorization header for an identity', () => {
+    for (const url of ['/api/settings', '/api/link/hello', '/api/service/health', '/ws/chat']) {
+      expect(refusal(() => enforceApiRequest(request({ url, headers: credentials }), policy)), url)
+        .toEqual({ status: 401, message: 'an identity assertion from the gateway is required' })
+    }
+    expect(refusal(() => enforceDocumentRequest(request({ url: '/', headers: credentials }), policy))).toMatchObject({ status: 401 })
+  })
+
+  it('lets the assertion\'s scope decide whatever else is sent', () => {
+    const link = signAssertion(gateway.privateKey, { scope: 'link' })
+    expect(refusal(() => enforceApiRequest(request({ url: '/api/settings', identity: link, headers: credentials }), policy))).toMatchObject({ status: 403 })
+    expect(enforceApiRequest(request({ url: '/api/link/hello', identity: link, headers: credentials }), policy)).toEqual({ kind: 'gateway', scope: 'link' })
+  })
+})
+
 describe('service mode: plain http for local end-to-end runs', () => {
   const at = (origin: string): ApiRequestPolicy => ({ service: readServiceConfig({ ...serviceEnvironment(gateway), POISE_PUBLIC_ORIGIN: origin }) })
 
