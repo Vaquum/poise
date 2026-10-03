@@ -1,12 +1,13 @@
 import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } from './model-refresh'
-// Settings panel — two tabs: General (GitHub accounts, username, timezone, refresh rate,
-// theme) and Models (which model each place in Poise launches, with a
-// fallback). Slides in from the right, same pattern as the typography panel.
+// Settings panel — two tabs: General (your GitHub account, the agent account,
+// GitHub accounts, timezone, refresh rate, theme) and Models (which model each
+// place in Poise launches, with a fallback). Slides in from the right, same
+// pattern as the typography panel.
 //
-// GitHub auth no longer lives here — Poise reads through the local
-// `github-datastore` CLI which handles auth on its own side. The
-// username here scopes the views to the user-footprint (things you're
-// involved in) rather than the whole org.
+// GitHub credentials stay in gh; Poise asks it for the account it acts as.
+// Your account scopes the views to your user-footprint (things you're
+// involved in) rather than the whole org. The agent account is who reviews
+// and comments are posted as.
 //
 // Model names are identities from Caller's catalog (`opus-5-max`), shown
 // verbatim: the same string the Swarm log records and the CLI takes. The
@@ -47,6 +48,7 @@ interface ModelsResponse {
 let panelEl: HTMLElement | null = null
 let orgInput: HTMLInputElement | null = null
 let meInput: HTMLInputElement | null = null
+let agentInput: HTMLInputElement | null = null
 let tzSelect: HTMLSelectElement | null = null
 let branchPrefixInput: HTMLInputElement | null = null
 let idleTimeoutInput: HTMLInputElement | null = null
@@ -85,6 +87,7 @@ function syncFieldsFromCache() {
   // a field the person is not currently in.
   const active = document.activeElement
   if (meInput && meInput !== active) meInput.value = s.me
+  if (agentInput && agentInput !== active) agentInput.value = s.agentAccount ?? ''
   if (tzSelect && tzSelect !== active) {
     const fallback = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return 'UTC' } })()
     tzSelect.value = ensureTimezoneOption(s.timezone || fallback)
@@ -431,23 +434,29 @@ let saving = false
 const GITHUB_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/
 
 async function saveAll() {
-  if (!saveBtn || !orgInput || !meInput || !tzSelect) return
+  if (!saveBtn || !orgInput || !meInput || !agentInput || !tzSelect) return
   if (saving) return
 
   const org = getCachedSettings().org
   const me = meInput.value.trim()
+  const agentAccount = agentInput.value.trim()
   const tz = tzSelect.value
   const models = collectModels()
   const branchPrefix = (branchPrefixInput?.value ?? CHAT_DEFAULTS.branchPrefix).trim() || CHAT_DEFAULTS.branchPrefix
   const idleTimeoutMinutes = Number(idleTimeoutInput?.value ?? CHAT_DEFAULTS.idleTimeoutMinutes)
 
   if (!me) {
-    setHelp('Username is required.', 'error')
+    setHelp('Your GitHub account is required.', 'error')
     return
   }
   if (!GITHUB_NAME.test(me)) {
-    setHelp('Username must be a GitHub login, not a URL or email.', 'error')
+    setHelp('Your GitHub account must be a GitHub login, not a URL or email.', 'error')
     meInput.focus()
+    return
+  }
+  if (agentAccount && !GITHUB_NAME.test(agentAccount)) {
+    setHelp('The agent account must be a GitHub login, not a URL or email.', 'error')
+    agentInput.focus()
     return
   }
   // A branch prefix is a git ref fragment: no spaces, no `..`, no leading
@@ -483,7 +492,7 @@ async function saveAll() {
   try {
     const res = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ org, me, timezone: tz, chat: { branchPrefix, idleTimeoutMinutes }, ...(models ? { models } : {}) }),
+      body: JSON.stringify({ org, me, agentAccount, timezone: tz, chat: { branchPrefix, idleTimeoutMinutes }, ...(models ? { models } : {}) }),
     })
     const data = await res.json()
     if (!res.ok) {
@@ -545,6 +554,18 @@ function buildPanel(): HTMLElement {
         <div class="tp-group-label">GitHub</div>
 
         <div class="tp-section">
+          <label class="tp-label" for="st-username">Your GitHub account</label>
+          <input id="st-username" type="text" class="st-input st-input-me" autocomplete="off" spellcheck="false" placeholder="octocat" />
+          <div class="st-help st-help-info">Scopes Current and Archive to your user-footprint (PRs and issues you're involved in). Poise reads GitHub as this account, so it must be signed in to <code>gh</code> here.</div>
+        </div>
+
+        <div class="tp-section">
+          <label class="tp-label" for="st-agent-account">Agent account</label>
+          <input id="st-agent-account" type="text" class="st-input st-input-agent" autocomplete="off" spellcheck="false" />
+          <div class="st-help st-help-info">The GitHub user your reviews and comments are posted as. It must be signed in to <code>gh</code> here.</div>
+        </div>
+
+        <div class="tp-section">
           <label class="tp-label" for="st-organization">GitHub accounts</label>
           <div class="st-organizations" aria-live="polite"></div>
           <div class="st-org-add-row">
@@ -553,12 +574,6 @@ function buildPanel(): HTMLElement {
           </div>
           <div class="st-help st-help-info">Add an organization name or personal username. Poise activates its datastore; initial sync may take a few minutes. Existing accounts keep working. Shared behavior settings apply when the new account is ready.</div>
           <div class="st-help st-help-info st-org-status" role="status"></div>
-        </div>
-
-        <div class="tp-section">
-          <label class="tp-label" for="st-username">Username (you)</label>
-          <input id="st-username" type="text" class="st-input st-input-me" autocomplete="off" spellcheck="false" placeholder="octocat" />
-          <div class="st-help st-help-info">Scopes Current and Archive to your user-footprint (PRs and issues you're involved in). GitHub auth is handled by the local <code>github-datastore</code> CLI.</div>
         </div>
 
         <div class="tp-group-label">Time</div>
@@ -635,7 +650,8 @@ function buildPanel(): HTMLElement {
       </div>
 
       <div class="tp-hint">
-        GitHub accounts, username, timezone and model choices are stored in
+        Your GitHub account, the agent account, GitHub accounts, timezone and
+        model choices are stored in
         <code>~/.poise/cache.db</code>. Refresh rate and theme are kept by this
         browser, so they do not follow you to another one.
       </div>
@@ -644,6 +660,7 @@ function buildPanel(): HTMLElement {
 
   orgInput = panel.querySelector('.st-input-org') as HTMLInputElement
   meInput = panel.querySelector('.st-input-me') as HTMLInputElement
+  agentInput = panel.querySelector('.st-input-agent') as HTMLInputElement
   tzSelect = panel.querySelector('.st-input-tz') as HTMLSelectElement
   branchPrefixInput = panel.querySelector('.st-input-branch-prefix') as HTMLInputElement
   idleTimeoutInput = panel.querySelector('.st-input-idle-timeout') as HTMLInputElement
@@ -654,7 +671,7 @@ function buildPanel(): HTMLElement {
   productionEl = panel.querySelector('.st-production')
   refreshBtn = panel.querySelector('.st-refresh-models') as HTMLButtonElement
   refreshBtn.addEventListener('click', () => { void refreshModels() })
-  // This used to be `panel.querySelector('.st-help')`, which is the Username
+  // This used to be `panel.querySelector('.st-help')`, which is an account
   // explainer — the first element of that class in the panel. Every "Saved."
   // and every validation error overwrote it, permanently for the session, and
   // in a short window the message landed off-screen where nobody would see it.
@@ -671,7 +688,7 @@ function buildPanel(): HTMLElement {
     const retry = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-retry-org]')
     if (retry?.dataset.retryOrg) void addOrganization(retry.dataset.retryOrg)
   })
-  for (const inp of [meInput, branchPrefixInput, idleTimeoutInput]) {
+  for (const inp of [meInput, agentInput, branchPrefixInput, idleTimeoutInput]) {
     inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveAll() })
   }
 

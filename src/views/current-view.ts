@@ -34,7 +34,7 @@ interface ManualCard {
 
 interface LiveItem {
   // Full GitHub identifier — `${repo}#${number}` is unique app-wide.
-  repo: string                     // full name, "Vaquum/foo"
+  repo: string                     // full name, "acme/foo"
   number: number
   title: string
   url: string
@@ -69,7 +69,7 @@ const LIVE_LIMIT = 200            // upper bound; time / status filters narrow f
 let initialized = false
 let manualCards: ManualCard[] = []
 let liveItems: LiveItem[] = []
-// Every Vaquum repo with any PR/issue history, populated from /api/repos
+// Every repo of the accounts with any PR/issue history, populated from /api/repos
 // on view init. Used by the manual + issue composers so the dropdown
 // covers the whole org, not just the repos in the user's involvement.
 let allRepos: string[] = []
@@ -742,7 +742,7 @@ async function fetchPrStatus() {
     if (!res.ok) return
     const data = await res.json()
     // The /github endpoint already returns full records — repo here is
-    // the full "Vaquum/repo" name, matching the format prKey() builds.
+    // the full "owner/repo" name, matching the format prKey() builds.
     const next = new Map<string, PrStatus>()
     for (const r of data.records || []) {
       next.set(`${r.repo}#${r.number}`, 'mergeable')
@@ -919,7 +919,7 @@ function attachAddHandlers() {
   }
 }
 
-// "— no repo —" + every Vaquum repo. Falls back to the involvement set
+// "— no repo —" + every repo of the accounts. Falls back to the involvement set
 // only if /api/repos hasn't loaded yet (cold start race).
 function manualRepoOptionsHtml(selected: string | null = null): string {
   const repos = allRepos.length > 0 ? allRepos : distinctRepos()

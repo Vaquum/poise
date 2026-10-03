@@ -5,7 +5,9 @@ operator's explicit request it runs its provider's own CLI with full access,
 in a fresh checkout of the issue's repository, so it can read the whole
 repository, build and run the tests. It does not post. It writes its comments
 to a file, and Caller posts them as the actor through github-interface — only
-on the issue and its sub-issues, one comment per issue.
+on the issue and its sub-issues, one comment per issue. Every github-interface
+call names the actor with --token-user, so the reads, the checkout and the
+comments are all the agent account's.
 """
 from __future__ import annotations
 
@@ -31,8 +33,6 @@ INSTRUCTION = "Provide an adversarial, meticulous, and comprehensive review with
 # Added to Claude Code's own system prompt; the task itself goes on stdin.
 UNATTENDED = ("You run unattended: nobody will answer a question or approve anything. "
               "Do not post to GitHub yourself; write your review comments to the output file the task names.")
-# github-interface --comment-issue always posts as this account.
-COMMENTER = "bit-mis"
 TIMEOUT_SECONDS = 3600
 POST_RESERVE_SECONDS = 120
 MAX_PACKET_BYTES = 1_500_000
@@ -84,9 +84,9 @@ def interface(*args: str, seconds: float = 120) -> dict:
     return json.loads(stdout)
 
 
-def _issue(repo: str, number: int) -> dict:
-    issue = interface("--read-issue", f"#{number}", "--repository", repo)["issue"]
-    comments = interface("--issue-comments", f"#{number}", "--repository", repo)["comments"]
+def _issue(repo: str, number: int, actor: str) -> dict:
+    issue = interface("--read-issue", f"#{number}", "--repository", repo, "--token-user", actor)["issue"]
+    comments = interface("--issue-comments", f"#{number}", "--repository", repo, "--token-user", actor)["comments"]
     return {
         "issue": ref(repo, number),
         "title": issue.get("title"),
@@ -102,17 +102,17 @@ def _issue(repo: str, number: int) -> dict:
     }
 
 
-def packet(repo: str, number: int) -> dict:
+def packet(repo: str, number: int, actor: str) -> dict:
     """The issue, its comments, and every sub-issue with its own comments."""
     progress.stage("preparing_issue", "Reading the issue and its sub-issues", timeout=review_budget.timeout(600))
-    target = _issue(repo, number)
+    target = _issue(repo, number, actor)
     if target.pop("pull_request"):
         raise AgentPreflightError(f"{ref(repo, number)} is a pull request, not an issue")
     subs = []
-    for item in interface("--sub-issues", f"#{number}", "--repository", repo)["sub_issues"]:
+    for item in interface("--sub-issues", f"#{number}", "--repository", repo, "--token-user", actor)["sub_issues"]:
         linked = ref(item["repository"], item["issue_number"])
         try:
-            sub = _issue(item["repository"], item["issue_number"])
+            sub = _issue(item["repository"], item["issue_number"], actor)
         except (RuntimeError, ValueError) as error:
             subs.append({"issue": linked, "via": item["via"], "error": str(error)[:500]})
             continue
@@ -128,14 +128,15 @@ def packet(repo: str, number: int) -> dict:
     return data
 
 
-def mark_reviewed(data: dict, reviews: Callable[[list[str]], dict[str, str]],
+def mark_reviewed(data: dict, actor: str, reviews: Callable[[list[str]], dict[str, str]],
                   running: frozenset[str] = frozenset()) -> None:
     """A sub-issue is reviewed once. One that a review of another issue has
-    already commented on (its own review, say, from before a PRD took it in),
-    or whose own review is running now, stays in the packet for context but
-    gets no comment from this review. `reviews` maps call ids to the issue each
-    review was of; a review this machine has no record of counts as another
-    issue's. `running` holds the issues, lowercased, with a review running."""
+    already commented on as the actor (its own review, say, from before a PRD
+    took it in), or whose own review is running now, stays in the packet for
+    context but gets no comment from this review. `reviews` maps call ids to
+    the issue each review was of; a review this machine has no record of counts
+    as another issue's. `running` holds the issues, lowercased, with a review
+    running."""
     target = data["issue"]["issue"].lower()
     for sub in data["sub_issues"]:
         if "error" in sub:
@@ -146,7 +147,7 @@ def mark_reviewed(data: dict, reviews: Callable[[list[str]], dict[str, str]],
         calls = []
         for comment in sub.get("comments") or []:
             match = MARKER_RE.search(str(comment.get("body") or ""))
-            if match and str(comment.get("author") or "").lower() == COMMENTER.lower():
+            if match and str(comment.get("author") or "").lower() == actor.lower():
                 calls.append(match.group(1))
         if not calls:
             continue
@@ -385,7 +386,7 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
     work.mkdir(parents=True)
     checkout = work / "repo"
     progress.stage("checking_out", f"Preparing a fresh checkout of {repo}", timeout=review_budget.timeout(1800))
-    info = interface("--checkout-repo", repo, "--path", str(checkout), seconds=1800)
+    info = interface("--checkout-repo", repo, "--path", str(checkout), "--token-user", actor, seconds=1800)
     output = work / "review.json"
     text = prompt(ref(repo, number), repo, info, data, output, actor, note)
     seconds = review_budget.timeout(TIMEOUT_SECONDS, reserve=POST_RESERVE_SECONDS)
@@ -438,7 +439,7 @@ def post(posts: list[dict], actor: str, call_id: str, model: str, record) -> lis
         body = (f"{item['body']}\n\n---\n<sub>Issue review · `{model}`</sub>\n"
                 f"<!-- agent-interface issue-review call={call_id} -->")
         try:
-            reply = interface("--comment-issue", f"#{number}", "--repository", repo, f"--body={body}")
+            reply = interface("--comment-issue", f"#{number}", "--repository", repo, "--token-user", actor, f"--body={body}")
         except (RuntimeError, ValueError, subprocess.SubprocessError) as error:
             # A locked or deleted sub-issue must not cost the others their comment.
             failures.append(f"{item['issue']}: {str(error)[:300]}")

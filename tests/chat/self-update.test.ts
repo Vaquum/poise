@@ -14,6 +14,7 @@ import type { Adapter, AdapterHost, AdapterStartOptions } from '../../server/cha
 import type { SelfUpdateBridge } from '../../server/self-update-bridge'
 import type { PreparedSelfChange, SelfChange, SelfUpdateStatus } from '../../src/self-update-types'
 import { CATALOG } from '../model-catalog-fixture'
+import { POISE_REPOSITORY as REPOSITORY } from '../../src/poise-repository'
 
 let root = ''
 let repo = ''
@@ -92,7 +93,7 @@ function fakeBridge(instance: string, options: { configured?: boolean } = {}): F
       git(['switch', '-q', '-c', `poise/change-${input.id}`], workspace)
       const now = new Date().toISOString()
       const change: SelfChange = {
-        id: input.id, sessionId: input.sessionId, instance, request: input.request, title: input.title || 'change', repository: 'mikkokotila/Poise',
+        id: input.id, sessionId: input.sessionId, instance, request: input.request, title: input.title || 'change', repository: REPOSITORY,
         branch: `poise/change-${input.id}`, baseSha: git(['rev-parse', 'HEAD'], workspace), state: 'implementing', createdAt: now, updatedAt: now, canRevert: false,
       }
       changes.set(input.id, change)
@@ -224,7 +225,7 @@ describe('/poise change sessions', () => {
 
     // The session is the server's: controller checkout, change branch, the
     // source's model, no user repo choice, titled by the request.
-    expect(session).toMatchObject({ workspaceKind: 'poise-change', selfChangeId: changeId, repo: 'mikkokotila/Poise', agent: 'grok', model: source.model, modelId: source.modelId, effort: source.effort })
+    expect(session).toMatchObject({ workspaceKind: 'poise-change', selfChangeId: changeId, repo: REPOSITORY, agent: 'grok', model: source.model, modelId: source.modelId, effort: source.effort })
     expect(session.branch).toMatchObject({ name: `poise/change-${changeId}`, origin: 'existing', provisional: false })
     expect(session.checkout).toContain(join('ws', changeId))
     expect(session.checkout).not.toBe(source.checkout)

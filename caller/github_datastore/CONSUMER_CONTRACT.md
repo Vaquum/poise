@@ -1,6 +1,6 @@
-# Vaquum GitHub Datastore Consumer Contract
+# GitHub Datastore Consumer Contract
 
-Use this datastore for Vaquum GitHub issues, pull requests, and user footprint data.
+Use this datastore for an account's GitHub issues, pull requests, and user footprint data.
 
 Do not call `POST http://127.0.0.1:8788/github`. That is the old service.
 
@@ -20,7 +20,7 @@ Consumers must complete this gate before each candidate scan.
 ```bash
 github-datastore view pr --status open --limit 50 --format json
 github-datastore view issue --status open --limit 50 --format json
-github-datastore view user --username mikkokotila --limit 50 --format json
+github-datastore view user --username LOGIN --limit 50 --format json
 ```
 
 CSV:
@@ -38,7 +38,7 @@ views = store.views
 
 prs_json = views.pr(status="open", limit=50)
 issues_json = views.issue(status="open", limit=50)
-user_items_json = views.user(username="mikkokotila", limit=50)
+user_items_json = views.user(username="LOGIN", limit=50)
 prs_csv = views.pr(status="open", limit=50, output="csv")
 ```
 
@@ -166,15 +166,15 @@ Datetimes must include timezone:
 Examples:
 
 ```python
-views.pr(status="open", repo="Vaquum/Praxis", limit=20)
+views.pr(status="open", repo="ORG/REPO", limit=20)
 
 views.issue(
-    author="mikkokotila",
+    author="LOGIN",
     updated_since_datetime="2026-05-03T09:00:00Z",
 )
 
 views.user(
-    username="mikkokotila",
+    username="LOGIN",
     item_type="pr",
     status="open",
     limit=50,

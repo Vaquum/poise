@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { recognisePoiseRequest, type PoiseIntent } from '../src/poise-request-intent'
+import { POISE_REPOSITORY } from '../src/poise-repository'
 
 // The natural-language entrypoint for a Poise self-change: which typed
 // messages count as an unambiguous implementation request, and everything
@@ -172,6 +173,12 @@ describe('other repositories and generic code requests stay ordinary chat', () =
       'Add a Chat console to the acme workspace',
     ]
     for (const text of elsewhere) expect(cue(text), text).toBeNull()
+  })
+
+  it('never counts Poise\'s own repository as another target', () => {
+    expect(cue(`Add a search box above the session list in github.com/${POISE_REPOSITORY}`)).toBe('vocabulary')
+    expect(cue(`Add a search box above the session list in the repository ${POISE_REPOSITORY}`)).toBe('vocabulary')
+    expect(cue('Add a search box above the session list in github.com/someone/elsewhere')).toBeNull()
   })
 
   it('still recognises Poise when the comparison points the other way', () => {

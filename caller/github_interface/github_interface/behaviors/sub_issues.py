@@ -4,8 +4,9 @@ from typing import Any
 from github_interface.atoms.issues import read_issue, sub_issues
 from github_interface.client import GitHubClient
 from github_interface.context import issue_number, repository
+from github_interface.identity import AGENT
 
-TOKEN_USER = "bit-mis"
+IDENTITY = AGENT
 
 # An issue makes another its sub-issue in either of two ways: GitHub's native
 # sub-issues, or a link under its own "Work Slices" heading — how an Origo PRD

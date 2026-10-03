@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -16,6 +17,11 @@ def response(payload: dict, *, returncode: int = 0, stderr: str = "", remaining:
 
 
 class GitHubRateLimitTest(unittest.TestCase):
+    def setUp(self) -> None:
+        token = patch.dict(os.environ, {"GH_TOKEN": "test-credential"})
+        token.start()
+        self.addCleanup(token.stop)
+
     def test_successful_last_point_is_returned_with_headers_stripped(self) -> None:
         data = {"viewer": {"login": "account"}}
         with patch("github_datastore.github_api.subprocess.run", return_value=response({"data": data})) as run:

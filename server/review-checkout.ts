@@ -28,11 +28,6 @@ export async function resolveReviewCheckout(
       || !failure.stderr.trim().endsWith(`: ${owner}/${repo}`)
       || !failure.stderr.trim().startsWith('error: checkout not found under ')) throw error
   }
-  // Caller's current checkout primitive fixes its token identity to bit-mis
-  // and has no --token-user option. Never silently provision as another actor.
-  if (actor.toLowerCase() !== 'bit-mis') {
-    throw new Error(`Caller cannot provision a checkout as reviewer ${actor}; create a local checkout or update Caller to support an explicit checkout identity`)
-  }
   const root = process.env.POISE_DB && process.env.POISE_DB !== ':memory:'
     ? dirname(resolve(process.env.POISE_DB)) : join(homedir(), '.poise')
   const base = join(root, 'review-checkouts', head, owner.toLowerCase())
@@ -60,7 +55,8 @@ export async function resolveReviewCheckout(
     const checkout = join(temporary, owner, repo)
     try {
       await mkdir(dirname(checkout), { recursive: true, mode: 0o700 })
-      const { stdout } = await runFile('github-interface', ['--checkout-repo', `${owner}/${repo}`, '--path', checkout], {
+      // Provisioned as the reviewer, who must be able to read the repository.
+      const { stdout } = await runFile('github-interface', ['--checkout-repo', `${owner}/${repo}`, '--path', checkout, '--token-user', actor], {
         signal, timeoutMs: 30_000, maxOutputBytes: 1024 * 1024,
       })
       const result = JSON.parse(stdout) as { action?: unknown, repository?: unknown, path?: unknown }

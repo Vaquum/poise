@@ -4,8 +4,9 @@ from github_interface.atoms.pulls import list_review_threads, resolve_conversati
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository
+from github_interface.identity import AGENT
 
-TOKEN_USER = "bit-mis"
+IDENTITY = AGENT
 
 
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:

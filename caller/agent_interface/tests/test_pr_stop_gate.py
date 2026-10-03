@@ -9,7 +9,15 @@ from unittest.mock import patch
 from agent_interface import pr_stop_gate
 
 
+ACCOUNTS = {"GITHUB_INTERFACE_AGENT_USER": "agent-account", "CALLER_PR_REVIEWER": "", "CALLER_GITHUB_READER": ""}
+
+
 class TestPrStopGate(TestCase):
+    def setUp(self) -> None:
+        accounts = patch.dict(os.environ, ACCOUNTS)
+        accounts.start()
+        self.addCleanup(accounts.stop)
+
     def test_codex_uses_its_supported_stop_response_contract(self) -> None:
         with patch.dict(os.environ, {"CALLER_HOOK_CLIENT": "codex"}):
             result = pr_stop_gate._block("not green")
@@ -285,6 +293,77 @@ class TestPrStopGate(TestCase):
             pr_stop_gate.run()
 
         output.assert_not_called()
+
+    def _stop(self, root: str, interface) -> dict | None:
+        state = Path(root) / "state"
+        state.mkdir()
+        repository = Path(root) / "repository"
+        (repository / ".git").mkdir(parents=True)
+        with patch.object(pr_stop_gate, "STATE_DIR", state), patch.object(pr_stop_gate, "_interface", side_effect=interface):
+            return pr_stop_gate.handle({
+                "hook_event_name": "Stop",
+                "session_id": "session-accounts",
+                "cwd": str(repository),
+                "last_assistant_message": "The PR is ready to merge.",
+            })
+
+    def test_waits_for_the_agent_accounts_approval_and_reads_as_it(self) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as root:
+            def interface(args, cwd):
+                calls.append(args)
+                return self._blocked_interface(cwd)(args, cwd)
+
+            self._stop(root, interface)
+
+        current, readiness = calls
+        self.assertEqual(current, ["--current-pr", "--token-user", "agent-account"])
+        self.assertEqual(readiness[:4], ["--pr-readiness", "#757", "--username", "agent-account"])
+        self.assertEqual(readiness[-2:], ["--token-user", "agent-account"])
+
+    def test_a_named_reviewer_and_reader_win(self) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as root, \
+                patch.dict(os.environ, {"CALLER_PR_REVIEWER": "review-account", "CALLER_GITHUB_READER": "person-account"}):
+            def interface(args, cwd):
+                calls.append(args)
+                return self._blocked_interface(cwd)(args, cwd)
+
+            self._stop(root, interface)
+
+        current, readiness = calls
+        self.assertEqual(current, ["--current-pr", "--token-user", "person-account"])
+        self.assertEqual(readiness[3], "review-account")
+        self.assertEqual(readiness[-2:], ["--token-user", "person-account"])
+
+    def test_without_an_agent_account_the_gate_says_what_to_set(self) -> None:
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"GITHUB_INTERFACE_AGENT_USER": ""}):
+            with self.assertRaisesRegex(RuntimeError, "set GITHUB_INTERFACE_AGENT_USER"):
+                self._stop(root, self._blocked_interface(root))
+
+    def test_install_fixes_the_accounts_into_both_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CLAUDE_SETTINGS_PATH": str(Path(root) / "claude.json"),
+            "CODEX_HOOKS_PATH": str(Path(root) / "codex.json"),
+            "CALLER_GITHUB_READER": "person-account",
+        }):
+            result = pr_stop_gate.install()
+            hooks = [json.loads((Path(root) / name).read_text()) for name in ("claude.json", "codex.json")]
+
+        for command in result["commands"].values():
+            self.assertIn(" CALLER_PR_REVIEWER=agent-account CALLER_GITHUB_READER=person-account ", command)
+        self.assertEqual([hook["hooks"]["Stop"][0]["hooks"][0]["command"] for hook in hooks],
+                         [result["commands"]["claude"], result["commands"]["codex"]])
+
+    def test_install_refuses_without_an_agent_account(self) -> None:
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CLAUDE_SETTINGS_PATH": str(Path(root) / "claude.json"),
+            "CODEX_HOOKS_PATH": str(Path(root) / "codex.json"),
+            "GITHUB_INTERFACE_AGENT_USER": "",
+        }):
+            with self.assertRaisesRegex(RuntimeError, "set GITHUB_INTERFACE_AGENT_USER"):
+                pr_stop_gate.install()
+            self.assertEqual(list(Path(root).iterdir()), [])
 
     @staticmethod
     def _blocked_interface(scratch: str):

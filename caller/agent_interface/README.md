@@ -10,6 +10,16 @@ default per behavior. `agent-interface --models` prints it as JSON.
 the runtime copy under the data directory when something changed; a family whose
 CLI cannot answer keeps its rows and is reported as unavailable.
 
+# Authoring content
+
+`--author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]`
+writes a piece on TOPIC with the catalog's `author_content` model and no tools.
+It writes in the voice guide `--voice-guide` names, else the one
+`AGENT_INTERFACE_VOICE_GUIDE` names: a local text file, read when the call
+starts. A named guide that is missing or empty fails the call. With neither,
+it writes without a voice guide, says so on stderr, and prints
+`"voice_guide": null` with its result.
+
 # Stopping a run
 
 Every call records the process id of the `agent-interface` that runs it.
@@ -185,6 +195,11 @@ Claude keeps Claude Code's own system prompt: the unattended rules are
 appended with `--append-system-prompt`, last on the line, and the task goes on
 stdin — the shape Poise's subscription wrapper reads a stdin prompt from.
 
+The actor is the agent account. `GITHUB_INTERFACE_AGENT_USER` names it, and
+an `--actor` that differs from it is refused before anything runs
+(`actor_mismatch`); without it nothing runs (`agent_account_missing`). Every
+github-interface call names the actor with `--token-user`.
+
 Caller first reads the packet through github-interface as the actor: the
 issue and its comments (`--read-issue`, `--issue-comments`) and each
 sub-issue with its own (`--sub-issues`). A sub-issue is a GitHub sub-issue or
@@ -193,12 +208,10 @@ an issue of the same owner linked under the issue's "Work Slices" heading
 with its error and gets no comment. A sub-issue is reviewed once: one that
 already carries an issue review from a review of another issue, or whose own
 review is running now, stays in the packet for context, marked `reviewed_by`,
-but gets no comment. A posted review is found by the marker that ends
-bit-mis's footer. Its call names the issue it was of; a call with no local
+but gets no comment. A posted review is found by the marker that ends the
+actor's footer. Its call names the issue it was of; a call with no local
 record counts as another issue's, and a row left running for over two hours
-counts as no run. Comments post as the account
-github-interface comments with, bit-mis; any other `--actor` is refused
-before anything runs (`actor_mismatch`). The agent does not post:
+counts as no run. Comments post as the actor. The agent does not post:
 it writes `{"comments": [{"issue": "owner/repo#N", "body": "..."}]}` to a file
 outside the checkout. Caller keeps one comment per issue (merging duplicates,
 splitting one over 60,000 characters into parts), sets aside any for an issue
@@ -221,3 +234,15 @@ Claude output limit before posting recovers once with the recovery model in a
 new checkout. github-interface runs in its own process group, so a timeout
 also ends the git it started; a mirror left broken is cloned afresh once.
 `--models` lists `issue_review_providers`.
+
+# PR stop gate
+
+`--install-pr-stop-gate` registers `--pr-stop-gate` as a Stop and PostToolUse
+hook for Claude Code and Codex. When a session claims its pull request is
+ready, or changed a repository, the hook asks github-interface whether that
+pull request is green — the reviewer approved its current head, checks pass,
+no live conversation is open — and blocks the stop until it is. The reviewer
+is the agent account: `CALLER_PR_REVIEWER`, else `GITHUB_INTERFACE_AGENT_USER`.
+Pull requests are read as `CALLER_GITHUB_READER`, else as the reviewer. The
+hook runs in every agent session on the machine, so installing fixes these
+accounts into its command; installing without an agent account fails.

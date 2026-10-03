@@ -79,6 +79,8 @@ function arrangeCli(): void {
       return { stdout: JSON.stringify(issues.filter((row) => row.repo === repo)), stderr: '' }
     }
     if (command === 'github-interface' && args[0] === '--sub-issues') {
+      // Read as the agent account, as Caller's review reads them.
+      if (args[args.indexOf('--token-user') + 1] !== 'bit-mis') throw new Error(`sub-issues read without the agent account: ${args.join(' ')}`)
       const repository = args[args.indexOf('--repository') + 1]
       const number = Number(args[1].replace('#', ''))
       const failure = subIssueFailures[`${repository}#${number}`]
@@ -111,9 +113,9 @@ async function start(options: {
   vi.resetModules()
   database = await import('../server/db')
   database.setMeta('org', 'Vaquum')
+  database.setMeta('me', 'mikkokotila')
+  database.setMeta('agentAccount', 'bit-mis')
   behaviors = await import('../server/behaviors')
-  const gh = await import('../server/gh')
-  gh.setReviewAgentUsername('bit-mis')
   const hourAgo = ago(60 * MINUTE)
   database.setMeta('behavior_review_new_issues_enabled', '1')
   database.setMeta('behavior_review_new_issues_repos', JSON.stringify(options.repos ?? [{ repo: REPO, since: hourAgo }]))
@@ -365,7 +367,7 @@ describe('Review New Issues', () => {
     const other = 'Vaquum/Limen'
     const since = ago(60 * MINUTE)
     const { behaviors, database } = await start({ repos: [{ repo: REPO, since }, { repo: other, since }] })
-    behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'bit-mis' })
+    behaviors.startBehaviorsRuntime()
     issues = [issue(452)]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(`${REPO}#452`, { status: 'failed', error: 'provider exited' })]
@@ -404,7 +406,7 @@ describe('Review New Issues', () => {
 
   it('isolates an issue launch error with its own retry while another issue starts', async () => {
     const { behaviors, database } = await start()
-    behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'bit-mis' })
+    behaviors.startBehaviorsRuntime()
     issues = [issue(452), issue(453)]
     mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
       if (args[1] === `${REPO}#452`) throw new Error('launch unavailable for this issue')
@@ -426,7 +428,7 @@ describe('Review New Issues', () => {
 
   it.each(['datastore', 'log feed'] as const)('keeps a shared %s failure globally degraded and retries it immediately', async (dependency) => {
     const { behaviors } = await start()
-    behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'bit-mis' })
+    behaviors.startBehaviorsRuntime()
     issues = [issue(452)]
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
@@ -1068,7 +1070,7 @@ describe('Review New Issues sub-issues', () => {
 
   it('launches nothing while no sub-issues can be read at all, and says why', async () => {
     const { behaviors, database } = await start()
-    behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'bit-mis' })
+    behaviors.startBehaviorsRuntime()
     issues = [issue(500, { created_at: ago(30 * MINUTE) }), issue(501, { created_at: ago(20 * MINUTE) })]
     subIssueFailures = { [ref(500)]: 'GitHub 502 reading sub-issues', [ref(501)]: 'GitHub 502 reading sub-issues' }
     await behaviors.runEnabledBehaviorsOnce()
@@ -1221,11 +1223,23 @@ describe('Review New Issues settings', () => {
     expect(behaviors.setIssueRepositories([])).toEqual([])
   })
 
-  it('trusts three authors by default and keeps each name once', async () => {
+  it('trusts your account and the agent account until a list is saved, and keeps each name once', async () => {
     const { behaviors, database } = await start()
     database.setMeta('behavior_review_new_issues_authors', '')
-    expect(behaviors.getIssueAuthors()).toEqual(['mikkokotila', 'zero-bang', 'bit-mis'])
+    expect(behaviors.getIssueAuthors()).toEqual(['mikkokotila', 'bit-mis'])
+    database.setMeta('agentAccount', '')
+    expect(behaviors.getIssueAuthors()).toEqual(['mikkokotila'])
+    database.setMeta('agentAccount', 'MikkoKotila')
+    expect(behaviors.getIssueAuthors()).toEqual(['mikkokotila'])
+    database.setMeta('me', '')
+    database.setMeta('agentAccount', '')
+    expect(behaviors.getIssueAuthors()).toEqual([])
+    database.setMeta('me', 'mikkokotila')
     expect(behaviors.setIssueAuthors(['mikkokotila', 'MikkoKotila', 'zero-bang'])).toEqual(['mikkokotila', 'zero-bang'])
+    expect(behaviors.getIssueAuthors()).toEqual(['mikkokotila', 'zero-bang'])
+    // A saved empty list is the person's choice, not a missing one.
+    expect(behaviors.setIssueAuthors([])).toEqual([])
+    expect(behaviors.getIssueAuthors()).toEqual([])
     expect(behaviors.isValidAuthorList(['not a name'])).toBe(false)
   })
 

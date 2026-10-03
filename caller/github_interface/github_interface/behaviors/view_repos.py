@@ -2,8 +2,9 @@ from typing import Any
 
 from github_interface.atoms.repos import list_org_repos
 from github_interface.client import GitHubClient
+from github_interface.identity import PERSON
 
-TOKEN_USER = "mikkokotila"
+IDENTITY = PERSON
 
 
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:

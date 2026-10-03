@@ -44,7 +44,7 @@ def _raise_for_response(response: httpx.Response, error: httpx.HTTPStatusError) 
 
 
 class GitHubClient:
-    def __init__(self, user: str | None = None, base_url: str = "https://api.github.com") -> None:
+    def __init__(self, user: str, base_url: str = "https://api.github.com") -> None:
         self.token = get_token(user)
         self.base_url = base_url.rstrip("/")
 

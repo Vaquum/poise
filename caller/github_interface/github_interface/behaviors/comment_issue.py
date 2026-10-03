@@ -3,8 +3,9 @@ from typing import Any
 from github_interface.atoms.issues import comment_issue
 from github_interface.client import GitHubClient
 from github_interface.context import repository
+from github_interface.identity import AGENT
 
-TOKEN_USER = "bit-mis"
+IDENTITY = AGENT
 
 
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
