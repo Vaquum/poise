@@ -105,17 +105,16 @@ build_runtime_image() {
   docker build --file "$root/deploy/runtime/Dockerfile" --build-arg "POISE_SOURCE_SHA=$sha" "${tags[@]}" "$root"
 }
 
-# A recreated gateway container is on Compose's network alone: the workspace
-# networks it had joined stay with the container it replaced. It reaches and
-# drains running workspaces over those networks, so join them again.
-reattach_gateway() {
-  local attached network
+# A recreated gateway container is on Compose's network alone; the gateway
+# joins every workspace's network itself as it starts, before it answers. Once
+# it answers, check that it shares a network with each running workspace,
+# which it must reach to drain it before an upgrade.
+check_gateway_networks() {
+  local attached handle
   attached=" $(docker inspect --format '{{range $name, $settings := .NetworkSettings.Networks}}{{$name}} {{end}}' "$gateway")"
-  for network in $(docker network ls --filter name=poise-net- --format '{{.Name}}'); do
-    if [[ $network == poise-net-* && $attached != *" $network "* ]]; then
-      docker network connect "$network" "$gateway"
-      say "The gateway joined $network again."
-    fi
+  for handle in $(docker ps --filter label=poise.managed=true --format '{{.Label "poise.workspace"}}'); do
+    [[ $attached == *" poise-net-$handle "* ]] \
+      || die "the gateway is not on poise-net-$handle, so it cannot reach the running workspace of $handle, nor drain it before an upgrade. Its log says why: docker logs $gateway 2>&1 | grep workspace.network"
   done
 }
 

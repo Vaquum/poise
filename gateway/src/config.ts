@@ -12,6 +12,7 @@ const IMAGE_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]*$/
 const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/
 const SIZE_UNITS: Record<string, number> = { '': 1, b: 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }
 const MIN_MEMORY_BYTES = 6 * 1024 ** 2
+const MAX_DRAIN_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 
 export interface Config {
   domain: string
@@ -165,7 +166,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     return parsed
   }
   const workspacePids = wholeNumber('POISE_WORKSPACE_PIDS', 4096)
-  const drainTimeoutSeconds = wholeNumber('POISE_DRAIN_TIMEOUT', 30 * 60)
+  // Workspaces get this value and refuse to start with more than a week.
+  const drainTimeoutSeconds = wholeNumber('POISE_DRAIN_TIMEOUT', 30 * 60, MAX_DRAIN_TIMEOUT_SECONDS)
   const port = wholeNumber('PORT', 8080, 65535)
 
   const workspaceRuntime = read('POISE_WORKSPACE_RUNTIME') ?? null

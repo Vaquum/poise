@@ -2,7 +2,8 @@
 # Installs the Poise service on this server, and applies later changes to
 # deploy/.env: checks Docker and deploy/.env, builds the workspace image,
 # starts Caddy and the gateway with Docker Compose, waits for the gateway to
-# answer and prints what is left to do. docs/Operating.md walks through it.
+# answer and to reach every running workspace, and prints what is left to do.
+# docs/Operating.md walks through it.
 #
 #   deploy/install.sh
 set -euo pipefail
@@ -70,6 +71,6 @@ sha=$(source_sha)
 build_runtime_image "$image" "$sha"
 say "Starting Caddy and the gateway."
 compose up --detach --build
-reattach_gateway
 wait_for_gateway
+check_gateway_networks
 next_steps

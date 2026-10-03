@@ -49,7 +49,7 @@ function inspect(container: FakeContainer): unknown {
     Name: `/${container.name}`,
     Image: container.imageId,
     State: { Status: container.running ? 'running' : 'exited', Running: container.running },
-    Config: { Image: container.imageRef, Labels: container.labels },
+    Config: { Image: container.imageRef, Labels: container.labels, Env: container.spec.Env ?? null },
     NetworkSettings: { Networks: Object.fromEntries([...container.networks].map((network) => [network, {}])) },
   }
 }
@@ -131,7 +131,8 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
         return send(res, 201, { Id: created.id, Warnings: [] })
       }
       if ((match = /^\/containers\/([^/]+)(?:\/(json|start|stop|restart))?$/.exec(path))) {
-        const container = containers.get(decodeURIComponent(match[1]))
+        const key = decodeURIComponent(match[1])
+        const container = containers.get(key) ?? [...containers.values()].find((candidate) => candidate.id === key)
         if (!container) return send(res, 404, { message: `No such container: ${match[1]}` })
         const action = match[2]
         if (method === 'GET' && action === 'json') return send(res, 200, inspect(container))

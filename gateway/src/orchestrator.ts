@@ -2,7 +2,7 @@ import http from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { signAssertion } from './assertion.js'
 import type { Config } from './config.js'
-import type { ContainerSpec, DockerClient } from './docker.js'
+import type { ContainerDetails, ContainerSpec, ContainerSummary, DockerClient } from './docker.js'
 import type { GatewayKeys } from './keys.js'
 import { errorMessage, type LogFields, type Logger } from './log.js'
 import type { Store } from './store.js'
@@ -46,6 +46,14 @@ export class WorkspaceAnswerError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'WorkspaceAnswerError'
+  }
+}
+
+/** The gateway could not join the workspace's network, so nothing it sends can reach the workspace. */
+export class WorkspaceNetworkError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'WorkspaceNetworkError'
   }
 }
 
@@ -110,6 +118,8 @@ function request(target: Upstream, method: string, path: string, headers: http.O
 /** Creates, starts, stops and upgrades workspace containers, and knows which ones answer. */
 export class Orchestrator {
   private readonly ready = new Set<string>()
+  /** Workspaces whose network this gateway process has seen itself on; see ensureOnNetwork. */
+  private readonly joined = new Set<string>()
   private readonly starts = new Map<string, Promise<void>>()
   private readonly locks = new Map<string, Promise<void>>()
   private readonly drainPollMs: number
@@ -137,6 +147,7 @@ export class Orchestrator {
         'POISE_HOST=0.0.0.0',
         `POISE_PORT=${WORKSPACE_PORT}`,
         'HOME=/home/poise',
+        this.drainTimeoutEnv(),
         ...(config.workspaceSkipCliBootstrap ? ['POISE_SKIP_CLI_BOOTSTRAP=1'] : []),
       ],
       Labels: { 'poise.managed': 'true', 'poise.workspace': handle },
@@ -162,11 +173,19 @@ export class Orchestrator {
 
   /** Whether the workspace answers its health check; a refused connection just means it is not up yet. */
   async readiness(handle: string, login: string): Promise<Readiness> {
-    if (this.ready.has(handle)) return { ready: true }
     let health: ServiceHealth
     try {
+      if (this.ready.has(handle)) {
+        // Proxied requests ask this first, so a network the gateway lost is joined again before them too.
+        await this.ensureOnNetwork(handle)
+        return { ready: true }
+      }
       health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
     } catch (error) {
+      if (error instanceof WorkspaceNetworkError) {
+        this.deps.log.error('workspace.network.join.failed', { handle, error: error.message })
+        return { ready: false, problem: error.message }
+      }
       if (!(error instanceof WorkspaceAnswerError)) return { ready: false, problem: null }
       this.deps.log.warn('workspace.health.refused', { handle, error: error.message })
       return { ready: false, problem: error.message }
@@ -238,6 +257,31 @@ export class Orchestrator {
     })
   }
 
+  /**
+   * Joins the network of every managed workspace, running or stopped. The gateway runs this before it
+   * answers a request or runs an upgrade pass: a recreated gateway container, as every upgrade makes, is on
+   * none of the networks the one it replaced had joined, and could not reach a running workspace to drain it.
+   */
+  async joinWorkspaceNetworks(): Promise<void> {
+    const { docker, log } = this.deps
+    let containers: ContainerSummary[]
+    try {
+      containers = await docker.listManagedContainers()
+    } catch (error) {
+      log.error('workspace.network.join.failed', { error: errorMessage(error) })
+      return
+    }
+    for (const summary of containers) {
+      const handle = summary.Labels['poise.workspace'] ?? ''
+      try {
+        if (!handle) throw new Error('it has no poise.workspace label')
+        await this.ensureOnNetwork(handle)
+      } catch (error) {
+        log.error('workspace.network.join.failed', { container: summary.Names[0], error: errorMessage(error) })
+      }
+    }
+  }
+
   /** Runs an upgrade pass now and every five minutes. Returns a function that stops the loop. */
   startUpgradeLoop(intervalMs = UPGRADE_INTERVAL_MS): () => void {
     const run = () => {
@@ -250,7 +294,10 @@ export class Orchestrator {
     return () => clearInterval(timer)
   }
 
-  /** Drains and recreates every managed container whose image differs from POISE_RUNTIME_IMAGE's current ID. */
+  /**
+   * Drains and recreates every managed container that differs from the one the gateway would create now: its
+   * image is not POISE_RUNTIME_IMAGE's current ID, or it was created with another POISE_DRAIN_TIMEOUT.
+   */
   async upgradePass(): Promise<void> {
     if (this.upgrading) {
       this.deps.log.info('workspace.upgrade.pass.skipped', { reason: 'the previous pass is still running' })
@@ -265,7 +312,10 @@ export class Orchestrator {
         return
       }
       for (const summary of await docker.listManagedContainers()) {
-        if (summary.ImageID === imageId) continue
+        // The list shows a container's image but not its environment, which holds its drain timeout.
+        const details = await docker.inspectContainer(summary.Id)
+        const reason = details && this.outdated(details, imageId)
+        if (!reason) continue
         const handle = summary.Labels['poise.workspace'] ?? ''
         const login = store.getWorkspace(handle)?.login
         if (!login) {
@@ -273,7 +323,7 @@ export class Orchestrator {
           continue
         }
         try {
-          await this.upgrade(handle, login, imageId)
+          await this.upgrade(handle, login, imageId, reason)
         } catch (error) {
           log.error('workspace.upgrade.failed', { handle, error: errorMessage(error) })
           store.noteWorkspaceError(handle, `upgrade failed: ${errorMessage(error)}`)
@@ -284,8 +334,8 @@ export class Orchestrator {
     }
   }
 
-  private async upgrade(handle: string, login: string, imageId: string): Promise<void> {
-    this.lifecycle('workspace.upgrade.started', handle, { image: imageId })
+  private async upgrade(handle: string, login: string, imageId: string, reason: string): Promise<void> {
+    this.lifecycle('workspace.upgrade.started', handle, { image: imageId, reason })
     let drained = false
     for (;;) {
       // Decided under the lock, so a lazy start or an admin action in between cannot be stopped undrained.
@@ -297,8 +347,8 @@ export class Orchestrator {
           this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'the container no longer exists' })
           return 'skipped'
         }
-        if (details.Image === imageId) {
-          this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'already on the current image' })
+        if (!this.outdated(details, imageId)) {
+          this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'already up to date' })
           return 'skipped'
         }
         const running = details.State.Running
@@ -329,6 +379,8 @@ export class Orchestrator {
   /**
    * Asks the workspace to stop admitting work, then waits until it reports idle or POISE_DRAIN_TIMEOUT
    * passes. The workspace lets a drain lapse unless it is renewed, so it is re-requested while waiting.
+   * A network the gateway cannot join fails the upgrade instead: waiting would drain nothing, and the
+   * timeout would then recreate the workspace with its work cut off.
    */
   private async drain(handle: string, login: string): Promise<void> {
     const { config, log, now } = this.deps
@@ -343,6 +395,7 @@ export class Orchestrator {
       })
       if (health.idle) return
     } catch (error) {
+      if (error instanceof WorkspaceNetworkError) throw error
       log.error('workspace.drain.request.failed', { handle, error: errorMessage(error) })
     }
     while (now() < deadline) {
@@ -358,6 +411,7 @@ export class Orchestrator {
           return
         }
       } catch (error) {
+        if (error instanceof WorkspaceNetworkError) throw error
         log.warn(renew ? 'workspace.drain.renew.failed' : 'workspace.drain.health.failed', { handle, error: errorMessage(error) })
       }
     }
@@ -371,10 +425,11 @@ export class Orchestrator {
     await this.ensureVolumeAndNetwork(handle)
     let details = await docker.inspectContainer(container)
     if (details?.State.Running) return
-    if (details && details.Image !== await this.currentImageId()) {
-      // A stopped container on an old image has nothing to drain: recreate it before it starts.
+    const outdated = details && this.outdated(details, await this.currentImageId())
+    if (outdated) {
+      // A stopped container that is out of date has nothing to drain: recreate it before it starts.
       await docker.removeContainer(container)
-      this.lifecycle('workspace.container.removed', handle, { reason: 'outdated image' })
+      this.lifecycle('workspace.container.removed', handle, { reason: outdated })
       details = null
     }
     if (!details) {
@@ -387,7 +442,7 @@ export class Orchestrator {
   }
 
   private async ensureVolumeAndNetwork(handle: string): Promise<void> {
-    const { config, docker } = this.deps
+    const { docker } = this.deps
     const { volume, network } = workspaceNames(handle)
     if (!(await docker.volumeExists(volume))) {
       await docker.createVolume(volume)
@@ -397,14 +452,60 @@ export class Orchestrator {
       await docker.createNetwork(network)
       this.lifecycle('workspace.network.created', handle, { network })
     }
-    const gateway = await docker.inspectContainer(config.gatewayContainer)
-    if (!gateway) {
-      throw new Error(`the gateway container ${config.gatewayContainer} (POISE_GATEWAY_CONTAINER) does not exist`)
+    await this.joinNetwork(handle)
+  }
+
+  /**
+   * Makes sure the gateway is on the workspace's network before a call to the workspace. Docker is asked the
+   * first time and then only after a call that reached nothing, so a proxied request costs no Docker call.
+   * A workspace that was never started has no network yet: its start creates the network and joins it.
+   */
+  private async ensureOnNetwork(handle: string): Promise<void> {
+    if (this.joined.has(handle)) return
+    const { network } = workspaceNames(handle)
+    try {
+      if (await this.deps.docker.networkExists(network)) await this.joinNetwork(handle)
+    } catch (error) {
+      throw new WorkspaceNetworkError(`the gateway could not join ${network}: ${errorMessage(error)}`)
     }
-    if (!(network in gateway.NetworkSettings.Networks)) {
-      await docker.connectNetwork(network, config.gatewayContainer)
-      this.lifecycle('workspace.network.connected', handle, { network, container: config.gatewayContainer })
+  }
+
+  /**
+   * Connects the gateway container to the workspace's network unless it is on it already. A recreated
+   * gateway container, as every upgrade makes, is on none of the networks the one it replaced had joined.
+   */
+  private async joinNetwork(handle: string): Promise<void> {
+    const { config, docker } = this.deps
+    const { network } = workspaceNames(handle)
+    const onNetwork = async (): Promise<boolean> => {
+      const gateway = await docker.inspectContainer(config.gatewayContainer)
+      if (!gateway) {
+        throw new Error(`the gateway container ${config.gatewayContainer} (POISE_GATEWAY_CONTAINER) does not exist`)
+      }
+      return network in gateway.NetworkSettings.Networks
     }
+    if (!(await onNetwork())) {
+      try {
+        await docker.connectNetwork(network, config.gatewayContainer)
+        this.lifecycle('workspace.network.connected', handle, { network, container: config.gatewayContainer })
+      } catch (error) {
+        // A start and a call can join at the same moment; only a gateway still off the network failed.
+        if (!(await onNetwork())) throw error
+      }
+    }
+    this.joined.add(handle)
+  }
+
+  /** The POISE_DRAIN_TIMEOUT a workspace gets: it lets an unrenewed drain lapse by the gateway's own value. */
+  private drainTimeoutEnv(): string {
+    return `POISE_DRAIN_TIMEOUT=${this.deps.config.drainTimeoutSeconds}`
+  }
+
+  /** What makes a workspace container differ from the one the gateway would create now, or null. */
+  private outdated(details: ContainerDetails, imageId: string): string | null {
+    if (details.Image !== imageId) return 'outdated image'
+    if (!(details.Config.Env ?? []).includes(this.drainTimeoutEnv())) return 'changed drain timeout'
+    return null
   }
 
   private async currentImageId(): Promise<string> {
@@ -417,16 +518,24 @@ export class Orchestrator {
 
   /** A call to the workspace's /api/service/* endpoints, carrying an admin-scope assertion. */
   private async serviceCall(handle: string, login: string, method: 'GET' | 'POST', path: string): Promise<ServiceHealth> {
+    await this.ensureOnNetwork(handle)
     const { config, keys, now } = this.deps
     const publicHost = `${handle}.${config.domain}`
-    const response = await request(this.deps.upstream(handle), method, path, {
-      host: publicHost,
-      'x-forwarded-host': publicHost,
-      'x-forwarded-proto': config.insecureHttp ? 'http' : 'https',
-      'x-poise-identity': signAssertion(keys.privateKey, { handle, login, scope: 'admin' }, now()),
-      accept: 'application/json',
-      ...(method === 'POST' ? { 'content-length': 0 } : {}),
-    })
+    let response: { status: number; text: string }
+    try {
+      response = await request(this.deps.upstream(handle), method, path, {
+        host: publicHost,
+        'x-forwarded-host': publicHost,
+        'x-forwarded-proto': config.insecureHttp ? 'http' : 'https',
+        'x-poise-identity': signAssertion(keys.privateKey, { handle, login, scope: 'admin' }, now()),
+        accept: 'application/json',
+        ...(method === 'POST' ? { 'content-length': 0 } : {}),
+      })
+    } catch (error) {
+      // Reaching nothing is also what a lost network looks like: check it again before the next call.
+      this.joined.delete(handle)
+      throw error
+    }
     if (response.status !== 200) {
       throw new WorkspaceAnswerError(`the workspace answered ${method} ${path} with HTTP ${response.status}`)
     }

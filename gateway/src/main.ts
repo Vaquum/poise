@@ -48,6 +48,9 @@ const gateway = createGateway({
   upstream: workspaceUpstream,
 })
 
+// Before anything can call a workspace: this container may be new, and on none of their networks.
+await orchestrator.joinWorkspaceNetworks()
+
 gateway.server.listen(config.port, () => {
   log.info('gateway.listening', { port: config.port, domain: config.domain, image: config.runtimeImage })
 })

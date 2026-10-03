@@ -64,6 +64,6 @@ build_runtime_image "$image" "$sha"
 plan=$(plan_workspaces "$image")
 say "Recreating what changed."
 compose up --detach --build
-reattach_gateway
 wait_for_gateway
+check_gateway_networks
 say "$plan"

@@ -174,9 +174,26 @@ Environment the gateway passes:
 | `POISE_HOST` | `0.0.0.0` |
 | `POISE_PORT` | `5555` |
 | `HOME` | `/home/poise` |
+| `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 1800), so both sides time a drain alike |
 | `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
-The gateway reaches the workspace at `http://poise-ws-<handle>:5555`.
+A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
+gateway's, or with none, is recreated as one on an outdated image is: drained
+first if it runs ([Deployment](#deployment)).
+
+The gateway reaches the workspace at `http://poise-ws-<handle>:5555`, over the
+workspace's network, which it joins by its own container name,
+`POISE_GATEWAY_CONTAINER`. A recreated gateway container is on none of the
+networks the one it replaced had joined, so the gateway joins them itself:
+- When it starts, before it answers a request or runs an upgrade pass, it
+  joins the network of every managed workspace container, running or stopped.
+- Before a call to a workspace (a proxied request, a health check, a drain) it
+  joins that workspace's network if it is not on it. It asks Docker the first
+  time, and again after any call that reached nothing.
+- A network it cannot join fails the call with the reason. The starting page
+  shows it, and an upgrade stops there (`workspace.upgrade.failed`) and tries
+  again on the next pass, instead of waiting out the drain and recreating the
+  workspace undrained.
 
 ## Poise in service mode
 
@@ -458,8 +475,8 @@ The `poise-runtime` image is built from this repository on the server, with
 the checkout's commit as the build argument `POISE_SOURCE_SHA`, which
 `/api/service/health` reports as `version`.
 Upgrading is: pull, build, `docker compose up -d`. The gateway then drains and
-recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, keeping
-its volume.
+recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, or
+whose `POISE_DRAIN_TIMEOUT` differs from its own, keeping its volume.
 
 **Provider CLIs** are installed into each person's home volume on first start
 and update themselves there, as Poise already does before each launch. The
