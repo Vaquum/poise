@@ -1,0 +1,34 @@
+# Caddy in front of the Poise gateway (docs/Operating.md). Caddy holds the
+# certificates: the apex's, obtained at start, and one for each workspace
+# host, obtained on its first visit once the gateway confirms the host belongs
+# to someone (on-demand TLS).
+#
+# Every request reaches the gateway with the browser's Host. Caddy passes
+# WebSockets through and puts no time limit on a proxied response or
+# WebSocket, so event streams, the Chat WebSocket and terminals stay open as
+# long as both ends keep them open.
+#
+# With no trusted_proxies, Caddy replaces any X-Forwarded-For,
+# X-Forwarded-Proto and X-Forwarded-Host a client sends with what it saw
+# itself. The gateway extends Caddy's X-Forwarded-For, sets the other two
+# itself, and drops Forwarded, any other X-Forwarded-* header and
+# X-Poise-Identity, so no client can pose as another address, scheme, host
+# or person.
+{
+	email {$POISE_ACME_EMAIL}
+	on_demand_tls {
+		# Caddy asks with Host: gateway:8080, the only Host the gateway answers this for.
+		ask http://gateway:8080/_gateway/tls-ask
+	}
+}
+
+{$POISE_DOMAIN} {
+	reverse_proxy gateway:8080
+}
+
+*.{$POISE_DOMAIN} {
+	tls {
+		on_demand
+	}
+	reverse_proxy gateway:8080
+}

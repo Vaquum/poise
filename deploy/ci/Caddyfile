@@ -1,0 +1,6 @@
+# deploy/Caddyfile's routing over plain http, for the end-to-end run with
+# POISE_INSECURE_HTTP=1 (deploy/ci/e2e.sh). The run checks deploy/Caddyfile
+# itself separately, over TLS from Caddy's own certificate authority.
+http://{$POISE_DOMAIN}, http://*.{$POISE_DOMAIN} {
+	reverse_proxy gateway:8080
+}

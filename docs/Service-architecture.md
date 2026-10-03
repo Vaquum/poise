@@ -174,6 +174,7 @@ Environment the gateway passes:
 | `POISE_HOST` | `0.0.0.0` |
 | `POISE_PORT` | `5555` |
 | `HOME` | `/home/poise` |
+| `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
 The gateway reaches the workspace at `http://poise-ws-<handle>:5555`.
 
@@ -415,9 +416,12 @@ alerts once, and again only after it has cleared:
 - a Compose file running Caddy and the gateway;
 - the Caddyfile (apex plus on-demand TLS for workspace hosts);
 - an environment template;
-- operator scripts.
+- operator scripts to install, upgrade, back up and restore
+  ([Operating Poise](Operating.md)).
 
-The `poise-runtime` image is built from this repository on the server.
+The `poise-runtime` image is built from this repository on the server, with
+the checkout's commit as the build argument `POISE_SOURCE_SHA`, which
+`/api/service/health` reports as `version`.
 Upgrading is: pull, build, `docker compose up -d`. The gateway then drains and
 recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, keeping
 its volume.
