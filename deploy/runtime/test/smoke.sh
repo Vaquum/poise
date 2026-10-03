@@ -109,7 +109,7 @@ request() {
 expect() {
   local want=$1 what=$2 request_host=$3 path=$4 got
   shift 4
-  got=$(request "$request_host" "$path" "$@")
+  got=$(request "$request_host" "$path" "$@") || fail "$what: $path could not be reached"
   [ "$got" = "$want" ] || fail "$what: $path answered $got, not $want: $(docker exec "$client" cat /tmp/body)"
   pass "$what: $path answered $got"
 }
