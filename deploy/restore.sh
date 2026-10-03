@@ -20,7 +20,7 @@ require_env_file
 say "Checking the archives in $backup."
 (cd "$backup" && sha256sum --check --quiet SHA256SUMS) || die "the archives in $backup do not match their SHA256SUMS."
 volumes=()
-while read -r _ archive; do
+while read -r _ archive || [ -n "${archive:-}" ]; do
   [[ $archive =~ ^(poise-gateway-data|poise-home-[a-z0-9-]+)\.tar\.gz$ ]] || die "$backup/SHA256SUMS names $archive, which is not a volume backup.sh archives."
   volumes+=("${archive%.tar.gz}")
 done <"$backup/SHA256SUMS"
