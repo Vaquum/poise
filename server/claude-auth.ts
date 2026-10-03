@@ -155,7 +155,8 @@ function isDefinitiveAuthFailure(error: unknown): boolean {
 export class ClaudeAuthMonitor {
   private readonly run: ClaudeAuthRunFile
   private readonly clock: ClaudeAuthClock
-  private status: ClaudeAuthStatus = 'checking'
+  private currentStatus: ClaudeAuthStatus = 'checking'
+  private readonly statusListeners = new Set<(status: ClaudeAuthStatus) => void>()
   private checkedAtMs: number | null = null
   private verifiedAtMs: number | null = null
   private authMethod: string | null = null
@@ -177,6 +178,24 @@ export class ClaudeAuthMonitor {
   constructor(options: ClaudeAuthMonitorOptions = {}) {
     this.run = options.runFile ?? defaultRunFile
     this.clock = options.clock ?? systemClock
+  }
+
+  // Every status the monitor decides passes through here, so a listener
+  // hears each change exactly once.
+  private get status(): ClaudeAuthStatus {
+    return this.currentStatus
+  }
+
+  private set status(next: ClaudeAuthStatus) {
+    if (next === this.currentStatus) return
+    this.currentStatus = next
+    for (const listener of this.statusListeners) listener(next)
+  }
+
+  /** Calls `listener` with each new status; returns the unsubscribe. */
+  onStatus(listener: (status: ClaudeAuthStatus) => void): () => void {
+    this.statusListeners.add(listener)
+    return () => { this.statusListeners.delete(listener) }
   }
 
   snapshot(): ClaudeAuthSnapshot {

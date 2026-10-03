@@ -145,6 +145,83 @@ notification. Import that file in Poise under Snippets to keep those snippets.
 5. Delete `poise.yml` from Espanso's match folder if you no longer want those
    snippets.
 
+## The workspace side
+
+Poise serves the Link API from `server/link/` and records alerts in
+`server/alerts/`.
+
+**Who reaches it.** In a workspace a request needs the gateway's identity
+assertion with a scope that reaches `/api/link/*`: a paired device's `link`
+scope, or the owner's `browser` scope. The `admin` scope gets 403. A missing,
+expired or forged assertion gets 401, the only status Poise Link signs out on;
+nothing in the Link API answers 401 for any other reason. Outside service mode
+it is a loopback API like every other route.
+
+**`GET /api/link/hello`** returns `{ login, version }`: the workspace owner
+(outside service mode the GitHub username from Settings, or `null`) and the
+commit the running bundle was built from (`null` for a development build).
+
+**`GET /api/link/snippets`** returns `{ version, yaml }`.
+
+- The YAML holds the library's plain pairs: an entry is sent only when it has
+  exactly a text `trigger`, a text `replace` and, optionally, a text `label`.
+  Variables of every type (shell and script included), forms, regex
+  triggers, `word`, `propagate_case` and every other match option, top-level
+  `global_vars` and `imports`, and the library's own metadata comment stay
+  out. A trigger belongs to its first entry, as in the Snippets view, and a
+  blank trigger is dropped.
+- Every value is double-quoted and escaped exactly as Poise Link renders its
+  own copy, so the file on the desktop equals what was sent, byte for byte.
+- `version` is the SHA-256 of that YAML and the `ETag` is `"<version>"`. A
+  request whose `If-None-Match` names it gets 304; one without
+  `If-None-Match` always gets 200.
+- `?wait=<version>` holds the request while that version is current, for up
+  to 25 seconds, and then answers as a plain request would. A change answers
+  at once. At most 32 requests wait at a time; more get 503.
+
+**`GET /api/link/events`** is a Server-Sent Events stream.
+
+- It opens with `retry: 3000`, then `event: snippets` with
+  `data: {"version":"…"}`, then the alerts recorded after `Last-Event-ID`.
+- An alert is `id: <alert id>`, `event: alert` and
+  `data: {"id","kind","title","body","url","created_at"}`. Alert ids look like
+  `3f9c0a1b2c4d-17`: the prefix belongs to the workspace's database, so a
+  replaced database never reuses an id a device has already shown.
+- A reconnect resumes after the last alert received: the newest 50 alerts
+  recorded since are replayed, oldest first. With no `Last-Event-ID`, or an
+  id the workspace did not issue, only alerts recorded from then on follow.
+- After that, a `snippets` event for each new version, an `alert` event for
+  each new alert, and `event: ping` with `data: {}` every 20 seconds.
+- A device that stops reading is cut off once a megabyte is queued for it; it
+  reconnects and resumes. At most 32 streams are open at a time.
+- When Poise stops, it ends every stream and answers every waiting long poll
+  with 503, so a restart never waits on a device.
+
+**Alerts** are kept in the workspace database for 30 days. Each condition
+alerts once and again only after it has cleared:
+
+| Kind | Recorded when | Cleared when |
+| --- | --- | --- |
+| `sign_in_needed` | Claude's sign-in check finds that a new sign-in is required | Claude is signed in again |
+| `behavior_held` | a behavior gives up on a pull request or issue (a dead letter) where Behaviors showed no incident | Behaviors no longer shows the incident |
+| `datastore_sync_failing` | syncing a GitHub account's datastore has been failing for 15 minutes | a sync succeeds |
+| `chat_waiting` | a Chat agent asks for a permission or an answer | the session has nothing pending |
+| `chat_turn_finished` | a Chat turn that ran longer than two minutes finishes, unless the person stopped it | (one alert per turn) |
+
+An alert's `url` is absolute: `POISE_PUBLIC_ORIGIN` in a workspace, the
+address the request came to otherwise. The browser client has no per-view
+addresses yet, so every alert opens the workspace's front page.
+
+**Snippets → Import** takes an Espanso match file, pasted or chosen (a chosen
+file is loaded to check first), and adds its plain pairs through the same
+compare-and-swap as every other snippet write. It applies the judgement above,
+so everything it imports reaches the desktop. It never replaces a trigger
+already in the library and never takes an entry that runs a command; it lists
+every entry it skipped with the reason: a duplicate trigger, not a plain
+snippet, or invalid. Labels are not kept. After importing a file from the
+desktop, delete those snippets from it, so that Espanso does not find each
+trigger twice.
+
 ## Develop
 
 The app lives in `link/`: Rust in `link/src-tauri` (Tauri 2) and the window's

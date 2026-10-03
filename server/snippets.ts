@@ -112,6 +112,16 @@ export async function readSnippetState(): Promise<SnippetState> {
   return parseSnippetSource(raw)
 }
 
+/** How every Espanso match file Poise reads is parsed. */
+export const MATCH_FILE_YAML_OPTIONS = {
+  maxAliasCount: 20,
+  merge: false,
+  schema: 'core',
+  strict: true,
+  stringKeys: true,
+  uniqueKeys: true,
+} as const
+
 export function parseSnippetSource(raw: string | null): SnippetState {
   if (raw === null) {
     return { snippets: [], version: MISSING_SNIPPETS_VERSION }
@@ -119,14 +129,7 @@ export function parseSnippetSource(raw: string | null): SnippetState {
 
   // Anything that isn't a simple trigger/replace pair is ignored. Poise only
   // models simple snippets, while the raw version still protects all content.
-  const doc = parseYaml(raw, {
-    maxAliasCount: 20,
-    merge: false,
-    schema: 'core',
-    strict: true,
-    stringKeys: true,
-    uniqueKeys: true,
-  }) as { matches?: unknown } | null
+  const doc = parseYaml(raw, MATCH_FILE_YAML_OPTIONS) as { matches?: unknown } | null
   const matches = doc && Array.isArray(doc.matches) ? doc.matches : []
   const snippets: Snippet[] = []
   const seenTriggers = new Set<string>()
@@ -171,7 +174,9 @@ export function readSnippetSnapshotSync(): { raw: string | null, state: SnippetS
   return { raw, state: parseSnippetSource(raw) }
 }
 
-function isSimpleMatch(m: unknown): m is Snippet {
+/** An entry the library shows as a snippet: a text trigger and a text
+ *  replacement, whatever else it carries. */
+export function isSimpleMatch(m: unknown): m is Snippet {
   return !!m && typeof m === 'object'
     && typeof (m as { trigger?: unknown }).trigger === 'string'
     && typeof (m as { replace?: unknown }).replace === 'string'

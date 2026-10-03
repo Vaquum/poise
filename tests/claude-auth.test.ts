@@ -561,4 +561,26 @@ describe('Claude subscription authentication monitor', () => {
     expect(run).not.toHaveBeenCalled()
     expect(monitor.snapshot().status).toBe('unavailable')
   })
+
+  it('tells its listeners each status it decides, once per change', async () => {
+    const loggedOut = { stdout: JSON.stringify({ loggedIn: false, authMethod: 'none' }), stderr: '' }
+    const run = vi.fn<ClaudeAuthRunFile>()
+      .mockResolvedValueOnce(loggedOut)
+      .mockResolvedValueOnce(loggedOut)
+      .mockResolvedValueOnce({ stdout: VALID_STATUS, stderr: '' })
+      .mockResolvedValueOnce(OK)
+    const monitor = new ClaudeAuthMonitor({ runFile: run, clock: new FakeClock() })
+    const heard: string[] = []
+    const stop = monitor.onStatus((status) => heard.push(status))
+
+    await monitor.check()
+    await monitor.check()
+    await monitor.check({ forceLive: true })
+    expect(heard).toEqual(['reauth_required', 'authenticated'])
+
+    stop()
+    await monitor.stop()
+    expect(monitor.snapshot().status).toBe('unavailable')
+    expect(heard).toEqual(['reauth_required', 'authenticated'])
+  })
 })
