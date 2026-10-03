@@ -677,3 +677,32 @@ async fn an_event_id_that_cannot_be_a_header_does_not_stop_the_stream() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn extreme_code_lifetimes_and_intervals_are_bounded() {
+    let fake = FakePoise::start(
+        Config {
+            code_expires_in: Some(u64::MAX),
+            code_interval: Some(u64::MAX),
+            ..Config::default()
+        },
+        "v1",
+        &snippets_yaml(&[]),
+    )
+    .await;
+    let client = http::client().unwrap();
+
+    let code = pairing::request_code(&client, &fake.url).await.unwrap();
+    assert_eq!(code.expires_in, Duration::from_secs(3600));
+    assert_eq!(code.interval, Duration::from_secs(60));
+
+    let waits = Mutex::new(Vec::new());
+    let paired = pairing::wait_for_token(&client, &fake.url, &code, |wait| {
+        waits.lock().unwrap().push(wait);
+        ready(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(*waits.lock().unwrap(), vec![Duration::from_secs(60)]);
+    assert_eq!(paired.login, support::LOGIN);
+}

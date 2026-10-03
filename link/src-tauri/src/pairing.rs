@@ -22,6 +22,10 @@ pub const TOKEN_PATH: &str = "link/device/token";
 const DEFAULT_INTERVAL_SECS: u64 = 5;
 /// RFC 8628: after `slow_down`, poll five seconds less often.
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
+/// Upper bounds for what the gateway may ask for. Anything longer is already
+/// unreasonable, and far larger values would overflow the timers.
+const MAX_LIFETIME: Duration = Duration::from_secs(60 * 60);
+const MAX_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PairingError {
@@ -145,10 +149,23 @@ pub async fn request_code(client: &Client, server: &Url) -> Result<DeviceCode, P
         device_code: code.device_code,
         user_code: code.user_code,
         verification_uri,
-        expires_in: Duration::from_secs(code.expires_in),
-        // An interval of zero would poll in a busy loop.
-        interval: Duration::from_secs(code.interval.unwrap_or(DEFAULT_INTERVAL_SECS).max(1)),
+        expires_in: Duration::from_secs(code.expires_in).min(MAX_LIFETIME),
+        interval: poll_interval(code.interval),
     })
+}
+
+/// The polling interval the gateway asked for, within bounds. Zero would
+/// poll in a busy loop.
+fn poll_interval(seconds: Option<u64>) -> Duration {
+    Duration::from_secs(
+        seconds
+            .unwrap_or(DEFAULT_INTERVAL_SECS)
+            .clamp(1, MAX_INTERVAL.as_secs()),
+    )
+}
+
+fn slowed_down(interval: Duration) -> Duration {
+    (interval + SLOW_DOWN_STEP).min(MAX_INTERVAL)
 }
 
 /// One answer from the token endpoint.
@@ -257,7 +274,7 @@ where
         };
         match poll {
             Poll::Pending => {}
-            Poll::SlowDown => interval += SLOW_DOWN_STEP,
+            Poll::SlowDown => interval = slowed_down(interval),
             Poll::Paired(pairing) => return Ok(pairing),
             Poll::Transient(problem) => {
                 log::warn!("waiting for pairing: {url} failed ({problem}); trying again");
@@ -399,6 +416,16 @@ mod tests {
             classify(StatusCode::SERVICE_UNAVAILABLE, b"{}").unwrap(),
             Poll::Transient(_)
         ));
+    }
+
+    #[test]
+    fn polling_stays_within_bounds_whatever_the_gateway_asks() {
+        assert_eq!(poll_interval(None), Duration::from_secs(5));
+        assert_eq!(poll_interval(Some(0)), Duration::from_secs(1));
+        assert_eq!(poll_interval(Some(7)), Duration::from_secs(7));
+        assert_eq!(poll_interval(Some(u64::MAX)), MAX_INTERVAL);
+        assert_eq!(slowed_down(Duration::from_secs(1)), Duration::from_secs(6));
+        assert_eq!(slowed_down(MAX_INTERVAL), MAX_INTERVAL);
     }
 
     #[test]

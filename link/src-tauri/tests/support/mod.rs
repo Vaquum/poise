@@ -30,6 +30,9 @@ pub struct Config {
     pub redirect_events: bool,
     /// Accept event stream requests and never answer them.
     pub stall_events: bool,
+    /// Override the device code's lifetime and polling interval (seconds).
+    pub code_expires_in: Option<u64>,
+    pub code_interval: Option<u64>,
 }
 
 enum Frame {
@@ -228,8 +231,8 @@ fn route(state: &mut State, request: &Request, base: &Url) -> Action {
                 "device_code": DEVICE_CODE,
                 "user_code": USER_CODE,
                 "verification_uri": "/link",
-                "expires_in": 600,
-                "interval": 1,
+                "expires_in": state.config.code_expires_in.unwrap_or(600),
+                "interval": state.config.code_interval.unwrap_or(1),
             }),
         ),
         ("POST", "/link/device/token") => token(state, request, base),
