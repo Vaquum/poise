@@ -319,7 +319,10 @@ logs() {
 }
 
 case "$mode" in
-  contract | offline | bootstrap | logs) "$mode" ;;
+  contract) contract ;;
+  offline) offline ;;
+  bootstrap) bootstrap ;;
+  logs) logs ;;
   *)
     sed -n '7,10p' "$0" >&2
     exit 2

@@ -8,7 +8,6 @@
 # ~/.poise/logs/cli-bootstrap.log: a failed install is logged with the command
 # and its exit code, the remaining CLIs are still installed, and Poise keeps
 # running. It exits 1 when a CLI is still missing.
-# shellcheck disable=SC2329 # the install_* functions run as "install_$provider"
 set -uo pipefail
 
 bin_dir="$HOME/.local/bin"
@@ -92,30 +91,27 @@ claude_release() {
   chmod +x "$work/claude" && run "$work/claude" install
 }
 
-# https://github.com/openai/codex (npm), under ~/.local rather than npm's
-# global prefix, which belongs to root. npm checks every package against the
-# registry's integrity hash.
-install_codex() {
-  run npm install --global --prefix "$HOME/.local" --include=optional --no-audit --no-fund @openai/codex@latest
-}
-
-# https://docs.x.ai/build/overview: installs into ~/.grok and links grok into
-# ~/.local/bin because that directory is on PATH. xAI publishes no checksums.
-install_grok() {
-  vendor_script https://x.ai/cli/install.sh
-}
-
-# https://antigravity.google/docs/cli/install/: installs ~/.local/bin/agy after
-# checking the SHA-512 its release manifest lists.
-install_antigravity() {
-  vendor_script https://antigravity.google/cli/install.sh
-}
-
-# https://dev.meta.ai/docs/muse-code: installs the ~/.local/bin/muse launcher,
-# which downloads the binary beside it; both are checked against the SHA-256
-# Meta publishes. The page pipes the script to sh, but it is a bash script.
-install_muse() {
-  vendor_script https://dev.meta.ai/install.sh
+# Each provider's vendor installer.
+install_cli() {
+  case $1 in
+    claude) install_claude ;;
+    # https://github.com/openai/codex (npm), under ~/.local rather than npm's
+    # global prefix, which belongs to root. npm checks every package against
+    # the registry's integrity hash.
+    codex) run npm install --global --prefix "$HOME/.local" --include=optional --no-audit --no-fund @openai/codex@latest ;;
+    # https://docs.x.ai/build/overview: installs into ~/.grok and links grok
+    # into ~/.local/bin because that directory is on PATH. xAI publishes no
+    # checksums.
+    grok) vendor_script https://x.ai/cli/install.sh ;;
+    # https://antigravity.google/docs/cli/install/: installs ~/.local/bin/agy
+    # after checking the SHA-512 its release manifest lists.
+    antigravity) vendor_script https://antigravity.google/cli/install.sh ;;
+    # https://dev.meta.ai/docs/muse-code: installs the ~/.local/bin/muse
+    # launcher, which downloads the binary beside it; both are checked against
+    # the SHA-256 Meta publishes. The page pipes the script to sh, but it is a
+    # bash script.
+    muse) vendor_script https://dev.meta.ai/install.sh ;;
+  esac
 }
 
 log "bootstrap started"
@@ -128,7 +124,7 @@ for entry in claude:claude codex:codex grok:grok antigravity:agy muse:muse; do
     continue
   fi
   log "$provider: installing"
-  if ! "install_$provider"; then
+  if ! install_cli "$provider"; then
     log "$provider: not installed"
     missing+=("$provider")
   elif [ ! -x "$command" ]; then
