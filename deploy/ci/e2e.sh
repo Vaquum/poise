@@ -2,7 +2,7 @@
 # The deployment bundle end to end, on a Linux host with Docker, as
 # .github/workflows/deploy-e2e.yml runs it:
 #
-#   deploy/ci/e2e.sh run    install, sign in, use a workspace and Poise Link, check TLS, back up and restore, upgrade
+#   deploy/ci/e2e.sh run    install, sign in, use a workspace and Poise Link, check TLS, back up and restore, upgrade, reinstall
 #   deploy/ci/e2e.sh logs   print what the stack and the workspaces logged
 #
 # It drives the real stack, deploy/compose.yaml, through deploy/install.sh,
@@ -423,6 +423,17 @@ check_upgrade() {
   wait_for_poise "$alice" alice
 }
 
+# A gateway container Compose recreates is on Compose's network alone; the
+# install script joins it to the workspace networks again, so alice's running
+# workspace answers at once rather than after a start.
+check_gateway_recreated() {
+  compose up --detach --force-recreate gateway
+  "$deploy/install.sh" | tee "$work/reinstall.log"
+  grep --quiet --fixed-strings 'The gateway joined poise-net-alice again.' "$work/reinstall.log" \
+    || fail "install.sh did not join the recreated gateway to alice's network"
+  expect 200 "alice's workspace, right after the gateway was recreated" "$alice" "http://alice.$domain/" "${navigate[@]}"
+}
+
 run() {
   install
   sign_in_alice
@@ -436,6 +447,7 @@ run() {
   revoke_link
   backup_and_restore
   check_upgrade
+  check_gateway_recreated
   echo "The deployment works end to end."
 }
 
