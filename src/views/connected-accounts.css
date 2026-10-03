@@ -1,0 +1,133 @@
+/* Settings → Connected accounts. A row is the GitHub account card's frame
+   (.st-organization) holding the panel's own type and controls; every
+   colour is a design token, so both themes follow. */
+
+.st-accounts {
+  display: grid;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.st-account {
+  padding: var(--sp-3);
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+}
+
+.st-account-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.st-account-name {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.st-account-version {
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.625rem;
+  color: var(--text-tertiary);
+}
+
+.st-account-head .st-clear {
+  margin-left: auto;
+  align-self: center;
+  padding: 4px 10px;
+}
+
+.st-account .st-clear:disabled,
+.st-account-actions .st-clear:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.st-account .st-clear:disabled:hover,
+.st-account-actions .st-clear:disabled:hover {
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+
+.st-account-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* The same dot as the panel's .st-dot. */
+.st-account-state::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--text-tertiary);
+}
+
+.st-account-state-on::before { background: var(--a3); box-shadow: 0 0 0 3px var(--tint-a3); }
+.st-account-state-off::before { background: var(--a5); box-shadow: 0 0 0 3px var(--tint-a5); }
+
+.st-account-detail,
+.st-account-login {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.st-gh-accounts {
+  list-style: none;
+  display: grid;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.st-gh-account {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 6px;
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+}
+
+.st-gh-account::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--a3);
+}
+
+.st-gh-account.st-account-state-off::before { background: var(--a5); }
+
+.st-gh-login {
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  color: var(--text);
+}
+
+.st-gh-notes { color: var(--text-tertiary); }
+
+.st-gh-problem {
+  flex-basis: 100%;
+  padding-left: 11px;
+  color: var(--red);
+}
+
+.st-account-actions {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+/* A terminal needs room for a login's lines: the panel widens while one is
+   open, as far as the window allows. */
+#settings-panel.st-terminal-open {
+  width: min(640px, 100vw);
+}
+
+.st-accounts-status:empty { display: none; }

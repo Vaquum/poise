@@ -9,6 +9,8 @@ import { assertCallerRelease } from './caller-release'
 import { assertSecureDotenv, loadSecureDotenv, validateConfabUrl } from './runtime-config'
 import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'
+import { TERMINAL_WS_PATH, type TerminalPreset } from './terminal/protocol'
+import type { TerminalCommand } from './terminal/pty'
 import { startLaunchdWatchdog } from './launchd-watchdog'
 import type { ClaudeAuthRuntime } from './cache-plugin'
 
@@ -52,6 +54,8 @@ export interface ProductionServerOptions {
   reviewAgentUsername?: string
   /** Auth runtime override for isolated integration tests. */
   claudeAuth?: ClaudeAuthRuntime
+  /** What a Connect terminal runs; tests confine it to their fake CLIs. */
+  terminalCommand?: (preset: TerminalPreset) => TerminalCommand
   /** Service mode. Omitted: read from the environment; `null`: off. */
   service?: ServiceConfig | null
 }
@@ -289,7 +293,8 @@ async function serveStatic(
 // An upgrade nothing serves is answered and closed, never left open: an
 // open one pins a descriptor and holds shutdown until its deadline.
 function refuseUpgrade(req: IncomingMessage, socket: Duplex, service: ServiceConfig | null): void {
-  if ((req.url || '').split('?')[0] === WS_PATH) return
+  const path = (req.url || '').split('?')[0]
+  if (path === WS_PATH || path === TERMINAL_WS_PATH) return
   let status = 404
   let message = 'not found'
   try {
@@ -396,6 +401,7 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
   const api = createPoiseMiddleware({
     reviewAgentUsername: options.reviewAgentUsername ?? process.env.REVIEW_AGENT_USERNAME ?? '',
     claudeAuth: options.claudeAuth,
+    terminalCommand: options.terminalCommand,
     instanceLabel: 'production',
     service,
   })
@@ -426,7 +432,8 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
       sendFailure(res, 500, error)
     })
   })
-  // /ws/chat: the same host/origin checks as the API, on the upgrade itself.
+  // /ws/chat and /ws/terminal: the same host/origin checks as the API, on the
+  // upgrade itself.
   attachChatSockets(server)
   server.on('upgrade', (req: IncomingMessage, socket: Duplex) => refuseUpgrade(req, socket, service))
   server.headersTimeout = 10_000

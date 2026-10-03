@@ -41,6 +41,12 @@ async function serviceModeApi(page: Page, calls: string[]): Promise<void> {
       await route.fulfill({ json: body.count_only ? { count: 0 } : { records: [] } })
       return
     }
+    if (url.pathname === '/api/accounts') {
+      await route.fulfill({ json: { accounts: [
+        { id: 'claude', installed: true, version: '2.1.288', signedIn: false, identity: null, detail: null, login: { label: 'claude auth login --claudeai' } },
+      ] } })
+      return
+    }
     await route.fulfill({ json: {} })
   })
 }
@@ -49,19 +55,31 @@ test.beforeEach(async ({ page }) => {
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com)\//, (route) => route.abort())
 })
 
-test('points Claude sign-in to Connected accounts instead of offering a local browser', async ({ page }) => {
+test('signs in to Claude from the banner in a Connected accounts terminal, not a local browser', async ({ page }) => {
   await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'main') })
   const calls: string[] = []
   await serviceModeApi(page, calls)
+  // The terminal never reaches the preview server, which would run a real login.
+  const terminals: string[] = []
+  await page.routeWebSocket(/\/ws\/terminal/, (ws) => {
+    terminals.push(new URL(ws.url()).searchParams.get('preset') ?? '')
+    ws.onMessage(() => {})
+    ws.send(JSON.stringify({ type: 'output', data: Buffer.from('Paste code here if prompted > ').toString('base64') }))
+  })
   await page.goto('/')
   const alert = page.getByRole('alert')
   await expect(alert).toContainText('Claude subscription sign-in required')
   await expect(alert).toContainText('Claude-backed work is paused.')
   await expect(alert).toContainText('Connect Claude in Settings → Connected accounts.')
   await expect(alert).not.toContainText('connected to this computer')
-  await expect(alert.getByRole('button')).toHaveCount(0)
-  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
-  await expect(alert.getByRole('button')).toHaveCount(0)
+
+  await alert.getByRole('button', { name: 'Sign in with Claude' }).click()
+  await expect(page.locator('#settings-panel')).toHaveClass(/open/)
+  await expect(page.getByRole('tab', { name: 'Accounts' })).toHaveAttribute('aria-selected', 'true')
+  const terminal = page.locator('.st-terminal[data-preset="claude"]')
+  await expect(terminal.locator('.st-terminal-title')).toHaveText('claude auth login --claudeai')
+  await expect(terminal.locator('.xterm-rows')).toContainText('Paste code here if prompted')
+  expect(terminals).toEqual(['claude'])
   expect(calls).not.toContain('POST /api/claude-auth/login')
 })
 

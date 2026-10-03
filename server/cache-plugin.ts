@@ -4,8 +4,8 @@ import type { ServerResponse } from 'node:http'
 import { agentAccount, callerAccounts, getModelSettings, getSettings, seedAgentAccount, setSettings } from './settings'
 import { MODEL_PLACES, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
 import { refreshModelCatalog } from './models-refresh'
-import { claudeAuth, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
-import { claudeAuthStatusChanged } from './alerts/producers'
+import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
+import { accountsChecked, claudeAuthStatusChanged } from './alerts/producers'
 import { pruneAlerts } from './alerts/store'
 import { LinkApi } from './link/api'
 import { getCallerReleaseHealth } from './caller-release'
@@ -33,6 +33,11 @@ import { DRAINING_ERROR, ServiceControl, handleServiceApi } from './service/cont
 import { countDebate } from './service/caller-calls'
 import { DailyModelRefresh } from './service/model-refresh'
 import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
+import { invalidateAccounts, listAccounts, scheduleAccountsCheck } from './accounts'
+import type { ConnectedAccount } from './accounts/types'
+import { TerminalSocketServer } from './terminal/server'
+import type { TerminalCommand } from './terminal/pty'
+import type { TerminalPreset } from './terminal/protocol'
 import type { Server } from 'node:http'
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -49,6 +54,9 @@ export interface CachePluginOptions {
   allowedHosts?: string[]
   /** Auth runtime override for isolated integration tests. */
   claudeAuth?: ClaudeAuthRuntime
+  /** What a Connect terminal runs for a preset. Omitted: the CLI's own login;
+   *  tests confine it to their fake CLIs. */
+  terminalCommand?: (preset: TerminalPreset) => TerminalCommand
   /** Which Poise server this is; chat sessions are owned per instance and
    *  the dev and production servers never adopt each other's. */
   instanceLabel?: 'dev' | 'production'
@@ -65,6 +73,9 @@ export interface CachePluginOptions {
 // servers' sessions and two different databases never mix.
 let chatRuntime: ChatRuntime | null = null
 let chatSockets: ChatSocketServer | null = null
+let terminalSockets: TerminalSocketServer | null = null
+// Service mode only: Connected accounts read on a schedule, for their alerts.
+let stopAccountsCheck: (() => void) | null = null
 let selfUpdate: SelfUpdateService | null = null
 // Service mode only: the gateway's drain and the in-process daily model check.
 let serviceControl: ServiceControl | null = null
@@ -86,10 +97,12 @@ export function getSelfUpdateService(): SelfUpdateService {
   return selfUpdate
 }
 
-/** Serve /ws/chat on an HTTP server (production server or Vite's). */
+/** Serve /ws/chat and /ws/terminal on an HTTP server (production server or
+ *  Vite's). */
 export function attachChatSockets(server: Server): void {
-  if (!chatSockets) throw new Error('the chat runtime is not started')
+  if (!chatSockets || !terminalSockets) throw new Error('the chat runtime is not started')
   chatSockets.attach(server)
+  terminalSockets.attach(server)
 }
 
 export interface ClaudeAuthRuntime {
@@ -97,6 +110,7 @@ export interface ClaudeAuthRuntime {
   stop(): Promise<void>
   snapshot(): ClaudeAuthSnapshot
   startLogin(): ClaudeAuthSnapshot
+  check(options?: ClaudeAuthCheckOptions): Promise<ClaudeAuthSnapshot>
   /** Calls `listener` with each new status; returns the unsubscribe. */
   onStatus(listener: (status: ClaudeAuthStatus) => void): () => void
 }
@@ -136,6 +150,13 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     })
     chatRuntime.on('log', (line: string) => console.log(line))
     chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
+    terminalSockets = new TerminalSocketServer({ allowedHosts: opts.allowedHosts, service }, { command: opts.terminalCommand })
+    // A login may have just changed an account. Claude's sign-in also gates
+    // Claude-backed work, so it is verified now instead of at the next poll.
+    terminalSockets.on('exit', (preset) => {
+      invalidateAccounts()
+      if (preset === 'claude') void auth.check({ forceLive: true })
+    })
     if (service) {
       serviceControl = new ServiceControl(chatRuntime, { drainTimeoutSeconds: service.drainTimeoutSeconds })
       dailyModelRefresh = new DailyModelRefresh({
@@ -144,6 +165,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
         paused: releaseBackgroundPaused,
       })
       dailyModelRefresh.start()
+      stopAccountsCheck = scheduleAccountsCheck(checkAccounts)
     } else {
       selfUpdate = new SelfUpdateService(chatRuntime, bridge)
     }
@@ -162,6 +184,9 @@ export async function stopPoiseRuntime(): Promise<void> {
   activeClaudeAuthRuntimes.clear()
   const chatStop = chatRuntime?.stop() ?? Promise.resolve()
   const socketStop = chatSockets?.close() ?? Promise.resolve()
+  const terminalStop = terminalSockets?.close() ?? Promise.resolve()
+  stopAccountsCheck?.()
+  stopAccountsCheck = null
   selfUpdate?.reset()
   serviceControl?.reset()
   dailyModelRefresh?.stop()
@@ -170,11 +195,20 @@ export async function stopPoiseRuntime(): Promise<void> {
   setCallerAccounts(null)
   chatRuntime = null
   chatSockets = null
+  terminalSockets = null
   selfUpdate = null
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
+}
+
+/** Connected accounts, read now or from the last few seconds, with their
+ *  sign-in alerts recorded. */
+async function checkAccounts(): Promise<ConnectedAccount[]> {
+  const accounts = await listAccounts()
+  accountsChecked(accounts, { me: getSettings().me, agentAccount: agentAccount() })
+  return accounts
 }
 
 export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.NextHandleFunction {
@@ -299,6 +333,16 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const before = auth.snapshot()
           const state = auth.startLogin()
           return json(res, before.status === 'authenticated' ? 200 : 202, state)
+        }
+
+        // ── Connected accounts: each CLI's own status command, never its
+        // credentials ──
+        if (path === '/api/accounts' && req.method === 'GET') {
+          try {
+            return json(res, 200, { accounts: await checkAccounts() })
+          } catch (err: any) {
+            return json(res, 500, { error: err.message || String(err) })
+          }
         }
 
         // Activation returns immediately; progress survives closing Settings

@@ -48,6 +48,7 @@ and `deploy/restore.sh` back it up and restore it.
   `agy` (Antigravity), `muse` — each signed in. The production services run
   with their own `PATH` (Caller's virtualenv, then `~/.local/bin`, then Homebrew
   and the system), not the shell's; `npm run doctor` looks each CLI up there.
+- `python3` on Poise's `PATH` for the terminal in Settings → Accounts.
 - Espanso is optional and only required for system-wide snippet expansion.
 
 Validate the local integrations without changing external state:
@@ -144,6 +145,19 @@ Your GitHub account configured in Settings must be signed in through `gh` and
 able to read those repositories. Caller currently requires visible repositories
 and indexed issues or PRs; an empty account reports an activation error until it
 has data.
+
+### Connected accounts
+
+Settings → Accounts shows each agent CLI (Claude Code, Codex, gh, Grok, Muse,
+Antigravity) with its version and what its own status command says about its
+sign-in; gh lists every account it holds, marks your GitHub account and the
+agent account, and says when either is not signed in to gh. A CLI or GitHub
+account that is not signed in also raises a sign-in alert, which opens this
+tab (`/?settings=accounts`). Connect opens a
+terminal in Settings running that CLI's own login, and the rows refresh when
+it exits; Open a shell starts your login shell. Poise never reads the CLIs'
+credentials. At most two terminals run at once, and one closes after 15 idle
+minutes. See [Connected accounts](docs/Connected-accounts.md).
 
 Current, Archive, and Swarm combine GitHub accounts and offer an account
 filter. Repository labels include their owner. Repository-free manual cards,
@@ -339,10 +353,11 @@ come from loopback, the page and its assets included, needs the gateway's
 identity assertion in `X-Poise-Identity` with a scope that reaches the route,
 the workspace's public host in `Host`, and exactly `POISE_PUBLIC_ORIGIN`,
 scheme included, when it sends `Origin`. Cookies and `Authorization` headers
-never identify anyone: the gateway keeps its own credentials. The Chat
-WebSocket applies the same rules; an upgrade to any other path is answered
-and closed. Loopback requests keep the local rules, so the container's own
-health check needs no assertion.
+never identify anyone: the gateway keeps its own credentials. The Chat and
+terminal WebSockets apply the same rules, and the terminal opens only to the
+`browser` scope; an upgrade to any other path is answered and closed.
+Loopback requests keep the local rules, so the container's own health check
+needs no assertion.
 
 **Storage.** Everything lives under `~/.poise` in the home volume: Chat
 workspaces in `~/.poise/chat`, snippets in `~/.poise/snippets/poise.yml` and
@@ -399,7 +414,8 @@ is reported and nothing runs until it is corrected. A drain skips the run.
 - Espanso detection: Snippets says snippets reach the desktop through Poise
   Link;
 - Claude sign-in through a local browser: `POST /api/claude-auth/login`
-  answers 409 and points to Settings → Connected accounts.
+  answers 409 and points to Settings → Connected accounts, where the sign-in
+  banner's button opens Claude's login in a terminal.
 
 ## Configuration
 

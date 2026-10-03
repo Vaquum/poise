@@ -61,8 +61,9 @@ const DEGRADED_STATE: ClaudeAuthState = {
 let localFailureDetail = ''
 
 // In service mode the server cannot open a browser to sign in, and says where
-// Claude is connected instead. Kept across failed polls: it is a property of
-// the server, not of one answer.
+// Claude is connected instead: Settings → Connected accounts, whose terminal
+// runs Claude's own login. Kept across failed polls: it is a property of the
+// server, not of one answer.
 let browserLoginUnavailable: string | null = null
 
 let initialized = false
@@ -185,19 +186,27 @@ function renderBanner(): void {
   text.append(title, message)
 
   bannerEl.replaceChildren(text)
-  if (LOGIN_STATUSES.has(status) && browserLoginUnavailable) {
+  if (!LOGIN_STATUSES.has(status)) return
+  if (browserLoginUnavailable) {
     const where = document.createElement('span')
     where.className = 'claude-auth-message claude-auth-elsewhere'
     where.textContent = browserLoginUnavailable
     text.append(where)
-  } else if (LOGIN_STATUSES.has(status)) {
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.className = 'claude-auth-login'
-    button.textContent = status === 'reauth_required' ? 'Sign in with Claude' : 'Reconnect Claude'
-    button.addEventListener('click', () => { void startLogin() })
-    bannerEl.appendChild(button)
   }
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'claude-auth-login'
+  button.textContent = status === 'reauth_required' ? 'Sign in with Claude' : 'Reconnect Claude'
+  button.addEventListener('click', () => {
+    if (browserLoginUnavailable) connectInSettings()
+    else void startLogin()
+  })
+  bannerEl.appendChild(button)
+}
+
+// Settings listens for this and opens Connected accounts with the terminal.
+function connectInSettings(): void {
+  window.dispatchEvent(new CustomEvent('poise:connect-account', { detail: { id: 'claude' } }))
 }
 
 function clearPoll(): void {
