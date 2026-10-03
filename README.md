@@ -32,13 +32,14 @@ and shows Poise alerts as native notifications; see [Poise Link](docs/Poise-Link
 - Claude Code, authenticated to a Claude Pro or Max subscription with
   `claude auth login --claudeai`. Poise does not require an Anthropic API key.
   On Linux/WSL, in-app sign-in requires an active graphical desktop session.
-- `github-datastore`, `github-interface`, and `agent-interface` on `PATH`.
+- Python 3.13 for [Caller](caller/README.md), the three CLIs Poise drives
+  (`agent-interface`, `github-interface`, `github-datastore`). They live in
+  `caller/`, and `npm run caller:setup` builds `caller/.venv`, which Poise runs
+  them from.
 - The other provider CLIs the catalog offers — `codex`, `grok` (Grok Build),
   `agy` (Antigravity), `muse` — each signed in. The production services run
-  with their own `PATH` (Caller's release, then `~/.local/bin`, then Homebrew
+  with their own `PATH` (Caller's virtualenv, then `~/.local/bin`, then Homebrew
   and the system), not the shell's; `npm run doctor` looks each CLI up there.
-- A local checkout of `agent-interface`; set `AGENT_INTERFACE_ROOT` when it is
-  not at `~/dev/caller/agent_interface`.
 - Espanso is optional and only required for system-wide snippet expansion.
 
 Validate the local integrations without changing external state:
@@ -85,6 +86,7 @@ scan or log-feed failures remain visible until a successful read confirms recove
 
 ```bash
 npm ci
+npm run caller:setup
 cp .env.example .env
 chmod 600 .env
 npm run dev
@@ -216,13 +218,14 @@ A new installation can start without an initialized datastore; add the first
 GitHub account in Settings. Existing databases and their sync services are retained.
 An explicitly configured `POISE_DATASTORE_DB` must point to an existing file.
 
-The macOS installer builds Poise, resolves the tracked Caller ref in
-`config/caller-release.json` to an immutable release, installs the Claude and
-Codex stop gates, and registers three per-user launchd services. They keep
-Poise alive, check `/api/health`, and reconcile Poise `main`, Caller, and both
-agent hooks from their remote sources every minute. Updates use fast-forward
-only and refuse to overwrite a dirty production checkout; a fast-forward whose
-install did not complete is installed again on the next run. Output is in
+The macOS installer builds Poise and the checkout's Caller virtualenv
+(`caller/.venv`, as `npm run caller:setup` does), installs the Claude and Codex
+stop gates from `caller/`, and registers three per-user launchd services. They
+keep Poise alive, check `/api/health`, and reconcile Poise `main` (which carries
+Caller) and both agent hooks every minute; a Caller that `/api/health` does not
+report ready is reinstalled. Updates use fast-forward only and refuse to
+overwrite a dirty production checkout; a fast-forward whose install did not
+complete is installed again on the next run. Output is in
 `~/.poise/logs/caller-update.out.log` and failures are in
 `~/.poise/logs/caller-update.err.log`. Each run also records its outcome in
 `~/.poise/production-update.json`: Settings → General shows the deployed
@@ -241,8 +244,8 @@ entrypoint at `dist/server.js`. The server binds `127.0.0.1:5555` by default.
 Poise intentionally refuses non-loopback bindings: its API can create GitHub
 issues, launch agents, and modify local files, so it is not a network service.
 Keep `.env` owner-readable only (`chmod 600 .env`) because it may contain the
-Confab API credential; production startup rejects broader permissions and any
-unmanaged or mismatched Caller release.
+Confab API credential; production startup rejects broader permissions and a
+Caller whose CLIs cannot run.
 
 ## Configuration
 
@@ -255,8 +258,10 @@ unmanaged or mismatched Caller release.
 | `POISE_EDITOR_DIR` | Markdown and annotation directory | `~/.poise/editor` |
 | `POISE_CHAT_ATTACHMENTS_DIR` | Durable chat attachments | `~/.poise/chat-attachments` |
 | `POISE_ESPANSO_MATCH_DIR` | Espanso match directory override | macOS Espanso default |
-| `AGENT_INTERFACE_ROOT` | `agent-interface` working directory | `~/dev/caller/agent_interface` |
-| `AGENT_INTERFACE_DATA_DIR` | Durable agent-interface calls and responses | package default |
+| `AGENT_INTERFACE_ROOT` | `agent-interface` working directory | `caller/agent_interface` |
+| `CALLER_BIN_ROOT` | Directory Poise runs Caller's CLIs from | `caller/.venv/bin` |
+| `AGENT_INTERFACE_DATA_DIR` | Durable agent-interface calls and responses | `caller/agent_interface/data` |
+| `POISE_PYTHON` | Python 3.13 that builds Caller's virtualenv | Homebrew `python@3.13`, then `python3.13` on `PATH` |
 | `POISE_VOICE_GUIDE_PATH` | Optional editor-chat voice guide | unset |
 | `REVIEW_AGENT_USERNAME` | GitHub identity used by review automation | unset |
 | `CONFAB_URL` | Optional Confab service | `http://localhost:8000` |
@@ -272,10 +277,12 @@ and automation deduplication state. Editor documents remain plain Markdown.
 npm run check      # typecheck, lint, unit/integration tests, production build
 npm run test:e2e   # Playwright smoke and visual regression tests
 npm run verify     # both suites
+caller/.venv/bin/python -m pytest caller/agent_interface/tests caller/github_interface/tests caller/github_datastore/tests
 ```
 
 CI runs the static, unit, build, and audit gates on Node 20, 22, and 24. Node 22
-also runs the browser suite and uploads its report.
+also runs the browser suite and uploads its report. The Caller workflow runs
+Caller's tests on Python 3.13.
 
 ## Architecture
 
@@ -284,6 +291,7 @@ also runs the browser suite and uploads its report.
 - `server/production.ts` — loopback-only static and API server.
 - `server/process.ts` — bounded external process execution.
 - `server/db.ts` — SQLite schema, migrations, and automation claims.
+- `caller/` — Caller, the Python CLIs Poise drives ([caller/README.md](caller/README.md)).
 - `tests/` — unit, integration, browser, and visual regression coverage.
 
 See [SECURITY.md](SECURITY.md) for the supported trust boundary.
@@ -354,11 +362,11 @@ See [Queued Chat messages](docs/Queue.md).
 After the one-time release-controller installation, a Poise implementation
 request in Chat can proceed through implementation, checks, CI, automatic PR
 merge, a verified release and safe tab refresh. Natural requests are supported;
-`/poise` is an optional shortcut. Other repositories do not inherit this merge
-authority. The persistent deployment card provides one-click **Revert** for
-the latest eligible change, backed by a retained release rather than another
-agent turn. Caller and persistent application data keep their existing versions
-and locations.
+`/poise` is an optional shortcut. Other repositories, and Caller in `caller/`,
+do not inherit this merge authority. The persistent deployment card provides
+one-click **Revert** for the latest eligible change, backed by a retained
+release rather than another agent turn. Caller and persistent application data
+keep their existing versions and locations.
 
 See [Self-improvement](docs/Self-improvement.md) for the setup commands, release
 boundary, independent recovery, maintenance, and verification record. The

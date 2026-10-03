@@ -2,19 +2,21 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { CALLER_ROOT, callerVersions } from '../scripts/caller.mjs'
 import {
   configureStopGate,
   installStopGate,
   stopGateIsCurrent,
+  stopGateManifest,
 } from '../scripts/stop-gate-runtime.mjs'
 
 const manifest = {
-  repository: 'mikkokotila/caller',
-  ref: 'main',
+  source: '/production/caller',
   commit: 'a'.repeat(40),
   packages: {
-    'agent-interface': '0.2.0',
+    'agent-interface': '0.3.0',
     'github-interface': '0.2.0',
+    'github-datastore': '0.2.0',
   },
 }
 const roots = []
@@ -60,14 +62,37 @@ describe('stop-gate runtime reconciliation', () => {
       home,
       manifest,
       python: '/python3.13',
-      releaseRoot: '/caller-release',
       run,
     })
 
     expect(await stopGateIsCurrent({ home, manifest })).toBe(true)
     expect(JSON.parse(await readFile(join(hookRoot, 'release.json'), 'utf8'))).toEqual(manifest)
+    const install = calls.find((call) => call.command === join(bin, 'python') && call.args.includes('pip'))
+    expect(install.args.slice(-2)).toEqual(['/production/caller/github_interface', '/production/caller/agent_interface'])
     const configuration = calls.find((call) => call.args[0] === '--install-pr-stop-gate')
     expect(configuration.options.env.CALLER_PR_GATE_SCOPE).toBe('Vaquum/*')
+  })
+
+  it('names the in-tree Caller it installs from, and treats any other as stale', async () => {
+    expect(await stopGateManifest({ callerRoot: CALLER_ROOT, commit: manifest.commit })).toEqual({
+      source: CALLER_ROOT,
+      commit: manifest.commit,
+      packages: await callerVersions(),
+    })
+    const home = await temporaryHome()
+    const hookRoot = join(home, '.local', 'share', 'caller-pr-stop-gate')
+    await mkdir(join(hookRoot, 'bin'), { recursive: true })
+    for (const name of ['python', 'agent-interface', 'github-interface']) await executable(join(hookRoot, 'bin', name))
+    await writeFile(join(hookRoot, 'release.json'), JSON.stringify(manifest))
+    expect(await stopGateIsCurrent({ home, manifest })).toBe(true)
+    for (const changed of [{ source: '/elsewhere/caller' }, { commit: 'b'.repeat(40) }, { packages: { 'agent-interface': '0.4.0' } }]) {
+      expect(await stopGateIsCurrent({ home, manifest: { ...manifest, ...changed } })).toBe(false)
+    }
+    // A gate installed from a pinned Caller release before Caller moved in-tree.
+    await writeFile(join(hookRoot, 'release.json'), JSON.stringify({
+      repository: 'mikkokotila/caller', ref: 'main', commit: manifest.commit, packages: manifest.packages,
+    }))
+    expect(await stopGateIsCurrent({ home, manifest })).toBe(false)
   })
 
   it('reapplies hook configuration without reinstalling packages', async () => {

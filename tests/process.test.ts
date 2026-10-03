@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawn as spawnProcess } from 'node:child_process'
-import { link, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import {
@@ -961,5 +961,65 @@ if (args.includes('auth') && args.includes('status')) {
     )
 
     await expect(exited).resolves.toMatchObject({ code: 7, signal: null })
+  })
+})
+
+describe('Caller command resolution', () => {
+  let root = ''
+  let bin = ''
+  let decoy = ''
+
+  async function script(directory: string, name: string, body: string): Promise<void> {
+    await writeFile(join(directory, name), `#!/bin/sh\n${body}\n`, { mode: 0o700 })
+  }
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'poise-caller-cli-'))
+    bin = join(root, 'caller-bin')
+    decoy = join(root, 'decoy')
+    await Promise.all([mkdir(bin), mkdir(decoy)])
+    for (const name of ['agent-interface', 'github-interface', 'github-datastore']) {
+      await script(decoy, name, 'printf decoy')
+    }
+    vi.stubEnv('CALLER_BIN_ROOT', bin)
+    vi.stubEnv('PATH', `${decoy}${delimiter}${process.env.PATH || ''}`)
+  })
+
+  afterEach(async () => {
+    vi.unstubAllEnvs()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it.runIf(process.platform !== 'win32')('runs bare Caller commands from the Caller directory, never from PATH', async () => {
+    await script(bin, 'agent-interface', 'printf "caller %s" "$PATH"')
+    const { stdout } = await runFile('agent-interface', ['--logs'])
+    expect(stdout).toBe(`caller ${bin}${delimiter}${decoy}${delimiter}${process.env.PATH!.split(delimiter).slice(1).join(delimiter)}`)
+  })
+
+  it.runIf(process.platform !== 'win32')('fails naming the Caller directory when a CLI is missing instead of using another copy', async () => {
+    await expect(runFile('github-interface', ['--help'])).rejects.toMatchObject({
+      code: 'ENOENT',
+      message: expect.stringContaining(join(bin, 'github-interface')),
+    })
+    await expect(spawnDetached('github-datastore', ['sync'])).rejects.toMatchObject({
+      code: 'ENOENT',
+      message: expect.stringContaining(join(bin, 'github-datastore')),
+    })
+  })
+
+  it('puts the Caller directory first, once, only on the PATH of Caller\'s own processes', async () => {
+    const probe = ['-e', 'process.stdout.write(process.env.PATH || "")']
+    const callerCli = await namedNode(root, 'github-datastore')
+    expect((await runFile(callerCli, probe)).stdout.split(delimiter).slice(0, 2)).toEqual([bin, decoy])
+    expect((await runFile(process.execPath, probe)).stdout).toBe(process.env.PATH)
+    vi.stubEnv('PATH', `${decoy}${delimiter}${bin}`)
+    expect((await runFile(callerCli, probe)).stdout).toBe(`${bin}${delimiter}${decoy}`)
+    // An explicit PATH still wins.
+    expect((await runFile(callerCli, probe, { env: { PATH: decoy } })).stdout).toBe(decoy)
+  })
+
+  it('refuses a relative CALLER_BIN_ROOT instead of resolving it against the working directory', async () => {
+    vi.stubEnv('CALLER_BIN_ROOT', 'caller/.venv/bin')
+    await expect(runFile('agent-interface', ['--logs'])).rejects.toThrow('CALLER_BIN_ROOT must be an absolute path')
   })
 })

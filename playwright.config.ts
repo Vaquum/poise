@@ -4,8 +4,6 @@ import { resolve } from 'node:path'
 const port = 5566
 const baseURL = `http://127.0.0.1:${port}`
 const e2eRoot = resolve('test-results/e2e')
-const callerCommit = 'a'.repeat(40)
-const callerReleaseRoot = resolve(e2eRoot, 'caller-release')
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -51,11 +49,9 @@ export default defineConfig({
       POISE_EDITOR_DIR: resolve(e2eRoot, 'editor'),
       POISE_CHAT_ATTACHMENTS_DIR: resolve(e2eRoot, 'chat-attachments'),
       POISE_ESPANSO_MATCH_DIR: resolve(e2eRoot, 'espanso-match'),
-      POISE_ENFORCE_CALLER_RELEASE: '1',
-      CALLER_RELEASE_SHA: callerCommit,
-      CALLER_RELEASE_ROOT: callerReleaseRoot,
-      CALLER_BIN_ROOT: resolve(callerReleaseRoot, 'venv/bin'),
-      AGENT_INTERFACE_ROOT: resolve(callerReleaseRoot, 'source/agent_interface'),
+      // Stand-in Caller CLIs from prepare-e2e.mjs.
+      CALLER_BIN_ROOT: resolve(e2eRoot, 'caller/bin'),
+      AGENT_INTERFACE_ROOT: resolve(e2eRoot, 'caller/agent_interface'),
       TMPDIR: resolve(e2eRoot, 'tmp'),
     },
     url: baseURL,

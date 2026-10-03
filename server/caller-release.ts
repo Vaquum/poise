@@ -1,128 +1,70 @@
+// The Caller this Poise runs: the packages under caller/, run from the CLIs
+// in callerBinRoot(). /api/health reports it and production refuses to start
+// without it. The check reads local files only.
 import { constants } from 'node:fs'
-import { access, readFile, realpath, stat } from 'node:fs/promises'
-import { isAbsolute, join, relative, sep } from 'node:path'
-import release from '../config/caller-release.json'
-
-const SHA_PATTERN = /^[0-9a-f]{40}$/
-const COMMANDS = ['agent-interface', 'github-datastore', 'github-interface'] as const
-
-interface ReleaseMarker {
-  repository?: unknown
-  ref?: unknown
-  commit?: unknown
-  packages?: unknown
-}
+import { access, readFile, stat } from 'node:fs/promises'
+import { join } from 'node:path'
+import { CALLER_COMMANDS, agentInterfaceRoot, callerBinRoot, callerVersions } from '../scripts/caller.mjs'
 
 export interface CallerReleaseHealth {
-  status: 'ready' | 'unmanaged' | 'invalid'
-  required: boolean
-  expectedCommit: string
-  actualCommit: string | null
+  status: 'ready' | 'invalid'
+  // Each package's version from caller/<package>/pyproject.toml.
   packages: Record<string, string>
   error: string | null
 }
 
-function invalid(
-  required: boolean,
-  actualCommit: string | null,
-  error: string,
-  expectedCommit = actualCommit || '',
-): CallerReleaseHealth {
-  return {
-    status: 'invalid',
-    required,
-    expectedCommit,
-    actualCommit,
-    packages: release.packages,
-    error,
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
   }
 }
 
-function isWithin(root: string, candidate: string): boolean {
-  const path = relative(root, candidate)
-  return path === '' || (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path))
+// An executable whose interpreter line names an executable interpreter.
+async function runnable(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.X_OK)
+    const firstLine = (await readFile(path, 'utf8')).split('\n', 1)[0]
+    if (!firstLine.startsWith('#!')) return false
+    await access(firstLine.slice(2).trim().split(/\s+/, 1)[0], constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
 }
 
 export async function getCallerReleaseHealth(): Promise<CallerReleaseHealth> {
-  const required = process.env.POISE_ENFORCE_CALLER_RELEASE === '1'
-  const actualCommit = process.env.CALLER_RELEASE_SHA?.trim().toLowerCase() || null
-  const releaseRoot = process.env.CALLER_RELEASE_ROOT?.trim() || ''
-  const binRoot = process.env.CALLER_BIN_ROOT?.trim() || ''
-  const agentRoot = process.env.AGENT_INTERFACE_ROOT?.trim() || ''
-  if (!required && !actualCommit && !releaseRoot && !binRoot) {
-    return {
-      status: 'unmanaged',
-      required,
-      expectedCommit: '',
-      actualCommit: null,
-      packages: release.packages,
-      error: null,
-    }
-  }
-  if (!actualCommit || !SHA_PATTERN.test(actualCommit)) {
-    return invalid(required, actualCommit, 'Caller release commit is missing or invalid')
-  }
-  if (![releaseRoot, binRoot, agentRoot].every(isAbsolute)) {
-    return invalid(required, actualCommit, 'Caller release paths must be absolute')
-  }
-
+  let packages: Record<string, string>
   try {
-    const [resolvedReleaseRoot, resolvedBinRoot, resolvedAgentRoot] = await Promise.all([
-      realpath(releaseRoot),
-      realpath(binRoot),
-      realpath(agentRoot),
-    ])
-    if (!isWithin(resolvedReleaseRoot, resolvedBinRoot)
-      || !isWithin(resolvedReleaseRoot, resolvedAgentRoot)) {
-      return invalid(required, actualCommit, 'Caller release paths escape the release root')
-    }
-    const markerPath = join(resolvedReleaseRoot, 'release.json')
-    const markerStat = await stat(markerPath)
-    if (!markerStat.isFile()) {
-      return invalid(required, actualCommit, 'Caller release marker is not a regular file')
-    }
-    const marker = JSON.parse(await readFile(markerPath, 'utf8')) as ReleaseMarker
-    if (marker.repository !== release.repository
-      || marker.ref !== release.ref
-      || JSON.stringify(marker.packages) !== JSON.stringify(release.packages)) {
-      return invalid(required, actualCommit, 'Caller release marker does not match the tracked release')
-    }
-    if (typeof marker.commit !== 'string'
-      || !SHA_PATTERN.test(marker.commit)
-      || marker.commit !== actualCommit) {
-      return invalid(
-        required,
-        actualCommit,
-        'Caller release commit does not match the release marker',
-        typeof marker.commit === 'string' ? marker.commit : '',
-      )
-    }
-    await Promise.all(COMMANDS.map(async (command) => {
-      const commandPath = join(resolvedBinRoot, command)
-      await access(commandPath, constants.X_OK)
-      const firstLine = (await readFile(commandPath, 'utf8')).split('\n', 1)[0]
-      if (!firstLine.startsWith('#!')) throw new Error('Caller entrypoint has no interpreter')
-      const interpreter = firstLine.slice(2).trim().split(/\s+/, 1)[0]
-      await access(interpreter, constants.X_OK)
-    }))
-  } catch {
-    return invalid(required, actualCommit, 'Caller release files are missing or unreadable')
+    packages = await callerVersions()
+  } catch (error) {
+    return { status: 'invalid', packages: {}, error: `Caller is missing from this checkout: ${message(error)}` }
   }
-
-  return {
-    status: 'ready',
-    required,
-    expectedCommit: actualCommit,
-    actualCommit,
-    packages: release.packages,
-    error: null,
+  const invalid = (error: string): CallerReleaseHealth => ({ status: 'invalid', packages, error })
+  let binRoot: string
+  let agentRoot: string
+  try {
+    binRoot = callerBinRoot()
+    agentRoot = agentInterfaceRoot()
+  } catch (error) {
+    return invalid(message(error))
   }
+  if (!await isDirectory(agentRoot)) return invalid(`agent-interface root ${agentRoot} is not a directory`)
+  for (const command of CALLER_COMMANDS) {
+    const path = join(binRoot, command)
+    if (!await runnable(path)) {
+      return invalid(`${path} is missing or not runnable${process.env.CALLER_BIN_ROOT ? ' (CALLER_BIN_ROOT)' : '; run npm run caller:setup'}`)
+    }
+  }
+  return { status: 'ready', packages, error: null }
 }
 
 export async function assertCallerRelease(): Promise<void> {
-  if (process.env.POISE_ENFORCE_CALLER_RELEASE !== '1') {
-    throw new Error('POISE_ENFORCE_CALLER_RELEASE=1 is required for production')
-  }
   const health = await getCallerReleaseHealth()
-  if (health.status !== 'ready') throw new Error(health.error || 'Caller release is not ready')
+  if (health.status !== 'ready') throw new Error(`Caller is not ready: ${health.error}`)
 }
