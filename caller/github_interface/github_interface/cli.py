@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import sys
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,12 @@ behaviors:
   --comment-issue ISSUE --body BODY [--repository OWNER/REPO]
   --edit-issue-comment ISSUE --body BODY [--comment-id ID]
   --checkout-repo OWNER/REPO --path DIR
+
+accounts:
+  Every behavior takes --token-user USER, the GitHub account it acts as.
+  Without it, agent behaviors act as GITHUB_INTERFACE_AGENT_USER and reads
+  done as you (--view-repos, --current-pr, --pr-readiness) as
+  GITHUB_INTERFACE_USER. gh's active account is never used.
 
 help:
   github-interface BEHAVIOR --help"""
@@ -126,11 +133,24 @@ def main() -> None:
 
 
 def _parser(behavior: str) -> argparse.ArgumentParser:
+    parser = _arguments(behavior)
+    module = import_module(f"github_interface.behaviors.{behavior.removeprefix('--').replace('-', '_')}")
+    required = getattr(module, "REQUIRE_TOKEN_USER", False)
+    if required:
+        account = "GitHub account to act as"
+    elif getattr(module, "NO_AUTH", False):
+        account = "not used: this behavior does not call GitHub"
+    else:
+        account = f"GitHub account to act as (default: ${module.IDENTITY})"
+    parser.add_argument("--token-user", required=required, metavar="USER", help=account)
+    return parser
+
+
+def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior == "--pr-review":
         parser = argparse.ArgumentParser(prog="github-interface --pr-review PR")
         parser.add_argument("--p", default="p2", metavar="p2")
         _add_expected_head(parser)
-        _add_token_user(parser)
         return parser
 
     if behavior in {"--create-issue", "--create-pr-linked-issue"}:
@@ -138,8 +158,6 @@ def _parser(behavior: str) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(prog=prog)
         parser.add_argument("--title", required=True)
         parser.add_argument("--body", required=True)
-        if behavior == "--create-pr-linked-issue":
-            _add_token_user(parser)
         return parser
 
     if behavior == "--request-changes":
@@ -148,7 +166,6 @@ def _parser(behavior: str) -> argparse.ArgumentParser:
         source.add_argument("--comments", help="file containing a JSON array of inline review comments")
         source.add_argument("--comments-json", help="inline JSON array of review comments")
         _add_expected_head(parser)
-        _add_token_user(parser)
         return parser
 
     if behavior == "--request-change":
@@ -158,7 +175,6 @@ def _parser(behavior: str) -> argparse.ArgumentParser:
         parser.add_argument("--side", choices=("LEFT", "RIGHT"), default="RIGHT")
         parser.add_argument("--body", required=True)
         _add_expected_head(parser)
-        _add_token_user(parser)
         return parser
 
     if behavior == "--commit-work":
@@ -180,7 +196,6 @@ def _parser(behavior: str) -> argparse.ArgumentParser:
     if behavior in {"--requested-changes-addressed", "--requested-review-ready", "--review-activity-since"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
         parser.add_argument("--username", required=True)
-        _add_token_user(parser)
         if behavior == "--review-activity-since":
             parser.add_argument("--since", required=True)
         return parser
@@ -188,24 +203,19 @@ def _parser(behavior: str) -> argparse.ArgumentParser:
     if behavior in {"--approve-pr", "--reviewed-clean"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
         _add_expected_head(parser)
-        _add_token_user(parser)
         return parser
 
     if behavior == "--head-sha":
         parser = argparse.ArgumentParser(prog="github-interface --head-sha PR")
-        _add_token_user(parser)
         return parser
 
     if behavior == "--current-pr":
-        parser = argparse.ArgumentParser(prog="github-interface --current-pr")
-        parser.add_argument("--token-user", metavar="USER")
-        return parser
+        return argparse.ArgumentParser(prog="github-interface --current-pr")
 
     if behavior == "--pr-readiness":
         parser = argparse.ArgumentParser(prog="github-interface --pr-readiness PR")
         parser.add_argument("--username", required=True)
         _add_expected_head(parser)
-        parser.add_argument("--token-user", metavar="USER")
         return parser
 
     if behavior == "--resolve-nonblocking-conversations-if-ready":
@@ -214,7 +224,6 @@ def _parser(behavior: str) -> argparse.ArgumentParser:
         )
         parser.add_argument("--username", required=True)
         _add_expected_head(parser)
-        _add_token_user(parser)
         return parser
 
     if behavior == "--resolve-conversation":
@@ -278,7 +287,3 @@ def _add_expected_head(parser: argparse.ArgumentParser) -> None:
 def _add_repository(parser: argparse.ArgumentParser) -> None:
     # Without it the repository comes from the working directory.
     parser.add_argument("--repository", metavar="OWNER/REPO")
-
-
-def _add_token_user(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--token-user", required=True, metavar="USER")
