@@ -3,6 +3,8 @@
 // service mode"). POISE_MODE unset is a personal computer and changes nothing.
 
 import { createPublicKey, type KeyObject } from 'node:crypto'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 export interface ServiceConfig {
   /** The owner's GitHub login in lower case; the workspace's DNS label. */
@@ -102,4 +104,15 @@ export function readServiceConfig(env: NodeJS.ProcessEnv = process.env): Service
     throw new Error(`Poise cannot start in service mode: ${problems.join('; ')}`)
   }
   return { handle, owner, publicOrigin: origin.origin, publicHost: origin.host, gatewayKey: key }
+}
+
+/** Where service mode keeps a piece of state: under ~/.poise in the home volume. */
+export function serviceStatePath(...segments: string[]): string {
+  return join(homedir(), '.poise', ...segments)
+}
+
+/** Caller's own data lives in the home volume too; children inherit the
+ *  variable through the process environment. An explicit value wins. */
+export function applyServiceEnvironment(env: NodeJS.ProcessEnv = process.env): void {
+  if (!env.AGENT_INTERFACE_DATA_DIR) env.AGENT_INTERFACE_DATA_DIR = serviceStatePath('agent-interface')
 }

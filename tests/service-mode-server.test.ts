@@ -3,7 +3,8 @@
 // on the container network) and from its own health check (loopback), with
 // every piece of state under an isolated home folder.
 
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
@@ -136,7 +137,22 @@ function openChatSocket(caller: Caller): Promise<SocketOutcome> {
   })
 }
 
+async function callerCalls(): Promise<Array<{ args: string[], dataDir: string | null }>> {
+  if (!existsSync(callerLog)) return []
+  return (await readFile(callerLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+}
+
 describe('Poise in service mode', () => {
+  it('keeps its state in the home volume and passes Caller its data directory there', async () => {
+    expect(existsSync(join(home, '.poise', 'cache.db'))).toBe(true)
+    expect((await import('../server/chat/local-workspace')).LOCAL_CHAT_ROOT).toBe(join(home, '.poise', 'chat'))
+    expect((await import('../server/snippets')).MATCH_FILE).toBe(join(home, '.poise', 'snippets', 'poise.yml'))
+
+    const models = await send('GET', '/api/models', fromGateway())
+    expect(models.status).toBe(200)
+    expect((await callerCalls()).find((call) => call.args[0] === '--models')).toEqual({ args: ['--models'], dataDir: join(home, '.poise', 'agent-interface') })
+  })
+
   it('serves the workspace to its owner through the gateway and to nobody else', async () => {
     const page = await send('GET', '/', fromGateway())
     expect(page.status).toBe(200)

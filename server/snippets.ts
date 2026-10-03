@@ -18,12 +18,16 @@ import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { parse as parseYaml, parseDocument, stringify as stringifyYaml, isMap, isSeq } from 'yaml'
 import { withProcessLock } from './process-lock'
+import { isServiceMode, serviceStatePath } from './service/config'
 
 // espanso's macOS config root holds config/ and match/. Override the
 // match dir via POISE_ESPANSO_MATCH_DIR (mirrors POISE_EDITOR_DIR) for
-// non-default installs or tests.
+// non-default installs or tests. In service mode no Espanso runs beside the
+// server: the file lives in the home volume and Poise Link carries it to the
+// person's desktop.
+const SERVICE_MODE = isServiceMode()
 const MATCH_DIR = process.env.POISE_ESPANSO_MATCH_DIR
-  || join(homedir(), 'Library', 'Application Support', 'espanso', 'match')
+  || (SERVICE_MODE ? serviceStatePath('snippets') : join(homedir(), 'Library', 'Application Support', 'espanso', 'match'))
 export const MATCH_FILE = join(MATCH_DIR, 'poise.yml')
 const LOCK_FILE = join(MATCH_DIR, '.poise-snippets-lock.sqlite3')
 export const MAX_SNIPPETS_BYTES = 1 * 1024 * 1024
@@ -291,8 +295,9 @@ const DEFAULT_ESPANSO_CONFIG = `# espanso configuration file
 
 async function ensureEspansoConfigDir(): Promise<void> {
   // With a custom POISE_ESPANSO_MATCH_DIR the caller owns the layout, so
-  // don't assume an espanso config root sits beside it.
-  if (process.env.POISE_ESPANSO_MATCH_DIR) return
+  // don't assume an espanso config root sits beside it; in service mode
+  // there is no Espanso root at all.
+  if (process.env.POISE_ESPANSO_MATCH_DIR || SERVICE_MODE) return
   const defaultYml = join(dirname(MATCH_DIR), 'config', 'default.yml')
   if (existsSync(defaultYml)) return
   await mkdir(dirname(defaultYml), { recursive: true })

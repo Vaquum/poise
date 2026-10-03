@@ -23,7 +23,7 @@ import { ChatSocketServer, handleChatApi } from './chat/transport'
 import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
 import { SelfUpdateService, createSelfUpdateBridge, drainAllowsPath, handleSelfUpdateApi, isSelfUpdateControlRoute, resolveSelfUpdateRoot, unconfiguredSelfUpdateBridge, type SelfUpdateBridge } from './self-update'
-import { readServiceConfig, type ServiceConfig } from './service/config'
+import { applyServiceEnvironment, readServiceConfig, type ServiceConfig } from './service/config'
 import type { Server } from 'node:http'
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -90,6 +90,7 @@ const activeClaudeAuthRuntimes = new Set<ClaudeAuthRuntime>()
 
 export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   const service = serviceOf(opts)
+  if (service) applyServiceEnvironment()
   const auth = opts.claudeAuth ?? claudeAuth
   activeClaudeAuthRuntimes.add(auth)
   auth.start()

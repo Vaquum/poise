@@ -1,6 +1,8 @@
 import { generateKeyPairSync } from 'node:crypto'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { isServiceMode, readServiceConfig } from '../server/service/config'
+import { applyServiceEnvironment, isServiceMode, readServiceConfig } from '../server/service/config'
 import { HANDLE, OWNER, PUBLIC_HOST, PUBLIC_ORIGIN, gatewayKeys, serviceEnvironment } from './service-fixture'
 
 const keys = gatewayKeys()
@@ -78,5 +80,14 @@ describe('service-mode configuration', () => {
     for (const [value, reason] of refused) {
       expect(() => readServiceConfig({ ...env, POISE_GATEWAY_PUBLIC_KEY: value })).toThrow(reason)
     }
+  })
+
+  it('passes Caller a data directory in the home volume unless one is set', () => {
+    const env: NodeJS.ProcessEnv = {}
+    applyServiceEnvironment(env)
+    expect(env.AGENT_INTERFACE_DATA_DIR).toBe(join(homedir(), '.poise', 'agent-interface'))
+    const explicit: NodeJS.ProcessEnv = { AGENT_INTERFACE_DATA_DIR: '/data/caller' }
+    applyServiceEnvironment(explicit)
+    expect(explicit.AGENT_INTERFACE_DATA_DIR).toBe('/data/caller')
   })
 })
