@@ -485,14 +485,18 @@ def run_issue_review(
     try:
         with review_budget.ReviewBudget(timeout_s, cap=issue_review.TIMEOUT_SECONDS), \
                 progress.Progress(DB, id_, "preparing_issue", "Reading the issue and its sub-issues"):
-            # github-interface comments as one fixed account; a different actor
-            # would find out only after its first comment went out.
-            if actor.lower() != issue_review.COMMENTER.lower():
-                fail(ValueError(f"issue comments are posted as {issue_review.COMMENTER}; --actor {actor} cannot post them"),
+            # Issue reviews post as the configured agent account; a different
+            # actor would find out only after its first comment went out.
+            agent = os.getenv("GITHUB_INTERFACE_AGENT_USER", "").strip()
+            if not agent:
+                fail(ValueError("GITHUB_INTERFACE_AGENT_USER is not set; it names the agent account issue reviews post as"),
+                     "agent_account_missing", preflight=True)
+            if actor.lower() != agent.lower():
+                fail(ValueError(f"issue comments are posted as the agent account {agent}; --actor {actor} cannot post them"),
                      "actor_mismatch", preflight=True)
             try:
-                data = issue_review.packet(repo, number)
-                issue_review.mark_reviewed(data, _issue_review_targets, _running_issue_reviews(id_))
+                data = issue_review.packet(repo, number, actor)
+                issue_review.mark_reviewed(data, actor, _issue_review_targets, _running_issue_reviews(id_))
             except review_budget.ReviewLimitError as e:
                 fail(e, e.code)
             except Exception as e:
