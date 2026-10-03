@@ -270,9 +270,10 @@ impl Controller {
     /// Poise until it is revoked there.
     pub fn sign_out(&self) -> io::Result<()> {
         self.stop_session();
-        self.forget_pairing()?;
+        // Signed out here even if the credential store fails; the caller still gets its error.
+        let forgotten = self.forget_pairing();
         self.signed_out(None);
-        Ok(())
+        forgotten
     }
 
     fn start_session(self: &Arc<Self>, endpoint: Url, token: String) {

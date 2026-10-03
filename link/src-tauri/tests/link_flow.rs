@@ -31,6 +31,8 @@ const WAIT: Duration = Duration::from_secs(10);
 #[derive(Clone, Default)]
 struct Probes {
     secret: Arc<Mutex<Option<String>>>,
+    /// Makes deleting the secret fail, as a locked or missing credential store would.
+    secret_delete_fails: Arc<AtomicBool>,
     notices: Arc<Mutex<Vec<Notice>>>,
     opened: Arc<Mutex<Vec<Url>>>,
     autostart: Arc<AtomicBool>,
@@ -48,18 +50,24 @@ impl Probes {
     }
 }
 
-struct Secrets(Arc<Mutex<Option<String>>>);
+struct Secrets {
+    secret: Arc<Mutex<Option<String>>>,
+    delete_fails: Arc<AtomicBool>,
+}
 
 impl SecretStore for Secrets {
     fn set(&self, secret: &str) -> Result<(), String> {
-        *self.0.lock().unwrap() = Some(secret.to_owned());
+        *self.secret.lock().unwrap() = Some(secret.to_owned());
         Ok(())
     }
     fn get(&self) -> Result<Option<String>, String> {
-        Ok(self.0.lock().unwrap().clone())
+        Ok(self.secret.lock().unwrap().clone())
     }
     fn delete(&self) -> Result<(), String> {
-        *self.0.lock().unwrap() = None;
+        if self.delete_fails.load(Ordering::SeqCst) {
+            return Err("the credential store is locked".to_owned());
+        }
+        *self.secret.lock().unwrap() = None;
         Ok(())
     }
 }
@@ -138,7 +146,10 @@ impl CommandRunner for NoEspanso {
 
 fn platform(probes: &Probes, espanso: Locator) -> Platform {
     Platform {
-        secrets: Box::new(Secrets(Arc::clone(&probes.secret))),
+        secrets: Box::new(Secrets {
+            secret: Arc::clone(&probes.secret),
+            delete_fails: Arc::clone(&probes.secret_delete_fails),
+        }),
         notifier: Arc::new(Recorder(Arc::clone(&probes.notices))),
         browser: Arc::new(Opened(Arc::clone(&probes.opened))),
         autostart: Arc::new(LoginItem(Arc::clone(&probes.autostart))),
@@ -575,4 +586,28 @@ async fn pairing_with_a_workspace_address_explains_what_to_enter() {
             .to_string()
             .contains("Enter the Poise address you sign in at")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_out_signs_out_even_when_the_credential_store_fails() {
+    let fake = FakePoise::start(Config::default(), "v1", &snippets_yaml(&[])).await;
+    let config = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (controller, probes) = already_paired(&fake, config.path(), home.path(), timing());
+    assert!(controller.start());
+    eventually("the connected status", WAIT, || {
+        controller.status().connection == Connection::Connected
+    })
+    .await;
+    probes.secret_delete_fails.store(true, Ordering::SeqCst);
+
+    let result = controller.sign_out();
+
+    assert!(result.is_err(), "the failure is reported");
+    assert_eq!(
+        controller.status().connection,
+        Connection::SignedOut { reason: None }
+    );
+    let saved = SettingsStore::open(config.path()).unwrap().get();
+    assert_eq!((saved.endpoint, saved.login), (None, None));
 }
