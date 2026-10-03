@@ -96,12 +96,16 @@ COPY deploy/runtime/entrypoint.sh deploy/runtime/install-clis.sh /opt/poise/depl
 
 # The provider CLIs come first on PATH: they live in the home volume and
 # update themselves there. No identity is baked in; the gateway passes it.
+# agent-interface opens its data directory as soon as it starts and would
+# otherwise look for it inside the read-only virtualenv; service mode names
+# the same directory for the processes Poise starts.
 ENV HOME=/home/poise \
     PATH=/home/poise/.local/bin:/opt/caller/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     LANG=en_US.UTF-8 \
     NODE_ENV=production \
     CALLER_BIN_ROOT=/opt/caller/venv/bin \
     AGENT_INTERFACE_ROOT=/opt/poise/caller/agent_interface \
+    AGENT_INTERFACE_DATA_DIR=/home/poise/.poise/agent-interface \
     POISE_HOST=0.0.0.0 \
     POISE_PORT=5555
 

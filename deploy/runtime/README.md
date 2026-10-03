@@ -19,7 +19,8 @@ docker build --file deploy/runtime/Dockerfile --tag poise-runtime .
   `node_modules`, `scripts/` and `caller/`, which is agent-interface's working
   directory (`AGENT_INTERFACE_ROOT`).
 - Python 3.13 and Caller's three CLIs in the virtualenv `/opt/caller/venv`
-  (`CALLER_BIN_ROOT`).
+  (`CALLER_BIN_ROOT`); agent-interface keeps its data in
+  `~/.poise/agent-interface` (`AGENT_INTERFACE_DATA_DIR`).
 - `gh` from GitHub's apt repository, `git`, `build-essential`,
   `openssh-client`, `curl`, `ripgrep`, `jq`, `unzip`, `xz-utils`, `less`,
   `procps`, `tini` and the `en_US.UTF-8` locale.
