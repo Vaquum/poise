@@ -19,7 +19,7 @@ Poise must keep working outside service mode too: `npm run dev` on a developer's
 | `.github/workflows/` | CI |
 | `link/` | Poise Link, the desktop companion (Tauri 2: Rust in `link/src-tauri`, the window in `link/ui`); see [docs/Poise-Link.md](docs/Poise-Link.md) |
 
-Slices that add `gateway/`, `deploy/` and `link/` add their rows and gates here in the same pull request.
+Slices that add `gateway/` and `deploy/` add their rows and gates here in the same pull request.
 
 ## Toolchain
 
