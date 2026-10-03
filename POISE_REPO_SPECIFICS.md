@@ -32,7 +32,7 @@ Slices that add `caller/`, `gateway/`, `deploy/` and `link/` add their rows and 
 | --- | --- |
 | Poise application | `npm run check` (lint, unit and integration tests, production build) |
 | Poise browser UI | `npm run check` and `npm run test:e2e` |
-| Gateway | In `gateway/`: `npm ci`, `npm run typecheck` and `npm test`; `docker build gateway/` where Docker is available |
+| Gateway | In `gateway/`: `npm ci`, `npm run typecheck` and `npm test`; where Docker is available, also `docker build gateway/` and `POISE_GATEWAY_DOCKER_TESTS=1 npx vitest run tests/docker.integration.test.ts` |
 | Documentation only | Links and examples checked by hand against the code |
 
 CI runs the Poise gates on Node 22 for pull requests and on Node 20, 22 and 24 for `main`. The gateway workflow runs its gates and builds its image on Node 22 when `gateway/` changes.

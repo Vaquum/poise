@@ -80,4 +80,4 @@ npm test
 npm run build
 ```
 
-The tests run in-process with no Docker: a fake GitHub, a fake Docker Engine API on a unix socket, and a real upstream that echoes HTTP and WebSocket traffic.
+The tests run in-process with no Docker: a fake GitHub, a fake Docker Engine API on a unix socket, and a real upstream that echoes HTTP and WebSocket traffic. The one exception is `tests/docker.integration.test.ts`. With `POISE_GATEWAY_DOCKER_TESTS=1` it creates, reaches and upgrades a workspace on the local Docker Engine, which CI does after building the image. Otherwise it is skipped.

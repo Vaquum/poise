@@ -50,3 +50,8 @@ jobs:
       - name: Build the gateway image
         working-directory: .
         run: docker build gateway/
+
+      - name: Run a workspace on the real Docker Engine
+        env:
+          POISE_GATEWAY_DOCKER_TESTS: '1'
+        run: npx vitest run tests/docker.integration.test.ts
