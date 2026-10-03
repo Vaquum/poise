@@ -18,7 +18,6 @@ from . import (
     author_content,
     chat,
     debate,
-    find_alpha,
     fix_failing_ci,
     issue_review,
     issue_simplify,
@@ -638,20 +637,6 @@ def run_debate(topic: str, rounds: int = 1, timeout_s: int = 3600):
         raise SystemExit(1)
 
 
-def run_find_alpha(topic: str, model: str, session_id: str | None = None, timeout_s: int = 3600):
-    name = CATALOG.resolve(model).identity
-    id_ = track(name, topic, actor=actor_name(), behavior="find_alpha", session_id=session_id)
-    try:
-        response = find_alpha.run(topic, model, session_id or id_[:8], timeout_s)
-        finish(id_, "completed", response=response)
-        print(json.dumps({"id": id_, "model": name, "session_id": session_id or id_[:8], "response": response}, indent=2))
-        return response
-    except Exception as e:
-        finish(id_, "failed", error=str(e))
-        print(json.dumps({"id": id_, "model": name, "session_id": session_id or id_[:8], "error": str(e)}, indent=2))
-        raise SystemExit(1)
-
-
 def run_chat(
     model: str,
     session_id: str | None,
@@ -1232,7 +1217,6 @@ behaviors:
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--note TEXT]
   --author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]
   --debate TOPIC [--rounds N]
-  --find-alpha TOPIC --model MODEL [--session ID]
   --record-turn start --model MODEL --session ID --source SOURCE [--repo OWNER/NAME --pr N] [--correlation-id ID]
   --record-turn finish CALL_ID --status completed|failed|cancelled [--error TEXT]
   --pr-stop-gate
@@ -1384,11 +1368,5 @@ def main():
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--debate":
         run_debate(sys.argv[2], int(flag_value("--rounds") or "1"))
-        return
-    if len(sys.argv) >= 3 and sys.argv[1] == "--find-alpha":
-        model = flag_value("--model")
-        if not model:
-            usage()
-        run_find_alpha(sys.argv[2], model, flag_value("--session") or flag_value("--session-id"))
         return
     usage(error="first argument must be a behavior switch")
