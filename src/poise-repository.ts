@@ -1,4 +1,4 @@
-import { repository } from '../package.json'
+import manifest from '../package.json' with { type: 'json' }
 
 /** owner/name of an HTTPS GitHub repository URL. */
 export function repositoryName(url: string): string {
@@ -9,4 +9,4 @@ export function repositoryName(url: string): string {
 
 // Poise's own repository, the one self-update releases. package.json is the
 // one place it is named, and the release policy refuses a change to it.
-export const POISE_REPOSITORY = repositoryName(repository.url)
+export const POISE_REPOSITORY = repositoryName(manifest.repository.url)
