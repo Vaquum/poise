@@ -12,6 +12,7 @@ import { delimiter, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
+import { STATUS, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 import { CATALOG } from './model-catalog-fixture'
 import { PUBLIC_HOST, PUBLIC_ORIGIN, gatewayKeys, serviceEnvironment, signAssertion } from './service-fixture'
 
@@ -53,6 +54,18 @@ else process.stdout.write('[]')
 `)
   await writeFile(join(bin, 'agent-interface'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(bin, 'fake-caller.cjs'))} "$@"\n`)
   await chmod(join(bin, 'agent-interface'), 0o755)
+
+  // Every agent CLI is a fake ahead of the real ones on PATH: the accounts
+  // and the terminal never reach a real CLI or a real login.
+  const loginPrompt = 'Open https://example.test/device and enter ABCD-1234\n'
+  await writeFakeClis(bin, home, {
+    claude: script('claude', STATUS.claudeSignedOut, { prompt: loginPrompt, afterLogin: STATUS.claudeSubscription }),
+    codex: script('codex', STATUS.codexSignedOut, { prompt: loginPrompt, afterLogin: STATUS.codexChatGpt }),
+    gh: script('gh', STATUS.ghTwoAccounts, { prompt: loginPrompt }),
+    grok: script('grok', undefined, { prompt: loginPrompt }),
+    muse: script('muse', undefined, { prompt: loginPrompt }),
+    antigravity: script('antigravity', undefined, { prompt: loginPrompt }),
+  })
 
   for (const [key, value] of Object.entries({ ...serviceEnvironment(gateway), HOME: home, PATH: `${bin}${delimiter}${process.env.PATH}`, AGENT_INTERFACE_ROOT: join(root, 'agent') })) {
     vi.stubEnv(key, value)
@@ -310,6 +323,16 @@ describe('Poise in service mode', () => {
     ] as Array<[Caller, number]>) {
       expect(await rawUpgrade('/ws/terminal', caller)).toEqual({ status, closed: true })
     }
+  })
+
+  it('answers Connected accounts to the owner\'s browser only', async () => {
+    const accounts = await send('GET', '/api/accounts', fromGateway())
+    expect(accounts.status).toBe(200)
+    expect(accounts.json.accounts.map((account: { id: string }) => account.id)).toEqual(['claude', 'codex', 'gh', 'grok', 'muse', 'antigravity'])
+    expect(accounts.json.accounts[2]).toMatchObject({ id: 'gh', installed: true, version: '2.92.0', signedIn: true, identity: 'octocat' })
+    expect((await send('GET', '/api/accounts', fromGateway('link'))).status).toBe(403)
+    expect((await send('GET', '/api/accounts', fromGateway('admin'))).status).toBe(403)
+    expect((await send('GET', '/api/accounts', { peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN })).status).toBe(401)
   })
 
   it('counts the Caller calls it launched until they finish', async () => {

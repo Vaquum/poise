@@ -29,6 +29,7 @@ import { DRAINING_ERROR, ServiceControl, handleServiceApi } from './service/cont
 import { countDebate } from './service/caller-calls'
 import { DailyModelRefresh } from './service/model-refresh'
 import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
+import { listAccounts } from './accounts'
 import type { Server } from 'node:http'
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -274,6 +275,16 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const before = auth.snapshot()
           const state = auth.startLogin()
           return json(res, before.status === 'authenticated' ? 200 : 202, state)
+        }
+
+        // ── Connected accounts: each CLI's own status command, never its
+        // credentials ──
+        if (path === '/api/accounts' && req.method === 'GET') {
+          try {
+            return json(res, 200, { accounts: await listAccounts() })
+          } catch (err: any) {
+            return json(res, 500, { error: err.message || String(err) })
+          }
         }
 
         // Activation returns immediately; progress survives closing Settings

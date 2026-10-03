@@ -101,7 +101,7 @@ export class ClaudeAuthReadinessError extends HttpError {
   }
 }
 
-function sanitizeSubscriptionType(value: unknown): string | null {
+export function sanitizeSubscriptionType(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const normalized = value.trim()
   return /^[A-Za-z0-9][A-Za-z0-9._ -]{0,31}$/.test(normalized)
@@ -109,14 +109,20 @@ function sanitizeSubscriptionType(value: unknown): string | null {
     : null
 }
 
+/** What `claude auth status --json` says when Claude Code is signed in to a
+ *  Claude subscription: the only sign-in Poise runs Claude on. */
+export function claudeSubscriptionReady(status: Record<string, unknown>): boolean {
+  return status.loggedIn === true
+    && status.authMethod === 'claude.ai'
+    && status.apiProvider === 'firstParty'
+}
+
 function parseStatusJson(raw: string): LocalAuthStatus | null {
   let value: unknown
   try { value = JSON.parse(raw) } catch { return null }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const status = value as Record<string, unknown>
-  const ready = status.loggedIn === true
-    && status.authMethod === 'claude.ai'
-    && status.apiProvider === 'firstParty'
+  const ready = claudeSubscriptionReady(status)
   return {
     ready,
     authMethod: ready ? 'claude.ai' : null,
