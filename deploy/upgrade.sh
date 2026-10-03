@@ -10,7 +10,9 @@ set -euo pipefail
 # shellcheck source=deploy/lib.sh
 . "$(dirname "$0")/lib.sh"
 
-report_workspaces() {
+# What the gateway will do with each workspace now that IMAGE is new, said the
+# moment the image is built: the gateway may start on one right after.
+plan_workspaces() {
   local image=$1 image_id ids lines handle id running drain outdated=0
   image_id=$(docker image inspect --format '{{.Id}}' "$image")
   drain=$(env_value POISE_DRAIN_TIMEOUT)
@@ -59,8 +61,9 @@ require_env_file
 image=$(runtime_image)
 sha=$(source_sha)
 build_runtime_image "$image" "$sha"
+plan=$(plan_workspaces "$image")
 say "Recreating what changed."
 compose up --detach --build
 reattach_gateway
 wait_for_gateway
-report_workspaces "$image"
+say "$plan"
