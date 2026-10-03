@@ -16,6 +16,7 @@ from agent_interface.atoms import AgentPreflightError
 from agent_interface.model_catalog import CATALOG, ModelCatalogError
 
 REPO = "Vaquum/Origo"
+ACTOR = "bit-mis"
 
 
 def issue(number: int, **extra) -> dict:
@@ -36,6 +37,8 @@ class FakeGitHub:
 
     def __call__(self, *args: str, seconds: float = 120) -> dict:
         self.calls.append(args)
+        # Every call acts as the actor, never as whatever account is configured.
+        assert args[args.index("--token-user") + 1] == ACTOR, args
         flag = args[0]
         if flag == "--read-issue":
             number = int(args[1].lstrip("#"))
@@ -82,6 +85,7 @@ class IssueReviewCase(TestCase):
             patch.object(agent_interface, "DB", data / "calls.sqlite3"),
             patch.object(agent_interface, "RESPONSES", data / "responses"),
             patch.object(issue_review, "WORK_ROOT", data / "runs"),
+            patch.dict(os.environ, {"GITHUB_INTERFACE_AGENT_USER": ACTOR}),
         ):
             target.start()
             self.addCleanup(target.stop)
@@ -125,8 +129,11 @@ class TestIssueReviewRun(IssueReviewCase):
         self.assertEqual(printed["receipts"], exported["receipts"])
 
         posted = [call for call in github.calls if call[0] == "--comment-issue"]
-        self.assertEqual([call[1:4] for call in posted], [("#452", "--repository", REPO), ("#453", "--repository", REPO)])
-        first = posted[0][4]
+        self.assertEqual([call[1:6] for call in posted], [("#452", "--repository", REPO, "--token-user", ACTOR),
+                                                           ("#453", "--repository", REPO, "--token-user", ACTOR)])
+        self.assertEqual({call[0] for call in github.calls},
+                         {"--read-issue", "--issue-comments", "--sub-issues", "--checkout-repo", "--comment-issue"})
+        first = posted[0][6]
         self.assertTrue(first.startswith("--body=The PRD skips the 72-hour clear window.\n\nAlso: the fingerprint"))
         self.assertIn("`opus-5-max`", first)
         self.assertIn(f"call={row['id']}", first)
@@ -175,15 +182,34 @@ class TestIssueReviewRun(IssueReviewCase):
         self.assertIn("posted 1 of 2", row["error"])
         self.assertEqual([r["comment_id"] for r in self.exported(row)["receipts"]], [9453])
 
-    def test_an_actor_that_is_not_the_commenting_account_is_refused_before_anything_runs(self):
+    def refused(self, actor: str) -> tuple[dict, FakeGitHub]:
         github = FakeGitHub()
         with patch.object(issue_review, "interface", github), patch.object(issue_review, "supervise", agent_writes(None)), \
                 redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
-            agent_interface.run_issue_review(f"{REPO}#452", "someone-else", "poise:review-new-issues", "claim-1", "opus-5-max")
+            agent_interface.run_issue_review(f"{REPO}#452", actor, "poise:review-new-issues", "claim-1", "opus-5-max")
         with agent_interface.db() as conn:
             row = conn.execute("select * from calls where correlation_id='claim-1'").fetchone()
+        return row, github
+
+    def test_an_actor_that_is_not_the_agent_account_is_refused_before_anything_runs(self):
+        row, github = self.refused("someone-else")
         self.assertEqual((row["status"], row["action"], row["outcome"], row["error_code"]), ("failed", "not_started", "preflight_failed", "actor_mismatch"))
+        self.assertIn(f"posted as the agent account {ACTOR}; --actor someone-else", row["error"])
         self.assertEqual(github.calls, [])
+
+    def test_without_a_configured_agent_account_nothing_runs(self):
+        with patch.dict(os.environ, {"GITHUB_INTERFACE_AGENT_USER": ""}):
+            row, github = self.refused(ACTOR)
+        self.assertEqual((row["status"], row["action"], row["outcome"], row["error_code"]),
+                         ("failed", "not_started", "preflight_failed", "agent_account_missing"))
+        self.assertIn("GITHUB_INTERFACE_AGENT_USER is not set", row["error"])
+        self.assertEqual(github.calls, [])
+
+    def test_the_agent_account_matches_whatever_its_case(self):
+        supervise = agent_writes({"comments": [{"issue": "#452", "body": "One."}]})
+        with patch.dict(os.environ, {"GITHUB_INTERFACE_AGENT_USER": ACTOR.upper()}):
+            row, _ = self.run_review(FakeGitHub(), supervise)
+        self.assertEqual(row["status"], "completed")
 
     def test_a_comment_posted_by_another_account_fails_the_run(self):
         supervise = agent_writes({"comments": [{"issue": "#452", "body": "One."}]})
@@ -227,7 +253,7 @@ class TestPacket(IssueReviewCase):
             {"repository": REPO, "issue_number": 455, "via": ["work_slices"]},
         ], unreadable={455})
         with patch.object(issue_review, "interface", github):
-            data = issue_review.packet(REPO, 452)
+            data = issue_review.packet(REPO, 452, ACTOR)
         self.assertEqual(data["issue"]["issue"], f"{REPO}#452")
         self.assertEqual(data["issue"]["comments"][0]["author"], "zero-bang")
         self.assertEqual([sub["issue"] for sub in data["sub_issues"]], [f"{REPO}#453", f"{REPO}#455"])
@@ -237,10 +263,10 @@ class TestPacket(IssueReviewCase):
     def test_a_pull_request_or_an_oversized_packet_is_refused(self):
         github = FakeGitHub()
         with patch.object(issue_review, "interface", github), self.assertRaises(AgentPreflightError):
-            issue_review.packet(REPO, 454)
+            issue_review.packet(REPO, 454, ACTOR)
         github.issues[452]["body"] = "x" * (issue_review.MAX_PACKET_BYTES + 1)
         with patch.object(issue_review, "interface", github), self.assertRaises(AgentPreflightError) as raised:
-            issue_review.packet(REPO, 452)
+            issue_review.packet(REPO, 452, ACTOR)
         self.assertEqual(raised.exception.code, "review_packet_too_large")
 
 
@@ -276,8 +302,8 @@ class TestSubIssuesReviewedOnce(IssueReviewCase):
         self.earlier_review("d" * 32, 458, running_since=time.time() - 60)
         self.earlier_review("e" * 32, 459, running_since=time.time() - 3 * issue_review.TIMEOUT_SECONDS)
         with patch.object(issue_review, "interface", github):
-            data = issue_review.packet(REPO, 452)
-        issue_review.mark_reviewed(data, agent_interface._issue_review_targets, agent_interface._running_issue_reviews("f" * 32))
+            data = issue_review.packet(REPO, 452, ACTOR)
+        issue_review.mark_reviewed(data, ACTOR, agent_interface._issue_review_targets, agent_interface._running_issue_reviews("f" * 32))
         self.assertEqual({sub["issue"]: sub.get("reviewed_by") for sub in data["sub_issues"]}, {
             f"{REPO}#453": f"{REPO}#453", f"{REPO}#455": None, f"{REPO}#456": "another issue", f"{REPO}#457": None,
             f"{REPO}#458": f"{REPO}#458", f"{REPO}#459": None,

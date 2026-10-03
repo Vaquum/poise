@@ -12,6 +12,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import type { SelfUpdateBridge } from '../server/self-update-bridge'
 import type { PreparedSelfChange, SelfChange, SelfUpdateStatus } from '../src/self-update-types'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
+import { POISE_REPOSITORY as REPOSITORY } from '../src/poise-repository'
 
 let root = ''
 
@@ -121,7 +122,7 @@ function fakeBridge(configured = true): FakeBridge {
 }
 
 function change(id: string, sessionId: string, instance: string): SelfChange {
-  return { id, sessionId, instance, request: 'r', title: 't', repository: 'mikkokotila/Poise', branch: `poise/change-${id}`, baseSha: 'a'.repeat(40), state: 'live', createdAt: 'now', updatedAt: 'now', releaseId: 'rel-2', previousReleaseId: 'rel-1', canRevert: true }
+  return { id, sessionId, instance, request: 'r', title: 't', repository: REPOSITORY, branch: `poise/change-${id}`, baseSha: 'a'.repeat(40), state: 'live', createdAt: 'now', updatedAt: 'now', releaseId: 'rel-2', previousReleaseId: 'rel-1', canRevert: true }
 }
 
 describe('self-update routes', () => {

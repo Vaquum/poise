@@ -12,20 +12,20 @@ from .store import build_user, init_org, sync_loop, sync_once
 
 
 HELP = """\
-Vaquum GitHub Datastore.
+GitHub Datastore.
 
 Consumer contract:
   github-datastore view pr
   github-datastore view issue
-  github-datastore view user --username mikkokotila
+  github-datastore view user --username LOGIN
   github-datastore health --max-age-seconds 120
 
 Python:
   from github_datastore import store
   views = store.views
   views.pr(status="open")
-  views.issue(author="mikkokotila", output="csv")
-  views.user(username="mikkokotila", item_type="pr")
+  views.issue(author="LOGIN", output="csv")
+  views.user(username="LOGIN", item_type="pr")
 
 Views:
   pr     PR rows: repo, number, status, author, times, title, url, refs, counts.
@@ -46,7 +46,7 @@ Default DB:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="github-datastore",
-        description="Vaquum GitHub Datastore.",
+        description="GitHub Datastore.",
         epilog=HELP.format(default_db=DEFAULT_DB),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

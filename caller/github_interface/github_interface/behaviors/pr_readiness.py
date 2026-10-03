@@ -5,6 +5,9 @@ from github_interface.client import GitHubClient
 from github_interface.context import expected_head
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository
+from github_interface.identity import PERSON
+
+IDENTITY = PERSON
 
 
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:

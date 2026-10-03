@@ -2,6 +2,8 @@ from importlib import import_module
 from typing import Any
 
 from .client import GitHubClient
+from .context import token_user
+from .identity import account
 
 
 class UnknownBehavior(ValueError):
@@ -23,11 +25,16 @@ async def run_behavior(name: str, payload: dict[str, Any]) -> Any:
     if not hasattr(module, "run"):
         raise UnknownBehavior(name)
 
-    if getattr(module, "REQUIRE_TOKEN_USER", False) and not payload.get("token_user"):
-        raise ValueError("token-user is required")
-    client = None if getattr(module, "NO_AUTH", False) else GitHubClient(
-        user=payload.get("token_user") or getattr(module, "TOKEN_USER", None) or payload.get("user")
-    )
+    if getattr(module, "NO_AUTH", False):
+        client = None
+    elif getattr(module, "REQUIRE_TOKEN_USER", False):
+        # The account is part of what these check — the reviewer's own
+        # reviews and threads — so every call names it.
+        if not payload.get("token_user"):
+            raise ValueError("token-user is required")
+        client = GitHubClient(user=token_user(payload))
+    else:
+        client = GitHubClient(user=account(module.IDENTITY, payload))
     return await module.run(client, payload)
 
 

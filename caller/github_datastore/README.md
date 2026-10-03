@@ -11,19 +11,25 @@ Each database indexes only repositories owned by that account and visible to the
 ## Commands
 
 ```bash
-github-datastore init-org Vaquum
-github-datastore init-org Vaquum --resume
-github-datastore init-org Vaquum --include-repos limen,design-system,backtest_simulator,experiment_runner,praxis,nexus,tdw-control-plane,confab,agent0
-github-datastore build-user mikkokotila
+github-datastore init-org ORG
+github-datastore init-org ORG --resume
+github-datastore init-org ORG --include-repos repo-a,repo-b
+github-datastore build-user LOGIN
 github-datastore sync
 github-datastore sync --reconcile --reconcile-sleep 17
 github-datastore sync --loop --interval 60
 github-datastore view pr --status open --format json
-github-datastore view issue --author mikkokotila --format csv
-github-datastore view user --username mikkokotila --item-type pr --limit 20
+github-datastore view issue --author LOGIN --format csv
+github-datastore view user --username LOGIN --item-type pr --limit 20
 ```
 
 `github-datastore` and `python3 -m github_datastore` work from any directory on this host.
+Every command takes `--db PATH`; without it the database is
+`$XDG_DATA_HOME/github-datastore/github_datastore.sqlite`
+(`~/.local/share/github-datastore/github_datastore.sqlite` when `XDG_DATA_HOME`
+is unset). GitHub is read through `gh` only as the account whose token
+`GH_TOKEN` holds (for example `GH_TOKEN=$(gh auth token --user LOGIN)`), never
+gh's active account; without it, the commands that read GitHub fail.
 
 ## Trust Rule
 
@@ -60,8 +66,8 @@ from github_datastore import store
 views = store.views
 
 views.pr(status="open")
-views.issue(author="mikkokotila", created_since_datetime="2026-01-01T00:00:00Z")
-views.user(username="mikkokotila", item_type="pr", updated_since_datetime="2026-05-01T00:00:00Z")
+views.issue(author="LOGIN", created_since_datetime="2026-01-01T00:00:00Z")
+views.user(username="LOGIN", item_type="pr", updated_since_datetime="2026-05-01T00:00:00Z")
 ```
 
 Output is JSON by default. Use `output="csv"` for CSV.

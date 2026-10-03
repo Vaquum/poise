@@ -2,39 +2,36 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 from .chat import STALE_SESSION, get_session, run_session, set_session, stable_uuid
 from .model_catalog import CATALOG
 
-VOICE_REF = "4e8bada538c46c817fed4d51a1b4282379e6d540"
-VOICE_PATH = "Voice-Addendum.md"
-VOICE_PERMALINK = f"https://github.com/Vaquum/design-system/blob/{VOICE_REF}/{VOICE_PATH}"
-SYSTEM = "Author content in the provided voice. Use no tools."
+VOICE_GUIDE_ENV = "AGENT_INTERFACE_VOICE_GUIDE"
 
 
-def voice() -> str:
-    done = subprocess.run(
-        [
-            "gh",
-            "api",
-            "-H",
-            "Accept: application/vnd.github.raw",
-            f"repos/Vaquum/design-system/contents/{VOICE_PATH}?ref={VOICE_REF}",
-        ],
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    if done.returncode:
-        raise RuntimeError((done.stderr or done.stdout).strip() or f"voice fetch exited {done.returncode}")
-    return done.stdout.strip()
+def voice_guide(path: str | None = None) -> Path | None:
+    """The voice guide to write in: `path`, else AGENT_INTERFACE_VOICE_GUIDE.
+    None when neither names one; the content is then written without one."""
+    raw = (path or os.getenv(VOICE_GUIDE_ENV, "")).strip()
+    return Path(raw).expanduser() if raw else None
 
 
-def prompt(topic: str, note: str = "") -> str:
-    return f"Voice source: {VOICE_PERMALINK}\n\nVoice:\n{voice()}\n\nTopic:\n{topic}\n\n{note}\n\nReturn only the authored content."
+def voice(guide: Path) -> str:
+    text = guide.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"voice guide is empty: {guide}")
+    return text
 
 
-def run(topic: str, pwd: str | None = None, session_id: str | None = None, note: str = "", timeout_s: int = 3600) -> str:
+def prompt(topic: str, note: str = "", guide: str = "") -> str:
+    voice_section = f"Voice:\n{guide}\n\n" if guide else ""
+    return f"{voice_section}Topic:\n{topic}\n\n{note}\n\nReturn only the authored content."
+
+
+def run(topic: str, pwd: str | None = None, session_id: str | None = None, note: str = "", timeout_s: int = 3600,
+        guide: Path | None = None) -> str:
+    text = voice(guide) if guide else ""
     model = CATALOG.behavior("author_content")
     session_model = f"{model.identity}:author-content"
     provider = get_session(session_id, session_model) if session_id else None
@@ -53,8 +50,8 @@ def run(topic: str, pwd: str | None = None, session_id: str | None = None, note:
         "--tools",
         "",
         "--system-prompt",
-        SYSTEM,
-        prompt(topic, note),
+        "Author content in the provided voice. Use no tools." if text else "Author the content. Use no tools.",
+        prompt(topic, note, text),
     ]
 
     def invoke(args: list[str]) -> subprocess.CompletedProcess:

@@ -75,7 +75,8 @@ The bootstrap itself changes release authority, so review and merge its PR
 manually. Let the ordinary managed updater install that version first. It must
 be serving the same compiled SHA as its clean managed source checkout.
 
-Provide a dedicated GitHub credential restricted to **mikkokotila/Poise**, with
+Provide a dedicated GitHub credential restricted to Poise's own repository —
+the one `package.json` names, **autonomio/poise** — with
 repository contents and pull-request write permission, and Actions/checks read
 access. Keep it in a private user-owned file, not in chat, source, an agent
 environment, or a command argument containing the token value. The controller

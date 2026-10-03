@@ -5,8 +5,9 @@ from github_interface.atoms.pulls import get_combined_status, get_pull, list_che
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository
+from github_interface.identity import AGENT
 
-TOKEN_USER = "bit-mis"
+IDENTITY = AGENT
 OK_CHECKS = {"success", "neutral", "skipped"}
 
 

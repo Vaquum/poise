@@ -12,8 +12,9 @@ Enable it once using `npm run self-update:enable -- --token-file <path>`
 (see `docs/Self-improvement.md`). The installer journals the bootstrap and
 preserves the running service and Caller pin. It requires a config file with
 `enabled: true` and a separate, `chmod 600` token file holding a fine-grained
-GitHub token scoped to `mikkokotila/Poise` only. It never reads `gh`
-credentials, `GH_TOKEN` or `GITHUB_TOKEN`.
+GitHub token scoped to Poise's own repository only — the one `package.json`
+names in `repository`, `autonomio/poise`. It never reads `gh` credentials,
+`GH_TOKEN` or `GITHUB_TOKEN`.
 
 ## Layout of the root (`$POISE_SELF_UPDATE_ROOT`, default `~/.poise/self-update`, mode 0700)
 
@@ -31,7 +32,7 @@ credentials, `GH_TOKEN` or `GITHUB_TOKEN`.
 | `releases/<id>/` | Immutable release: full clone at the exact SHA, `node_modules`, `dist/`, `release.json`. Never built in place; staged as `.<id>.staging` and renamed. |
 | `workspaces/<changeId>/` | Isolated clone the agent works in (branch `poise/change-<uuid>` off the active SHA). |
 | `logs/` | Captured stdout/stderr of every `npm ci` / `npm run check` / build, per change or release. |
-| `controller/` | Trusted copy of these modules (`cli.mjs install-controller`); launchd should run `controller/daemon.mjs` and `controller/launch.mjs`, never a checkout. |
+| `controller/` | Trusted copy of these modules (`cli.mjs install-controller`); launchd should run `controller/daemon.mjs` and `controller/launch.mjs`, never a checkout. Its `repository.mjs` carries the repository fixed at install, since no `package.json` sits beside it. |
 
 ## `config.json`
 
@@ -39,7 +40,7 @@ credentials, `GH_TOKEN` or `GITHUB_TOKEN`.
 {
   "version": 1,
   "enabled": false,
-  "repository": "mikkokotila/Poise",
+  "repository": "autonomio/poise",
   "branch": "main",
   "tokenFile": "/Users/you/.poise/self-update/release-token",
   "bridgeKeyFile": "/Users/you/.poise/self-update/bridge.key",

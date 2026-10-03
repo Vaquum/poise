@@ -1,7 +1,7 @@
 // Controller configuration and the release token. The controller is disabled
 // until an operator writes this file by hand (or through the bootstrap
 // helpers) with `enabled: true` and points it at a token file that holds a
-// fine-grained token scoped to mikkokotila/Poise alone. The user's `gh`
+// fine-grained token scoped to Poise's own repository alone. The user's `gh`
 // login, GH_TOKEN and GITHUB_TOKEN are never consulted: a controller that
 // silently borrowed the operator's credentials would be a controller that
 // could merge into any repository the operator can.

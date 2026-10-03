@@ -1,4 +1,4 @@
-// Client-side cache of server settings (org, me, timezone).
+// Client-side cache of server settings (org, me, agent account, timezone).
 // Loaded once at startup from /api/settings, refreshed whenever the user saves
 // in the Settings panel.
 
@@ -21,6 +21,8 @@ export interface AppSettings {
   org: string
   organizations?: Organization[]
   me: string
+  // The GitHub user reviews and comments are posted as.
+  agentAccount?: string
   timezone: string
   // Per place that launches a model (chat, editor, pr_review, pr_approve):
   // the identities picked as default and fallback. Absent = Caller default.

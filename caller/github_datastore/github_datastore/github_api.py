@@ -342,6 +342,10 @@ class GitHubClient:
 
         last_error = ""
         environment = os.environ.copy()
+        # Several accounts can be signed in to gh; the datastore reads GitHub
+        # only as the account whose token it is given, never gh's active one.
+        if not environment.get("GH_TOKEN", "").strip():
+            raise GitHubApiError("GH_TOKEN is not set: github-datastore reads GitHub only as the account whose token it is given")
         for attempt in range(1, self.attempts + 1):
             if self._rate_limit_error is not None and time.time() < self._rate_limit_error.reset_at:
                 raise self._rate_limit_error
