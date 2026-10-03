@@ -11,6 +11,9 @@ describes how the gateway, the workspaces, Poise and the Poise Link desktop
 companion fit together. The rest of this README describes the Poise application
 itself, which still runs on a single computer for development.
 
+Poise Link, the desktop companion in `link/`, keeps Espanso's snippets in sync
+and shows Poise alerts as native notifications; see [Poise Link](docs/Poise-Link.md).
+
 ## Capabilities
 
 - **Current** — manual idea/concept/plan cards beside live issues and PRs.
