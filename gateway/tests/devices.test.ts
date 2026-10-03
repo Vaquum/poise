@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import WebSocket from 'ws'
 import { APEX, startHarness, verifyAssertion, workspaceHost, type Harness, type Reply } from './harness.js'
 
 const ALICE = workspaceHost('alice')
@@ -31,6 +32,24 @@ async function decide(h: Harness, apexCookie: string, userCode: string, decision
     host: APEX, method: 'POST', path: '/link',
     headers: { cookie: apexCookie, origin: `https://${APEX}`, 'content-type': FORM },
     body: new URLSearchParams({ csrf: csrfOf(page), user_code: userCode, decision }).toString(),
+  })
+}
+
+/** What Poise Link relies on: 401 with a JSON reason, never 403 and never a redirect. */
+function expectDeviceRefusal(reply: Reply, error: string): void {
+  expect(reply.status, error).toBe(401)
+  expect(reply.headers.location).toBeUndefined()
+  expect(reply.headers['www-authenticate']).toBe('Bearer error="invalid_token"')
+  expect(reply.headers['content-type']).toContain('application/json')
+  expect(reply.json()).toMatchObject({ error })
+}
+
+/** A Link API call dressed as a browser navigation, which would otherwise be redirected to sign-in. */
+function linkCall(h: Harness, host: string, token: string): Promise<Reply> {
+  return h.request({
+    host,
+    path: '/api/link/events',
+    headers: { authorization: `Bearer ${token}`, 'sec-fetch-mode': 'navigate', accept: 'text/html' },
   })
 }
 
@@ -167,15 +186,14 @@ describe('device pairing', () => {
     expect(revoked.headers.location).toBe('/link/devices')
 
     const after = await h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })
-    expect(after.status).toBe(401)
-    expect(after.json()).toMatchObject({ error: 'invalid_token' })
+    expectDeviceRefusal(after, 'device_revoked')
   })
 
   it('keeps a device to the workspace that paired it and to its owner\'s device list', async () => {
     const token = await pair(h, alice.apexCookie)
     const bob = await h.openWorkspace('bob')
     const crossed = await h.request({ host: BOB, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })
-    expect(crossed.status).toBe(403)
+    expectDeviceRefusal(crossed, 'device_unknown')
 
     const aliceDevice = h.store.listDevices('alice')[0]
     const bobList = await h.request({ host: APEX, path: '/link/devices', headers: { cookie: bob.apexCookie } })
@@ -200,9 +218,7 @@ describe('device pairing', () => {
     }
     // Still in use, but 365 days old.
     h.advance(17 * day)
-    const old = await hello()
-    expect(old.status).toBe(401)
-    expect(old.json()).toMatchObject({ error: 'invalid_token' })
+    expectDeviceRefusal(await hello(), 'device_expired')
 
     // A year on, alice signs in again to pair a second device, then leaves it unused.
     const { apexCookie } = await h.signIn('Alice')
@@ -211,6 +227,80 @@ describe('device pairing', () => {
     expect((await h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: `Bearer ${idle}` } })).status).toBe(401)
     const list = await h.request({ host: APEX, path: '/link/devices', headers: { cookie: (await h.signIn('Alice')).apexCookie } })
     expect(list.body.match(/Expired; pair it again/g)).toHaveLength(2)
+  })
+
+  it('answers every unusable device token with 401 and a reason, never 403 or a redirect', async () => {
+    const day = 24 * 60 * 60_000
+    expectDeviceRefusal(await linkCall(h, ALICE, 'never-issued'), 'device_unknown')
+
+    const elsewhere = await pair(h, alice.apexCookie)
+    await h.openWorkspace('bob')
+    expectDeviceRefusal(await linkCall(h, BOB, elsewhere), 'device_unknown')
+
+    const revoked = await pair(h, alice.apexCookie)
+    expect(h.store.revokeDevice('alice', h.store.findDeviceByToken(revoked)?.id ?? '')).toBe(true)
+    expectDeviceRefusal(await linkCall(h, ALICE, revoked), 'device_revoked')
+
+    const idle = await pair(h, alice.apexCookie)
+    h.advance(31 * day)
+    expectDeviceRefusal(await linkCall(h, ALICE, idle), 'device_expired')
+
+    // Removed from the allow list without being disabled: the device survives, the access does not.
+    h.store.addAllowed('mallory', 'root')
+    const mallory = await h.openWorkspace('mallory')
+    const malloryToken = await pair(h, mallory.apexCookie)
+    h.store.removeAllowed('mallory')
+    expectDeviceRefusal(await linkCall(h, workspaceHost('mallory'), malloryToken), 'access_removed')
+
+    // Disabling revokes every device; a device that somehow outlived it still meets the per-request flag.
+    const fresh = await h.signIn('Alice')
+    const before = await pair(h, fresh.apexCookie)
+    h.store.disableUser('alice', 'root')
+    expectDeviceRefusal(await linkCall(h, ALICE, before), 'device_revoked')
+    const code = h.store.createDeviceCode(null, 60_000, 5)
+    h.store.decideDeviceCode(code.userCode, 'alice', true)
+    const outlived = h.store.pollDeviceCode(code.deviceCode, 5)
+    expect(outlived.issued).toBe(true)
+    expectDeviceRefusal(await linkCall(h, ALICE, outlived.issued ? outlived.token : ''), 'user_disabled')
+
+    const upgrade = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${h.port}/api/link/events`, { headers: { host: ALICE, authorization: `Bearer ${revoked}` } })
+      socket.on('unexpected-response', (_req, res) => {
+        let body = ''
+        res.on('data', (chunk: Buffer) => {
+          body += chunk.toString('utf8')
+        })
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body }))
+      })
+      socket.on('error', reject)
+    })
+    expect(upgrade.status).toBe(401)
+    expect(JSON.parse(upgrade.body)).toMatchObject({ error: 'device_revoked' })
+    expect(h.workspace.requests).toHaveLength(0)
+  })
+
+  it('answers the token endpoint with exactly the documented RFC 8628 errors', async () => {
+    const answers: Array<[string, Reply]> = []
+    const code = await requestCode(h)
+    answers.push(['authorization_pending', await poll(h, code.device_code)])
+    answers.push(['slow_down', await poll(h, code.device_code)])
+    const denied = await requestCode(h)
+    await decide(h, alice.apexCookie, denied.user_code, 'deny')
+    answers.push(['access_denied', await poll(h, denied.device_code)])
+    const approved = await requestCode(h)
+    await decide(h, alice.apexCookie, approved.user_code, 'approve')
+    expect((await poll(h, approved.device_code)).status).toBe(200)
+    answers.push(['invalid_grant', await poll(h, approved.device_code)])
+    answers.push(['invalid_grant', await poll(h, 'never-issued')])
+    h.advance(15 * 60_000 + 1000)
+    answers.push(['expired_token', await poll(h, code.device_code)])
+    for (const [error, reply] of answers) {
+      expect(reply.status, error).toBe(400)
+      expect(reply.json(), error).toEqual({ error })
+    }
+    const malformed = await h.request({ host: APEX, method: 'POST', path: '/link/device/token', body: '{}' })
+    expect(malformed.status).toBe(400)
+    expect(malformed.json()).toEqual({ error: 'invalid_request', error_description: 'Send {"device_code": "..."} as JSON.' })
   })
 
   it('lets a session try only ten codes in fifteen minutes', async () => {

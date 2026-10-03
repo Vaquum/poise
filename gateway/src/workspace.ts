@@ -10,7 +10,7 @@ import { deviceState, hashSecret, type Session, type User } from './store.js'
 
 type Authentication =
   | { kind: 'ok'; scope: 'browser' | 'link' }
-  | { kind: 'unauthenticated'; bearer: boolean; message: string }
+  | { kind: 'unauthenticated'; bearer: boolean; error: string; message: string }
   | { kind: 'forbidden'; message: string }
 
 const ACCESS_REMOVED = 'Your access to this Poise has been removed. Ask an admin.'
@@ -45,20 +45,25 @@ function ownSession(ctx: Context, req: IncomingMessage, owner: User): Session | 
   return ctx.workspaceSessions(req).find((session) => isOwnSession(session, owner)) ?? null
 }
 
-/** Who is asking, judged only by credentials for this host: the owner's session or one of their devices. */
+/**
+ * Who is asking, judged only by credentials for this host: the owner's session or one of their devices.
+ * Every unusable device token is a 401 with a reason, never a 403 or a redirect: Poise Link treats any
+ * 401 as "sign out and pair again".
+ */
 function authenticate(ctx: Context, req: IncomingMessage, owner: User): Authentication {
   const { store } = ctx.deps
   const authorization = header(req, 'authorization')
   if (/^bearer(\s|$)/i.test(authorization)) {
-    if (!isLinkPath(req.url ?? '')) {
-      return { kind: 'unauthenticated', bearer: true, message: 'Device tokens are accepted only for /api/link/*.' }
-    }
+    const refused = (error: string, message: string): Authentication => ({ kind: 'unauthenticated', bearer: true, error, message })
+    if (!isLinkPath(req.url ?? '')) return refused('invalid_token', 'Device tokens are accepted only for /api/link/*.')
     const device = store.findDeviceByToken(authorization.slice('bearer'.length).trim())
-    if (!device || deviceState(device, ctx.deps.now()) !== 'active') {
-      return { kind: 'unauthenticated', bearer: true, message: 'This device token is not valid or has expired. Pair the device again.' }
-    }
-    if (device.handle !== owner.handle) return { kind: 'forbidden', message: 'This device is paired with another workspace.' }
-    if (!ctx.isAllowed(owner)) return { kind: 'forbidden', message: ACCESS_REMOVED }
+    // A token paired with another workspace is as unknown here as one never issued.
+    if (!device || device.handle !== owner.handle) return refused('device_unknown', 'This device token is not known here. Pair the device again.')
+    const state = deviceState(device, ctx.deps.now())
+    if (state === 'revoked') return refused('device_revoked', 'This device was revoked. Pair it again.')
+    if (state === 'expired') return refused('device_expired', 'This device token has expired. Pair the device again.')
+    if (owner.disabledAt !== null) return refused('user_disabled', 'This account has been disabled by an admin.')
+    if (!ctx.isAllowed(owner)) return refused('access_removed', ACCESS_REMOVED)
     store.touchDevice(device.id)
     return { kind: 'ok', scope: 'link' }
   }
@@ -67,18 +72,18 @@ function authenticate(ctx: Context, req: IncomingMessage, owner: User): Authenti
     return ctx.isAllowed(owner) ? { kind: 'ok', scope: 'browser' } : { kind: 'forbidden', message: ACCESS_REMOVED }
   }
   if (sessions.length > 0) return { kind: 'forbidden', message: 'This workspace belongs to someone else.' }
-  return { kind: 'unauthenticated', bearer: false, message: 'Sign in to use this workspace.' }
+  return { kind: 'unauthenticated', bearer: false, error: 'unauthorized', message: 'Sign in to use this workspace.' }
 }
 
 function refuse(ctx: Context, req: IncomingMessage, res: ServerResponse, owner: User, auth: Exclude<Authentication, { kind: 'ok' }>): void {
   if (auth.kind === 'unauthenticated') {
     if (auth.bearer) {
-      sendJson(res, 401, { error: 'invalid_token', message: auth.message }, { 'www-authenticate': 'Bearer error="invalid_token"' })
+      sendJson(res, 401, { error: auth.error, message: auth.message }, { 'www-authenticate': 'Bearer error="invalid_token"' })
     } else if (isNavigation(req)) {
       const back = `${ctx.workspaceOrigin(owner.handle)}${req.url ?? '/'}`
       redirect(res, `${ctx.apexOrigin}/auth/login?next=${encodeURIComponent(back)}`)
     } else {
-      sendJson(res, 401, { error: 'unauthorized', message: `${auth.message} Sign in at ${ctx.apexOrigin}/.` })
+      sendJson(res, 401, { error: auth.error, message: `${auth.message} Sign in at ${ctx.apexOrigin}/.` })
     }
     return
   }
@@ -221,7 +226,7 @@ export async function workspaceUpgrade(ctx: Context, req: IncomingMessage, socke
   }
   const auth = authenticate(ctx, req, owner)
   if (auth.kind === 'unauthenticated') {
-    rejectUpgrade(socket, 401, { error: auth.bearer ? 'invalid_token' : 'unauthorized', message: auth.message },
+    rejectUpgrade(socket, 401, { error: auth.error, message: auth.message },
       auth.bearer ? { 'www-authenticate': 'Bearer error="invalid_token"' } : {})
     return
   }
