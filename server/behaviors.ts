@@ -69,6 +69,7 @@ import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { resolveReviewCheckout } from './review-checkout'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
 import { withProcessLock } from './process-lock'
+import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { getReviewAgentUsername, setReviewAgentUsername } from './gh'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 
@@ -186,8 +187,7 @@ function listBehaviorIncidents(limit = 50) {
 // cwd's last two path parts when no git remote is found.
 const GH_INTERFACE_CWD_ROOT = join(tmpdir(), 'poise-gh-interface')
 function agentInterfaceCwd(): string {
-  return process.env.AGENT_INTERFACE_ROOT
-    || join(homedir(), 'dev', 'caller', 'agent_interface')
+  return agentInterfaceRoot()
 }
 
 function behaviorProcessLockPath(behavior: BehaviorKey): string {

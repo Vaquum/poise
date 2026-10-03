@@ -5,14 +5,10 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { productionUpdatePath, readProductionUpdate, writeProductionUpdate } from './production-update.mjs'
-import { configureStopGate, stopGateIsCurrent } from './stop-gate-runtime.mjs'
+import { configureStopGate, stopGateIsCurrent, stopGateManifest } from './stop-gate-runtime.mjs'
 
 const scriptPath = fileURLToPath(import.meta.url)
 const projectRoot = await realpath(fileURLToPath(new URL('..', import.meta.url)))
-const callerRelease = JSON.parse(await readFile(
-  join(projectRoot, 'config', 'caller-release.json'),
-  'utf8',
-))
 const packageDocument = JSON.parse(await readFile(join(projectRoot, 'package.json'), 'utf8'))
 const poiseRepository = packageDocument.repository?.url
 const healthUrl = process.env.POISE_HEALTH_URL || 'http://127.0.0.1:5555/api/health'
@@ -42,16 +38,15 @@ function output(command, args, options = {}) {
   })
 }
 
-async function callerHealth() {
+async function callerReady() {
   try {
     const response = await fetch(healthUrl, { signal: AbortSignal.timeout(5_000) })
     const health = await response.json()
-    const commit = health?.callerRelease?.actualCommit?.toLowerCase()
-    if (health?.callerRelease?.status === 'ready' && validCommit(commit)) return commit
+    return health?.callerRelease?.status === 'ready'
   } catch {
     // The installer repairs an unavailable or invalid runtime.
+    return false
   }
-  return null
 }
 
 async function productionInstall(run) {
@@ -64,17 +59,9 @@ async function productionInstall(run) {
   })
 }
 
-async function datastoreServicesCurrent({ home, commit }) {
-  const executable = join(
-    home,
-    '.poise',
-    'releases',
-    'caller',
-    commit,
-    'venv',
-    'bin',
-    'github-datastore',
-  )
+// The legacy datastore jobs must run this checkout's github-datastore.
+export async function datastoreServicesCurrent({ home, binRoot }) {
+  const executable = join(binRoot, 'github-datastore')
   const launchAgents = join(home, 'Library', 'LaunchAgents')
   const labels = [
     'com.vaquum.github-datastore.sync',
@@ -124,7 +111,6 @@ export async function reconcileRuntime(options = {}) {
       remote: null,
       behind: null,
     },
-    caller: validCommit(previous?.caller) ? previous.caller : null,
   }
   try {
     // A managed release controller is the only promoter once opted in. Even
@@ -138,7 +124,6 @@ export async function reconcileRuntime(options = {}) {
       state.poise.deployed = requireCommit(managed.activeRelease.sha, 'Active release')
       state.poise.installed = state.poise.deployed
       state.poise.remote = managed.hold?.sha || managed.remoteSha || state.poise.deployed
-      state.caller = managed.activeRelease.callerSha || state.caller
       if (managed.hold) throw new Error(`Automatic promotion held: ${managed.hold.reason}`)
       state.status = 'current'
       state.action = 'managed-self-update'
@@ -178,9 +163,9 @@ export async function reconcileRuntime(options = {}) {
 async function reconcile(options) {
   const root = options.projectRoot || projectRoot
   const { home, run, previous, state } = options
-  const release = options.callerRelease || callerRelease
   const repository = options.poiseRepository || poiseRepository
-  const readHealth = options.readHealth || callerHealth
+  const readHealth = options.readHealth || callerReady
+  const manifestFor = options.stopGateManifest || stopGateManifest
   const hookCurrent = options.hookCurrent || stopGateIsCurrent
   const datastoreCurrent = options.datastoreCurrent || datastoreServicesCurrent
   const repairHookConfiguration = options.repairHookConfiguration || configureStopGate
@@ -243,32 +228,30 @@ async function reconcile(options) {
     return { action: 'installed-poise', poiseCommit: localPoise }
   }
 
-  const remoteCaller = requireCommit((await run('gh', [
-    'api',
-    `repos/${release.repository}/commits/${encodeURIComponent(release.ref)}`,
-    '--jq',
-    '.sha',
-  ])).stdout, `Caller ${release.ref}`)
-  state.caller = remoteCaller
-  const [localCaller, currentHook, currentDatastore] = await Promise.all([
+  // Caller is part of the checkout: the runtime is current when the service
+  // reports it ready and the hooks and datastore services run this checkout's.
+  const callerRoot = join(root, 'caller')
+  const manifest = await manifestFor({ callerRoot, commit: localPoise })
+  const [callerIsReady, currentHook, currentDatastore] = await Promise.all([
     readHealth(),
-    hookCurrent({ home, manifest: { ...release, commit: remoteCaller } }),
-    datastoreCurrent({ home, commit: remoteCaller }),
+    hookCurrent({ home, manifest }),
+    datastoreCurrent({ home, binRoot: join(callerRoot, '.venv', 'bin') }),
   ])
 
-  if (localCaller !== remoteCaller || !currentHook || !currentDatastore) {
-    log(
-      `Reconciling Caller/runtime from ${localCaller || 'unknown'} to ${remoteCaller}`
-      + (currentHook ? '' : ' and repairing agent hooks')
-      + (currentDatastore ? '' : ' and repairing datastore services'),
-    )
+  if (!callerIsReady || !currentHook || !currentDatastore) {
+    const reasons = [
+      callerIsReady ? null : 'Caller is not ready',
+      currentHook ? null : 'agent hooks need repair',
+      currentDatastore ? null : 'datastore services need repair',
+    ].filter(Boolean)
+    log(`Reconciling the runtime of Poise ${localPoise}: ${reasons.join('; ')}`)
     await install()
-    return { action: 'reconciled-runtime', callerCommit: remoteCaller }
+    return { action: 'reconciled-runtime', poiseCommit: localPoise }
   }
 
   await repairHookConfiguration({ home, run })
-  log(`Poise ${localPoise} and Caller ${remoteCaller} are current; agent hooks are configured`)
-  return { action: 'current', poiseCommit: localPoise, callerCommit: remoteCaller }
+  log(`Poise ${localPoise} and its Caller are current; agent hooks are configured`)
+  return { action: 'current', poiseCommit: localPoise }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {

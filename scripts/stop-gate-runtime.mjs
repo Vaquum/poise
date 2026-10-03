@@ -1,6 +1,7 @@
 import { constants } from 'node:fs'
 import { access, chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { callerVersions } from './caller.mjs'
 
 function paths(home) {
   const root = join(home, '.local', 'share', 'caller-pr-stop-gate')
@@ -22,9 +23,14 @@ async function executable(path) {
   }
 }
 
+/** The Caller a gate is installed from: its source directory, the Poise
+ *  commit that carries it and the package versions. */
+export async function stopGateManifest({ callerRoot, commit }) {
+  return { source: callerRoot, commit, packages: await callerVersions(callerRoot) }
+}
+
 function sameManifest(actual, expected) {
-  return actual?.repository === expected.repository
-    && actual?.ref === expected.ref
+  return actual?.source === expected.source
     && actual?.commit === expected.commit
     && JSON.stringify(actual?.packages) === JSON.stringify(expected.packages)
 }
@@ -80,7 +86,6 @@ export async function installStopGate({
   home,
   manifest,
   python,
-  releaseRoot,
   run,
   environment = process.env,
 }) {
@@ -96,8 +101,8 @@ export async function installStopGate({
     'install',
     '--disable-pip-version-check',
     '--force-reinstall',
-    join(releaseRoot, 'source', 'github_interface'),
-    join(releaseRoot, 'source', 'agent_interface'),
+    join(manifest.source, 'github_interface'),
+    join(manifest.source, 'agent_interface'),
   ])
   await configureStopGate({ home, run, environment })
   await writeFile(hook.marker, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 })

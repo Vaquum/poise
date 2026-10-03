@@ -37,6 +37,7 @@
     "test:e2e": "npm run prepare:e2e && playwright test",
     "test:e2e:update": "npm run prepare:e2e && playwright test --update-snapshots",
     "doctor": "node scripts/check-external-clis.mjs",
+    "caller:setup": "node scripts/caller-setup.mjs",
     "check": "npm run lint && npm test && npm run build",
     "verify": "npm run check && npm run test:e2e",
     "self-update:enable": "node scripts/install-self-update.mjs enable",

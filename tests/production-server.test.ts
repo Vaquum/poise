@@ -3,7 +3,7 @@ import { createServer as createHttpServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import release from '../config/caller-release.json'
+import { callerVersions } from '../scripts/caller.mjs'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
 
 // Choosing a repository for Review New Issues checks it against the
@@ -13,9 +13,9 @@ vi.mock('../server/gh', async (importOriginal) => ({
   listOrgRepos: vi.fn(async () => ['Vaquum/Limen', 'Vaquum/Origo']),
 }))
 
-const EXPECTED_CALLER_COMMIT = 'a'.repeat(40)
 let root = ''
 let staticDir = ''
+let callerBin = ''
 let server: Server
 let baseUrl = ''
 let production: typeof import('../server/production')
@@ -35,6 +35,15 @@ beforeAll(async () => {
   process.env.POISE_ESPANSO_MATCH_DIR = join(root, 'espanso')
   process.env.AGENT_INTERFACE_ROOT = join(root, 'agent')
   process.env.POISE_PRODUCTION_UPDATE_REPORT = join(root, 'production-update.json')
+  // Stand-in Caller CLIs: health and startup only need them runnable.
+  callerBin = join(root, 'caller-bin')
+  await Promise.all([mkdir(callerBin), mkdir(join(root, 'agent'))])
+  for (const command of ['agent-interface', 'github-datastore', 'github-interface']) {
+    const path = join(callerBin, command)
+    await writeFile(path, '#!/bin/sh\nexit 0\n')
+    await chmod(path, 0o700)
+  }
+  vi.stubEnv('CALLER_BIN_ROOT', callerBin)
   vi.resetModules()
   production = await import('../server/production')
   server = production.createProductionServer({
@@ -62,6 +71,7 @@ afterAll(async () => {
     'AGENT_INTERFACE_ROOT',
     'POISE_PRODUCTION_UPDATE_REPORT',
   ]) delete process.env[key]
+  vi.unstubAllEnvs()
   vi.resetModules()
   await rm(root, { recursive: true, force: true })
 })
@@ -129,9 +139,9 @@ describe('production server', () => {
         subscriptionType: 'max',
       },
       callerRelease: {
-        status: 'unmanaged',
-        required: false,
-        expectedCommit: '',
+        status: 'ready',
+        packages: await callerVersions(),
+        error: null,
       },
       // No updater record yet: nothing is claimed about production.
       production: { status: 'unknown', checkedAt: null, deployedCommit: null },
@@ -194,6 +204,25 @@ describe('production server', () => {
     } finally {
       await rm(path, { force: true })
     }
+  })
+
+  it('reports degraded health while the Caller cannot run', async () => {
+    await chmod(join(callerBin, 'github-datastore'), 0o600)
+    try {
+      const health = await fetch(`${baseUrl}/api/health`)
+      expect(health.status).toBe(503)
+      await expect(health.json()).resolves.toMatchObject({
+        status: 'degraded',
+        scheduler: { status: 'ok' },
+        callerRelease: {
+          status: 'invalid',
+          error: `${join(callerBin, 'github-datastore')} is missing or not runnable (CALLER_BIN_ROOT)`,
+        },
+      })
+    } finally {
+      await chmod(join(callerBin, 'github-datastore'), 0o700)
+    }
+    expect((await fetch(`${baseUrl}/api/health`)).status).toBe(200)
   })
 
   it('returns 503 when Claude-backed behavior work is enabled without authentication', async () => {
@@ -437,9 +466,14 @@ describe('production server', () => {
     await expect(production.startProductionServer({ staticDir, port })).rejects.toThrow(/POISE_PORT/)
   })
 
-  it('fails closed when production has no managed Caller release', async () => {
-    await expect(production.startProductionServer({ staticDir, port: 5556 }))
-      .rejects.toThrow(/POISE_ENFORCE_CALLER_RELEASE/)
+  it('fails closed when the Caller is not set up', async () => {
+    vi.stubEnv('CALLER_BIN_ROOT', join(root, 'no-caller'))
+    try {
+      await expect(production.startProductionServer({ staticDir, port: 5556 }))
+        .rejects.toThrow(`Caller is not ready: ${join(root, 'no-caller', 'agent-interface')} is missing or not runnable`)
+    } finally {
+      vi.stubEnv('CALLER_BIN_ROOT', callerBin)
+    }
   })
 
   it('validates Confab URLs before creating or starting a server', async () => {
@@ -459,31 +493,6 @@ describe('production server', () => {
     await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve))
     const address = blocker.address()
     if (!address || typeof address === 'string') throw new Error('blocker did not bind')
-    const releaseRoot = join(root, 'caller-release')
-    const binRoot = join(releaseRoot, 'venv', 'bin')
-    const agentRoot = join(releaseRoot, 'source', 'agent_interface')
-    await mkdir(binRoot, { recursive: true })
-    await mkdir(agentRoot, { recursive: true })
-    for (const command of ['agent-interface', 'github-datastore', 'github-interface']) {
-      const path = join(binRoot, command)
-      await writeFile(path, '#!/bin/sh\nexit 0\n')
-      await chmod(path, 0o700)
-    }
-    await writeFile(join(releaseRoot, 'release.json'), JSON.stringify({
-      repository: 'mikkokotila/caller',
-      ref: release.ref,
-      commit: EXPECTED_CALLER_COMMIT,
-      packages: {
-        'agent-interface': '0.3.0',
-        'github-datastore': '0.2.0',
-        'github-interface': '0.2.0',
-      },
-    }))
-    process.env.POISE_ENFORCE_CALLER_RELEASE = '1'
-    process.env.CALLER_RELEASE_SHA = EXPECTED_CALLER_COMMIT
-    process.env.CALLER_RELEASE_ROOT = releaseRoot
-    process.env.CALLER_BIN_ROOT = binRoot
-    process.env.AGENT_INTERFACE_ROOT = agentRoot
 
     const { stopBehaviorsRuntime } = await import('../server/behaviors')
     await stopBehaviorsRuntime()
@@ -496,13 +505,6 @@ describe('production server', () => {
     } finally {
       vi.useRealTimers()
       await new Promise<void>((resolve) => blocker.close(() => resolve()))
-      for (const key of [
-        'POISE_ENFORCE_CALLER_RELEASE',
-        'CALLER_RELEASE_SHA',
-        'CALLER_RELEASE_ROOT',
-        'CALLER_BIN_ROOT',
-      ]) delete process.env[key]
-      process.env.AGENT_INTERFACE_ROOT = join(root, 'agent')
     }
   })
 })
