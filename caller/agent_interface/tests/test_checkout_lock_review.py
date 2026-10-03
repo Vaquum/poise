@@ -18,7 +18,8 @@ from agent_interface.checkout_lock import Lease, LeaseLost, LockBusy, pgid_alive
 
 from test_checkout_lock import GATE, WRITER, LockCase, dead_pid
 
-POISE_DIR = Path(os.environ.get("POISE_DIR") or Path.home() / "dev" / "Poise")
+# The Poise this Caller lives in: caller/agent_interface/tests -> the repository root.
+POISE_DIR = Path(os.environ.get("POISE_DIR") or Path(__file__).resolve().parents[3])
 NODE = shutil.which("node", path="/opt/homebrew/opt/node@22/bin:" + os.environ.get("PATH", "")) or ""
 POISE_LOCK = POISE_DIR / "server" / "chat" / "checkout-lock.ts"
 POISE_GATE = POISE_DIR / "scripts" / "chat-worker-gate.mjs"
