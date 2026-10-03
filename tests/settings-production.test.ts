@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { productionSummary, type ProductionUpdate } from '../src/production-status'
+import { productionSummary, type ProductionRecord } from '../src/production-status'
 
 const A = 'a'.repeat(40)
 const B = 'b'.repeat(40)
 const NOW = Date.parse('2026-09-18T12:00:00.000Z')
 const minutesBefore = (minutes: number) => new Date(NOW - minutes * 60_000).toISOString()
 
-function update(overrides: Partial<ProductionUpdate> = {}): ProductionUpdate {
+function update(overrides: Partial<ProductionRecord> = {}): ProductionRecord {
   return {
     status: 'current',
     checkedAt: minutesBefore(1),
@@ -49,6 +49,11 @@ describe('production summary in Settings', () => {
     expect(summary?.text).toMatch(/^Deployed aaaaaaa · main bbbbbbb — 2 commits behind; updater failing since \d{1,2}:\d{2}(?: [AP]M)?: Remote Poise main is not a fast-forward of the deployed commit$/)
     expect(productionSummary(update({ status: 'failed', remoteCommit: null, behind: null }), NOW)?.text)
       .toBe('Deployed aaaaaaa; updater failing: no error recorded')
+  })
+
+  it('says why there is no updater in service mode', () => {
+    const off = { ...update({ checkedAt: null, deployedCommit: null, remoteCommit: null, behind: null }), status: 'off' as const, reason: 'No production updater runs in service mode.' }
+    expect(productionSummary(off, NOW)).toEqual({ text: 'No production updater runs in service mode.', level: 'info' })
   })
 
   it('treats a record that stopped arriving as the most important fact', () => {

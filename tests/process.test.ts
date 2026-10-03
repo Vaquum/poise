@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawn as spawnProcess } from 'node:child_process'
-import { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import {
@@ -9,6 +9,7 @@ import {
   assertProcessArgSize,
   claudeSubscriptionEnvironment,
   runFile,
+  runningCallerLaunches,
   scrubbedChildEnvironment,
   setCallerAccounts,
   spawnDetached,
@@ -964,6 +965,30 @@ if (args.includes('auth') && args.includes('status')) {
     )
 
     await expect(exited).resolves.toMatchObject({ code: 7, signal: null })
+  })
+
+  // Service health reports these as runningCallerCalls: a drain waits on them.
+  it('counts launched Caller processes until each one exits', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'poise-caller-launches-'))
+    try {
+      const caller = join(dir, 'agent-interface')
+      await writeFile(caller, '#!/bin/sh\nwhile [ ! -e "$1" ]; do sleep 0.02; done\n')
+      await chmod(caller, 0o755)
+      const before = runningCallerLaunches()
+      await spawnDetached(caller, [join(dir, 'first')])
+      await spawnDetached(caller, [join(dir, 'second')])
+      expect(runningCallerLaunches()).toBe(before + 2)
+      // Other detached processes and launches that never started are not Caller calls.
+      await spawnDetached(process.execPath, ['-e', 'setTimeout(() => {}, 200)'])
+      await expect(spawnDetached(join(dir, 'missing', 'agent-interface'), [])).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(runningCallerLaunches()).toBe(before + 2)
+      await writeFile(join(dir, 'first'), '')
+      await vi.waitFor(() => expect(runningCallerLaunches()).toBe(before + 1), { timeout: 5_000 })
+      await writeFile(join(dir, 'second'), '')
+      await vi.waitFor(() => expect(runningCallerLaunches()).toBe(before), { timeout: 5_000 })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 

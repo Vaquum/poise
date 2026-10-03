@@ -245,6 +245,24 @@ for (const prefix of ['', '/poise ']) test(`${prefix ? '/poise' : 'A natural req
   await expect(revert).toHaveCount(0)
 })
 
+test('says /poise is turned off in service mode and keeps the request', async ({ page }) => {
+  const state = makeState([session()])
+  await installRoutes(page, state)
+  const sock = await installSocket(page)
+  const reason = 'Improve Poise from Poise is turned off in service mode: this workspace runs the Poise image its server deploys, and /poise cannot change that image.'
+  sock.onPoiseChange = () => ({ ok: false, error: reason, code: 'service_mode' })
+  await page.goto('/')
+  await sock.subscribed('s1')
+  await input(page).fill('/poise Rename the Swarm view')
+  await input(page).press('Enter')
+  await expect.poll(() => sock.framesOf('poise.change').length).toBe(1)
+  const notice = page.locator('.chat-notice')
+  await expect(notice).toHaveText(`${reason} Your request is still in the composer; nothing was sent to a model.`)
+  await expect(input(page)).toHaveValue('/poise Rename the Swarm view')
+  expect(sock.framesOf('prompt')).toHaveLength(0)
+  await expect(card(page)).toHaveCount(0)
+})
+
 test('keeps the request in the composer, sends no prompt and opens nothing when the feature is not set up', async ({ page }) => {
   const state = makeState([session()])
   await installRoutes(page, state)

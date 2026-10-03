@@ -249,6 +249,13 @@ function errorResponse(res: ServerResponse, error: unknown): void {
   json(res, httpStatus(error, 400), { error: message })
 }
 
+/** /api/self-update* where the controller is turned off (service mode): the
+ *  status says why, and every other route is refused with that reason. */
+export function handleSelfUpdateTurnedOff(req: IncomingMessage, res: ServerResponse, path: string, reason: string, code: string): void {
+  if (path === '/api/self-update' && req.method === 'GET') return json(res, 200, disabledStatus(reason))
+  json(res, 409, { error: reason, code })
+}
+
 /** Handle /api/self-update* routes; false when the url is not ours. The
  *  caller has already enforced the local trust boundary. */
 export async function handleSelfUpdateApi(req: IncomingMessage, res: ServerResponse, url: string, service: SelfUpdateService): Promise<boolean> {

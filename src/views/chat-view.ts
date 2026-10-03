@@ -1014,6 +1014,7 @@ async function startPoiseChange(cmd: PoiseCommand, draft: ComposerDraft): Promis
     } else {
       if (changeId) releaseChangeId(pendingStore, changeId)
       const why = code === 'self_update_unavailable' ? `Poise self-updates are not set up on this server — ${message}`
+        : code === 'service_mode' ? message
         : code === 'draining' ? `Poise is installing an update and refuses new work until it restarts — ${message}`
         : `Poise change not started${code ? ` (${code})` : ''} — ${message}`
       setNotice(`${why} Your request is still in the composer; nothing was sent to a model.`)

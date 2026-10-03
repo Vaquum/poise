@@ -294,6 +294,7 @@ test('shows in Settings whether production is on main', async ({ page }) => {
   await expect(line).toContainText('Deployed bbbbbbb · main ccccccc — 2 commits behind; updater failing since')
   await expect(line).toContainText('not a fast-forward')
   await expect(line).toHaveClass(/st-help-error/)
+  await expect(page.locator('.st-production-updater')).toBeVisible()
 
   // Back on main: the same line, quiet.
   production = { ...production, status: 'current', remoteCommit: deployed, behind: 0, failingSince: null, error: null }

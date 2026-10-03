@@ -252,6 +252,9 @@ function renderProduction(update: ProductionUpdate) {
   }
   productionEl.textContent = summary.text
   productionEl.className = `st-help st-help-${summary.level} st-production`
+  // The launchd updater and its desktop notification do not exist in service mode.
+  const updater = group?.querySelector<HTMLElement>('.st-production-updater')
+  if (updater) updater.hidden = update.status === 'off'
   if (group) group.hidden = false
 }
 
@@ -619,7 +622,7 @@ function buildPanel(): HTMLElement {
           <div class="tp-group-label">Production</div>
           <div class="tp-section">
             <div class="st-help st-help-info st-production" role="status" aria-live="polite"></div>
-            <div class="st-help st-help-info">Production follows <code>main</code>: a launchd job fast-forwards its checkout and rebuilds every minute. A failing or silent updater also raises a desktop notification.</div>
+            <div class="st-help st-help-info st-production-updater">Production follows <code>main</code>: a launchd job fast-forwards its checkout and rebuilds every minute. A failing or silent updater also raises a desktop notification.</div>
           </div>
         </div>
       </section>

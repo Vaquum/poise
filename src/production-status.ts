@@ -5,7 +5,7 @@
 // The production updater's last run, as /api/health passes it through
 // (server/production-update.ts). `unknown` on a dev server, or before the
 // updater has run since this record existed.
-export interface ProductionUpdate {
+export interface ProductionRecord {
   status: 'current' | 'updated' | 'failed' | 'unknown'
   checkedAt: string | null
   deployedCommit: string | null
@@ -14,6 +14,14 @@ export interface ProductionUpdate {
   failingSince: string | null
   error: string | null
 }
+
+// Service mode has no updater; `reason` says what upgrades the workspace.
+interface ProductionOff extends Omit<ProductionRecord, 'status'> {
+  status: 'off'
+  reason: string
+}
+
+export type ProductionUpdate = ProductionRecord | ProductionOff
 
 // The updater runs every minute; a record older than this means it is not
 // running at all, which matters more than whatever it last found.
@@ -38,6 +46,7 @@ function clock(iso: string): string {
 // whether the updater is keeping the two together. Null when there is nothing
 // to say (no record), so the group hides instead of showing a placeholder.
 export function productionSummary(update: ProductionUpdate, now = Date.now()): { text: string, level: 'info' | 'error' } | null {
+  if (update.status === 'off') return { text: update.reason, level: 'info' }
   if (update.status === 'unknown' || !update.checkedAt) return null
   const deployed = `Deployed ${short(update.deployedCommit)}`
   if (now - Date.parse(update.checkedAt) >= UPDATER_SILENT_AFTER_MS) {

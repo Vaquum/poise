@@ -187,11 +187,29 @@ computer.
 - Binding to a non-loopback address is allowed only in service mode.
 - Loopback requests keep today's rules; they come from inside the owner's own
   container.
-- Non-loopback requests need a valid assertion with the right scope.
+- Non-loopback requests need a valid assertion with the right scope: API
+  routes, static assets and the page itself alike. The assertion header is
+  removed before any check, so Poise never echoes, logs or forwards it.
+  Identity comes from the assertion alone: no cookie or `Authorization`
+  header stands in for it.
 - The Host and Origin checks compare against `POISE_PUBLIC_ORIGIN`, scheme
-  included. Requests without an Origin are accepted only from loopback or with
-  a valid assertion.
-- The Chat WebSocket and the terminal WebSocket apply the same rules.
+  included: every non-loopback request, the gateway's own `admin` calls
+  included, carries the workspace's public host in `Host`, and an `Origin`
+  must equal `POISE_PUBLIC_ORIGIN` exactly. Requests without an Origin are
+  accepted only from loopback or with a valid assertion.
+- `POISE_PUBLIC_ORIGIN` is an https origin. It may be plain http only when its
+  host is `localhost` or ends in `.localhost` or `.test` (such as
+  `<handle>.poise.localhost` under the gateway's `POISE_INSECURE_HTTP`); any
+  other http origin stops startup.
+- A missing or invalid assertion is refused with 401; a valid one whose scope
+  does not reach the route, a wrong Host or Origin, and a cross-site API call
+  with 403.
+- The Chat WebSocket and the terminal WebSocket apply the same rules. An
+  upgrade to any other path is answered (401, 403 or 404) and closed.
+- Startup validates `POISE_WORKSPACE_HANDLE`, `POISE_WORKSPACE_OWNER`,
+  `POISE_PUBLIC_ORIGIN`, `POISE_GATEWAY_PUBLIC_KEY` and, when set,
+  `POISE_DRAIN_TIMEOUT`, and stops with one message naming each that is
+  missing or invalid; any `POISE_MODE` other than `service` is an error.
 
 **Storage.** Everything lives under `~/.poise` in the home volume:
 - Chat workspaces in `~/.poise/chat` (`POISE_CHAT_ROOT`).
@@ -201,8 +219,8 @@ computer.
   `agent-interface` in `AGENT_INTERFACE_ROOT`.
 
 **Scheduling.** The daily model-catalogue refresh runs inside Poise at 07:00
-in the owner's configured timezone, replacing the launchd job. Datastore sync
-already runs inside Poise.
+in the owner's configured timezone (UTC, logged, when none is set), replacing
+the launchd job; a drain skips it. Datastore sync already runs inside Poise.
 
 **Turned off in service mode** (each with a clear message where the UI would
 otherwise offer it):
@@ -214,17 +232,37 @@ otherwise offer it):
 - Claude sign-in through a local browser; the Connected accounts terminal
   replaces it.
 
-**Service endpoints** (loopback, or the `admin` scope):
+**Service endpoints** (loopback, or the `admin` scope; the owner's `browser`
+assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
   runningCallerCalls, backgroundWork, idle, draining }`. `idle` is true only
   when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
   It backs the container health check and the gateway's readiness check.
+  - `version` is the commit the running bundle was built from, `null` for a
+    development build.
+  - `activeChatTurns` counts the Chat turns recorded open: reserved before
+    their first write, closed once their outcome is recorded.
+  - `runningCallerCalls` counts the Caller processes Poise launched for agent
+    work (behavior runs, manual reviews and replays, card chats, `/content`)
+    that it has not seen exit, plus `/consensus` debates still running.
+  - `backgroundWork` counts everything else a restart would cut: the Chat
+    runtime's startups, operations and agent processes, process-owned
+    background work (behavior ticks, provider CLI updates, the model check),
+    and launches from the browser admitted and still in their handler.
 - `POST /api/service/drain` stops admitting new Chat turns and behavior
   launches, then returns the same fields. A drain lapses unless it is renewed:
   while the gateway polls health it re-POSTs `/api/service/drain` at least
   every 5 minutes. It recreates the container once `idle` is true or
   `POISE_DRAIN_TIMEOUT` seconds (default 1800, 30 minutes) have passed.
-- `POST /api/service/resume` lifts a drain.
+  - New Chat turns include queued messages, and launches include the
+    browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
+    `/api/debate`, `/api/chat`, `/api/models/refresh`). Refused work answers
+    503 with code `draining`; work already running continues.
+  - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
+    1800) plus five minutes after the last drain call, so a gateway that
+    stopped renewing it cannot leave the workspace refusing work.
+- `POST /api/service/resume` lifts a drain. The owner's browser may call it
+  too, to lift a drain a gateway left behind.
 
 ## Accounts, identities and the terminal
 

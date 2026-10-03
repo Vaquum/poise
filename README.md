@@ -273,27 +273,106 @@ which a working checkout is not.
 
 The production build emits the browser client under `dist/client` and the Node
 entrypoint at `dist/server.js`. The server binds `127.0.0.1:5555` by default.
-Poise intentionally refuses non-loopback bindings: its API can create GitHub
-issues, launch agents, and modify local files, so it is not a network service.
+Outside [service mode](#service-mode) Poise refuses non-loopback bindings: its
+API can create GitHub issues, launch agents, and modify local files, so it is
+not a network service.
 Keep `.env` owner-readable only (`chmod 600 .env`) because it may contain the
 Confab API credential; production startup rejects broader permissions and a
 Caller whose CLIs cannot run.
+
+## Service mode
+
+With `POISE_MODE=service` Poise runs as the single-user application inside
+one workspace container behind the gateway, as
+[Service architecture](docs/Service-architecture.md) specifies. Without it
+nothing on this page changes. The gateway passes:
+
+| Variable | Value |
+| --- | --- |
+| `POISE_MODE` | `service`; any other value stops startup |
+| `POISE_WORKSPACE_HANDLE` | The owner's GitHub login in lower case |
+| `POISE_WORKSPACE_OWNER` | The owner's GitHub login |
+| `POISE_PUBLIC_ORIGIN` | `https://<handle>.<domain>`; plain `http://` only on a `localhost`, `*.localhost` or `*.test` host, for local and CI end-to-end runs |
+| `POISE_GATEWAY_PUBLIC_KEY` | The gateway's Ed25519 public key: its SPKI PEM as single-line base64 |
+
+Startup checks all of them and stops with one message naming each variable
+that is missing or invalid.
+
+**Requests.** `POISE_HOST=0.0.0.0` is allowed. Every request that does not
+come from loopback, the page and its assets included, needs the gateway's
+identity assertion in `X-Poise-Identity` with a scope that reaches the route,
+the workspace's public host in `Host`, and exactly `POISE_PUBLIC_ORIGIN`,
+scheme included, when it sends `Origin`. Cookies and `Authorization` headers
+never identify anyone: the gateway keeps its own credentials. The Chat
+WebSocket applies the same rules; an upgrade to any other path is answered
+and closed. Loopback requests keep the local rules, so the container's own
+health check needs no assertion.
+
+**Storage.** Everything lives under `~/.poise` in the home volume: Chat
+workspaces in `~/.poise/chat`, snippets in `~/.poise/snippets/poise.yml` and
+Caller's data in `~/.poise/agent-interface`, which every Caller process gets
+as `AGENT_INTERFACE_DATA_DIR`. An explicit `POISE_CHAT_ROOT`,
+`POISE_ESPANSO_MATCH_DIR` or `AGENT_INTERFACE_DATA_DIR` still wins. Chat
+storage no longer needs a git checkout of Poise.
+
+**Service endpoints**, from loopback or with the gateway's `admin` scope:
+
+- `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
+  runningCallerCalls, backgroundWork, idle, draining }`. `version` is the
+  commit the running bundle was built from (`null` for a development build).
+  `activeChatTurns` counts the Chat turns recorded open. `runningCallerCalls`
+  counts the Caller processes this server launched for agent work (behavior
+  runs, manual reviews and replays, card chats, `/content`) that it has not
+  seen exit, plus `/consensus` debates still running. `backgroundWork` counts
+  everything else a restart would cut: Chat startups, operations and agent
+  processes, background work (behavior ticks, provider CLI updates, the model
+  check) and browser launches still in their handler. `idle` is true only
+  when all three are zero; the gateway recreates a container once it is.
+- `POST /api/service/drain` stops admitting new Chat turns (queued messages
+  included), scheduled behavior launches, and launches from the browser
+  (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`, `/api/debate`,
+  `/api/chat`, `/api/models/refresh`), which answer 503 with code `draining`.
+  Work already running continues. It returns the health body. The gateway
+  renews a drain by calling it again while it waits; one that is not renewed
+  lapses `POISE_DRAIN_TIMEOUT` seconds (default 1800; read from the
+  workspace's environment and validated at startup) plus five minutes after
+  the last drain call, so a gateway that stops renewing it cannot leave the
+  workspace refusing work.
+- `POST /api/service/resume` lifts the drain; the owner's browser may call it
+  too.
+
+**Daily model check.** At 07:00 in the timezone set in Settings, Poise runs
+the same check as Settings → Models → Check now, in place of the launchd job.
+With no timezone set it uses UTC and logs that; a name that is not a timezone
+is reported and nothing runs until it is corrected. A drain skips the run.
+
+**Turned off**, each saying so where the feature would otherwise be offered:
+
+- the self-update controller and Improve Poise from Poise (`/api/self-update*`
+  and `/poise`);
+- the production updater, its Settings line and its desktop notification;
+- launchd recovery of legacy datastore sync;
+- Espanso detection: Snippets says snippets reach the desktop through Poise
+  Link;
+- Claude sign-in through a local browser: `POST /api/claude-auth/login`
+  answers 409 and points to Settings → Connected accounts.
 
 ## Configuration
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `POISE_HOST` | Production bind address; loopback only | `127.0.0.1` |
+| `POISE_HOST` | Production bind address; loopback only outside service mode | `127.0.0.1` |
 | `POISE_PORT` | Production port | `5555` |
 | `POISE_DB` | SQLite path | `~/.poise/cache.db` |
 | `POISE_DATASTORE_DB` | Existing account’s Caller datastore | github-datastore's default under `~/.local/share/github-datastore` |
 | `POISE_EDITOR_DIR` | Markdown and annotation directory | `~/.poise/editor` |
 | `POISE_CHAT_ATTACHMENTS_DIR` | Durable chat attachments | `~/.poise/chat-attachments` |
-| `POISE_ESPANSO_MATCH_DIR` | Espanso match directory override | macOS Espanso default |
+| `POISE_ESPANSO_MATCH_DIR` | Espanso match directory override | macOS Espanso default; `~/.poise/snippets` in service mode |
 | `AGENT_INTERFACE_ROOT` | `agent-interface` working directory | `caller/agent_interface` |
 | `CALLER_BIN_ROOT` | Directory Poise runs Caller's CLIs from | `caller/.venv/bin` |
-| `AGENT_INTERFACE_DATA_DIR` | Durable agent-interface calls and responses | `caller/agent_interface/data` |
+| `AGENT_INTERFACE_DATA_DIR` | Durable agent-interface calls and responses | `caller/agent_interface/data`; `~/.poise/agent-interface` in service mode |
 | `POISE_PYTHON` | Python 3.13 that builds Caller's virtualenv | Homebrew `python@3.13`, then `python3.13` on `PATH` |
+| `POISE_CHAT_ROOT` | Chat workspace storage | `.poise-chat/` in the installation; `~/.poise/chat` in service mode |
 | `POISE_VOICE_GUIDE_PATH` | Optional editor-chat voice guide | unset |
 | `AGENT_INTERFACE_VOICE_GUIDE` | Optional voice guide `/content` writes in; without one it writes without | unset |
 | `REVIEW_AGENT_USERNAME` | Seeds the agent account (Settings → GitHub) on the first start without one saved; ignored after that | unset |
@@ -321,7 +400,8 @@ Caller's tests on Python 3.13.
 
 - `src/` — browser views and interaction logic.
 - `server/cache-plugin.ts` — shared API middleware for development/production.
-- `server/production.ts` — loopback-only static and API server.
+- `server/production.ts` — static and API server, loopback-only outside service mode.
+- `server/service/` — service mode: configuration, identity assertions, drain and health, the daily model check.
 - `server/process.ts` — bounded external process execution.
 - `server/db.ts` — SQLite schema, migrations, and automation claims.
 - `caller/` — Caller, the Python CLIs Poise drives ([caller/README.md](caller/README.md)).
