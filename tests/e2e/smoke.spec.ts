@@ -234,6 +234,44 @@ test('saves a review model choice and restores it after reload', async ({ page }
   await expect(page.getByLabel('PR review secondary reviewer')).toHaveValue('muse-spark-1.3-contributor-max')
 })
 
+test('keeps your GitHub account and the agent account under GitHub in Settings', async ({ page }) => {
+  let settings: Record<string, unknown> = { org: 'acme', me: 'octocat', agentAccount: 'review-bot', timezone: 'UTC', models: {} }
+  const posts: Array<Record<string, unknown>> = []
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      posts.push(route.request().postDataJSON())
+      settings = { ...settings, ...posts.at(-1) }
+    }
+    await route.fulfill({ json: settings })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('[data-action="settings"]').click()
+  const panel = page.locator('#settings-panel')
+  await expect(panel.locator('.tp-group-label').first()).toHaveText('GitHub')
+  const yours = page.getByLabel('Your GitHub account')
+  const agent = page.getByLabel('Agent account')
+  await expect(yours).toHaveValue('octocat')
+  await expect(agent).toHaveValue('review-bot')
+  await expect(agent.locator('xpath=..')).toContainText('The GitHub user your reviews and comments are posted as. It must be signed in to gh here.')
+
+  await agent.fill('https://github.com/other-bot')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('The agent account must be a GitHub login, not a URL or email.')
+  await expect(agent).toBeFocused()
+  expect(posts).toEqual([])
+
+  await agent.fill('other-bot')
+  await agent.press('Enter')
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(posts).toMatchObject([{ me: 'octocat', agentAccount: 'other-bot' }])
+
+  await page.reload()
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('[data-action="settings"]').click()
+  await expect(page.getByLabel('Agent account')).toHaveValue('other-bot')
+})
+
 test('shows in Settings whether production is on main', async ({ page }) => {
   const deployed = 'b'.repeat(40)
   let production: Record<string, unknown> = {

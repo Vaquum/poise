@@ -14,9 +14,8 @@ import { organizationErrors } from '../organizations'
 
 let viewEl: HTMLElement
 let initialized = false
-// Owner per behavior, fetched once from /api/behaviors. Server-side
-// values come from env vars (REVIEW_AGENT_USERNAME, etc.) — these are
-// the actual GitHub usernames the automations act as.
+// Owner per behavior, fetched once from /api/behaviors: the agent account
+// from Settings → GitHub, the GitHub user the automations act as.
 const behaviorOwners: Partial<Record<BehaviorKey, string | null>> = {}
 // Tick listener — installed on view init, removed on view leave by
 // stopBehaviorsRefresh(). Single shared clock, same pattern as the
@@ -419,7 +418,7 @@ function buildTriggersPanel(): HTMLElement {
     </div>
     <div class="bt-section">
       <label class="bt-label" for="bt-authors">Trusted authors</label>
-      <input id="bt-authors" class="st-input bt-authors" type="text" autocomplete="off" spellcheck="false" placeholder="mikkokotila, zero-bang" />
+      <input id="bt-authors" class="st-input bt-authors" type="text" autocomplete="off" spellcheck="false" />
       <div class="st-help st-help-info">Only their new issues are reviewed. Reviewers run with full access on this machine.</div>
     </div>
     <div class="bt-footer">
