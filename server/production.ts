@@ -9,7 +9,8 @@ import { assertCallerRelease } from './caller-release'
 import { assertSecureDotenv, loadSecureDotenv, validateConfabUrl } from './runtime-config'
 import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'
-import { TERMINAL_WS_PATH } from './terminal/protocol'
+import { TERMINAL_WS_PATH, type TerminalPreset } from './terminal/protocol'
+import type { TerminalCommand } from './terminal/pty'
 import { startLaunchdWatchdog } from './launchd-watchdog'
 import type { ClaudeAuthRuntime } from './cache-plugin'
 
@@ -53,6 +54,8 @@ export interface ProductionServerOptions {
   reviewAgentUsername?: string
   /** Auth runtime override for isolated integration tests. */
   claudeAuth?: ClaudeAuthRuntime
+  /** What a Connect terminal runs; tests confine it to their fake CLIs. */
+  terminalCommand?: (preset: TerminalPreset) => TerminalCommand
   /** Service mode. Omitted: read from the environment; `null`: off. */
   service?: ServiceConfig | null
 }
@@ -398,6 +401,7 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
   const api = createPoiseMiddleware({
     reviewAgentUsername: options.reviewAgentUsername ?? process.env.REVIEW_AGENT_USERNAME ?? '',
     claudeAuth: options.claudeAuth,
+    terminalCommand: options.terminalCommand,
     instanceLabel: 'production',
     service,
   })

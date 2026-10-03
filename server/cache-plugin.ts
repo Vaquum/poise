@@ -36,6 +36,8 @@ import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productio
 import { invalidateAccounts, listAccounts, scheduleAccountsCheck } from './accounts'
 import type { ConnectedAccount } from './accounts/types'
 import { TerminalSocketServer } from './terminal/server'
+import type { TerminalCommand } from './terminal/pty'
+import type { TerminalPreset } from './terminal/protocol'
 import type { Server } from 'node:http'
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -52,6 +54,9 @@ export interface CachePluginOptions {
   allowedHosts?: string[]
   /** Auth runtime override for isolated integration tests. */
   claudeAuth?: ClaudeAuthRuntime
+  /** What a Connect terminal runs for a preset. Omitted: the CLI's own login;
+   *  tests confine it to their fake CLIs. */
+  terminalCommand?: (preset: TerminalPreset) => TerminalCommand
   /** Which Poise server this is; chat sessions are owned per instance and
    *  the dev and production servers never adopt each other's. */
   instanceLabel?: 'dev' | 'production'
@@ -145,7 +150,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     })
     chatRuntime.on('log', (line: string) => console.log(line))
     chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
-    terminalSockets = new TerminalSocketServer({ allowedHosts: opts.allowedHosts, service })
+    terminalSockets = new TerminalSocketServer({ allowedHosts: opts.allowedHosts, service }, { command: opts.terminalCommand })
     // A login may have just changed an account. Claude's sign-in also gates
     // Claude-backed work, so it is verified now instead of at the next poll.
     terminalSockets.on('exit', (preset) => {
