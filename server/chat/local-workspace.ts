@@ -3,6 +3,7 @@
 import { lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { CLAUDE_SUBSCRIPTION_CLI, runFile } from '../process'
+import { isServiceMode, serviceStatePath } from '../service/config'
 import { CheckoutLease, canonicalCheckout } from './checkout-lock'
 import { runGuarded } from './git'
 import { pgidAlive } from './worker'
@@ -10,9 +11,11 @@ import { pgidAlive } from './worker'
 export const POISE_ROOT = dirname(dirname(CLAUDE_SUBSCRIPTION_CLI))
 const DEFAULT_LOCAL_CHAT_ROOT = join(POISE_ROOT, '.poise-chat')
 // Immutable releases keep user data in the original installation's ignored
-// workspace, selected by the trusted launcher, never a browser request.
+// workspace, selected by the trusted launcher, never a browser request. In
+// service mode it lives in the home volume, outside the installed image.
 export const LOCAL_CHAT_ROOT = process.env.POISE_CHAT_ROOT
-  ? resolve(process.env.POISE_CHAT_ROOT) : DEFAULT_LOCAL_CHAT_ROOT
+  ? resolve(process.env.POISE_CHAT_ROOT)
+  : isServiceMode() ? serviceStatePath('chat') : DEFAULT_LOCAL_CHAT_ROOT
 const OWNER = 'Poise local Chat workspace v1\n'
 
 async function privateDirectory(path: string): Promise<void> {
@@ -39,6 +42,9 @@ async function readyWorkspace(checkout: string): Promise<boolean> {
 }
 
 export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'poise'): Promise<string> {
+  // Only the installation's own default storage must be ignored by its
+  // checkout; any other root (service mode's, a release's) needs no checkout
+  // of Poise at all.
   if (root === DEFAULT_LOCAL_CHAT_ROOT) {
     await runFile('git', ['check-ignore', '--quiet', '--no-index', '.poise-chat/workspace'], { cwd: POISE_ROOT })
       .catch(() => { throw new Error('Poise must ignore /.poise-chat/ before local Chat storage can be created') })

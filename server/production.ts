@@ -1,16 +1,21 @@
 import { createReadStream, type Stats } from 'node:fs'
 import { realpath, stat } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { STATUS_CODES, createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import type { Duplex } from 'node:stream'
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { HttpError, readBuffer, setApiHeaders } from './http'
+import { HttpError, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
 import { assertCallerRelease } from './caller-release'
 import { assertSecureDotenv, loadSecureDotenv, validateConfabUrl } from './runtime-config'
+import { readServiceConfig, type ServiceConfig } from './service/config'
+import { WS_PATH } from './chat/protocol'
 import type { ClaudeAuthRuntime } from './cache-plugin'
 
 // Security validation must run before dotenv reads the file and before modules
-// that derive database/runtime paths from process.env are evaluated.
+// that derive database/runtime paths from process.env are evaluated. A
+// misconfigured service mode stops here, naming every variable at fault.
 await loadSecureDotenv()
+readServiceConfig()
 const { attachChatSockets, createPoiseMiddleware, stopPoiseRuntime } = await import('./cache-plugin')
 const { closeDatabase } = await import('./db')
 
@@ -46,10 +51,20 @@ export interface ProductionServerOptions {
   reviewAgentUsername?: string
   /** Auth runtime override for isolated integration tests. */
   claudeAuth?: ClaudeAuthRuntime
+  /** Service mode. Omitted: read from the environment; `null`: off. */
+  service?: ServiceConfig | null
 }
 
 function isLoopbackHost(host: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host === '::1'
+}
+
+// Only a workspace container behind the gateway listens beyond loopback; it
+// holds every request that is not its own to the gateway's assertion.
+function assertBindable(host: string, service: ServiceConfig | null): void {
+  if (!service && !isLoopbackHost(host)) {
+    throw new Error('Poise is a local application and only binds to a loopback host')
+  }
 }
 
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
@@ -270,6 +285,22 @@ async function serveStatic(
   })
 }
 
+// An upgrade nothing serves is answered and closed, never left open: an
+// open one pins a descriptor and holds shutdown until its deadline.
+function refuseUpgrade(req: IncomingMessage, socket: Duplex, service: ServiceConfig | null): void {
+  if ((req.url || '').split('?')[0] === WS_PATH) return
+  let status = 404
+  let message = 'not found'
+  try {
+    enforceDocumentRequest(req, { service })
+  } catch (error) {
+    status = httpStatus(error, 403)
+    message = error instanceof Error ? error.message : 'forbidden'
+  }
+  socket.write(`HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Error'}\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n${message}`)
+  socket.destroy()
+}
+
 let runtimeStopPromise: Promise<void> | null = null
 let databaseClosed = false
 const serverShutdowns = new WeakMap<Server, Promise<void>>()
@@ -352,9 +383,8 @@ export function createProductionShutdown(
 
 export function createProductionServer(options: ProductionServerOptions = {}): Server {
   const host = options.host || DEFAULT_HOST
-  if (!isLoopbackHost(host)) {
-    throw new Error('Poise is a local application and only binds to a loopback host')
-  }
+  const service = options.service === undefined ? readServiceConfig() : options.service
+  assertBindable(host, service)
   const staticDir = resolve(options.staticDir || resolve(process.cwd(), 'dist/client'))
   const confabUrl = validateConfabUrl(
     options.confabUrl ?? process.env.CONFAB_URL ?? 'http://localhost:8000',
@@ -366,6 +396,7 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
     reviewAgentUsername: options.reviewAgentUsername ?? process.env.REVIEW_AGENT_USERNAME ?? '',
     claudeAuth: options.claudeAuth,
     instanceLabel: 'production',
+    service,
   })
 
   const server = createServer((req, res) => {
@@ -381,6 +412,12 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
         sendJson(res, 404, { error: 'API route not found' })
         return
       }
+      try {
+        enforceDocumentRequest(req, { service })
+      } catch (error) {
+        sendFailure(res, httpStatus(error, 403), error)
+        return
+      }
       void serveStatic(req, res, staticDir).catch((error: unknown) => {
         sendFailure(res, 500, error)
       })
@@ -390,6 +427,7 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
   })
   // /ws/chat: the same host/origin checks as the API, on the upgrade itself.
   attachChatSockets(server)
+  server.on('upgrade', (req: IncomingMessage, socket: Duplex) => refuseUpgrade(req, socket, service))
   server.headersTimeout = 10_000
   server.requestTimeout = 30_000
   server.keepAliveTimeout = 5_000
@@ -404,9 +442,8 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
 export async function startProductionServer(options: ProductionServerOptions = {}): Promise<Server> {
   await assertSecureDotenv()
   const host = options.host || process.env.POISE_HOST || DEFAULT_HOST
-  if (!isLoopbackHost(host)) {
-    throw new Error('Poise is a local application and only binds to a loopback host')
-  }
+  const service = options.service === undefined ? readServiceConfig() : options.service
+  assertBindable(host, service)
   const port = options.port ?? Number(process.env.POISE_PORT || DEFAULT_PORT)
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error('POISE_PORT must be an integer between 1 and 65535')
@@ -419,7 +456,7 @@ export async function startProductionServer(options: ProductionServerOptions = {
   await stat(resolve(staticDir, 'index.html'))
   let server: Server
   try {
-    server = createProductionServer({ ...options, host, port, staticDir, confabUrl })
+    server = createProductionServer({ ...options, host, port, staticDir, confabUrl, service })
   } catch (error) {
     await settleRuntimeStop()
     throw error
