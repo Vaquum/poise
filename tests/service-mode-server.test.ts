@@ -177,6 +177,55 @@ describe('Poise in service mode', () => {
     expect((await send('GET', '/api/settings')).status).toBe(200)
   })
 
+  it('answers the container health check and the gateway\'s admin scope only', async () => {
+    const health = await send('GET', '/api/service/health')
+    expect(health.status).toBe(200)
+    expect(health.json).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 0, runningCallerCalls: 0, draining: false })
+    expect(await send('GET', '/api/service/health', fromGateway('admin'))).toMatchObject({ status: 200, json: { mode: 'service' } })
+    expect((await send('GET', '/api/service/health', fromGateway('browser'))).status).toBe(403)
+    expect((await send('GET', '/api/service/health', fromGateway('link'))).status).toBe(403)
+    expect((await send('GET', '/api/service/health', { peer: GATEWAY_PEER })).status).toBe(401)
+    expect((await send('POST', '/api/service/drain', fromGateway('browser'))).status).toBe(403)
+    expect((await send('GET', '/api/settings', fromGateway('admin'))).status).toBe(403)
+  })
+
+  it('drains new Chat work and launches until it is resumed', async () => {
+    const background = await import('../server/release-background')
+    expect(await send('POST', '/api/service/drain', fromGateway('admin'))).toMatchObject({ status: 200, json: { draining: true, activeChatTurns: 0, runningCallerCalls: 0 } })
+    expect(background.releaseBackgroundPaused()).toBe(true)
+    expect((await send('GET', '/api/service/health')).json).toMatchObject({ draining: true })
+
+    for (const [path, body] of [
+      ['/api/pr-review', { url: 'https://github.com/acme/app/pull/1' }],
+      ['/api/agent-replay', { behavior: 'pr_review', repo: 'acme/app', pr_id: '1' }],
+      ['/api/chat-content', { topic: 'Release notes', session: 'chat-1' }],
+      ['/api/debate', { topic: 'Ship it?' }],
+      ['/api/chat', { session: 'card-1', message: 'hello' }],
+    ] as const) {
+      expect(await send('POST', path, fromGateway(), body), path).toMatchObject({ status: 503, json: { error: 'Poise is installing an update; try again after it restarts', code: 'draining' } })
+    }
+    expect(await send('POST', '/api/chat/sessions', fromGateway(), { agent: 'grok', model: 'grok-4.6-high' })).toMatchObject({ status: 503, json: { code: 'draining' } })
+    // Ordinary writes are not work a restart would cut.
+    expect((await send('POST', '/api/settings', fromGateway(), { timezone: 'Europe/Helsinki' })).status).toBe(200)
+
+    expect(await send('POST', '/api/service/resume', fromGateway('admin'))).toMatchObject({ status: 200, json: { draining: false } })
+    expect(background.releaseBackgroundPaused()).toBe(false)
+    const after = await send('POST', '/api/pr-review', fromGateway(), { url: 'not a pull request' })
+    expect(after.status).not.toBe(503)
+    expect(after.json.error).toContain('not a github PR url')
+  })
+
+  it('counts the Caller calls it launched until they finish', async () => {
+    const { spawnDetached } = await import('../server/process')
+    const release = join(root, 'release-call')
+    await spawnDetached(join(bin, 'agent-interface'), ['--wait', release])
+    expect((await send('GET', '/api/service/health')).json).toMatchObject({ runningCallerCalls: 1 })
+    await writeFile(release, '')
+    await vi.waitFor(async () => {
+      expect((await send('GET', '/api/service/health')).json).toMatchObject({ runningCallerCalls: 0 })
+    }, { timeout: 5_000, interval: 50 })
+  })
+
   it('turns off what only a personal computer has, and says why', async () => {
     expect(await send('GET', '/api/self-update', fromGateway())).toMatchObject({ status: 200, json: { enabled: false, available: false, reason: turnedOff.SELF_UPDATE_OFF, changes: [] } })
     expect(await send('POST', '/api/self-update/revert', fromGateway(), { changeId: 'x' })).toMatchObject({ status: 409, json: { error: turnedOff.SELF_UPDATE_OFF, code: 'service_mode' } })
@@ -254,6 +303,7 @@ describe('Poise in service mode', () => {
         const caller = { ...fromGateway(), identity }
         replies.push(await send('GET', '/api/settings', caller))
         replies.push(await send('GET', '/', caller))
+        replies.push(await send('GET', '/api/service/health', caller))
         replies.push(await send('POST', '/api/pr-review', caller, { url: 'not a pull request' }))
         replies.push(await send('GET', '/api/settings', { ...caller, host: 'elsewhere.example' }))
       }

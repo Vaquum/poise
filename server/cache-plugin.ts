@@ -17,7 +17,7 @@ import { handleSnippetApi } from './snippet-api'
 import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { ContentLaunchPendingError, getContentJobResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
-import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders } from './http'
+import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders, type RequestAuthority } from './http'
 import { ChatRuntime } from './chat/runtime'
 import { ChatSocketServer, handleChatApi } from './chat/transport'
 import { getChatSettings } from './settings'
@@ -25,6 +25,8 @@ import { buildIdentity } from './build-identity'
 import { SelfUpdateService, createSelfUpdateBridge, drainAllowsPath, handleSelfUpdateApi, handleSelfUpdateTurnedOff, isSelfUpdateControlRoute, resolveSelfUpdateRoot, unconfiguredSelfUpdateBridge, type SelfUpdateBridge } from './self-update'
 import { releaseBackgroundPaused } from './release-background'
 import { applyServiceEnvironment, readServiceConfig, type ServiceConfig } from './service/config'
+import { DRAINING_ERROR, ServiceControl, handleServiceApi } from './service/control'
+import { countDebate } from './service/caller-calls'
 import { DailyModelRefresh } from './service/model-refresh'
 import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
 import type { Server } from 'node:http'
@@ -61,7 +63,8 @@ export interface CachePluginOptions {
 let chatRuntime: ChatRuntime | null = null
 let chatSockets: ChatSocketServer | null = null
 let selfUpdate: SelfUpdateService | null = null
-// Service mode only: the in-process daily model check.
+// Service mode only: the gateway's drain and the in-process daily model check.
+let serviceControl: ServiceControl | null = null
 let dailyModelRefresh: DailyModelRefresh | null = null
 
 function serviceOf(opts: CachePluginOptions): ServiceConfig | null {
@@ -123,6 +126,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     chatRuntime.on('log', (line: string) => console.log(line))
     chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
     if (service) {
+      serviceControl = new ServiceControl(chatRuntime)
       dailyModelRefresh = new DailyModelRefresh({
         timeZone: () => getSettings().timezone,
         refresh: refreshModelCatalog,
@@ -144,10 +148,12 @@ export async function stopPoiseRuntime(): Promise<void> {
   const chatStop = chatRuntime?.stop() ?? Promise.resolve()
   const socketStop = chatSockets?.close() ?? Promise.resolve()
   selfUpdate?.reset()
+  serviceControl?.reset()
   dailyModelRefresh?.stop()
   chatRuntime = null
   chatSockets = null
   selfUpdate = null
+  serviceControl = null
   dailyModelRefresh = null
   await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, ...authStops])
 }
@@ -179,8 +185,9 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
       async function handleApi(req: Parameters<Connect.NextHandleFunction>[0], res: ServerResponse, next: Connect.NextFunction, url: string, path: string, mutating: boolean): Promise<void> {
         setApiHeaders(res)
         const selectedOrg = new URLSearchParams(url.split('?')[1] || '').get('org') || undefined
+        let authority: RequestAuthority
         try {
-          enforceApiRequest(req, { allowedHosts: opts.allowedHosts, service })
+          authority = enforceApiRequest(req, { allowedHosts: opts.allowedHosts, service })
         } catch (err) {
           return json(res, httpStatus(err, 403), { error: (err as Error).message })
         }
@@ -188,9 +195,15 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           return json(res, 405, { error: 'cross-origin preflight is not supported' })
         }
 
-        // ── Service mode: the self-update routes that do not exist here ──
-        if (service && (path === '/api/self-update' || path.startsWith('/api/self-update/'))) {
-          return handleSelfUpdateTurnedOff(req, res, path, SELF_UPDATE_OFF, SERVICE_MODE_CODE)
+        // ── Service mode: the gateway's endpoints, the self-update routes
+        // that do not exist here, and the drain's refusal of new launches ──
+        if (service) {
+          if (!serviceControl) throw new Error('the service runtime is not started')
+          if (path === '/api/service' || path.startsWith('/api/service/')) return handleServiceApi(req, res, path, authority, serviceControl)
+          if (path === '/api/self-update' || path.startsWith('/api/self-update/')) {
+            return handleSelfUpdateTurnedOff(req, res, path, SELF_UPDATE_OFF, SERVICE_MODE_CODE)
+          }
+          if (serviceControl.refusesLaunch(req.method, path)) return json(res, 503, { error: DRAINING_ERROR, code: 'draining' })
         }
 
         // ── Self-update: the controller's private endpoints and the public
@@ -203,7 +216,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // It was registered before this check, so a request that was in
         // before the drain is never missed by readiness.
         if (selfUpdate && mutating && selfUpdate.draining && !drainAllowsPath(path)) {
-          return json(res, 503, { error: 'Poise is installing an update; try again after it restarts', code: 'draining' })
+          return json(res, 503, { error: DRAINING_ERROR, code: 'draining' })
         }
 
         if (await handleJevApi(req, res, url)) return
@@ -698,7 +711,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (url === '/api/debate' && req.method === 'POST') {
           try {
             const body = await readJson<any>(req)
-            const result = await runDebate(String(body.topic || ''), Number(body.rounds || 1))
+            const result = await countDebate(() => runDebate(String(body.topic || ''), Number(body.rounds || 1)))
             return json(res, 200, result)
           } catch (err: any) {
             return json(res, httpStatus(err, 500), { error: err?.message || String(err) })
