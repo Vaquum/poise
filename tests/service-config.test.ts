@@ -113,6 +113,13 @@ describe('service-mode configuration', () => {
     }
   })
 
+  it('refuses launchd watchdog jobs, which a workspace does not have', () => {
+    const env = serviceEnvironment(keys)
+    expect(() => readServiceConfig({ ...env, POISE_LAUNCHD_WATCHDOG: 'com.example.job' }))
+      .toThrow('POISE_LAUNCHD_WATCHDOG names launchd jobs, which a workspace does not have; unset it')
+    expect(readServiceConfig({ ...env, POISE_LAUNCHD_WATCHDOG: '' })).not.toBeNull()
+  })
+
   it('passes Caller a data directory in the home volume unless one is set', () => {
     const env: NodeJS.ProcessEnv = {}
     applyServiceEnvironment(env)
