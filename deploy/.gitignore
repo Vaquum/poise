@@ -1,0 +1,2 @@
+# Where deploy/backup.sh writes unless told otherwise.
+/backups/
