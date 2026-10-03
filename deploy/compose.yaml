@@ -1,0 +1,74 @@
+# The Poise service on one server (docs/Operating.md). Caddy terminates TLS
+# and hands every request to the gateway; the gateway signs people in and
+# creates each person's workspace container itself, through the Docker
+# socket. deploy/install.sh and deploy/upgrade.sh run this file, and
+# deploy/.env holds its settings (.env.example describes each).
+name: poise
+
+services:
+  caddy:
+    image: caddy:2
+    container_name: poise-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      POISE_DOMAIN: ${POISE_DOMAIN:?set POISE_DOMAIN in deploy/.env}
+      POISE_ACME_EMAIL: ${POISE_ACME_EMAIL:?set POISE_ACME_EMAIL in deploy/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - edge
+    depends_on:
+      - gateway
+
+  gateway:
+    build: ../gateway
+    # The gateway joins each workspace network by this name.
+    container_name: poise-gateway
+    restart: unless-stopped
+    env_file: .env
+    # This file's own wiring, which deploy/.env cannot change.
+    environment:
+      POISE_GATEWAY_CONTAINER: poise-gateway
+      POISE_RUNTIME_IMAGE: ${POISE_RUNTIME_IMAGE:-poise-runtime:latest}
+      POISE_GATEWAY_DATA: /data
+      POISE_DOCKER_SOCKET: /var/run/docker.sock
+      PORT: "8080"
+    volumes:
+      - gateway-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - edge
+    healthcheck:
+      # Caddy's certificate question about the apex, asked the way Caddy asks it.
+      test:
+        - CMD
+        - node
+        - --eval
+        - >-
+          require('node:http').get({ host: '127.0.0.1', port: 8080,
+          path: '/_gateway/tls-ask?domain=' + encodeURIComponent(process.env.POISE_DOMAIN.trim()),
+          headers: { host: 'gateway:8080' } },
+          (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  edge:
+    name: poise-edge
+
+# Named outright, so the scripts and docs/Operating.md can name them too.
+volumes:
+  gateway-data:
+    name: poise-gateway-data
+  caddy-data:
+    name: poise-caddy-data
+  caddy-config:
+    name: poise-caddy-config
