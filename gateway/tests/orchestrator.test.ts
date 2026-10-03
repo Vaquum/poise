@@ -5,6 +5,7 @@ import {
   CURRENT_IMAGE_ID, events, OLD_IMAGE_ID, startHarness, verifyAssertion, workspaceHost,
   type Harness, type HarnessOptions,
 } from './harness.js'
+import { MAX_SERVICE_ANSWER_BYTES } from '../src/orchestrator.js'
 
 const ALICE = workspaceHost('alice')
 const NAVIGATE = { 'sec-fetch-mode': 'navigate', accept: 'text/html' }
@@ -246,6 +247,16 @@ describe('lazy start', () => {
     expect(page.status).toBe(503)
     expect(page.body).toContain('the workspace answered GET /api/service/health with HTTP 401')
     expect(events(h.logs, 'workspace.health.refused')).toHaveLength(1)
+    await h.orchestrator.startInProgress('alice')
+  })
+
+  it('stops reading a health answer longer than any health answer can be', async () => {
+    const cookie = await start()
+    h.workspace.reachable = true
+    h.workspace.healthPadding = MAX_SERVICE_ANSWER_BYTES
+    const page = await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    expect(page.status).toBe(503)
+    expect(page.body).toContain(`the workspace answered GET /api/service/health with more than ${MAX_SERVICE_ANSWER_BYTES} bytes`)
     await h.orchestrator.startInProgress('alice')
   })
 

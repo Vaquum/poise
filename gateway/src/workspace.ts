@@ -5,7 +5,7 @@ import { GATEWAY_COOKIES, WORKSPACE_COOKIE, type Context } from './context.js'
 import { header, HttpError, isNavigation, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
 import { errorMessage } from './log.js'
 import { messagePage, signOutPage, startingPage } from './pages.js'
-import { forwardHeaders, isUnreachable, proxyRequest, proxyUpgrade, rejectUpgrade } from './proxy.js'
+import { forwardHeaders, isUnreachable, MAX_REQUEST_BODY_BYTES, proxyRequest, proxyUpgrade, rejectUpgrade, RequestTooLargeError } from './proxy.js'
 import { deviceState, hashSecret, type Session, type User } from './store.js'
 
 type Authentication =
@@ -174,6 +174,9 @@ async function gatewayPath(ctx: Context, req: IncomingMessage, res: ServerRespon
 export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL, owner: User): Promise<void> {
   const problem = framingProblem(req)
   if (problem) throw new HttpError(400, problem)
+  if (Number(req.headers['content-length'] ?? 0) > MAX_REQUEST_BODY_BYTES) {
+    throw new HttpError(413, `A request body may be at most ${MAX_REQUEST_BODY_BYTES} bytes.`)
+  }
   if (url.pathname === '/_poise' || url.pathname.startsWith('/_poise/')) return gatewayPath(ctx, req, res, url, owner)
   if (!req.url?.startsWith('/')) throw new HttpError(400, 'The request target must be a path.')
   const auth = authenticate(ctx, req, owner)
@@ -190,6 +193,12 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
   proxyRequest(req, res, ctx.deps.upstream(owner.handle), headers, ctx.agent, (error) => {
     // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
     try {
+      if (error instanceof RequestTooLargeError) {
+        log.warn('proxy.body_too_large', { handle: owner.handle, limit: error.limit })
+        // The rest of the body is never read: close the connection once the refusal is sent.
+        sendJson(res, 413, { error: 'payload_too_large', message: `A request body may be at most ${error.limit} bytes.` }, { connection: 'close' })
+        return
+      }
       if (isUnreachable(error)) {
         orchestrator.markNotReady(owner.handle)
         log.warn('workspace.unreachable', { handle: owner.handle, error: error.message })

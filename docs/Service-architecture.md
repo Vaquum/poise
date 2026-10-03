@@ -142,6 +142,14 @@ client sent.
   so nothing can ride along as a second request.
 - The gateway's own calls to `/api/service/*` carry an `admin` assertion and
   `Host: <handle>.<POISE_DOMAIN>`.
+- Sizes the gateway relays are bounded, so one person cannot exhaust the shared
+  gateway's memory. Request bodies may be at most 32 MiB, which covers Poise's
+  largest body, the 30 MiB editor envelope. A larger declared body gets `413`
+  before it reaches the workspace, and a chunked body is cut off with `413` as
+  soon as it crosses the limit. A workspace's answer to a declined WebSocket
+  upgrade is relayed only up to 64 KiB, and anything longer gets `502`. The
+  gateway reads at most 64 KiB of a workspace's health or drain answer, and
+  treats a longer one as a refused health check.
 
 ## Workspace runtime contract
 

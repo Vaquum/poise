@@ -3,6 +3,7 @@ import net from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
+import { MAX_DECLINED_UPGRADE_BYTES, MAX_REQUEST_BODY_BYTES, proxyRequest, RequestTooLargeError } from '../src/proxy.js'
 import { events, startHarness, verifyAssertion, workspaceHost, type Harness } from './harness.js'
 
 const ALICE = workspaceHost('alice')
@@ -143,6 +144,20 @@ describe('proxy', () => {
     expect((await h.request({ host: ALICE, path: '/api/state', headers: { cookie } })).status).toBe(200)
   })
 
+  it('refuses a declared body larger than it relays, without reaching the workspace', async () => {
+    const answer = await rawExchange(h.port, `POST /api/large HTTP/1.1\r\nHost: ${ALICE}\r\nCookie: ${cookie}\r\nContent-Type: application/octet-stream\r\nContent-Length: ${MAX_REQUEST_BODY_BYTES + 1}\r\nConnection: close\r\n\r\n`)
+    expect(answer.split('\r\n')[0]).toBe('HTTP/1.1 413 Payload Too Large')
+    expect(h.workspace.requestLines).not.toContain('POST /api/large')
+  })
+
+  it('relays a refused WebSocket upgrade only while its answer is short', async () => {
+    expect(await upgradeAnswer(h, '/ws/declined-large', cookie)).toEqual({ status: 502, setCookie: undefined })
+    expect(h.logs.filter((entry) => entry.event === 'proxy.upgrade.failed').map((entry) => entry.error)).toEqual([
+      `the workspace declined the upgrade with more than ${MAX_DECLINED_UPGRADE_BYTES} bytes`,
+    ])
+    expect((await h.request({ host: ALICE, path: '/api/state', headers: { cookie } })).status).toBe(200)
+  })
+
   it('refuses a body on a bodiless method instead of smuggling it to the workspace', async () => {
     await h.request({ host: ALICE, path: '/api/state', headers: { cookie } })
     const smuggled = `GET /smuggled HTTP/1.1\r\nHost: ${ALICE}\r\nX-Poise-Identity: forged\r\n\r\n`
@@ -216,5 +231,56 @@ describe('proxy', () => {
     expect(events(h.logs, 'workspace.unreachable')).toHaveLength(1)
     await h.orchestrator.startInProgress('alice')
     expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
+  })
+})
+
+describe('streamed request bodies', () => {
+  it('stops relaying a chunked body at the limit and answers 413 once', async () => {
+    const seen: number[] = []
+    const upstream = http.createServer((req, res) => {
+      let size = 0
+      req.on('data', (chunk: Buffer) => { size += chunk.length })
+      req.on('close', () => seen.push(size))
+      req.on('end', () => res.end('relayed'))
+    })
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+    const upstreamPort = (upstream.address() as net.AddressInfo).port
+    const errors: string[] = []
+    const gateway = http.createServer((req, res) => {
+      proxyRequest(req, res, { host: '127.0.0.1', port: upstreamPort }, { 'transfer-encoding': 'chunked' }, new http.Agent(), (error) => {
+        errors.push(error.message)
+        expect(error).toBeInstanceOf(RequestTooLargeError)
+        res.writeHead(413, { connection: 'close' })
+        res.end()
+      }, 1024)
+    })
+    await new Promise<void>((resolve) => gateway.listen(0, '127.0.0.1', resolve))
+    const gatewayPort = (gateway.address() as net.AddressInfo).port
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port: gatewayPort, method: 'POST', path: '/', headers: { 'transfer-encoding': 'chunked' } })
+        let answered = false
+        req.on('response', (res) => {
+          answered = true
+          res.resume()
+          resolve(res.statusCode ?? 0)
+        })
+        // The gateway closes the connection after refusing; a write racing that close is expected.
+        req.on('error', (error) => { if (!answered) reject(error) })
+        const chunk = Buffer.alloc(512, 0x61)
+        for (let index = 0; index < 64; index += 1) req.write(chunk)
+        req.end()
+      })
+      expect(status).toBe(413)
+      await delay(50)
+      expect(errors).toEqual(['the request body is larger than 1024 bytes'])
+      // The workspace saw at most what arrived before the limit was crossed, never the whole body.
+      expect(seen.every((size) => size < 64 * 512)).toBe(true)
+    } finally {
+      await new Promise<void>((resolve) => gateway.close(() => resolve()))
+      gateway.closeAllConnections()
+      await new Promise<void>((resolve) => upstream.close(() => resolve()))
+      upstream.closeAllConnections()
+    }
   })
 })
