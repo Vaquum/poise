@@ -490,6 +490,7 @@ export async function replayAgentJob(input: {
   else if (behavior === 'pr_approve') flag = '--pr-approve'
   else throw new Error(`behavior "${behavior}" is not replayable`)
 
+  const actor = requireAgentAccount()
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
   const { model, recovery, catalog } = await reviewChoice(place)
   const claude = needsClaude(catalog, model)
@@ -497,7 +498,6 @@ export async function replayAgentJob(input: {
   const [owner, repoName] = repo.split('/', 2)
   await prepareModelClis(catalog, [model, recovery])
   const pwd = await localCheckoutPath(owner, repoName)
-  const actor = requireAgentAccount()
   const expectedHead = await getHeadSha(repo, Number(prId))
   const source = 'poise:replay'
   const correlationId = randomUUID()
@@ -529,14 +529,14 @@ export async function replayAgentJob(input: {
 }
 
 // A replayed issue review is one fresh full-access run by the Issue review
-// default, commenting again as the review agent. It needs no head and no
+// default, commenting again as the agent account. It needs no head and no
 // local checkout: Caller prepares its own.
 async function replayIssueReview(repo: string, issue: string): Promise<{ ok: true, source: string, correlationId: string }> {
+  const actor = requireAgentAccount()
   const { model, recovery, catalog } = await reviewChoice('issue_review')
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   await prepareModelClis(catalog, [model, recovery])
-  const actor = requireAgentAccount()
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()

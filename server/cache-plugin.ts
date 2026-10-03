@@ -82,10 +82,11 @@ export interface ClaudeAuthRuntime {
 const activeClaudeAuthRuntimes = new Set<ClaudeAuthRuntime>()
 
 export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
+  // First: a malformed seed stops the start before anything is running.
+  seedAgentAccount(opts.reviewAgentUsername)
   const auth = opts.claudeAuth ?? claudeAuth
   activeClaudeAuthRuntimes.add(auth)
   auth.start()
-  seedAgentAccount(opts.reviewAgentUsername)
   setCallerAccounts(callerAccounts)
   startOrganizationsRuntime()
   startBehaviorsRuntime()
