@@ -22,7 +22,9 @@ describe('legacy updater hands over release ownership', () => {
     const h = harness({ enabled: true, activeRelease: { sha, callerSha }, hold: null })
     expect(await reconcileRuntime(h.options)).toEqual({ action: 'managed-self-update', poiseCommit: sha })
     expect(h.run).not.toHaveBeenCalled()
-    expect(h.report()).toMatchObject({ status: 'current', poise: { deployed: sha, installed: sha }, caller: callerSha })
+    expect(h.report()).toMatchObject({ status: 'current', poise: { deployed: sha, installed: sha } })
+    // Caller is part of the Poise commit; the record keeps no separate one.
+    expect(h.report()).not.toHaveProperty('caller')
   })
   it('preserves the promotion hold rather than reinstalling a rejected release', async () => {
     const h = harness({ enabled: true, activeRelease: { sha, callerSha }, hold: { sha, reason: 'User reverted' } })

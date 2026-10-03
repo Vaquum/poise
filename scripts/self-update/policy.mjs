@@ -13,11 +13,13 @@ export const PROTECTED_PATHS = new Set([
   'scripts/build-identity.mjs', 'scripts/build-identity.d.mts', 'scripts/build-server.mjs',
   'scripts/claude-subscription.mjs', 'scripts/chat-worker-gate.mjs',
   'scripts/clean-dist.mjs', 'scripts/prepare-e2e.mjs',
-  'config/caller-release.json',
 ])
+// Caller lived in its own repository, outside this lane's merge authority;
+// in-tree it keeps that boundary, with the scripts that build and resolve it.
 const PROTECTED_PREFIXES = [
   'scripts/self-update/', 'scripts/self-update-', 'scripts/stop-gate',
   'server/self-update', 'src/self-update', '.github/workflows/',
+  'caller/', 'scripts/caller',
 ]
 
 // Tests that guard server credential handling, production install/update and
@@ -29,7 +31,7 @@ export const PROTECTED_TEST_PATTERNS = [
   /^tests\/production-/,
   /^tests\/runtime-reconciler/,
   /^tests\/stop-gate-runtime/,
-  /^tests\/caller-release/,
+  /^tests\/caller/,
   /^tests\/settings-production/,
   /^tests\/http\.test\./,
   /^tests\/gh-token/,
