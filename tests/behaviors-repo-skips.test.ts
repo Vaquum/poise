@@ -4,9 +4,10 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
 
-// Skip lists of the three PR behaviors. Caller is faked at the process
-// boundary: the datastore and github-interface answer from the rows each test
-// sets, and every call is recorded, so a test can prove what was never asked.
+// Skip lists of the three PR behaviors, and the check a Swarm replay shares
+// with the scheduler. Caller is faked at the process boundary: the datastore
+// and github-interface answer from the rows each test sets, and every call is
+// recorded, so a test can prove what was never asked.
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn() }))
 
 vi.mock('../server/process', () => ({
@@ -43,6 +44,11 @@ let held: Record<string, { reached: () => void, release: () => void, released: P
 
 function pull(repo: string, number: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { repo, number, url: `https://github.com/${repo}/pull/${number}`, status: 'open', author: ME, draft: 0, ...overrides }
+}
+
+function issue(repo: string, number: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const created = new Date(Date.now() - 20 * 60_000).toISOString()
+  return { repo, number, url: `https://github.com/${repo}/issues/${number}`, status: 'open', author: ME, created_at: created, updated_at: created, ...overrides }
 }
 
 function flagValue(args: string[], flag: string): string | undefined {
@@ -321,5 +327,191 @@ describe('Skip repositories', () => {
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({
       behavior: 'review-new-prs', kind: 'operation', error: expect.stringContaining('Skip repositories list'),
     })])
+  })
+})
+
+describe('Replay checks', () => {
+  async function refusal(behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number): Promise<string | null> {
+    try {
+      await behaviors!.admitReplay(behavior, repo, number)
+      return null
+    } catch (error) {
+      expect(error).toBeInstanceOf(behaviors!.ReplayRefusedError)
+      expect((error as { statusCode: number }).statusCode).toBe(409)
+      return (error as Error).message
+    }
+  }
+
+  it('admits an open pull request of yours outside the skipped repositories, for review and approval', async () => {
+    const { runtime } = await start()
+    runtime.setRepositorySkips('review-new-prs', [WEB])
+    runtime.setRepositorySkips('approve-prs', [WEB])
+    await expect(refusal('pr_review', API, 1)).resolves.toBeNull()
+    await expect(refusal('pr_approve', API, 1)).resolves.toBeNull()
+    // Read fresh, behind the scheduler's own freshness gate.
+    const reads = mocks.runFile.mock.calls.filter(([command]) => command === 'github-datastore').map(([, args]) => (args as string[]).join(' '))
+    expect(reads).toEqual([
+      'health --max-age-seconds 120', `view pr --repo ${API} --number 1 --format json`,
+      'health --max-age-seconds 120', `view pr --repo ${API} --number 1 --format json`,
+    ])
+  })
+
+  it.each([
+    ['pr_review', 'closed', { status: 'closed' }, `Replay refused: ${API}#1 is not an open pull request.`],
+    ['pr_approve', 'merged', { status: 'merged' }, `Replay refused: ${API}#1 is not an open pull request.`],
+    ['pr_review', 'a draft', { draft: 1 }, `Replay refused: ${API}#1 is a draft.`],
+    ['pr_approve', 'authored by someone else', { author: 'someone-else' }, `Replay refused: ${API}#1 is authored by someone-else, not by your GitHub account ${ME}.`],
+  ] as const)('refuses %s replay of a pull request that is %s', async (behavior, _case, facts, message) => {
+    await start()
+    pulls = [pull(API, 1, facts)]
+    await expect(refusal(behavior, API, 1)).resolves.toBe(message)
+  })
+
+  it('refuses a pull request the datastore does not have', async () => {
+    await start()
+    await expect(refusal('pr_review', API, 99)).resolves.toBe(`Replay refused: ${API}#99 is not an open pull request.`)
+  })
+
+  it('refuses when your GitHub account is not set', async () => {
+    const { db } = await start()
+    db.setMeta('me', '')
+    await expect(refusal('pr_approve', API, 1)).resolves
+      .toBe(`Replay refused: ${API}#1 cannot be matched to your GitHub account: none is set in Settings → GitHub.`)
+  })
+
+  it('refuses a repository skipped for that behavior only', async () => {
+    const { runtime } = await start()
+    runtime.setRepositorySkips('review-new-prs', [API])
+    await expect(refusal('pr_review', API, 1)).resolves
+      .toBe(`Replay refused: ${API} is in the Skip repositories list of Review New Pull Requests.`)
+    await expect(refusal('pr_approve', API, 1)).resolves.toBeNull()
+    runtime.setRepositorySkips('approve-prs', ['ACME/API'])
+    await expect(refusal('pr_approve', API, 1)).resolves
+      .toBe(`Replay refused: ${API} is in the Skip repositories list of Approve Pull Requests.`)
+  })
+
+  it('refuses a repository outside every ready account without reading anything', async () => {
+    await start()
+    await expect(refusal('pr_review', 'elsewhere/api', 1)).resolves
+      .toBe('Replay refused: elsewhere/api does not belong to a ready GitHub account.')
+    await expect(refusal('issue_review', 'elsewhere/api', 1)).resolves
+      .toBe('Replay refused: elsewhere/api does not belong to a ready GitHub account.')
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('admits an open issue of a trusted author in an opted-in repository', async () => {
+    const { runtime } = await start()
+    runtime.setIssueRepositories([API])
+    issues = [issue(API, 4, { author: AGENT })]
+    await expect(refusal('issue_review', API, 4)).resolves.toBeNull()
+  })
+
+  it.each([
+    ['in a repository that is not opted in', [], {}, `Replay refused: ${API} is not opted in to Review New Issues.`],
+    ['that is closed', [API], { status: 'closed' }, `Replay refused: ${API}#4 is not an open issue.`],
+    ['by an author who is not trusted', [API], { author: 'stranger' }, `Replay refused: ${API}#4 was opened by stranger, who is not a trusted author of Review New Issues.`],
+  ] as const)('refuses an issue review replay of an issue %s', async (_case, repos, facts, message) => {
+    const { runtime } = await start()
+    runtime.setIssueRepositories(repos)
+    issues = [issue(API, 4, facts)]
+    await expect(refusal('issue_review', API, 4)).resolves.toBe(message)
+  })
+
+  it('refuses an issue the datastore does not have, and follows the trusted author list', async () => {
+    const { runtime } = await start()
+    runtime.setIssueRepositories([API])
+    await expect(refusal('issue_review', API, 4)).resolves.toBe(`Replay refused: ${API}#4 is not an open issue.`)
+    issues = [issue(API, 4, { author: 'zero-bang' })]
+    runtime.setIssueAuthors(['Zero-Bang'])
+    await expect(refusal('issue_review', API, 4)).resolves.toBeNull()
+  })
+
+  it('launches nothing when the facts cannot be read, and says why', async () => {
+    await start()
+    healthFailure = new Error('datastore unavailable')
+    const failure = behaviors!.admitReplay('pr_review', API, 1)
+    await expect(failure).rejects.toMatchObject({ statusCode: 502 })
+    await expect(failure).rejects.toThrow(`Replay could not check ${API}#1: github-datastore freshness gate failed: datastore unavailable`)
+    await expect(failure).rejects.not.toBeInstanceOf(behaviors!.ReplayRefusedError)
+    healthFailure = null
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) =>
+      command === 'github-datastore' && args[0] === 'view' ? { stdout: '{}', stderr: '' } : cli(command, args, options))
+    await expect(behaviors!.admitReplay('issue_review', API, 1)).rejects.toMatchObject({ statusCode: 502 })
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) =>
+      command === 'github-datastore' && args[0] === 'view'
+        ? { stdout: JSON.stringify([pull(API, 1), pull(API, 2)]), stderr: '' }
+        : cli(command, args, options))
+    await expect(behaviors!.admitReplay('pr_review', API, 1)).rejects.toThrow(`returned rows other than ${API}#1`)
+  })
+})
+
+// The scheduler's candidate filter and a replay's admission are one check. For
+// each set of facts, the scheduler launches exactly when a replay of the same
+// target is admitted, and a replay refused names the check that failed.
+describe('the scheduler and a replay apply the same check', () => {
+  async function admitted(behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number): Promise<true | string> {
+    try {
+      await behaviors!.admitReplay(behavior, repo, number)
+      return true
+    } catch (error) {
+      if (!(error instanceof behaviors!.ReplayRefusedError)) throw error
+      return error.message
+    }
+  }
+
+  const pullRequestCases: Array<[string, Record<string, unknown> | null, string[], string | true]> = [
+    ['open, yours and not skipped', {}, [], true],
+    ['a draft', { draft: 1 }, [], 'is a draft'],
+    ['authored by someone else', { author: 'someone-else' }, [], 'not by your GitHub account'],
+    ['merged', { status: 'merged' }, [], 'is not an open pull request'],
+    ['missing from the datastore', null, [], 'is not an open pull request'],
+    ['in a skipped repository', {}, [API], 'Skip repositories list'],
+  ]
+
+  for (const [behavior, replay] of [['review-new-prs', 'pr_review'], ['approve-prs', 'pr_approve']] as const) {
+    it.each(pullRequestCases)(`${behavior}: a pull request %s`, async (_case, facts, skipped, expected) => {
+      const { db, runtime } = await start()
+      pulls = facts ? [pull(API, 1, facts)] : []
+      runtime.setRepositorySkips(behavior, skipped)
+      enable(db, behavior)
+      runtime.startBehaviorsRuntime()
+      await runtime.runEnabledBehaviorsOnce()
+      const launched = actedOn(behavior).length === 1
+      // Refused by the scan itself: never claimed, nothing asked of GitHub.
+      const scanned = { github: githubCalls(API), ledger: ledgerRows(API) }
+      const admission = await admitted(replay, API, 1)
+      expect(launched).toBe(admission === true)
+      if (expected === true) expect(admission).toBe(true)
+      else {
+        expect(admission).toContain(expected)
+        expect(scanned).toEqual({ github: [], ledger: [] })
+      }
+    })
+  }
+
+  const issueCases: Array<[string, Record<string, unknown> | null, string[], string | true]> = [
+    ['open, by a trusted author, opted in', {}, [API], true],
+    ['by an author who is not trusted', { author: 'stranger' }, [API], 'not a trusted author'],
+    ['closed', { status: 'closed' }, [API], 'is not an open issue'],
+    ['missing from the datastore', null, [API], 'is not an open issue'],
+    ['in a repository that is not opted in', {}, [], 'is not opted in'],
+  ]
+
+  it.each(issueCases)('review-new-issues: an issue %s', async (_case, facts, repos, expected) => {
+    const { db, runtime } = await start()
+    issues = facts ? [issue(API, 4, facts)] : []
+    db.setMeta('behavior_review_new_issues_repos', JSON.stringify(repos.map((repo) => ({ repo, since: new Date(Date.now() - 60 * 60_000).toISOString() }))))
+    enable(db, 'review-new-issues')
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    const launched = mocks.spawnDetached.mock.calls.filter(([, args]) => (args as string[])[0] === '--issue-review').length === 1
+    const scanned = { github: githubCalls(API), ledger: ledgerRows(API) }
+    const admission = await admitted('issue_review', API, 4)
+    expect(launched).toBe(admission === true)
+    if (expected === true) expect(admission).toBe(true)
+    else {
+      expect(admission).toContain(expected)
+      expect(scanned).toEqual({ github: [], ledger: [] })
+    }
   })
 })

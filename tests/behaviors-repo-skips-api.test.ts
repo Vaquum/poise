@@ -7,8 +7,8 @@ import type { RunFileOptions } from '../server/process'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
 
-// The Skip repositories lists through the HTTP API the Behaviors view uses,
-// with Caller faked at the process boundary.
+// The Skip repositories lists and the replay check through the HTTP API the
+// Behaviors and Swarm views use, with Caller faked at the process boundary.
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn() }))
 vi.mock('../server/process', async (original) => ({
   ...(await original<typeof import('../server/process')>()),
@@ -105,6 +105,8 @@ beforeEach(async () => {
   database.setMeta('org', 'Legacy')
   database.setMeta('me', 'octocat')
   database.setMeta('agentAccount', 'review-bot')
+  // A replay launched here runs on a Codex model: no Claude sign-in is involved.
+  database.setMeta('models', JSON.stringify({ pr_review: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' } }))
   const behaviors = await import('../server/behaviors')
   vi.spyOn(behaviors, 'startBehaviorsRuntime').mockImplementation(() => undefined)
   vi.spyOn(behaviors, 'stopBehaviorsRuntime').mockResolvedValue(undefined)
@@ -194,5 +196,62 @@ describe('Skip repositories API', () => {
     expect((await post('/api/behaviors/review-new-prs', { skipRepos: [] })).status).toBe(200)
     expect(ledger()).toEqual(before)
     expect((await behaviorState())['review-new-prs']!.enabled).toBe(true)
+  })
+})
+
+describe('Replay API', () => {
+  const replay = (body: Record<string, unknown>) => post('/api/agent-replay', body)
+
+  it('launches a replay the scheduler would have launched', async () => {
+    const launched = await replay({ behavior: 'pr_review', repo: REPO, pr_id: '1' })
+    expect(launched.status, JSON.stringify(launched.body)).toBe(200)
+    expect(launched.body).toMatchObject({ ok: true, source: 'poise:replay' })
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--pr-review', '#1', '--expected-head', HEAD, '--source', 'poise:replay']))
+  })
+
+  const cases: Array<[string, () => void, 'pr_review' | 'pr_approve' | 'issue_review', string]> = [
+    ['a draft', () => { pulls[0]!.draft = 1 }, 'pr_review', `Replay refused: ${REPO}#1 is a draft.`],
+    ['a merged pull request', () => { pulls[0]!.status = 'merged' }, 'pr_approve', `Replay refused: ${REPO}#1 is not an open pull request.`],
+    ['someone else\'s pull request', () => { pulls[0]!.author = 'mallory' }, 'pr_review', `Replay refused: ${REPO}#1 is authored by mallory, not by your GitHub account octocat.`],
+    ['a skipped repository', () => database!.setMeta('behavior_approve_prs_skip_repos', JSON.stringify([REPO])), 'pr_approve', `Replay refused: ${REPO} is in the Skip repositories list of Approve Pull Requests.`],
+    ['an issue in a repository that is not opted in', () => undefined, 'issue_review', `Replay refused: ${REPO} is not opted in to Review New Issues.`],
+  ]
+  it.each(cases)('refuses %s with 409, naming the check, and launches nothing', async (_case, arrange, behavior, error) => {
+    arrange()
+    expect(await replay({ behavior, repo: REPO, pr_id: '1' })).toEqual({ status: 409, body: { error } })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('cannot be talked past the check by what the request claims', async () => {
+    pulls[0]!.author = 'mallory'
+    // The Swarm row says nothing the server trusts: a different spelling or
+    // behavior name reads the same facts, and an unknown behavior is refused.
+    for (const body of [
+      { behavior: 'pr_review', repo: REPO, pr_id: 1, author: 'octocat' },
+      { behavior: 'pr_approve', repo: REPO, pr_id: '1', draft: false, status: 'open' },
+    ]) expect((await replay(body)).status).toBe(409)
+    expect(await replay({ behavior: 'resolve_unblocking', repo: REPO, pr_id: '1' })).toEqual({
+      status: 400, body: { error: 'agent-replay failed: behavior "resolve_unblocking" is not replayable' },
+    })
+    expect(await replay({ behavior: 'pr_review', repo: 'a/b/c', pr_id: '1' })).toEqual({
+      status: 400, body: { error: 'agent-replay failed: repo must be owner/name' },
+    })
+    // Shaped like owner/name but no account's: refused before anything is read.
+    const reads = mocks.runFile.mock.calls.length
+    expect(await replay({ behavior: 'pr_review', repo: '../etc', pr_id: '1' })).toEqual({
+      status: 409, body: { error: 'Replay refused: ../etc does not belong to a ready GitHub account.' },
+    })
+    expect(mocks.runFile.mock.calls).toHaveLength(reads)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('launches nothing when the facts cannot be read', async () => {
+    healthFailure = new Error('datastore unavailable')
+    expect(await replay({ behavior: 'pr_review', repo: REPO, pr_id: '1' })).toEqual({
+      status: 502,
+      body: { error: `agent-replay failed: Replay could not check ${REPO}#1: github-datastore freshness gate failed: datastore unavailable` },
+    })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 })
