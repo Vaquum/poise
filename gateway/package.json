@@ -1,0 +1,28 @@
+{
+  "name": "poise-gateway",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Sign-in, routing and workspace orchestration for Poise as a self-hosted service.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": "^22.13.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.9.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.20.5",
+    "@types/ws": "8.18.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11",
+    "ws": "8.21.3"
+  }
+}
