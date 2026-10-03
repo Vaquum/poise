@@ -121,7 +121,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
   const allowedUsers = nameList('POISE_ALLOWED_USERS', 'login')
   const allowedOrgs = nameList('POISE_ALLOWED_ORGS', 'organisation')
   const admins = nameList('POISE_ADMINS', 'login')
-  if (read('POISE_ADMINS') === undefined) {
+  if (admins.length === 0) {
     problems.push('POISE_ADMINS is required (at least one GitHub login that may administer the gateway)')
   }
   for (const [name, handles] of [['POISE_ALLOWED_USERS', allowedUsers], ['POISE_ADMINS', admins]] as const) {

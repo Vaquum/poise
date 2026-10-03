@@ -84,6 +84,12 @@ describe('configuration', () => {
     }
   })
 
+  it('refuses a POISE_ADMINS that names nobody', () => {
+    for (const admins of [',', ' , ;', ', ,']) {
+      expect(problems({ ...BASE, POISE_ADMINS: admins }).some((problem) => problem.startsWith('POISE_ADMINS is required'))).toBe(true)
+    }
+  })
+
   it('refuses POISE_INSECURE_HTTP for a public domain', () => {
     expect(problems({ ...BASE, POISE_INSECURE_HTTP: '1' })).toEqual([
       expect.stringContaining('POISE_INSECURE_HTTP=1 sends session cookies over plain http and is refused for "poise.example.com"'),
