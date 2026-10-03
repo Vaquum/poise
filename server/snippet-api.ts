@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { readJson, httpStatus } from './http'
 import { ProcessLockError } from './process-lock'
-import { espansoDetected, SnippetConflictError } from './snippets'
+import { SnippetConflictError, snippetDelivery } from './snippets'
 import { readSkillSnippets, saveSkillSnippets, addSkillSnippet } from './snippet-library'
 
 /** Shared by the application and isolated browser journeys. The caller applies
@@ -15,7 +15,7 @@ export async function handleSnippetApi(req: IncomingMessage, res: ServerResponse
     return true
   }
   try {
-    if (req.method === 'GET') return send(200, { ...await readSkillSnippets(), espansoDetected: espansoDetected() })
+    if (req.method === 'GET') return send(200, { ...await readSkillSnippets(), ...snippetDelivery() })
     if (req.method === 'PUT') {
       const body = await readJson<{ snippets?: unknown, base_version?: unknown }>(req)
       if (body?.base_version === undefined) return send(428, { error: 'snippet write precondition is required; reload snippets' })

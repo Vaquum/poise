@@ -21,6 +21,7 @@ import type { Duplex } from 'node:stream'
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { ATTACHMENT_MAX_BYTES, HttpError, enforceApiRequest, httpStatus, readBuffer, readJson, type ApiRequestPolicy } from '../http'
+import { SELF_UPDATE_OFF, SERVICE_MODE_CODE } from '../service/turned-off'
 import { runFile } from '../process'
 import { handleGhBody } from '../gh'
 import { getChatSettings } from '../settings'
@@ -289,6 +290,7 @@ export class ChatSocketServer {
         await runtime.revert(String(command.sessionId || ''), String(command.diffId || ''))
         return {}
       case 'poise.change': {
+        if (this.policy.service) throw new ChatError(409, SELF_UPDATE_OFF, SERVICE_MODE_CODE)
         // Only these three fields exist: the browser never names a
         // repository, branch or path for a change — the controller does.
         const changeId = String(command.changeId || '')

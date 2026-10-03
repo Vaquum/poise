@@ -22,8 +22,9 @@ import { ChatRuntime } from './chat/runtime'
 import { ChatSocketServer, handleChatApi } from './chat/transport'
 import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
-import { SelfUpdateService, createSelfUpdateBridge, drainAllowsPath, handleSelfUpdateApi, isSelfUpdateControlRoute, resolveSelfUpdateRoot, unconfiguredSelfUpdateBridge, type SelfUpdateBridge } from './self-update'
+import { SelfUpdateService, createSelfUpdateBridge, drainAllowsPath, handleSelfUpdateApi, handleSelfUpdateTurnedOff, isSelfUpdateControlRoute, resolveSelfUpdateRoot, unconfiguredSelfUpdateBridge, type SelfUpdateBridge } from './self-update'
 import { applyServiceEnvironment, readServiceConfig, type ServiceConfig } from './service/config'
+import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
 import type { Server } from 'node:http'
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -101,10 +102,13 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   if (!chatRuntime) {
     const label = opts.instanceLabel ?? 'dev'
     // The self-update controller is separately installed; without a root
-    // (development, tests) the bridge is inert and `/poise` says so.
-    const bridge = opts.selfUpdateBridge === undefined
-      ? createSelfUpdateBridge({ root: resolveSelfUpdateRoot(label) })
-      : opts.selfUpdateBridge ?? unconfiguredSelfUpdateBridge()
+    // (development, tests) the bridge is inert and `/poise` says so. Service
+    // mode never talks to one.
+    const bridge = service
+      ? unconfiguredSelfUpdateBridge()
+      : opts.selfUpdateBridge === undefined
+        ? createSelfUpdateBridge({ root: resolveSelfUpdateRoot(label) })
+        : opts.selfUpdateBridge ?? unconfiguredSelfUpdateBridge()
     chatRuntime = new ChatRuntime({
       instance: `poise-${label}:${process.env.POISE_DB || 'default'}`,
       instanceLabel: label,
@@ -114,7 +118,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     })
     chatRuntime.on('log', (line: string) => console.log(line))
     chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
-    selfUpdate = new SelfUpdateService(chatRuntime, bridge)
+    if (!service) selfUpdate = new SelfUpdateService(chatRuntime, bridge)
     void chatRuntime.recover().catch((error: unknown) => {
       console.error('[chat] startup reconciliation failed:', error)
     })
@@ -169,6 +173,11 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           return json(res, 405, { error: 'cross-origin preflight is not supported' })
         }
 
+        // ── Service mode: the self-update routes that do not exist here ──
+        if (service && (path === '/api/self-update' || path.startsWith('/api/self-update/'))) {
+          return handleSelfUpdateTurnedOff(req, res, path, SELF_UPDATE_OFF, SERVICE_MODE_CODE)
+        }
+
         // ── Self-update: the controller's private endpoints and the public
         // status/revert, ahead of the drain gate they are exempt from ──
         if (selfUpdate && (path === '/api/self-update' || path.startsWith('/api/self-update/'))) {
@@ -189,7 +198,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const claudeAuthState = auth.snapshot()
           const [callerRelease, production] = await Promise.all([
             getCallerReleaseHealth(),
-            getProductionUpdateHealth(),
+            service ? productionUpdaterOff() : getProductionUpdateHealth(),
           ])
           const organizations = getOrganizations()
           const requiresClaude = () => {
@@ -221,11 +230,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
 
         // Claude Code owns credentials. Poise exposes only sanitized health
         // metadata and can start the subscription login flow; no token or
-        // provider output crosses this API boundary.
+        // provider output crosses this API boundary. In service mode no
+        // browser runs beside the server to complete that flow.
         if (url === '/api/claude-auth' && req.method === 'GET') {
-          return json(res, 200, auth.snapshot())
+          return json(res, 200, service ? { ...auth.snapshot(), loginUnavailable: CLAUDE_BROWSER_LOGIN_OFF } : auth.snapshot())
         }
         if (url === '/api/claude-auth/login' && req.method === 'POST') {
+          if (service) return json(res, 409, { error: CLAUDE_BROWSER_LOGIN_OFF, code: SERVICE_MODE_CODE })
           const before = auth.snapshot()
           const state = auth.startLogin()
           return json(res, before.status === 'authenticated' ? 200 : 202, state)

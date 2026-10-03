@@ -79,6 +79,11 @@ describe('legacy datastore sync recovery', () => {
     expect(await recovery.recoverLegacyDatastore(org)).toBe(false)
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
+  it('does nothing in service mode, where no launchd runs', async () => {
+    vi.stubEnv('POISE_MODE', 'service')
+    expect(await recovery.recoverLegacyDatastore(org)).toBe(false)
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
   it('bounds failed recovery attempts and preserves the failure for the caller', async () => {
     mocks.runFile.mockRejectedValue(new Error('service unavailable'))
     await expect(recovery.recoverLegacyDatastore(org)).rejects.toThrow('service unavailable')

@@ -24,6 +24,7 @@ let callerLog = ''
 let server: Server
 let port = 0
 let production: typeof import('../server/production')
+let turnedOff: typeof import('../server/service/turned-off')
 
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-service-mode-'))
@@ -57,6 +58,7 @@ else process.stdout.write('[]')
   }
   vi.resetModules()
   production = await import('../server/production')
+  turnedOff = await import('../server/service/turned-off')
   // The container listens on every interface; the test binds loopback only.
   server = production.createProductionServer({ host: '0.0.0.0', staticDir, claudeAuth: auth, reviewAgentUsername: 'bit-mis' })
   const fromGatewayNetwork = (req: IncomingMessage) => {
@@ -175,6 +177,36 @@ describe('Poise in service mode', () => {
     expect((await send('GET', '/api/settings')).status).toBe(200)
   })
 
+  it('turns off what only a personal computer has, and says why', async () => {
+    expect(await send('GET', '/api/self-update', fromGateway())).toMatchObject({ status: 200, json: { enabled: false, available: false, reason: turnedOff.SELF_UPDATE_OFF, changes: [] } })
+    expect(await send('POST', '/api/self-update/revert', fromGateway(), { changeId: 'x' })).toMatchObject({ status: 409, json: { error: turnedOff.SELF_UPDATE_OFF, code: 'service_mode' } })
+    expect((await send('POST', '/api/self-update/drain', {}, { releaseId: 'r1' })).status).toBe(409)
+
+    expect(await send('GET', '/api/claude-auth', fromGateway())).toMatchObject({ status: 200, json: { status: 'authenticated', loginUnavailable: turnedOff.CLAUDE_BROWSER_LOGIN_OFF } })
+    auth.setStatus('reauth_required')
+    try {
+      const login = await send('POST', '/api/claude-auth/login', fromGateway())
+      expect(login).toMatchObject({ status: 409, json: { code: 'service_mode' } })
+      expect(login.json.error).toContain('Settings → Connected accounts')
+      expect(auth.logins).toBe(0)
+    } finally {
+      auth.setStatus('authenticated')
+    }
+
+    expect((await send('GET', '/api/health', fromGateway())).json.production).toEqual({
+      status: 'off', reason: turnedOff.PRODUCTION_UPDATER_OFF,
+      checkedAt: null, deployedCommit: null, remoteCommit: null, behind: null, failingSince: null, error: null,
+    })
+
+    const snippets = await send('GET', '/api/snippets', fromGateway())
+    expect(snippets).toMatchObject({ status: 200, json: { desktop: 'poise-link' } })
+    expect(snippets.json).not.toHaveProperty('espansoDetected')
+    expect((await send('POST', '/api/snippets', fromGateway(), { trigger: ';regards', replace: 'Kind regards' })).status).toBe(200)
+    expect(await readFile(join(home, '.poise', 'snippets', 'poise.yml'), 'utf8')).toContain(';regards')
+    expect(existsSync(join(home, '.poise', 'config'))).toBe(false)
+    expect(existsSync(join(home, 'Library'))).toBe(false)
+  })
+
   it('holds the Chat WebSocket to the same rules', async () => {
     expect(await openChatSocket({ peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN })).toEqual({ status: 401 })
     expect(await openChatSocket(fromGateway('link'))).toEqual({ status: 403 })
@@ -186,7 +218,19 @@ describe('Poise in service mode', () => {
 
     const opened = await openChatSocket(fromGateway())
     if (!('open' in opened)) throw new Error(`the owner's socket was refused with ${opened.status}`)
-    opened.open.terminate()
+    const socket = opened.open
+    try {
+      const ack = new Promise<{ ok: boolean, error?: string, code?: string }>((resolve) => {
+        socket.on('message', (raw) => {
+          const frame = JSON.parse(raw.toString())
+          if (frame.kind === 'ack' && frame.id === 'poise-change-1') resolve(frame)
+        })
+      })
+      socket.send(JSON.stringify({ id: 'poise-change-1', command: { type: 'poise.change', sessionId: '00000000-0000-4000-8000-000000000000', text: 'Add a button', changeId: '11111111-1111-4111-8111-111111111111' } }))
+      expect(await ack).toMatchObject({ ok: false, code: 'service_mode', error: turnedOff.SELF_UPDATE_OFF })
+    } finally {
+      socket.terminate()
+    }
 
     const local = await openChatSocket({ origin: `http://127.0.0.1:${port}` })
     if (!('open' in local)) throw new Error(`the loopback socket was refused with ${local.status}`)

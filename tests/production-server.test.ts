@@ -139,6 +139,14 @@ describe('production server', () => {
     expect((await fetch(`${baseUrl}/api/unknown`)).status).toBe(404)
   })
 
+  it('has no service endpoints and keeps Espanso detection outside service mode', async () => {
+    expect((await fetch(`${baseUrl}/api/service/health`)).status).toBe(404)
+    expect((await fetch(`${baseUrl}/api/service/drain`, { method: 'POST' })).status).toBe(404)
+    const snippets = await (await fetch(`${baseUrl}/api/snippets`)).json() as Record<string, unknown>
+    expect(snippets).toMatchObject({ espansoDetected: true })
+    expect(snippets).not.toHaveProperty('desktop')
+  })
+
   it('passes the production updater record through health, validated', async () => {
     const deployed = 'b'.repeat(40)
     const remote = 'c'.repeat(40)

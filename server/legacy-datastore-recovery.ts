@@ -2,6 +2,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { db } from './db'
 import { runFile } from './process'
+import { isServiceMode } from './service/config'
 import type { Organization } from './organizations'
 
 const LABEL = 'com.vaquum.github-datastore.sync'
@@ -10,10 +11,11 @@ const shell = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 
 // Wake only Poise's installed sync job, never take over an external datastore
 // or kill a running sync. launchd coalesces kickstart for an already live job.
+// A workspace container has no launchd: datastore sync runs inside Poise.
 export async function recoverLegacyDatastore(org: Organization | null, signal?: AbortSignal): Promise<boolean> {
   const bin = process.env.CALLER_BIN_ROOT
   const databasePath = org?.datastorePath
-  if (process.platform !== 'darwin' || org?.managed !== false || !databasePath
+  if (isServiceMode() || process.platform !== 'darwin' || org?.managed !== false || !databasePath
     || !bin || !isAbsolute(bin)) return false
   signal?.throwIfAborted()
   const now = Date.now()

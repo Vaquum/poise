@@ -406,3 +406,10 @@ export function espansoDetected(): boolean {
   const dirs = (process.env.PATH || '').split(delimiter)
   return dirs.some((p) => p !== '' && existsSync(join(p, 'espanso')))
 }
+
+/** How snippets reach the desktop, for the Snippets view: through Espanso on
+ *  this computer, or through Poise Link in service mode, where looking for
+ *  Espanso on the server would say nothing about the person's desktop. */
+export function snippetDelivery(): { espansoDetected: boolean } | { desktop: 'poise-link' } {
+  return SERVICE_MODE ? { desktop: 'poise-link' } : { espansoDetected: espansoDetected() }
+}
