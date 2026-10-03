@@ -283,7 +283,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               providers: placeProviders(catalog, place.key),
             }))
             const fixed = [
-              { key: 'content', label: '/content', model: catalog.behaviors.author_content, why: 'Authors content in your voice; set by the Caller catalog.' },
+              { key: 'content', label: '/content', model: catalog.behaviors.author_content, why: 'Authors content, in the voice guide AGENT_INTERFACE_VOICE_GUIDE names when one is set; set by the Caller catalog.' },
               { key: 'consensus', label: '/consensus', model: catalog.behaviors.debate_moderator, why: `Moderates the debate; participants: ${catalog.debate_participants.join(', ')}.` },
               { key: 'fix_failing_ci', label: 'Fix failing CI', model: catalog.behaviors.fix_failing_ci, why: 'Caller behavior; set by the Caller catalog.' },
               { key: 'issue_simplify', label: 'Simplify issue', model: catalog.behaviors.issue_simplify, why: 'Caller behavior; set by the Caller catalog.' },

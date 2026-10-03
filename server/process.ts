@@ -122,6 +122,8 @@ const MODEL_ENV = [
   // silently falling back to raw provider executables.
   'AGENT_INTERFACE_CLI',
   'AGENT_INTERFACE_BASH_ALLOW',
+  // The voice guide /content writes in (a file path).
+  'AGENT_INTERFACE_VOICE_GUIDE',
   'CLAUDE_CLI',
   'CLAUDE_CODE_SHELL_PREFIX',
   'CODEX_CLI',

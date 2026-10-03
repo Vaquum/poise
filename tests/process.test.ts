@@ -1026,6 +1026,18 @@ describe('GitHub accounts for Caller', () => {
   })
 })
 
+describe('the /content voice guide', () => {
+  afterEach(() => { vi.unstubAllEnvs() })
+
+  it('reaches agent-interface and no other process', () => {
+    vi.stubEnv('AGENT_INTERFACE_VOICE_GUIDE', '/guides/voice.md')
+    expect(scrubbedChildEnvironment('agent-interface').AGENT_INTERFACE_VOICE_GUIDE).toBe('/guides/voice.md')
+    for (const command of ['github-interface', 'github-datastore', 'claude', 'gh']) {
+      expect(scrubbedChildEnvironment(command).AGENT_INTERFACE_VOICE_GUIDE, command).toBeUndefined()
+    }
+  })
+})
+
 describe('Caller command resolution', () => {
   let root = ''
   let bin = ''
