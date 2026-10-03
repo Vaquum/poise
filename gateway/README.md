@@ -1,0 +1,83 @@
+# Poise gateway
+
+The gateway is the one public entry point of a Poise service. It signs people in with GitHub, routes each workspace host to its owner's container, attaches a signed identity assertion to everything it forwards, pairs Poise Link devices, and creates, starts and upgrades workspace containers through the Docker Engine API.
+
+[docs/Service-architecture.md](../docs/Service-architecture.md) is the contract it implements: addresses, sessions, the assertion format, the workspace runtime and device pairing are specified there and not repeated here.
+
+It is a standalone Node 22 TypeScript service built on `node:http` and `node:crypto`, with `better-sqlite3` for state.
+
+## Configuration
+
+Everything comes from the environment and is validated at startup. Every problem is reported at once and the process exits with status 1.
+
+| Variable | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `POISE_DOMAIN` | yes | | Apex host name, for example `poise.example.com` |
+| `POISE_GITHUB_CLIENT_ID` | yes | | GitHub OAuth App client ID |
+| `POISE_GITHUB_CLIENT_SECRET` | yes | | GitHub OAuth App client secret |
+| `POISE_ADMINS` | yes | | GitHub logins that may open `/admin`; admins may always sign in |
+| `POISE_ALLOWED_USERS` | | | Logins seeded into the allow list |
+| `POISE_ALLOWED_ORGS` | | | Organisations whose active members may sign in; adds the `read:org` scope |
+| `POISE_RUNTIME_IMAGE` | yes | | Workspace image, for example `poise-runtime:latest` |
+| `POISE_GATEWAY_CONTAINER` | yes | | The gateway's own container name, so it can join workspace networks |
+| `POISE_WORKSPACE_MEMORY` | | `8g` | Memory limit per workspace (`b`, `k`, `m`, `g`) |
+| `POISE_WORKSPACE_CPUS` | | `4` | CPU limit per workspace |
+| `POISE_WORKSPACE_PIDS` | | `4096` | Process limit per workspace |
+| `POISE_WORKSPACE_RUNTIME` | | | OCI runtime for workspaces, for example `runsc` |
+| `POISE_DRAIN_TIMEOUT` | | `1800` | Seconds to wait for a workspace to go idle before it is recreated |
+| `POISE_GATEWAY_DATA` | | `/data` | Data directory |
+| `POISE_DOCKER_SOCKET` | | `/var/run/docker.sock` | Docker Engine socket |
+| `PORT` | | `8080` | Listening port |
+| `POISE_GITHUB_URL` | | `https://github.com` | GitHub web origin; tests point it at a fake |
+| `POISE_GITHUB_API_URL` | | `https://api.github.com` | GitHub API origin; tests point it at a fake |
+| `POISE_INSECURE_HTTP` | | | `1` serves plain http for local and CI end-to-end runs; refused unless the domain is `localhost`, `*.localhost` or `*.test` |
+
+The GitHub OAuth App's callback URL is `https://<POISE_DOMAIN>/auth/callback`.
+
+## Routes
+
+On the apex:
+
+| Path | Purpose |
+| --- | --- |
+| `/` | Sign-in page, or links to your workspace, devices and admin |
+| `/auth/login`, `/auth/callback`, `/auth/logout` | GitHub sign-in and sign-out; `/auth/login?next=` accepts an apex path or a URL on a workspace host |
+| `/link` | Approve or deny a Poise Link user code |
+| `/link/devices` | List and revoke paired devices |
+| `POST /link/device/code`, `POST /link/device/token` | Device authorization for Poise Link |
+| `/admin` | Users, workspace state and image, allowed logins, start, stop and restart |
+
+On a workspace host, `/_poise/session` redeems a sign-in ticket and `/_poise/logout` signs out of the workspace and the apex together. Everything else is proxied to the owner's workspace. While it starts, navigations get a page that reloads every two seconds and other requests get `503` JSON.
+
+`GET /_gateway/tls-ask?domain=` answers Caddy's on-demand TLS question. It is served only on hosts that are neither the apex nor a workspace, so the public cannot use it to list handles.
+
+## State
+
+`POISE_GATEWAY_DATA` holds:
+
+- `gateway.db`: users, the allow list, sessions, tickets, OAuth states, device codes, devices and workspace records. Session ids, tickets, OAuth states, device codes and device tokens are stored as SHA-256 hashes only. GitHub tokens are never stored.
+- `identity-ed25519.pem`: the assertion signing key, generated on first start with mode `0600`. The gateway refuses to start if others can read it.
+
+A handle stays bound to the GitHub account id that first signed in with it, so a renamed-and-reused login cannot take over an existing workspace.
+
+## Logs
+
+One JSON object per line on standard output, with an `event` name. Every container lifecycle step is logged (`workspace.volume.created`, `workspace.container.started`, `workspace.upgrade.finished` and so on), as are sign-ins, refusals, device pairing and admin actions. Query strings are never logged, because they can carry sign-in tickets.
+
+## Container
+
+The gateway drives the Docker Engine through its mounted socket and joins each workspace network. The socket is root-equivalent on the host whatever user the process runs as, so the image does not switch to an unprivileged user. Build it with `docker build gateway/`.
+
+## Development
+
+Use Node 22:
+
+```sh
+cd gateway
+npm ci
+npm run typecheck
+npm test
+npm run build
+```
+
+The tests run in-process with no Docker: a fake GitHub, a fake Docker Engine API on a unix socket, and a real upstream that echoes HTTP and WebSocket traffic.
