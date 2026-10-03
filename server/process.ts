@@ -469,6 +469,15 @@ export interface DetachedProcessExit {
   error?: Error
 }
 
+let callerLaunches = 0
+
+/** Caller (`agent-interface`) processes this server launched detached and
+ *  has not yet seen exit: every behavior run, manual review, replay, card
+ *  chat and /content call it started. */
+export function runningCallerLaunches(): number {
+  return callerLaunches
+}
+
 // Resolve only after the OS accepted the launch. In particular, ENOENT and
 // invalid cwd errors are observed and rejected instead of becoming an
 // unhandled ChildProcess error that can terminate the Poise server.
@@ -478,6 +487,7 @@ export function spawnDetached(
   options: DetachedSpawnOptions = {},
 ): Promise<void> {
   assertProcessArgs(args)
+  const caller = commandName(command) === 'agent-interface'
   return new Promise((resolve, reject) => {
     let launched = false
     let exitReported = false
@@ -507,9 +517,13 @@ export function spawnDetached(
     })
     child.once('spawn', () => {
       launched = true
+      if (caller) callerLaunches += 1
       child.unref()
       resolve()
     })
-    child.once('exit', (code, signal) => reportExit({ code, signal }))
+    child.once('exit', (code, signal) => {
+      if (caller && launched) callerLaunches -= 1
+      reportExit({ code, signal })
+    })
   })
 }

@@ -60,6 +60,11 @@ const DEGRADED_STATE: ClaudeAuthState = {
 // have helped. Kept separate, and the detail is shown rather than swallowed.
 let localFailureDetail = ''
 
+// In service mode the server cannot open a browser to sign in, and says where
+// Claude is connected instead. Kept across failed polls: it is a property of
+// the server, not of one answer.
+let browserLoginUnavailable: string | null = null
+
 let initialized = false
 let bannerEl: HTMLElement | null = null
 let pollTimer: number | null = null
@@ -80,6 +85,7 @@ function parseState(value: unknown): ClaudeAuthState {
   if (typeof raw.status !== 'string' || !AUTH_STATUSES.has(raw.status as ClaudeAuthStatus)) {
     throw new Error('invalid Claude auth status')
   }
+  browserLoginUnavailable = nullableString(raw.loginUnavailable)
   return {
     status: raw.status as ClaudeAuthStatus,
     reason: nullableString(raw.reason),
@@ -104,7 +110,9 @@ function bannerCopy(status: ClaudeAuthStatus): { title: string, message: string 
   if (status === 'reauth_required') {
     return {
       title: 'Claude subscription sign-in required',
-      message: 'Claude-backed work is paused. Sign in with the Claude Max or Pro subscription connected to this computer.',
+      message: browserLoginUnavailable
+        ? 'Claude-backed work is paused.'
+        : 'Claude-backed work is paused. Sign in with the Claude Max or Pro subscription connected to this computer.',
     }
   }
   if (status === 'signing_in') {
@@ -127,7 +135,9 @@ function bannerCopy(status: ClaudeAuthStatus): { title: string, message: string 
   }
   return {
     title: 'Claude subscription verification failed',
-    message: 'Claude-backed work is paused. Reconnect the subscription now, or let Poise keep retrying automatically.',
+    message: browserLoginUnavailable
+      ? 'Claude-backed work is paused; Poise keeps retrying automatically.'
+      : 'Claude-backed work is paused. Reconnect the subscription now, or let Poise keep retrying automatically.',
   }
 }
 
@@ -175,7 +185,12 @@ function renderBanner(): void {
   text.append(title, message)
 
   bannerEl.replaceChildren(text)
-  if (LOGIN_STATUSES.has(status)) {
+  if (LOGIN_STATUSES.has(status) && browserLoginUnavailable) {
+    const where = document.createElement('span')
+    where.className = 'claude-auth-message claude-auth-elsewhere'
+    where.textContent = browserLoginUnavailable
+    text.append(where)
+  } else if (LOGIN_STATUSES.has(status)) {
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'claude-auth-login'
@@ -226,7 +241,7 @@ async function refreshAuthState(): Promise<void> {
 }
 
 async function startLogin(): Promise<void> {
-  if (loginRequestInProgress || !LOGIN_STATUSES.has(effectiveStatus(currentState))) return
+  if (loginRequestInProgress || browserLoginUnavailable || !LOGIN_STATUSES.has(effectiveStatus(currentState))) return
   loginRequestInProgress = true
   stateEpoch += 1
   clearPoll()

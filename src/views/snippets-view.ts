@@ -24,6 +24,9 @@ let initialized = false
 let snippets: Snippet[] = []
 let snippetVersion = ''
 let espansoOk = true
+// Service mode: no Espanso runs beside the server; Poise Link brings the
+// snippets to the person's desktop.
+let viaPoiseLink = false
 let skills: ChatSwitches = { revision: 0, switches: [] }
 let saving = false
 let loadGeneration = 0
@@ -51,6 +54,7 @@ function renderShell(): string {
         <button type="button" class="st-save snip-add">Add snippet</button>
         <span class="filter-count" id="snippets-count"></span>
         <span class="st-help st-help-info snip-espanso-hint" hidden>Chat skills work without Espanso. Install Espanso for system-wide text expansion.</span>
+        <span class="st-help st-help-info snip-link-hint" hidden>Snippets reach your desktop through Poise Link, which keeps Espanso there in sync.</span>
       </div>
     </header>
     <main>
@@ -133,6 +137,7 @@ function renderRows() {
   // when the data was actually read.
   viewEl.querySelector<HTMLElement>('.snip-empty')!.hidden = failed || n > 0
   viewEl.querySelector<HTMLElement>('.snip-espanso-hint')!.hidden = failed || espansoOk
+  viewEl.querySelector<HTMLElement>('.snip-link-hint')!.hidden = failed || !viaPoiseLink
 
   const errorBox = viewEl.querySelector<HTMLElement>('.snip-load-error')!
   errorBox.hidden = !failed
@@ -451,6 +456,7 @@ async function fetchSnippets(): Promise<boolean> {
     snippets = Array.isArray(data.snippets) ? data.snippets : []
     snippetVersion = data.version
     espansoOk = data.espansoDetected !== false
+    viaPoiseLink = data.desktop === 'poise-link'
     loadError = null
     return true
   } catch (err) {

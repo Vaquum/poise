@@ -9,17 +9,19 @@ import { readMemories, saveMemories } from './memories'
 // request — allowed host, no cross-site fetch metadata, an Origin that
 // matches the host — before the socket is accepted; a browser always sends
 // Origin on an upgrade, so a missing one is accepted only from loopback like
-// a CLI probe. Each command frame carries a client request id: an id the
+// a CLI probe. In service mode the gateway's upgrade also needs a browser
+// identity assertion. Each command frame carries a client request id: an id the
 // server already answered is answered again from a bounded cache instead of
 // being executed twice, which is what makes resending after a reconnect safe.
 // A subscriber that falls too far behind is disconnected rather than buffered
 // without limit; it comes back and asks for everything after its last seq.
 
-import type { IncomingMessage, Server, ServerResponse } from 'node:http'
+import { STATUS_CODES, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { ATTACHMENT_MAX_BYTES, HttpError, enforceApiRequest, httpStatus, readBuffer, readJson, type ApiRequestPolicy } from '../http'
+import { SELF_UPDATE_OFF, SERVICE_MODE_CODE } from '../service/turned-off'
 import { runFile } from '../process'
 import { handleGhBody } from '../gh'
 import { getChatSettings } from '../settings'
@@ -111,7 +113,7 @@ export class ChatSocketServer {
       // a browser always sends Origin on an upgrade, so that path is a CLI.
     } catch (error) {
       const status = error instanceof HttpError ? error.statusCode : 403
-      socket.write(`HTTP/1.1 ${status} Forbidden\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n${error instanceof Error ? error.message : 'forbidden'}`)
+      socket.write(`HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Forbidden'}\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n${error instanceof Error ? error.message : 'forbidden'}`)
       socket.destroy()
       return true
     }
@@ -288,6 +290,7 @@ export class ChatSocketServer {
         await runtime.revert(String(command.sessionId || ''), String(command.diffId || ''))
         return {}
       case 'poise.change': {
+        if (this.policy.service) throw new ChatError(409, SELF_UPDATE_OFF, SERVICE_MODE_CODE)
         // Only these three fields exist: the browser never names a
         // repository, branch or path for a change — the controller does.
         const changeId = String(command.changeId || '')
