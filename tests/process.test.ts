@@ -1026,6 +1026,24 @@ describe('GitHub accounts for Caller', () => {
     expect(scrubbedChildEnvironment('github-interface')).toMatchObject({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'other-bot' })
   })
 
+  // Behavior runs, manual reviews and replays launch agent-interface detached,
+  // the launches a drain counts.
+  it('gives a detached Caller launch the accounts too, and counts it as one', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }))
+    const caller = await namedNode(root, 'agent-interface')
+    const out = join(root, 'accounts.json')
+    const before = runningCallerLaunches()
+    let exited!: () => void
+    const done = new Promise<void>((resolve) => { exited = resolve })
+    await spawnDetached(caller, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(out)}, JSON.stringify({ person: process.env.GITHUB_INTERFACE_USER, agent: process.env.GITHUB_INTERFACE_AGENT_USER }))`], {
+      onExit: () => exited(),
+    })
+    expect(runningCallerLaunches()).toBe(before + 1)
+    await done
+    expect(JSON.parse(await readFile(out, 'utf8'))).toEqual({ person: 'octocat', agent: 'review-bot' })
+    expect(runningCallerLaunches()).toBe(before)
+  })
+
   it('never lets an inherited account stand in for one that is not set', async () => {
     setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat' }))
     expect(await accountsOf('github-interface')).toEqual({ person: 'octocat' })
