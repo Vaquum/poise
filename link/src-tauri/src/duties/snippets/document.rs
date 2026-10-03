@@ -319,7 +319,7 @@ mod tests {
                 "*alias &anchor !tag #comment key: value - [x] {y} | > % @ `",
                 None,
             ),
-            snippet(";var", "{{output}} stays literal text", None),
+            snippet(";var", "Dear {{name}},", None),
             snippet(
                 ";ctl",
                 "bell\u{7} esc\u{1b} nel\u{85} ls\u{2028} bom\u{feff}",
