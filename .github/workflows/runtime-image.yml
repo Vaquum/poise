@@ -1,0 +1,91 @@
+name: Runtime image
+
+on:
+  pull_request:
+    paths:
+      - "deploy/runtime/**"
+      - ".dockerignore"
+      - "package*.json"
+      - "server/**"
+      - "src/**"
+      - "scripts/**"
+      - "caller/**"
+      - ".github/workflows/runtime-image.yml"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/runtime/**"
+      - ".dockerignore"
+      - "package*.json"
+      - "server/**"
+      - "src/**"
+      - "scripts/**"
+      - "caller/**"
+      - ".github/workflows/runtime-image.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Workspace image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Lint the image's shell scripts
+        run: shellcheck deploy/runtime/*.sh deploy/runtime/test/*.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/runtime/Dockerfile
+          tags: poise-runtime:ci
+          load: true
+          cache-from: type=gha,scope=runtime-image
+          cache-to: type=gha,scope=runtime-image,mode=max
+
+      - name: Print the image size
+        run: |
+          docker image ls poise-runtime:ci
+          size=$(docker image inspect --format '{{.Size}}' poise-runtime:ci)
+          echo "poise-runtime:ci is $((size / 1000000)) MB" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Check identity, user, tools and entrypoint
+        run: deploy/runtime/test/smoke.sh contract poise-runtime:ci
+
+      - name: Check that a failed CLI bootstrap leaves Poise running
+        run: deploy/runtime/test/smoke.sh offline poise-runtime:ci
+
+      # Installing the provider CLIs downloads about a gigabyte from five
+      # vendors, so it runs only when the image's own files change.
+      - name: Check whether the image's own files changed
+        id: changes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE"
+          if git diff --quiet FETCH_HEAD HEAD -- deploy/runtime .github/workflows/runtime-image.yml; then
+            echo "runtime=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "runtime=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the provider CLIs
+        if: steps.changes.outputs.runtime == 'true'
+        run: deploy/runtime/test/smoke.sh bootstrap poise-runtime:ci
+
+      - name: Print the containers' logs
+        if: failure()
+        run: deploy/runtime/test/smoke.sh logs poise-runtime:ci
