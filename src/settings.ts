@@ -1,7 +1,9 @@
 import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } from './model-refresh'
-// Settings panel — two tabs: General (GitHub accounts, username, timezone, refresh rate,
-// theme) and Models (which model each place in Poise launches, with a
-// fallback). Slides in from the right, same pattern as the typography panel.
+// Settings panel — three tabs: General (GitHub accounts, username, timezone, refresh rate,
+// theme), Models (which model each place in Poise launches, with a
+// fallback) and Accounts (Connected accounts: each agent CLI's sign-in, and a
+// terminal for its login). Slides in from the right, same pattern as the
+// typography panel.
 //
 // GitHub auth no longer lives here — Poise reads through the local
 // `github-datastore` CLI which handles auth on its own side. The
@@ -14,6 +16,10 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 
 import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
 import { productionSummary, type ProductionUpdate } from './production-status'
+import { ACCOUNT_LOGINS, type ConnectedAccount } from '../server/accounts/types'
+import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
+import { accountsHtml, fetchAccounts } from './views/connected-accounts'
+import type { TerminalPanel } from './views/terminal-panel'
 
 interface CatalogModel { identity: string, provider: string, selector: string, effort: string }
 interface ModelPlace {
@@ -64,6 +70,14 @@ const dirtyModels = new Set<string>()
 let modelRefreshActive = false
 let modelsGeneration = 0
 let lastModels: ModelsResponse | null = null
+let accountsEl: HTMLElement | null = null
+let accountsStatusEl: HTMLElement | null = null
+let terminalSlot: HTMLElement | null = null
+let shellBtn: HTMLButtonElement | null = null
+let accounts: ConnectedAccount[] | null = null
+let accountsGeneration = 0
+let terminal: TerminalPanel | null = null
+let terminalOpening = false
 
 async function refreshStatus(): Promise<void> {
   const before = getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login).join(',')
@@ -265,6 +279,88 @@ async function loadProduction(): Promise<void> {
   } catch {
     // Leave whatever was shown; the next open tries again.
   }
+}
+
+// ── Connected accounts tab ──────────────────────────────────────────────
+
+// One login at a time from this panel; the server allows two terminals in
+// all, across every open tab.
+function terminalBusy(): boolean {
+  return terminalOpening || !!terminal?.running
+}
+
+function renderAccounts(): void {
+  if (accountsEl && accounts) accountsEl.innerHTML = accountsHtml(accounts, getCachedSettings().me, terminalBusy())
+  if (shellBtn) shellBtn.disabled = terminalBusy()
+}
+
+function accountsStatus(text: string, failed = false): void {
+  if (!accountsStatusEl) return
+  accountsStatusEl.textContent = text
+  accountsStatusEl.className = `st-help st-help-${failed ? 'error' : 'info'} st-accounts-status`
+}
+
+async function loadAccounts(): Promise<void> {
+  if (!accountsEl) return
+  const generation = ++accountsGeneration
+  if (!accounts) accountsEl.innerHTML = '<div class="st-help st-help-info">Checking each CLI…</div>'
+  try {
+    const next = await fetchAccounts()
+    if (generation !== accountsGeneration) return
+    accounts = next
+    renderAccounts()
+  } catch (error) {
+    if (generation !== accountsGeneration) return
+    const message = `Could not read the connected accounts: ${(error as Error).message}`
+    if (!accounts) accountsEl.innerHTML = `<div class="st-help st-help-error">${escapeHtml(message)}</div>`
+    else accountsStatus(message, true)
+  }
+}
+
+function terminalTitle(preset: TerminalPreset): string {
+  return preset === 'shell' ? 'Login shell' : ACCOUNT_LOGINS[preset].join(' ')
+}
+
+async function connect(preset: TerminalPreset): Promise<void> {
+  if (!panelEl || !terminalSlot) return
+  if (terminalBusy()) {
+    accountsStatus('A terminal is already open here; close it first.', true)
+    terminal?.focus()
+    return
+  }
+  // A finished terminal gives way to the new one.
+  terminal?.dispose()
+  terminalOpening = true
+  accountsStatus('')
+  renderAccounts()
+  panelEl.classList.add('st-terminal-open')
+  try {
+    const { openTerminal } = await import('./views/terminal-panel')
+    const opened = openTerminal({
+      preset,
+      title: terminalTitle(preset),
+      // A login may have changed what the CLI's status says.
+      onEnd: () => { renderAccounts(); void loadAccounts() },
+      onDispose: () => {
+        if (terminal === opened) terminal = null
+        panelEl?.classList.remove('st-terminal-open')
+        renderAccounts()
+      },
+    })
+    terminal = opened
+    terminalSlot.append(opened.element)
+    opened.element.scrollIntoView({ block: 'nearest' })
+  } catch (error) {
+    panelEl.classList.remove('st-terminal-open')
+    accountsStatus(`Could not open the terminal: ${(error as Error).message}`, true)
+  } finally {
+    terminalOpening = false
+    renderAccounts()
+  }
+}
+
+function accountsTabSelected(): boolean {
+  return !!panelEl?.querySelector('.st-tabs [data-tab="accounts"].active')
 }
 
 // ── Models tab ──────────────────────────────────────────────────────────
@@ -523,6 +619,7 @@ function selectTab(panel: HTMLElement, tab: string) {
   for (const section of panel.querySelectorAll<HTMLElement>('.st-tab')) {
     section.hidden = section.dataset.tab !== tab
   }
+  if (tab === 'accounts') void loadAccounts()
 }
 
 function buildPanel(): HTMLElement {
@@ -539,6 +636,7 @@ function buildPanel(): HTMLElement {
       <div class="range-picker st-tabs" role="tablist" aria-label="Settings sections">
         <button type="button" role="tab" data-tab="general" class="active" aria-selected="true">General</button>
         <button type="button" role="tab" data-tab="models" aria-selected="false">Models</button>
+        <button type="button" role="tab" data-tab="accounts" aria-selected="false">Accounts</button>
       </div>
 
       <section class="st-tab" data-tab="general">
@@ -629,6 +727,24 @@ function buildPanel(): HTMLElement {
         </div>
       </section>
 
+      <section class="st-tab" data-tab="accounts" hidden>
+        <div class="tp-group-label">Connected accounts</div>
+        <div class="tp-section">
+          <div class="st-help st-help-info st-accounts-intro">Each agent CLI keeps its own sign-in. Connect opens a terminal here that runs the CLI's own login; the CLI keeps what it signs in with in its own files, and Poise never reads them.</div>
+        </div>
+        <div class="st-terminal-slot"></div>
+        <div class="st-accounts" aria-live="polite"></div>
+        <div class="st-help st-help-info st-accounts-status" role="status"></div>
+
+        <div class="tp-group-label">Terminal</div>
+        <div class="tp-section">
+          <div class="st-account-actions">
+            <button type="button" class="st-clear st-open-shell">Open a shell</button>
+          </div>
+          <div class="st-help st-help-info">Your login shell, for what the logins above do not cover. At most two terminals run at once, and one closes after 15 idle minutes.</div>
+        </div>
+      </section>
+
       <div class="st-row">
         <button class="st-save">Save</button>
         <span class="st-help st-help-info st-status" role="status" aria-live="polite"></span>
@@ -654,6 +770,15 @@ function buildPanel(): HTMLElement {
   productionEl = panel.querySelector('.st-production')
   refreshBtn = panel.querySelector('.st-refresh-models') as HTMLButtonElement
   refreshBtn.addEventListener('click', () => { void refreshModels() })
+  accountsEl = panel.querySelector('.st-accounts')
+  accountsStatusEl = panel.querySelector('.st-accounts-status')
+  terminalSlot = panel.querySelector('.st-terminal-slot')
+  shellBtn = panel.querySelector('.st-open-shell') as HTMLButtonElement
+  shellBtn.addEventListener('click', () => { void connect('shell') })
+  accountsEl!.addEventListener('click', (event) => {
+    const preset = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-connect]')?.dataset.connect
+    if (isTerminalPreset(preset)) void connect(preset)
+  })
   // This used to be `panel.querySelector('.st-help')`, which is the Username
   // explainer — the first element of that class in the panel. Every "Saved."
   // and every validation error overwrote it, permanently for the session, and
@@ -718,6 +843,15 @@ export function initSettings() {
   window.addEventListener('poise:refresh-tick', () => {
     if (!panelEl?.classList.contains('open') && getOrganizations().some((org) => org.status === 'initializing')) void pollOrganizations()
   })
+  // Elsewhere in Poise (the Claude sign-in banner in service mode) asks for a
+  // CLI's login: Settings → Connected accounts, with its terminal open.
+  window.addEventListener('poise:connect-account', (event) => {
+    const preset = (event as CustomEvent<{ id?: string }>).detail?.id
+    if (!panelEl || !isTerminalPreset(preset)) return
+    openSettingsPanel()
+    selectTab(panelEl, 'accounts')
+    void connect(preset)
+  })
 }
 
 export function openSettingsPanel() {
@@ -730,6 +864,7 @@ export function openSettingsPanel() {
   void loadModels()
   void loadProduction()
   void pollOrganizations()
+  if (accountsTabSelected()) void loadAccounts()
   if (focusTimer) clearTimeout(focusTimer)
   const openingFocus = document.activeElement
   focusTimer = setTimeout(() => {
@@ -764,6 +899,8 @@ export function closeSettingsPanel() {
 function onSettingsKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape') return
   if (!panelEl?.classList.contains('open')) return
+  // Escape inside a terminal belongs to the program running there.
+  if ((e.target as Element | null)?.closest?.('.st-terminal')) return
   e.preventDefault()
   closeSettingsPanel()
 }
