@@ -54,7 +54,6 @@ else process.stdout.write('[]')
 `)
   await writeFile(join(bin, 'agent-interface'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(bin, 'fake-caller.cjs'))} "$@"\n`)
   await chmod(join(bin, 'agent-interface'), 0o755)
-
   // Every agent CLI is a fake ahead of the real ones on PATH: the accounts
   // and the terminal never reach a real CLI or a real login.
   const loginPrompt = 'Open https://example.test/device and enter ABCD-1234\n'
@@ -151,6 +150,40 @@ function openChatSocket(caller: Caller): Promise<SocketOutcome> {
     socket.once('open', () => resolve({ open: socket }))
     socket.once('unexpected-response', (_request, response) => {
       resolve({ status: response.statusCode ?? 0 })
+      response.destroy()
+      socket.terminate()
+    })
+    socket.once('error', (error) => { if (socket.readyState !== WebSocket.CLOSED) reject(error) })
+  })
+}
+
+interface TerminalOutcome { status: number, output: string, frames: Array<{ type: string, code?: number }>, close: number }
+
+/** A terminal through the gateway (or not): refused with a status, or opened
+ *  and driven to its end, typing Enter once the program asks for it. */
+function runTerminal(preset: string, caller: Caller): Promise<TerminalOutcome> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/terminal?preset=${preset}`, {
+      ...(caller.origin ? { origin: caller.origin } : {}),
+      headers: {
+        host: caller.host ?? (caller.peer ? PUBLIC_HOST : `127.0.0.1:${port}`),
+        ...(caller.identity ? { 'x-poise-identity': caller.identity } : {}),
+        ...(caller.peer ? { 'x-test-peer': caller.peer } : {}),
+        ...caller.headers,
+      },
+    })
+    let output = ''
+    const frames: Array<{ type: string, code?: number }> = []
+    socket.on('message', (raw) => {
+      const frame = JSON.parse(raw.toString())
+      frames.push(frame)
+      if (frame.type !== 'output') return
+      output += Buffer.from(frame.data, 'base64').toString('utf8')
+      if (output.includes('ABCD-1234') && !output.includes('\r\n\r\n')) socket.send(JSON.stringify({ type: 'input', data: '\r' }))
+    })
+    socket.once('close', (close) => resolve({ status: 101, output, frames, close }))
+    socket.once('unexpected-response', (_request, response) => {
+      resolve({ status: response.statusCode ?? 0, output, frames, close: 0 })
       response.destroy()
       socket.terminate()
     })
@@ -321,7 +354,7 @@ describe('Poise in service mode', () => {
       [fromGateway('link'), 403],
       [fromGateway(), 404],
     ] as Array<[Caller, number]>) {
-      expect(await rawUpgrade('/ws/terminal', caller)).toEqual({ status, closed: true })
+      expect(await rawUpgrade('/ws/elsewhere', caller)).toEqual({ status, closed: true })
     }
   })
 
@@ -333,6 +366,36 @@ describe('Poise in service mode', () => {
     expect((await send('GET', '/api/accounts', fromGateway('link'))).status).toBe(403)
     expect((await send('GET', '/api/accounts', fromGateway('admin'))).status).toBe(403)
     expect((await send('GET', '/api/accounts', { peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN })).status).toBe(401)
+  })
+
+  it('opens the terminal to the owner\'s browser only, and refreshes the accounts when a login exits', async () => {
+    for (const [caller, status] of [
+      [{ peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN }, 401],
+      [fromGateway('link'), 403],
+      [fromGateway('admin'), 403],
+      [{ ...fromGateway(), identity: signAssertion(gateway.privateKey, { iat: 1, exp: 61 }) }, 401],
+      [{ ...fromGateway(), origin: `http://${PUBLIC_HOST}` }, 403],
+      [{ ...fromGateway(), host: 'poise-ws-octocat:5555' }, 403],
+      [{ ...fromGateway(), headers: { 'sec-fetch-site': 'cross-site' } }, 403],
+      [{ peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN, headers: { cookie: 'poise_ws=session', authorization: 'Bearer device-token' } }, 401],
+    ] as Array<[Caller, number]>) {
+      expect((await runTerminal('codex', caller)).status).toBe(status)
+    }
+
+    expect((await send('GET', '/api/accounts', fromGateway())).json.accounts[1]).toMatchObject({ id: 'codex', signedIn: false })
+    const login = await runTerminal('codex', fromGateway())
+    expect(login).toMatchObject({ status: 101, close: 1000 })
+    expect(login.output).toContain('ABCD-1234')
+    expect(login.frames.at(-1)).toEqual({ type: 'exit', code: 0 })
+    expect((await send('GET', '/api/accounts', fromGateway())).json.accounts[1]).toMatchObject({ id: 'codex', signedIn: true, detail: 'Signed in with ChatGPT' })
+  })
+
+  it('verifies the Claude sign-in at once when Claude\'s login exits', async () => {
+    const before = auth.liveChecks
+    const login = await runTerminal('claude', fromGateway())
+    expect(login.frames.at(-1)).toEqual({ type: 'exit', code: 0 })
+    await vi.waitFor(() => expect(auth.liveChecks).toBe(before + 1), { timeout: 2_000, interval: 20 })
+    expect((await send('GET', '/api/accounts', fromGateway())).json.accounts[0]).toMatchObject({ id: 'claude', signedIn: true, identity: 'octocat@example.com' })
   })
 
   it('counts the Caller calls it launched until they finish', async () => {

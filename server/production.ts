@@ -9,6 +9,7 @@ import { assertCallerRelease } from './caller-release'
 import { assertSecureDotenv, loadSecureDotenv, validateConfabUrl } from './runtime-config'
 import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'
+import { TERMINAL_WS_PATH } from './terminal/protocol'
 import type { ClaudeAuthRuntime } from './cache-plugin'
 
 // Security validation must run before dotenv reads the file and before modules
@@ -288,7 +289,8 @@ async function serveStatic(
 // An upgrade nothing serves is answered and closed, never left open: an
 // open one pins a descriptor and holds shutdown until its deadline.
 function refuseUpgrade(req: IncomingMessage, socket: Duplex, service: ServiceConfig | null): void {
-  if ((req.url || '').split('?')[0] === WS_PATH) return
+  const path = (req.url || '').split('?')[0]
+  if (path === WS_PATH || path === TERMINAL_WS_PATH) return
   let status = 404
   let message = 'not found'
   try {
@@ -425,7 +427,8 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
       sendFailure(res, 500, error)
     })
   })
-  // /ws/chat: the same host/origin checks as the API, on the upgrade itself.
+  // /ws/chat and /ws/terminal: the same host/origin checks as the API, on the
+  // upgrade itself.
   attachChatSockets(server)
   server.on('upgrade', (req: IncomingMessage, socket: Duplex) => refuseUpgrade(req, socket, service))
   server.headersTimeout = 10_000

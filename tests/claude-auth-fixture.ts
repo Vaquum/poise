@@ -5,6 +5,8 @@ export interface FakeClaudeAuthRuntime extends ClaudeAuthRuntime {
   readonly starts: number
   readonly stops: number
   readonly logins: number
+  /** Checks asked for a live verification. */
+  readonly liveChecks: number
   setStatus(status: ClaudeAuthStatus): void
 }
 
@@ -12,6 +14,7 @@ export function createAuthenticatedClaudeAuth(): FakeClaudeAuthRuntime {
   let starts = 0
   let stops = 0
   let logins = 0
+  let liveChecks = 0
   let state: ClaudeAuthSnapshot = {
     status: 'authenticated',
     reason: null,
@@ -25,9 +28,14 @@ export function createAuthenticatedClaudeAuth(): FakeClaudeAuthRuntime {
     get starts() { return starts },
     get stops() { return stops },
     get logins() { return logins },
+    get liveChecks() { return liveChecks },
     start() { starts += 1 },
     async stop() { stops += 1 },
     snapshot() { return { ...state } },
+    async check(options = {}) {
+      if (options.forceLive) liveChecks += 1
+      return { ...state }
+    },
     startLogin() {
       if (state.status === 'authenticated' || state.loginInProgress) return { ...state }
       logins += 1

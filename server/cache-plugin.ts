@@ -4,7 +4,7 @@ import type { ServerResponse } from 'node:http'
 import { getModelSettings, getSettings, setSettings } from './settings'
 import { MODEL_PLACES, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
 import { refreshModelCatalog } from './models-refresh'
-import { claudeAuth, type ClaudeAuthSnapshot } from './claude-auth'
+import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot } from './claude-auth'
 import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
@@ -29,7 +29,8 @@ import { DRAINING_ERROR, ServiceControl, handleServiceApi } from './service/cont
 import { countDebate } from './service/caller-calls'
 import { DailyModelRefresh } from './service/model-refresh'
 import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
-import { listAccounts } from './accounts'
+import { invalidateAccounts, listAccounts } from './accounts'
+import { TerminalSocketServer } from './terminal/server'
 import type { Server } from 'node:http'
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -63,6 +64,7 @@ export interface CachePluginOptions {
 // servers' sessions and two different databases never mix.
 let chatRuntime: ChatRuntime | null = null
 let chatSockets: ChatSocketServer | null = null
+let terminalSockets: TerminalSocketServer | null = null
 let selfUpdate: SelfUpdateService | null = null
 // Service mode only: the gateway's drain and the in-process daily model check.
 let serviceControl: ServiceControl | null = null
@@ -82,10 +84,12 @@ export function getSelfUpdateService(): SelfUpdateService {
   return selfUpdate
 }
 
-/** Serve /ws/chat on an HTTP server (production server or Vite's). */
+/** Serve /ws/chat and /ws/terminal on an HTTP server (production server or
+ *  Vite's). */
 export function attachChatSockets(server: Server): void {
-  if (!chatSockets) throw new Error('the chat runtime is not started')
+  if (!chatSockets || !terminalSockets) throw new Error('the chat runtime is not started')
   chatSockets.attach(server)
+  terminalSockets.attach(server)
 }
 
 export interface ClaudeAuthRuntime {
@@ -93,6 +97,7 @@ export interface ClaudeAuthRuntime {
   stop(): Promise<void>
   snapshot(): ClaudeAuthSnapshot
   startLogin(): ClaudeAuthSnapshot
+  check(options?: ClaudeAuthCheckOptions): Promise<ClaudeAuthSnapshot>
 }
 
 const activeClaudeAuthRuntimes = new Set<ClaudeAuthRuntime>()
@@ -126,6 +131,13 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     })
     chatRuntime.on('log', (line: string) => console.log(line))
     chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
+    terminalSockets = new TerminalSocketServer({ allowedHosts: opts.allowedHosts, service })
+    // A login may have just changed an account. Claude's sign-in also gates
+    // Claude-backed work, so it is verified now instead of at the next poll.
+    terminalSockets.on('exit', (preset) => {
+      invalidateAccounts()
+      if (preset === 'claude') void auth.check({ forceLive: true })
+    })
     if (service) {
       serviceControl = new ServiceControl(chatRuntime, { drainTimeoutSeconds: service.drainTimeoutSeconds })
       dailyModelRefresh = new DailyModelRefresh({
@@ -148,15 +160,17 @@ export async function stopPoiseRuntime(): Promise<void> {
   activeClaudeAuthRuntimes.clear()
   const chatStop = chatRuntime?.stop() ?? Promise.resolve()
   const socketStop = chatSockets?.close() ?? Promise.resolve()
+  const terminalStop = terminalSockets?.close() ?? Promise.resolve()
   selfUpdate?.reset()
   serviceControl?.reset()
   dailyModelRefresh?.stop()
   chatRuntime = null
   chatSockets = null
+  terminalSockets = null
   selfUpdate = null
   serviceControl = null
   dailyModelRefresh = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
 }
 
 export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.NextHandleFunction {
