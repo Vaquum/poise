@@ -256,6 +256,7 @@ nothing on this page changes. The gateway passes:
 | `POISE_WORKSPACE_OWNER` | The owner's GitHub login |
 | `POISE_PUBLIC_ORIGIN` | `https://<handle>.<domain>`; plain `http://` only on a `localhost`, `*.localhost` or `*.test` host, for local and CI end-to-end runs |
 | `POISE_GATEWAY_PUBLIC_KEY` | The gateway's Ed25519 public key: its SPKI PEM as single-line base64 |
+| `POISE_DRAIN_TIMEOUT` | Optional: how long the gateway waits for a drain, in seconds (default 1800) |
 
 Startup checks all of them and stops with one message naming each variable
 that is missing or invalid.
@@ -266,8 +267,9 @@ identity assertion in `X-Poise-Identity` with a scope that reaches the route,
 the workspace's public host in `Host`, and exactly `POISE_PUBLIC_ORIGIN`,
 scheme included, when it sends `Origin`. Cookies and `Authorization` headers
 never identify anyone: the gateway keeps its own credentials. The Chat
-WebSocket applies the same rules. Loopback requests keep the local rules, so
-the container's own health check needs no assertion.
+WebSocket applies the same rules; an upgrade to any other path is answered
+and closed. Loopback requests keep the local rules, so the container's own
+health check needs no assertion.
 
 **Storage.** Everything lives under `~/.poise` in the home volume: Chat
 workspaces in `~/.poise/chat`, snippets in `~/.poise/snippets/poise.yml` and
@@ -279,18 +281,25 @@ storage no longer needs a git checkout of Poise.
 **Service endpoints**, from loopback or with the gateway's `admin` scope:
 
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
-  runningCallerCalls, draining }`. `version` is the commit the running bundle
-  was built from (`null` for a development build). `activeChatTurns` counts
-  the Chat turns recorded open. `runningCallerCalls` counts the Caller
-  processes this server launched for agent work (behavior runs, manual reviews
-  and replays, card chats, `/content`) that it has not seen exit, plus
-  `/consensus` debates still running.
+  runningCallerCalls, backgroundWork, idle, draining }`. `version` is the
+  commit the running bundle was built from (`null` for a development build).
+  `activeChatTurns` counts the Chat turns recorded open. `runningCallerCalls`
+  counts the Caller processes this server launched for agent work (behavior
+  runs, manual reviews and replays, card chats, `/content`) that it has not
+  seen exit, plus `/consensus` debates still running. `backgroundWork` counts
+  everything else a restart would cut: Chat startups, operations and agent
+  processes, background work (behavior ticks, provider CLI updates, the model
+  check) and browser launches still in their handler. `idle` is true only
+  when all three are zero; the gateway recreates a container once it is.
 - `POST /api/service/drain` stops admitting new Chat turns (queued messages
   included), scheduled behavior launches, and launches from the browser
   (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`, `/api/debate`,
-  `/api/chat`), which answer 503 with code `draining`. Work already running
-  continues. It returns the health body.
-- `POST /api/service/resume` lifts the drain.
+  `/api/chat`, `/api/models/refresh`), which answer 503 with code `draining`.
+  Work already running continues. It returns the health body. A drain lapses
+  `POISE_DRAIN_TIMEOUT` plus five minutes after the last drain call, so a
+  gateway that stops renewing it cannot leave the workspace refusing work.
+- `POST /api/service/resume` lifts the drain; the owner's browser may call it
+  too.
 
 **Daily model check.** At 07:00 in the timezone set in Settings, Poise runs
 the same check as Settings → Models → Check now, in place of the launchd job.

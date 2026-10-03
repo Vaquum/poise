@@ -25,7 +25,8 @@ scope that reaches the route (`browser` every route, `link` only
 `/api/link/*`, `admin` only `/api/service/*`). `Host` must be the public host
 and `Origin`, when sent, exactly the public origin; cross-site API calls are
 refused. Anything else is refused before a handler runs. The assertion header
-is removed once checked, so Poise never echoes, logs or forwards it.
+is removed before any check, so Poise never echoes, logs or forwards it, and
+no cookie or `Authorization` header ever stands in for an assertion.
 Assertions are not tracked for replay: their short lifetime and the gateway,
 which mints one per request, bound that risk. Loopback requests keep the
 local rules: whatever runs inside the container is already the owner's.
