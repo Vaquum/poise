@@ -262,7 +262,6 @@ nothing on this page changes. The gateway passes:
 | `POISE_WORKSPACE_OWNER` | The owner's GitHub login |
 | `POISE_PUBLIC_ORIGIN` | `https://<handle>.<domain>`; plain `http://` only on a `localhost`, `*.localhost` or `*.test` host, for local and CI end-to-end runs |
 | `POISE_GATEWAY_PUBLIC_KEY` | The gateway's Ed25519 public key: its SPKI PEM as single-line base64 |
-| `POISE_DRAIN_TIMEOUT` | Optional: how long the gateway waits for a drain, in seconds (default 1800) |
 
 Startup checks all of them and stops with one message naming each variable
 that is missing or invalid.
@@ -301,9 +300,12 @@ storage no longer needs a git checkout of Poise.
   included), scheduled behavior launches, and launches from the browser
   (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`, `/api/debate`,
   `/api/chat`, `/api/models/refresh`), which answer 503 with code `draining`.
-  Work already running continues. It returns the health body. A drain lapses
-  `POISE_DRAIN_TIMEOUT` plus five minutes after the last drain call, so a
-  gateway that stops renewing it cannot leave the workspace refusing work.
+  Work already running continues. It returns the health body. The gateway
+  renews a drain by calling it again while it waits; one that is not renewed
+  lapses `POISE_DRAIN_TIMEOUT` seconds (default 1800; read from the
+  workspace's environment and validated at startup) plus five minutes after
+  the last drain call, so a gateway that stops renewing it cannot leave the
+  workspace refusing work.
 - `POST /api/service/resume` lifts the drain; the owner's browser may call it
   too.
 

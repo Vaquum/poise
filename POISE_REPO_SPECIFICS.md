@@ -16,10 +16,11 @@ Poise must keep working outside service mode too: `npm run dev` on a developer's
 | `src/`, `server/`, `scripts/`, `tests/`, `index.html`, `vite.config.ts` | Poise application |
 | `caller/` | Caller: `agent_interface`, `github_interface` and `github_datastore`, the Python CLIs Poise drives ([caller/README.md](caller/README.md)) |
 | `docs/` | Documentation; `docs/Service-architecture.md` is the interface contract |
+| `gateway/` | Login, routing and workspace orchestration service (Node 22, TypeScript, its own `package.json`) |
 | `.github/workflows/` | CI |
 | `link/` | Poise Link, the desktop companion (Tauri 2: Rust in `link/src-tauri`, the window in `link/ui`); see [docs/Poise-Link.md](docs/Poise-Link.md) |
 
-Slices that add `gateway/` and `deploy/` add their rows and gates here in the same pull request.
+Slices that add `deploy/` add their rows and gates here in the same pull request.
 
 ## Toolchain
 
@@ -34,11 +35,12 @@ Slices that add `gateway/` and `deploy/` add their rows and gates here in the sa
 | --- | --- |
 | Poise application | `npm run check` (lint, unit and integration tests, production build) |
 | Poise browser UI | `npm run check` and `npm run test:e2e` |
+| Gateway | In `gateway/`: `npm ci`, `npm run typecheck` and `npm test`; where Docker is available, also `docker build gateway/` and `POISE_GATEWAY_DOCKER_TESTS=1 npx vitest run tests/docker.integration.test.ts` |
 | Caller | `npm ci` and `npm run caller:setup`, then `caller/.venv/bin/python -m pytest caller/agent_interface/tests caller/github_interface/tests caller/github_datastore/tests` |
 | Documentation only | Links and examples checked by hand against the code |
 | Poise Link (`link/`) | In `link/src-tauri`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` |
 
-CI runs the Poise gates on Node 22 for pull requests and on Node 20, 22 and 24 for `main`. The Caller workflow runs Caller's tests on Python 3.13 for pull requests and `main`. The Poise Link workflow runs its gates on Ubuntu for pull requests and `main` pushes that touch `link/`, and builds the macOS, Windows and Linux installers only when run by hand or for a `link-v*` tag.
+CI runs the Poise gates on Node 22 for pull requests and on Node 20, 22 and 24 for `main`. The gateway workflow runs its gates and builds its image on Node 22 when `gateway/` changes. The Caller workflow runs Caller's tests on Python 3.13 for pull requests and `main`. The Poise Link workflow runs its gates on Ubuntu for pull requests and `main` pushes that touch `link/`, and builds the macOS, Windows and Linux installers only when run by hand or for a `link-v*` tag.
 
 ## Proof obligations
 
