@@ -395,7 +395,7 @@ next_commit() {
 }
 
 check_upgrade() {
-  local sha before image id current status health
+  local sha before image id current status health recreated=false
   before=$(docker inspect --format '{{.Id}}' poise-ws-alice)
   sha=$(next_commit)
   "$deploy/upgrade.sh" | tee "$work/upgrade.log"
@@ -407,11 +407,13 @@ check_upgrade() {
   for _ in $(seq 1 90); do
     read -r id current status health < <(docker inspect --format \
       '{{.Id}} {{.Image}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' poise-ws-alice 2>/dev/null || echo gone)
-    if [ "$id" != "$before" ] && [ "$current" = "$image" ] && [ "$status" = running ] && [ "$health" = healthy ]; then break; fi
+    if [ "$id" != "$before" ] && [ "$current" = "$image" ] && [ "$status" = running ] && [ "$health" = healthy ]; then
+      recreated=true
+      break
+    fi
     sleep 5
   done
-  [ "$id" != "$before" ] && [ "$current" = "$image" ] && [ "$status" = running ] && [ "$health" = healthy ] \
-    || fail "the gateway did not recreate alice's workspace on the new image within 7.5 minutes: $id $current $status $health"
+  [ "$recreated" = true ] || fail "the gateway did not recreate alice's workspace on the new image within 7.5 minutes: $id $current $status $health"
   docker logs poise-gateway 2>&1 | grep '"handle":"alice"' | grep --quiet '"event":"workspace.drain.requested"' \
     || fail "the gateway recreated alice's workspace without draining it"
   pass "the gateway drained alice's workspace and recreated it on the new image"
