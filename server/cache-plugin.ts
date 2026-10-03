@@ -7,6 +7,7 @@ import { refreshModelCatalog } from './models-refresh'
 import { claudeAuth, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
 import { claudeAuthStatusChanged } from './alerts/producers'
 import { pruneAlerts } from './alerts/store'
+import { LinkApi } from './link/api'
 import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
@@ -68,6 +69,8 @@ let selfUpdate: SelfUpdateService | null = null
 // Service mode only: the gateway's drain and the in-process daily model check.
 let serviceControl: ServiceControl | null = null
 let dailyModelRefresh: DailyModelRefresh | null = null
+// What paired Poise Link devices read: snippets, alerts and the event stream.
+let linkApi: LinkApi | null = null
 
 function serviceOf(opts: CachePluginOptions): ServiceConfig | null {
   return opts.service === undefined ? readServiceConfig() : opts.service
@@ -146,6 +149,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       console.error('[chat] startup reconciliation failed:', error)
     })
   }
+  if (!linkApi) linkApi = new LinkApi({ service })
 }
 
 export async function stopPoiseRuntime(): Promise<void> {
@@ -159,11 +163,14 @@ export async function stopPoiseRuntime(): Promise<void> {
   selfUpdate?.reset()
   serviceControl?.reset()
   dailyModelRefresh?.stop()
+  // Open event streams and long polls would otherwise hold the server open.
+  linkApi?.close()
   chatRuntime = null
   chatSockets = null
   selfUpdate = null
   serviceControl = null
   dailyModelRefresh = null
+  linkApi = null
   await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, ...authStops])
 }
 
@@ -219,6 +226,12 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const launch = serviceControl.admitLaunch(req.method, path)
           if (launch === 'draining') return json(res, 503, { error: DRAINING_ERROR, code: 'draining' })
           if (launch) finished.push(launch)
+        }
+
+        // ── /api/link/* — what a paired Poise Link reads (server/link) ──
+        if (path.startsWith('/api/link/')) {
+          if (!linkApi) throw new Error('the Link API is not started')
+          return linkApi.handle(req, res, url)
         }
 
         // ── Self-update: the controller's private endpoints and the public
