@@ -193,6 +193,17 @@ describe('the Link API in a workspace', () => {
     }
   })
 
+  it('imports an Espanso file in the browser and sends only its plain pairs to the device', async () => {
+    const imported = await postJson(browser(), '/api/snippets/import', {
+      yaml: 'matches:\n  - trigger: ";addr"\n    replace: "1 Main St"\n  - trigger: ";pwn"\n    replace: "{{o}}"\n    vars: [{ name: o, type: shell, params: { cmd: id } }]\n',
+    })
+    expect(imported).toMatchObject({ status: 200, json: { added: [';addr'], skipped: [{ entry: 2, trigger: ';pwn', reason: 'not_plain', detail: 'it runs a shell command' }] } })
+    const { yaml } = (await send(device(), 'GET', '/api/link/snippets')).json
+    expect(assertLinkAccepts(yaml)).toContainEqual({ trigger: ';addr', replace: '1 Main St' })
+    expect(yaml).not.toContain('pwn')
+    expect((await postJson(device(), '/api/snippets/import', { yaml: 'matches: []\n' })).status).toBe(403)
+  })
+
   it('lets the server shut down promptly with event streams and long polls open', async () => {
     const stream = await eventsAs(device())
     const { version } = (await send(device(), 'GET', '/api/link/snippets')).json
