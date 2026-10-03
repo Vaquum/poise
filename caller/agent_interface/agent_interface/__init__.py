@@ -605,17 +605,22 @@ def run_issue_simplify(issue: str, pwd: str | None = None, note: str = "", timeo
     return run_legacy_behavior(issue_simplify, "issue_simplify", issue, pwd, note, timeout_s)
 
 
-def run_author_content(topic: str, pwd: str | None = None, session_id: str | None = None, note: str = "", timeout_s: int = 3600):
+def run_author_content(topic: str, pwd: str | None = None, session_id: str | None = None, note: str = "", timeout_s: int = 3600,
+                       voice_guide: str | None = None):
     name = CATALOG.behavior("author_content").identity
     id_ = track(name, topic, actor=actor_name(), behavior="author_content", session_id=session_id)
+    guide = author_content.voice_guide(voice_guide)
+    if guide is None:
+        print(f"author-content: no voice guide (--voice-guide or {author_content.VOICE_GUIDE_ENV}); writing without one", file=sys.stderr)
+    stamp_ = {"id": id_, "model": name, "session_id": session_id, "voice_guide": str(guide) if guide else None}
     try:
-        response = author_content.run(topic, pwd, session_id, note, timeout_s)
+        response = author_content.run(topic, pwd, session_id, note, timeout_s, guide)
         finish(id_, "completed", response=response)
-        print(json.dumps({"id": id_, "model": name, "session_id": session_id, "response": response}, indent=2))
+        print(json.dumps({**stamp_, "response": response}, indent=2))
         return response
     except Exception as e:
         finish(id_, "failed", error=str(e))
-        print(json.dumps({"id": id_, "model": name, "session_id": session_id, "error": str(e)}, indent=2))
+        print(json.dumps({**stamp_, "error": str(e)}, indent=2))
         raise SystemExit(1)
 
 
@@ -1225,7 +1230,7 @@ behaviors:
   --fix-failing-ci PR [--pwd DIR]
   --issue-simplify ISSUE [--pwd DIR]
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--note TEXT]
-  --author-content TOPIC [--session-id ID] [--pwd DIR]
+  --author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]
   --debate TOPIC [--rounds N]
   --find-alpha TOPIC --model MODEL [--session ID]
   --record-turn start --model MODEL --session ID --source SOURCE [--repo OWNER/NAME --pr N] [--correlation-id ID]
@@ -1374,7 +1379,8 @@ def main():
         run_issue_simplify(sys.argv[2], flag_value("--pwd"))
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--author-content":
-        run_author_content(sys.argv[2], flag_value("--pwd"), flag_value("--session") or flag_value("--session-id"))
+        run_author_content(sys.argv[2], flag_value("--pwd"), flag_value("--session") or flag_value("--session-id"),
+                           voice_guide=flag_value("--voice-guide"))
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--debate":
         run_debate(sys.argv[2], int(flag_value("--rounds") or "1"))

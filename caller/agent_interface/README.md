@@ -10,6 +10,16 @@ default per behavior. `agent-interface --models` prints it as JSON.
 the runtime copy under the data directory when something changed; a family whose
 CLI cannot answer keeps its rows and is reported as unavailable.
 
+# Authoring content
+
+`--author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]`
+writes a piece on TOPIC with the catalog's `author_content` model and no tools.
+It writes in the voice guide `--voice-guide` names, else the one
+`AGENT_INTERFACE_VOICE_GUIDE` names: a local text file, read when the call
+starts. A named guide that is missing or empty fails the call. With neither,
+it writes without a voice guide, says so on stderr, and prints
+`"voice_guide": null` with its result.
+
 # Stopping a run
 
 Every call records the process id of the `agent-interface` that runs it.
