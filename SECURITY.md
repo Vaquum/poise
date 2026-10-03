@@ -1,16 +1,62 @@
 # Security policy
 
-## Supported deployment
+## Supported deployments
 
-Poise is supported as a single-user local application bound to loopback. The
-production server refuses non-loopback addresses outside service mode. API
-requests enforce allowed hosts, same-origin browser access, bounded bodies,
-and explicit content types.
+Poise is supported two ways:
 
-Do not expose Poise through a public listener or reverse proxy. Its intended
-capabilities include launching local agent processes, modifying local Markdown
-and Espanso files, and creating GitHub issues through the authenticated `gh`
-session.
+- **As a service** (`deploy/`, [Operating Poise](docs/Operating.md)): Caddy and the gateway are the only public entry, and each person's Poise runs in its own workspace container behind them.
+- **On a single computer**, bound to loopback, as a one-person application.
+
+Never expose a workspace or a single-computer Poise directly. Their capabilities include launching unsandboxed agent processes, modifying files, and acting on GitHub with the person's accounts. They are safe only behind the gateway's identity assertions, or on loopback.
+
+## The service
+
+[Service architecture](docs/Service-architecture.md) is the precise contract. In short:
+
+### Sign-in and routing
+
+- People sign in with GitHub at the apex domain. The gateway admits allow-listed logins, members of allowed organisations, and admins. It reads the login and discards the GitHub token.
+- A handle stays with the GitHub account id that first claimed it, so a renamed and reclaimed login cannot take over a workspace.
+- Each workspace host serves only its owner. Admins get no implicit access, but can disable anyone, which ends that person's sessions and device tokens at once.
+- Sessions use host-only, `HttpOnly`, `Secure`, `SameSite=Lax` cookies. Workspace hosts get their session through single-use tickets bound to the requesting browser (`poise_bind`), so a ticket minted by someone else cannot sign a visitor into the wrong workspace.
+
+### What the gateway relays
+
+- The gateway strips its own cookies, a device's `Authorization` header and any client-sent identity header before forwarding.
+- It adds a fresh 60-second Ed25519 identity assertion naming the owner and a scope.
+- Workspaces cannot set cookies: every `Set-Cookie` they send is dropped.
+- Request bodies are bounded at 32 MiB, and the gateway bounds what it reads back from a workspace. This keeps one person from exhausting the shared gateway.
+
+### The host
+
+- The gateway holds the Docker socket, which is root on the host. Run the service on a host dedicated to it, and keep `deploy/.env` and the gateway's data volume (with its signing key) readable only by the operator.
+- Anyone with root on the host can read every workspace volume, including each person's agent CLI logins. People using the service must trust its operator.
+- Backups contain the same material. `deploy/backup.sh` writes each one into a directory only its owner can open (`umask 077`). Keep them on storage with the same protection.
+
+### Workspaces
+
+- Each person's workspace is a container:
+  - running as uid 10001 with every capability dropped and `no-new-privileges`;
+  - under memory, CPU and process limits;
+  - on a network shared only with the gateway.
+- Isolation between people is that container boundary. Set `POISE_WORKSPACE_RUNTIME=runsc` (gVisor) where a stronger boundary is wanted.
+- Inside a workspace, agents run unsandboxed with the person's own credentials: anything those credentials allow, an agent can do. The browser terminal in Settings → Accounts is a shell as that same user, open only to the owner's browser scope.
+
+### Poise Link
+
+- Device tokens are stored hashed. They reach only `/api/link/*`, and expire after 30 idle days or 365 days.
+- A revoked, expired or disabled device gets 401 and pairs again.
+- Poise Link accepts only plain trigger/replace string pairs and writes its own rendering of them. Nothing the server sends can become an Espanso shell, script, form or variable.
+- Notifications open only http(s) addresses.
+
+### Review status
+
+The service had adversarial reviews of the gateway (twice), service mode, and the deployment end to end. A final review across the whole system was stopped before it finished. What it confirmed is fixed:
+- The relay and read bounds above.
+- An unescaped model picker in Chat.
+- The workspace home folder's permissions.
+
+The areas it did not finish are listed in the [open security follow-up](https://github.com/autonomio/poise/issues?q=is%3Aopen+label%3Asecurity).
 
 ### Service mode
 

@@ -1144,9 +1144,8 @@ async function loadModelCatalog(force = false): Promise<void> {
       catalogModels = data.catalog.models.map((m) => m.identity)
       placeDefaults = Object.fromEntries(data.places.map((p) => [p.key, p.default]))
       if (modelSelectEl) {
-        modelSelectEl.innerHTML = catalogModels
-          .map((m) => `<option value="${m}">${m}</option>`)
-          .join('')
+        // Catalogue identities come from the provider CLIs; build the options as nodes so no text is parsed as HTML.
+        modelSelectEl.replaceChildren(...catalogModels.map((m) => new Option(m, m)))
         applyPlaceDefault()
       }
     } catch { /* the server applies the place default when no model is sent */ }
