@@ -16,7 +16,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 
 import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
 import { productionSummary, type ProductionUpdate } from './production-status'
-import { ACCOUNT_LOGINS, type ConnectedAccount } from '../server/accounts/types'
+import { ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, type ConnectedAccount } from '../server/accounts/types'
 import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
 import './views/connected-accounts.css'
@@ -367,6 +367,20 @@ async function connect(preset: TerminalPreset): Promise<void> {
 
 function accountsTabSelected(): boolean {
   return !!panelEl?.querySelector('.st-tabs [data-tab="accounts"].active')
+}
+
+// A sign-in alert opens the workspace at CONNECTED_ACCOUNTS_PATH. The query is
+// dropped once read, so reloading the page does not open Settings again.
+function openFromAddress(): void {
+  if (!panelEl) return
+  const wanted = new URL(CONNECTED_ACCOUNTS_PATH, location.origin).searchParams
+  const params = new URLSearchParams(location.search)
+  if ([...wanted].some(([key, value]) => params.get(key) !== value)) return
+  for (const key of wanted.keys()) params.delete(key)
+  const query = params.toString()
+  history.replaceState(history.state, '', `${location.pathname}${query ? `?${query}` : ''}${location.hash}`)
+  openSettingsPanel()
+  selectTab(panelEl, 'accounts')
 }
 
 // ── Models tab ──────────────────────────────────────────────────────────
@@ -873,6 +887,7 @@ export function initSettings() {
     selectTab(panelEl, 'accounts')
     void connect(preset)
   })
+  openFromAddress()
 }
 
 export function openSettingsPanel() {

@@ -223,6 +223,13 @@ function rawUpgrade(path: string, caller: Caller): Promise<{ status: number, clo
   })
 }
 
+/** The sign-in alerts recorded so far, by dedupe key: open, or resolved. */
+async function signInAlerts(): Promise<Record<string, 'open' | 'resolved'>> {
+  const { db } = await import('../server/db')
+  const rows = db.prepare('SELECT dedupe_key AS key, resolved_at AS resolved FROM alerts WHERE kind = \'sign_in_needed\' ORDER BY id').all() as Array<{ key: string, resolved: string | null }>
+  return Object.fromEntries(rows.map((row) => [row.key, row.resolved === null ? 'open' : 'resolved']))
+}
+
 async function callerCalls(): Promise<Array<{ args: string[], dataDir: string | null }>> {
   if (!existsSync(callerLog)) return []
   return (await readFile(callerLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
@@ -370,6 +377,9 @@ describe('Poise in service mode', () => {
     expect(accounts.status).toBe(200)
     expect(accounts.json.accounts.map((account: { id: string }) => account.id)).toEqual(['claude', 'codex', 'gh', 'grok', 'muse', 'antigravity'])
     expect(accounts.json.accounts[2]).toMatchObject({ id: 'gh', installed: true, version: '2.92.0', signedIn: true, identity: 'octocat' })
+    // Codex is signed out, and gh does not hold the agent account (bit-mis);
+    // Claude is its auth monitor's to alert for, and it is signed in.
+    expect(await signInAlerts()).toEqual({ 'sign-in:codex': 'open', 'sign-in:gh:agent': 'open' })
     expect((await send('GET', '/api/accounts', fromGateway('link'))).status).toBe(403)
     expect((await send('GET', '/api/accounts', fromGateway('admin'))).status).toBe(403)
     expect((await send('GET', '/api/accounts', { peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN })).status).toBe(401)
@@ -395,6 +405,7 @@ describe('Poise in service mode', () => {
     expect(login.output).toContain('ABCD-1234')
     expect(login.frames.at(-1)).toEqual({ type: 'exit', code: 0 })
     expect((await send('GET', '/api/accounts', fromGateway())).json.accounts[1]).toMatchObject({ id: 'codex', signedIn: true, detail: 'Signed in with ChatGPT' })
+    expect(await signInAlerts()).toMatchObject({ 'sign-in:codex': 'resolved', 'sign-in:gh:agent': 'open' })
   })
 
   it('verifies the Claude sign-in at once when Claude\'s login exits', async () => {

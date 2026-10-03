@@ -6,7 +6,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AccountsCache, ACCOUNTS_CACHE_MS } from '../server/accounts'
+import { AccountsCache, ACCOUNTS_CACHE_MS, ACCOUNTS_CHECK_MS, scheduleAccountsCheck } from '../server/accounts'
 import { probeAccounts, type RunCommand } from '../server/accounts/status'
 import type { ConnectedAccount } from '../server/accounts/types'
 import { runFile } from '../server/process'
@@ -253,5 +253,34 @@ describe('the accounts cache', () => {
     fail = false
     await expect(cache.list()).resolves.toEqual([])
     expect(probes).toBe(2)
+  })
+})
+
+describe('the scheduled accounts check', () => {
+  it('runs every fifteen minutes, never at once, past a failed check, until stopped', async () => {
+    vi.useFakeTimers()
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      let checks = 0
+      const stop = scheduleAccountsCheck(async () => {
+        checks += 1
+        if (checks === 2) throw new Error('gh did not answer')
+      })
+      expect(ACCOUNTS_CHECK_MS).toBe(15 * 60_000)
+      await vi.advanceTimersByTimeAsync(ACCOUNTS_CHECK_MS - 1)
+      expect(checks).toBe(0)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(checks).toBe(1)
+      await vi.advanceTimersByTimeAsync(ACCOUNTS_CHECK_MS)
+      expect(checks).toBe(2)
+      expect(errors).toHaveBeenCalledWith('[accounts] the scheduled check failed:', expect.objectContaining({ message: 'gh did not answer' }))
+      await vi.advanceTimersByTimeAsync(ACCOUNTS_CHECK_MS)
+      expect(checks).toBe(3)
+      stop()
+      await vi.advanceTimersByTimeAsync(3 * ACCOUNTS_CHECK_MS)
+      expect(checks).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

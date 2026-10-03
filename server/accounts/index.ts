@@ -35,6 +35,20 @@ export class AccountsCache {
   }
 }
 
+/** In service mode Poise also reads the accounts on its own this often, so a
+ *  sign-in that lapses is alerted while the browser is closed. */
+export const ACCOUNTS_CHECK_MS = 15 * 60_000
+
+/** Runs `check` every `intervalMs`, never at once, until the returned stop is
+ *  called. A failed check is logged and the next one runs as planned. */
+export function scheduleAccountsCheck(check: () => Promise<unknown>, intervalMs = ACCOUNTS_CHECK_MS): () => void {
+  const timer = setInterval(() => {
+    void check().catch((error: unknown) => console.error('[accounts] the scheduled check failed:', error))
+  }, intervalMs)
+  timer.unref()
+  return () => clearInterval(timer)
+}
+
 const accounts = new AccountsCache(() => probeAccounts(runFile))
 
 export function listAccounts(): Promise<ConnectedAccount[]> {

@@ -4,8 +4,10 @@
 // about, so a failure to record one is logged there instead of thrown.
 //
 // The browser client has no URL routing (each browser remembers its own
-// view), so every alert opens the workspace's front page.
+// view), so alerts open the workspace's front page; a sign-in alert from
+// Connected accounts opens Settings there.
 
+import { CONNECTED_ACCOUNTS_PATH, type AccountId, type ConnectedAccount } from '../accounts/types'
 import type { ClaudeAuthStatus } from '../claude-auth'
 import type { StopReason } from '../chat/protocol'
 import { isServiceMode } from '../service/config'
@@ -62,6 +64,81 @@ export function claudeAuthStatusChanged(status: ClaudeAuthStatus): void {
       : 'Claude-backed work is paused until you sign in to Claude from Poise.',
     path: FRONT_PAGE,
   }))
+}
+
+const ACCOUNT_NAMES: Partial<Record<AccountId, string>> = { codex: 'Codex', grok: 'Grok', muse: 'Muse', antigravity: 'Antigravity' }
+
+/** The two GitHub accounts Settings → General names, each of which gh must
+ *  hold signed in. */
+export interface GitHubIdentities {
+  me: string
+  agentAccount: string
+}
+
+const GH_ROLES = [
+  {
+    key: 'sign-in:gh:you',
+    login: (identities: GitHubIdentities) => identities.me,
+    title: 'Your GitHub account is not signed in to gh',
+    body: (login: string) => `Poise reads GitHub as ${login}, which gh does not hold signed in. Connect GitHub in Settings → Connected accounts and sign in as ${login}.`,
+  },
+  {
+    key: 'sign-in:gh:agent',
+    login: (identities: GitHubIdentities) => identities.agentAccount,
+    title: 'The agent account is not signed in to gh',
+    body: (login: string) => `Reviews and comments are posted as ${login}, which gh does not hold signed in. Connect GitHub in Settings → Connected accounts and sign in as ${login}.`,
+  },
+]
+
+/** What Connected accounts read from each CLI's own status command. An
+ *  installed CLI that says it is not signed in alerts until it says it is;
+ *  for gh, so does your GitHub account or the agent account when gh does not
+ *  hold it signed in. A CLI whose state is unknown changes nothing, and Claude
+ *  is left to its auth monitor (claudeAuthStatusChanged). */
+export function accountsChecked(accounts: readonly ConnectedAccount[], identities: GitHubIdentities): void {
+  for (const account of accounts) {
+    if (account.id === 'claude' || !account.installed) continue
+    if (account.id === 'gh') {
+      ghAccountsChecked(account, identities)
+      continue
+    }
+    if (account.signedIn === null) continue
+    const name = ACCOUNT_NAMES[account.id] ?? account.id
+    const dedupeKey = `sign-in:${account.id}`
+    if (account.signedIn) {
+      record(`the end of the ${name} sign-in alert`, () => resolveAlert(dedupeKey))
+      continue
+    }
+    record(`the ${name} sign-in alert`, () => raiseAlert({
+      kind: 'sign_in_needed',
+      dedupeKey,
+      title: `${name} needs you to sign in`,
+      body: `${name} is not signed in, so work that runs it cannot start. Connect it in Settings → Connected accounts.`,
+      path: CONNECTED_ACCOUNTS_PATH,
+    }))
+  }
+}
+
+function ghAccountsChecked(gh: ConnectedAccount, identities: GitHubIdentities): void {
+  // Without gh's own answer nothing is known about either account.
+  if (!gh.accounts) return
+  const held = gh.accounts
+  for (const role of GH_ROLES) {
+    const login = role.login(identities)
+    const signedIn = held.some((account) => account.signedIn && account.login.toLowerCase() === login.toLowerCase())
+    // An account that is not set is not one gh has to hold.
+    if (!login || signedIn) {
+      record(`the end of the alert "${role.title}"`, () => resolveAlert(role.key))
+      continue
+    }
+    record(`the alert "${role.title}"`, () => raiseAlert({
+      kind: 'sign_in_needed',
+      dedupeKey: role.key,
+      title: role.title,
+      body: role.body(login),
+      path: CONNECTED_ACCOUNTS_PATH,
+    }))
+  }
 }
 
 /** A behavior recorded a dead letter for `target`. `alreadyHeld` says whether
