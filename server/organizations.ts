@@ -6,6 +6,7 @@ import { db, getMeta } from './db'
 import { ProcessLockError, withProcessLock } from './process-lock'
 import { runFile } from './process'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
+import { datastoreSyncFailed, datastoreSyncRecovered } from './alerts/producers'
 
 export interface Organization {
   login: string
@@ -31,6 +32,8 @@ interface OrganizationRow {
   indexed_user: string | null
   next_sync_at: number
   sync_failures: number
+  /** When the current run of failed syncs began (ms); 0 while syncs succeed. */
+  sync_failing_since: number
 }
 
 // The existing Caller database remains externally managed. Only databases
@@ -48,14 +51,15 @@ db.exec(`
     last_reconcile_at INTEGER NOT NULL DEFAULT 0,
     indexed_user TEXT,
     next_sync_at INTEGER NOT NULL DEFAULT 0,
-    sync_failures INTEGER NOT NULL DEFAULT 0
+    sync_failures INTEGER NOT NULL DEFAULT 0,
+    sync_failing_since INTEGER NOT NULL DEFAULT 0
   );
 `)
 
 // Keep this migration additive for registries created by an earlier build.
 db.transaction(() => {
   const columns = db.prepare('PRAGMA table_info(organizations)').all() as Array<{ name: string }>
-  for (const column of ['next_sync_at', 'sync_failures']) {
+  for (const column of ['next_sync_at', 'sync_failures', 'sync_failing_since']) {
     if (!columns.some((entry) => entry.name === column)) {
       db.exec(`ALTER TABLE organizations ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`)
     }
@@ -358,9 +362,11 @@ async function activate(row: OrganizationRow, me: string, signal: AbortSignal, e
   if (sourcePath === tempPath) publishDatabase(tempPath, path)
   db.prepare(`
     UPDATE organizations SET status = 'ready', stage = 'ready', error = NULL,
-      activated_at = COALESCE(activated_at, ?), last_sync_at = ?, last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0
+      activated_at = COALESCE(activated_at, ?), last_sync_at = ?, last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0,
+      sync_failing_since = 0
     WHERE login = ?
   `).run(new Date().toISOString(), Date.now(), Date.now(), me, row.login)
+  datastoreSyncRecovered(row.login)
 }
 
 async function synchronize(row: OrganizationRow, me: string, signal: AbortSignal, env: NodeJS.ProcessEnv): Promise<void> {
@@ -382,8 +388,9 @@ async function synchronize(row: OrganizationRow, me: string, signal: AbortSignal
   await checkHealth(path, me, env, signal)
   db.prepare(`
     UPDATE organizations SET stage = 'ready', error = NULL, last_sync_at = ?,
-      last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0 WHERE login = ?
+      last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0, sync_failing_since = 0 WHERE login = ?
   `).run(Date.now(), reconcile ? Date.now() : row.last_reconcile_at, me, row.login)
+  datastoreSyncRecovered(row.login)
 }
 
 function launch(login: string): void {
@@ -426,11 +433,13 @@ function launch(login: string): void {
       }
       const failures = failed.activated_at ? failed.sync_failures + 1 : 0
       const retryAt = failures ? Date.now() + Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(failures - 1, 6), MAX_SYNC_RETRY_MS) : 0
+      const failingSince = failures ? failed.sync_failing_since || Date.now() : 0
       db.prepare(`
         UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'error' ELSE 'ready' END,
           stage = CASE WHEN activated_at IS NULL THEN stage ELSE 'sync-error' END, error = ?,
-          next_sync_at = ?, sync_failures = ? WHERE login = ?
-      `).run(safeError(error, env), retryAt, failures, login)
+          next_sync_at = ?, sync_failures = ?, sync_failing_since = ? WHERE login = ?
+      `).run(safeError(error, env), retryAt, failures, failingSince, login)
+      if (failures) datastoreSyncFailed(login, failingSince)
     }
   }).finally(() => { jobs.delete(key); releaseOperation() })
   jobs.set(key, { controller, promise })

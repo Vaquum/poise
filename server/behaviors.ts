@@ -46,7 +46,7 @@ import {
   listSeenTargets,
   listSnapshotOnlySeen,
   markBehaviorLaunchIntentOwned,
-  recordBehaviorDeadLetter,
+  recordBehaviorDeadLetter as databaseRecordBehaviorDeadLetter,
   quarantineBehaviorLaunchOwned,
   retireBehaviorDeadLetter,
   retireBehaviorDeadLettersForClosedPrs,
@@ -72,6 +72,7 @@ import { withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { agentAccount, requireAgentAccount } from './settings'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
+import { behaviorHeld } from './alerts/producers'
 
 const DATASTORE = 'github-datastore'
 const GH_INTERFACE = 'github-interface'
@@ -181,6 +182,18 @@ function listBehaviorDeadLetters(limit = 50) {
 
 function listBehaviorIncidents(limit = 50) {
   return databaseListBehaviorIncidents(limit, currentOrganization()?.login)
+}
+
+// A dead letter is an incident in the Behaviors view, grouped by pull request
+// or issue. Recording the first one for a target alerts the person; more for
+// the same target stay that one alert until the incident has cleared.
+function recordBehaviorDeadLetter(claim: BehaviorLaunchClaim, error: string, callId?: string | null): string {
+  const target = claim.launchRepo && claim.launchPr ? `${claim.launchRepo}#${claim.launchPr}` : claim.target
+  const alreadyHeld = databaseListBehaviorIncidents(500)
+    .some((incident) => incident.behavior === claim.key && incident.target === target)
+  const id = databaseRecordBehaviorDeadLetter(claim, error, callId)
+  behaviorHeld(claim.key, target, alreadyHeld)
+  return id
 }
 
 // Same cwd hack agent.ts uses — agent-interface infers the repo from

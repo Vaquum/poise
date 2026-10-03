@@ -10,6 +10,7 @@ import { assertSecureDotenv, loadSecureDotenv, validateConfabUrl } from './runti
 import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'
 import { TERMINAL_WS_PATH } from './terminal/protocol'
+import { startLaunchdWatchdog } from './launchd-watchdog'
 import type { ClaudeAuthRuntime } from './cache-plugin'
 
 // Security validation must run before dotenv reads the file and before modules
@@ -480,6 +481,9 @@ export async function startProductionServer(options: ProductionServerOptions = {
     throw error
   }
   console.log(`[poise] listening on http://${host}:${port}`)
+  // Production only: the installer names the launchd jobs to keep alive.
+  const stopWatchdog = startLaunchdWatchdog()
+  if (stopWatchdog) server.once('close', stopWatchdog)
   return server
 }
 

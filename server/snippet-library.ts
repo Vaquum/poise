@@ -5,7 +5,8 @@ import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { db, getMeta, setMeta } from './db'
 import { HttpError } from './http'
-import { MATCH_FILE, readSnippetSnapshotSync, mutateSnippetLibrary, validateSnippets, SnippetConflictError, type Snippet, type SnippetState } from './snippets'
+import { MATCH_FILE, MAX_SNIPPETS_BYTES, readSnippetSnapshotSync, mutateSnippetLibrary, validateSnippets, SnippetConflictError, type Snippet, type SnippetState } from './snippets'
+import { judgeEntry, parseMatchFile, type MatchFile } from './link/espanso'
 import { parseChatSwitches, RESERVED_SWITCHES, switchName, SWITCH_LIMITS, type ChatSwitches } from '../src/chat-switches'
 
 const PREFIX = '# poise-chat-library-v1 '
@@ -161,6 +162,56 @@ export async function saveSkillSnippets(input: unknown, version: unknown): Promi
   })
   return publish()
 }
+export interface ImportSkip {
+  /** 1-based position in the file's `matches`; null for a top-level key. */
+  entry: number | null
+  trigger: string | null
+  reason: 'duplicate' | 'not_plain' | 'invalid'
+  detail: string
+}
+export interface ImportReport extends SkillSnippetState { added: string[], skipped: ImportSkip[] }
+
+/** Snippets → Import: adds an Espanso match file's plain pairs (what Poise
+ * Link delivers, and nothing else) through the same compare-and-swap as every
+ * other write. A trigger already in the library is never replaced. */
+export async function importEspansoSnippets(raw: unknown): Promise<ImportReport> {
+  if (typeof raw !== 'string' || !raw.trim()) throw new HttpError(400, 'Paste or choose an Espanso match file to import.')
+  if (Buffer.byteLength(raw, 'utf8') > MAX_SNIPPETS_BYTES) throw new HttpError(413, `The file is larger than ${MAX_SNIPPETS_BYTES} bytes. Nothing was imported.`)
+  let file: MatchFile
+  try { file = parseMatchFile(raw) } catch (error) {
+    throw new HttpError(400, `The file is not valid YAML: ${(error instanceof Error ? error.message : String(error)).split('\n')[0]}`)
+  }
+  const matches = file.matches
+  if (!matches) throw new HttpError(400, 'This is not an Espanso match file: it has no list of matches.')
+  await importLegacy()
+  let added: string[] = [], skipped: ImportSkip[] = []
+  await mutateSnippetLibrary(snapshot => {
+    added = []
+    skipped = file.otherKeys.map(key => ({ entry: null, trigger: null, reason: 'not_plain' as const, detail: `${key.slice(0, 40)} is not a snippet` }))
+    const existing = new Set(snapshot.state.snippets.map(snippet => snippet.trigger.trim())), imported = new Set<string>()
+    const additions: Snippet[] = []
+    matches.forEach((entry, index) => {
+      const verdict = judgeEntry(entry)
+      const skip = (reason: ImportSkip['reason'], detail: string, trigger = verdict.kind === 'plain' ? verdict.snippet.trigger : verdict.trigger) =>
+        skipped.push({ entry: index + 1, trigger, reason, detail })
+      if (verdict.kind !== 'plain') return skip(verdict.kind, verdict.detail)
+      const trigger = verdict.snippet.trigger.trim()
+      if (!trigger) return skip('invalid', 'its trigger is empty')
+      if (!verdict.snippet.replace.trim()) return skip('invalid', 'its replacement is empty')
+      if (existing.has(trigger)) return skip('duplicate', 'a snippet with this trigger already exists', trigger)
+      if (imported.has(trigger)) return skip('duplicate', 'an earlier entry in this file has this trigger', trigger)
+      imported.add(trigger)
+      additions.push({ trigger, replace: verdict.snippet.replace })
+      added.push(trigger)
+    })
+    if (!additions.length) return null
+    const snippets = validateSnippets([...snapshot.state.snippets, ...additions]), metadata = metadataFrom(snapshot.raw)
+    bind(snippets, metadata)
+    return { snippets, header: header(metadata) }
+  })
+  return { ...(added.length ? publish() : snapshotLibrary.immediate()), added, skipped }
+}
+
 export async function addSkillSnippet(input: unknown): Promise<{ snippet: Snippet, version: string, skills: ChatSwitches }> {
   const [snippet] = validateSnippets([input])
   await importLegacy()

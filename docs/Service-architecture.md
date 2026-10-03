@@ -389,8 +389,10 @@ after pairing; Poise Link then pairs again.
   - `snippets` with `{ version }`;
   - `alert` with `{ id, kind, title, body, url, created_at }`;
   - `ping` every 20 seconds.
-  - On connect it sends the current snippets version, plus any alerts after
-    `Last-Event-ID`.
+  - On connect it sends the current snippets version, plus the alerts
+    recorded after `Last-Event-ID`: the newest 50 of them at most, so a device
+    that was away for weeks is not flooded. An id the workspace did not issue
+    resumes nothing. Each alert's id is its event id.
 - An unusable device token gets HTTP 401 with `{ error, message }` and
   `WWW-Authenticate: Bearer error="invalid_token"`, never a 403 or a
   redirect. Poise Link treats any 401 as "sign out and pair again". `error`
@@ -404,7 +406,8 @@ after pairing; Poise Link then pairs again.
   A device token on a path outside `/api/link/*` gets 401 with
   `invalid_token`.
 
-**Alerts** are recorded by the workspace:
+**Alerts** are recorded by the workspace and kept for 30 days. Each condition
+alerts once, and again only after it has cleared:
 - a Claude or other provider sign-in is needed;
 - a behavior failed and is held;
 - datastore sync has been failing for 15 minutes;

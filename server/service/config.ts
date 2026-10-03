@@ -127,6 +127,9 @@ export function readServiceConfig(env: NodeJS.ProcessEnv = process.env): Service
   const origin = publicOrigin(env.POISE_PUBLIC_ORIGIN, HANDLE.test(handle) ? handle : '', problems)
   const key = gatewayKey(env.POISE_GATEWAY_PUBLIC_KEY, problems)
   const drainTimeoutSeconds = drainTimeout(env.POISE_DRAIN_TIMEOUT, problems)
+  // The launchd watchdog keeps a Mac install's timed jobs alive; a workspace
+  // container has no launchd, so naming jobs for it is a misconfiguration.
+  if (env.POISE_LAUNCHD_WATCHDOG) problems.push('POISE_LAUNCHD_WATCHDOG names launchd jobs, which a workspace does not have; unset it')
   if (problems.length || !origin || !key) {
     throw new Error(`Poise cannot start in service mode: ${problems.join('; ')}`)
   }

@@ -15,6 +15,7 @@ export function createAuthenticatedClaudeAuth(): FakeClaudeAuthRuntime {
   let stops = 0
   let logins = 0
   let liveChecks = 0
+  const listeners = new Set<(status: ClaudeAuthStatus) => void>()
   let state: ClaudeAuthSnapshot = {
     status: 'authenticated',
     reason: null,
@@ -48,12 +49,18 @@ export function createAuthenticatedClaudeAuth(): FakeClaudeAuthRuntime {
       return { ...state }
     },
     setStatus(status) {
+      const changed = status !== state.status
       state = {
         ...state,
         status,
         reason: status === 'authenticated' ? null : 'Claude subscription sign-in is required.',
         loginInProgress: status === 'signing_in',
       }
+      if (changed) for (const listener of listeners) listener(status)
+    },
+    onStatus(listener) {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
     },
   }
 }

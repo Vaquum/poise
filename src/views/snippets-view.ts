@@ -52,12 +52,29 @@ function renderShell(): string {
     <header class="view-header">
       <div class="filter-cluster" id="snippets-filters">
         <button type="button" class="st-save snip-add">Add snippet</button>
+        <button type="button" class="st-clear snip-import-open" aria-expanded="false">Import</button>
         <span class="filter-count" id="snippets-count"></span>
         <span class="st-help st-help-info snip-espanso-hint" hidden>Chat skills work without Espanso. Install Espanso for system-wide text expansion.</span>
         <span class="st-help st-help-info snip-link-hint" hidden>Snippets reach your desktop through Poise Link, which keeps Espanso there in sync.</span>
       </div>
     </header>
     <main>
+      <section class="snip-import" aria-label="Import snippets from Espanso" hidden>
+        <div class="snip-edit">
+          <p class="st-help st-help-info">Paste an Espanso match file, such as <code>base.yml</code>, or choose one. Its plain trigger and replacement pairs are added; entries that run commands or use other Espanso features are skipped, and snippets you already have are kept.</p>
+          <textarea class="st-input snip-import-text" aria-label="Espanso match file" placeholder="matches:&#10;  - trigger: &quot;:hi&quot;&#10;    replace: Hello" spellcheck="false"></textarea>
+          <div class="st-row">
+            <button type="button" class="st-save snip-import-run">Import</button>
+            <button type="button" class="st-clear snip-import-choose">Choose file…</button>
+            <input type="file" class="snip-import-file" accept=".yml,.yaml" hidden />
+            <button type="button" class="st-clear snip-import-close">Close</button>
+          </div>
+          <div>
+            <p class="st-help st-help-info snip-import-status" role="status"></p>
+            <ul class="st-help snip-import-report" aria-label="Skipped entries" hidden></ul>
+          </div>
+        </div>
+      </section>
       <table id="snippets-table">
         <thead>
           <tr>
@@ -317,6 +334,7 @@ function repaintRowsAroundOpenEditor(): void {
 function setMutationDisabled(row: HTMLTableRowElement, disabled: boolean): void {
   for (const el of row.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLButtonElement>('input,textarea,button')) el.disabled = disabled
   viewEl.querySelector<HTMLButtonElement>('.snip-add')!.disabled = disabled
+  viewEl.querySelector<HTMLButtonElement>('.snip-import-run')!.disabled = disabled || importing
 }
 
 async function save(editRow: HTMLTableRowElement) {
@@ -425,11 +443,129 @@ function openAdd() {
   ;(editRow.querySelector('.snip-trigger-input') as HTMLElement | null)?.focus()
 }
 
+// ── Import ───────────────────────────────────────────────────────────────
+// An Espanso match file's plain pairs join the library through the server's
+// compare-and-swap, the one every other write uses; the server says which
+// entries it skipped and why.
+
+interface ImportSkip { entry: number | null; trigger: string | null; reason: 'duplicate' | 'not_plain' | 'invalid'; detail: string }
+
+const IMPORT_MAX_BYTES = 1024 * 1024
+const SKIP_REASONS: Record<ImportSkip['reason'], string> = {
+  duplicate: 'duplicate trigger',
+  not_plain: 'not a plain snippet',
+  invalid: 'invalid',
+}
+let importing = false
+
+function importEl<T extends HTMLElement>(selector: string): T {
+  return viewEl.querySelector<T>(selector)!
+}
+
+function setImportStatus(text: string, cls: 'info' | 'ok' | 'error'): void {
+  const el = importEl('.snip-import-status')
+  el.textContent = text
+  el.className = `st-help st-help-${cls} snip-import-status`
+}
+
+function toggleImport(open: boolean): void {
+  importEl('.snip-import').hidden = !open
+  importEl('.snip-import-open').setAttribute('aria-expanded', String(open))
+  if (open) importEl<HTMLTextAreaElement>('.snip-import-text').focus()
+}
+
+function renderSkip(skip: ImportSkip): string {
+  // A top-level key (global_vars, imports) is not an entry; its detail names it.
+  if (skip.entry === null) return `<li>${escapeHtml(skip.detail)}</li>`
+  const what = skip.trigger !== null ? `<code>${escapeHtml(skip.trigger)}</code>` : `Entry ${skip.entry}`
+  return `<li>${what} — ${SKIP_REASONS[skip.reason] ?? escapeHtml(skip.reason)}: ${escapeHtml(skip.detail)}</li>`
+}
+
+async function runImport(): Promise<void> {
+  if (importing || saving) return
+  const text = importEl<HTMLTextAreaElement>('.snip-import-text')
+  const run = importEl<HTMLButtonElement>('.snip-import-run')
+  const report = importEl<HTMLUListElement>('.snip-import-report')
+  if (!text.value.trim()) {
+    setImportStatus('Paste an Espanso match file or choose one first.', 'error')
+    text.focus()
+    return
+  }
+  importing = true
+  loadGeneration++
+  run.disabled = true
+  run.textContent = 'Importing…'
+  report.hidden = true
+  report.innerHTML = ''
+  setImportStatus('', 'info')
+  try {
+    const res = await fetch('/api/snippets/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ yaml: text.value }),
+    })
+    const data = await res.json().catch(() => ({})) as {
+      added?: unknown, skipped?: unknown, snippets?: unknown, version?: unknown, skills?: unknown, error?: string
+    }
+    if (!res.ok) throw new Error(data.error || `The import failed (HTTP ${res.status}).`)
+    if (!Array.isArray(data.added) || !Array.isArray(data.skipped) || !Array.isArray(data.snippets) || typeof data.version !== 'string') {
+      throw new Error('The server returned an unreadable import report.')
+    }
+    snippets = data.snippets as Snippet[]
+    snippetVersion = data.version
+    skills = parseChatSwitches(data.skills) ?? skills
+    loadError = null
+    // An open editor keeps its text; the rows around it are brought up to date.
+    if (tbodyEl.querySelector('.snip-expand-row')) repaintRowsAroundOpenEditor()
+    else renderRows()
+    const added = data.added.length
+    const skipped = data.skipped as ImportSkip[]
+    setImportStatus(
+      `${added ? `Added ${added} snippet${added === 1 ? '' : 's'}.` : 'No new snippets to add.'}${skipped.length ? ` Skipped ${skipped.length}:` : ''}`,
+      added ? 'ok' : 'info',
+    )
+    report.innerHTML = skipped.map(renderSkip).join('')
+    report.hidden = skipped.length === 0
+  } catch (err) {
+    setImportStatus((err as Error).message || 'The import failed.', 'error')
+  } finally {
+    importing = false
+    run.disabled = saving
+    run.textContent = 'Import'
+  }
+}
+
+// A chosen file is put in the text area to review before importing it.
+async function loadImportFile(input: HTMLInputElement): Promise<void> {
+  const file = input.files?.[0]
+  input.value = '' // Choosing the same file again after editing still loads it.
+  if (!file) return
+  try {
+    if (file.size > IMPORT_MAX_BYTES) throw new Error('Choose a file smaller than 1 MiB.')
+    let content: string
+    try { content = new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer()) }
+    catch { throw new Error('Choose a UTF-8 text file; this one could not be read as text.') }
+    importEl<HTMLTextAreaElement>('.snip-import-text').value = content
+    setImportStatus(`Loaded ${file.name}. Check it, then choose Import.`, 'info')
+  } catch (err) {
+    setImportStatus((err as Error).message, 'error')
+  }
+}
+
 function attachHandlers() {
   viewEl.querySelector('.snip-add')!.addEventListener('click', openAdd)
   tbodyEl.addEventListener('click', onTbodyClick)
   viewEl.querySelector('.snip-retry')!.addEventListener('click', () => {
     void fetchSnippets().then(() => renderRows())
+  })
+  importEl('.snip-import-open').addEventListener('click', () => toggleImport(importEl('.snip-import').hidden))
+  importEl('.snip-import-close').addEventListener('click', () => toggleImport(false))
+  importEl('.snip-import-run').addEventListener('click', () => void runImport())
+  importEl('.snip-import-choose').addEventListener('click', () => importEl<HTMLInputElement>('.snip-import-file').click())
+  importEl<HTMLInputElement>('.snip-import-file').addEventListener('change', (e) => void loadImportFile(e.target as HTMLInputElement))
+  importEl<HTMLTextAreaElement>('.snip-import-text').addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void runImport() }
   })
 }
 
