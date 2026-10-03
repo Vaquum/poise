@@ -137,6 +137,7 @@ export class Orchestrator {
         'POISE_HOST=0.0.0.0',
         `POISE_PORT=${WORKSPACE_PORT}`,
         'HOME=/home/poise',
+        ...(config.workspaceSkipCliBootstrap ? ['POISE_SKIP_CLI_BOOTSTRAP=1'] : []),
       ],
       Labels: { 'poise.managed': 'true', 'poise.workspace': handle },
       HostConfig: {

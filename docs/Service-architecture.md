@@ -174,6 +174,7 @@ Environment the gateway passes:
 | `POISE_HOST` | `0.0.0.0` |
 | `POISE_PORT` | `5555` |
 | `HOME` | `/home/poise` |
+| `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
 The gateway reaches the workspace at `http://poise-ws-<handle>:5555`.
 
