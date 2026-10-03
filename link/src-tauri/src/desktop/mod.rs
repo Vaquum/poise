@@ -41,12 +41,11 @@ pub fn run() {
                 .max_file_size(MAX_LOG_BYTES)
                 .build(),
         )
-        .plugin(
-            tauri_plugin_autostart::Builder::new()
-                .macos_launcher(MacosLauncher::LaunchAgent)
-                .arg(AUTOSTART_ARG)
-                .build(),
-        )
+        // The launcher choice only matters on macOS; `init` takes it on every system.
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec![AUTOSTART_ARG]),
+        ))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
