@@ -4,7 +4,8 @@
 workspace container. The gateway creates those containers as
 [docs/Service-architecture.md](../../docs/Service-architecture.md) ("Workspace
 runtime contract") describes: uid 10001, the home volume at `/home/poise`, the
-contract's environment, `init`, no capabilities.
+contract's environment, `init`, no capabilities, restart policy
+`unless-stopped`.
 
 Build it from the repository root; `.dockerignore` keeps dependencies, builds
 and local state out of the context:
@@ -65,12 +66,17 @@ and the next start tries again. From then on Poise's updater
 
 ## Tests
 
-`test/smoke.sh` runs containers the way the gateway does and checks the image:
+`test/smoke.sh` runs containers with the gateway's settings and environment
+(`gateway/src/orchestrator.ts`) and checks the image:
 
-- `contract`: loopback health; identity assertions from another container on
-  the workspace network (unsigned, forged, expired, wrong audience, subject,
-  scope and host are refused; the right ones get through); uid 10001 under
-  tini; the toolchain and Caller's CLIs; the entrypoint's refusals.
+- `contract`: the workspace twice on one home volume, first with the plain-http
+  origin of the gateway's `POISE_INSECURE_HTTP` runs, then with an https
+  origin. Each time: health over loopback with every field the gateway reads;
+  identity assertions from another container on the workspace network (the
+  right ones get through; unsigned, bearer-only, forged, expired, wrong
+  audience, subject, scope, host and origin scheme are refused). Then the
+  image's user and uid 10001 under tini, the toolchain and Caller's CLIs, the
+  home layout and the entrypoint's refusals.
 - `offline`: with no network every install fails, is logged, and Poise keeps
   answering.
 - `bootstrap`: installs the five CLIs for real, finds them with Poise's

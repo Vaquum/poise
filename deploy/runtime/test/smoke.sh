@@ -1,17 +1,18 @@
 #!/bin/bash
 # Smoke tests for the poise-runtime image. Each starts containers the way the
-# gateway does (docs/Service-architecture.md, "Workspace runtime contract")
-# and checks what the image promises. CI runs them from
-# .github/workflows/runtime-image.yml; anywhere with Docker and Node they run as
+# gateway does (docs/Service-architecture.md, "Workspace runtime contract";
+# gateway/src/orchestrator.ts) and checks what the image promises. CI runs
+# them from .github/workflows/runtime-image.yml; anywhere with Docker and Node
+# they run as
 #
-#   deploy/runtime/test/smoke.sh contract IMAGE   identity, user, tools, entrypoint checks
+#   deploy/runtime/test/smoke.sh contract IMAGE   health, identity, user, tools, entrypoint
 #   deploy/runtime/test/smoke.sh offline IMAGE    a failed CLI bootstrap leaves Poise running
 #   deploy/runtime/test/smoke.sh bootstrap IMAGE  installs the provider CLIs (needs the internet)
 #   deploy/runtime/test/smoke.sh logs IMAGE       prints what every smoke container logged
 set -euo pipefail
 
 if [ $# -ne 2 ]; then
-  sed -n '7,10p' "$0" >&2
+  sed -n '8,11p' "$0" >&2
   exit 2
 fi
 mode=$1
@@ -26,6 +27,10 @@ owner=Octo-CI
 host=$handle.poise.test
 workspace=poise-ws-$handle
 client=poise-smoke-client
+# Every field the gateway reads from /api/service/health, with its type.
+health_shape='.ok == true and .mode == "service"
+  and (.activeChatTurns | type) == "number" and (.runningCallerCalls | type) == "number"
+  and (.backgroundWork | type) == "number" and (.idle | type) == "boolean" and (.draining | type) == "boolean"'
 
 pass() { echo "ok - $*"; }
 fail() {
@@ -33,10 +38,14 @@ fail() {
   exit 1
 }
 
+remove_container() {
+  if docker container inspect "$1" >/dev/null 2>&1; then docker container rm --force "$1" >/dev/null; fi
+}
+
 # A new volume, and a new network unless it is `none`, for CONTAINER.
 fresh() {
   local container=$1 volume=$2 network=$3
-  if docker container inspect "$container" >/dev/null 2>&1; then docker container rm --force "$container" >/dev/null; fi
+  remove_container "$container"
   if docker volume inspect "$volume" >/dev/null 2>&1; then docker volume rm "$volume" >/dev/null; fi
   docker volume create "$volume" >/dev/null
   if [ "$network" != none ]; then
@@ -46,18 +55,21 @@ fresh() {
 }
 
 # A workspace container with the settings and environment the gateway gives
-# one. The user is left to the image, which must make it uid 10001.
+# one (Orchestrator.containerSpec); only the limits are sized for a CI runner
+# and the health check is polled faster.
 start_workspace() {
-  local container=$1 volume=$2 network=$3 public_key=$4
-  shift 4
+  local container=$1 volume=$2 network=$3 origin=$4 public_key=$5
+  shift 5
   docker run --detach --name "$container" --label poise.smoke=1 \
-    --init --security-opt no-new-privileges --cap-drop ALL --memory 4g --pids-limit 4096 \
+    --label poise.managed=true --label poise.workspace="$handle" \
+    --user 10001 --init --security-opt no-new-privileges --cap-drop ALL \
+    --memory 4g --cpus 2 --pids-limit 4096 --restart unless-stopped \
     --network "$network" --mount "type=volume,source=$volume,target=/home/poise" \
     --health-interval 2s \
     --env POISE_MODE=service \
     --env POISE_WORKSPACE_HANDLE="$handle" \
     --env POISE_WORKSPACE_OWNER="$owner" \
-    --env POISE_PUBLIC_ORIGIN="https://$host" \
+    --env POISE_PUBLIC_ORIGIN="$origin" \
     --env POISE_GATEWAY_PUBLIC_KEY="$public_key" \
     --env POISE_HOST=0.0.0.0 \
     --env POISE_PORT=5555 \
@@ -77,6 +89,13 @@ wait_healthy() {
     esac
   done
   fail "$container was not healthy within 180 seconds"
+}
+
+# The restart policy must never have had to bring Poise back.
+check_no_restarts() {
+  local count
+  count=$(docker inspect --format '{{.RestartCount}}' "$1")
+  [ "$count" = 0 ] || fail "$1 was restarted $count times"
 }
 
 # Waits until the CLI bootstrap has finished COUNT times in CONTAINER and
@@ -119,16 +138,39 @@ body_has() {
     || fail "the answer lacks $1: $(docker exec "$client" cat /tmp/body)"
 }
 
+# Loopback health, as the container's own health check asks for it.
+check_health() {
+  local health
+  health=$(docker exec "$workspace" curl --fail --silent --show-error http://127.0.0.1:5555/api/service/health) \
+    || fail "loopback health check failed"
+  jq --exit-status "$health_shape" <<<"$health" >/dev/null || fail "loopback health answered $health"
+  pass "loopback health: $health"
+}
+
+# The gateway's requests to a workspace whose public origin is ORIGIN, and
+# requests the workspace must refuse. The Host is the public host either way;
+# an Origin must equal ORIGIN, scheme included.
 check_identity() {
-  local key=$work/gateway.pem forger=$work/forger.pem aud=workspace:$handle
+  local origin=$1 other_scheme_origin key=$work/gateway.pem forger=$work/forger.pem aud=workspace:$handle
+  case "$origin" in
+    http:*) other_scheme_origin=https://$host ;;
+    *) other_scheme_origin=http://$host ;;
+  esac
   expect 401 "an unsigned request" "$host" /api/service/health
   expect 401 "an unsigned request" "$host" /
+  expect 401 "a bearer token instead of an assertion" "$host" /api/service/health \
+    --header "Authorization: Bearer $(identity "$key" "$aud" "$owner" admin)"
   expect 200 "the gateway's admin assertion" "$host" /api/service/health \
     --header "X-Poise-Identity: $(identity "$key" "$aud" "$owner" admin)"
-  body_has '"mode":"service"'
+  docker exec "$client" cat /tmp/body | jq --exit-status "$health_shape" >/dev/null \
+    || fail "health through the gateway answered $(docker exec "$client" cat /tmp/body)"
   expect 200 "the owner's browser assertion" "$host" / \
     --header "X-Poise-Identity: $(identity "$key" "$aud" "$owner" browser)"
   body_has '<title>Poise</title>'
+  expect 200 "the owner's browser assertion with the workspace's origin" "$host" / \
+    --header "Origin: $origin" --header "X-Poise-Identity: $(identity "$key" "$aud" "$owner" browser)"
+  expect 403 "the workspace's host under the other scheme as origin" "$host" / \
+    --header "Origin: $other_scheme_origin" --header "X-Poise-Identity: $(identity "$key" "$aud" "$owner" browser)"
   expect 401 "an assertion for another workspace" "$host" /api/service/health \
     --header "X-Poise-Identity: $(identity "$key" workspace:someone-else "$owner" admin)"
   expect 401 "an assertion for another person" "$host" / \
@@ -143,12 +185,16 @@ check_identity() {
     --header "X-Poise-Identity: $(identity "$key" "$aud" "$owner" link)"
   expect 403 "an admin assertion on the browser app" "$host" / \
     --header "X-Poise-Identity: $(identity "$key" "$aud" "$owner" admin)"
+  expect 403 "an admin assertion on another API route" "$host" /api/health \
+    --header "X-Poise-Identity: $(identity "$key" "$aud" "$owner" admin)"
   expect 403 "another host" other.poise.test /api/service/health \
     --header "X-Poise-Identity: $(identity "$key" "$aud" "$owner" admin)"
 }
 
 check_user() {
-  local pid uid ppid parent uids
+  local configured pid uid ppid parent uids
+  configured=$(docker image inspect --format '{{.Config.User}}' "$image")
+  [ "$configured" = 10001:10001 ] || fail "the image runs as $configured, not 10001:10001"
   pid=$(docker exec "$workspace" pgrep --exact --oldest node) || fail "no node process runs"
   read -r uid ppid < <(docker exec "$workspace" ps -o uid=,ppid= -p "$pid")
   parent=$(docker exec "$workspace" ps -o comm= -p "$ppid")
@@ -156,7 +202,7 @@ check_user() {
   [ "$parent" = tini ] || fail "Poise's parent is $parent, not tini"
   uids=$(docker exec "$workspace" ps -e -o uid= | tr -d ' ' | sort -u | tr '\n' ' ')
   [ "$uids" = "10001 " ] || fail "the container's processes run as uids $uids"
-  pass "Poise runs as uid 10001 under tini (PID 1 is $(docker exec "$workspace" ps -o comm= -p 1)); every process is uid 10001"
+  pass "the image's user is 10001:10001; Poise runs as uid 10001 under tini (PID 1 is $(docker exec "$workspace" ps -o comm= -p 1)); every process is uid 10001"
 }
 
 check_tools() {
@@ -213,23 +259,27 @@ check_home() {
   pass "the home volume is prepared: ${layout//$'\n'/, }"
 }
 
+# The workspace twice on one home volume, as the gateway recreates it: with
+# the plain-http origin of the gateway's POISE_INSECURE_HTTP runs, then with
+# the https origin of a real deployment.
 contract() {
-  local volume=poise-home-$handle network=poise-net-$handle public_key health
-  if docker container inspect "$client" >/dev/null 2>&1; then docker container rm --force "$client" >/dev/null; fi
+  local volume=poise-home-$handle network=poise-net-$handle public_key origin
+  remove_container "$client"
   fresh "$workspace" "$volume" "$network"
   public_key=$(node "$here/identity.mjs" key "$work/gateway.pem")
   node "$here/identity.mjs" key "$work/forger.pem" >/dev/null
-  start_workspace "$workspace" "$volume" "$network" "$public_key" --env POISE_SKIP_CLI_BOOTSTRAP=1
-  wait_healthy "$workspace"
-
-  health=$(docker exec "$workspace" curl --fail --silent --show-error http://127.0.0.1:5555/api/service/health) \
-    || fail "loopback health check failed"
-  grep --quiet --fixed-strings '"mode":"service"' <<<"$health" || fail "loopback health answered $health"
-  pass "loopback health: $health"
-
   docker run --detach --name "$client" --label poise.smoke=1 --network "$network" --no-healthcheck \
     --entrypoint sleep "$image" infinity >/dev/null
-  check_identity
+
+  for origin in "http://$host" "https://$host"; do
+    echo "--- POISE_PUBLIC_ORIGIN=$origin"
+    remove_container "$workspace"
+    start_workspace "$workspace" "$volume" "$network" "$origin" "$public_key" --env POISE_SKIP_CLI_BOOTSTRAP=1
+    wait_healthy "$workspace"
+    check_health
+    check_identity "$origin"
+    check_no_restarts "$workspace"
+  done
   check_user
   check_tools
   check_home "$workspace"
@@ -241,7 +291,7 @@ offline() {
   fresh "$container" "$volume" none
   public_key=$(node "$here/identity.mjs" key "$work/gateway.pem")
   # Without a network every install fails at once; npm would retry for a minute.
-  start_workspace "$container" "$volume" none "$public_key" --env npm_config_fetch_retries=0
+  start_workspace "$container" "$volume" none "https://$host" "$public_key" --env npm_config_fetch_retries=0
   wait_healthy "$container"
   check_home "$container"
   log=$(wait_for_bootstrap "$container" 1 300)
@@ -256,6 +306,7 @@ offline() {
     || fail "the container's log does not report the failed bootstrap"
   docker exec "$container" curl --fail --silent --show-error http://127.0.0.1:5555/api/service/health >/dev/null \
     || fail "Poise stopped answering after the failed bootstrap"
+  check_no_restarts "$container"
   pass "every install failed and was logged with its command and exit code; Poise kept running"
 }
 
@@ -279,7 +330,7 @@ bootstrap() {
   local container=poise-ws-bootstrap volume=poise-home-bootstrap network=poise-net-bootstrap public_key log command path version last_run
   fresh "$container" "$volume" "$network"
   public_key=$(node "$here/identity.mjs" key "$work/gateway.pem")
-  start_workspace "$container" "$volume" "$network" "$public_key"
+  start_workspace "$container" "$volume" "$network" "https://$host" "$public_key"
   wait_healthy "$container"
   log=$(wait_for_bootstrap "$container" 1 1200)
   grep --quiet 'bootstrap finished: every provider CLI is installed' <<<"$log" || fail "the bootstrap failed: $log"
@@ -307,7 +358,7 @@ logs() {
   local container mounts
   for container in $(docker ps --all --filter label=poise.smoke=1 --format '{{.Names}}'); do
     echo "::group::$container"
-    docker inspect --format '{{.State.Status}} (exit {{.State.ExitCode}}) health: {{json .State.Health}}' "$container"
+    docker inspect --format '{{.State.Status}} (exit {{.State.ExitCode}}, restarts {{.RestartCount}}) health: {{json .State.Health}}' "$container"
     docker logs --tail 300 "$container" 2>&1
     mounts=$(docker inspect --format '{{range .Mounts}}{{.Destination}} {{end}}' "$container")
     if [[ $mounts == *"/home/poise "* ]]; then
@@ -325,7 +376,7 @@ case "$mode" in
   bootstrap) bootstrap ;;
   logs) logs ;;
   *)
-    sed -n '7,10p' "$0" >&2
+    sed -n '8,11p' "$0" >&2
     exit 2
     ;;
 esac
