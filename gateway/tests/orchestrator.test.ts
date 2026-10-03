@@ -13,9 +13,16 @@ function dockerCalls(h: Harness): string[] {
   return h.docker.calls.map((call) => `${call.method} ${call.path.split('?')[0]}`)
 }
 
-function addWorkspaceContainer(h: Harness, handle: string, imageId: string, running: boolean): void {
+interface WorkspaceContainerOptions {
+  /** Whether the gateway's container is on the workspace's network; a recreated one is on none. */
+  gatewayJoined?: boolean
+}
+
+function addWorkspaceContainer(h: Harness, handle: string, imageId: string, running: boolean, options: WorkspaceContainerOptions = {}): void {
+  const { gatewayJoined = true } = options
   h.docker.volumes.add(`poise-home-${handle}`)
   h.docker.networks.add(`poise-net-${handle}`)
+  if (gatewayJoined) h.docker.containers.get('poise-gateway')?.networks.add(`poise-net-${handle}`)
   h.docker.addContainer({
     name: `poise-ws-${handle}`,
     imageId,
@@ -25,6 +32,10 @@ function addWorkspaceContainer(h: Harness, handle: string, imageId: string, runn
     networks: new Set([`poise-net-${handle}`]),
     spec: {},
   })
+}
+
+function gatewayNetworks(h: Harness): string[] {
+  return [...(h.docker.containers.get('poise-gateway')?.networks ?? [])]
 }
 
 async function waitFor(condition: () => boolean, what: string): Promise<void> {
@@ -59,6 +70,8 @@ describe('lazy start', () => {
 
     await h.orchestrator.startInProgress('alice')
     expect(dockerCalls(h)).toEqual([
+      // The health check first looks for a network to join; a workspace never started has none.
+      'GET /networks/poise-net-alice',
       'GET /volumes/poise-home-alice',
       'POST /volumes/create',
       'GET /networks/poise-net-alice',
@@ -69,10 +82,10 @@ describe('lazy start', () => {
       'POST /containers/create',
       'POST /containers/poise-ws-alice/start',
     ])
-    expect(h.docker.calls[1].body).toEqual({ Name: 'poise-home-alice' })
-    expect(h.docker.calls[3].body).toEqual({ Name: 'poise-net-alice', Driver: 'bridge' })
-    expect(h.docker.calls[5].body).toEqual({ Container: 'poise-gateway' })
-    expect(h.docker.calls[7].path).toBe('/containers/create?name=poise-ws-alice')
+    expect(h.docker.calls[2].body).toEqual({ Name: 'poise-home-alice' })
+    expect(h.docker.calls[4].body).toEqual({ Name: 'poise-net-alice', Driver: 'bridge' })
+    expect(h.docker.calls[6].body).toEqual({ Container: 'poise-gateway' })
+    expect(h.docker.calls[8].path).toBe('/containers/create?name=poise-ws-alice')
 
     const ready = await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
     expect(ready.status).toBe(200)
@@ -164,6 +177,8 @@ describe('lazy start', () => {
     await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
     await h.orchestrator.startInProgress('alice')
     expect(dockerCalls(h)).toEqual([
+      'GET /networks/poise-net-alice',
+      'GET /containers/poise-gateway/json',
       'GET /volumes/poise-home-alice',
       'GET /networks/poise-net-alice',
       'GET /containers/poise-gateway/json',
@@ -227,18 +242,19 @@ describe('lazy start', () => {
   it('recreates a stopped container on an outdated image before starting it', async () => {
     const cookie = await start()
     addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, false)
-    h.docker.containers.get('poise-gateway')?.networks.add('poise-net-alice')
     await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
     await h.orchestrator.startInProgress('alice')
-    expect(dockerCalls(h).slice(3)).toEqual([
+    expect(dockerCalls(h).slice(5)).toEqual([
       'GET /containers/poise-ws-alice/json',
       'GET /images/poise-runtime:latest/json',
       'DELETE /containers/poise-ws-alice',
       'POST /containers/create',
       'POST /containers/poise-ws-alice/start',
     ])
+    expect(h.logs.find((entry) => entry.event === 'workspace.container.removed')).toMatchObject({ handle: 'alice', reason: 'outdated image' })
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
+
 })
 
 describe('image upgrades', () => {
@@ -279,6 +295,9 @@ describe('image upgrades', () => {
       'GET /images/poise-runtime:latest/json',
       'GET /containers/json',
       'GET /containers/poise-ws-alice/json',
+      // Before the first call to the workspace, the gateway makes sure it is on its network.
+      'GET /networks/poise-net-alice',
+      'GET /containers/poise-gateway/json',
       'GET /containers/poise-ws-alice/json',
       'POST /containers/poise-ws-alice/stop',
       'DELETE /containers/poise-ws-alice',
@@ -387,5 +406,193 @@ describe('image upgrades', () => {
     } finally {
       stop()
     }
+  })
+})
+
+describe('a recreated gateway container', () => {
+  let h: Harness
+  // The workspace answers only over a network the gateway's container is on, as on a Docker host, and
+  // a recreated gateway container is on none of the networks of the workspaces that kept running.
+  const start = async (env: Record<string, string> = {}, drainPollMs?: number): Promise<string> => {
+    h = await startHarness({ env, requireNetwork: true, drainPollMs })
+    const { workspaceCookie } = await h.openWorkspace('Alice')
+    h.store.noteWorkspace('alice', 'Alice')
+    return workspaceCookie
+  }
+  const cannotJoin = 'the gateway could not join poise-net-alice: the gateway container poise-gateway (POISE_GATEWAY_CONTAINER) does not exist'
+  afterEach(async () => {
+    await h.close()
+  })
+
+  it('joins the network of every workspace when it starts, running or stopped', async () => {
+    await start()
+    addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, true, { gatewayJoined: false })
+    addWorkspaceContainer(h, 'bob', CURRENT_IMAGE_ID, false, { gatewayJoined: false })
+    addWorkspaceContainer(h, 'carol', CURRENT_IMAGE_ID, true)
+    await h.orchestrator.joinWorkspaceNetworks()
+    expect(gatewayNetworks(h)).toEqual(['bridge', 'poise-net-carol', 'poise-net-alice', 'poise-net-bob'])
+    expect(dockerCalls(h)).toEqual([
+      'GET /containers/json',
+      'GET /networks/poise-net-alice',
+      'GET /containers/poise-gateway/json',
+      'POST /networks/poise-net-alice/connect',
+      'GET /networks/poise-net-bob',
+      'GET /containers/poise-gateway/json',
+      'POST /networks/poise-net-bob/connect',
+      'GET /networks/poise-net-carol',
+      'GET /containers/poise-gateway/json',
+    ])
+    expect(h.logs.filter((entry) => entry.event === 'workspace.network.connected')).toEqual([
+      expect.objectContaining({ handle: 'alice', network: 'poise-net-alice', container: 'poise-gateway' }),
+      expect.objectContaining({ handle: 'bob', network: 'poise-net-bob', container: 'poise-gateway' }),
+    ])
+  })
+
+  it('logs a workspace it cannot join when it starts, and joins the others', async () => {
+    await start()
+    h.docker.addContainer({
+      name: 'stray', imageId: CURRENT_IMAGE_ID, imageRef: 'poise-runtime:latest', running: true,
+      labels: { 'poise.managed': 'true' }, networks: new Set(), spec: {},
+    })
+    addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, true, { gatewayJoined: false })
+    await h.orchestrator.joinWorkspaceNetworks()
+    expect(h.logs.filter((entry) => entry.event === 'workspace.network.join.failed')).toEqual([
+      expect.objectContaining({ level: 'error', container: '/stray', error: 'it has no poise.workspace label' }),
+    ])
+    expect(gatewayNetworks(h)).toContain('poise-net-alice')
+  })
+
+  it('logs it when it cannot list the workspaces as it starts, and starts all the same', async () => {
+    await start()
+    await h.docker.close()
+    await h.orchestrator.joinWorkspaceNetworks()
+    expect(h.logs.find((entry) => entry.event === 'workspace.network.join.failed'))
+      .toMatchObject({ level: 'error', error: expect.stringContaining('Docker Engine GET /containers/json') })
+  })
+
+  it('drains a running workspace over the network it joined at start, then recreates it on the new image', async () => {
+    await start({ POISE_DRAIN_TIMEOUT: '2' })
+    addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true, { gatewayJoined: false })
+    h.workspace.health.activeChatTurns = 1
+    setTimeout(() => {
+      h.workspace.health.activeChatTurns = 0
+    }, 60)
+    await h.orchestrator.joinWorkspaceNetworks()
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.serviceRequests[0]).toMatchObject({ method: 'POST', url: '/api/service/drain' })
+    expect(events(h.logs, 'workspace.')).toEqual([
+      'workspace.network.connected',
+      'workspace.upgrade.started',
+      'workspace.drain.requested',
+      'workspace.drain.idle',
+      'workspace.container.stopped',
+      'workspace.container.removed',
+      'workspace.container.created',
+      'workspace.container.started',
+      'workspace.upgrade.finished',
+    ])
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('joins the network before a drain when it is not on it yet', async () => {
+    await start({ POISE_DRAIN_TIMEOUT: '2' })
+    addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true, { gatewayJoined: false })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)).toEqual(['POST /api/service/drain'])
+    expect(events(h.logs, 'workspace.')).toEqual([
+      'workspace.upgrade.started',
+      'workspace.network.connected',
+      'workspace.drain.requested',
+      'workspace.container.stopped',
+      'workspace.container.removed',
+      'workspace.container.created',
+      'workspace.container.started',
+      'workspace.upgrade.finished',
+    ])
+  })
+
+  it('joins the network before a proxied request, so a running workspace answers at once', async () => {
+    const cookie = await start()
+    addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, true, { gatewayJoined: false })
+    const page = await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    expect(page.status).toBe(200)
+    expect(h.workspace.requests.map((request) => request.url)).toEqual(['/'])
+    expect(dockerCalls(h)).toEqual([
+      'GET /networks/poise-net-alice',
+      'GET /containers/poise-gateway/json',
+      'POST /networks/poise-net-alice/connect',
+    ])
+  })
+
+  it('joins the network once when requests arrive together', async () => {
+    const cookie = await start()
+    addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, true, { gatewayJoined: false })
+    const pages = await Promise.all([1, 2, 3, 4].map(() => h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })))
+    expect(pages.map((page) => page.status)).toEqual([200, 200, 200, 200])
+    expect(events(h.logs, 'workspace.network.connected')).toHaveLength(1)
+    expect(events(h.logs, 'workspace.network.join.failed')).toEqual([])
+  })
+
+  it('joins the network again when a drain finds it gone', async () => {
+    await start({ POISE_DRAIN_TIMEOUT: '5' })
+    addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true)
+    h.workspace.health.activeChatTurns = 1
+    const pass = h.orchestrator.upgradePass()
+    await waitFor(() => h.workspace.serviceRequests.length > 0, 'the drain request')
+    h.docker.containers.get('poise-gateway')?.networks.delete('poise-net-alice')
+    await waitFor(() => events(h.logs, 'workspace.network.connected').length > 0, 'the gateway to join again')
+    h.workspace.health.activeChatTurns = 0
+    await pass
+    expect(events(h.logs, 'workspace.')).toEqual([
+      'workspace.upgrade.started',
+      'workspace.drain.requested',
+      'workspace.drain.health.failed',
+      'workspace.network.connected',
+      'workspace.drain.idle',
+      'workspace.container.stopped',
+      'workspace.container.removed',
+      'workspace.container.created',
+      'workspace.container.started',
+      'workspace.upgrade.finished',
+    ])
+  })
+
+  it('joins a network a drain found gone before the next proxied request, too', async () => {
+    // The drain looks again only after a second, so the proxied request comes first.
+    const cookie = await start({ POISE_DRAIN_TIMEOUT: '5' }, 1000)
+    addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true)
+    expect((await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })).status).toBe(200)
+    h.docker.containers.get('poise-gateway')?.networks.delete('poise-net-alice')
+    const pass = h.orchestrator.upgradePass()
+    await waitFor(() => events(h.logs, 'workspace.drain.request.failed').length > 0, 'the drain to reach nothing')
+    const page = await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    expect(page.status).toBe(200)
+    expect(events(h.logs, 'workspace.network.connected')).toHaveLength(1)
+    await pass
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('fails the upgrade with the reason, and keeps the workspace running, when it cannot join the network', async () => {
+    // Far longer than the test may run: waiting out the drain would fail it.
+    await start({ POISE_DRAIN_TIMEOUT: '600' })
+    addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true, { gatewayJoined: false })
+    h.docker.containers.delete('poise-gateway')
+    await h.orchestrator.upgradePass()
+    expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.failed')).toMatchObject({ level: 'error', handle: 'alice', error: cannotJoin })
+    expect(h.store.getWorkspace('alice')?.lastError).toBe(`upgrade failed: ${cannotJoin}`)
+    expect(events(h.logs, 'workspace.drain')).toEqual([])
+    expect(h.workspace.serviceRequests).toHaveLength(0)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
+  })
+
+  it('shows on the starting page why it cannot reach the workspace', async () => {
+    const cookie = await start()
+    addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, true, { gatewayJoined: false })
+    h.docker.containers.delete('poise-gateway')
+    const page = await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    expect(page.status).toBe(503)
+    expect(page.body).toContain(cannotJoin)
+    expect(h.logs.find((entry) => entry.event === 'workspace.network.join.failed')).toMatchObject({ level: 'error', handle: 'alice', error: cannotJoin })
+    await h.orchestrator.startInProgress('alice')
   })
 })

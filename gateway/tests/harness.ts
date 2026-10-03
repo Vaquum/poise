@@ -62,7 +62,10 @@ export interface Harness {
 
 export interface HarnessOptions {
   env?: Record<string, string | undefined>
+  drainPollMs?: number
   drainRenewMs?: number
+  /** The workspace answers only while the gateway's container is on its network, as on a Docker host. */
+  requireNetwork?: boolean
 }
 
 export function workspaceHost(handle: string): string {
@@ -167,10 +170,13 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   const store = new Store(join(dataDir, 'gateway.db'), now)
   store.syncEnvAllowList(config.allowedUsers)
   const keys = loadOrCreateKeys(dataDir, log)
-  const upstream = (): Upstream => ({ host: '127.0.0.1', port: workspace.reachable ? workspace.port : unreachablePort })
+  const upstream = (handle: string): Upstream => {
+    const joined = !options.requireNetwork || docker.containers.get('poise-gateway')?.networks.has(`poise-net-${handle}`) === true
+    return { host: '127.0.0.1', port: workspace.reachable && joined ? workspace.port : unreachablePort }
+  }
   const dockerClient = new DockerClient(config.dockerSocket)
   const orchestrator = new Orchestrator({
-    config, docker: dockerClient, store, keys, log, now, upstream, drainPollMs: 10, drainRenewMs: options.drainRenewMs,
+    config, docker: dockerClient, store, keys, log, now, upstream, drainPollMs: options.drainPollMs ?? 10, drainRenewMs: options.drainRenewMs,
   })
   const gateway: Gateway = createGateway({
     config, store, keys, github: new GitHubClient(config), docker: dockerClient, orchestrator, log, now, upstream,
