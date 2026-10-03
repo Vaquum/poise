@@ -1,0 +1,63 @@
+name: Caller
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: caller-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  caller:
+    name: Caller (Python 3.13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # The checkout-lock interop tests drive Poise's TypeScript lock and gate.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Poise dependencies
+        run: npm ci
+
+      - name: Install Caller
+        run: python -m pip install ./caller/agent_interface ./caller/github_interface ./caller/github_datastore pytest
+
+      - name: Run Caller tests
+        run: python -m pytest caller/agent_interface/tests caller/github_interface/tests caller/github_datastore/tests -q
+
+      - name: Parse every Python file
+        run: |
+          python - <<'PY'
+          import ast
+          import subprocess
+
+          files = subprocess.run(["git", "ls-files", "*.py"], check=True, capture_output=True, text=True).stdout.splitlines()
+          for path in files:
+              with open(path, encoding="utf-8") as source:
+                  ast.parse(source.read(), filename=path)
+          print(f"parsed {len(files)} Python files")
+          PY
+
+      - name: Check the CLI entry points
+        run: |
+          agent-interface --help
+          github-interface --help
+          github-datastore --help

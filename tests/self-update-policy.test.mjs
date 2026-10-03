@@ -18,7 +18,8 @@ describe('Poise-only delegated change policy', () => {
     expect(evaluatePolicy(null).violations[0].reason).toBe('no changed files')
   })
   it.each([
-    'server/http.ts', 'scripts/self-update/policy.mjs', 'config/caller-release.json',
+    'server/http.ts', 'scripts/self-update/policy.mjs', 'caller/agent_interface/agent_interface/__init__.py',
+    'caller/github_interface/pyproject.toml', 'scripts/caller.mjs', 'scripts/caller-setup.mjs', 'tests/caller-setup.test.mjs',
     '.github/workflows/ci.yml', 'server/self-update.ts', 'src/self-update-reload.ts',
     'src/build-identity.ts', 'src/poise-request-intent.ts', 'tests/self-update-controller.test.mjs',
     'tests/http.test.ts', 'tests/claude-auth.test.ts', 'scripts/install-production.mjs',

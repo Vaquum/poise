@@ -16,7 +16,6 @@ import { layout } from '../scripts/self-update/paths.mjs'
 
 const SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'
 const NEXT_SHA = 'b'.repeat(40)
-const CALLER_SHA = 'cddc30284e6057c1f835fcc8ffa6924d07a2537d'
 const TOKEN = `github_pat_${'x'.repeat(60)}`
 // File ownership is real even though launchd is simulated.
 const UID = process.getuid?.() ?? 501
@@ -27,24 +26,21 @@ afterEach(async () => { await rm(home, { recursive: true, force: true }) })
 
 // The production plist install-production.mjs writes today, including one
 // credential-shaped variable that must not travel and one functional one that must.
-function legacyDocument({ checkout, callerRoot, node, extraEnvironment = {} }) {
+function legacyDocument({ checkout, node, extraEnvironment = {} }) {
   return {
     Label: SERVICE_LABEL,
     ProgramArguments: [node, join(checkout, 'scripts', 'start-production.mjs')],
     WorkingDirectory: checkout,
     EnvironmentVariables: {
       AGENT_INTERFACE_DATA_DIR: join(home, 'dev', 'caller', 'agent_interface', 'data'),
-      AGENT_INTERFACE_ROOT: join(callerRoot, 'source', 'agent_interface'),
-      CALLER_BIN_ROOT: join(callerRoot, 'venv', 'bin'),
-      CALLER_RELEASE_ROOT: callerRoot,
-      CALLER_RELEASE_SHA: CALLER_SHA,
+      AGENT_INTERFACE_ROOT: join(checkout, 'caller', 'agent_interface'),
+      CALLER_BIN_ROOT: join(checkout, 'caller', '.venv', 'bin'),
       HOME: home,
       LANG: 'en_US.UTF-8',
       NODE_ENV: 'production',
       NODE_OPTIONS: '--max-old-space-size=4096',
-      PATH: `${join(callerRoot, 'venv', 'bin')}:${join(home, '.local', 'bin')}:/opt/homebrew/bin:/usr/bin:/bin`,
+      PATH: `${join(checkout, 'caller', '.venv', 'bin')}:${join(home, '.local', 'bin')}:/opt/homebrew/bin:/usr/bin:/bin`,
       POISE_DB: join(home, '.poise', 'cache.db'),
-      POISE_ENFORCE_CALLER_RELEASE: '1',
       TMPDIR: '/tmp',
       ...extraEnvironment,
     },
@@ -69,7 +65,7 @@ function response(status, body) {
 async function world(overrides = {}) {
   const root = join(home, '.poise', 'self-update')
   const checkout = join(home, '.poise', 'production')
-  const callerRoot = join(home, '.poise', 'releases', 'caller', CALLER_SHA)
+  const callerBin = join(checkout, 'caller', '.venv', 'bin')
   const node = join(home, 'node22', 'bin', 'node')
   const launchAgents = join(home, 'Library', 'LaunchAgents')
   const tokenFile = join(home, '.poise', 'release-token')
@@ -80,13 +76,13 @@ async function world(overrides = {}) {
   }
   await writeFile(join(checkout, 'scripts', 'self-update', 'README.md'), 'not copied\n')
   await writeFile(join(checkout, 'scripts', 'start-production.mjs'), 'export {}\n')
-  await mkdir(join(callerRoot, 'venv', 'bin'), { recursive: true })
+  await mkdir(callerBin, { recursive: true })
   await mkdir(join(home, 'node22', 'bin'), { recursive: true })
   await writeFile(node, '#!/bin/sh\necho v22.13.1\n', { mode: 0o755 })
   await mkdir(launchAgents, { recursive: true })
   await mkdir(join(home, '.poise'), { recursive: true })
   await writeFile(tokenFile, `${TOKEN}\n`, { mode: 0o600 })
-  const legacy = legacyDocument({ checkout, callerRoot, node, extraEnvironment: overrides.extraEnvironment || { GH_TOKEN: 'ghp_legacy_secret_value' } })
+  const legacy = legacyDocument({ checkout, node, extraEnvironment: overrides.extraEnvironment || { GH_TOKEN: 'ghp_legacy_secret_value' } })
   const servicePlistPath = join(launchAgents, `${SERVICE_LABEL}.plist`)
   await writeFile(servicePlistPath, plistXml(legacy))
   const legacyText = await readFile(servicePlistPath, 'utf8')
@@ -232,7 +228,7 @@ async function world(overrides = {}) {
     log: (line) => { if (line.includes(TOKEN)) state.tokenSeen.push('log'); state.logs.push(line) },
     timing: { pollMs: 1_000, drainMaxMs: 5_000, healthGraceMs: 5_000, restoreGraceMs: 5_000, updaterIdleMaxMs: 5_000, daemonStartMaxMs: 3_000 },
   })
-  return { root, checkout, callerRoot, node, tokenFile, servicePlistPath, launchAgents, legacy, legacyText, state, installer, paths: layout(root) }
+  return { root, checkout, callerBin, node, tokenFile, servicePlistPath, launchAgents, legacy, legacyText, state, installer, paths: layout(root) }
 }
 
 const uid = UID
@@ -329,7 +325,7 @@ describe('enable', () => {
   it('dry run plans everything and writes nothing', async () => {
     const w = await world()
     const plan = await w.installer.enable({ tokenFile: w.tokenFile, dryRun: true })
-    expect(plan).toMatchObject({ dryRun: true, changed: false, sha: SHA, callerSha: CALLER_SHA, checkout: w.checkout, node: w.node, serviceMode: 'legacy', strippedEnvironment: ['GH_TOKEN'] })
+    expect(plan).toMatchObject({ dryRun: true, changed: false, sha: SHA, callerSha: SHA, checkout: w.checkout, node: w.node, serviceMode: 'legacy', strippedEnvironment: ['GH_TOKEN'] })
     expect(plan.servicePlist.ProgramArguments).toEqual([w.node, join(w.root, TRUSTED_LAUNCHER)])
     expect(plan.daemonPlist.EnvironmentVariables.POISE_RELEASE_TOKEN_FILE).toBe(w.tokenFile)
     await expect(stat(w.root)).rejects.toThrow()
@@ -350,7 +346,7 @@ describe('enable', () => {
     expect(installed).toMatchObject({ phase: 'completed', checkout: w.checkout, baseline: { sha: SHA, id: result.releaseId } })
     expect(installed.legacyEnvironment).toEqual(w.legacy.EnvironmentVariables)
     const { config } = await readConfig(root, {})
-    expect(config).toMatchObject({ enabled: true, tokenFile: w.tokenFile, callerSha: CALLER_SHA, nodeBin: join(home, 'node22', 'bin'), productionPort: 5555, productionServiceLabel: SERVICE_LABEL })
+    expect(config).toMatchObject({ enabled: true, tokenFile: w.tokenFile, callerSha: SHA, nodeBin: join(home, 'node22', 'bin'), productionPort: 5555, productionServiceLabel: SERVICE_LABEL })
     expect(await selfUpdateEnabled(root)).toBe(true)
     expect((await stat(paths.bridgeKeyPath)).mode & 0o777).toBe(0o600)
     expect((await stat(root)).mode & 0o777).toBe(0o700)
@@ -360,7 +356,7 @@ describe('enable', () => {
 
     // Baseline release is complete, exact, retained beside (not in) production.
     const manifest = JSON.parse(await readFile(join(paths.releasesDir, result.releaseId, 'release.json'), 'utf8'))
-    expect(manifest).toMatchObject({ id: result.releaseId, sha: SHA, callerSha: CALLER_SHA, builder: 'poise-self-update-bootstrap', node: 'v22.13.1' })
+    expect(manifest).toMatchObject({ id: result.releaseId, sha: SHA, callerSha: SHA, builder: 'poise-self-update-bootstrap', node: 'v22.13.1' })
     await expect(stat(join(paths.releasesDir, result.releaseId, 'dist', 'server.js'))).resolves.toBeTruthy()
     await expect(stat(join(w.checkout, 'dist'))).rejects.toThrow()
     await expect(stat(join(w.checkout, 'node_modules'))).rejects.toThrow()
@@ -376,7 +372,7 @@ describe('enable', () => {
     const pointer = JSON.parse(await readFile(paths.activePointerPath, 'utf8'))
     expect(pointer).toMatchObject({ id: result.releaseId, sha: SHA, root: join(paths.releasesDir, result.releaseId), previousId: null })
     const stateDocument = JSON.parse(await readFile(paths.statePath, 'utf8'))
-    expect(stateDocument.releases[result.releaseId]).toMatchObject({ sha: SHA, callerSha: CALLER_SHA })
+    expect(stateDocument.releases[result.releaseId]).toMatchObject({ sha: SHA, callerSha: SHA })
 
     // Legacy plist preserved byte-for-byte; new plist points at the trusted launcher with the same environment.
     expect(await readFile(installed.preservedPlist, 'utf8')).toBe(w.legacyText)
@@ -387,7 +383,7 @@ describe('enable', () => {
       POISE_ENV_ROOT: w.checkout, POISE_CHAT_ROOT: join(w.checkout, '.poise-chat'), POISE_SELF_UPDATE_ROOT: root,
     })
     expect(service.EnvironmentVariables.GH_TOKEN).toBeUndefined()
-    expect(service.EnvironmentVariables.CALLER_RELEASE_SHA).toBe(CALLER_SHA)
+    expect(service.EnvironmentVariables.CALLER_BIN_ROOT).toBe(w.callerBin)
     expect(service.EnvironmentVariables.POISE_DB).toBe(join(home, '.poise', 'cache.db'))
     expect(service.EnvironmentVariables.NODE_OPTIONS).toBe('--max-old-space-size=4096')
     expect(service).toMatchObject({ KeepAlive: true, RunAtLoad: true, ThrottleInterval: 10, ProcessType: 'Interactive' })
@@ -729,14 +725,23 @@ describe('preflight refusals', () => {
     expect(w.state.tokenSeen.every((where) => where === 'github')).toBe(true)
   })
 
-  it('refuses an unsupported Node runtime, a missing Caller pin, or a non-macOS host', async () => {
+  it('refuses an unsupported Node runtime, a service without the checkout\'s Caller, or a non-macOS host', async () => {
     const oldNode = await world({ state: { nodeVersion: 'v18.20.0' } })
     await expect(oldNode.installer.enable({ tokenFile: oldNode.tokenFile })).rejects.toThrow(/v18.20.0/)
-    const noCaller = await world()
-    const document = parsePlist(await readFile(noCaller.servicePlistPath, 'utf8'))
-    delete document.EnvironmentVariables.CALLER_RELEASE_SHA
-    await writeFile(noCaller.servicePlistPath, plistXml(document))
-    await expect(noCaller.installer.enable({ tokenFile: noCaller.tokenFile })).rejects.toThrow(/CALLER_RELEASE_SHA/)
+    for (const callerBin of [undefined, join(home, '.poise', 'releases', 'caller', 'c'.repeat(40), 'venv', 'bin')]) {
+      const elsewhere = await world()
+      const document = parsePlist(await readFile(elsewhere.servicePlistPath, 'utf8'))
+      if (callerBin) document.EnvironmentVariables.CALLER_BIN_ROOT = callerBin
+      else delete document.EnvironmentVariables.CALLER_BIN_ROOT
+      await writeFile(elsewhere.servicePlistPath, plistXml(document))
+      await expect(elsewhere.installer.enable({ tokenFile: elsewhere.tokenFile }))
+        .rejects.toThrow(`the production plist runs Caller from ${callerBin || '(unset)'}, not ${elsewhere.callerBin}; run npm run install:production first`)
+    }
+    const notSetUp = await world()
+    await rm(notSetUp.callerBin, { recursive: true })
+    await expect(notSetUp.installer.enable({ tokenFile: notSetUp.tokenFile }))
+      .rejects.toThrow(`Caller is not set up at ${notSetUp.callerBin}; run npm run install:production first`)
+    expect(notSetUp.state.commands.filter((c) => c.command === 'npm')).toEqual([])
     const linux = await world({ platform: 'linux' })
     await expect(linux.installer.enable({ tokenFile: linux.tokenFile })).rejects.toThrow(/macOS/)
     await expect(linux.installer.disable()).rejects.toThrow(/macOS/)
@@ -771,7 +776,7 @@ describe('maintenance', () => {
     expect(labelsTouched(w.state.launchctl, 'bootstrap')).toEqual([SERVICE_LABEL])
     expect(w.state.loaded[DAEMON_LABEL]).toBeUndefined()
     const { config } = await readConfig(w.root, {})
-    expect(config).toMatchObject({ enabled: false, callerSha: CALLER_SHA, tokenFile: w.tokenFile })
+    expect(config).toMatchObject({ enabled: false, callerSha: SHA, tokenFile: w.tokenFile })
     await expect(selfUpdateEnabled(w.root)).rejects.toThrow(/maintenance/)
     const installed = JSON.parse(await readFile(w.installer.installedPath, 'utf8'))
     expect(installed.phase).toBe('disabled')
@@ -780,10 +785,18 @@ describe('maintenance', () => {
     await expect(stat(join(w.paths.releasesDir, w.releaseId, 'dist', 'server.js'))).resolves.toBeTruthy()
     await expect(stat(w.paths.activePointerPath)).resolves.toBeTruthy()
     await expect(stat(w.paths.statePath)).resolves.toBeTruthy()
-    // Caller stays pinned in the restored definition.
-    expect(parsePlist(await readFile(w.servicePlistPath, 'utf8')).EnvironmentVariables.CALLER_RELEASE_SHA).toBe(CALLER_SHA)
+    // The restored definition still runs the checkout's Caller.
+    expect(parsePlist(await readFile(w.servicePlistPath, 'utf8')).EnvironmentVariables.CALLER_BIN_ROOT).toBe(w.callerBin)
     // A second disable is a no-op.
     expect(await w.installer.disable()).toMatchObject({ changed: false, serviceMode: 'legacy' })
+  })
+
+  it('disable refuses to hand production back to a service whose Caller is gone', async () => {
+    const w = await enabledWorld()
+    await rm(w.callerBin, { recursive: true })
+    await expect(w.installer.disable()).rejects.toThrow('the preserved plist no longer points at an installed Caller')
+    expect(await readFile(w.servicePlistPath, 'utf8')).toContain(TRUSTED_LAUNCHER)
+    expect(await selfUpdateEnabled(w.root)).toBe(true)
   })
 
   it('disable refuses while the controller has work in flight, unless forced', async () => {
