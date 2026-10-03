@@ -18,7 +18,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: link-${{ github.workflow }}-${{ github.ref }}
+  # The event is part of the group, so a manual installer build and a push to
+  # the same branch never cancel each other.
+  group: link-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
