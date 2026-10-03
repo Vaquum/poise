@@ -51,7 +51,9 @@ workspace can reach another one.
   is their GitHub login in lower case. GitHub logins are already valid DNS
   labels. The handles `www`, `api`, `admin`, `auth`, `link`, `static`,
   `gateway`, `app` and `mail` are reserved; a login that equals one of them is
-  refused at sign-in.
+  refused at sign-in. A handle stays with the GitHub account that first signed
+  in with it, matched by account id, so a login that is renamed and later
+  claimed by someone else cannot take over the workspace.
 - DNS needs two records pointing at the server: `POISE_DOMAIN` and
   `*.POISE_DOMAIN`. Caddy obtains a certificate for each workspace host on first
   use (on-demand TLS); it asks the gateway first
@@ -66,18 +68,28 @@ workspace can reach another one.
   discards the GitHub token.
 - Access: a login may sign in when it is on the allow list (seeded from
   `POISE_ALLOWED_USERS`, editable by admins) or is a member of an organisation
-  in `POISE_ALLOWED_ORGS`. Admins come from `POISE_ADMINS`.
+  in `POISE_ALLOWED_ORGS`. Admins come from `POISE_ADMINS` and may always sign
+  in.
 - The apex session cookie is `poise_gw` (host-only, `Secure`, `HttpOnly`,
   `SameSite=Lax`, 14 days).
 - A workspace host gets its own host-only cookie, `poise_ws`, through a ticket:
   the apex mints a single-use ticket valid for 60 seconds and redirects to
   `https://<handle>.<POISE_DOMAIN>/_poise/session?ticket=…&next=<path>`, where the
   gateway checks it, sets `poise_ws` and redirects to `next` (a same-host path
-  only).
+  only). `poise_ws` has the same attributes as `poise_gw` and ends with the apex
+  session it came from; signing out on either host ends both.
 - A workspace host only ever serves its owner. A session for another person on
   that host is rejected with 403; admins get no implicit access.
-- Paths under `/_poise/` on workspace hosts belong to the gateway (session,
-  sign-out, a "starting your workspace" page). Everything else is proxied.
+- Paths under `/_poise/` on workspace hosts belong to the gateway
+  (`/_poise/session` and `/_poise/logout`). Everything else is proxied. While a
+  workspace starts, the gateway answers navigations itself with a "starting
+  your workspace" page that reloads until the workspace is ready, and other
+  requests with `503`.
+- For local and CI end-to-end runs only, `POISE_INSECURE_HTTP=1` serves plain
+  http: the cookies drop `Secure`, and every address the gateway builds,
+  including `POISE_PUBLIC_ORIGIN` and `X-Forwarded-Proto`, uses `http`. The
+  gateway refuses it unless `POISE_DOMAIN` is `localhost`, `*.localhost` or
+  `*.test`.
 
 ## Gateway → workspace identity
 
@@ -110,7 +122,11 @@ client sent.
   - `link`: a paired Poise Link device; only `/api/link/*`.
   - `admin`: the gateway itself; only `/api/service/*`.
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
-  `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers.
+  `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers. Its
+  own credentials stay with it: the `poise_ws` cookie and a device token's
+  `Authorization` header are not forwarded.
+- The gateway's own calls to `/api/service/*` carry an `admin` assertion and
+  `Host: <handle>.<POISE_DOMAIN>`.
 
 ## Workspace runtime contract
 
@@ -186,8 +202,8 @@ otherwise offer it):
   gateway's readiness check.
 - `POST /api/service/drain` stops admitting new Chat turns and behavior
   launches, then returns the same counters. The gateway polls health until
-  both counters are zero, or until `POISE_DRAIN_TIMEOUT` (default 30 minutes)
-  has passed, before it recreates a container.
+  both counters are zero, or until `POISE_DRAIN_TIMEOUT` seconds (default
+  1800, 30 minutes) have passed, before it recreates a container.
 - `POST /api/service/resume` lifts a drain.
 
 ## Accounts, identities and the terminal
@@ -262,7 +278,10 @@ trigger/replace pairs, reporting any it skipped.
 3. `POST /link/device/token` with `{ device_code }` returns
    `{ error: "authorization_pending" }` until approved, then
    `{ access_token, endpoint, login }`, where `endpoint` is the workspace
-   address.
+   address. Errors follow RFC 8628 with HTTP 400: `authorization_pending`,
+   `slow_down` (polling faster than `interval`, which then grows by 5 seconds),
+   `access_denied`, `expired_token` (after `expires_in`, 15 minutes) and
+   `invalid_grant` (an unknown or already redeemed code).
 
 Devices are listed and revoked at `/link/devices`. The gateway stores token
 hashes only.
