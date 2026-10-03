@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { basename, delimiter, join } from 'node:path'
 import { config as loadDotenv } from 'dotenv'
 import { servicePath } from './production-path.mjs'
 import { CALLER_COMMANDS, agentInterfaceRoot, callerBinRoot } from './caller.mjs'
@@ -44,7 +44,7 @@ if (existsSync(envPath) && process.platform !== 'win32') {
 if (dotenvSecure) loadDotenv({ path: envPath, quiet: true })
 
 // Caller's CLIs are checked where Poise runs them from, not wherever PATH
-// finds a copy.
+// finds a copy, with that directory first on their PATH as Poise runs them.
 const callerBin = callerBinRoot()
 const caller = (command) => join(callerBin, command)
 if (CALLER_COMMANDS.every((command) => existsSync(caller(command)))) console.log(`ok  Caller CLIs in ${callerBin}`)
@@ -67,7 +67,9 @@ function diagnosticEnvironment(command) {
   const env = Object.fromEntries(SAFE_CHILD_ENV
     .filter((key) => process.env[key] !== undefined)
     .map((key) => [key, process.env[key]]))
-  env.PATH = [callerBin, ...(env.PATH || '').split(delimiter).filter(Boolean)].join(delimiter)
+  if (CALLER_COMMANDS.includes(basename(command))) {
+    env.PATH = [callerBin, ...(env.PATH || '').split(delimiter).filter(Boolean)].join(delimiter)
+  }
   if (command === 'gh') {
     for (const key of ['GH_CONFIG_DIR', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY']) {
       if (process.env[key] !== undefined) env[key] = process.env[key]

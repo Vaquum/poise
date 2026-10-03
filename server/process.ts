@@ -209,8 +209,8 @@ function commandName(command: string): string {
 // Caller's CLIs run from the in-tree Caller (or the installation
 // CALLER_BIN_ROOT names), never from whatever copy PATH happens to find: a
 // bare name resolves to that directory, so a Caller that is not set up fails
-// naming it. Children get the directory first on PATH, so the CLIs Caller
-// starts itself resolve there too.
+// naming it. Caller's own processes get the directory first on PATH, so the
+// CLIs Caller starts by name resolve there too.
 function resolveCommand(command: string): string {
   return CALLER_COMMANDS.includes(command) ? join(callerBinRoot(), command) : command
 }
@@ -262,7 +262,7 @@ function childEnvironment(
       env[key] = value
     }
   }
-  withCallerOnPath(env)
+  if (CALLER_COMMANDS.includes(commandName(command))) withCallerOnPath(env)
   for (const [key, value] of Object.entries(overrides)) {
     // Avoid case-variant duplicates on Windows and make an explicit undefined
     // reliably remove an inherited variable on every platform.

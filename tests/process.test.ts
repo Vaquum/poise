@@ -1007,13 +1007,15 @@ describe('Caller command resolution', () => {
     })
   })
 
-  it('puts the Caller directory first on every child PATH once, and an explicit PATH still wins', async () => {
+  it('puts the Caller directory first, once, only on the PATH of Caller\'s own processes', async () => {
     const probe = ['-e', 'process.stdout.write(process.env.PATH || "")']
-    const inherited = (await runFile(process.execPath, probe)).stdout.split(delimiter)
-    expect(inherited.slice(0, 2)).toEqual([bin, decoy])
+    const callerCli = await namedNode(root, 'github-datastore')
+    expect((await runFile(callerCli, probe)).stdout.split(delimiter).slice(0, 2)).toEqual([bin, decoy])
+    expect((await runFile(process.execPath, probe)).stdout).toBe(process.env.PATH)
     vi.stubEnv('PATH', `${decoy}${delimiter}${bin}`)
-    expect((await runFile(process.execPath, probe)).stdout).toBe(`${bin}${delimiter}${decoy}`)
-    expect((await runFile(process.execPath, probe, { env: { PATH: decoy } })).stdout).toBe(decoy)
+    expect((await runFile(callerCli, probe)).stdout).toBe(`${bin}${delimiter}${decoy}`)
+    // An explicit PATH still wins.
+    expect((await runFile(callerCli, probe, { env: { PATH: decoy } })).stdout).toBe(decoy)
   })
 
   it('refuses a relative CALLER_BIN_ROOT instead of resolving it against the working directory', async () => {
