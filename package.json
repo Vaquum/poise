@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mikkokotila/Poise.git"
+    "url": "https://github.com/autonomio/poise.git"
   },
   "packageManager": "npm@10.9.2",
   "type": "module",

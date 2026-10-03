@@ -14,7 +14,7 @@
 // — it's a read-only consumer view of GitHub. We return 501 so the
 // frontend's existing error handling kicks in.
 //
-// Reference: see Vaquum GitHub Datastore Consumer Contract.
+// Reference: caller/github_datastore/CONSUMER_CONTRACT.md.
 
 import { mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -23,6 +23,7 @@ import { getMeta } from './db'
 import { HttpError } from './http'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { MAX_PROCESS_ARG_BYTES, runFile } from './process'
+import { agentAccount, requireAgentAccount } from './settings'
 
 const CLI = 'github-datastore'
 const GH_INTERFACE = 'github-interface'
@@ -32,26 +33,6 @@ const ISSUE_BODY_PREFIX = 'body='
 
 function fitsProcessArgument(prefix: string, value: string): boolean {
   return Buffer.byteLength(prefix + value, 'utf8') <= MAX_PROCESS_ARG_BYTES
-}
-
-// The GitHub identity the review-agent acts as — threaded through from
-// cachePlugin's opts (Vite's loadEnv populates the plugin options object
-// but NOT process.env, so reading process.env.REVIEW_AGENT_USERNAME here
-// would silently come back empty — see the same note in
-// server/behaviors.ts). Set once at server start by
-// setReviewAgentUsername. The involvement scope in fetchKind unions this
-// account's *authored* issues/PRs with the configured `me`'s involvement,
-// so work the user's own agent opened surfaces in Current as the user's.
-let reviewAgentUsername = ''
-export function setReviewAgentUsername(name: string): void {
-  reviewAgentUsername = String(name || '').trim()
-}
-
-export function getReviewAgentUsername(): string {
-  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/.test(reviewAgentUsername)) {
-    throw new Error('REVIEW_AGENT_USERNAME must be a valid GitHub username')
-  }
-  return reviewAgentUsername
 }
 
 // github-interface resolves the repo from cwd's last two path parts when
@@ -203,7 +184,10 @@ async function discoverOrgRepos(org: Organization): Promise<string[]> {
   const cached = repoListCache.get(key)
   if (cached && cached.expiry > now) return cached.repos
   const generation = repoCacheGeneration
-  const { stdout } = await runFile(GH_INTERFACE, ['--view-repos', org.login], {
+  // Repositories are listed as the person: what they can see.
+  const me = getMeta('me') || ''
+  if (!me) throw new Error('Set your GitHub account in Settings → GitHub to list repositories')
+  const { stdout } = await runFile(GH_INTERFACE, ['--view-repos', org.login, '--token-user', me], {
     timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024,
   })
   const data = JSON.parse(stdout)
@@ -266,7 +250,7 @@ export async function getHeadSha(
   const [owner, name] = repo.split('/', 2)
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
-  const actor = getReviewAgentUsername()
+  const actor = requireAgentAccount()
   const { stdout } = await runFile(GH_INTERFACE, [
     '--head-sha',
     `#${number}`,
@@ -300,7 +284,7 @@ export async function getHeadSha(
 // github-interface infers the repo from cwd when no `--repository` flag
 // or git remote is available. We just point cwd at a tmp directory whose
 // last two parts are `<owner>/<repo>` and the CLI picks it up.
-async function checkMergeable(owner: string, repo: string, number: number): Promise<boolean> {
+async function checkMergeable(owner: string, repo: string, number: number, agent: string): Promise<boolean> {
   const key = `${owner}/${repo}#${number}`
   const now = Date.now()
   const cached = greenCache.get(key)
@@ -309,7 +293,7 @@ async function checkMergeable(owner: string, repo: string, number: number): Prom
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, repo)
   try {
     await mkdir(cwd, { recursive: true })
-    const { stdout } = await runFile(GH_INTERFACE, ['--mergeable', `#${number}`], {
+    const { stdout } = await runFile(GH_INTERFACE, ['--mergeable', `#${number}`, '--token-user', agent], {
       cwd,
       timeoutMs: 30_000,
       maxOutputBytes: 1 * 1024 * 1024,
@@ -331,6 +315,9 @@ async function checkMergeable(owner: string, repo: string, number: number): Prom
 // capped to be polite to GitHub's REST endpoint — typical involvement
 // only has a handful of open PRs at once.
 async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promise<{ records: { repo: string, number: number }[], errors: OrganizationReadError[] }> {
+  // Checked up front: each check below fails quietly to "not green", which
+  // would hide a missing agent account behind an empty result.
+  const agent = requireAgentAccount()
   const read = await fetchKind('pr', { ...body, record_state: 'open', count_only: true }, me, orgs)
   const openPrs = read.records
 
@@ -340,7 +327,7 @@ async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promi
     const checks = await Promise.all(chunk.map(async (pr) => {
       if (!pr.repo.includes('/')) return { pr, green: false }
       const [owner, repoName] = pr.repo.split('/', 2)
-      const green = await checkMergeable(owner, repoName, pr.number)
+      const green = await checkMergeable(owner, repoName, pr.number, agent)
       return { pr, green }
     }))
     for (const { pr, green } of checks) {
@@ -363,10 +350,10 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: 
   // even when the configured `me` is a different user — no agent union.
   //
   // Otherwise scope is "things `me` is involved in" via views.user. The
-  // review-agent acts on the user's behalf, so we also union what IT
+  // agent account acts on the user's behalf, so we also union what IT
   // AUTHORED when one is configured and distinct: without this, issues/PRs
-  // the agent opened (e.g. bit-mis chores) never surface in Current even
-  // though they're the user's work.
+  // the agent opened (chores, say) never surface in Current even though
+  // they're the user's work.
   //
   // We use the agent's *authored* set (views.{issue,pr} --author), NOT its
   // involvement view: github-datastore only populates views.user for the
@@ -374,12 +361,13 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: 
   // "authored" is the semantic we want anyway (what the agent produced for
   // us, not every PR it merely reviewed). Deduped by repo#number below.
   const scopes: string[][] = []
+  const agent = agentAccount()
   if (body.author) {
     scopes.push([itemType, '--author', String(body.author)])
   } else if (me) {
     scopes.push(['user', '--username', me, '--item-type', itemType])
-    if (reviewAgentUsername && reviewAgentUsername !== me) {
-      scopes.push([itemType, '--author', reviewAgentUsername])
+    if (agent && agent !== me) {
+      scopes.push([itemType, '--author', agent])
     }
   } else {
     scopes.push([itemType])
@@ -494,16 +482,13 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
 
   if (op === 'open_issue') {
     // User-initiated issue creation — authored as the configured main user
-    // (settings.me), NOT the review-agent.
+    // (settings.me), NOT the agent account.
     //
-    // We deliberately bypass `github-interface --create-issue`: its
-    // create_issue behavior hardcodes TOKEN_USER="bit-mis" (the bot
-    // account) with no flag/env/payload override, so every issue it opens
-    // is authored by the bot. Current's composer and Editor's "create
-    // issue from selection" are the user's OWN actions, so we POST through
-    // `gh api` with the token pinned to `me` (gh's stored credential for
-    // that account) — making the identity independent of whichever gh
-    // account happens to be "active".
+    // Current's composer and Editor's "create issue from selection" are the
+    // user's OWN actions, so we POST through `gh api` with the token pinned
+    // to `me` (gh's stored credential for that account) — never whichever
+    // gh account happens to be "active". `github-interface --create-issue`
+    // is agent work: it acts as the agent account unless told otherwise.
     const repoFull = String(body.repository_full_name || '')
     const title = String(body.title || '').trim()
     const issueBody = String(body.body || '').trim()
@@ -517,13 +502,13 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
     }
     try { requireConfiguredRepository(repoFull) }
     catch (error) { return { status: 400, body: { error: (error as Error).message } } }
+    if (!me) return { status: 400, body: { error: 'Set your GitHub account in Settings → GitHub before creating issues' } }
     const [owner, repo] = repoFull.split('/', 2)
 
-    // Resolve `me`'s gh credential. With no `me` configured, fall back to
-    // gh's active account.
+    // Resolve `me`'s gh credential.
     let token = ''
     try {
-      const tokenArgs = ['auth', 'token', '--hostname', 'github.com', ...(me ? ['--user', me] : [])]
+      const tokenArgs = ['auth', 'token', '--hostname', 'github.com', '--user', me]
       token = (await runFile(GH, tokenArgs, {
         // Resolve the stored github.com credential selected above. Inherited
         // token variables and GH_HOST must not redirect identity selection.
@@ -540,7 +525,7 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
       if (!token) throw new Error('empty token')
     } catch (err: any) {
       const msg = err?.stderr?.toString?.() || err?.message || String(err)
-      return { status: 502, body: { error: `could not resolve a gh token for ${me || 'the active account'} (run \`gh auth login\` as ${me || 'that user'}): ${msg}` } }
+      return { status: 502, body: { error: `could not resolve a gh token for ${me} (run \`gh auth login\` as ${me}): ${msg}` } }
     }
 
     try {

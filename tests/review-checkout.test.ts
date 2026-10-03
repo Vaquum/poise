@@ -51,6 +51,7 @@ describe('review checkout provisioning through Caller', () => {
     const fetches = mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-interface' && args[0] === '--checkout-repo')
     expect(fetches).toHaveLength(1)
     expect(fetches[0][1].slice(0, 3)).toEqual(['--checkout-repo', `${owner}/${repo}`, '--path'])
+    expect(fetches[0][1].slice(4)).toEqual(['--token-user', actor])
     expect(mocks.runFile).toHaveBeenCalledWith('git', ['checkout', '--quiet', '--detach', head], expect.any(Object))
     expect(mocks.runFile.mock.calls.some(([command]) => command === 'gh')).toBe(false)
   })
@@ -75,9 +76,10 @@ describe('review checkout provisioning through Caller', () => {
     await expect(resolveCheckout()).rejects.toThrow()
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
   })
-  it('never substitutes the fixed checkout identity for another reviewer', async () => {
-    await expect(resolveReviewCheckout(owner, repo, 146, 'other-reviewer', head)).rejects.toThrow('explicit checkout identity')
-    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+  it('provisions as whichever agent account reviews, named to Caller', async () => {
+    expect(await resolveReviewCheckout(owner, repo, 146, 'other-reviewer', head)).toBe(join(root, 'review-checkouts', head, owner, repo))
+    const fetches = mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-interface' && args[0] === '--checkout-repo')
+    expect(fetches.map(([, args]) => args.slice(4))).toEqual([['--token-user', 'other-reviewer']])
   })
   it('rejects path traversal before invoking any process', async () => {
     await expect(resolveReviewCheckout(owner, '..', 146, actor, head)).rejects.toThrow('Invalid review')

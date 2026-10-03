@@ -234,6 +234,44 @@ test('saves a review model choice and restores it after reload', async ({ page }
   await expect(page.getByLabel('PR review secondary reviewer')).toHaveValue('muse-spark-1.3-contributor-max')
 })
 
+test('keeps your GitHub account and the agent account under GitHub in Settings', async ({ page }) => {
+  let settings: Record<string, unknown> = { org: 'acme', me: 'octocat', agentAccount: 'review-bot', timezone: 'UTC', models: {} }
+  const posts: Array<Record<string, unknown>> = []
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      posts.push(route.request().postDataJSON())
+      settings = { ...settings, ...posts.at(-1) }
+    }
+    await route.fulfill({ json: settings })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('[data-action="settings"]').click()
+  const panel = page.locator('#settings-panel')
+  await expect(panel.locator('.tp-group-label').first()).toHaveText('GitHub')
+  const yours = page.getByLabel('Your GitHub account')
+  const agent = page.getByLabel('Agent account')
+  await expect(yours).toHaveValue('octocat')
+  await expect(agent).toHaveValue('review-bot')
+  await expect(agent.locator('xpath=..')).toContainText('The GitHub user your reviews and comments are posted as. It must be signed in to gh here.')
+
+  await agent.fill('https://github.com/other-bot')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('The agent account must be a GitHub login, not a URL or email.')
+  await expect(agent).toBeFocused()
+  expect(posts).toEqual([])
+
+  await agent.fill('other-bot')
+  await agent.press('Enter')
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(posts).toMatchObject([{ me: 'octocat', agentAccount: 'other-bot' }])
+
+  await page.reload()
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('[data-action="settings"]').click()
+  await expect(page.getByLabel('Agent account')).toHaveValue('other-bot')
+})
+
 test('shows in Settings whether production is on main', async ({ page }) => {
   const deployed = 'b'.repeat(40)
   let production: Record<string, unknown> = {
@@ -307,6 +345,33 @@ test('chooses how many reviewers each new pull request gets from Behaviors', asy
   await page.reload()
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
   await expect(page.getByLabel('Reviewers for review-new-prs')).toHaveValue('3')
+})
+
+test('shows the agent account as the Behaviors owner and follows it when it changes', async ({ page }) => {
+  let owner: string | null = 'review-bot'
+  const missing = 'No agent account is set. Set it in Settings → GitHub: it is the GitHub user your reviews and comments are posted as.'
+  const behavior = (extra: Record<string, unknown>) => ({
+    owner, enabled: false, setting: null, reviewers: null, scratchpad: '', lastTriggered: null, ...extra,
+  })
+  await page.route(/\/api\/behaviors(?:\?.*)?$/, async (route) => {
+    await route.fulfill({ json: {
+      'review-new-prs': behavior({ setting: 'p2', reviewers: 1 }),
+      'approve-prs': behavior({}),
+      'resolve-unblocking': behavior({ scratchpad: null }),
+      diagnostics: { status: owner ? 'ok' : 'degraded', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: owner ? { status: 'valid', actor: owner, error: null } : { status: 'invalid', actor: null, error: missing }, failures: [], deadLetters: [] },
+    } })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  const cell = page.locator('tr[data-behavior="review-new-prs"] .behavior-owner-cell')
+  await expect(cell).toHaveText('review-bot')
+  owner = 'other-bot'
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(cell).toHaveText('other-bot')
+  owner = null
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(cell).toHaveText('—')
+  await expect(page.locator('#behavior-diagnostics')).toContainText(`Identity: ${missing}`)
 })
 
 test('opts repositories and trusted authors into Review New Issues from Behaviors', async ({ page }) => {

@@ -4,6 +4,10 @@ from github_interface.atoms.local import current_branch
 from github_interface.atoms.pulls import list_open_pulls_for_branch
 from github_interface.client import GitHubClient
 from github_interface.context import repository
+from github_interface.identity import PERSON
+
+IDENTITY = PERSON
+
 
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     owner, repo = repository(payload)

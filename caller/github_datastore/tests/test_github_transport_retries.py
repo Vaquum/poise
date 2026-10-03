@@ -21,6 +21,17 @@ def succeeded() -> subprocess.CompletedProcess[str]:
 
 
 class GitHubTransportRetryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        token = patch.dict(os.environ, {"GH_TOKEN": "test-credential"})
+        token.start()
+        self.addCleanup(token.stop)
+
+    def test_without_a_token_nothing_is_read(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch("github_datastore.github_api.subprocess.run") as run:
+            with self.assertRaisesRegex(GitHubApiError, "GH_TOKEN is not set"):
+                GitHubClient().graphql(QUERY, VARIABLES)
+        run.assert_not_called()
+
     def test_string_variables_are_not_coerced_by_gh(self) -> None:
         query = "query($name: String!, $number: Int!, $cursor: String) { viewer { login } }"
         for name in ("33", "001", "true", "false", "null", "@repo-name", "{repo}"):

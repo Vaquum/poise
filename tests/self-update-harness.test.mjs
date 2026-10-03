@@ -12,7 +12,7 @@ import { writeJsonAtomic } from '../scripts/self-update/atomic.mjs'
 import { adoptInitialRelease } from '../scripts/self-update/bootstrap.mjs'
 import { createController } from '../scripts/self-update/controller.mjs'
 import { GitHubError, REQUIRED_CONTEXTS } from '../scripts/self-update/github.mjs'
-import { layout } from '../scripts/self-update/paths.mjs'
+import { REPOSITORY, layout } from '../scripts/self-update/paths.mjs'
 import { releaseIsComplete } from '../scripts/self-update/releases.mjs'
 import { SubprocessError } from '../scripts/self-update/runner.mjs'
 import { openStore } from '../scripts/self-update/store.mjs'
@@ -104,7 +104,7 @@ export function fakeGitHub(model, git) {
   const commits = {}
   const log = []
   let nextNumber = 100
-  const repo = { full_name: 'mikkokotila/Poise' }
+  const repo = { full_name: REPOSITORY }
   const protection = () => model.protection ?? {
     required_status_checks: { strict: true, contexts: [...REQUIRED_CONTEXTS] },
     enforce_admins: { enabled: true },
@@ -150,7 +150,7 @@ export function fakeGitHub(model, git) {
       const number = nextNumber++
       pulls[number] = {
         number, title, body, state: 'open', merged: false, draft: false, mergeable: true, mergeable_state: 'clean',
-        merge_commit_sha: null, html_url: `https://github.com/mikkokotila/Poise/pull/${number}`,
+        merge_commit_sha: null, html_url: `https://github.com/${REPOSITORY}/pull/${number}`,
         head: { ref: head, sha: git.remoteRefs[head], repo }, base: { ref: base, repo },
       }
       if (model.createPrUncertain) {
@@ -180,7 +180,7 @@ export function fakeGitHub(model, git) {
       return [{
         path: '.github/workflows/ci.yml', head_sha: sha, event: 'pull_request', run_number: 1, check_suite_id: 7,
         status: status === 'pending' ? 'in_progress' : 'completed', conclusion: status === 'pending' ? null : 'success',
-        head_repository: repo, html_url: 'https://github.com/mikkokotila/Poise/actions/runs/1',
+        head_repository: repo, html_url: `https://github.com/${REPOSITORY}/actions/runs/1`,
       }]
     },
     // The real merge: main advances to a merge commit whose parents are [main, head].

@@ -36,6 +36,27 @@ async function executable(path) {
   await chmod(path, 0o700)
 }
 
+const SAVED = JSON.stringify([
+  { key: 'agentAccount', value: 'review-bot' },
+  { key: 'me', value: 'octocat' },
+  { key: 'org', value: 'Vaquum' },
+])
+
+// Poise has started at least once: its database holds saved settings.
+async function savedPoise(home) {
+  await mkdir(join(home, '.poise'), { recursive: true })
+  await writeFile(join(home, '.poise', 'cache.db'), '')
+}
+
+async function configuredEnvironment(home, sqlite, environment) {
+  const bin = join(home, '.local', 'share', 'caller-pr-stop-gate', 'bin')
+  await mkdir(bin, { recursive: true })
+  await executable(join(bin, 'agent-interface'))
+  const run = vi.fn(async (command) => (command === '/usr/bin/sqlite3' ? { stdout: sqlite, stderr: '' } : { stdout: '', stderr: '' }))
+  await configureStopGate({ home, run, environment })
+  return { env: run.mock.lastCall[2].env, run }
+}
+
 describe('stop-gate runtime reconciliation', () => {
   it('creates a missing runtime, records its release, and configures both hooks', async () => {
     const home = await temporaryHome()
@@ -54,9 +75,10 @@ describe('stop-gate runtime reconciliation', () => {
         await executable(join(bin, 'github-interface'))
         return { stdout: '', stderr: '' }
       }
-      if (command === '/usr/bin/sqlite3') return { stdout: 'Vaquum', stderr: '' }
+      if (command === '/usr/bin/sqlite3') return { stdout: SAVED, stderr: '' }
       return { stdout: '', stderr: '' }
     })
+    await savedPoise(home)
 
     await installStopGate({
       home,
@@ -70,7 +92,11 @@ describe('stop-gate runtime reconciliation', () => {
     const install = calls.find((call) => call.command === join(bin, 'python') && call.args.includes('pip'))
     expect(install.args.slice(-2)).toEqual(['/production/caller/github_interface', '/production/caller/agent_interface'])
     const configuration = calls.find((call) => call.args[0] === '--install-pr-stop-gate')
-    expect(configuration.options.env.CALLER_PR_GATE_SCOPE).toBe('Vaquum/*')
+    expect(configuration.options.env).toMatchObject({
+      CALLER_PR_GATE_SCOPE: 'Vaquum/*',
+      GITHUB_INTERFACE_AGENT_USER: 'review-bot',
+      CALLER_GITHUB_READER: 'octocat',
+    })
   })
 
   it('names the in-tree Caller it installs from, and treats any other as stale', async () => {
@@ -102,9 +128,10 @@ describe('stop-gate runtime reconciliation', () => {
     await executable(join(bin, 'agent-interface'))
     const run = vi.fn(async (command) => (
       command === '/usr/bin/sqlite3'
-        ? { stdout: 'Vaquum', stderr: '' }
+        ? { stdout: SAVED, stderr: '' }
         : { stdout: '', stderr: '' }
     ))
+    await savedPoise(home)
 
     await configureStopGate({ home, run })
 
@@ -112,8 +139,32 @@ describe('stop-gate runtime reconciliation', () => {
       join(bin, 'agent-interface'),
       ['--install-pr-stop-gate'],
       expect.objectContaining({
-        env: expect.objectContaining({ CALLER_PR_GATE_SCOPE: 'Vaquum/*' }),
+        env: expect.objectContaining({ CALLER_PR_GATE_SCOPE: 'Vaquum/*', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }),
       }),
     )
+  })
+
+  it('before Poise has started, waits for the agent account REVIEW_AGENT_USERNAME will seed', async () => {
+    const home = await temporaryHome()
+    const { env, run } = await configuredEnvironment(home, '', { REVIEW_AGENT_USERNAME: 'seed-bot' })
+    expect(run.mock.calls.some(([command]) => command === '/usr/bin/sqlite3')).toBe(false)
+    expect(env).toEqual({ REVIEW_AGENT_USERNAME: 'seed-bot', GITHUB_INTERFACE_AGENT_USER: 'seed-bot' })
+  })
+
+  it('once Poise has saved the agent account, Settings decides, cleared included', async () => {
+    const home = await temporaryHome()
+    await savedPoise(home)
+    expect((await configuredEnvironment(home, SAVED, { REVIEW_AGENT_USERNAME: 'seed-bot' })).env)
+      .toMatchObject({ GITHUB_INTERFACE_AGENT_USER: 'review-bot', CALLER_GITHUB_READER: 'octocat' })
+    const cleared = JSON.stringify([{ key: 'agentAccount', value: '' }])
+    expect((await configuredEnvironment(home, cleared, { REVIEW_AGENT_USERNAME: 'seed-bot' })).env)
+      .toEqual({ REVIEW_AGENT_USERNAME: 'seed-bot' })
+  })
+
+  it('refuses a saved account that is not a GitHub login', async () => {
+    const home = await temporaryHome()
+    await savedPoise(home)
+    await expect(configuredEnvironment(home, JSON.stringify([{ key: 'agentAccount', value: 'not a login' }]), {}))
+      .rejects.toThrow('Configured agent account is invalid')
   })
 })

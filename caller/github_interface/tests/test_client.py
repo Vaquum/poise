@@ -47,7 +47,7 @@ class TestClientRetrySemantics(IsolatedAsyncioTestCase):
                 lambda **kwargs: FakeAsyncClient(self.script, self.calls, **kwargs),
             )
         )
-        self.client = GitHubClient()
+        self.client = GitHubClient("test-account")
 
     async def test_get_retries_once_after_transport_error(self) -> None:
         self.script.extend([httpx.ConnectError("boom"), _response(200, {"ok": True})])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -9,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_DB = "/Users/mikkokotila/dev/caller/github_datastore/github_datastore.sqlite"
+def default_db() -> str:
+    """Without --db the database lives in the user's data directory."""
+    data = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+    return str(Path(data) / "github-datastore" / "github_datastore.sqlite")
+
+
+DEFAULT_DB = default_db()
 VIEW_SCHEMA_VERSION = 1
 VIEW_NAMES = frozenset({"user_associations", "prs", "issues", "user_items"})
 
@@ -23,6 +30,7 @@ def dumps(value: Any) -> str:
 
 
 def connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=60)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 60000")

@@ -8,7 +8,7 @@ export interface SelfChange {
   instance: string
   request: string
   title: string
-  repository: 'mikkokotila/Poise'
+  repository: string
   branch: string
   baseSha: string
   headSha?: string

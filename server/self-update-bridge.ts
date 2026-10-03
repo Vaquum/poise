@@ -13,8 +13,9 @@ import { lstatSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { PreparedSelfChange, SelfChange, SelfUpdateStatus } from '../src/self-update-types'
+import { POISE_REPOSITORY } from '../src/poise-repository'
 
-export const SELF_UPDATE_REPOSITORY = 'mikkokotila/Poise'
+export const SELF_UPDATE_REPOSITORY = POISE_REPOSITORY
 const SOCKET_NAME = 'control.sock'
 const KEY_NAME = 'bridge.key'
 const RESPONSE_MAX_BYTES = 1024 * 1024

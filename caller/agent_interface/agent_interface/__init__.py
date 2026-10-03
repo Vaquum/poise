@@ -18,7 +18,6 @@ from . import (
     author_content,
     chat,
     debate,
-    find_alpha,
     fix_failing_ci,
     issue_review,
     issue_simplify,
@@ -485,14 +484,18 @@ def run_issue_review(
     try:
         with review_budget.ReviewBudget(timeout_s, cap=issue_review.TIMEOUT_SECONDS), \
                 progress.Progress(DB, id_, "preparing_issue", "Reading the issue and its sub-issues"):
-            # github-interface comments as one fixed account; a different actor
-            # would find out only after its first comment went out.
-            if actor.lower() != issue_review.COMMENTER.lower():
-                fail(ValueError(f"issue comments are posted as {issue_review.COMMENTER}; --actor {actor} cannot post them"),
+            # Issue reviews post as the configured agent account; a different
+            # actor would find out only after its first comment went out.
+            agent = os.getenv("GITHUB_INTERFACE_AGENT_USER", "").strip()
+            if not agent:
+                fail(ValueError("GITHUB_INTERFACE_AGENT_USER is not set; it names the agent account issue reviews post as"),
+                     "agent_account_missing", preflight=True)
+            if actor.lower() != agent.lower():
+                fail(ValueError(f"issue comments are posted as the agent account {agent}; --actor {actor} cannot post them"),
                      "actor_mismatch", preflight=True)
             try:
-                data = issue_review.packet(repo, number)
-                issue_review.mark_reviewed(data, _issue_review_targets, _running_issue_reviews(id_))
+                data = issue_review.packet(repo, number, actor)
+                issue_review.mark_reviewed(data, actor, _issue_review_targets, _running_issue_reviews(id_))
             except review_budget.ReviewLimitError as e:
                 fail(e, e.code)
             except Exception as e:
@@ -601,17 +604,22 @@ def run_issue_simplify(issue: str, pwd: str | None = None, note: str = "", timeo
     return run_legacy_behavior(issue_simplify, "issue_simplify", issue, pwd, note, timeout_s)
 
 
-def run_author_content(topic: str, pwd: str | None = None, session_id: str | None = None, note: str = "", timeout_s: int = 3600):
+def run_author_content(topic: str, pwd: str | None = None, session_id: str | None = None, note: str = "", timeout_s: int = 3600,
+                       voice_guide: str | None = None):
     name = CATALOG.behavior("author_content").identity
     id_ = track(name, topic, actor=actor_name(), behavior="author_content", session_id=session_id)
+    guide = author_content.voice_guide(voice_guide)
+    if guide is None:
+        print(f"author-content: no voice guide (--voice-guide or {author_content.VOICE_GUIDE_ENV}); writing without one", file=sys.stderr)
+    stamp_ = {"id": id_, "model": name, "session_id": session_id, "voice_guide": str(guide) if guide else None}
     try:
-        response = author_content.run(topic, pwd, session_id, note, timeout_s)
+        response = author_content.run(topic, pwd, session_id, note, timeout_s, guide)
         finish(id_, "completed", response=response)
-        print(json.dumps({"id": id_, "model": name, "session_id": session_id, "response": response}, indent=2))
+        print(json.dumps({**stamp_, "response": response}, indent=2))
         return response
     except Exception as e:
         finish(id_, "failed", error=str(e))
-        print(json.dumps({"id": id_, "model": name, "session_id": session_id, "error": str(e)}, indent=2))
+        print(json.dumps({**stamp_, "error": str(e)}, indent=2))
         raise SystemExit(1)
 
 
@@ -626,20 +634,6 @@ def run_debate(topic: str, rounds: int = 1, timeout_s: int = 3600):
     except Exception as e:
         finish(id_, "failed", error=str(e))
         print(json.dumps({"id": id_, "model": name, "rounds": rounds, "error": str(e)}, indent=2))
-        raise SystemExit(1)
-
-
-def run_find_alpha(topic: str, model: str, session_id: str | None = None, timeout_s: int = 3600):
-    name = CATALOG.resolve(model).identity
-    id_ = track(name, topic, actor=actor_name(), behavior="find_alpha", session_id=session_id)
-    try:
-        response = find_alpha.run(topic, model, session_id or id_[:8], timeout_s)
-        finish(id_, "completed", response=response)
-        print(json.dumps({"id": id_, "model": name, "session_id": session_id or id_[:8], "response": response}, indent=2))
-        return response
-    except Exception as e:
-        finish(id_, "failed", error=str(e))
-        print(json.dumps({"id": id_, "model": name, "session_id": session_id or id_[:8], "error": str(e)}, indent=2))
         raise SystemExit(1)
 
 
@@ -1221,9 +1215,8 @@ behaviors:
   --fix-failing-ci PR [--pwd DIR]
   --issue-simplify ISSUE [--pwd DIR]
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--note TEXT]
-  --author-content TOPIC [--session-id ID] [--pwd DIR]
+  --author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]
   --debate TOPIC [--rounds N]
-  --find-alpha TOPIC --model MODEL [--session ID]
   --record-turn start --model MODEL --session ID --source SOURCE [--repo OWNER/NAME --pr N] [--correlation-id ID]
   --record-turn finish CALL_ID --status completed|failed|cancelled [--error TEXT]
   --pr-stop-gate
@@ -1370,15 +1363,10 @@ def main():
         run_issue_simplify(sys.argv[2], flag_value("--pwd"))
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--author-content":
-        run_author_content(sys.argv[2], flag_value("--pwd"), flag_value("--session") or flag_value("--session-id"))
+        run_author_content(sys.argv[2], flag_value("--pwd"), flag_value("--session") or flag_value("--session-id"),
+                           voice_guide=flag_value("--voice-guide"))
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--debate":
         run_debate(sys.argv[2], int(flag_value("--rounds") or "1"))
-        return
-    if len(sys.argv) >= 3 and sys.argv[1] == "--find-alpha":
-        model = flag_value("--model")
-        if not model:
-            usage()
-        run_find_alpha(sys.argv[2], model, flag_value("--session") or flag_value("--session-id"))
         return
     usage(error="first argument must be a behavior switch")

@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-REVIEWER = os.getenv("CALLER_PR_REVIEWER", "bit-mis")
 STATE_DIR = Path(
     os.getenv(
         "CALLER_PR_STOP_GATE_STATE_DIR",
@@ -88,13 +87,17 @@ def handle(event: dict[str, Any]) -> dict[str, Any] | None:
     message = str(event.get("last_assistant_message") or "")
     if not active and not _claims_completion(message):
         return None
+    reviewer = _reviewer()
+    # Pull requests are read as CALLER_GITHUB_READER when set, otherwise as
+    # the reviewer, which can read every pull request it approves.
+    reader = ["--token-user", os.getenv("CALLER_GITHUB_READER", "").strip() or reviewer]
 
     currents: list[tuple[dict[str, Any], str]] = []
     errors: list[RuntimeError | OSError] = []
     seen = set()
     for candidate in _tracked_cwds(session_id, cwd):
         try:
-            current = _interface(_reader_args(["--current-pr"]), candidate)
+            current = _interface(["--current-pr", *reader], candidate)
         except (RuntimeError, OSError) as error:
             if _benign_candidate_failure(error, candidate):
                 continue
@@ -122,10 +125,11 @@ def handle(event: dict[str, Any]) -> dict[str, Any] | None:
                     "--pr-readiness",
                     f"#{current['pull_number']}",
                     "--username",
-                    REVIEWER,
+                    reviewer,
                     "--expected-head",
                     str(current["head_sha"]),
-                ] + _reader_args([]),
+                    *reader,
+                ],
                 candidate,
             )
         except (RuntimeError, OSError) as error:
@@ -165,8 +169,14 @@ def install() -> dict[str, Any]:
         raise RuntimeError("github-interface executable is not installed")
     scope = os.getenv("CALLER_PR_GATE_SCOPE", "").strip()
     scope_env = f" CALLER_PR_GATE_SCOPE={shlex.quote(scope)}" if scope else ""
+    # The hook runs in every agent session on the machine, whose environment
+    # does not carry Poise's accounts: they are fixed into the command.
+    accounts_env = f" CALLER_PR_REVIEWER={shlex.quote(_reviewer())}"
+    reader = os.getenv("CALLER_GITHUB_READER", "").strip()
+    if reader:
+        accounts_env += f" CALLER_GITHUB_READER={shlex.quote(reader)}"
     command = (
-        f"GITHUB_INTERFACE_CLI={shlex.quote(interface)}{scope_env} "
+        f"GITHUB_INTERFACE_CLI={shlex.quote(interface)}{scope_env}{accounts_env} "
         f"{shlex.quote(str(Path(sys.executable)))} "
         f"{shlex.quote(str(Path(__file__).resolve()))}"
     )
@@ -289,9 +299,12 @@ def _interface(args: list[str], cwd: str) -> dict[str, Any]:
     return payload
 
 
-def _reader_args(args: list[str]) -> list[str]:
-    reader = os.getenv("CALLER_GITHUB_READER", "").strip()
-    return [*args, "--token-user", reader] if reader else args
+def _reviewer() -> str:
+    """The account whose approval the gate waits for: the agent account."""
+    reviewer = os.getenv("CALLER_PR_REVIEWER", "").strip() or os.getenv("GITHUB_INTERFACE_AGENT_USER", "").strip()
+    if not reviewer:
+        raise RuntimeError("no reviewer: set GITHUB_INTERFACE_AGENT_USER (or CALLER_PR_REVIEWER) to the agent account that approves pull requests")
+    return reviewer
 
 
 def _mark(session_id: str, cwd: str, event: dict[str, Any]) -> None:
