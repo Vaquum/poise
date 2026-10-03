@@ -88,7 +88,8 @@ EOF
 # The gateway runs the container as uid 10001. A new named volume mounted at
 # /home/poise starts as a copy of this directory, ownership included.
 RUN groupadd --gid 10001 poise \
- && useradd --uid 10001 --gid 10001 --home-dir /home/poise --create-home --shell /bin/bash poise
+ && useradd --uid 10001 --gid 10001 --home-dir /home/poise --create-home --shell /bin/bash poise \
+ && chmod 700 /home/poise
 
 COPY --from=caller /opt/python /opt/python
 COPY --from=caller /opt/caller/venv /opt/caller/venv
