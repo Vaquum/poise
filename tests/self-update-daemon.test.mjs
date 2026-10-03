@@ -12,6 +12,7 @@ import { ControlError, ControlUnavailable, createControlClient, disabledStatus, 
 import { startDaemon } from '../scripts/self-update/daemon.mjs'
 import { assertRecoveryRequest, createNonceStore, escapeHtml } from '../scripts/self-update/recovery.mjs'
 import { BASE, HEAD, INSTANCE, SESSION, SESSION2, UUID, createHarness } from './self-update-harness.test.mjs'
+import { REPOSITORY } from '../scripts/self-update/paths.mjs'
 
 async function freePort() {
   return new Promise((resolve, reject) => {
@@ -191,7 +192,7 @@ describe('control API over the Unix socket', () => {
   it('drives a change end to end through the socket, queueing the check in the daemon', async () => {
     const { h, client, started } = await daemon()
     const prepared = await client.prepareChange({ id: UUID, sessionId: SESSION, instance: INSTANCE, request: 'Make the chat header sticky' })
-    expect(prepared).toMatchObject({ change: { id: UUID, state: 'implementing', repository: 'mikkokotila/Poise' }, branch: `poise/change-${UUID}`, baseSha: BASE })
+    expect(prepared).toMatchObject({ change: { id: UUID, state: 'implementing', repository: REPOSITORY }, branch: `poise/change-${UUID}`, baseSha: BASE })
     expect(prepared.workspace).toBe(join(started.paths.workspacesDir, UUID))
     expect((await client.bindSession(UUID, { sessionId: SESSION2, instance: INSTANCE })).sessionId).toBe(SESSION2)
     expect((await client.status()).available).toBe(false)
@@ -365,7 +366,7 @@ describe('CLI', () => {
       expect(await runCli(['init', '--token-file', tokenFile, '--caller-sha', 'c'.repeat(40)], { root: h.root, stdout: (line) => out.push(line) })).toBe(0)
       expect(out[0]).toMatch(/disabled until/)
       const config = await readJson(join(h.root, 'config.json'))
-      expect(config).toMatchObject({ enabled: false, tokenFile, callerSha: 'c'.repeat(40), repository: 'mikkokotila/Poise' })
+      expect(config).toMatchObject({ enabled: false, tokenFile, callerSha: 'c'.repeat(40), repository: REPOSITORY })
       expect(await runCli(['install-controller'], { root: h.root, stdout: (line) => out.push(line) })).toBe(0)
       expect(await readFile(join(h.root, 'controller', 'launch.mjs'), 'utf8')).toContain('resolveLaunch')
       expect(await runCli(['report'], { root: h.root, stdout: (line) => out.push(line) })).toBe(0)

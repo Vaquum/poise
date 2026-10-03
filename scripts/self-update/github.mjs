@@ -133,8 +133,8 @@ export function assertRepositoryIdentity(repository) {
 
 export function assertPullRequestIdentity(pull, { branch, headSha = null }) {
   const problems = []
-  if (pull?.base?.repo?.full_name !== REPOSITORY) problems.push('base repository is not mikkokotila/Poise')
-  if (pull?.head?.repo?.full_name !== REPOSITORY) problems.push('head repository is not mikkokotila/Poise')
+  if (pull?.base?.repo?.full_name !== REPOSITORY) problems.push(`base repository is not ${REPOSITORY}`)
+  if (pull?.head?.repo?.full_name !== REPOSITORY) problems.push(`head repository is not ${REPOSITORY}`)
   if (pull?.base?.ref !== BASE_BRANCH) problems.push(`base branch is ${pull?.base?.ref ?? 'unknown'}, not main`)
   if (pull?.head?.ref !== branch) problems.push(`head branch is ${pull?.head?.ref ?? 'unknown'}, not ${branch}`)
   if (headSha && pull?.head?.sha !== headSha) problems.push(`PR head moved to ${String(pull?.head?.sha).slice(0, 12)}`)

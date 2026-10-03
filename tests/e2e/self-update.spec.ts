@@ -5,6 +5,7 @@ import { createServer, type Server } from 'node:http'
 import { dirname, extname, join, resolve } from 'node:path'
 import type { ChatEnvelope, ChatEvent, ClientFrame, SessionRecord } from '../../server/chat/protocol'
 import type { SelfChange, SelfUpdateStatus } from '../../src/self-update-types'
+import { POISE_REPOSITORY as REPOSITORY } from '../../src/poise-repository'
 
 // The browser side of a Poise self-change against a scripted server: the
 // typed `/poise` entrypoint, the deploy card that follows the supervisor's
@@ -34,7 +35,7 @@ function session(overrides: Partial<SessionRecord> = {}): SessionRecord {
 function change(overrides: Partial<SelfChange> = {}): SelfChange {
   return {
     id: '00000000-0000-4000-8000-000000000000', sessionId: 's1', instance: 'poise-prod:test', request: 'Add a Stop button to the Swarm header', title: 'Add a Stop button to the Swarm header',
-    repository: 'mikkokotila/Poise', branch: 'poise/change-0000', baseSha: SHA_A, state: 'implementing', createdAt: NOW, updatedAt: NOW, canRevert: false,
+    repository: REPOSITORY, branch: 'poise/change-0000', baseSha: SHA_A, state: 'implementing', createdAt: NOW, updatedAt: NOW, canRevert: false,
     ...overrides,
   }
 }
@@ -175,7 +176,7 @@ for (const prefix of ['', '/poise ']) test(`${prefix ? '/poise' : 'A natural req
   const state = makeState([session()])
   await installRoutes(page, state)
   const sock = await installSocket(page)
-  const dedicated = session({ id: 'change-session', title: 'Poise change: Add a Stop button', workspaceKind: 'poise-change', selfChangeId: change().id, repo: 'mikkokotila/Poise', checkout: '/tmp/poise-change', branch: { name: 'poise/change-0000', origin: 'existing', provisional: false }, status: 'running' })
+  const dedicated = session({ id: 'change-session', title: 'Poise change: Add a Stop button', workspaceKind: 'poise-change', selfChangeId: change().id, repo: REPOSITORY, checkout: '/tmp/poise-change', branch: { name: 'poise/change-0000', origin: 'existing', provisional: false }, status: 'running' })
   sock.onPoiseChange = (frame) => {
     const cmd = frame.command as { sessionId: string, text: string, changeId: string }
     state.sessions.unshift(dedicated)
@@ -209,9 +210,9 @@ for (const prefix of ['', '/poise ']) test(`${prefix ? '/poise' : 'A natural req
   await expect.poll(() => state.calls.filter((c) => c.path === '/api/self-update').map((c) => c.query.session)).toContain('change-session')
 
   // The card keeps following the supervisor without any agent event.
-  state.status = { ...state.status!, changes: [change({ id: cmd.changeId, request: cmd.text, state: 'awaiting_ci', prNumber: 91, prUrl: 'https://github.com/mikkokotila/Poise/pull/91', headSha: SHA_B })] }
+  state.status = { ...state.status!, changes: [change({ id: cmd.changeId, request: cmd.text, state: 'awaiting_ci', prNumber: 91, prUrl: `https://github.com/${REPOSITORY}/pull/91`, headSha: SHA_B })] }
   await expect(card(page)).toHaveAttribute('data-state', 'awaiting_ci', { timeout: 10_000 })
-  await expect(card(page).locator('a[href="https://github.com/mikkokotila/Poise/pull/91"]')).toHaveText('PR #91')
+  await expect(card(page).locator(`a[href="https://github.com/${REPOSITORY}/pull/91"]`)).toHaveText('PR #91')
   await expect(card(page)).toContainText('bbbbbbb')
   await expect(card(page).locator('.chat-deploy-revert')).toHaveCount(0)
 
@@ -219,7 +220,7 @@ for (const prefix of ['', '/poise ']) test(`${prefix ? '/poise' : 'A natural req
     ...state.status!,
     activeRelease: { id: 'r2', sha: SHA_B, root: '/r/r2', createdAt: NOW, callerSha: 'c' },
     previousRelease: { id: 'r1', sha: SHA_A, root: '/r/r1', createdAt: NOW, callerSha: 'c' },
-    changes: [change({ id: cmd.changeId, request: cmd.text, state: 'live', prNumber: 91, prUrl: 'https://github.com/mikkokotila/Poise/pull/91', headSha: SHA_B, mergeSha: SHA_B, releaseId: 'r2', previousReleaseId: 'r1', canRevert: true })],
+    changes: [change({ id: cmd.changeId, request: cmd.text, state: 'live', prNumber: 91, prUrl: `https://github.com/${REPOSITORY}/pull/91`, headSha: SHA_B, mergeSha: SHA_B, releaseId: 'r2', previousReleaseId: 'r1', canRevert: true })],
   }
   await expect(card(page)).toHaveAttribute('data-state', 'live', { timeout: 10_000 })
   await expect(card(page)).toContainText('r2')

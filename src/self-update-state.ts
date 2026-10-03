@@ -3,6 +3,7 @@
 // honest. Pure functions over the shared public types; no DOM, no fetch.
 
 import type { BuildIdentity, SelfChange, SelfChangeState, SelfRelease, SelfUpdateStatus } from './self-update-types'
+import { POISE_REPOSITORY } from './poise-repository'
 
 const CHANGE_STATES: readonly SelfChangeState[] = ['implementing', 'checking', 'awaiting_ci', 'merging', 'merged', 'deploying', 'verifying', 'live', 'reverting', 'reverted', 'failed', 'blocked', 'superseded']
 
@@ -52,7 +53,7 @@ export function parseChange(v: unknown): SelfChange | null {
     instance: typeof v.instance === 'string' ? v.instance : '',
     request: typeof v.request === 'string' ? v.request : '',
     title: typeof v.title === 'string' ? v.title : '',
-    repository: 'mikkokotila/Poise',
+    repository: POISE_REPOSITORY,
     branch: typeof v.branch === 'string' ? v.branch : '',
     baseSha: typeof v.baseSha === 'string' ? v.baseSha : '',
     headSha: optionalString(v.headSha),

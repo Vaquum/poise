@@ -16,6 +16,8 @@
 // the explicit shortcuts and are parsed before this recogniser is consulted.
 // Kept free of DOM imports so it runs under the node test environment.
 
+import { POISE_REPOSITORY } from './poise-repository'
+
 export interface PoiseIntentContext {
   /** True only when the caller knows the active session is itself about
    *  changing Poise: its record has `workspaceKind === 'poise-change'`, or the
@@ -97,7 +99,9 @@ const CONTROLLER_ACTION = /\b(?:revert|roll\s*back|rollback|redeploy|deploy|rele
 
 // Requests explicitly aimed elsewhere. Hyphenated sibling names are unambiguous;
 // "caller" is an English word, so it only counts as a repository in those frames.
-const OTHER_TARGET = /\b(?:agent-interface|github-interface|bit-mis)\b|\bcaller\s+(?:repo|repository|package|project|codebase|release|pr|main|branch|checkout)\b|\b(?:in|to|into|for|of|on)\s+(?:the\s+)?caller\b|github\.com\/(?!mikkokotila\/poise\b)[\w.-]+\/[\w.-]+|\b(?:repo|repository)\s+(?!mikkokotila\/poise\b)[\w.-]+\/[\w.-]+/i
+// Poise's own repository is never elsewhere.
+const OWN_REPOSITORY = POISE_REPOSITORY.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+const OTHER_TARGET = new RegExp(String.raw`\b(?:agent-interface|github-interface)\b|\bcaller\s+(?:repo|repository|package|project|codebase|release|pr|main|branch|checkout)\b|\b(?:in|to|into|for|of|on)\s+(?:the\s+)?caller\b|github\.com\/(?!${OWN_REPOSITORY}\b)[\w.-]+\/[\w.-]+|\b(?:repo|repository)\s+(?!${OWN_REPOSITORY}\b)[\w.-]+\/[\w.-]+`, 'i')
 const NAMED_TARGET = /\b(?:in|to|into|for|on|inside|within|of|from)\s+(?:the\s+|my\s+|our\s+)?([\w.-]+)\s+(?:repo|repository|package|project|codebase|library|extension|plugin|cli|monorepo|workspace)\b/gi
 const THIS_TARGET = /\b(?:in|to|into|for|on|inside|within)\s+(?:this|that|the\s+current|my|our)\s+(?:repo|repository|package|project|codebase|library|module|app|application|site|website|service)\b/i
 const TARGET_FILLERS = new Set(['this', 'that', 'the', 'a', 'an', 'my', 'our', 'your', 'its', 'current', 'same', 'other', 'another', 'new', 'existing', 'whole', 'entire', 'main', 'root', 'poise'])

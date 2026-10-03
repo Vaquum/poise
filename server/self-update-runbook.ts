@@ -3,6 +3,8 @@
 // agent's claims are never what gets released: the checkout, the branch, the
 // allowed paths, the check command and the commit are the whole handover.
 
+import { POISE_REPOSITORY } from '../src/poise-repository'
+
 const REQUEST_CHARS = 64 * 1024
 
 export interface RunbookInput {
@@ -28,7 +30,7 @@ export function poiseChangePrompt(input: RunbookInput): string {
   const request = input.request.length > REQUEST_CHARS ? `${input.request.slice(0, REQUEST_CHARS)}…` : input.request
   return [
     '[Poise self-improvement change]',
-    `You are implementing one change to Poise (mikkokotila/Poise) in a checkout the release controller prepared for it: ${input.workspace}`,
+    `You are implementing one change to Poise (${POISE_REPOSITORY}) in a checkout the release controller prepared for it: ${input.workspace}`,
     `Work on the branch that is already checked out, ${input.branch} (based on ${input.baseSha}). Never switch, rebase, reset or rename it, and never touch any other checkout or repository.`,
     '',
     'Do exactly this, in order:',
