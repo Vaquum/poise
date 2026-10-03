@@ -245,6 +245,7 @@ offline() {
   wait_healthy "$container"
   check_home "$container"
   log=$(wait_for_bootstrap "$container" 1 300)
+  grep ' [a-z]*: \(installing\|not installed\)\| command failed ' <<<"$log"
   for provider in claude codex grok antigravity muse; do
     grep --quiet "$provider: not installed" <<<"$log" || fail "the log does not report $provider as not installed: $log"
   done
