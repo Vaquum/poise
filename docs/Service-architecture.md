@@ -196,7 +196,7 @@ otherwise offer it):
 - Desktop notifications through `osascript`.
 - Espanso detection on the server.
 - Claude sign-in through a local browser; the Connected accounts terminal
-  replaces it.
+  replaces it, and the sign-in banner opens it there.
 
 **Service endpoints** (loopback, or the `admin` scope; the owner's `browser`
 assertion may only resume, and anything else is refused with 403):
@@ -239,14 +239,25 @@ account. Poise passes the accounts to Caller explicitly, through `--token-user`
 and the `GITHUB_INTERFACE_USER` and `GITHUB_INTERFACE_AGENT_USER` environment
 variables, and Caller fails loudly when an account is needed and missing.
 
-**Connected accounts** (Settings) lists `claude`, `codex`, `gh`, `grok`, `muse`
-and `antigravity`. Each shows whether the CLI is installed, its version,
-whether it is signed in and as whom.
-- `GET /api/accounts` returns that list. Each entry is
-  `{ id, installed, version, signedIn: true | false | null, identity, detail,
-  login: { label } }`.
+**Connected accounts** (Settings → Accounts) lists `claude`, `codex`, `gh`,
+`grok`, `muse` and `antigravity`. Each shows whether the CLI is installed, its
+version, whether it is signed in and as whom.
+- `GET /api/accounts` returns `{ accounts }`, one entry per CLI in that order.
+  Each entry is `{ id, installed, version, signedIn: true | false | null,
+  identity, detail, login: { label } }`; gh's also has `accounts: [{ login,
+  active, signedIn, detail }]`, every account gh holds for github.com.
+  - Each CLI's own status command answers, never its credential files:
+    `claude auth status --json` through Poise's Claude wrapper (signed in
+    means a Claude subscription), `codex login status`, and `gh auth status
+    --json hosts --hostname github.com` with no token from the environment.
+    Grok, Muse and Antigravity have no status command: their `signedIn` is
+    `null` and `detail` says so.
+  - `identity` is the account name the status command prints (Claude's email,
+    gh's active login); no token, key or organisation id is returned.
+  - Each command has 10 seconds. Answers are kept for 15 seconds and dropped
+    whenever a terminal exits.
 - Connect opens a terminal in the browser, inside the workspace, running that
-  CLI's own login:
+  CLI's own login (`login.label`):
 
   | CLI | Login command |
   | --- | --- |
@@ -254,16 +265,26 @@ whether it is signed in and as whom.
   | Codex | `codex login --device-auth` |
   | gh | `gh auth login --hostname github.com --git-protocol https --web` |
   | Grok | `grok login --device-auth` |
-  | Muse | its own login |
-  | Antigravity | its own login |
+  | Muse | `muse login` |
+  | Antigravity | `agy`, which has no login subcommand: it opens its sign-in screen when it starts signed out |
 
   Credentials go straight from the CLI to its own files; Poise never reads them.
 - `/ws/terminal?preset=<id>|shell` is browser scope only.
-  - Client to server: `{type:"input", data}` and `{type:"resize", cols, rows}`.
-  - Server to client: `{type:"output", data}` (base64) and `{type:"exit", code}`.
-  - At most two terminals at a time, closed after 15 idle minutes.
-  - A small Python helper provides the pseudo-terminal, so the server needs no
-    native Node module.
+  - Client to server: `{type:"input", data}` and `{type:"resize", cols, rows}`,
+    with `cols` from 2 to 500, `rows` from 2 to 200 and frames up to 64 KiB.
+  - Server to client: `{type:"output", data}` (base64) and `{type:"exit",
+    code}`, then a close with 1000. `code` is the program's exit code, or 128
+    plus the signal that ended it.
+  - At most two terminals at a time: a third is closed with 1013 and a message
+    saying so. One with neither input nor output for 15 minutes is closed with
+    4000. One that cannot start is closed with 1011 and the reason; a frame
+    that is not one of the above with 1007, a binary frame with 1003.
+  - Closing or losing the socket hangs up the program's process group (SIGHUP,
+    then SIGKILL a second later); so does Poise stopping.
+  - `shell` is the owner's login shell. Every program starts in the home
+    folder with Poise's environment allowlists and `TERM=xterm-256color`.
+  - A small Python helper (`python3`, standard library only) provides the
+    pseudo-terminal, so the server needs no native Node module.
 
 ## Behaviors
 
