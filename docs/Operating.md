@@ -383,9 +383,10 @@ a limit for every container, workspaces included, in
   `deploy/install.sh`. It applies to workspace containers created from then
   on (see [Upgrades](#upgrades)).
 - **Sign-in and sessions.** Caddy serves everything over TLS. Session
-  cookies are `Secure`, `HttpOnly` and `SameSite=Lax`, and a workspace host
-  serves its owner only, admins included. The gateway stores no GitHub token,
-  and keeps only hashes of session ids, tickets and device tokens.
+  cookies are `Secure`, `HttpOnly` and `SameSite=Lax`. A workspace host
+  serves its owner only; an admin gets no access to it either. The gateway
+  stores no GitHub token, and keeps only hashes of session ids, tickets and
+  device tokens.
 - **Secrets on disk**: the OAuth App's client secret in `deploy/.env`, the
   gateway's signing key in `poise-gateway-data`, and each person's CLI
   credentials in their home volume. Backups hold the last two.
