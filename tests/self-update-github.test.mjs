@@ -4,6 +4,7 @@ import {
   GitHubError, REQUIRED_CONTEXTS, assertPullRequestIdentity, assertRepositoryIdentity, createGitHubClient,
   evaluateCi, isUncertain, verifyMergeCommit,
 } from '../scripts/self-update/github.mjs'
+import { REPOSITORY } from '../scripts/self-update/paths.mjs'
 
 const HEAD = 'b'.repeat(40)
 const MAIN = 'a'.repeat(40)
@@ -13,8 +14,8 @@ const TREE = 'd'.repeat(40)
 function workflowRun(overrides = {}) {
   return {
     path: '.github/workflows/ci.yml', head_sha: HEAD, event: 'pull_request', status: 'completed', conclusion: 'success',
-    run_number: 7, created_at: '2026-09-19T10:00:00Z', check_suite_id: 55, html_url: 'https://github.com/mikkokotila/Poise/actions/runs/7',
-    head_repository: { full_name: 'mikkokotila/Poise' }, ...overrides,
+    run_number: 7, created_at: '2026-09-19T10:00:00Z', check_suite_id: 55, html_url: `https://github.com/${REPOSITORY}/actions/runs/7`,
+    head_repository: { full_name: REPOSITORY }, ...overrides,
   }
 }
 
@@ -60,13 +61,13 @@ describe('CI gate', () => {
 
 describe('repository identity', () => {
   it('rejects repository and pull request identity mismatches', () => {
-    expect(() => assertRepositoryIdentity({ full_name: 'mikkokotila/Poise', default_branch: 'main' })).not.toThrow()
+    expect(() => assertRepositoryIdentity({ full_name: REPOSITORY, default_branch: 'main' })).not.toThrow()
     expect(() => assertRepositoryIdentity({ full_name: 'mikkokotila/poise-fork', default_branch: 'main' })).toThrow(/identity mismatch/)
-    expect(() => assertRepositoryIdentity({ full_name: 'mikkokotila/Poise', default_branch: 'develop' })).toThrow(/default branch/)
+    expect(() => assertRepositoryIdentity({ full_name: REPOSITORY, default_branch: 'develop' })).toThrow(/default branch/)
     const pull = {
       number: 3, draft: false,
-      base: { ref: 'main', repo: { full_name: 'mikkokotila/Poise' } },
-      head: { ref: 'poise/change-x', sha: HEAD, repo: { full_name: 'mikkokotila/Poise' } },
+      base: { ref: 'main', repo: { full_name: REPOSITORY } },
+      head: { ref: 'poise/change-x', sha: HEAD, repo: { full_name: REPOSITORY } },
     }
     expect(() => assertPullRequestIdentity(pull, { branch: 'poise/change-x', headSha: HEAD })).not.toThrow()
     expect(() => assertPullRequestIdentity({ ...pull, base: { ref: 'release', repo: pull.base.repo } }, { branch: 'poise/change-x' })).toThrow(/base branch is release/)
@@ -107,7 +108,7 @@ describe('GitHub client', () => {
   it('sends the release token as a bearer header to the pinned repository only', async () => {
     const { api, calls } = client(() => response(200, { object: { sha: MAIN } }))
     expect(await api.getBranchSha()).toBe(MAIN)
-    expect(calls[0].url).toBe('https://api.github.com/repos/mikkokotila/Poise/git/ref/heads/main')
+    expect(calls[0].url).toBe(`https://api.github.com/repos/${REPOSITORY}/git/ref/heads/main`)
     expect(calls[0].init.headers.authorization).toBe('Bearer github_pat_TESTTOKEN0123456789abcdef')
     expect(calls[0].init.redirect).toBe('error')
     expect(calls[0].init.signal).toBeInstanceOf(AbortSignal)
@@ -130,7 +131,7 @@ describe('GitHub client', () => {
     const { api, calls } = client(() => response(200, { merged: true, sha: MERGE }))
     expect(await api.mergePullRequest(12, { sha: HEAD })).toEqual({ merged: true, sha: MERGE })
     expect(calls[0].init.method).toBe('PUT')
-    expect(calls[0].url).toBe('https://api.github.com/repos/mikkokotila/Poise/pulls/12/merge')
+    expect(calls[0].url).toBe(`https://api.github.com/repos/${REPOSITORY}/pulls/12/merge`)
     expect(JSON.parse(calls[0].init.body)).toEqual({ sha: HEAD, merge_method: 'merge' })
     await expect(api.mergePullRequest(12, { sha: 'abc' })).rejects.toThrow(/exact head SHA/)
   })
@@ -139,7 +140,7 @@ describe('GitHub client', () => {
     const pulls = [{ number: 1, head: { ref: 'poise/change-other' } }, { number: 2, head: { ref: 'poise/change-x' } }]
     const { api, calls } = client((url) => (url.includes('/pulls?') ? response(200, pulls) : response(201, { number: 3 })))
     expect((await api.findPullRequest('poise/change-x')).number).toBe(2)
-    expect(calls[0].url).toContain('head=mikkokotila%3Apoise%2Fchange-x')
+    expect(calls[0].url).toContain(`head=${REPOSITORY.split('/')[0]}%3Apoise%2Fchange-x`)
     expect(await api.findPullRequest('poise/change-none')).toBeNull()
     await api.createPullRequest({ title: 't', body: 'b', head: 'poise/change-x' })
     expect(JSON.parse(calls.at(-1).init.body)).toEqual({ title: 't', body: 'b', head: 'poise/change-x', base: 'main', maintainer_can_modify: false })

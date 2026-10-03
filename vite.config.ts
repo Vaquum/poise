@@ -14,6 +14,7 @@ const RUNTIME_ENV_KEYS = [
   'POISE_EDITOR_DIR',
   'POISE_ESPANSO_MATCH_DIR',
   'POISE_VOICE_GUIDE_PATH',
+  'AGENT_INTERFACE_VOICE_GUIDE',
 ] as const
 
 function poiseApiPlugin(env: Record<string, string>): Plugin {

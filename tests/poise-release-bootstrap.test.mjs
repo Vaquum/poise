@@ -12,7 +12,7 @@ import {
 } from '../scripts/install-self-update.mjs'
 import { selfUpdateEnabled } from '../scripts/self-update-bridge.mjs'
 import { readConfig } from '../scripts/self-update/config.mjs'
-import { layout } from '../scripts/self-update/paths.mjs'
+import { REPOSITORY, layout } from '../scripts/self-update/paths.mjs'
 
 const SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'
 const NEXT_SHA = 'b'.repeat(40)
@@ -88,7 +88,7 @@ async function world(overrides = {}) {
   const legacyText = await readFile(servicePlistPath, 'utf8')
 
   const state = {
-    sha: SHA, remoteMain: SHA, branch: 'main', dirty: '', remote: 'https://github.com/mikkokotila/Poise.git',
+    sha: SHA, remoteMain: SHA, branch: 'main', dirty: '', remote: `https://github.com/${REPOSITORY}.git`,
     runningSha: SHA, served: 'legacy', updaterBusyPolls: 0, readyAfter: 2, readinessPolls: 0, drains: [], resumes: 0,
     loaded: {}, launchctl: [], commands: [], buildFails: false, managedNeverHealthy: false, legacyNeverHealthy: false,
     tokenSeen: [], bootstrapFails: {}, clockMs: 0, sleeps: [], logs: [], stagedSha: {}, githubRepo: null,
@@ -197,7 +197,7 @@ async function world(overrides = {}) {
     if (target.hostname === 'api.github.com') {
       const auth = headers.authorization || ''
       if (auth.includes(TOKEN)) state.tokenSeen.push('github')
-      return response(200, state.githubRepo || { full_name: 'mikkokotila/Poise', default_branch: 'main', permissions: { push: true, pull: true } })
+      return response(200, state.githubRepo || { full_name: REPOSITORY, default_branch: 'main', permissions: { push: true, pull: true } })
     }
     if (target.pathname === '/api/health') {
       const build = await currentBuild()
@@ -699,7 +699,7 @@ describe('preflight refusals', () => {
     const branch = await world({ state: { branch: 'feat/x' } })
     await expect(branch.installer.enable({ tokenFile: branch.tokenFile })).rejects.toThrow(/not main/)
     const remote = await world({ state: { remote: 'https://github.com/someone/Poise.git' } })
-    await expect(remote.installer.enable({ tokenFile: remote.tokenFile })).rejects.toThrow(/not mikkokotila\/Poise/)
+    await expect(remote.installer.enable({ tokenFile: remote.tokenFile })).rejects.toThrow(`not ${REPOSITORY}`)
     const missing = await world()
     await rm(join(missing.checkout, 'scripts', 'self-update', 'daemon.mjs'))
     await expect(missing.installer.enable({ tokenFile: missing.tokenFile })).rejects.toThrow(/does not contain the self-update controller/)
@@ -718,10 +718,10 @@ describe('preflight refusals', () => {
     await expect(w.installer.enable({ tokenFile: w.tokenFile })).rejects.toThrow(/chmod 600/)
     await chmod(w.tokenFile, 0o600)
     await expect(w.installer.enable({ tokenFile: join(w.root, 'release-token') })).rejects.toThrow(/outside the controller root/)
-    w.state.githubRepo = { full_name: 'mikkokotila/Poise', default_branch: 'main', permissions: { push: false, pull: true } }
+    w.state.githubRepo = { full_name: REPOSITORY, default_branch: 'main', permissions: { push: false, pull: true } }
     await expect(w.installer.enable({ tokenFile: w.tokenFile })).rejects.toThrow(/cannot push/)
     w.state.githubRepo = { full_name: 'mikkokotila/Other', default_branch: 'main', permissions: { push: true } }
-    await expect(w.installer.enable({ tokenFile: w.tokenFile })).rejects.toThrow(/instead of mikkokotila\/Poise/)
+    await expect(w.installer.enable({ tokenFile: w.tokenFile })).rejects.toThrow(`instead of ${REPOSITORY}`)
     expect(w.state.tokenSeen.every((where) => where === 'github')).toBe(true)
   })
 

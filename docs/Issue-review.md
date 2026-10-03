@@ -4,8 +4,8 @@ An adversarial review of each new issue in the repositories you opt in, and of
 every sub-issue it makes part of itself. One to three reviewers work on each
 issue at the same time. Each is its provider's own coding-agent CLI with full
 access to a fresh checkout of the repository: it reads the whole codebase and
-its history, builds, and runs the tests. Every comment is posted as the review
-agent (`REVIEW_AGENT_USERNAME`, bit-mis).
+its history, builds, and runs the tests. Every comment is posted as your agent
+account (Settings → GitHub → Agent account).
 
 The instruction each reviewer gets is fixed:
 
@@ -23,8 +23,9 @@ Behaviors → **Review New Issues**:
   issues are reviewed; nothing is reviewed until at least one is ticked, even
   with Active on. The list is the configured organization's repositories, the
   same list Current uses. Below it, **Trusted authors** lists the GitHub
-  accounts whose issues count: `mikkokotila, zero-bang, bit-mis` by default.
-  Every way of closing the dropdown saves it.
+  accounts whose issues count. Until you save a list it is your GitHub account
+  and your agent account (Settings → GitHub), whichever are set. Every way of
+  closing the dropdown saves it.
 - **Reviewers** chooses how many of the Issue review models review each issue.
 - **Active** is the switch.
 
@@ -45,7 +46,7 @@ An open issue is reviewed once, when all of these hold:
 - no other issue's review covers it as a sub-issue (see below).
 
 An extra reviewer reviews only the issues opened after the panel grew to
-include it. Edits, new comments and the review agent's own comments never
+include it. Edits, new comments and your agent account's own comments never
 start another review; Replay in Swarm runs one by hand. At most three
 reviewers run at once across all issues; the rest wait for a free slot.
 
@@ -99,8 +100,8 @@ mirror, and starts the provider's CLI in it with no tool restrictions and no
 sandbox. The mirror (`~/.cache/github-interface/mirrors`) and the checkout
 (`~/.cache/agent-interface/issue-review`) are outside `~/dev`; the checkout
 is deleted when the reviewer finishes. The reviewer does not post. It writes its
-comments to a file; Caller posts them through github-interface as the review
-agent — one comment per issue per reviewer (in parts when it is longer than
+comments to a file; Caller posts them through github-interface as your agent
+account — one comment per issue per reviewer (in parts when it is longer than
 GitHub takes in one), only on the issue and its readable sub-issues, each
 signed with the reviewer's model:
 
@@ -114,10 +115,13 @@ the PR review panel. When a reviewer finishes, anything still running in its
 checkout — a dev server, a watcher, a process that detached — is stopped
 before the checkout is deleted.
 
-Comments are posted as the account github-interface comments with (bit-mis);
-Caller refuses a run whose actor is any other account before it reads or posts
-anything. A Claude reviewer runs through Poise's Claude subscription wrapper,
-like every other Claude launch, keeping Claude Code's own system prompt.
+Poise launches each reviewer with your agent account as `--actor` and in
+`GITHUB_INTERFACE_AGENT_USER`, and nothing launches while it is not set. Caller
+reads, checks out and comments as that account (`--token-user`), and refuses a
+run whose actor is any other account, or whose agent account is not set, before
+it reads or posts anything. A Claude reviewer runs through Poise's Claude
+subscription wrapper, like every other Claude launch, keeping Claude Code's own
+system prompt.
 
 ## In Swarm
 
@@ -165,7 +169,8 @@ from your working copies; it is not a sandbox. See SECURITY.md.
   (`issue`, `comment_id`, `url`, `author`).
 - github-interface primitives: `--read-issue`, `--issue-comments`,
   `--sub-issues` and `--comment-issue`, each with `--repository OWNER/REPO`,
-  and `--checkout-repo OWNER/REPO --path DIR`.
+  and `--checkout-repo OWNER/REPO --path DIR`, every one with
+  `--token-user` naming the agent account.
 
 Poise must be deployed before a Caller that writes `issue_review` rows: an
 older Poise cannot read them and would stop reading the whole agent log.

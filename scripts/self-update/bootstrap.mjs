@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ensurePrivateDirectory, isFile, pathExists, writeFileAtomic } from './atomic.mjs'
 import { normalizeConfig, readConfig, writeConfig } from './config.mjs'
-import { layout } from './paths.mjs'
+import { REPOSITORY, layout } from './paths.mjs'
 import { newReleaseId, readManifest, releaseIsComplete, toRelease } from './releases.mjs'
 import { openStore } from './store.mjs'
 
@@ -57,7 +57,9 @@ export async function installControllerCopy(root, { source = CONTROLLER_SOURCE }
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith('.mjs')) continue
     const target = join(paths.controllerDir, entry.name)
-    await copyFile(join(source, entry.name), target)
+    // The copy has no package.json beside it: it carries the repository fixed.
+    if (entry.name === 'repository.mjs') await writeFileAtomic(target, `export const REPOSITORY = ${JSON.stringify(REPOSITORY)}\n`, { mode: 0o644 })
+    else await copyFile(join(source, entry.name), target)
     copied.push(target)
   }
   return { directory: paths.controllerDir, files: copied.sort() }
