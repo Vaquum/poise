@@ -9,7 +9,10 @@ import {
   assertProcessArgSize,
   claudeSubscriptionEnvironment,
   runFile,
+  scrubbedChildEnvironment,
+  setCallerAccounts,
   spawnDetached,
+  type CallerAccounts,
 } from '../server/process'
 
 function processExists(pid: number): boolean {
@@ -961,6 +964,65 @@ if (args.includes('auth') && args.includes('status')) {
     )
 
     await expect(exited).resolves.toMatchObject({ code: 7, signal: null })
+  })
+})
+
+describe('GitHub accounts for Caller', () => {
+  const probe = ['-e', 'process.stdout.write(JSON.stringify({ person: process.env.GITHUB_INTERFACE_USER, agent: process.env.GITHUB_INTERFACE_AGENT_USER }))']
+  let root = ''
+  let commands = new Map<string, string>()
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'poise-caller-accounts-'))
+    commands = new Map()
+    vi.stubEnv('GITHUB_INTERFACE_USER', 'inherited-person')
+    vi.stubEnv('GITHUB_INTERFACE_AGENT_USER', 'inherited-agent')
+  })
+
+  afterEach(async () => {
+    setCallerAccounts(null)
+    vi.unstubAllEnvs()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  async function accountsOf(name: string, env?: NodeJS.ProcessEnv): Promise<unknown> {
+    if (!commands.has(name)) commands.set(name, await namedNode(root, name))
+    return JSON.parse((await runFile(commands.get(name)!, probe, { env })).stdout)
+  }
+
+  it('gives every github-interface and agent-interface process the accounts saved when it starts', async () => {
+    let accounts: CallerAccounts = { GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }
+    setCallerAccounts(() => accounts)
+    expect(await accountsOf('github-interface')).toEqual({ person: 'octocat', agent: 'review-bot' })
+    expect(await accountsOf('agent-interface')).toEqual({ person: 'octocat', agent: 'review-bot' })
+    accounts = { GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'other-bot' }
+    expect(await accountsOf('agent-interface')).toEqual({ person: 'octocat', agent: 'other-bot' })
+    // The chat runtime's worker gate scrubs with the same rules.
+    expect(scrubbedChildEnvironment('github-interface')).toMatchObject({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'other-bot' })
+  })
+
+  it('never lets an inherited account stand in for one that is not set', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat' }))
+    expect(await accountsOf('github-interface')).toEqual({ person: 'octocat' })
+    setCallerAccounts(() => ({}))
+    expect(await accountsOf('agent-interface')).toEqual({})
+  })
+
+  it('keeps the accounts from every other process', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }))
+    for (const name of ['github-datastore', 'gh', 'claude', 'node-tool']) {
+      expect(await accountsOf(name), name).toEqual({})
+    }
+  })
+
+  it('passes inherited accounts through when no Poise settings are running', async () => {
+    expect(await accountsOf('github-interface')).toEqual({ person: 'inherited-person', agent: 'inherited-agent' })
+    expect(await accountsOf('gh')).toEqual({})
+  })
+
+  it('still lets a call name an account explicitly', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }))
+    expect(await accountsOf('agent-interface', { GITHUB_INTERFACE_AGENT_USER: 'named-bot' })).toEqual({ person: 'octocat', agent: 'named-bot' })
   })
 })
 

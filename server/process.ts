@@ -191,12 +191,27 @@ const CLAUDE_LOGIN_ENV = new Set([
   'WSL_INTEROP',
 ])
 
+// The GitHub accounts Caller acts as: the person's own account and the agent
+// account (Settings → GitHub). A running Poise sets them from its settings at
+// every spawn (setCallerAccounts); without that — a script, an isolated test —
+// inherited values pass like any other allowlisted variable.
+export const CALLER_ACCOUNT_ENV = ['GITHUB_INTERFACE_USER', 'GITHUB_INTERFACE_AGENT_USER'] as const
+export type CallerAccounts = Partial<Record<typeof CALLER_ACCOUNT_ENV[number], string>>
+const CALLER_ACCOUNT_COMMANDS: ReadonlySet<string> = new Set(['github-interface', 'agent-interface'])
+let callerAccounts: (() => CallerAccounts) | null = null
+
+/** Read at every spawn, so each Caller process gets the accounts saved at that
+ *  moment. An account that is not set is removed, never inherited. */
+export function setCallerAccounts(source: (() => CallerAccounts) | null): void {
+  callerAccounts = source
+}
+
 // Credentials are inherited only by the binaries that intentionally consume
 // them. A caller can still pass a one-off value explicitly through options.env.
 const COMMAND_ENV = new Map<string, ReadonlySet<string>>([
   ['gh', new Set(GITHUB_ENV)],
-  ['github-interface', new Set(GITHUB_ENV)],
-  ['agent-interface', new Set([...GITHUB_ENV, ...MODEL_ENV])],
+  ['github-interface', new Set([...GITHUB_ENV, ...CALLER_ACCOUNT_ENV])],
+  ['agent-interface', new Set([...GITHUB_ENV, ...MODEL_ENV, ...CALLER_ACCOUNT_ENV])],
   ['claude', new Set(CLAUDE_ENV)],
   ['claude-subscription', new Set(CLAUDE_ENV)],
   ['claude-subscription.mjs', new Set(CLAUDE_ENV)],
@@ -242,6 +257,12 @@ export function scrubbedChildEnvironment(
   return childEnvironment(command, overrides, args)
 }
 
+function withoutInherited(env: NodeJS.ProcessEnv, key: string): void {
+  for (const inheritedKey of Object.keys(env)) {
+    if (inheritedKey.toUpperCase() === key.toUpperCase()) delete env[inheritedKey]
+  }
+}
+
 function childEnvironment(
   command: string,
   overrides: NodeJS.ProcessEnv = {},
@@ -263,12 +284,18 @@ function childEnvironment(
     }
   }
   if (CALLER_COMMANDS.includes(commandName(command))) withCallerOnPath(env)
+  if (callerAccounts && CALLER_ACCOUNT_COMMANDS.has(commandName(command))) {
+    const accounts = callerAccounts()
+    for (const key of CALLER_ACCOUNT_ENV) {
+      withoutInherited(env, key)
+      const value = accounts[key]
+      if (value) env[key] = value
+    }
+  }
   for (const [key, value] of Object.entries(overrides)) {
     // Avoid case-variant duplicates on Windows and make an explicit undefined
     // reliably remove an inherited variable on every platform.
-    for (const inheritedKey of Object.keys(env)) {
-      if (inheritedKey.toUpperCase() === key.toUpperCase()) delete env[inheritedKey]
-    }
+    withoutInherited(env, key)
     if (value === undefined) delete env[key]
     else env[key] = value
   }
