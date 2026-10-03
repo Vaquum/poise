@@ -5,6 +5,7 @@
 //! notify-rust (the library the plugin itself uses), and a thread waits for
 //! the person to click it.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -73,19 +74,54 @@ impl DesktopNotifier {
 
 impl Notifier for DesktopNotifier {
     fn notify(&self, notice: Notice) {
+        let body = display_body(&notice.body, body_is_markup()).into_owned();
         match notice.url {
-            Some(url) if self.reserve_waiter() => {
-                self.show_clickable(notice.title, notice.body, url)
-            }
+            Some(url) if self.reserve_waiter() => self.show_clickable(notice.title, body, url),
             Some(url) => {
                 log::warn!(
                     "{MAX_WAITING} notifications are still waiting for a click; showing one without its link to {url}"
                 );
-                self.show_plain(&notice.title, &notice.body);
+                self.show_plain(&notice.title, &body);
             }
-            None => self.show_plain(&notice.title, &notice.body),
+            None => self.show_plain(&notice.title, &body),
         }
     }
+}
+
+/// Notification servers that advertise `body-markup` (several Linux desktops)
+/// read the body as markup, where the workspace could place links to any
+/// scheme. Escaped, it shows exactly as written.
+fn display_body(body: &str, markup: bool) -> Cow<'_, str> {
+    if !markup || !body.contains(['&', '<', '>']) {
+        return Cow::Borrowed(body);
+    }
+    Cow::Owned(
+        body.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;"),
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn body_is_markup() -> bool {
+    static MARKUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MARKUP.get_or_init(|| match notify_rust::get_capabilities() {
+        Ok(capabilities) => capabilities
+            .iter()
+            .any(|capability| capability == "body-markup"),
+        Err(error) => {
+            log::warn!(
+                "could not ask the notification server what it supports ({error}); escaping markup"
+            );
+            true
+        }
+    })
+}
+
+/// macOS and Windows show notification text as plain text.
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn body_is_markup() -> bool {
+    false
 }
 
 /// Shows the notification and blocks this thread until the person clicks or
@@ -156,5 +192,22 @@ fn running_installed() -> bool {
             log::warn!("could not locate the running executable: {error}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markup_in_a_body_is_shown_as_text_where_servers_read_markup() {
+        let body =
+            r#"Done <a href="file:///etc/passwd">here</a> & <img src="https://x.example/t.png">"#;
+        assert_eq!(
+            display_body(body, true),
+            "Done &lt;a href=\"file:///etc/passwd\"&gt;here&lt;/a&gt; &amp; &lt;img src=\"https://x.example/t.png\"&gt;"
+        );
+        assert_eq!(display_body(body, false), body);
+        assert!(matches!(display_body("plain text", true), Cow::Borrowed(_)));
     }
 }
