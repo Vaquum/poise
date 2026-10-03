@@ -13,6 +13,8 @@ export interface ServiceConfig {
   owner: string
   /** `https://<handle>.<domain>`, exactly as a browser sends it in Origin. */
   publicOrigin: string
+  /** `https:`, or `http:` for a local end-to-end run (see `publicOrigin()`). */
+  publicProtocol: 'https:' | 'http:'
   /** The Host every request from the gateway carries. */
   publicHost: string
   /** The gateway's Ed25519 key that signs identity assertions. */
@@ -59,6 +61,12 @@ function gatewayKey(value: string | undefined, problems: string[]): KeyObject | 
   return key
 }
 
+// The gateway serves plain http only for local and CI end-to-end runs
+// (POISE_INSECURE_HTTP), and only on these hosts; so does the workspace.
+function plainHttpHost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.test')
+}
+
 function publicOrigin(value: string | undefined, handle: string, problems: string[]): URL | null {
   if (!value) {
     problems.push('POISE_PUBLIC_ORIGIN is required')
@@ -71,8 +79,12 @@ function publicOrigin(value: string | undefined, handle: string, problems: strin
     problems.push(`POISE_PUBLIC_ORIGIN must be an https origin such as https://<handle>.<domain>; it is "${value}"`)
     return null
   }
-  if (url.protocol !== 'https:' || url.origin !== value) {
+  if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.origin !== value) {
     problems.push(`POISE_PUBLIC_ORIGIN must be an https origin such as https://<handle>.<domain>, with no path or trailing slash; it is "${value}"`)
+    return null
+  }
+  if (url.protocol === 'http:' && !plainHttpHost(url.hostname)) {
+    problems.push(`POISE_PUBLIC_ORIGIN may use http only on a localhost, *.localhost or *.test host; it is "${value}"`)
     return null
   }
   const domain = url.hostname.startsWith(`${handle}.`) ? url.hostname.slice(handle.length + 1) : ''
@@ -103,7 +115,7 @@ export function readServiceConfig(env: NodeJS.ProcessEnv = process.env): Service
   if (problems.length || !origin || !key) {
     throw new Error(`Poise cannot start in service mode: ${problems.join('; ')}`)
   }
-  return { handle, owner, publicOrigin: origin.origin, publicHost: origin.host, gatewayKey: key }
+  return { handle, owner, publicOrigin: origin.origin, publicProtocol: origin.protocol === 'http:' ? 'http:' : 'https:', publicHost: origin.host, gatewayKey: key }
 }
 
 /** Where service mode keeps a piece of state: under ~/.poise in the home volume. */

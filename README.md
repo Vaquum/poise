@@ -254,7 +254,7 @@ nothing on this page changes. The gateway passes:
 | `POISE_MODE` | `service`; any other value stops startup |
 | `POISE_WORKSPACE_HANDLE` | The owner's GitHub login in lower case |
 | `POISE_WORKSPACE_OWNER` | The owner's GitHub login |
-| `POISE_PUBLIC_ORIGIN` | `https://<handle>.<domain>` |
+| `POISE_PUBLIC_ORIGIN` | `https://<handle>.<domain>`; plain `http://` only on a `localhost`, `*.localhost` or `*.test` host, for local and CI end-to-end runs |
 | `POISE_GATEWAY_PUBLIC_KEY` | The gateway's Ed25519 public key: its SPKI PEM as single-line base64 |
 
 Startup checks all of them and stops with one message naming each variable

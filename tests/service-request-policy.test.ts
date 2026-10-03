@@ -16,6 +16,7 @@ function request(options: {
   fetchSite?: string
   identity?: string
   remoteAddress?: string | null
+  headers?: Record<string, string>
 } = {}): IncomingMessage {
   return Object.assign(Readable.from([]), {
     headers: {
@@ -23,6 +24,7 @@ function request(options: {
       ...(options.origin ? { origin: options.origin } : {}),
       ...(options.fetchSite ? { 'sec-fetch-site': options.fetchSite } : {}),
       ...(options.identity ? { 'x-poise-identity': options.identity } : {}),
+      ...options.headers,
     },
     method: 'GET',
     socket: { remoteAddress: options.remoteAddress === null ? undefined : options.remoteAddress ?? GATEWAY_PEER },
@@ -114,6 +116,26 @@ describe('service mode: the gateway\'s requests', () => {
     const expired = request({ identity: browser({ iat: 1, exp: 61 }) })
     expect(refusal(() => enforceApiRequest(expired, policy))).toMatchObject({ status: 401 })
     expect(expired.headers['x-poise-identity']).toBeUndefined()
+  })
+})
+
+describe('service mode: plain http for local end-to-end runs', () => {
+  const at = (origin: string): ApiRequestPolicy => ({ service: readServiceConfig({ ...serviceEnvironment(gateway), POISE_PUBLIC_ORIGIN: origin }) })
+
+  it('holds Host and Origin to the http origin, scheme included', () => {
+    const local = at('http://octocat.localhost:8080')
+    expect(enforceApiRequest(request({ host: 'octocat.localhost:8080', origin: 'http://octocat.localhost:8080', identity: browser(), headers: { 'x-forwarded-proto': 'http' } }), local))
+      .toEqual({ kind: 'gateway', scope: 'browser' })
+    expect(enforceDocumentRequest(request({ url: '/', host: 'octocat.localhost:8080', identity: browser() }), local)).toEqual({ kind: 'gateway', scope: 'browser' })
+    expect(refusal(() => enforceApiRequest(request({ host: 'octocat.localhost:8080', origin: 'https://octocat.localhost:8080', identity: browser() }), local)))
+      .toEqual({ status: 403, message: 'request origin is not allowed' })
+    expect(refusal(() => enforceApiRequest(request({ host: 'octocat.localhost', identity: browser() }), local))).toEqual({ status: 403, message: 'host is not allowed' })
+  })
+
+  it('reads the default port in Host as the origin\'s own scheme does', () => {
+    const local = at('http://octocat.localhost')
+    expect(enforceApiRequest(request({ host: 'octocat.localhost:80', identity: browser() }), local)).toEqual({ kind: 'gateway', scope: 'browser' })
+    expect(refusal(() => enforceApiRequest(request({ host: 'octocat.localhost:443', identity: browser() }), local))).toEqual({ status: 403, message: 'host is not allowed' })
   })
 })
 

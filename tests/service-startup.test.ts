@@ -34,8 +34,8 @@ it('names every missing variable before creating any state', async () => {
 })
 
 it('refuses an invalid variable', async () => {
-  for (const [key, value] of Object.entries({ ...serviceEnvironment(gatewayKeys()), POISE_PUBLIC_ORIGIN: 'http://octocat.poise.example.test' })) vi.stubEnv(key, value)
-  await expect(import('../server/production')).rejects.toThrow(/POISE_PUBLIC_ORIGIN must be an https origin/)
+  for (const [key, value] of Object.entries({ ...serviceEnvironment(gatewayKeys()), POISE_PUBLIC_ORIGIN: 'http://octocat.poise.example.com' })) vi.stubEnv(key, value)
+  await expect(import('../server/production')).rejects.toThrow('POISE_PUBLIC_ORIGIN may use http only on a localhost, *.localhost or *.test host')
 })
 
 it('refuses a mode it does not know', async () => {

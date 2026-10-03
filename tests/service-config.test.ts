@@ -45,7 +45,7 @@ describe('service-mode configuration', () => {
   it('accepts only an https origin whose host is the handle followed by a domain', () => {
     const env = serviceEnvironment(keys)
     for (const origin of [
-      `http://${PUBLIC_HOST}`,
+      'ftp://octocat.poise.example.test',
       `${PUBLIC_ORIGIN}/`,
       `${PUBLIC_ORIGIN}/workspace`,
       'https://OctoCat.poise.example.test',
@@ -59,8 +59,24 @@ describe('service-mode configuration', () => {
     }
     expect(readServiceConfig({ ...env, POISE_PUBLIC_ORIGIN: 'https://octocat.example.test:8443' })).toMatchObject({
       publicOrigin: 'https://octocat.example.test:8443',
+      publicProtocol: 'https:',
       publicHost: 'octocat.example.test:8443',
     })
+  })
+
+  // The gateway's POISE_INSECURE_HTTP mode for local and CI end-to-end runs.
+  it('accepts a plain http origin only on a localhost, *.localhost or *.test host', () => {
+    const env = serviceEnvironment(keys)
+    for (const origin of ['http://octocat.localhost', 'http://octocat.localhost:5555', 'http://octocat.poise.localhost', 'http://octocat.test', 'http://octocat.poise.example.test:8080']) {
+      expect(readServiceConfig({ ...env, POISE_PUBLIC_ORIGIN: origin }), origin).toMatchObject({ publicOrigin: origin, publicProtocol: 'http:' })
+    }
+    for (const origin of ['http://octocat.example.com', 'http://octocat.localhost.example.com', 'http://octocat.test.example.com', 'http://octocat.testing', 'http://octocat.localhostx']) {
+      expect(() => readServiceConfig({ ...env, POISE_PUBLIC_ORIGIN: origin }), origin)
+        .toThrow(`POISE_PUBLIC_ORIGIN may use http only on a localhost, *.localhost or *.test host; it is "${origin}"`)
+    }
+    // Still the handle followed by a domain, and still exactly an origin.
+    expect(() => readServiceConfig({ ...env, POISE_PUBLIC_ORIGIN: 'http://localhost' })).toThrow(/host must be the workspace handle followed by a domain/)
+    expect(() => readServiceConfig({ ...env, POISE_PUBLIC_ORIGIN: 'http://octocat.localhost/' })).toThrow(/with no path or trailing slash/)
   })
 
   it('accepts only the base64 of an Ed25519 SPKI public key PEM', () => {

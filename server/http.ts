@@ -28,7 +28,8 @@ function normalizeHostname(value: string): string {
 }
 
 /** A Host header as the URL it names under `protocol`: the local server is
- *  plain HTTP, the gateway's public origin HTTPS. */
+ *  plain HTTP, the gateway's public origin HTTPS (plain HTTP only for a local
+ *  end-to-end run). */
 function urlFromHost(value: string, protocol: 'http:' | 'https:' = 'http:'): URL | null {
   try {
     const parsed = new URL(`${protocol}//${value}`)
@@ -75,7 +76,7 @@ function isLoopbackPeer(req: IncomingMessage): boolean {
  *  The assertion header is removed once checked, so nothing downstream can
  *  echo, log or forward it. */
 function enforceGatewayRequest(req: IncomingMessage, service: ServiceConfig, api: boolean): RequestAuthority {
-  if (urlFromHost(header(req, 'host'), 'https:')?.host !== service.publicHost) throw new HttpError(403, 'host is not allowed')
+  if (urlFromHost(header(req, 'host'), service.publicProtocol)?.host !== service.publicHost) throw new HttpError(403, 'host is not allowed')
   if (api && header(req, 'sec-fetch-site').toLowerCase() === 'cross-site') {
     throw new HttpError(403, 'cross-site API requests are not allowed')
   }
