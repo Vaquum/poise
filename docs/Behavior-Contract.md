@@ -65,3 +65,42 @@ A closed legacy failure can recover when Caller subsequently supplies an exact
 and after restart. Bounded, oversized-packet and invalid-result holds retain
 their existing rules; unrelated reviewers’ submitted receipts do not override
 an exact proof that this particular run never submitted.
+
+## Where the pull-request behaviors act
+
+`review-new-prs`, `approve-prs` and `resolve-unblocking` each have a Skip
+repositories list (`behavior_<behavior>_skip_repos`): `owner/repo` names, one
+list per behavior shared by every ready account. Before a scan claims, reads or
+launches anything, it keeps only the pull requests that pass one check: open,
+not a draft, authored by your GitHub account, and outside the behavior's
+skipped repositories. A skipped pull request is never claimed, dead-lettered or
+counted toward a retry. The list is read again immediately before a launch or a
+resolution, so a repository skipped while a scan is under way is left alone too.
+
+`review-new-prs` takes its anti-flood baseline (`behavior_seen`,
+`__snapshot_v3__` and the pull requests recorded with it) over every open pull
+request of yours, skipped repositories included: the baseline records what was
+already open when the behavior began, wherever it is. Saving a skip list never
+retakes the baseline or clears the ledger. Unskipping a repository therefore
+makes its open pull requests eligible on the next tick exactly as new ones are:
+those opened since the baseline are reviewed, and the backlog it recorded is
+not. `approve-prs` and `resolve-unblocking` have no baseline; an unskipped
+repository's pull requests are evaluated on the next tick like any other.
+
+## Replays
+
+A replay from Swarm passes the same check the scheduler applies, or it is
+refused with HTTP 409 and an error naming the check that failed. Poise reads
+the target fresh, behind the datastore freshness gate and from the same
+datastore the scheduler reads, and decides before it prepares a model, a
+checkout or a head. The scheduler and the replay call the same function for
+each kind of target, so the two cannot drift apart.
+
+- `pr_review` and `pr_approve`: the pull request is open, not a draft,
+  authored by your GitHub account, and not in the Skip repositories list of
+  `review-new-prs` or `approve-prs` respectively.
+- `issue_review`: the repository is opted in to `review-new-issues`, the issue
+  is open, and its author is a trusted author.
+
+A repository outside every ready account is refused the same way. When the
+facts cannot be read, the replay answers 502 and launches nothing.

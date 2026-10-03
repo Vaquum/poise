@@ -197,7 +197,13 @@ container and the volume: `docker rm poise-ws-<handle>` and
    There is no server-wide default: `REVIEW_AGENT_USERNAME` only seeds the
    agent account on a personal computer. Then add the organisations and
    accounts to work with under **GitHub accounts**.
-4. Install [Poise Link](Poise-Link.md) on your computer and pair it with
+4. In **Behaviors**, choose where your automations act before you turn them
+   on. The pull-request behaviors act in every repository of your accounts
+   except those ticked under **Skip repositories** in their Setting; Review
+   New Issues reviews only the repositories you opt in. Colleagues can
+   automate the same repositories: each person's automations act only as
+   their own agent account.
+5. Install [Poise Link](Poise-Link.md) on your computer and pair it with
    `poise.example.com`. It keeps Espanso's snippets in sync and shows Poise's
    alerts while the browser is closed.
 
