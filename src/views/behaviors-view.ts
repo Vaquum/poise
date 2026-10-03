@@ -9,7 +9,7 @@
 // runtime — the view is just a UI for state, not the place where
 // agent automations actually run.
 
-import { BEHAVIORS, isEnabled, setEnabled, getSetting, setSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, setTriggers, getLastTriggered, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
+import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
 import { organizationErrors } from '../organizations'
 
 let viewEl: HTMLElement
@@ -64,54 +64,7 @@ function ownerCell(username: string | null): string {
 // still travelling. Rendering consults this so the guard survives a repaint.
 const togglesInFlight = new Set<BehaviorKey>()
 
-// A native <select> fires `change` on every value the keyboard passes through,
-// so holding Down from ==p0 to <=p4 used to persist p1, p2 and p3 on the way —
-// each one a ceiling a behavior could genuinely fire at. And disabling the
-// element while that write was in flight took focus away from the person
-// pressing the key. Settle on the value they land on, then write once.
 const DEAD_LETTERS_SHOWN = 5
-const SETTING_WRITE_DELAY_MS = 400
-// The pending value is held here, not read back off the <select> when the
-// timer fires. The element can be repainted from the mirror in between — by a
-// refresh tick, or by renderRows() after any behaviour is toggled — and the
-// mirror still holds the old ceiling until the write lands. Reading the DOM
-// at flush time therefore stored the value the person had moved away from.
-const settingWrites = new Map<BehaviorKey, { timer: ReturnType<typeof setTimeout>, value: BehaviorSetting }>()
-
-function writeSetting(key: BehaviorKey, value: BehaviorSetting): Promise<void> {
-  return setSetting(key, value).catch((err: unknown) => {
-    alert(`Could not update behavior setting: ${(err as Error).message}`)
-  }).then(() => {
-    // A newer choice may have been queued while this was in flight; leave the
-    // control showing what the person chose, not what this older write stored.
-    if (settingWrites.has(key)) return
-    const current = viewEl?.querySelector<HTMLSelectElement>(
-      `select.behavior-setting[data-behavior="${key}"]`,
-    )
-    if (current) current.value = getSetting(key)
-  })
-}
-
-function queueSettingWrite(key: BehaviorKey, requested: BehaviorSetting) {
-  const pending = settingWrites.get(key)
-  if (pending) clearTimeout(pending.timer)
-  settingWrites.set(key, {
-    value: requested,
-    timer: setTimeout(() => {
-      settingWrites.delete(key)
-      void writeSetting(key, requested)
-    }, SETTING_WRITE_DELAY_MS),
-  })
-}
-
-// Leaving the view must not drop a ceiling the person just chose.
-function flushSettingWrites() {
-  for (const [key, pending] of [...settingWrites]) {
-    clearTimeout(pending.timer)
-    settingWrites.delete(key)
-    void writeSetting(key, pending.value)
-  }
-}
 
 function stateUnknown(): boolean {
   return !isBehaviorStateLoaded()
@@ -166,8 +119,8 @@ function repaintToggle(key: BehaviorKey, toggle: HTMLInputElement): void {
   if (!togglesInFlight.has(key)) toggle.checked = isEnabled(key)
 }
 
-// Setting dropdown — priority ceiling for the behavior. p0 is shown as
-// `==p0` (only p0); the rest as `<=pX` (pX and below).
+// Priority ceiling for Review New Pull Requests, chosen in its Setting
+// dropdown. p0 is shown as `==p0` (only p0); the rest as `<=pX` (pX and below).
 const SETTING_OPTIONS: { value: BehaviorSetting, label: string }[] = [
   { value: 'p0', label: '==p0' },
   { value: 'p1', label: '<=p1' },
@@ -213,21 +166,11 @@ function lastTriggeredCell(key: BehaviorKey): string {
   return `<a class="behavior-last-link" href="#" data-target="${escapeHtml(last.target)}" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
 }
 
+// Every behavior with something to set shows one pill that opens its Setting
+// dropdown; the others render a dash so the column still aligns.
 function settingCell(meta: typeof BEHAVIORS[number]): string {
-  if (meta.hasTriggers) return triggersCell(meta.key)
-  // Behaviors that don't take a priority ceiling render a dash so the
-  // column still aligns visually but doesn't offer a control the
-  // server would ignore anyway.
-  if (!meta.hasSetting) return '<span class="last-dash">—</span>'
-  const current = getSetting(meta.key)
-  const opts = SETTING_OPTIONS.map((o) =>
-    `<option value="${o.value}"${o.value === current ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
-  ).join('')
-  return `
-    <select class="behavior-setting" data-behavior="${escapeHtml(meta.key)}" aria-label="Setting for ${escapeHtml(meta.key)}">
-      ${opts}
-    </select>
-  `
+  if (meta.hasTriggers || meta.hasSkips) return triggersCell(meta.key)
+  return '<span class="last-dash">—</span>'
 }
 
 // Reviewers cell — how many of the PR review place's models (Settings →
@@ -264,10 +207,16 @@ function writeReviewers(key: BehaviorKey, value: ReviewerCount): void {
   })
 }
 
-// ── Triggers (Review New Issues) ────────────────────────────────────────
-// Review New Issues is opt-in per repository. Its Setting cell is one pill
-// that opens a dropdown: a filterable checkbox list across all ready accounts
-// and, below it, the trusted authors whose new issues count.
+// ── Setting dropdown ────────────────────────────────────────────────────
+// A behavior with something to set has one pill in its Setting cell, which
+// opens a dropdown: a filterable checkbox list of the repositories of all
+// ready accounts, asked for again on every opening.
+// - Review New Issues is opt-in per repository: the ticked repositories
+//   trigger it, and below the list are the trusted authors whose new issues
+//   count.
+// - The PR behaviors skip the ticked repositories. Their list is grouped by
+//   account, with a Select all for each account and one for the whole list;
+//   Review New Pull Requests also chooses its priority ceiling here.
 // Like the memory panel, every way of closing it — Done, Escape, a click
 // outside, leaving the view — saves what changed; a save that fails keeps it
 // open next to the error rather than closing over the choice.
@@ -278,20 +227,54 @@ let orgReposLoading: Promise<void> | null = null
 let triggersPanelEl: HTMLElement | null = null
 let triggersKey: BehaviorKey | null = null
 let triggersDraft = new Set<string>()
-let triggersLoaded = { repos: [] as string[], authors: [] as string[] }
+let triggersLoaded = { repos: [] as string[], authors: [] as string[], skipRepos: [] as string[], setting: 'p2' as BehaviorSetting }
 let triggersSaving: Promise<boolean> | null = null
 
 function shortRepo(repo: string): string {
   return repo
 }
 
+function behaviorMeta(key: BehaviorKey): typeof BEHAVIORS[number] {
+  return BEHAVIORS.find((behavior) => behavior.key === key)!
+}
+
+// Repositories are grouped under the account that owns them; GitHub matches
+// account names case-insensitively.
+function ownerKey(repo: string): string {
+  return repo.split('/')[0].toLowerCase()
+}
+
+function settingLabel(setting: BehaviorSetting): string {
+  return SETTING_OPTIONS.find((option) => option.value === setting)?.label ?? setting
+}
+
 function triggersPresentation(key: BehaviorKey) {
-  const repos = getRepos(key)
-  const authors = getAuthors(key)
-  const none = repos.length === 0
   // What is on screen may not be what is stored; saving from it would replace
   // the stored list with a guess.
   const unknown = stateUnknown()
+  const open = triggersKey === key && !!triggersPanelEl?.classList.contains('open')
+  const meta = behaviorMeta(key)
+  if (meta.hasSkips) {
+    const skipped = getSkipRepos(key)
+    const ceiling = meta.hasSetting ? settingLabel(getSetting(key)) : ''
+    return {
+      none: false,
+      unknown,
+      // A whole account skipped runs into hundreds; the count must stay
+      // readable in the cell next to the ceiling.
+      label: ceiling
+        ? (skipped.length ? `${ceiling}, skip ${skipped.length}` : ceiling)
+        : (skipped.length ? `Skip ${skipped.length}` : 'All repos'),
+      title: unknown
+        ? 'The setting could not be read from the server.'
+        : [ceiling ? `Priority ${ceiling}` : '', skipped.length ? `Skipped: ${skipped.join(', ')}` : 'Acts in every repository']
+          .filter(Boolean).join(' · '),
+      open,
+    }
+  }
+  const repos = getRepos(key)
+  const authors = getAuthors(key)
+  const none = repos.length === 0
   return {
     none,
     unknown,
@@ -301,7 +284,7 @@ function triggersPresentation(key: BehaviorKey) {
       : none
         ? 'Choose the repositories whose new issues are reviewed'
         : `Repositories: ${repos.map(shortRepo).join(', ')} · Authors: ${authors.join(', ') || 'none'}`,
-    open: triggersKey === key && !!triggersPanelEl?.classList.contains('open'),
+    open,
   }
 }
 
@@ -374,13 +357,24 @@ function renderTriggerRepos() {
   // A row that stays is kept where it is, not rebuilt: the list can grow while
   // the dropdown is open, and replacing the row under the pointer or the
   // keyboard focus would swallow the click or drop the focus.
-  const rows = new Map([...list.querySelectorAll<HTMLInputElement>('.bt-repo input')]
-    .map((box) => [box.value, box.closest<HTMLElement>('.bt-repo')!]))
-  const wanted = [...notes, ...shown.map((repo) => {
-    const row = rows.get(repo) ?? triggerRepoRow(repo)
+  const rows = new Map([...list.querySelectorAll<HTMLElement>('.bt-repo')].map((row) => [row.dataset.key, row]))
+  const grouped = triggersPanelEl!.dataset.mode === 'skips'
+  const repoRow = (repo: string) => {
+    const row = rows.get(`repo:${repo}`) ?? triggerRepoRow(repo, grouped)
     row.querySelector<HTMLInputElement>('input')!.checked = triggersDraft.has(repo)
     return row
-  })]
+  }
+  const entries: HTMLElement[] = []
+  if (!grouped) entries.push(...shown.map(repoRow))
+  else if (shown.length) {
+    entries.push(rows.get('all') ?? selectAllRow())
+    const groups = new Map<string, string[]>()
+    for (const repo of shown) groups.set(ownerKey(repo), [...(groups.get(ownerKey(repo)) ?? []), repo])
+    for (const [owner, repos] of groups) {
+      entries.push(rows.get(`group:${owner}`) ?? groupRow(owner, repos[0].split('/')[0]), ...repos.map(repoRow))
+    }
+  }
+  const wanted = [...notes, ...entries]
   const keep = new Set<Node>(wanted)
   for (const node of [...list.childNodes]) if (!keep.has(node)) node.remove()
   let cursor = list.firstChild
@@ -388,14 +382,58 @@ function renderTriggerRepos() {
     if (node === cursor) cursor = cursor.nextSibling
     else list.insertBefore(node, cursor)
   }
+  if (grouped) syncSelectAll()
 }
 
-function triggerRepoRow(repo: string): HTMLElement {
+function triggerRepoRow(repo: string, grouped: boolean): HTMLElement {
   const row = document.createElement('label')
-  row.className = 'bt-repo'
+  row.className = grouped ? 'bt-repo bt-grouped' : 'bt-repo'
   row.title = repo
-  row.innerHTML = `<input type="checkbox" value="${escapeHtml(repo)}" /><span>${escapeHtml(shortRepo(repo))}</span>`
+  row.dataset.key = `repo:${repo}`
+  // Under its account a repository shows its own name; the full name stays
+  // its accessible name, as in the flat list.
+  row.innerHTML = grouped
+    ? `<input type="checkbox" value="${escapeHtml(repo)}" data-repo aria-label="${escapeHtml(repo)}" /><span>${escapeHtml(repo.slice(repo.indexOf('/') + 1))}</span>`
+    : `<input type="checkbox" value="${escapeHtml(repo)}" data-repo /><span>${escapeHtml(shortRepo(repo))}</span>`
   return row
+}
+
+function groupRow(owner: string, name: string): HTMLElement {
+  const row = document.createElement('label')
+  row.className = 'bt-repo bt-group'
+  row.title = `Select all ${name} repositories`
+  row.dataset.key = `group:${owner}`
+  row.innerHTML = `<input type="checkbox" data-group="${escapeHtml(owner)}" aria-label="Select all ${escapeHtml(name)}" /><span>${escapeHtml(name)}</span><span class="bt-select-all">Select all</span>`
+  return row
+}
+
+function selectAllRow(): HTMLElement {
+  const row = document.createElement('label')
+  row.className = 'bt-repo bt-all'
+  row.dataset.key = 'all'
+  row.innerHTML = '<input type="checkbox" data-all aria-label="Select all repositories" /><span>Select all</span>'
+  return row
+}
+
+// The repository rows on screen. A Select all covers these, so a filter
+// narrows what it ticks.
+function repoBoxes(owner?: string): HTMLInputElement[] {
+  return [...(triggersPanelEl?.querySelectorAll<HTMLInputElement>('.bt-repo input[data-repo]') ?? [])]
+    .filter((box) => owner === undefined || ownerKey(box.value) === owner)
+}
+
+// A Select all is ticked when every row it covers is, and mixed when some are.
+function syncSelectAll() {
+  const reflect = (box: HTMLInputElement, covered: HTMLInputElement[]) => {
+    const ticked = covered.filter((repo) => repo.checked).length
+    box.checked = covered.length > 0 && ticked === covered.length
+    box.indeterminate = ticked > 0 && ticked < covered.length
+  }
+  for (const box of triggersPanelEl?.querySelectorAll<HTMLInputElement>('input[data-group]') ?? []) {
+    reflect(box, repoBoxes(box.dataset.group))
+  }
+  const all = triggersPanelEl?.querySelector<HTMLInputElement>('input[data-all]')
+  if (all) reflect(all, repoBoxes())
 }
 
 function triggerReposNote(kind: 'info' | 'error', html: string): HTMLElement {
@@ -409,14 +447,19 @@ function buildTriggersPanel(): HTMLElement {
   const panel = document.createElement('div')
   panel.id = 'behavior-triggers-panel'
   panel.setAttribute('role', 'dialog')
-  panel.setAttribute('aria-label', 'Repositories and authors that trigger Review New Issues')
+  const ceilings = SETTING_OPTIONS.map((option) => `<option value="${option.value}">${escapeHtml(option.label)}</option>`).join('')
   panel.innerHTML = `
-    <div class="bt-section">
-      <label class="bt-label" for="bt-filter">Repositories</label>
-      <input id="bt-filter" class="st-input bt-filter" type="search" placeholder="Filter" autocomplete="off" spellcheck="false" />
-      <div class="bt-repos" role="group" aria-label="Repositories"></div>
+    <div class="bt-section bt-ceiling" hidden>
+      <label class="bt-label" for="bt-ceiling">Priority</label>
+      <select id="bt-ceiling" class="behavior-setting bt-ceiling-select">${ceilings}</select>
     </div>
     <div class="bt-section">
+      <label class="bt-label bt-repos-label" for="bt-filter">Repositories</label>
+      <input id="bt-filter" class="st-input bt-filter" type="search" placeholder="Filter" autocomplete="off" spellcheck="false" />
+      <div class="bt-repos" role="group" aria-label="Repositories"></div>
+      <div class="st-help st-help-info bt-skip-help" hidden>This behavior leaves ticked repositories alone. Unticking one makes its open pull requests eligible again on the next run.</div>
+    </div>
+    <div class="bt-section bt-authors-section">
       <label class="bt-label" for="bt-authors">Trusted authors</label>
       <input id="bt-authors" class="st-input bt-authors" type="text" autocomplete="off" spellcheck="false" />
       <div class="st-help st-help-info">Only their new issues are reviewed. Reviewers run with full access on this machine.</div>
@@ -436,8 +479,14 @@ function buildTriggersPanel(): HTMLElement {
   panel.querySelector('.bt-repos')!.addEventListener('change', (e) => {
     const box = e.target as HTMLInputElement
     if (!box.matches('input[type="checkbox"]')) return
-    if (box.checked) triggersDraft.add(box.value)
-    else triggersDraft.delete(box.value)
+    const covered = box.dataset.group !== undefined ? repoBoxes(box.dataset.group)
+      : box.dataset.all !== undefined ? repoBoxes() : [box]
+    for (const repo of covered) {
+      repo.checked = box.checked
+      if (box.checked) triggersDraft.add(repo.value)
+      else triggersDraft.delete(repo.value)
+    }
+    if (panel.dataset.mode === 'skips') syncSelectAll()
   })
   panel.querySelector('.bt-repos')!.addEventListener('click', (e) => {
     if (!(e.target as HTMLElement).closest('.bt-retry')) return
@@ -475,9 +524,21 @@ function openTriggersPanel(key: BehaviorKey) {
     triggersPanelEl = buildTriggersPanel()
     document.body.appendChild(triggersPanelEl)
   }
+  const meta = behaviorMeta(key)
+  const mode = meta.hasSkips ? 'skips' : 'triggers'
+  // The two lists are built differently; one cannot reuse the other's rows.
+  if (triggersPanelEl.dataset.mode !== mode) triggersPanelEl.querySelector('.bt-repos')!.replaceChildren()
+  triggersPanelEl.dataset.mode = mode
+  triggersPanelEl.setAttribute('aria-label', meta.hasSkips ? `Setting for ${meta.label}` : 'Repositories and authors that trigger Review New Issues')
+  triggersPanelEl.querySelector<HTMLElement>('.bt-ceiling')!.hidden = !(meta.hasSkips && meta.hasSetting)
+  triggersPanelEl.querySelector<HTMLElement>('.bt-authors-section')!.hidden = meta.hasSkips
+  triggersPanelEl.querySelector<HTMLElement>('.bt-skip-help')!.hidden = !meta.hasSkips
+  triggersPanelEl.querySelector('.bt-repos-label')!.textContent = meta.hasSkips ? 'Skip repositories' : 'Repositories'
+  triggersPanelEl.querySelector('.bt-repos')!.setAttribute('aria-label', meta.hasSkips ? 'Repositories to skip' : 'Repositories')
   triggersKey = key
-  triggersLoaded = { repos: getRepos(key), authors: getAuthors(key) }
-  triggersDraft = new Set(triggersLoaded.repos)
+  triggersLoaded = { repos: getRepos(key), authors: getAuthors(key), skipRepos: getSkipRepos(key), setting: getSetting(key) }
+  triggersDraft = new Set(meta.hasSkips ? triggersLoaded.skipRepos : triggersLoaded.repos)
+  triggersPanelEl.querySelector<HTMLSelectElement>('.bt-ceiling-select')!.value = triggersLoaded.setting
   triggersPanelEl.querySelector<HTMLInputElement>('.bt-filter')!.value = ''
   triggersPanelEl.querySelector<HTMLInputElement>('.bt-authors')!.value = triggersLoaded.authors.join(', ')
   setTriggersStatus('')
@@ -494,7 +555,10 @@ function openTriggersPanel(key: BehaviorKey) {
   setTimeout(() => {
     document.addEventListener('mousedown', onTriggersOutside)
     document.addEventListener('keydown', onTriggersKeydown)
-    triggersPanelEl?.querySelector<HTMLInputElement>('.bt-filter')?.focus()
+    // The first control: the ceiling where there is one, otherwise the filter.
+    const first = triggersPanelEl?.querySelector<HTMLElement>('.bt-ceiling:not([hidden]) select')
+      ?? triggersPanelEl?.querySelector<HTMLInputElement>('.bt-filter')
+    first?.focus()
   }, 0)
 }
 
@@ -509,41 +573,50 @@ function closeTriggersPanel(force = false): Promise<boolean> {
   if (triggersSaving) return triggersSaving.then((closed) => closed || closeTriggersPanel(force))
   if (!triggersPanelEl || !triggersKey || !triggersPanelEl.classList.contains('open')) return Promise.resolve(true)
   const key = triggersKey
-  const repos = [...triggersDraft].sort()
-  const authors = parseAuthors(triggersPanelEl.querySelector<HTMLInputElement>('.bt-authors')!.value)
-  const invalid = authors.filter((name) => !GITHUB_LOGIN.test(name))
+  const meta = behaviorMeta(key)
+  const draft = [...triggersDraft].sort()
   const same = (a: string[], b: string[]) => a.length === b.length && a.every((value, index) => value === b[index])
-  const changes: { repos?: string[], authors?: string[] } = {}
-  if (!same(repos, [...triggersLoaded.repos].sort())) changes.repos = repos
-  if (!same(authors, triggersLoaded.authors)) changes.authors = authors
-  if (invalid.length) {
-    if (!force) {
-      setTriggersStatus(`Not a GitHub username: ${invalid.join(', ')}`, 'error')
-      return Promise.resolve(false)
+  const changes: SettingFields = {}
+  if (meta.hasSkips) {
+    if (!same(draft, [...triggersLoaded.skipRepos].sort())) changes.skipRepos = draft
+    const setting = triggersPanelEl.querySelector<HTMLSelectElement>('.bt-ceiling-select')!.value as BehaviorSetting
+    if (meta.hasSetting && setting !== triggersLoaded.setting) changes.setting = setting
+  } else {
+    const authors = parseAuthors(triggersPanelEl.querySelector<HTMLInputElement>('.bt-authors')!.value)
+    const invalid = authors.filter((name) => !GITHUB_LOGIN.test(name))
+    if (!same(draft, [...triggersLoaded.repos].sort())) changes.repos = draft
+    if (!same(authors, triggersLoaded.authors)) changes.authors = authors
+    if (invalid.length) {
+      if (!force) {
+        setTriggersStatus(`Not a GitHub username: ${invalid.join(', ')}`, 'error')
+        return Promise.resolve(false)
+      }
+      alert(`The trusted authors were not saved — not a GitHub username: ${invalid.join(', ')}`)
+      delete changes.authors
     }
-    alert(`The trusted authors were not saved — not a GitHub username: ${invalid.join(', ')}`)
-    delete changes.authors
   }
-  if (!changes.repos && !changes.authors) {
+  if (Object.keys(changes).length === 0) {
     finishClosingTriggersPanel()
     return Promise.resolve(true)
   }
   if (stateUnknown()) {
     if (!force) {
-      setTriggersStatus('Not saved — the current repositories could not be read from the server.', 'error')
+      setTriggersStatus(`Not saved — the current ${meta.hasSkips ? 'setting' : 'repositories'} could not be read from the server.`, 'error')
       return Promise.resolve(false)
     }
-    alert('The Review New Issues repositories were not saved: the current ones could not be read from the server.')
+    alert(meta.hasSkips
+      ? `The ${meta.label} setting was not saved: the current one could not be read from the server.`
+      : 'The Review New Issues repositories were not saved: the current ones could not be read from the server.')
     finishClosingTriggersPanel()
     return Promise.resolve(true)
   }
   setTriggersStatus('Saving…')
-  triggersSaving = setTriggers(key, changes).then(() => {
+  triggersSaving = setSettingFields(key, changes).then(() => {
     finishClosingTriggersPanel()
     return true
   }, (err: unknown) => {
     if (force) {
-      alert(`Could not save the Review New Issues triggers: ${(err as Error).message}`)
+      alert(`Could not save the ${meta.hasSkips ? `${meta.label} setting` : 'Review New Issues triggers'}: ${(err as Error).message}`)
       finishClosingTriggersPanel()
       return true
     }
@@ -1010,13 +1083,6 @@ function attachHandlers() {
       })
       return
     }
-    // Setting dropdown
-    if (target.matches('select.behavior-setting[data-behavior]')) {
-      const sel = target as HTMLSelectElement
-      const key = sel.dataset.behavior as BehaviorKey
-      queueSettingWrite(key, sel.value as BehaviorSetting)
-      return
-    }
     // Reviewers dropdown — three values, written as chosen; an intermediate
     // value only changes how many reviewers the next new pull request gets.
     if (target.matches('select.behavior-reviewers[data-behavior]')) {
@@ -1028,7 +1094,7 @@ function attachHandlers() {
     }
   })
   tbody.addEventListener('click', (e) => {
-    // Triggers pill → open or close the Review New Issues dropdown.
+    // Setting pill → open or close the behavior's Setting dropdown.
     const triggersBtn = (e.target as HTMLElement).closest<HTMLButtonElement>('.behavior-triggers-btn')
     if (triggersBtn) {
       e.preventDefault()
@@ -1083,16 +1149,10 @@ async function tickRefresh() {
     }
     const toggle = tr.querySelector<HTMLInputElement>('input[type="checkbox"][data-behavior]')
     if (toggle) repaintToggle(meta.key, toggle)
-    const setting = tr.querySelector<HTMLSelectElement>('select.behavior-setting[data-behavior]')
-    // A pending choice is the person's, not the server's. The write is
-    // debounced rather than sent on each keystroke, so between choosing a
-    // ceiling and it being stored there is a window in which the mirror still
-    // holds the old value — repainting from it here threw the choice away.
-    if (setting && !settingWrites.has(meta.key)) setting.value = getSetting(meta.key)
     const reviewers = tr.querySelector<HTMLSelectElement>('select.behavior-reviewers[data-behavior]')
     if (reviewers && !reviewersInFlight.has(meta.key)) reviewers.value = String(getReviewers(meta.key))
     // An open dropdown holds the person's draft; the pill repaints once it closes.
-    if (meta.hasTriggers && triggersKey !== meta.key) refreshTriggersCell(meta.key)
+    if ((meta.hasTriggers || meta.hasSkips) && triggersKey !== meta.key) refreshTriggersCell(meta.key)
   }
 }
 
@@ -1100,7 +1160,6 @@ export function stopBehaviorsRefresh() {
   // The view is going away, so the panel cannot stay open over what replaces it.
   closeMemoryPanel(true)
   void closeTriggersPanel(true)
-  flushSettingWrites()
   if (!tickListening) return
   window.removeEventListener('poise:refresh-tick', onTick)
   tickListening = false

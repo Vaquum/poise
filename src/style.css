@@ -2939,12 +2939,13 @@ tr:hover .stop-btn { opacity: 1; }
    ───────────────────────────────────────────────────────────────────────── */
 
 /* The controls take what they need and the name gets the rest — at the
-   default 960px content width that is ~290px, enough for the longest name
+   default 960px content width that is ~220px, enough for the longest name
    on one line; every cell stays on one line and ellipsizes rather than
    wraps (the shared .title-cell rule allows wrapping for Archive's
-   titles, which is exactly what stacked the names three lines high). */
+   titles, which is exactly what stacked the names three lines high). The
+   Setting column fits "<=p3, skip 236" within that budget. */
 .col-owner-wide { width: 150px; }
-.col-setting    { width: 128px; }
+.col-setting    { width: 164px; }
 .col-reviewers  { width: 80px; }
 .col-memory     { width: 90px; }
 .col-last       { width: 125px; }
@@ -3164,10 +3165,11 @@ tr:hover .stop-btn { opacity: 1; }
 }
 .behavior-memory-btn.has-note .behavior-memory-dot { background: var(--a3); }
 
-/* Triggers pill (Review New Issues) — the Setting cell's control for the
-   repositories that opt in, in the same pill grammar as the ceiling select
-   beside it, with the same caret. Amber while nothing is selected: the
-   behaviour can be on and still review nothing. */
+/* Setting pill — the Setting cell's control: the repositories that opt in to
+   Review New Issues, or the ceiling and the repositories a PR behavior skips.
+   The pill grammar of the selects beside it, with the same caret, a little
+   tighter so "<=p3, skip 236" fits. Amber while Review New Issues has nothing
+   selected: the behaviour can be on and still review nothing. */
 .behavior-triggers-btn {
   font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
   font-size: 0.75rem;
@@ -3176,7 +3178,7 @@ tr:hover .stop-btn { opacity: 1; }
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--r-pill);
-  padding: 4px 32px 4px 14px;
+  padding: 4px 28px 4px 12px;
   cursor: pointer;
   max-width: 100%;
   white-space: nowrap;
@@ -3270,6 +3272,16 @@ tr:hover .stop-btn { opacity: 1; }
   gap: 8px;
 }
 .bt-footer .bt-status { margin: 0; min-width: 0; }
+
+/* The PR behaviors' dropdown: Review New Pull Requests' ceiling above the
+   repositories to skip, listed under their account with a Select all for each
+   account and one for the whole list. */
+.bt-section[hidden] { display: none; }
+.bt-ceiling .behavior-setting { align-self: flex-start; margin-top: 4px; }
+.bt-repo.bt-all,
+.bt-repo.bt-group { font-weight: 600; }
+.bt-repo.bt-grouped { padding-left: 28px; }
+.bt-select-all { margin-left: auto; font-weight: 400; color: var(--text-tertiary); }
 
 /* Memory editor textarea — same chrome as .st-input, sized for prose. */
 .st-textarea {
