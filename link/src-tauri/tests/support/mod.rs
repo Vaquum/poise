@@ -28,6 +28,8 @@ pub struct Config {
     pub expire: bool,
     /// Answer the event stream with a redirect to `/stolen`.
     pub redirect_events: bool,
+    /// Accept event stream requests and never answer them.
+    pub stall_events: bool,
 }
 
 enum Frame {
@@ -194,6 +196,8 @@ enum Action {
         opening: String,
         frames: mpsc::UnboundedReceiver<Frame>,
     },
+    /// Keep the connection open without a word.
+    Stall,
 }
 
 async fn serve(mut socket: TcpStream, state: Arc<Mutex<State>>, base: Url) {
@@ -208,6 +212,10 @@ async fn serve(mut socket: TcpStream, state: Arc<Mutex<State>>, base: Url) {
             let _ = socket.shutdown().await;
         }
         Action::Stream { opening, frames } => stream(socket, opening, frames).await,
+        Action::Stall => {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(socket);
+        }
     }
 }
 
@@ -235,6 +243,11 @@ fn route(state: &mut State, request: &Request, base: &Url) -> Action {
                 )
             } else if path == "/api/link/snippets" {
                 snippets(state, request)
+            } else if path == "/api/link/events" && state.config.stall_events {
+                state
+                    .stream_connections
+                    .push(request.headers.get("last-event-id").cloned());
+                return Action::Stall;
             } else if path == "/api/link/events" && state.config.redirect_events {
                 response("302 Found", &[("Location", &format!("{base}stolen"))], "")
             } else if path == "/api/link/events" {

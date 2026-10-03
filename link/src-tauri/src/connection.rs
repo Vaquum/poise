@@ -172,7 +172,13 @@ async fn read_events(
     backoff: &mut Backoff,
 ) -> Result<Infallible, StreamError> {
     let last_event_id = context.settings.get().last_event_id;
-    let mut response = context.api.open_events(last_event_id.as_deref()).await?;
+    // A workspace (or proxy) that accepts the connection but never answers must not stall reconnects.
+    let mut response = tokio::time::timeout(
+        timing.idle_timeout,
+        context.api.open_events(last_event_id.as_deref()),
+    )
+    .await
+    .map_err(|_| StreamError::Idle(timing.idle_timeout))??;
     context.status.set_connection(Connection::Connected);
     let mut parser = sse::Parser::new();
     loop {

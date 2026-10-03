@@ -611,3 +611,34 @@ async fn sign_out_signs_out_even_when_the_credential_store_fails() {
     let saved = SettingsStore::open(config.path()).unwrap().get();
     assert_eq!((saved.endpoint, saved.login), (None, None));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_event_stream_is_given_up_and_retried() {
+    let fake = FakePoise::start(
+        Config {
+            stall_events: true,
+            ..Config::default()
+        },
+        "v1",
+        &snippets_yaml(&[]),
+    )
+    .await;
+    let config = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let quick = Timing {
+        idle_timeout: Duration::from_millis(300),
+        ..timing()
+    };
+    let (controller, _probes) = already_paired(&fake, config.path(), home.path(), quick);
+
+    assert!(controller.start());
+
+    eventually("a second attempt after the stall", WAIT, || {
+        fake.state().stream_connections.len() >= 2
+    })
+    .await;
+    assert!(matches!(
+        &controller.status().connection,
+        Connection::Reconnecting { error } if error.contains("no data")
+    ));
+}
