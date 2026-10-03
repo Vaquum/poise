@@ -58,6 +58,7 @@ On a workspace host, `/_poise/session` redeems a sign-in ticket and `/_poise/log
 - A body on `GET`, `HEAD`, `OPTIONS`, `DELETE` or `TRACE` is refused with 400, and forwarded bodies are always framed, so nothing can be smuggled to a workspace as a second request.
 - A workspace answer the gateway cannot relay, such as a status outside 100–599, becomes a 502 for that request alone.
 - A device token stops working after 30 days without use or 365 days after pairing, and Poise Link pairs again.
+- Every unusable device token gets 401 with a JSON reason (`device_unknown`, `device_revoked`, `device_expired`, `user_disabled` or `access_removed`), never a 403 or a redirect, because Poise Link treats any 401 as "sign out and pair again".
 - A disabled person is cut off at once: every session ends, every device is revoked, sign-in is refused and the workspace stops. Organisation membership is verified at each sign-in, so disabling is how an admin cuts off an organisation member before then.
 
 ## State

@@ -298,10 +298,16 @@ trigger/replace pairs, reporting any it skipped.
 3. `POST /link/device/token` with `{ device_code }` returns
    `{ error: "authorization_pending" }` until approved, then
    `{ access_token, endpoint, login }`, where `endpoint` is the workspace
-   address. Errors follow RFC 8628 with HTTP 400: `authorization_pending`,
-   `slow_down` (polling faster than `interval`, which then grows by 5 seconds),
-   `access_denied`, `expired_token` (after `expires_in`, 15 minutes) and
-   `invalid_grant` (an unknown or already redeemed code).
+   address. Every refusal follows RFC 8628: HTTP 400 with `{ error }`, where
+   `error` is one of these and nothing else:
+   - `authorization_pending`;
+   - `slow_down`, when polling faster than `interval`, which then grows by 5
+     seconds;
+   - `access_denied`;
+   - `expired_token`, after `expires_in` (15 minutes);
+   - `invalid_grant`, for an unknown or already redeemed code;
+   - `invalid_request`, for a body without a `device_code` string. This one
+     also carries `error_description`.
 
 The approval page takes at most 10 code submissions per session in 15 minutes.
 
@@ -324,6 +330,18 @@ after pairing; Poise Link then pairs again.
   - `ping` every 20 seconds.
   - On connect it sends the current snippets version, plus any alerts after
     `Last-Event-ID`.
+- An unusable device token gets HTTP 401 with `{ error, message }` and
+  `WWW-Authenticate: Bearer error="invalid_token"`, never a 403 or a
+  redirect. Poise Link treats any 401 as "sign out and pair again". `error`
+  names why:
+  - `device_unknown`: never issued, or paired with another workspace;
+  - `device_revoked`;
+  - `device_expired`;
+  - `user_disabled`: the owner is disabled;
+  - `access_removed`: the owner no longer has access.
+
+  A device token on a path outside `/api/link/*` gets 401 with
+  `invalid_token`.
 
 **Alerts** are recorded by the workspace:
 - a Claude or other provider sign-in is needed;
