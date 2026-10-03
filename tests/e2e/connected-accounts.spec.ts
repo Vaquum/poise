@@ -5,6 +5,7 @@ import { mkdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { STATUS, fakeCalls, script, writeFakeClis } from '../fixtures/accounts/fake-clis'
+import { cliHomes } from '../fixtures/cli-isolation'
 
 // Settings → Connected accounts against fake CLIs: the real accounts route
 // and the real terminal, with nothing but the fakes on the server's PATH.
@@ -32,7 +33,9 @@ async function start(page: Page, info: TestInfo, assets: string) {
   })
   const child = spawn(process.execPath, [bundle], {
     cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
-    env: { PATH: bin, HOME: home, LANG: 'en_US.UTF-8', ACCOUNTS_ASSETS_URL: assets },
+    // Only the fakes on PATH, and every CLI's configuration in folders of its
+    // own; HOME is the fakes' home, where they keep their state.
+    env: { ...cliHomes(join(root, 'homes')), HOME: home, PATH: bin, LANG: 'en_US.UTF-8', ACCOUNTS_ASSETS_URL: assets, FAKE_CLI_BIN: bin },
   })
   let stderr = ''
   child.stderr!.on('data', (chunk) => { stderr = (stderr + String(chunk)).slice(-4096) })

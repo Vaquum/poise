@@ -9,8 +9,11 @@ import type { AddressInfo } from 'node:net'
 import { invalidateAccounts, listAccounts } from '../../../server/accounts'
 import { enforceApiRequest, httpStatus } from '../../../server/http'
 import { TerminalSocketServer } from '../../../server/terminal/server'
+import { fakePresetCommand } from './fake-presets'
 
 const assets = process.env.ACCOUNTS_ASSETS_URL!
+const fakes = process.env.FAKE_CLI_BIN
+if (!fakes) throw new Error('FAKE_CLI_BIN must name the directory of fake CLIs')
 
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.statusCode = status
@@ -18,7 +21,8 @@ function json(res: ServerResponse, status: number, value: unknown): void {
   res.end(JSON.stringify(value))
 }
 
-const terminals = new TerminalSocketServer()
+// A Connect terminal starts only once its CLI resolves to the fake.
+const terminals = new TerminalSocketServer({}, { command: fakePresetCommand(fakes) })
 terminals.on('exit', () => invalidateAccounts())
 
 const server = createServer((req, res) => {

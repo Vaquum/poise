@@ -10,8 +10,9 @@
 // that directory a missing fake is a missing command, never the real CLI.
 
 import { execFileSync } from 'node:child_process'
+import { accessSync, constants, statSync } from 'node:fs'
 import { chmod, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { delimiter, join, resolve } from 'node:path'
 import type { AccountId } from '../../../server/accounts/types'
 
 export const COMMANDS: Record<AccountId, string> = {
@@ -188,3 +189,28 @@ export async function clearCalls(home: string): Promise<void> {
   await writeFile(join(home, '.fake-cli', 'calls.jsonl'), '')
 }
 
+/** Where `name` resolves on `path`, as execvp finds it, or null. */
+export function resolveOnPath(name: string, path: string): string | null {
+  for (const dir of path.split(delimiter)) {
+    const candidate = resolve(dir || '.', name)
+    try {
+      accessSync(candidate, constants.X_OK)
+      if (statSync(candidate).isFile()) return candidate
+    } catch {
+      // Not in this directory: execvp looks in the next one.
+    }
+  }
+  return null
+}
+
+/** Throws unless `name` resolves on `path` to its fake in `bin`. */
+export function assertFake(bin: string, name: string, path: string = process.env.PATH ?? ''): void {
+  const found = resolveOnPath(name, path)
+  if (found !== resolve(bin, name)) throw new Error(`${name} resolves to ${found ?? 'nothing'}, not its fake in ${bin}`)
+}
+
+/** Throws unless every agent CLI resolves on `path` to its fake in `bin`:
+ *  then no real CLI, and no real login, can run. */
+export function assertFakeClis(bin: string, path: string = process.env.PATH ?? ''): void {
+  for (const name of Object.values(COMMANDS)) assertFake(bin, name, path)
+}

@@ -12,7 +12,8 @@ import { delimiter, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
-import { COMMANDS, STATUS, script, writeFakeClis } from './fixtures/accounts/fake-clis'
+import { STATUS, assertFakeClis, script, writeFakeClis } from './fixtures/accounts/fake-clis'
+import { fakePresetCommand } from './fixtures/accounts/fake-presets'
 import { CATALOG } from './model-catalog-fixture'
 import { PUBLIC_HOST, PUBLIC_ORIGIN, gatewayKeys, serviceEnvironment, signAssertion } from './service-fixture'
 
@@ -71,11 +72,10 @@ else process.stdout.write('[]')
   for (const [key, value] of Object.entries({ ...serviceEnvironment(gateway), HOME: home, CALLER_BIN_ROOT: bin, AGENT_INTERFACE_ROOT: join(root, 'agent'), PATH: `${bin}${delimiter}${process.env.PATH}` })) {
     vi.stubEnv(key, value)
   }
-  // Nothing in this file may reach a real CLI, least of all a real login.
-  for (const name of Object.values(COMMANDS)) {
-    const found = process.env.PATH!.split(delimiter).map((dir) => join(dir, name)).find((path) => existsSync(path))
-    if (found !== join(bin, name)) throw new Error(`${name} resolves to ${found ?? 'nothing'}, not its fake in ${bin}`)
-  }
+  // Nothing in this file may reach a real CLI, least of all a real login: the
+  // whole file stops here unless every CLI resolves to its fake, and each
+  // Connect terminal checks its own CLI again before it starts.
+  assertFakeClis(bin)
   // Everything else defaults under ~/.poise, as it does in a workspace.
   for (const key of ['POISE_DB', 'POISE_CHAT_ROOT', 'POISE_ESPANSO_MATCH_DIR', 'AGENT_INTERFACE_DATA_DIR', 'POISE_EDITOR_DIR', 'POISE_CHAT_ATTACHMENTS_DIR',
     'POISE_MODEL_CATALOG_REPORT', 'POISE_PRODUCTION_UPDATE_REPORT', 'POISE_SELF_UPDATE_ROOT', 'POISE_LOCK_DIR', 'POISE_DATASTORE_DB']) {
@@ -85,7 +85,7 @@ else process.stdout.write('[]')
   production = await import('../server/production')
   turnedOff = await import('../server/service/turned-off')
   // The container listens on every interface; the test binds loopback only.
-  server = production.createProductionServer({ host: '0.0.0.0', staticDir, claudeAuth: auth, reviewAgentUsername: 'bit-mis' })
+  server = production.createProductionServer({ host: '0.0.0.0', staticDir, claudeAuth: auth, terminalCommand: fakePresetCommand(bin), reviewAgentUsername: 'bit-mis' })
   const fromGatewayNetwork = (req: IncomingMessage) => {
     const peer = req.headers['x-test-peer']
     if (typeof peer === 'string') Object.defineProperty(req.socket, 'remoteAddress', { value: peer, configurable: true })
