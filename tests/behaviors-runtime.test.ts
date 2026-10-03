@@ -501,6 +501,31 @@ describe('behavior launch claims', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
   })
 
+  // A drain (the release controller's or the gateway's) pauses background
+  // admission: a scheduled tick must not launch until it is lifted.
+  it('launches nothing while background admission is paused and resumes after', async () => {
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    const background = await import('../server/release-background')
+    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+
+    background.pauseReleaseBackground()
+    try {
+      await runtime.runEnabledBehaviorsOnce()
+      expect(externalCalls()).toEqual([])
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    } finally {
+      background.resumeReleaseBackground()
+    }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+  })
+
   it('pauses approval work and resumes it once authenticated', async () => {
     arrangeCli(true)
     mocks.spawnDetached.mockResolvedValue(undefined)
