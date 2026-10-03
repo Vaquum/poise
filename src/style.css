@@ -2876,6 +2876,38 @@ tr:hover .stop-btn { opacity: 1; }
   animation: agent-row-focus-pulse 1.5s ease-out 1;
 }
 
+/* Why a replay was refused, under the row it was asked for. */
+#view-swarm tr.agent-refusal-row > td {
+  padding: 6px var(--sp-5) 8px;
+  background: var(--surface);
+  border-bottom: var(--b-hair);
+  white-space: normal;
+}
+.agent-refusal {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  max-width: var(--typo-width, 960px);
+  font-size: 0.75rem;
+  color: var(--a4);
+}
+.agent-refusal-dismiss {
+  flex: 0 0 auto;
+  border: none;
+  background: none;
+  padding: 0 4px;
+  font: inherit;
+  font-size: 0.875rem;
+  line-height: 1;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.agent-refusal-dismiss:hover { color: var(--text); }
+.agent-refusal-dismiss:focus-visible {
+  outline: 2px solid var(--a1);
+  outline-offset: 2px;
+}
+
 /* Expanded response row — soft surface so the body reads as a
    continuation of the row above rather than a separate item. */
 #view-swarm tr.agent-expand-row > td {

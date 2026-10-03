@@ -490,6 +490,39 @@ function isReplayable(e: LogEntry): boolean {
 // outlive the DOM node.
 const replaysInFlight = new Set<string>()
 
+// Why a replay was refused, by row id. The server holds a replay to the check
+// the scheduler applies and names the check that failed; that answer belongs
+// under the row Replay was pressed on, and stays until it is dismissed or the
+// row is replayed again. Kept here, like the in-flight guard, so a render does
+// not lose it.
+const replayRefusals = new Map<string, string>()
+
+// The message alone is the alert, so the Dismiss button is not read with it.
+function refusalMarkup(message: string): string {
+  return `<td colspan="${COLUMN_COUNT}"><div class="agent-refusal">`
+    + `<span class="agent-refusal-text" role="alert">${escapeHtml(message)}</span>`
+    + '<button type="button" class="agent-refusal-dismiss" aria-label="Dismiss">&times;</button></div></td>'
+}
+
+function buildRefusalRow(id: string, message: string): HTMLTableRowElement {
+  const tr = document.createElement('tr')
+  tr.className = 'agent-refusal-row'
+  tr.dataset.refusalFor = id
+  tr.innerHTML = refusalMarkup(message)
+  return tr
+}
+
+function showReplayRefusal(id: string, message: string): void {
+  replayRefusals.set(id, message)
+  bodyEl.querySelector(`tr.agent-refusal-row[data-refusal-for="${id}"]`)?.remove()
+  bodyEl.querySelector(`tr.agent-row[data-id="${id}"]`)?.insertAdjacentElement('afterend', buildRefusalRow(id, message))
+}
+
+function clearReplayRefusal(id: string): void {
+  replayRefusals.delete(id)
+  bodyEl.querySelector(`tr.agent-refusal-row[data-refusal-for="${id}"]`)?.remove()
+}
+
 function replayCell(e: LogEntry): string {
   if (!isReplayable(e)) return '<span class="agent-dash">—</span>'
   const busy = replaysInFlight.has(e.id)
@@ -664,13 +697,16 @@ function buildExpandRow(e: LogEntry): HTMLTableRowElement {
 function reconcileRows(nextEntries: LogEntry[]): void {
   const main = new Map<string, HTMLTableRowElement>()
   const detail = new Map<string, HTMLTableRowElement>()
+  const refusal = new Map<string, HTMLTableRowElement>()
   for (const row of [...bodyEl.children] as HTMLTableRowElement[]) {
     if (row.dataset.id) main.set(row.dataset.id, row)
     if (row.dataset.expandFor) detail.set(row.dataset.expandFor, row)
+    if (row.dataset.refusalFor) refusal.set(row.dataset.refusalFor, row)
   }
   const ids = new Set(nextEntries.map((e) => e.id))
   for (const [id, row] of main) if (!ids.has(id)) row.remove()
   for (const [id, row] of detail) if (!ids.has(id) || !expanded.has(id)) row.remove()
+  for (const [id, row] of refusal) if (!ids.has(id) || !replayRefusals.has(id)) row.remove()
   let cursor: ChildNode | null = bodyEl.firstChild
   const place = (row: HTMLTableRowElement) => {
     if (cursor !== row) bodyEl.insertBefore(row, cursor)
@@ -681,6 +717,8 @@ function reconcileRows(nextEntries: LogEntry[]): void {
     row.dataset.callId = entry.response ? entry.id : ''
     patchContent(row, mainRowInnerHTML(entry))
     place(row)
+    const refused = replayRefusals.get(entry.id)
+    if (refused !== undefined) place(refusal.get(entry.id) ?? buildRefusalRow(entry.id, refused))
     if (expanded.has(entry.id)) {
       const expandedRow = detail.get(entry.id) || buildExpandRow(entry)
       refreshRunDetail(expandedRow, entry)
@@ -844,10 +882,16 @@ function attachClicks() {
             pr_id: entry.pr_id,
           }),
         })
+        if (res.status === 409) {
+          const data = await res.json().catch(() => ({}))
+          showReplayRefusal(id, typeof data?.error === 'string' && data.error ? data.error : 'Replay refused.')
+          return
+        }
         if (!res.ok) {
           const text = await res.text().catch(() => '')
           throw new Error(`HTTP ${res.status}: ${text.slice(0, 160)}`)
         }
+        clearReplayRefusal(id)
         // Pull the log right away so the new running row shows up
         // without the user waiting for the 15s poll.
         window.setTimeout(() => { void pollOnce() }, 800)
@@ -867,6 +911,15 @@ function attachClicks() {
           current.title = 'Replay this run'
         }
       }
+      return
+    }
+
+    // Dismissing a refusal hands focus back to the Replay it answered.
+    const dismiss = target.closest<HTMLButtonElement>('.agent-refusal-dismiss')
+    if (dismiss) {
+      const id = dismiss.closest<HTMLTableRowElement>('tr')?.dataset.refusalFor || ''
+      clearReplayRefusal(id)
+      bodyEl.querySelector<HTMLButtonElement>(`tr.agent-row[data-id="${id}"] .replay-btn`)?.focus()
       return
     }
 
