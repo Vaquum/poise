@@ -1,8 +1,15 @@
 # Poise
 
-Poise is a local engineering dashboard for GitHub work, agent activity,
+Poise is an engineering dashboard for GitHub work, agent activity,
 automations, snippets, and long-form writing. It is a TypeScript application
 with a framework-free browser client, a Node server, and a small SQLite store.
+
+This repository runs Poise as a self-hosted service: several people sign in at
+one public address, and each gets their own Poise, agent CLIs, GitHub accounts
+and data in an isolated workspace. [Service architecture](docs/Service-architecture.md)
+describes how the gateway, the workspaces, Poise and the Poise Link desktop
+companion fit together. The rest of this README describes the Poise application
+itself, which still runs on a single computer for development.
 
 ## Capabilities
 
