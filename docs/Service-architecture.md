@@ -295,6 +295,13 @@ version, whether it is signed in and as whom.
     gh's accounts and says when either is not signed in to gh.
   - Each command has 10 seconds. Answers are kept for 15 seconds and dropped
     whenever a terminal exits.
+  - Every read records sign-in alerts (`sign_in_needed`): one for an
+    installed CLI that says it is not signed in, and one each for the
+    person's own account and the agent account while gh does not hold it
+    signed in. Each clears once signed in again; Claude's alert stays its
+    auth monitor's. In service mode Poise also reads the accounts every 15
+    minutes, so the alerts come while the browser is closed. They open
+    `/?settings=accounts`, Settings → Connected accounts.
 - Connect opens a terminal in the browser, inside the workspace, running that
   CLI's own login (`login.label`):
 
@@ -408,7 +415,8 @@ after pairing; Poise Link then pairs again.
 
 **Alerts** are recorded by the workspace and kept for 30 days. Each condition
 alerts once, and again only after it has cleared:
-- a Claude or other provider sign-in is needed;
+- a Claude or other provider sign-in is needed, or the person's own GitHub
+  account or the agent account is not signed in to gh;
 - a behavior failed and is held;
 - datastore sync has been failing for 15 minutes;
 - a Chat agent is waiting for a permission or an answer;

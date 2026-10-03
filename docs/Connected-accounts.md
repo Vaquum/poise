@@ -37,6 +37,18 @@ above and passes on only the account name one prints. Answers are kept for 15
 seconds, so reopening Settings does not run every CLI again, and dropped
 whenever a terminal exits.
 
+## Alerts
+
+Each read also records a sign-in alert, which Poise Link shows on the desktop:
+for an installed CLI that says it is not signed in (Codex, today), and for
+your GitHub account or the agent account while gh does not hold it signed in.
+An alert comes once and again only after it has cleared, which happens when
+the CLI or the account is signed in again; a CLI that cannot say changes
+nothing. Claude's alert comes from Poise's own Claude sign-in check instead.
+In service mode Poise reads the accounts every 15 minutes as well, so the
+alerts come while no browser is open. Each one opens the workspace on
+Settings → Accounts (`/?settings=accounts`).
+
 ## The terminal
 
 Connect opens a terminal in Settings, running that CLI's login in your home
