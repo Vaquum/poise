@@ -3,13 +3,34 @@
 ## Supported deployment
 
 Poise is supported as a single-user local application bound to loopback. The
-production server refuses non-loopback addresses. API requests enforce allowed
-hosts, same-origin browser access, bounded bodies, and explicit content types.
+production server refuses non-loopback addresses outside service mode. API
+requests enforce allowed hosts, same-origin browser access, bounded bodies,
+and explicit content types.
 
 Do not expose Poise through a public listener or reverse proxy. Its intended
 capabilities include launching local agent processes, modifying local Markdown
 and Espanso files, and creating GitHub issues through the authenticated `gh`
 session.
+
+### Service mode
+
+With `POISE_MODE=service` Poise is one person's workspace behind the gateway
+and listens beyond loopback inside its container. Every request that does not
+come from loopback, the page and its assets included, must carry the gateway's
+identity assertion: an EdDSA (Ed25519) JWT verified against the gateway's
+public key, issued by `poise-gateway` for this workspace's audience with the
+owner as subject (in any case), at most five seconds in the future, not
+expired beyond five seconds of skew, living at most 120 seconds, and with a
+scope that reaches the route (`browser` every route, `link` only
+`/api/link/*`, `admin` only `/api/service/*`). `Host` must be the public host
+and `Origin`, when sent, exactly the public origin; cross-site API calls are
+refused. Anything else is refused before a handler runs. The assertion header
+is removed once checked, so Poise never echoes, logs or forwards it.
+Assertions are not tracked for replay: their short lifetime and the gateway,
+which mints one per request, bound that risk. Loopback requests keep the
+local rules: whatever runs inside the container is already the owner's.
+Isolation between people is the container boundary, as
+[Service architecture](docs/Service-architecture.md) describes.
 
 ## Reporting
 
