@@ -42,21 +42,30 @@ On the apex:
 | --- | --- |
 | `/` | Sign-in page, or links to your workspace, devices and admin |
 | `/auth/login`, `/auth/callback`, `/auth/logout` | GitHub sign-in and sign-out; `/auth/login?next=` accepts an apex path or a URL on a workspace host |
-| `/link` | Approve or deny a Poise Link user code |
+| `/link` | Approve or deny a Poise Link user code (at most 10 tries per session in 15 minutes) |
 | `/link/devices` | List and revoke paired devices |
 | `POST /link/device/code`, `POST /link/device/token` | Device authorization for Poise Link |
-| `/admin` | Users, workspace state and image, allowed logins, start, stop and restart |
+| `/admin` | Users with their access, workspace state and image; allowed logins; start, stop and restart a workspace; disable or enable a person |
 
 On a workspace host, `/_poise/session` redeems a sign-in ticket and `/_poise/logout` signs out of the workspace and the apex together. Everything else is proxied to the owner's workspace. While it starts, navigations get a page that reloads every two seconds and other requests get `503` JSON.
 
-`GET /_gateway/tls-ask?domain=` answers Caddy's on-demand TLS question. It is served only on hosts that are neither the apex nor a workspace, so the public cannot use it to list handles.
+`GET /_gateway/tls-ask?domain=` answers Caddy's on-demand TLS question. It is served only to requests addressed to `gateway:<PORT>`, so the public cannot use it to list handles.
+
+## Security properties
+
+- A ticket redeems only in the browser it was minted for, through the `poise_bind` cookie the apex sets for the whole domain.
+- None of the gateway's cookies reaches a workspace, and a workspace cannot set cookies: `Set-Cookie` is dropped from every proxied answer.
+- A body on `GET`, `HEAD`, `OPTIONS`, `DELETE` or `TRACE` is refused with 400, and forwarded bodies are always framed, so nothing can be smuggled to a workspace as a second request.
+- A workspace answer the gateway cannot relay, such as a status outside 100–599, becomes a 502 for that request alone.
+- A device token stops working after 30 days without use or 365 days after pairing, and Poise Link pairs again.
+- A disabled person is cut off at once: every session ends, every device is revoked, sign-in is refused and the workspace stops. Organisation membership is verified at each sign-in, so disabling is how an admin cuts off an organisation member before then.
 
 ## State
 
 `POISE_GATEWAY_DATA` holds:
 
-- `gateway.db`: users, the allow list, sessions, tickets, OAuth states, device codes, devices and workspace records. Session ids, tickets, OAuth states, device codes and device tokens are stored as SHA-256 hashes only. GitHub tokens are never stored.
-- `identity-ed25519.pem`: the assertion signing key, generated on first start with mode `0600`. The gateway refuses to start if others can read it.
+- `gateway.db`: users, the allow list, sessions, tickets, OAuth states, device codes, devices and workspace records. Session ids, tickets, binding values, OAuth states, device codes and device tokens are stored as SHA-256 hashes only. GitHub tokens are never stored.
+- `identity-ed25519.pem`: the assertion signing key, generated on first start with mode `0600` and linked into place whole, so concurrent starts agree on one key. The gateway refuses to start if others can read it.
 
 A handle stays bound to the GitHub account id that first signed in with it, so a renamed-and-reused login cannot take over an existing workspace.
 

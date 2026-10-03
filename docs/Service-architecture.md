@@ -58,7 +58,8 @@ workspace can reach another one.
   `*.POISE_DOMAIN`. Caddy obtains a certificate for each workspace host on first
   use (on-demand TLS); it asks the gateway first
   (`GET http://gateway:8080/_gateway/tls-ask?domain=<host>`), and the gateway
-  answers 200 only for the apex and the handles of known users.
+  answers 200 only for the apex and the handles of known users. It answers this
+  only for requests addressed to `gateway:8080`, never on a public host.
 
 ## Sign-in and sessions
 
@@ -69,7 +70,10 @@ workspace can reach another one.
 - Access: a login may sign in when it is on the allow list (seeded from
   `POISE_ALLOWED_USERS`, editable by admins) or is a member of an organisation
   in `POISE_ALLOWED_ORGS`. Admins come from `POISE_ADMINS` and may always sign
-  in.
+  in. Organisation membership is verified at each sign-in.
+- An admin can disable anyone, however they got access. That takes effect at
+  once: sign-in is refused, every session ends, every paired device is revoked
+  and the workspace stops. Re-enabling lets the person sign in and pair again.
 - The apex session cookie is `poise_gw` (host-only, `Secure`, `HttpOnly`,
   `SameSite=Lax`, 14 days).
 - A workspace host gets its own host-only cookie, `poise_ws`, through a ticket:
@@ -78,6 +82,10 @@ workspace can reach another one.
   gateway checks it, sets `poise_ws` and redirects to `next` (a same-host path
   only). `poise_ws` has the same attributes as `poise_gw` and ends with the apex
   session it came from; signing out on either host ends both.
+- A ticket redeems only in the browser it was minted for. The apex sets
+  `poise_bind` (`Domain=<POISE_DOMAIN>`, `Secure`, `HttpOnly`, `SameSite=Lax`,
+  14 days), each ticket stores a hash of its value, and `/_poise/session`
+  refuses a ticket that arrives without the matching `poise_bind`.
 - A workspace host only ever serves its owner. A session for another person on
   that host is rejected with 403; admins get no implicit access.
 - Paths under `/_poise/` on workspace hosts belong to the gateway
@@ -123,8 +131,14 @@ client sent.
   - `admin`: the gateway itself; only `/api/service/*`.
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
   `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers. Its
-  own credentials stay with it: the `poise_ws` cookie and a device token's
-  `Authorization` header are not forwarded.
+  own credentials stay with it: none of its cookies (`poise_gw`, `poise_ws`,
+  `poise_bind`, `poise_oauth`) and no device token's `Authorization` header is
+  forwarded.
+- Workspaces cannot set cookies: the gateway drops every `Set-Cookie` from
+  their responses. An answer with a status outside 100–599 becomes a 502.
+- A request on a bodiless method (`GET`, `HEAD`, `OPTIONS`, `DELETE`, `TRACE`)
+  that carries a body is refused with 400, and every forwarded body is framed,
+  so nothing can ride along as a second request.
 - The gateway's own calls to `/api/service/*` carry an `admin` assertion and
   `Host: <handle>.<POISE_DOMAIN>`.
 
@@ -143,7 +157,9 @@ labels `poise.managed=true` and `poise.workspace=<handle>`; no published ports;
 `init` enabled; `no-new-privileges`; all capabilities dropped; memory, CPU and
 process limits from `POISE_WORKSPACE_MEMORY` (default `8g`),
 `POISE_WORKSPACE_CPUS` (default `4`) and `POISE_WORKSPACE_PIDS` (default `4096`);
-optional OCI runtime from `POISE_WORKSPACE_RUNTIME` (for example `runsc`).
+restart policy `unless-stopped`, so a server reboot brings workspaces back
+while one an admin stopped stays stopped; optional OCI runtime from
+`POISE_WORKSPACE_RUNTIME` (for example `runsc`).
 
 Environment the gateway passes:
 
@@ -198,12 +214,14 @@ otherwise offer it):
 
 **Service endpoints** (loopback, or the `admin` scope):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
-  runningCallerCalls, draining }`. It backs the container health check and the
-  gateway's readiness check.
+  runningCallerCalls, backgroundWork, idle, draining }`. `idle` is true only
+  when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
+  It backs the container health check and the gateway's readiness check.
 - `POST /api/service/drain` stops admitting new Chat turns and behavior
-  launches, then returns the same counters. The gateway polls health until
-  both counters are zero, or until `POISE_DRAIN_TIMEOUT` seconds (default
-  1800, 30 minutes) have passed, before it recreates a container.
+  launches, then returns the same fields. A drain lapses unless it is renewed:
+  while the gateway polls health it re-POSTs `/api/service/drain` at least
+  every 5 minutes. It recreates the container once `idle` is true or
+  `POISE_DRAIN_TIMEOUT` seconds (default 1800, 30 minutes) have passed.
 - `POST /api/service/resume` lifts a drain.
 
 ## Accounts, identities and the terminal
@@ -283,8 +301,11 @@ trigger/replace pairs, reporting any it skipped.
    `access_denied`, `expired_token` (after `expires_in`, 15 minutes) and
    `invalid_grant` (an unknown or already redeemed code).
 
+The approval page takes at most 10 code submissions per session in 15 minutes.
+
 Devices are listed and revoked at `/link/devices`. The gateway stores token
-hashes only.
+hashes only. A device token expires after 30 days without use and 365 days
+after pairing; Poise Link then pairs again.
 
 **Link API** (workspace, `link` scope, `Authorization: Bearer <access_token>`):
 - `GET /api/link/hello` returns `{ login, version }`.
