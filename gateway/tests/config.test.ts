@@ -90,17 +90,25 @@ describe('configuration', () => {
     }
   })
 
+  it('refuses a single-label POISE_DOMAIN, which poise_bind cannot span', () => {
+    for (const domain of ['localhost', 'test', 'intranet']) {
+      expect(problems({ ...BASE, POISE_DOMAIN: domain })).toEqual([
+        `POISE_DOMAIN must have at least two labels, such as poise.example.com or poise.localhost; got "${domain}"`,
+      ])
+    }
+  })
+
   it('refuses POISE_INSECURE_HTTP for a public domain', () => {
     expect(problems({ ...BASE, POISE_INSECURE_HTTP: '1' })).toEqual([
       expect.stringContaining('POISE_INSECURE_HTTP=1 sends session cookies over plain http and is refused for "poise.example.com"'),
     ])
   })
 
-  it('accepts POISE_INSECURE_HTTP only for localhost, *.localhost and *.test', () => {
-    for (const domain of ['localhost', 'poise.localhost', 'poise.test']) {
+  it('accepts POISE_INSECURE_HTTP only for *.localhost and *.test', () => {
+    for (const domain of ['poise.localhost', 'poise.test']) {
       expect(loadConfig({ ...BASE, POISE_DOMAIN: domain, POISE_INSECURE_HTTP: '1' }).insecureHttp).toBe(true)
     }
-    for (const domain of ['localhost.example.com', 'test', 'poise.testing']) {
+    for (const domain of ['localhost.example.com', 'poise.testing']) {
       expect(problems({ ...BASE, POISE_DOMAIN: domain, POISE_INSECURE_HTTP: '1' })).toHaveLength(1)
     }
     expect(problems({ ...BASE, POISE_DOMAIN: 'poise.test', POISE_INSECURE_HTTP: 'yes' })).toEqual([

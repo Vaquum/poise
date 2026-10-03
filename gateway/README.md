@@ -12,7 +12,7 @@ Everything comes from the environment and is validated at startup. Every problem
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `POISE_DOMAIN` | yes | | Apex host name, for example `poise.example.com` |
+| `POISE_DOMAIN` | yes | | Apex host name with at least two labels, for example `poise.example.com` or `poise.localhost` |
 | `POISE_GITHUB_CLIENT_ID` | yes | | GitHub OAuth App client ID |
 | `POISE_GITHUB_CLIENT_SECRET` | yes | | GitHub OAuth App client secret |
 | `POISE_ADMINS` | yes | | GitHub logins that may open `/admin`; admins may always sign in |
@@ -30,7 +30,7 @@ Everything comes from the environment and is validated at startup. Every problem
 | `PORT` | | `8080` | Listening port |
 | `POISE_GITHUB_URL` | | `https://github.com` | GitHub web origin; tests point it at a fake |
 | `POISE_GITHUB_API_URL` | | `https://api.github.com` | GitHub API origin; tests point it at a fake |
-| `POISE_INSECURE_HTTP` | | | `1` serves plain http for local and CI end-to-end runs; refused unless the domain is `localhost`, `*.localhost` or `*.test` |
+| `POISE_INSECURE_HTTP` | | | `1` serves plain http for local and CI end-to-end runs; refused unless the domain is `*.localhost` or `*.test` |
 
 The GitHub OAuth App's callback URL is `https://<POISE_DOMAIN>/auth/callback`.
 

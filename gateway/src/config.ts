@@ -48,7 +48,7 @@ export function isGitHubName(value: string): boolean {
 
 /** Names that never resolve on the public internet, the only ones plain-http mode may serve. */
 export function isLocalDomain(domain: string): boolean {
-  return domain === 'localhost' || domain.endsWith('.localhost') || domain.endsWith('.test')
+  return domain.endsWith('.localhost') || domain.endsWith('.test')
 }
 
 function isDomainName(value: string): boolean {
@@ -72,6 +72,10 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
   const domain = domainValue.toLowerCase()
   if (domainValue && !isDomainName(domain)) {
     problems.push(`POISE_DOMAIN must be a bare host name such as poise.example.com, without scheme, port or path; got "${domainValue}"`)
+  } else if (domainValue && !domain.includes('.')) {
+    // Browsers keep a Domain cookie on a single-label host to that host, so poise_bind would never
+    // reach the workspace hosts and no ticket could be redeemed.
+    problems.push(`POISE_DOMAIN must have at least two labels, such as poise.example.com or poise.localhost; got "${domainValue}"`)
   }
 
   let insecureHttp = false
@@ -80,7 +84,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     if (insecureValue !== '1') {
       problems.push(`POISE_INSECURE_HTTP must be 1 or unset; got "${insecureValue}"`)
     } else if (domain && !isLocalDomain(domain)) {
-      problems.push(`POISE_INSECURE_HTTP=1 sends session cookies over plain http and is refused for "${domain}"; it is only for localhost, *.localhost and *.test domains`)
+      problems.push(`POISE_INSECURE_HTTP=1 sends session cookies over plain http and is refused for "${domain}"; it is only for *.localhost and *.test domains`)
     } else {
       insecureHttp = true
     }

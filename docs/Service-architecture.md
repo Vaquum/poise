@@ -96,8 +96,9 @@ workspace can reach another one.
 - For local and CI end-to-end runs only, `POISE_INSECURE_HTTP=1` serves plain
   http: the cookies drop `Secure`, and every address the gateway builds,
   including `POISE_PUBLIC_ORIGIN` and `X-Forwarded-Proto`, uses `http`. The
-  gateway refuses it unless `POISE_DOMAIN` is `localhost`, `*.localhost` or
-  `*.test`.
+  gateway refuses it unless `POISE_DOMAIN` is `*.localhost` or `*.test`; a
+  single-label domain such as `localhost` is refused in any mode, because
+  `poise_bind` cannot span it.
 
 ## Gateway → workspace identity
 
