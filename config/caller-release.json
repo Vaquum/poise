@@ -1,9 +1,0 @@
-{
-  "repository": "mikkokotila/caller",
-  "ref": "main",
-  "packages": {
-    "agent-interface": "0.3.0",
-    "github-datastore": "0.2.0",
-    "github-interface": "0.2.0"
-  }
-}

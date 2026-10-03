@@ -8,7 +8,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server } from 'node:http'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
@@ -54,7 +54,8 @@ else process.stdout.write('[]')
   await writeFile(join(bin, 'agent-interface'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(join(bin, 'fake-caller.cjs'))} "$@"\n`)
   await chmod(join(bin, 'agent-interface'), 0o755)
 
-  for (const [key, value] of Object.entries({ ...serviceEnvironment(gateway), HOME: home, PATH: `${bin}${delimiter}${process.env.PATH}`, AGENT_INTERFACE_ROOT: join(root, 'agent') })) {
+  // Caller's CLIs run from CALLER_BIN_ROOT: here, the stand-in above.
+  for (const [key, value] of Object.entries({ ...serviceEnvironment(gateway), HOME: home, CALLER_BIN_ROOT: bin, AGENT_INTERFACE_ROOT: join(root, 'agent') })) {
     vi.stubEnv(key, value)
   }
   // Everything else defaults under ~/.poise, as it does in a workspace.

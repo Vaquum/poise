@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { basename } from 'node:path'
+import { basename, delimiter, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { CALLER_COMMANDS, callerBinRoot } from '../scripts/caller.mjs'
 
 export const DEFAULT_EXEC_TIMEOUT_MS = 30_000
 export const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -205,6 +206,22 @@ function commandName(command: string): string {
   return basename(command).replace(/\.(?:exe|cmd|bat|com)$/i, '').toLowerCase()
 }
 
+// Caller's CLIs run from the in-tree Caller (or the installation
+// CALLER_BIN_ROOT names), never from whatever copy PATH happens to find: a
+// bare name resolves to that directory, so a Caller that is not set up fails
+// naming it. Caller's own processes get the directory first on PATH, so the
+// CLIs Caller starts by name resolve there too.
+function resolveCommand(command: string): string {
+  return CALLER_COMMANDS.includes(command) ? join(callerBinRoot(), command) : command
+}
+
+function withCallerOnPath(env: NodeJS.ProcessEnv): void {
+  const bin = callerBinRoot()
+  const key = Object.keys(env).find((name) => name.toUpperCase() === 'PATH') ?? 'PATH'
+  const rest = (env[key] || '').split(delimiter).filter((entry) => entry && entry !== bin)
+  env[key] = [bin, ...rest].join(delimiter)
+}
+
 function isClaudeSubscriptionLogin(command: string, args: readonly string[]): boolean {
   const name = commandName(command)
   return (name === 'claude-subscription' || name === 'claude-subscription.mjs')
@@ -245,6 +262,7 @@ function childEnvironment(
       env[key] = value
     }
   }
+  if (CALLER_COMMANDS.includes(commandName(command))) withCallerOnPath(env)
   for (const [key, value] of Object.entries(overrides)) {
     // Avoid case-variant duplicates on Windows and make an explicit undefined
     // reliably remove an inherited variable on every platform.
@@ -331,7 +349,7 @@ export function runFile(
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn(command, [...args], {
+    const child = spawn(resolveCommand(command), [...args], {
       cwd: options.cwd,
       env: childEnvironment(command, options.env, args),
       detached: process.platform !== 'win32',
@@ -473,7 +491,7 @@ export function spawnDetached(
   return new Promise((resolve, reject) => {
     let launched = false
     let exitReported = false
-    const child = spawn(command, [...args], {
+    const child = spawn(resolveCommand(command), [...args], {
       cwd: options.cwd,
       env: childEnvironment(command, options.env),
       detached: true,

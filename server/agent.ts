@@ -10,9 +10,8 @@ import { prepareModelClis } from './provider-clis'
 // the agent-interface project owns.
 
 import { parseProgress, type ModelProgress } from '../src/agent-progress'
-import { join } from 'node:path'
-import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
+import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { getHeadSha, getReviewAgentUsername, localCheckoutPath } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
@@ -25,10 +24,9 @@ const CLI = 'agent-interface'
 // (`data/responses/<id>.txt`) and `--read-response` reads them without
 // resolving against the project root — so the CLI must be invoked with
 // cwd at the agent-interface project root for those entries to work.
-// Override via env if your install lives elsewhere.
+// That is caller/agent_interface unless AGENT_INTERFACE_ROOT names another.
 function agentCwd(): string {
-  return process.env.AGENT_INTERFACE_ROOT
-    || join(homedir(), 'dev', 'caller', 'agent_interface')
+  return agentInterfaceRoot()
 }
 
 export interface LogEntry {

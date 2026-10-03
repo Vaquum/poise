@@ -23,7 +23,6 @@ function record(overrides = {}) {
     error: null,
     failingSince: null,
     poise: { deployed: A, installed: A, remote: A, behind: 0 },
-    caller: B,
     ...overrides,
   }
 }

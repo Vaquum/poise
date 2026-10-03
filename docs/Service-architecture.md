@@ -182,7 +182,8 @@ computer.
 - Chat workspaces in `~/.poise/chat` (`POISE_CHAT_ROOT`).
 - Snippets in `~/.poise/snippets/poise.yml`.
 - Caller's data in `~/.poise/agent-interface` (`AGENT_INTERFACE_DATA_DIR`).
-- Caller itself runs from the image (`AGENT_INTERFACE_ROOT`).
+- Caller itself runs from the image: its CLIs from `CALLER_BIN_ROOT`,
+  `agent-interface` in `AGENT_INTERFACE_ROOT`.
 
 **Scheduling.** The daily model-catalogue refresh runs inside Poise at 07:00
 in the owner's configured timezone (UTC, logged, when none is set), replacing
