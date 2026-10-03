@@ -37,6 +37,7 @@ describe('configuration', () => {
       workspaceNanoCpus: 4_000_000_000,
       workspacePids: 4096,
       workspaceRuntime: null,
+      workspaceSkipCliBootstrap: false,
       drainTimeoutSeconds: 1800,
       dataDir: '/data',
       dockerSocket: '/var/run/docker.sock',
@@ -56,6 +57,7 @@ describe('configuration', () => {
       POISE_WORKSPACE_CPUS: '1.5',
       POISE_WORKSPACE_PIDS: '100',
       POISE_WORKSPACE_RUNTIME: 'runsc',
+      POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP: '1',
       POISE_DRAIN_TIMEOUT: '60',
       POISE_GATEWAY_DATA: '/srv/gateway',
       POISE_DOCKER_SOCKET: '/run/docker.sock',
@@ -70,6 +72,7 @@ describe('configuration', () => {
       workspaceNanoCpus: 1_500_000_000,
       workspacePids: 100,
       workspaceRuntime: 'runsc',
+      workspaceSkipCliBootstrap: true,
       drainTimeoutSeconds: 60,
       dataDir: '/srv/gateway',
       dockerSocket: '/run/docker.sock',
@@ -114,6 +117,14 @@ describe('configuration', () => {
     expect(problems({ ...BASE, POISE_DOMAIN: 'poise.test', POISE_INSECURE_HTTP: 'yes' })).toEqual([
       'POISE_INSECURE_HTTP must be 1 or unset; got "yes"',
     ])
+  })
+
+  it('accepts POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP only as 1', () => {
+    for (const value of ['0', 'yes', 'true']) {
+      expect(problems({ ...BASE, POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP: value })).toEqual([
+        `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP must be 1 or unset; got "${value}"`,
+      ])
+    }
   })
 
   it('refuses reserved handles as allowed users or admins', () => {

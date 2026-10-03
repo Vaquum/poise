@@ -130,6 +130,24 @@ describe('lazy start', () => {
     })
   })
 
+  it('tells workspaces to skip the CLI bootstrap only when POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP=1', async () => {
+    const cookie = await start({ env: { POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP: '1' } })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    const create = h.docker.calls.find((call) => call.path.startsWith('/containers/create'))
+    expect((create?.body as { Env: string[] }).Env).toEqual([
+      'POISE_MODE=service',
+      'POISE_WORKSPACE_HANDLE=alice',
+      'POISE_WORKSPACE_OWNER=Alice',
+      `POISE_PUBLIC_ORIGIN=https://${ALICE}`,
+      `POISE_GATEWAY_PUBLIC_KEY=${h.keys.publicKeyBase64}`,
+      'POISE_HOST=0.0.0.0',
+      'POISE_PORT=5555',
+      'HOME=/home/poise',
+      'POISE_SKIP_CLI_BOOTSTRAP=1',
+    ])
+  })
+
   it('leaves out the OCI runtime unless one is configured', async () => {
     const cookie = await start()
     await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })

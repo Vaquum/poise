@@ -14,6 +14,16 @@ and local state out of the context:
 docker build --file deploy/runtime/Dockerfile --tag poise-runtime .
 ```
 
+The context has no `.git`, so the image cannot tell which commit it was built
+from: `/api/service/health` reports `version: null`. The build argument
+`POISE_SOURCE_SHA` declares the commit; `deploy/install.sh` and
+`deploy/upgrade.sh` pass it whenever the checkout is clean:
+
+```bash
+docker build --file deploy/runtime/Dockerfile --tag poise-runtime \
+  --build-arg POISE_SOURCE_SHA="$(git rev-parse HEAD)" .
+```
+
 ## Contents
 
 - Node 22 and Poise in `/opt/poise`: the built `dist/`, the production

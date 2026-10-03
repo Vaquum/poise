@@ -1,0 +1,28 @@
+# For deploy/ci/e2e.sh only, on top of deploy/compose.yaml (paths are
+# relative to deploy/): Caddy on plain http, and a fake GitHub that shares
+# the gateway's network namespace, so the gateway reaches it on 127.0.0.1,
+# the only plain-http address POISE_GITHUB_URL accepts.
+services:
+  caddy:
+    volumes:
+      - ./ci/Caddyfile:/etc/caddy/Caddyfile:ro
+
+  gateway:
+    ports:
+      # The fake GitHub's sign-in page, for the test's browser.
+      - "127.0.0.1:9999:9999"
+
+  github:
+    image: node:22-bookworm-slim
+    network_mode: service:gateway
+    depends_on:
+      - gateway
+    volumes:
+      - ./ci/fake-github.mjs:/fake-github.mjs:ro
+    environment:
+      FAKE_GITHUB_PORT: "9999"
+      FAKE_GITHUB_CLIENT_ID: ${POISE_GITHUB_CLIENT_ID}
+      FAKE_GITHUB_CLIENT_SECRET: ${POISE_GITHUB_CLIENT_SECRET}
+      FAKE_GITHUB_CALLBACK: http://${POISE_DOMAIN}/auth/callback
+      FAKE_GITHUB_USERS: alice:1001,bob:1002
+    command: ["node", "/fake-github.mjs"]
