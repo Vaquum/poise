@@ -1,5 +1,5 @@
-import { createPublicKey, verify } from 'node:crypto'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { createPublicKey, generateKeyPairSync, verify } from 'node:crypto'
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -71,6 +71,17 @@ describe('identity assertions', () => {
     const second = loadOrCreateKeys(dir, log)
     expect(readFileSync(path, 'utf8')).toBe(pem)
     expect(second.publicKeyBase64).toBe(first.publicKeyBase64)
+  })
+
+  it('keeps a key another start published first and leaves no temporary files behind', () => {
+    const { privateKey } = generateKeyPairSync('ed25519')
+    const pem = privateKey.export({ type: 'pkcs8', format: 'pem' })
+    writeFileSync(join(dir, PRIVATE_KEY_FILE), pem, { mode: 0o600 })
+    const logs: string[] = []
+    loadOrCreateKeys(dir, createLogger((line) => logs.push(line)))
+    expect(readFileSync(join(dir, PRIVATE_KEY_FILE), 'utf8')).toBe(pem)
+    expect(readdirSync(dir)).toEqual([PRIVATE_KEY_FILE])
+    expect(logs.join('\n')).not.toContain('identity.key.created')
   })
 
   it('refuses a private key file that others can read', () => {
