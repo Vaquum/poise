@@ -9,7 +9,7 @@ import { BUILD_SHA } from '../build-identity'
 import type { ChatRuntime } from '../chat/runtime'
 import { listOpenTurns } from '../chat/storage'
 import { HttpError, type RequestAuthority } from '../http'
-import { pauseReleaseBackground, resumeReleaseBackground } from '../release-background'
+import { pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
 import { runningCallerCalls } from './caller-calls'
 
 export interface ServiceHealth {
@@ -19,6 +19,9 @@ export interface ServiceHealth {
   version: string | null
   activeChatTurns: number
   runningCallerCalls: number
+  backgroundWork: number
+  /** True only when nothing a restart would cut is running. */
+  idle: boolean
   draining: boolean
 }
 
@@ -26,11 +29,12 @@ export interface ServiceHealth {
  *  does for a release. */
 export const DRAINING_ERROR = 'Poise is installing an update; try again after it restarts'
 
-// Browser routes that start a Caller call.
-const LAUNCH_ROUTES = new Set(['/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/chat'])
+// Browser routes that start a Caller call or the model check.
+const LAUNCH_ROUTES = new Set(['/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/chat', '/api/models/refresh'])
 
 export class ServiceControl {
   private drainOn = false
+  private launches = 0
 
   constructor(private readonly runtime: ChatRuntime) {}
 
@@ -39,14 +43,23 @@ export class ServiceControl {
   }
 
   /** `activeChatTurns` are the Chat turns recorded open: reserved before
-   *  their first write, closed once their outcome is recorded. */
+   *  their first write, closed once their outcome is recorded.
+   *  `backgroundWork` is everything else a restart would cut: the Chat
+   *  runtime's startups, operations and agent processes, process-owned
+   *  background work (behavior ticks, CLI updates, the model check), and
+   *  browser launches admitted and still in their handler. */
   health(): ServiceHealth {
+    const activeChatTurns = listOpenTurns(this.runtime.instance).length
+    const calls = runningCallerCalls()
+    const backgroundWork = this.runtime.busy() + releaseBackgroundBusy() + this.launches
     return {
       ok: true,
       mode: 'service',
       version: BUILD_SHA,
-      activeChatTurns: listOpenTurns(this.runtime.instance).length,
-      runningCallerCalls: runningCallerCalls(),
+      activeChatTurns,
+      runningCallerCalls: calls,
+      backgroundWork,
+      idle: activeChatTurns + calls + backgroundWork === 0,
       draining: this.drainOn,
     }
   }
@@ -64,9 +77,20 @@ export class ServiceControl {
     return this.health()
   }
 
-  /** A launch from the browser that a drain refuses. */
-  refusesLaunch(method: string | undefined, path: string): boolean {
-    return this.drainOn && method === 'POST' && LAUNCH_ROUTES.has(path)
+  /** The gate for a browser launch: null when the request is not one,
+   *  'draining' when it is refused, otherwise the release to call once its
+   *  handler has finished. Checking and counting happen in one step, so no
+   *  drain can fall between them. */
+  admitLaunch(method: string | undefined, path: string): (() => void) | 'draining' | null {
+    if (method !== 'POST' || !LAUNCH_ROUTES.has(path)) return null
+    if (this.drainOn) return 'draining'
+    this.launches += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.launches -= 1
+    }
   }
 
   /** On runtime stop: a paused background must not outlive this server. */
@@ -88,7 +112,7 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 }
 
 /** /api/service/*: from loopback (the container's own health check) or with
- *  the gateway's admin scope; a browser assertion does not reach them. */
+ *  the gateway's admin scope; a browser or Poise Link assertion is refused. */
 export function handleServiceApi(req: IncomingMessage, res: ServerResponse, path: string, authority: RequestAuthority, control: ServiceControl): void {
   if (authority.kind === 'gateway' && authority.scope !== 'admin') {
     throw new HttpError(403, 'service endpoints answer loopback and the gateway\'s admin scope only')

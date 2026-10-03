@@ -173,16 +173,20 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         const path = url.split('?')[0]
         const mutating = req.method !== 'GET' && req.method !== 'HEAD'
         const release = selfUpdate && mutating && !isSelfUpdateControlRoute(path) ? selfUpdate.beginApiWrite() : null
+        // Releases due once the handler has finished: a service-mode launch
+        // counts as work from its drain check until then.
+        const finished: Array<() => void> = []
         try {
-          return await handleApi(req, res, next, url, path, mutating)
+          return await handleApi(req, res, next, url, path, mutating, finished)
         } catch (error) {
           return json(res, httpStatus(error, 400), { error: (error as Error).message })
         } finally {
           release?.()
+          for (const done of finished) done()
         }
       }
 
-      async function handleApi(req: Parameters<Connect.NextHandleFunction>[0], res: ServerResponse, next: Connect.NextFunction, url: string, path: string, mutating: boolean): Promise<void> {
+      async function handleApi(req: Parameters<Connect.NextHandleFunction>[0], res: ServerResponse, next: Connect.NextFunction, url: string, path: string, mutating: boolean, finished: Array<() => void>): Promise<void> {
         setApiHeaders(res)
         const selectedOrg = new URLSearchParams(url.split('?')[1] || '').get('org') || undefined
         let authority: RequestAuthority
@@ -203,7 +207,9 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           if (path === '/api/self-update' || path.startsWith('/api/self-update/')) {
             return handleSelfUpdateTurnedOff(req, res, path, SELF_UPDATE_OFF, SERVICE_MODE_CODE)
           }
-          if (serviceControl.refusesLaunch(req.method, path)) return json(res, 503, { error: DRAINING_ERROR, code: 'draining' })
+          const launch = serviceControl.admitLaunch(req.method, path)
+          if (launch === 'draining') return json(res, 503, { error: DRAINING_ERROR, code: 'draining' })
+          if (launch) finished.push(launch)
         }
 
         // ── Self-update: the controller's private endpoints and the public

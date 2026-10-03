@@ -35,13 +35,18 @@ beforeAll(async () => {
   await Promise.all([home, bin, join(root, 'agent'), join(staticDir, 'assets')].map((dir) => mkdir(dir, { recursive: true })))
   await writeFile(join(staticDir, 'index.html'), '<!doctype html><title>Poise workspace</title>')
   await writeFile(join(staticDir, 'assets', 'app.js'), 'export {}')
-  // A stand-in Caller: records how it was started, answers --models, and holds
-  // a call open until its release file exists.
+  // A stand-in Caller: records how it was started, answers --models (held
+  // while a hold file exists, unreadable while a fail file does), and holds a
+  // call open until its release file exists.
   await writeFile(join(bin, 'fake-caller.cjs'), `
 const fs = require('node:fs')
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callerLog)}, JSON.stringify({ args, dataDir: process.env.AGENT_INTERFACE_DATA_DIR ?? null }) + '\\n')
-if (args[0] === '--models') process.stdout.write(${JSON.stringify(JSON.stringify(CATALOG))})
+const models = () => process.stdout.write(fs.existsSync(${JSON.stringify(join(root, 'fail-models'))}) ? 'not a catalogue' : ${JSON.stringify(JSON.stringify(CATALOG))})
+if (args[0] === '--models') {
+  if (!fs.existsSync(${JSON.stringify(join(root, 'hold-models'))})) models()
+  else { const timer = setInterval(() => { if (!fs.existsSync(${JSON.stringify(join(root, 'hold-models'))})) { clearInterval(timer); models() } }, 20) }
+}
 else if (args[0] === '--wait') { const timer = setInterval(() => { if (fs.existsSync(args[1])) clearInterval(timer) }, 20) }
 else process.stdout.write('[]')
 `)
@@ -180,7 +185,9 @@ describe('Poise in service mode', () => {
   it('answers the container health check and the gateway\'s admin scope only', async () => {
     const health = await send('GET', '/api/service/health')
     expect(health.status).toBe(200)
-    expect(health.json).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 0, runningCallerCalls: 0, draining: false })
+    // Background passes (the /content finalizer every two seconds) can count for a moment.
+    expect(health.json).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: expect.any(Number), idle: expect.any(Boolean), draining: false })
+    expect(health.json.idle).toBe(health.json.backgroundWork === 0)
     expect(await send('GET', '/api/service/health', fromGateway('admin'))).toMatchObject({ status: 200, json: { mode: 'service' } })
     expect((await send('GET', '/api/service/health', fromGateway('browser'))).status).toBe(403)
     expect((await send('GET', '/api/service/health', fromGateway('link'))).status).toBe(403)
@@ -221,6 +228,7 @@ describe('Poise in service mode', () => {
       ['/api/chat-content', { topic: 'Release notes', session: 'chat-1' }],
       ['/api/debate', { topic: 'Ship it?' }],
       ['/api/chat', { session: 'card-1', message: 'hello' }],
+      ['/api/models/refresh', {}],
     ] as const) {
       expect(await send('POST', path, fromGateway(), body), path).toMatchObject({ status: 503, json: { error: 'Poise is installing an update; try again after it restarts', code: 'draining' } })
     }
@@ -233,6 +241,30 @@ describe('Poise in service mode', () => {
     const after = await send('POST', '/api/pr-review', fromGateway(), { url: 'not a pull request' })
     expect(after.status).not.toBe(503)
     expect(after.json.error).toContain('not a github PR url')
+  })
+
+  it('counts a launch admitted before the drain until its handler finishes', async () => {
+    const hold = join(root, 'hold-models')
+    const fail = join(root, 'fail-models')
+    await writeFile(hold, '')
+    await writeFile(fail, '')
+    ;(await import('../server/models')).invalidateCatalog()
+    const before = (await callerCalls()).length
+    const launch = send('POST', '/api/pr-review', fromGateway(), { url: 'https://github.com/acme/app/pull/1' })
+    try {
+      // Past the drain check, waiting on Caller's catalogue: nothing is spawned yet.
+      await vi.waitFor(async () => expect((await callerCalls()).slice(before).some((call) => call.args[0] === '--models')).toBe(true), { timeout: 5_000, interval: 20 })
+      const drained = await send('POST', '/api/service/drain', fromGateway('admin'))
+      expect(drained.json).toMatchObject({ draining: true, runningCallerCalls: 0, idle: false })
+      expect(drained.json.backgroundWork).toBeGreaterThanOrEqual(1)
+      expect(await send('GET', '/api/service/health')).toMatchObject({ json: { idle: false } })
+    } finally {
+      await rm(hold, { force: true })
+    }
+    expect((await launch).json.error).toBe('pr-review trigger failed: Update Caller: the model catalog is unavailable')
+    await rm(fail, { force: true })
+    await vi.waitFor(async () => expect((await send('GET', '/api/service/health')).json).toMatchObject({ backgroundWork: 0, idle: true, draining: true }), { timeout: 5_000, interval: 50 })
+    expect(await send('POST', '/api/service/resume', fromGateway('admin'))).toMatchObject({ status: 200, json: { draining: false } })
   })
 
   it('counts the Caller calls it launched until they finish', async () => {

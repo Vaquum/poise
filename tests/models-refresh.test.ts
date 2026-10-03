@@ -28,3 +28,19 @@ it('a failed process clears the pending check so retry can run', async () => {
   mocks.run.mockResolvedValueOnce({ stdout: JSON.stringify({ families: { claude: { status: 'ok' } } }) })
   await expect(refreshModelCatalog()).resolves.toHaveProperty('families'); expect(mocks.run).toHaveBeenCalledTimes(2)
 })
+it('starts no check while a drain pauses background work, but keeps one already running', async () => {
+  const background = await import('../server/release-background')
+  let finish!: (result: { stdout: string }) => void
+  mocks.run.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+  const running = refreshModelCatalog()
+  background.pauseReleaseBackground()
+  try {
+    expect(refreshModelCatalog()).toBe(running)
+    finish({ stdout: JSON.stringify({ families: { claude: { status: 'ok' } } }) })
+    await running
+    await expect(refreshModelCatalog()).rejects.toMatchObject({ statusCode: 503, message: 'Poise is installing an update; the model check has not started.' })
+    expect(mocks.run).toHaveBeenCalledTimes(1)
+  } finally {
+    background.resumeReleaseBackground()
+  }
+})
