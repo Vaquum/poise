@@ -4,7 +4,9 @@ import type { ServerResponse } from 'node:http'
 import { getModelSettings, getSettings, setSettings } from './settings'
 import { MODEL_PLACES, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
 import { refreshModelCatalog } from './models-refresh'
-import { claudeAuth, type ClaudeAuthSnapshot } from './claude-auth'
+import { claudeAuth, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
+import { claudeAuthStatusChanged } from './alerts/producers'
+import { pruneAlerts } from './alerts/store'
 import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
@@ -92,16 +94,20 @@ export interface ClaudeAuthRuntime {
   stop(): Promise<void>
   snapshot(): ClaudeAuthSnapshot
   startLogin(): ClaudeAuthSnapshot
+  /** Calls `listener` with each new status; returns the unsubscribe. */
+  onStatus(listener: (status: ClaudeAuthStatus) => void): () => void
 }
 
-const activeClaudeAuthRuntimes = new Set<ClaudeAuthRuntime>()
+// Each running auth monitor, with the unsubscribe of the alert it raises.
+const activeClaudeAuthRuntimes = new Map<ClaudeAuthRuntime, () => void>()
 
 export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   const service = serviceOf(opts)
   if (service) applyServiceEnvironment()
   const auth = opts.claudeAuth ?? claudeAuth
-  activeClaudeAuthRuntimes.add(auth)
+  if (!activeClaudeAuthRuntimes.has(auth)) activeClaudeAuthRuntimes.set(auth, auth.onStatus(claudeAuthStatusChanged))
   auth.start()
+  pruneAlerts()
   setReviewAgentUsername(opts.reviewAgentUsername || '')
   startOrganizationsRuntime()
   startBehaviorsRuntime({ reviewAgentUsername: opts.reviewAgentUsername })
@@ -143,7 +149,10 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
 }
 
 export async function stopPoiseRuntime(): Promise<void> {
-  const authStops = [...activeClaudeAuthRuntimes].map((auth) => auth.stop())
+  const authStops = [...activeClaudeAuthRuntimes].map(([auth, unwatch]) => {
+    unwatch()
+    return auth.stop()
+  })
   activeClaudeAuthRuntimes.clear()
   const chatStop = chatRuntime?.stop() ?? Promise.resolve()
   const socketStop = chatSockets?.close() ?? Promise.resolve()

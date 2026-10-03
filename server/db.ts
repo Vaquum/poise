@@ -1,15 +1,16 @@
 import Database from 'better-sqlite3'
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync, existsSync } from 'node:fs'
 import { homedir } from 'os'
 import { join, dirname } from 'path'
 
-// Poise's local SQLite holds five things only:
+// Poise's local SQLite holds:
 //   meta          — small key-value store for org / me / timezone settings
 //   current_cards  — the manual Idea / Concept / Plan kanban cards
 //   behavior_seen  — atomic automation dedupe claims
 //   content_jobs   — durable /content finalization state and worker leases
 //   content_launches — pre-spawn /content intent and call correlation
+//   alerts         — what Poise Link shows as desktop notifications (server/alerts)
 //
 // Everything else (issues, PRs, reviews, files) lives in the user's external
 // /github service. Older Poise versions kept a full mirror of GitHub data
@@ -135,6 +136,20 @@ db.exec(`
     error TEXT,
     updated_at TEXT NOT NULL
   );
+
+  -- Alerts for Poise Link (server/alerts). AUTOINCREMENT never hands out an
+  -- id again after pruning, so a device's resume point stays meaningful.
+  -- One alert per condition while it is unresolved: see the unique index below.
+  CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    url TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    resolved_at TEXT
+  );
 `)
 
 // One-time migrations: the kanban table has been renamed twice.
@@ -184,6 +199,7 @@ function ensureColumn(table: string, column: string, ddl: string): boolean {
 export const CONTENT_LAUNCH_RECOVERY_WATERMARK_KEY = 'content_launch_recovery_watermark_v1'
 export const CONTENT_LEGACY_MAPPING_KEY = 'content_legacy_short_slug_mapping_v1'
 export const CONTENT_LAUNCH_REGISTRATION_TIMEOUT_MS = 2 * 60 * 1_000
+export const ALERT_ID_EPOCH_KEY = 'alert_id_epoch_v1'
 const BEHAVIOR_LAUNCH_TRACKING_MIGRATION_KEY = 'behavior_launch_tracking_v1'
 
 // Serialize the read-before-write migration checks across server processes.
@@ -295,6 +311,10 @@ const migrateSchema = db.transaction(() => {
       WHERE claim_id <> '' AND launch_requested_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_created
       ON behavior_dead_letters(created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_one_unresolved
+      ON alerts(dedupe_key) WHERE resolved_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_alerts_created
+      ON alerts(created_at);
   `)
   // Recovery may inspect agent-interface logs, but it must never claim calls
   // predating the feature installation. The first migration timestamp is a
@@ -302,6 +322,13 @@ const migrateSchema = db.transaction(() => {
   db.prepare('INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)').run(
     CONTENT_LAUNCH_RECOVERY_WATERMARK_KEY,
     new Date().toISOString(),
+  )
+  // Alert ids carry this database's own prefix. A device remembers the ids it
+  // has shown; were this database ever replaced, its new alerts must not reuse
+  // those ids and be taken for alerts already shown.
+  db.prepare('INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)').run(
+    ALERT_ID_EPOCH_KEY,
+    randomBytes(6).toString('hex'),
   )
   // Old releases persisted a classic GitHub PAT in plaintext. It is no
   // longer read, and retaining it would keep an unnecessary credential on

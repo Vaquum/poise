@@ -131,6 +131,11 @@ async function waitFor(check: () => boolean, ms = 8_000): Promise<void> {
 
 const ofType = (events: ChatEnvelope[], id: string, type: ChatEvent['type']) => events.filter((e) => e.sessionId === id && e.event.type === type).map((e) => e.event as any)
 const lastStatus = (events: ChatEnvelope[], id: string) => ofType(events, id, 'status.changed').at(-1)?.status
+async function alertRows(kind: string, key: string): Promise<Array<Record<string, unknown>>> {
+  const { db } = await import('../../server/db')
+  return db.prepare('SELECT kind, title, body, dedupe_key AS key, resolved_at AS resolved FROM alerts WHERE kind = ? AND dedupe_key = ? ORDER BY id').all(kind, key) as Array<Record<string, unknown>>
+}
+let waitingAlerts: (sessionId: string) => Array<Record<string, unknown>> = () => []
 
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-chat-runtime-'))
@@ -148,6 +153,8 @@ beforeAll(async () => {
   runtimeModule = await import('../../server/chat/runtime')
   storage = await import('../../server/chat/storage')
   worker = await import('../../server/chat/worker')
+  const { db } = await import('../../server/db')
+  waitingAlerts = (sessionId) => db.prepare('SELECT resolved_at AS resolved FROM alerts WHERE dedupe_key = ? ORDER BY id').all(`chat-waiting:${sessionId}`) as Array<Record<string, unknown>>
 })
 
 afterAll(async () => {
@@ -250,6 +257,72 @@ describe('chat runtime', () => {
     await runtime.stop()
   }, 40_000)
 
+  it('alerts while an agent waits for a permission or an answer, once per wait', async () => {
+    ensureBranch('chat/alpha')
+    const { runtime, controls, events } = makeRuntime()
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', safeMode: true, repo: 'acme/repo', branch: { existing: 'chat/alpha' } })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    controls.adapters[0].auto = false
+    await runtime.prompt(session.id, { text: 'needs a decision', attachments: [], mentions: [] })
+    await waitFor(() => lastStatus(events, session.id) === 'running')
+    const host = controls.hosts[0]
+    const options = [{ id: 'once', name: 'Yes', kind: 'allow_once' as const }, { id: 'no', name: 'No', kind: 'reject_once' as const }]
+    const first = host.requestPermission({ title: 'Execute `rm -f x`', input: { command: 'rm -f x' }, options })
+    const second = host.requestPermission({ title: 'Execute `rm -f y`', input: { command: 'rm -f y' }, options })
+    await waitFor(() => ofType(events, session.id, 'permission.requested').length === 2)
+    const key = `chat-waiting:${session.id}`
+    expect(await alertRows('chat_waiting', key)).toEqual([{
+      kind: 'chat_waiting', key, resolved: null,
+      title: 'Grok Build is waiting for you', body: 'In “needs a decision”: allow or deny Execute `rm -f x`.',
+    }])
+    const [a, b] = ofType(events, session.id, 'permission.requested')
+    runtime.respondPermission(session.id, a.id, 'once')
+    await first
+    expect(await alertRows('chat_waiting', key)).toEqual([expect.objectContaining({ resolved: null })])
+    runtime.respondPermission(session.id, b.id, 'once')
+    await second
+    expect(await alertRows('chat_waiting', key)).toEqual([expect.objectContaining({ resolved: expect.any(String) })])
+
+    const question = host.askQuestion({ questions: [{ id: '0', question: 'Which branch?', options: [{ label: 'A' }, { label: 'B' }], multiSelect: false, freeText: false }] })
+    question.catch(() => undefined)
+    await waitFor(() => ofType(events, session.id, 'question.asked').length === 1)
+    expect((await alertRows('chat_waiting', key)).at(-1)).toEqual(expect.objectContaining({ body: 'In “needs a decision”: Which branch?', resolved: null }))
+    await runtime.cancel(session.id)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect((await alertRows('chat_waiting', key)).map((row) => row.resolved === null)).toEqual([false, false])
+    await runtime.stop()
+  }, 40_000)
+
+  it('alerts when a turn that ran longer than two minutes finishes', async () => {
+    ensureBranch('chat/alpha')
+    const { runtime, controls, events } = makeRuntime()
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'chat/alpha' } })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const quick = await runtime.prompt(session.id, { text: 'a quick one', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    expect(await alertRows('chat_turn_finished', `chat-turn-finished:${quick.turnId}`)).toEqual([])
+
+    controls.adapters[0].auto = false
+    // The turn is reserved, and its start taken, synchronously in prompt():
+    // started three minutes ago as far as the runtime knows.
+    const realNow = Date.now.bind(Date)
+    const earlier = vi.spyOn(Date, 'now').mockImplementation(() => realNow() - 3 * 60_000)
+    let long: { turnId: string }
+    try {
+      long = runtime.prompt(session.id, { text: 'a long one', attachments: [], mentions: [] })
+    } finally {
+      earlier.mockRestore()
+    }
+    await waitFor(() => controls.adapters[0].inputs.length === 2)
+    controls.adapters[0].finish()
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    expect(await alertRows('chat_turn_finished', `chat-turn-finished:${long.turnId}`)).toEqual([{
+      kind: 'chat_turn_finished', key: `chat-turn-finished:${long.turnId}`, resolved: null,
+      title: 'Grok Build finished', body: '“a quick one” is done after 3 minutes.',
+    }])
+    await runtime.stop()
+  }, 40_000)
+
   it('serializes turns on one checkout, checkpoints the outgoing session, and refuses unowned dirty state', async () => {
     ensureBranch('chat/alpha')
     const { runtime, controls, events } = makeRuntime()
@@ -343,12 +416,15 @@ describe('chat runtime', () => {
     const host = crashed.controls.hosts[0]
     void host.requestPermission({ title: 'Execute `x`', options: [{ id: 'y', name: 'y', kind: 'allow_once' }, { id: 'n', name: 'n', kind: 'reject_once' }] }).catch(() => undefined)
     await waitFor(() => ofType(crashed.events, session.id, 'permission.requested').length === 1)
+    expect(waitingAlerts(session.id)).toEqual([expect.objectContaining({ resolved: null })])
     // "Crash": a new runtime for the same instance with no shutdown in between.
     crashed.runtime.removeAllListeners('event')
     const revived = makeRuntime({ instance: 'poise-crash:db', caller })
     await revived.runtime.recover()
     const record = revived.runtime.get(session.id)!
     expect(record.status).toBe('interrupted')
+    // No request outlives the process that asked it; neither does its alert.
+    expect(waitingAlerts(session.id)).toEqual([expect.objectContaining({ resolved: expect.any(String) })])
     expect(record.interruptedTurnId).toBeTruthy()
     const { events } = revived.runtime.events(session.id, 0)
     const finished = events.filter((e) => e.event.type === 'turn.finished').map((e) => e.event as any)
