@@ -302,7 +302,7 @@ version, whether it is signed in and as whom.
     signed in. Each clears once signed in again; Claude's alert stays its
     auth monitor's. In service mode Poise also reads the accounts every 15
     minutes, so the alerts come while the browser is closed. They open
-    `/?settings=accounts`, Settings → Connected accounts.
+    `/?settings=accounts`, Settings → Accounts.
 - Connect opens a terminal in the browser, inside the workspace, running that
   CLI's own login (`login.label`):
 

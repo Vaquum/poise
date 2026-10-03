@@ -187,9 +187,11 @@ container and the volume: `docker rm poise-ws-<handle>` and
    first start takes about a minute, behind a page that reloads by itself,
    and the provider CLIs install in the background over the next few
    minutes.
-2. In **Settings → Connected accounts**, sign in each agent CLI you use
-   (Claude, Codex, Grok, Muse, Antigravity) and `gh`. Sign `gh` in twice: as
-   your own GitHub account and as your agent account.
+2. In **Settings → Accounts**, under **Connected accounts**, choose
+   **Connect** for each agent CLI you use (Claude, Codex, Grok, Muse,
+   Antigravity) and for **GitHub**. Each opens a terminal in the panel running
+   that CLI's own login. Connect GitHub twice: sign in once as your own GitHub
+   account and once as your agent account.
 3. In **Settings → General → GitHub**, set **Your GitHub account** and
    **Agent account**. Both must be signed in to `gh` in the workspace. Poise
    acts on GitHub only as these two accounts, and every automation that posts
