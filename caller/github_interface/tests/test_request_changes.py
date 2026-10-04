@@ -130,8 +130,8 @@ class TestRequestChanges(IsolatedAsyncioTestCase):
         self.assertTrue(result["reaffirmed"])
         self.assertEqual(result["comments"], 0)
 
-    async def test_resolved_or_outdated_findings_are_not_reaffirmed(self) -> None:
-        for resolved, outdated in ((True, False), (False, True), (True, True)):
+    async def test_resolved_findings_are_not_reaffirmed(self) -> None:
+        for resolved, outdated in ((True, False), (True, True)):
             with self.subTest(resolved=resolved, outdated=outdated):
                 fake = FakeClient([COMMENT], review(), [thread(resolved=resolved, outdated=outdated)])
 

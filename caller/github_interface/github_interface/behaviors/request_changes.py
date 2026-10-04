@@ -35,7 +35,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     rest_comments = await list_inline_comments(client, owner, repo, pull_number)
     threads = await list_review_threads(client, owner, repo, pull_number)
     accepted, skipped = accepted_inline_comments(comments, rest_comments, threads)
-    reaffirmed = not accepted and _has_current_unresolved_finding(comments, threads)
+    reaffirmed = not accepted and _has_unresolved_finding(comments, threads)
     if not accepted and not reaffirmed:
         return {"action": "no_review", "repository": f"{owner}/{repo}", "pull_number": pull_number, "skipped": skipped}
     submitted = await submit_change_request(
@@ -74,22 +74,22 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _has_current_unresolved_finding(
+def _has_unresolved_finding(
     comments: list[dict[str, Any]],
     threads: list[dict[str, Any]],
 ) -> bool:
     active = [
         thread
         for thread in threads
-        if not thread["is_resolved"] and not thread["is_outdated"]
+        if not thread["is_resolved"]
     ]
     keys = {
         (str(thread["path"]), int(thread["line"]), str(thread["side"]).upper())
         for thread in active
-        if thread["path"] and thread["line"]
+        if not thread["is_outdated"] and thread["path"] and thread["line"]
     }
     bodies = {
-        " ".join(str(body).lower().split())
+        (str(thread["path"]), " ".join(str(body).lower().split()))
         for thread in active
         for body in thread["bodies"]
         if body
@@ -101,6 +101,6 @@ def _has_current_unresolved_finding(
         body = " ".join(str(comment.get("body") or "").lower().split())
         if line and (path, int(line), side) in keys:
             return True
-        if body and body in bodies:
+        if body and (path, body) in bodies:
             return True
     return False

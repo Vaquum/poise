@@ -64,7 +64,7 @@ def _instructions(p: int) -> list[str]:
     levels = "/".join(f"p{level}" for level in range(p + 1))
     return [
         "If only positive things remain, record one clean review.",
-        "Never publish duplicate inline comments or re-litigate resolved or outdated findings.",
+        "Never publish duplicate inline comments or re-litigate resolved findings. An outdated location does not prove a defect is fixed; reaffirm an unresolved outdated finding only after confirming it still blocks the supplied head, using its original body and path.",
         "For an existing current, unresolved finding that still blocks this head, include its original body and exact path, current line, and side in the request-changes comments array.",
         "github-interface deduplicates existing findings and can reaffirm them with one summary-only change-request review; do not send an empty comments array.",
         f"Make one inline comment per {levels} found issue.",
