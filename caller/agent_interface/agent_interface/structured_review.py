@@ -112,7 +112,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     except subprocess.TimeoutExpired as error:
         raise review_budget.ReviewLimitError("Review reached its total time limit; needs attention", "review_budget_exhausted") from error
     except (ValueError, OSError) as error:
-        raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {error}") from error
+        code = "review_packet_too_large" if "Input exceeds the maximum length" in str(error) else None
+        raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {error}", code) from error
 
     flag = {"request_changes": "--request-changes", "reviewed_clean": "--reviewed-clean",
             "approve": "--approve-pr"}[verdict["action"]]

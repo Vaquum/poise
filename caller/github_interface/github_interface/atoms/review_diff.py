@@ -127,7 +127,7 @@ def _excluded(file: dict[str, Any], sizes: dict[str, int], compact: bool | None 
     if (len(parts) >= 5 and parts[0] in {"venv", ".venv"}
             and parts[1] in {"lib", "lib64"} and re.fullmatch(r"python\d+(?:\.\d+)*", parts[2])
             and parts[3] == "site-packages"):
-        return f"installed Python dependency ({size} bytes across base and head)"
+        return "installed Python dependency"
     if "__pycache__" in parts and path.suffix.lower() in {".pyc", ".pyo"}:
         return "generated Python bytecode"
     if ({"captures", "raw"} <= set(path.parts)

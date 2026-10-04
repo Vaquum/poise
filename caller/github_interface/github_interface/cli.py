@@ -129,7 +129,7 @@ def main() -> None:
     except (RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, separators=(",", ":")) if argv[0] == "--pr-review" else json.dumps(result, indent=2))
 
 
 def _parser(behavior: str) -> argparse.ArgumentParser:
