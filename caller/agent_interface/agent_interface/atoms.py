@@ -178,6 +178,7 @@ def run_agent(
     pr: str = "",
     actor_name: str = "",
     head: str = "",
+    repository=None,
 ) -> str:
     prompt_bytes = len(text.encode("utf-8"))
     if prompt_bytes > MAX_GOVERNED_PROMPT_BYTES:
@@ -190,7 +191,7 @@ def run_agent(
     spec = CATALOG.review_model(behavior, model)
     if spec.provider != "claude":
         from .structured_review import run
-        return run(pwd, system, text, spec, behavior, pr, actor_name, head, timeout_s)
+        return run(pwd, system, text, spec, behavior, pr, actor_name, head, timeout_s, repository=repository)
     from .review_watch import ReviewWatch
     with ReviewWatch(pwd, pr, actor_name, head) as watch:
         done = watch.run(
@@ -218,9 +219,9 @@ def run_agent(
                 system,
             ],
             input=text,
-            cwd=pwd,
+            cwd=str(repository.root) if repository else pwd,
             timeout=review_budget.timeout(timeout_s, reserve=review_budget.FINAL_CHECK_SECONDS),
-            env=claude_env(tools),
+            env={**claude_env(tools), **({"GITHUB_INTERFACE_REVIEW_ROOT": str(repository.root)} if repository else {})},
             provider="claude",
         )
     result = claude_result(done.stdout)

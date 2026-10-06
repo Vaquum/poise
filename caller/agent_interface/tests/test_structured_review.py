@@ -3,13 +3,14 @@ import json
 import os
 import subprocess
 from contextlib import redirect_stdout
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
 import agent_interface
-from agent_interface import atoms, pr_review, pr_approve, structured_review
+from agent_interface import atoms, pr_review, pr_approve, structured_review, review_repository
 from agent_interface.model_catalog import CATALOG, ModelCatalogError
 from agent_interface.review_watch import ReviewWatch
 
@@ -62,7 +63,9 @@ class TestReviewModel(TestCase):
     def test_packet_and_review_rules_are_shared(self):
         for mod in (pr_review, pr_approve):
             for identity in ("gpt-6-astra-ultra", "grok-4.6-xhigh", "gemini-3.8-flash-high", "muse-spark-1.3-contributor-max"):
-                with patch.object(atoms, "packet", return_value="immutable packet"), patch.object(atoms, "run_agent") as run:
+                repository = SimpleNamespace(prompt=lambda: "repo guidance", root=Path("/tmp/review"))
+                with patch.object(atoms, "packet", return_value="immutable packet"), patch.object(atoms, "run_agent") as run, \
+                        patch.object(review_repository, "prepare", return_value=nullcontext(repository)):
                     mod.run("/tmp", "12", "bit-mis", "a" * 40, note="memory", p="p1", model=identity)
                     text = run.call_args.args[2]
                     self.assertIn("immutable packet", text)

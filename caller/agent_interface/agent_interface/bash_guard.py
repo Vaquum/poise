@@ -47,6 +47,10 @@ def main():
         raise SystemExit(str(e))
     if not argv or not allowed(command) or any(t in BAD for t in argv):
         raise SystemExit(f"blocked by agent-interface: {command}")
+    if argv[:2] == ["github-interface", "--review-context"]:
+        # Inspection has no GitHub side effect and must not enter the
+        # submission lock or be mistaken for an ambiguous publication.
+        raise SystemExit(subprocess.run(argv, text=True).returncode)
     receipt = os.environ.get("AGENT_INTERFACE_REVIEW_RECEIPT")
     with submission_gate(os.environ.get("AGENT_INTERFACE_REVIEW_GATE")):
         if not receipt:

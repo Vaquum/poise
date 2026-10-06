@@ -13,16 +13,20 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from time import monotonic
 
-from .atoms import AgentPreflightError, actor, expected_head, pr_ref
+from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, expected_head, pr_ref
 from .model_catalog import Model
 from .review_watch import ReviewWatch
 from . import progress, review_budget, review_receipt
 
 
-def verdict_schema(behavior: str) -> dict:
+MAX_INSPECTION_ROUNDS = 12
+
+
+def verdict_schema(behavior: str, *, inspection: bool = False) -> dict:
     terminal = "reviewed_clean" if behavior == "pr_review" else "approve"
-    return {
+    schema = {
         "type": "object",
         "additionalProperties": False,
         "required": ["action", "comments"],
@@ -43,6 +47,20 @@ def verdict_schema(behavior: str) -> dict:
             },
         },
     }
+    if inspection:
+        schema["required"].append("requests")
+        schema["properties"]["action"]["enum"].append("inspect")
+        schema["properties"]["requests"] = {
+            "type": "array", "maxItems": 8,
+            "items": {"type": "object", "additionalProperties": False,
+                      "required": ["operation", "path", "query", "start_line"],
+                      "properties": {
+                          "operation": {"type": "string", "enum": ["read", "search", "list"]},
+                          "path": {"type": "string"}, "query": {"type": "string"},
+                          "start_line": {"type": "integer", "minimum": 1},
+                      }},
+        }
+    return schema
 
 
 def validate_verdict(raw: str, behavior: str) -> dict:
@@ -92,7 +110,7 @@ def events(stdout: str) -> list[dict]:
 
 
 def run(pwd: str, system: str, text: str, model: Model, behavior: str,
-        pr: str, actor_name: str, head: str, timeout_s: int) -> str:
+        pr: str, actor_name: str, head: str, timeout_s: int, *, repository=None) -> str:
     # Target and credentials are controller-owned, never model output.
     fixed = ["--expected-head", expected_head(head), "--token-user", actor(actor_name)]
     ref = pr_ref(pr)
@@ -103,12 +121,43 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         with tempfile.TemporaryDirectory(prefix="agent-interface-review-") as work, \
                 ReviewWatch(pwd, pr, actor_name, head) as watch:
             root = Path(work)
-            schema = verdict_schema(behavior)
+            schema = verdict_schema(behavior, inspection=repository is not None)
             (root / "verdict.schema.json").write_text(json.dumps(schema))
-            timeout = review_budget.timeout(timeout_s, reserve=review_budget.FINAL_CHECK_SECONDS)
-            raw = ask(root, model, system, text, schema, watch, timeout)
-            progress.stage("validating", "Validating review result")
-            verdict = validate_verdict(raw, behavior)
+            deadline = monotonic() + timeout_s
+            context = ""
+            for round_number in range(MAX_INSPECTION_ROUNDS + 1):
+                timeout = review_budget.timeout(timeout_s, reserve=review_budget.FINAL_CHECK_SECONDS)
+                if repository is not None:
+                    timeout = min(deadline - monotonic(), timeout)
+                if timeout <= 0:
+                    raise review_budget.ReviewLimitError("Review reached its total time limit", "review_budget_exhausted")
+                if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
+                    raise AgentPreflightError("Repository inspection exceeds the review prompt limit", "review_packet_too_large")
+                raw = ask(root, model, system, text + context, schema, watch, timeout)
+                progress.stage("validating", "Validating review result")
+                if repository is None:
+                    verdict = validate_verdict(raw, behavior)
+                    break
+                step = json.loads(raw)
+                if not isinstance(step, dict) or set(step) != {"action", "comments", "requests"}:
+                    raise ValueError("review step must contain action, comments, and requests")
+                requests = step["requests"]
+                if not isinstance(requests, list):
+                    raise ValueError("review requests must be an array")
+                if step["action"] != "inspect":
+                    if requests:
+                        raise ValueError("terminal verdict must not request repository inspection")
+                    verdict = validate_verdict(json.dumps({key: step[key] for key in ("action", "comments")}), behavior)
+                    break
+                if round_number == MAX_INSPECTION_ROUNDS or not 1 <= len(requests) <= 8:
+                    raise ValueError("repository inspection limit reached or invalid request count")
+                # Validate provisional findings without submitting anything.
+                validate_verdict(json.dumps({"action": "request_changes" if step["comments"] else
+                                            "reviewed_clean" if behavior == "pr_review" else "approve",
+                                            "comments": step["comments"]}), behavior)
+                progress.stage("inspecting", "Inspecting pinned repository")
+                result = repository.inspect(requests)
+                context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
     except subprocess.TimeoutExpired as error:
         raise review_budget.ReviewLimitError("Review reached its total time limit; needs attention", "review_budget_exhausted") from error
     except (ValueError, OSError) as error:
@@ -133,6 +182,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
 # ── Codex ─────────────────────────────────────────────────────────────
 def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, watch: ReviewWatch, timeout: float) -> str:
     output = root / "verdict.json"
+    output.unlink(missing_ok=True)
     args = [
         os.getenv("CODEX_CLI", "codex"), "exec",
         "--ignore-user-config", "--ignore-rules", "--ephemeral",

@@ -29,7 +29,7 @@ class ReviewPacketTooLarge(RuntimeError):
     pass
 
 
-def _git(cwd: str, env: dict[str, str], *args: str, limit: int = MAX_DIFF_BYTES) -> bytes:
+def _git(cwd: str, env: dict[str, str], *args: str, limit: int = MAX_DIFF_BYTES, timeout: float = 120) -> bytes:
     # The credential stays out of argv and errors. Every command is read-only
     # against GitHub, and all local writes are inside the temporary directory.
     with tempfile.TemporaryFile() as errors, subprocess.Popen(
@@ -44,7 +44,7 @@ def _git(cwd: str, env: dict[str, str], *args: str, limit: int = MAX_DIFF_BYTES)
             except PermissionError:
                 process.kill()
 
-        timer = threading.Timer(120, stop)
+        timer = threading.Timer(timeout, stop)
         timer.start()
         try:
             stdout = process.stdout.read(limit + 1)
