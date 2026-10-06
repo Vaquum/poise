@@ -1,4 +1,5 @@
 import json
+import signal
 import subprocess
 from contextlib import nullcontext
 from pathlib import Path
@@ -19,6 +20,21 @@ PACKET = json.dumps({"repository": "o/r", "head_sha": HEAD, "merge_base_sha": BA
 
 
 class TestRepositoryLifecycle(TestCase):
+    def test_cancellation_during_preparation_cleans_checkout_and_restores_handler(self):
+        roots = []
+        original = signal.getsignal(signal.SIGTERM)
+        def cancelled(args, **kwargs):
+            root = Path(args[args.index("--path") + 1])
+            root.mkdir()
+            roots.append(root)
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        with patch.object(rr.subprocess, "run", side_effect=cancelled), self.assertRaises(SystemExit) as stopped:
+            with rr.prepare("/repo", PR, "bot", HEAD, PACKET):
+                self.fail("cancelled preparation yielded")
+        self.assertEqual(stopped.exception.code, 128 + signal.SIGTERM)
+        self.assertFalse(roots[0].parent.exists())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), original)
+
     def test_checkout_and_inspection_are_internal_calls_and_cleanup_follows_success_or_failure(self):
         for fail in (False, True):
             roots = []

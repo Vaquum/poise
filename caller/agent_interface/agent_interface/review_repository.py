@@ -1,10 +1,12 @@
 """Temporary source for PR reviews; providers can only inspect it through Caller."""
 import json
 import os
+import signal
 import subprocess
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from threading import current_thread, main_thread
 
 from . import atoms, progress, review_budget
 
@@ -68,7 +70,7 @@ def prepare(pwd: str, pr: str, actor: str, head: str, packet: str):
             raise ValueError("PR packet target differs from review target")
     except (ValueError, KeyError, TypeError) as error:
         raise atoms.AgentPreflightError(f"cannot prepare review checkout: {error}") from error
-    with tempfile.TemporaryDirectory(prefix="caller-pr-review-") as work:
+    with _cancellation(), tempfile.TemporaryDirectory(prefix="caller-pr-review-") as work:
         root = Path(work) / "repo"
         limit = review_budget.timeout(240, reserve=review_budget.FINAL_CHECK_SECONDS)
         progress.stage("checking_out", "Preparing pinned PR checkout", timeout=limit)
@@ -89,3 +91,18 @@ def prepare(pwd: str, pr: str, actor: str, head: str, packet: str):
             yield Repository(root, info)
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             raise atoms.AgentPreflightError(f"cannot inspect review checkout: {error}") from error
+
+
+@contextmanager
+def _cancellation():
+    # SIGTERM must unwind preparation too, before ReviewWatch supervises a
+    # provider. Preserve callers' handlers and avoid thread signal mutation.
+    from .review_watch import _interrupted
+    previous = None
+    if current_thread() is main_thread():
+        previous = signal.signal(signal.SIGTERM, _interrupted)
+    try:
+        yield
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
