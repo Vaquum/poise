@@ -27,19 +27,19 @@ export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
 GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
 export GIT_CONFIG_VALUE_0
 
-cloned=false
 if [ ! -e "$path/.git" ]; then
   if [ -e "$path" ] && [ -n "$(ls -A "$path")" ]; then
     die "$path holds files but no checkout. Empty it, or point POISE_DEPLOY_PATH at another directory."
   fi
   say "Cloning $repo into $path."
   git clone --quiet --no-checkout "$repo" "$path"
-  cloned=true
 fi
 cd "$path"
 origin=$(git remote get-url origin)
 [ "$origin" = "$repo" ] || die "$path is a checkout of $origin, not of $repo."
-if [ "$cloned" = false ] && [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+# A clone whose files were never checked out, this run's or one an earlier run
+# left when it stopped, has no index yet, and nothing of its own to keep.
+if [ -e "$(git rev-parse --git-path index)" ] && [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   die "$path has changes that are not committed, which a deployment would build into the workspace image. See them with: git -C $path status"
 fi
 

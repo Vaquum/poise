@@ -243,6 +243,18 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn(self.TOKEN, result.stdout + result.stderr)
         self.assertNotIn('s3cret', result.stdout + result.stderr)
 
+    def test_finishes_a_first_deployment_that_stopped_after_the_clone(self):
+        # The fetch fails after the clone, as a network failure or a cancelled run would leave it.
+        missing = '0' * 40
+        result = self.deploy(missing)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(os.path.isdir(os.path.join(self.path, '.git')))
+        result = self.deploy(self.commits[0])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('Cloning', result.stdout)
+        self.assertEqual(self.checkout('rev-parse', 'HEAD'), self.commits[0])
+        self.assertEqual(self.calls_made(), [f'install.sh  {self.commits[0]}'])
+
     def test_refuses_a_checkout_with_changes_that_are_not_committed(self):
         first, second = self.commits
         self.assertEqual(self.deploy(first).returncode, 0)
