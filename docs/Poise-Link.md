@@ -59,10 +59,13 @@ The installer, [`link/install.sh`](../link/install.sh):
 An Espanso that is already installed is used as it is: the installer never
 replaces, upgrades or reconfigures it.
 
-**Update** by running the same command again. It quits Poise Link, replaces it
-with the newest release and opens it again; the pairing stays. On macOS,
-Keychain may then ask once whether Poise Link may use its saved pairing,
-because each build carries a new ad-hoc signature: choose Always Allow.
+**Update** by running the same command again. It installs the newest release
+first and only then quits the running Poise Link and opens the new one, so a
+failed update leaves Poise Link running as it was. Over a connection without
+a display, such as SSH, the running Poise Link keeps the previous version
+until you quit it and open it again. The pairing stays. On macOS, Keychain may
+ask once whether the new Poise Link may use its saved pairing, because each
+build carries a new ad-hoc signature: choose Always Allow.
 
 **Elsewhere.** The installer stops before changing anything when it runs as
 root, on Linux without apt, or on Linux on anything but x86_64: Espanso

@@ -41,8 +41,16 @@ ESPANSO_X11 = 'espanso-debian-x11-amd64.deb'
 ESPANSO_WAYLAND = 'espanso-debian-wayland-amd64.deb'
 
 # Appends one line per call to $CALLS: the command's name and its arguments, separated by \x1f.
+# link_was_running notes, for the installing stand-ins, whether a Poise Link was running at that moment.
 RECORD = r'''#!/bin/sh
 { printf '%s' "${0##*/}"; for arg in "$@"; do printf '\037%s' "$arg"; done; printf '\n'; } >>"$CALLS"
+link_was_running() {
+	for pid in $(cat "$STATE/pids.poise-link" 2>/dev/null); do
+		if kill -0 "$pid" 2>/dev/null; then
+			echo yes >"$STATE/link-ran-during-install"
+		fi
+	done
+}
 '''
 
 STANDINS = {
@@ -89,6 +97,8 @@ detach)
 esac
 ''',
     'ditto': r'''
+link_was_running
+[ ! -f "$STATE/ditto-fails" ] || exit 1
 cp -R "$1" "$2"
 ''',
     # Opening Espanso for the first time ends, when the person finishes its setup, with its match folder.
@@ -111,6 +121,7 @@ update)
 	exit "$(cat "$STATE/apt-update-exit")"
 	;;
 install)
+	link_was_running
 	[ ! -f "$STATE/apt-install-fails" ] || exit 100
 	for arg; do
 		case $arg in
@@ -422,12 +433,31 @@ class MacTest(InstallerTest):
 
         result = mac.run()
         self.assert_ok(result)
-        self.assertFalse(alive(link), 'the running Poise Link was asked to quit')
-        self.assertIn('Quitting the running Poise Link', result.stdout)
+        self.assertTrue((mac.state / 'link-ran-during-install').exists(), 'Poise Link keeps running until the new one is in place')
+        self.assertFalse(alive(link), 'the previous Poise Link was asked to quit')
+        self.assertIn('Restarting Poise Link', result.stdout)
         self.assertFalse((old / 'Contents/stale').exists(), 'the old app is replaced, not merged into')
         self.assertIn('<string>0.1.0</string>', (old / 'Contents/Info.plist').read_text())
         self.assertFalse(any(p.name.startswith('.') for p in mac.apps.iterdir()))
         self.assertEqual([call[1] for call in mac.calls('open')], [str(old)])
+
+    def test_a_failed_update_leaves_the_running_poise_link_and_its_app_alone(self):
+        mac = Installer(self, 'Darwin', 'arm64')
+        old = mac.apps / 'Poise Link.app'
+        (old / 'Contents').mkdir(parents=True)
+        (old / 'Contents/Info.plist').write_text(info_plist('0.0.9'))
+        (mac.apps / 'Espanso.app').mkdir()
+        mac.running('espanso')
+        link = mac.running('poise-link')
+        mac.set('ditto-fails')
+
+        result = mac.run()
+        self.assert_refused(result, 'could not copy Poise Link.app')
+        self.assertTrue(alive(link), 'a failed install does not stop Poise Link')
+        self.assertIn('<string>0.0.9</string>', (old / 'Contents/Info.plist').read_text())
+        self.assertEqual(sorted(p.name for p in mac.apps.iterdir()), ['Espanso.app', 'Poise Link.app'])
+        self.assertEqual(mac.calls('open'), [])
+        self.assertEqual([call[1] for call in mac.calls('hdiutil')], ['attach', 'detach'], 'the image is detached on failure')
 
     def test_opens_poise_link_when_espanso_setup_is_not_finished_in_time(self):
         mac = Installer(self, 'Darwin', 'arm64')
@@ -541,10 +571,38 @@ class LinuxTest(InstallerTest):
         link = linux.running('poise-link')
         result = linux.run(DISPLAY=':0')
         self.assert_ok(result)
+        self.assertTrue((linux.state / 'link-ran-during-install').exists(), 'Poise Link keeps running while apt installs')
         self.assertFalse(alive(link))
+        self.assertIn('Restarting Poise Link', result.stdout)
         self.assertEqual(linux.background_calls('setsid'), [['setsid', 'poise-link']])
         names = linux.names()
         self.assertLess(names.index('apt-get'), names.index('setsid'))
+
+    def test_a_failed_update_leaves_the_running_poise_link_running(self):
+        linux = Installer(self, 'Linux')
+        linux.standin('espanso', ESPANSO)
+        (linux.home / '.config/espanso/match').mkdir(parents=True)
+        linux.running('espanso')
+        link = linux.running('poise-link')
+        linux.set('apt-install-fails')
+        result = linux.run(DISPLAY=':0')
+        self.assert_refused(result, "apt-get could not install Poise Link's package; its messages above say why")
+        self.assertNotIn('Debian 12', result.stderr, 'without Espanso in the call, the release is not the suspect')
+        self.assertTrue(alive(link), 'a failed install does not stop Poise Link')
+        self.assertEqual(linux.calls('setsid'), [])
+
+    def test_an_update_without_a_display_leaves_the_running_poise_link_alone(self):
+        linux = Installer(self, 'Linux')
+        linux.standin('espanso', ESPANSO)
+        (linux.home / '.config/espanso/match').mkdir(parents=True)
+        linux.running('espanso')
+        link = linux.running('poise-link')
+        result = linux.run()
+        self.assert_ok(result)
+        self.assertTrue(alive(link), 'nothing could open the new one, so the running one stays')
+        self.assertIn('still running the previous version', result.stderr)
+        self.assertEqual(linux.calls('setsid'), [])
+        self.assertNotIn('Open Poise Link from your applications menu', result.stdout)
 
     def test_without_a_systemd_user_session_it_says_how_to_start_espanso(self):
         linux = Installer(self, 'Linux')
@@ -602,7 +660,8 @@ class LinuxTest(InstallerTest):
         linux = Installer(self, 'Linux')
         linux.set('apt-install-fails')
         result = linux.run(**self.desktop('x11'))
-        self.assert_refused(result, 'need Debian 12 or Ubuntu 24.04 or newer')
+        self.assert_refused(result, 'its messages above say why')
+        self.assertIn('need Debian 12 or Ubuntu 24.04 or newer', result.stderr)
         self.assertEqual(linux.calls('setsid'), [])
 
     def test_a_failed_apt_update_still_installs(self):

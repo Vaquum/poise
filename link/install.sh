@@ -47,6 +47,7 @@ MOUNT=
 ESPANSO_CLI=
 ESPANSO_STARTED=
 ESPANSO_READY=
+LINK_OPEN=
 STOP_WAITING=
 
 say() {
@@ -127,18 +128,41 @@ running() {
 	pgrep -x -u "$(id -u)" "$1"
 }
 
-stop_link() {
+can_open_link() {
+	[ "$OS" = Darwin ] || [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]
+}
+
+open_link() {
+	if [ "$OS" = Darwin ]; then
+		open "$APP_DIR/Poise Link.app"
+	else
+		setsid poise-link </dev/null >/dev/null 2>&1 &
+	fi
+	LINK_OPEN=1
+}
+
+# The running Poise Link is the previous version once the new one is in
+# place: quit it and open the new one. Nothing stops Poise Link before the
+# new version is installed, so a failed install leaves it running.
+restart_link() {
 	link_pids=$(running poise-link) || return 0
-	step "Quitting the running Poise Link"
+	if ! can_open_link; then
+		warn "Poise Link is still running the previous version. Quit it from its menu and open it again to use the new one."
+		LINK_OPEN=1
+		return
+	fi
+	step "Restarting Poise Link"
 	# One argument per process ID.
 	# shellcheck disable=SC2086
 	kill $link_pids
 	waited_for_link=0
 	while running poise-link >/dev/null; do
-		[ "$waited_for_link" -lt 20 ] || fail "Poise Link did not quit. Quit it from its menu, then run this again."
+		[ "$waited_for_link" -lt 20 ] ||
+			fail "the previous Poise Link did not quit. Quit it from its menu and open Poise Link again to use the new version."
 		sleep 1
 		waited_for_link=$((waited_for_link + 1))
 	done
+	open_link
 }
 
 # The folder Espanso reads match files from, found the way Poise Link finds it:
@@ -258,10 +282,10 @@ install_mac() {
 	else
 		say "Espanso is already installed; it is left as it is."
 	fi
-	stop_link
 	step "Installing Poise Link in $APP_DIR"
 	mac_install_app "$WORK/$MAC_IMAGE" "Poise Link.app"
 	say "Installed Poise Link $(mac_version "$APP_DIR/Poise Link.app")."
+	restart_link
 
 	if running espanso >/dev/null; then
 		ESPANSO_STARTED=1
@@ -273,9 +297,6 @@ install_mac() {
 		warn "Espanso is installed but not running. Start it, and Poise Link fills it with your snippets."
 	fi
 	wait_for_espanso "Allow Accessibility when it asks: Espanso needs it to type your snippets."
-
-	step "Opening Poise Link"
-	open "$APP_DIR/Poise Link.app"
 }
 
 detect_session() {
@@ -361,13 +382,17 @@ install_linux() {
 		fi
 	fi
 
-	stop_link
 	step "Installing the packages (sudo may ask for your password)"
 	sudo apt-get update || warn "apt-get update failed; installing with the package lists this computer already has"
-	sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes "$@" ||
-		fail "apt-get could not install the packages. Espanso $ESPANSO_VERSION's packages need Debian 12 or Ubuntu 24.04 or newer."
+	if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes "$@"; then
+		if [ -n "$espanso_package" ]; then
+			fail "apt-get could not install the packages; its messages above say why. When it cannot find a dependency such as libwxgtk3.2-1, the cause is the release: Espanso $ESPANSO_VERSION's packages need Debian 12 or Ubuntu 24.04 or newer."
+		fi
+		fail "apt-get could not install Poise Link's package; its messages above say why."
+	fi
 	# shellcheck disable=SC2016
 	say "Installed Poise Link $(dpkg-query --show --showformat='${Version}' poise-link)."
+	restart_link
 	if [ -n "$espanso_package" ]; then
 		ESPANSO_CLI=$(command -v espanso) || fail "Espanso's package did not install the espanso command"
 		if [ "$SESSION" = wayland ]; then
@@ -379,13 +404,6 @@ install_linux() {
 
 	start_espanso_linux
 	wait_for_espanso "Choose Start in it."
-
-	if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
-		step "Opening Poise Link"
-		setsid poise-link </dev/null >/dev/null 2>&1 &
-	else
-		say "Open Poise Link from your applications menu."
-	fi
 }
 
 finish() {
@@ -422,6 +440,14 @@ main() {
 		install_mac
 	else
 		install_linux
+	fi
+	if [ -z "$LINK_OPEN" ]; then
+		if can_open_link; then
+			step "Opening Poise Link"
+			open_link
+		else
+			say "Open Poise Link from your applications menu."
+		fi
 	fi
 	finish
 }
