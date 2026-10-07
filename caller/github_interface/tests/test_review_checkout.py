@@ -168,7 +168,7 @@ class TestInspection(TestCase):
         names = ["src/figure.jpg", "src/utf16.txt", "src/invalid.txt", "src/code.py"]
         (self.root / names[0]).write_bytes(b"\xff\xd8\xff\xe0JPEG")
         (self.root / names[1]).write_bytes("UTF-16 source".encode("utf-16"))
-        (self.root / names[2]).write_bytes((b"valid prefix " + b"x" * 90 + b"\n") * 90 + b"\xff")
+        (self.root / names[2]).write_bytes((b"valid prefix " + b"x" * 1500 + b"\n") * 6 + b"\xff")
         (self.root / ".git" / rc.MANIFEST).write_text(json.dumps({"head_sha": "a" * 40, "files": names}))
         response = rc.inspect(self.root, [self.request(path=name) for name in names])
         self.assertEqual(response["head_sha"], "a" * 40)
