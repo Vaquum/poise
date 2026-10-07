@@ -419,7 +419,7 @@ export async function sendChat(
   const claude = isClaudeModel(catalog, chosen)
   if (claude) await claudeAuth.requireReady()
 
-  await prepareModelClis(catalog, [chosen])
+  const modelCliEnv = await prepareModelClis(catalog, [chosen])
   await ensureLegacyAttachmentMigration()
   const pwd = chatPwd(sessionId)
   await ensurePrivateSessionDirectory(pwd)
@@ -504,7 +504,7 @@ export async function sendChat(
       ['--chat', prompt, '--model', chosen, '--session', sessionId, '--pwd', pwd],
       {
         cwd: agentInterfaceCwd(),
-        ...(claude ? { env: claudeSubscriptionEnvironment() } : {}),
+        env: { ...(claude ? claudeSubscriptionEnvironment() : {}), ...modelCliEnv },
         ...((contextPath || claude) ? {
           onExit: async (result: { code: number | null, signal: NodeJS.Signals | null, error?: Error }) => {
             if (contextPath) await unlink(contextPath).catch(() => undefined)
@@ -570,7 +570,7 @@ export async function runDebate(topic: string, rounds: number = 1): Promise<Deba
   const catalog = await loadCatalog()
   const models = [catalog.behaviors.debate_moderator, ...catalog.debate_participants]
   if (models.some((model) => isClaudeModel(catalog, model))) await claudeAuth.requireReady()
-  await prepareModelClis(catalog, models)
+  const modelCliEnv = await prepareModelClis(catalog, models)
   const r = Math.min(Math.max(Number.isFinite(rounds) ? rounds : 1, 1), DEBATE_MAX_ROUNDS)
   let stdout: string
   try {
@@ -581,7 +581,7 @@ export async function runDebate(topic: string, rounds: number = 1): Promise<Deba
         cwd: agentInterfaceCwd(),
         timeoutMs: DEBATE_TIMEOUT_MS,
         maxOutputBytes: DEBATE_MAX_OUTPUT_BYTES,
-        env: claudeSubscriptionEnvironment(),
+        env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
       },
     ))
   } catch (err: any) {
@@ -676,7 +676,7 @@ export async function startAuthorContent(topic: string, sessionId: string): Prom
   const catalog = await loadCatalog()
   const claude = isClaudeModel(catalog, catalog.behaviors.author_content)
   if (claude) await claudeAuth.requireReady()
-  await prepareModelClis(catalog, [catalog.behaviors.author_content])
+  const modelCliEnv = await prepareModelClis(catalog, [catalog.behaviors.author_content])
   // Snapshot every existing id in this session. Exact topic matching prevents
   // an unrelated delayed call from being attributed to this launch.
   const beforeIds = new Set((await fetchAgentLogs({ identity: { sessionId: normalizedSessionId, behavior: 'author_content' } }))
@@ -692,7 +692,7 @@ export async function startAuthorContent(topic: string, sessionId: string): Prom
     ['--author-content', trimmed, '--session-id', normalizedSessionId],
     {
       cwd: agentInterfaceCwd(),
-      env: claudeSubscriptionEnvironment(),
+      env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
       onExit: (result) => { claudeAuth.observeProcessFailure(result) },
     },
   )

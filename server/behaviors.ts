@@ -31,6 +31,7 @@ import {
   clearSeenExceptLaunched,
   clearUnreadableBehaviorLaunchOwned,
   completeBehaviorLaunchOwned,
+  completeFailedBehaviorReplay,
   completeIssueReviewLaunchOwned,
   countBehaviorDeadLetters,
   hasExpiredPreLaunchClaim,
@@ -1603,7 +1604,7 @@ async function fireReview(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
+  const modelCliEnv = await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
   // mkdir the cwd hack dir — agent-interface needs it to exist for
   // --pwd resolution behavior identical to triggerPrReview in agent.ts.
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
@@ -1663,7 +1664,7 @@ async function fireReview(
   }
   await spawnDetached(AGENT_INTERFACE, args, {
     cwd: agentInterfaceCwd(),
-    env: claudeSubscriptionEnvironment(),
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: settleClaimAfterExit('review-new-prs', claimTarget, claimId),
   })
   markClaimLaunched(claimId)
@@ -1977,6 +1978,7 @@ interface ChangesAddressedResult {
   headSha: string
   commitsAfterRequest: number
   authorInlineRepliesAfterRequest: number
+  authorPrCommentsAfterRequest: number
   responseCount: number
 }
 
@@ -2138,8 +2140,83 @@ async function packetBlocked(
 // a fresh decision.
 function boundedReviewFailure(call: LogEntry): boolean {
   return call.review_policy === REVIEW_POLICY
-    && (['model_output_limit', 'review_budget_exhausted', 'review_recovery_failed', 'review_contract_violation', 'stopped'].includes(call.error_code || '')
+    && (['model_output_limit', 'review_budget_exhausted', 'review_recovery_failed', 'review_contract_violation', 'review_provider_blocked', 'stopped'].includes(call.error_code || '')
       || /^\w+ behavior must produce exactly one atomic /.test(call.error || ''))
+}
+
+// An explicit operator retry releases only failed slots whose live GitHub
+// inventory proves no unclaimed or pending publication. The scheduler owns
+// the next launch; this API neither submits reviews nor rewrites Caller logs.
+export async function retryFailedPrReviews(callIds: unknown): Promise<{ ok: true, targets: string[] }> {
+  if (!Array.isArray(callIds) || callIds.length < 1 || callIds.length > 3
+    || callIds.some((id) => typeof id !== 'string' || !/^[0-9a-f]{32}$/.test(id))
+    || new Set(callIds).size !== callIds.length) throw new HttpError(400, 'callIds must contain 1-3 distinct failed review call IDs')
+  const snapshot = await readBehaviorLogSnapshot()
+  const calls = callIds.map((id) => snapshot.entries.find((row) => row.id === id))
+  if (calls.some((call) => !call || !unambiguousAgentCall(snapshot, call)
+    || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) || call.head_sha || call.review_id
+    || !call.repo || !call.pr_id || !call.expected_head || !SHA_PATTERN.test(call.expected_head)
+    || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
+    || !(call.action === null && call.outcome === null
+      || call.action === 'not_started' && call.outcome === 'preflight_failed'))) {
+    throw new HttpError(409, 'Retry requires unambiguous failed calls without a recorded review action')
+  }
+  const first = calls[0]!
+  const behavior = first.behavior === 'pr_review' ? 'review-new-prs' : first.behavior === 'pr_approve' ? 'approve-prs' : null
+  if (!behavior || calls.some((call) => call!.repo !== first.repo || call!.pr_id !== first.pr_id
+    || call!.expected_head !== first.expected_head || call!.actor !== first.actor
+    || call!.behavior !== first.behavior || call!.source !== `poise:${behavior}`)) {
+    throw new HttpError(409, 'Retry calls must belong to one automated PR review on one head')
+  }
+  return withBehaviorOrganization(first.repo!.split('/')[0], async () => {
+    if (!isEnabled(behavior) || first.actor?.toLowerCase() !== configuredReviewer().toLowerCase()) {
+      throw new HttpError(409, 'Retry does not match the enabled reviewer')
+    }
+    const failed = failedBehaviorLaunches(behavior).filter((claim) => callIds.includes(claim.launchCallId))
+    if (failed.length !== calls.length || failed.some((claim) => claim.launchQuarantine
+      || claim.launchRepo !== first.repo || String(claim.launchPr) !== first.pr_id
+      || claim.launchBehavior !== first.behavior || claim.launchSource !== first.source
+      || claim.launchExpectedHead !== first.expected_head || claim.launchActor !== first.actor
+      || !calls.some((call) => call!.id === claim.launchCallId && call!.correlation_id === claim.launchCorrelationId))) {
+      throw new HttpError(409, 'Failed launch ownership changed or remains quarantined')
+    }
+    if (snapshot.quarantined.some((row) => quarantinedLogMayMatch(row, { repo: first.repo!, prId: first.pr_id! }))
+      || hasActiveAgentLaunchForPr(first.repo!, Number(first.pr_id)) || snapshot.entries.some((row) =>
+      row.repo === first.repo && row.pr_id === first.pr_id && RUNNING_AGENT_STATUSES.has(row.status.toLowerCase()))) {
+      throw new HttpError(409, 'Another PR worker is still active')
+    }
+    const operation = claimPrOperationOwned(failed[0].target, PR_OPERATION_EVALUATION_LEASE_MS)
+    if (!operation) throw new HttpError(409, 'PR operation is busy')
+    try {
+      const since = calls.map((call) => agentCallStartedAt(call!)).sort((a, b) => Date.parse(a) - Date.parse(b))[0]
+      const activity = await checkReviewActivity(first.repo!, Number(first.pr_id), first.actor!, since)
+      const claimed = new Set(snapshot.entries.filter((row) => row.repo === first.repo && row.pr_id === first.pr_id
+        && typeof row.review_id === 'number').map((row) => row.review_id))
+      if (activity.state !== 'OPEN' || activity.draft || activity.headSha !== first.expected_head
+        || activity.reviewerPendingReviews !== 0 || activity.reviewerReviewIdsSince === null
+        || activity.reviewerReviewIdsSince.some((id) => !claimed.has(id))) {
+        throw new HttpError(409, 'Live GitHub evidence cannot prove a safe retry')
+      }
+      db.transaction(() => {
+        for (const claim of failed) {
+          const current = getFailedBehaviorLaunch(behavior, claim.target)
+          if (!current || current.launchQuarantine || current.launchCorrelationId !== claim.launchCorrelationId
+            || !releaseFailedBehaviorLaunch(behavior, claim.target, claim.launchCallId!, first.expected_head!)) {
+            throw new HttpError(409, 'Failed launch changed during retry')
+          }
+          setMeta(`${META_PREFIX}operator_retry:${claim.launchCallId}`, JSON.stringify({ at: new Date().toISOString(),
+            target: claim.target, expectedHead: first.expected_head, correlationId: claim.launchCorrelationId }))
+          retireBehaviorDeadLettersForTarget(behavior, claim.target)
+          clearBehaviorFailure(behavior, claim.target)
+          clearBehaviorFailure(behavior, `${claim.target}:check`)
+        }
+        setMeta(packetBlockKey(behavior, first.repo!, Number(first.pr_id)), '')
+      })()
+      return { ok: true as const, targets: failed.map((claim) => claim.target) }
+    } finally {
+      releasePrOperationOwned(operation)
+    }
+  })
 }
 
 async function releaseFailedBehaviorIfNoAction(
@@ -2180,6 +2257,41 @@ async function releaseFailedBehaviorIfNoAction(
   const configuredModel = launchBehavior === 'pr_approve'
     ? (await reviewChoice('pr_approve')).model
     : (await slotModel(reviewSlotOfTarget(target)))?.model
+  // An explicit replay is a separate Caller run. Reconcile its verified
+  // receipt into the held launch so approval sees the recovered decision.
+  if (boundedReviewFailure(call) && call.model === configuredModel
+    && call.action === 'not_started' && call.outcome === 'preflight_failed') {
+    const after = Date.parse(call.completed_at || agentCallStartedAt(call))
+    const replays = logs.filter((row) => row.status === 'completed'
+      && row.behavior === launchBehavior && row.repo === repo && String(row.pr_id) === String(number)
+      && row.actor?.toLowerCase() === failed.launchActor.toLowerCase()
+      && row.model === call.model && row.source === 'poise:replay'
+      && row.expected_head === failed.launchExpectedHead && row.head_sha === failed.launchExpectedHead
+      && Number.isFinite(after) && Date.parse(agentCallStartedAt(row)) > after
+      && Number.isFinite(Date.parse(row.completed_at || ''))
+      && Date.parse(row.completed_at!) >= Date.parse(agentCallStartedAt(row))
+      && !!row.correlation_id && unambiguousAgentCall(snapshot, row)
+      && Number.isSafeInteger(row.review_id) && (row.review_id || 0) > 0
+      && (row.action === 'requested_changes' && row.outcome === 'changes_requested'
+        || launchBehavior === 'pr_review' && row.action === 'reviewed_clean' && row.outcome === 'clean'
+        || launchBehavior === 'pr_approve' && row.action === 'approved' && row.outcome === 'approved'))
+      .sort((a, b) => Date.parse(b.completed_at!) - Date.parse(a.completed_at!))
+    for (const replay of replays) {
+      const activity = await checkReviewActivity(repo, number, failed.launchActor, agentCallStartedAt(replay))
+      if (activity.headSha === failed.launchExpectedHead
+        && activity.reviewerReviewIdsSince?.includes(replay.review_id!)
+        && activity.reviewerPendingReviews === 0
+        && completeFailedBehaviorReplay({ key: behavior, target, failedCallId: call.id,
+          headSha: failed.launchExpectedHead, callId: replay.id, correlationId: replay.correlation_id!,
+          startedAt: agentCallStartedAt(replay), completedAt: replay.completed_at!,
+          action: replay.action as 'reviewed_clean' | 'requested_changes' | 'approved',
+          outcome: replay.outcome as 'clean' | 'changes_requested' | 'approved' })) {
+        retireBehaviorDeadLettersForTarget(behavior, target)
+        clearBehaviorFailure(behavior, target)
+        return false
+      }
+    }
+  }
   if (boundedReviewFailure(call) && call.model === configuredModel
     && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
   const blockedPacket = call.action === 'not_started'
@@ -2262,6 +2374,13 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
     data.author_inline_replies_after_request,
     'requested-changes-addressed author_inline_replies_after_request',
   )
+  // Older Caller releases do not report public PR replies yet.
+  const authorPrCommentsAfterRequest = data.author_pr_comments_after_request === undefined
+    ? 0
+    : safeInteger(
+      data.author_pr_comments_after_request,
+      'requested-changes-addressed author_pr_comments_after_request',
+    )
   const responseCount = safeInteger(
     data.response_count,
     'requested-changes-addressed response_count',
@@ -2279,7 +2398,7 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
     || typeof hasChangeRequest !== 'boolean'
     || typeof status !== 'boolean'
     || !SHA_PATTERN.test(headSha)
-    || responseCount !== commitsAfterRequest + authorInlineRepliesAfterRequest
+    || responseCount !== commitsAfterRequest + authorInlineRepliesAfterRequest + authorPrCommentsAfterRequest
     || (hasChangeRequest
       ? latestState !== 'CHANGES_REQUESTED'
         || latestRequestAt === null
@@ -2293,6 +2412,7 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
     headSha,
     commitsAfterRequest,
     authorInlineRepliesAfterRequest,
+    authorPrCommentsAfterRequest,
     responseCount,
   }
 }
@@ -2311,7 +2431,7 @@ async function fireApprove(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
+  const modelCliEnv = await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
   if (!isEnabled('approve-prs')) return false
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
@@ -2363,7 +2483,7 @@ async function fireApprove(
   }
   await spawnDetached(AGENT_INTERFACE, args, {
     cwd: agentInterfaceCwd(),
-    env: claudeSubscriptionEnvironment(),
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: settleClaimAfterExit('approve-prs', claimTarget, claimId),
   })
   markClaimLaunched(claimId)
@@ -2408,17 +2528,17 @@ async function tickApprovePrs(): Promise<void> {
         if (!isEnabled('approve-prs')) return
         // Follow-up trigger: reviewer has at least one CHANGES_REQUESTED review
         // on the PR, AND the author has engaged with it at least once
-        // since — either by pushing a commit OR by replying inline
-        // on a review thread. A refutation reply ("FTL is internal,
+        // since — by pushing a commit, replying inline on a review
+        // thread, or posting a public PR comment. A refutation ("FTL is internal,
         // everyone knows") is as much a "respond to this" signal as
         // a code change; the agent run that follows decides whether
         // it's convincing.
         //
         // Each subsequent author response (commit or reply) re-arms
-        // the trigger — the dedupe key sums both counters, so every
+        // the trigger — the dedupe key sums all three counters, so every
         // increment produces a fresh seen-key. If the reviewer posts
         // another CHANGES_REQUESTED (latest_request_at advances),
-        // both counters reset to 0 and a fresh round begins on the
+        // all counters reset to 0 and a fresh round begins on the
         // next author response.
         let seenTarget = ''
         let firedReason = ''
@@ -2447,7 +2567,7 @@ async function tickApprovePrs(): Promise<void> {
           }
           expectedHead = check.headSha
           seenTarget = `${pr.repo}#${pr.number}@req=${check.latestRequestAt}/r=${check.responseCount}/head=${check.headSha}`
-          firedReason = `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}reply, head=${check.headSha.slice(0, 8)}`
+          firedReason = `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}inline+${check.authorPrCommentsAfterRequest}pr-comment, head=${check.headSha.slice(0, 8)}`
         } else {
           const review = latestApprovalBasisLaunch(pr.repo, pr.number)
           if (!review) {
@@ -2760,6 +2880,7 @@ const ISSUE_PRE_LAUNCH_LEASE_MS = 5 * 60_000
 const HELD_ISSUE_REVIEW_ERRORS = new Set([
   'review_budget_exhausted',
   'review_recovery_failed',
+  'review_provider_blocked',
   'stopped',
   'review_packet_too_large',
   'posting_failed',
@@ -3208,7 +3329,7 @@ async function fireIssueReview(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
+  const modelCliEnv = await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
   // The CLI check and the model read can each take a while; turning the
   // behavior off, deselecting the repository, untrusting the author or
   // changing the panel meanwhile must stop this launch, so these are the last
@@ -3246,7 +3367,7 @@ async function fireIssueReview(
     ...noteArgs(ISSUES_KEY),
   ], {
     cwd: agentInterfaceCwd(),
-    env: claudeSubscriptionEnvironment(),
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: settleClaimAfterExit(ISSUES_KEY, target, claimId),
   })
   markClaimLaunched(claimId)

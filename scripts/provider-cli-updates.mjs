@@ -1,6 +1,6 @@
 // Refresh the actual standalone provider launchers, never an IDE's bundled CLI.
 import { spawn } from 'node:child_process'
-import { access, mkdir, readFile, rename, writeFile, realpath } from 'node:fs/promises'
+import { access, cp, mkdir, readFile, rename, rm, writeFile, realpath } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { dirname, delimiter, isAbsolute, join } from 'node:path'
@@ -95,6 +95,29 @@ async function acquireLock(path, timeoutMs = CLI_UPDATE_TIMEOUT_MS + 30_000) {
   }
 }
 
+// npm replaces its native dependencies in place. Keep each admitted worker
+// on a verified package copy, including helper binaries, across later updates.
+async function codexLaunchSnapshot(resolved, version, root, run, env, remaining) {
+  const destination = join(root, `codex-${hash(resolved).slice(0, 16)}-${version}`)
+  const launcher = join(destination, 'bin', 'codex.js')
+  const verify = async path => {
+    const actual = versionOf((await run(path, ['--version'], { env, cwd: root, timeoutMs: remaining(10_000) })).stdout)
+    if (actual !== version) throw new Error(`Codex launch snapshot reports ${actual}, expected ${version}`)
+  }
+  try { await access(destination) } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+    const staged = `${destination}.${randomUUID()}.tmp`
+    try {
+      await cp(dirname(dirname(resolved)), staged, { recursive: true, dereference: true })
+      await verify(join(staged, 'bin', 'codex.js'))
+      await rename(staged, destination)
+    } finally { await rm(staged, { recursive: true, force: true }) }
+  }
+  await verify(launcher)
+  await saveReceipt(join(root, `codex-${hash(resolved).slice(0, 16)}.launcher.json`), { version, path: launcher })
+  return launcher
+}
+
 async function update(provider, options, requestedAt) {
   const source = options.env || process.env
   const deadline = Date.now() + (options.timeoutMs ?? CLI_UPDATE_TIMEOUT_MS)
@@ -129,7 +152,24 @@ async function update(provider, options, requestedAt) {
       return shown
     }
     try { before = await version(); result.before = before } catch { /* an incomplete npm install may be repairable */ }
-    if (prior?.provider === provider && prior.path === path && Date.parse(prior.checkedAt) >= requestedAt && Date.parse(prior.checkedAt) <= Date.now() && prior.after === before && ['current', 'updated'].includes(prior.status)) return prior
+    const npmCodex = provider === 'codex' && resolved.endsWith('/lib/node_modules/@openai/codex/bin/codex.js')
+    if (before) result.launchPath = npmCodex
+      ? await codexLaunchSnapshot(resolved, before, root, run, env, remaining) : path
+    if (result.launchPath) result.launchVersion = before
+    if (npmCodex && !before) {
+      const retained = await readReceipt(join(root, `codex-${hash(resolved).slice(0, 16)}.launcher.json`))
+      if (typeof retained?.version === 'string' && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(retained.version)
+        && retained.path === join(root, `codex-${hash(resolved).slice(0, 16)}-${retained.version}`, 'bin', 'codex.js')) {
+        try {
+          const actual = versionOf((await run(retained.path, ['--version'], { env, cwd: root, timeoutMs: remaining(10_000) })).stdout)
+          if (actual === retained.version) {
+            result.launchPath = retained.path
+            result.launchVersion = retained.version
+          }
+        } catch { /* an unusable retained copy cannot admit a worker; still attempt repair */ }
+      }
+    }
+    if (prior?.provider === provider && prior.path === path && prior.launchPath && prior.launchVersion === before && Date.parse(prior.checkedAt) >= requestedAt && Date.parse(prior.checkedAt) <= Date.now() && prior.after === before && ['current', 'updated'].includes(prior.status)) return prior
     let plan = updatePlan(provider, path)
     const npmSuffix = '/lib/node_modules/@openai/codex/bin/codex.js'
     let registryVersion
@@ -148,6 +188,9 @@ async function update(provider, options, requestedAt) {
     after = await version(); result.after = after
     const advertised = registryVersion || /(?:Version:|updated[^\n]*?to(?: version)?)[ \t]+(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)/i.exec(output.stdout + '\n' + output.stderr)?.[1]
     if (advertised && advertised !== after && !(provider === 'muse' && after.startsWith(advertised + '-R'))) throw new Error(`The updater installed ${advertised}, but Poise's launcher still reports ${after}; check duplicate CLI installations on PATH`)
+    result.launchPath = npmCodex
+      ? await codexLaunchSnapshot(resolved, after, root, run, env, remaining) : path
+    result.launchVersion = after
     result.status = before === after ? 'current' : 'updated'
     result.checkedAt = new Date().toISOString()
     await saveReceipt(receipt, result)

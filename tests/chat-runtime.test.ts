@@ -90,6 +90,20 @@ function worktreeName(session: string): string {
 }
 
 describe('chat runtime hardening', () => {
+  it('passes the admitted Codex launcher through legacy chat and debate workers', async () => {
+    const providers = await import('../server/provider-clis')
+    vi.mocked(providers.prepareModelClis).mockResolvedValueOnce({ CODEX_CLI: '/verified/codex.js' })
+      .mockResolvedValueOnce({ CODEX_CLI: '/verified/codex.js' })
+    const chat = await import('../server/chat')
+    database = await import('../server/db')
+    await chat.sendChat('snapshot-session', 'hello', 'gpt-6-astra-ultra')
+    expect(mocks.spawnDetached.mock.calls[0][2].env).toMatchObject({ CODEX_CLI: '/verified/codex.js' })
+    mocks.runFile.mockImplementation(async (_command, args) => ({ stdout: args[0] === '--models'
+      ? mocks.catalogStdout : JSON.stringify({ response: JSON.stringify({ synthesis: 'Comparison', rounds: [] }) }), stderr: '' }))
+    await chat.runDebate('Compare the providers')
+    expect(mocks.runFile.mock.calls.find(call => call[1][0] === '--debate')?.[2].env).toMatchObject({ CODEX_CLI: '/verified/codex.js' })
+  })
+
   it('keeps chat history available when unrelated review logs are malformed', async () => {
     const chat = await import('../server/chat')
     database = await import('../server/db')
@@ -143,7 +157,7 @@ describe('chat runtime hardening', () => {
 
     await expect(chat.sendChat('codex-session', 'hello', 'gpt-6-astra-ultra')).resolves.toEqual({ ok: true, model: 'gpt-6-astra-ultra' })
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    expect(mocks.spawnDetached.mock.calls[0][2]).not.toHaveProperty('env')
+    expect(mocks.spawnDetached.mock.calls[0][2].env).toEqual({})
 
     // A fallback on another provider launches instead of the signed-out default.
     database.setMeta('models', JSON.stringify({ chat: { default: 'opus-5-max', fallback: 'grok-4.6-xhigh' } }))

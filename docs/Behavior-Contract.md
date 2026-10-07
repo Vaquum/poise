@@ -3,6 +3,14 @@
 Poise is a trigger and orchestration layer. It does not read GitHub source,
 construct reviews, or mutate review threads itself.
 
+An operator can POST `/api/behaviors/retry-pr-reviews` with 1-3 `callIds`
+from failed automated slots on one PR/head. Poise verifies exact launch
+ownership, unchanged live head, no active worker, and no unclaimed or pending
+GitHub review. Only then does one transaction release those failed slots and
+their retry delay, retaining Caller results and a durable retry audit record.
+The normal scheduler launches the configured panel. Unknown evidence,
+quarantined results, recorded actions and concurrent changes remain held.
+
 Each behavior follows one transaction shape:
 
 1. Gate on fresh `github-datastore` consumer state.
@@ -28,8 +36,13 @@ approval or one atomic change request. An unresolved finding whose location beca
 outdated can be reaffirmed without another inline comment when the reviewer
 confirms it still blocks the supplied head. A terminal review contract violation
 is held on unchanged input and model instead of repeatedly launching the same
-worker. A clean review becomes approval-eligible
-on the next scheduler scan. `resolve-unblocking` uses the upstream strong
+worker. A clean review becomes approval-eligible on the next scheduler scan.
+Provider account blocks (`review_provider_blocked`) use the same hold, preventing
+an exhausted balance or local account latch from launching identical workers.
+After account recovery, a successful explicit replay on the same head, model,
+and reviewer reconciles the held no-action attempt. Its GitHub review receipt
+must be present in live evidence before it becomes durable approval evidence.
+`resolve-unblocking` uses the upstream strong
 resolution primitive, which revalidates the complete gate before every thread
 mutation.
 

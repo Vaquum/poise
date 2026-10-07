@@ -670,8 +670,11 @@ export class ChatRuntime extends EventEmitter {
     try {
       const result = await (this.options.prepareCli ?? prepareProviderCli)(agent, signal)
       signal.throwIfAborted()
+      if (agent === 'codex' && result.status === 'unavailable' && !result.launchPath) {
+        throw new Error(`Codex CLI has no verified launcher: ${result.error || 'version check failed'}`)
+      }
       session.cliCheck = { agent, turnId, result }
-      session.record.cliVersion = result.after || result.before
+      session.record.cliVersion = result.launchVersion || result.after || result.before
       session.record.cliWarning = result.status === 'unavailable'
         ? `Latest ${agent} CLI could not be verified: ${result.error}. Trying the installed CLI${result.before ? ` (${result.before})` : ''}.` : undefined
       if (session.record.cliWarning) this.setStatus(session, 'starting', session.record.cliWarning)
@@ -733,7 +736,7 @@ export class ChatRuntime extends EventEmitter {
       }
       const started = await adapter.start(startOptions)
       signal.throwIfAborted()
-      session.nativeCliVersion = cli?.after || cli?.before
+      session.nativeCliVersion = cli?.launchVersion || cli?.after || cli?.before
       session.nativeSafeMode = startOptions.safeMode
       record.safeModePending = session.nativeSafeMode !== (record.safeMode === true)
       record.nativeSessionId = started.nativeSessionId
@@ -2268,7 +2271,11 @@ export class ChatRuntime extends EventEmitter {
     return {
       sessionId: record.id,
       checkout: record.checkout,
-      spawn: async (command, args, options) => { requireContext(); return this.spawnAgent(session, command, args, options?.env) },
+      spawn: async (command, args, options) => {
+        requireContext()
+        const launchPath = command === 'codex' ? session.cliCheck?.result.launchPath : undefined
+        return this.spawnAgent(session, launchPath || command, args, options?.env)
+      },
       emit: (event) => {
         if (!currentContext() || session.record.status === 'closed') return
         // Native compaction chatter is maintenance, not a new assistant reply.
@@ -2321,7 +2328,8 @@ export class ChatRuntime extends EventEmitter {
       cwd: record.checkout,
       env,
       // The Claude SDK asks for `node <wrapper>`: scrub by the wrapper's name.
-      envCommand: command === process.execPath && args[0] ? basename(args[0]) : undefined,
+      envCommand: record.agent === 'codex' && command === session.cliCheck?.result.launchPath ? 'codex'
+        : command === process.execPath && args[0] ? basename(args[0]) : undefined,
     })
     session.worker = worker
     storage.recordWorker({

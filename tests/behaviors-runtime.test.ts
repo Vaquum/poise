@@ -116,6 +116,7 @@ function arrangeCli(
   changesAddressed = false,
   failCheckout = false,
   reviewActivity: ReviewActivityFixture = {},
+  changesEvidence: Record<string, unknown> = {},
 ): void {
   mocks.runFile.mockImplementation(async (
     command: string,
@@ -193,6 +194,7 @@ function arrangeCli(
           author_commits_after_request: changesAddressed ? 1 : 0,
           author_inline_replies_after_request: 0,
           response_count: changesAddressed ? 1 : 0,
+          ...changesEvidence,
         }),
         stderr: '',
       }
@@ -573,6 +575,70 @@ describe('behavior launch claims', () => {
     mocks.authStatus = 'authenticated'
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+  })
+
+  it('starts a current-head follow-up for a public author reply without a newer commit', async () => {
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA }, {
+      commits_after_request: 0,
+      author_commits_after_request: 0,
+      author_pr_comments_after_request: 1,
+    })
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--pr-approve', '#17', '--expected-head', NEXT_HEAD_SHA,
+    ]))
+    expect(db.hasSeen('approve-prs',
+      `${pr.repo}#17@req=2026-07-10T10:00:00Z/r=1/head=${NEXT_HEAD_SHA}`)).toBe(true)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+    expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--approve-pr')).toBe(false)
+  })
+
+  it('waits for a response when the latest change request has no author engagement', async () => {
+    arrangeCli(true, false, {}, {
+      status: false,
+      commits_after_request: 0,
+      author_commits_after_request: 0,
+      author_pr_comments_after_request: 0,
+      response_count: 0,
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+
+  it.each([
+    { author_pr_comments_after_request: -1 },
+    { author_pr_comments_after_request: null },
+    { author_pr_comments_after_request: '1' },
+    { author_pr_comments_after_request: 1.5 },
+    { author_pr_comments_after_request: 1, response_count: 1 },
+  ])('rejects invalid public reply evidence %j without launching', async (evidence) => {
+    arrangeCli(true, false, {}, evidence)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ behavior: 'approve-prs', target: `${pr.repo}#17:check` }),
+    ])
   })
 
   it('approves a requested clean review on the next scan without a CI gate', async () => {
@@ -2627,7 +2693,147 @@ describe('behavior launch claims', () => {
     expect(args[args.indexOf('--recovery-model') + 1]).toBe('opus-5-xhigh')
   })
 
-  it.each(['model_output_limit', 'review_budget_exhausted', 'review_recovery_failed', 'review_contract_violation', 'stopped'])('holds %s across restarts, without blocking another PR or a new head', async (code) => {
+  it('resumes a whole failed panel atomically through its normal scheduler', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-07T12:00:00Z'))
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const loaded = await loadModules()
+    loaded.behaviors.startBehaviorsRuntime()
+    loaded.database.setMeta('me', 'poise-user')
+    loaded.database.setMeta('behavior_review_new_prs_keyver', '3')
+    loaded.database.setMeta('behavior_review_new_prs_enabled', '1')
+    loaded.database.setMeta('behavior_review_new_prs_reviewers', '3')
+    loaded.database.recordSeen('review-new-prs', '__snapshot_v3__')
+    await loaded.behaviors.runEnabledBehaviorsOnce()
+    const claims = loaded.database.listBehaviorLaunchClaims('review-new-prs')
+    expect(claims).toHaveLength(3)
+    agentLogs = claims.map((claim, index) => agentLog({ id: String(index + 1).repeat(32), status: 'failed',
+      started_at: claim.launchRequestedAt, started_at_precise: claim.launchRequestedAt,
+      source: claim.launchSource, correlation_id: claim.launchCorrelationId,
+      actor: claim.launchActor, expected_head: claim.launchExpectedHead,
+      model: claim.target.endsWith(':tertiary') ? 'grok-4.6-xhigh' : claim.target.endsWith(':secondary') ? 'gpt-6-astra-ultra' : 'opus-5-xhigh',
+      error: 'review behavior must produce exactly one atomic clean or change-request review',
+      error_code: 'review_contract_violation', review_policy: 'bounded-v1' }))
+    await loaded.behaviors.runEnabledBehaviorsOnce()
+    expect(loaded.database.listBehaviorDeadLetters()).toHaveLength(3)
+    arrangeCli(false, false, { reviewerReviewIdsSince: [] })
+    await expect(loaded.behaviors.retryFailedPrReviews(agentLogs.map((row) => row.id))).resolves.toEqual({
+      ok: true, targets: expect.arrayContaining(claims.map((claim) => claim.target)) })
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    await loaded.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(6)
+    expect(loaded.database.listBehaviorDeadLetters()).toEqual([])
+  })
+
+  it.each(['valid', 'head', 'actor', 'source', 'receipt', 'pending', 'unclaimed', 'missing-inventory', 'running', 'quarantine', 'late-quarantine', 'ambiguous', 'claimed-sibling'])('explicit operator retry preserves publication and ownership guards (%s)', async (variant) => {
+    const launched = await launchReviewBeforeCrash()
+    const failed = agentLog({ id: 'f'.repeat(32), started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      status: 'failed', error: 'review behavior must produce exactly one atomic clean or change-request review',
+      error_code: 'review_contract_violation', review_policy: 'bounded-v1', model: 'opus-5-xhigh',
+      expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
+    agentLogs = [failed]
+    const modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+    if (variant === 'actor') failed.actor = 'another-account'
+    if (variant === 'source') failed.source = 'another-system'
+    if (variant === 'receipt') failed.review_id = 91
+    if (variant === 'quarantine') modules.database.db.prepare("UPDATE behavior_seen SET launch_quarantine = 'unreadable' WHERE target = ?").run(launched.target)
+    if (variant === 'ambiguous') agentLogs.push({ ...failed, id: 'e'.repeat(32) })
+    if (variant === 'running') agentLogs.push(agentLog({ id: 'e'.repeat(32), correlation_id: 'running-sibling' }))
+    if (variant === 'claimed-sibling') agentLogs.push(agentLog({ id: 'e'.repeat(32), correlation_id: 'completed-sibling',
+      status: 'completed', action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA, review_id: 91 }))
+    arrangeCli(false, false, { headSha: variant === 'head' ? NEXT_HEAD_SHA : HEAD_SHA,
+      ...(variant === 'missing-inventory' ? {} : { reviewerReviewIdsSince: ['unclaimed', 'claimed-sibling'].includes(variant) ? [91] : [] }),
+      reviewerPendingReviews: variant === 'pending' ? 1 : 0 })
+    if (variant === 'late-quarantine') {
+      const implementation = mocks.runFile.getMockImplementation()!
+      mocks.runFile.mockImplementation(async (...args: any[]) => {
+        const result = await implementation(...args)
+        if (args[1][0] === '--review-activity-since') modules.database.db.prepare("UPDATE behavior_seen SET launch_quarantine = 'unreadable' WHERE target = ?").run(launched.target)
+        return result
+      })
+    }
+    if (variant === 'valid' || variant === 'claimed-sibling') {
+      await expect(modules.behaviors.retryFailedPrReviews([failed.id])).resolves.toEqual({ ok: true, targets: [launched.target] })
+      expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).toBeNull()
+      expect(modules.database.getMeta(`behavior_operator_retry:${failed.id}`)).toContain(launched.correlationId)
+      expect(modules.database.listBehaviorDeadLetters()).toEqual([])
+      await modules.behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+      await expect(modules.behaviors.retryFailedPrReviews([failed.id])).rejects.toThrow()
+    } else {
+      await expect(modules.behaviors.retryFailedPrReviews([failed.id])).rejects.toThrow()
+      expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    }
+  })
+
+  it.each(['valid', 'head', 'actor', 'source', 'model', 'receipt', 'old', 'ambiguous', 'claimed', 'newest-claimed', 'posted-original'])('reconciles a held review only from a verified explicit replay (%s)', async (variant) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-07T12:00:00Z'))
+    const launched = await launchReviewBeforeCrash()
+    const failed = agentLog({
+      id: 'f'.repeat(32), started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', model: 'opus-5-xhigh',
+      review_policy: 'bounded-v1', error_code: 'review_provider_blocked', error: 'account blocked',
+      expected_head: launched.expectedHead, actor: launched.actor,
+      source: launched.source, correlation_id: launched.correlationId,
+    })
+    if (variant === 'posted-original') Object.assign(failed, { action: null, outcome: null })
+    agentLogs = [failed]
+    let modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+    vi.setSystemTime(Date.now() + 2_000)
+    const replay = agentLog({
+      id: 'e'.repeat(32), model: 'opus-5-xhigh', status: 'completed',
+      action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA,
+      source: 'poise:replay', correlation_id: 'explicit-replay', review_id: 91,
+    })
+    if (variant === 'head') replay.head_sha = NEXT_HEAD_SHA
+    if (variant === 'actor') replay.actor = 'another-account'
+    if (variant === 'source') replay.source = 'another-system'
+    if (variant === 'model') replay.model = 'gpt-6-astra-ultra'
+    if (variant === 'old') Object.assign(replay, { started_at: launched.requestedAt, started_at_precise: launched.requestedAt })
+    agentLogs.push(replay)
+    if (variant === 'newest-claimed') {
+      vi.setSystemTime(Date.now() + 1_000)
+      agentLogs.push(agentLog({ ...replay, id: 'd'.repeat(32), correlation_id: 'newer-replay', review_id: 92,
+        started_at: new Date().toISOString(), started_at_precise: new Date().toISOString(), completed_at: new Date().toISOString() }))
+    }
+    if (variant === 'ambiguous') agentLogs.push({ ...replay, id: 'd'.repeat(32) })
+    arrangeCli(false, false, { reviewerReviewIdsSince: variant === 'receipt' ? [] : variant === 'newest-claimed' ? [91, 92] : [91] })
+    modules = await restartModules()
+    if (variant === 'claimed' || variant === 'newest-claimed') {
+      modules.database.recordSeen('review-new-prs', 'another-slot')
+      modules.database.db.prepare('UPDATE behavior_seen SET launch_call_id = ? WHERE target = ?').run(variant === 'claimed' ? replay.id : 'd'.repeat(32), 'another-slot')
+    }
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    if (variant === 'valid' || variant === 'newest-claimed') {
+      expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).toBeNull()
+      expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toEqual({
+        callId: replay.id, completedAt: replay.completed_at, headSha: HEAD_SHA,
+      })
+      expect(modules.database.listBehaviorDeadLetters()).toEqual([])
+      modules = await restartModules()
+      modules.database.setMeta('behavior_approve_prs_enabled', '1')
+      modules.behaviors.startBehaviorsRuntime()
+      await modules.behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+      expect(mocks.spawnDetached.mock.calls[1][1]).toContain('--pr-approve')
+    } else {
+      expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+      expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
+    }
+  })
+
+  it.each(['model_output_limit', 'review_budget_exhausted', 'review_recovery_failed', 'review_contract_violation', 'review_provider_blocked', 'stopped'])('holds %s across restarts, without blocking another PR or a new head', async (code) => {
     const behavior = 'approve-prs' as 'review-new-prs' | 'approve-prs'
     const launched = behavior === 'review-new-prs'
       ? await launchReviewBeforeCrash() : await launchApprovalBeforeCrash()

@@ -431,7 +431,7 @@ export async function triggerPrReview(
   const { model, recovery, catalog } = await reviewChoice('pr_review')
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
-  await prepareModelClis(catalog, [model, recovery])
+  const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
   const pwd = await localCheckoutPath(owner, repo)
   const expectedHead = await getHeadSha(repoFullName, Number(num))
   const source = 'poise:manual-review'
@@ -458,7 +458,7 @@ export async function triggerPrReview(
     pwd,
   ], {
     cwd: agentCwd(),
-    env: claudeSubscriptionEnvironment(),
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
   })
   return { ok: true, source, correlationId }
@@ -506,7 +506,7 @@ export async function replayAgentJob(input: {
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   const [owner, repoName] = repo.split('/', 2)
-  await prepareModelClis(catalog, [model, recovery])
+  const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
   const pwd = await localCheckoutPath(owner, repoName)
   const expectedHead = await getHeadSha(repo, Number(prId))
   const source = 'poise:replay'
@@ -532,7 +532,7 @@ export async function replayAgentJob(input: {
     pwd,
   ], {
     cwd: agentCwd(),
-    env: claudeSubscriptionEnvironment(),
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
   })
   return { ok: true, source, correlationId }
@@ -546,7 +546,7 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
   const { model, recovery, catalog } = await reviewChoice('issue_review')
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
-  await prepareModelClis(catalog, [model, recovery])
+  const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
@@ -566,7 +566,7 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
     correlationId,
   ], {
     cwd: agentCwd(),
-    env: claudeSubscriptionEnvironment(),
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
   })
   return { ok: true, source, correlationId }
