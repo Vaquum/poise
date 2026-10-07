@@ -2,7 +2,8 @@ from datetime import datetime
 from typing import Any
 
 from github_interface.atoms.issues import issue_comments
-from github_interface.atoms.pulls import get_pull, list_commits, list_inline_comments, list_reviews
+from github_interface.atoms.pulls import get_pull, list_commits, list_inline_comments, list_review_threads, list_reviews
+from github_interface.behaviors.request_changes import REAFFIRM_BODY
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository, token_user
@@ -26,6 +27,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     comments = await list_inline_comments(client, owner, repo, pull_number)
     commits = await list_commits(client, owner, repo, pull_number)
     public_comments = await issue_comments(client, owner, repo, pull_number)
+    threads = await list_review_threads(client, owner, repo, pull_number)
 
     actor_reviews = [
         review
@@ -79,7 +81,37 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         and _login(comment) == author
         and _time(comment["created_at"]) > latest_request_at
     ]
-    response_count = len(commits_after_request) + len(author_replies) + len(author_pr_comments)
+    # Resolution has no timestamp in GitHub's thread state. Match the active
+    # request's exact root comments instead of treating old resolved threads as
+    # responses. A summary-only reaffirmation refers to the current sequence
+    # of change requests, ending at an approval or dismissal.
+    resolution_review_ids = set(request_ids)
+    if request_review and not request_comments and request_review.get("body") == REAFFIRM_BODY:
+        for review in reversed(actor_reviews):
+            if review["state"] != "CHANGES_REQUESTED":
+                break
+            resolution_review_ids.add(review["id"])
+    resolution_thread_ids = {
+        comment.get("in_reply_to_id") or comment["id"]
+        for comment in comments
+        if comment.get("pull_request_review_id") in resolution_review_ids
+        and _login(comment) == username.lower()
+    }
+    resolution_threads = [
+        thread for thread in threads if thread["root_comment_id"] in resolution_thread_ids
+    ]
+    if len(resolution_threads) != len(resolution_thread_ids):
+        raise RuntimeError("GitHub review-thread inventory is missing change-request root comments")
+    resolved_request_threads = (
+        len(resolution_threads)
+        if resolution_thread_ids
+        and all(thread["is_resolved"] for thread in resolution_threads)
+        else 0
+    )
+    response_count = (
+        len(commits_after_request) + len(author_replies) + len(author_pr_comments)
+        + resolved_request_threads
+    )
     addressed = request_review is not None and response_count > 0
     head_sha = str((pull.get("head") or {}).get("sha") or "").lower()
     if len(head_sha) != 40:
@@ -104,6 +136,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "author_commits_after_request": len(commits_after_request),
         "author_inline_replies_after_request": len(author_replies),
         "author_pr_comments_after_request": len(author_pr_comments),
+        "resolved_request_threads": resolved_request_threads,
         "response_count": response_count,
     }
 

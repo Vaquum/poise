@@ -167,6 +167,7 @@ async def list_review_threads(client: GitHubClient, owner: str, repo: str, pull_
               diffSide
               comments(first: 100) {
                 nodes {
+                  databaseId
                   body
                   author { login }
                 }
@@ -448,6 +449,7 @@ def _thread_summary(thread: dict[str, Any]) -> dict[str, Any]:
         "id": thread["id"],
         "is_outdated": thread["isOutdated"],
         "is_resolved": thread["isResolved"],
+        "root_comment_id": comments[0].get("databaseId") if comments else None,
         "author": str((comments[0].get("author") or {}).get("login") or "") if comments else "",
         "path": thread["path"],
         "line": thread["line"] or thread["originalLine"],
