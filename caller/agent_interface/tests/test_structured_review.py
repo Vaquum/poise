@@ -108,6 +108,7 @@ class TestStructuredVerdict(TestCase):
         args = model_call.args[0]
         self.assertEqual(args[args.index("--model") + 1], "gpt-6-astra")
         self.assertIn('model_reasoning_effort="ultra"', args)
+        self.assertIn('model_reasoning_summary="auto"', args)
         self.assertIn("--ignore-user-config", args)
         self.assertIn('forced_login_method="chatgpt"', args)
         self.assertEqual(args[args.index("--sandbox") + 1], "read-only")

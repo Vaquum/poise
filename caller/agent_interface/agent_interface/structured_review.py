@@ -220,6 +220,7 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
         "--skip-git-repo-check", "--sandbox", "read-only",
         "--model", model.selector,
         "-c", f'model_reasoning_effort="{model.effort}"',
+        "-c", 'model_reasoning_summary="auto"',
         "-c", 'approval_policy="never"',
         "-c", 'forced_login_method="chatgpt"',
         "-c", 'web_search="disabled"',
