@@ -620,6 +620,49 @@ describe('behavior launch claims', () => {
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   })
 
+  it('starts inspection when requested threads are resolved without a commit or reply', async () => {
+    arrangeCli(true, false, {}, {
+      commits_after_request: 0,
+      author_commits_after_request: 0,
+      author_pr_comments_after_request: 0,
+      resolved_request_threads: 2,
+      response_count: 2,
+    })
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--pr-approve', '#17', '--expected-head', HEAD_SHA,
+    ]))
+    expect(db.hasSeen('approve-prs',
+      `${pr.repo}#17@req=2026-07-10T10:00:00Z/r=2/head=${HEAD_SHA}`)).toBe(true)
+    expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--approve-pr')).toBe(false)
+  })
+
+  it.each([
+    { resolved_request_threads: '2', response_count: 3 },
+    { resolved_request_threads: 2, response_count: 1 },
+  ])('rejects malformed resolution evidence %j without launching', async (evidence) => {
+    arrangeCli(true, false, {}, evidence)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ behavior: 'approve-prs', target: `${pr.repo}#17:check` }),
+    ])
+  })
+
   it.each([
     { author_pr_comments_after_request: -1 },
     { author_pr_comments_after_request: null },
