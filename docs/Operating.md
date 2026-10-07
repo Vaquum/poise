@@ -207,7 +207,13 @@ container and the volume: `docker rm poise-ws-<handle>` and
    their own agent account.
 5. Install [Poise Link](Poise-Link.md) on your computer and pair it with
    `poise.example.com`. It keeps Espanso's snippets in sync and shows Poise's
-   alerts while the browser is closed.
+   alerts while the browser is closed. On macOS or on Debian and Ubuntu, one
+   command installs it, with Espanso when that is missing; the **Pair Poise
+   Link** page at `https://poise.example.com/link` shows it too:
+
+   ```bash
+   curl -fsSL https://github.com/autonomio/poise/releases/latest/download/install.sh | sh
+   ```
 
 ## Upgrades
 
