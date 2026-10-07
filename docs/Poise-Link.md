@@ -66,9 +66,9 @@ because each build carries a new ad-hoc signature: choose Always Allow.
 
 **Elsewhere.** The installer stops before changing anything when it runs as
 root, on Linux without apt, or on Linux on anything but x86_64: Espanso
-publishes Linux packages for amd64 Debian and Ubuntu only, and Espanso
-2.4.1's packages need Debian 12 or Ubuntu 24.04 or newer. Install by hand
-there, from the [release page](https://github.com/autonomio/poise/releases/latest):
+builds for Linux on x86_64 only, as Debian packages and an X11 AppImage, and
+Espanso 2.4.1's packages need Debian 12 or Ubuntu 24.04 or newer. Install by
+hand there, from the [release page](https://github.com/autonomio/poise/releases/latest):
 
 - **Linux:** make `Poise-Link-linux-amd64.AppImage` executable and run it, and
   install [Espanso](https://espanso.org/install/) for your distribution. Start
