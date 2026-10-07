@@ -445,18 +445,24 @@ check_gateway_recreated() {
 # server's existing proxy would be (deploy/ci/proxy.Caddyfile), serves alice's
 # workspace and gets certificates on demand. Then install.sh switches back.
 check_proxy_mode() {
-  local listen=127.0.0.1:8080 published host
+  local first=127.0.0.2:8080 listen=127.0.0.1:8080 published host
   sed -i '/^POISE_ACME_EMAIL=/d' "$deploy/.env"
   echo 'POISE_PROXY_LISTEN=0.0.0.0:8080' >>"$deploy/.env"
   refused "install.sh with POISE_PROXY_LISTEN on every address" "must be the one IP address and port" "$deploy/install.sh"
+  sed -i "s/^POISE_PROXY_LISTEN=.*/POISE_PROXY_LISTEN=$first/" "$deploy/.env"
+  "$deploy/install.sh" >"$work/proxy-first-install.log"
+  published=$(docker port poise-gateway 8080/tcp 2>&1 || true)
+  [ "$published" = "$first" ] || fail "the gateway is published on $published, not on $first"
+  # Another address on the same port: the gateway's own port is no obstacle. And
+  # deploy/.env alone decides, whatever the shell exports.
   sed -i "s/^POISE_PROXY_LISTEN=.*/POISE_PROXY_LISTEN=$listen/" "$deploy/.env"
-  "$deploy/install.sh" | tee "$work/proxy-install.log"
+  POISE_PROXY_LISTEN=0.0.0.0:8080 "$deploy/install.sh" | tee "$work/proxy-install.log"
   grep --quiet --fixed-strings "ask http://$listen/_gateway/tls-ask" "$work/proxy-install.log" \
     || fail "install.sh did not say what the proxy must ask the gateway"
   if docker container inspect poise-caddy >/dev/null 2>&1; then fail "install.sh left the bundled Caddy in place"; fi
   published=$(docker port poise-gateway 8080/tcp 2>&1 || true)
   [ "$published" = "$listen" ] || fail "the gateway is published on $published, not on $listen alone"
-  pass "install.sh needs no POISE_ACME_EMAIL, removes the bundled Caddy and publishes the gateway on $listen alone"
+  pass "install.sh needs no POISE_ACME_EMAIL, removes the bundled Caddy, moves the gateway from $first and publishes it on $listen alone, as deploy/.env says"
 
   [ "$(curl --silent --max-time 10 "http://$listen/_gateway/tls-ask?domain=alice.$domain")" = ok ] \
     || fail "the gateway does not answer the certificate question at $listen"

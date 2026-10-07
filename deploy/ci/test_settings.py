@@ -33,10 +33,10 @@ class LibTest(unittest.TestCase):
             file.writelines(f'{name}={value}\n' for name, value in settings.items())
         os.chmod(self.env_file, 0o600)
 
-    def lib(self, script, *args, path=None):
+    def lib(self, script, *args, path=None, exported=None):
         """Runs SCRIPT with deploy/lib.sh sourced and deploy/.env replaced by this test's file."""
-        env = dict(os.environ)
-        env.pop('COMPOSE_FILE', None)
+        env = {name: value for name, value in os.environ.items() if not name.startswith(('POISE_', 'COMPOSE_'))}
+        env.update(exported or {})
         if path:
             env['PATH'] = f'{path}{os.pathsep}{env["PATH"]}'
         return subprocess.run(
@@ -62,20 +62,23 @@ class ListenAddressTest(LibTest):
 class ComposeTest(LibTest):
     def setUp(self):
         super().setUp()
-        # A docker that prints the Compose files it was given instead of running anything.
+        # A docker that prints what Compose would get instead of running anything.
         self.bin = os.path.join(self.work.name, 'bin')
         os.mkdir(self.bin)
         docker = os.path.join(self.bin, 'docker')
         with open(docker, 'w') as file:
-            file.write('#!/bin/sh\nprintf "%s %s\\n" "$PWD" "$COMPOSE_FILE"\n')
+            file.write('#!/bin/sh\nprintf "%s %s %s\\n" "$PWD" "$COMPOSE_FILE" "${POISE_PROXY_LISTEN-unset}"\n')
         os.chmod(docker, 0o755)
 
-    def compose_files(self, script='compose config'):
-        result = self.lib(script, path=self.bin)
+    def compose(self, script='compose config', exported=None):
+        result = self.lib(script, path=self.bin, exported=exported)
         self.assertEqual(result.returncode, 0, result.stderr)
-        directory, files = result.stdout.split()
+        directory, files, proxy_listen = result.stdout.split()
         self.assertEqual(os.path.realpath(directory), os.path.realpath(os.path.join(ROOT, 'deploy')))
-        return files
+        return files, proxy_listen
+
+    def compose_files(self, script='compose config'):
+        return self.compose(script)[0]
 
     def test_runs_the_bundled_stack_without_proxy_listen(self):
         self.write_env(**REQUIRED, POISE_ACME_EMAIL='ops@example.com')
@@ -86,6 +89,12 @@ class ComposeTest(LibTest):
         self.assertEqual(self.compose_files(), 'compose.yaml:compose.proxy.yaml')
         self.assertEqual(self.compose_files('COMPOSE_FILE=compose.yaml:ci/compose.yaml compose config'),
                          'compose.yaml:ci/compose.yaml:compose.proxy.yaml')
+
+    def test_takes_settings_from_the_env_file_alone(self):
+        # An exported value would take the checked one's place in compose.proxy.yaml's port mapping.
+        self.write_env(**REQUIRED, POISE_PROXY_LISTEN='127.0.0.1:8080')
+        files, proxy_listen = self.compose(exported={'POISE_PROXY_LISTEN': '0.0.0.0:8080'})
+        self.assertEqual((files, proxy_listen), ('compose.yaml:compose.proxy.yaml', 'unset'))
 
 
 def compose_available():

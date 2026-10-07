@@ -28,9 +28,11 @@ require_free_ports() {
   local port proxy
   proxy=$(proxy_listen)
   if [ -n "$proxy" ]; then
-    # Once installed this way, this installation's gateway holds it.
-    if docker port "$gateway" 8080/tcp 2>/dev/null | grep --quiet --ignore-case --line-regexp --fixed-strings "$proxy"; then return; fi
     port=${proxy##*:}
+    # Once installed this way, this installation's gateway holds the port, on
+    # this address or on the one it had before, and Compose frees it as it
+    # recreates the gateway.
+    if docker port "$gateway" 8080/tcp 2>/dev/null | grep --quiet ":$port\$"; then return; fi
     if listening "$port"; then
       die "something on this server already listens on port $port, which POISE_PROXY_LISTEN gives the gateway. See what: sudo ss -ltnp 'sport = :$port'"
     fi

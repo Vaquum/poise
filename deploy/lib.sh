@@ -16,10 +16,15 @@ die() {
 
 # Docker Compose on deploy/compose.yaml, or on the files COMPOSE_FILE names,
 # with compose.proxy.yaml added when deploy/.env sets POISE_PROXY_LISTEN.
+# deploy/.env is the only source of settings: a POISE_ variable exported in
+# this shell would otherwise take its place in compose.yaml, unchecked.
 compose() {
-  local files=${COMPOSE_FILE:-compose.yaml}
+  local files=${COMPOSE_FILE:-compose.yaml} name exported=()
   if [ -n "$(proxy_listen)" ]; then files=$files:compose.proxy.yaml; fi
-  (cd "$deploy" && COMPOSE_FILE=$files docker compose "$@")
+  for name in $(compgen -e); do
+    if [[ $name == POISE_* ]]; then exported+=(-u "$name"); fi
+  done
+  (cd "$deploy" && env "${exported[@]}" COMPOSE_FILE="$files" docker compose "$@")
 }
 
 require_linux() {
