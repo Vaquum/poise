@@ -18,8 +18,9 @@ services:
       - "443:443/udp"
     environment:
       POISE_DOMAIN: ${POISE_DOMAIN:?set POISE_DOMAIN in deploy/.env}
-      # Required unless POISE_PROXY_LISTEN is set, which leaves this service out.
-      POISE_ACME_EMAIL: ${POISE_ACME_EMAIL:-${POISE_PROXY_LISTEN:?set POISE_ACME_EMAIL in deploy/.env}}
+      # The scripts require it unless POISE_PROXY_LISTEN leaves this service
+      # out, which Compose cannot express; without it Caddy refuses to start.
+      POISE_ACME_EMAIL: ${POISE_ACME_EMAIL:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

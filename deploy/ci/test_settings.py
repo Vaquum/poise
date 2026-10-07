@@ -4,6 +4,7 @@
 """
 
 import glob
+import json
 import os
 import shutil
 import subprocess
@@ -85,6 +86,41 @@ class ComposeTest(LibTest):
         self.assertEqual(self.compose_files(), 'compose.yaml:compose.proxy.yaml')
         self.assertEqual(self.compose_files('COMPOSE_FILE=compose.yaml:ci/compose.yaml compose config'),
                          'compose.yaml:ci/compose.yaml:compose.proxy.yaml')
+
+
+def compose_available():
+    return shutil.which('docker') is not None and subprocess.run(
+        ['docker', 'compose', 'version'], capture_output=True).returncode == 0
+
+
+@unittest.skipUnless(compose_available(), 'Docker Compose is not installed')
+class ComposeConfigTest(unittest.TestCase):
+    """The stack as this Docker Compose reads deploy/compose.yaml, alone and with compose.proxy.yaml."""
+
+    def config(self, files, **settings):
+        with tempfile.TemporaryDirectory() as work:
+            for name in ('compose.yaml', 'compose.proxy.yaml'):
+                shutil.copy(os.path.join(ROOT, 'deploy', name), work)
+            with open(os.path.join(work, '.env'), 'w') as file:
+                file.writelines(f'{name}={value}\n' for name, value in settings.items())
+            env = {name: value for name, value in os.environ.items() if not name.startswith(('POISE_', 'COMPOSE_'))}
+            result = subprocess.run(['docker', 'compose', 'config', '--format', 'json'], cwd=work, capture_output=True,
+                                    text=True, env={**env, 'COMPOSE_FILE': files})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)['services']
+
+    def test_runs_caddy_and_an_unpublished_gateway_without_proxy_listen(self):
+        services = self.config('compose.yaml', **REQUIRED, POISE_ACME_EMAIL='ops@example.com')
+        self.assertEqual(services['caddy']['environment']['POISE_ACME_EMAIL'], 'ops@example.com')
+        self.assertNotEqual(services['caddy'].get('scale', 1), 0)
+        self.assertEqual(services['gateway'].get('ports', []), [])
+
+    def test_runs_the_gateway_alone_on_the_listen_address_with_proxy_listen(self):
+        services = self.config('compose.yaml:compose.proxy.yaml', **REQUIRED, POISE_PROXY_LISTEN='127.0.0.1:8080')
+        caddy = services['caddy']
+        self.assertEqual(caddy.get('scale', (caddy.get('deploy') or {}).get('replicas')), 0)
+        ports = [(port.get('host_ip'), str(port.get('published')), port.get('target')) for port in services['gateway']['ports']]
+        self.assertEqual(ports, [('127.0.0.1', '8080', 8080)])
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'deploy/lib.sh reads the file mode with GNU stat, as on the Linux server')
