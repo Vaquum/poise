@@ -179,7 +179,10 @@ class TestInspection(TestCase):
             self.assertFalse(result["truncated"])
             self.assertIsNone(result["next_line"])
         self.assertEqual(response["results"][3]["lines"][0], {"line": 1, "text": "needle"})
-        self.assertEqual(response["results"][3]["next_line"], 201)
+        text_result = response["results"][3]
+        remainder = rc.inspect(self.root, [self.request(start=text_result["next_line"])])["results"][0]
+        self.assertEqual(text_result["lines"] + remainder["lines"],
+                         [{"line": n, "text": "needle"} for n in range(1, 202)])
 
     def test_never_reads_git_metadata_untracked_paths_or_symlinks(self):
         for path in ("../secret", "/etc/passwd", ".git/config", "src/../../secret", "escape"):
