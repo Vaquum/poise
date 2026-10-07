@@ -165,6 +165,10 @@ it('keeps admitted Codex launchers usable when npm removes a native dependency m
   const launch = (path: string) => runUpdateCommand(path, ['--version'], { env, cwd: root })
   await expect(launch(launcher)).rejects.toThrow('exited')
   expect((await launch(failed.launchPath!)).stdout.trim()).toBe('1.0.0')
+  const stillFailed = await ensureProviderCli('codex', { root, env, run })
+  expect(stillFailed).toMatchObject({ status: 'unavailable', launchPath: failed.launchPath, launchVersion: '1.0.0' })
+  expect(stillFailed.before).toBeUndefined()
+  expect((await launch(stillFailed.launchPath!)).stdout.trim()).toBe('1.0.0')
   failInstall = false
   const repaired = await ensureProviderCli('codex', { root, env, run })
   expect(repaired).toMatchObject({ status: 'updated', after: '1.1.0' })

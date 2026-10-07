@@ -114,6 +114,7 @@ async function codexLaunchSnapshot(resolved, version, root, run, env, remaining)
     } finally { await rm(staged, { recursive: true, force: true }) }
   }
   await verify(launcher)
+  await saveReceipt(join(root, `codex-${hash(resolved).slice(0, 16)}.launcher.json`), { version, path: launcher })
   return launcher
 }
 
@@ -155,6 +156,19 @@ async function update(provider, options, requestedAt) {
     if (before) result.launchPath = npmCodex
       ? await codexLaunchSnapshot(resolved, before, root, run, env, remaining) : path
     if (result.launchPath) result.launchVersion = before
+    if (npmCodex && !before) {
+      const retained = await readReceipt(join(root, `codex-${hash(resolved).slice(0, 16)}.launcher.json`))
+      if (typeof retained?.version === 'string' && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(retained.version)
+        && retained.path === join(root, `codex-${hash(resolved).slice(0, 16)}-${retained.version}`, 'bin', 'codex.js')) {
+        try {
+          const actual = versionOf((await run(retained.path, ['--version'], { env, cwd: root, timeoutMs: remaining(10_000) })).stdout)
+          if (actual === retained.version) {
+            result.launchPath = retained.path
+            result.launchVersion = retained.version
+          }
+        } catch { /* an unusable retained copy cannot admit a worker; still attempt repair */ }
+      }
+    }
     if (prior?.provider === provider && prior.path === path && prior.launchPath && prior.launchVersion === before && Date.parse(prior.checkedAt) >= requestedAt && Date.parse(prior.checkedAt) <= Date.now() && prior.after === before && ['current', 'updated'].includes(prior.status)) return prior
     let plan = updatePlan(provider, path)
     const npmSuffix = '/lib/node_modules/@openai/codex/bin/codex.js'

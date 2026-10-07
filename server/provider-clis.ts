@@ -23,7 +23,7 @@ export async function prepareModelClis(catalog: Catalog, identities: string[]): 
   await Promise.all([...providers].map(async provider => {
     const result = await prepareProviderCli(provider)
     if (result.status === 'unavailable') console.warn(`[models] ${provider}: latest CLI could not be verified — ${result.error}`)
-    if (provider === 'codex') {
+    if (provider === 'codex' && !process.env.CODEX_CLI) {
       if (!result.launchPath) throw new Error(`Codex CLI has no verified launcher: ${result.error || 'version check failed'}`)
       env.CODEX_CLI = result.launchPath
     }
