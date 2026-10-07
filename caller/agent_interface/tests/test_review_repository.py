@@ -105,6 +105,46 @@ class TestRepositoryLifecycle(TestCase):
 
 
 class TestStructuredInspection(TestCase):
+    def test_real_cli_reports_a_binary_read_and_allows_one_informed_verdict(self):
+        actual_run = subprocess.run
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); (root / ".git").mkdir()
+            (root / "figure.jpg").write_bytes(b"\xff\xd8\xff\xe0JPEG")
+            (root / "consumer.py").write_text("old_contract()\n")
+            (root / ".git" / "caller-review.json").write_text(json.dumps({"head_sha": HEAD,
+                "files": ["figure.jpg", "consumer.py"]}))
+            repo = rr.Repository(root, {"head_sha": HEAD})
+            rounds = []; submissions = []
+
+            def command(args, **kwargs):
+                if "--review-context" in args:
+                    done = actual_run(args, **kwargs)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    response = json.loads(done.stdout)
+                    self.assertEqual(response["head_sha"], HEAD)
+                    self.assertEqual(response["results"][0]["lines"], [])
+                    self.assertIn("not UTF-8 text", response["results"][0]["error"])
+                    self.assertEqual(response["results"][1]["lines"], [{"line": 1, "text": "old_contract()"}])
+                    return done
+                submissions.append(args)
+                return SimpleNamespace(returncode=0, stdout="submitted", stderr="")
+
+            def ask(*args):
+                rounds.append(args[3])
+                if len(rounds) == 1:
+                    return json.dumps({"action": "inspect", "comments": [],
+                        "requests": [{**REQUEST, "path": "figure.jpg"}, REQUEST]})
+                self.assertIn("not UTF-8 text", args[3])
+                self.assertIn("old_contract()", args[3])
+                return json.dumps({"action": "request_changes", "comments": [FINDING], "requests": []})
+
+            with patch.dict(sr.ASK, {"codex": ask}), patch.object(sr.subprocess, "run", side_effect=command):
+                sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR,
+                       "bot", HEAD, 60, repository=repo)
+            self.assertEqual(len(rounds), 2)
+            self.assertEqual(len(submissions), 1)
+            self.assertEqual(submissions[0][-4:], ["--expected-head", HEAD, "--token-user", "bot"])
+
     def test_real_inspection_cli_pages_a_dense_batch_before_one_submission(self):
         actual_run = subprocess.run
         with tempfile.TemporaryDirectory() as work:

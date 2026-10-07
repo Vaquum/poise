@@ -164,6 +164,23 @@ class TestInspection(TestCase):
         self.assertEqual(single["lines"], [{"line": 1, "text": text}])
         self.assertFalse(single["truncated"])
 
+    def test_non_utf8_read_reports_unavailable_text_without_losing_the_batch(self):
+        names = ["src/figure.jpg", "src/utf16.txt", "src/invalid.txt", "src/code.py"]
+        (self.root / names[0]).write_bytes(b"\xff\xd8\xff\xe0JPEG")
+        (self.root / names[1]).write_bytes("UTF-16 source".encode("utf-16"))
+        (self.root / names[2]).write_bytes((b"valid prefix " + b"x" * 90 + b"\n") * 90 + b"\xff")
+        (self.root / ".git" / rc.MANIFEST).write_text(json.dumps({"head_sha": "a" * 40, "files": names}))
+        response = rc.inspect(self.root, [self.request(path=name) for name in names])
+        self.assertEqual(response["head_sha"], "a" * 40)
+        self.assertLessEqual(len(json.dumps(response, indent=2).encode()) + 1, rc.MAX_RESPONSE_BYTES)
+        for result in response["results"][:3]:
+            self.assertIn("not UTF-8 text", result["error"])
+            self.assertEqual(result["lines"], [])
+            self.assertFalse(result["truncated"])
+            self.assertIsNone(result["next_line"])
+        self.assertEqual(response["results"][3]["lines"][0], {"line": 1, "text": "needle"})
+        self.assertEqual(response["results"][3]["next_line"], 201)
+
     def test_never_reads_git_metadata_untracked_paths_or_symlinks(self):
         for path in ("../secret", "/etc/passwd", ".git/config", "src/../../secret", "escape"):
             with self.subTest(path=path), self.assertRaises(ValueError):

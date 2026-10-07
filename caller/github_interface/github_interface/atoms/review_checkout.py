@@ -110,8 +110,14 @@ def inspect(root: Path, requests: list[dict]) -> dict:
             if relative not in files:
                 result["error"] = "tracked regular file not found"
             else:
-                lines, truncated = _page(_lines(root, relative, start), 200, page_bytes)
-                result.update(lines=lines, truncated=truncated, next_line=start + len(lines) if truncated else None)
+                try:
+                    lines, truncated = _page(_lines(root, relative, start), 200, page_bytes)
+                except UnicodeDecodeError:
+                    result.update(error="File is not UTF-8 text; text inspection is unavailable.",
+                                  lines=[], truncated=False, next_line=None)
+                else:
+                    result.update(lines=lines, truncated=truncated,
+                                  next_line=start + len(lines) if truncated else None)
         else:
             if not query:
                 raise ValueError("search requires a nonempty literal query")

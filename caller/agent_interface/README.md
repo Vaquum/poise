@@ -108,6 +108,9 @@ limited to 64 KiB including JSON formatting. The budget is shared across request
 dense batches return shorter pages with lossless `next_line` continuations.
 An entry too large for its share asks for a separate request. Git metadata, untracked files, symlinks,
 path escapes, writes, test execution, and arbitrary commands are unavailable.
+Reading a non-UTF-8 file returns an explicit per-file error and no text; other
+requests in the batch still return their results. Binary content is not decoded
+with replacement characters or treated as inspected source.
 
 Claude reviews with the governed `github-interface` tools and can invoke that
 inspection command from the pinned checkout. Every other provider
