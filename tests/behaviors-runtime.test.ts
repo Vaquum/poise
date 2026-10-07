@@ -2633,7 +2633,7 @@ describe('behavior launch claims', () => {
     arrangeCli(false)
     mocks.spawnDetached.mockResolvedValue(undefined)
     const loaded = await loadModules()
-    loaded.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    loaded.behaviors.startBehaviorsRuntime()
     loaded.database.setMeta('me', 'poise-user')
     loaded.database.setMeta('behavior_review_new_prs_keyver', '3')
     loaded.database.setMeta('behavior_review_new_prs_enabled', '1')
@@ -2668,7 +2668,7 @@ describe('behavior launch claims', () => {
       expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
     agentLogs = [failed]
     const modules = await restartModules()
-    modules.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    modules.behaviors.startBehaviorsRuntime()
     await modules.behaviors.runEnabledBehaviorsOnce()
     expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
     if (variant === 'actor') failed.actor = 'another-account'
