@@ -1,6 +1,5 @@
 import http, { STATUS_CODES, type IncomingHttpHeaders, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
-import { withoutCookies } from './cookies.js'
 import { header } from './http.js'
 import type { Upstream } from './orchestrator.js'
 
@@ -56,8 +55,6 @@ export interface ForwardOptions {
   proto: 'http' | 'https'
   /** The Authorization header carried a device token the gateway has consumed. */
   dropAuthorization: boolean
-  /** The gateway's own cookies, which a workspace never sees. */
-  stripCookies: ReadonlySet<string>
 }
 
 function connectionTokens(headers: IncomingHttpHeaders): Set<string> {
@@ -70,19 +67,18 @@ function clientAddress(req: IncomingMessage): string {
   return (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '')
 }
 
-/** The request headers a workspace receives: the client's, minus anything identity-bearing the gateway owns. */
+/**
+ * The request headers a workspace receives: the client's, minus anything identity-bearing the gateway owns
+ * and every cookie. A workspace needs none, and a cookie a parent domain shares with every host below it,
+ * such as another service's login, must not reach the agents.
+ */
 export function forwardHeaders(req: IncomingMessage, options: ForwardOptions): OutgoingHttpHeaders {
   const listed = connectionTokens(req.headers)
   const out: OutgoingHttpHeaders = {}
   for (const [name, value] of Object.entries(req.headers)) {
     if (value === undefined || HOP_BY_HOP.has(name) || listed.has(name)) continue
-    if (name === 'x-poise-identity' || name === 'forwarded' || name.startsWith('x-forwarded-')) continue
+    if (name === 'x-poise-identity' || name === 'forwarded' || name.startsWith('x-forwarded-') || name === 'cookie') continue
     if (name === 'authorization' && options.dropAuthorization) continue
-    if (name === 'cookie') {
-      const kept = withoutCookies(Array.isArray(value) ? value.join('; ') : value, options.stripCookies)
-      if (kept) out.cookie = kept
-      continue
-    }
     out[name] = value
   }
   // A chunked body is re-framed as chunked on the way in: Node would otherwise send it unframed for some

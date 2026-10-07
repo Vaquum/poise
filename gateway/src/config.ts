@@ -1,3 +1,4 @@
+import { isIPv4, isIPv6 } from 'node:net'
 import { isAbsolute } from 'node:path'
 
 /** Handles that name the gateway's own addresses and can never belong to a person. */
@@ -36,6 +37,11 @@ export interface Config {
   dockerSocket: string
   gatewayContainer: string
   port: number
+  /**
+   * The address a proxy of the operator's own reaches the gateway at, which deploy/compose.proxy.yaml
+   * publishes it on (POISE_PROXY_LISTEN), in lower case; null when the deployment's own Caddy fronts it.
+   */
+  proxyListen: string | null
 }
 
 export class ConfigError extends Error {
@@ -56,6 +62,14 @@ export function isLocalDomain(domain: string): boolean {
 
 function isDomainName(value: string): boolean {
   return value.length <= 253 && value.split('.').every((label) => DNS_LABEL.test(label))
+}
+
+/** One IPv4 address, or one IPv6 address in brackets, with a port: never 0.0.0.0 or [::], which mean every address. */
+function isListenAddress(value: string): boolean {
+  const match = /^(?:\[([\da-f:.]+)\]|([\d.]+)):([1-9]\d{0,4})$/.exec(value)
+  if (!match || Number(match[3]) > 65535) return false
+  if (match[2] !== undefined) return isIPv4(match[2]) && match[2] !== '0.0.0.0'
+  return isIPv6(match[1]) && new URL(`http://[${match[1]}]/`).hostname !== '[::]'
 }
 
 /** Reads and validates the whole configuration, reporting every problem at once. */
@@ -170,6 +184,12 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
   const drainTimeoutSeconds = wholeNumber('POISE_DRAIN_TIMEOUT', 30 * 60, MAX_DRAIN_TIMEOUT_SECONDS)
   const port = wholeNumber('PORT', 8080, 65535)
 
+  const proxyListenValue = read('POISE_PROXY_LISTEN')
+  const proxyListen = proxyListenValue?.toLowerCase() ?? null
+  if (proxyListen !== null && !isListenAddress(proxyListen)) {
+    problems.push(`POISE_PROXY_LISTEN must be one IP address and port, such as 127.0.0.1:8080 or [::1]:8080, never 0.0.0.0 or [::]; got "${proxyListenValue}"`)
+  }
+
   const workspaceRuntime = read('POISE_WORKSPACE_RUNTIME') ?? null
   if (workspaceRuntime !== null && !DOCKER_NAME.test(workspaceRuntime)) {
     problems.push(`POISE_WORKSPACE_RUNTIME is not a valid OCI runtime name; got "${workspaceRuntime}"`)
@@ -216,5 +236,6 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     dockerSocket,
     gatewayContainer,
     port,
+    proxyListen,
   }
 }

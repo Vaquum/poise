@@ -43,6 +43,7 @@ describe('configuration', () => {
       dockerSocket: '/var/run/docker.sock',
       gatewayContainer: 'poise-gateway',
       port: 8080,
+      proxyListen: null,
     })
   })
 
@@ -62,6 +63,7 @@ describe('configuration', () => {
       POISE_GATEWAY_DATA: '/srv/gateway',
       POISE_DOCKER_SOCKET: '/run/docker.sock',
       PORT: '9000',
+      POISE_PROXY_LISTEN: '[FD00::5]:8080',
     })
     expect(config).toMatchObject({
       domain: 'poise.example.com',
@@ -77,6 +79,7 @@ describe('configuration', () => {
       dataDir: '/srv/gateway',
       dockerSocket: '/run/docker.sock',
       port: 9000,
+      proxyListen: '[fd00::5]:8080',
     })
   })
 
@@ -123,6 +126,20 @@ describe('configuration', () => {
     for (const value of ['0', 'yes', 'true']) {
       expect(problems({ ...BASE, POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP: value })).toEqual([
         `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP must be 1 or unset; got "${value}"`,
+      ])
+    }
+  })
+
+  it('accepts POISE_PROXY_LISTEN only as one IP address and port', () => {
+    for (const value of ['127.0.0.1:8080', '192.168.150.10:80', '[::1]:8080', '[fd00::5]:65535']) {
+      expect(loadConfig({ ...BASE, POISE_PROXY_LISTEN: value }).proxyListen).toBe(value)
+    }
+    for (const value of [
+      '8080', '127.0.0.1', 'localhost:8080', 'gateway:8080', '0.0.0.0:8080', '[::]:8080', '[0:0:0:0:0:0:0:0]:8080',
+      '::1:8080', '127.0.0.1:0', '127.0.0.1:08080', '127.0.0.1:65536', '127.0.0.01:8080', 'http://127.0.0.1:8080',
+    ]) {
+      expect(problems({ ...BASE, POISE_PROXY_LISTEN: value }), value).toEqual([
+        `POISE_PROXY_LISTEN must be one IP address and port, such as 127.0.0.1:8080 or [::1]:8080, never 0.0.0.0 or [::]; got "${value}"`,
       ])
     }
   })

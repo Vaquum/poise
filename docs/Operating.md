@@ -8,7 +8,9 @@ describes how the parts fit together.
 
 Setting up takes four steps: point DNS at the server, create a GitHub OAuth
 App, fill in `deploy/.env`, and run `deploy/install.sh`. Upgrading is
-`deploy/upgrade.sh`.
+`deploy/upgrade.sh`. On a server whose web server already holds ports 80 and
+443, Poise runs behind it instead (see
+[Behind your own proxy](#behind-your-own-proxy)).
 
 ## What runs
 
@@ -20,6 +22,9 @@ App, fill in `deploy/.env`, and run `deploy/install.sh`. Upgrading is
 - **`poise-gateway`** signs people in, routes each workspace host to its
   owner's workspace, and creates, starts and upgrades the workspace
   containers itself through the Docker socket.
+
+Behind a proxy the server already runs, the gateway runs alone and that
+proxy does Caddy's part.
 
 Each person's workspace is a container named `poise-ws-<handle>`, where the
 handle is their GitHub login in lower case. Their home folder is the volume
@@ -33,7 +38,8 @@ signing key) in the volume `poise-gateway-data`.
   ([install Docker](https://docs.docker.com/engine/install/)), and `git`.
   The deployment is tested on Ubuntu on x86-64.
 - Ports 80 and 443 reachable from the internet, and nothing else listening on
-  them.
+  them, or a proxy already on them that will front Poise too
+  ([Behind your own proxy](#behind-your-own-proxy)).
 - A domain whose DNS you control.
 
 Size it for what agents do: they check out repositories, build them and run
@@ -117,7 +123,7 @@ describes every setting with an example. These are required:
 | `POISE_GITHUB_CLIENT_ID` | The OAuth App's client ID |
 | `POISE_GITHUB_CLIENT_SECRET` | The OAuth App's client secret |
 | `POISE_ADMINS` | GitHub logins that administer this Poise, separated by commas |
-| `POISE_ACME_EMAIL` | The address Let's Encrypt writes to about certificates |
+| `POISE_ACME_EMAIL` | The address Let's Encrypt writes to about certificates; not needed behind your own proxy |
 
 `POISE_ALLOWED_USERS` and `POISE_ALLOWED_ORGS` decide who else may sign in
 (see [People](#people)). The workspace limits, the drain timeout and the
@@ -155,6 +161,91 @@ page then links to your workspace, your Poise Link devices and the admin page,
 `https://poise.example.com/admin`. The admin page lists everyone who has
 signed in, how they got access, and their workspace's state and image, and
 lets you start, stop or restart a workspace and disable or enable a person.
+
+## Behind your own proxy
+
+When the server already runs a web server or reverse proxy on ports 80 and
+443, such as a Caddy or nginx serving other sites, Poise runs behind it
+instead of with a Caddy of its own. Set `POISE_PROXY_LISTEN` in
+`deploy/.env` to the address that proxy will reach the gateway at, and run
+`deploy/install.sh`:
+
+```bash
+POISE_PROXY_LISTEN=127.0.0.1:8080
+```
+
+The installation then runs the gateway alone, removes a Caddy it ran before,
+and publishes the gateway, over plain http, on that one address. Choose one
+only the proxy can reach: `127.0.0.1` when the proxy runs on the same host,
+or the private address it reaches this server at, such as a virtual
+machine's address on its host's internal network. `0.0.0.0` and `[::]` are
+refused, because they would publish the gateway on every address.
+`POISE_ACME_EMAIL` is not needed: the proxy holds the certificates.
+
+Your proxy must:
+
+- send every request for `poise.example.com` and `*.poise.example.com`, and
+  for no other name, to `http://<POISE_PROXY_LISTEN>`, with the browser's
+  `Host` header;
+- pass WebSockets through, put no time limit on a response, and accept
+  request bodies of up to 32 MiB: event streams, Chat's WebSocket and
+  terminals stay open for as long as people use them;
+- set `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` from what
+  it saw itself, never from what the client sent; Caddy does unless told to
+  trust another proxy;
+- serve a certificate for the apex and one for each workspace host: either a
+  wildcard certificate for `*.poise.example.com`, or each host's on demand.
+  For on-demand certificates it asks the gateway first,
+  `GET http://<POISE_PROXY_LISTEN>/_gateway/tls-ask?domain=<host>`, which
+  answers 200 only for the apex and the hosts of people who have signed in.
+  The gateway answers that question only for requests addressed to
+  `POISE_PROXY_LISTEN`, which is why the proxy must never pass that name on.
+
+With Caddy, for a gateway on `127.0.0.1:8080`:
+
+```caddyfile
+{
+	on_demand_tls {
+		ask http://127.0.0.1:8080/_gateway/tls-ask
+	}
+}
+
+poise.example.com {
+	reverse_proxy 127.0.0.1:8080
+}
+
+*.poise.example.com {
+	tls {
+		on_demand
+	}
+	reverse_proxy 127.0.0.1:8080
+}
+```
+
+Point the DNS records at the proxy. The OAuth App and everything after it
+are the same as above.
+
+**A sign-in of the proxy's own.** A proxy may ask for a sign-in of its own
+before it passes a request on, as a company portal does. Poise Link cannot
+answer one, so let these requests through without it; the gateway checks
+each against the device's token itself:
+
+- `POST /link/device/code` and `POST /link/device/token` on the apex;
+- every path under `/api/link/` on the workspace hosts.
+
+**A parent domain shared with other services.** When `POISE_DOMAIN` is under
+a domain other services use, such as `poise.example.com` beside a portal at
+`portal.example.com`, the browser also sends the gateway every cookie set
+for the whole of `example.com`, the portal's login among them. The gateway
+forwards no cookie to a workspace, so none of them reaches a workspace or
+its agents. A page in a workspace still counts as the same site as those
+services, so they must refuse cross-origin requests, for example by checking
+`Origin` or `Sec-Fetch-Site`, as they should in any case.
+
+To switch back, remove `POISE_PROXY_LISTEN`, set `POISE_ACME_EMAIL`, free
+ports 80 and 443 and run `deploy/install.sh`. When you run Compose yourself
+in `deploy/`, name both files as the scripts do, for example
+`COMPOSE_FILE=compose.yaml:compose.proxy.yaml docker compose ps`.
 
 ## People
 
@@ -365,7 +456,9 @@ a limit for every container, workspaces included, in
 ## Troubleshooting
 
 - **`install.sh` says a port is in use.** Another web server holds port 80
-  or 443; stop it. `sudo ss -ltnp 'sport = :443'` names it.
+  or 443; stop it, or run Poise behind it
+  ([Behind your own proxy](#behind-your-own-proxy)).
+  `sudo ss -ltnp 'sport = :443'` names it.
 - **The gateway keeps restarting.** `docker compose logs gateway` lists every
   setting it refused, each with the reason.
 - **The browser warns about the certificate.** For the apex, check the DNS
@@ -417,8 +510,9 @@ a limit for every container, workspaces included, in
   `POISE_WORKSPACE_RUNTIME=runsc` in `deploy/.env` and run
   `deploy/install.sh`. It applies to workspace containers created from then
   on (see [Upgrades](#upgrades)).
-- **Sign-in and sessions.** Caddy serves everything over TLS. Session
-  cookies are `Secure`, `HttpOnly` and `SameSite=Lax`. A workspace host
+- **Sign-in and sessions.** Caddy, or your own proxy, serves everything over
+  TLS. Session cookies are `Secure`, `HttpOnly` and `SameSite=Lax`, and no
+  cookie the browser sends ever reaches a workspace. A workspace host
   serves its owner only; an admin gets no access to it either. The gateway
   stores no GitHub token, and keeps only hashes of session ids, tickets and
   device tokens.

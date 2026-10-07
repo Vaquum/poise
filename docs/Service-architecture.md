@@ -17,6 +17,9 @@ Poise Link (desktop) ──https──▶ Caddy ──▶ gateway ──▶ the 
 ```
 
 - **Caddy** terminates TLS for the apex domain and every workspace subdomain.
+  A server that already runs a proxy on ports 80 and 443 can have that proxy
+  do it instead (`POISE_PROXY_LISTEN`): the deployment then runs no Caddy and
+  publishes the gateway on that one address for the proxy.
 - **The gateway** (`gateway/`) signs people in with GitHub, owns the user list,
   starts and upgrades workspace containers through the Docker Engine API, and
   proxies HTTP and WebSocket traffic to the signed-in person's own workspace.
@@ -59,7 +62,8 @@ workspace can reach another one.
   use (on-demand TLS); it asks the gateway first
   (`GET http://gateway:8080/_gateway/tls-ask?domain=<host>`), and the gateway
   answers 200 only for the apex and the handles of known users. It answers this
-  only for requests addressed to `gateway:8080`, never on a public host.
+  only for requests addressed to `gateway:8080`, or to `POISE_PROXY_LISTEN`
+  when the server's own proxy asks it there, never on a public host.
 
 ## Sign-in and sessions
 
@@ -131,10 +135,11 @@ client sent.
   - `link`: a paired Poise Link device; only `/api/link/*`.
   - `admin`: the gateway itself; only `/api/service/*`.
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
-  `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers. Its
-  own credentials stay with it: none of its cookies (`poise_gw`, `poise_ws`,
-  `poise_bind`, `poise_oauth`) and no device token's `Authorization` header is
-  forwarded.
+  `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers. It
+  forwards no `Cookie` header at all: neither its own cookies (`poise_gw`,
+  `poise_ws`, `poise_bind`, `poise_oauth`) nor any other the browser sends,
+  such as a login cookie that a parent domain shares with every host below
+  it. Nor does it forward a device token's `Authorization` header.
 - Workspaces cannot set cookies: the gateway drops every `Set-Cookie` from
   their responses. An answer with a status outside 100–599 becomes a 502.
 - A request on a bodiless method (`GET`, `HEAD`, `OPTIONS`, `DELETE`, `TRACE`)
@@ -473,7 +478,9 @@ alerts once, and again only after it has cleared:
 ## Deployment
 
 `deploy/` holds:
-- a Compose file running Caddy and the gateway;
+- a Compose file running Caddy and the gateway, and `compose.proxy.yaml`,
+  which the scripts add when `POISE_PROXY_LISTEN` leaves TLS to a proxy the
+  server already runs;
 - the Caddyfile (apex plus on-demand TLS for workspace hosts);
 - an environment template;
 - operator scripts to install, upgrade, back up and restore
