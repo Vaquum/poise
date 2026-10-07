@@ -19,6 +19,7 @@ type Helpers = {
   progressText: (e: any) => string
   progressDetail: (e: any) => string
   quarantineRecordMarkup: (e: any) => string
+  groupRuns: (entries: any[]) => Array<{ key: string, entries: any[] }>
 }
 
 async function loadHelpers(): Promise<Helpers> {
@@ -27,7 +28,7 @@ async function loadHelpers(): Promise<Helpers> {
   // otherwise only reachable through a DOM input event.
   const patched = source + `
 export const __test = {
-  sessionLabel, targetText, matchesSearch, startedAtMs, elapsedText, hasDetail, progressText, progressDetail, quarantineRecordMarkup,
+  sessionLabel, targetText, matchesSearch, startedAtMs, elapsedText, hasDetail, progressText, progressDetail, quarantineRecordMarkup, groupRuns,
   setSearch: (q: string) => { searchQuery = q },
 }
 `
@@ -52,6 +53,72 @@ function entry(over: Record<string, unknown> = {}): any {
     outcome: null, response: '', error: '', ...over,
   }
 }
+
+describe('identical finished attempts share a row', () => {
+  const failed = (overrides: Record<string, unknown> = {}) => entry({
+    repo: 'owner/repo', pr_id: '42', model: 'muse-spark-1.3-contributor-max',
+    behavior: 'pr_review', status: 'failed', outcome: 'preflight_failed', error: 'Provider access blocked',
+    expected_head: '1'.repeat(40), ...overrides,
+  })
+
+  it('groups repeated failures while preserving every attempt and the newest row', () => {
+    const newest = failed({ id: 'b'.repeat(32), started_at: '2026-10-06T20:00:00', time_elapsed: '14s' })
+    const earlier = failed({ started_at: '2026-10-06T19:00:00', time_elapsed: '13s' })
+    expect(helpers.groupRuns([newest, entry(), earlier]).map((group) => group.entries))
+      .toEqual([[newest, earlier], [entry()]])
+  })
+
+  it('compares full error output even when the first status line is identical', () => {
+    const groups = helpers.groupRuns([
+      failed({ error: 'Provider failed\nAPI key blocked' }),
+      failed({ error: 'Provider failed\nNetwork unavailable' }),
+    ])
+    expect(groups).toHaveLength(2)
+  })
+
+  it('keeps different work separate even when it fails with the same error', () => {
+    const rows = [failed(), failed({ pr_id: '43' }), failed({ model: 'grok-4.7-xhigh' }),
+      failed({ expected_head: '2'.repeat(40) }), failed({ prompt: 'A different request' }),
+      failed({ outcome: null }), failed({ actor: 'other-reviewer' })]
+    expect(helpers.groupRuns(rows)).toHaveLength(rows.length)
+  })
+
+  it('never treats response availability markers as equal output bodies', () => {
+    expect(helpers.groupRuns([
+      failed({ id: 'b'.repeat(32), response: 'body-one' }),
+      failed({ response: 'body-two' }),
+    ])).toHaveLength(2)
+  })
+
+  it('keeps unseen provider reasoning separate even when its character count matches', () => {
+    const progress = { phase: 'failed', warning: null, events: [], reasoning_available: true, reasoning_chars: 100 }
+    expect(helpers.groupRuns([
+      failed({ id: 'b'.repeat(32), progress }), failed({ progress }),
+    ])).toHaveLength(2)
+  })
+
+  it('keeps live workers individually visible and stoppable', () => {
+    expect(helpers.groupRuns([
+      failed({ id: 'b'.repeat(32), status: 'running' }),
+      failed({ status: 'running' }),
+    ])).toHaveLength(2)
+  })
+
+  it('groups the same final error despite differing activity histories', () => {
+    const progress = { phase: 'finished', warning: null, events: [{ message: 'Failed before posting', at: '2026-10-06T17:00:00Z' }] }
+    const newest = failed({ id: 'b'.repeat(32), progress })
+    const earlier = failed({ progress: { ...progress, events: [{ message: 'Waiting for provider', at: '2026-10-06T16:00:00Z' }] } })
+    expect(helpers.groupRuns([newest, earlier])[0].entries).toEqual([newest, earlier])
+    expect(helpers.groupRuns([newest, earlier])).toHaveLength(1)
+  })
+
+  it('keeps distinct posted comment receipts separate under a matching error', () => {
+    expect(helpers.groupRuns([
+      failed(),
+      failed({ receipts: [{ issue: 'owner/repo#42', comment_id: 123, url: null, author: 'reviewer' }] }),
+    ])).toHaveLength(2)
+  })
+})
 
 // A chat run is not tied to a repo or pull request, and Swarm has no Prompt
 // column, so the session id is the only thing that identifies the row. It was
