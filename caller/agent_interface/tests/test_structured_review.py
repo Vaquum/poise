@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+import tempfile
 from contextlib import redirect_stdout
 from contextlib import nullcontext
 from pathlib import Path
@@ -83,6 +84,45 @@ class TestReviewModel(TestCase):
 
 
 class TestStructuredVerdict(TestCase):
+    def test_codex_resumes_only_its_review_with_new_inspection_evidence(self):
+        thread = "01234567-89ab-4cde-8123-456789abcdef"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watch = SimpleNamespace(run=lambda *args, **kwargs: None)
+            def process(args, **kwargs):
+                Path(args[args.index("--output-last-message") + 1]).write_text('{"action":"reviewed_clean","comments":[]}')
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"type":"thread.started","thread_id":thread}), stderr="")
+            with patch.object(watch, "run", side_effect=process) as run:
+                first = "immutable packet\n\nInspection rounds remaining: 12."
+                second = "immutable packet\n\nPrevious review step: inspected consumer\n\nInspection rounds remaining: 11."
+                model = CATALOG.resolve("gpt-6-astra-max")
+                structured_review.ask_codex(root, model, "system", first, {}, watch, 60)
+                structured_review.ask_codex(root, model, "system", second, {}, watch, 60)
+                initial, resumed = run.call_args_list
+                self.assertNotIn("resume", initial.args[0])
+                self.assertNotIn("--ephemeral", initial.args[0])
+                self.assertEqual(resumed.args[0][-3:], ["resume", thread, "-"])
+                self.assertNotIn("immutable packet", resumed.kwargs["input"])
+                self.assertIn("inspected consumer", resumed.kwargs["input"])
+                self.assertEqual(resumed.args[0][resumed.args[0].index("--sandbox") + 1], "read-only")
+                self.assertIn("shell_tool", resumed.args[0])
+                self.assertIn("multi_agent", resumed.args[0])
+                self.assertNotIn("--last", resumed.args[0])
+
+    def test_codex_rejects_an_unrelated_resumed_thread(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watch = SimpleNamespace(run=lambda *args, **kwargs: None)
+            threads = iter(["01234567-89ab-4cde-8123-456789abcdef", "01234567-89ab-4cde-8123-456789abcdea"])
+            def process(args, **kwargs):
+                Path(args[args.index("--output-last-message") + 1]).write_text('{"action":"reviewed_clean","comments":[]}')
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"type":"thread.started","thread_id":next(threads)}), stderr="")
+            with patch.object(watch, "run", side_effect=process):
+                model = CATALOG.resolve("gpt-6-astra-max")
+                structured_review.ask_codex(root, model, "system", "packet", {}, watch, 60)
+                with self.assertRaisesRegex(structured_review.InvalidVerdict, "different review conversation"):
+                    structured_review.ask_codex(root, model, "system", "packet plus inspection", {}, watch, 60)
+
     def _run(self, verdict, behavior="pr_review", event=None, code=0):
         def process(args, **kwargs):
             if args[0] == "github-interface":
@@ -107,6 +147,7 @@ class TestStructuredVerdict(TestCase):
         args = model_call.args[0]
         self.assertEqual(args[args.index("--model") + 1], "gpt-6-astra")
         self.assertIn('model_reasoning_effort="ultra"', args)
+        self.assertIn('model_reasoning_summary="auto"', args)
         self.assertIn("--ignore-user-config", args)
         self.assertIn('forced_login_method="chatgpt"', args)
         self.assertEqual(args[args.index("--sandbox") + 1], "read-only")
@@ -208,6 +249,13 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(args[args.index("--effort") + 1], "xhigh")
         self.assertEqual(args[args.index("--tools") + 1], "")
         self.assertEqual(args[args.index("--max-turns") + 1], "1")
+        self.assertIn("--verbatim", args)
+        self.assertEqual(args[args.index("--system-prompt-override") + 1], "system")
+        disabled = args[args.index("--disallowed-tools") + 1].split(",")
+        for tool in ("read_file", "run_terminal_cmd", "search_tool", "use_tool"):
+            self.assertIn(tool, disabled)
+        self.assertEqual(kwargs["env"]["GROK_CLAUDE_MCPS_ENABLED"], "0")
+        self.assertEqual(kwargs["env"]["GROK_CLAUDE_HOOKS_ENABLED"], "0")
         self.assertEqual(args[args.index("--permission-mode") + 1], "dontAsk")
         self.assertEqual(args[args.index("--output-format") + 1], "json")
         self.assertEqual(json.loads(args[args.index("--json-schema") + 1]), structured_review.verdict_schema("pr_review"))
@@ -234,12 +282,19 @@ class TestOtherProviderVerdicts(TestCase):
 
     def test_grok_rejects_extra_turns_missing_output_and_failures(self):
         for stdout, code in ((json.dumps({**GROK_REPLY, "structuredOutput": {"action": "reviewed_clean", "comments": []}, "num_turns": 2}), 0),
-                             (json.dumps({**GROK_REPLY, "stopReason": "max_turns"}), 0),
                              (json.dumps({**GROK_REPLY, "text": '{"action":"reviewed_clean","comments":[]}'}), 0),
                              ("not json", 0),
                              (json.dumps({**GROK_REPLY, "structuredOutput": {"action": "reviewed_clean", "comments": []}}), 1)):
             with self.subTest(stdout=stdout, code=code), self.assertRaises(atoms.AgentPreflightError):
                 self._run("grok-4.6-xhigh", stdout, code=code)
+
+    def test_grok_turn_limits_are_held_but_provider_outages_remain_retryable(self):
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            self._run("grok-4.6-high", json.dumps({**GROK_REPLY, "stopReason": "max_turns"}))
+        self.assertEqual(failure.exception.code, "review_budget_exhausted")
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run("grok-4.6-high", "", code=1)
+        self.assertIsNone(failure.exception.code)
 
     def test_antigravity_streams_the_packet_in_plan_mode_and_submits(self):
         result_event = {**AGY_RESULT, "structured_output": {"action": "approve", "comments": []}}
@@ -284,7 +339,36 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(args[args.index("--workspace") + 1], kwargs["cwd"])
         self.assertNotEqual(kwargs["cwd"], "/repo")
         self.assertEqual(kwargs["provider"], "muse")
+        for flag in ("--output-schema", "--no-foreign-personal-context", "--disable-reminders"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("--max-model-steps") + 1], "1")
         self.assertEqual(mutation[:3], ["github-interface", "--reviewed-clean", "#12"])
+
+    def test_account_blocks_are_typed_without_submitting_or_hiding_transient_errors(self):
+        for message in ("MUSE GUARD: Muse provider access is latched off locally.",
+                        "API error: Grok Build usage balance exhausted",
+                        "API Error: Opus 5's safeguards flagged this message"):
+            with self.subTest(message=message), self.assertRaises(atoms.AgentPreflightError) as failure:
+                structured_review.provider_failure(message)
+            self.assertEqual(failure.exception.code, "review_provider_blocked")
+        with self.assertRaises(ValueError):
+            structured_review.provider_failure("temporary provider outage")
+
+    def test_muse_isolates_its_tool_roster_and_keeps_sign_in(self):
+        with tempfile.TemporaryDirectory() as work:
+            original = Path(work) / "original" / "muse"
+            original.mkdir(parents=True)
+            (original / "auth.json").write_text('{"test": "credential pointer"}')
+            (original / "settings.json").write_text('{"run":{"toolset":["workflow"]}}')
+            root = Path(work) / "review"
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(original.parent)}):
+                env = structured_review.muse_environment(root)
+            isolated = Path(env["XDG_CONFIG_HOME"]) / "muse"
+            self.assertEqual(json.loads((isolated / "settings.json").read_text())["run"],
+                             {"toolset": [], "workflow_trigger_mode": "off"})
+            self.assertEqual((isolated / "auth.json").read_text(), (original / "auth.json").read_text())
+            self.assertEqual((isolated / "auth.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads((original / "settings.json").read_text())["run"]["toolset"], ["workflow"])
 
     def test_muse_rejects_tool_use_prose_and_failed_runs(self):
         clean = '{"action": "reviewed_clean", "comments": []}'

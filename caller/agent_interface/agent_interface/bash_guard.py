@@ -11,8 +11,10 @@ import sys
 
 if __package__:
     from .review_gate import submission_gate
+    from .review_receipt import record_failure
 else:
     from review_gate import submission_gate
+    from review_receipt import record_failure
 
 
 BAD = {";", "|", "||", "&&", "&", "<", ">", ">>", "<<", "2>", "2>>", "2>&1"}
@@ -66,6 +68,11 @@ def main():
         with open(staged, "w") as handle:
             handle.write(done.stdout)
         os.replace(staged, receipt)
+    elif done.returncode and record_failure(done.stderr or done.stdout):
+        staged = receipt + ".failure.tmp"
+        with open(staged, "w") as handle:
+            handle.write(done.stderr or done.stdout)
+        os.replace(staged, receipt + ".failure")
     raise SystemExit(done.returncode)
 
 

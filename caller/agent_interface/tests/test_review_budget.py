@@ -71,6 +71,16 @@ class TestRecovery(TestCase):
         self.assertEqual(row['recovery_model'], 'gpt-6-astra-ultra')
         self.assertEqual(row['model'], 'opus-5-high')
 
+    def test_terminal_contract_failure_is_logged_with_its_hold_code(self):
+        row = self.execute([atoms.AgentPreflightError('invalid review verdict', 'review_contract_violation')],
+                           [facts()], model='gpt-6-astra-ultra')
+        self.assertEqual(row['status'], 'failed')
+        self.assertEqual(row['error_code'], 'review_contract_violation')
+        self.assertEqual(row['action'], 'not_started')
+        self.assertEqual(row['outcome'], 'preflight_failed')
+        self.assertIsNone(row['head_sha'])
+        self.assertIsNone(row['recovery_model'])
+
     def test_github_submission_before_provider_error_never_launches_recovery(self):
         row = self.execute([budget.ReviewLimitError('output token maximum')], [facts(), approved()])
         self.assertEqual(self.mod.run.call_count, 1)

@@ -89,6 +89,11 @@ class TestReviewDiff(IsolatedAsyncioTestCase):
 
 
 class TestPacketPolicy(TestCase):
+    def test_git_deadline_reports_a_timeout_instead_of_a_kill_exit(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(TimeoutError, "timed out"):
+                rd._git(root, rd._env("test-token"), "-c", "alias.stall=!sleep 1", "stall", timeout=0.02)
+
     def test_compaction_preserves_source_configuration_and_small_fixtures(self):
         def reason(path, size, compact=True):
             return rd._excluded({'filename': path, 'old_mode': '000000', 'new_mode': '100644',

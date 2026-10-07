@@ -44,7 +44,13 @@ def _git(cwd: str, env: dict[str, str], *args: str, limit: int = MAX_DIFF_BYTES,
             except PermissionError:
                 process.kill()
 
-        timer = threading.Timer(timeout, stop)
+        timed_out = threading.Event()
+
+        def expire() -> None:
+            timed_out.set()
+            stop()
+
+        timer = threading.Timer(timeout, expire)
         timer.start()
         try:
             stdout = process.stdout.read(limit + 1)
@@ -52,6 +58,8 @@ def _git(cwd: str, env: dict[str, str], *args: str, limit: int = MAX_DIFF_BYTES,
                 stop()
                 raise ReviewPacketTooLarge(f"{PACKET_LIMIT_CODE}: retained review diff exceeds {limit} bytes")
             if process.wait():
+                if timed_out.is_set():
+                    raise TimeoutError(f"review git {args[0]} timed out after {timeout:g}s")
                 raise RuntimeError(f"review diff git {args[0]} failed (exit {process.returncode})")
             return stdout
         finally:
