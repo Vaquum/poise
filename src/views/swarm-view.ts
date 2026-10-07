@@ -1,5 +1,5 @@
 import { mountOrganizationFilter, organizationUrl, getSelectedOrganization } from '../organizations'
-// Swarm — log of agent calls. One row per call: model, prompt
+// Swarm — log of agent calls. Identical finished calls share a row: model, prompt
 // (truncated), status, time elapsed, response (View → expand row to
 // reveal the full response text underneath).
 //
@@ -40,9 +40,16 @@ interface LogEntry {
   // The verdict of a finished review. 'completed' alone does not say whether
   // the agent approved or demanded changes.
   outcome: 'clean' | 'changes_requested' | 'approved' | 'superseded' | 'preflight_failed' | 'commented' | null
-  response: string        // upstream availability marker; fetch body by full id
+  response: string | null // upstream availability marker; fetch body by full id
   error: string
   error_code?: string | null   // 'stopped' when a person stopped the run
+  head_sha?: string | null
+  expected_head?: string | null
+  action?: string | null
+  review_policy?: string | null
+  review_id?: number | null
+  receipts?: Array<{ issue: string, comment_id: number, url: string | null, author: string }> | null
+  runner?: string | null
 }
 
 // These identities are independently readable fields from rejected records,
@@ -126,6 +133,62 @@ const onSwarmTick = () => pollOnce()
 let swarmListening = false
 let progressPoll: ReturnType<typeof setInterval> | null = null
 const expanded = new Map<string, { body: string | null, loading: boolean }>()
+const expandedGroups = new Set<string>()
+let displayedGroups = new Map<string, RunGroup>()
+
+interface RunGroup {
+  key: string
+  entries: LogEntry[]
+}
+
+interface RunRow {
+  entry: LogEntry
+  group?: RunGroup
+  repeat?: boolean
+}
+
+// Run IDs, timestamps and durations identify attempts, not different work.
+// Activity histories belong to each attempt and remain in its detail view.
+// Compare the full input and result, including the whole error, rather than
+// just the truncated status note. A response marker is not its body: keep
+// those runs separate because their output has not been proven identical.
+function groupRuns(list: LogEntry[]): RunGroup[] {
+  const groups = new Map<string, RunGroup>()
+  const terminal = new Set(['completed', 'failed', 'error', 'superseded', 'cancelled', 'canceled', 'stopped', 'timed_out', 'timeout'])
+  for (const entry of list) {
+    const p = entry.progress
+    const key = entry.response || p?.reasoning_available || !terminal.has(entry.status.toLowerCase())
+      ? JSON.stringify(['call', entry.id])
+      : JSON.stringify([
+        'result', entry.repo, entry.pr_id, entry.actor, entry.model, entry.recovery_model ?? null,
+        entry.behavior, entry.session_id, entry.source ?? null, entry.prompt,
+        entry.status, entry.outcome, entry.error, entry.error_code ?? null,
+        entry.head_sha ?? null, entry.expected_head ?? null, entry.action ?? null,
+        entry.review_policy ?? null, entry.review_id ?? null, entry.receipts ?? null, entry.runner ?? null,
+      ])
+    const group = groups.get(key)
+    if (group) group.entries.push(entry)
+    else groups.set(key, { key, entries: [entry] })
+  }
+  return [...groups.values()]
+}
+
+function groupRows(groups: RunGroup[]): RunRow[] {
+  return groups.flatMap((group) => [
+    { entry: group.entries[0], group },
+    ...(expandedGroups.has(group.key) ? group.entries.slice(1).map((entry) => ({ entry, repeat: true })) : []),
+  ])
+}
+
+function groupButton(group?: RunGroup): string {
+  if (!group || group.entries.length < 2) return ''
+  const open = expandedGroups.has(group.key)
+  const count = group.entries.length
+  const label = `${open ? 'Hide' : 'Show'} ${count - 1} identical earlier ${count === 2 ? 'run' : 'runs'} (${count} total)`
+  return `<button class="agent-group-btn${open ? ' open' : ''}" data-group-id="${escapeHtml(group.entries[0].id)}"`
+    + ` aria-expanded="${open}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">`
+    + `<span aria-hidden="true">${open ? '−' : '+'}</span><span>${count}</span></button>`
+}
 
 
 // Attribute-safe HTML escape. textContent → innerHTML only escapes &,
@@ -549,7 +612,7 @@ function visible(): LogEntry[] {
 }
 
 // Every column in the header row; the expanded detail row spans all of them.
-const COLUMN_COUNT = 10
+const COLUMN_COUNT = 11
 
 function renderShell() {
   viewEl.innerHTML = `
@@ -567,6 +630,7 @@ function renderShell() {
       <table id="swarm-table">
         <thead>
           <tr>
+            <th class="col-group" aria-label="Identical runs"></th>
             <th class="col-model">Model</th>
             <th class="col-behavior">Behavior</th>
             <th class="col-org">Org</th>
@@ -616,7 +680,7 @@ function hasDetail(e: LogEntry): boolean {
   return !!e.response || !!e.error || !!e.progress
 }
 
-function mainRowInnerHTML(e: LogEntry): string {
+function mainRowInnerHTML(e: LogEntry, group?: RunGroup): string {
   const isOpen = expanded.has(e.id)
   const btn = hasDetail(e)
     ? `<button class="expand-btn${isOpen ? ' open' : ''}" aria-expanded="${isOpen}"`
@@ -624,6 +688,7 @@ function mainRowInnerHTML(e: LogEntry): string {
       + ` aria-label="Toggle detail">${CHEV_SVG}</button>`
     : ''
   return `
+    <td class="group-cell">${groupButton(group)}</td>
     <td>${modelCell(e.recovery_model ? `${e.model} → ${e.recovery_model}` : e.model)}</td>
     <td>${behaviorCell(e.behavior)}</td>
     <td class="org-cell">${orgCell(e)}</td>
@@ -694,7 +759,7 @@ function buildExpandRow(e: LogEntry): HTMLTableRowElement {
 }
 
 // Stable keyed rows: unchanged rows are never detached or animated on refresh.
-function reconcileRows(nextEntries: LogEntry[]): void {
+function reconcileRows(nextRows: RunRow[]): void {
   const main = new Map<string, HTMLTableRowElement>()
   const detail = new Map<string, HTMLTableRowElement>()
   const refusal = new Map<string, HTMLTableRowElement>()
@@ -703,7 +768,7 @@ function reconcileRows(nextEntries: LogEntry[]): void {
     if (row.dataset.expandFor) detail.set(row.dataset.expandFor, row)
     if (row.dataset.refusalFor) refusal.set(row.dataset.refusalFor, row)
   }
-  const ids = new Set(nextEntries.map((e) => e.id))
+  const ids = new Set(nextRows.map(({ entry }) => entry.id))
   for (const [id, row] of main) if (!ids.has(id)) row.remove()
   for (const [id, row] of detail) if (!ids.has(id) || !expanded.has(id)) row.remove()
   for (const [id, row] of refusal) if (!ids.has(id) || !replayRefusals.has(id)) row.remove()
@@ -712,10 +777,11 @@ function reconcileRows(nextEntries: LogEntry[]): void {
     if (cursor !== row) bodyEl.insertBefore(row, cursor)
     cursor = row.nextSibling
   }
-  for (const entry of nextEntries) {
+  for (const { entry, group, repeat } of nextRows) {
     const row = main.get(entry.id) || buildMainRow(entry)
+    row.classList.toggle('agent-repeat-row', !!repeat)
     row.dataset.callId = entry.response ? entry.id : ''
-    patchContent(row, mainRowInnerHTML(entry))
+    patchContent(row, mainRowInnerHTML(entry, group))
     place(row)
     const refused = replayRefusals.get(entry.id)
     if (refused !== undefined) place(refusal.get(entry.id) ?? buildRefusalRow(entry.id, refused))
@@ -735,6 +801,8 @@ function render() {
   if (!viewEl || viewEl.hidden) return
   renderQuarantine()
   const list = visible()
+  const groups = groupRuns(list)
+  displayedGroups = new Map(groups.map((group) => [group.entries[0].id, group]))
   const empty = viewEl.querySelector<HTMLElement>('#swarm-empty')!
   const table = viewEl.querySelector<HTMLElement>('#swarm-table')!
   const countEl = viewEl.querySelector<HTMLElement>('#swarm-count')!
@@ -746,7 +814,8 @@ function render() {
     bodyEl.innerHTML = ''
     return
   }
-  countEl.textContent = list.length === entries.length ? `${entries.length}` : `${list.length} / ${entries.length}`
+  const runCount = list.length === entries.length ? `${entries.length}` : `${list.length} / ${entries.length}`
+  countEl.textContent = groups.length < list.length ? `${groups.length} groups · ${runCount} runs` : runCount
   // A filter matching nothing used to leave a bare header strip over blank
   // space, with only a small count pill to explain it. Archive says so in
   // words for exactly this case.
@@ -759,7 +828,7 @@ function render() {
   }
   table.hidden = false
   empty.hidden = true
-  reconcileRows(list)
+  reconcileRows(groupRows(groups))
 }
 
 async function loadResponse(id: string, refresh = false) {
@@ -810,6 +879,16 @@ function attachClicks() {
   }, true)
   bodyEl.addEventListener('click', async (ev) => {
     const target = ev.target as HTMLElement
+
+    const groupBtn = target.closest<HTMLButtonElement>('.agent-group-btn')
+    if (groupBtn) {
+      const group = displayedGroups.get(groupBtn.dataset.groupId || '')
+      if (!group) return
+      if (expandedGroups.has(group.key)) expandedGroups.delete(group.key)
+      else expandedGroups.add(group.key)
+      render()
+      return
+    }
 
     // Stop — first click arms, second click within STOP_ARM_MS stops.
     // Caller kills the call's process group and closes the row; the next
@@ -1169,6 +1248,8 @@ export async function initSwarmView() {
       lastLoadError = null
       lastLoadedAt = 0
       expanded.clear()
+      expandedGroups.clear()
+      displayedGroups.clear()
       render()
       renderStaleBanner()
       if (!viewEl.hidden) void pollOnce()
