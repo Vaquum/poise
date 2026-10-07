@@ -102,9 +102,11 @@ Repository inspection is a read-only interface, not permission to execute code.
 `github-interface --review-context --requests-json JSON` accepts 1-8 requests with
 `operation` (`read`, `search`, or `list`), repository-relative `path`, `query`
 (literal search text, otherwise empty), and `start_line` (1 initially). Reads and
-lists return 200 entries, searches return 100 matches; use `next_line` when
+lists return up to 200 entries, searches up to 100 matches; use `next_line` when
 `truncated` is true. Search covers tracked UTF-8 files up to 4 MiB. Responses are
-limited to 64 KiB and file pages to 32 KiB. Git metadata, untracked files, symlinks,
+limited to 64 KiB including JSON formatting. The budget is shared across requests;
+dense batches return shorter pages with lossless `next_line` continuations.
+An entry too large for its share asks for a separate request. Git metadata, untracked files, symlinks,
 path escapes, writes, test execution, and arbitrary commands are unavailable.
 
 Claude reviews with the governed `github-interface` tools and can invoke that

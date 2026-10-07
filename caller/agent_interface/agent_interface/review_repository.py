@@ -43,7 +43,10 @@ class Repository:
             env={**os.environ, "GITHUB_INTERFACE_REVIEW_ROOT": str(self.root)},
         )
         if done.returncode:
-            raise atoms.AgentPreflightError((done.stderr or done.stdout).strip() or "repository inspection failed")
+            message = (done.stderr or done.stdout).strip() or "repository inspection failed"
+            code = ("review_contract_violation" if message.startswith(("error: inspection", "error: invalid repository",
+                    "error: search requires", "error: search exceeds")) else None)
+            raise atoms.AgentPreflightError(message, code)
         response = json.loads(done.stdout)
         if response.get("action") != "review_context" or response.get("head_sha") != self.info["head_sha"]:
             raise atoms.AgentPreflightError("repository inspection returned a different head")

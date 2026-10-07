@@ -84,6 +84,11 @@ def inspect(root: Path, requests: list[dict]) -> dict:
         raise ValueError("inspection requires 1-8 requests")
     files = set(manifest["files"])
     results = []
+    # Share the response budget across requests, including JSON escaping and
+    # envelope metadata. A full batch returns shorter pages, never a lost batch.
+    page_bytes = (MAX_RESPONSE_BYTES - len(json.dumps(requests, indent=2).encode()) - 2048) // len(requests)
+    if page_bytes < 1:
+        raise ValueError("inspection request metadata exceeds its byte limit")
     for request in requests:
         if not isinstance(request, dict) or set(request) != {"operation", "path", "query", "start_line"}:
             raise ValueError("invalid repository inspection request")
@@ -98,47 +103,26 @@ def inspect(root: Path, requests: list[dict]) -> dict:
         selected = sorted(path for path in files if relative in ("", ".") or path == relative or path.startswith(relative + "/"))
         result = {"request": request}
         if operation == "list":
-            result.update(paths=selected[start - 1:start - 1 + 200], truncated=len(selected) >= start + 200,
-                          next_line=start + 200 if len(selected) >= start + 200 else None)
+            paths, truncated = _page(iter(selected[start - 1:]), 200, page_bytes)
+            result.update(paths=paths, truncated=truncated,
+                          next_line=start + len(paths) if truncated else None)
         elif operation == "read":
             if relative not in files:
                 result["error"] = "tracked regular file not found"
             else:
-                lines, truncated = _lines(root, relative, start, 200)
+                lines, truncated = _page(_lines(root, relative, start), 200, page_bytes)
                 result.update(lines=lines, truncated=truncated, next_line=start + len(lines) if truncated else None)
         else:
             if not query:
                 raise ValueError("search requires a nonempty literal query")
-            matches, seen = [], 0
-            scanned = 0
-            truncated = False
-            for name in selected:
-                target = _target(root, name)
-                size = target.stat().st_size
-                if scanned + size > MAX_CHECKOUT_BYTES:
-                    raise ValueError("search exceeds its byte limit")
-                scanned += size
-                if size > 4 * 1024 * 1024:
-                    continue
-                try:
-                    with target.open(encoding="utf-8") as handle:
-                        for line_number, line in enumerate(handle, 1):
-                            if query in line:
-                                seen += 1
-                                if seen >= start:
-                                    if len(matches) == 100:
-                                        truncated = True
-                                        break
-                                    matches.append({"path": name, "line": line_number, "text": line.rstrip()[:1000]})
-                except UnicodeDecodeError:
-                    continue
-                if truncated:
-                    break
+            matches, truncated = _page(_matches(root, selected, query, start), 100, page_bytes)
             result.update(matches=matches, truncated=truncated, next_line=start + len(matches) if truncated else None,
                           scope="Tracked UTF-8 files up to 4 MiB; literal search.")
+        if result.get("next_line") == start:
+            result["error"] = "Entry exceeds this batch's page budget; request it separately."
         results.append(result)
     response = {"action": "review_context", "head_sha": manifest["head_sha"], "results": results}
-    if len(json.dumps(response).encode()) > MAX_RESPONSE_BYTES:
+    if len(json.dumps(response, indent=2).encode()) + 1 > MAX_RESPONSE_BYTES:
         raise ValueError("inspection response exceeds 64 KiB; request fewer files or lines")
     return response
 
@@ -155,17 +139,41 @@ def _target(root: Path, relative: str) -> Path:
     return target
 
 
-def _lines(root: Path, relative: str, start: int, count: int) -> tuple[list[dict], bool]:
-    lines = []
-    size = 0
+def _page(items, count: int, byte_limit: int) -> tuple[list, bool]:
+    page, size = [], 2
+    for item in items:
+        # Account for the CLI's pretty JSON and nested indentation too.
+        cost = len(json.dumps(item, indent=2).encode()) + 64
+        if len(page) == count or size + cost > byte_limit:
+            return page, True
+        page.append(item)
+        size += cost
+    return page, False
+
+
+def _lines(root: Path, relative: str, start: int):
     with _target(root, relative).open(encoding="utf-8") as handle:
         for number, line in enumerate(handle, 1):
-            if number < start:
-                continue
-            if len(lines) == count:
-                return lines, True
-            size += len(line.encode())
-            if size > 32 * 1024:
-                raise ValueError("file page exceeds 32 KiB")
-            lines.append({"line": number, "text": line.rstrip("\n")})
-    return lines, False
+            if number >= start:
+                yield {"line": number, "text": line.rstrip("\n")}
+
+
+def _matches(root: Path, selected: list[str], query: str, start: int):
+    seen, scanned = 0, 0
+    for name in selected:
+        target = _target(root, name)
+        size = target.stat().st_size
+        if scanned + size > MAX_CHECKOUT_BYTES:
+            raise ValueError("search exceeds its byte limit")
+        scanned += size
+        if size > 4 * 1024 * 1024:
+            continue
+        try:
+            with target.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if query in line:
+                        seen += 1
+                        if seen >= start:
+                            yield {"path": name, "line": line_number, "text": line.rstrip()[:1000]}
+        except UnicodeDecodeError:
+            continue

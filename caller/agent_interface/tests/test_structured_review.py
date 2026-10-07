@@ -208,6 +208,13 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(args[args.index("--effort") + 1], "xhigh")
         self.assertEqual(args[args.index("--tools") + 1], "")
         self.assertEqual(args[args.index("--max-turns") + 1], "1")
+        self.assertIn("--verbatim", args)
+        self.assertEqual(args[args.index("--system-prompt-override") + 1], "system")
+        disabled = args[args.index("--disallowed-tools") + 1].split(",")
+        for tool in ("read_file", "run_terminal_cmd", "search_tool", "use_tool"):
+            self.assertIn(tool, disabled)
+        self.assertEqual(kwargs["env"]["GROK_CLAUDE_MCPS_ENABLED"], "0")
+        self.assertEqual(kwargs["env"]["GROK_CLAUDE_HOOKS_ENABLED"], "0")
         self.assertEqual(args[args.index("--permission-mode") + 1], "dontAsk")
         self.assertEqual(args[args.index("--output-format") + 1], "json")
         self.assertEqual(json.loads(args[args.index("--json-schema") + 1]), structured_review.verdict_schema("pr_review"))
@@ -234,12 +241,19 @@ class TestOtherProviderVerdicts(TestCase):
 
     def test_grok_rejects_extra_turns_missing_output_and_failures(self):
         for stdout, code in ((json.dumps({**GROK_REPLY, "structuredOutput": {"action": "reviewed_clean", "comments": []}, "num_turns": 2}), 0),
-                             (json.dumps({**GROK_REPLY, "stopReason": "max_turns"}), 0),
                              (json.dumps({**GROK_REPLY, "text": '{"action":"reviewed_clean","comments":[]}'}), 0),
                              ("not json", 0),
                              (json.dumps({**GROK_REPLY, "structuredOutput": {"action": "reviewed_clean", "comments": []}}), 1)):
             with self.subTest(stdout=stdout, code=code), self.assertRaises(atoms.AgentPreflightError):
                 self._run("grok-4.6-xhigh", stdout, code=code)
+
+    def test_grok_turn_limits_are_held_but_provider_outages_remain_retryable(self):
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            self._run("grok-4.6-high", json.dumps({**GROK_REPLY, "stopReason": "max_turns"}))
+        self.assertEqual(failure.exception.code, "review_budget_exhausted")
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run("grok-4.6-high", "", code=1)
+        self.assertIsNone(failure.exception.code)
 
     def test_antigravity_streams_the_packet_in_plan_mode_and_submits(self):
         result_event = {**AGY_RESULT, "structured_output": {"action": "approve", "comments": []}}
