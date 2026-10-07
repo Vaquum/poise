@@ -135,3 +135,40 @@ it('checks npm for the latest Codex on each launch without reinstalling a curren
   expect(run.mock.calls.filter(call => call[1][0] === 'view')).toHaveLength(2)
   expect(run.mock.calls.some(call => call[1][0] === 'install')).toBe(false)
 })
+
+it('keeps admitted Codex launchers usable when npm removes a native dependency mid-update', async () => {
+  const { symlink } = await import('node:fs/promises')
+  const packageRoot = join(root, 'prefix/lib/node_modules/@openai/codex')
+  const native = join(packageRoot, 'node_modules/native/version')
+  const launcher = join(packageRoot, 'bin/codex.js')
+  await mkdir(join(packageRoot, 'bin'), { recursive: true })
+  await mkdir(join(packageRoot, 'node_modules/native'), { recursive: true })
+  await writeFile(join(packageRoot, 'package.json'), '{"type":"module"}')
+  await writeFile(native, '1.0.0')
+  await writeFile(launcher, `#!${process.execPath}\nimport fs from 'node:fs'; console.log(fs.readFileSync(new URL('../node_modules/native/version', import.meta.url), 'utf8'));\n`, { mode: 0o700 })
+  await rm(join(root, 'bin/codex')); await symlink(launcher, join(root, 'bin/codex'))
+  await writeFile(join(root, 'bin/npm'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+  let failInstall = true
+  const run = vi.fn<typeof runUpdateCommand>(async (command, args, options) => {
+    if (args[0] === 'view') return { stdout: '"1.1.0"', stderr: '' }
+    if (args[0] === 'install') {
+      await rm(native, { force: true })
+      if (failInstall) throw new Error('interrupted npm install')
+      await writeFile(native, '1.1.0')
+      return { stdout: '', stderr: '' }
+    }
+    return runUpdateCommand(command, args, options)
+  })
+  const failed = await ensureProviderCli('codex', { root, env, run })
+  expect(failed).toMatchObject({ status: 'unavailable', before: '1.0.0', error: 'interrupted npm install' })
+  expect(failed.launchPath).not.toBe(join(root, 'bin/codex'))
+  const launch = (path: string) => runUpdateCommand(path, ['--version'], { env, cwd: root })
+  await expect(launch(launcher)).rejects.toThrow('exited')
+  expect((await launch(failed.launchPath!)).stdout.trim()).toBe('1.0.0')
+  failInstall = false
+  const repaired = await ensureProviderCli('codex', { root, env, run })
+  expect(repaired).toMatchObject({ status: 'updated', after: '1.1.0' })
+  expect(repaired.launchPath).not.toBe(failed.launchPath)
+  expect((await launch(repaired.launchPath!)).stdout.trim()).toBe('1.1.0')
+  expect((await launch(failed.launchPath!)).stdout.trim()).toBe('1.0.0')
+})

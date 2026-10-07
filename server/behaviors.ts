@@ -1604,7 +1604,7 @@ async function fireReview(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
+  const modelCliEnv = await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
   // mkdir the cwd hack dir — agent-interface needs it to exist for
   // --pwd resolution behavior identical to triggerPrReview in agent.ts.
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
@@ -1664,7 +1664,7 @@ async function fireReview(
   }
   await spawnDetached(AGENT_INTERFACE, args, {
     cwd: agentInterfaceCwd(),
-    env: claudeSubscriptionEnvironment(),
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: settleClaimAfterExit('review-new-prs', claimTarget, claimId),
   })
   markClaimLaunched(claimId)
@@ -2422,7 +2422,7 @@ async function fireApprove(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
+  const modelCliEnv = await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
   if (!isEnabled('approve-prs')) return false
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
@@ -2474,7 +2474,7 @@ async function fireApprove(
   }
   await spawnDetached(AGENT_INTERFACE, args, {
     cwd: agentInterfaceCwd(),
-    env: claudeSubscriptionEnvironment(),
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: settleClaimAfterExit('approve-prs', claimTarget, claimId),
   })
   markClaimLaunched(claimId)
@@ -3320,7 +3320,7 @@ async function fireIssueReview(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
+  const modelCliEnv = await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
   // The CLI check and the model read can each take a while; turning the
   // behavior off, deselecting the repository, untrusting the author or
   // changing the panel meanwhile must stop this launch, so these are the last
@@ -3358,7 +3358,7 @@ async function fireIssueReview(
     ...noteArgs(ISSUES_KEY),
   ], {
     cwd: agentInterfaceCwd(),
-    env: claudeSubscriptionEnvironment(),
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: settleClaimAfterExit(ISSUES_KEY, target, claimId),
   })
   markClaimLaunched(claimId)

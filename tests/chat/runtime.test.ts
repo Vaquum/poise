@@ -94,7 +94,7 @@ function fakeCaller(): CallerTurns & { starts: any[], finishes: any[] } {
 
 const runtimes: Array<import('../../server/chat/runtime').ChatRuntime> = []
 
-function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: FakeControls, caller?: CallerTurns | null, leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions } = {}) {
+function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: FakeControls, caller?: CallerTurns | null, leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions, prepareCli?: import('../../server/chat/runtime').RuntimeOptions['prepareCli'] } = {}) {
   const controls: FakeControls = options.controls ?? { hosts: [], adapters: [], startCount: 0 }
   const runtime = new runtimeModule.ChatRuntime({
     instance: options.instance ?? 'poise-test:db',
@@ -106,6 +106,7 @@ function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: F
     idleTimeoutMinutes: () => 0,
     requireClaudeReady: async () => {},
     leaseProbes: options.leaseProbes,
+    prepareCli: options.prepareCli,
   })
   const events: ChatEnvelope[] = []
   runtime.on('event', (e: ChatEnvelope) => events.push(e))
@@ -136,6 +137,34 @@ async function alertRows(kind: string, key: string): Promise<Array<Record<string
   return db.prepare('SELECT kind, title, body, dedupe_key AS key, resolved_at AS resolved FROM alerts WHERE kind = ? AND dedupe_key = ? ORDER BY id').all(kind, key) as Array<Record<string, unknown>>
 }
 let waitingAlerts: (sessionId: string) => Array<Record<string, unknown>> = () => []
+
+it('refuses native Codex startup when its installation has no verified launcher', async () => {
+  const { runtime, controls, events } = makeRuntime({ agent: 'codex', prepareCli: async provider => ({
+    provider, status: 'unavailable', checkedAt: new Date().toISOString(), error: 'missing native dependency' }) })
+  const session = await runtime.create({ agent: 'codex', model: 'gpt-6-astra-ultra', repo: 'test/repo', branch: { new: 'codex/broken-cli' } })
+  await waitFor(() => lastStatus(events, session.id) === 'error')
+  expect(controls.startCount).toBe(0)
+  expect(storage.listWorkers().some(row => row.sessionId === session.id)).toBe(false)
+  expect(ofType(events, session.id, 'error').at(-1).message).toContain('no verified launcher')
+})
+
+it('launches native Codex through its verified snapshot and retains the Codex environment policy', async () => {
+  const launcher = join(root, 'immutable-codex.js')
+  await writeFile(launcher, `#!${process.execPath}\nsetInterval(() => {}, 1000);\n`, { mode: 0o700 })
+  const { runtime, controls } = makeRuntime({ agent: 'codex', prepareCli: async provider => ({ provider,
+    status: 'current', after: '0.161.0', launchVersion: '0.161.0', launchPath: launcher, checkedAt: new Date().toISOString() }) })
+  const spy = vi.spyOn(worker, 'spawnWorker')
+  try {
+    const session = await runtime.create({ agent: 'codex', model: 'gpt-6-astra-ultra', repo: 'test/repo', branch: { new: 'codex/snapshot-cli' } })
+    await waitFor(() => lastStatus(runtime.events(session.id, 0).events, session.id) === 'idle')
+    controls.adapters[0].auto = false
+    runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] })
+    await waitFor(() => runtime.get(session.id)?.status === 'running')
+    await controls.hosts[0].spawn('codex', ['app-server', '--listen', 'stdio://'])
+    expect(spy).toHaveBeenCalledWith(launcher, ['app-server', '--listen', 'stdio://'], expect.objectContaining({ envCommand: 'codex' }))
+    await runtime.close(session.id)
+  } finally { spy.mockRestore() }
+})
 
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-chat-runtime-'))

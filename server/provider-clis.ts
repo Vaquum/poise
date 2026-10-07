@@ -17,10 +17,16 @@ export async function prepareProviderCli(provider: Provider, signal?: AbortSigna
 }
 
 /** Existing Caller-backed surfaces use the same maintenance as native Chat. */
-export async function prepareModelClis(catalog: Catalog, identities: string[]): Promise<void> {
+export async function prepareModelClis(catalog: Catalog, identities: string[]): Promise<NodeJS.ProcessEnv> {
   const providers = new Set(identities.map(identity => catalog.models.find(row => row.identity === identity)?.provider).filter(Boolean) as Provider[])
+  const env: NodeJS.ProcessEnv = {}
   await Promise.all([...providers].map(async provider => {
     const result = await prepareProviderCli(provider)
     if (result.status === 'unavailable') console.warn(`[models] ${provider}: latest CLI could not be verified — ${result.error}`)
+    if (provider === 'codex') {
+      if (!result.launchPath) throw new Error(`Codex CLI has no verified launcher: ${result.error || 'version check failed'}`)
+      env.CODEX_CLI = result.launchPath
+    }
   }))
+  return env
 }

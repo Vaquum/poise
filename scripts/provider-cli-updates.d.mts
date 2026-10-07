@@ -4,6 +4,8 @@ export interface CliUpdate {
   status: 'current' | 'updated' | 'unavailable'
   checkedAt: string
   path?: string
+  launchPath?: string
+  launchVersion?: string
   before?: string
   after?: string
   error?: string
