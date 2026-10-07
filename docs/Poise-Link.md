@@ -53,8 +53,9 @@ The installer, [`link/install.sh`](../link/install.sh):
    window. On macOS, allow Accessibility when it asks: Espanso needs it to
    type your snippets. The installer waits up to 15 minutes for the setup to
    finish; Ctrl-C stops waiting.
-4. Opens Poise Link, which asks for your Poise address the first time (see
-   [Pair](#pair)).
+4. Opens Poise Link and checks that it is still running a few seconds later;
+   the installer fails, saying so, when it is not. The first time, Poise Link
+   asks for your Poise address (see [Pair](#pair)).
 
 An Espanso that is already installed is used as it is: the installer never
 replaces, upgrades or reconfigures it.

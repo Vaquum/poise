@@ -42,6 +42,7 @@ ESPANSO_WAYLAND = 'espanso-debian-wayland-amd64.deb'
 
 # Appends one line per call to $CALLS: the command's name and its arguments, separated by \x1f.
 # link_was_running notes, for the installing stand-ins, whether a Poise Link was running at that moment.
+# start_link stands for Poise Link starting: a detached process registered under its name.
 RECORD = r'''#!/bin/sh
 { printf '%s' "${0##*/}"; for arg in "$@"; do printf '\037%s' "$arg"; done; printf '\n'; } >>"$CALLS"
 link_was_running() {
@@ -50,6 +51,12 @@ link_was_running() {
 			echo yes >"$STATE/link-ran-during-install"
 		fi
 	done
+}
+start_link() {
+	[ ! -f "$STATE/link-start-fails" ] || return 0
+	pid=$(/bin/sh -c 'sleep 600 >/dev/null 2>&1 & echo $!')
+	echo "$pid" >>"$STATE/pids.poise-link"
+	echo "$pid" >>"$STATE/started.poise-link"
 }
 '''
 
@@ -67,6 +74,11 @@ cat "$STATE/uid"
     'pgrep': r'''
 for name; do :; done
 found=1
+if [ -f "$STATE/stale.$name" ]; then
+	cat "$STATE/stale.$name"
+	rm "$STATE/stale.$name"
+	found=0
+fi
 if [ -f "$STATE/pids.$name" ]; then
 	for pid in $(cat "$STATE/pids.$name"); do
 		if kill -0 "$pid" 2>/dev/null; then
@@ -109,6 +121,9 @@ case $1 in
 		mkdir -p "$HOME/Library/Application Support/espanso/match"
 	fi
 	;;
+*/Poise\ Link.app)
+	start_link
+	;;
 esac
 ''',
     'sudo': r'''
@@ -139,7 +154,9 @@ echo amd64
 echo 0.1.0
 ''',
     'setcap': '',
-    'setsid': '',
+    'setsid': r'''
+[ "$1" != poise-link ] || start_link
+''',
     'systemctl': r'''
 case "$1 $2" in
 "--user show-environment")
@@ -289,6 +306,7 @@ class Installer:
 
         self.script = self.root / 'install.sh'
         self.write_script()
+        test.addCleanup(self.stop_started)
         self.env = {
             'PATH': f'{self.standins}:{self.tools}',
             'HOME': str(self.home),
@@ -323,6 +341,16 @@ class Installer:
             text, count = re.subn(rf'^{name}=.*$', f'{name}={value}', text, flags=re.M)
             self.test.assertEqual(count, 1, f'install.sh sets {name} on exactly one line')
         self.script.write_text(text)
+
+    def started(self):
+        """The Poise Links the run started and that are still running."""
+        path = self.state / 'started.poise-link'
+        return [int(pid) for pid in path.read_text().split()] if path.exists() else []
+
+    def stop_started(self):
+        for pid in self.started():
+            if alive(pid):
+                os.kill(pid, 9)
 
     def standin(self, name, body=''):
         write_executable(self.standins / name, RECORD + body)
@@ -401,6 +429,7 @@ class MacTest(InstallerTest):
         self.assertIn('Installed Poise Link 0.1.0.', result.stdout)
         self.assertIn('Espanso is ready', result.stdout)
         self.assertNotIn("setup has not finished", result.stdout)
+        self.assertTrue(all(alive(pid) for pid in mac.started()) and mac.started(), 'the opened Poise Link runs')
         self.assert_cleaned_up(mac)
 
     def test_leaves_an_installed_espanso_alone(self):
@@ -440,6 +469,7 @@ class MacTest(InstallerTest):
         self.assertIn('<string>0.1.0</string>', (old / 'Contents/Info.plist').read_text())
         self.assertFalse(any(p.name.startswith('.') for p in mac.apps.iterdir()))
         self.assertEqual([call[1] for call in mac.calls('open')], [str(old)])
+        self.assertTrue(mac.started() and all(alive(pid) for pid in mac.started()), 'the new Poise Link runs')
 
     def test_a_failed_update_leaves_the_running_poise_link_and_its_app_alone(self):
         mac = Installer(self, 'Darwin', 'arm64')
@@ -458,6 +488,16 @@ class MacTest(InstallerTest):
         self.assertEqual(sorted(p.name for p in mac.apps.iterdir()), ['Espanso.app', 'Poise Link.app'])
         self.assertEqual(mac.calls('open'), [])
         self.assertEqual([call[1] for call in mac.calls('hdiutil')], ['attach', 'detach'], 'the image is detached on failure')
+
+    def test_a_poise_link_that_does_not_start_is_an_error(self):
+        mac = Installer(self, 'Darwin', 'arm64')
+        (mac.apps / 'Espanso.app').mkdir(parents=True)
+        (mac.home / 'Library/Application Support/espanso/match').mkdir(parents=True)
+        mac.running('espanso')
+        mac.set('link-start-fails')
+        result = mac.run()
+        self.assert_refused(result, f'Poise Link did not start. Open it from {mac.apps} to see what macOS says.')
+        self.assertNotIn('==> Done', result.stdout)
 
     def test_opens_poise_link_when_espanso_setup_is_not_finished_in_time(self):
         mac = Installer(self, 'Darwin', 'arm64')
@@ -521,6 +561,7 @@ class LinuxTest(InstallerTest):
         self.assertEqual([call[1:] for call in linux.calls('espanso') if call[1] == 'service'], [['service', 'register']])
         self.assertIn(['systemctl', '--user', 'start', 'espanso'], linux.calls('systemctl'))
         self.assertEqual(linux.background_calls('setsid'), [['setsid', 'poise-link']])
+        self.assertTrue(linux.started() and all(alive(pid) for pid in linux.started()), 'the started Poise Link runs')
         order = [name for name in linux.names() if name in {'apt-get', 'espanso', 'setsid'}]
         self.assertEqual(order.index('setsid'), len(order) - 1, 'Poise Link starts last')
         self.assertLess(order.index('apt-get'), order.index('espanso'))
@@ -577,6 +618,34 @@ class LinuxTest(InstallerTest):
         self.assertEqual(linux.background_calls('setsid'), [['setsid', 'poise-link']])
         names = linux.names()
         self.assertLess(names.index('apt-get'), names.index('setsid'))
+
+    def test_a_relaunch_that_does_not_start_fails_instead_of_reporting_done(self):
+        linux = Installer(self, 'Linux')
+        linux.standin('espanso', ESPANSO)
+        (linux.home / '.config/espanso/match').mkdir(parents=True)
+        linux.running('espanso')
+        link = linux.running('poise-link')
+        linux.set('link-start-fails')
+        result = linux.run(DISPLAY=':0')
+        self.assert_refused(result, 'Poise Link did not start. Run poise-link in a terminal to see why.')
+        self.assertFalse(alive(link), 'the previous version was stopped')
+        self.assertNotIn('==> Done', result.stdout)
+
+    def test_a_poise_link_that_exits_during_the_restart_does_not_stop_the_update(self):
+        linux = Installer(self, 'Linux')
+        linux.standin('espanso', ESPANSO)
+        (linux.home / '.config/espanso/match').mkdir(parents=True)
+        linux.running('espanso')
+        gone = detached_sleeper()
+        os.kill(gone, 9)
+        deadline = time.monotonic() + 5
+        while alive(gone) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        linux.set('stale.poise-link', f'{gone}\n')
+        result = linux.run(DISPLAY=':0')
+        self.assert_ok(result)
+        self.assertIn('Restarting Poise Link', result.stdout)
+        self.assertTrue(linux.started() and all(alive(pid) for pid in linux.started()), 'the new Poise Link runs')
 
     def test_a_failed_update_leaves_the_running_poise_link_running(self):
         linux = Installer(self, 'Linux')

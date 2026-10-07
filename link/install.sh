@@ -132,13 +132,29 @@ can_open_link() {
 	[ "$OS" = Darwin ] || [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]
 }
 
+# open_link starts the installed Poise Link and fails unless it is still
+# running a few seconds later: Poise Link that is not running syncs nothing.
 open_link() {
 	if [ "$OS" = Darwin ]; then
-		open "$APP_DIR/Poise Link.app"
+		open "$APP_DIR/Poise Link.app" || fail "macOS could not open $APP_DIR/Poise Link.app"
+		start_hint="Open it from $APP_DIR to see what macOS says."
 	else
 		setsid poise-link </dev/null >/dev/null 2>&1 &
+		start_hint="Run poise-link in a terminal to see why."
 	fi
 	LINK_OPEN=1
+	if ! has pgrep; then
+		warn "pgrep is not installed, so the installer cannot check that Poise Link started"
+		return
+	fi
+	waited_for_start=0
+	until running poise-link >/dev/null; do
+		[ "$waited_for_start" -lt 15 ] || fail "Poise Link did not start. $start_hint"
+		sleep 1
+		waited_for_start=$((waited_for_start + 1))
+	done
+	sleep 2
+	running poise-link >/dev/null || fail "Poise Link quit right after it started. $start_hint"
 }
 
 # The running Poise Link is the previous version once the new one is in
@@ -152,9 +168,10 @@ restart_link() {
 		return
 	fi
 	step "Restarting Poise Link"
-	# One argument per process ID.
+	# One argument per process ID. A process that exits by itself in the
+	# meantime makes kill fail; the loop below checks what is still running.
 	# shellcheck disable=SC2086
-	kill $link_pids
+	kill $link_pids 2>/dev/null || :
 	waited_for_link=0
 	while running poise-link >/dev/null; do
 		[ "$waited_for_link" -lt 20 ] ||
