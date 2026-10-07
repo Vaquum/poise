@@ -9,10 +9,12 @@ anything but the verdict submits nothing.
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 import os
 import shutil
 import subprocess
 import tempfile
+from uuid import UUID
 from pathlib import Path
 from time import monotonic
 
@@ -154,6 +156,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
                     raise AgentPreflightError("Repository inspection exceeds the review prompt limit", "review_packet_too_large")
                 remaining = (f"\n\nInspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
+                             f"Analysis time remaining: {int(timeout)} seconds. "
+                             "Batch independent inspection requests in one step. "
                              "Return a terminal verdict as soon as the supplied evidence is sufficient. "
                              "Do not repeat completed reads or searches."
                              if repository is not None else "")
@@ -214,9 +218,13 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
 def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, watch: ReviewWatch, timeout: float) -> str:
     output = root / "verdict.json"
     output.unlink(missing_ok=True)
+    prompt = f"{system}\n\n{text}"
+    state_path = root / "codex-session.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else None
+    resume = (state is not None and state["prefix_digest"] == sha256(prompt[:state["prefix_length"]].encode()).hexdigest())
     args = [
         os.getenv("CODEX_CLI", "codex"), "exec",
-        "--ignore-user-config", "--ignore-rules", "--ephemeral",
+        "--ignore-user-config", "--ignore-rules",
         "--skip-git-repo-check", "--sandbox", "read-only",
         "--model", model.selector,
         "-c", f'model_reasoning_effort="{model.effort}"',
@@ -238,13 +246,19 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
     env = os.environ.copy()
     for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
         env.pop(key, None)
-    done = watch.run([*args, "-"], input=f"{system}\n\n{text}", cwd=str(root), timeout=timeout, env=env, provider="codex")
+    # Each review owns one fresh native conversation. Resume that exact ID
+    # with only newly supplied inspection evidence, retaining the provider's
+    # prior analysis instead of recomputing the whole packet each round.
+    command = [*args, "resume", state["thread_id"], "-"] if resume else [*args, "-"]
+    done = watch.run(command, input=prompt[state["prefix_length"]:] if resume else prompt,
+                     cwd=str(root), timeout=timeout, env=env, provider="codex")
     if done.returncode:
         raise ValueError((done.stderr or done.stdout).strip() or f"codex exited {done.returncode}")
     # A tool-using response is outside this adapter's contract. Never
     # submit its verdict, even if the provider returned exit code zero.
     # Item-level errors can be startup notices about disabled tools;
     # turn failures and actual tool executions still reject the verdict.
+    thread_id = None
     for event in events(done.stdout):
         if event.get("type") in {"error", "turn.failed"}:
             raise ValueError("Codex review did not complete successfully")
@@ -254,6 +268,18 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
         kind = item.get("type", "")
         if not isinstance(kind, str) or (kind and kind not in {"agent_message", "reasoning", "todo_list", "error"}):
             raise InvalidVerdict(f"unexpected Codex review item: {kind}")
+        if event.get("type") == "thread.started":
+            try:
+                observed = str(UUID(event["thread_id"]))
+            except (KeyError, ValueError, TypeError, AttributeError) as error:
+                raise InvalidVerdict("invalid Codex review conversation ID") from error
+            if (thread_id and observed != thread_id) or (resume and observed != state["thread_id"]):
+                raise InvalidVerdict("Codex resumed a different review conversation")
+            thread_id = observed
+    if thread_id:
+        prefix = prompt.rsplit("\n\nInspection rounds remaining:", 1)[0]
+        state_path.write_text(json.dumps({"thread_id": thread_id, "prefix_length": len(prefix),
+                                         "prefix_digest": sha256(prefix.encode()).hexdigest()}))
     return output.read_text()
 
 

@@ -84,6 +84,45 @@ class TestReviewModel(TestCase):
 
 
 class TestStructuredVerdict(TestCase):
+    def test_codex_resumes_only_its_review_with_new_inspection_evidence(self):
+        thread = "01234567-89ab-4cde-8123-456789abcdef"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watch = SimpleNamespace(run=lambda *args, **kwargs: None)
+            def process(args, **kwargs):
+                Path(args[args.index("--output-last-message") + 1]).write_text('{"action":"reviewed_clean","comments":[]}')
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"type":"thread.started","thread_id":thread}), stderr="")
+            with patch.object(watch, "run", side_effect=process) as run:
+                first = "immutable packet\n\nInspection rounds remaining: 12."
+                second = "immutable packet\n\nPrevious review step: inspected consumer\n\nInspection rounds remaining: 11."
+                model = CATALOG.resolve("gpt-6-astra-max")
+                structured_review.ask_codex(root, model, "system", first, {}, watch, 60)
+                structured_review.ask_codex(root, model, "system", second, {}, watch, 60)
+                initial, resumed = run.call_args_list
+                self.assertNotIn("resume", initial.args[0])
+                self.assertNotIn("--ephemeral", initial.args[0])
+                self.assertEqual(resumed.args[0][-3:], ["resume", thread, "-"])
+                self.assertNotIn("immutable packet", resumed.kwargs["input"])
+                self.assertIn("inspected consumer", resumed.kwargs["input"])
+                self.assertEqual(resumed.args[0][resumed.args[0].index("--sandbox") + 1], "read-only")
+                self.assertIn("shell_tool", resumed.args[0])
+                self.assertIn("multi_agent", resumed.args[0])
+                self.assertNotIn("--last", resumed.args[0])
+
+    def test_codex_rejects_an_unrelated_resumed_thread(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watch = SimpleNamespace(run=lambda *args, **kwargs: None)
+            threads = iter(["01234567-89ab-4cde-8123-456789abcdef", "01234567-89ab-4cde-8123-456789abcdea"])
+            def process(args, **kwargs):
+                Path(args[args.index("--output-last-message") + 1]).write_text('{"action":"reviewed_clean","comments":[]}')
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"type":"thread.started","thread_id":next(threads)}), stderr="")
+            with patch.object(watch, "run", side_effect=process):
+                model = CATALOG.resolve("gpt-6-astra-max")
+                structured_review.ask_codex(root, model, "system", "packet", {}, watch, 60)
+                with self.assertRaisesRegex(structured_review.InvalidVerdict, "different review conversation"):
+                    structured_review.ask_codex(root, model, "system", "packet plus inspection", {}, watch, 60)
+
     def _run(self, verdict, behavior="pr_review", event=None, code=0):
         def process(args, **kwargs):
             if args[0] == "github-interface":
