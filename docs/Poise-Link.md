@@ -12,41 +12,112 @@ browser is closed:
   datastore sync keeps failing, a Chat agent is waiting for you, a long Chat
   turn finished) become native notifications. Clicking one opens its page.
 
-It starts at login by itself; installing the app is the only setup. The
-contract it is built against is the "Snippets and Poise Link" section of
+One command installs it, with Espanso when Espanso is missing, and once it is
+paired it starts at login by itself. The contract it is built against is the
+"Snippets and Poise Link" section of
 [Service architecture](Service-architecture.md).
 
 ## Install
 
-Installers are built by the **Poise Link** GitHub Actions workflow, on demand
-(Run workflow) and for every `link-v*` tag. Open the run and download the
-artifact for your system. They are not published as releases yet, and they
-are not signed with a developer certificate (the macOS app carries only an
-ad-hoc signature), so each system asks once whether you trust the app.
+On macOS, or on Debian 12+ and Ubuntu 24.04+ (amd64), run this in a terminal
+as yourself:
 
-**macOS (Apple silicon and Intel).** Download `poise-link-macos-universal-dmg`,
-open the `.dmg` inside it and drag Poise Link to Applications. The first time
-you open it macOS says it cannot check the app for malicious software. Choose
-Done, open System Settings → Privacy & Security, find the note that Poise Link
-was blocked and choose Open Anyway, then confirm. On macOS 14 and earlier you can instead
-Control-click the app in Applications and choose Open. Allow notifications
-when macOS asks.
+```bash
+curl -fsSL https://github.com/autonomio/poise/releases/latest/download/install.sh | sh
+```
 
-**Windows.** Download `poise-link-windows-x64-nsis` (a setup `.exe`) or
-`poise-link-windows-x64-msi`, and run it. SmartScreen says "Windows
-protected your PC": choose More info, then Run anyway. The installer adds
-Microsoft's WebView2 runtime if it is missing.
+Debian and Ubuntu do not always come with curl; `wget` does the same:
 
-**Linux.** Download `poise-link-linux-amd64-deb` and install the package in it
-with `sudo apt install ./Poise*_amd64.deb`, or download
-`poise-link-linux-amd64-appimage`, make the `.AppImage` executable and run it.
-The tray icon needs a desktop with AppIndicator support; on GNOME that is the
-"AppIndicator and KStatusNotifierItem Support" extension, which Ubuntu
-includes. The device token goes to the Secret Service (GNOME Keyring or
-KWallet) when one is running.
+```bash
+wget -qO- https://github.com/autonomio/poise/releases/latest/download/install.sh | sh
+```
 
-Install [Espanso](https://espanso.org/install/) and start it once so that its
-match folder exists. Poise Link never creates that folder.
+The installer, [`link/install.sh`](../link/install.sh):
+
+1. Downloads Poise Link from the newest release and, when Espanso is not
+   installed yet, Espanso 2.4.1 from Espanso's own release. It checks Poise
+   Link's files against the release's `SHA256SUMS` and Espanso's against
+   checksums pinned in the script, and stops before changing anything when one
+   does not match.
+2. On **macOS** it copies Poise Link, and Espanso when it was missing, into
+   `/Applications` (`~/Applications` when `/Applications` is not writable).
+   Downloaded this way the apps carry no quarantine flag, so macOS opens Poise
+   Link without the "cannot check it for malicious software" prompt that its
+   ad-hoc signature would otherwise bring. On **Debian and Ubuntu** it installs
+   Poise Link's package, and Espanso's X11 or Wayland package to match your
+   session, in one `apt-get` call; `sudo` asks for your password. On Wayland
+   it then grants Espanso the `cap_dac_override` capability, as Espanso's own
+   instructions do.
+3. Starts Espanso; on Linux it registers Espanso's systemd user service, so
+   Espanso also starts at login. The first time, Espanso opens its setup
+   window. On macOS, allow Accessibility when it asks: Espanso needs it to
+   type your snippets. The installer waits up to 15 minutes for the setup to
+   finish; Ctrl-C stops waiting.
+4. Opens Poise Link and checks that it is still running a few seconds later;
+   the installer fails, saying so, when it is not. The first time, Poise Link
+   asks for your Poise address (see [Pair](#pair)).
+
+An Espanso that is already installed is used as it is: the installer never
+replaces, upgrades or reconfigures it.
+
+**Update** by running the same command again. It installs the newest release
+first and only then quits the running Poise Link and opens the new one, so a
+failed update leaves Poise Link running as it was. Over a connection without
+a display, such as SSH, the running Poise Link keeps the previous version
+until you quit it and open it again. The pairing stays. On macOS, Keychain may
+ask once whether the new Poise Link may use its saved pairing, because each
+build carries a new ad-hoc signature: choose Always Allow.
+
+**Elsewhere.** The installer stops before changing anything when it runs as
+root, on Linux without apt, or on Linux on anything but x86_64: Espanso
+builds for Linux on x86_64 only, as Debian packages and an X11 AppImage, and
+Espanso 2.4.1's packages need Debian 12 or Ubuntu 24.04 or newer. Install by
+hand there, from the [release page](https://github.com/autonomio/poise/releases/latest):
+
+- **Linux:** make `Poise-Link-linux-amd64.AppImage` executable and run it, and
+  install [Espanso](https://espanso.org/install/) for your distribution. Start
+  Espanso once so that its match folder exists; Poise Link never creates that
+  folder.
+- **Windows:** run `Poise-Link-windows-x64-setup.exe` (or the `.msi`).
+  SmartScreen says "Windows protected your PC": choose More info, then Run
+  anyway. The installer adds Microsoft's WebView2 runtime if it is missing.
+  Install [Espanso](https://espanso.org/install/) as well.
+- **macOS, from a browser download:** open `Poise-Link-macos-universal.dmg` and
+  drag Poise Link to Applications. The first time you open it, macOS says it
+  cannot check the app for malicious software: choose Done, open System
+  Settings → Privacy & Security, find the note that Poise Link was blocked and
+  choose Open Anyway. On macOS 14 and earlier you can instead Control-click
+  the app in Applications and choose Open.
+
+Allow notifications when the system asks. On Linux the tray icon needs a
+desktop with AppIndicator support; on GNOME that is the "AppIndicator and
+KStatusNotifierItem Support" extension, which Ubuntu includes. The device
+token goes to the Secret Service (GNOME Keyring or KWallet) when one is
+running.
+
+These settings change what the installer does, given as
+`curl -fsSL … | POISE_LINK_SESSION=wayland sh`:
+
+| Variable | Effect |
+| --- | --- |
+| `POISE_LINK_DOWNLOAD_BASE` | Where Poise Link's files and `SHA256SUMS` are; by default the newest release |
+| `POISE_LINK_APP_DIR` | macOS: the folder the apps go to, and the only folder Espanso is looked for in |
+| `POISE_LINK_ESPANSO_WAIT` | Seconds to wait for Espanso's setup: 900 by default, `0` does not wait |
+| `POISE_LINK_SESSION` | Linux: `x11` or `wayland`, when the terminal is not part of your desktop session |
+
+### Releases
+
+A `link-v*` tag that names the version in `link/src-tauri/Cargo.toml` makes
+the **Poise Link** workflow build the installers for macOS (universal), Linux
+and Windows, run the installer with them for real on fresh macOS (Apple
+silicon and Intel), Ubuntu 24.04 and 26.04, and Debian 12 and 13 machines, and
+only then publish the GitHub release. It holds
+`Poise-Link-macos-universal.dmg`, `Poise-Link-linux-amd64.deb`,
+`Poise-Link-linux-amd64.AppImage`, `Poise-Link-windows-x64-setup.exe`,
+`Poise-Link-windows-x64.msi`, `install.sh` and `SHA256SUMS`. The names carry no
+version, so `releases/latest/download/<name>` always reaches the newest
+release. Pull requests and pushes to `main` that touch `link/` run the same
+builds and installs without publishing anything.
 
 ## Pair
 
@@ -143,7 +214,8 @@ notification. Import that file in Poise under Snippets to keep those snippets.
    quit without signing out, also delete the `com.vaquum.poise.link` entry in
    Keychain Access, Credential Manager or Seahorse.
 5. Delete `poise.yml` from Espanso's match folder if you no longer want those
-   snippets.
+   snippets. Espanso stays installed, also when the installer installed it;
+   remove it as [Espanso's documentation](https://espanso.org/docs/) describes.
 
 ## The workspace side
 
@@ -239,7 +311,16 @@ cargo build                     # a debug build
 
 cd ..
 npm ci && npm run tauri build   # installers for this system
+
+cd ..
+shellcheck link/install.sh
+python3 -m unittest discover --start-directory link/tests --pattern 'test_*.py'
 ```
+
+The installer's tests run `link/install.sh` with stand-ins for every system
+command it could change the computer with, so they install, start and stop
+nothing. The real installs happen in CI, on fresh machines (see
+[Releases](#releases)).
 
 The core (pairing, the event stream and the duties) has no user interface, so
 the integration test in `link/src-tauri/tests` drives it against a fake Poise.
@@ -252,8 +333,8 @@ on Start at login for that build.
 ## Not done yet
 
 - Code signing with a developer certificate and notarization (macOS), and
-  Authenticode signing (Windows), once signing keys exist. Until then the
-  first-launch steps above apply.
-- Automatic updates; install a newer build over the old one.
+  Authenticode signing (Windows), once signing keys exist. Until then a
+  browser download needs the first-launch steps above.
+- Automatic updates; run the install command again to update.
 - On Windows, an alert opens its page when clicked while the notification is on
   screen, but not later from the notification center.

@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
+import { LINK_INSTALLER_URL } from '../src/pages.js'
 import { APEX, startHarness, verifyAssertion, workspaceHost, type Harness, type Reply } from './harness.js'
 
 const ALICE = workspaceHost('alice')
@@ -321,6 +322,16 @@ describe('device pairing', () => {
     h.advance(15 * 60_000)
     const fresh = await requestCode(h)
     expect((await attempt(fresh.user_code)).status).toBe(200)
+  })
+
+  it('shows how to install Poise Link where pairing starts', async () => {
+    const page = await h.request({ host: APEX, path: '/link', headers: { cookie: alice.apexCookie } })
+    expect(page.status).toBe(200)
+    expect(page.body).toContain(`curl -fsSL ${LINK_INSTALLER_URL} | sh`)
+    expect(page.body).toContain(`wget -qO- ${LINK_INSTALLER_URL} | sh`)
+    // The command the installer itself documents, so the page and the script name the same file.
+    const installer = readFileSync(new URL('../../link/install.sh', import.meta.url), 'utf8')
+    expect(installer).toContain(`curl -fsSL ${LINK_INSTALLER_URL} | sh`)
   })
 
   it('stores only hashes of device codes and tokens', async () => {
