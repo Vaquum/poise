@@ -630,7 +630,7 @@ describe('behavior launch claims', () => {
     })
     mocks.spawnDetached.mockResolvedValue(undefined)
     const { database: db, behaviors: runtime } = await loadModules()
-    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    runtime.startBehaviorsRuntime()
     db.setMeta('me', 'poise-user')
     db.setMeta('behavior_approve_prs_enabled', '1')
 
@@ -651,7 +651,7 @@ describe('behavior launch claims', () => {
   ])('rejects malformed resolution evidence %j without launching', async (evidence) => {
     arrangeCli(true, false, {}, evidence)
     const { database: db, behaviors: runtime } = await loadModules()
-    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    runtime.startBehaviorsRuntime()
     db.setMeta('me', 'poise-user')
     db.setMeta('behavior_approve_prs_enabled', '1')
 
