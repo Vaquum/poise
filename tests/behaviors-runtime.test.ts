@@ -2627,6 +2627,63 @@ describe('behavior launch claims', () => {
     expect(args[args.indexOf('--recovery-model') + 1]).toBe('opus-5-xhigh')
   })
 
+  it.each(['valid', 'head', 'actor', 'source', 'model', 'receipt', 'old', 'ambiguous', 'claimed', 'posted-original'])('reconciles a held review only from a verified explicit replay (%s)', async (variant) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-07T12:00:00Z'))
+    const launched = await launchReviewBeforeCrash()
+    const failed = agentLog({
+      id: 'f'.repeat(32), started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', model: 'opus-5-xhigh',
+      review_policy: 'bounded-v1', error_code: 'review_provider_blocked', error: 'account blocked',
+      expected_head: launched.expectedHead, actor: launched.actor,
+      source: launched.source, correlation_id: launched.correlationId,
+    })
+    if (variant === 'posted-original') Object.assign(failed, { action: null, outcome: null })
+    agentLogs = [failed]
+    let modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+    vi.setSystemTime(Date.now() + 2_000)
+    const replay = agentLog({
+      id: 'e'.repeat(32), model: 'opus-5-xhigh', status: 'completed',
+      action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA,
+      source: 'poise:replay', correlation_id: 'explicit-replay', review_id: 91,
+    })
+    if (variant === 'head') replay.head_sha = NEXT_HEAD_SHA
+    if (variant === 'actor') replay.actor = 'another-account'
+    if (variant === 'source') replay.source = 'another-system'
+    if (variant === 'model') replay.model = 'gpt-6-astra-ultra'
+    if (variant === 'old') Object.assign(replay, { started_at: launched.requestedAt, started_at_precise: launched.requestedAt })
+    agentLogs.push(replay)
+    if (variant === 'ambiguous') agentLogs.push({ ...replay, id: 'd'.repeat(32) })
+    arrangeCli(false, false, { reviewerReviewIdsSince: variant === 'receipt' ? [] : [91] })
+    modules = await restartModules()
+    if (variant === 'claimed') {
+      modules.database.recordSeen('review-new-prs', 'another-slot')
+      modules.database.db.prepare('UPDATE behavior_seen SET launch_call_id = ? WHERE target = ?').run(replay.id, 'another-slot')
+    }
+    modules.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    if (variant === 'valid') {
+      expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).toBeNull()
+      expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toEqual({
+        callId: replay.id, completedAt: replay.completed_at, headSha: HEAD_SHA,
+      })
+      expect(modules.database.listBehaviorDeadLetters()).toEqual([])
+      modules = await restartModules()
+      modules.database.setMeta('behavior_approve_prs_enabled', '1')
+      modules.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+      await modules.behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+      expect(mocks.spawnDetached.mock.calls[1][1]).toContain('--pr-approve')
+    } else {
+      expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+      expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
+    }
+  })
+
   it.each(['model_output_limit', 'review_budget_exhausted', 'review_recovery_failed', 'review_contract_violation', 'review_provider_blocked', 'stopped'])('holds %s across restarts, without blocking another PR or a new head', async (code) => {
     const behavior = 'approve-prs' as 'review-new-prs' | 'approve-prs'
     const launched = behavior === 'review-new-prs'

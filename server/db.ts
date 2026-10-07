@@ -699,6 +699,27 @@ export function releaseFailedBehaviorLaunch(
   return info.changes === 1
 }
 
+export function completeFailedBehaviorReplay(input: {
+  key: string, target: string, failedCallId: string, headSha: string,
+  callId: string, correlationId: string, startedAt: string, completedAt: string,
+  action: BehaviorLaunchAction, outcome: BehaviorLaunchOutcome,
+}): boolean {
+  return db.prepare(`
+    UPDATE behavior_seen
+    SET seen_at = ?, launch_error = NULL, launch_call_id = ?,
+        launch_source = 'poise:replay', launch_correlation_id = ?,
+        launch_requested_at = ?, launch_completed_at = ?, launch_head_sha = ?,
+        launch_action = ?, launch_outcome = ?
+    WHERE key = ? AND target = ? AND claim_id = ''
+      AND launch_call_id = ? AND launch_expected_head = ?
+      AND launch_error IS NOT NULL AND launch_outcome IS NULL
+      AND launch_quarantine IS NULL
+      AND NOT EXISTS (SELECT 1 FROM behavior_seen WHERE launch_call_id = ?)
+  `).run(new Date().toISOString(), input.callId, input.correlationId,
+    input.startedAt, input.completedAt, input.headSha, input.action, input.outcome,
+    input.key, input.target, input.failedCallId, input.headSha, input.callId).changes === 1
+}
+
 export function linkBehaviorLaunchCallOwned(
   key: string,
   target: string,

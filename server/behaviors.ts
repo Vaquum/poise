@@ -31,6 +31,7 @@ import {
   clearSeenExceptLaunched,
   clearUnreadableBehaviorLaunchOwned,
   completeBehaviorLaunchOwned,
+  completeFailedBehaviorReplay,
   completeIssueReviewLaunchOwned,
   countBehaviorDeadLetters,
   hasExpiredPreLaunchClaim,
@@ -2180,6 +2181,42 @@ async function releaseFailedBehaviorIfNoAction(
   const configuredModel = launchBehavior === 'pr_approve'
     ? (await reviewChoice('pr_approve')).model
     : (await slotModel(reviewSlotOfTarget(target)))?.model
+  // An explicit replay is a separate Caller run. Reconcile its verified
+  // receipt into the held launch so approval sees the recovered decision.
+  if (boundedReviewFailure(call) && call.model === configuredModel
+    && call.action === 'not_started' && call.outcome === 'preflight_failed') {
+    const after = Date.parse(call.completed_at || agentCallStartedAt(call))
+    const replays = logs.filter((row) => row.status === 'completed'
+      && row.behavior === launchBehavior && row.repo === repo && String(row.pr_id) === String(number)
+      && row.actor?.toLowerCase() === failed.launchActor.toLowerCase()
+      && row.model === call.model && row.source === 'poise:replay'
+      && row.expected_head === failed.launchExpectedHead && row.head_sha === failed.launchExpectedHead
+      && Number.isFinite(after) && Date.parse(agentCallStartedAt(row)) > after
+      && Number.isFinite(Date.parse(row.completed_at || ''))
+      && Date.parse(row.completed_at!) >= Date.parse(agentCallStartedAt(row))
+      && !!row.correlation_id && unambiguousAgentCall(snapshot, row)
+      && Number.isSafeInteger(row.review_id) && (row.review_id || 0) > 0
+      && (row.action === 'requested_changes' && row.outcome === 'changes_requested'
+        || launchBehavior === 'pr_review' && row.action === 'reviewed_clean' && row.outcome === 'clean'
+        || launchBehavior === 'pr_approve' && row.action === 'approved' && row.outcome === 'approved'))
+      .sort((a, b) => Date.parse(b.completed_at!) - Date.parse(a.completed_at!))
+    const replay = replays[0]
+    if (replay) {
+      const activity = await checkReviewActivity(repo, number, failed.launchActor, agentCallStartedAt(replay))
+      if (activity.headSha === failed.launchExpectedHead
+        && activity.reviewerReviewIdsSince?.includes(replay.review_id!)
+        && activity.reviewerPendingReviews === 0
+        && completeFailedBehaviorReplay({ key: behavior, target, failedCallId: call.id,
+          headSha: failed.launchExpectedHead, callId: replay.id, correlationId: replay.correlation_id!,
+          startedAt: agentCallStartedAt(replay), completedAt: replay.completed_at!,
+          action: replay.action as 'reviewed_clean' | 'requested_changes' | 'approved',
+          outcome: replay.outcome as 'clean' | 'changes_requested' | 'approved' })) {
+        retireBehaviorDeadLettersForTarget(behavior, target)
+        clearBehaviorFailure(behavior, target)
+        return false
+      }
+    }
+  }
   if (boundedReviewFailure(call) && call.model === configuredModel
     && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
   const blockedPacket = call.action === 'not_started'

@@ -31,7 +31,9 @@ is held on unchanged input and model instead of repeatedly launching the same
 worker. A clean review becomes approval-eligible on the next scheduler scan.
 Provider account blocks (`review_provider_blocked`) use the same hold, preventing
 an exhausted balance or local account latch from launching identical workers.
-After account recovery, an explicit replay releases the held attempt.
+After account recovery, a successful explicit replay on the same head, model,
+and reviewer reconciles the held no-action attempt. Its GitHub review receipt
+must be present in live evidence before it becomes durable approval evidence.
 `resolve-unblocking` uses the upstream strong
 resolution primitive, which revalidates the complete gate before every thread
 mutation.
