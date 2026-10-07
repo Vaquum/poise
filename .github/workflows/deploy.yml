@@ -1,0 +1,53 @@
+# Deploys a fork of autonomio/poise to its own server (docs/Operating.md,
+# "Run your own Poise from a fork"). It does nothing in a repository that
+# sets no POISE_DEPLOY_HOST variable, so autonomio/poise deploys nowhere.
+#
+# On a push to main, or when started by hand on main, it signs in to the
+# server over SSH, brings the server's checkout to this commit, writes
+# deploy/.env from the repository's POISE_ variables and its
+# POISE_GITHUB_CLIENT_SECRET secret, and applies it with deploy/install.sh,
+# or deploy/upgrade.sh --no-pull once installed.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to the server
+    if: vars.POISE_DEPLOY_HOST != '' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up SSH
+        env:
+          POISE_DEPLOY_HOST: ${{ vars.POISE_DEPLOY_HOST }}
+          POISE_DEPLOY_USER: ${{ vars.POISE_DEPLOY_USER }}
+          POISE_DEPLOY_PORT: ${{ vars.POISE_DEPLOY_PORT }}
+          POISE_DEPLOY_JUMP: ${{ vars.POISE_DEPLOY_JUMP }}
+          POISE_DEPLOY_KNOWN_HOSTS: ${{ vars.POISE_DEPLOY_KNOWN_HOSTS }}
+          POISE_DEPLOY_SSH_KEY: ${{ secrets.POISE_DEPLOY_SSH_KEY }}
+        run: deploy/actions/ssh-setup.sh
+
+      - name: Deploy ${{ github.sha }}
+        env:
+          REPO: ${{ github.server_url }}/${{ github.repository }}.git
+          SHA: ${{ github.sha }}
+          DEPLOY_PATH: ${{ vars.POISE_DEPLOY_PATH || '/srv/poise' }}
+          TOKEN: ${{ github.token }}
+          VARS: ${{ toJSON(vars) }}
+          POISE_GITHUB_CLIENT_SECRET: ${{ secrets.POISE_GITHUB_CLIENT_SECRET }}
+        run: deploy/actions/deploy.sh
