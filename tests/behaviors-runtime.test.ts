@@ -2641,7 +2641,7 @@ describe('behavior launch claims', () => {
     if (variant === 'posted-original') Object.assign(failed, { action: null, outcome: null })
     agentLogs = [failed]
     let modules = await restartModules()
-    modules.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    modules.behaviors.startBehaviorsRuntime()
     await modules.behaviors.runEnabledBehaviorsOnce()
     expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
     vi.setSystemTime(Date.now() + 2_000)
@@ -2668,7 +2668,7 @@ describe('behavior launch claims', () => {
       modules.database.recordSeen('review-new-prs', 'another-slot')
       modules.database.db.prepare('UPDATE behavior_seen SET launch_call_id = ? WHERE target = ?').run(variant === 'claimed' ? replay.id : 'd'.repeat(32), 'another-slot')
     }
-    modules.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    modules.behaviors.startBehaviorsRuntime()
     await modules.behaviors.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     if (variant === 'valid' || variant === 'newest-claimed') {
@@ -2679,7 +2679,7 @@ describe('behavior launch claims', () => {
       expect(modules.database.listBehaviorDeadLetters()).toEqual([])
       modules = await restartModules()
       modules.database.setMeta('behavior_approve_prs_enabled', '1')
-      modules.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+      modules.behaviors.startBehaviorsRuntime()
       await modules.behaviors.runEnabledBehaviorsOnce()
       expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
       expect(mocks.spawnDetached.mock.calls[1][1]).toContain('--pr-approve')
