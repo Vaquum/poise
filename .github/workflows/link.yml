@@ -278,7 +278,7 @@ jobs:
         run: |
           set -eu
           sudo apt-get update
-          sudo apt-get install -y xvfb imagemagick
+          sudo apt-get install -y xvfb imagemagick xdotool
           Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 &
           sudo loginctl enable-linger "$USER"
           runtime=/run/user/$(id -u)
@@ -304,17 +304,23 @@ jobs:
 
       # A running process is not enough: the pairing form must render. A blank
       # window is one or two colours; the form's text and fields are hundreds.
+      # Nothing waits for Espanso's setup here, and without a window manager
+      # its window can open over Poise Link's, so the check raises Poise Link's
+      # window before looking at it.
       - name: Check that the pairing window renders
         run: |
           for _ in $(seq 45); do
-            if import -window 'Poise Link' link-window.png 2>/dev/null; then
+            for window in $(xdotool search --onlyvisible --name '^Poise Link$' 2>/dev/null); do
+              xdotool windowraise "$window"
+              sleep 1
+              import -window "$window" link-window.png 2>/dev/null || continue
               colours=$(convert link-window.png -format %k info:)
               if [ "$colours" -gt 50 ]; then
                 echo "Poise Link's window shows $colours colours"
                 import -window root first-run.png
                 exit 0
               fi
-            fi
+            done
             sleep 2
           done
           import -window root first-run.png
