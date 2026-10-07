@@ -1978,6 +1978,7 @@ interface ChangesAddressedResult {
   headSha: string
   commitsAfterRequest: number
   authorInlineRepliesAfterRequest: number
+  authorPrCommentsAfterRequest: number
   responseCount: number
 }
 
@@ -2373,6 +2374,13 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
     data.author_inline_replies_after_request,
     'requested-changes-addressed author_inline_replies_after_request',
   )
+  // Older Caller releases do not report public PR replies yet.
+  const authorPrCommentsAfterRequest = data.author_pr_comments_after_request === undefined
+    ? 0
+    : safeInteger(
+      data.author_pr_comments_after_request,
+      'requested-changes-addressed author_pr_comments_after_request',
+    )
   const responseCount = safeInteger(
     data.response_count,
     'requested-changes-addressed response_count',
@@ -2390,7 +2398,7 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
     || typeof hasChangeRequest !== 'boolean'
     || typeof status !== 'boolean'
     || !SHA_PATTERN.test(headSha)
-    || responseCount !== commitsAfterRequest + authorInlineRepliesAfterRequest
+    || responseCount !== commitsAfterRequest + authorInlineRepliesAfterRequest + authorPrCommentsAfterRequest
     || (hasChangeRequest
       ? latestState !== 'CHANGES_REQUESTED'
         || latestRequestAt === null
@@ -2404,6 +2412,7 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
     headSha,
     commitsAfterRequest,
     authorInlineRepliesAfterRequest,
+    authorPrCommentsAfterRequest,
     responseCount,
   }
 }
@@ -2519,17 +2528,17 @@ async function tickApprovePrs(): Promise<void> {
         if (!isEnabled('approve-prs')) return
         // Follow-up trigger: reviewer has at least one CHANGES_REQUESTED review
         // on the PR, AND the author has engaged with it at least once
-        // since — either by pushing a commit OR by replying inline
-        // on a review thread. A refutation reply ("FTL is internal,
+        // since — by pushing a commit, replying inline on a review
+        // thread, or posting a public PR comment. A refutation ("FTL is internal,
         // everyone knows") is as much a "respond to this" signal as
         // a code change; the agent run that follows decides whether
         // it's convincing.
         //
         // Each subsequent author response (commit or reply) re-arms
-        // the trigger — the dedupe key sums both counters, so every
+        // the trigger — the dedupe key sums all three counters, so every
         // increment produces a fresh seen-key. If the reviewer posts
         // another CHANGES_REQUESTED (latest_request_at advances),
-        // both counters reset to 0 and a fresh round begins on the
+        // all counters reset to 0 and a fresh round begins on the
         // next author response.
         let seenTarget = ''
         let firedReason = ''
@@ -2558,7 +2567,7 @@ async function tickApprovePrs(): Promise<void> {
           }
           expectedHead = check.headSha
           seenTarget = `${pr.repo}#${pr.number}@req=${check.latestRequestAt}/r=${check.responseCount}/head=${check.headSha}`
-          firedReason = `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}reply, head=${check.headSha.slice(0, 8)}`
+          firedReason = `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}inline+${check.authorPrCommentsAfterRequest}pr-comment, head=${check.headSha.slice(0, 8)}`
         } else {
           const review = latestApprovalBasisLaunch(pr.repo, pr.number)
           if (!review) {

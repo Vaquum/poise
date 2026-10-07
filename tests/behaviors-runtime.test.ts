@@ -116,6 +116,7 @@ function arrangeCli(
   changesAddressed = false,
   failCheckout = false,
   reviewActivity: ReviewActivityFixture = {},
+  changesEvidence: Record<string, unknown> = {},
 ): void {
   mocks.runFile.mockImplementation(async (
     command: string,
@@ -193,6 +194,7 @@ function arrangeCli(
           author_commits_after_request: changesAddressed ? 1 : 0,
           author_inline_replies_after_request: 0,
           response_count: changesAddressed ? 1 : 0,
+          ...changesEvidence,
         }),
         stderr: '',
       }
@@ -573,6 +575,70 @@ describe('behavior launch claims', () => {
     mocks.authStatus = 'authenticated'
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+  })
+
+  it('starts a current-head follow-up for a public author reply without a newer commit', async () => {
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA }, {
+      commits_after_request: 0,
+      author_commits_after_request: 0,
+      author_pr_comments_after_request: 1,
+    })
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--pr-approve', '#17', '--expected-head', NEXT_HEAD_SHA,
+    ]))
+    expect(db.hasSeen('approve-prs',
+      `${pr.repo}#17@req=2026-07-10T10:00:00Z/r=1/head=${NEXT_HEAD_SHA}`)).toBe(true)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+    expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--approve-pr')).toBe(false)
+  })
+
+  it('waits for a response when the latest change request has no author engagement', async () => {
+    arrangeCli(true, false, {}, {
+      status: false,
+      commits_after_request: 0,
+      author_commits_after_request: 0,
+      author_pr_comments_after_request: 0,
+      response_count: 0,
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+
+  it.each([
+    { author_pr_comments_after_request: -1 },
+    { author_pr_comments_after_request: null },
+    { author_pr_comments_after_request: '1' },
+    { author_pr_comments_after_request: 1.5 },
+    { author_pr_comments_after_request: 1, response_count: 1 },
+  ])('rejects invalid public reply evidence %j without launching', async (evidence) => {
+    arrangeCli(true, false, {}, evidence)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ behavior: 'approve-prs', target: `${pr.repo}#17:check` }),
+    ])
   })
 
   it('approves a requested clean review on the next scan without a CI gate', async () => {
