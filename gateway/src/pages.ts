@@ -52,6 +52,7 @@ const STYLE = `
   th { font-weight: 600; color: var(--muted); font-size: 13px; }
   nav { display: flex; gap: 16px; flex-wrap: wrap; }
   code { font: 13px ui-monospace, Menlo, monospace; }
+  pre { margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); overflow-x: auto; }
 `
 
 export function page(title: string, body: Html, options: { refreshSeconds?: number } = {}): string {
@@ -126,6 +127,9 @@ ${input.problem ? html`<p class="error">${input.problem}</p>` : ''}
 </div>`, { refreshSeconds: 2 })
 }
 
+/** Poise Link's installer (link/install.sh), as published with the newest release. */
+export const LINK_INSTALLER_URL = 'https://github.com/autonomio/poise/releases/latest/download/install.sh'
+
 export function linkPage(csrf: string, notice?: { text: string; error: boolean }): string {
   return page('Pair Poise Link', html`<div class="card">
 <h1>Pair Poise Link</h1>
@@ -140,6 +144,12 @@ ${notice ? html`<p class="${notice.error ? 'error' : ''}">${notice.text}</p>` : 
 </p>
 </form>
 <p><a href="/link/devices">Paired devices</a> · <a href="/">Home</a></p>
+</div>
+<div class="card">
+<h2>Install Poise Link</h2>
+<p>On macOS, or on Debian 12+ and Ubuntu 24.04+, run this in a terminal. It installs Poise Link, and Espanso when it is missing, then opens Poise Link to pair:</p>
+<pre><code>curl -fsSL ${LINK_INSTALLER_URL} | sh</code></pre>
+<p class="muted">Without curl: <code>wget -qO- ${LINK_INSTALLER_URL} | sh</code>. Run it again to update Poise Link. Windows installers are on the <a href="https://github.com/autonomio/poise/releases/latest">release page</a>.</p>
 </div>`)
 }
 
