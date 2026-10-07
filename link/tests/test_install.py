@@ -614,6 +614,13 @@ class LinuxTest(InstallerTest):
         self.assertEqual(len([call for call in linux.calls('apt-get') if call[1] == 'install']), 1)
 
 
+class LintTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('shellcheck'), 'shellcheck is not installed')
+    def test_passes_shellcheck(self):
+        result = subprocess.run(['shellcheck', str(SCRIPT)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class AnySystemTest(InstallerTest):
     def test_refuses_to_run_as_root(self):
         linux = Installer(self, 'Linux')
