@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Any
 
+from github_interface.atoms.issues import issue_comments
 from github_interface.atoms.pulls import get_pull, list_commits, list_inline_comments, list_reviews
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
@@ -24,6 +25,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     reviews = await list_reviews(client, owner, repo, pull_number)
     comments = await list_inline_comments(client, owner, repo, pull_number)
     commits = await list_commits(client, owner, repo, pull_number)
+    public_comments = await issue_comments(client, owner, repo, pull_number)
 
     actor_reviews = [
         review
@@ -70,7 +72,15 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         and _login(comment) == author
         and _time(comment["created_at"]) > latest_request_at
     ]
-    addressed = bool(request_comments) and bool(commits_after_request or author_replies)
+    author_pr_comments = [
+        comment
+        for comment in public_comments
+        if latest_request_at
+        and _login(comment) == author
+        and _time(comment["created_at"]) > latest_request_at
+    ]
+    response_count = len(commits_after_request) + len(author_replies) + len(author_pr_comments)
+    addressed = request_review is not None and response_count > 0
     head_sha = str((pull.get("head") or {}).get("sha") or "").lower()
     if len(head_sha) != 40:
         raise RuntimeError("GitHub returned no pull-request head SHA")
@@ -93,7 +103,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "commits_after_request": len(commits_after_request),
         "author_commits_after_request": len(commits_after_request),
         "author_inline_replies_after_request": len(author_replies),
-        "response_count": len(commits_after_request) + len(author_replies),
+        "author_pr_comments_after_request": len(author_pr_comments),
+        "response_count": response_count,
     }
 
 
