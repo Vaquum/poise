@@ -38,14 +38,23 @@ cd "$path"
 origin=$(git remote get-url origin)
 [ "$origin" = "$repo" ] || die "$path is a checkout of $origin, not of $repo."
 # A clone whose files were never checked out, this run's or one an earlier run
-# left when it stopped, has no index yet, and nothing of its own to keep.
-if [ -e "$(git rev-parse --git-path index)" ] && [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-  die "$path has changes that are not committed, which a deployment would build into the workspace image. See them with: git -C $path status"
+# left when it stopped, has no index yet, and nothing in it is anyone else's.
+checked_out=false
+if [ -e "$(git rev-parse --git-path index)" ]; then
+  checked_out=true
+  [ -z "$(git status --porcelain --untracked-files=no)" ] \
+    || die "$path has changes that are not committed, which a deployment would build into the workspace image. See them with: git -C $path status"
 fi
 
 say "Bringing $path to $sha."
 git fetch --quiet origin "$sha" "+refs/heads/main:refs/remotes/origin/main"
-git checkout --quiet --force -B main "$sha"
+if [ "$checked_out" = true ]; then
+  # Without --force, git refuses rather than overwrite a file it does not track.
+  git checkout --quiet -B main "$sha" \
+    || die "$path has files git does not track where $sha puts its own; git named them above. Move them away and deploy again."
+else
+  git checkout --quiet --force -B main "$sha"
+fi
 git branch --quiet --set-upstream-to=origin/main main
 
 (

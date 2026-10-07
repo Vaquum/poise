@@ -376,6 +376,23 @@ deployment runs this way, with libvirt on an Ubuntu host:
    restrict,port-forwarding,permitopen="192.168.150.10:22" ssh-ed25519 AAAA… poise-deploy
    ```
 
+   `permitopen` limits only the connections the key opens through the host;
+   `port-forwarding` would also let it listen on the host (`ssh -R`). Allow
+   the account local forwarding alone in the host's SSH server, in a file of
+   its own such as `/etc/ssh/sshd_config.d/poise-deploy.conf`, check it with
+   `sudo sshd -t`, and reload SSH:
+
+   ```text
+   Match User poise-deploy
+   	AllowTcpForwarding local
+   	PermitOpen 192.168.150.10:22
+   	PermitListen none
+   	PermitTTY no
+   	X11Forwarding no
+   	AllowAgentForwarding no
+   	AllowStreamLocalForwarding no
+   ```
+
 ## People
 
 A GitHub login may sign in when it is an admin, on the allow list, or an

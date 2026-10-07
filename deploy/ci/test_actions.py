@@ -166,13 +166,17 @@ class DeployTest(unittest.TestCase):
         self.git('-C', self.origin, 'config', 'uploadpack.allowReachableSHA1InWant', 'true')
         self.seed = os.path.join(work, 'seed')
         self.git('clone', '--quiet', self.origin, self.seed)
-        self.commits = [self.commit('first'), self.commit('second')]
+        self.commits = [self.commit('first'), self.commit('second', {'docs/new.md': 'added by the second commit'})]
 
     def git(self, *args):
         return subprocess.run(['git', *args], capture_output=True, text=True, check=True, env=clean_env()).stdout.strip()
 
-    def commit(self, label):
-        """A commit on origin's main whose install.sh and upgrade.sh say they ran, and at which commit."""
+    def commit(self, label, files=None):
+        """A commit on origin's main, with FILES, whose install.sh and upgrade.sh say they ran, and at which commit."""
+        for name, text in (files or {}).items():
+            os.makedirs(os.path.dirname(os.path.join(self.seed, name)), exist_ok=True)
+            with open(os.path.join(self.seed, name), 'w') as file:
+                file.write(text)
         deploy = os.path.join(self.seed, 'deploy')
         os.makedirs(deploy, exist_ok=True)
         log = f'printf "%s %s\\n" "$(basename "$0") $*" "$(git rev-parse HEAD)" >>"{self.calls}"\n'
@@ -263,6 +267,21 @@ class DeployTest(unittest.TestCase):
         result = self.deploy(second)
         self.assertEqual(result.returncode, 1)
         self.assertIn('has changes that are not committed', result.stderr)
+        self.assertEqual(self.checkout('rev-parse', 'HEAD'), first)
+        self.assertEqual(self.calls_made(), [f'install.sh  {first}'])
+
+    def test_refuses_to_overwrite_an_untracked_file_the_commit_adds(self):
+        first, second = self.commits
+        self.assertEqual(self.deploy(first).returncode, 0)
+        notes = os.path.join(self.path, 'docs', 'new.md')
+        os.makedirs(os.path.dirname(notes), exist_ok=True)
+        with open(notes, 'w') as file:
+            file.write('the operator\'s notes')
+        result = self.deploy(second)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('has files git does not track where', result.stderr)
+        with open(notes) as file:
+            self.assertEqual(file.read(), 'the operator\'s notes')
         self.assertEqual(self.checkout('rev-parse', 'HEAD'), first)
         self.assertEqual(self.calls_made(), [f'install.sh  {first}'])
 
