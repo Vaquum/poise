@@ -9,6 +9,7 @@ reviewers Poise runs in parallel — can tell this run's review from its own.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextvars import ContextVar
 from pathlib import Path
@@ -16,11 +17,31 @@ from pathlib import Path
 SUBMISSIONS = {"requested_changes", "reviewed_clean", "approved_pr"}
 _current: ContextVar[dict | None] = ContextVar("review_receipt", default=None)
 _call: ContextVar[tuple[Path, str] | None] = ContextVar("review_receipt_call", default=None)
+_failure: ContextVar[str | None] = ContextVar("review_submission_failure", default=None)
+
+
+class SubmissionError(RuntimeError):
+    """An observed transient GitHub command failure, not a verdict defect."""
+
+
+def record_failure(text: str) -> str | None:
+    # Only controller-observed command errors qualify. Provider prose never
+    # calls this path, and validation/authentication failures remain held.
+    if re.search(r"(?:^|\n)(?:error: )?GitHub (?:408|429|5\d\d)(?: rate-limit)?:", text):
+        message = text.strip()[:4096]
+        _failure.set(message)
+        return message
+    return None
+
+
+def failure() -> str | None:
+    return _failure.get()
 
 
 def bind(database: Path, call_id: str) -> None:
     _call.set((database, call_id))
     _current.set(None)
+    _failure.set(None)
 
 
 def get() -> dict | None:
@@ -56,6 +77,10 @@ def record(text: str) -> dict | None:
 def record_file(path: str | Path) -> dict | None:
     if _current.get() is not None:
         return _current.get()
+    try:
+        record_failure(Path(str(path) + ".failure").read_text())
+    except OSError:
+        pass
     try:
         text = Path(path).read_text()
     except OSError:

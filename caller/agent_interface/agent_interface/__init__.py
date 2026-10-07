@@ -826,6 +826,12 @@ def run_governed_behavior(
                 "completed_at": utc_stamp(ended_at),
                 **result,
             }, indent=2))
+        except review_receipt.SubmissionError as e:
+            # Publication may have been accepted before its response failed.
+            # Leave action unknown; Poise verifies live receipts before retry.
+            finish(id_, "failed", response=response, error=str(e), error_code="review_submission_failed")
+            print(json.dumps({"id": id_, "error": str(e), "error_code": "review_submission_failed"}))
+            raise SystemExit(1)
         except review_budget.ReviewLimitError as e:
             finish(id_, "failed", response=response, error=str(e), error_code=e.code)
             print(json.dumps({"id": id_, "error": str(e), "error_code": e.code}))
@@ -968,6 +974,8 @@ def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | 
 
 def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: dict | None) -> dict[str, str | None]:
     if len(own) != 1:
+        if not own and receipt is None and review_receipt.failure():
+            raise review_receipt.SubmissionError(review_receipt.failure())
         kind = "review behavior must produce exactly one atomic clean or change-request review" if behavior == "pr_review" \
             else "approval behavior must produce exactly one atomic approval or change-request review"
         raise review_budget.ReviewLimitError(kind, "review_contract_violation")
@@ -1032,6 +1040,8 @@ def behavior_outcome(
         before,
         "reviewer_comments_since",
     )
+    if not any((change_requests, approvals, comments)) and receipt is None and review_receipt.failure():
+        raise review_receipt.SubmissionError(review_receipt.failure())
     if change_requests < 0 or approvals < 0 or comments < 0:
         raise RuntimeError("review activity counters moved backwards")
     previous_review_id = str(before.get("reviewer_latest_review_id") or "")

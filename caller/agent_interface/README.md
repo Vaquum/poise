@@ -81,6 +81,13 @@ lease never touches the row again.
 
 # PR review models
 
+A controller-observed transient GitHub submission failure is recorded as
+`review_submission_failed`, with action and outcome unknown until live review
+receipts establish what happened. It does not become a permanent model-contract
+hold. A verified accepted review wins over a lost response; Caller never retries
+the write automatically. Claude's pinned inspection root is also carried in its
+explicit settings so shell tools retain repository access.
+
 PR reviews and approvals default to `opus-5-high`; on a Claude output limit they
 recover once with `gpt-6-astra-ultra`. Pass `--model` and `--recovery-model` to
 `--pr-review` or `--pr-approve` with any identity from the catalog.

@@ -102,6 +102,8 @@ class TestRepositoryLifecycle(TestCase):
         self.assertEqual(run.call_args.kwargs["env"]["GITHUB_INTERFACE_REVIEW_ROOT"], "/tmp/pinned")
         argv = run.call_args.args[0]
         self.assertEqual(argv[argv.index("--tools") + 1], "Bash")
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings["env"]["GITHUB_INTERFACE_REVIEW_ROOT"], "/tmp/pinned")
 
 
 class TestStructuredInspection(TestCase):

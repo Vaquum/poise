@@ -203,6 +203,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     done = subprocess.run([*args, *fixed], cwd=pwd, text=True, capture_output=True, timeout=limit)
     if done.returncode == 0:
         review_receipt.record(done.stdout)
+    else:
+        review_receipt.record_failure(done.stderr or done.stdout)
     # The outer governed behavior reads authoritative review facts afterward,
     # including head supersession when GitHub correctly rejects a stale verdict.
     return raw.strip() + "\n" + (done.stdout or done.stderr).strip()
