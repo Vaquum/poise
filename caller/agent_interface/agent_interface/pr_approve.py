@@ -23,11 +23,11 @@ RULES = (
     "Do not block on unverified assumptions about dependency internals; require evidence in the supplied packet.",
     "State the defect and impact in one sentence; do not write the fix.",
     "Put one inline comment per {levels} finding into the single atomic review; for non-{levels}, do nothing.",
-    "Never publish duplicate inline comments or re-litigate resolved or outdated findings.",
+    "Never publish duplicate inline comments or re-litigate resolved findings. An outdated location does not prove a defect is fixed; reaffirm an unresolved outdated finding only after confirming it still blocks the supplied head, using its original body and path.",
     "If an existing current, unresolved thread still describes a confirmed blocking defect on this head, include its original body and exact path, current line, and side in the request-changes comments array, including in a structured JSON verdict.",
     "github-interface deduplicates existing findings; when no new inline comments remain, it submits one summary-only change-request review reaffirming the current unresolved blocker.",
     "A request-changes comments array must contain at least one finding; pass the existing blocking finding instead of an empty array.",
-    "Finish with exactly one terminal class: one or more change requests, or approval.",
+    "Finish with exactly one atomic review: one change request with all blocking findings, or one approval.",
 )
 
 

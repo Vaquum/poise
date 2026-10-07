@@ -970,7 +970,7 @@ def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: di
     if len(own) != 1:
         kind = "review behavior must produce exactly one atomic clean or change-request review" if behavior == "pr_review" \
             else "approval behavior must produce exactly one atomic approval or change-request review"
-        raise RuntimeError(kind)
+        raise review_budget.ReviewLimitError(kind, "review_contract_violation")
     review = own[0]
     state = review.get("state")
     if receipt is not None and RECEIPT_STATES.get(receipt["action"]) != state:

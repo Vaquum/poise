@@ -85,16 +85,46 @@ PR reviews and approvals default to `opus-5-high`; on a Claude output limit they
 recover once with `gpt-6-astra-ultra`. Pass `--model` and `--recovery-model` to
 `--pr-review` or `--pr-approve` with any identity from the catalog.
 
-Claude reviews with the governed `github-interface` tools. Every other provider
+PR review prepares an independent temporary checkout at the packet's exact head,
+with its merge base available. `github-interface --checkout-review` checks the
+live head and base before and after preparation, disables Git hooks and user
+configuration, limits preparation to 180 seconds, and rejects incomplete trees,
+more than 20,000 tree entries, or more than 256 MiB of tracked content. The checkout
+is removed after the provider finishes, fails, or is cancelled. Approvals retain
+their existing packet-only behavior.
+
+Every PR reviewer receives AGENTS.md and CLAUDE.md guidance from the pinned merge
+base, including nested files and their paths. Guidance is limited to 256 KiB,
+applies within its directory scope, and cannot change the review contract. Changes
+to those files in the PR are source to review, not new authority over the reviewer.
+
+Repository inspection is a read-only interface, not permission to execute code.
+`github-interface --review-context --requests-json JSON` accepts 1-8 requests with
+`operation` (`read`, `search`, or `list`), repository-relative `path`, `query`
+(literal search text, otherwise empty), and `start_line` (1 initially). Reads and
+lists return 200 entries, searches return 100 matches; use `next_line` when
+`truncated` is true. Search covers tracked UTF-8 files up to 4 MiB. Responses are
+limited to 64 KiB and file pages to 32 KiB. Git metadata, untracked files, symlinks,
+path escapes, writes, test execution, and arbitrary commands are unavailable.
+
+Claude reviews with the governed `github-interface` tools and can invoke that
+inspection command from the pinned checkout. Every other provider
 returns a structured JSON verdict instead; Caller validates it and invokes exactly
 one existing `github-interface` terminal command with the original PR, actor, and
-expected head. Each runs in an empty temporary directory with no tools: Codex
+expected head. For PR review these providers can first return `action: "inspect"`
+with provisional `comments` and a `requests` array; Caller reads the requested
+source and supplies the result in their next turn. Terminal verdicts require
+`requests: []`. At most 12 inspection rounds fit within the existing total review
+deadline and 1.5 MB prompt limit; exhausting inspection never submits a review.
+Each provider process runs in a separate temporary directory with native tools
+disabled, receiving the same explicit guidance and scoped inspection access: Codex
 (Astra, Sol; CLI 0.154.0 or newer, signed in to ChatGPT — API credentials are not
 used) with read-only sandboxing, user configuration ignored, and shell, connector,
 extension, and delegation tools disabled; Grok Build (`grok`) in one turn with
 its built-in tools, web search and subagents off; Antigravity (`agy`) in plan
 mode, the packet streamed on stdin; Muse (`muse`) with shell, writes and web
-tools off. A run that used a tool, failed, or answered anything but the verdict
+tools off. A run that used a native tool, failed, or answered anything but a valid
+inspection request or terminal verdict
 submits nothing, and the existing authoritative outcome check still determines
 completion or supersession.
 

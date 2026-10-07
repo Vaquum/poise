@@ -3,6 +3,7 @@ from __future__ import annotations
 import shlex
 
 from . import atoms
+from . import review_repository
 
 SYSTEM = (
     "You get one pass at this review. Be thorough, report only defects you can "
@@ -25,7 +26,7 @@ RULES = (
     "For every changed contract, find consumers of the old shape and flag diff-scoped omissions.",
     "After finding one issue, sweep the whole diff for the same bug class.",
     "Confirm every defect against the cited diff line before commenting.",
-    "Do not block on unverified assumptions about dependency internals; require evidence in the supplied packet.",
+    "Do not block on unverified assumptions about dependency internals; require evidence in the supplied packet or pinned repository inspection.",
     "State the defect and impact in one sentence; do not propose or write the fix.",
     "Put one inline comment per {levels} finding into the single atomic review; for non-{levels}, do nothing.",
     "If only positive things remain, call reviewed-clean exactly once.",
@@ -61,16 +62,13 @@ def run(
 ) -> str:
     spec = atoms.CATALOG.review_model("pr_review", model)
     tools = allowed(pr, actor, expected_head) if spec.provider == "claude" else []
-    text = atoms.prompt(
-        POLICY if spec.provider == "claude" else atoms.STRUCTURED_POLICY,
-        SEVERITY,
-        RULES,
-        atoms.packet(pwd, pr, actor, expected_head, p),
-        tools,
-        note,
-        p,
-    )
-    return atoms.run_agent(
-        pwd, SYSTEM, text, tools, "pr_review", timeout_s,
-        model=spec.identity, pr=pr, actor_name=actor, head=expected_head,
-    )
+    packet = atoms.packet(pwd, pr, actor, expected_head, p)
+    with review_repository.prepare(pwd, pr, actor, expected_head, packet) as repository:
+        if spec.provider == "claude":
+            tools.append(review_repository.INSPECTION_RULE)
+        policy = POLICY if spec.provider == "claude" else atoms.STRUCTURED_POLICY + " " + review_repository.REQUEST_POLICY
+        text = atoms.prompt(policy, SEVERITY, RULES, packet, tools, note, p) + repository.prompt()
+        return atoms.run_agent(
+            pwd, SYSTEM + " " + review_repository.POLICY, text, tools, "pr_review", timeout_s,
+            model=spec.identity, pr=pr, actor_name=actor, head=expected_head, repository=repository,
+        )

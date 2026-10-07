@@ -172,3 +172,11 @@ async def issue_comments(payload: dict[str, Any]) -> Any:
 
 async def checkout_repo(payload: dict[str, Any]) -> Any:
     return await run_behavior("checkout_repo", payload)
+
+
+async def checkout_review(payload: dict[str, Any]) -> Any:
+    return await run_behavior("checkout_review", payload)
+
+
+async def review_context(payload: dict[str, Any]) -> Any:
+    return await run_behavior("review_context", payload)
