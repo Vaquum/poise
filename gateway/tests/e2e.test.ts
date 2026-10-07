@@ -60,14 +60,14 @@ describe('end to end', () => {
     expect(seen.headers['x-forwarded-proto']).toBe('https')
     expect(seen.headers['x-forwarded-host']).toBe(alice)
     expect(seen.headers['x-forwarded-for']).toBe('127.0.0.1')
-    expect(seen.headers.cookie).toBe('theme=dark')
+    expect(seen.headers.cookie).toBeUndefined()
     expect(seen.headers['x-poise-identity']).not.toBe('forged')
     const claims = verifyAssertion(seen.headers['x-poise-identity'], h.keys.publicKeyBase64)
     expect(claims).toMatchObject({ iss: 'poise-gateway', aud: 'workspace:alice', sub: 'Alice', scope: 'browser' })
     expect(claims.exp - claims.iat).toBe(60)
 
     const socket = new WebSocket(`ws://127.0.0.1:${h.port}/ws/chat?tab=1`, {
-      headers: { host: alice, cookie: workspaceCookie, 'x-poise-identity': 'forged' },
+      headers: { host: alice, cookie: `${workspaceCookie}; portal_session=p`, 'x-poise-identity': 'forged' },
       origin: `https://${alice}`,
     })
     const messages: string[] = []
@@ -76,6 +76,7 @@ describe('end to end', () => {
     expect(hello.url).toBe('/ws/chat?tab=1')
     expect(hello.headers.host).toBe(alice)
     expect(hello.headers.origin).toBe(`https://${alice}`)
+    expect(hello.headers.cookie).toBeUndefined()
     const wsClaims = verifyAssertion(hello.headers['x-poise-identity'], h.keys.publicKeyBase64)
     expect(wsClaims).toMatchObject({ aud: 'workspace:alice', sub: 'Alice', scope: 'browser' })
     expect(wsClaims.jti).not.toBe(claims.jti)

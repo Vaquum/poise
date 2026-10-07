@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { heldBindings, isSafePath } from './auth.js'
-import { GATEWAY_COOKIES, WORKSPACE_COOKIE, type Context } from './context.js'
+import { WORKSPACE_COOKIE, type Context } from './context.js'
 import { header, HttpError, isNavigation, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
 import { errorMessage } from './log.js'
 import { messagePage, signOutPage, startingPage } from './pages.js'
@@ -188,7 +188,6 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
     assertion: ctx.assertion(owner, auth.scope),
     proto: ctx.scheme,
     dropAuthorization: auth.scope === 'link',
-    stripCookies: GATEWAY_COOKIES,
   })
   proxyRequest(req, res, ctx.deps.upstream(owner.handle), headers, ctx.agent, (error) => {
     // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
@@ -254,7 +253,6 @@ export async function workspaceUpgrade(ctx: Context, req: IncomingMessage, socke
     assertion: ctx.assertion(owner, auth.scope),
     proto: ctx.scheme,
     dropAuthorization: auth.scope === 'link',
-    stripCookies: GATEWAY_COOKIES,
   })
   proxyUpgrade(req, socket, head, ctx.deps.upstream(owner.handle), headers, (error) => {
     // Runs inside a socket event: a throw here would escape every handler and stop the gateway.

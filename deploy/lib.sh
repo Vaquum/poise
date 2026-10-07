@@ -14,8 +14,18 @@ die() {
   exit 1
 }
 
-# Docker Compose on deploy/compose.yaml; COMPOSE_FILE, when set, adds files.
-compose() { (cd "$deploy" && docker compose "$@"); }
+# Docker Compose on deploy/compose.yaml, or on the files COMPOSE_FILE names,
+# with compose.proxy.yaml added when deploy/.env sets POISE_PROXY_LISTEN.
+# deploy/.env is the only source of settings: a POISE_ variable exported in
+# this shell would otherwise take its place in compose.yaml, unchecked.
+compose() {
+  local files=${COMPOSE_FILE:-compose.yaml} name exported=()
+  if [ -n "$(proxy_listen)" ]; then files=$files:compose.proxy.yaml; fi
+  for name in $(compgen -e); do
+    if [[ $name == POISE_* ]]; then exported+=(-u "$name"); fi
+  done
+  (cd "$deploy" && env "${exported[@]}" COMPOSE_FILE="$files" docker compose "$@")
+}
 
 require_linux() {
   [ "$(uname -s)" = Linux ] || die "run this on the Linux server that hosts Poise; this is $(uname -s)."
@@ -52,8 +62,33 @@ env_value() {
   printf '%s' "$value"
 }
 
+# The address the gateway is published on for a proxy the server already
+# runs (POISE_PROXY_LISTEN); empty when this installation's own Caddy fronts it.
+proxy_listen() {
+  if [ -r "$env_file" ]; then env_value POISE_PROXY_LISTEN; fi
+}
+
+# Whether VALUE is one IPv4 address, or one IPv6 address in brackets, and a
+# port: never a port alone, 0.0.0.0 or [::], which Docker publishes on every
+# address. The gateway checks the IPv6 form in full when it starts.
+listen_address() {
+  local octet
+  [[ $1 =~ ^(\[[0-9A-Fa-f:.]+\]|[0-9.]+):([1-9][0-9]{0,4})$ ]] || return 1
+  [ "${BASH_REMATCH[2]}" -le 65535 ] || return 1
+  case ${BASH_REMATCH[1]} in
+    \[*) [[ ! ${BASH_REMATCH[1]} =~ ^\[[0:]*\]$ ]] ;;
+    0.0.0.0) return 1 ;;
+    *)
+      [[ ${BASH_REMATCH[1]} =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]] || return 1
+      for octet in "${BASH_REMATCH[@]:1}"; do
+        [ "$octet" -le 255 ] || return 1
+      done
+      ;;
+  esac
+}
+
 require_env_file() {
-  local mode name missing=()
+  local mode name proxy missing=() required=(POISE_DOMAIN POISE_GITHUB_CLIENT_ID POISE_GITHUB_CLIENT_SECRET POISE_ADMINS)
   [ -f "$env_file" ] || die "$env_file does not exist. Create it from the template, then fill it in:
   cp $deploy/.env.example $env_file
   chmod 600 $env_file"
@@ -61,10 +96,16 @@ require_env_file() {
   mode=$(stat -c %a "$env_file")
   [ $((8#$mode & 8#077)) -eq 0 ] \
     || die "$env_file holds the GitHub OAuth App's client secret, but its mode $mode lets others read it. Run: chmod 600 $env_file"
-  for name in POISE_DOMAIN POISE_GITHUB_CLIENT_ID POISE_GITHUB_CLIENT_SECRET POISE_ADMINS POISE_ACME_EMAIL; do
+  proxy=$(env_value POISE_PROXY_LISTEN)
+  # Behind the server's own proxy, that proxy obtains the certificates.
+  if [ -z "$proxy" ]; then required+=(POISE_ACME_EMAIL); fi
+  for name in "${required[@]}"; do
     [ -n "$(env_value "$name")" ] || missing+=("$name")
   done
   [ ${#missing[@]} -eq 0 ] || die "$env_file sets no ${missing[*]}; $deploy/.env.example describes each."
+  if [ -n "$proxy" ] && ! listen_address "$proxy"; then
+    die "POISE_PROXY_LISTEN in $env_file is $proxy, but it must be the one IP address and port your proxy reaches the gateway at, such as 127.0.0.1:8080 or [::1]:8080. A port alone, 0.0.0.0 or [::] would publish the gateway's plain http on every address."
+  fi
 }
 
 # The workspace image the gateway runs: POISE_RUNTIME_IMAGE as Compose resolves it.

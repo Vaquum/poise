@@ -2,7 +2,7 @@
 # The deployment bundle end to end, on a Linux host with Docker, as
 # .github/workflows/deploy-e2e.yml runs it:
 #
-#   deploy/ci/e2e.sh run    install, sign in, use a workspace and Poise Link, check TLS, back up and restore, recreate the gateway, upgrade
+#   deploy/ci/e2e.sh run    install, sign in, use a workspace and Poise Link, check TLS, back up and restore, recreate the gateway, upgrade, run behind another proxy
 #   deploy/ci/e2e.sh logs   print what the stack and the workspaces logged
 #
 # It drives the real stack, deploy/compose.yaml, through deploy/install.sh,
@@ -439,6 +439,75 @@ check_gateway_recreated() {
   expect 200 "alice's workspace, right after the gateway was recreated" "$alice" "http://alice.$domain/" "${navigate[@]}"
 }
 
+# The installation behind a proxy the server already runs (POISE_PROXY_LISTEN):
+# install.sh removes the bundled Caddy and publishes the gateway on that one
+# address, and a second Caddy on the host's network, in front of it the way a
+# server's existing proxy would be (deploy/ci/proxy.Caddyfile), serves alice's
+# workspace and gets certificates on demand. Then install.sh switches back.
+check_proxy_mode() {
+  local first=127.0.0.2:8080 listen=127.0.0.1:8080 published host
+  sed -i '/^POISE_ACME_EMAIL=/d' "$deploy/.env"
+  echo 'POISE_PROXY_LISTEN=0.0.0.0:8080' >>"$deploy/.env"
+  refused "install.sh with POISE_PROXY_LISTEN on every address" "must be the one IP address and port" "$deploy/install.sh"
+  sed -i "s/^POISE_PROXY_LISTEN=.*/POISE_PROXY_LISTEN=$first/" "$deploy/.env"
+  "$deploy/install.sh" >"$work/proxy-first-install.log"
+  published=$(docker port poise-gateway 8080/tcp 2>&1 || true)
+  [ "$published" = "$first" ] || fail "the gateway is published on $published, not on $first"
+  # Another address on the same port: the gateway's own port is no obstacle. And
+  # deploy/.env alone decides, whatever the shell exports.
+  sed -i "s/^POISE_PROXY_LISTEN=.*/POISE_PROXY_LISTEN=$listen/" "$deploy/.env"
+  POISE_PROXY_LISTEN=0.0.0.0:8080 "$deploy/install.sh" | tee "$work/proxy-install.log"
+  grep --quiet --fixed-strings "ask http://$listen/_gateway/tls-ask" "$work/proxy-install.log" \
+    || fail "install.sh did not say what the proxy must ask the gateway"
+  if docker container inspect poise-caddy >/dev/null 2>&1; then fail "install.sh left the bundled Caddy in place"; fi
+  published=$(docker port poise-gateway 8080/tcp 2>&1 || true)
+  [ "$published" = "$listen" ] || fail "the gateway is published on $published, not on $listen alone"
+  pass "install.sh needs no POISE_ACME_EMAIL, removes the bundled Caddy, moves the gateway from $first and publishes it on $listen alone, as deploy/.env says"
+
+  [ "$(curl --silent --max-time 10 "http://$listen/_gateway/tls-ask?domain=alice.$domain")" = ok ] \
+    || fail "the gateway does not answer the certificate question at $listen"
+  [ "$(curl --silent --max-time 10 --output /dev/null --write-out '%{http_code}' "http://$listen/_gateway/tls-ask?domain=nobody.$domain")" = 404 ] \
+    || fail "the gateway would let the proxy get a certificate for nobody.$domain"
+  pass "the gateway answers the certificate question at $listen"
+
+  docker run --detach --name poise-e2e-proxy --network host --env POISE_DOMAIN=$domain --env POISE_PROXY_LISTEN=$listen \
+    --mount "type=bind,source=$here/proxy.Caddyfile,target=/etc/caddy/Caddyfile,readonly" caddy:2 >/dev/null
+  for _ in $(seq 1 30); do
+    if docker exec poise-e2e-proxy cat /data/caddy/pki/authorities/local/root.crt >"$work/proxy-root.crt" 2>/dev/null \
+      && curl --silent --max-time 10 --cacert "$work/proxy-root.crt" --output /dev/null "https://$domain:8443/"; then
+      break
+    fi
+    sleep 1
+  done
+  wait_for_poise "$alice" alice
+  expect 200 "the admin page, through the server's own proxy" "$alice" "$apex/admin"
+  expect 404 "the certificate question, through the server's own proxy" "$nobody" "$apex/_gateway/tls-ask?domain=$domain"
+  [ -z "$(curl --silent --max-time 10 --header "Host: $listen" "http://127.0.0.1/_gateway/tls-ask?domain=$domain")" ] \
+    || fail "the server's own proxy passed a request for Host $listen to the gateway"
+  pass "the server's own proxy never passes Host $listen on"
+  for host in "$domain" "alice.$domain" "bob.$domain"; do
+    curl --silent --show-error --max-time 30 --cacert "$work/proxy-root.crt" --output /dev/null "https://$host:8443/" \
+      || fail "the server's own proxy has no valid certificate for $host"
+    pass "the server's own proxy serves $host with a valid certificate"
+  done
+  for host in "nobody.$domain" "admin.$domain"; do
+    if curl --silent --max-time 30 --cacert "$work/proxy-root.crt" --output /dev/null "https://$host:8443/"; then
+      fail "the server's own proxy served $host, whose owner the gateway does not know"
+    fi
+    pass "the server's own proxy gets no certificate for $host"
+  done
+  docker rm --force poise-e2e-proxy >/dev/null
+
+  sed -i '/^POISE_PROXY_LISTEN=/d' "$deploy/.env"
+  echo 'POISE_ACME_EMAIL=e2e@poise.test' >>"$deploy/.env"
+  "$deploy/install.sh"
+  [ "$(docker inspect --format '{{.State.Running}}' poise-caddy)" = true ] || fail "install.sh did not bring the bundled Caddy back"
+  published=$(docker port poise-gateway 8080/tcp 2>/dev/null || true)
+  [ -z "$published" ] || fail "the gateway is still published on $published"
+  wait_for_poise "$alice" alice
+  pass "install.sh switches back to the bundled Caddy"
+}
+
 run() {
   install
   sign_in_alice
@@ -453,6 +522,7 @@ run() {
   backup_and_restore
   check_gateway_recreated
   check_upgrade
+  check_proxy_mode
   echo "The deployment works end to end."
 }
 
@@ -460,7 +530,7 @@ logs() {
   local container
   compose ps --all || echo "(docker compose ps failed)"
   compose logs --no-color --timestamps --tail 400 || echo "(docker compose logs failed)"
-  for container in $(docker ps --all --filter label=poise.managed=true --format '{{.Names}}') poise-e2e-tls; do
+  for container in $(docker ps --all --filter label=poise.managed=true --format '{{.Names}}') poise-e2e-tls poise-e2e-proxy; do
     if ! docker container inspect "$container" >/dev/null 2>&1; then continue; fi
     echo "::group::$container"
     docker inspect --format '{{.State.Status}} (exit {{.State.ExitCode}}, restarts {{.RestartCount}}) health: {{json .State.Health}}' "$container"

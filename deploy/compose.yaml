@@ -2,7 +2,9 @@
 # and hands every request to the gateway; the gateway signs people in and
 # creates each person's workspace container itself, through the Docker
 # socket. deploy/install.sh and deploy/upgrade.sh run this file, and
-# deploy/.env holds its settings (.env.example describes each).
+# deploy/.env holds its settings (.env.example describes each). With
+# POISE_PROXY_LISTEN set, they add compose.proxy.yaml, which leaves TLS to a
+# proxy the server already runs.
 name: poise
 
 services:
@@ -16,7 +18,9 @@ services:
       - "443:443/udp"
     environment:
       POISE_DOMAIN: ${POISE_DOMAIN:?set POISE_DOMAIN in deploy/.env}
-      POISE_ACME_EMAIL: ${POISE_ACME_EMAIL:?set POISE_ACME_EMAIL in deploy/.env}
+      # The scripts require it unless POISE_PROXY_LISTEN leaves this service
+      # out, which Compose cannot express; without it Caddy refuses to start.
+      POISE_ACME_EMAIL: ${POISE_ACME_EMAIL:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

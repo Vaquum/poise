@@ -14,8 +14,6 @@ export const APEX_COOKIE = 'poise_gw'
 export const WORKSPACE_COOKIE = 'poise_ws'
 export const BIND_COOKIE = 'poise_bind'
 export const OAUTH_COOKIE = 'poise_oauth'
-/** The gateway's own cookies. None of them is ever forwarded to a workspace. */
-export const GATEWAY_COOKIES: ReadonlySet<string> = new Set([APEX_COOKIE, WORKSPACE_COOKIE, BIND_COOKIE, OAUTH_COOKIE])
 export const APEX_SESSION_TTL_MS = 14 * 24 * 60 * 60_000
 export const TICKET_TTL_MS = 60_000
 export const OAUTH_STATE_TTL_MS = 10 * 60_000

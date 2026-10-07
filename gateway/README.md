@@ -29,6 +29,7 @@ Everything comes from the environment and is validated at startup. Every problem
 | `POISE_GATEWAY_DATA` | | `/data` | Data directory |
 | `POISE_DOCKER_SOCKET` | | `/var/run/docker.sock` | Docker Engine socket |
 | `PORT` | | `8080` | Listening port |
+| `POISE_PROXY_LISTEN` | | | The address a proxy the server already runs reaches the gateway at, which `deploy/compose.proxy.yaml` publishes it on: one IP address and port such as `127.0.0.1:8080` or `[::1]:8080`, never `0.0.0.0` or `[::]`. The TLS ask is answered there too |
 | `POISE_GITHUB_URL` | | `https://github.com` | GitHub web origin; tests point it at a fake |
 | `POISE_GITHUB_API_URL` | | `https://api.github.com` | GitHub API origin; tests point it at a fake |
 | `POISE_INSECURE_HTTP` | | | `1` serves plain http for local and CI end-to-end runs; refused unless the domain is `*.localhost` or `*.test` |
@@ -50,12 +51,12 @@ On the apex:
 
 On a workspace host, `/_poise/session` redeems a sign-in ticket and `/_poise/logout` signs out of the workspace and the apex together. Everything else is proxied to the owner's workspace. While it starts, navigations get a page that reloads every two seconds and other requests get `503` JSON.
 
-`GET /_gateway/tls-ask?domain=` answers Caddy's on-demand TLS question. It is served only to requests addressed to `gateway:<PORT>`, so the public cannot use it to list handles.
+`GET /_gateway/tls-ask?domain=` answers Caddy's on-demand TLS question, or that of the server's own proxy. It is served only to requests addressed to `gateway:<PORT>` or to `POISE_PROXY_LISTEN`, so the public cannot use it to list handles.
 
 ## Security properties
 
 - A ticket redeems only in the browser it was minted for, through the `poise_bind` cookie the apex sets for the whole domain.
-- None of the gateway's cookies reaches a workspace, and a workspace cannot set cookies: `Set-Cookie` is dropped from every proxied answer.
+- No cookie reaches a workspace, neither the gateway's own nor any other the browser sends, such as a login cookie a parent domain shares with every host below it. A workspace cannot set cookies either: `Set-Cookie` is dropped from every proxied answer.
 - A body on `GET`, `HEAD`, `OPTIONS`, `DELETE` or `TRACE` is refused with 400, and forwarded bodies are always framed, so nothing can be smuggled to a workspace as a second request.
 - A workspace answer the gateway cannot relay, such as a status outside 100–599, becomes a 502 for that request alone.
 - A device token stops working after 30 days without use or 365 days after pairing, and Poise Link pairs again.

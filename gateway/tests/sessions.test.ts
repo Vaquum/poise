@@ -63,6 +63,21 @@ describe('hosts', () => {
       expect(reply.body).not.toBe('ok\n')
     }
   })
+
+  it('answers the TLS ask at POISE_PROXY_LISTEN too, where a proxy of the operator\'s own asks it', async () => {
+    await h.close()
+    h = await startHarness({ env: { POISE_PROXY_LISTEN: '[FD00::5]:8080' } })
+    await h.openWorkspace('alice')
+    const ask = (domain: string, host: string) => h.request({ host, path: `/_gateway/tls-ask?domain=${encodeURIComponent(domain)}` })
+    for (const host of ['[fd00::5]:8080', '[FD00::5]:8080', 'gateway:8080']) {
+      expect((await ask(APEX, host)).status, host).toBe(200)
+      expect((await ask(ALICE, host)).status, host).toBe(200)
+      expect((await ask(BOB, host)).status, host).toBe(404)
+    }
+    for (const host of [APEX, '[fd00::5]', '[fd00::5]:9999', '[fd00::6]:8080', '127.0.0.1:8080']) {
+      expect((await ask(ALICE, host)).status, host).toBe(404)
+    }
+  })
 })
 
 describe('workspace hosts', () => {

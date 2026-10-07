@@ -73,12 +73,17 @@ function fail(ctx: Context, req: IncomingMessage, res: ServerResponse, error: un
   else answer(ctx, req, res, 500, 'Something went wrong. The gateway log has the details.')
 }
 
-/** The address Caddy uses inside the deployment; no public host ever matches it. */
+/**
+ * The address Caddy uses inside the deployment, or the one a proxy of the operator's own reaches the
+ * gateway at (POISE_PROXY_LISTEN); no public host ever matches either.
+ */
 function isInternalAddress(ctx: Context, req: IncomingMessage): boolean {
-  return (req.headers.host ?? '').toLowerCase() === `gateway:${ctx.deps.config.port}`
+  const host = (req.headers.host ?? '').toLowerCase()
+  const { port, proxyListen } = ctx.deps.config
+  return host === `gateway:${port}` || (proxyListen !== null && host === proxyListen)
 }
 
-/** Caddy's on-demand TLS check: certificates only for the apex and the hosts of known people. */
+/** The proxy's on-demand TLS check: certificates only for the apex and the hosts of known people. */
 function tlsAsk(ctx: Context, res: ServerResponse, url: URL): void {
   const host = classifyHost(url.searchParams.get('domain') ?? '', ctx.deps.config.domain)
   const known = host.kind === 'apex' || (host.kind === 'workspace' && ctx.deps.store.getUser(host.handle) !== null)

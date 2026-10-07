@@ -8,16 +8,6 @@ export function cookieValues(header: string | undefined, name: string): string[]
   return values
 }
 
-/** The Cookie header without the named cookies, or undefined when nothing else is left. */
-export function withoutCookies(header: string | undefined, names: ReadonlySet<string>): string | undefined {
-  const kept = (header ?? '').split(';').map((part) => part.trim()).filter((part) => {
-    if (!part) return false
-    const separator = part.indexOf('=')
-    return !names.has(separator < 0 ? part : part.slice(0, separator).trim())
-  })
-  return kept.length > 0 ? kept.join('; ') : undefined
-}
-
 export interface CookieOptions {
   maxAgeSeconds: number
   secure: boolean

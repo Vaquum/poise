@@ -1,0 +1,29 @@
+# For deploy/ci/e2e.sh only: a proxy the server already runs, in front of an
+# installation with POISE_PROXY_LISTEN, the way docs/Operating.md ("Behind
+# your own proxy") has a server's existing Caddy front it. It runs on the
+# host's network: plain http on port 80 for the end-to-end run, and TLS on
+# port 8443 from Caddy's own certificate authority, where a workspace host
+# gets its certificate on demand once the gateway confirms it has an owner.
+{
+	local_certs
+	skip_install_trust
+	auto_https disable_redirects
+	on_demand_tls {
+		ask http://{$POISE_PROXY_LISTEN}/_gateway/tls-ask
+	}
+}
+
+http://{$POISE_DOMAIN}, http://*.{$POISE_DOMAIN} {
+	reverse_proxy {$POISE_PROXY_LISTEN}
+}
+
+https://{$POISE_DOMAIN}:8443 {
+	reverse_proxy {$POISE_PROXY_LISTEN}
+}
+
+https://*.{$POISE_DOMAIN}:8443 {
+	tls {
+		on_demand
+	}
+	reverse_proxy {$POISE_PROXY_LISTEN}
+}

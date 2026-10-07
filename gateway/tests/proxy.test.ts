@@ -80,12 +80,13 @@ describe('proxy', () => {
     await h.close()
   })
 
-  it('replaces client identity and forwarding headers and keeps Host, Origin and the client\'s own cookies', async () => {
+  it('replaces client identity and forwarding headers, keeps Host and Origin, and forwards no cookie', async () => {
     const reply = await h.request({
       host: ALICE,
       path: '/api/echo',
       headers: {
-        cookie: `a=1; ${cookie}; poise_bind=b; poise_gw=g; poise_oauth=o; b=2`,
+        // portal_session stands for a login cookie the parent domain shares with every host below it.
+        cookie: `a=1; ${cookie}; poise_bind=b; poise_gw=g; poise_oauth=o; portal_session=p; b=2`,
         origin: `https://${ALICE}`,
         'X-Poise-Identity': 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJyb290Iiwic2NvcGUiOiJhZG1pbiJ9.',
         'x-forwarded-proto': 'http',
@@ -103,7 +104,7 @@ describe('proxy', () => {
     const { headers } = reply.json<{ headers: Record<string, string> }>()
     expect(headers.host).toBe(ALICE)
     expect(headers.origin).toBe(`https://${ALICE}`)
-    expect(headers.cookie).toBe('a=1; b=2')
+    expect(headers.cookie).toBeUndefined()
     expect(headers['x-forwarded-proto']).toBe('https')
     expect(headers['x-forwarded-host']).toBe(ALICE)
     expect(headers['x-forwarded-for']).toBe('203.0.113.9, 127.0.0.1')
