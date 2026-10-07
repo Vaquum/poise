@@ -10,7 +10,9 @@ Setting up takes four steps: point DNS at the server, create a GitHub OAuth
 App, fill in `deploy/.env`, and run `deploy/install.sh`. Upgrading is
 `deploy/upgrade.sh`. On a server whose web server already holds ports 80 and
 443, Poise runs behind it instead (see
-[Behind your own proxy](#behind-your-own-proxy)).
+[Behind your own proxy](#behind-your-own-proxy)). A fork of this repository
+can do the installing and upgrading itself from GitHub Actions (see
+[Run your own Poise from a fork](#run-your-own-poise-from-a-fork)).
 
 ## What runs
 
@@ -247,6 +249,133 @@ ports 80 and 443 and run `deploy/install.sh`. When you run Compose yourself
 in `deploy/`, name both files as the scripts do, for example
 `COMPOSE_FILE=compose.yaml:compose.proxy.yaml docker compose ps`.
 
+## Run your own Poise from a fork
+
+This repository is meant to be forked. A fork deploys itself to its own
+server from GitHub Actions, and can take this repository's changes as they
+land.
+
+1. **Fork** autonomio/poise into your account or organisation. GitHub turns
+   workflows off in a new fork: enable them on the fork's **Actions** tab.
+2. **Prepare the server** as for any installation: [the server](#the-server),
+   [DNS](#1-dns) and [the OAuth App](#2-the-github-oauth-app). Then give the
+   workflow an account on it:
+   - a user that may use Docker, such as `poise` in the `docker` group, with
+     `git` installed;
+   - an empty directory for the checkout, owned by that user: `/srv/poise`,
+     unless you set `POISE_DEPLOY_PATH`;
+   - a key pair of the workflow's own, its public key in that user's
+     `~/.ssh/authorized_keys`.
+3. **Set the fork's variables and secrets** under Settings → Secrets and
+   variables → Actions (below).
+4. **Run the Deploy workflow** on the fork's **Actions** tab. It signs in to
+   the server, brings the checkout to the commit, cloning it the first time,
+   writes `deploy/.env`, and runs `deploy/install.sh` the first time and
+   `deploy/upgrade.sh --no-pull` after that. Every push to the fork's main
+   deploys the same way, and a deployment that fails fails the run.
+
+The workflow reaches the server with these:
+
+| Name | Kind | Value |
+| --- | --- | --- |
+| `POISE_DEPLOY_HOST` | variable | The server's address or host name. Without it the workflow does nothing, which is why autonomio/poise itself deploys nowhere |
+| `POISE_DEPLOY_USER` | variable | The account it deploys as |
+| `POISE_DEPLOY_KNOWN_HOSTS` | variable | The server's host keys, and the jump host's, as `ssh-keyscan` prints them. The workflow connects to no other key |
+| `POISE_DEPLOY_SSH_KEY` | secret | The workflow's private key |
+| `POISE_DEPLOY_PORT` | variable | The server's SSH port, when not 22 |
+| `POISE_DEPLOY_JUMP` | variable | `user@host` of a jump host to reach the server through, when it has no address of its own on the internet |
+| `POISE_DEPLOY_PATH` | variable | The checkout, when not `/srv/poise` |
+
+Every other `POISE_` variable becomes a line of `deploy/.env`, so the
+settings [`deploy/.env.example`](../deploy/.env.example) describes are
+variables of the fork: `POISE_DOMAIN`, `POISE_GITHUB_CLIENT_ID`,
+`POISE_ADMINS`, `POISE_ACME_EMAIL` or `POISE_PROXY_LISTEN`, and whichever
+others you need. The OAuth App's client secret is the secret
+`POISE_GITHUB_CLIENT_SECRET`. The workflow writes `deploy/.env` anew at every
+deployment, so change settings in the fork, not on the server, and run the
+workflow to apply them. Of what a run brings, only `deploy/.env` stays on the
+server: the checkout fetches with the run's own token, which expires with the
+run, and the settings reach the server over SSH alone, never on a command
+line.
+
+**Keeping up with autonomio/poise.** Set the variable `POISE_UPSTREAM_SYNC`
+to `true`. The Sync workflow then merges autonomio/poise's main into the
+fork's main every hour, as the **Sync fork** button on the fork's page does,
+and deploys what that brought in. GitHub lets no workflow's own token change
+a workflow file, so when autonomio/poise changes one, the sync fails until
+you press **Sync fork**, or give the fork a `POISE_SYNC_TOKEN` secret: a
+fine-grained personal access token for the fork with read and write access
+to its contents and workflows. A fork with commits of its own can conflict
+with autonomio/poise; the sync then fails and leaves the merge to you.
+
+## In a virtual machine on a shared server
+
+The gateway drives the Docker Engine of the machine it runs on, which amounts
+to root there (see [Security](#security)). On a server that runs other
+services too, give Poise a virtual machine of its own, so that neither the
+gateway nor an agent in a workspace can reach those services. Vaquum's
+deployment runs this way, with libvirt on an Ubuntu host:
+
+1. **A network of its own.** A libvirt NAT network, such as
+   `192.168.150.0/24` with the host at `.1` and the VM fixed at `.10` by its
+   MAC address, gives the VM the internet, and nothing outside the host can
+   open a connection into it.
+2. **A traffic filter.** A libvirt network filter on the VM's interface drops
+   what the VM sends to every private range and to the host's own public
+   addresses, so it reaches none of the host's services, containers or other
+   VMs. It lets through DNS and DHCP to the host, and the answers to the
+   host's connections to the VM's SSH and to the gateway:
+
+   ```xml
+   <filter name='poise-isolation' chain='root'>
+     <filterref filter='clean-traffic'/>
+     <rule action='accept' direction='out' priority='-905'>
+       <tcp dstipaddr='192.168.150.1' srcportstart='22' state='ESTABLISHED'/>
+     </rule>
+     <rule action='accept' direction='out' priority='-904'>
+       <tcp dstipaddr='192.168.150.1' srcportstart='8080' state='ESTABLISHED'/>
+     </rule>
+     <rule action='accept' direction='out' priority='-900'>
+       <udp dstipaddr='192.168.150.1' dstportstart='53'/>
+     </rule>
+     <rule action='accept' direction='out' priority='-899'>
+       <tcp dstipaddr='192.168.150.1' dstportstart='53'/>
+     </rule>
+     <rule action='accept' direction='out' priority='-898'>
+       <udp srcportstart='68' dstportstart='67'/>
+     </rule>
+     <rule action='drop' direction='out' priority='-850'><all dstipaddr='10.0.0.0' dstipmask='8'/></rule>
+     <rule action='drop' direction='out' priority='-849'><all dstipaddr='172.16.0.0' dstipmask='12'/></rule>
+     <rule action='drop' direction='out' priority='-848'><all dstipaddr='192.168.0.0' dstipmask='16'/></rule>
+     <rule action='drop' direction='out' priority='-847'><all dstipaddr='169.254.0.0' dstipmask='16'/></rule>
+     <rule action='drop' direction='out' priority='-846'><all dstipaddr='100.64.0.0' dstipmask='10'/></rule>
+     <rule action='drop' direction='out' priority='-845'><all dstipaddr='203.0.113.10'/></rule>
+     <rule action='drop' direction='inout' priority='-844'><ipv6/></rule>
+   </filter>
+   ```
+
+   Write one rule like the one for `203.0.113.10` for each public address of
+   the host. From inside the VM, check that the internet answers and the
+   host does not.
+3. **The VM.** Ubuntu 24.04 from Ubuntu's cloud image, checked against its
+   signed checksums, sized as the server would be ([The server](#the-server)).
+   Install Docker Engine and its Compose plugin from Docker's repository, and
+   gVisor from gVisor's, and set `POISE_WORKSPACE_RUNTIME=runsc`.
+4. **The host's proxy in front.** Set `POISE_PROXY_LISTEN` to the VM's
+   address, `192.168.150.10:8080`, and have the host's proxy send Poise's
+   names there ([Behind your own proxy](#behind-your-own-proxy)). The filter
+   above lets the answers through.
+5. **Deploying from a fork** reaches the VM through the host. Give the
+   workflow an account on the host that can do nothing but forward a
+   connection to the VM's SSH, and set `POISE_DEPLOY_JUMP` to it and
+   `POISE_DEPLOY_HOST` to the VM's address. Create the account without a
+   shell (`/usr/sbin/nologin`) and put the workflow's public key in its
+   `~/.ssh/authorized_keys` with these restrictions:
+
+   ```text
+   restrict,port-forwarding,permitopen="192.168.150.10:22" ssh-ed25519 AAAA… poise-deploy
+   ```
+
 ## People
 
 A GitHub login may sign in when it is an admin, on the allow list, or an
@@ -315,6 +444,8 @@ deploy/upgrade.sh
 It pulls the newest commit of the branch the checkout follows (fast-forward
 only), rebuilds the workspace image, lets Compose recreate Caddy or the
 gateway if they changed, and lists the workspaces that run an older image.
+A fork that deploys itself does this at every push to its main
+([Run your own Poise from a fork](#run-your-own-poise-from-a-fork)).
 
 The gateway upgrades those workspaces by itself, when it starts and every
 five minutes. It drains a running workspace first: the workspace refuses new

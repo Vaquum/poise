@@ -1,0 +1,52 @@
+# Keeps a fork of autonomio/poise in step with it (docs/Operating.md, "Run
+# your own Poise from a fork"). Opt in with the repository variable
+# POISE_UPSTREAM_SYNC=true. Every hour it merges autonomio/poise's main into
+# this repository's main, as the Sync fork button does, and deploys what that
+# brought in.
+#
+# GitHub lets the workflow's own token change no workflow file. When
+# autonomio/poise changes one, the merge fails until the fork is synced by
+# hand, or the repository gives this workflow a POISE_SYNC_TOKEN secret: a
+# fine-grained token with read and write access to this repository's contents
+# and workflows.
+name: Sync with autonomio/poise
+
+on:
+  schedule:
+    - cron: '41 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge autonomio/poise's main
+    if: vars.POISE_UPSTREAM_SYNC == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Merge autonomio/poise's main into main
+        env:
+          GH_TOKEN: ${{ secrets.POISE_SYNC_TOKEN || github.token }}
+          WORKFLOW_TOKEN_ONLY: ${{ secrets.POISE_SYNC_TOKEN == '' }}
+          WORKFLOW_TOKEN: ${{ github.token }}
+        run: |
+          if ! result=$(gh api --method POST "repos/$GITHUB_REPOSITORY/merge-upstream" --field branch=main 2>&1); then
+            echo "::error::Merging autonomio/poise's main failed: $result"
+            echo "A conflict needs merging by hand. A workflow file the token may not change needs Sync fork on the repository's page, or a POISE_SYNC_TOKEN secret (see this workflow's header)."
+            exit 1
+          fi
+          jq --raw-output .message <<<"$result"
+          if [ "$(jq --raw-output .merge_type <<<"$result")" = none ]; then exit 0; fi
+          # A push made with the workflow's own token starts no workflow, so start the deployment here.
+          if [ "$WORKFLOW_TOKEN_ONLY" = true ]; then
+            GH_TOKEN=$WORKFLOW_TOKEN gh workflow run deploy.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo "Started the Deploy workflow for the merged main."
+          fi
