@@ -2138,7 +2138,7 @@ async function packetBlocked(
 // a fresh decision.
 function boundedReviewFailure(call: LogEntry): boolean {
   return call.review_policy === REVIEW_POLICY
-    && (['model_output_limit', 'review_budget_exhausted', 'review_recovery_failed', 'review_contract_violation', 'stopped'].includes(call.error_code || '')
+    && (['model_output_limit', 'review_budget_exhausted', 'review_recovery_failed', 'review_contract_violation', 'review_provider_blocked', 'stopped'].includes(call.error_code || '')
       || /^\w+ behavior must produce exactly one atomic /.test(call.error || ''))
 }
 
@@ -2760,6 +2760,7 @@ const ISSUE_PRE_LAUNCH_LEASE_MS = 5 * 60_000
 const HELD_ISSUE_REVIEW_ERRORS = new Set([
   'review_budget_exhausted',
   'review_recovery_failed',
+  'review_provider_blocked',
   'stopped',
   'review_packet_too_large',
   'posting_failed',
