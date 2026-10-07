@@ -302,9 +302,24 @@ jobs:
           pid=$(pgrep -x poise-link) || { echo "::error::Poise Link is not running"; exit 1; }
           echo "FIRST_PID=$pid" >> "$GITHUB_ENV"
 
-      - name: Capture the screen
-        continue-on-error: true
-        run: import -window root first-run.png
+      # A running process is not enough: the pairing form must render. A blank
+      # window is one or two colours; the form's text and fields are hundreds.
+      - name: Check that the pairing window renders
+        run: |
+          for _ in $(seq 45); do
+            if import -window 'Poise Link' link-window.png 2>/dev/null; then
+              colours=$(convert link-window.png -format %k info:)
+              if [ "$colours" -gt 50 ]; then
+                echo "Poise Link's window shows $colours colours"
+                import -window root first-run.png
+                exit 0
+              fi
+            fi
+            sleep 2
+          done
+          import -window root first-run.png
+          echo "::error::Poise Link's window stayed blank"
+          exit 1
 
       - name: Run the installer again, as an update
         run: sh link/install.sh
@@ -322,7 +337,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: install-screen-ubuntu-${{ matrix.ubuntu }}
-          path: first-run.png
+          path: |
+            first-run.png
+            link-window.png
           if-no-files-found: ignore
 
   install-debian:
