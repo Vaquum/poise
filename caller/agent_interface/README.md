@@ -92,6 +92,10 @@ configuration, limits preparation to 180 seconds, and rejects incomplete trees,
 more than 20,000 tree entries, or more than 256 MiB of tracked content. The checkout
 is removed after the provider finishes, fails, or is cancelled. Approvals retain
 their existing packet-only behavior.
+Preparation uses a sparse checkout: archives, images, fonts, media, and bytecode
+remain in the tracked-file inventory but are not downloaded. Reading one returns
+an explicit text-unavailable result. All other tracked source remains available.
+Checkout uses the remaining preparation deadline; a timeout is reported explicitly.
 
 Every PR reviewer receives AGENTS.md and CLAUDE.md guidance from the pinned merge
 base, including nested files and their paths. Guidance is limited to 256 KiB,
@@ -127,11 +131,15 @@ disabled, receiving the same explicit guidance and scoped inspection access: Cod
 used) with read-only sandboxing, user configuration ignored, and shell, connector,
 extension, and delegation tools disabled; Grok Build (`grok`) in one turn with
 its built-in tools, web search and subagents off; Antigravity (`agy`) in plan
-mode, the packet streamed on stdin; Muse (`muse`) with shell, writes and web
-tools off. A run that used a native tool, failed, or answered anything but a valid
+mode, the packet streamed on stdin; Muse (`muse`) with an isolated configuration,
+an empty tool roster, workflows and reminders off, schema-enforced output and
+one model step per inspection round. Sign-in is preserved without importing
+personal settings. A run that used a native tool, failed, or answered anything but a valid
 inspection request or terminal verdict
 submits nothing, and the existing authoritative outcome check still determines
 completion or supersession.
+An explicit provider refusal, exhausted Grok balance, or local Muse account latch
+is recorded as `review_provider_blocked`; transient provider outages remain retryable.
 
 While a model is analyzing a PR, Caller checks its live head approximately
 every 30 seconds through `github-interface --head-sha`. Only a valid response

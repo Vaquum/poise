@@ -93,7 +93,11 @@ def prepare(pwd: str, pr: str, actor: str, head: str, packet: str):
                 raise ValueError("checkout receipt differs from the pinned PR packet")
             yield Repository(root, info)
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-            raise atoms.AgentPreflightError(f"cannot inspect review checkout: {error}") from error
+            message = str(error)
+            code = ("review_budget_exhausted" if isinstance(error, (TimeoutError, subprocess.TimeoutExpired))
+                    or "timed out" in message else "review_packet_too_large"
+                    if "exceeds its file or byte limit" in message or "guidance exceeds its byte limit" in message else None)
+            raise atoms.AgentPreflightError(f"cannot inspect review checkout: {error}", code) from error
 
 
 @contextmanager

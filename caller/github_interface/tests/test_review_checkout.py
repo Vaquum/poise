@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import TestCase, IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
@@ -27,6 +28,44 @@ def tree(root, sha):
 
 
 class TestPinnedCheckout(TestCase):
+    def test_concurrent_partial_checkouts_never_hydrate_archives_and_keep_source(self):
+        with tempfile.TemporaryDirectory() as work:
+            source = Path(work) / "source"
+            source.mkdir()
+            git(source, "init", "-q")
+            git(source, "config", "user.name", "Test")
+            git(source, "config", "user.email", "test@example.com")
+            git(source, "config", "uploadpack.allowFilter", "true")
+            git(source, "config", "uploadpack.allowAnySHA1InWant", "true")
+            (source / "AGENTS.md").write_text("Review consumers.\n")
+            (source / "consumer.py").write_text("old_contract()\n")
+            (source / "fixture.json").write_text('"' + "x" * 80_000 + '"\n')
+            archive = "payload[1]*.zip"
+            (source / archive).write_bytes(os.urandom(2 * 1024 * 1024))
+            git(source, "add", ".")
+            git(source, "commit", "-qm", "source and binary fixture")
+            head = git(source, "rev-parse", "HEAD")
+            blob = git(source, "rev-parse", f"HEAD:{archive}")
+            metadata = tree(source, head)
+
+            def prepare(index):
+                target = Path(work) / f"review-{index}"
+                rc.checkout("o", "r", head, head, "token", target, metadata, metadata,
+                            remote=source.as_uri())
+                self.assertEqual(git(target, "rev-parse", "HEAD"), head)
+                self.assertFalse((target / archive).exists())
+                self.assertIn("?" + blob, git(target, "rev-list", "--objects", "--all", "--missing=print"))
+                self.assertEqual((target / "fixture.json").read_text(), (source / "fixture.json").read_text())
+                request = lambda operation, path, query="": {"operation": operation, "path": path,
+                                                            "query": query, "start_line": 1}
+                response = rc.inspect(target, [request("read", archive), request("search", ".", "old_contract")])
+                self.assertIn("unavailable", response["results"][0]["error"])
+                self.assertEqual(response["results"][1]["matches"][0]["path"], "consumer.py")
+                return target
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                self.assertEqual(len(list(pool.map(prepare, range(3)))), 3)
+
     def test_checkout_pins_head_and_merge_base_and_never_adopts_pr_instructions(self):
         with tempfile.TemporaryDirectory() as work:
             source, target = Path(work) / "source", Path(work) / "review"

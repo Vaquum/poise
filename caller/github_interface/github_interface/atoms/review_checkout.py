@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path, PurePosixPath
 from time import monotonic
 
-from .review_diff import _env, _git
+from .review_diff import OPAQUE_SUFFIXES, _env, _git
 
 MAX_FILES = 20_000
 MAX_CHECKOUT_BYTES = 256 * 1024 * 1024
@@ -13,6 +13,17 @@ MAX_GUIDANCE_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_REQUESTS = 8
 MANIFEST = "caller-review.json"
+OPAQUE_FILES = OPAQUE_SUFFIXES | {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".woff", ".woff2", ".ttf", ".mp3", ".mp4", ".mov", ".pyc", ".pyo"}
+
+
+def opaque_path(name: str) -> bool:
+    # Sparse patterns cannot represent a newline. Keep such files available
+    # rather than silently changing which source is accessible.
+    return "\n" not in name and PurePosixPath(name).suffix.lower() in OPAQUE_FILES
+
+
+def sparse_literal(name: str) -> str:
+    return re.sub(r"([\\*?\[\] ])", r"\\\1", name)
 
 
 def bounded_tree(tree: dict) -> list[dict]:
@@ -45,11 +56,11 @@ def checkout(owner: str, repo: str, head: str, merge_base: str, token: str,
     deadline = monotonic() + 180
     path.mkdir(parents=True, mode=0o700)
 
-    def git(*args, limit=MAX_RESPONSE_BYTES):
+    def git(*args, limit=MAX_RESPONSE_BYTES, checkout=False):
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise RuntimeError("review checkout timed out")
-        return _git(str(path), env, *args, limit=limit, timeout=min(60, remaining))
+        return _git(str(path), env, *args, limit=limit, timeout=remaining if checkout else min(60, remaining))
 
     try:
         git("init", "--quiet", "--template=")
@@ -57,7 +68,17 @@ def checkout(owner: str, repo: str, head: str, merge_base: str, token: str,
         git("config", "remote.origin.promisor", "true")
         git("config", "remote.origin.partialclonefilter", "blob:none")
         git("fetch", "--quiet", "--no-tags", "--depth=1", "--filter=blob:none", "origin", head, merge_base)
-        git("-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", head)
+        unavailable = {item["path"]: "Opaque binary payload; text inspection is unavailable."
+                       for item in files if item.get("type") == "blob" and opaque_path(item["path"])}
+        # A full checkout hydrates every blob despite blob:none. Keep all
+        # repository source, but do not download archives for every reviewer.
+        sparse = path / ".git" / "info" / "sparse-checkout"
+        sparse.parent.mkdir(exist_ok=True)
+        sparse.write_text(
+            "/*\n" + "".join(f"!/{sparse_literal(name)}\n" for name in sorted(unavailable)))
+        git("config", "core.sparseCheckout", "true")
+        git("config", "core.sparseCheckoutCone", "false")
+        git("-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", head, checkout=True)
         if git("rev-parse", "HEAD").decode().strip() != head:
             raise RuntimeError("review checkout does not match the expected head")
         instructions = []
@@ -67,7 +88,7 @@ def checkout(owner: str, repo: str, head: str, merge_base: str, token: str,
         tracked = [item["path"] for item in files if item.get("type") == "blob"
                    and item.get("mode") in ("100644", "100755")]
         manifest = {"repository": f"{owner}/{repo}", "head_sha": head, "merge_base_sha": merge_base,
-                    "files": tracked, "instructions": instructions}
+                    "files": tracked, "instructions": instructions, "unavailable": unavailable}
         (path / ".git" / MANIFEST).write_text(json.dumps(manifest))
         return {"head_sha": head, "merge_base_sha": merge_base, "instructions": instructions,
                 "files": len(tracked)}
@@ -83,6 +104,7 @@ def inspect(root: Path, requests: list[dict]) -> dict:
     if not isinstance(requests, list) or not 1 <= len(requests) <= MAX_REQUESTS:
         raise ValueError("inspection requires 1-8 requests")
     files = set(manifest["files"])
+    unavailable = manifest.get("unavailable", {})
     results = []
     # Share the response budget across requests, including JSON escaping and
     # envelope metadata. A full batch returns shorter pages, never a lost batch.
@@ -109,6 +131,8 @@ def inspect(root: Path, requests: list[dict]) -> dict:
         elif operation == "read":
             if relative not in files:
                 result["error"] = "tracked regular file not found"
+            elif relative in unavailable:
+                result.update(error=unavailable[relative], lines=[], truncated=False, next_line=None)
             else:
                 try:
                     lines, truncated = _page(_lines(root, relative, start), 200, page_bytes)
@@ -121,7 +145,8 @@ def inspect(root: Path, requests: list[dict]) -> dict:
         else:
             if not query:
                 raise ValueError("search requires a nonempty literal query")
-            matches, truncated = _page(_matches(root, selected, query, start), 100, page_bytes)
+            searchable = [name for name in selected if name not in unavailable]
+            matches, truncated = _page(_matches(root, searchable, query, start), 100, page_bytes)
             result.update(matches=matches, truncated=truncated, next_line=start + len(matches) if truncated else None,
                           scope="Tracked UTF-8 files up to 4 MiB; literal search.")
         if result.get("next_line") == start:

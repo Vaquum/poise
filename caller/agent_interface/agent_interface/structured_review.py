@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -33,6 +34,14 @@ GROK_DISABLED_TOOLS = (
 
 class InvalidVerdict(ValueError):
     """A terminal contract failure, not a transient provider outage."""
+
+
+def provider_failure(message: str) -> None:
+    if ("MUSE GUARD: Muse provider access is latched off locally" in message
+            or "Grok Build usage balance exhausted" in message
+            or "safeguards flagged this message" in message):
+        raise AgentPreflightError(message, "review_provider_blocked")
+    raise ValueError(message)
 
 
 def verdict_schema(behavior: str, *, inspection: bool = False) -> dict:
@@ -275,7 +284,7 @@ def ask_grok(root: Path, model: Model, system: str, text: str, schema: dict, wat
         if "max turns reached" in (done.stderr + done.stdout).lower():
             raise review_budget.ReviewLimitError("Grok reached its model turn limit; needs attention",
                                                 "review_budget_exhausted")
-        raise ValueError((done.stderr or done.stdout).strip() or f"agent exited {done.returncode}")
+        provider_failure((done.stderr or done.stdout).strip() or f"agent exited {done.returncode}")
     reply = json.loads(done.stdout)
     if isinstance(reply, dict) and reply.get("stopReason") == "max_turns":
         raise review_budget.ReviewLimitError("Grok reached its model turn limit; needs attention",
@@ -325,6 +334,24 @@ def ask_antigravity(root: Path, model: Model, system: str, text: str, schema: di
 
 
 # ── Muse ──────────────────────────────────────────────────────────────
+def muse_environment(root: Path) -> dict:
+    env = os.environ.copy()
+    original = Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "muse"
+    config = root / "config" / "muse"
+    config.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Preserve sign-in, but do not import personal hooks, skills, or tools.
+    auth = original / "auth.json"
+    if auth.is_file():
+        shutil.copyfile(auth, config / "auth.json")
+        (config / "auth.json").chmod(0o600)
+    settings = config / "settings.json"
+    settings.write_text(json.dumps({"schema_version": 1,
+                                  "run": {"toolset": [], "workflow_trigger_mode": "off"}}))
+    settings.chmod(0o600)
+    env["XDG_CONFIG_HOME"] = str(config.parent)
+    return env
+
+
 def ask_muse(root: Path, model: Model, system: str, text: str, schema: dict, watch: ReviewWatch, timeout: float) -> str:
     prompt = root / "prompt.txt"
     prompt.write_text(f"{system}\n\n{text}{instructions(schema)}")
@@ -333,12 +360,14 @@ def ask_muse(root: Path, model: Model, system: str, text: str, schema: dict, wat
         "--prompt-file", str(prompt),
         "--model", model.selector, "--reasoning-effort", model.effort,
         "--disable-shell", "--disable-write", "--disable-web-tools",
+        "--no-foreign-personal-context", "--disable-reminders",
+        "--output-schema", str(root / "verdict.schema.json"), "--max-model-steps", "1",
         "--approval-mode", "never", "--no-session-log",
         "--workspace", str(root), "--json",
     ]
-    done = watch.run(args, input="", cwd=str(root), timeout=timeout, env=os.environ.copy(), provider="muse")
+    done = watch.run(args, input="", cwd=str(root), timeout=timeout, env=muse_environment(root), provider="muse")
     if done.returncode:
-        raise ValueError((done.stderr or done.stdout).strip() or f"muse exited {done.returncode}")
+        provider_failure((done.stderr or done.stdout).strip() or f"muse exited {done.returncode}")
     answer = None
     for event in events(done.stdout):
         payload = event.get("payload") or {}

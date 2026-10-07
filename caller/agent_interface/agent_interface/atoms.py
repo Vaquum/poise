@@ -227,6 +227,8 @@ def run_agent(
     result = claude_result(done.stdout)
     if done.returncode:
         error = (result or done.stderr or claude_error(done.stdout)).strip() or f"agent exited {done.returncode}"
+        if "safeguards flagged this message" in error:
+            raise AgentPreflightError(error, "review_provider_blocked")
         if "Prompt is too long" in error:
             raise AgentPreflightError(error, "review_packet_too_large")
         if "output token maximum" in error or "context window limit" in error:

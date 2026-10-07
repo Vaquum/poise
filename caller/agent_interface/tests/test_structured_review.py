@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+import tempfile
 from contextlib import redirect_stdout
 from contextlib import nullcontext
 from pathlib import Path
@@ -298,7 +299,36 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(args[args.index("--workspace") + 1], kwargs["cwd"])
         self.assertNotEqual(kwargs["cwd"], "/repo")
         self.assertEqual(kwargs["provider"], "muse")
+        for flag in ("--output-schema", "--no-foreign-personal-context", "--disable-reminders"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("--max-model-steps") + 1], "1")
         self.assertEqual(mutation[:3], ["github-interface", "--reviewed-clean", "#12"])
+
+    def test_account_blocks_are_typed_without_submitting_or_hiding_transient_errors(self):
+        for message in ("MUSE GUARD: Muse provider access is latched off locally.",
+                        "API error: Grok Build usage balance exhausted",
+                        "API Error: Opus 5's safeguards flagged this message"):
+            with self.subTest(message=message), self.assertRaises(atoms.AgentPreflightError) as failure:
+                structured_review.provider_failure(message)
+            self.assertEqual(failure.exception.code, "review_provider_blocked")
+        with self.assertRaises(ValueError):
+            structured_review.provider_failure("temporary provider outage")
+
+    def test_muse_isolates_its_tool_roster_and_keeps_sign_in(self):
+        with tempfile.TemporaryDirectory() as work:
+            original = Path(work) / "original" / "muse"
+            original.mkdir(parents=True)
+            (original / "auth.json").write_text('{"test": "credential pointer"}')
+            (original / "settings.json").write_text('{"run":{"toolset":["workflow"]}}')
+            root = Path(work) / "review"
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(original.parent)}):
+                env = structured_review.muse_environment(root)
+            isolated = Path(env["XDG_CONFIG_HOME"]) / "muse"
+            self.assertEqual(json.loads((isolated / "settings.json").read_text())["run"],
+                             {"toolset": [], "workflow_trigger_mode": "off"})
+            self.assertEqual((isolated / "auth.json").read_text(), (original / "auth.json").read_text())
+            self.assertEqual((isolated / "auth.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads((original / "settings.json").read_text())["run"]["toolset"], ["workflow"])
 
     def test_muse_rejects_tool_use_prose_and_failed_runs(self):
         clean = '{"action": "reviewed_clean", "comments": []}'
