@@ -3,6 +3,14 @@
 Poise is a trigger and orchestration layer. It does not read GitHub source,
 construct reviews, or mutate review threads itself.
 
+An operator can POST `/api/behaviors/retry-pr-reviews` with 1-3 `callIds`
+from failed automated slots on one PR/head. Poise verifies exact launch
+ownership, unchanged live head, no active worker, and no unclaimed or pending
+GitHub review. Only then does one transaction release those failed slots and
+their retry delay, retaining Caller results and a durable retry audit record.
+The normal scheduler launches the configured panel. Unknown evidence,
+quarantined results, recorded actions and concurrent changes remain held.
+
 Each behavior follows one transaction shape:
 
 1. Gate on fresh `github-datastore` consumer state.

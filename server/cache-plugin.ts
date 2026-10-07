@@ -20,6 +20,7 @@ import { handleSnippetApi } from './snippet-api'
 import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { ContentLaunchPendingError, getContentJobResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
+import { retryFailedPrReviews } from './behaviors'
 import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders, type RequestAuthority } from './http'
 import { ChatRuntime } from './chat/runtime'
 import { ChatSocketServer, handleChatApi } from './chat/transport'
@@ -463,6 +464,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         // ── /api/behaviors — state + metadata for behavior automations ──
+        if (path === '/api/behaviors/retry-pr-reviews' && req.method === 'POST') {
+          const body = await readJson<{ callIds?: unknown }>(req)
+          return json(res, 200, await retryFailedPrReviews(body.callIds))
+        }
         // GET returns owner (the agent account), enabled flag, and the
         // per-behavior setting (e.g. "p2") from cache.db meta. Owner is
         // who the agent acts as; enabled is whether the server-side

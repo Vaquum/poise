@@ -2143,6 +2143,81 @@ function boundedReviewFailure(call: LogEntry): boolean {
       || /^\w+ behavior must produce exactly one atomic /.test(call.error || ''))
 }
 
+// An explicit operator retry releases only failed slots whose live GitHub
+// inventory proves no unclaimed or pending publication. The scheduler owns
+// the next launch; this API neither submits reviews nor rewrites Caller logs.
+export async function retryFailedPrReviews(callIds: unknown): Promise<{ ok: true, targets: string[] }> {
+  if (!Array.isArray(callIds) || callIds.length < 1 || callIds.length > 3
+    || callIds.some((id) => typeof id !== 'string' || !/^[0-9a-f]{32}$/.test(id))
+    || new Set(callIds).size !== callIds.length) throw new HttpError(400, 'callIds must contain 1-3 distinct failed review call IDs')
+  const snapshot = await readBehaviorLogSnapshot()
+  const calls = callIds.map((id) => snapshot.entries.find((row) => row.id === id))
+  if (calls.some((call) => !call || !unambiguousAgentCall(snapshot, call)
+    || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) || call.head_sha || call.review_id
+    || !call.repo || !call.pr_id || !call.expected_head || !SHA_PATTERN.test(call.expected_head)
+    || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
+    || !(call.action === null && call.outcome === null
+      || call.action === 'not_started' && call.outcome === 'preflight_failed'))) {
+    throw new HttpError(409, 'Retry requires unambiguous failed calls without a recorded review action')
+  }
+  const first = calls[0]!
+  const behavior = first.behavior === 'pr_review' ? 'review-new-prs' : first.behavior === 'pr_approve' ? 'approve-prs' : null
+  if (!behavior || calls.some((call) => call!.repo !== first.repo || call!.pr_id !== first.pr_id
+    || call!.expected_head !== first.expected_head || call!.actor !== first.actor
+    || call!.behavior !== first.behavior || call!.source !== `poise:${behavior}`)) {
+    throw new HttpError(409, 'Retry calls must belong to one automated PR review on one head')
+  }
+  return withBehaviorOrganization(first.repo!.split('/')[0], async () => {
+    if (!isEnabled(behavior) || first.actor?.toLowerCase() !== configuredReviewer().toLowerCase()) {
+      throw new HttpError(409, 'Retry does not match the enabled reviewer')
+    }
+    const failed = failedBehaviorLaunches(behavior).filter((claim) => callIds.includes(claim.launchCallId))
+    if (failed.length !== calls.length || failed.some((claim) => claim.launchQuarantine
+      || claim.launchRepo !== first.repo || String(claim.launchPr) !== first.pr_id
+      || claim.launchBehavior !== first.behavior || claim.launchSource !== first.source
+      || claim.launchExpectedHead !== first.expected_head || claim.launchActor !== first.actor
+      || !calls.some((call) => call!.id === claim.launchCallId && call!.correlation_id === claim.launchCorrelationId))) {
+      throw new HttpError(409, 'Failed launch ownership changed or remains quarantined')
+    }
+    if (snapshot.quarantined.some((row) => quarantinedLogMayMatch(row, { repo: first.repo!, prId: first.pr_id! }))
+      || hasActiveAgentLaunchForPr(first.repo!, Number(first.pr_id)) || snapshot.entries.some((row) =>
+      row.repo === first.repo && row.pr_id === first.pr_id && RUNNING_AGENT_STATUSES.has(row.status.toLowerCase()))) {
+      throw new HttpError(409, 'Another PR worker is still active')
+    }
+    const operation = claimPrOperationOwned(failed[0].target, PR_OPERATION_EVALUATION_LEASE_MS)
+    if (!operation) throw new HttpError(409, 'PR operation is busy')
+    try {
+      const since = calls.map((call) => agentCallStartedAt(call!)).sort((a, b) => Date.parse(a) - Date.parse(b))[0]
+      const activity = await checkReviewActivity(first.repo!, Number(first.pr_id), first.actor!, since)
+      const claimed = new Set(snapshot.entries.filter((row) => row.repo === first.repo && row.pr_id === first.pr_id
+        && typeof row.review_id === 'number').map((row) => row.review_id))
+      if (activity.state !== 'OPEN' || activity.draft || activity.headSha !== first.expected_head
+        || activity.reviewerPendingReviews !== 0 || activity.reviewerReviewIdsSince === null
+        || activity.reviewerReviewIdsSince.some((id) => !claimed.has(id))) {
+        throw new HttpError(409, 'Live GitHub evidence cannot prove a safe retry')
+      }
+      db.transaction(() => {
+        for (const claim of failed) {
+          const current = getFailedBehaviorLaunch(behavior, claim.target)
+          if (!current || current.launchQuarantine || current.launchCorrelationId !== claim.launchCorrelationId
+            || !releaseFailedBehaviorLaunch(behavior, claim.target, claim.launchCallId!, first.expected_head!)) {
+            throw new HttpError(409, 'Failed launch changed during retry')
+          }
+          setMeta(`${META_PREFIX}operator_retry:${claim.launchCallId}`, JSON.stringify({ at: new Date().toISOString(),
+            target: claim.target, expectedHead: first.expected_head, correlationId: claim.launchCorrelationId }))
+          retireBehaviorDeadLettersForTarget(behavior, claim.target)
+          clearBehaviorFailure(behavior, claim.target)
+          clearBehaviorFailure(behavior, `${claim.target}:check`)
+        }
+        setMeta(packetBlockKey(behavior, first.repo!, Number(first.pr_id)), '')
+      })()
+      return { ok: true as const, targets: failed.map((claim) => claim.target) }
+    } finally {
+      releasePrOperationOwned(operation)
+    }
+  })
+}
+
 async function releaseFailedBehaviorIfNoAction(
   behavior: ActiveClaim['behavior'],
   repo: string,

@@ -2627,6 +2627,84 @@ describe('behavior launch claims', () => {
     expect(args[args.indexOf('--recovery-model') + 1]).toBe('opus-5-xhigh')
   })
 
+  it('resumes a whole failed panel atomically through its normal scheduler', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-07T12:00:00Z'))
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const loaded = await loadModules()
+    loaded.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    loaded.database.setMeta('me', 'poise-user')
+    loaded.database.setMeta('behavior_review_new_prs_keyver', '3')
+    loaded.database.setMeta('behavior_review_new_prs_enabled', '1')
+    loaded.database.setMeta('behavior_review_new_prs_reviewers', '3')
+    loaded.database.recordSeen('review-new-prs', '__snapshot_v3__')
+    await loaded.behaviors.runEnabledBehaviorsOnce()
+    const claims = loaded.database.listBehaviorLaunchClaims('review-new-prs')
+    expect(claims).toHaveLength(3)
+    agentLogs = claims.map((claim, index) => agentLog({ id: String(index + 1).repeat(32), status: 'failed',
+      started_at: claim.launchRequestedAt, started_at_precise: claim.launchRequestedAt,
+      source: claim.launchSource, correlation_id: claim.launchCorrelationId,
+      actor: claim.launchActor, expected_head: claim.launchExpectedHead,
+      model: claim.target.endsWith(':tertiary') ? 'grok-4.6-xhigh' : claim.target.endsWith(':secondary') ? 'gpt-6-astra-ultra' : 'opus-5-xhigh',
+      error: 'review behavior must produce exactly one atomic clean or change-request review',
+      error_code: 'review_contract_violation', review_policy: 'bounded-v1' }))
+    await loaded.behaviors.runEnabledBehaviorsOnce()
+    expect(loaded.database.listBehaviorDeadLetters()).toHaveLength(3)
+    arrangeCli(false, false, { reviewerReviewIdsSince: [] })
+    await expect(loaded.behaviors.retryFailedPrReviews(agentLogs.map((row) => row.id))).resolves.toEqual({
+      ok: true, targets: expect.arrayContaining(claims.map((claim) => claim.target)) })
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    await loaded.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(6)
+    expect(loaded.database.listBehaviorDeadLetters()).toEqual([])
+  })
+
+  it.each(['valid', 'head', 'actor', 'source', 'receipt', 'pending', 'unclaimed', 'missing-inventory', 'running', 'quarantine', 'late-quarantine', 'ambiguous', 'claimed-sibling'])('explicit operator retry preserves publication and ownership guards (%s)', async (variant) => {
+    const launched = await launchReviewBeforeCrash()
+    const failed = agentLog({ id: 'f'.repeat(32), started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      status: 'failed', error: 'review behavior must produce exactly one atomic clean or change-request review',
+      error_code: 'review_contract_violation', review_policy: 'bounded-v1', model: 'opus-5-xhigh',
+      expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
+    agentLogs = [failed]
+    const modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+    if (variant === 'actor') failed.actor = 'another-account'
+    if (variant === 'source') failed.source = 'another-system'
+    if (variant === 'receipt') failed.review_id = 91
+    if (variant === 'quarantine') modules.database.db.prepare("UPDATE behavior_seen SET launch_quarantine = 'unreadable' WHERE target = ?").run(launched.target)
+    if (variant === 'ambiguous') agentLogs.push({ ...failed, id: 'e'.repeat(32) })
+    if (variant === 'running') agentLogs.push(agentLog({ id: 'e'.repeat(32), correlation_id: 'running-sibling' }))
+    if (variant === 'claimed-sibling') agentLogs.push(agentLog({ id: 'e'.repeat(32), correlation_id: 'completed-sibling',
+      status: 'completed', action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA, review_id: 91 }))
+    arrangeCli(false, false, { headSha: variant === 'head' ? NEXT_HEAD_SHA : HEAD_SHA,
+      ...(variant === 'missing-inventory' ? {} : { reviewerReviewIdsSince: ['unclaimed', 'claimed-sibling'].includes(variant) ? [91] : [] }),
+      reviewerPendingReviews: variant === 'pending' ? 1 : 0 })
+    if (variant === 'late-quarantine') {
+      const implementation = mocks.runFile.getMockImplementation()!
+      mocks.runFile.mockImplementation(async (...args: any[]) => {
+        const result = await implementation(...args)
+        if (args[1][0] === '--review-activity-since') modules.database.db.prepare("UPDATE behavior_seen SET launch_quarantine = 'unreadable' WHERE target = ?").run(launched.target)
+        return result
+      })
+    }
+    if (variant === 'valid' || variant === 'claimed-sibling') {
+      await expect(modules.behaviors.retryFailedPrReviews([failed.id])).resolves.toEqual({ ok: true, targets: [launched.target] })
+      expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).toBeNull()
+      expect(modules.database.getMeta(`behavior_operator_retry:${failed.id}`)).toContain(launched.correlationId)
+      expect(modules.database.listBehaviorDeadLetters()).toEqual([])
+      await modules.behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+      await expect(modules.behaviors.retryFailedPrReviews([failed.id])).rejects.toThrow()
+    } else {
+      await expect(modules.behaviors.retryFailedPrReviews([failed.id])).rejects.toThrow()
+      expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    }
+  })
+
   it.each(['valid', 'head', 'actor', 'source', 'model', 'receipt', 'old', 'ambiguous', 'claimed', 'newest-claimed', 'posted-original'])('reconciles a held review only from a verified explicit replay (%s)', async (variant) => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2026-10-07T12:00:00Z'))
