@@ -9,12 +9,14 @@ def tools_arg(rules: list[str]) -> str:
     return ",".join(sorted({rule.split("(", 1)[0] for rule in rules}))
 
 
-def settings(rules: list[str], review_gate: str | None = None, output_tokens: int | None = None, review_receipt: str | None = None) -> str:
+def settings(rules: list[str], review_gate: str | None = None, output_tokens: int | None = None, review_receipt: str | None = None, review_root: str | None = None) -> str:
     config = {"permissions": {"allow": rules}, "defaultMode": "dontAsk"}
     if review_gate:
         config["env"] = {"AGENT_INTERFACE_REVIEW_GATE": review_gate}
     if review_receipt:
         config.setdefault("env", {})["AGENT_INTERFACE_REVIEW_RECEIPT"] = review_receipt
+    if review_root:
+        config.setdefault("env", {})["GITHUB_INTERFACE_REVIEW_ROOT"] = review_root
     if output_tokens is not None:
         config.setdefault("env", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(output_tokens)
     return json.dumps(config)

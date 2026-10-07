@@ -156,6 +156,25 @@ class TestReceiptRecording(TestCase):
         self.assertEqual(review_receipt.get()["review_id"], 92)
         self.assertEqual(self.stored(), "92")
 
+    def test_failed_structured_submission_records_controller_error_without_a_receipt(self):
+        def process(args, **kwargs):
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 500:\n")
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"stopReason": "end_turn", "num_turns": 1,
+                                   "structuredOutput": {"action": "reviewed_clean", "comments": []}}), stderr="")
+        with patch.object(structured_review.subprocess, "run", side_effect=process), patch.object(ReviewWatch, "run", side_effect=process):
+            structured_review.run("/repo", "system", "packet", CATALOG.resolve("grok-4.6-xhigh"), "pr_review",
+                                  "https://github.com/o/r/pull/12", "bit-mis", HEAD, 60)
+        self.assertEqual(review_receipt.failure(), "error: GitHub 500:")
+        self.assertIsNone(review_receipt.get())
+        self.assertIsNone(self.stored())
+
+    def test_validation_auth_and_provider_prose_are_not_transient_submission_errors(self):
+        for text in ("error: GitHub 422: invalid review", "error: GitHub 403: forbidden",
+                     "The model says GitHub 500: failed", "invalid model verdict"):
+            self.assertIsNone(review_receipt.record_failure(text))
+        self.assertIsNone(review_receipt.failure())
+
     def test_claude_guard_leaves_the_reply_for_the_run_and_the_model(self):
         head = HEAD
         command = f"github-interface --reviewed-clean #68 --expected-head {head} --token-user bit-mis"
@@ -185,6 +204,21 @@ class TestReceiptRecording(TestCase):
                 bash_guard.main()
         self.assertNotIn("capture_output", run.call_args.kwargs)
 
+    def test_claude_guard_preserves_transient_submission_error_for_controller(self):
+        command = f"github-interface --reviewed-clean #68 --expected-head {HEAD} --token-user bit-mis"
+        receipt_path = Path(self.directory.name) / "receipt.json"
+        with patch.dict(os.environ, {"AGENT_INTERFACE_BASH_ALLOW": json.dumps([command]), "AGENT_INTERFACE_REVIEW_RECEIPT": str(receipt_path)}), \
+                patch.object(sys, "argv", ["bash_guard.py", command]), \
+                patch.object(bash_guard.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 503:\n")), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as stopped:
+                bash_guard.main()
+        self.assertEqual(stopped.exception.code, 1)
+        review_receipt.bind(api.DB, "run")
+        self.assertIsNone(review_receipt.record_file(receipt_path))
+        self.assertEqual(review_receipt.failure(), "error: GitHub 503:")
+        self.assertIsNone(self.stored())
+
 
 class TestRecoveryWithSiblings(TestCase):
     def setUp(self):
@@ -213,6 +247,29 @@ class TestRecoveryWithSiblings(TestCase):
             except SystemExit:
                 pass
         return api.logs()[-1]
+
+    def test_github_outage_is_retryable_but_never_claims_no_action(self):
+        def failed(*args, **kwargs):
+            review_receipt.record_failure("error: GitHub 500:")
+            return "valid verdict; submission failed"
+        row = self.execute([failed], [facts(), facts()])
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["error_code"], "review_submission_failed")
+        self.assertEqual(row["error"], "error: GitHub 500:")
+        self.assertIsNone(row["action"])
+        self.assertIsNone(row["outcome"])
+        self.assertIsNone(row["review_id"])
+        self.assertEqual(self.mod.run.call_count, 1)
+
+    def test_github_accepted_review_wins_over_lost_submission_response(self):
+        def lost(*args, **kwargs):
+            review_receipt.record_failure("error: GitHub 502:")
+            return "response lost"
+        row = self.execute([lost], [facts(), facts([CLEAN])])
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["outcome"], "clean")
+        self.assertIsNone(row["error_code"])
+        self.assertEqual(self.mod.run.call_count, 1)
 
     def test_a_siblings_review_does_not_stop_recovery(self):
         with sqlite3.connect(api.DB) as conn:

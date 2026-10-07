@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import TestCase, IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
@@ -27,6 +28,44 @@ def tree(root, sha):
 
 
 class TestPinnedCheckout(TestCase):
+    def test_concurrent_partial_checkouts_never_hydrate_archives_and_keep_source(self):
+        with tempfile.TemporaryDirectory() as work:
+            source = Path(work) / "source"
+            source.mkdir()
+            git(source, "init", "-q")
+            git(source, "config", "user.name", "Test")
+            git(source, "config", "user.email", "test@example.com")
+            git(source, "config", "uploadpack.allowFilter", "true")
+            git(source, "config", "uploadpack.allowAnySHA1InWant", "true")
+            (source / "AGENTS.md").write_text("Review consumers.\n")
+            (source / "consumer.py").write_text("old_contract()\n")
+            (source / "fixture.json").write_text('"' + "x" * 80_000 + '"\n')
+            archive = "payload[1]*.zip"
+            (source / archive).write_bytes(os.urandom(2 * 1024 * 1024))
+            git(source, "add", ".")
+            git(source, "commit", "-qm", "source and binary fixture")
+            head = git(source, "rev-parse", "HEAD")
+            blob = git(source, "rev-parse", f"HEAD:{archive}")
+            metadata = tree(source, head)
+
+            def prepare(index):
+                target = Path(work) / f"review-{index}"
+                rc.checkout("o", "r", head, head, "token", target, metadata, metadata,
+                            remote=source.as_uri())
+                self.assertEqual(git(target, "rev-parse", "HEAD"), head)
+                self.assertFalse((target / archive).exists())
+                self.assertIn("?" + blob, git(target, "rev-list", "--objects", "--all", "--missing=print"))
+                self.assertEqual((target / "fixture.json").read_text(), (source / "fixture.json").read_text())
+                request = lambda operation, path, query="": {"operation": operation, "path": path,
+                                                            "query": query, "start_line": 1}
+                response = rc.inspect(target, [request("read", archive), request("search", ".", "old_contract")])
+                self.assertIn("unavailable", response["results"][0]["error"])
+                self.assertEqual(response["results"][1]["matches"][0]["path"], "consumer.py")
+                return target
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                self.assertEqual(len(list(pool.map(prepare, range(3)))), 3)
+
     def test_checkout_pins_head_and_merge_base_and_never_adopts_pr_instructions(self):
         with tempfile.TemporaryDirectory() as work:
             source, target = Path(work) / "source", Path(work) / "review"
@@ -110,6 +149,79 @@ class TestInspection(TestCase):
         self.assertEqual(search["next_line"], 201)
         listing = rc.inspect(self.root, [self.request("list", path="src")])["results"][0]
         self.assertEqual(listing["paths"], ["src/code.py"])
+
+    def test_dense_unicode_batch_pages_every_line_within_the_wire_byte_limit(self):
+        names = [f"src/consumer{i}.py" for i in range(8)]
+        text = '"\\' + "\u03bb" * 180
+        for name in names:
+            (self.root / name).write_text((text + "\n") * 100)
+        (self.root / ".git" / rc.MANIFEST).write_text(json.dumps({"head_sha": "a" * 40, "files": names}))
+        requests = [self.request(path=name) for name in names]
+        read = {name: [] for name in names}
+        while requests:
+            response = rc.inspect(self.root, requests)
+            self.assertLessEqual(len(json.dumps(response, indent=2).encode()) + 1, rc.MAX_RESPONSE_BYTES)
+            remaining = []
+            for result in response["results"]:
+                request = result["request"]
+                read[request["path"]].extend(result["lines"])
+                if result["truncated"]:
+                    self.assertGreater(result["next_line"], request["start_line"])
+                    remaining.append({**request, "start_line": result["next_line"]})
+            requests = remaining
+        for lines in read.values():
+            self.assertEqual(lines, [{"line": n, "text": text} for n in range(1, 101)])
+
+    def test_long_listing_and_search_results_have_lossless_continuations(self):
+        names = [f"src/{n:04d}-" + "x" * 220 for n in range(300)]
+        (self.root / ".git" / rc.MANIFEST).write_text(json.dumps({"head_sha": "a" * 40, "files": names}))
+        requests = [self.request("list", ".") for _ in range(4)]
+        first = rc.inspect(self.root, requests)
+        self.assertLessEqual(len(json.dumps(first, indent=2).encode()) + 1, rc.MAX_RESPONSE_BYTES)
+        listed = []; start = 1
+        while start:
+            result = rc.inspect(self.root, [self.request("list", ".", start=start)])["results"][0]
+            listed.extend(result["paths"]); start = result["next_line"]
+        self.assertEqual(listed, names)
+
+        (self.root / "src" / "code.py").write_text(("needle" + "x" * 950 + "\n") * 150)
+        (self.root / ".git" / rc.MANIFEST).write_text(json.dumps({"head_sha": "a" * 40, "files": ["src/code.py"]}))
+        matches = []; start = 1
+        while start:
+            response = rc.inspect(self.root, [self.request("search", query="needle", start=start)])
+            self.assertLessEqual(len(json.dumps(response, indent=2).encode()) + 1, rc.MAX_RESPONSE_BYTES)
+            result = response["results"][0]; matches.extend(result["matches"]); start = result["next_line"]
+        self.assertEqual([match["line"] for match in matches], list(range(1, 151)))
+
+    def test_a_long_line_can_be_read_separately_without_silent_truncation(self):
+        text = "x" * 40_000
+        (self.root / "src" / "code.py").write_text(text + "\n")
+        first = rc.inspect(self.root, [self.request()] * 8)["results"][0]
+        self.assertEqual(first["next_line"], 1)
+        self.assertIn("separately", first["error"])
+        single = rc.inspect(self.root, [self.request()])["results"][0]
+        self.assertEqual(single["lines"], [{"line": 1, "text": text}])
+        self.assertFalse(single["truncated"])
+
+    def test_non_utf8_read_reports_unavailable_text_without_losing_the_batch(self):
+        names = ["src/figure.jpg", "src/utf16.txt", "src/invalid.txt", "src/code.py"]
+        (self.root / names[0]).write_bytes(b"\xff\xd8\xff\xe0JPEG")
+        (self.root / names[1]).write_bytes("UTF-16 source".encode("utf-16"))
+        (self.root / names[2]).write_bytes((b"valid prefix " + b"x" * 1500 + b"\n") * 6 + b"\xff")
+        (self.root / ".git" / rc.MANIFEST).write_text(json.dumps({"head_sha": "a" * 40, "files": names}))
+        response = rc.inspect(self.root, [self.request(path=name) for name in names])
+        self.assertEqual(response["head_sha"], "a" * 40)
+        self.assertLessEqual(len(json.dumps(response, indent=2).encode()) + 1, rc.MAX_RESPONSE_BYTES)
+        for result in response["results"][:3]:
+            self.assertIn("not UTF-8 text", result["error"])
+            self.assertEqual(result["lines"], [])
+            self.assertFalse(result["truncated"])
+            self.assertIsNone(result["next_line"])
+        self.assertEqual(response["results"][3]["lines"][0], {"line": 1, "text": "needle"})
+        text_result = response["results"][3]
+        remainder = rc.inspect(self.root, [self.request(start=text_result["next_line"])])["results"][0]
+        self.assertEqual(text_result["lines"] + remainder["lines"],
+                         [{"line": n, "text": "needle"} for n in range(1, 202)])
 
     def test_never_reads_git_metadata_untracked_paths_or_symlinks(self):
         for path in ("../secret", "/etc/passwd", ".git/config", "src/../../secret", "escape"):
