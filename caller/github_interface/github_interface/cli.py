@@ -280,7 +280,6 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
         parser.add_argument("--base-sha", required=True)
         parser.add_argument("--merge-base-sha", required=True)
         _add_expected_head(parser)
-        _add_token_user(parser)
         _add_repository(parser)
         return parser
 
