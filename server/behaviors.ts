@@ -2200,8 +2200,7 @@ async function releaseFailedBehaviorIfNoAction(
         || launchBehavior === 'pr_review' && row.action === 'reviewed_clean' && row.outcome === 'clean'
         || launchBehavior === 'pr_approve' && row.action === 'approved' && row.outcome === 'approved'))
       .sort((a, b) => Date.parse(b.completed_at!) - Date.parse(a.completed_at!))
-    const replay = replays[0]
-    if (replay) {
+    for (const replay of replays) {
       const activity = await checkReviewActivity(repo, number, failed.launchActor, agentCallStartedAt(replay))
       if (activity.headSha === failed.launchExpectedHead
         && activity.reviewerReviewIdsSince?.includes(replay.review_id!)

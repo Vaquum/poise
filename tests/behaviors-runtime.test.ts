@@ -2627,7 +2627,7 @@ describe('behavior launch claims', () => {
     expect(args[args.indexOf('--recovery-model') + 1]).toBe('opus-5-xhigh')
   })
 
-  it.each(['valid', 'head', 'actor', 'source', 'model', 'receipt', 'old', 'ambiguous', 'claimed', 'posted-original'])('reconciles a held review only from a verified explicit replay (%s)', async (variant) => {
+  it.each(['valid', 'head', 'actor', 'source', 'model', 'receipt', 'old', 'ambiguous', 'claimed', 'newest-claimed', 'posted-original'])('reconciles a held review only from a verified explicit replay (%s)', async (variant) => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2026-10-07T12:00:00Z'))
     const launched = await launchReviewBeforeCrash()
@@ -2656,17 +2656,22 @@ describe('behavior launch claims', () => {
     if (variant === 'model') replay.model = 'gpt-6-astra-ultra'
     if (variant === 'old') Object.assign(replay, { started_at: launched.requestedAt, started_at_precise: launched.requestedAt })
     agentLogs.push(replay)
+    if (variant === 'newest-claimed') {
+      vi.setSystemTime(Date.now() + 1_000)
+      agentLogs.push(agentLog({ ...replay, id: 'd'.repeat(32), correlation_id: 'newer-replay', review_id: 92,
+        started_at: new Date().toISOString(), started_at_precise: new Date().toISOString(), completed_at: new Date().toISOString() }))
+    }
     if (variant === 'ambiguous') agentLogs.push({ ...replay, id: 'd'.repeat(32) })
-    arrangeCli(false, false, { reviewerReviewIdsSince: variant === 'receipt' ? [] : [91] })
+    arrangeCli(false, false, { reviewerReviewIdsSince: variant === 'receipt' ? [] : variant === 'newest-claimed' ? [91, 92] : [91] })
     modules = await restartModules()
-    if (variant === 'claimed') {
+    if (variant === 'claimed' || variant === 'newest-claimed') {
       modules.database.recordSeen('review-new-prs', 'another-slot')
-      modules.database.db.prepare('UPDATE behavior_seen SET launch_call_id = ? WHERE target = ?').run(replay.id, 'another-slot')
+      modules.database.db.prepare('UPDATE behavior_seen SET launch_call_id = ? WHERE target = ?').run(variant === 'claimed' ? replay.id : 'd'.repeat(32), 'another-slot')
     }
     modules.behaviors.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
     await modules.behaviors.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    if (variant === 'valid') {
+    if (variant === 'valid' || variant === 'newest-claimed') {
       expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).toBeNull()
       expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toEqual({
         callId: replay.id, completedAt: replay.completed_at, headSha: HEAD_SHA,
