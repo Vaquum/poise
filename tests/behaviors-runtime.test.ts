@@ -525,7 +525,7 @@ describe('behavior launch claims', () => {
     arrangeCli(behavior === 'approve-prs')
     mocks.spawnDetached.mockResolvedValue(undefined)
     const { database: db, behaviors: runtime } = await loadModules()
-    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    runtime.startBehaviorsRuntime()
     db.setMeta('me', 'poise-user')
     db.setMeta('behavior_review_new_prs_keyver', '3')
     db.recordSeen('review-new-prs', '__snapshot_v3__')
