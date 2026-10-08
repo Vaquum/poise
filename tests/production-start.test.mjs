@@ -3,7 +3,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { computeBuildStamp, ensureFreshBundle } from '../scripts/start-production.mjs'
+import {
+  computeBuildStamp, ensureFreshBundle, prepareInstalledBundle,
+} from '../scripts/start-production.mjs'
 
 // A checkout whose shape matches what computeBuildStamp reads.
 async function scaffold() {
@@ -26,6 +28,42 @@ async function writeBundle(root, body = 'export const startProductionServer = ()
 }
 
 const silent = { log: () => {}, error: () => {} }
+
+describe('installer build handoff', () => {
+  let root
+  beforeEach(async () => { root = await scaffold() })
+  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+
+  it('starts from the installer build without running a second build', async () => {
+    let builds = 0
+    const build = async () => { builds += 1; await writeBundle(root) }
+    await prepareInstalledBundle({ root, build })
+    expect(await ensureFreshBundle({ root, build, log: silent })).toBe('current')
+    expect(builds).toBe(1)
+  })
+
+  it('does not stamp a failed installer build', async () => {
+    await expect(prepareInstalledBundle({
+      root,
+      build: async () => { throw new Error('typecheck failed') },
+    })).rejects.toThrow('typecheck failed')
+    await expect(stat(join(root, 'dist', '.build-stamp'))).rejects.toThrow()
+  })
+
+  it('still rebuilds if the source changes while the installer is building', async () => {
+    await prepareInstalledBundle({
+      root,
+      build: async () => {
+        await writeBundle(root, 'old inputs\n')
+        await writeFile(join(root, 'src', 'main.ts'), 'export const a = 222\n')
+      },
+    })
+    expect(await ensureFreshBundle({
+      root, log: silent, build: async () => writeBundle(root, 'new inputs\n'),
+    })).toBe('rebuilt')
+    expect(await readFile(join(root, 'dist', 'server.js'), 'utf8')).toBe('new inputs\n')
+  })
+})
 
 describe('production build stamp', () => {
   let root

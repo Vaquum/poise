@@ -106,6 +106,15 @@ function runBuild(root) {
   })
 }
 
+// The installer builds before starting launchd. Record those inputs so the
+// service can use that completed build without rebuilding during its health wait.
+// Capture before building: an edit during the build must still force a rebuild.
+export async function prepareInstalledBundle({ root = projectRoot, build = runBuild } = {}) {
+  const wanted = await computeBuildStamp(root)
+  await build(root)
+  await writeFile(join(root, 'dist', '.build-stamp'), `${wanted}\n`, { mode: 0o600 })
+}
+
 /**
  * Bring dist/ in line with the checkout. Returns 'current' when the existing
  * bundle already matches, 'rebuilt' after a successful build, or 'stale' when

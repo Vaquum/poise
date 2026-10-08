@@ -59,6 +59,32 @@ it('does not resurrect an expired operation when preparation begins after its de
   clock.close()
 })
 
+it('bounds reservations through overlapping preparation and later unused preparation', async () => {
+  const clock = new BehaviorDeadline(55_000, 120_000)
+  expect(clock.remainingMs).toBe(175_000)
+  await vi.advanceTimersByTimeAsync(10_000)
+  let first!: () => void, second!: () => void
+  const a = clock.prepare(() => new Promise<void>(resolve => { first = resolve }))
+  const b = clock.prepare(() => new Promise<void>(resolve => { second = resolve }))
+  await vi.advanceTimersByTimeAsync(20_000)
+  first(); await a
+  expect(clock.remainingMs).toBe(145_000)
+  await vi.advanceTimersByTimeAsync(70_000)
+  second(); await b
+  expect(clock.remainingMs).toBe(75_000)
+  await vi.advanceTimersByTimeAsync(10_000)
+  expect(clock.remainingMs).toBe(65_000)
+  clock.close()
+  expect(clock.remainingMs).toBe(0)
+})
+
+it('does not offer unused preparation to a reservation after work has expired', async () => {
+  const clock = new BehaviorDeadline(55_000, 120_000)
+  vi.setSystemTime(Date.now() + 55_000)
+  expect(clock.remainingMs).toBe(0)
+  clock.close()
+})
+
 it('does not leave a timeout behind a completed operation', async () => {
   const clock = new BehaviorDeadline(55_000, 120_000)
   clock.close()
