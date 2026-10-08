@@ -1,4 +1,6 @@
 import { prepareModelClis } from './provider-clis'
+import { BehaviorDeadline } from './behavior-deadline'
+import { CLI_UPDATE_TIMEOUT_MS } from '../scripts/provider-cli-updates.mjs'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
 // Server-side behavior runtime. Lives with the Poise HTTP server
 // so the toggle keeps working when the browser tab is closed,
@@ -244,6 +246,7 @@ export const BEHAVIOR_KEYS: BehaviorKey[] = ['review-new-prs', 'approve-prs', 'r
 
 let behaviorAbortController: AbortController | null = null
 const behaviorOperationSignal = new AsyncLocalStorage<AbortSignal>()
+const behaviorOperationDeadline = new WeakMap<AbortSignal, BehaviorDeadline>()
 
 function behaviorSignal(): AbortSignal | undefined {
   return behaviorOperationSignal.getStore() ?? behaviorAbortController?.signal
@@ -251,6 +254,13 @@ function behaviorSignal(): AbortSignal | undefined {
 
 function behaviorAborted(): boolean {
   return behaviorSignal()?.aborted === true
+}
+
+async function prepareBehaviorModelClis(catalog: Catalog, identities: string[]): Promise<NodeJS.ProcessEnv> {
+  const signal = behaviorSignal()
+  const deadline = signal && behaviorOperationDeadline.get(signal)
+  const prepare = () => waitForBehavior(prepareModelClis(catalog, identities))
+  return deadline ? deadline.prepare(prepare) : prepare()
 }
 
 async function waitForBehavior<T>(operation: T | PromiseLike<T>): Promise<T> {
@@ -1604,7 +1614,7 @@ async function fireReview(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  const modelCliEnv = await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
+  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery])
   // mkdir the cwd hack dir — agent-interface needs it to exist for
   // --pwd resolution behavior identical to triggerPrReview in agent.ts.
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
@@ -2439,7 +2449,7 @@ async function fireApprove(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  const modelCliEnv = await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
+  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery])
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
   if (!isEnabled('approve-prs')) return false
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
@@ -3337,7 +3347,7 @@ async function fireIssueReview(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  const modelCliEnv = await waitForBehavior(prepareModelClis(catalog, [model, recovery]))
+  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery])
   // The CLI check and the model read can each take a while; turning the
   // behavior off, deselecting the repository, untrusting the author or
   // changing the panel meanwhile must stop this launch, so these are the last
@@ -3882,6 +3892,7 @@ let lastTickCompletedAtMs: number | null = null
 // needless duplicate CLI work inside one process.
 const behaviorOperationTails = new Map<string, Promise<void>>()
 const behaviorOperationStartedAt = new Map<string, number>()
+const behaviorOperationClocks = new Map<string, BehaviorDeadline>()
 
 function serializeBehaviorOperation<T>(
   key: BehaviorKey,
@@ -3893,16 +3904,21 @@ function serializeBehaviorOperation<T>(
   const execute = async () => {
     const startedAt = Date.now()
     behaviorOperationStartedAt.set(scopeKey, startedAt)
-    const deadline = AbortSignal.timeout(BEHAVIOR_OPERATION_TIMEOUT_MS)
+    const clock = new BehaviorDeadline(BEHAVIOR_OPERATION_TIMEOUT_MS, CLI_UPDATE_TIMEOUT_MS)
+    behaviorOperationClocks.set(scopeKey, clock)
+    const deadline = clock.controller.signal
     const lifecycle = behaviorAbortController?.signal
     const signal = lifecycle ? AbortSignal.any([lifecycle, deadline]) : deadline
+    behaviorOperationDeadline.set(signal, clock)
     try {
       const result = await behaviorOperationSignal.run(signal, operation)
       if (signal.aborted) throw signal.reason
       return result
     } finally {
+      clock.close()
       if (behaviorOperationStartedAt.get(scopeKey) === startedAt) {
         behaviorOperationStartedAt.delete(scopeKey)
+        behaviorOperationClocks.delete(scopeKey)
       }
     }
   }
@@ -4031,7 +4047,7 @@ export interface BehaviorsRuntimeHealth {
   startedAt: string | null
   lastTickAt: string | null
   lastTickCompletedAt: string | null
-  busy: Array<{ behavior: BehaviorKey, since: string, org?: string }>
+  busy: Array<{ behavior: BehaviorKey, since: string, org?: string, phase?: 'provider-preparation', deadlineAt?: string }>
   failures: Array<{
     org?: string
     behavior: BehaviorKey
@@ -4057,12 +4073,14 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   const busy = busyEntries.map(([key, since]) => ({
     behavior: key.slice(key.indexOf(':') + 1) as BehaviorKey,
     since: new Date(since).toISOString(),
+    ...(behaviorOperationClocks.get(key)?.preparing ? { phase: 'provider-preparation' as const } : {}),
+    deadlineAt: new Date(behaviorOperationClocks.get(key)?.expiresAt ?? since + BEHAVIOR_OPERATION_TIMEOUT_MS).toISOString(),
   }))
   const heartbeatAt = lastTickAtMs ?? runtimeStartedAtMs
   const heartbeatStale = heartbeatAt === null
     || now - heartbeatAt > (2 * BEHAVIOR_TICK_MS) + BEHAVIOR_HEALTH_GRACE_MS
   const operationStale = busyEntries
-    .some(([, startedAt]) => now - startedAt > BEHAVIOR_OPERATION_TIMEOUT_MS + BEHAVIOR_HEALTH_GRACE_MS)
+    .some(([key, startedAt]) => now > (behaviorOperationClocks.get(key)?.expiresAt ?? startedAt + BEHAVIOR_OPERATION_TIMEOUT_MS) + BEHAVIOR_HEALTH_GRACE_MS)
   const failures = BEHAVIOR_KEYS.flatMap((behavior) => {
     if (!isEnabled(behavior)) return []
     return [undefined, ...behaviorFailureTargets(behavior)].flatMap((target) => {
