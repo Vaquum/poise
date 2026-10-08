@@ -149,7 +149,7 @@ describe('configuration', () => {
     expect(loadConfig({ ...BASE, POISE_WORKSPACE_DNS: '1.1.1.1, 2606:4700:4700::1111 1.1.1.1' }).workspaceDns)
       .toEqual(['1.1.1.1', '2606:4700:4700::1111'])
     expect(loadConfig({ ...BASE, POISE_WORKSPACE_DNS: 'FD00::53' }).workspaceDns).toEqual(['fd00::53'])
-    for (const value of ['dns.example.com', '0.0.0.0', '::', '1.1.1.1:53', '256.1.1.1']) {
+    for (const value of ['dns.example.com', '0.0.0.0', '::', '0:0:0:0:0:0:0:0', '1.1.1.1:53', '256.1.1.1', 'fe80::1%eth0', '[::1]']) {
       expect(problems({ ...BASE, POISE_WORKSPACE_DNS: value }), value).toEqual([
         `POISE_WORKSPACE_DNS: "${value}" is not the IP address of a resolver`,
       ])

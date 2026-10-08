@@ -77,10 +77,13 @@ function isListenAddress(value: string): boolean {
   return isIPv6(match[1]) && new URL(`http://[${match[1]}]/`).hostname !== '[::]'
 }
 
-/** One IPv4 or IPv6 address a resolver can answer at: never 0.0.0.0 or ::, which name no host. */
+/**
+ * One IPv4 or IPv6 address a resolver can answer at: never 0.0.0.0 or ::, which name no host, and no
+ * IPv6 zone, whose interface name means nothing inside a workspace.
+ */
 function isResolverAddress(value: string): boolean {
   if (isIPv4(value)) return value !== '0.0.0.0'
-  return isIPv6(value) && new URL(`http://[${value}]/`).hostname !== '[::]'
+  return /^[\da-f:.]+$/.test(value) && isIPv6(value) && new URL(`http://[${value}]/`).hostname !== '[::]'
 }
 
 /** Reads and validates the whole configuration, reporting every problem at once. */
