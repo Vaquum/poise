@@ -256,17 +256,27 @@ function behaviorAborted(): boolean {
   return behaviorSignal()?.aborted === true
 }
 
+function prOperationEvaluationLeaseMs(): number {
+  const signal = behaviorSignal()
+  const deadline = signal && behaviorOperationDeadline.get(signal)
+  // A peer can pause the shared work clock after this launch finishes its CLI
+  // check. Cover the remaining whole cycle, plus the existing cleanup grace.
+  return deadline
+    ? deadline.remainingMs + PR_OPERATION_EVALUATION_LEASE_MS - BEHAVIOR_OPERATION_TIMEOUT_MS
+    : PR_OPERATION_EVALUATION_LEASE_MS
+}
+
 async function prepareBehaviorModelClis(catalog: Catalog, identities: string[], claimId?: string): Promise<NodeJS.ProcessEnv> {
   const signal = behaviorSignal()
   const deadline = signal && behaviorOperationDeadline.get(signal)
   const prepare = async () => {
     // Keep the PR mutation reservation through the bounded preparation wait.
     // Failure/shutdown releases it through the existing owned-claim cleanup.
-    if (claimId && !renewPrOperationOwned(claimId, CLI_UPDATE_TIMEOUT_MS + PR_OPERATION_EVALUATION_LEASE_MS)) {
+    if (claimId && !renewPrOperationOwned(claimId, prOperationEvaluationLeaseMs())) {
       throw new Error('PR operation ownership was lost before provider preparation')
     }
     const env = await waitForBehavior(prepareModelClis(catalog, identities))
-    if (claimId && !renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
+    if (claimId && !renewPrOperationOwned(claimId, prOperationEvaluationLeaseMs())) {
       throw new Error('PR operation ownership was lost during provider preparation')
     }
     return env
@@ -689,7 +699,7 @@ function upstreamBehavior(behavior: ActiveClaim['behavior']): BehaviorAgentLaunc
 async function claimEligiblePrOperation(behavior: ActiveClaim['behavior'], target: string): Promise<string | null> {
   const deadline = Date.now() + PR_OPERATION_WAIT_MS
   while (!behaviorAborted() && isEnabled(behavior)) {
-    const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
+    const operationId = claimPrOperationOwned(target, prOperationEvaluationLeaseMs())
     if (operationId) return operationId
     const remaining = deadline - Date.now()
     if (remaining <= 0) return null

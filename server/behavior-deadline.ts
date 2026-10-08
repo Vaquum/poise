@@ -18,6 +18,12 @@ export class BehaviorDeadline {
 
   get preparing(): boolean { return this.depth > 0 }
 
+  /** Upper bound on this cycle, including preparation another launch may use. */
+  get remainingMs(): number {
+    if (this.closed || this.controller.signal.aborted || Date.now() >= this.expiresAt) return 0
+    return this.expiresAt - Date.now() + (this.preparing ? this.workRemaining : this.preparationRemaining)
+  }
+
   private timeout(): never {
     const error = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
     this.controller.abort(error)

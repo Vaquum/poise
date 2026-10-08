@@ -562,10 +562,21 @@ describe('behavior launch claims', () => {
     })
     arrangeCli(behavior === 'approve-prs')
     const ordinaryCli = mocks.runFile.getMockImplementation()!
+    const authEntered = deferred<void>(), authReady = deferred<void>()
+    const headEntered = deferred<void>(), headReady = deferred<void>()
+    const checkoutEntered = deferred<void>(), checkoutReady = deferred<void>()
+    let afterFastPreparation = false
+    let fastPr: typeof pr | undefined
     mocks.runFile.mockImplementation(async (command, args, options) => {
-      if (command === 'github-interface' && (args[0] === '--head-sha' && args[1] === '#17'
-        || args[0] === '--local-checkout-path' && args[2] === 'poise-test')) {
-        await new Promise<void>(resolve => setTimeout(resolve, 25_000))
+      if (afterFastPreparation && command === 'github-interface' && args[0] === '--head-sha' && !fastPr) {
+        fastPr = listedPrs.find(row => '#' + row.number === args[1])!
+        headEntered.resolve()
+        await headReady.promise
+      }
+      if (fastPr && command === 'github-interface' && args[0] === '--local-checkout-path'
+        && `${args[1]}/${args[2]}` === fastPr.repo) {
+        checkoutEntered.resolve()
+        await checkoutReady.promise
       }
       return ordinaryCli(command, args, options)
     })
@@ -573,6 +584,9 @@ describe('behavior launch claims', () => {
     mocks.spawnDetached.mockResolvedValue(undefined)
     const { database: db, behaviors: runtime } = await loadModules()
     runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    // Drive just this manual cycle, without a wall-clock tick launching more
+    // evaluations while the two controlled preparations are in flight.
+    vi.clearAllTimers()
     db.setMeta('me', 'poise-user')
     db.setMeta('behavior_review_new_prs_keyver', '3')
     db.recordSeen('review-new-prs', '__snapshot_v3__')
@@ -591,12 +605,24 @@ describe('behavior launch claims', () => {
     await entered.promise
     // Each ordinary call takes less than its own 30-second timeout. Their
     // combined work outlives 65 seconds while the peer keeps the clock paused.
-    mocks.requireAuth.mockImplementationOnce(() => new Promise<void>(resolve => setTimeout(resolve, 25_000)))
+    mocks.requireAuth.mockImplementationOnce(() => {
+      authEntered.resolve()
+      return authReady.promise
+    })
+    afterFastPreparation = true
     fast.resolve({})
-    await vi.advanceTimersByTimeAsync(66_000)
-    const competing = db.claimPrOperationOwned(`${pr.repo}#${pr.number}`, 65_000)
+    await authEntered.promise
+    await vi.advanceTimersByTimeAsync(25_000)
+    authReady.resolve()
+    await headEntered.promise
+    await vi.advanceTimersByTimeAsync(25_000)
+    headReady.resolve()
+    await checkoutEntered.promise
+    await vi.advanceTimersByTimeAsync(16_000)
+    const competing = db.claimPrOperationOwned(`${fastPr!.repo}#${fastPr!.number}`, 65_000)
     if (competing) db.releasePrOperationOwned(competing)
     await vi.advanceTimersByTimeAsync(9_000)
+    checkoutReady.resolve()
     slow.resolve({})
     await cycle
     expect(competing).toBeNull()
