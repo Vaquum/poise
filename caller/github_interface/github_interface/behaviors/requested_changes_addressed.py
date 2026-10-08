@@ -33,11 +33,11 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         review
         for review in reviews
         if _login(review) == username.lower()
-        and review.get("state") in ACTIONABLE_STATES
         and review.get("submitted_at")
     ]
     actor_reviews.sort(key=lambda review: _time(review["submitted_at"]))
-    latest_review = actor_reviews[-1] if actor_reviews else None
+    actionable_reviews = [review for review in actor_reviews if review.get("state") in ACTIONABLE_STATES]
+    latest_review = actionable_reviews[-1] if actionable_reviews else None
     request_review = (
         latest_review
         if latest_review and latest_review.get("state") == "CHANGES_REQUESTED"
@@ -83,14 +83,15 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     ]
     # Resolution has no timestamp in GitHub's thread state. Match the active
     # request's exact root comments instead of treating old resolved threads as
-    # responses. A summary-only reaffirmation refers to the current sequence
-    # of change requests, ending at an approval or dismissal.
+    # responses. A summary-only reaffirmation can repeat a COMMENTED finding
+    # as well as a change request, ending at an approval or dismissal.
     resolution_review_ids = set(request_ids)
     if request_review and not request_comments and request_review.get("body") == REAFFIRM_BODY:
         for review in reversed(actor_reviews):
-            if review["state"] != "CHANGES_REQUESTED":
+            if review["state"] in {"APPROVED", "DISMISSED"}:
                 break
-            resolution_review_ids.add(review["id"])
+            if review["state"] in {"CHANGES_REQUESTED", "COMMENTED"}:
+                resolution_review_ids.add(review["id"])
     resolution_thread_ids = {
         comment.get("in_reply_to_id") or comment["id"]
         for comment in comments
