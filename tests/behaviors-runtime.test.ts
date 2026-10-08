@@ -514,6 +514,45 @@ describe('the agent account the behaviors act as', () => {
 })
 
 describe('behavior launch claims', () => {
+  it.each(['review-new-prs', 'approve-prs'] as const)('bounded provider preparation: %s launches after a 90-second CLI check', async (behavior) => {
+    vi.useFakeTimers()
+    // Node's native AbortSignal.timeout is not driven by Vitest's clock.
+    vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+      const controller = new AbortController()
+      setTimeout(() => controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), ms)
+      return controller.signal
+    })
+    arrangeCli(behavior === 'approve-prs')
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+    db.setMeta(`behavior_${behavior.replaceAll('-', '_')}_enabled`, '1')
+    const { prepareModelClis } = await import('../server/provider-clis')
+    const entered = deferred<void>(), checked = deferred<NodeJS.ProcessEnv>()
+    vi.mocked(prepareModelClis).mockImplementationOnce(() => {
+      entered.resolve()
+      return checked.promise
+    })
+    const cycle = runtime.runEnabledBehaviorsOnce()
+    await entered.promise
+    await vi.advanceTimersByTimeAsync(90_000)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.getBehaviorsRuntimeHealth().failures.filter(row => row.kind === 'operation')).toEqual([])
+    expect(runtime.getBehaviorsRuntimeHealth().busy).toEqual(expect.arrayContaining([
+      expect.objectContaining({ behavior, phase: 'provider-preparation' }),
+    ]))
+    // A resolver, other runtime or operator cannot take the same PR while
+    // preparation is still pending beyond the original 65-second lease.
+    expect(db.claimPrOperationOwned(`${pr.repo}#${pr.number}`, 65_000)).toBeNull()
+    checked.resolve({})
+    await cycle
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(runtime.getBehaviorsRuntimeHealth().failures.filter(row => row.kind === 'operation')).toEqual([])
+  })
+
   it('pauses Claude-backed behaviors before external work and resumes once authenticated', async () => {
     arrangeCli(false)
     mocks.spawnDetached.mockResolvedValue(undefined)
