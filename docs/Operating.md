@@ -360,7 +360,8 @@ deployment runs this way, with libvirt on an Ubuntu host:
 3. **The VM.** Ubuntu 24.04 from Ubuntu's cloud image, checked against its
    signed checksums, sized as the server would be ([The server](#the-server)).
    Install Docker Engine and its Compose plugin from Docker's repository, and
-   gVisor from gVisor's, and set `POISE_WORKSPACE_RUNTIME=runsc`.
+   gVisor from gVisor's, and set `POISE_WORKSPACE_RUNTIME=runsc` and
+   `POISE_WORKSPACE_DNS` ([Security](#security)).
 4. **The host's proxy in front.** Set `POISE_PROXY_LISTEN` to the VM's
    address, `192.168.150.10:8080`, and have the host's proxy send Poise's
    names there ([Behind your own proxy](#behind-your-own-proxy)). The filter
@@ -657,7 +658,12 @@ a limit for every container, workspaces included, in
   (`sudo runsc install`, then `sudo systemctl reload docker`), set
   `POISE_WORKSPACE_RUNTIME=runsc` in `deploy/.env` and run
   `deploy/install.sh`. It applies to workspace containers created from then
-  on (see [Upgrades](#upgrades)).
+  on (see [Upgrades](#upgrades)). Set `POISE_WORKSPACE_DNS` with it, to
+  resolvers such as `1.1.1.1,8.8.8.8`. gVisor cannot reach the DNS server
+  Docker gives containers on their own networks, so without it a workspace
+  resolves no host: it installs no provider CLI and cannot reach GitHub. The
+  gateway mounts a file naming those resolvers over each workspace's
+  `/etc/resolv.conf`, and recreates a workspace whose resolvers differ.
 - **Sign-in and sessions.** Caddy, or your own proxy, serves everything over
   TLS. Session cookies are `Secure`, `HttpOnly` and `SameSite=Lax`, and no
   cookie the browser sends ever reaches a workspace. A workspace host

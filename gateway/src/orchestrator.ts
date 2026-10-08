@@ -2,10 +2,11 @@ import http from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { signAssertion } from './assertion.js'
 import type { Config } from './config.js'
-import type { ContainerDetails, ContainerSpec, ContainerSummary, DockerClient } from './docker.js'
+import type { ContainerDetails, ContainerMount, ContainerSpec, ContainerSummary, DockerClient } from './docker.js'
 import type { GatewayKeys } from './keys.js'
 import { errorMessage, type LogFields, type Logger } from './log.js'
 import type { Store } from './store.js'
+import { WORKSPACE_RESOLV_CONF } from './workspace-dns.js'
 
 export const WORKSPACE_PORT = 5555
 export const UPGRADE_INTERVAL_MS = 5 * 60_000
@@ -67,6 +68,8 @@ export interface OrchestratorDeps {
   log: Logger
   now: () => number
   upstream: UpstreamResolver
+  /** The resolver file's path on the Docker host, mounted over each workspace's /etc/resolv.conf; null for Docker's own. */
+  workspaceResolvConf?: string | null
   drainPollMs?: number
   drainRenewMs?: number
 }
@@ -143,9 +146,13 @@ export class Orchestrator {
   }
 
   containerSpec(handle: string, login: string): ContainerSpec {
-    const { config, keys } = this.deps
+    const { config, keys, workspaceResolvConf } = this.deps
     const { volume, network } = workspaceNames(handle)
     const scheme = config.insecureHttp ? 'http' : 'https'
+    const mounts: ContainerMount[] = [{ Type: 'volume', Source: volume, Target: '/home/poise' }]
+    if (workspaceResolvConf) {
+      mounts.push({ Type: 'bind', Source: workspaceResolvConf, Target: WORKSPACE_RESOLV_CONF, ReadOnly: true })
+    }
     return {
       Image: config.runtimeImage,
       User: '10001',
@@ -161,7 +168,11 @@ export class Orchestrator {
         this.drainTimeoutEnv(),
         ...(config.workspaceSkipCliBootstrap ? ['POISE_SKIP_CLI_BOOTSTRAP=1'] : []),
       ],
-      Labels: { 'poise.managed': 'true', 'poise.workspace': handle },
+      Labels: {
+        'poise.managed': 'true',
+        'poise.workspace': handle,
+        ...(workspaceResolvConf ? { 'poise.dns': this.dnsLabel() } : {}),
+      },
       HostConfig: {
         Init: true,
         SecurityOpt: ['no-new-privileges'],
@@ -171,7 +182,7 @@ export class Orchestrator {
         PidsLimit: config.workspacePids,
         RestartPolicy: { Name: 'unless-stopped' },
         ...(config.workspaceRuntime ? { Runtime: config.workspaceRuntime } : {}),
-        Mounts: [{ Type: 'volume', Source: volume, Target: '/home/poise' }],
+        Mounts: mounts,
         NetworkMode: network,
       },
       NetworkingConfig: { EndpointsConfig: { [network]: {} } },
@@ -512,10 +523,19 @@ export class Orchestrator {
     return `POISE_DRAIN_TIMEOUT=${this.deps.config.drainTimeoutSeconds}`
   }
 
+  /** The resolvers a workspace was created with, as its poise.dns label records them. */
+  private dnsLabel(): string {
+    return this.deps.workspaceResolvConf ? this.deps.config.workspaceDns.join(',') : ''
+  }
+
   /** What makes a workspace container differ from the one the gateway would create now, or null. */
   private outdated(details: ContainerDetails, imageId: string): string | null {
     if (details.Image !== imageId) return 'outdated image'
     if (!(details.Config.Env ?? []).includes(this.drainTimeoutEnv())) return 'changed drain timeout'
+    const resolver = details.Mounts?.find((mount) => mount.Destination === WORKSPACE_RESOLV_CONF)?.Source ?? null
+    if (resolver !== (this.deps.workspaceResolvConf ?? null) || (details.Config.Labels?.['poise.dns'] ?? '') !== this.dnsLabel()) {
+      return 'changed workspace DNS'
+    }
     return null
   }
 

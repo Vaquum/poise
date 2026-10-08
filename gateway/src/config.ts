@@ -30,6 +30,11 @@ export interface Config {
   workspaceNanoCpus: number
   workspacePids: number
   workspaceRuntime: string | null
+  /**
+   * Resolvers every workspace uses instead of Docker's embedded DNS (POISE_WORKSPACE_DNS), which gVisor
+   * cannot reach; empty keeps Docker's.
+   */
+  workspaceDns: string[]
   /** Workspaces get POISE_SKIP_CLI_BOOTSTRAP=1 and install no provider CLIs; for end-to-end tests. */
   workspaceSkipCliBootstrap: boolean
   drainTimeoutSeconds: number
@@ -70,6 +75,12 @@ function isListenAddress(value: string): boolean {
   if (!match || Number(match[3]) > 65535) return false
   if (match[2] !== undefined) return isIPv4(match[2]) && match[2] !== '0.0.0.0'
   return isIPv6(match[1]) && new URL(`http://[${match[1]}]/`).hostname !== '[::]'
+}
+
+/** One IPv4 or IPv6 address a resolver can answer at: never 0.0.0.0 or ::, which name no host. */
+function isResolverAddress(value: string): boolean {
+  if (isIPv4(value)) return value !== '0.0.0.0'
+  return isIPv6(value) && new URL(`http://[${value}]/`).hostname !== '[::]'
 }
 
 /** Reads and validates the whole configuration, reporting every problem at once. */
@@ -195,6 +206,15 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     problems.push(`POISE_WORKSPACE_RUNTIME is not a valid OCI runtime name; got "${workspaceRuntime}"`)
   }
 
+  const workspaceDns: string[] = []
+  for (const value of (read('POISE_WORKSPACE_DNS') ?? '').split(/[\s,]+/).filter(Boolean)) {
+    const address = value.toLowerCase()
+    if (!isResolverAddress(address)) problems.push(`POISE_WORKSPACE_DNS: "${value}" is not the IP address of a resolver`)
+    else if (!workspaceDns.includes(address)) workspaceDns.push(address)
+  }
+  // The C library reads at most three nameserver lines.
+  if (workspaceDns.length > 3) problems.push(`POISE_WORKSPACE_DNS names ${workspaceDns.length} resolvers; at most three are used`)
+
   const skipBootstrapValue = read('POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP')
   if (skipBootstrapValue !== undefined && skipBootstrapValue !== '1') {
     problems.push(`POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP must be 1 or unset; got "${skipBootstrapValue}"`)
@@ -230,6 +250,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     workspaceNanoCpus: Math.round(cpus * 1e9),
     workspacePids,
     workspaceRuntime,
+    workspaceDns,
     workspaceSkipCliBootstrap: skipBootstrapValue === '1',
     drainTimeoutSeconds,
     dataDir,

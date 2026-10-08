@@ -2,7 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import {
-  CURRENT_IMAGE_ID, events, OLD_IMAGE_ID, startHarness, verifyAssertion, workspaceHost,
+  CURRENT_IMAGE_ID, events, GATEWAY_DATA_SOURCE, OLD_IMAGE_ID, startHarness, verifyAssertion, workspaceHost,
   type Harness, type HarnessOptions,
 } from './harness.js'
 import { MAX_SERVICE_ANSWER_BYTES } from '../src/orchestrator.js'
@@ -19,23 +19,29 @@ interface WorkspaceContainerOptions {
   gatewayJoined?: boolean
   /** The environment the container was created with; by default it holds the gateway's drain timeout. */
   env?: string[]
+  /** The resolvers it was created with: its resolver file's path on the Docker host and its poise.dns label. */
+  dns?: { file: string; label: string }
 }
 
 function addWorkspaceContainer(h: Harness, handle: string, imageId: string, running: boolean, options: WorkspaceContainerOptions = {}): void {
-  const { gatewayJoined = true, env = [`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`] } = options
+  const { gatewayJoined = true, env = [`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`], dns } = options
   h.docker.volumes.add(`poise-home-${handle}`)
   h.docker.networks.add(`poise-net-${handle}`)
   if (gatewayJoined) h.docker.containers.get('poise-gateway')?.networks.add(`poise-net-${handle}`)
+  const mounts = [{ Type: 'volume', Source: `poise-home-${handle}`, Target: '/home/poise' }]
+  if (dns) mounts.push({ Type: 'bind', Source: dns.file, Target: '/etc/resolv.conf' })
   h.docker.addContainer({
     name: `poise-ws-${handle}`,
     imageId,
     imageRef: 'poise-runtime:latest',
     running,
-    labels: { 'poise.managed': 'true', 'poise.workspace': handle },
+    labels: { 'poise.managed': 'true', 'poise.workspace': handle, ...(dns ? { 'poise.dns': dns.label } : {}) },
     networks: new Set([`poise-net-${handle}`]),
-    spec: { Env: env },
+    spec: { Env: env, HostConfig: { Mounts: mounts } },
   })
 }
+
+const RESOLV_CONF = `${GATEWAY_DATA_SOURCE}/workspace-resolv.conf`
 
 function containerEnv(h: Harness, handle: string): string[] {
   return (h.docker.containers.get(`poise-ws-${handle}`)?.spec as { Env: string[] }).Env
@@ -180,6 +186,29 @@ describe('lazy start', () => {
     expect((create?.body as { HostConfig: Record<string, unknown> }).HostConfig).not.toHaveProperty('Runtime')
   })
 
+  it('mounts the POISE_WORKSPACE_DNS resolvers over /etc/resolv.conf, read-only, and records them', async () => {
+    const cookie = await start({ env: { POISE_WORKSPACE_DNS: '1.1.1.1, 2606:4700:4700::1111' } })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    const create = h.docker.calls.find((call) => call.path.startsWith('/containers/create'))
+    const body = create?.body as { Labels: Record<string, string>; HostConfig: { Mounts: unknown[] } }
+    expect(body.HostConfig.Mounts).toEqual([
+      { Type: 'volume', Source: 'poise-home-alice', Target: '/home/poise' },
+      { Type: 'bind', Source: RESOLV_CONF, Target: '/etc/resolv.conf', ReadOnly: true },
+    ])
+    expect(body.Labels).toEqual({ 'poise.managed': 'true', 'poise.workspace': 'alice', 'poise.dns': '1.1.1.1,2606:4700:4700::1111' })
+  })
+
+  it('leaves /etc/resolv.conf to Docker unless POISE_WORKSPACE_DNS is set', async () => {
+    const cookie = await start()
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    const create = h.docker.calls.find((call) => call.path.startsWith('/containers/create'))
+    const body = create?.body as { Labels: Record<string, string>; HostConfig: { Mounts: unknown[] } }
+    expect(body.HostConfig.Mounts).toEqual([{ Type: 'volume', Source: 'poise-home-alice', Target: '/home/poise' }])
+    expect(body.Labels).not.toHaveProperty('poise.dns')
+  })
+
   it('reuses an existing volume and network and does not reconnect the gateway', async () => {
     const cookie = await start()
     h.docker.volumes.add('poise-home-alice')
@@ -290,6 +319,29 @@ describe('lazy start', () => {
     ])
     expect(h.logs.find((entry) => entry.event === 'workspace.container.removed')).toMatchObject({ handle: 'alice', reason: 'changed drain timeout' })
     expect(containerEnv(h, 'alice')).toContain('POISE_DRAIN_TIMEOUT=600')
+    expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
+  })
+
+  it.each([
+    ['without resolvers, now that POISE_WORKSPACE_DNS is set', '1.1.1.1', undefined],
+    ['with other resolvers', '1.1.1.1', { file: RESOLV_CONF, label: '8.8.8.8' }],
+    ['with resolvers, now that POISE_WORKSPACE_DNS is unset', undefined, { file: RESOLV_CONF, label: '1.1.1.1' }],
+  ])('recreates a stopped container created %s before starting it', async (_case, setting, dns) => {
+    const cookie = await start({ env: { POISE_WORKSPACE_DNS: setting } })
+    addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, false, { dns })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    expect(dockerCalls(h)).toContain('DELETE /containers/poise-ws-alice')
+    expect(h.logs.find((entry) => entry.event === 'workspace.container.removed')).toMatchObject({ handle: 'alice', reason: 'changed workspace DNS' })
+    expect(h.docker.containers.get('poise-ws-alice')?.labels['poise.dns']).toBe(setting)
+  })
+
+  it('starts a stopped container created with the configured resolvers as it is', async () => {
+    const cookie = await start({ env: { POISE_WORKSPACE_DNS: '1.1.1.1' } })
+    addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, false, { dns: { file: RESOLV_CONF, label: '1.1.1.1' } })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    expect(dockerCalls(h)).not.toContain('DELETE /containers/poise-ws-alice')
     expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
   })
 })

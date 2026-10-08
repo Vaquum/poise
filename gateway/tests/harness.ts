@@ -14,6 +14,7 @@ import { loadOrCreateKeys, type GatewayKeys } from '../src/keys.js'
 import { createLogger } from '../src/log.js'
 import { Orchestrator, type Upstream } from '../src/orchestrator.js'
 import { Store } from '../src/store.js'
+import { prepareWorkspaceDns } from '../src/workspace-dns.js'
 import { startFakeDocker, type FakeDocker } from './fakes/docker.js'
 import { startFakeGitHub, type FakeGitHub } from './fakes/github.js'
 import { startWorkspaceStub, type WorkspaceStub } from './fakes/workspace.js'
@@ -22,6 +23,8 @@ export const DOMAIN = 'poise.test'
 export const APEX = DOMAIN
 export const CURRENT_IMAGE_ID = 'sha256:1111111111111111111111111111111111111111111111111111111111111111'
 export const OLD_IMAGE_ID = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+/** Where the Docker host keeps the gateway container's data directory, as Docker reports its mount. */
+export const GATEWAY_DATA_SOURCE = '/var/lib/docker/volumes/poise-gateway-data/_data'
 
 export interface Reply {
   status: number
@@ -143,7 +146,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     running: true,
     labels: {},
     networks: new Set(['bridge']),
-    spec: {},
+    spec: { HostConfig: { Mounts: [{ Type: 'volume', Source: GATEWAY_DATA_SOURCE, Target: dataDir }] } },
   })
   const workspace = await startWorkspaceStub()
   const unreachablePort = await closedPort()
@@ -175,8 +178,10 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     return { host: '127.0.0.1', port: workspace.reachable && joined ? workspace.port : unreachablePort }
   }
   const dockerClient = new DockerClient(config.dockerSocket)
+  const workspaceResolvConf = await prepareWorkspaceDns(config, dockerClient)
   const orchestrator = new Orchestrator({
-    config, docker: dockerClient, store, keys, log, now, upstream, drainPollMs: options.drainPollMs ?? 10, drainRenewMs: options.drainRenewMs,
+    config, docker: dockerClient, store, keys, log, now, upstream, workspaceResolvConf,
+    drainPollMs: options.drainPollMs ?? 10, drainRenewMs: options.drainRenewMs,
   })
   const gateway: Gateway = createGateway({
     config, store, keys, github: new GitHubClient(config), docker: dockerClient, orchestrator, log, now, upstream,

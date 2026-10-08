@@ -8,6 +8,7 @@ import { loadOrCreateKeys } from './keys.js'
 import { createLogger, errorMessage } from './log.js'
 import { Orchestrator, workspaceUpstream } from './orchestrator.js'
 import { startPurgeLoop, Store } from './store.js'
+import { prepareWorkspaceDns } from './workspace-dns.js'
 
 const PURGE_INTERVAL_MS = 10 * 60_000
 
@@ -35,7 +36,9 @@ const store = new Store(join(config.dataDir, 'gateway.db'), now)
 store.syncEnvAllowList(config.allowedUsers)
 const keys = loadOrCreateKeys(config.dataDir, log)
 const docker = new DockerClient(config.dockerSocket)
-const orchestrator = new Orchestrator({ config, docker, store, keys, log, now, upstream: workspaceUpstream })
+const workspaceResolvConf = await prepareWorkspaceDns(config, docker)
+if (workspaceResolvConf) log.info('workspace.dns.configured', { resolvers: config.workspaceDns, file: workspaceResolvConf })
+const orchestrator = new Orchestrator({ config, docker, store, keys, log, now, upstream: workspaceUpstream, workspaceResolvConf })
 const gateway = createGateway({
   config,
   store,

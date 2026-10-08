@@ -51,6 +51,9 @@ function inspect(container: FakeContainer): unknown {
     State: { Status: container.running ? 'running' : 'exited', Running: container.running },
     Config: { Image: container.imageRef, Labels: container.labels, Env: container.spec.Env ?? null },
     NetworkSettings: { Networks: Object.fromEntries([...container.networks].map((network) => [network, {}])) },
+    // As Docker reports them: where each mount comes from, and where the container sees it.
+    Mounts: ((container.spec.HostConfig as { Mounts?: Array<{ Type: string; Source: string; Target: string }> } | undefined)?.Mounts ?? [])
+      .map((mount) => ({ Type: mount.Type, Source: mount.Source, Destination: mount.Target })),
   }
 }
 
