@@ -583,7 +583,7 @@ describe('behavior launch claims', () => {
     listedPrs = [pr, { ...pr, repo: 'Vaquum/poise-peer', number: 18, url: 'https://github.com/Vaquum/poise-peer/pull/18' }]
     mocks.spawnDetached.mockResolvedValue(undefined)
     const { database: db, behaviors: runtime } = await loadModules()
-    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    runtime.startBehaviorsRuntime()
     // Drive just this manual cycle, without a wall-clock tick launching more
     // evaluations while the two controlled preparations are in flight.
     vi.clearAllTimers()
