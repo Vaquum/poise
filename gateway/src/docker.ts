@@ -23,10 +23,16 @@ export interface ContainerDetails {
   /** The image ID the container was created from. */
   Image: string
   /** Env is the image's environment with the container's own on top, as the container was created. */
-  Config: { Env: string[] | null }
+  Config: { Env: string[] | null; Labels?: Record<string, string> | null }
   State: { Status: string; Running: boolean }
   NetworkSettings: { Networks: Record<string, unknown> }
+  /** Volumes and bind mounts, each with its path on the Docker host (Source) and in the container. */
+  Mounts?: Array<{ Type: string; Source: string; Destination: string }>
 }
+
+export type ContainerMount =
+  | { Type: 'volume'; Source: string; Target: string }
+  | { Type: 'bind'; Source: string; Target: string; ReadOnly: true }
 
 export interface ContainerSpec {
   Image: string
@@ -42,7 +48,7 @@ export interface ContainerSpec {
     PidsLimit: number
     RestartPolicy: { Name: 'unless-stopped' }
     Runtime?: string
-    Mounts: Array<{ Type: 'volume'; Source: string; Target: string }>
+    Mounts: ContainerMount[]
     NetworkMode: string
   }
   NetworkingConfig: { EndpointsConfig: Record<string, Record<string, never>> }

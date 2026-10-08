@@ -37,6 +37,7 @@ describe('configuration', () => {
       workspaceNanoCpus: 4_000_000_000,
       workspacePids: 4096,
       workspaceRuntime: null,
+      workspaceDns: [],
       workspaceSkipCliBootstrap: false,
       drainTimeoutSeconds: 1800,
       dataDir: '/data',
@@ -142,6 +143,20 @@ describe('configuration', () => {
         `POISE_PROXY_LISTEN must be one IP address and port, such as 127.0.0.1:8080 or [::1]:8080, never 0.0.0.0 or [::]; got "${value}"`,
       ])
     }
+  })
+
+  it('reads POISE_WORKSPACE_DNS as up to three resolver addresses, in order and once each', () => {
+    expect(loadConfig({ ...BASE, POISE_WORKSPACE_DNS: '1.1.1.1, 2606:4700:4700::1111 1.1.1.1' }).workspaceDns)
+      .toEqual(['1.1.1.1', '2606:4700:4700::1111'])
+    expect(loadConfig({ ...BASE, POISE_WORKSPACE_DNS: 'FD00::53' }).workspaceDns).toEqual(['fd00::53'])
+    for (const value of ['dns.example.com', '0.0.0.0', '::', '0:0:0:0:0:0:0:0', '1.1.1.1:53', '256.1.1.1', 'fe80::1%eth0', '[::1]']) {
+      expect(problems({ ...BASE, POISE_WORKSPACE_DNS: value }), value).toEqual([
+        `POISE_WORKSPACE_DNS: "${value}" is not the IP address of a resolver`,
+      ])
+    }
+    expect(problems({ ...BASE, POISE_WORKSPACE_DNS: '1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4' })).toEqual([
+      'POISE_WORKSPACE_DNS names 4 resolvers; at most three are used',
+    ])
   })
 
   it('refuses reserved handles as allowed users or admins', () => {

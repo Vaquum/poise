@@ -173,7 +173,11 @@ process limits from `POISE_WORKSPACE_MEMORY` (default `8g`),
 `POISE_WORKSPACE_CPUS` (default `4`) and `POISE_WORKSPACE_PIDS` (default `4096`);
 restart policy `unless-stopped`, so a server reboot brings workspaces back
 while one an admin stopped stays stopped; optional OCI runtime from
-`POISE_WORKSPACE_RUNTIME` (for example `runsc`).
+`POISE_WORKSPACE_RUNTIME` (for example `runsc`). With `POISE_WORKSPACE_DNS`,
+a file naming those resolvers is mounted read-only over `/etc/resolv.conf`,
+and the label `poise.dns` records them; gVisor cannot reach Docker's embedded
+DNS server. A workspace whose resolvers differ is recreated, drained, like
+one on an outdated image.
 
 Environment the gateway passes:
 
