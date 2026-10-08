@@ -12,7 +12,7 @@ from unittest.mock import patch
 from github_datastore.cli import main
 from github_datastore.db import connect, get_state, init_db, set_state, upsert_repo
 from github_datastore.store import INITIALIZATION_KEY, init_org, iter_expanded, store_expanded, sync_once
-from tests.test_store import base_expanded, repo_row
+from tests.test_store import BatchReader, base_expanded, repo_row
 
 
 START = "2026-08-29T12:00:00Z"
@@ -31,7 +31,7 @@ def stub(expanded: dict) -> dict:
     return {"id": issue["id"], "number": issue["number"], "updated_at": issue["updated_at"], "item_kind": "issue"}
 
 
-class InitializationReader:
+class InitializationReader(BatchReader):
     def __init__(self, repos: list[dict], items: dict[str, list[dict]]) -> None:
         self.repos = repos
         self.items = copy.deepcopy(items)
@@ -452,7 +452,7 @@ class InitializationTest(unittest.TestCase):
                 shutdown.set()
                 super().shutdown(*args, **kwargs)
 
-        class QuotaReader:
+        class QuotaReader(BatchReader):
             def expand_issue_or_pr(self, repo: dict, issue: dict) -> dict:
                 calls.append(issue["number"])
                 if issue["number"] == 1:

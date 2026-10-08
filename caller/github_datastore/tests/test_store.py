@@ -94,6 +94,14 @@ def initialize_sync_state(
 
 
 class BatchReader:
+    def fetch_initial_item_graphs(self, repo: dict, items: list[dict]) -> dict:
+        return {item["number"]: item for item in items}
+
+    def expand_item_graph(self, repo: dict, item: dict, node: dict) -> dict:
+        if node != item:
+            raise AssertionError("wrong prefetched item")
+        return self.expand_issue_or_pr(repo, item)
+
     def list_repos_changed_items(
         self, full_names: list[str], since: str | None, stored: dict[str, dict[int, str]]
     ) -> dict[str, list[dict]]:
