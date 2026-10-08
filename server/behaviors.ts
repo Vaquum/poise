@@ -256,10 +256,21 @@ function behaviorAborted(): boolean {
   return behaviorSignal()?.aborted === true
 }
 
-async function prepareBehaviorModelClis(catalog: Catalog, identities: string[]): Promise<NodeJS.ProcessEnv> {
+async function prepareBehaviorModelClis(catalog: Catalog, identities: string[], claimId?: string): Promise<NodeJS.ProcessEnv> {
   const signal = behaviorSignal()
   const deadline = signal && behaviorOperationDeadline.get(signal)
-  const prepare = () => waitForBehavior(prepareModelClis(catalog, identities))
+  const prepare = async () => {
+    // Keep the PR mutation reservation through the bounded preparation wait.
+    // Failure/shutdown releases it through the existing owned-claim cleanup.
+    if (claimId && !renewPrOperationOwned(claimId, CLI_UPDATE_TIMEOUT_MS + PR_OPERATION_EVALUATION_LEASE_MS)) {
+      throw new Error('PR operation ownership was lost before provider preparation')
+    }
+    const env = await waitForBehavior(prepareModelClis(catalog, identities))
+    if (claimId && !renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
+      throw new Error('PR operation ownership was lost during provider preparation')
+    }
+    return env
+  }
   return deadline ? deadline.prepare(prepare) : prepare()
 }
 
@@ -1614,7 +1625,7 @@ async function fireReview(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery])
+  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], claimId)
   // mkdir the cwd hack dir — agent-interface needs it to exist for
   // --pwd resolution behavior identical to triggerPrReview in agent.ts.
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
@@ -2449,7 +2460,7 @@ async function fireApprove(
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
-  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery])
+  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], claimId)
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
   if (!isEnabled('approve-prs')) return false
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
