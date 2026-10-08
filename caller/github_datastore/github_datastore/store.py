@@ -27,7 +27,7 @@ from .db import (
     utc_now,
 )
 from .extract import extract_associations
-from .github_api import GitHubClient, GitHubOrgReader, parse_graphql_datetime
+from .github_api import ITEM_GRAPH_BATCH_SIZE, GitHubClient, GitHubOrgReader, parse_graphql_datetime
 
 
 FULL_BUILD_COMPLETE_KEY = "full_build_complete"
@@ -588,23 +588,26 @@ def store_expanded(
 def iter_expanded(
     reader: GitHubOrgReader, repo: dict[str, Any], issues: list[dict[str, Any]], workers: int
 ) -> Iterator[dict[str, Any]]:
-    if workers == 1 or len(issues) <= 1:
-        for issue in issues:
-            yield reader.expand_issue_or_pr(repo, issue)
-        return
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(reader.expand_issue_or_pr, repo, issue): issue["number"] for issue in issues
-        }
-        try:
-            for future in as_completed(futures):
-                yield future.result()
-        finally:
-            # Stop queued work immediately after a quota failure (or a consumer
-            # error); the context manager waits only for already-running calls.
-            for future in futures:
-                future.cancel()
+    for offset in range(0, len(issues), ITEM_GRAPH_BATCH_SIZE):
+        batch = issues[offset:offset + ITEM_GRAPH_BATCH_SIZE]
+        graphs = reader.fetch_initial_item_graphs(repo, batch)
+        if workers == 1 or len(batch) == 1:
+            for issue in batch:
+                yield reader.expand_item_graph(repo, issue, graphs[issue["number"]])
+            continue
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(reader.expand_item_graph, repo, issue, graphs[issue["number"]]): issue["number"]
+                for issue in batch
+            }
+            try:
+                for future in as_completed(futures):
+                    yield future.result()
+            finally:
+                # Do not fetch the next batch after a quota or consumer error;
+                # cancel queued pagination and wait for already-running calls.
+                for future in futures:
+                    future.cancel()
 
 
 def validate_repo_filter(

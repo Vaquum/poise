@@ -209,12 +209,12 @@ updatedAt
 """
 
 
-ISSUE_BASE_QUERY = f"""
-query($owner: String!, $name: String!, $number: Int!, $commentsCursor: String, $timelineCursor: String) {{
-  repository(owner: $owner, name: $name) {{
-    issue(number: $number) {{
+ITEM_GRAPH_BATCH_SIZE = 20
+
+
+ISSUE_GRAPH_FIELDS = f"""
       {ISSUE_ITEM_FIELDS}
-      comments(first: 100, after: $commentsCursor) {{
+      comments(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
           databaseId
@@ -226,35 +226,20 @@ query($owner: String!, $name: String!, $number: Int!, $commentsCursor: String, $
           updatedAt
         }}
       }}
-      timelineItems(first: 100, after: $timelineCursor, itemTypes: [{ISSUE_TIMELINE_TYPES}]) {{
+      timelineItems(first: 100, itemTypes: [{ISSUE_TIMELINE_TYPES}]) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{ {ISSUE_TIMELINE_FRAGMENT} }}
       }}
-    }}
-  }}
-}}
+
 """
 
 
-PR_BASE_QUERY = f"""
-query(
-  $owner: String!,
-  $name: String!,
-  $number: Int!,
-  $commentsCursor: String,
-  $timelineCursor: String,
-  $reviewsCursor: String,
-  $reviewThreadsCursor: String,
-  $commitsCursor: String,
-  $reviewRequestsCursor: String
-) {{
-  repository(owner: $owner, name: $name) {{
-    pullRequest(number: $number) {{
+PR_GRAPH_FIELDS = f"""
       {PULL_ITEM_FIELDS}
       mergedAt
       mergedBy {{ login }}
       isDraft
-      comments(first: 100, after: $commentsCursor) {{
+      comments(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
           databaseId
@@ -266,18 +251,18 @@ query(
           updatedAt
         }}
       }}
-      timelineItems(first: 100, after: $timelineCursor, itemTypes: [{PR_TIMELINE_TYPES}]) {{
+      timelineItems(first: 100, itemTypes: [{PR_TIMELINE_TYPES}]) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{ {PR_TIMELINE_FRAGMENT} }}
       }}
-      reviewRequests(first: 100, after: $reviewRequestsCursor) {{
+      reviewRequests(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
           id
           requestedReviewer {{ {REQUESTED_REVIEWER_FRAGMENT} }}
         }}
       }}
-      reviews(first: 100, after: $reviewsCursor) {{
+      reviews(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
           fullDatabaseId
@@ -289,7 +274,7 @@ query(
           commit {{ oid }}
         }}
       }}
-      reviewThreads(first: 100, after: $reviewThreadsCursor) {{
+      reviewThreads(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
           id
@@ -307,7 +292,7 @@ query(
           }}
         }}
       }}
-      commits(first: 100, after: $commitsCursor) {{
+      commits(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
           id
@@ -318,6 +303,26 @@ query(
           }}
         }}
       }}
+
+"""
+
+
+ISSUE_BASE_QUERY = f"""
+query($owner: String!, $name: String!, $number: Int!) {{
+  repository(owner: $owner, name: $name) {{
+    issue(number: $number) {{
+      {ISSUE_GRAPH_FIELDS}
+    }}
+  }}
+}}
+"""
+
+
+PR_BASE_QUERY = f"""
+query($owner: String!, $name: String!, $number: Int!) {{
+  repository(owner: $owner, name: $name) {{
+    pullRequest(number: $number) {{
+      {PR_GRAPH_FIELDS}
     }}
   }}
 }}
@@ -683,6 +688,64 @@ class GitHubOrgReader:
             return self._expand_pull(repo, owner, name, number)
         return self._expand_issue(repo, owner, name, number)
 
+    def fetch_initial_item_graphs(
+        self, repo: dict[str, Any], items: list[dict[str, Any]]
+    ) -> dict[int, dict[str, Any]]:
+        if not 1 <= len(items) <= ITEM_GRAPH_BATCH_SIZE:
+            raise ValueError(f"item graph batch must contain 1..{ITEM_GRAPH_BATCH_SIZE} items")
+        numbers = [int(item["number"]) for item in items]
+        if len(set(numbers)) != len(numbers):
+            raise ValueError("item graph batch has duplicate numbers")
+        owner, name = split_full_name(str(repo["full_name"]))
+        variables: dict[str, Any] = {"owner": owner, "name": name}
+        declarations = ["$owner: String!", "$name: String!"]
+        selections = []
+        for index, item in enumerate(items):
+            kind = item["item_kind"]
+            if kind not in ("issue", "pr"):
+                raise ValueError(f"invalid item graph kind: {kind!r}")
+            field = "pullRequest" if kind == "pr" else "issue"
+            fields = PR_GRAPH_FIELDS if kind == "pr" else ISSUE_GRAPH_FIELDS
+            # Narrow only the first thread page; the existing paginator still
+            # reads every remaining thread and every thread's comment pages.
+            fields = fields.replace("reviewThreads(first: 100)", "reviewThreads(first: 20)")
+            declarations.append(f"$number_{index}: Int!")
+            variables[f"number_{index}"] = numbers[index]
+            selections.append(
+                f"item_{index}: {field}(number: $number_{index}) {{ __typename {fields} }}"
+            )
+        query = (
+            "query(" + ", ".join(declarations) + ") {"
+            " repository(owner: $owner, name: $name) { " + " ".join(selections) + " } }"
+        )
+        data = self.client.graphql(query, variables)
+        nodes = data.get("repository")
+        expected_aliases = {f"item_{index}" for index in range(len(items))}
+        if not isinstance(nodes, dict) or set(nodes) != expected_aliases:
+            raise GitHubApiError(f"incomplete item graph batch for {owner}/{name}")
+        result = {}
+        for index, item in enumerate(items):
+            node = nodes[f"item_{index}"]
+            expected_type = "PullRequest" if item["item_kind"] == "pr" else "Issue"
+            if (
+                not isinstance(node, dict)
+                or node.get("__typename") != expected_type
+                or node.get("number") != numbers[index]
+                or int(required_id(node, item["item_kind"])) != int(item["id"])
+            ):
+                raise GitHubApiError(f"item graph identity mismatch for {owner}/{name}#{numbers[index]}")
+            result[numbers[index]] = {key: value for key, value in node.items() if key != "__typename"}
+        return result
+
+    def expand_item_graph(
+        self, repo: dict[str, Any], item: dict[str, Any], node: dict[str, Any]
+    ) -> dict[str, Any]:
+        owner, name = split_full_name(str(repo["full_name"]))
+        number = int(item["number"])
+        if item["item_kind"] == "pr":
+            return self._expand_pull_graph(repo, owner, name, number, node)
+        return self._expand_issue_graph(repo, owner, name, number, node)
+
     def _list_issue_nodes(
         self,
         owner: str,
@@ -830,7 +893,11 @@ class GitHubOrgReader:
             ISSUE_BASE_QUERY,
             {"owner": owner, "name": name, "number": number},
         )
-        issue = data["repository"]["issue"]
+        return self._expand_issue_graph(repo, owner, name, number, data["repository"]["issue"])
+
+    def _expand_issue_graph(
+        self, repo: dict[str, Any], owner: str, name: str, number: int, issue: dict[str, Any]
+    ) -> dict[str, Any]:
         comments = [graphql_comment_to_row(node) for node in issue["comments"]["nodes"]]
         timeline = [graphql_timeline_to_row(node, index) for index, node in enumerate(issue["timelineItems"]["nodes"])]
         comments.extend(self._page_issue_comments(owner, name, number, issue["comments"]["pageInfo"]))
@@ -856,12 +923,20 @@ class GitHubOrgReader:
             PR_BASE_QUERY,
             {"owner": owner, "name": name, "number": number},
         )
-        pull = data["repository"]["pullRequest"]
+        return self._expand_pull_graph(repo, owner, name, number, data["repository"]["pullRequest"])
+
+    def _expand_pull_graph(
+        self, repo: dict[str, Any], owner: str, name: str, number: int, pull: dict[str, Any]
+    ) -> dict[str, Any]:
         comments = [graphql_comment_to_row(node) for node in pull["comments"]["nodes"]]
         timeline = [graphql_timeline_to_row(node, index) for index, node in enumerate(pull["timelineItems"]["nodes"])]
         reviews = [graphql_review_to_row(node) for node in pull["reviews"]["nodes"]]
         review_requests = list(pull["reviewRequests"]["nodes"])
-        review_comments = self._review_thread_comments(pull["reviewThreads"]["nodes"])
+        review_comments = [
+            graphql_review_comment_to_row(comment)
+            for thread in pull["reviewThreads"]["nodes"]
+            for comment in thread["comments"]["nodes"]
+        ]
         commits = [graphql_commit_to_row(node) for node in pull["commits"]["nodes"]]
         comments.extend(self._page_pull_comments(owner, name, number, pull["comments"]["pageInfo"]))
         timeline.extend(
