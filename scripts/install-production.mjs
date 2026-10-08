@@ -17,6 +17,7 @@ import { callerPython, setupCaller } from './caller-setup.mjs'
 import { installStopGate, stopGateManifest } from './stop-gate-runtime.mjs'
 import { servicePath } from './production-path.mjs'
 import { legacyDatastoreServices, resolveLegacyDatastore } from './legacy-datastore.mjs'
+import { prepareInstalledBundle } from './start-production.mjs'
 
 import { selfUpdateEnabled } from './self-update-bridge.mjs'
 
@@ -279,9 +280,12 @@ async function main() {
     cwd: projectRoot,
     env: nodeEnvironment,
   })
-  await run('npm', ['run', 'build'], {
-    cwd: projectRoot,
-    env: nodeEnvironment,
+  await prepareInstalledBundle({
+    root: projectRoot,
+    build: () => run('npm', ['run', 'build'], {
+      cwd: projectRoot,
+      env: nodeEnvironment,
+    }),
   })
 
   const legacyData = join(home, 'dev', 'caller', 'agent_interface', 'data')
