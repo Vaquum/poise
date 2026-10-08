@@ -553,6 +553,57 @@ describe('behavior launch claims', () => {
     expect(runtime.getBehaviorsRuntimeHealth().failures.filter(row => row.kind === 'operation')).toEqual([])
   })
 
+  it.each(['review-new-prs', 'approve-prs'] as const)('parallel provider preparation: %s retains a peer reservation through ordinary launch work', async (behavior) => {
+    vi.useFakeTimers()
+    vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+      const controller = new AbortController()
+      setTimeout(() => controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), ms)
+      return controller.signal
+    })
+    arrangeCli(behavior === 'approve-prs')
+    const ordinaryCli = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-interface' && (args[0] === '--head-sha' && args[1] === '#17'
+        || args[0] === '--local-checkout-path' && args[2] === 'poise-test')) {
+        await new Promise<void>(resolve => setTimeout(resolve, 25_000))
+      }
+      return ordinaryCli(command, args, options)
+    })
+    listedPrs = [pr, { ...pr, repo: 'Vaquum/poise-peer', number: 18, url: 'https://github.com/Vaquum/poise-peer/pull/18' }]
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime({ reviewAgentUsername: 'review-bot' })
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+    db.setMeta(`behavior_${behavior.replaceAll('-', '_')}_enabled`, '1')
+    const { prepareModelClis } = await import('../server/provider-clis')
+    const entered = deferred<void>(), fast = deferred<NodeJS.ProcessEnv>(), slow = deferred<NodeJS.ProcessEnv>()
+    let preparations = 0
+    vi.mocked(prepareModelClis).mockImplementationOnce(() => {
+      if (++preparations === 2) entered.resolve()
+      return fast.promise
+    }).mockImplementationOnce(() => {
+      if (++preparations === 2) entered.resolve()
+      return slow.promise
+    })
+    const cycle = runtime.runEnabledBehaviorsOnce()
+    await entered.promise
+    // Each ordinary call takes less than its own 30-second timeout. Their
+    // combined work outlives 65 seconds while the peer keeps the clock paused.
+    mocks.requireAuth.mockImplementationOnce(() => new Promise<void>(resolve => setTimeout(resolve, 25_000)))
+    fast.resolve({})
+    await vi.advanceTimersByTimeAsync(66_000)
+    const competing = db.claimPrOperationOwned(`${pr.repo}#${pr.number}`, 65_000)
+    if (competing) db.releasePrOperationOwned(competing)
+    await vi.advanceTimersByTimeAsync(9_000)
+    slow.resolve({})
+    await cycle
+    expect(competing).toBeNull()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(runtime.getBehaviorsRuntimeHealth().failures.filter(row => row.kind === 'operation')).toEqual([])
+  })
+
   it('pauses Claude-backed behaviors before external work and resumes once authenticated', async () => {
     arrangeCli(false)
     mocks.spawnDetached.mockResolvedValue(undefined)
