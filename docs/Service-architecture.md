@@ -225,7 +225,7 @@ Environment the gateway passes:
 | `POISE_HOST` | `0.0.0.0` |
 | `POISE_PORT` | `5555` |
 | `HOME` | `/home/poise` |
-| `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 1800), so both sides time a drain alike |
+| `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 5400), so both sides time a drain alike |
 | `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
@@ -373,13 +373,14 @@ assertion may only resume, and anything else is refused with 403):
   launches, then returns the same fields. A drain lapses unless it is renewed:
   while the gateway polls health it re-POSTs `/api/service/drain` at least
   every 5 minutes. It recreates the container once `idle` is true or
-  `POISE_DRAIN_TIMEOUT` seconds (default 1800, 30 minutes) have passed.
+  `POISE_DRAIN_TIMEOUT` seconds (default 5400, 90 minutes: longer than an
+  issue review may run, so it should cut only a hung call) have passed.
   - New Chat turns include queued messages, and launches include the
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
     `/api/debate`, `/api/chat`, `/api/models/refresh`). Refused work answers
     503 with code `draining`; work already running continues.
   - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
-    1800) plus five minutes after the last drain call, so a gateway that
+    5400) plus five minutes after the last drain call, so a gateway that
     stopped renewing it cannot leave the workspace refusing work.
 - `POST /api/service/resume` lifts a drain. The owner's browser may call it
   too, to lift a drain a gateway left behind.

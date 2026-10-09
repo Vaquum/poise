@@ -173,7 +173,7 @@ describe('lazy start', () => {
       'POISE_HOST=0.0.0.0',
       'POISE_PORT=5555',
       'HOME=/home/poise',
-      'POISE_DRAIN_TIMEOUT=1800',
+      'POISE_DRAIN_TIMEOUT=5400',
       'POISE_SKIP_CLI_BOOTSTRAP=1',
     ])
   })

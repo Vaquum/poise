@@ -39,7 +39,7 @@ describe('configuration', () => {
       workspaceRuntime: null,
       workspaceDns: [],
       workspaceSkipCliBootstrap: false,
-      drainTimeoutSeconds: 1800,
+      drainTimeoutSeconds: 5400,
       dataDir: '/data',
       dockerSocket: '/var/run/docker.sock',
       gatewayContainer: 'poise-gateway',

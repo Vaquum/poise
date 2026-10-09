@@ -103,9 +103,9 @@ describe('service-mode configuration', () => {
     }
   })
 
-  it('reads how long the gateway waits for a drain, 1800 seconds when unset', () => {
+  it('reads how long the gateway waits for a drain, 5400 seconds when unset', () => {
     const env = serviceEnvironment(keys)
-    expect(readServiceConfig(env)?.drainTimeoutSeconds).toBe(1800)
+    expect(readServiceConfig(env)?.drainTimeoutSeconds).toBe(5400)
     expect(readServiceConfig({ ...env, POISE_DRAIN_TIMEOUT: '600' })?.drainTimeoutSeconds).toBe(600)
     for (const value of ['', '0', '-5', '1.5', '30m', '1e3', ' 600', '604801']) {
       expect(() => readServiceConfig({ ...env, POISE_DRAIN_TIMEOUT: value }), JSON.stringify(value))

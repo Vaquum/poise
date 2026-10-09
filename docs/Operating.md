@@ -486,10 +486,11 @@ An upgrade that changes the system itself, the files under `deploy/runtime/`,
 gets a new container instead. The gateway drains a running workspace first:
 the workspace refuses new Chat turns and agent launches, which then answer
 that Poise is installing an update, and lets running work finish. Once it is
-idle, or after `POISE_DRAIN_TIMEOUT` seconds (30 minutes by default), the
-gateway recreates the container on the new image with the same home volume. A
-stopped workspace is recreated without being started. Follow it all in the
-gateway's log:
+idle, or after `POISE_DRAIN_TIMEOUT` seconds (90 minutes by default, longer
+than an issue review may run, so it should cut only a hung call), the gateway
+recreates the container on the new image with the same home volume. A stopped
+workspace is recreated without being started. Follow it all in the gateway's
+log:
 
 ```bash
 docker logs --follow poise-gateway 2>&1 | grep workspace.

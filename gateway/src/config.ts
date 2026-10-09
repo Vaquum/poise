@@ -195,7 +195,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
   }
   const workspacePids = wholeNumber('POISE_WORKSPACE_PIDS', 4096)
   // Workspaces get this value and refuse to start with more than a week.
-  const drainTimeoutSeconds = wholeNumber('POISE_DRAIN_TIMEOUT', 30 * 60, MAX_DRAIN_TIMEOUT_SECONDS)
+  // Longer than an issue review may run (an hour), so a drain should cut only a hung call.
+  const drainTimeoutSeconds = wholeNumber('POISE_DRAIN_TIMEOUT', 90 * 60, MAX_DRAIN_TIMEOUT_SECONDS)
   const port = wholeNumber('PORT', 8080, 65535)
 
   const proxyListenValue = read('POISE_PROXY_LISTEN')

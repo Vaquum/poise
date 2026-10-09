@@ -29,7 +29,8 @@ const HANDLE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/
 const DOMAIN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
 const SPKI_PEM = /^-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+-----END PUBLIC KEY-----\r?\n?$/
-const DEFAULT_DRAIN_TIMEOUT_SECONDS = 1800
+// The gateway's default: longer than an issue review may run (an hour), so a drain should cut only a hung call.
+const DEFAULT_DRAIN_TIMEOUT_SECONDS = 90 * 60
 // A week: far beyond any drain, and well inside what a timer can hold.
 const MAX_DRAIN_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 

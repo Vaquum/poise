@@ -38,7 +38,7 @@ plan_workspaces() {
     if [ "$running" = true ] && [ -n "$base" ] && [ "$(image_base "$id")" = "$base" ]; then
       say "  $handle: running. The gateway installs the new release in it, and Poise restarts on it alone within seconds, once no Chat turn runs; agents carry on."
     elif [ "$running" = true ]; then
-      say "  $handle: running. The gateway drains it first: it takes no new work and finishes what runs, for at most ${drain:-1800} seconds."
+      say "  $handle: running. The gateway drains it first: it takes no new work and finishes what runs, for at most ${drain:-5400} seconds."
     else
       say "  $handle: stopped. The gateway recreates it and leaves it stopped."
     fi
