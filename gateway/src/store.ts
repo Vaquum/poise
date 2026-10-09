@@ -520,10 +520,11 @@ export class Store {
     return row ? toDevice(row) : null
   }
 
-  touchDevice(id: string): void {
+  /** Records the device's use now, unless it was recorded less than `minIntervalMs` ago. */
+  touchDevice(id: string, minIntervalMs = DEVICE_TOUCH_INTERVAL_MS): void {
     const now = this.now()
     this.db.prepare('UPDATE devices SET last_used_at = ? WHERE id = ? AND (last_used_at IS NULL OR last_used_at <= ?)')
-      .run(now, id, now - DEVICE_TOUCH_INTERVAL_MS)
+      .run(now, id, now - minIntervalMs)
   }
 
   listDevices(handle: string): Device[] {

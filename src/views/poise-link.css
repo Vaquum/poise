@@ -80,7 +80,8 @@
   color: var(--text-secondary);
 }
 
-.pl-device-state-active { color: var(--a3); }
+.pl-device-state-connected { color: var(--a3); }
+.pl-device-state-disconnected { color: var(--a4); }
 .pl-device-state-revoked,
 .pl-device-state-expired { color: var(--text-tertiary); }
 

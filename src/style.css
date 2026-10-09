@@ -1983,6 +1983,7 @@ body:has(#behavior-memory-panel.open) #menu-toggle {
   margin-top: var(--sp-2);
 }
 .st-help-ok    { color: var(--green); }
+.st-help-warn  { color: var(--amber); }
 .st-help-error { color: var(--red); }
 
 .st-row {
@@ -5161,7 +5162,8 @@ body.editor-writer-mode .editor-focus-btn:hover { color: var(--text); }
 /* Add-snippet — the view's primary action: .st-save fill, trimmed to the
    header's pill rhythm. */
 .snip-add,
-.snip-import-open {
+.snip-import-open,
+.snip-link-settings {
   padding: var(--sp-1) var(--sp-3);
   border-radius: var(--r-pill);
 }
