@@ -297,6 +297,8 @@ describe('lazy start', () => {
     expect(dockerCalls(h).slice(5)).toEqual([
       'GET /containers/poise-ws-alice/json',
       'GET /images/poise-runtime:latest/json',
+      // Its release, made current before the new container starts; this image names none.
+      'GET /images/poise-runtime:latest/json',
       'DELETE /containers/poise-ws-alice',
       'POST /containers/create',
       'POST /containers/poise-ws-alice/start',
@@ -312,6 +314,8 @@ describe('lazy start', () => {
     await h.orchestrator.startInProgress('alice')
     expect(dockerCalls(h).slice(5)).toEqual([
       'GET /containers/poise-ws-alice/json',
+      'GET /images/poise-runtime:latest/json',
+      // Its release, made current before the new container starts; this image names none.
       'GET /images/poise-runtime:latest/json',
       'DELETE /containers/poise-ws-alice',
       'POST /containers/create',
@@ -383,6 +387,8 @@ describe('image upgrades', () => {
     expect(h.workspace.serviceRequests.length).toBeGreaterThan(1)
 
     expect(dockerCalls(h)).toEqual([
+      'GET /images/poise-runtime:latest/json',
+      // The release it carries, if it names one; this image does not, so every update needs a new container.
       'GET /images/poise-runtime:latest/json',
       'GET /containers/json',
       `GET /containers/${aliceId}/json`,

@@ -113,7 +113,7 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
 
       if (method === 'GET' && (match = /^\/images\/(.+)\/json$/.exec(path))) {
         const ref = decodeURI(match[1])
-        const id = images.get(ref) ?? ([...images.values()].includes(ref) ? ref : undefined)
+        const id = images.get(ref) ?? ([...images.values()].includes(ref) || imageLabels.has(ref) ? ref : undefined)
         return id
           ? send(res, 200, { Id: id, Config: { Labels: imageLabels.get(id) ?? null } })
           : send(res, 404, { message: `No such image: ${match[1]}` })
