@@ -949,7 +949,7 @@ class Onboarding {
       if (event.key === 'Escape' && !(event.target as Element).closest('.st-terminal')) event.preventDefault()
       if (event.key === 'Tab') this.trapFocus(event)
     })
-    for (const id of ['app', 'settings-panel', 'typo-panel', 'claude-auth-banner', 'menu-popover']) {
+    for (const id of ['app', 'settings-panel', 'typo-panel', 'analytics-panel', 'claude-auth-banner', 'menu-popover']) {
       const node = document.getElementById(id)
       if (node && !node.hasAttribute('inert')) {
         node.setAttribute('inert', '')

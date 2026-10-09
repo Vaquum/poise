@@ -945,9 +945,10 @@ tr:hover .review-btn { opacity: 1; }
   border-color: var(--text-tertiary);
 }
 
-/* ── Side panels (Typography, Settings, Behavior memory) ── */
+/* ── Side panels (Typography, Settings, Analytics, Behavior memory) ── */
 #typo-panel,
 #settings-panel,
+#analytics-panel,
 #behavior-memory-panel {
   position: fixed;
   /* Below the control bar rather than under it: the burger doubles as
@@ -974,8 +975,55 @@ tr:hover .review-btn { opacity: 1; }
 
 #typo-panel.open,
 #settings-panel.open,
+#analytics-panel.open,
 #behavior-memory-panel.open {
   transform: translateX(0);
+}
+
+/* ── Analytics panel ── */
+.analytics-range { margin-bottom: var(--sp-5); }
+.analytics-range button { flex: 1; padding-inline: 0; white-space: nowrap; }
+.analytics-status { margin: 0 0 var(--sp-4); }
+.analytics-groups { transition: opacity var(--t-base) ease; }
+/* The previous range's numbers stay in place while the next ones load,
+   dimmed so they do not read as the answer. */
+.analytics-groups.is-stale { opacity: 0.45; }
+.analytics-group { margin-bottom: var(--sp-5); }
+.analytics-group .tp-group-label { margin-top: 0; }
+.analytics-tiles {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-4) var(--sp-3);
+  margin: 0;
+}
+.analytics-tile { min-width: 0; }
+/* A tile left alone on its row takes the row, so its note has room. */
+.analytics-tile:last-child:nth-child(odd) { grid-column: 1 / -1; }
+.analytics-label {
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+  margin-bottom: 2px;
+}
+.analytics-value {
+  margin: 0;
+  font-size: 1.375rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+.analytics-note {
+  margin: 4px 0 0;
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}
+.analytics-group-note {
+  margin: var(--sp-3) 0 0;
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+  line-height: 1.5;
 }
 
 .tp-header {
