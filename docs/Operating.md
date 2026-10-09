@@ -55,8 +55,10 @@ five people, start with:
 - **Memory**: 16 GB, 32 GB if agents work on large codebases. An agent CLI
   and a test run each take several hundred megabytes to a few gigabytes.
 - **Disk**: 150 GB of SSD. Each home volume holds about 1 GB of provider
-  CLIs plus every repository its agents check out; the workspace image is
-  about 1 GB, and every upgrade adds a new one and some build cache.
+  CLIs plus the repositories its agents check out; review checkouts are
+  removed a day after their last use. The workspace image is about 1 GB; each
+  upgrade keeps the previous one and at most 5 GB of build cache, and removes
+  the rest ([Upgrades](#upgrades)).
 
 Run the scripts as a user who owns the checkout and may use Docker (root, or
 a member of the `docker` group).
@@ -512,9 +514,13 @@ git checkout main
 deploy/upgrade.sh
 ```
 
-Every upgrade keeps the previous image under its commit tag. List them with
-`docker image ls poise-runtime`, and remove the ones you no longer need with
-`docker image rm poise-runtime:<commit>` and `docker builder prune`.
+Every upgrade keeps the previous image under its commit tag, for a rollback
+to rebuild from cache. Once Poise is up, `deploy/install.sh` and
+`deploy/upgrade.sh` remove what older builds left: workspace images of
+earlier commits that no container uses, Poise's images that lost their tag
+to a newer build, and Docker's build cache beyond 5 GB (`build_cache_limit`
+in `deploy/lib.sh`; the cache is shared with the server's other builds). List
+what is left with `docker image ls poise-runtime` and `docker system df`.
 
 Settings that shape a workspace container (its limits and runtime) apply to
 containers the gateway creates from then on. To apply them to an existing

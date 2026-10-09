@@ -66,6 +66,8 @@ only_listed_keys claude-code.gpg 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
 EOF
 
 FROM node:22-bookworm-slim
+# deploy/lib.sh removes the workspace images an upgrade leaves without a tag by this label.
+LABEL poise.image=runtime
 
 COPY --from=keys /keys/githubcli-archive-keyring.gpg /etc/apt/keyrings/githubcli-archive-keyring.gpg
 # install-clis.sh checks Claude Code's signed release manifest with it.

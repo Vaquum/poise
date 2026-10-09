@@ -157,6 +157,55 @@ build_runtime_image() {
     --build-arg "POISE_RELEASE=$release" --build-arg "POISE_BASE=$(runtime_base)" "${tags[@]}" "$root"
 }
 
+# Docker's build cache may keep this much once a deploy finishes: the layers
+# the next build reuses. The cache is shared with the server's other builds.
+build_cache_limit=5GB
+
+# Removes what earlier builds left behind: workspace images under older commit
+# tags, Poise images that lost their tag to a newer build (labelled
+# poise.image), and build cache beyond build_cache_limit. It keeps IMAGE, the
+# build before it, so a rollback to that commit rebuilds from cache, and every
+# image a container uses: a workspace the gateway has yet to recreate keeps
+# its image until a later deploy. Nothing here stops a deploy.
+prune_docker_storage() {
+  local image=$1 name=$1 current ids used='' tag id previous='' removed=0 help cache_flag=--keep-storage
+  if [[ ${image##*/} == *:* ]]; then name=${image%:*}; fi
+  current=$(docker image inspect --format '{{.Id}}' "$image") || return 0
+  ids=$(docker ps --all --quiet) || return 0
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086 # one argument per container ID
+    used=" $(docker inspect --format '{{.Image}}' $ids 2>/dev/null | tr '\n' ' ')" || true
+  fi
+  while read -r _ id tag; do
+    if [ "$id" = "$current" ]; then continue; fi
+    if [ -z "$previous" ]; then
+      previous=$tag
+      continue
+    fi
+    if [[ $used == *" $id "* ]]; then continue; fi
+    if docker image rm "$name:$tag" >/dev/null; then
+      removed=$((removed + 1))
+    else
+      warn "could not remove the workspace image $name:$tag; the next deploy tries again."
+    fi
+  done < <(
+    for tag in $(docker image ls "$name" --format '{{.Tag}}' | grep -E '^[0-9a-f]{40}$'); do
+      printf '%s %s\n' "$(docker image inspect --format '{{.Created}} {{.Id}}' "$name:$tag")" "$tag"
+    done | sort -r
+  )
+  if [ $removed -gt 0 ]; then say "Removed $removed workspace images of earlier commits."; fi
+  docker image prune --force --filter label=poise.image >/dev/null \
+    || warn "could not remove Poise images that lost their tag; the next deploy tries again."
+  # Docker 28 and later name the limit --max-used-space; earlier ones --keep-storage.
+  help=$(docker builder prune --help 2>&1) || true
+  if [[ $help == *--max-used-space* ]]; then cache_flag=--max-used-space; fi
+  if docker builder prune --force "$cache_flag" "$build_cache_limit" >/dev/null; then
+    say "Docker's build cache keeps at most $build_cache_limit."
+  else
+    warn "could not trim Docker's build cache to $build_cache_limit; the next deploy tries again."
+  fi
+}
+
 # A recreated gateway container is on Compose's network alone; the gateway
 # joins every workspace's network itself as it starts, before it answers. Once
 # it answers, check that it shares a network with each running workspace,
