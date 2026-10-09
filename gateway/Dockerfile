@@ -11,6 +11,8 @@ COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
 FROM node:22-bookworm-slim
+# deploy/lib.sh removes the gateway images an upgrade leaves without a tag by this label.
+LABEL poise.image=gateway
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build /app/package.json ./
