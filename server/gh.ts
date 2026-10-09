@@ -45,7 +45,10 @@ const GH_INTERFACE_CWD_ROOT = join(tmpdir(), 'poise-gh-interface')
 // checks within the tick.
 const GREEN_TTL_MS = 60_000
 const GREEN_CONCURRENCY = 5
-const greenCache = new Map<string, { green: boolean, expiry: number }>()
+// Current's colour for a pull request: green when it is ready to merge, yellow when
+// its merge button is green but a check fails or runs, or a conversation is open.
+type PrColour = 'green' | 'yellow'
+const greenCache = new Map<string, { status: PrColour | null, expiry: number }>()
 
 // Subset of fields the datastore returns. Pr-only and issue-only fields
 // are optional; the user-footprint view adds `item_type` and `reasons`.
@@ -284,11 +287,11 @@ export async function getHeadSha(
 // github-interface infers the repo from cwd when no `--repository` flag
 // or git remote is available. We just point cwd at a tmp directory whose
 // last two parts are `<owner>/<repo>` and the CLI picks it up.
-async function checkMergeable(owner: string, repo: string, number: number, agent: string): Promise<boolean> {
+async function checkPrStatus(owner: string, repo: string, number: number, agent: string): Promise<PrColour | null> {
   const key = `${owner}/${repo}#${number}`
   const now = Date.now()
   const cached = greenCache.get(key)
-  if (cached && cached.expiry > now) return cached.green
+  if (cached && cached.expiry > now) return cached.status
 
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, repo)
   try {
@@ -299,39 +302,42 @@ async function checkMergeable(owner: string, repo: string, number: number, agent
       maxOutputBytes: 1 * 1024 * 1024,
     })
     const result = JSON.parse(stdout)
-    const green = !!result.mergeable
-    greenCache.set(key, { green, expiry: now + GREEN_TTL_MS })
-    return green
+    // A github-interface that reports no status says only whether the PR is clean: green.
+    const status: PrColour | null = result.status === 'green' || result.status === 'yellow'
+      ? result.status
+      : result.status === undefined && result.mergeable ? 'green' : null
+    greenCache.set(key, { status, expiry: now + GREEN_TTL_MS })
+    return status
   } catch {
     // Network blip / API error / parse failure — cache the negative so we
     // don't hammer on every retry. Better to under-show green than to
     // over-show it.
-    greenCache.set(key, { green: false, expiry: now + GREEN_TTL_MS })
-    return false
+    greenCache.set(key, { status: null, expiry: now + GREEN_TTL_MS })
+    return null
   }
 }
 
 // Resolve mergeable-true PRs across the user's open-PR set. Concurrency
 // capped to be polite to GitHub's REST endpoint — typical involvement
 // only has a handful of open PRs at once.
-async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promise<{ records: { repo: string, number: number }[], errors: OrganizationReadError[] }> {
+async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promise<{ records: { repo: string, number: number, status: PrColour }[], errors: OrganizationReadError[] }> {
   // Checked up front: each check below fails quietly to "not green", which
   // would hide a missing agent account behind an empty result.
   const agent = requireAgentAccount()
   const read = await fetchKind('pr', { ...body, record_state: 'open', count_only: true }, me, orgs)
   const openPrs = read.records
 
-  const results: { repo: string, number: number }[] = []
+  const results: { repo: string, number: number, status: PrColour }[] = []
   for (let i = 0; i < openPrs.length; i += GREEN_CONCURRENCY) {
     const chunk = openPrs.slice(i, i + GREEN_CONCURRENCY)
     const checks = await Promise.all(chunk.map(async (pr) => {
-      if (!pr.repo.includes('/')) return { pr, green: false }
+      if (!pr.repo.includes('/')) return { pr, status: null }
       const [owner, repoName] = pr.repo.split('/', 2)
-      const green = await checkMergeable(owner, repoName, pr.number, agent)
-      return { pr, green }
+      const status = await checkPrStatus(owner, repoName, pr.number, agent)
+      return { pr, status }
     }))
-    for (const { pr, green } of checks) {
-      if (green) results.push({ repo: pr.repo, number: pr.number })
+    for (const { pr, status } of checks) {
+      if (status) results.push({ repo: pr.repo, number: pr.number, status })
     }
   }
   return { records: results, errors: read.errors }
