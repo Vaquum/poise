@@ -18,6 +18,7 @@ import { getSelectedOrganization, setSelectedOrganization } from './organization
 import { initServiceSettings, openServicePlace, takeServicePlace } from './service-settings'
 import { restartOnboarding, startOnboarding } from './onboarding'
 import { watchForUpdates } from './updating'
+import { watchForSignOut } from './signed-out'
 import './views/updating.css'
 
 const viewMainEl = document.getElementById('view-main')!
@@ -140,6 +141,11 @@ const menu = initMenu({
 // Before anything asks the server: an answer the gateway marks as updating
 // dims the page until the new version is up.
 watchForUpdates()
+// A sign-in in front of Poise that has ended turns every request away; the
+// page then says so once, instead of failing view by view. Only a gateway or a
+// login proxy turns requests away like that, so a personal computer never sees
+// it. Installed at once, not after a first answer that may itself fail.
+watchForSignOut()
 
 ;(async () => {
   await loadSettings()

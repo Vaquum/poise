@@ -1,5 +1,6 @@
 /* "Updating to the latest version": the whole page dimmed for the seconds a
-   workspace restarts onto a new release (src/updating.ts). */
+   workspace restarts onto a new release (src/updating.ts). "Your sign-in has
+   ended" shares the look, with one action (src/signed-out.ts). */
 
 :root { --up-scrim: rgba(22, 26, 32, 0.45); }
 [data-theme="dark"] { --up-scrim: rgba(0, 0, 0, 0.66); }
@@ -59,3 +60,5 @@
 @media (prefers-reduced-motion: reduce) {
   .up-spinner { animation-duration: 2.4s; }
 }
+
+.up-action { margin-top: var(--sp-2); }

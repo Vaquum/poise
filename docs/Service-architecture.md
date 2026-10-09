@@ -100,6 +100,15 @@ workspace can reach another one.
   itself with a "starting your workspace" page that reloads until the
   workspace is ready, and other requests with `503`. For an admin whose start
   failed, the page links to the apex admin page.
+- When the sign-in in front of an open page ends, every request it makes is
+  turned away. The gateway answers 401 once its own session has ended. A login
+  proxy in front of the gateway, such as a portal, redirects to its own login
+  page, which the page's requests cannot follow. Poise then checks once,
+  without following redirects, whether `/api/workspace` is turned away too: a
+  401 or a redirect. If it is, Poise dims the page under "Your sign-in has
+  ended" with **Sign in again**, which reloads the page through the sign-in
+  and back (`src/signed-out.ts`). A server that cannot be reached at all is not
+  an ended sign-in.
 
 **Gateway API on workspace hosts.** Poise's Settings calls the gateway at
 `/_poise/api/*` on its own host; the gateway answers itself and nothing reaches
