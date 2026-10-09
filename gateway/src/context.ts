@@ -53,7 +53,10 @@ export class Context {
       'content-security-policy': `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${this.apexOrigin}; frame-ancestors 'none'; base-uri 'none'`,
       'x-frame-options': 'DENY',
       'x-content-type-options': 'nosniff',
-      'referrer-policy': 'no-referrer',
+      // Not no-referrer: under it a browser sends `Origin: null` with every form post, even to this
+      // origin, and verifyForm refuses it, as does any proxy in front that refuses cross-origin
+      // requests. same-origin still gives no other origin a Referer.
+      'referrer-policy': 'same-origin',
     }
   }
 
