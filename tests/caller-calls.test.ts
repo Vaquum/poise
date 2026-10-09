@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
 import { spawnSync } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -27,6 +27,12 @@ describe('Caller calls still running', () => {
     insert.run('turn', 'running', null, 'external')
     db.close()
     expect(liveCallerCalls(dir)).toBe(1)
+  })
+
+  it('says it cannot tell when the records exist but cannot be read', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'poise-caller-calls-'))
+    await writeFile(join(dir, 'calls.sqlite3'), 'not a database')
+    expect(liveCallerCalls(dir)).toBeNull()
   })
 
   it('counts nothing without records', async () => {

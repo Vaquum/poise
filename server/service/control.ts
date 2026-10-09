@@ -115,9 +115,10 @@ export class ServiceControl {
       mode: 'service',
       version: BUILD_SHA,
       activeChatTurns,
-      runningCallerCalls: calls,
+      runningCallerCalls: calls.count,
       backgroundWork,
-      idle: activeChatTurns + calls + backgroundWork === 0,
+      // Never idle while Caller's records cannot be read: calls an earlier server started may still run.
+      idle: calls.known && activeChatTurns + calls.count + backgroundWork === 0,
       draining: this.drainOn,
       release: this.release.name,
     }

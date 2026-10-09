@@ -32,8 +32,9 @@ function alive(pid: number): boolean {
   }
 }
 
-/** Caller calls recorded as running whose process is alive, whichever server started them. */
-export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR): number {
+/** Caller calls recorded as running whose process is alive, whichever server
+ *  started them; null when the records exist but cannot be read. */
+export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR): number | null {
   const path = dataDir ? join(dataDir, 'calls.sqlite3') : ''
   if (!path || !existsSync(path)) return 0
   let db: InstanceType<typeof Database> | undefined
@@ -43,13 +44,16 @@ export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR):
     const rows = db.prepare("select pid from calls where status = 'running' and pid is not null and runner is null").all() as Array<{ pid: unknown }>
     return rows.filter(({ pid }) => Number.isSafeInteger(Number(pid)) && Number(pid) > 0 && alive(Number(pid))).length
   } catch {
-    // Unreadable records count nothing; this server's own launches are still counted.
-    return 0
+    // Unknown, not none: calls an earlier server started may be running unseen.
+    return null
   } finally {
     db?.close()
   }
 }
 
-export function runningCallerCalls(): number {
-  return Math.max(runningCallerLaunches() + debates, liveCallerCalls())
+/** The Caller calls a restart would cut. `known` is false while Caller's
+ *  records cannot be read; `count` then holds this server's own launches. */
+export function runningCallerCalls(): { count: number, known: boolean } {
+  const live = liveCallerCalls()
+  return { count: Math.max(runningCallerLaunches() + debates, live ?? 0), known: live !== null }
 }

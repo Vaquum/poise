@@ -120,6 +120,20 @@ describe('service health', () => {
     launch()
     expect(service.health()).toMatchObject({ backgroundWork: 0, idle: true })
   })
+
+  it('is never idle while Caller\'s records cannot be read, since an earlier server\'s calls may still run', async () => {
+    const { service } = serviceOf()
+    const records = join(root, 'caller-records')
+    await mkdir(records, { recursive: true })
+    await writeFile(join(records, 'calls.sqlite3'), 'not a database')
+    vi.stubEnv('AGENT_INTERFACE_DATA_DIR', records)
+    try {
+      expect(service.health()).toMatchObject({ runningCallerCalls: 0, idle: false })
+    } finally {
+      vi.stubEnv('AGENT_INTERFACE_DATA_DIR', '')
+    }
+    expect(service.health()).toMatchObject({ idle: true })
+  })
 })
 
 describe('service drain', () => {
