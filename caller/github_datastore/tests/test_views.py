@@ -181,9 +181,23 @@ class ViewsTest(unittest.TestCase):
             init_db(conn)
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], VIEW_SCHEMA_VERSION)
             columns = [column[0] for column in conn.execute("SELECT * FROM user_items LIMIT 0").description]
-            pr_columns = [column[0] for column in conn.execute("SELECT * FROM prs LIMIT 0").description]
             conn.close()
             self.assertIn("evidence_count", columns)
+
+    def test_a_version_2_database_gets_pull_request_sizes(self) -> None:
+        # A version-2 database has every view name, so only the version
+        # number tells init_db that its prs view lacks the size columns.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            conn.execute("DROP VIEW prs")
+            conn.execute("CREATE VIEW prs AS SELECT item_id AS pr_ref FROM items WHERE item_type = 'pr'")
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+            init_db(conn)
+            pr_columns = [column[0] for column in conn.execute("SELECT * FROM prs LIMIT 0").description]
+            conn.close()
             self.assertIn("additions", pr_columns)
             self.assertIn("deletions", pr_columns)
 
