@@ -115,7 +115,7 @@ export async function setupWorkspace(page: Page, initial: Partial<SetupState> = 
       case '/_poise/api/devices': return route.fulfill({ json: { devices: state.devices } })
       case '/_poise/api/devices/pair':
         setTimeout(() => {
-          state.devices = [{ id: 'laptop', label: 'PoiseLink/0.3.1', createdAt: Date.parse('2026-10-09T07:00:00Z'), lastUsedAt: null, revokedAt: null, state: 'active' }]
+          state.devices = [{ id: 'laptop', label: 'PoiseLink/0.3.1', createdAt: Date.parse('2026-10-09T07:00:00Z'), lastUsedAt: null, revokedAt: null, state: 'active', connected: true }]
         }, 300)
         return route.fulfill({ json: { decision: 'approve', message: 'Approved. Poise Link on that computer is now paired with octocat.poise.example.test.' } })
     }

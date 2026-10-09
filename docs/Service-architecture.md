@@ -112,8 +112,11 @@ the workspace.
 - `GET /_poise/api/account` returns `{ login, handle, isAdmin, workspaceHost,
   apexOrigin, link: { installer, releases } }`.
 - `GET /_poise/api/devices` returns `{ devices: [{ id, label, createdAt,
-  lastUsedAt, revokedAt, state }] }`, times in milliseconds and `state` one of
-  `active`, `revoked` or `expired`.
+  lastUsedAt, revokedAt, state, connected }] }`, times in milliseconds and
+  `state` one of `active`, `revoked` or `expired`. `connected` is true while an
+  active device holds `/api/link/events` open through the gateway and the
+  workspace has answered it with 200; the gateway keeps this in memory. When
+  that stream closes, `lastUsedAt` becomes that moment.
 - `POST /_poise/api/devices/pair` with `{ userCode, decision }`, `decision`
   being `approve` or `deny`, returns `{ decision, message }`. An unknown or
   expired code answers 400 `invalid_code`. More than 10 codes per sign-in in
@@ -554,7 +557,9 @@ refusal under the row whose Replay was pressed.
 **Snippets are edited only in Poise:** the Snippets view, Chat's `/create`, and
 the Editor's "save selection as snippet". The desktop copy is generated.
 Snippets view → Import takes an Espanso YAML file once and adds its simple
-trigger/replace pairs, reporting any it skipped.
+trigger/replace pairs, reporting any it skipped. In a workspace the Snippets
+view says, from the devices answer, whether Poise Link is connected, so whether
+a change reaches the desktop now or once Poise Link runs there.
 
 **Device pairing** (gateway, on the apex):
 1. `POST /link/device/code` returns

@@ -24,6 +24,8 @@ export interface PoiseLinkOptions {
 // seconds; the list is read until its device shows up.
 const PAIRING_POLL_MS = 2_500
 const PAIRING_WATCH_MS = 2 * 60_000
+// While the list is on screen it follows computers connecting and going away.
+const LIVE_REFRESH_MS = 10_000
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
@@ -38,21 +40,60 @@ function moment(ms: number): string {
   return new Date(ms).toLocaleString([], { timeZone: effectiveTimezone(), dateStyle: 'medium', timeStyle: 'short' })
 }
 
-const STATE_TEXT: Record<PairedDevice['state'], string> = { active: 'Paired', revoked: 'Revoked', expired: 'Expired' }
+// Paired is not running: an active device is Connected only while its Poise
+// Link holds the event stream open, which the gateway reports.
+function badge(device: PairedDevice): { text: string, tone: string } {
+  if (device.state === 'revoked') return { text: 'Revoked', tone: 'revoked' }
+  if (device.state === 'expired') return { text: 'Expired', tone: 'expired' }
+  return device.connected ? { text: 'Connected', tone: 'connected' } : { text: 'Not connected', tone: 'disconnected' }
+}
+
+function seen(device: PairedDevice): string {
+  if (device.connected) return ''
+  return device.lastUsedAt ? ` · last seen ${moment(device.lastUsedAt)}` : ' · never connected'
+}
+
+const NOT_CONNECTED_HELP = 'Poise Link is not running on that computer, or it cannot reach Poise. Snippets and alerts reach it once it connects again.'
 
 function devicesHtml(devices: PairedDevice[]): string {
   if (!devices.length) return '<div class="st-help st-help-info">No computer is paired yet.</div>'
-  return devices.map((device) => `
+  return devices.map((device) => {
+    const state = badge(device)
+    return `
     <div class="pl-device" data-device="${escapeHtml(device.id)}">
       <div class="pl-device-head">
         <span class="pl-device-name">${escapeHtml(deviceName(device))}</span>
-        <span class="pl-device-state pl-device-state-${device.state}">${STATE_TEXT[device.state]}</span>
+        <span class="pl-device-state pl-device-state-${state.tone}">${state.text}</span>
       </div>
-      <div class="st-help st-help-info">Paired ${escapeHtml(moment(device.createdAt))} · ${device.lastUsedAt ? `last used ${escapeHtml(moment(device.lastUsedAt))}` : 'not used yet'}</div>
+      <div class="st-help st-help-info pl-device-times">Paired ${escapeHtml(moment(device.createdAt))}${escapeHtml(seen(device))}</div>
+      ${device.state === 'active' && !device.connected ? `<div class="st-help st-help-info">${NOT_CONNECTED_HELP}</div>` : ''}
       ${device.state === 'active'
         ? `<button type="button" class="st-clear pl-revoke" data-revoke="${escapeHtml(device.id)}">Revoke</button>`
         : device.state === 'expired' ? '<div class="st-help st-help-info">Pair it again in Poise Link.</div>' : ''}
-    </div>`).join('')
+    </div>`
+  }).join('')
+}
+
+export interface LinkStanding {
+  text: string
+  tone: 'ok' | 'warn'
+  /** Settings → Poise Link is where to act on it. */
+  act: boolean
+}
+
+/** Whether a change made in Poise reaches a computer now, as the Snippets view says it. */
+export function linkStanding(devices: PairedDevice[]): LinkStanding {
+  const active = devices.filter((device) => device.state === 'active')
+  const connected = active.filter((device) => device.connected).length
+  if (connected === 1) return { text: 'Poise Link is connected: changes reach your computer in seconds.', tone: 'ok', act: false }
+  if (connected > 1) return { text: `Poise Link is connected on ${connected} computers: changes reach them in seconds.`, tone: 'ok', act: false }
+  if (!active.length) return { text: 'No computer is paired with Poise Link, so snippets reach no desktop.', tone: 'warn', act: true }
+  const last = Math.max(...active.map((device) => device.lastUsedAt ?? 0))
+  return {
+    text: `Poise Link is not connected${last ? ` (last seen ${moment(last)})` : ''}. Changes reach your computer once Poise Link runs there.`,
+    tone: 'warn',
+    act: true,
+  }
 }
 
 // Settings and first-run setup can each hold a section at once.
@@ -103,6 +144,7 @@ export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOpti
   let disposed = false
   let watchTimer: ReturnType<typeof setTimeout> | null = null
   let copyTimer: ReturnType<typeof setTimeout> | null = null
+  let onScreen = false
 
   const status = (text: string, tone: 'info' | 'ok' | 'error' = 'info') => {
     statusEl.textContent = text
@@ -219,6 +261,18 @@ export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOpti
     }
   })
 
+  // Settings slides in from off screen and keeps a closed tab hidden: read the
+  // list again as it comes into view, and every few seconds while it stays.
+  const visibility = new IntersectionObserver((entries) => {
+    const visible = entries[entries.length - 1]?.isIntersecting ?? false
+    if (visible && !onScreen) void refresh()
+    onScreen = visible
+  })
+  visibility.observe(element)
+  const liveTimer = setInterval(() => {
+    if (onScreen && document.visibilityState === 'visible') void refresh()
+  }, LIVE_REFRESH_MS)
+
   void refresh()
   return {
     element,
@@ -226,6 +280,8 @@ export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOpti
     dispose: () => {
       disposed = true
       stopWatching()
+      visibility.disconnect()
+      clearInterval(liveTimer)
       if (copyTimer) clearTimeout(copyTimer)
       element.remove()
     },

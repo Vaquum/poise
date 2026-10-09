@@ -117,11 +117,16 @@ export function decideCode(ctx: Context, principal: Principal, userCodeInput: st
 
 export interface DeviceView extends Device {
   state: 'active' | 'revoked' | 'expired'
+  /** Its Poise Link holds the event stream open right now, so snippets and alerts reach it. */
+  connected: boolean
 }
 
 export function listDevices(ctx: Context, handle: string): DeviceView[] {
   const now = ctx.deps.now()
-  return ctx.deps.store.listDevices(handle).map((device) => ({ ...device, state: deviceState(device, now) }))
+  return ctx.deps.store.listDevices(handle).map((device) => {
+    const state = deviceState(device, now)
+    return { ...device, state, connected: state === 'active' && ctx.linkStreams.connected(device.id) }
+  })
 }
 
 export function revokeDevice(ctx: Context, principal: Principal, id: string): void {

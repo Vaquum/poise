@@ -91,6 +91,13 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
       req.socket.destroy()
       return
     }
+    if (url === '/api/link/events') {
+      // Poise Link's event stream: answered at once and held open until the device goes.
+      stub.requests.push({ method: req.method ?? '', url, headers: req.headers, body: '' })
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' })
+      res.write('retry: 3000\n\n')
+      return
+    }
     if (url === '/status/099' || url === '/status/999') {
       rawAnswer(req.socket, `HTTP/1.1 ${url.slice(-3)} Odd\r\ncontent-length: 2\r\n\r\nhi`)
       return
