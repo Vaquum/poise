@@ -54,7 +54,33 @@ export interface ContainerSpec {
   NetworkingConfig: { EndpointsConfig: Record<string, Record<string, never>> }
 }
 
+/**
+ * A short-lived container that runs one command and exits, such as installing a release into a workspace's
+ * home volume (Orchestrator.installRelease). It carries no poise.managed label, so it is never taken for a
+ * workspace.
+ */
+export interface TaskSpec {
+  Image: string
+  User: string
+  Entrypoint: string[]
+  Cmd: string[]
+  Env: string[]
+  Labels: Record<string, string>
+  HostConfig: {
+    SecurityOpt: string[]
+    CapDrop: string[]
+    Memory: number
+    NanoCpus: number
+    PidsLimit: number
+    Runtime?: string
+    Mounts: ContainerMount[]
+    NetworkMode: 'none'
+  }
+}
+
 const TIMEOUT_MS = 60_000
+/** How long a task container may run before the gateway gives up waiting for it. */
+const TASK_TIMEOUT_MS = 10 * 60_000
 
 /**
  * The slice of the Docker Engine API the gateway needs, over the Engine's unix socket.
@@ -67,6 +93,13 @@ export class DockerClient {
   async imageId(name: string): Promise<string | null> {
     const response = await this.call('GET', `/images/${encodeURI(name)}/json`, undefined, [404])
     return response.status === 404 ? null : (response.body as { Id: string }).Id
+  }
+
+  /** An image's labels, by name or ID; null when there is no such image. */
+  async imageLabels(name: string): Promise<Record<string, string> | null> {
+    const response = await this.call('GET', `/images/${encodeURI(name)}/json`, undefined, [404])
+    if (response.status === 404) return null
+    return (response.body as { Config?: { Labels?: Record<string, string> | null } | null }).Config?.Labels ?? {}
   }
 
   async inspectContainer(name: string): Promise<ContainerDetails | null> {
@@ -121,7 +154,20 @@ export class DockerClient {
     await this.call('DELETE', `/containers/${encodeURIComponent(name)}`)
   }
 
-  private call(method: string, path: string, body?: unknown, accepted: number[] = []): Promise<{ status: number; body: unknown }> {
+  /** Runs a task container to its end and removes it; resolves with its exit code. */
+  async runTask(name: string, spec: TaskSpec): Promise<number> {
+    await this.call('DELETE', `/containers/${encodeURIComponent(name)}?force=true`, undefined, [404])
+    await this.call('POST', `/containers/create?name=${encodeURIComponent(name)}`, spec)
+    try {
+      await this.call('POST', `/containers/${encodeURIComponent(name)}/start`)
+      const result = await this.call('POST', `/containers/${encodeURIComponent(name)}/wait`, undefined, [], TASK_TIMEOUT_MS)
+      return Number((result.body as { StatusCode?: unknown }).StatusCode ?? -1)
+    } finally {
+      await this.call('DELETE', `/containers/${encodeURIComponent(name)}?force=true`, undefined, [404])
+    }
+  }
+
+  private call(method: string, path: string, body?: unknown, accepted: number[] = [], timeoutMs = TIMEOUT_MS): Promise<{ status: number; body: unknown }> {
     const operation = `${method} ${path.split('?')[0]}`
     return new Promise((resolve, reject) => {
       const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body))
@@ -159,7 +205,7 @@ export class DockerClient {
           reject(new DockerError(status, `Docker Engine ${operation} failed with HTTP ${status}: ${message}`))
         })
       })
-      req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error(`timed out after ${TIMEOUT_MS / 1000} seconds`)))
+      req.setTimeout(timeoutMs, () => req.destroy(new Error(`timed out after ${timeoutMs / 1000} seconds`)))
       req.on('error', (error) => reject(new Error(`Docker Engine ${operation} at ${this.socketPath} failed: ${error.message}`)))
       req.end(payload)
     })

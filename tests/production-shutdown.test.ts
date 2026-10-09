@@ -55,6 +55,17 @@ describe('production shutdown', () => {
     expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
   })
 
+  it('exits with the code a release switch asks for once it has shut down', async () => {
+    mocks.stopPoiseRuntime.mockResolvedValue(undefined)
+    const production = await import('../server/production')
+    const server = production.createProductionServer()
+    const exits: number[] = []
+    const shutdown = production.createProductionShutdown(server, (code) => { exits.push(code) })
+    shutdown(75)
+    await vi.waitFor(() => expect(exits).toEqual([75]))
+    expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
+  })
+
   it('forces shutdown once after the ten-second deadline', async () => {
     vi.useFakeTimers()
     let releaseRuntime!: () => void

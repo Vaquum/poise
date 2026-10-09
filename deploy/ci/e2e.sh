@@ -393,31 +393,32 @@ next_commit() {
   git -C "$next" rev-parse HEAD
 }
 
+# The new commit leaves the workspace image's base as it was, so the gateway
+# updates alice's workspace in place: it installs the new release in it and
+# Poise restarts on it alone, in the same container, while a process Poise
+# does not wait for, as it does not wait for a detached agent call, runs on.
 check_upgrade() {
-  local sha before image id current status health recreated=false
+  local sha before version=''
   before=$(docker inspect --format '{{.Id}}' poise-ws-alice)
+  docker exec --detach poise-ws-alice setsid sleep 3600
   sha=$(next_commit)
   "$deploy/upgrade.sh" | tee "$work/upgrade.log"
   [ "$(git -C "$root" rev-parse HEAD)" = "$sha" ] || fail "upgrade.sh did not pull $sha"
-  grep --quiet 'alice: running. The gateway drains it first' "$work/upgrade.log" || fail "upgrade.sh did not say it will drain alice's workspace"
+  grep --quiet 'alice: running. The gateway installs the new release in it' "$work/upgrade.log" \
+    || fail "upgrade.sh did not say it will update alice's workspace in place"
   docker image inspect "poise-runtime:$sha" >/dev/null || fail "upgrade.sh did not tag the image with the commit"
-  image=$(docker image inspect --format '{{.Id}}' poise-runtime:latest)
   # The gateway looks for outdated workspaces when it starts and every five minutes.
   for _ in $(seq 1 90); do
-    read -r id current status health < <(docker inspect --format \
-      '{{.Id}} {{.Image}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' poise-ws-alice 2>/dev/null || echo gone)
-    if [ "$id" != "$before" ] && [ "$current" = "$image" ] && [ "$status" = running ] && [ "$health" = healthy ]; then
-      recreated=true
-      break
-    fi
+    version=$(workspace_version 2>/dev/null || true)
+    [ "$version" = "$sha" ] && break
     sleep 5
   done
-  [ "$recreated" = true ] || fail "the gateway did not recreate alice's workspace on the new image within 7.5 minutes: $id $current $status $health"
-  docker logs poise-gateway 2>&1 | grep '"handle":"alice"' | grep --quiet '"event":"workspace.drain.requested"' \
-    || fail "the gateway recreated alice's workspace without draining it"
-  pass "the gateway drained alice's workspace and recreated it on the new image"
-  [ "$(workspace_version)" = "$sha" ] || fail "the workspace reports version $(workspace_version), not $sha"
-  pass "the workspace reports the new commit"
+  [ "$version" = "$sha" ] || fail "alice's workspace did not come back on $sha within 7.5 minutes; it reports '$version'"
+  [ "$(docker inspect --format '{{.Id}}' poise-ws-alice)" = "$before" ] || fail "the gateway replaced alice's container instead of updating it in place"
+  in_workspace pgrep -f 'sleep 3600' >/dev/null || fail "a process running in alice's workspace did not survive the update"
+  docker logs poise-gateway 2>&1 | grep '"handle":"alice"' | grep --quiet '"event":"workspace.update.requested"' \
+    || fail "the gateway did not log the switch it asked for"
+  pass "the gateway updated alice's workspace in place: Poise runs $sha in the same container, and its other processes kept running"
   check_data "$(cat "$work/marker")"
   wait_for_poise "$alice" alice
 }

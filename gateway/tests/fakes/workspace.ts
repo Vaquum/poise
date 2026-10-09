@@ -15,6 +15,8 @@ export interface StubHealth {
   runningCallerCalls: number
   backgroundWork: number
   draining: boolean
+  /** The release its supervisor runs; null for a workspace started without one. */
+  release: string | null
 }
 
 /**
@@ -32,6 +34,8 @@ export interface WorkspaceStub {
   healthPadding: number
   requests: SeenRequest[]
   serviceRequests: SeenRequest[]
+  /** The releases POST /api/service/switch was asked for. */
+  switches: string[]
   /** Every request line the stub parsed, including any a client smuggled past the gateway. */
   requestLines: string[]
   close(): Promise<void>
@@ -52,7 +56,8 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
   const stub: Omit<WorkspaceStub, 'port' | 'close'> = {
     reachable: true,
     healthStatus: 200,
-    health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, draining: false },
+    health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, draining: false, release: null },
+    switches: [],
     healthPadding: 0,
     requests: [],
     serviceRequests: [],
@@ -92,6 +97,11 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
       if (url.startsWith('/api/service/')) {
         stub.serviceRequests.push(seen)
         if (url === '/api/service/drain' && req.method === 'POST') stub.health.draining = true
+        if (url === '/api/service/switch' && req.method === 'POST') {
+          const { release } = JSON.parse(seen.body || '{}') as { release?: string }
+          stub.switches.push(String(release))
+          return json(res, 202, { release, switching: release !== stub.health.release })
+        }
         if (url === '/api/service/health' || url === '/api/service/drain') {
           if (stub.healthStatus !== 200) return json(res, stub.healthStatus, { error: 'refused' })
           return json(res, 200, healthBody())

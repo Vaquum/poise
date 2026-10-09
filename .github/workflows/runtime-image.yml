@@ -68,6 +68,9 @@ jobs:
       - name: Check that a failed CLI bootstrap leaves Poise running
         run: deploy/runtime/test/smoke.sh offline poise-runtime:ci
 
+      - name: Check that a release switch restarts Poise alone
+        run: deploy/runtime/test/smoke.sh switch poise-runtime:ci
+
       # Installing the provider CLIs downloads about a gigabyte from five
       # vendors, so it runs only when the image's own files change.
       - name: Check whether the image's own files changed

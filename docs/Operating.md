@@ -473,12 +473,21 @@ A fork that deploys itself does this at every push to its main
 ([Run your own Poise from a fork](#run-your-own-poise-from-a-fork)).
 
 The gateway upgrades those workspaces by itself, when it starts and every
-five minutes. It drains a running workspace first: the workspace refuses new
-Chat turns and agent launches, which then answer that Poise is installing an
-update, and lets running work finish. Once it is idle, or after
-`POISE_DRAIN_TIMEOUT` seconds (30 minutes by default), the gateway recreates
-the container on the new image with the same home volume. A stopped
-workspace is recreated without being started. Follow it in the gateway's log:
+five minutes. Most upgrades change Poise but not the system it runs on, and
+those happen in place: the gateway installs the new release into each
+running workspace, and Poise restarts on it alone within seconds, at a moment
+no Chat turn runs. Agents and reviews keep running through it, and the open
+page shows "Updating to the latest version" until it reloads into the new
+version (docs/Service-architecture.md, "Updates in place").
+
+An upgrade that changes the system itself, the files under `deploy/runtime/`,
+gets a new container instead. The gateway drains a running workspace first:
+the workspace refuses new Chat turns and agent launches, which then answer
+that Poise is installing an update, and lets running work finish. Once it is
+idle, or after `POISE_DRAIN_TIMEOUT` seconds (30 minutes by default), the
+gateway recreates the container on the new image with the same home volume. A
+stopped workspace is recreated without being started. Follow it all in the
+gateway's log:
 
 ```bash
 docker logs --follow poise-gateway 2>&1 | grep workspace.

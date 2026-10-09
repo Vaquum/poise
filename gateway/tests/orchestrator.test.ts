@@ -533,6 +533,126 @@ describe('image upgrades', () => {
   })
 })
 
+describe('updates in place', () => {
+  let h: Harness
+  const BASE = 'base-1'
+  const start = async (options: { oldBase?: string | null; running?: boolean; release?: string | null } = {}) => {
+    const { oldBase = BASE, running = true, release = 'old-release' } = options
+    h = await startHarness()
+    await h.openWorkspace('Alice')
+    h.store.noteWorkspace('alice', 'Alice')
+    h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': BASE })
+    if (oldBase !== null) h.docker.imageLabels.set(OLD_IMAGE_ID, { 'poise.release': 'old-release', 'poise.base': oldBase })
+    addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, running)
+    h.workspace.health.release = release
+  }
+  const containerId = () => h.docker.containers.get('poise-ws-alice')?.id
+  afterEach(async () => {
+    await h.close()
+  })
+
+  it('installs a new release of the same base into a running workspace and asks Poise to switch, keeping its container', async () => {
+    await start()
+    const before = containerId()
+    await h.orchestrator.upgradePass()
+
+    expect(h.docker.tasks).toHaveLength(1)
+    expect(h.docker.tasks[0]).toMatchObject({
+      name: 'poise-release-alice',
+      spec: {
+        Image: 'poise-runtime:latest',
+        User: '10001',
+        Entrypoint: ['/opt/poise-runtime/install-release.sh'],
+        Cmd: [],
+        Labels: { 'poise.task': 'install-release', 'poise.workspace': 'alice' },
+        HostConfig: { NetworkMode: 'none', CapDrop: ['ALL'], Mounts: [{ Type: 'volume', Source: 'poise-home-alice', Target: '/home/poise' }] },
+      },
+    })
+    expect(h.docker.containers.has('poise-release-alice')).toBe(false)
+    expect(h.workspace.switches).toEqual(['new-release'])
+    expect(containerId()).toBe(before)
+    expect(h.workspace.serviceRequests.some((request) => request.url === '/api/service/drain')).toBe(false)
+    expect(h.orchestrator.updatingTo('alice')).toBe('new-release')
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.requested')).toMatchObject({ handle: 'alice', release: 'new-release', from: 'old-release' })
+
+    // Asked again until it runs the release, but installed only once.
+    await h.orchestrator.upgradePass()
+    expect(h.docker.tasks).toHaveLength(1)
+    expect(h.workspace.switches).toEqual(['new-release', 'new-release'])
+
+    // Poise restarted on the new release.
+    h.workspace.health.release = 'new-release'
+    h.orchestrator.markNotReady('alice')
+    expect(await h.orchestrator.readiness('alice', 'Alice')).toEqual({ ready: true })
+    expect(h.orchestrator.updatingTo('alice')).toBeNull()
+    expect(events(h.logs, 'workspace.update')).toEqual(['workspace.update.requested', 'workspace.update.finished'])
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toHaveLength(2)
+    expect(containerId()).toBe(before)
+  })
+
+  it('says Poise is updating while the workspace restarts onto the new release', async () => {
+    await start()
+    const { workspaceCookie } = await h.openWorkspace('Alice')
+    await h.orchestrator.upgradePass()
+    h.workspace.reachable = false
+    h.orchestrator.markNotReady('alice')
+
+    const page = await h.request({ host: ALICE, path: '/', headers: { cookie: workspaceCookie, ...NAVIGATE } })
+    expect(page.status).toBe(503)
+    expect(page.headers['x-poise-updating']).toBe('1')
+    expect(page.body).toContain('Updating to the latest version')
+    const call = await h.request({ host: ALICE, path: '/api/workspace', headers: { cookie: workspaceCookie } })
+    expect(call.status).toBe(503)
+    expect(call.headers['x-poise-updating']).toBe('1')
+    expect(call.json()).toMatchObject({ error: 'workspace_updating' })
+  })
+
+  it('recreates the container when the new image has another base, its release made current first', async () => {
+    await start({ oldBase: 'base-0' })
+    const before = containerId()
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate']])
+    const calls = dockerCalls(h)
+    expect(calls.indexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(calls.indexOf('POST /containers/poise-ws-alice/stop'))
+    expect(containerId()).not.toBe(before)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('recreates a workspace whose image names no release, or that runs without the supervisor', async () => {
+    await start({ oldBase: null })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(h.docker.containers.get('poise-ws-alice')?.imageId).toBe(CURRENT_IMAGE_ID)
+    await h.close()
+
+    await start({ release: null })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(h.docker.containers.get('poise-ws-alice')?.imageId).toBe(CURRENT_IMAGE_ID)
+  })
+
+  it('leaves the workspace on its release when installing the new one fails, and tries again', async () => {
+    await start()
+    h.docker.taskExitCode = 1
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.failed')).toMatchObject({ handle: 'alice', error: expect.stringContaining('exited with 1') })
+    expect(h.docker.containers.has('poise-release-alice')).toBe(false)
+    h.docker.taskExitCode = 0
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+  })
+
+  it('recreates a stopped workspace on the new image, with the new release current', async () => {
+    await start({ running: false })
+    await h.orchestrator.upgradePass()
+    expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate']])
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: false })
+  })
+})
+
 describe('a recreated gateway container', () => {
   let h: Harness
   // The workspace answers only over a network the gateway's container is on, as on a Docker host, and

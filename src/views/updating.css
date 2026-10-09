@@ -1,0 +1,61 @@
+/* "Updating to the latest version": the whole page dimmed for the seconds a
+   workspace restarts onto a new release (src/updating.ts). */
+
+:root { --up-scrim: rgba(22, 26, 32, 0.45); }
+[data-theme="dark"] { --up-scrim: rgba(0, 0, 0, 0.66); }
+
+.up-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: var(--sp-5) var(--sp-4);
+  background: var(--up-scrim);
+  -webkit-backdrop-filter: blur(4px) saturate(0.9);
+  backdrop-filter: blur(4px) saturate(0.9);
+  opacity: 0;
+  transition: opacity var(--t-slow) var(--ease);
+}
+
+.up-backdrop.up-visible { opacity: 1; }
+
+.up-card {
+  display: grid;
+  justify-items: center;
+  gap: var(--sp-3);
+  width: min(380px, 100%);
+  padding: var(--sp-6) var(--sp-5);
+  text-align: center;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  box-shadow: var(--e-3);
+}
+
+.up-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.up-detail {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.up-spinner {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 3px solid var(--hairline);
+  border-top-color: var(--accent);
+  animation: up-spin 0.9s linear infinite;
+}
+
+@keyframes up-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .up-spinner { animation-duration: 2.4s; }
+}

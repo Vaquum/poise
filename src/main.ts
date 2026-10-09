@@ -17,6 +17,7 @@ import { initClaudeAuth } from './claude-auth'
 import { getSelectedOrganization, setSelectedOrganization } from './organizations'
 import { initServiceSettings, openServicePlace, takeServicePlace } from './service-settings'
 import { restartOnboarding, startOnboarding } from './onboarding'
+import { watchForUpdates } from './updating'
 
 const viewMainEl = document.getElementById('view-main')!
 const viewCurrentEl = document.getElementById('view-current')!
@@ -135,6 +136,10 @@ const menu = initMenu({
 // On load: pull settings first so views render with the correct org/me/timezone,
 // then show the initial view. The user's external service keeps the data
 // fresh; Poise only reads.
+// Before anything asks the server: an answer the gateway marks as updating
+// dims the page until the new version is up.
+watchForUpdates()
+
 ;(async () => {
   await loadSettings()
   showView(menu.currentView())

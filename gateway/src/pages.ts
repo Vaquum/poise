@@ -195,6 +195,16 @@ ${input.adminHref && input.lastError ? html`<p class="muted">As an admin you can
 </div>`, { refreshSeconds: 2 })
 }
 
+/** While a workspace restarts onto a new release; Poise's own page shows the same over itself. */
+export function updatingPage(input: { workspaceHost: string }): string {
+  return page('Updating Poise', html`<div class="card">
+<div class="label">Your workspace</div>
+<h1>Updating to the latest version…</h1>
+<p>Your Poise at <code>${input.workspaceHost}</code> is restarting on its new version. Running agents and reviews carry on. This page reloads by itself in a few seconds.</p>
+<div class="loader" aria-hidden="true"><span></span><span></span><span></span></div>
+</div>`, { refreshSeconds: 2 })
+}
+
 /** Poise Link's installer (link/install.sh), as published with the newest release. */
 export const LINK_INSTALLER_URL = 'https://github.com/autonomio/poise/releases/latest/download/install.sh'
 /** Where the Windows installers and every other Poise Link build are. */
