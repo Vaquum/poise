@@ -389,7 +389,7 @@ def reap_interrupted() -> int:
     now = time()
     with db() as conn:
         rows = conn.execute(
-            "select id, pid, started_at, error_code from calls where status='running' and runner is null and pid is not null"
+            "select id, pid, started_at from calls where status='running' and runner is null and pid is not null"
         ).fetchall()
     ended = []
     for row in rows:
@@ -404,15 +404,18 @@ def reap_interrupted() -> int:
             command = process_command(pid)
             if command is not None and STOP_COMMAND_MARK in command:
                 continue
-        ended.append((row["id"], row["error_code"] == "stopping"))
+        ended.append(row["id"])
     count = 0
     with db() as conn:
-        for id_, stopping in ended:
-            error, code = ("Stopped by user", "stopped") if stopping else (INTERRUPTED_ERROR, "interrupted")
+        for id_ in ended:
+            # Whether it is being stopped is read by the update itself: stop_call
+            # may have marked it, and ended its worker, since the select above.
             count += conn.execute(
-                "update calls set status='failed', ended_at=?, error=?, error_code=?, "
+                "update calls set status='failed', ended_at=?, "
+                "error=case when error_code='stopping' then 'Stopped by user' else ? end, "
+                "error_code=case when error_code='stopping' then 'stopped' else 'interrupted' end, "
                 "progress=coalesce(?, progress) where id=? and status='running'",
-                (now, error, code, progress.terminal("failed"), id_),
+                (now, INTERRUPTED_ERROR, progress.terminal("failed"), id_),
             ).rowcount
     return count
 

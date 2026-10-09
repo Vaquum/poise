@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 from pathlib import Path
 from time import time
 from unittest import TestCase
@@ -92,6 +93,38 @@ class InterruptedCallsCase(TestCase):
             result = agent_interface.stop_call(id_)
         self.assertEqual(result, {"id": id_, "stopped": True, "status": "failed", "error_code": "stopped"})
         self.assertEqual(self.row(id_)["error_code"], "stopped")
+
+    def test_a_stop_between_the_reapers_read_and_its_write_stays_a_stop(self):
+        id_ = self.call(started_ago=agent_interface.ORPHAN_AFTER_SECONDS + 60)
+        read, killed, reaped = threading.Event(), threading.Event(), threading.Event()
+
+        def command(pid):
+            if threading.current_thread() is reaper:
+                # The reaper has read the row; the stop marks it and ends its worker now.
+                read.set()
+                killed.wait(5)
+                return None
+            return None if killed.is_set() else AGENT
+
+        def kill(pid, signum):
+            killed.set()
+            # The reaper writes before the stop's own last update.
+            reaped.wait(5)
+
+        def reap():
+            agent_interface.reap_interrupted()
+            reaped.set()
+
+        reaper = threading.Thread(target=reap)
+        with patch.object(agent_interface, "init_started_at", return_value=None), \
+                patch.object(agent_interface, "process_command", side_effect=command), \
+                patch.object(agent_interface, "signal_group", side_effect=kill):
+            reaper.start()
+            self.assertTrue(read.wait(5))
+            result = agent_interface.stop_call(id_)
+            reaper.join(5)
+        self.assertEqual(result, {"id": id_, "stopped": True, "status": "failed", "error_code": "stopped"})
+        self.assertEqual((self.row(id_)["error"], self.row(id_)["error_code"]), ("Stopped by user", "stopped"))
 
     def test_finished_calls_turns_and_calls_without_a_pid_are_left_alone(self):
         done = self.call(started_ago=2 * 3600, status="completed")
