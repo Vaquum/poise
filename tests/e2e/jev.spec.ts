@@ -179,21 +179,32 @@ test('JEV: another tab cannot overwrite an unsaved builder without an explicit c
   test.setTimeout(60_000)
   const w = await start(page, info, baseURL!), other = await page.context().newPage()
   try {
+    await page.bringToFront()
     await openBuilder(page)
     await page.getByRole('textbox', { name: 'Workspace title', exact: true }).fill('Shared builder')
     await page.getByRole('textbox', { name: 'State', exact: true }).fill('Original state')
     await page.getByRole('textbox', { name: 'Instructions', exact: true }).fill('Does it apply?')
     await expect(page.locator('.jev-save-status')).toHaveText('Builder saved')
+    await other.bringToFront()
     await other.goto(w.origin)
     await other.locator('.jev-session-item').filter({ hasText: 'Shared builder' }).click()
     await expect(other.getByRole('textbox', { name: 'State', exact: true })).toHaveValue('Original state')
+    await page.bringToFront()
+    const firstSave = page.waitForResponse(response => response.request().method() === 'PATCH'
+      && /\/api\/jev\/sessions\/[^/]+$/.test(new URL(response.url()).pathname) && response.status() === 200)
     await page.getByRole('textbox', { name: 'State', exact: true }).fill('Saved from first tab')
+    await firstSave
     await expect(page.locator('.jev-save-status')).toHaveText('Builder saved')
+    await other.bringToFront()
+    const conflict = other.waitForResponse(response => response.request().method() === 'PATCH'
+      && /\/api\/jev\/sessions\/[^/]+$/.test(new URL(response.url()).pathname) && response.status() === 409)
     await other.getByRole('textbox', { name: 'State', exact: true }).fill('My deliberate second version')
+    await conflict
     await expect(other.locator('.jev-conflict')).toBeVisible()
     await expect(other.getByRole('textbox', { name: 'State', exact: true })).toHaveValue('My deliberate second version')
     await other.getByRole('button', { name: 'Save my version', exact: true }).click()
     await expect(other.locator('.jev-save-status')).toHaveText('Builder saved')
+    await page.bringToFront()
     await page.reload()
     await expect(page.getByRole('textbox', { name: 'State', exact: true })).toHaveValue('My deliberate second version')
     expect(await w.calls()).toHaveLength(0)
