@@ -151,6 +151,7 @@ describe('lazy start', () => {
         NanoCpus: 1_500_000_000,
         PidsLimit: 512,
         RestartPolicy: { Name: 'unless-stopped' },
+        LogConfig: { Type: 'json-file', Config: { 'max-size': '20m', 'max-file': '5' } },
         Runtime: 'runsc',
         Mounts: [{ Type: 'volume', Source: 'poise-home-alice', Target: '/home/poise' }],
         NetworkMode: 'poise-net-alice',

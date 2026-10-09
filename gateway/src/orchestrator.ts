@@ -13,6 +13,8 @@ export const UPGRADE_INTERVAL_MS = 5 * 60_000
 
 const SERVICE_TIMEOUT_MS = 5_000
 const DRAIN_POLL_MS = 5_000
+/** Docker keeps a container's log without limit unless told; a workspace keeps five files of 20 MB, as the gateway does (deploy/compose.yaml). */
+const WORKSPACE_LOG = { Type: 'json-file', Config: { 'max-size': '20m', 'max-file': '5' } } as const
 // A workspace lets a drain lapse unless it is renewed within five minutes; renew well inside that.
 const DRAIN_RENEW_MS = 60_000
 
@@ -181,6 +183,7 @@ export class Orchestrator {
         NanoCpus: config.workspaceNanoCpus,
         PidsLimit: config.workspacePids,
         RestartPolicy: { Name: 'unless-stopped' },
+        LogConfig: { Type: WORKSPACE_LOG.Type, Config: { ...WORKSPACE_LOG.Config } },
         ...(config.workspaceRuntime ? { Runtime: config.workspaceRuntime } : {}),
         Mounts: mounts,
         NetworkMode: network,

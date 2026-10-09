@@ -7,11 +7,20 @@
 # proxy the server already runs.
 name: poise
 
+# Docker keeps a container's log without limit unless told. Each service keeps
+# five files of 20 MB, as the gateway sets for every workspace.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 20m
+    max-file: "5"
+
 services:
   caddy:
     image: caddy:2
     container_name: poise-caddy
     restart: unless-stopped
+    logging: *logging
     ports:
       - "80:80"
       - "443:443"
@@ -35,6 +44,7 @@ services:
     # The gateway joins each workspace network by this name.
     container_name: poise-gateway
     restart: unless-stopped
+    logging: *logging
     env_file: .env
     # This file's own wiring, which deploy/.env cannot change.
     environment:

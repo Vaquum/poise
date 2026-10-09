@@ -208,7 +208,8 @@ The gateway creates, per person:
 
 Container settings: image `POISE_RUNTIME_IMAGE`; user `poise` (uid 10001);
 labels `poise.managed=true` and `poise.workspace=<handle>`; no published ports;
-`init` enabled; `no-new-privileges`; all capabilities dropped; memory, CPU and
+`init` enabled; `no-new-privileges`; all capabilities dropped; a log of at most
+five 20 MB files (`json-file`); memory, CPU and
 process limits from `POISE_WORKSPACE_MEMORY` (default `8g`),
 `POISE_WORKSPACE_CPUS` (default `4`) and `POISE_WORKSPACE_PIDS` (default `4096`);
 restart policy `unless-stopped`, so a server reboot brings workspaces back

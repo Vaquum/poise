@@ -177,6 +177,7 @@ describe.skipIf(!enabled)('workspaces on a real Docker Engine', () => {
       NanoCpus: 1_000_000_000,
       PidsLimit: 256,
       RestartPolicy: expect.objectContaining({ Name: 'unless-stopped' }),
+      LogConfig: { Type: 'json-file', Config: { 'max-size': '20m', 'max-file': '5' } },
       NetworkMode: 'poise-net-ci',
     })
     expect(workspace.HostConfig.PortBindings ?? {}).toEqual({})
