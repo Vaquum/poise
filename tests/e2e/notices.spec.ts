@@ -208,6 +208,56 @@ test('reports a missing notification run instead of opening another run on the s
   await expect(page.locator('.agent-row-focus')).toHaveCount(0)
 })
 
+test('keeps the last clicked notice in control when two navigations share a pending account request', async ({ page }) => {
+  const insideCall = 'e'.repeat(32)
+  const inside: Notice = { ...HELD, id: 'aaaaaaaaaaaa-4', title: 'Review New Pull Requests failed on beta/other#10', target: { swarm: insideCall } }
+  const state = await workspace(page, [HELD, inside], true, ['acme', 'beta'])
+  const insideRun = failedRun(insideCall, { repo: 'beta/other', pr_id: '10' })
+  let holdSelected = false
+  let heldRequests = 0
+  let allRequests = 0
+  let release!: () => void
+  const loaded = new Promise<void>((resolve) => { release = resolve })
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, async (route) => {
+    const selected = new URL(route.request().url()).searchParams.get('org') === 'beta'
+    if (!selected) allRequests += 1
+    if (selected && holdSelected) {
+      heldRequests += 1
+      await loaded
+    }
+    await route.fulfill({ json: { logs: selected ? [insideRun] : [failedRun(), insideRun] } })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(`.agent-row[data-id="${HELD_CALL}"]`)).toBeVisible()
+  const accountLoaded = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/agent-logs'
+    && new URL(response.url()).searchParams.get('org') === 'beta')
+  const account = page.locator('#swarm-filters').getByRole('combobox', { name: 'Account filter' })
+  await account.selectOption('beta')
+  await accountLoaded
+  await expect(page.locator(`.agent-row[data-id="${insideCall}"]`)).toBeVisible()
+  const unfilteredBefore = allRequests
+  holdSelected = true
+  try {
+    await island(page).getByRole('button', { name: /Review New Pull Requests failed on acme\/api#9.*Swarm/ }).click()
+    await expect.poll(() => heldRequests).toBe(1)
+    await expect(shownTitle(page)).toHaveText(inside.title)
+    // Let each click's deferred navigation join the held request before it answers.
+    await page.evaluate(() => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())))
+    await island(page).getByRole('button', { name: /Review New Pull Requests failed on beta\/other#10.*Swarm/ }).click()
+    await page.evaluate(() => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())))
+    await expect.poll(() => state.sent).toEqual([`dismiss ${HELD.id}`, `dismiss ${inside.id}`])
+  } finally { release() }
+  const focused = page.locator(`.agent-row[data-id="${insideCall}"]`)
+  await expect(focused).toHaveClass(/agent-row-focus/)
+  await expect(focused.getByRole('button', { name: 'Toggle detail' })).toBeFocused()
+  await expect(account).toHaveValue('beta')
+  await expect(page.locator('#swarm-stale')).toBeHidden()
+  await expect(page.locator(`.agent-row[data-id="${HELD_CALL}"]`)).toHaveCount(0)
+  expect(allRequests).toBe(unfilteredBefore)
+  expect(heldRequests).toBe(1)
+})
+
 test('silences a pull request ready to merge, and offers that for nothing else', async ({ page }) => {
   const state = await workspace(page, [READY, WAITING])
   await page.goto('/')

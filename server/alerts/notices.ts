@@ -10,7 +10,7 @@
 // Settings → General → Notifications turns this off: the page shows nothing
 // and nothing here checks GitHub. Poise Link's other alerts go on as before.
 
-import { listBehaviorIncidents } from '../db'
+import { getBehaviorIncident, listBehaviorIncidents } from '../db'
 import { readOwnPullRequests, type OwnPullRequest } from '../gh'
 import { HttpError } from '../http'
 import { getNotificationSettings } from '../settings'
@@ -74,15 +74,13 @@ function dueAt(alert: OpenAlert, now: number): number | null {
 /** What the page shows now, the most pressing first. */
 export function noticesState(now = Date.now()): NoticesState {
   if (!getNotificationSettings().enabled) return { enabled: false, notices: [] }
-  const alerts = openAlerts({ now })
-  // Read the incident's current call, including alerts recorded before Swarm
-  // navigation existed and later attempts covered by the same held alert.
-  const incidents = new Map((alerts.some((alert) => alert.kind === 'behavior_held') ? listBehaviorIncidents(INCIDENT_READ_LIMIT) : [])
-    .map((incident) => [`behavior-held:${incident.behavior}:${incident.target}`, incident]))
-  const notices = alerts.flatMap((alert): Notice[] => {
+  const notices = openAlerts({ now }).flatMap((alert): Notice[] => {
     const due = dueAt(alert, now)
     if (due === null) return []
-    const incident = alert.kind === 'behavior_held' ? incidents.get(alert.dedupeKey) : undefined
+    // A notice may outlive the incident list's first page. Look up its exact
+    // current incident, including alerts recorded before Swarm navigation.
+    const held = alert.kind === 'behavior_held' ? /^behavior-held:([^:]+):(.+)$/.exec(alert.dedupeKey) : null
+    const incident = held ? getBehaviorIncident(held[1], held[2]) : null
     const target: AlertTarget | null = incident?.callId ? { swarm: incident.callId } : alert.target
     return [{
       id: alert.id,

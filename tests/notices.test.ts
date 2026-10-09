@@ -172,6 +172,22 @@ describe('an alert target', () => {
     expect(shown(at(1))[0].target).toEqual({ view: 'behaviors' })
   })
 
+  it('opens an older notice beyond the first 500 active incidents', () => {
+    store.raiseAlert(held, at(0))
+    const insert = database.db.prepare(`
+      INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, call_id, error, created_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    insert.run('old', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'old-call', 'Review failed', new Date(at(0)).toISOString())
+    database.db.transaction(() => {
+      for (let number = 10; number < 511; number++) {
+        insert.run(`new-${number}`, 'review-new-prs', `acme/api#${number}`, 'acme/api', number, `new-call-${number}`, 'Review failed', new Date(at(1)).toISOString())
+      }
+    })()
+    expect(database.listBehaviorIncidents(500).some((incident) => incident.callId === 'old-call')).toBe(false)
+    expect(shown(at(2))[0].target).toEqual({ swarm: 'old-call' })
+  })
+
   it('is kept with the alert and refused when it could open anything else', () => {
     store.raiseAlert(held, at(0))
     expect(shown(at(1))[0].target).toEqual({ view: 'behaviors' })

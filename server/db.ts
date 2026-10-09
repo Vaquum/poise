@@ -1086,7 +1086,15 @@ export function listBehaviorIncidents(limit = 50, organization?: string): Behavi
   return readBehaviorDeadLetters(limit, true, organization)
 }
 
-function readBehaviorDeadLetters(limit: number, grouped: boolean, organization?: string): BehaviorDeadLetter[] {
+/** The current incident for one behavior target, independent of list limits. */
+export function getBehaviorIncident(behavior: string, target: string): BehaviorDeadLetter | null {
+  return readBehaviorDeadLetters(1, true, undefined, { behavior, target })[0] ?? null
+}
+
+function readBehaviorDeadLetters(
+  limit: number, grouped: boolean, organization?: string,
+  incident?: { behavior: string, target: string },
+): BehaviorDeadLetter[] {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
     throw new Error('dead-letter limit must be between 1 and 500')
   }
@@ -1096,6 +1104,7 @@ function readBehaviorDeadLetters(limit: number, grouped: boolean, organization?:
     FROM behavior_dead_letters AS dead
     WHERE dead.retired_at IS NULL
       AND (? IS NULL OR lower(substr(COALESCE(dead.repo, dead.target), 1, instr(COALESCE(dead.repo, dead.target), '/') - 1)) = ?)
+      AND (? IS NULL OR (dead.behavior = ? AND COALESCE(dead.repo || '#' || dead.pr, dead.target) = ?))
       AND NOT EXISTS (
       SELECT 1
       FROM behavior_seen AS recovered
@@ -1126,7 +1135,9 @@ function readBehaviorDeadLetters(limit: number, grouped: boolean, organization?:
     SELECT * FROM ranked WHERE ? = 0 OR rank = 1
     ORDER BY created_at DESC, id DESC
     LIMIT ?
-  `).all(organization ?? null, organization?.toLowerCase() ?? null, Number(grouped), limit) as Array<{
+  `).all(organization ?? null, organization?.toLowerCase() ?? null,
+    incident?.behavior ?? null, incident?.behavior ?? null, incident?.target ?? null,
+    Number(grouped), limit) as Array<{
     id: string
     behavior: string
     target: string

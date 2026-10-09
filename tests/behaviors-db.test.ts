@@ -298,7 +298,11 @@ describe('behavior database lifecycle', () => {
       expect.objectContaining({ target: 'Vaquum/repo#2', attemptCount: 1, error: 'other failure' }),
     ])
     expect(store.listBehaviorDeadLetters(500)).toHaveLength(56)
+    expect(store.getBehaviorIncident('review-new-prs', 'Vaquum/repo#1'))
+      .toMatchObject({ target: 'Vaquum/repo#1', attemptCount: 55, error: 'timeout 54' })
+    expect(store.getBehaviorIncident('approve-prs', 'Vaquum/repo#1')).toBeNull()
     store.retireBehaviorDeadLetter('older')
+    expect(store.getBehaviorIncident('review-new-prs', 'Vaquum/repo#2')).toBeNull()
     expect(store.listBehaviorIncidents()).toHaveLength(1)
     expect(store.db.prepare('SELECT count(*) FROM behavior_dead_letters').pluck().get()).toBe(56)
   })

@@ -1119,17 +1119,20 @@ function highlightRow(row: HTMLTableRowElement): void {
   }, 1500))
 }
 
+let callFocusSequence = 0
+
 /** Open the exact run a notification names, including an earlier grouped
  *  failure. The caller makes Swarm visible before asking for it. */
 export async function focusCall(callId: string): Promise<void> {
+  const mine = ++callFocusSequence
   if (!viewEl || !bodyEl) return
   await pollOnce()
-  if (viewEl.hidden) return
+  if (mine !== callFocusSequence || viewEl.hidden) return
   let match = entries.find((entry) => entry.id === callId)
   if (!match && getSelectedOrganization()) {
     setSelectedOrganization('')
     await pollOnce()
-    if (viewEl.hidden) return
+    if (mine !== callFocusSequence || viewEl.hidden) return
     match = entries.find((entry) => entry.id === callId)
   }
   if (!match) {
