@@ -308,8 +308,10 @@ line.
 
 **Keeping up with autonomio/poise.** Set the variable `POISE_UPSTREAM_SYNC`
 to `true`. The Sync workflow then merges autonomio/poise's main into the
-fork's main every hour, as the **Sync fork** button on the fork's page does,
-and deploys what that brought in. GitHub lets no workflow's own token change
+fork's main every five minutes, as the **Sync fork** button on the fork's page
+does, and deploys what that brought in. A merged change reaches the server
+within minutes and the workspaces within five more ([Upgrades](#upgrades)).
+GitHub may start a scheduled run some minutes late when it is busy. GitHub lets no workflow's own token change
 a workflow file, so when autonomio/poise changes one, the sync fails until
 you press **Sync fork**, or give the fork a `POISE_SYNC_TOKEN` secret: a
 fine-grained personal access token for the fork with read and write access
