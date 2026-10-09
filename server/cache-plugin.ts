@@ -18,6 +18,7 @@ import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, getOrCreateChatSession, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
 import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
+import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
 import { ContentLaunchPendingError, getContentJobResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
 import { retryFailedPrReviews } from './behaviors'
@@ -132,6 +133,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   setCallerAccounts(callerAccounts)
   startOrganizationsRuntime()
   startBehaviorsRuntime()
+  startReviewCheckoutPruning()
   startContentFinalizer()
   if (!chatRuntime) {
     const label = opts.instanceLabel ?? 'dev'
@@ -204,7 +206,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
 }
 
 /** Connected accounts, read now or from the last few seconds, with their
