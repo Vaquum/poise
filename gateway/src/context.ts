@@ -8,6 +8,7 @@ import { header, HttpError, safeEqual } from './http.js'
 import type { GatewayKeys } from './keys.js'
 import type { Logger } from './log.js'
 import type { Orchestrator, UpstreamResolver } from './orchestrator.js'
+import { FONT_ORIGIN } from './pages.js'
 import type { Session, Store, User } from './store.js'
 
 export const APEX_COOKIE = 'poise_gw'
@@ -50,7 +51,8 @@ export class Context {
     this.apexOrigin = `${this.scheme}://${deps.config.domain}`
     this.pageHeaders = {
       // Workspace-host forms (sign-out) redirect to the apex, so the apex is an allowed form target everywhere.
-      'content-security-policy': `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${this.apexOrigin}; frame-ancestors 'none'; base-uri 'none'`,
+      // The pages use Poise's typeface, Inter, from where Poise itself loads it.
+      'content-security-policy': `default-src 'none'; style-src 'unsafe-inline' ${FONT_ORIGIN}; font-src ${FONT_ORIGIN}; form-action 'self' ${this.apexOrigin}; frame-ancestors 'none'; base-uri 'none'`,
       'x-frame-options': 'DENY',
       'x-content-type-options': 'nosniff',
       // Not no-referrer: under it a browser sends `Origin: null` with every form post, even to this

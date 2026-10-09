@@ -15,7 +15,7 @@ import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
 import { STATUS, assertFakeClis, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 import { fakePresetCommand } from './fixtures/accounts/fake-presets'
 import { CATALOG } from './model-catalog-fixture'
-import { PUBLIC_HOST, PUBLIC_ORIGIN, gatewayKeys, serviceEnvironment, signAssertion } from './service-fixture'
+import { OWNER, PUBLIC_HOST, PUBLIC_ORIGIN, gatewayKeys, serviceEnvironment, signAssertion } from './service-fixture'
 
 const gateway = gatewayKeys()
 const auth = createAuthenticatedClaudeAuth()
@@ -370,6 +370,14 @@ describe('Poise in service mode', () => {
     ] as Array<[Caller, number]>) {
       expect(await rawUpgrade('/ws/elsewhere', caller)).toEqual({ status, closed: true })
     }
+  })
+
+  it('tells the owner\'s browser whose workspace this is, so Settings adds the gateway\'s sections', async () => {
+    const answer = await send('GET', '/api/workspace', fromGateway())
+    expect(answer.status).toBe(200)
+    expect(answer.json).toEqual({ mode: 'service', owner: OWNER })
+    expect((await send('GET', '/api/workspace', fromGateway('link'))).status).toBe(403)
+    expect((await send('GET', '/api/workspace', { peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN })).status).toBe(401)
   })
 
   it('answers Connected accounts to the owner\'s browser only', async () => {

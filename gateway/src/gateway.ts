@@ -18,9 +18,9 @@ const APEX_ROUTES: Record<string, Record<string, Handler>> = {
   '/auth/login': { GET: auth.login },
   '/auth/callback': { GET: auth.callback },
   '/auth/logout': { GET: auth.logoutPage, POST: auth.logout },
-  '/link': { GET: link.approvalPage, POST: link.decide },
-  '/link/devices': { GET: link.devices },
-  '/link/devices/revoke': { POST: link.revoke },
+  // Approving a code and the device list are in Settings; Poise Link still opens /link.
+  '/link': { GET: link.toSettings },
+  '/link/devices': { GET: link.toSettings },
   '/link/device/code': { POST: link.deviceCode },
   '/link/device/token': { POST: link.deviceToken },
   '/admin': { GET: admin.overview },

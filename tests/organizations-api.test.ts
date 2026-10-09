@@ -146,6 +146,12 @@ afterEach(async () => {
 })
 
 describe('organizations API', () => {
+  it('says this is a personal computer, so Settings adds no gateway sections', async () => {
+    const response = await fetch(`${base}/api/workspace`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ mode: 'local' })
+  })
+
   it('returns the existing organization unchanged through registry and Settings', async () => {
     const registry = await request('/api/organizations')
     expect(registry.status).toBe(200)

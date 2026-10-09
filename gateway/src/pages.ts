@@ -1,4 +1,4 @@
-import type { AllowedLogin, Device, User, WorkspaceRecord } from './store.js'
+import type { AllowedLogin, User, WorkspaceRecord } from './store.js'
 
 /** Markup that is already safe to emit. Everything else interpolated into `html` is escaped. */
 export class Html {
@@ -29,43 +29,112 @@ export function html(strings: TemplateStringsArray, ...values: unknown[]): Html 
   return new Html(out)
 }
 
+/** Inter, as Poise itself loads it; the page CSP admits this origin for styles and fonts. */
+export const FONT_ORIGIN = 'https://rsms.me'
+
+// Poise's own design tokens (src/style.css), light and dark, so the pages before the workspace look like
+// the workspace. The browser's colour scheme picks the theme: the one chosen in Poise is kept by the
+// workspace host's browser storage, which the apex cannot read.
 const STYLE = `
-  :root { color-scheme: light dark; --fg: #1d1d1f; --muted: #6e6e73; --bg: #f5f5f7; --card: #fff; --line: #d2d2d7; --accent: #0a66d8; --danger: #c4231a; }
-  @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --muted: #a1a1a6; --bg: #111113; --card: #1c1c1f; --line: #38383d; --accent: #4c9aff; --danger: #ff6961; } }
-  * { box-sizing: border-box; }
-  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
-  main { max-width: 760px; margin: 0 auto; padding: 48px 16px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 24px; margin-bottom: 16px; }
-  h1 { font-size: 22px; margin: 0 0 12px; }
-  h2 { font-size: 17px; margin: 0 0 12px; }
-  p { margin: 0 0 12px; }
-  .muted { color: var(--muted); }
-  .error { color: var(--danger); }
-  a { color: var(--accent); }
-  .button, button { display: inline-block; font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent); color: #fff; text-decoration: none; cursor: pointer; }
-  button.secondary { background: transparent; color: var(--accent); }
-  button.danger { background: transparent; color: var(--danger); border-color: var(--danger); }
+  :root {
+    color-scheme: light;
+    --bg: #F7F8F9; --surface: #EEF0F2; --hover: #DEE2E6; --hairline: #DEE2E6; --border: #C5CBD1;
+    --text: #2F353D; --text-secondary: #5C636D; --text-tertiary: #8E959E;
+    --n0: #F7F8F9; --n5: #5C636D; --n6: #2F353D; --a1: #3A72B0; --a5: #B85048;
+    --e-3: 0 12px 24px rgba(22, 26, 32, .14), 0 4px 8px rgba(22, 26, 32, .06);
+    --ease: cubic-bezier(0.2, 0, 0, 1);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #161A20; --surface: #1C2129; --hover: #2F353D; --hairline: #2F353D; --border: #5C636D;
+      --text: #DEE2E6; --text-secondary: #C5CBD1; --text-tertiary: #8E959E;
+      --n0: #161A20; --n5: #C5CBD1; --n6: #DEE2E6;
+      --e-3: 0 12px 24px rgba(0, 0, 0, .55), 0 4px 8px rgba(0, 0, 0, .35);
+    }
+  }
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  html { font-size: 15px; background: var(--bg); -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+  body {
+    min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: 48px 16px;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; line-height: 1.5;
+    color: var(--text); background: var(--bg);
+  }
+  main { width: min(400px, 100%); display: flex; flex-direction: column; gap: 20px; animation: enter 250ms var(--ease) both; }
+  main.wide { width: min(960px, 100%); }
+  @keyframes enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .brand { text-align: center; font-size: 1.25rem; font-weight: 600; letter-spacing: -0.015em; color: var(--text); }
+  .card {
+    display: flex; flex-direction: column; gap: 12px; padding: 24px;
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px; box-shadow: var(--e-3);
+  }
+  .label {
+    font-size: 0.625rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-tertiary); padding-bottom: 6px; border-bottom: 1px solid var(--border);
+  }
+  h1 { font-size: 1rem; font-weight: 600; line-height: 1.35; color: var(--text); }
+  p { font-size: 0.8125rem; color: var(--text-secondary); }
+  strong { font-weight: 600; color: var(--text); }
+  .muted { font-size: 0.75rem; color: var(--text-tertiary); }
+  .error { color: var(--a5); }
+  .footer { text-align: center; font-size: 0.6875rem; color: var(--text-tertiary); }
+  a { color: var(--text-secondary); text-decoration: underline; text-underline-offset: 2px; }
+  a:hover { color: var(--text); }
+  code { font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace; font-size: 0.75rem; }
+  .actions { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+  .actions form { display: flex; flex-direction: column; }
+  .button, button {
+    display: inline-block; padding: 8px 14px; font: inherit; font-size: 0.75rem; font-weight: 600; line-height: 1.5;
+    text-align: center; text-decoration: none; cursor: pointer; border-radius: 8px;
+    color: var(--n0); background: var(--n5); border: 1px solid var(--n5);
+    transition: background 180ms ease, border-color 180ms ease, color 180ms ease;
+  }
+  .button:hover, button:hover { color: var(--n0); background: var(--n6); border-color: var(--n6); }
+  .button.secondary, button.secondary { color: var(--text-secondary); background: var(--surface); border-color: var(--border); }
+  .button.secondary:hover, button.secondary:hover { color: var(--text); background: var(--surface); border-color: var(--text-tertiary); }
+  button.danger { color: var(--a5); background: var(--surface); border-color: var(--border); }
+  button.danger:hover { color: var(--a5); background: var(--surface); border-color: var(--a5); }
+  :focus-visible { outline: 2px solid var(--a1); outline-offset: 2px; }
+  :focus:not(:focus-visible) { outline: none; }
+  .loader { display: flex; justify-content: center; gap: 6px; padding: 8px 0; }
+  .loader span { width: 5px; height: 5px; border-radius: 999px; background: var(--text-tertiary); animation: pulse 1s ease-in-out infinite; }
+  .loader span:nth-child(2) { animation-delay: 0.15s; }
+  .loader span:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes pulse { 0%, 100% { opacity: 0.2; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
   form.inline { display: inline; }
-  input[type=text] { font: inherit; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  input[type=text] {
+    flex: 1; min-width: 0; padding: 8px 10px; font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace; font-size: 0.75rem;
+    color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 8px; outline: none;
+  }
+  input[type=text]:focus { border-color: var(--text); }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-weight: 600; color: var(--muted); font-size: 13px; }
-  nav { display: flex; gap: 16px; flex-wrap: wrap; }
-  code { font: 13px ui-monospace, Menlo, monospace; }
-  pre { margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); overflow-x: auto; }
+  th {
+    text-align: left; font-size: 0.6875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-tertiary); padding: 0 12px 10px 0; border-bottom: 1px solid var(--border);
+  }
+  td { padding: 11px 12px 11px 0; font-size: 0.8125rem; vertical-align: top; border-bottom: 1px solid var(--hairline); }
+  td form.inline + form.inline { margin-left: 4px; }
+  @media (prefers-reduced-motion: reduce) { main, .loader span { animation: none; } }
 `
 
-export function page(title: string, body: Html, options: { refreshSeconds?: number } = {}): string {
+export function page(title: string, body: Html, options: { refreshSeconds?: number; wide?: boolean; footer?: string } = {}): string {
   return html`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 ${options.refreshSeconds ? html`<meta http-equiv="refresh" content="${options.refreshSeconds}">` : ''}
 <title>${title} · Poise</title>
+<link rel="stylesheet" href="${FONT_ORIGIN}/inter/inter.css">
 <style>${new Html(STYLE)}</style>
 </head>
-<body><main>${body}</main></body>
+<body><main${options.wide ? html` class="wide"` : ''}>
+<div class="brand">Poise</div>
+${body}
+${options.footer ? html`<div class="footer">${options.footer}</div>` : ''}
+</main></body>
 </html>
 `.value
 }
@@ -74,33 +143,29 @@ export function messagePage(title: string, message: string, link?: { href: strin
   return page(title, html`<div class="card">
 <h1>${title}</h1>
 <p>${message}</p>
-${link ? html`<p><a href="${link.href}">${link.label}</a></p>` : ''}
+${link ? html`<div class="actions"><a class="button" href="${link.href}">${link.label}</a></div>` : ''}
 </div>`)
 }
 
-export function signInPage(): string {
+export function signInPage(domain: string): string {
   return page('Sign in', html`<div class="card">
-<h1>Poise</h1>
-<p>Sign in with your GitHub account to open your workspace.</p>
-<p><a class="button" href="/auth/login">Sign in with GitHub</a></p>
-</div>`)
+<div class="label">Welcome</div>
+<h1>Sign in</h1>
+<p>Use your GitHub account to open your Poise workspace.</p>
+<div class="actions"><a class="button" href="/auth/login">Sign in with GitHub</a></div>
+</div>`, { footer: domain })
 }
 
-export function homePage(input: { user: User; isAdmin: boolean; workspaceHref: string; workspaceHost: string; csrf: string }): string {
+export function homePage(input: { user: User; workspaceHref: string; workspaceHost: string; csrf: string }): string {
   return page('Poise', html`<div class="card">
-<h1>Poise</h1>
-<p>Signed in as <strong>${input.user.login}</strong>.</p>
-<p><a class="button" href="${input.workspaceHref}">Open your workspace</a></p>
-<p class="muted">Your workspace lives at <code>${input.workspaceHost}</code>.</p>
+<div class="label">Your workspace</div>
+<h1>Signed in as ${input.user.login}</h1>
+<p>Your workspace lives at <code>${input.workspaceHost}</code>. Devices, sign-ins and everything else are in its Settings.</p>
+<div class="actions">
+<a class="button" href="${input.workspaceHref}">Open your workspace</a>
+${signOutForm('/auth/logout', input.csrf)}
 </div>
-<div class="card">
-<nav>
-<a href="/link">Pair Poise Link</a>
-<a href="/link/devices">Paired devices</a>
-${input.isAdmin ? html`<a href="/admin">Admin</a>` : ''}
-</nav>
-</div>
-${signOutForm('/auth/logout', input.csrf)}`)
+</div>`)
 }
 
 function signOutForm(action: string, csrf: string): Html {
@@ -114,72 +179,29 @@ export function signOutPage(action: string, csrf: string): string {
   return page('Sign out', html`<div class="card">
 <h1>Sign out of Poise?</h1>
 <p>This signs you out of the gateway and of your workspace in this browser.</p>
-${signOutForm(action, csrf)}
+<div class="actions">${signOutForm(action, csrf)}</div>
 </div>`)
 }
 
-export function startingPage(input: { workspaceHost: string; lastError: string | null; problem: string | null }): string {
+export function startingPage(input: { workspaceHost: string; lastError: string | null; problem: string | null; adminHref: string | null }): string {
   return page('Starting your workspace', html`<div class="card">
+<div class="label">Your workspace</div>
 <h1>Starting your workspace…</h1>
 <p>Your Poise at <code>${input.workspaceHost}</code> is starting. This page reloads by itself when it is ready.</p>
+<div class="loader" aria-hidden="true"><span></span><span></span><span></span></div>
 ${input.lastError ? html`<p class="error">The last start failed: ${input.lastError}</p>` : ''}
 ${input.problem ? html`<p class="error">${input.problem}</p>` : ''}
+${input.adminHref && input.lastError ? html`<p class="muted">As an admin you can restart it from the <a href="${input.adminHref}">admin page</a>.</p>` : ''}
 </div>`, { refreshSeconds: 2 })
 }
 
 /** Poise Link's installer (link/install.sh), as published with the newest release. */
 export const LINK_INSTALLER_URL = 'https://github.com/autonomio/poise/releases/latest/download/install.sh'
+/** Where the Windows installers and every other Poise Link build are. */
+export const LINK_RELEASES_URL = 'https://github.com/autonomio/poise/releases/latest'
 
-export function linkPage(csrf: string, notice?: { text: string; error: boolean }): string {
-  return page('Pair Poise Link', html`<div class="card">
-<h1>Pair Poise Link</h1>
-<p>Type the code Poise Link shows you, then approve it to let that computer receive your snippets and alerts.</p>
-${notice ? html`<p class="${notice.error ? 'error' : ''}">${notice.text}</p>` : ''}
-<form method="post" action="/link">
-<input type="hidden" name="csrf" value="${csrf}">
-<p><input type="text" name="user_code" placeholder="XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" required></p>
-<p>
-<button type="submit" name="decision" value="approve">Approve</button>
-<button class="danger" type="submit" name="decision" value="deny">Deny</button>
-</p>
-</form>
-<p><a href="/link/devices">Paired devices</a> · <a href="/">Home</a></p>
-</div>
-<div class="card">
-<h2>Install Poise Link</h2>
-<p>On macOS, or on Debian 12+ and Ubuntu 24.04+, run this in a terminal. It installs Poise Link, and Espanso when it is missing, then opens Poise Link to pair:</p>
-<pre><code>curl -fsSL ${LINK_INSTALLER_URL} | sh</code></pre>
-<p class="muted">Without curl: <code>wget -qO- ${LINK_INSTALLER_URL} | sh</code>. Run it again to update Poise Link. Windows installers are on the <a href="https://github.com/autonomio/poise/releases/latest">release page</a>.</p>
-</div>`)
-}
-
-function when(ms: number | null): string {
+export function when(ms: number | null): string {
   return ms === null ? 'never' : new Date(ms).toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
-}
-
-export function devicesPage(devices: Array<Device & { state: 'active' | 'revoked' | 'expired' }>, csrf: string): string {
-  const rows = devices.map((device) => html`<tr>
-<td>${device.label ?? 'Poise Link'}</td>
-<td>${when(device.createdAt)}</td>
-<td>${when(device.lastUsedAt)}</td>
-<td>${device.state === 'active'
-    ? html`<form class="inline" method="post" action="/link/devices/revoke">
-<input type="hidden" name="csrf" value="${csrf}">
-<input type="hidden" name="id" value="${device.id}">
-<button class="danger" type="submit">Revoke</button>
-</form>`
-    : device.state === 'expired'
-      ? html`<span class="muted">Expired; pair it again</span>`
-      : html`<span class="muted">Revoked ${when(device.revokedAt)}</span>`}</td>
-</tr>`)
-  return page('Paired devices', html`<div class="card">
-<h1>Paired devices</h1>
-<p class="muted">A device stays paired until it goes unused for 30 days or turns a year old.</p>
-${devices.length === 0
-    ? html`<p class="muted">No devices are paired with your workspace.</p>`
-    : html`<table><tr><th>Device</th><th>Paired</th><th>Last used</th><th></th></tr>${rows}</table>`}
-<p><a href="/link">Pair another device</a> · <a href="/">Home</a></p>
-</div>`)
 }
 
 export interface AdminWorkspaceView {
@@ -207,6 +229,10 @@ function actionButton(csrf: string, action: string, handle: string, label: strin
 </form>`
 }
 
+/**
+ * The admin page at the apex. Admins use Settings → Admin in their workspace; this page stays for when
+ * their own workspace cannot open, which is when it is needed most.
+ */
 export function adminPage(view: AdminView): string {
   const userRows = view.users.map((user) => {
     const workspace = view.workspaces?.get(user.handle)
@@ -234,20 +260,20 @@ ${user.disabledAt === null
 </form>`}</td>
 </tr>`)
   return page('Admin', html`<div class="card">
-<h1>Users and workspaces</h1>
+<div class="label">Users and workspaces</div>
 ${view.dockerError ? html`<p class="error">Docker Engine: ${view.dockerError}</p>` : ''}
 ${view.users.length === 0
     ? html`<p class="muted">Nobody has signed in yet.</p>`
     : html`<table><tr><th>User</th><th>Workspace</th><th>Image</th><th></th></tr>${userRows}</table>`}
 </div>
 <div class="card">
-<h2>Allowed logins</h2>
+<div class="label">Allowed logins</div>
 <p class="muted">Admins (${view.admins.join(', ')}) may always sign in.${view.allowedOrgs.length > 0 ? ` Members of ${view.allowedOrgs.join(', ')} may sign in too.` : ''}</p>
 ${view.allowed.length > 0 ? html`<table><tr><th>Login</th><th>Source</th><th></th></tr>${allowRows}</table>` : ''}
 <form method="post" action="/admin/allow">
 <input type="hidden" name="csrf" value="${view.csrf}">
-<p><input type="text" name="login" placeholder="GitHub login" autocomplete="off" spellcheck="false" required> <button type="submit">Allow</button></p>
+<div class="row"><input type="text" name="login" placeholder="GitHub login" autocomplete="off" spellcheck="false" required> <button type="submit">Allow</button></div>
 </form>
-<p><a href="/">Home</a></p>
-</div>`)
+<p class="muted">The same controls are in Settings → Admin in your workspace. <a href="/">Home</a></p>
+</div>`, { wide: true })
 }

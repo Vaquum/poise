@@ -84,11 +84,6 @@ cookie() {
   awk -F '\t' -v domain="$2" -v name="$3" '{ sub(/^#HttpOnly_/, "", $1) } $1 == domain && $6 == name { print $7 }' "$1"
 }
 
-# The value of the first form field NAME on the last page fetched.
-form_field() {
-  grep --only-matching "name=\"$1\" value=\"[^\"]*\"" "$work/body" | head -n 1 | sed 's/.*value="//; s/"$//'
-}
-
 # Signs LOGIN in through the fake GitHub into JAR, asking to continue to NEXT.
 sign_in() {
   local login=$1 jar=$2 next=$3
@@ -219,7 +214,7 @@ socket_refused() {
 }
 
 # Poise Link's path through Caddy and the gateway: a device code, alice's
-# approval at the apex, the token, and the Link API on her workspace host,
+# approval in her workspace's Settings, the token, and the Link API on her workspace host,
 # its event stream left open while the other checks run.
 pair_link() {
   local code user
@@ -228,10 +223,12 @@ pair_link() {
   user=$(jq --raw-output .user_code <<<"$code")
   [ "$(jq --raw-output .verification_uri <<<"$code")" = "$apex/link" ] || fail "the device code sends people elsewhere: $code"
   pass "Poise Link gets the device code $user"
-  expect 200 "alice opens the pairing page" "$alice" "$apex/link"
-  expect 200 "alice approves $user" "$alice" "$apex/link" --header "Origin: $apex" \
-    --data-urlencode "csrf=$(form_field csrf)" --data-urlencode "user_code=$user" --data-urlencode decision=approve
-  grep --quiet 'Approved.' "$work/body" || fail "the approval was not confirmed: $(head -c 800 "$work/body")"
+  expect 302 "/link sends alice to her workspace's Settings" "$alice" "$apex/link"
+  [ "$location" = "http://alice.$domain/?settings=link" ] || fail "/link sent alice to $location, not to her workspace's Settings"
+  expect 200 "alice approves $user in Settings" "$alice" "http://alice.$domain/_poise/api/devices/pair" \
+    --header "Origin: http://alice.$domain" --header 'Content-Type: application/json' \
+    --data "{\"userCode\":\"$user\",\"decision\":\"approve\"}"
+  [ "$(jq --raw-output .decision "$work/body")" = approve ] || fail "the approval was not confirmed: $(head -c 800 "$work/body")"
   curl --silent --show-error --fail --max-time 30 --header 'Content-Type: application/json' \
     --data "{\"device_code\":\"$(jq --raw-output .device_code <<<"$code")\"}" "$apex/link/device/token" >"$work/token" \
     || fail "POST /link/device/token failed: $(cat "$work/token")"
@@ -264,7 +261,7 @@ pair_link() {
 # The event stream must still be open after 25 seconds, having sent the
 # snippets version at once and a ping since. Then alice revokes the device.
 revoke_link() {
-  local status=0
+  local status=0 device
   wait "$events" || status=$?
   [ "$status" = 28 ] || fail "the event stream ended before 25 seconds (curl $status): $(cat "$work/events")"
   if ! grep --quiet --line-regexp 'event: snippets' "$work/events" \
@@ -273,9 +270,11 @@ revoke_link() {
   fi
   grep --quiet --line-regexp 'event: ping' "$work/events" || fail "the event stream sent no ping: $(cat "$work/events")"
   pass "the event stream stays open through Caddy and the gateway, with the snippets version and pings"
-  expect 200 "alice opens her paired devices" "$alice" "$apex/link/devices"
-  expect 303 "alice revokes the device" "$alice" "$apex/link/devices/revoke" --header "Origin: $apex" \
-    --data-urlencode "csrf=$(form_field csrf)" --data-urlencode "id=$(form_field id)"
+  expect 200 "alice lists her paired devices in Settings" "$alice" "http://alice.$domain/_poise/api/devices"
+  device=$(jq --raw-output '.devices[] | select(.state == "active") | .id' "$work/body" | head -n 1)
+  [ -n "$device" ] || fail "Settings lists no paired device: $(head -c 800 "$work/body")"
+  expect 200 "alice revokes the device" "$alice" "http://alice.$domain/_poise/api/devices/revoke" \
+    --header "Origin: http://alice.$domain" --header 'Content-Type: application/json' --data "{\"id\":\"$device\"}"
   expect 401 "/api/link/hello with the revoked device's token" "$nobody" "http://alice.$domain/api/link/hello" \
     --header "Authorization: Bearer $link_token" --dump-header "$work/headers"
   [ "$(jq --raw-output .error "$work/body")" = device_revoked ] || fail "the refusal does not say device_revoked: $(cat "$work/body")"

@@ -1,32 +1,37 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { pagePrincipal, postPrincipal } from './auth.js'
-import type { Context } from './context.js'
-import { header, HttpError, readBody, readForm, redirect, sendHtml, sendJson } from './http.js'
-import { devicesPage, linkPage } from './pages.js'
-import { deviceState, normalizeUserCode } from './store.js'
+import { pagePrincipal } from './auth.js'
+import type { Context, Principal } from './context.js'
+import { header, HttpError, readBody, redirect, sendJson } from './http.js'
+import { deviceState, normalizeUserCode, type Device } from './store.js'
 
 export const DEVICE_CODE_TTL_SECONDS = 15 * 60
 export const DEVICE_POLL_INTERVAL_SECONDS = 5
 // RFC 8628 section 3.5: every slow_down adds five seconds to the polling interval.
 const SLOW_DOWN_STEP_SECONDS = 5
 const LABEL_MAX_LENGTH = 200
-// User codes are short enough to guess, so each signed-in session may try only a few.
+// User codes are short enough to guess, so each sign-in may try only a few.
 const CODE_ATTEMPTS_PER_WINDOW = 10
 const CODE_ATTEMPT_WINDOW_MS = 15 * 60_000
+/** Where Settings shows Poise Link: pairing and the paired devices. */
+export const LINK_SETTINGS_PATH = '/?settings=link'
 
-/** Counts a code submission; returns the seconds to wait when the session has used up its attempts. */
-function codeAttemptWait(ctx: Context, sessionHash: string): number {
+/**
+ * Counts a code submission; returns the seconds to wait when the sign-in has used up its attempts. A
+ * workspace session counts against the apex session it came from, so the limit holds across hosts.
+ */
+function codeAttemptWait(ctx: Context, principal: Principal): number {
+  const key = principal.session.parentHash ?? principal.session.idHash
   const now = ctx.deps.now()
-  for (const [key, times] of ctx.codeAttempts) {
-    if (times.every((time) => now - time >= CODE_ATTEMPT_WINDOW_MS)) ctx.codeAttempts.delete(key)
+  for (const [entry, times] of ctx.codeAttempts) {
+    if (times.every((time) => now - time >= CODE_ATTEMPT_WINDOW_MS)) ctx.codeAttempts.delete(entry)
   }
-  const recent = (ctx.codeAttempts.get(sessionHash) ?? []).filter((time) => now - time < CODE_ATTEMPT_WINDOW_MS)
+  const recent = (ctx.codeAttempts.get(key) ?? []).filter((time) => now - time < CODE_ATTEMPT_WINDOW_MS)
   if (recent.length >= CODE_ATTEMPTS_PER_WINDOW) {
-    ctx.codeAttempts.set(sessionHash, recent)
+    ctx.codeAttempts.set(key, recent)
     return Math.ceil((recent[0] + CODE_ATTEMPT_WINDOW_MS - now) / 1000)
   }
   recent.push(now)
-  ctx.codeAttempts.set(sessionHash, recent)
+  ctx.codeAttempts.set(key, recent)
   return 0
 }
 
@@ -71,60 +76,55 @@ export async function deviceToken(ctx: Context, req: IncomingMessage, res: Serve
   sendJson(res, 200, { access_token: poll.token, endpoint: ctx.workspaceOrigin(user.handle), login: user.login })
 }
 
-export function approvalPage(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL): void {
+/**
+ * GET /link and GET /link/devices: Poise Link opens /link to have a code approved, and approving and
+ * listing devices happen in Settings. The person goes on to their workspace, signing in first if need be.
+ */
+export function toSettings(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL): void {
   const principal = pagePrincipal(ctx, req, res, url)
   if (!principal) return
-  sendHtml(res, 200, linkPage(principal.session.csrf), ctx.pageHeaders)
+  redirect(res, `${ctx.workspaceOrigin(principal.user.handle)}${LINK_SETTINGS_PATH}`)
 }
 
-export async function decide(ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const principal = postPrincipal(ctx, req)
-  const form = await readForm(req)
-  ctx.verifyForm(req, form, principal.session, ctx.apexOrigin)
-  const decision = form.get('decision')
-  if (decision !== 'approve' && decision !== 'deny') throw new HttpError(400, 'Choose Approve or Deny.')
-  const csrf = principal.session.csrf
-  const wait = codeAttemptWait(ctx, principal.session.idHash)
+export type PairOutcome =
+  | { ok: true; decision: 'approve' | 'deny'; message: string }
+  | { ok: false; status: 429; message: string; retryAfterSeconds: number }
+  | { ok: false; status: 400; message: string }
+
+/** Approves or denies a user code for the principal's own workspace. */
+export function decideCode(ctx: Context, principal: Principal, userCodeInput: string, decision: string): PairOutcome {
+  if (decision !== 'approve' && decision !== 'deny') throw new HttpError(400, 'Choose approve or deny.')
+  const wait = codeAttemptWait(ctx, principal)
   if (wait > 0) {
     ctx.deps.log.warn('device.code.rate_limited', { login: principal.user.login })
     const minutes = Math.ceil(wait / 60)
-    sendHtml(res, 429, linkPage(csrf, {
-      text: `Too many codes were tried. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
-      error: true,
-    }), { ...ctx.pageHeaders, 'retry-after': String(wait) })
-    return
+    return { ok: false, status: 429, message: `Too many codes were tried. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`, retryAfterSeconds: wait }
   }
-  const userCode = normalizeUserCode(form.get('user_code') ?? '')
+  const userCode = normalizeUserCode(userCodeInput)
   if (!userCode || !ctx.deps.store.decideDeviceCode(userCode, principal.user.handle, decision === 'approve')) {
-    sendHtml(res, 400, linkPage(csrf, {
-      text: 'That code is not valid or has expired. Start pairing again in Poise Link.',
-      error: true,
-    }), ctx.pageHeaders)
-    return
+    return { ok: false, status: 400, message: 'That code is not valid or has expired. Start pairing again in Poise Link.' }
   }
   ctx.deps.log.info(decision === 'approve' ? 'device.approved' : 'device.denied', { login: principal.user.login })
   const host = new URL(ctx.workspaceOrigin(principal.user.handle)).host
-  sendHtml(res, 200, linkPage(csrf, {
-    text: decision === 'approve'
+  return {
+    ok: true,
+    decision,
+    message: decision === 'approve'
       ? `Approved. Poise Link on that computer is now paired with ${host}.`
       : 'Denied. That computer will not be paired.',
-    error: false,
-  }), ctx.pageHeaders)
+  }
 }
 
-export function devices(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL): void {
-  const principal = pagePrincipal(ctx, req, res, url)
-  if (!principal) return
-  const devices = ctx.deps.store.listDevices(principal.user.handle)
-  sendHtml(res, 200, devicesPage(devices.map((device) => ({ ...device, state: deviceState(device, ctx.deps.now()) })), principal.session.csrf), ctx.pageHeaders)
+export interface DeviceView extends Device {
+  state: 'active' | 'revoked' | 'expired'
 }
 
-export async function revoke(ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const principal = postPrincipal(ctx, req)
-  const form = await readForm(req)
-  ctx.verifyForm(req, form, principal.session, ctx.apexOrigin)
-  const id = form.get('id') ?? ''
+export function listDevices(ctx: Context, handle: string): DeviceView[] {
+  const now = ctx.deps.now()
+  return ctx.deps.store.listDevices(handle).map((device) => ({ ...device, state: deviceState(device, now) }))
+}
+
+export function revokeDevice(ctx: Context, principal: Principal, id: string): void {
   if (!ctx.deps.store.revokeDevice(principal.user.handle, id)) throw new HttpError(404, 'There is no such paired device.')
   ctx.deps.log.info('device.revoked', { login: principal.user.login, device: id })
-  redirect(res, '/link/devices', 303)
 }
