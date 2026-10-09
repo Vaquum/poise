@@ -65,9 +65,10 @@ test('shows the most pressing notice at the top centre, clear of every control',
   await expect(island(page).getByRole('button', { name: 'Show the next notification, 2 more' })).toBeVisible()
 
   const box = (await island(page).locator('.ni-shell').boundingBox())!
-  // Centred in the width the page lays out in: a classic scrollbar's gutter is reserved.
-  const width = await page.evaluate(() => document.documentElement.clientWidth)
-  expect(Math.abs(box.x + box.width / 2 - width / 2)).toBeLessThan(2)
+  // Centred on the band the page lays out in, as its fixed control bar is: a
+  // classic scrollbar's reserved gutter is not part of it.
+  const band = (await page.locator('.view:not([hidden]) .view-header').boundingBox())!
+  expect(Math.abs(box.x + box.width / 2 - (band.x + band.width / 2))).toBeLessThan(2)
   // In the band every view keeps above its controls, in every view.
   for (const view of ['Current', 'Swarm', 'Chat', 'Archive', 'Behaviors', 'Snippets', 'Editor']) {
     await page.locator('#top-nav').getByRole('button', { name: view, exact: true }).click()
