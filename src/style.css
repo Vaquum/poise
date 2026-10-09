@@ -963,10 +963,19 @@ tr:hover .review-btn { opacity: 1; }
   box-shadow: var(--e-3);
   z-index: 110;
   transform: translateX(100%);
-  transition: transform var(--t-slow) var(--ease);
+  transition: transform var(--t-slow) var(--ease), box-shadow var(--t-slow) var(--ease);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+/* Parked off-screen, a panel's shadow still reached 24px into the page: a
+   grey strip down the right edge of every view, darker with each panel. */
+#typo-panel:not(.open),
+#settings-panel:not(.open),
+#analytics-panel:not(.open),
+#behavior-memory-panel:not(.open) {
+  box-shadow: none;
 }
 
 /* The memory editor holds a multi-line textarea, so it gets more room
@@ -982,7 +991,8 @@ tr:hover .review-btn { opacity: 1; }
 
 /* ── Analytics panel ── */
 .analytics-range { margin-bottom: var(--sp-5); }
-.analytics-range button { flex: 1; padding-inline: 0; white-space: nowrap; }
+/* Four ranges share the panel's width evenly instead of overflowing it. */
+#analytics-panel .analytics-range button { flex: 1 1 0; min-width: 0; padding-inline: 4px; white-space: nowrap; }
 .analytics-status { margin: 0 0 var(--sp-4); }
 .analytics-groups { transition: opacity var(--t-base) ease; }
 /* The previous range's numbers stay in place while the next ones load,
