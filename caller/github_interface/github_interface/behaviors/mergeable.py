@@ -13,15 +13,16 @@ IDENTITY = AGENT
 BUTTON_GREEN = {"clean", "unstable", "has_hooks"}
 
 
-def status(pull: dict[str, Any], checks_state: str | None, unresolved: int) -> str | None:
+def status(pull: dict[str, Any], checks_state: str | None, unresolved: int, all_threads_read: bool = True) -> str | None:
     """Current's colour for a pull request: green when its merge button is
     green, no check fails or is still running and no conversation is left
-    unresolved; yellow when the button is green but one of those remains."""
+    unresolved; yellow when the button is green but one of those remains, or
+    when there were more conversations than one read could check."""
     if pull.get("state") != "open" or pull.get("draft") or pull.get("mergeable") is not True:
         return None
     if pull.get("mergeable_state") not in BUTTON_GREEN:
         return None
-    return "green" if checks_state in (None, "SUCCESS") and unresolved == 0 else "yellow"
+    return "green" if checks_state in (None, "SUCCESS") and unresolved == 0 and all_threads_read else "yellow"
 
 
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
@@ -39,7 +40,9 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     readiness = await get_pr_readiness_state(client, owner, repo, pull_number)
     commit = (((readiness.get("commits") or {}).get("nodes") or [{}])[0].get("commit") or {})
     checks_state = (commit.get("statusCheckRollup") or {}).get("state")
-    unresolved = sum(1 for thread in readiness["reviewThreads"]["nodes"] if not thread["isResolved"] and not thread["isOutdated"])
+    threads = readiness["reviewThreads"]
+    unresolved = sum(1 for thread in threads["nodes"] if not thread["isResolved"] and not thread["isOutdated"])
+    all_threads_read = not threads["pageInfo"]["hasNextPage"]
     return {
         "action": "mergeable",
         "repository": f"{owner}/{repo}",
@@ -51,5 +54,5 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "draft": pull.get("draft"),
         "checks_state": checks_state,
         "unresolved_conversations": unresolved,
-        "status": status(pull, checks_state, unresolved),
+        "status": status(pull, checks_state, unresolved, all_threads_read),
     }

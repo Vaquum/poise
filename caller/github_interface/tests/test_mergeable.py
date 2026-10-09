@@ -8,10 +8,11 @@ from github_interface.behaviors import mergeable
 OPEN = {"state": "open", "draft": False, "mergeable": True, "mergeable_state": "clean"}
 
 
-def readiness(checks: str | None, threads: list[tuple[bool, bool]]) -> dict:
+def readiness(checks: str | None, threads: list[tuple[bool, bool]], more: bool = False) -> dict:
     return {
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": checks} if checks else None}}]},
-        "reviewThreads": {"nodes": [{"isResolved": resolved, "isOutdated": outdated} for resolved, outdated in threads]},
+        "reviewThreads": {"pageInfo": {"hasNextPage": more},
+                          "nodes": [{"isResolved": resolved, "isOutdated": outdated} for resolved, outdated in threads]},
     }
 
 
@@ -40,3 +41,9 @@ class TestStatus(IsolatedAsyncioTestCase):
             result = await mergeable.run(client, {"repository": "acme/app", "pull_number": "7"})
         self.assertEqual((result["mergeable"], result["checks_state"], result["unresolved_conversations"], result["status"]),
                          (True, "SUCCESS", 1, "yellow"))
+
+    async def test_more_conversations_than_one_read_checks_cannot_show_green(self):
+        with patch.object(mergeable, "get_pull", AsyncMock(return_value=OPEN)), \
+                patch.object(mergeable, "get_pr_readiness_state", AsyncMock(return_value=readiness("SUCCESS", [(True, False)], more=True))):
+            result = await mergeable.run(object(), {"repository": "acme/app", "pull_number": "7"})
+        self.assertEqual((result["unresolved_conversations"], result["status"]), (0, "yellow"))
