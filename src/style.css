@@ -1398,6 +1398,28 @@ body:has(#behavior-memory-panel.open) #menu-toggle {
   margin: 4px 8px;
 }
 
+/* The menu's first line: the commit Poise runs and since when. Quiet, like a
+   caption; the hash is the one thing to click. */
+.menu-release {
+  padding: 6px 12px 4px;
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.6875rem;
+  line-height: 1.4;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+.menu-release-commit {
+  color: inherit;
+  text-decoration: none;
+  border-radius: var(--r-sm);
+  transition: color var(--t-quick) ease;
+}
+.menu-release-commit:hover {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 /* ──────────────────────────────────────────────────────────────── */
 /* FLOW DASHBOARD                                                    */
 /* ──────────────────────────────────────────────────────────────── */

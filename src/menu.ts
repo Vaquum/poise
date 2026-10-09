@@ -1,7 +1,10 @@
 // Top-right chrome — three view-nav items inline (Current · Swarm ·
 // Archive) with the burger toggle as a sibling. The burger opens the side
 // panels (Analytics, Settings, Typography); view switching happens via the
-// inline nav.
+// inline nav. Its first line says which commit Poise runs and since when.
+
+import { effectiveTimezone } from './config'
+import { releaseLine } from './release'
 
 type ViewName = 'current' | 'swarm' | 'chat' | 'main' | 'behaviors' | 'snippets' | 'editor'
 
@@ -98,6 +101,10 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
   menu.id = 'menu-popover'
   menu.hidden = true
   menu.innerHTML = `
+    <div class="menu-release" hidden>
+      <a class="menu-release-commit" target="_blank" rel="noopener noreferrer"></a><span class="menu-release-when"></span>
+    </div>
+    <div class="menu-divider menu-release-divider" hidden></div>
     <button class="menu-item" data-action="analytics">
       <span class="menu-icon">${ICON_ANALYTICS}</span><span class="menu-text">Analytics</span>
     </button>
@@ -160,8 +167,34 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
   }
   setActiveItem()
 
+  // Read on each opening: an update reloads the page, but a first read may
+  // have found the server still starting.
+  const releaseEl = menu.querySelector<HTMLElement>('.menu-release')!
+  const releaseDivider = menu.querySelector<HTMLElement>('.menu-release-divider')!
+  async function showRelease() {
+    try {
+      const res = await fetch('/api/release')
+      const line = res.ok ? releaseLine(await res.json(), effectiveTimezone()) : null
+      if (!line) return
+      const link = releaseEl.querySelector<HTMLAnchorElement>('.menu-release-commit')!
+      link.textContent = line.commit
+      link.href = line.href
+      link.setAttribute('aria-label', line.label)
+      link.title = line.label
+      releaseEl.querySelector<HTMLElement>('.menu-release-when')!.textContent = line.when ? ` · ${line.when}` : ''
+      releaseEl.hidden = false
+      releaseDivider.hidden = false
+    } catch { /* Offline: the line stays as it was. */ }
+  }
+
+  // Following the commit to GitHub is done with the menu.
+  releaseEl.addEventListener('click', (e) => {
+    if ((e.target as HTMLElement).closest('a')) closeMenu()
+  })
+
   function openMenu() {
     menu.hidden = false
+    void showRelease()
     requestAnimationFrame(() => menu.classList.add('open'))
   }
   function closeMenu() {
