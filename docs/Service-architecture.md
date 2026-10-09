@@ -629,8 +629,10 @@ alerts once, and again only after it has cleared:
 **Poise Link** runs on macOS, Windows and Linux from one Tauri codebase.
 - **First run:** asks for the server address, runs device pairing, keeps the
   token in the operating system's credential store, and turns on
-  start-at-login itself (LaunchAgent on macOS, the Run key on Windows, XDG
-  autostart on Linux). It then lives in the tray.
+  start-at-login itself (a launch agent on macOS, the Run key on Windows, XDG
+  autostart on Linux). It then lives in the tray. On macOS launchd also starts
+  it again whenever it stops other than by Quit, so while start at login is on
+  every other start hands over to launchd's copy.
 - **Snippet sync:**
   - It holds the event stream open, refetching snippets on change and at least
     every 10 minutes.
