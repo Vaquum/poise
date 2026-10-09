@@ -197,3 +197,86 @@ describe('organization repository discovery', () => {
     expect(await listOrgRepos('alpha')).toEqual(['alpha/new'])
   })
 })
+
+describe('concurrent pull request status reads', () => {
+  function statusCalls() {
+    return mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-interface' && args[0] === '--mergeable')
+  }
+
+  function datastoreResult(args: string[], number: number) {
+    return { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', number, 5)] : []), stderr: '' }
+  }
+
+  it('shares one GitHub read between simultaneous Current and ready-PR notification requests', async () => {
+    mocks.meta = { me: 'octocat', agentAccount: 'review-bot' }
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => command === 'github-interface'
+      ? { stdout: JSON.stringify({ mergeable: true, status: 'green' }), stderr: '' }
+      : datastoreResult(args, 21))
+
+    const [current, notices, otherCurrent] = await Promise.all([
+      handleGhBody({ operation: 'green_pr', org: 'alpha' }),
+      readOwnPullRequests(),
+      handleGhBody({ operation: 'green_pr', org: 'alpha' }),
+    ])
+
+    expect(current.body).toEqual({ records: [{ repo: 'alpha/same', number: 21, status: 'green' }], errors: [] })
+    expect(otherCurrent).toEqual(current)
+    expect(notices.pullRequests).toEqual([{ repo: 'alpha/same', number: 21, title: 'alpha 21', status: 'green' }])
+    expect(statusCalls()).toHaveLength(1)
+    await handleGhBody({ operation: 'green_pr', org: 'alpha' })
+    expect(statusCalls()).toHaveLength(1)
+  })
+
+  it('keeps concurrent reads and cached results separate for different authenticated accounts', async () => {
+    mocks.meta = { me: 'octocat', agentAccount: 'first-bot' }
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => command === 'github-interface'
+      ? { stdout: JSON.stringify({ mergeable: true, status: args[3] === 'first-bot' ? 'green' : 'yellow' }), stderr: '' }
+      : datastoreResult(args, 22))
+
+    const first = handleGhBody({ operation: 'green_pr', org: 'alpha' })
+    mocks.meta.agentAccount = 'second-bot'
+    const second = handleGhBody({ operation: 'green_pr', org: 'alpha' })
+    const [firstResult, secondResult] = await Promise.all([first, second])
+
+    expect(firstResult.body).toEqual({ records: [{ repo: 'alpha/same', number: 22, status: 'green' }], errors: [] })
+    expect(secondResult.body).toEqual({ records: [{ repo: 'alpha/same', number: 22, status: 'yellow' }], errors: [] })
+    expect(statusCalls().map(([, args]) => args[3]).sort()).toEqual(['first-bot', 'second-bot'])
+    expect(await handleGhBody({ operation: 'green_pr', org: 'alpha' })).toEqual(secondResult)
+    mocks.meta.agentAccount = 'first-bot'
+    expect(await handleGhBody({ operation: 'green_pr', org: 'alpha' })).toEqual(firstResult)
+    expect(statusCalls()).toHaveLength(2)
+  })
+
+  it.each(['transport', 'parse'] as const)('shares %s failures, keeps their existing cache duration, and retries after expiry', async (failure) => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000)
+    const number = failure === 'transport' ? 23 : 24
+    mocks.meta = { me: 'octocat', agentAccount: 'review-bot' }
+    let failed = true
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command !== 'github-interface') return datastoreResult(args, number)
+      if (failed && failure === 'transport') throw new Error('GitHub unavailable')
+      return { stdout: failed ? 'invalid JSON' : JSON.stringify({ mergeable: true, status: 'green' }), stderr: '' }
+    })
+
+    const [current, notices] = await Promise.all([
+      handleGhBody({ operation: 'green_pr', org: 'alpha' }),
+      readOwnPullRequests(),
+    ])
+    expect(current.body).toEqual({ records: [], errors: [] })
+    expect(notices.pullRequests).toEqual([{ repo: 'alpha/same', number, title: `alpha ${number}`, status: undefined }])
+    expect(statusCalls()).toHaveLength(1)
+
+    failed = false
+    clock.mockReturnValue(1_800_000_059_999)
+    expect((await handleGhBody({ operation: 'green_pr', org: 'alpha' })).body).toEqual({ records: [], errors: [] })
+    expect(statusCalls()).toHaveLength(1)
+    clock.mockReturnValue(1_800_000_060_000)
+    const [retried, retriedNotices] = await Promise.all([
+      handleGhBody({ operation: 'green_pr', org: 'alpha' }),
+      readOwnPullRequests(),
+    ])
+    expect(retried.body).toEqual({ records: [{ repo: 'alpha/same', number, status: 'green' }], errors: [] })
+    expect(retriedNotices.pullRequests[0].status).toBe('green')
+    expect(statusCalls()).toHaveLength(2)
+  })
+})

@@ -51,7 +51,10 @@ up before marking the index complete. Incomplete builds have no freshness marker
 Without `--resume`, initialization still clears and rebuilds the index.
 
 Incremental sync batches the first issue/PR probe for up to 20 repositories per
-GraphQL request. Pagination and complete association expansion remain unchanged.
+GraphQL request. Subsequent pages share requests across up to 20 independent
+issue/PR connections, using each connection's own returned cursor. Every page
+and complete association graph is still read; total-count, identity and cursor
+checks still reject incomplete enumeration.
 A primary quota failure raises `GitHubRateLimitError` with `reset_at` (Unix seconds)
 and `GITHUB_RATE_LIMIT_RESET=<seconds>` in the CLI error. Callers must wait until
 that deadline before retrying; the CLI does not sleep through a quota window.
