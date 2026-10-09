@@ -25,7 +25,8 @@ function notice(id: string, overrides: Partial<Notice> = {}): Notice {
 describe("the server's answer", () => {
   it('is read as the state the island shows', () => {
     const ready = notice('a-2', { kind: 'pr_ready', silenceable: true, target: { pullRequest: 'https://github.com/acme/api/pull/7' } })
-    expect(noticesFrom({ enabled: true, notices: [notice('a-1'), ready] })).toEqual({ enabled: true, notices: [notice('a-1'), ready] })
+    const held = notice('a-3', { kind: 'behavior_held', target: { swarm: 'failed-call' } })
+    expect(noticesFrom({ enabled: true, notices: [notice('a-1'), ready, held] })).toEqual({ enabled: true, notices: [notice('a-1'), ready, held] })
     expect(noticesFrom({ enabled: false, notices: [notice('a-1')] })).toEqual({ enabled: false, notices: [] })
   })
 
@@ -37,6 +38,10 @@ describe("the server's answer", () => {
     const unsafe = notice('a-3', { kind: 'pr_ready', target: { pullRequest: 'javascript:alert(1)' } })
     const undated = { ...notice('a-4'), due: 'soon' }
     expect(noticesFrom({ enabled: true, notices: [notice('a-1'), unknown, unsafe, undated, null] })!.notices.map((n) => n.id)).toEqual(['a-1'])
+    for (const swarm of ['', 'a b', '<img>', 'a'.repeat(201), 7, null]) {
+      const malformed = { ...notice('a-5'), target: { swarm } }
+      expect(noticesFrom({ enabled: true, notices: [malformed] })!.notices).toEqual([])
+    }
   })
 })
 
@@ -103,6 +108,11 @@ describe("a notice's markup", () => {
     expect(ready).toContain('data-action="silence"')
     expect(ready).toContain('Open the pull request on GitHub.')
     expect(ready).not.toContain('data-action="next"')
+
+    const held = noticeHtml(notice('c', { kind: 'behavior_held', target: { swarm: 'failed-call' } }), 0, T0)
+    expect(held).toContain('Open the failed run in Swarm.')
+    expect(held.match(/data-action="open"/g)).toHaveLength(1)
+    expect(held).not.toContain('Open Behaviors')
   })
 
   it('only informs when it has nowhere to go', () => {

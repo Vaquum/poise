@@ -6,7 +6,7 @@ import { initSettings, toggleSettingsPanel, openSettingsPanel, openSettingsAt, c
 import { initMenu } from './menu'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
 import { initCurrentView, stopCurrentPolling } from './views/current-view'
-import { initSwarmView, stopSwarmRefresh, focusRow as focusSwarmRow } from './views/swarm-view'
+import { initSwarmView, stopSwarmRefresh, focusRow as focusSwarmRow, focusCall as focusSwarmCall } from './views/swarm-view'
 import { initChatView, stopChatRefresh, openChatSession, openChatWithContext, chatSessionInView, type NewSessionPrefill } from './views/chat-view'
 import { initBehaviorsView, stopBehaviorsRefresh } from './views/behaviors-view'
 import { initSnippetsView } from './views/snippets-view'
@@ -143,6 +143,10 @@ const menu = initMenu({
 const notices = new NoticeFeed()
 function openNotice(target: NoticeTarget): void {
   if ('view' in target) menu.switchTo(target.view)
+  else if ('swarm' in target) {
+    if (menu.currentView() !== 'swarm') menu.switchTo('swarm')
+    void focusSwarmCall(target.swarm)
+  }
   else if ('settings' in target) openSettingsAt(target.settings)
   else if ('chat' in target) window.dispatchEvent(new CustomEvent('poise:open-chat-session', { detail: { id: target.chat } }))
   else window.open(target.pullRequest, '_blank', 'noopener,noreferrer')

@@ -74,18 +74,25 @@ function dueAt(alert: OpenAlert, now: number): number | null {
 /** What the page shows now, the most pressing first. */
 export function noticesState(now = Date.now()): NoticesState {
   if (!getNotificationSettings().enabled) return { enabled: false, notices: [] }
-  const notices = openAlerts({ now }).flatMap((alert): Notice[] => {
+  const alerts = openAlerts({ now })
+  // Read the incident's current call, including alerts recorded before Swarm
+  // navigation existed and later attempts covered by the same held alert.
+  const incidents = new Map((alerts.some((alert) => alert.kind === 'behavior_held') ? listBehaviorIncidents(INCIDENT_READ_LIMIT) : [])
+    .map((incident) => [`behavior-held:${incident.behavior}:${incident.target}`, incident]))
+  const notices = alerts.flatMap((alert): Notice[] => {
     const due = dueAt(alert, now)
     if (due === null) return []
+    const incident = alert.kind === 'behavior_held' ? incidents.get(alert.dedupeKey) : undefined
+    const target: AlertTarget | null = incident?.callId ? { swarm: incident.callId } : alert.target
     return [{
       id: alert.id,
       kind: alert.kind,
       title: alert.title,
-      body: alert.body,
+      body: target && 'swarm' in target ? 'Open Swarm in Poise to see what happened.' : alert.body,
       since: alert.createdAt,
       due: new Date(due).toISOString(),
       silenceable: SILENCEABLE.has(alert.kind),
-      target: alert.target,
+      target,
     }]
   })
   // Within a kind, the one that most recently came due leads.

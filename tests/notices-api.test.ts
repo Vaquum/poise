@@ -105,6 +105,23 @@ const waiting = { kind: 'chat_waiting', dedupeKey: 'chat-waiting:s1', title: 'Cl
 const ready = { kind: 'pr_ready', dedupeKey: 'pr-ready:acme/api#1', title: 'acme/api#1 is ready to merge', body: 'Change 1', path: '/', target: { pullRequest: 'https://github.com/acme/api/pull/1' } } as const
 
 describe('the notices API', () => {
+  it('gives an existing failed-behavior notice its exact Swarm call', async () => {
+    const failed = store!.raiseAlert({
+      kind: 'behavior_held', dedupeKey: 'behavior-held:approve-prs:acme/api#9',
+      title: 'Approve Pull Requests failed on acme/api#9',
+      body: 'Open Behaviors in Poise to see what happened.', path: '/', target: { view: 'behaviors' },
+    })!
+    database!.db.prepare(`
+      INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, call_id, error, created_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('failed', 'approve-prs', 'acme/api#9', 'acme/api', 9, 'failed-call', 'Approval failed', new Date().toISOString())
+    const answer = await call('GET', '/api/notices')
+    expect(answer.status).toBe(200)
+    expect(answer.body.notices).toEqual([expect.objectContaining({
+      id: failed.id, target: { swarm: 'failed-call' }, body: 'Open Swarm in Poise to see what happened.',
+    })])
+  })
+
   it('serves what the page shows, the most pressing first', async () => {
     store!.raiseAlert(ready)
     store!.raiseAlert(waiting)
