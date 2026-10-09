@@ -305,11 +305,9 @@ async function checkPrStatus(owner: string, repo: string, number: number, agent:
     })
     const result = JSON.parse(stdout)
     // A github-interface that reports no status says only whether the PR is clean: green.
-    const status: PrStatus = result?.action !== 'mergeable'
-      ? undefined
-      : result.status === 'green' || result.status === 'yellow'
-        ? result.status
-        : result.status === undefined && result.mergeable ? 'green' : null
+    const status: PrStatus = result.status === 'green' || result.status === 'yellow'
+      ? result.status
+      : result.status === undefined && result.mergeable ? 'green' : null
     greenCache.set(key, { status, expiry: now + GREEN_TTL_MS })
     return status
   } catch {

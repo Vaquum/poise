@@ -21,6 +21,7 @@ import { watchForUpdates } from './updating'
 import { watchForSignOut } from './signed-out'
 import { NoticeFeed, type NoticeTarget } from './notices'
 import { mountNoticeIsland } from './views/notice-island'
+import './views/notice-island.css'
 import './views/updating.css'
 
 const viewMainEl = document.getElementById('view-main')!

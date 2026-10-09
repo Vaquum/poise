@@ -9,7 +9,6 @@
 // next. Nothing here takes focus or makes a sound.
 
 import { standingFor, type Notice, type NoticeFeed, type NoticeKind, type NoticesState, type NoticeTarget } from '../notices'
-import './notice-island.css'
 
 const ICONS: Record<NoticeKind, string> = {
   chat_waiting: '<circle cx="3" cy="6" r="1.1" fill="currentColor"/><circle cx="6" cy="6" r="1.1" fill="currentColor"/><circle cx="9" cy="6" r="1.1" fill="currentColor"/>',
