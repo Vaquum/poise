@@ -47,11 +47,19 @@ function pr(number: number, created: string, merged: string | null, extra: Parti
 }
 
 describe('the window', () => {
-  it('takes zoned times, keeps whole UTC seconds and leaves absent bounds open', () => {
-    expect(parseWindow('2026-10-08T21:00:00.000Z', '2026-10-09T21:00:00.000Z'))
-      .toEqual({ since: '2026-10-08T21:00:00Z', until: '2026-10-09T21:00:00Z' })
-    expect(parseWindow('2026-10-09T00:00:00+03:00', undefined)).toEqual({ since: '2026-10-08T21:00:00Z', until: null })
+  it('takes zoned times in UTC to the millisecond, and leaves absent bounds open', () => {
+    expect(parseWindow('2026-10-08T21:00:00.000Z', '2026-10-09T21:00:00.250Z'))
+      .toEqual({ since: '2026-10-08T21:00:00.000Z', until: '2026-10-09T21:00:00.250Z' })
+    expect(parseWindow('2026-10-09T00:00:00+03:00', undefined)).toEqual({ since: '2026-10-08T21:00:00.000Z', until: null })
     expect(parseWindow(null, '')).toEqual({ since: null, until: null })
+  })
+
+  it('keeps a bound inside a second where it is: since stays inclusive and until exclusive', () => {
+    const at = [issue(1, '2026-10-09T00:00:00Z'), issue(2, '2026-10-09T00:00:01Z')]
+    const after = computeAnalytics({ window: parseWindow('2026-10-09T00:00:00.500Z', null), issues: at, prs: [], behaviors: [] })
+    expect(after.issues.opened).toBe(1)
+    const before = computeAnalytics({ window: parseWindow(null, '2026-10-09T00:00:00.500Z'), issues: at, prs: [], behaviors: [] })
+    expect(before.issues.opened).toBe(1)
   })
 
   it('refuses a time without a zone, garbage and an empty window', () => {

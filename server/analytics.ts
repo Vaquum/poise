@@ -55,8 +55,8 @@ function windowBound(value: unknown, name: string): string | null {
   if (typeof value !== 'string' || !ISO_WITH_ZONE.test(value) || !Number.isFinite(Date.parse(value))) {
     throw new HttpError(400, `${name} must be a date and time with a timezone`)
   }
-  // The datastore only accepts whole seconds in UTC.
-  return new Date(Date.parse(value)).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  // Exact to the millisecond: rounding would move an edge of the window.
+  return new Date(Date.parse(value)).toISOString()
 }
 
 export function parseWindow(since: unknown, until: unknown): AnalyticsWindow {
@@ -146,7 +146,9 @@ function dedupe(rows: DatastoreRecord[]): DatastoreRecord[] {
 
 async function readOrganization(org: Organization, me: string, window: AnalyticsWindow): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[] }> {
   // Anything opened, closed or merged since the window began was updated
-  // since then too, so the datastore can narrow the read.
+  // since then too, so the datastore can narrow the read. It rounds the time
+  // down to the second, which only widens the read; the window itself is
+  // applied exactly in computeAnalytics.
   const common = [...(window.since ? ['--updated-since-datetime', window.since] : []), '--format', 'json']
   const read = (scope: string[]) => runCli(org, ['view', ...scope, ...common])
   const [issueRows, prScopeRows, prDetails] = await Promise.all([
