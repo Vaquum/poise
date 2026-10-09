@@ -36,6 +36,8 @@ export interface WorkspaceStub {
   serviceRequests: SeenRequest[]
   /** The releases POST /api/service/switch was asked for. */
   switches: string[]
+  /** Releases the workspace refuses because they failed to start there. */
+  failedReleases: string[]
   /** Every request line the stub parsed, including any a client smuggled past the gateway. */
   requestLines: string[]
   close(): Promise<void>
@@ -58,6 +60,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
     healthStatus: 200,
     health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, draining: false, release: null },
     switches: [],
+    failedReleases: [],
     healthPadding: 0,
     requests: [],
     serviceRequests: [],
@@ -100,6 +103,9 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
         if (url === '/api/service/switch' && req.method === 'POST') {
           const { release } = JSON.parse(seen.body || '{}') as { release?: string }
           stub.switches.push(String(release))
+          if (stub.failedReleases.includes(String(release))) {
+            return json(res, 409, { error: `release ${release} failed to start in this workspace; it stays on release ${stub.health.release}` })
+          }
           return json(res, 202, { release, switching: release !== stub.health.release })
         }
         if (url === '/api/service/health' || url === '/api/service/drain') {

@@ -544,7 +544,8 @@ describe('updates in place', () => {
   const BASE = 'base-1'
   const start = async (options: { oldBase?: string | null; running?: boolean; release?: string | null } = {}) => {
     const { oldBase = BASE, running = true, release = 'old-release' } = options
-    h = await startHarness()
+    // A workspace that does not answer is drained until this timeout, then recreated.
+    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1' } })
     await h.openWorkspace('Alice')
     h.store.noteWorkspace('alice', 'Alice')
     h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': BASE })
@@ -649,6 +650,53 @@ describe('updates in place', () => {
     h.docker.taskExitCode = 0
     await h.orchestrator.upgradePass()
     expect(h.workspace.switches).toEqual(['new-release'])
+  })
+
+  it('stops asking for a release that failed to start in the workspace, which stays on its own', async () => {
+    await start()
+    h.workspace.failedReleases.push('new-release')
+    await h.orchestrator.upgradePass()
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+    expect(h.orchestrator.updatingTo('alice')).toBeNull()
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.refused')).toMatchObject({ handle: 'alice', release: 'new-release', running: 'old-release' })
+    expect(h.store.getWorkspace('alice')?.lastError).toContain('failed to start')
+  })
+
+  it('recreates a workspace of the same base whose container settings changed', async () => {
+    await start()
+    const before = containerId()
+    h.docker.containers.get('poise-ws-alice')!.spec = { ...h.docker.containers.get('poise-ws-alice')!.spec, Env: ['POISE_DRAIN_TIMEOUT=60'] }
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(containerId()).not.toBe(before)
+    expect(containerEnv(h, 'alice')).toContain(`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`)
+  })
+
+  it('switches a workspace on the current image that still runs an older release', async () => {
+    await start()
+    const alice = h.docker.containers.get('poise-ws-alice')!
+    alice.imageId = CURRENT_IMAGE_ID
+    await h.orchestrator.upgradePass()
+    expect(h.docker.tasks).toHaveLength(1)
+    expect(h.workspace.switches).toEqual(['new-release'])
+    h.workspace.health.release = 'new-release'
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toHaveLength(1)
+  })
+
+  it('waits for a workspace restarting onto the release it was asked for, and recreates one that stays unreachable', async () => {
+    await start()
+    const before = containerId()
+    await h.orchestrator.upgradePass()
+    h.workspace.reachable = false
+    h.orchestrator.markNotReady('alice')
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    h.advance(11 * 60_000)
+    await h.orchestrator.upgradePass()
+    expect(containerId()).not.toBe(before)
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
   })
 
   it('recreates a stopped workspace on the new image, with the new release current', async () => {

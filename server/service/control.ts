@@ -127,8 +127,9 @@ export class ServiceControl {
    * Restarts this server onto an installed release of the same base, at the
    * first moment no Chat turn and no work of this server's own runs. Agent
    * calls are not waited for: they run detached, survive the restart, and the
-   * next server reconciles them as after any restart. Background ticks stop
-   * being admitted meanwhile; the person's own work is still admitted.
+   * next server reconciles them as after any restart. Nothing is refused
+   * while it waits, behavior ticks included: they end within a minute, and
+   * the moment between two of them is quiet.
    */
   switchRelease(release: unknown): SwitchAnswer {
     if (typeof release !== 'string' || !RELEASE_NAME.test(release)) throw new HttpError(400, 'release must name an installed release')
@@ -144,6 +145,8 @@ export class ServiceControl {
       throw new HttpError(409, `release ${release} is not installed`)
     }
     if (base !== this.release.base) throw new HttpError(409, `release ${release} was built for another base; recreate the container to update it`)
+    // The supervisor marks a release that failed to start, and never runs it again.
+    if (existsSync(join(dir, 'failed'))) throw new HttpError(409, `release ${release} failed to start in this workspace; it stays on release ${this.release.name}`)
     if (release === this.release.name) return { release, switching: false }
     const next = join(this.releasesDir, 'next')
     writeFileSync(`${next}.tmp`, `${release}\n`)
@@ -151,7 +154,6 @@ export class ServiceControl {
     const first = this.switchTo === null
     this.switchTo = release
     if (first) {
-      pauseReleaseBackground()
       this.log(`[service] switching to release ${release} once no Chat turn and no work of this server runs`)
       this.pollSwitch()
     }
@@ -161,10 +163,11 @@ export class ServiceControl {
   private pollSwitch(): void {
     this.switchPoll = this.timer.setTimeout(() => {
       this.switchPoll = null
-      const quiet = listOpenTurns(this.runtime.instance).length === 0 && this.runtime.busy() === 0
+      const quiet = listOpenTurns(this.runtime.instance).length === 0 && this.runtime.working() === 0
         && releaseBackgroundBusy() === 0 && this.launches === 0
       if (!quiet) return this.pollSwitch()
       // Refused from here on; the gateway shows the person that Poise is updating.
+      pauseReleaseBackground()
       this.runtime.startDrain('service')
       this.drainOn = true
       this.log(`[service] restarting on release ${this.switchTo}; running agent calls carry on`)

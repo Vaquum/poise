@@ -123,9 +123,11 @@ ENV HOME=/home/poise \
 # The release this image carries, and the base it runs on. deploy/lib.sh
 # names the release by its commit and the base by the files that build it; a
 # workspace takes a newer image of the same base in place, without a new
-# container (docs/Service-architecture.md, "Updates in place").
-ARG POISE_RELEASE=development
-ARG POISE_BASE=development
+# container (docs/Service-architecture.md, "Updates in place"). A build that
+# names neither, as a plain `docker build` does, carries no release: a
+# workspace on it is never switched, and every new image gets a new container.
+ARG POISE_RELEASE=
+ARG POISE_BASE=
 RUN printf '%s\n' "$POISE_RELEASE" > /opt/poise/RELEASE \
  && printf '%s\n' "$POISE_BASE" > /opt/poise-runtime/BASE
 LABEL poise.image=runtime poise.release=$POISE_RELEASE poise.base=$POISE_BASE

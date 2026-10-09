@@ -8,6 +8,10 @@ set -eu
 
 release=$(cat /opt/poise/RELEASE)
 base=$(cat /opt/poise-runtime/BASE)
+if [ -z "$release" ] || [ -z "$base" ]; then
+  echo "install-release.sh: this image names no release or base; build it with deploy/lib.sh" >&2
+  exit 1
+fi
 releases=$HOME/.poise/releases
 mkdir -p "$releases"
 

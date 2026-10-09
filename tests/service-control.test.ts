@@ -45,7 +45,11 @@ function session(instance: string, openTurn: boolean): string {
 }
 
 function fakeRuntime(instance = `poise-production:${randomUUID()}`) {
-  return { instance, busyNow: 0, busy() { return this.busyNow }, startDrain: vi.fn(), endDrain: vi.fn() }
+  return {
+    instance, busyNow: 0, workingNow: 0,
+    busy() { return this.busyNow }, working() { return this.workingNow },
+    startDrain: vi.fn(), endDrain: vi.fn(),
+  }
 }
 
 class FakeTimer {
@@ -233,22 +237,25 @@ describe('switching to another release', () => {
     try {
       expect(service.switchRelease('r2')).toEqual({ release: 'r2', switching: true })
       expect((await readFile(join(dir, 'next'), 'utf8')).trim()).toBe('r2')
-      // New background ticks wait; the person's own work is still admitted.
-      expect(background.releaseBackgroundPaused()).toBe(true)
+      // Nothing is refused while it waits, behavior ticks included.
+      expect(background.releaseBackgroundPaused()).toBe(false)
       const launch = service.admitLaunch('POST', '/api/chat')
       expect(launch).toEqual(expect.any(Function))
       ;(launch as () => void)()
-      runtime.busyNow = 1
+      runtime.workingNow = 1
       timer.fire()
       expect(restart).not.toHaveBeenCalled()
+      // Agent processes idle between turns do not hold it back; work in a turn does.
+      runtime.workingNow = 0
+      runtime.busyNow = 3
       const sessionId = session(runtime.instance, true)
-      runtime.busyNow = 0
       timer.fire()
       expect(restart).not.toHaveBeenCalled()
       storage.setOpenTurn(sessionId, null, null)
       timer.fire()
       expect(restart).toHaveBeenCalledTimes(1)
       expect(runtime.startDrain).toHaveBeenCalledWith('service')
+      expect(background.releaseBackgroundPaused()).toBe(true)
       expect(service.health().draining).toBe(true)
       expect(timer.timers.size).toBe(0)
     } finally {
@@ -264,8 +271,10 @@ describe('switching to another release', () => {
     expect(existsSync(join(dir, 'next'))).toBe(false)
   })
 
-  it('refuses a release not installed, one built for another base, and a server without the supervisor', async () => {
-    const dir = await releases({ r2: 'b1', r3: 'b2' })
+  it('refuses a release not installed, one built for another base or that failed to start, and a server without the supervisor', async () => {
+    const dir = await releases({ r2: 'b1', r3: 'b2', r4: 'b1' })
+    await writeFile(join(dir, 'r4', 'failed'), 'exited with 1 within a minute of starting\n')
+    expect(() => switching(dir).service.switchRelease('r4')).toThrow(expect.objectContaining({ statusCode: 409, message: expect.stringContaining('failed to start') }))
     expect(() => switching(dir).service.switchRelease('r9')).toThrow(expect.objectContaining({ statusCode: 409 }))
     expect(() => switching(dir).service.switchRelease('r3')).toThrow(expect.objectContaining({ statusCode: 409 }))
     expect(() => switching(dir).service.switchRelease('../r2')).toThrow(expect.objectContaining({ statusCode: 400 }))
