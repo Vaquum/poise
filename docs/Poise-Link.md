@@ -10,7 +10,10 @@ browser is closed:
   folder.
 - **Alerts.** Poise alerts (a sign-in is needed, a behavior failed and is held,
   datastore sync keeps failing, a Chat agent is waiting for you, a long Chat
-  turn finished) become native notifications. Clicking one opens its page.
+  turn finished, a pull request of yours is ready to merge) become native
+  notifications. Clicking one opens its page. With the browser open, Poise
+  shows the same alerts at the top of the page; see
+  [Notifications](Notifications.md).
 
 One command installs it, with Espanso when Espanso is missing, and once it is
 paired it starts at login by itself. The contract it is built against is the
@@ -301,6 +304,7 @@ alerts once and again only after it has cleared:
 | `datastore_sync_failing` | syncing a GitHub account's datastore has been failing for 15 minutes | a sync succeeds |
 | `chat_waiting` | a Chat agent asks for a permission or an answer | the session has nothing pending |
 | `chat_turn_finished` | a Chat turn that ran longer than two minutes finishes, unless the person stopped it | (one alert per turn) |
+| `pr_ready` | one of the person's own open pull requests becomes ready to merge, by Current's rule, checked every two minutes while notifications are on; not while the person has silenced it | it is merged or closed, or stops being ready |
 
 An alert's `url` is absolute: `POISE_PUBLIC_ORIGIN` in a workspace, the
 address the request came to otherwise. The browser client has no per-view

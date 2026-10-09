@@ -30,6 +30,8 @@ export interface AppSettings {
   // Chat view: the prefix for branches new sessions cut, and how long an idle
   // session keeps its agent process alive.
   chat?: { branchPrefix: string, idleTimeoutMinutes: number }
+  // The notifications at the top of the page; on unless turned off.
+  notifications?: { enabled: boolean }
 }
 
 let current: AppSettings = { org: '', me: '', timezone: '' }

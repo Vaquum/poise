@@ -2,12 +2,12 @@ import './style.css'
 import { installIconTooltips } from './icon-tooltips'
 installIconTooltips()
 import { initTypography, toggleTypographyPanel, closeTypographyPanel } from './typo'
-import { initSettings, toggleSettingsPanel, openSettingsPanel, closeSettingsPanel, isFullyConfigured } from './settings'
+import { initSettings, toggleSettingsPanel, openSettingsPanel, openSettingsAt, closeSettingsPanel, isFullyConfigured } from './settings'
 import { initMenu } from './menu'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
 import { initCurrentView, stopCurrentPolling } from './views/current-view'
 import { initSwarmView, stopSwarmRefresh, focusRow as focusSwarmRow } from './views/swarm-view'
-import { initChatView, stopChatRefresh, openChatSession, openChatWithContext, type NewSessionPrefill } from './views/chat-view'
+import { initChatView, stopChatRefresh, openChatSession, openChatWithContext, chatSessionInView, type NewSessionPrefill } from './views/chat-view'
 import { initBehaviorsView, stopBehaviorsRefresh } from './views/behaviors-view'
 import { initSnippetsView } from './views/snippets-view'
 import { initEditorView, stopEditorRefresh } from './views/editor-view'
@@ -19,6 +19,9 @@ import { initServiceSettings, openServicePlace, takeServicePlace } from './servi
 import { restartOnboarding, startOnboarding } from './onboarding'
 import { watchForUpdates } from './updating'
 import { watchForSignOut } from './signed-out'
+import { NoticeFeed, type NoticeTarget } from './notices'
+import { mountNoticeIsland } from './views/notice-island'
+import './views/notice-island.css'
 import './views/updating.css'
 
 const viewMainEl = document.getElementById('view-main')!
@@ -135,6 +138,19 @@ const menu = initMenu({
   onClosePanels: () => { closeTypographyPanel(); closeSettingsPanel() },
 })
 
+// The notification island at the top of the page, and where each notice in it
+// takes the person.
+const notices = new NoticeFeed()
+function openNotice(target: NoticeTarget): void {
+  if ('view' in target) menu.switchTo(target.view)
+  else if ('settings' in target) openSettingsAt(target.settings)
+  else if ('chat' in target) window.dispatchEvent(new CustomEvent('poise:open-chat-session', { detail: { id: target.chat } }))
+  else window.open(target.pullRequest, '_blank', 'noopener,noreferrer')
+}
+// A Chat session on screen already shows what its notice would say.
+mountNoticeIsland(notices, { open: openNotice, inView: (target) => 'chat' in target && chatSessionInView() === target.chat })
+window.addEventListener('poise:notifications-changed', () => { void notices.refresh() })
+
 // On load: pull settings first so views render with the correct org/me/timezone,
 // then show the initial view. The user's external service keeps the data
 // fresh; Poise only reads.
@@ -155,6 +171,7 @@ watchForSignOut()
   // an off-cycle re-fetch. (Behaviors run server-side on their own
   // wall-clock ticker — see server/behaviors.ts.)
   startRefreshTicker()
+  notices.start()
   void initServiceSettings({
     runSetup: () => {
       restartOnboarding().catch((error: unknown) => console.error('[setup] setup could not start again:', error))

@@ -633,7 +633,12 @@ alerts once, and again only after it has cleared:
 - a behavior failed and is held;
 - datastore sync has been failing for 15 minutes;
 - a Chat agent is waiting for a permission or an answer;
-- a Chat turn that ran longer than two minutes has finished.
+- a Chat turn that ran longer than two minutes has finished;
+- a pull request of the person's own has become ready to merge, while
+  notifications are on ([Notifications](Notifications.md)).
+
+With the browser open, the page shows the unresolved alerts too, one at a time
+at its top.
 
 **Poise Link** runs on macOS, Windows and Linux from one Tauri codebase.
 - **First run:** asks for the server address, runs device pairing, keeps the

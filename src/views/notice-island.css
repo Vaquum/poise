@@ -1,0 +1,194 @@
+/* ── Notification island (src/views/notice-island.ts) ──
+   A capsule at the top centre, in the 40px band every view's control bar
+   keeps above its controls (--app-pad-top), so it never covers a control or
+   content. Inverse colours: dark on the light theme, a raised chip on the dark
+   one. Above the control bar (130), below the update banner (140), dialogs
+   and the updating overlay. */
+#notice-island {
+  --ni-bg: var(--n7);
+  --ni-ink: var(--n0);
+  --ni-muted: var(--n4);
+  --ni-hover: color-mix(in srgb, var(--n0) 12%, transparent);
+  --ni-h: 28px;
+  position: fixed;
+  top: calc((var(--app-pad-top) - var(--ni-h)) / 2);
+  left: 50%;
+  z-index: 135;
+  transform: translateX(-50%);
+}
+[data-theme="dark"] #notice-island {
+  --ni-bg: var(--n2);
+  --ni-ink: var(--n7);
+  --ni-muted: var(--n5);
+  --ni-hover: color-mix(in srgb, var(--n7) 10%, transparent);
+}
+#notice-island[hidden] { display: none; }
+
+.ni-shell {
+  position: relative;
+  /* The dot it grows out of and shrinks back into. */
+  width: var(--ni-h);
+  /* Never wider than the window, even before it is measured again. */
+  max-width: calc(100vw - 24px);
+  height: var(--ni-h);
+  border-radius: var(--r-pill);
+  background: var(--ni-bg);
+  color: var(--ni-ink);
+  box-shadow: var(--e-2);
+  overflow: hidden;
+  transition:
+    width var(--t-slow) var(--ease),
+    opacity var(--t-slow) var(--ease),
+    transform var(--t-slow) var(--ease);
+}
+#notice-island[data-state="entering"] .ni-shell,
+#notice-island[data-state="leaving"] .ni-shell {
+  width: var(--ni-h);
+  opacity: 0;
+  transform: scale(0.6);
+}
+
+/* Each notice's content. Two overlap while one gives way to the next. */
+.ni-content {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 3px;
+  white-space: nowrap;
+  /* The arriving notice waits for the leaving one to be mostly gone, so the
+     two never read on top of each other. */
+  transition: opacity var(--t-base) var(--ease) calc(var(--t-quick) / 2), transform var(--t-base) var(--ease) calc(var(--t-quick) / 2);
+}
+.ni-content.ni-arriving { opacity: 0; transform: translateY(6px); }
+.ni-content.ni-leaving {
+  opacity: 0;
+  transform: translateY(-6px);
+  pointer-events: none;
+  transition-duration: var(--t-quick);
+  transition-delay: 0s;
+}
+
+.ni-content[data-kind="chat_waiting"]           { --ni-tone: var(--a1); }
+.ni-content[data-kind="sign_in_needed"]         { --ni-tone: var(--a4); }
+.ni-content[data-kind="behavior_held"]          { --ni-tone: var(--a5); }
+.ni-content[data-kind="datastore_sync_failing"] { --ni-tone: var(--a4); }
+.ni-content[data-kind="pr_ready"]               { --ni-tone: var(--a3); }
+.ni-content[data-kind="chat_turn_finished"]     { --ni-tone: var(--a2); }
+
+.ni-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 22px;
+  padding: 0 var(--sp-2) 0 0;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+button.ni-main {
+  cursor: pointer;
+  transition: background var(--t-quick) ease;
+}
+button.ni-main:hover { background: var(--ni-hover); }
+
+.ni-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--ni-tone);
+  color: var(--ni-ink);
+}
+
+.ni-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.75rem;
+  line-height: 1.2;
+  letter-spacing: 0.01em;
+}
+.ni-title {
+  font-weight: 600;
+  color: var(--ni-ink);
+}
+.ni-body { color: var(--ni-muted); }
+.ni-body::before {
+  content: '·';
+  margin: 0 0.45em;
+}
+
+.ni-meta {
+  flex: 0 0 auto;
+  font-size: 0.6875rem;
+  color: var(--ni-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ni-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+.ni-action {
+  display: grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--ni-muted);
+  font: inherit;
+  cursor: pointer;
+  transition: color var(--t-quick) ease, background var(--t-quick) ease;
+}
+.ni-action:hover {
+  color: var(--ni-ink);
+  background: var(--ni-hover);
+}
+.ni-more {
+  padding: 0 7px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The capsule clips its content, so the focus ring is drawn inside. */
+#notice-island :focus-visible { outline-offset: -2px; }
+
+/* A ready pull request's reminder: the capsule swells once and its icon rings. */
+@keyframes ni-swell { to { transform: scale(1.05); } }
+@keyframes ni-ring {
+  from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ni-tone) 70%, transparent); }
+  to { box-shadow: 0 0 0 7px color-mix(in srgb, var(--ni-tone) 0%, transparent); }
+}
+#notice-island.ni-remind .ni-shell { animation: ni-swell var(--t-slow) var(--ease) 2 alternate; }
+#notice-island.ni-remind .ni-content:not(.ni-leaving) .ni-icon { animation: ni-ring calc(var(--t-slow) * 2) var(--ease) 1; }
+
+/* Visually hidden, read aloud. */
+.ni-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Writer mode keeps nothing outside the page; the notices wait for its end. */
+body.editor-writer-mode #notice-island { display: none; }
+@media print {
+  #notice-island { display: none; }
+}

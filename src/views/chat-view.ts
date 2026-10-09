@@ -2025,6 +2025,11 @@ async function createSession(req: NewSessionRequest, errorEl: HTMLElement): Prom
 
 // ── Entry points ───────────────────────────────────────────────────────────
 
+/** The session on screen in the Chat view, or null when Chat is not showing one. */
+export function chatSessionInView(): string | null {
+  return viewEl && !viewEl.hidden && activeId && !activeId.startsWith('jev:') ? activeId : null
+}
+
 /** Open an existing session by id (Swarm's Target column). */
 export async function openChatSession(id: string): Promise<void> {
   await ensureInit()
