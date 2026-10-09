@@ -37,10 +37,22 @@ test('the menu opens on the commit Poise runs and since when', async ({ page }) 
 })
 
 test('a build without a commit opens the menu on Settings', async ({ page }) => {
-  await workspace(page, { commit: null, since: null })
+  const release: { commit: string | null, since: string | null } = { commit: null, since: null }
+  await workspace(page, release)
   await page.goto('/')
+  const answered = page.waitForResponse('**/api/release')
   await page.getByRole('button', { name: 'Menu' }).click()
+  await answered
+  // The line starts hidden: look only once the page has handled the answer.
+  await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 50)))
   await expect(page.locator('#menu-popover').getByRole('button', { name: 'Settings' })).toBeVisible()
   await expect(page.locator('#menu-popover .menu-release')).toBeHidden()
   await expect(page.locator('#menu-popover .menu-release-divider')).toBeHidden()
+  // The same menu shows the line as soon as there is a commit to show.
+  release.commit = COMMIT
+  release.since = '2026-10-09T18:40:00Z'
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: 'Menu' }).click()
+  await expect(page.locator('#menu-popover .menu-release')).toBeVisible()
+  await expect(page.locator('#menu-popover .menu-release-divider')).toBeVisible()
 })
