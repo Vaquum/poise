@@ -24,7 +24,7 @@ from time import monotonic, sleep, time
 from typing import Callable
 
 from . import progress, review_budget
-from .atoms import AgentPreflightError
+from .atoms import AgentPreflightError, provider_blocked
 from .model_catalog import Model
 from .provider_progress import ProviderStream, claude_error
 from .review_watch import _interrupted, _stop_process_group
@@ -402,6 +402,9 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
         error = error or done.stderr.strip()[-500:] or f"{model.provider} exited {done.returncode}"
         if "output token maximum" in error or "context window limit" in error:
             raise review_budget.ReviewLimitError(error)
+        # Held for a person, as a PR review is: relaunching cannot succeed until the account is fixed.
+        if provider_blocked(error):
+            raise AgentPreflightError(error, "review_provider_blocked")
         raise RuntimeError(error)
     progress.stage("validating", "Validating review comments")
     return comments(output, allowed(data), repo)

@@ -157,6 +157,14 @@ class TestIssueReviewRun(IssueReviewCase):
         self.assertIn("provider failed", row["error"])
         self.assertFalse((issue_review.WORK_ROOT / row["id"]).exists())
 
+    def test_a_provider_whose_account_is_exhausted_is_held_as_blocked(self):
+        stdout = json.dumps({"type": "error", "error": {"message": 'Internal error: {\n  "message": "API error (status 402 Payment Required): '
+                                                                  'Grok Build usage balance exhausted",\n  "http_status": 402\n}'}})
+        row, printed = self.run_review(FakeGitHub(), agent_writes(None, code=1, stdout=stdout), model="grok-4.6-xhigh", expect_exit=True)
+        self.assertEqual((row["status"], row["error_code"]), ("failed", "review_provider_blocked"))
+        self.assertIn("Grok Build usage balance exhausted", row["error"])
+        self.assertIsNone(self.exported(row)["receipts"])
+
     def test_an_unusable_review_fails_before_posting(self):
         for review in ("not json", {"comments": []}, {"comments": [{"issue": "#452", "body": " "}, {"issue": 7, "body": "x"}]}, {"verdict": "ok"}):
             with self.subTest(review=review):

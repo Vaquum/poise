@@ -35,6 +35,19 @@ class AgentPreflightError(RuntimeError):
         self.code = code
 
 
+# A provider that refused the work or an account it cannot use: running the
+# same input again cannot succeed until a person acts.
+PROVIDER_BLOCKS = (
+    "MUSE GUARD: Muse provider access is latched off locally",
+    "Grok Build usage balance exhausted",
+    "safeguards flagged this message",
+)
+
+
+def provider_blocked(message: str) -> bool:
+    return any(block in message for block in PROVIDER_BLOCKS)
+
+
 def pr_number(pr: str) -> str:
     raw = str(pr).strip().rstrip("/")
     if "/pull/" in raw:
