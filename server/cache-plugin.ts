@@ -4,6 +4,7 @@ import type { ServerResponse } from 'node:http'
 import { agentAccount, callerAccounts, getModelSettings, getSettings, seedAgentAccount, setSettings } from './settings'
 import { MODEL_PLACES, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
 import { refreshModelCatalog } from './models-refresh'
+import { deleteModelPreset, listModelPresets, saveModelPreset } from './model-presets'
 import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
 import { accountsChecked, claudeAuthStatusChanged } from './alerts/producers'
 import { pruneAlerts } from './alerts/store'
@@ -444,9 +445,25 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               { key: 'issue_simplify', label: 'Simplify issue', model: catalog.behaviors.issue_simplify, why: 'Caller behavior; set by the Caller catalog.' },
               { key: 'canary', label: 'Sign-in check', model: 'haiku', why: 'One minimal Claude request that proves the Claude.ai sign-in; fixed.' },
             ]
-            return json(res, 200, { catalog, places, fixed, refresh: await readCatalogReport() })
+            return json(res, 200, { catalog, places, fixed, refresh: await readCatalogReport(), presets: listModelPresets() })
           } catch (err: any) {
             return json(res, httpStatus(err, 503), { error: err.message || String(err) })
+          }
+        }
+        // Saved model configurations: save the choices under a name, or delete one.
+        if (url === '/api/models/presets' && req.method === 'POST') {
+          try {
+            const body = await readJson<unknown>(req)
+            return json(res, 200, { presets: saveModelPreset(body, await loadCatalog()) })
+          } catch (err: any) {
+            return json(res, httpStatus(err, 400), { error: err.message || String(err) })
+          }
+        }
+        if (url === '/api/models/presets/delete' && req.method === 'POST') {
+          try {
+            return json(res, 200, { presets: deleteModelPreset(await readJson<unknown>(req)) })
+          } catch (err: any) {
+            return json(res, httpStatus(err, 400), { error: err.message || String(err) })
           }
         }
         if (url === '/api/models/refresh' && req.method === 'POST') {

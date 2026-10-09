@@ -173,6 +173,75 @@ test('gives the gateway\'s admins an Admin tab that manages people and workspace
   expect(Math.max(...tabs.map((tab) => tab.right))).toBeLessThanOrEqual(panelRight)
 })
 
+test('saves the model choices under a name and switches back to them in one step', async ({ page }) => {
+  await setup(page, 'service')
+  const posts: Array<{ path: string, body: unknown }> = []
+  const chat = { key: 'chat', label: 'Chat', why: 'Card chats.', review: false, reviewers: false, notes: [], stored: null, providers: null }
+  let chosen = { default: 'opus-5-max', fallback: 'gpt-6-astra-max' }
+  let presets = [{ name: 'Quota day', models: { chat: { default: 'gpt-6-astra-max', fallback: 'opus-5-max' } }, savedAt: '2026-10-09T12:00:00Z' }]
+  let loads = 0
+  await page.route('**/api/models', async (route) => {
+    // What the server holds when the read starts; every read after the first is slow.
+    const answer = { places: [{ ...chat, ...chosen }], presets: [...presets] }
+    loads += 1
+    if (loads > 1) await new Promise((resolve) => setTimeout(resolve, 800))
+    return route.fulfill({ json: { catalog: { models: [
+      { identity: 'opus-5-max', provider: 'claude', selector: 'claude-opus-5', effort: 'max' },
+      { identity: 'gpt-6-astra-max', provider: 'codex', selector: 'gpt-6-astra', effort: 'max' },
+    ], review_providers: [], path: '' }, fixed: [], refresh: null, ...answer } })
+  })
+  await page.route('**/api/models/presets', async (route) => {
+    const body = route.request().postDataJSON() as { name: string, models: Record<string, unknown> }
+    posts.push({ path: 'save', body })
+    presets = [...presets, { name: body.name, models: body.models as never, savedAt: '2026-10-09T13:00:00Z' }]
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    return route.fulfill({ json: { presets } })
+  })
+  await page.route('**/api/models/presets/delete', (route) => {
+    const body = route.request().postDataJSON() as { name: string }
+    presets = presets.filter((preset) => preset.name !== body.name)
+    return route.fulfill({ json: { presets } })
+  })
+  await page.route('**/api/settings', (route) => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    const body = route.request().postDataJSON() as { models: { chat: typeof chosen } }
+    posts.push({ path: 'settings', body })
+    chosen = body.models.chat
+    return route.fulfill({ json: { org: '', me: 'octocat', agentAccount: '', timezone: 'UTC', models: body.models, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 }, organizations: [] } })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('[data-action="settings"]').click()
+  await page.locator('.st-tabs [data-tab="models"]').click()
+  const saved = page.getByLabel('Saved model configuration')
+  await expect(saved).toHaveValue('Quota day')
+
+  await page.getByLabel('Configuration name').fill('Normal')
+  await page.getByRole('button', { name: 'Save current', exact: true }).click()
+  // One configuration action at a time: nothing else can start while the save is on its way.
+  await expect(page.getByRole('button', { name: 'Use', exact: true })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Delete', exact: true })).toBeDisabled()
+  await expect(page.locator('.st-status')).toHaveText('Saved the model choices as "Normal".')
+  await expect(page.getByRole('button', { name: 'Use', exact: true })).toBeEnabled()
+  expect(posts[0]).toEqual({ path: 'save', body: { name: 'Normal', models: { chat: { default: 'opus-5-max', fallback: 'gpt-6-astra-max' } } } })
+
+  // Using one shows its choices at once, before the slow reload, so a Save right away keeps them.
+  const reload = page.waitForResponse((response) => response.url().endsWith('/api/models'))
+  await saved.selectOption('Quota day')
+  await page.getByRole('button', { name: 'Use', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Using "Quota day".')
+  expect(posts[1]).toEqual({ path: 'settings', body: { models: { chat: { default: 'gpt-6-astra-max', fallback: 'opus-5-max' } } } })
+  await expect(page.getByLabel('Chat default model')).toHaveValue('gpt-6-astra-max')
+
+  // A delete while that reload is on its way stays deleted when the older answer lands.
+  await saved.selectOption('Normal')
+  await page.getByRole('button', { name: 'Delete', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Deleted "Normal".')
+  await reload
+  await expect(saved.locator('option')).toHaveText(['Quota day'])
+  await expect(page.getByLabel('Chat default model')).toHaveValue('gpt-6-astra-max')
+})
+
 test('adds no gateway sections on a personal computer', async ({ page }) => {
   const state = await setup(page, 'local')
   await page.goto('/')
