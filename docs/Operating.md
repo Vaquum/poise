@@ -621,9 +621,12 @@ A workspace logs to `docker logs --follow poise-ws-<handle>`. The provider
 CLI installation logs inside it:
 `docker exec poise-ws-<handle> cat /home/poise/.poise/logs/cli-bootstrap.log`.
 
-Docker keeps container logs without a size limit unless told otherwise. Set
-a limit for every container, workspaces included, in
-`/etc/docker/daemon.json`, and restart Docker:
+Docker keeps container logs without a size limit unless told otherwise.
+Poise's own containers need nothing: Caddy and the gateway (in
+`deploy/compose.yaml`) and every workspace (set by the gateway) keep at most
+five log files of 20 MB each. A workspace created before this limit gets it
+when it is next recreated. For other containers on the server, set a default
+in `/etc/docker/daemon.json` and restart Docker:
 
 ```json
 { "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "5" } }
