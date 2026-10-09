@@ -142,6 +142,14 @@ class TestReceiptRecording(TestCase):
         self.assertEqual(review_receipt.get()["review_id"], 91)
         self.assertEqual(self.stored(), "91")
 
+    def test_a_change_request_records_how_many_comments_it_posted(self):
+        review_receipt.record(json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD, "comments": 3}))
+        with sqlite3.connect(api.DB) as conn:
+            self.assertEqual(conn.execute("select review_comments from calls where id='run'").fetchone()[0], "3")
+        self.assertEqual([entry["review_comments"] for entry in api.logs() if entry["id"] == "run"], [3])
+        review_receipt.record(json.dumps({"action": "reviewed_clean", "review_id": 92, "head_sha": HEAD}))
+        self.assertEqual([entry["review_comments"] for entry in api.logs() if entry["id"] == "run"], [None])
+
     def test_structured_submission_records_its_receipt(self):
         reply = json.dumps({"action": "reviewed_clean", "review_id": 92, "head_sha": HEAD})
 

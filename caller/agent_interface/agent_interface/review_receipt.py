@@ -61,6 +61,15 @@ def parse(text: str) -> dict | None:
     return {"action": reply["action"], "review_id": review_id, "head_sha": reply.get("head_sha")}
 
 
+def _comments(text: str) -> str | None:
+    """The inline comments a change request posted, as GitHub's reply counted them."""
+    try:
+        count = json.loads(text).get("comments")
+    except (ValueError, AttributeError):
+        return None
+    return str(count) if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
+
+
 def record(text: str) -> dict | None:
     receipt = parse(text)
     if receipt is None:
@@ -70,7 +79,8 @@ def record(text: str) -> dict | None:
     if bound:
         database, call_id = bound
         with sqlite3.connect(database, timeout=30) as conn:
-            conn.execute("update calls set review_id=? where id=?", (str(receipt["review_id"]), call_id))
+            conn.execute("update calls set review_id=?, review_comments=? where id=?",
+                         (str(receipt["review_id"]), _comments(text), call_id))
     return receipt
 
 
