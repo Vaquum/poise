@@ -527,7 +527,8 @@ export class Orchestrator {
 
   private async upgrade(handle: string, login: string, imageId: string, reason: string, target: ImageRelease | null): Promise<void> {
     this.lifecycle('workspace.upgrade.started', handle, { image: imageId, reason })
-    let drained = false
+    // null until drained; then whether the drain left the workspace idle rather than timing out.
+    let drainedIdle: boolean | null = null
     for (;;) {
       // Decided under the lock, so a lazy start or an admin action in between cannot be stopped undrained.
       const outcome = await this.withLock(handle, async (): Promise<'needs-drain' | 'done' | 'skipped'> => {
@@ -543,8 +544,12 @@ export class Orchestrator {
           return 'skipped'
         }
         const running = details.State.Running
-        if (running && !drained) return 'needs-drain'
+        if (running && drainedIdle === null) return 'needs-drain'
         await this.activateRelease(handle, target)
+        // Activation can restart Poise: a switch queued before the drain fires once the drain leaves it
+        // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
+        // idle. A drain that timed out cuts its work anyway.
+        if (running && drainedIdle && !(await this.idleUnderDrain(handle, login))) return 'needs-drain'
         this.ready.delete(handle)
         if (running) {
           await docker.stopContainer(container)
@@ -563,8 +568,18 @@ export class Orchestrator {
         return 'done'
       })
       if (outcome !== 'needs-drain') return
-      await this.drain(handle, login)
-      drained = true
+      drainedIdle = await this.drain(handle, login)
+    }
+  }
+
+  /** Drains again and says whether the workspace is idle; false when it cannot tell. */
+  private async idleUnderDrain(handle: string, login: string): Promise<boolean> {
+    try {
+      return (await this.serviceCall(handle, login, 'POST', '/api/service/drain')).idle
+    } catch (error) {
+      if (error instanceof WorkspaceNetworkError) throw error
+      this.deps.log.warn('workspace.drain.recheck.failed', { handle, error: errorMessage(error) })
+      return false
     }
   }
 
@@ -572,9 +587,10 @@ export class Orchestrator {
    * Asks the workspace to stop admitting work, then waits until it reports idle or POISE_DRAIN_TIMEOUT
    * passes. The workspace lets a drain lapse unless it is renewed, so it is re-requested while waiting.
    * A network the gateway cannot join fails the upgrade instead: waiting would drain nothing, and the
-   * timeout would then recreate the workspace with its work cut off.
+   * timeout would then recreate the workspace with its work cut off. Resolves true once the workspace
+   * is idle, false when the timeout passed first.
    */
-  private async drain(handle: string, login: string): Promise<void> {
+  private async drain(handle: string, login: string): Promise<boolean> {
     const { config, log, now } = this.deps
     const deadline = now() + config.drainTimeoutSeconds * 1000
     let requestedAt = now()
@@ -585,7 +601,7 @@ export class Orchestrator {
         runningCallerCalls: health.runningCallerCalls,
         backgroundWork: health.backgroundWork,
       })
-      if (health.idle) return
+      if (health.idle) return true
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       log.error('workspace.drain.request.failed', { handle, error: errorMessage(error) })
@@ -600,7 +616,7 @@ export class Orchestrator {
         if (renew) requestedAt = now()
         if (health.idle) {
           this.lifecycle('workspace.drain.idle', handle)
-          return
+          return true
         }
       } catch (error) {
         if (error instanceof WorkspaceNetworkError) throw error
@@ -608,6 +624,7 @@ export class Orchestrator {
       }
     }
     log.warn('workspace.drain.timeout', { handle, timeoutSeconds: config.drainTimeoutSeconds })
+    return false
   }
 
   private async startLocked(handle: string, login: string): Promise<void> {

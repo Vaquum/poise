@@ -34,6 +34,8 @@ export interface FakeDocker {
   /** The task containers run so far, and the exit code the next one ends with. */
   tasks: FakeTask[]
   taskExitCode: number
+  /** Called as each task container runs, before it ends. */
+  onTask?: (task: FakeTask) => void
   /** Each volume's size in bytes, as /system/df reports it. */
   volumeSizes: Map<string, number>
   volumes: Set<string>
@@ -125,6 +127,7 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
         const container = containers.get(decodeURIComponent(match[1]))
         if (!container) return send(res, 404, { message: `No such container: ${match[1]}` })
         fake.tasks.push({ name: container.name, spec: container.spec })
+        fake.onTask?.(fake.tasks[fake.tasks.length - 1])
         container.running = false
         return send(res, 200, { StatusCode: fake.taskExitCode, Error: null })
       }

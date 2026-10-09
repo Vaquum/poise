@@ -383,8 +383,10 @@ describe('image upgrades', () => {
     expect(drain.headers.host).toBe(ALICE)
     expect(verifyAssertion(String(drain.headers['x-poise-identity']), h.keys.publicKeyBase64))
       .toMatchObject({ aud: 'workspace:alice', sub: 'Alice', scope: 'admin' })
-    expect(h.workspace.serviceRequests.slice(1).every((request) => request.url === '/api/service/health')).toBe(true)
-    expect(h.workspace.serviceRequests.length).toBeGreaterThan(1)
+    // Health while it waits, then the drain again just before the container stops.
+    expect(h.workspace.serviceRequests.slice(1, -1).every((request) => request.url === '/api/service/health')).toBe(true)
+    expect(h.workspace.serviceRequests.at(-1)).toMatchObject({ method: 'POST', url: '/api/service/drain' })
+    expect(h.workspace.serviceRequests.length).toBeGreaterThan(2)
 
     expect(dockerCalls(h)).toEqual([
       'GET /images/poise-runtime:latest/json',
@@ -624,6 +626,25 @@ describe('updates in place', () => {
     const calls = dockerCalls(h)
     expect(calls.indexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(calls.indexOf('POST /containers/poise-ws-alice/stop'))
     expect(containerId()).not.toBe(before)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('drains again when activation restarts Poise, and stops the container only once it is idle again', async () => {
+    await start({ oldBase: 'base-0' })
+    h.docker.onTask = () => {
+      // A switch queued before the drain restarts Poise while the release activates; the new Poise takes a call.
+      h.workspace.health.runningCallerCalls = 1
+      setTimeout(() => { h.workspace.health.runningCallerCalls = 0 }, 60)
+      h.docker.onTask = undefined
+    }
+    await h.orchestrator.upgradePass()
+    const calls = h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)
+    expect(calls.filter((call) => call === 'POST /api/service/drain').length).toBeGreaterThanOrEqual(3)
+    expect(events(h.logs, 'workspace.drain')).toEqual(['workspace.drain.requested', 'workspace.drain.requested', 'workspace.drain.idle'])
+    // Activated again once idle, and only then stopped.
+    expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate'], ['--activate']])
+    const docker = dockerCalls(h)
+    expect(docker.lastIndexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(docker.indexOf('POST /containers/poise-ws-alice/stop'))
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 
