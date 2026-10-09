@@ -112,8 +112,11 @@ the workspace.
 - `GET /_poise/api/account` returns `{ login, handle, isAdmin, workspaceHost,
   apexOrigin, link: { installer, releases } }`.
 - `GET /_poise/api/devices` returns `{ devices: [{ id, label, createdAt,
-  lastUsedAt, revokedAt, state }] }`, times in milliseconds and `state` one of
-  `active`, `revoked` or `expired`.
+  lastUsedAt, revokedAt, state, connected }] }`, times in milliseconds and
+  `state` one of `active`, `revoked` or `expired`. `connected` is true while an
+  active device holds `/api/link/events` open through the gateway and the
+  workspace has answered it with 200; the gateway keeps this in memory. When
+  that stream closes, `lastUsedAt` becomes that moment.
 - `POST /_poise/api/devices/pair` with `{ userCode, decision }`, `decision`
   being `approve` or `deny`, returns `{ decision, message }`. An unknown or
   expired code answers 400 `invalid_code`. More than 10 codes per sign-in in
