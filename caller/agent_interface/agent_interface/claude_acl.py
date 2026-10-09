@@ -31,7 +31,10 @@ def env(rules: list[str]) -> dict[str, str]:
     patterns = bash_patterns(rules)
     if patterns:
         guard = Path(__file__).with_name("bash_guard.py")
-        guard.chmod(guard.stat().st_mode | 0o111)
+        # Installed read-only, as in Poise's workspace image, the guard is
+        # executable already and only its owner, root, may chmod it.
+        if not os.access(guard, os.X_OK):
+            guard.chmod(guard.stat().st_mode | 0o111)
         e["AGENT_INTERFACE_BASH_ALLOW"] = json.dumps(patterns)
         e["CLAUDE_CODE_SHELL_PREFIX"] = str(guard)
     return e
