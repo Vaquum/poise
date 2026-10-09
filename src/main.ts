@@ -16,6 +16,7 @@ import { loadSettings, startRefreshTicker, applyTheme, getTheme } from './config
 import { initClaudeAuth } from './claude-auth'
 import { getSelectedOrganization, setSelectedOrganization } from './organizations'
 import { initServiceSettings, openServicePlace, takeServicePlace } from './service-settings'
+import { restartOnboarding, startOnboarding } from './onboarding'
 
 const viewMainEl = document.getElementById('view-main')!
 const viewCurrentEl = document.getElementById('view-current')!
@@ -142,10 +143,17 @@ const menu = initMenu({
   // an off-cycle re-fetch. (Behaviors run server-side on their own
   // wall-clock ticker — see server/behaviors.ts.)
   startRefreshTicker()
-  void initServiceSettings()
+  void initServiceSettings({
+    runSetup: () => {
+      restartOnboarding().catch((error: unknown) => console.error('[setup] setup could not start again:', error))
+    },
+  })
 
   // The gateway sends Poise Link's /link here as /?settings=link.
   const place = takeServicePlace()
+  // A workspace that still has to be set up opens first-run setup instead, at
+  // pairing when Poise Link sent the person here.
+  if (await startOnboarding(place)) return
   if (place) {
     void openServicePlace(place)
     return
