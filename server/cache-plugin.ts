@@ -8,6 +8,7 @@ import { deleteModelPreset, listModelPresets, saveModelPreset } from './model-pr
 import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
 import { accountsChecked, claudeAuthStatusChanged } from './alerts/producers'
 import { pruneAlerts } from './alerts/store'
+import { checkNotices, dismissNotice, noticesState, silenceNotice, startNoticesRuntime, stopNoticesRuntime } from './alerts/notices'
 import { LinkApi } from './link/api'
 import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
@@ -134,6 +135,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   setCallerAccounts(callerAccounts)
   startOrganizationsRuntime()
   startBehaviorsRuntime()
+  startNoticesRuntime()
   startReviewCheckoutPruning()
   startContentFinalizer()
   if (!chatRuntime) {
@@ -207,7 +209,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
 }
 
 /** Connected accounts, read now or from the last few seconds, with their
@@ -417,9 +419,28 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               return json(res, 400, { error: 'Add GitHub accounts through account setup.' })
             }
             const settings = setSettings(body, catalog)
+            // Turned on, what needs attention is looked for now, not at the next pass.
+            if (body && typeof body === 'object' && 'notifications' in body) void checkNotices()
             return json(res, 200, { ...settings, organizations: getOrganizations() })
           } catch (err: any) {
             return json(res, httpStatus(err, 400), { error: err.message || String(err) })
+          }
+        }
+
+        // ── Notices ──
+        // The notifications at the top of the page (server/alerts/notices.ts).
+        if (path === '/api/notices' && req.method === 'GET') {
+          return json(res, 200, noticesState())
+        }
+        const noticeAction = path.match(/^\/api\/notices\/([^/]+)\/(dismiss|silence)$/)
+        if (noticeAction && req.method === 'POST') {
+          try {
+            const id = decodeURIComponent(noticeAction[1])
+            if (noticeAction[2] === 'dismiss') dismissNotice(id)
+            else silenceNotice(id)
+            return json(res, 200, noticesState())
+          } catch (error) {
+            return json(res, httpStatus(error, 400), { error: (error as Error).message })
           }
         }
 

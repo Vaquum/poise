@@ -10,7 +10,8 @@ import { join, dirname } from 'path'
 //   behavior_seen  — atomic automation dedupe claims
 //   content_jobs   — durable /content finalization state and worker leases
 //   content_launches — pre-spawn /content intent and call correlation
-//   alerts         — what Poise Link shows as desktop notifications (server/alerts)
+//   alerts         — what Poise Link shows as desktop notifications, and Poise
+//                    as notices at the top of the page (server/alerts)
 //
 // Everything else (issues, PRs, reviews, files) lives in the user's external
 // /github service. Older Poise versions kept a full mirror of GitHub data
@@ -228,6 +229,11 @@ const migrateSchema = db.transaction(() => {
   ensureColumn('behavior_seen', 'launch_action', 'launch_action TEXT')
   ensureColumn('behavior_seen', 'launch_covers', 'launch_covers TEXT')
   ensureColumn('behavior_dead_letters', 'retired_at', 'retired_at TEXT')
+  // What a notice in the page needs on top of an alert (server/alerts/notices.ts):
+  // where it opens, and when the person dismissed or silenced it.
+  ensureColumn('alerts', 'target', 'target TEXT')
+  ensureColumn('alerts', 'dismissed_at', 'dismissed_at TEXT')
+  ensureColumn('alerts', 'silenced_at', 'silenced_at TEXT')
   const behaviorLaunchTrackingMigrated = db.prepare(
     'SELECT 1 FROM meta WHERE key = ?',
   ).get(BEHAVIOR_LAUNCH_TRACKING_MIGRATION_KEY)

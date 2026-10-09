@@ -1,6 +1,7 @@
 // Alerts: what the workspace has to tell its owner while the browser is
 // closed (docs/Service-architecture.md, "Snippets and Poise Link"). Poise Link
-// shows each one as a desktop notification, once.
+// shows each one as a desktop notification, once. While the browser is open,
+// the page shows the unresolved ones as notices (./notices.ts).
 //
 // An alert is raised under a dedupe key and stays the only one for that key
 // until it is resolved, so a condition that persists alerts once, and alerts
@@ -9,8 +10,30 @@
 import { EventEmitter } from 'node:events'
 import { ALERT_ID_EPOCH_KEY, db, getMeta } from '../db'
 
-export const ALERT_KINDS = ['sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'chat_waiting', 'chat_turn_finished'] as const
+export const ALERT_KINDS = ['sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'chat_waiting', 'chat_turn_finished', 'pr_ready'] as const
 export type AlertKind = typeof ALERT_KINDS[number]
+
+/** Where the alert's notice in the page takes the person: a view, a Settings
+ *  tab, a Chat session, or a pull request on GitHub. */
+export type AlertTarget =
+  | { view: 'behaviors' }
+  | { settings: 'general' | 'accounts' }
+  | { chat: string }
+  | { pullRequest: string }
+
+const PULL_REQUEST_URL = /^https:\/\/github\.com\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/pull\/[1-9][0-9]*$/
+
+export function isAlertTarget(value: unknown): value is AlertTarget {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const target = value as Record<string, unknown>
+  const keys = Object.keys(target)
+  if (keys.length !== 1) return false
+  if ('view' in target) return target.view === 'behaviors'
+  if ('settings' in target) return target.settings === 'general' || target.settings === 'accounts'
+  if ('chat' in target) return typeof target.chat === 'string' && /^[A-Za-z0-9._:-]{1,200}$/.test(target.chat)
+  if ('pullRequest' in target) return typeof target.pullRequest === 'string' && PULL_REQUEST_URL.test(target.pullRequest)
+  return false
+}
 
 export const ALERT_RETENTION_MS = 30 * 24 * 60 * 60_000
 
@@ -22,6 +45,8 @@ export interface AlertInput {
   body: string
   /** The page in this workspace the alert opens, as a path. */
   path: string
+  /** Where its notice in the page opens; none, and the notice only informs. */
+  target?: AlertTarget
 }
 
 export interface Alert {
@@ -85,6 +110,7 @@ function assertInput(input: AlertInput): void {
   if (!input.dedupeKey || input.dedupeKey.length > 512) throw new Error('an alert needs a dedupe key of at most 512 characters')
   if (!input.title.trim()) throw new Error('an alert needs a title')
   if (!input.path.startsWith('/') || input.path.startsWith('//')) throw new Error(`an alert opens a path in this workspace, not "${input.path}"`)
+  if (input.target !== undefined && !isAlertTarget(input.target)) throw new Error(`an alert's notice cannot open ${JSON.stringify(input.target)}`)
 }
 
 export function pruneAlerts(now = Date.now()): number {
@@ -98,10 +124,10 @@ export function raiseAlert(input: AlertInput, now = Date.now()): Alert | null {
   pruneAlerts(now)
   const createdAt = new Date(now).toISOString()
   const info = db.prepare(`
-    INSERT INTO alerts(kind, title, body, url, created_at, dedupe_key)
-    VALUES(?, ?, ?, ?, ?, ?)
+    INSERT INTO alerts(kind, title, body, url, created_at, dedupe_key, target)
+    VALUES(?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING
-  `).run(input.kind, input.title, input.body, input.path, createdAt, input.dedupeKey)
+  `).run(input.kind, input.title, input.body, input.path, createdAt, input.dedupeKey, input.target ? JSON.stringify(input.target) : null)
   if (info.changes !== 1) return null
   announce()
   const seq = Number(info.lastInsertRowid)
@@ -131,4 +157,91 @@ export function alertsAfter(seq: number, limit: number, options: { newest?: bool
 /** The newest alert's seq, 0 when there is none. */
 export function latestAlertSeq(): number {
   return (db.prepare('SELECT COALESCE(MAX(id), 0) AS seq FROM alerts').get() as { seq: number }).seq
+}
+
+/** An unresolved alert as its notice in the page needs it. */
+export interface OpenAlert {
+  id: string
+  seq: number
+  kind: AlertKind
+  title: string
+  body: string
+  createdAt: string
+  dedupeKey: string
+  target: AlertTarget | null
+  dismissedAt: string | null
+  silencedAt: string | null
+}
+
+interface OpenAlertRow {
+  id: number
+  kind: AlertKind
+  title: string
+  body: string
+  created_at: string
+  dedupe_key: string
+  target: string | null
+  dismissed_at: string | null
+  silenced_at: string | null
+}
+
+function storedTarget(raw: string | null): AlertTarget | null {
+  if (raw === null) return null
+  try {
+    const value: unknown = JSON.parse(raw)
+    return isAlertTarget(value) ? value : null
+  } catch {
+    return null
+  }
+}
+
+/** The unresolved alerts inside the retention window, newest first; with
+ *  `kind`, only those of that kind. */
+export function openAlerts(options: { kind?: AlertKind, now?: number } = {}): OpenAlert[] {
+  const cutoff = new Date((options.now ?? Date.now()) - ALERT_RETENTION_MS).toISOString()
+  const rows = db.prepare(`
+    SELECT id, kind, title, body, created_at, dedupe_key, target, dismissed_at, silenced_at FROM alerts
+    WHERE resolved_at IS NULL AND created_at >= ? AND (? IS NULL OR kind = ?)
+    ORDER BY id DESC
+  `).all(cutoff, options.kind ?? null, options.kind ?? null) as OpenAlertRow[]
+  const prefix = epoch()
+  return rows.map((row) => ({
+    id: `${prefix}-${row.id}`,
+    seq: row.id,
+    kind: row.kind,
+    title: row.title,
+    body: row.body,
+    createdAt: row.created_at,
+    dedupeKey: row.dedupe_key,
+    target: storedTarget(row.target),
+    dismissedAt: row.dismissed_at,
+    silencedAt: row.silenced_at,
+  }))
+}
+
+/** The person put the notice of unresolved alert `seq` away. False when there
+ *  is no such unresolved alert. */
+export function dismissAlert(seq: number, now = Date.now()): boolean {
+  return db.prepare('UPDATE alerts SET dismissed_at = ? WHERE id = ? AND resolved_at IS NULL')
+    .run(new Date(now).toISOString(), seq).changes === 1
+}
+
+/** The person asked to hear no more about unresolved alert `seq`. False when
+ *  there is no such unresolved alert. */
+export function silenceAlert(seq: number, now = Date.now()): boolean {
+  return db.prepare('UPDATE alerts SET silenced_at = ? WHERE id = ? AND resolved_at IS NULL')
+    .run(new Date(now).toISOString(), seq).changes === 1
+}
+
+/** Whether the newest alert under `dedupeKey`, resolved or not, was silenced. */
+export function silenced(dedupeKey: string): boolean {
+  const row = db.prepare('SELECT silenced_at FROM alerts WHERE dedupe_key = ? ORDER BY id DESC LIMIT 1')
+    .get(dedupeKey) as { silenced_at: string | null } | undefined
+  return !!row?.silenced_at
+}
+
+/** The kind of alert `seq`, unresolved or not; null when there is none. */
+export function alertKind(seq: number): AlertKind | null {
+  const row = db.prepare('SELECT kind FROM alerts WHERE id = ?').get(seq) as { kind: AlertKind } | undefined
+  return row?.kind ?? null
 }

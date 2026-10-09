@@ -21,6 +21,7 @@ export interface Settings {
   // actually launches is resolved against the live catalog (server/models.ts).
   models: ModelSettings
   chat: ChatSettings
+  notifications: NotificationSettings
 }
 
 // Chat v1 (server/chat): the prefix of branches new sessions cut from the
@@ -65,6 +66,32 @@ function validateChatSettings(value: unknown): ChatSettings {
   return next
 }
 
+// The notifications at the top of the page (server/alerts/notices.ts): on
+// unless the person turns them off.
+export interface NotificationSettings {
+  enabled: boolean
+}
+
+export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = { enabled: true }
+
+export function getNotificationSettings(): NotificationSettings {
+  const raw = getMeta('notification_settings')
+  if (!raw) return { ...DEFAULT_NOTIFICATION_SETTINGS }
+  try {
+    const parsed = JSON.parse(raw) as Partial<NotificationSettings>
+    return { enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : DEFAULT_NOTIFICATION_SETTINGS.enabled }
+  } catch {
+    return { ...DEFAULT_NOTIFICATION_SETTINGS }
+  }
+}
+
+function validateNotificationSettings(value: unknown): NotificationSettings {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('notification settings must be an object')
+  const enabled = (value as Record<string, unknown>).enabled
+  if (typeof enabled !== 'boolean') throw new Error('notifications must be turned on or off: enabled is true or false')
+  return { enabled }
+}
+
 const TEXT_KEYS = ['org', 'me', 'agentAccount', 'timezone'] as const
 const ACCOUNT_KEYS: ReadonlySet<string> = new Set(['org', 'me', 'agentAccount'])
 
@@ -105,6 +132,7 @@ export function getSettings(): Settings {
     timezone: getMeta('timezone') || '',
     models: getModelSettings(),
     chat: getChatSettings(),
+    notifications: getNotificationSettings(),
   }
 }
 
@@ -130,6 +158,8 @@ export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Sett
   }
   let chat: ChatSettings | undefined
   if ('chat' in partial && partial.chat !== undefined) chat = validateChatSettings(partial.chat)
+  let notifications: NotificationSettings | undefined
+  if ('notifications' in partial && partial.notifications !== undefined) notifications = validateNotificationSettings(partial.notifications)
   const orgChanged = typeof next.org === 'string' && next.org !== (getMeta('org') || '')
   for (const k of TEXT_KEYS) {
     const v = next[k]
@@ -137,6 +167,7 @@ export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Sett
   }
   if (models) setMeta('models', JSON.stringify(models))
   if (chat) setMeta('chat_settings', JSON.stringify(chat))
+  if (notifications) setMeta('notification_settings', JSON.stringify(notifications))
   if (orgChanged) invalidateRepoListCache()
   return getSettings()
 }
