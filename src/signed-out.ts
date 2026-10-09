@@ -1,7 +1,8 @@
 // When the sign-in in front of a workspace ends, every request the open page
 // makes is turned away. The gateway answers 401, and a login proxy in front of
-// it, such as a portal, redirects to its own login page, which a page's request
-// cannot follow: it fails as if the connection had dropped. Each view would
+// it, such as a portal, redirects to its own login page: on another origin the
+// request fails as if the connection had dropped, and on the same origin it
+// arrives at the login page instead of the answer it asked for. Each view would
 // show its own failure. Instead, Poise checks once whether the page is still
 // signed in and, when it is not, dims the page under "Your sign-in has ended"
 // with Sign in again, which reloads the page through the sign-in. Its look is
@@ -45,7 +46,8 @@ export function watchForSignOut(): () => void {
       if (!aborted(error) && sameOrigin(args[0])) void checkSignIn()
       throw error
     }
-    if (response.status === 401 && sameOrigin(args[0])) void checkSignIn()
+    // Poise's own API never redirects: a redirected answer came from a sign-in in front of it.
+    if ((response.status === 401 || response.redirected) && sameOrigin(args[0])) void checkSignIn()
     return response
   }
   return () => {

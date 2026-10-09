@@ -32,6 +32,8 @@ const ok = () => new Response('{"mode":"service"}', { status: 200 })
 // What fetch gives for a redirect it was told not to follow; no Response constructor makes one.
 const redirected = () => ({ type: 'opaqueredirect', status: 0, ok: false, headers: new Headers() }) as unknown as Response
 const dropped = () => new TypeError('Failed to fetch')
+// A login page on the same origin, reached by following the proxy's redirect.
+const loginPage = () => ({ type: 'basic', status: 200, ok: true, redirected: true, headers: new Headers({ 'content-type': 'text/html' }) }) as unknown as Response
 // The checks run after the answer is handed back: let them finish.
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -83,6 +85,15 @@ describe('the ended sign-in notice', () => {
     await settle()
     expect(appended).toHaveLength(1)
     expect(appended[0].innerHTML).toContain('Your sign-in has ended')
+  })
+
+  it('says so when a login proxy on the same origin answers with its login page', async () => {
+    const { watchForSignOut } = await load()
+    watchForSignOut()
+    fetchMock.mockResolvedValueOnce(loginPage()).mockResolvedValueOnce(redirected())
+    expect((await window.fetch('/api/accounts')).redirected).toBe(true)
+    await settle()
+    expect(appended).toHaveLength(1)
   })
 
   it('shows nothing when Poise cannot be reached, or when only one request was turned away', async () => {

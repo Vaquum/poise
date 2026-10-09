@@ -5,7 +5,7 @@ import { expect, test, type Page } from '@playwright/test'
 // away with 401, or a login proxy in front of it, such as a portal,
 // redirecting them to its login page on another origin.
 
-type SignIn = 'valid' | 'ended' | 'redirected'
+type SignIn = 'valid' | 'ended' | 'redirected' | 'redirected-here'
 
 const PORTAL = 'https://portal.example.test'
 
@@ -21,6 +21,8 @@ async function workspace(page: Page, state: State): Promise<void> {
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com|github\.com)\//, (route) => route.abort())
   // The login page of a proxy in front of Poise: on another origin, so the page's own requests cannot read it.
   await page.route(`${PORTAL}/**`, (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<p>Sign in</p>' }))
+  // A proxy's login page on the workspace's own origin, as some proxies serve it.
+  await page.route('**/proxy-login**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<p>Sign in</p>' }))
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
     if (state.signIn === 'ended') {
@@ -28,6 +30,9 @@ async function workspace(page: Page, state: State): Promise<void> {
     }
     if (state.signIn === 'redirected') {
       return route.fulfill({ status: 303, headers: { location: `${PORTAL}/login?next=${encodeURIComponent(url.href)}` } })
+    }
+    if (state.signIn === 'redirected-here') {
+      return route.fulfill({ status: 302, headers: { location: `/proxy-login?next=${encodeURIComponent(url.pathname)}` } })
     }
     if (url.pathname === '/api/workspace') {
       if (state.workspaceFailures) {
@@ -53,8 +58,14 @@ async function untilNoticed(page: Page): Promise<void> {
   }, { timeout: 10_000 }).toBe(1)
 }
 
-for (const signIn of ['ended', 'redirected'] as const) {
-  test(`says the sign-in has ended when ${signIn === 'ended' ? 'the gateway answers 401' : 'a login proxy redirects'}, and signs in again by reloading`, async ({ page }) => {
+const WHEN: Record<'ended' | 'redirected' | 'redirected-here', string> = {
+  ended: 'the gateway answers 401',
+  redirected: 'a login proxy redirects to another origin',
+  'redirected-here': 'a login proxy redirects to a login page on the same origin',
+}
+
+for (const signIn of ['ended', 'redirected', 'redirected-here'] as const) {
+  test(`says the sign-in has ended when ${WHEN[signIn]}, and signs in again by reloading`, async ({ page }) => {
     const state: State = { signIn: 'valid' }
     await workspace(page, state)
     await page.goto('/')
