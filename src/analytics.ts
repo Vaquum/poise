@@ -77,9 +77,13 @@ async function readAnalytics(): Promise<void> {
   const panel = panelEl
   if (!panel) return
   const generation = ++readGeneration
+  const groups = panel.querySelector<HTMLElement>('.analytics-groups')!
   showRange(panel)
-  showStatus(panel, 'Reading…')
-  panel.querySelector('.analytics-groups')!.classList.add('is-stale')
+  // With numbers on screen, dimming them says enough: a line above them
+  // would push the panel down and back up on every switch.
+  if (!groups.childElementCount) showStatus(panel, 'Reading…')
+  groups.classList.add('is-stale')
+  groups.setAttribute('aria-busy', 'true')
   const bounds = timeRangeWindow(range)
   const query = new URLSearchParams()
   if (bounds.since) query.set('since', bounds.since)
@@ -95,10 +99,13 @@ async function readAnalytics(): Promise<void> {
   } catch (error) {
     if (generation !== readGeneration) return
     // Numbers from the last range under the next range's name would be wrong.
-    panel.querySelector('.analytics-groups')!.innerHTML = ''
+    groups.innerHTML = ''
     showStatus(panel, error instanceof Error ? error.message : String(error), true)
   } finally {
-    if (generation === readGeneration) panel.querySelector('.analytics-groups')!.classList.remove('is-stale')
+    if (generation === readGeneration) {
+      groups.classList.remove('is-stale')
+      groups.removeAttribute('aria-busy')
+    }
   }
 }
 
