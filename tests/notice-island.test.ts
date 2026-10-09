@@ -2,7 +2,7 @@
 // reading the server's answer, which notice the island shows, and what it says.
 
 import { describe, expect, it } from 'vitest'
-import { noticesFrom, standingFor, type Notice } from '../src/notices'
+import { NoticeFeed, noticesFrom, sendLatest, standingFor, type Notice } from '../src/notices'
 import { chooseShown, noticeHtml, noticeMeta } from '../src/views/notice-island'
 
 const T0 = Date.parse('2026-10-09T10:00:00.000Z')
@@ -109,5 +109,138 @@ describe("a notice's markup", () => {
     const html = noticeHtml(notice('a', { target: null }), 0, T0)
     expect(html).not.toContain('data-action="open"')
     expect(html).toContain('data-action="dismiss"')
+  })
+})
+
+describe('the notices this tab shows', () => {
+  interface Call { url: string, method: string, answer: (body: unknown) => void, fail: (error: Error) => void }
+  function server() {
+    const calls: Call[] = []
+    const request = ((url: string, init?: RequestInit) => new Promise((resolve, reject) => {
+      calls.push({
+        url,
+        method: init?.method ?? 'GET',
+        answer: (body) => resolve({ ok: true, status: 200, json: async () => body }),
+        fail: reject,
+      })
+    })) as unknown as typeof fetch
+    return { calls, request }
+  }
+  const state = (...notices: Notice[]) => ({ enabled: true, notices })
+  const ids = (feed: NoticeFeed) => feed.current.notices.map((item) => item.id)
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+  const a = notice('a')
+  const b = notice('b', { kind: 'behavior_held' })
+  const c = notice('c', { kind: 'pr_ready', due: iso(15) })
+
+  async function shown(...notices: Notice[]) {
+    const { calls, request } = server()
+    const feed = new NoticeFeed(request)
+    const first = feed.read()
+    calls[0].answer(state(...notices))
+    await first
+    return { calls, feed }
+  }
+
+  it('keeps a notice put away when a read sent before answers after', async () => {
+    const { calls, feed } = await shown(a, b)
+    const late = feed.read()
+    const dismissed = feed.dismiss('a')
+    expect(ids(feed)).toEqual(['b'])
+    expect([calls[1].method, calls[2].method, calls[2].url]).toEqual(['GET', 'POST', '/api/notices/a/dismiss'])
+    calls[2].answer(state(b))
+    await dismissed
+    calls[1].answer(state(a, b))
+    await late
+    expect(ids(feed)).toEqual(['b'])
+  })
+
+  it('keeps it away when a read sent meanwhile was answered before the server took it, until a later read', async () => {
+    const { calls, feed } = await shown(a, b)
+    const dismissed = feed.dismiss('a')
+    const meanwhile = feed.read()
+    calls[2].answer(state(a, b))
+    await meanwhile
+    expect(ids(feed)).toEqual(['b'])
+    calls[1].answer(state(b))
+    await dismissed
+    expect(ids(feed)).toEqual(['b'])
+    // Once a read sent after the server took it answers, the server alone decides.
+    const after = feed.read()
+    calls[3].answer(state(a, b))
+    await after
+    expect(ids(feed)).toEqual(['a', 'b'])
+  })
+
+  it('lets the later of two actions stand over the earlier one answered last', async () => {
+    const { calls, feed } = await shown(a, b, c)
+    const first = feed.dismiss('a')
+    const second = feed.silence('b')
+    expect(calls[2].url).toBe('/api/notices/b/silence')
+    calls[2].answer(state(c))
+    await second
+    calls[1].answer(state(b, c))
+    await first
+    expect(ids(feed)).toEqual(['c'])
+  })
+
+  it('shows a notice again when putting it away failed', async () => {
+    const { calls, feed } = await shown(a, b)
+    const dismissed = feed.dismiss('a')
+    expect(ids(feed)).toEqual(['b'])
+    calls[1].fail(new Error('offline'))
+    await settle()
+    calls[2].answer(state(a, b))
+    await dismissed
+    expect(ids(feed)).toEqual(['a', 'b'])
+  })
+
+  it('shows the next reminder of a pull request put away until then', async () => {
+    const { calls, feed } = await shown(c)
+    const dismissed = feed.dismiss('c')
+    calls[1].answer(state())
+    await dismissed
+    const reminder = feed.read()
+    calls[2].answer(state({ ...c, due: iso(30) }))
+    await reminder
+    expect(feed.current.notices.map((item) => [item.id, item.due])).toEqual([['c', iso(30)]])
+  })
+})
+
+describe('saving a choice', () => {
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  it('sends one choice at a time, and of those waiting only the newest', async () => {
+    const sent: number[] = []
+    const done: Array<() => void> = []
+    const save = sendLatest((value: number) => {
+      sent.push(value)
+      return new Promise<void>((resolve) => done.push(resolve))
+    }, () => undefined)
+    save(1)
+    save(2)
+    save(3)
+    expect(sent).toEqual([1])
+    done[0]()
+    await settle()
+    expect(sent).toEqual([1, 3])
+    done[1]()
+    await settle()
+    save(4)
+    expect(sent).toEqual([1, 3, 4])
+  })
+
+  it('reports a failure only when no newer choice replaces it', async () => {
+    const failures: unknown[] = []
+    const pending: Array<{ reject: (error: Error) => void }> = []
+    const save = sendLatest((_value: number) => new Promise<void>((_resolve, reject) => pending.push({ reject })), (error, value) => failures.push([String(error), value]))
+    save(1)
+    save(2)
+    pending[0].reject(new Error('first'))
+    await settle()
+    expect(failures).toEqual([])
+    pending[1].reject(new Error('second'))
+    await settle()
+    expect(failures).toEqual([['Error: second', 2]])
   })
 })

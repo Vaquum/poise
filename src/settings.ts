@@ -19,6 +19,7 @@ import { productionSummary, type ProductionUpdate } from './production-status'
 import { ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, type ConnectedAccount } from '../server/accounts/types'
 import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
+import { sendLatest } from './notices'
 import './views/connected-accounts.css'
 import type { TerminalPanel } from './views/terminal-panel'
 
@@ -130,31 +131,33 @@ function showNotificationsChoice(enabled: boolean): void {
 }
 
 // Notifications apply at once, like the theme, but are kept by the server: the
-// check behind them runs there, whether or not a page is open.
-async function setNotifications(enabled: boolean): Promise<void> {
-  const before = getCachedSettings().notifications?.enabled !== false
+// check behind them runs there, whether or not a page is open. Choices are
+// saved one at a time, so the last one made is the one kept.
+const saveNotifications = sendLatest(async (enabled: boolean) => {
+  const res = await fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ notifications: { enabled } }),
+  })
+  const data = await res.json().catch(() => null)
+  if (!res.ok || !data || typeof data !== 'object') throw new Error((data as { error?: string } | null)?.error || `HTTP ${res.status}`)
+  setLocalSettings(data)
+  window.dispatchEvent(new CustomEvent('poise:notifications-changed'))
+}, (error, enabled) => {
+  showNotificationsChoice(getCachedSettings().notifications?.enabled !== false)
+  if (notificationsStatusEl) {
+    notificationsStatusEl.textContent = `Notifications were not turned ${enabled ? 'on' : 'off'}: ${(error as Error).message}`
+    notificationsStatusEl.hidden = false
+  }
+})
+
+function setNotifications(enabled: boolean): void {
   showNotificationsChoice(enabled)
   if (notificationsStatusEl) {
     notificationsStatusEl.textContent = ''
     notificationsStatusEl.hidden = true
   }
-  try {
-    const res = await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ notifications: { enabled } }),
-    })
-    const data = await res.json().catch(() => null)
-    if (!res.ok || !data || typeof data !== 'object') throw new Error((data as { error?: string } | null)?.error || `HTTP ${res.status}`)
-    setLocalSettings(data)
-    window.dispatchEvent(new CustomEvent('poise:notifications-changed'))
-  } catch (error) {
-    showNotificationsChoice(before)
-    if (notificationsStatusEl) {
-      notificationsStatusEl.textContent = `Notifications were not turned ${enabled ? 'on' : 'off'}: ${(error as Error).message}`
-      notificationsStatusEl.hidden = false
-    }
-  }
+  saveNotifications(enabled)
 }
 
 // What the server applies when nothing is stored; shown so an empty field
@@ -972,7 +975,7 @@ function buildPanel(): HTMLElement {
   notificationsStatusEl = panel.querySelector('.st-notifications-status')
   notificationsPicker!.addEventListener('click', (event) => {
     const choice = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-notifications]')?.dataset.notifications
-    if (choice === 'on' || choice === 'off') void setNotifications(choice === 'on')
+    if (choice === 'on' || choice === 'off') setNotifications(choice === 'on')
   })
   panel.querySelector('.st-preset-save')!.addEventListener('click', () => { void presetAction(savePreset) })
   panel.querySelector('.st-preset-use')!.addEventListener('click', () => { void presetAction(usePreset) })

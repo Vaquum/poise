@@ -76,11 +76,53 @@ export function standingFor(since: string, now: number): string {
   return rest ? `${hours} h ${rest} min` : `${hours} h`
 }
 
+/** Sends the newest of a series of choices, one request at a time: a choice
+ *  made while another is being sent waits for it, and of those waiting only
+ *  the newest is sent. So the last choice made is the one that stays, whatever
+ *  order the server would have taken simultaneous requests in. `failed` hears
+ *  of a failure only when no newer choice is waiting to replace it. */
+export function sendLatest<T>(send: (value: T) => Promise<void>, failed: (error: unknown, value: T) => void): (value: T) => void {
+  let waiting: { value: T } | null = null
+  let sending = false
+  async function drain(): Promise<void> {
+    sending = true
+    while (waiting) {
+      const { value } = waiting
+      waiting = null
+      try {
+        await send(value)
+      } catch (error) {
+        if (!waiting) failed(error, value)
+      }
+    }
+    sending = false
+  }
+  return (value) => {
+    waiting = { value }
+    if (!sending) void drain()
+  }
+}
+
 type Listener = (state: NoticesState) => void
 
-/** The notices this tab shows, kept in step with the server. */
+/** A notice this tab put away, kept away until an answer that knows of it. */
+interface PutAway {
+  /** The showing put away: a later reminder of the same notice shows. */
+  due: string
+  /** The request count once the server had taken it; null while it is being sent. */
+  settledAt: number | null
+}
+
+/** The notices this tab shows, kept in step with the server. Requests are
+ *  numbered as they are sent: an answer older than one already shown is
+ *  dropped, and a notice put away stays away until an answer to a request sent
+ *  after the server took it, so no answer in flight can bring it back. */
 export class NoticeFeed {
   private state: NoticesState = { enabled: false, notices: [] }
+  private server: NoticesState = { enabled: false, notices: [] }
+  private readonly putAway = new Map<string, PutAway>()
+  private sent = 0
+  private shown = 0
   private readonly listeners = new Set<Listener>()
   private timer: ReturnType<typeof setInterval> | null = null
   private reading: Promise<void> | null = null
@@ -116,18 +158,23 @@ export class NoticeFeed {
   /** Reads what the server shows now; an answer that is not one changes nothing. */
   read(): Promise<void> {
     if (this.reading) return this.reading
-    this.reading = (async () => {
-      try {
-        const res = await this.request('/api/notices', { headers: { Accept: 'application/json' } })
-        if (!res.ok) return
-        this.apply(noticesFrom(await res.json()))
-      } catch {
-        // Offline or restarting: the next read tries again.
-      } finally {
-        this.reading = null
-      }
-    })()
-    return this.reading
+    // Cleared once settled, never before it is recorded.
+    const current: Promise<void> = this.fetchState().finally(() => {
+      if (this.reading === current) this.reading = null
+    })
+    this.reading = current
+    return current
+  }
+
+  private async fetchState(): Promise<void> {
+    const sent = ++this.sent
+    try {
+      const res = await this.request('/api/notices', { headers: { Accept: 'application/json' } })
+      if (!res.ok) return
+      this.receive(sent, noticesFrom(await res.json()))
+    } catch {
+      // Offline or restarting: the next read tries again.
+    }
   }
 
   /** Puts a notice away here at once, then on the server, whose answer wins. */
@@ -141,22 +188,41 @@ export class NoticeFeed {
   }
 
   private async act(id: string, action: 'dismiss' | 'silence'): Promise<void> {
-    this.apply({ ...this.state, notices: this.state.notices.filter((notice) => notice.id !== id) })
+    const due = this.state.notices.find((notice) => notice.id === id)?.due ?? ''
+    const away: PutAway = { due, settledAt: null }
+    this.putAway.set(id, away)
+    this.publish()
+    const sent = ++this.sent
     try {
       const res = await this.request(`/api/notices/${encodeURIComponent(id)}/${action}`, { method: 'POST', headers: { Accept: 'application/json' } })
       const next = noticesFrom(await res.json().catch(() => null))
       if (res.ok && next) {
-        this.apply(next)
+        away.settledAt = this.sent
+        this.receive(sent, next)
         return
       }
     } catch {
       // Fall through: the server says what still stands.
     }
+    if (this.putAway.get(id) === away) this.putAway.delete(id)
+    this.publish()
     await this.read()
   }
 
-  private apply(next: NoticesState | null): void {
-    if (!next) return
+  /** The server's answer to request `sent`, unless a later one is shown already. */
+  private receive(sent: number, next: NoticesState | null): void {
+    if (!next || sent <= this.shown) return
+    this.shown = sent
+    // An answer to a request sent after the server took an action knows of it.
+    for (const [id, away] of this.putAway) {
+      if (away.settledAt !== null && away.settledAt < sent) this.putAway.delete(id)
+    }
+    this.server = next
+    this.publish()
+  }
+
+  private publish(): void {
+    const next = { ...this.server, notices: this.server.notices.filter((notice) => this.putAway.get(notice.id)?.due !== notice.due) }
     this.state = next
     for (const listener of this.listeners) listener(next)
   }
