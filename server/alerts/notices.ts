@@ -184,13 +184,13 @@ let firstCheck: ReturnType<typeof setTimeout> | null = null
 let pass: Promise<void> | null = null
 
 /** One pass, unless one is already running or notifications are off. */
-export function checkNotices(): Promise<void> {
+export function checkNotices(read: typeof readOwnPullRequests = readOwnPullRequests): Promise<void> {
   if (pass) return pass
   if (!getNotificationSettings().enabled) return Promise.resolve()
   pass = (async () => {
     try {
       retireClearedBehaviorAlerts()
-      await checkReadyPullRequests()
+      await checkReadyPullRequests(read)
     } catch (error) {
       console.error('[notices] could not check what needs attention:', error)
     } finally {
