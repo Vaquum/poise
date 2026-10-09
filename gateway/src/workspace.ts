@@ -10,7 +10,8 @@ import { deviceState, hashSecret, type Session, type User } from './store.js'
 import { workspaceApi, WORKSPACE_API_PREFIX } from './workspace-api.js'
 
 type Authentication =
-  | { kind: 'ok'; scope: 'browser' | 'link' }
+  | { kind: 'ok'; scope: 'browser'; device: null }
+  | { kind: 'ok'; scope: 'link'; device: string }
   | { kind: 'unauthenticated'; bearer: boolean; error: string; message: string }
   | { kind: 'forbidden'; message: string }
 
@@ -34,6 +35,11 @@ const STARTING = { error: 'workspace_starting', message: 'Your workspace is star
 const UPDATING = { error: 'workspace_updating', message: 'Poise is updating to the latest version. It is back in a few seconds.' }
 /** Marks every answer given while a workspace restarts onto a new release, for Poise's page to notice. */
 export const UPDATING_HEADER = 'x-poise-updating'
+
+/** Poise Link's event stream, held open while it runs. */
+function isLinkEventStream(req: IncomingMessage): boolean {
+  return req.method === 'GET' && (req.url ?? '').split('?')[0] === '/api/link/events'
+}
 
 /** /api/link/* exactly as written: no dot segments or backslashes that a URL parser would resolve elsewhere. */
 export function isLinkPath(target: string): boolean {
@@ -69,11 +75,11 @@ function authenticate(ctx: Context, req: IncomingMessage, owner: User): Authenti
     if (owner.disabledAt !== null) return refused('user_disabled', 'This account has been disabled by an admin.')
     if (!ctx.isAllowed(owner)) return refused('access_removed', ACCESS_REMOVED)
     store.touchDevice(device.id)
-    return { kind: 'ok', scope: 'link' }
+    return { kind: 'ok', scope: 'link', device: device.id }
   }
   const sessions = ctx.workspaceSessions(req)
   if (sessions.some((session) => isOwnSession(session, owner))) {
-    return ctx.isAllowed(owner) ? { kind: 'ok', scope: 'browser' } : { kind: 'forbidden', message: ACCESS_REMOVED }
+    return ctx.isAllowed(owner) ? { kind: 'ok', scope: 'browser', device: null } : { kind: 'forbidden', message: ACCESS_REMOVED }
   }
   if (sessions.length > 0) return { kind: 'forbidden', message: 'This workspace belongs to someone else.' }
   return { kind: 'unauthenticated', bearer: false, error: 'unauthorized', message: 'Sign in to use this workspace.' }
@@ -206,6 +212,18 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
     proto: ctx.scheme,
     dropAuthorization: auth.scope === 'link',
   })
+  if (auth.device !== null && isLinkEventStream(req)) {
+    const device = auth.device
+    // The moment a device's stream closes is when Settings says it was last seen.
+    ctx.linkStreams.watch(device, res, () => {
+      // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
+      try {
+        ctx.deps.store.touchDevice(device, 0)
+      } catch (failure) {
+        log.error('device.touch.failed', { handle: owner.handle, device, error: errorMessage(failure) })
+      }
+    })
+  }
   proxyRequest(req, res, ctx.deps.upstream(owner.handle), headers, ctx.agent, (error) => {
     // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
     try {

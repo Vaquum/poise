@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs'
+import http from 'node:http'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import { LINK_INSTALLER_URL, LINK_RELEASES_URL } from '../src/pages.js'
 import { APEX, startHarness, verifyAssertion, workspaceHost, type Harness, type Reply } from './harness.js'
@@ -59,6 +60,47 @@ function linkCall(h: Harness, host: string, token: string): Promise<Reply> {
     path: '/api/link/events',
     headers: { authorization: `Bearer ${token}`, 'sec-fetch-mode': 'navigate', accept: 'text/html' },
   })
+}
+
+interface EventStream {
+  status: number
+  /** Hangs up, as a Poise Link that quits or is killed does. */
+  close(): void
+}
+
+/** Poise Link's event stream through the gateway, held open until it hangs up. */
+function openEventStream(h: Harness, credentials: { token: string } | { cookie: string }): Promise<EventStream> {
+  return new Promise((resolve, reject) => {
+    const req = http.get({
+      host: '127.0.0.1',
+      port: h.port,
+      path: '/api/link/events',
+      headers: {
+        host: ALICE,
+        accept: 'text/event-stream',
+        ...('token' in credentials ? { authorization: `Bearer ${credentials.token}` } : { cookie: credentials.cookie }),
+      },
+    }, (res) => {
+      // Hanging up mid-stream is the point; the aborted response's error is expected.
+      res.on('error', () => {})
+      res.resume()
+      resolve({ status: res.statusCode ?? 0, close: () => req.destroy() })
+    })
+    req.on('error', reject)
+  })
+}
+
+interface ListedDevice {
+  id: string
+  state: string
+  connected: boolean
+  lastUsedAt: number | null
+}
+
+async function listDevices(h: Harness, workspaceCookie: string): Promise<ListedDevice[]> {
+  const reply = await api(h, ALICE, workspaceCookie, 'devices')
+  expect(reply.status).toBe(200)
+  return reply.json<{ devices: ListedDevice[] }>().devices
 }
 
 async function pair(h: Harness, workspaceCookie: string, host = ALICE): Promise<string> {
@@ -372,5 +414,75 @@ describe('device pairing', () => {
       expect(bytes.includes(token)).toBe(false)
       expect(bytes.includes(code.device_code)).toBe(false)
     }
+  })
+})
+
+describe('which paired computers are connected', () => {
+  let h: Harness
+  let alice: { apexCookie: string; workspaceCookie: string }
+  beforeEach(async () => {
+    h = await startHarness()
+    alice = await h.openWorkspace('Alice')
+  })
+  afterEach(async () => {
+    await h.close()
+  })
+
+  const listed = async (token: string): Promise<ListedDevice | undefined> => {
+    const id = h.store.findDeviceByToken(token)?.id
+    return (await listDevices(h, alice.workspaceCookie)).find((device) => device.id === id)
+  }
+
+  it('shows a device connected while its Poise Link holds the event stream open, and last seen when it hangs up', async () => {
+    const laptop = await pair(h, alice.workspaceCookie)
+    const desktop = await pair(h, alice.workspaceCookie)
+    expect((await listDevices(h, alice.workspaceCookie)).map((device) => device.connected)).toEqual([false, false])
+
+    const stream = await openEventStream(h, { token: laptop })
+    expect(stream.status).toBe(200)
+    expect(h.workspace.requests.map((request) => request.url)).toEqual(['/api/link/events'])
+    expect(await listed(laptop)).toMatchObject({ state: 'active', connected: true })
+    // Each computer is its own: the other one is still not connected.
+    expect(await listed(desktop)).toMatchObject({ state: 'active', connected: false })
+
+    // Sooner than another request would count as use: the hang-up is recorded all the same.
+    const opened = h.store.findDeviceByToken(laptop)?.lastUsedAt ?? 0
+    expect(opened).toBeGreaterThan(0)
+    h.advance(30_000)
+    stream.close()
+    await vi.waitFor(async () => {
+      expect((await listed(laptop))?.connected).toBe(false)
+    })
+    expect(h.store.findDeviceByToken(laptop)?.lastUsedAt).toBeGreaterThanOrEqual(opened + 30_000)
+  })
+
+  it('counts no browser stream, no revoked device, no refused stream and no stream to a workspace that is not running', async () => {
+    const token = await pair(h, alice.workspaceCookie)
+    // The owner's browser may read the stream too, but it is not a paired computer.
+    const browser = await openEventStream(h, { cookie: alice.workspaceCookie })
+    expect(browser.status).toBe(200)
+    expect(await listed(token)).toMatchObject({ connected: false })
+    browser.close()
+
+    // A revoked device's open stream lasts until Poise Link next asks, but the device is no longer counted.
+    const before = await openEventStream(h, { token })
+    expect(before.status).toBe(200)
+    expect(await listed(token)).toMatchObject({ connected: true })
+    const id = h.store.findDeviceByToken(token)?.id ?? ''
+    expect((await api(h, ALICE, alice.workspaceCookie, 'devices/revoke', { id })).status).toBe(200)
+    expect(await listed(token)).toMatchObject({ state: 'revoked', connected: false })
+    const refused = await openEventStream(h, { token })
+    expect(refused.status).toBe(401)
+    expect(await listed(token)).toMatchObject({ connected: false })
+    before.close()
+    refused.close()
+
+    // The workspace does not answer: the gateway says it is starting, and no device is connected.
+    const second = await pair(h, alice.workspaceCookie)
+    h.workspace.reachable = false
+    const starting = await openEventStream(h, { token: second })
+    expect(starting.status).toBe(503)
+    expect(await listed(second)).toMatchObject({ state: 'active', connected: false })
+    starting.close()
   })
 })

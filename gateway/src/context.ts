@@ -6,6 +6,7 @@ import type { DockerClient } from './docker.js'
 import type { GitHubClient } from './github.js'
 import { header, HttpError, safeEqual } from './http.js'
 import type { GatewayKeys } from './keys.js'
+import { LinkStreams } from './link-streams.js'
 import type { Logger } from './log.js'
 import type { DiskWatch } from './disk.js'
 import type { Orchestrator, UpstreamResolver } from './orchestrator.js'
@@ -48,6 +49,8 @@ export class Context {
   readonly agent = new http.Agent({ keepAlive: true })
   /** Recent user-code submissions per apex session, for the /link rate limit. */
   readonly codeAttempts = new Map<string, number[]>()
+  /** The Link event streams open through this gateway, per paired device. */
+  readonly linkStreams = new LinkStreams()
 
   constructor(readonly deps: GatewayDeps) {
     this.scheme = deps.config.insecureHttp ? 'http' : 'https'
