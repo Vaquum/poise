@@ -19,7 +19,8 @@ def main() -> None:
     paths = [str(root / "caller" / ".venv" / "bin")]
     if args.node_bin:
         paths.append(str(args.node_bin))
-    environment["PATH"] = os.pathsep.join([*paths, environment["PATH"]])
+    # macOS keeps lsof, required by Caller's process cleanup, in /usr/sbin.
+    environment["PATH"] = os.pathsep.join([*paths, environment["PATH"], "/usr/sbin", "/sbin"])
     version = subprocess.run(["node", "--version"], env=environment, capture_output=True, text=True, check=True).stdout.strip()
     if not version.startswith("v22."):
         raise RuntimeError(f"Poise's required checks need Node 22; selected runtime is {version}")
