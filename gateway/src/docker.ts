@@ -47,6 +47,7 @@ export interface ContainerSpec {
     NanoCpus: number
     PidsLimit: number
     RestartPolicy: { Name: 'unless-stopped' }
+    LogConfig: { Type: 'json-file'; Config: Record<string, string> }
     Runtime?: string
     Mounts: ContainerMount[]
     NetworkMode: string
