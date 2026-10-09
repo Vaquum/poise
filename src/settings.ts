@@ -1,6 +1,6 @@
 import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } from './model-refresh'
 // Settings panel — three tabs: General (your GitHub account, the agent account,
-// GitHub accounts, timezone, refresh rate, theme), Models (which model each
+// GitHub accounts, timezone, refresh rate, notifications, theme), Models (which model each
 // place in Poise launches, with a fallback) and Accounts (Connected accounts:
 // each agent CLI's sign-in, and a terminal for its login). Slides in from the
 // right, same pattern as the typography panel.
@@ -19,6 +19,7 @@ import { productionSummary, type ProductionUpdate } from './production-status'
 import { ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, type ConnectedAccount } from '../server/accounts/types'
 import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
+import { sendLatest } from './notices'
 import './views/connected-accounts.css'
 import type { TerminalPanel } from './views/terminal-panel'
 
@@ -69,6 +70,8 @@ let fixedEl: HTMLElement | null = null
 let catalogStatusEl: HTMLElement | null = null
 let productionEl: HTMLElement | null = null
 let refreshBtn: HTMLButtonElement | null = null
+let notificationsPicker: HTMLElement | null = null
+let notificationsStatusEl: HTMLElement | null = null
 let focusTimer: ReturnType<typeof setTimeout> | null = null
 // A model select someone has changed keeps its value across background
 // reloads until Save, exactly like the text fields keep typed text.
@@ -116,6 +119,45 @@ function syncFieldsFromCache() {
   }
   if (branchPrefixInput && branchPrefixInput !== active) branchPrefixInput.value = s.chat?.branchPrefix ?? CHAT_DEFAULTS.branchPrefix
   if (idleTimeoutInput && idleTimeoutInput !== active) idleTimeoutInput.value = String(s.chat?.idleTimeoutMinutes ?? CHAT_DEFAULTS.idleTimeoutMinutes)
+  showNotificationsChoice(s.notifications?.enabled !== false)
+}
+
+function showNotificationsChoice(enabled: boolean): void {
+  notificationsPicker?.querySelectorAll<HTMLButtonElement>('[data-notifications]').forEach((button) => {
+    const on = (button.dataset.notifications === 'on') === enabled
+    button.classList.toggle('active', on)
+    button.setAttribute('aria-pressed', on ? 'true' : 'false')
+  })
+}
+
+// Notifications apply at once, like the theme, but are kept by the server: the
+// check behind them runs there, whether or not a page is open. Choices are
+// saved one at a time, so the last one made is the one kept.
+const saveNotifications = sendLatest(async (enabled: boolean) => {
+  const res = await fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ notifications: { enabled } }),
+  })
+  const data = await res.json().catch(() => null)
+  if (!res.ok || !data || typeof data !== 'object') throw new Error((data as { error?: string } | null)?.error || `HTTP ${res.status}`)
+  setLocalSettings(data)
+  window.dispatchEvent(new CustomEvent('poise:notifications-changed'))
+}, (error, enabled) => {
+  showNotificationsChoice(getCachedSettings().notifications?.enabled !== false)
+  if (notificationsStatusEl) {
+    notificationsStatusEl.textContent = `Notifications were not turned ${enabled ? 'on' : 'off'}: ${(error as Error).message}`
+    notificationsStatusEl.hidden = false
+  }
+})
+
+function setNotifications(enabled: boolean): void {
+  showNotificationsChoice(enabled)
+  if (notificationsStatusEl) {
+    notificationsStatusEl.textContent = ''
+    notificationsStatusEl.hidden = true
+  }
+  saveNotifications(enabled)
 }
 
 // What the server applies when nothing is stored; shown so an empty field
@@ -807,6 +849,18 @@ function buildPanel(): HTMLElement {
           <div class="st-help st-help-info">How often Current, Swarm, and Archive pull fresh data.</div>
         </div>
 
+        <div class="tp-group-label">Notifications</div>
+
+        <div class="tp-section">
+          <label class="tp-label" id="st-notifications-label">Show notifications</label>
+          <div class="range-picker st-notifications-picker" role="group" aria-labelledby="st-notifications-label">
+            <button type="button" data-notifications="on" class="active" aria-pressed="true">On</button>
+            <button type="button" data-notifications="off" aria-pressed="false">Off</button>
+          </div>
+          <div class="st-help st-help-info">One at a time at the top of Poise: a failed behavior, a sign-in or a chat waiting for you, and your pull requests once they are ready to merge, again every 15 minutes until you merge or silence them. Applies instantly.</div>
+          <div class="st-help st-help-error st-notifications-status" role="status" hidden></div>
+        </div>
+
         <div class="tp-group-label">Chat</div>
 
         <div class="tp-section">
@@ -896,8 +950,8 @@ function buildPanel(): HTMLElement {
       </div>
 
       <div class="tp-hint">
-        Your GitHub account, the agent account, GitHub accounts, timezone and
-        model choices are stored in
+        Your GitHub account, the agent account, GitHub accounts, timezone,
+        notifications and model choices are stored in
         <code>~/.poise/cache.db</code>. Refresh rate and theme are kept by this
         browser, so they do not follow you to another one.
       </div>
@@ -917,6 +971,12 @@ function buildPanel(): HTMLElement {
   productionEl = panel.querySelector('.st-production')
   refreshBtn = panel.querySelector('.st-refresh-models') as HTMLButtonElement
   refreshBtn.addEventListener('click', () => { void refreshModels() })
+  notificationsPicker = panel.querySelector('.st-notifications-picker')
+  notificationsStatusEl = panel.querySelector('.st-notifications-status')
+  notificationsPicker!.addEventListener('click', (event) => {
+    const choice = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-notifications]')?.dataset.notifications
+    if (choice === 'on' || choice === 'off') setNotifications(choice === 'on')
+  })
   panel.querySelector('.st-preset-save')!.addEventListener('click', () => { void presetAction(savePreset) })
   panel.querySelector('.st-preset-use')!.addEventListener('click', () => { void presetAction(usePreset) })
   panel.querySelector('.st-preset-delete')!.addEventListener('click', () => { void presetAction(deletePreset) })
@@ -1029,6 +1089,13 @@ export function openSettingsPanel() {
     if (!meInput.value) meInput.focus()
     else orgInput.focus()
   }, 200)
+}
+
+/** Settings, opened at one of its tabs. */
+export function openSettingsAt(tab: 'general' | 'accounts'): void {
+  if (!panelEl) return
+  openSettingsPanel()
+  selectTab(panelEl, tab)
 }
 
 export function closeSettingsPanel() {
