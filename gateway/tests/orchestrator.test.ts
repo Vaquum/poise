@@ -484,7 +484,7 @@ describe('image upgrades', () => {
       expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.started' && entry.handle === handle))
         .toMatchObject({ reason: 'changed drain timeout' })
       expect(h.workspace.serviceRequests.filter((request) => request.headers.host === workspaceHost(handle)).map((request) => request.url))
-        .toEqual(['/api/service/drain'])
+        .toEqual(['/api/service/drain', '/api/service/drain'])
       expect(containerEnv(h, handle)).toContain('POISE_DRAIN_TIMEOUT=600')
       expect(h.docker.containers.get(`poise-ws-${handle}`)).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
     }
@@ -818,7 +818,8 @@ describe('a recreated gateway container', () => {
     await start({ POISE_DRAIN_TIMEOUT: '2' })
     addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true, { gatewayJoined: false })
     await h.orchestrator.upgradePass()
-    expect(h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)).toEqual(['POST /api/service/drain'])
+    // The drain, and the drain again just before the container stops.
+    expect(h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)).toEqual(['POST /api/service/drain', 'POST /api/service/drain'])
     expect(events(h.logs, 'workspace.')).toEqual([
       'workspace.upgrade.started',
       'workspace.network.connected',
