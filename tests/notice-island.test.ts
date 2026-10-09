@@ -195,6 +195,18 @@ describe('the notices this tab shows', () => {
     expect(ids(feed)).toEqual(['a', 'b'])
   })
 
+  it('reads anew after a change, never trusting a read sent before it', async () => {
+    const { calls, feed } = await shown(a, b)
+    const before = feed.read()
+    const after = feed.refresh()
+    expect(calls).toHaveLength(3)
+    calls[2].answer({ enabled: false, notices: [] })
+    await after
+    calls[1].answer(state(a, b))
+    await before
+    expect(feed.current).toEqual({ enabled: false, notices: [] })
+  })
+
   it('shows the next reminder of a pull request put away until then', async () => {
     const { calls, feed } = await shown(c)
     const dismissed = feed.dismiss('c')

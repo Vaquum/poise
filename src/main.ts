@@ -149,7 +149,7 @@ function openNotice(target: NoticeTarget): void {
 }
 // A Chat session on screen already shows what its notice would say.
 mountNoticeIsland(notices, { open: openNotice, inView: (target) => 'chat' in target && chatSessionInView() === target.chat })
-window.addEventListener('poise:notifications-changed', () => { void notices.read() })
+window.addEventListener('poise:notifications-changed', () => { void notices.refresh() })
 
 // On load: pull settings first so views render with the correct org/me/timezone,
 // then show the initial view. The user's external service keeps the data

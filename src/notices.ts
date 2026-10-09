@@ -155,7 +155,8 @@ export class NoticeFeed {
     window.removeEventListener('focus', this.onVisible)
   }
 
-  /** Reads what the server shows now; an answer that is not one changes nothing. */
+  /** Reads what the server shows now, joining a read already on its way; an
+   *  answer that is not one changes nothing. */
   read(): Promise<void> {
     if (this.reading) return this.reading
     // Cleared once settled, never before it is recorded.
@@ -164,6 +165,12 @@ export class NoticeFeed {
     })
     this.reading = current
     return current
+  }
+
+  /** Reads anew, never joining a read sent before: after a change, such as
+   *  turning notifications off, only an answer sent after it is current. */
+  refresh(): Promise<void> {
+    return this.fetchState()
   }
 
   private async fetchState(): Promise<void> {
@@ -206,7 +213,7 @@ export class NoticeFeed {
     }
     if (this.putAway.get(id) === away) this.putAway.delete(id)
     this.publish()
-    await this.read()
+    await this.refresh()
   }
 
   /** The server's answer to request `sent`, unless a later one is shown already. */
