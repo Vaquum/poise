@@ -57,7 +57,9 @@ interface GhRecord {
   merged_at: string | null
 }
 
-type PrStatus = 'mergeable'        // currently the only meaningful upstream signal
+// Green: ready to merge. Caution (yellow): the merge button is green, but a check
+// fails or still runs, or a conversation is unresolved.
+type PrStatus = 'mergeable' | 'caution'
 const FRESH_WINDOW_MS = 6 * 60 * 60 * 1000   // PRs created in the last 6h read as "just opened"
 
 type TimeFilter = 'all' | 'today' | 'yesterday' | 'week'
@@ -207,6 +209,10 @@ function isFresh(item: LiveItem): boolean {
 
 function isMergeable(item: LiveItem): boolean {
   return item.is_pr === 1 && prStatus.get(prKey(item)) === 'mergeable'
+}
+
+function isCaution(item: LiveItem): boolean {
+  return item.is_pr === 1 && prStatus.get(prKey(item)) === 'caution'
 }
 
 function loadFilters() {
@@ -446,6 +452,7 @@ function renderLiveItem(item: LiveItem): HTMLElement {
 function paintLiveItem(el: HTMLElement, item: LiveItem): void {
   const classes = ['card', 'card-live']
   if (isMergeable(item))      classes.push('card-mergeable')
+  else if (isCaution(item))   classes.push('card-caution')
   else if (isFresh(item) && item.is_pr === 1) classes.push('card-fresh')
   if (agentActiveKeys.has(prKey(item))) classes.push('card-active')
   el.className = classes.join(' ')
@@ -745,7 +752,7 @@ async function fetchPrStatus() {
     // the full "owner/repo" name, matching the format prKey() builds.
     const next = new Map<string, PrStatus>()
     for (const r of data.records || []) {
-      next.set(`${r.repo}#${r.number}`, 'mergeable')
+      next.set(`${r.repo}#${r.number}`, r.status === 'yellow' ? 'caution' : 'mergeable')
     }
     if (org !== getSelectedOrganization()) return
     const changed = next.size !== prStatus.size
@@ -766,8 +773,10 @@ function applyPrStatusClasses() {
     const item = liveItems.find((i) => prKey(i) === id)
     if (!item || item.is_pr !== 1) continue
     const merge = isMergeable(item)
-    const fresh = !merge && isFresh(item)
+    const caution = isCaution(item)
+    const fresh = !merge && !caution && isFresh(item)
     cardEl.classList.toggle('card-mergeable', merge)
+    cardEl.classList.toggle('card-caution', caution)
     cardEl.classList.toggle('card-fresh', fresh)
   }
 }
