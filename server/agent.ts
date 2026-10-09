@@ -59,6 +59,8 @@ export interface LogEntry {
   // The GitHub review this run submitted (Caller's receipt); tells a
   // reviewer's review apart from a sibling's on the same pull request.
   review_id?: number | null
+  // The inline comments a change request posted; null when unknown or not one.
+  review_comments?: number | null
   // Issue review only: null until the run starts posting; from then on the
   // comments it knows it posted. A failed run with receipts must never be
   // relaunched on its own — it may already have commented.
@@ -369,6 +371,7 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     review_policy: optionalString('review_policy'),
     recovery_model: optionalString('recovery_model'),
     review_id: Number.isSafeInteger(row.review_id) && Number(row.review_id) > 0 ? Number(row.review_id) : null,
+    review_comments: Number.isSafeInteger(row.review_comments) && Number(row.review_comments) >= 0 ? Number(row.review_comments) : null,
     receipts: parseReceipts(row.receipts),
     runner: runner as LogEntry['runner'],
   }

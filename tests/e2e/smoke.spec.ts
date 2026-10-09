@@ -601,6 +601,24 @@ test('shows live activity, preserves its expansion, and loads the final response
   expect(requests).toBe(leftAt)
 })
 
+test('says what each finished review did, and why a run was superseded', async ({ page }) => {
+  const at = new Date().toISOString()
+  const row = (id: string, fields: Record<string, unknown>) => ({ id: id.repeat(32), model: 'astra', behavior: 'pr_review',
+    repo: 'o/r', pr_id: '1', started_at: at, completed_at: at, response: '', error: '', ...fields })
+  await page.route('**/api/agent-logs', (route) => route.fulfill({ json: { logs: [
+    row('a', { status: 'completed', outcome: 'clean' }),
+    row('b', { status: 'completed', outcome: 'changes_requested', review_comments: 3 }),
+    row('c', { status: 'superseded', outcome: 'superseded', expected_head: '1'.repeat(40), head_sha: '2'.repeat(40) }),
+    row('d', { status: 'superseded', outcome: 'superseded', expected_head: '1'.repeat(40), head_sha: '1'.repeat(40) }),
+  ], quarantined: [] } }))
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator('.agent-row')).toHaveCount(4)
+  for (const note of ['No comments', '3 comments', 'New commits arrived while it ran', 'The pull request was closed, merged or made a draft']) {
+    await expect(page.locator('.agent-row .agent-status-note', { hasText: note })).toHaveCount(1)
+  }
+})
+
 test('keeps healthy Swarm rows live while identifying unreadable records', async ({ page }) => {
   const logs = [{ id: 'a'.repeat(32), model: 'astra', behavior: 'pr_review', repo: 'o/r', pr_id: '1',
     status: 'running', started_at: new Date().toISOString(), response: '', error: '' }]
