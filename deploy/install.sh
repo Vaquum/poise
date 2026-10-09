@@ -117,4 +117,5 @@ fi
 compose up --detach --build
 wait_for_gateway
 check_gateway_networks
+prune_docker_storage "$image"
 next_steps
