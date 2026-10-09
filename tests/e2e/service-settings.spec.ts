@@ -190,10 +190,11 @@ test('saves the model choices under a name and switches back to them in one step
       { identity: 'gpt-6-astra-max', provider: 'codex', selector: 'gpt-6-astra', effort: 'max' },
     ], review_providers: [], path: '' }, fixed: [], refresh: null, ...answer } })
   })
-  await page.route('**/api/models/presets', (route) => {
+  await page.route('**/api/models/presets', async (route) => {
     const body = route.request().postDataJSON() as { name: string, models: Record<string, unknown> }
     posts.push({ path: 'save', body })
     presets = [...presets, { name: body.name, models: body.models as never, savedAt: '2026-10-09T13:00:00Z' }]
+    await new Promise((resolve) => setTimeout(resolve, 400))
     return route.fulfill({ json: { presets } })
   })
   await page.route('**/api/models/presets/delete', (route) => {
@@ -217,7 +218,11 @@ test('saves the model choices under a name and switches back to them in one step
 
   await page.getByLabel('Configuration name').fill('Normal')
   await page.getByRole('button', { name: 'Save current', exact: true }).click()
+  // One configuration action at a time: nothing else can start while the save is on its way.
+  await expect(page.getByRole('button', { name: 'Use', exact: true })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Delete', exact: true })).toBeDisabled()
   await expect(page.locator('.st-status')).toHaveText('Saved the model choices as "Normal".')
+  await expect(page.getByRole('button', { name: 'Use', exact: true })).toBeEnabled()
   expect(posts[0]).toEqual({ path: 'save', body: { name: 'Normal', models: { chat: { default: 'opus-5-max', fallback: 'gpt-6-astra-max' } } } })
 
   // Using one shows its choices at once, before the slow reload, so a Save right away keeps them.

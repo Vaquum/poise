@@ -504,6 +504,23 @@ function renderPresets(presets: ModelPreset[]): void {
   for (const button of panelEl!.querySelectorAll<HTMLButtonElement>('.st-preset-use, .st-preset-delete')) button.disabled = !presets.length
 }
 
+// One configuration action at a time: overlapping saves, uses and deletes could
+// answer out of order and bring back a deleted configuration or an earlier choice.
+let presetBusy = false
+async function presetAction(run: () => Promise<void>): Promise<void> {
+  if (presetBusy || !panelEl) return
+  presetBusy = true
+  const buttons = [...panelEl.querySelectorAll<HTMLButtonElement>('.st-preset-save, .st-preset-use, .st-preset-delete')]
+  for (const button of buttons) button.disabled = true
+  try {
+    await run()
+  } finally {
+    presetBusy = false
+    panelEl.querySelector<HTMLButtonElement>('.st-preset-save')!.disabled = false
+    renderPresets(lastModels?.presets ?? [])
+  }
+}
+
 async function postPresets(path: string, body: unknown): Promise<ModelPreset[] | null> {
   try {
     const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
@@ -900,9 +917,9 @@ function buildPanel(): HTMLElement {
   productionEl = panel.querySelector('.st-production')
   refreshBtn = panel.querySelector('.st-refresh-models') as HTMLButtonElement
   refreshBtn.addEventListener('click', () => { void refreshModels() })
-  panel.querySelector('.st-preset-save')!.addEventListener('click', () => { void savePreset() })
-  panel.querySelector('.st-preset-use')!.addEventListener('click', () => { void usePreset() })
-  panel.querySelector('.st-preset-delete')!.addEventListener('click', () => { void deletePreset() })
+  panel.querySelector('.st-preset-save')!.addEventListener('click', () => { void presetAction(savePreset) })
+  panel.querySelector('.st-preset-use')!.addEventListener('click', () => { void presetAction(usePreset) })
+  panel.querySelector('.st-preset-delete')!.addEventListener('click', () => { void presetAction(deletePreset) })
   accountsEl = panel.querySelector('.st-accounts')
   accountsStatusEl = panel.querySelector('.st-accounts-status')
   terminalSlot = panel.querySelector('.st-terminal-slot')
