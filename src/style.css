@@ -2306,10 +2306,16 @@ body:has(#behavior-memory-panel.open) #menu-toggle {
 
 /* PR-card status accents — a 3px coloured stripe down the left edge so
    actionable cards (mergeable, just-opened) catch the eye in a column
-   of mostly-neutral ones, without shouting. Mergeable wins if both
-   would apply: green = "this is ready", blue = "this is fresh". */
+   of mostly-neutral ones, without shouting. Green = "this is ready":
+   no check fails or runs and no conversation is open. Yellow = the merge
+   button is green, but a check or a conversation is not done yet. Blue
+   = "this is fresh", when neither applies. */
 .card.card-live.card-mergeable {
   box-shadow: inset 3px 0 0 0 var(--a3);
+}
+
+.card.card-live.card-caution {
+  box-shadow: inset 3px 0 0 0 var(--a4);
 }
 
 .card.card-live.card-fresh:not(.card-mergeable) {
@@ -2317,9 +2323,10 @@ body:has(#behavior-memory-panel.open) #menu-toggle {
 }
 
 /* Active — an agent-interface job is currently running for this PR or
-   issue. A soft amber breathing accent on the right edge says
-   "something is happening behind the scenes" without competing with
-   the green/blue left-edge state markers or the action icons. */
+   issue. A soft grey breathing accent on the right edge says
+   "something is happening behind the scenes", with no claim about how
+   it is going, and without competing with the left-edge state markers
+   or the action icons. */
 .card.card-live.card-active {
   position: relative;
 }
@@ -2331,7 +2338,7 @@ body:has(#behavior-memory-panel.open) #menu-toggle {
   right: 0;
   width: 2px;
   border-radius: 2px;
-  background: var(--a4);
+  background: var(--n4);
   pointer-events: none;
   animation: card-active-breathe 1.8s ease-in-out infinite;
 }

@@ -108,9 +108,19 @@ describe('the accounts GitHub is read as', () => {
       ? { stdout: JSON.stringify({ mergeable: args[1] === '#1' }), stderr: '' }
       : { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', 1, 5)] : []), stderr: '' })
     const result = await handleGhBody({ operation: 'green_pr' })
-    expect(result.body).toEqual({ records: [{ repo: 'alpha/same', number: 1 }], errors: [] })
+    expect(result.body).toEqual({ records: [{ repo: 'alpha/same', number: 1, status: 'green' }], errors: [] })
     const checks = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')
     expect(checks.map(([, args]) => args)).toEqual([['--mergeable', '#1', '--token-user', 'review-bot']])
+  })
+
+  it('passes on each pull request\'s colour: yellow while a check or a conversation is not done', async () => {
+    mocks.meta = { me: 'octocat', agentAccount: 'review-bot' }
+    const colours: Record<string, unknown> = { '#2': { mergeable: true, status: 'yellow' }, '#3': { mergeable: false, status: null } }
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => command === 'github-interface'
+      ? { stdout: JSON.stringify(colours[args[1]]), stderr: '' }
+      : { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', 2, 5), record('alpha', 3, 4)] : []), stderr: '' })
+    const result = await handleGhBody({ operation: 'green_pr' })
+    expect(result.body).toEqual({ records: [{ repo: 'alpha/same', number: 2, status: 'yellow' }], errors: [] })
   })
 
   it('says the agent account is missing instead of reporting nothing green', async () => {
