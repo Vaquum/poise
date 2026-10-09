@@ -211,6 +211,13 @@ Your proxy must:
   The gateway answers that question only for requests addressed to
   `POISE_PROXY_LISTEN`, which is why the proxy must never pass that name on.
 
+A proxy that signs people in itself, as a portal does, should keep that
+sign-in alive while it is used. Once the sign-in has ended, it should answer
+an open page's requests, those that are not page navigations, with 401 rather
+than a redirect to its login page. Poise notices either: it says "Your
+sign-in has ended" and offers Sign in again, which reloads the page through
+the proxy's login.
+
 With Caddy, for a gateway on `127.0.0.1:8080`:
 
 ```caddyfile

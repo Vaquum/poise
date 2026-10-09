@@ -186,7 +186,8 @@ function renderBanner(): void {
   text.append(title, message)
 
   bannerEl.replaceChildren(text)
-  if (!LOGIN_STATUSES.has(status)) return
+  // Not reaching Poise's own server is not fixed by reconnecting Claude: offer nothing to click.
+  if (!LOGIN_STATUSES.has(status) || localFailureDetail) return
   if (browserLoginUnavailable) {
     const where = document.createElement('span')
     where.className = 'claude-auth-message claude-auth-elsewhere'
