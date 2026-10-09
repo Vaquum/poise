@@ -208,6 +208,7 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
     if (previous) {
       previous.classList.add('ni-leaving')
       previous.setAttribute('inert', '')
+      previous.setAttribute('aria-hidden', 'true')
       afterFade(previous, CONTENT_MS, () => previous.remove())
     }
     if (appearing) {
@@ -228,6 +229,7 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
     const hadFocus = island.contains(document.activeElement)
     content?.classList.add('ni-leaving')
     content?.setAttribute('inert', '')
+    content?.setAttribute('aria-hidden', 'true')
     island.dataset.state = 'leaving'
     shell.style.width = ''
     cancelLeaving = afterFade(shell, SHAPE_MS, () => {
