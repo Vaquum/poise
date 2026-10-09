@@ -18,6 +18,7 @@ import { getSelectedOrganization, setSelectedOrganization } from './organization
 import { initServiceSettings, openServicePlace, takeServicePlace } from './service-settings'
 import { restartOnboarding, startOnboarding } from './onboarding'
 import { watchForUpdates } from './updating'
+import './views/updating.css'
 
 const viewMainEl = document.getElementById('view-main')!
 const viewCurrentEl = document.getElementById('view-current')!

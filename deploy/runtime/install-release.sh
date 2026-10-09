@@ -30,12 +30,12 @@ fi
 # since they were installed, so an agent still running from one keeps its
 # files. The current release and this one always stay.
 current=$(cat "$releases/current" 2>/dev/null || true)
-# shellcheck disable=SC2012 # names are release names: no newlines or spaces
-ls -1t "$releases" | grep -v -e '^current' -e '^next' -e '^\.' | tail -n +6 | while read -r old; do
-  if [ "$old" != "$release" ] && [ "$old" != "$current" ] && [ -n "$(find "$releases/$old" -maxdepth 0 -mmin +180)" ]; then
-    rm -rf "${releases:?}/$old"
-  fi
-done
+find "$releases" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %f\n' | sort -rn | tail -n +6 |
+  while read -r _ old; do
+    if [ "$old" != "$release" ] && [ "$old" != "$current" ] && [ -n "$(find "$releases/$old" -maxdepth 0 -mmin +180)" ]; then
+      rm -rf "${releases:?}/$old"
+    fi
+  done
 # What an interrupted install left.
 find "$releases" -maxdepth 1 -name '.install-*' -mmin +60 -exec rm -rf {} +
 

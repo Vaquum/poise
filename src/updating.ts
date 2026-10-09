@@ -2,9 +2,8 @@
 // with `x-poise-updating: 1` (gateway/src/workspace.ts). Poise then dims the
 // page under "Updating to the latest version" and, once it answers again,
 // reloads into the new version. A dropped Chat connection asks at once, so
-// the notice shows within moments of the restart.
-
-import './views/updating.css'
+// the notice shows within moments of the restart. Its styles are
+// views/updating.css, which main.ts loads.
 
 export const UPDATING_HEADER = 'x-poise-updating'
 export const UPDATING_PROBE_PATH = '/api/workspace'
