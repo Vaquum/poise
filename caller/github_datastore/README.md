@@ -59,6 +59,15 @@ A primary quota failure raises `GitHubRateLimitError` with `reset_at` (Unix seco
 and `GITHUB_RATE_LIMIT_RESET=<seconds>` in the CLI error. Callers must wait until
 that deadline before retrying; the CLI does not sleep through a quota window.
 
+The bounded live proof below, run from the repository root, compares two public
+PR continuation pages fetched separately and together. It requires exact
+page-payload equality and a reduction in GitHub's reported `rateLimit.cost`,
+using four read-only calls:
+
+```bash
+caller/.venv/bin/python scripts/measure-github-pagination.py --token-user LOGIN
+```
+
 ## Read Interface
 
 Ad hoc SQL is not the consumer contract.
