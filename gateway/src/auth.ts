@@ -67,13 +67,12 @@ export function postPrincipal(ctx: Context, req: IncomingMessage): Principal {
 export function home(ctx: Context, req: IncomingMessage, res: ServerResponse): void {
   const principal = ctx.apexPrincipal(req)
   if (!principal) {
-    sendHtml(res, 200, signInPage(), ctx.pageHeaders)
+    sendHtml(res, 200, signInPage(ctx.deps.config.domain), ctx.pageHeaders)
     return
   }
   const workspaceOrigin = ctx.workspaceOrigin(principal.user.handle)
   sendHtml(res, 200, homePage({
     user: principal.user,
-    isAdmin: principal.isAdmin,
     workspaceHref: `/auth/login?next=${encodeURIComponent(`${workspaceOrigin}/`)}`,
     workspaceHost: new URL(workspaceOrigin).host,
     csrf: principal.session.csrf,

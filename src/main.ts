@@ -15,6 +15,7 @@ import { toggle as toggleChat, close as closeChatPane } from './views/chat-pane'
 import { loadSettings, startRefreshTicker, applyTheme, getTheme } from './config'
 import { initClaudeAuth } from './claude-auth'
 import { getSelectedOrganization, setSelectedOrganization } from './organizations'
+import { initServiceSettings, openServicePlace, takeServicePlace } from './service-settings'
 
 const viewMainEl = document.getElementById('view-main')!
 const viewCurrentEl = document.getElementById('view-current')!
@@ -141,7 +142,14 @@ const menu = initMenu({
   // an off-cycle re-fetch. (Behaviors run server-side on their own
   // wall-clock ticker — see server/behaviors.ts.)
   startRefreshTicker()
+  void initServiceSettings()
 
+  // The gateway sends Poise Link's /link here as /?settings=link.
+  const place = takeServicePlace()
+  if (place) {
+    void openServicePlace(place)
+    return
+  }
   const ready = await isFullyConfigured()
   if (!ready) openSettingsPanel()
 })()

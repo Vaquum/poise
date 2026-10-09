@@ -1,0 +1,86 @@
+/* Settings → Admin. A person is the GitHub account card's frame
+   (.st-organization); every colour is a design token. */
+
+.ad-users,
+.ad-allowed {
+  display: grid;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.ad-user {
+  padding: var(--sp-3);
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+}
+
+.ad-user .st-help { margin-top: 2px; overflow-wrap: anywhere; }
+
+.ad-user-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.ad-user-login {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ad-badge {
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+}
+
+.ad-user-state {
+  margin-left: auto;
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+}
+
+.ad-state-running { color: var(--a3); }
+.ad-state-exited,
+.ad-state-not-created { color: var(--text-tertiary); }
+
+.ad-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: var(--sp-2);
+}
+
+.ad-actions .st-clear,
+.ad-allowed-row .st-clear {
+  padding: 4px 10px;
+}
+
+.st-clear.ad-danger { color: var(--a5); }
+.st-clear.ad-danger:hover { color: var(--a5); border-color: var(--a5); }
+.st-clear.ad-confirm { color: var(--n0); background: var(--a5); border-color: var(--a5); }
+.st-clear.ad-confirm:hover { color: var(--n0); }
+
+.ad-allowed-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 6px 0;
+  border-bottom: var(--b-hair);
+}
+
+.ad-allowed-row .st-help { margin-top: 0; flex: 1; min-width: 0; }
+
+.ad-allowed-login {
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.75rem;
+  color: var(--text);
+}
+
+.ad-busy button { pointer-events: none; opacity: 0.6; }
+.ad-status:empty { display: none; }
+
+/* With Admin the Settings tabs are four across the same width. */
+.st-tabs.st-tabs-four button { padding-left: var(--sp-2); padding-right: var(--sp-2); }

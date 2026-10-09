@@ -49,7 +49,9 @@ workspace can reach another one.
 ## Addresses
 
 - `POISE_DOMAIN` is the apex, for example `poise.example.com`. The gateway's own
-  pages (sign-in, device approval, admin) live there.
+  pages live there: sign-in, a home page that opens the workspace, and an admin
+  page for when an admin's own workspace cannot open. They share Poise's look.
+  Pairing, the paired devices and admin are otherwise in Poise's Settings.
 - Each person's workspace lives at `https://<handle>.<POISE_DOMAIN>`. The handle
   is their GitHub login in lower case. GitHub logins are already valid DNS
   labels. The handles `www`, `api`, `admin`, `auth`, `link`, `static`,
@@ -93,10 +95,42 @@ workspace can reach another one.
 - A workspace host only ever serves its owner. A session for another person on
   that host is rejected with 403; admins get no implicit access.
 - Paths under `/_poise/` on workspace hosts belong to the gateway
-  (`/_poise/session` and `/_poise/logout`). Everything else is proxied. While a
-  workspace starts, the gateway answers navigations itself with a "starting
-  your workspace" page that reloads until the workspace is ready, and other
-  requests with `503`.
+  (`/_poise/session`, `/_poise/logout` and the gateway API below). Everything
+  else is proxied. While a workspace starts, the gateway answers navigations
+  itself with a "starting your workspace" page that reloads until the
+  workspace is ready, and other requests with `503`. For an admin whose start
+  failed, the page links to the apex admin page.
+
+**Gateway API on workspace hosts.** Poise's Settings calls the gateway at
+`/_poise/api/*` on its own host; the gateway answers itself and nothing reaches
+the workspace.
+- Only the owner's `poise_ws` session reaches it: a device token gets 401,
+  another person's session 403. A request whose `Sec-Fetch-Site` is not
+  `same-origin` is refused with 403. A `POST` must carry the workspace's exact
+  `Origin` and `Content-Type: application/json`, or it is refused with 403
+  or 415.
+- `GET /_poise/api/account` returns `{ login, handle, isAdmin, workspaceHost,
+  apexOrigin, link: { installer, releases } }`.
+- `GET /_poise/api/devices` returns `{ devices: [{ id, label, createdAt,
+  lastUsedAt, revokedAt, state }] }`, times in milliseconds and `state` one of
+  `active`, `revoked` or `expired`.
+- `POST /_poise/api/devices/pair` with `{ userCode, decision }`, `decision`
+  being `approve` or `deny`, returns `{ decision, message }`. An unknown or
+  expired code answers 400 `invalid_code`. More than 10 codes per sign-in in
+  15 minutes answers 429 `too_many_requests` with `Retry-After`.
+- `POST /_poise/api/devices/revoke` with `{ id }` returns `{ devices }`, or 404
+  for a device that is not the owner's.
+- For admins only (403 otherwise): `GET /_poise/api/admin` returns `{ users,
+  allowed, admins, allowedOrgs, dockerError }`. Each user is `{ handle, login,
+  admin, access, lastLoginAt, disabled, workspace, lastError }`, where
+  `workspace` is `{ state, image }` or `null` while the Docker Engine cannot be
+  asked.
+  - `POST /_poise/api/admin/allow` and `/_poise/api/admin/allow/remove` take
+    `{ login }`.
+  - `POST /_poise/api/admin/workspaces/start`, `…/stop`, `…/restart`,
+    `/_poise/api/admin/users/disable` and `…/enable` take `{ handle }`.
+  - Each answers with the updated overview.
+- Failures answer `{ error, message }` with their HTTP status.
 - For local and CI end-to-end runs only, `POISE_INSECURE_HTTP=1` serves plain
   http: the cookies drop `Secure`, and every address the gateway builds,
   including `POISE_PUBLIC_ORIGIN` and `X-Forwarded-Proto`, uses `http`. The
@@ -241,6 +275,9 @@ computer.
   with 403.
 - The Chat WebSocket and the terminal WebSocket apply the same rules. An
   upgrade to any other path is answered (401, 403 or 404) and closed.
+- `GET /api/workspace` returns `{ mode: "service", owner }`, or `{ mode:
+  "local" }` outside service mode. Settings adds Poise Link, and Admin for the
+  gateway's admins, only in service mode.
 - Startup validates `POISE_WORKSPACE_HANDLE`, `POISE_WORKSPACE_OWNER`,
   `POISE_PUBLIC_ORIGIN`, `POISE_GATEWAY_PUBLIC_KEY` and, when set,
   `POISE_DRAIN_TIMEOUT`, and stops with one message naming each that is
@@ -400,8 +437,9 @@ trigger/replace pairs, reporting any it skipped.
 **Device pairing** (gateway, on the apex):
 1. `POST /link/device/code` returns
    `{ device_code, user_code, verification_uri, expires_in, interval }`.
-2. The person opens `verification_uri` (`/link`, signed in) and confirms the
-   `user_code`.
+2. The person opens `verification_uri` (`/link`). Signed in, the gateway sends
+   them on to Settings in their workspace (`/?settings=link`), where they
+   confirm the `user_code` through `POST /_poise/api/devices/pair`.
 3. `POST /link/device/token` with `{ device_code }` returns
    `{ error: "authorization_pending" }` until approved, then
    `{ access_token, endpoint, login }`, where `endpoint` is the workspace
@@ -416,10 +454,10 @@ trigger/replace pairs, reporting any it skipped.
    - `invalid_request`, for a body without a `device_code` string. This one
      also carries `error_description`.
 
-The approval page takes at most 10 code submissions per session in 15 minutes.
+Settings may submit at most 10 codes per sign-in in 15 minutes.
 
-Devices are listed and revoked at `/link/devices`. The gateway stores token
-hashes only. A device token expires after 30 days without use and 365 days
+Devices are listed and revoked in Settings → Accounts → Poise Link;
+`/link/devices` sends there too. The gateway stores token hashes only. A device token expires after 30 days without use and 365 days
 after pairing; Poise Link then pairs again.
 
 **Link API** (workspace, `link` scope, `Authorization: Bearer <access_token>`):

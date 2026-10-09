@@ -15,7 +15,7 @@ Everything comes from the environment and is validated at startup. Every problem
 | `POISE_DOMAIN` | yes | | Apex host name with at least two labels, for example `poise.example.com` or `poise.localhost` |
 | `POISE_GITHUB_CLIENT_ID` | yes | | GitHub OAuth App client ID |
 | `POISE_GITHUB_CLIENT_SECRET` | yes | | GitHub OAuth App client secret |
-| `POISE_ADMINS` | yes | | GitHub logins that may open `/admin`; admins may always sign in |
+| `POISE_ADMINS` | yes | | GitHub logins that may use Settings → Admin and `/admin`; admins may always sign in |
 | `POISE_ALLOWED_USERS` | | | Logins seeded into the allow list |
 | `POISE_ALLOWED_ORGS` | | | Organisations whose active members may sign in; adds the `read:org` scope |
 | `POISE_RUNTIME_IMAGE` | yes | | Workspace image, for example `poise-runtime:latest` |
@@ -43,14 +43,15 @@ On the apex:
 
 | Path | Purpose |
 | --- | --- |
-| `/` | Sign-in page, or links to your workspace, devices and admin |
+| `/` | Sign-in page, or the way into your workspace and sign-out |
 | `/auth/login`, `/auth/callback`, `/auth/logout` | GitHub sign-in and sign-out; `/auth/login?next=` accepts an apex path or a URL on a workspace host |
-| `/link` | Approve or deny a Poise Link user code (at most 10 tries per session in 15 minutes) |
-| `/link/devices` | List and revoke paired devices |
+| `/link`, `/link/devices` | Send the signed-in person to Settings → Accounts → Poise Link in their workspace, where codes are approved and devices revoked |
 | `POST /link/device/code`, `POST /link/device/token` | Device authorization for Poise Link |
-| `/admin` | Users with their access, workspace state and image; allowed logins; start, stop and restart a workspace; disable or enable a person |
+| `/admin` | Users with their access, workspace state and image; allowed logins; start, stop and restart a workspace; disable or enable a person. Settings → Admin has the same controls; this page is for when an admin's own workspace cannot open |
 
-On a workspace host, `/_poise/session` redeems a sign-in ticket and `/_poise/logout` signs out of the workspace and the apex together. Everything else is proxied to the owner's workspace. While it starts, navigations get a page that reloads every two seconds and other requests get `503` JSON.
+Every page has Poise's look: its design tokens and its typeface, Inter, which the page CSP admits from `https://rsms.me` as Poise itself loads it.
+
+On a workspace host, `/_poise/session` redeems a sign-in ticket and `/_poise/logout` signs out of the workspace and the apex together. `/_poise/api/*` is the JSON API Poise's Settings uses for pairing (at most 10 codes per sign-in in 15 minutes), the paired devices and admin; [docs/Service-architecture.md](../docs/Service-architecture.md) specifies it. Everything else is proxied to the owner's workspace. While it starts, navigations get a page that reloads every two seconds and other requests get `503` JSON.
 
 `GET /_gateway/tls-ask?domain=` answers Caddy's on-demand TLS question, or that of the server's own proxy. It is served only to requests addressed to `gateway:<PORT>` or to `POISE_PROXY_LISTEN`, so the public cannot use it to list handles.
 

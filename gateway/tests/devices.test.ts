@@ -2,16 +2,11 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
-import { LINK_INSTALLER_URL } from '../src/pages.js'
+import { LINK_INSTALLER_URL, LINK_RELEASES_URL } from '../src/pages.js'
 import { APEX, startHarness, verifyAssertion, workspaceHost, type Harness, type Reply } from './harness.js'
 
 const ALICE = workspaceHost('alice')
 const BOB = workspaceHost('bob')
-const FORM = 'application/x-www-form-urlencoded'
-
-function csrfOf(reply: Reply): string {
-  return /name="csrf" value="([^"]+)"/.exec(reply.body)?.[1] ?? ''
-}
 
 async function requestCode(h: Harness): Promise<{ device_code: string; user_code: string }> {
   const reply = await h.request({ host: APEX, method: 'POST', path: '/link/device/code', headers: { 'user-agent': 'PoiseLink/1.0 (macOS)' } })
@@ -27,13 +22,25 @@ function poll(h: Harness, deviceCode: string): Promise<Reply> {
   })
 }
 
-async function decide(h: Harness, apexCookie: string, userCode: string, decision: 'approve' | 'deny'): Promise<Reply> {
-  const page = await h.request({ host: APEX, path: '/link', headers: { cookie: apexCookie } })
+/** A call to the gateway's API on a workspace host, as Settings makes it from that host's own page. */
+function api(h: Harness, host: string, cookie: string, path: string, body?: Record<string, unknown>, headers: Record<string, string> = {}): Promise<Reply> {
   return h.request({
-    host: APEX, method: 'POST', path: '/link',
-    headers: { cookie: apexCookie, origin: `https://${APEX}`, 'content-type': FORM },
-    body: new URLSearchParams({ csrf: csrfOf(page), user_code: userCode, decision }).toString(),
+    host,
+    method: body === undefined ? 'GET' : 'POST',
+    path: `/_poise/api/${path}`,
+    headers: {
+      cookie,
+      'sec-fetch-site': 'same-origin',
+      ...(body === undefined ? {} : { origin: `https://${host}`, 'content-type': 'application/json' }),
+      ...headers,
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
   })
+}
+
+/** Settings → Poise Link approving or denying the code Poise Link shows. */
+function decide(h: Harness, workspaceCookie: string, userCode: string, decision: 'approve' | 'deny', host = ALICE): Promise<Reply> {
+  return api(h, host, workspaceCookie, 'devices/pair', { userCode, decision })
 }
 
 /** What Poise Link relies on: 401 with a JSON reason, never 403 and never a redirect. */
@@ -54,9 +61,9 @@ function linkCall(h: Harness, host: string, token: string): Promise<Reply> {
   })
 }
 
-async function pair(h: Harness, apexCookie: string): Promise<string> {
+async function pair(h: Harness, workspaceCookie: string, host = ALICE): Promise<string> {
   const code = await requestCode(h)
-  expect((await decide(h, apexCookie, code.user_code, 'approve')).status).toBe(200)
+  expect((await decide(h, workspaceCookie, code.user_code, 'approve', host)).status).toBe(200)
   const reply = await poll(h, code.device_code)
   expect(reply.status).toBe(200)
   return reply.json<{ access_token: string }>().access_token
@@ -98,9 +105,9 @@ describe('device pairing', () => {
     expect((await poll(h, code.device_code)).json()).toEqual({ error: 'authorization_pending' })
 
     // People type codes loosely; the page accepts lower case and a missing dash.
-    const approved = await decide(h, alice.apexCookie, code.user_code.toLowerCase().replace('-', ''), 'approve')
+    const approved = await decide(h, alice.workspaceCookie, code.user_code.toLowerCase().replace('-', ''), 'approve')
     expect(approved.status).toBe(200)
-    expect(approved.body).toContain(`paired with ${ALICE}`)
+    expect(approved.json()).toEqual({ decision: 'approve', message: `Approved. Poise Link on that computer is now paired with ${ALICE}.` })
 
     const issued = await poll(h, code.device_code)
     expect(issued.status).toBe(200)
@@ -111,7 +118,9 @@ describe('device pairing', () => {
 
   it('answers access_denied when the person denies the code', async () => {
     const code = await requestCode(h)
-    expect((await decide(h, alice.apexCookie, code.user_code, 'deny')).status).toBe(200)
+    const denied = await decide(h, alice.workspaceCookie, code.user_code, 'deny')
+    expect(denied.status).toBe(200)
+    expect(denied.json()).toEqual({ decision: 'deny', message: 'Denied. That computer will not be paired.' })
     const reply = await poll(h, code.device_code)
     expect(reply.status).toBe(400)
     expect(reply.json()).toEqual({ error: 'access_denied' })
@@ -121,7 +130,9 @@ describe('device pairing', () => {
     const code = await requestCode(h)
     h.advance(15 * 60_000 + 1000)
     expect((await poll(h, code.device_code)).json()).toEqual({ error: 'expired_token' })
-    expect((await decide(h, alice.apexCookie, code.user_code, 'approve')).status).toBe(400)
+    const expired = await decide(h, alice.workspaceCookie, code.user_code, 'approve')
+    expect(expired.status).toBe(400)
+    expect(expired.json()).toEqual({ error: 'invalid_code', message: 'That code is not valid or has expired. Start pairing again in Poise Link.' })
   })
 
   it('refuses unknown device codes and malformed requests', async () => {
@@ -131,34 +142,54 @@ describe('device pairing', () => {
     expect(malformed.json()).toMatchObject({ error: 'invalid_request' })
   })
 
-  it('needs a signed-in person, a CSRF token and the apex origin to decide a code', async () => {
+  it('decides a code only for the owner\'s own session, from the workspace\'s own page', async () => {
     const code = await requestCode(h)
-    const page = await h.request({ host: APEX, path: '/link', headers: { cookie: alice.apexCookie } })
-    const body = (csrf: string) => new URLSearchParams({ csrf, user_code: code.user_code, decision: 'approve' }).toString()
+    const body = { userCode: code.user_code, decision: 'approve' }
+    const bob = await h.openWorkspace('bob')
 
-    const signedOut = await h.request({ host: APEX, method: 'POST', path: '/link', headers: { origin: `https://${APEX}`, 'content-type': FORM }, body: body(csrfOf(page)) })
-    expect(signedOut.status).toBe(403)
-    const noToken = await h.request({ host: APEX, method: 'POST', path: '/link', headers: { cookie: alice.apexCookie, origin: `https://${APEX}`, 'content-type': FORM }, body: body('') })
-    expect(noToken.status).toBe(403)
-    const crossSite = await h.request({ host: APEX, method: 'POST', path: '/link', headers: { cookie: alice.apexCookie, origin: 'https://evil.example', 'content-type': FORM }, body: body(csrfOf(page)) })
-    expect(crossSite.status).toBe(403)
+    expect((await api(h, ALICE, '', 'devices/pair', body)).status).toBe(401)
+    // Bob's session on Alice's host is not Alice's.
+    expect((await api(h, ALICE, bob.workspaceCookie, 'devices/pair', body)).status).toBe(403)
+    // The apex session alone is not a workspace session.
+    expect((await api(h, ALICE, alice.apexCookie, 'devices/pair', body)).status).toBe(401)
+    // Another origin, a sibling workspace host included, or none at all.
+    for (const origin of ['https://evil.example', `https://${BOB}`, `https://${APEX}`, 'null']) {
+      expect((await api(h, ALICE, alice.workspaceCookie, 'devices/pair', body, { origin })).status, origin).toBe(403)
+    }
+    const noOrigin = await h.request({
+      host: ALICE, method: 'POST', path: '/_poise/api/devices/pair',
+      headers: { cookie: alice.workspaceCookie, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    expect(noOrigin.status).toBe(403)
+    for (const site of ['cross-site', 'same-site', 'none']) {
+      expect((await api(h, ALICE, alice.workspaceCookie, 'devices/pair', body, { 'sec-fetch-site': site })).status, site).toBe(403)
+    }
+    // A form post cannot be made to look like the JSON Settings sends.
+    const form = await api(h, ALICE, alice.workspaceCookie, 'devices/pair', body, { 'content-type': 'application/x-www-form-urlencoded' })
+    expect(form.status).toBe(415)
     expect((await poll(h, code.device_code)).json()).toEqual({ error: 'authorization_pending' })
-
-    const signedOutPage = await h.request({ host: APEX, path: '/link' })
-    expect(signedOutPage.status).toBe(302)
-    expect(signedOutPage.headers.location).toBe('/auth/login?next=%2Flink')
+    // The gateway answers these itself: none reaches the workspace.
+    expect(h.workspace.requests).toHaveLength(0)
   })
 
-  it('serves its forms under a referrer policy that lets a browser send their origin', async () => {
-    // Under no-referrer, browsers send `Origin: null` with every form post, which the check above refuses.
-    const page = await h.request({ host: APEX, path: '/link', headers: { cookie: alice.apexCookie } })
-    expect(page.status).toBe(200)
-    expect(page.body).toContain('<form method="post" action="/link">')
-    expect(page.headers['referrer-policy']).toBe('same-origin')
+  it('sends Poise Link\'s /link and the old device list to Settings in the workspace', async () => {
+    for (const path of ['/link', '/link/devices']) {
+      const page = await h.request({ host: APEX, path, headers: { cookie: alice.apexCookie } })
+      expect(page.status, path).toBe(302)
+      expect(page.headers.location, path).toBe(`https://${ALICE}/?settings=link`)
+    }
+    const signedOut = await h.request({ host: APEX, path: '/link' })
+    expect(signedOut.status).toBe(302)
+    expect(signedOut.headers.location).toBe('/auth/login?next=%2Flink')
+    // The apex no longer takes codes or revocations itself.
+    for (const path of ['/link', '/link/devices/revoke']) {
+      expect((await h.request({ host: APEX, method: 'POST', path, headers: { cookie: alice.apexCookie, origin: `https://${APEX}` } })).status, path).not.toBe(200)
+    }
   })
 
   it('lets a device token reach /api/link/* with the link scope and nothing else', async () => {
-    const token = await pair(h, alice.apexCookie)
+    const token = await pair(h, alice.workspaceCookie)
     const hello = await h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })
     expect(hello.status).toBe(200)
     const { headers } = hello.json<{ headers: Record<string, string> }>()
@@ -178,48 +209,39 @@ describe('device pairing', () => {
   })
 
   it('refuses unknown and revoked device tokens', async () => {
-    const token = await pair(h, alice.apexCookie)
+    const token = await pair(h, alice.workspaceCookie)
     expect((await h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: 'Bearer guessed' } })).status).toBe(401)
     expect((await h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: 'Bearer' } })).status).toBe(401)
 
-    const list = await h.request({ host: APEX, path: '/link/devices', headers: { cookie: alice.apexCookie } })
+    const list = await api(h, ALICE, alice.workspaceCookie, 'devices')
     expect(list.status).toBe(200)
-    expect(list.body).toContain('PoiseLink/1.0 (macOS)')
-    const id = /name="id" value="([^"]+)"/.exec(list.body)?.[1] ?? ''
-    const revoked = await h.request({
-      host: APEX, method: 'POST', path: '/link/devices/revoke',
-      headers: { cookie: alice.apexCookie, origin: `https://${APEX}`, 'content-type': FORM },
-      body: new URLSearchParams({ csrf: csrfOf(list), id }).toString(),
-    })
-    expect(revoked.status).toBe(303)
-    expect(revoked.headers.location).toBe('/link/devices')
+    const [device] = list.json<{ devices: Array<{ id: string; label: string; state: string }> }>().devices
+    expect(device).toMatchObject({ label: 'PoiseLink/1.0 (macOS)', state: 'active', revokedAt: null })
+    const revoked = await api(h, ALICE, alice.workspaceCookie, 'devices/revoke', { id: device.id })
+    expect(revoked.status).toBe(200)
+    expect(revoked.json<{ devices: Array<{ state: string }> }>().devices).toEqual([expect.objectContaining({ id: device.id, state: 'revoked' })])
 
     const after = await h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })
     expectDeviceRefusal(after, 'device_revoked')
   })
 
   it('keeps a device to the workspace that paired it and to its owner\'s device list', async () => {
-    const token = await pair(h, alice.apexCookie)
+    const token = await pair(h, alice.workspaceCookie)
     const bob = await h.openWorkspace('bob')
     const crossed = await h.request({ host: BOB, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })
     expectDeviceRefusal(crossed, 'device_unknown')
 
     const aliceDevice = h.store.listDevices('alice')[0]
-    const bobList = await h.request({ host: APEX, path: '/link/devices', headers: { cookie: bob.apexCookie } })
-    expect(bobList.body).not.toContain(aliceDevice.id)
-    const bobHome = await h.request({ host: APEX, path: '/', headers: { cookie: bob.apexCookie } })
-    const stolen = await h.request({
-      host: APEX, method: 'POST', path: '/link/devices/revoke',
-      headers: { cookie: bob.apexCookie, origin: `https://${APEX}`, 'content-type': FORM },
-      body: new URLSearchParams({ csrf: csrfOf(bobHome), id: aliceDevice.id }).toString(),
-    })
+    const bobList = await api(h, BOB, bob.workspaceCookie, 'devices')
+    expect(bobList.json()).toEqual({ devices: [] })
+    const stolen = await api(h, BOB, bob.workspaceCookie, 'devices/revoke', { id: aliceDevice.id })
     expect(stolen.status).toBe(404)
     expect(h.store.listDevices('alice')[0].revokedAt).toBeNull()
   })
 
   it('expires a device after 30 days unused and a year after pairing, so Poise Link pairs again', async () => {
     const day = 24 * 60 * 60_000
-    const token = await pair(h, alice.apexCookie)
+    const token = await pair(h, alice.workspaceCookie)
     const hello = () => h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })
     for (let month = 0; month < 12; month += 1) {
       h.advance(29 * day)
@@ -230,40 +252,38 @@ describe('device pairing', () => {
     expectDeviceRefusal(await hello(), 'device_expired')
 
     // A year on, alice signs in again to pair a second device, then leaves it unused.
-    const { apexCookie } = await h.signIn('Alice')
-    const idle = await pair(h, apexCookie)
+    const idle = await pair(h, (await h.openWorkspace('Alice')).workspaceCookie)
     h.advance(30 * day)
     expect((await h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: `Bearer ${idle}` } })).status).toBe(401)
-    const list = await h.request({ host: APEX, path: '/link/devices', headers: { cookie: (await h.signIn('Alice')).apexCookie } })
-    expect(list.body.match(/Expired; pair it again/g)).toHaveLength(2)
+    const list = await api(h, ALICE, (await h.openWorkspace('Alice')).workspaceCookie, 'devices')
+    expect(list.json<{ devices: Array<{ state: string }> }>().devices.map((device) => device.state)).toEqual(['expired', 'expired'])
   })
 
   it('answers every unusable device token with 401 and a reason, never 403 or a redirect', async () => {
     const day = 24 * 60 * 60_000
     expectDeviceRefusal(await linkCall(h, ALICE, 'never-issued'), 'device_unknown')
 
-    const elsewhere = await pair(h, alice.apexCookie)
+    const elsewhere = await pair(h, alice.workspaceCookie)
     await h.openWorkspace('bob')
     expectDeviceRefusal(await linkCall(h, BOB, elsewhere), 'device_unknown')
 
-    const revoked = await pair(h, alice.apexCookie)
+    const revoked = await pair(h, alice.workspaceCookie)
     expect(h.store.revokeDevice('alice', h.store.findDeviceByToken(revoked)?.id ?? '')).toBe(true)
     expectDeviceRefusal(await linkCall(h, ALICE, revoked), 'device_revoked')
 
-    const idle = await pair(h, alice.apexCookie)
+    const idle = await pair(h, alice.workspaceCookie)
     h.advance(31 * day)
     expectDeviceRefusal(await linkCall(h, ALICE, idle), 'device_expired')
 
     // Removed from the allow list without being disabled: the device survives, the access does not.
     h.store.addAllowed('mallory', 'root')
     const mallory = await h.openWorkspace('mallory')
-    const malloryToken = await pair(h, mallory.apexCookie)
+    const malloryToken = await pair(h, mallory.workspaceCookie, workspaceHost('mallory'))
     h.store.removeAllowed('mallory')
     expectDeviceRefusal(await linkCall(h, workspaceHost('mallory'), malloryToken), 'access_removed')
 
     // Disabling revokes every device; a device that somehow outlived it still meets the per-request flag.
-    const fresh = await h.signIn('Alice')
-    const before = await pair(h, fresh.apexCookie)
+    const before = await pair(h, (await h.openWorkspace('Alice')).workspaceCookie)
     h.store.disableUser('alice', 'root')
     expectDeviceRefusal(await linkCall(h, ALICE, before), 'device_revoked')
     const code = h.store.createDeviceCode(null, 60_000, 5)
@@ -294,10 +314,10 @@ describe('device pairing', () => {
     answers.push(['authorization_pending', await poll(h, code.device_code)])
     answers.push(['slow_down', await poll(h, code.device_code)])
     const denied = await requestCode(h)
-    await decide(h, alice.apexCookie, denied.user_code, 'deny')
+    await decide(h, alice.workspaceCookie, denied.user_code, 'deny')
     answers.push(['access_denied', await poll(h, denied.device_code)])
     const approved = await requestCode(h)
-    await decide(h, alice.apexCookie, approved.user_code, 'approve')
+    await decide(h, alice.workspaceCookie, approved.user_code, 'approve')
     expect((await poll(h, approved.device_code)).status).toBe(200)
     answers.push(['invalid_grant', await poll(h, approved.device_code)])
     answers.push(['invalid_grant', await poll(h, 'never-issued')])
@@ -312,17 +332,13 @@ describe('device pairing', () => {
     expect(malformed.json()).toEqual({ error: 'invalid_request', error_description: 'Send {"device_code": "..."} as JSON.' })
   })
 
-  it('lets a session try only ten codes in fifteen minutes', async () => {
-    const page = await h.request({ host: APEX, path: '/link', headers: { cookie: alice.apexCookie } })
-    const attempt = (userCode: string) => h.request({
-      host: APEX, method: 'POST', path: '/link',
-      headers: { cookie: alice.apexCookie, origin: `https://${APEX}`, 'content-type': FORM },
-      body: new URLSearchParams({ csrf: csrfOf(page), user_code: userCode, decision: 'approve' }).toString(),
-    })
+  it('lets a sign-in try only ten codes in fifteen minutes, across its hosts', async () => {
+    const attempt = (userCode: string) => decide(h, alice.workspaceCookie, userCode, 'approve')
     const code = await requestCode(h)
     for (let guess = 0; guess < 10; guess += 1) expect((await attempt('BCDF-GHJK')).status).toBe(400)
     const limited = await attempt(code.user_code)
     expect(limited.status).toBe(429)
+    expect(limited.json()).toEqual({ error: 'too_many_requests', message: 'Too many codes were tried. Try again in 15 minutes.' })
     expect(Number(limited.headers['retry-after'])).toBeGreaterThan(890)
     expect((await poll(h, code.device_code)).json()).toEqual({ error: 'authorization_pending' })
     expect(h.logs.filter((entry) => entry.event === 'device.code.rate_limited')).toHaveLength(1)
@@ -332,19 +348,24 @@ describe('device pairing', () => {
     expect((await attempt(fresh.user_code)).status).toBe(200)
   })
 
-  it('shows how to install Poise Link where pairing starts', async () => {
-    const page = await h.request({ host: APEX, path: '/link', headers: { cookie: alice.apexCookie } })
-    expect(page.status).toBe(200)
-    expect(page.body).toContain(`curl -fsSL ${LINK_INSTALLER_URL} | sh`)
-    expect(page.body).toContain(`wget -qO- ${LINK_INSTALLER_URL} | sh`)
-    // The command the installer itself documents, so the page and the script name the same file.
+  it('tells Settings how to install Poise Link, with the command the installer documents', async () => {
+    const account = await api(h, ALICE, alice.workspaceCookie, 'account')
+    expect(account.status).toBe(200)
+    expect(account.json()).toEqual({
+      login: 'Alice',
+      handle: 'alice',
+      isAdmin: false,
+      workspaceHost: ALICE,
+      apexOrigin: `https://${APEX}`,
+      link: { installer: LINK_INSTALLER_URL, releases: LINK_RELEASES_URL },
+    })
     const installer = readFileSync(new URL('../../link/install.sh', import.meta.url), 'utf8')
     expect(installer).toContain(`curl -fsSL ${LINK_INSTALLER_URL} | sh`)
   })
 
   it('stores only hashes of device codes and tokens', async () => {
     const code = await requestCode(h)
-    await decide(h, alice.apexCookie, code.user_code, 'approve')
+    await decide(h, alice.workspaceCookie, code.user_code, 'approve')
     const token = (await poll(h, code.device_code)).json<{ access_token: string }>().access_token
     for (const file of readdirSync(h.config.dataDir)) {
       const bytes = readFileSync(join(h.config.dataDir, file))

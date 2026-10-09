@@ -346,6 +346,12 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           }
         }
 
+        // Service mode, and whose workspace this is: Settings then adds the
+        // gateway's own sections (Poise Link, and Admin for its admins).
+        if (path === '/api/workspace' && req.method === 'GET') {
+          return json(res, 200, service ? { mode: 'service', owner: service.owner } : { mode: 'local' })
+        }
+
         // Activation returns immediately; progress survives closing Settings
         // and restarting Poise. Only server-generated datastore paths are used.
         if (path === '/api/organizations' && req.method === 'GET') {

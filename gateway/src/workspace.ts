@@ -7,6 +7,7 @@ import { errorMessage } from './log.js'
 import { messagePage, signOutPage, startingPage } from './pages.js'
 import { forwardHeaders, isUnreachable, MAX_REQUEST_BODY_BYTES, proxyRequest, proxyUpgrade, rejectUpgrade, RequestTooLargeError } from './proxy.js'
 import { deviceState, hashSecret, type Session, type User } from './store.js'
+import { workspaceApi, WORKSPACE_API_PREFIX } from './workspace-api.js'
 
 type Authentication =
   | { kind: 'ok'; scope: 'browser' | 'link' }
@@ -105,6 +106,8 @@ function starting(ctx: Context, req: IncomingMessage, res: ServerResponse, owner
     workspaceHost: `${owner.handle}.${ctx.deps.config.domain}`,
     lastError: ctx.deps.store.getWorkspace(owner.handle)?.lastError ?? null,
     problem,
+    // Settings → Admin lives in the workspace; when it cannot start, the apex admin page still works.
+    adminHref: ctx.isAdmin(owner.handle) ? `${ctx.apexOrigin}/admin` : null,
   }), { ...ctx.pageHeaders, 'retry-after': '2' })
 }
 
@@ -165,6 +168,7 @@ async function signOut(ctx: Context, req: IncomingMessage, res: ServerResponse, 
 
 /** Paths under /_poise/ belong to the gateway on every workspace host. */
 async function gatewayPath(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL, owner: User): Promise<void> {
+  if (url.pathname.startsWith(WORKSPACE_API_PREFIX)) return workspaceApi(ctx, req, res, url, owner)
   if (url.pathname === '/_poise/session' && req.method === 'GET') return redeemTicket(ctx, req, res, url, owner)
   if (url.pathname === '/_poise/logout' && req.method === 'GET') return signOutConfirmation(ctx, req, res, owner)
   if (url.pathname === '/_poise/logout' && req.method === 'POST') return signOut(ctx, req, res, owner)

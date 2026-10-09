@@ -123,10 +123,10 @@ builds and installs without publishing anything.
 
 1. Open Poise Link. The window asks for the Poise address you sign in at, for
    example `poise.example.com` (`https://` is assumed).
-2. Choose Pair. Poise Link shows a code such as `WDJB-MJHT` and opens the
-   confirmation page (`/link`) in your browser.
-3. Sign in there if asked, check that the page shows the same code, and
-   approve it.
+2. Choose Pair. Poise Link shows a code such as `WDJB-MJHT` and opens
+   `/link` in your browser, which takes you to Settings → Accounts → Poise
+   Link in your workspace.
+3. Sign in there if asked, enter the code Poise Link shows, and approve it.
 4. Poise Link keeps the device token in the operating system's credential
    store, turns on Start at login, and steps aside to the tray. A notification
    confirms who it is paired as.
@@ -137,7 +137,7 @@ are fetched when they change and checked every ten minutes. Alerts are shown
 once, even across reconnects and restarts. Opening Poise Link again shows its
 window with the pairing and sync status.
 
-If the device is revoked in Poise (at `/link/devices`), Poise Link notices on
+If the device is revoked in Poise (Settings → Accounts → Poise Link), Poise Link notices on
 its next request, says so once in a notification, forgets the token and shows
 the pairing window again. Espanso keeps the last snippets it received.
 
@@ -206,7 +206,7 @@ notification. Import that file in Poise under Snippets to keep those snippets.
    **Quit**. Turning off Start at login removes the LaunchAgent, Run key value
    or autostart entry listed above; if the app is already gone, delete that
    entry by hand.
-2. Revoke the device in Poise at `/link/devices`.
+2. Revoke the device in Poise under Settings → Accounts → Poise Link.
 3. Remove the app: drag it from Applications to the Trash (macOS), use
    Settings → Apps → Installed apps (Windows), or `sudo apt remove poise-link`
    or delete the `.AppImage` (Linux).

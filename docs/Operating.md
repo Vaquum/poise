@@ -159,10 +159,12 @@ recreates the gateway with the new settings.
 
 Open `https://poise.example.com/` and sign in with GitHub as one of the
 `POISE_ADMINS`. GitHub asks once whether to authorize the OAuth App. The home
-page then links to your workspace, your Poise Link devices and the admin page,
-`https://poise.example.com/admin`. The admin page lists everyone who has
-signed in, how they got access, and their workspace's state and image, and
-lets you start, stop or restart a workspace and disable or enable a person.
+page then opens your workspace. In the workspace, Settings → Admin lists
+everyone who has signed in, how they got access, and their workspace's state
+and image, and lets you start, stop or restart a workspace, disable or enable a
+person, and change who may sign in. The same controls stay at
+`https://poise.example.com/admin` for when your own workspace cannot open; its
+starting page links there when a start failed.
 
 ## Behind your own proxy
 
@@ -446,8 +448,9 @@ container and the volume: `docker rm poise-ws-<handle>` and
 5. Install [Poise Link](Poise-Link.md) on your computer and pair it with
    `poise.example.com`. It keeps Espanso's snippets in sync and shows Poise's
    alerts while the browser is closed. On macOS or on Debian and Ubuntu, one
-   command installs it, with Espanso when that is missing; the **Pair Poise
-   Link** page at `https://poise.example.com/link` shows it too:
+   command installs it, with Espanso when that is missing; Settings →
+   Accounts → Poise Link shows it too, and is where you approve the code
+   Poise Link shows:
 
    ```bash
    curl -fsSL https://github.com/autonomio/poise/releases/latest/download/install.sh | sh

@@ -1,0 +1,99 @@
+/* Poise Link in Settings → Accounts and in first-run setup. Cards share the
+   GitHub account card's frame (.st-organization); every colour is a token. */
+
+.pl-command {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: 4px;
+  padding: 6px 6px 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+
+.pl-command-text {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.6875rem;
+  color: var(--text);
+  scrollbar-width: none;
+}
+
+.pl-command-text::-webkit-scrollbar { display: none; }
+
+.pl-command .st-clear,
+.pl-device .st-clear {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+}
+
+.pl-code {
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.pl-decide { margin-top: var(--sp-2); }
+
+.pl-decide button:disabled,
+.pl-device button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.pl-status:empty { display: none; }
+
+.pl-devices {
+  display: grid;
+  gap: var(--sp-2);
+  margin-top: 4px;
+}
+
+.pl-device {
+  display: grid;
+  gap: 2px;
+  justify-items: start;
+  padding: var(--sp-3);
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+}
+
+.pl-device-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  width: 100%;
+}
+
+.pl-device-name {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.pl-device-state {
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+}
+
+.pl-device-state-active { color: var(--a3); }
+.pl-device-state-revoked,
+.pl-device-state-expired { color: var(--text-tertiary); }
+
+.pl-device .st-help { margin-top: 0; }
+.pl-device .st-clear { margin-top: 6px; }
+
+/* An installer address is one long word; let it break rather than run out of the panel. */
+.pl .st-help code { word-break: break-all; }
+
+.pl a {
+  color: var(--text-secondary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.pl a:hover { color: var(--text); }
