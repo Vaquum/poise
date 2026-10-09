@@ -62,9 +62,11 @@ replaces, upgrades or reconfigures it.
 
 **Update** by running the same command again. It installs the newest release
 first and only then quits the running Poise Link and opens the new one, so a
-failed update leaves Poise Link running as it was. Over a connection without
-a display, such as SSH, the running Poise Link keeps the previous version
-until you quit it and open it again. The pairing stays. On macOS, Keychain may
+failed update leaves Poise Link running as it was. On macOS, while launchd
+runs Poise Link (see [Start at login](#the-tray-menu)), launchd restarts it
+on the new version instead. On Linux, over a connection without a display,
+such as SSH, the running Poise Link keeps the previous version until you quit
+it and open it again. The pairing stays. On macOS, Keychain may
 ask once whether the new Poise Link may use its saved pairing, because each
 build carries a new ad-hoc signature: choose Always Allow.
 
@@ -129,7 +131,9 @@ builds and installs without publishing anything.
 3. Sign in there if asked, enter the code Poise Link shows, and approve it.
 4. Poise Link keeps the device token in the operating system's credential
    store, turns on Start at login, and steps aside to the tray. A notification
-   confirms who it is paired as.
+   confirms who it is paired as. On macOS it then hands over to launchd, which
+   from then on starts it again if it stops: its icon leaves the menu bar for
+   a moment and comes back.
 
 From then on it holds an event stream open to your workspace, reconnecting
 with backoff (at most five minutes apart) when the connection drops. Snippets
@@ -148,7 +152,13 @@ the pairing window again. Espanso keeps the last snippets it received.
 - **Open Poise** opens your workspace in the browser.
 - **Sync now** fetches the snippets again and brings `poise.yml` up to date.
 - **Notifications** turns alert notifications on or off.
-- **Start at login** turns the login item on or off.
+- **Start at login** turns the login item on or off. On macOS it is a launch
+  agent that also keeps Poise Link running: when Poise Link crashes or is
+  stopped any way but Quit, for example with `kill`, launchd starts it again
+  within seconds. While it is on, launchd's copy is the one that runs: opening
+  Poise Link from the Finder has launchd start it, and launchd's copy asks any
+  other copy to quit. Turning it off leaves the running copy as it is; it is
+  not started at the next login.
 - **Sign out** forgets the pairing on this computer. Revoke the device in Poise
   as well to invalidate its token.
 - **Quit** stops Poise Link until you open it again (or until the next login).
@@ -182,7 +192,7 @@ found" and nothing is written.
 | Snippets (`poise.yml`), by default | `~/Library/Application Support/espanso/match` | `%APPDATA%\espanso\match` | `$XDG_CONFIG_HOME/espanso/match` (default `~/.config`) |
 | Settings (`state.json`) | `~/Library/Application Support/com.vaquum.poise.link/` | `%APPDATA%\com.vaquum.poise.link\` | `$XDG_CONFIG_HOME/com.vaquum.poise.link/` |
 | Device token | Keychain, service `com.vaquum.poise.link`, account `device-token` | Credential Manager, same names | Secret Service, same names |
-| Start at login | `~/Library/LaunchAgents/Poise Link.plist` | `Poise Link` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | `~/.config/autostart/Poise Link.desktop` |
+| Start at login | `~/Library/LaunchAgents/com.vaquum.poise.link.plist` | `Poise Link` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | `~/.config/autostart/Poise Link.desktop` |
 | Log | `~/Library/Logs/com.vaquum.poise.link/` | `%LOCALAPPDATA%\com.vaquum.poise.link\logs\` | `~/.local/share/com.vaquum.poise.link/logs/` |
 
 When the `espanso` command is on PATH, the snippets go to the `match` folder
@@ -328,7 +338,13 @@ A new local job is a new module under `src/duties` implementing the `Duty`
 trait and one line in `duties::standard`.
 
 Running a development build registers nothing until you pair it; pairing turns
-on Start at login for that build.
+on Start at login for that build. On macOS launchd then runs that build in
+place of the installed one; turn Start at login off in its tray menu and quit
+it, or pair the installed Poise Link again, to go back.
+
+Poise Link 0.1 wrote its login item as `Poise Link.plist`, which started it
+at login only. Poise Link 0.1.2 and later replace it with the launch agent
+when they start, so start at login stays as it was.
 
 ## Not done yet
 

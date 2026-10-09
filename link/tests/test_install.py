@@ -129,6 +129,21 @@ esac
     'sudo': r'''
 exec env "$@"
 ''',
+    # launchd: the agent is loaded when $STATE/launch-agent-loaded exists, and kickstart -k replaces its copy.
+    'launchctl': r'''
+case $1 in
+print)
+	[ -f "$STATE/launch-agent-loaded" ] || exit 113
+	;;
+kickstart)
+	[ ! -f "$STATE/kickstart-fails" ] || exit 1
+	for pid in $(cat "$STATE/pids.poise-link" 2>/dev/null); do
+		kill "$pid" 2>/dev/null || :
+	done
+	start_link
+	;;
+esac
+''',
     # Installing a package puts its command on PATH.
     'apt-get': r'''
 case $1 in
@@ -470,6 +485,53 @@ class MacTest(InstallerTest):
         self.assertFalse(any(p.name.startswith('.') for p in mac.apps.iterdir()))
         self.assertEqual([call[1] for call in mac.calls('open')], [str(old)])
         self.assertTrue(mac.started() and all(alive(pid) for pid in mac.started()), 'the new Poise Link runs')
+
+    def test_has_launchd_restart_the_poise_link_it_runs(self):
+        mac = Installer(self, 'Darwin', 'arm64')
+        old = mac.apps / 'Poise Link.app'
+        (old / 'Contents').mkdir(parents=True)
+        (old / 'Contents/Info.plist').write_text(info_plist('0.1.2'))
+        (mac.apps / 'Espanso.app').mkdir()
+        (mac.home / 'Library/Application Support/espanso/match').mkdir(parents=True)
+        mac.running('espanso')
+        link = mac.running('poise-link')
+        mac.set('launch-agent-loaded')
+
+        result = mac.run()
+        self.assert_ok(result)
+        self.assertTrue((mac.state / 'link-ran-during-install').exists(), 'Poise Link keeps running until the new one is in place')
+        self.assertIn('Restarting Poise Link', result.stdout)
+        self.assertIn(['launchctl', 'kickstart', '-k', 'gui/501/com.vaquum.poise.link'], mac.calls('launchctl'))
+        self.assertFalse(alive(link), 'launchd replaced the previous Poise Link')
+        self.assertEqual(mac.calls('open'), [], 'launchd starts Poise Link; the installer opens nothing')
+        self.assertIn('<string>0.1.0</string>', (old / 'Contents/Info.plist').read_text())
+        self.assertTrue(mac.started() and all(alive(pid) for pid in mac.started()), 'the new Poise Link runs')
+
+    def test_has_launchd_start_a_poise_link_that_was_quit(self):
+        mac = Installer(self, 'Darwin', 'arm64')
+        (mac.apps / 'Espanso.app').mkdir(parents=True)
+        (mac.home / 'Library/Application Support/espanso/match').mkdir(parents=True)
+        mac.running('espanso')
+        mac.set('launch-agent-loaded')
+
+        result = mac.run()
+        self.assert_ok(result)
+        self.assertEqual(mac.calls('launchctl')[-1], ['launchctl', 'kickstart', '-k', 'gui/501/com.vaquum.poise.link'])
+        self.assertEqual(mac.calls('open'), [])
+        self.assertTrue(mac.started() and all(alive(pid) for pid in mac.started()), 'Poise Link runs')
+
+    def test_a_launchd_that_cannot_restart_poise_link_is_an_error(self):
+        mac = Installer(self, 'Darwin', 'arm64')
+        (mac.apps / 'Espanso.app').mkdir(parents=True)
+        mac.running('espanso')
+        link = mac.running('poise-link')
+        mac.set('launch-agent-loaded')
+        mac.set('kickstart-fails')
+
+        result = mac.run()
+        self.assert_refused(result, 'launchd could not restart Poise Link. Quit it from its menu and open Poise Link again to use the new version.')
+        self.assertTrue(alive(link), 'the running Poise Link is left alone')
+        self.assertNotIn('==> Done', result.stdout)
 
     def test_a_failed_update_leaves_the_running_poise_link_and_its_app_alone(self):
         mac = Installer(self, 'Darwin', 'arm64')

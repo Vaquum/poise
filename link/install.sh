@@ -31,6 +31,8 @@ RELEASES=https://github.com/autonomio/poise/releases/latest
 DOCS=https://github.com/autonomio/poise/blob/main/docs/Poise-Link.md
 MAC_IMAGE=Poise-Link-macos-universal.dmg
 DEBIAN_PACKAGE=Poise-Link-linux-amd64.deb
+# The launch agent Poise Link 0.1.2 and later run as on macOS while start at login is on.
+LAUNCH_AGENT=com.vaquum.poise.link
 
 # Espanso's own release, pinned: these exact files are what gets installed.
 ESPANSO_VERSION=2.4.1
@@ -132,8 +134,24 @@ can_open_link() {
 	[ "$OS" = Darwin ] || [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]
 }
 
-# open_link starts the installed Poise Link and fails unless it is still
-# running a few seconds later: Poise Link that is not running syncs nothing.
+# link_started HINT fails unless Poise Link runs, and still runs a few seconds
+# later: Poise Link that is not running syncs nothing.
+link_started() {
+	if ! has pgrep; then
+		warn "pgrep is not installed, so the installer cannot check that Poise Link started"
+		return
+	fi
+	waited_for_start=0
+	until running poise-link >/dev/null; do
+		[ "$waited_for_start" -lt 15 ] || fail "Poise Link did not start. $1"
+		sleep 1
+		waited_for_start=$((waited_for_start + 1))
+	done
+	sleep 2
+	running poise-link >/dev/null || fail "Poise Link quit right after it started. $1"
+}
+
+# open_link starts the installed Poise Link and checks that it keeps running.
 open_link() {
 	if [ "$OS" = Darwin ]; then
 		open "$APP_DIR/Poise Link.app" || fail "macOS could not open $APP_DIR/Poise Link.app"
@@ -143,24 +161,28 @@ open_link() {
 		start_hint="Run poise-link in a terminal to see why."
 	fi
 	LINK_OPEN=1
-	if ! has pgrep; then
-		warn "pgrep is not installed, so the installer cannot check that Poise Link started"
-		return
-	fi
-	waited_for_start=0
-	until running poise-link >/dev/null; do
-		[ "$waited_for_start" -lt 15 ] || fail "Poise Link did not start. $start_hint"
-		sleep 1
-		waited_for_start=$((waited_for_start + 1))
-	done
-	sleep 2
-	running poise-link >/dev/null || fail "Poise Link quit right after it started. $start_hint"
+	link_started "$start_hint"
+}
+
+# On macOS, while start at login is on, launchd runs Poise Link and starts it
+# again whenever it stops, so only launchd can restart it.
+launchd_runs_link() {
+	[ "$OS" = Darwin ] && has launchctl && launchctl print "gui/$(id -u)/$LAUNCH_AGENT" >/dev/null 2>&1
 }
 
 # The running Poise Link is the previous version once the new one is in
-# place: quit it and open the new one. Nothing stops Poise Link before the
-# new version is installed, so a failed install leaves it running.
+# place: launchd restarts its copy, and any other copy is quit and the new one
+# opened. Nothing stops Poise Link before the new version is installed, so a
+# failed install leaves it running.
 restart_link() {
+	if launchd_runs_link; then
+		step "Restarting Poise Link"
+		launchctl kickstart -k "gui/$(id -u)/$LAUNCH_AGENT" ||
+			fail "launchd could not restart Poise Link. Quit it from its menu and open Poise Link again to use the new version."
+		LINK_OPEN=1
+		link_started "Open it from $APP_DIR to see what macOS says."
+		return
+	fi
 	link_pids=$(running poise-link) || return 0
 	if ! can_open_link; then
 		warn "Poise Link is still running the previous version. Quit it from its menu and open it again to use the new one."
