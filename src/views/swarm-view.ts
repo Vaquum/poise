@@ -48,6 +48,7 @@ interface LogEntry {
   action?: string | null
   review_policy?: string | null
   review_id?: number | null
+  review_comments?: number | null
   receipts?: Array<{ issue: string, comment_id: number, url: string | null, author: string }> | null
   runner?: string | null
 }
@@ -285,6 +286,21 @@ function statusLook(e: LogEntry): StatusLook {
   return { icon: ICON_OTHER, tone: 'flat', word, detail: word }
 }
 
+// What a finished review did, or why it was superseded: a clean review's
+// green tick alone did not say it left no comments.
+function reviewNote(e: LogEntry): string {
+  if (e.outcome === 'superseded' || e.status === 'superseded') {
+    if (e.head_sha && e.expected_head && e.head_sha !== e.expected_head) return 'New commits arrived while it ran'
+    return 'The pull request was closed, merged or made a draft'
+  }
+  if (e.behavior !== 'pr_review' && e.behavior !== 'pr_approve') return ''
+  if (e.outcome === 'clean') return 'No comments'
+  if (e.outcome === 'changes_requested' && typeof e.review_comments === 'number') {
+    return e.review_comments === 1 ? '1 comment' : `${e.review_comments} comments`
+  }
+  return ''
+}
+
 // The line after the word: what a running agent is doing now, or why a failed
 // one failed. A stopped run's error only repeats "Stopped".
 function statusNote(e: LogEntry): string {
@@ -293,7 +309,7 @@ function statusNote(e: LogEntry): string {
     return `<span class="agent-status-note agent-progress-summary" title="${escapeHtml(text)}">${escapeHtml(text)}</span>`
   }
   if (e.error_code === 'stopped') return ''
-  const failure = (e.error || '').trim().split('\n')[0]
+  const failure = (e.error || '').trim().split('\n')[0] || reviewNote(e)
   if (!failure) return ''
   return `<span class="agent-status-note" title="${escapeHtml(failure)}">${escapeHtml(failure)}</span>`
 }

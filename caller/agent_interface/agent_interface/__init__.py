@@ -72,6 +72,7 @@ def init_db():
             "review_id",
             "runner",
             "receipts",
+            "review_comments",
         ):
             if col not in cols:
                 try:
@@ -428,7 +429,7 @@ def logs():
                       response_path, error, pr_id, repo, actor, behavior,
                       session_id, outcome, head_sha, expected_head, source,
                       correlation_id, action, error_code, progress, review_policy, recovery_model,
-                      review_id, runner, receipts
+                      review_id, runner, receipts, review_comments
                from calls order by started_at"""
         ).fetchall()
     return [
@@ -457,6 +458,8 @@ def logs():
             "review_policy": r["review_policy"],
             "recovery_model": r["recovery_model"],
             "review_id": int(r["review_id"]) if r["review_id"] and str(r["review_id"]).isdigit() else None,
+            # The inline comments a change request posted, as GitHub's reply counted them.
+            "review_comments": int(r["review_comments"]) if r["review_comments"] and str(r["review_comments"]).isdigit() else None,
             "response": Path(r["response_path"]).stem[:8] if r["response_path"] else None,
             "error": r["error"],
             "runner": r["runner"],
