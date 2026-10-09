@@ -381,7 +381,7 @@ pub fn arrange(start: &Arrangement) -> Result<Arranged, String> {
             start.agent.program().display()
         )
     })?;
-    let job = start.launchd.job()?;
+    let mut job = start.launchd.job()?;
     if job.runs(start.agent.program()) {
         // launchd's copy may still be starting, before it listens for a
         // second launch: never run beside it. It looks for the request every
@@ -392,6 +392,12 @@ pub fn arrange(start: &Arrangement) -> Result<Arranged, String> {
             })?;
         }
         return Ok(Start::HandedOver.into());
+    }
+    if matches!(&job, Job::Loaded { program, .. } if program != start.agent.program()) {
+        // launchd runs a Poise Link from another place. Stop it before asking
+        // for a window, or its own look for requests could take this one.
+        start.launchd.bootout()?;
+        job = Job::NotLoaded;
     }
     if start.show_window {
         request_window(start.settings_dir)
@@ -524,6 +530,9 @@ mod tests {
         job: RefCell<Option<Job>>,
         fails: Cell<bool>,
         calls: RefCell<Vec<String>>,
+        /// A settings folder to look into at bootout: whether a window request was already there.
+        watched: RefCell<Option<PathBuf>>,
+        request_at_bootout: Cell<Option<bool>>,
     }
 
     impl FakeLaunchd {
@@ -573,6 +582,10 @@ mod tests {
 
         fn bootout(&self) -> Result<(), String> {
             self.calls.borrow_mut().push("bootout".to_owned());
+            if let Some(settings) = self.watched.borrow().as_ref() {
+                self.request_at_bootout
+                    .set(Some(settings.join(WINDOW_REQUEST_FILE_NAME).exists()));
+            }
             self.job.replace(Some(Job::NotLoaded));
             Ok(())
         }
@@ -913,6 +926,7 @@ mod tests {
                 .install()
                 .unwrap();
             let launchd = FakeLaunchd::with(job.clone());
+            launchd.watched.replace(Some(fixture.settings.clone()));
             let start = arrange_with(&fixture, &launchd, &FakeCopies::default(), false, true);
             assert_eq!(start, Ok(Start::HandedOver), "{job:?}");
             assert_eq!(
@@ -924,6 +938,9 @@ mod tests {
                 ],
                 "{job:?}"
             );
+            // The copy from the other place was stopped before the request
+            // existed, so only the new copy can take it.
+            assert_eq!(launchd.request_at_bootout.get(), Some(false), "{job:?}");
             assert_eq!(
                 fs::read_to_string(fixture.agent.path()).unwrap(),
                 plist(Path::new(PROGRAM)),
