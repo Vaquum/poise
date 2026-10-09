@@ -352,7 +352,44 @@ def finish(
     return ended_at
 
 
+INTERRUPTED_ERROR = "The agent process ended without recording a result"
+
+
+def reap_interrupted() -> int:
+    """Marks a running call failed and `interrupted` once its process is gone,
+    or its pid belongs to another process: a container restart or a crash
+    ended it before it could record a result. Without this the call would
+    read as running for good, and what launched it would never try again;
+    Poise retries an interrupted call as it does any failed one. Calls Poise
+    runs itself record no pid and are left to it."""
+    with db() as conn:
+        rows = conn.execute(
+            "select id, pid from calls where status='running' and runner is null and pid is not null"
+        ).fetchall()
+    gone = []
+    for row in rows:
+        try:
+            pid = int(row["pid"])
+        except (TypeError, ValueError):
+            continue
+        command = process_command(pid)
+        if command is None or STOP_COMMAND_MARK not in command:
+            gone.append(row["id"])
+    if not gone:
+        return 0
+    with db() as conn:
+        return sum(
+            conn.execute(
+                "update calls set status='failed', ended_at=?, error=?, error_code='interrupted', "
+                "progress=coalesce(?, progress) where id=? and status='running'",
+                (time(), INTERRUPTED_ERROR, progress.terminal("failed"), id_),
+            ).rowcount
+            for id_ in gone
+        )
+
+
 def logs():
+    reap_interrupted()
     with db() as conn:
         rows = conn.execute(
             """select id, model, prompt, started_at, ended_at, status,
