@@ -48,7 +48,9 @@ const GREEN_CONCURRENCY = 5
 // Current's colour for a pull request: green when it is ready to merge, yellow when
 // its merge button is green but a check fails or runs, or a conversation is open.
 type PrColour = 'green' | 'yellow'
-const greenCache = new Map<string, { status: PrColour | null, expiry: number }>()
+// Null: neither colour. Undefined: GitHub could not be asked, so nothing is known.
+type PrStatus = PrColour | null | undefined
+const greenCache = new Map<string, { status: PrStatus, expiry: number }>()
 
 // Subset of fields the datastore returns. Pr-only and issue-only fields
 // are optional; the user-footprint view adds `item_type` and `reasons`.
@@ -287,7 +289,7 @@ export async function getHeadSha(
 // github-interface infers the repo from cwd when no `--repository` flag
 // or git remote is available. We just point cwd at a tmp directory whose
 // last two parts are `<owner>/<repo>` and the CLI picks it up.
-async function checkPrStatus(owner: string, repo: string, number: number, agent: string): Promise<PrColour | null> {
+async function checkPrStatus(owner: string, repo: string, number: number, agent: string): Promise<PrStatus> {
   const key = `${owner}/${repo}#${number}`
   const now = Date.now()
   const cached = greenCache.get(key)
@@ -302,19 +304,58 @@ async function checkPrStatus(owner: string, repo: string, number: number, agent:
       maxOutputBytes: 1 * 1024 * 1024,
     })
     const result = JSON.parse(stdout)
-    // A github-interface that reports no status says only whether the PR is clean: green.
-    const status: PrColour | null = result.status === 'green' || result.status === 'yellow'
-      ? result.status
-      : result.status === undefined && result.mergeable ? 'green' : null
+    // GitHub works out whether an open pull request can merge after a push to it
+    // or its base; until it has, nothing is known. A github-interface that
+    // reports no status says only whether the PR is clean: green.
+    const computing = result.state === 'open' && (result.github_mergeable === null || result.github_mergeable_state === 'unknown')
+    const status: PrStatus = computing
+      ? undefined
+      : result.status === 'green' || result.status === 'yellow'
+        ? result.status
+        : result.status === undefined && result.mergeable ? 'green' : null
     greenCache.set(key, { status, expiry: now + GREEN_TTL_MS })
     return status
   } catch {
-    // Network blip / API error / parse failure — cache the negative so we
-    // don't hammer on every retry. Better to under-show green than to
-    // over-show it.
-    greenCache.set(key, { status: null, expiry: now + GREEN_TTL_MS })
-    return null
+    // Network blip / API error / parse failure — cache it so we don't hammer
+    // on every retry. Current shows such a PR uncoloured: better to
+    // under-show green than to over-show it.
+    greenCache.set(key, { status: undefined, expiry: now + GREEN_TTL_MS })
+    return undefined
   }
+}
+
+/** One of the person's own open pull requests: authored by their GitHub
+ *  account or by the agent account. */
+export interface OwnPullRequest {
+  repo: string
+  number: number
+  title: string
+  /** Current's colour; null when it has neither, undefined when GitHub could not say. */
+  status: PrStatus
+}
+
+/** The person's own open pull requests with Current's colour for each. `read`
+ *  names the accounts whose pull requests are all listed; `tracked`, every
+ *  account Poise follows. Nothing is tracked until both GitHub accounts are set. */
+export async function readOwnPullRequests(): Promise<{ pullRequests: OwnPullRequest[], read: string[], tracked: string[] }> {
+  const me = getMeta('me') || ''
+  const agent = agentAccount()
+  if (!me || !agent) return { pullRequests: [], read: [], tracked: [] }
+  const tracked = getOrganizations().map((org) => org.login)
+  const orgs = readyOrganizations()
+  const read = await fetchKind('pr', { record_state: 'open', count_only: true }, me, orgs)
+  const authors = new Set([me.toLowerCase(), agent.toLowerCase()])
+  const own = read.records.filter((pr) => pr.state === 'open' && pr.repo.includes('/') && authors.has(String(pr.author || '').toLowerCase()))
+  const pullRequests: OwnPullRequest[] = []
+  for (let i = 0; i < own.length; i += GREEN_CONCURRENCY) {
+    const chunk = own.slice(i, i + GREEN_CONCURRENCY)
+    pullRequests.push(...await Promise.all(chunk.map(async (pr) => {
+      const [owner, name] = pr.repo.split('/', 2)
+      return { repo: pr.repo, number: pr.number, title: pr.title, status: await checkPrStatus(owner, name, pr.number, agent) }
+    })))
+  }
+  const failed = new Set(read.errors.map((error) => error.org.toLowerCase()))
+  return { pullRequests, read: orgs.map((org) => org.login).filter((login) => !failed.has(login.toLowerCase())), tracked }
 }
 
 // Resolve mergeable-true PRs across the user's open-PR set. Concurrency

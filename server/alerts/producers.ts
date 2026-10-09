@@ -5,13 +5,14 @@
 //
 // The browser client has no URL routing (each browser remembers its own
 // view), so alerts open the workspace's front page; a sign-in alert from
-// Connected accounts opens Settings there.
+// Connected accounts opens Settings there. Each alert's notice in the page
+// opens its own target: the view, Settings tab or Chat session it is about.
 
 import { CONNECTED_ACCOUNTS_PATH, type AccountId, type ConnectedAccount } from '../accounts/types'
 import type { ClaudeAuthStatus } from '../claude-auth'
 import type { StopReason } from '../chat/protocol'
 import { isServiceMode } from '../service/config'
-import { raiseAlert, resolveAlert } from './store'
+import { raiseAlert, resolveAlert, type AlertTarget } from './store'
 
 const FRONT_PAGE = '/'
 /** Datastore sync alerts once it has been failing this long. */
@@ -46,6 +47,7 @@ function minutes(ms: number): string {
 }
 
 const CLAUDE_SIGN_IN = 'sign-in:claude'
+const ACCOUNTS: AlertTarget = { settings: 'accounts' }
 
 /** The Claude auth monitor's status: `reauth_required` alerts, and the alert
  *  clears once Claude is `authenticated` again. Other states say nothing. */
@@ -63,6 +65,7 @@ export function claudeAuthStatusChanged(status: ClaudeAuthStatus): void {
       ? 'Claude-backed work is paused. Connect Claude in Settings → Connected accounts.'
       : 'Claude-backed work is paused until you sign in to Claude from Poise.',
     path: FRONT_PAGE,
+    ...(isServiceMode() ? { target: ACCOUNTS } : {}),
   }))
 }
 
@@ -115,6 +118,7 @@ export function accountsChecked(accounts: readonly ConnectedAccount[], identitie
       title: `${name} needs you to sign in`,
       body: `${name} is not signed in, so work that runs it cannot start. Connect it in Settings → Accounts.`,
       path: CONNECTED_ACCOUNTS_PATH,
+      target: ACCOUNTS,
     }))
   }
 }
@@ -137,6 +141,7 @@ function ghAccountsChecked(gh: ConnectedAccount, identities: GitHubIdentities): 
       title: role.title,
       body: role.body(login),
       path: CONNECTED_ACCOUNTS_PATH,
+      target: ACCOUNTS,
     }))
   }
 }
@@ -154,6 +159,7 @@ export function behaviorHeld(behavior: string, target: string, alreadyHeld: bool
       title: `${BEHAVIOR_LABELS[behavior] ?? behavior} failed on ${clip(target, 80)}`,
       body: 'Open Behaviors in Poise to see what happened.',
       path: FRONT_PAGE,
+      target: { view: 'behaviors' },
     })
   })
 }
@@ -169,6 +175,7 @@ export function datastoreSyncFailed(login: string, sinceMs: number, nowMs = Date
     title: `GitHub data for ${login} is not updating`,
     body: `Syncing it has failed for ${minutes(nowMs - sinceMs)}. Poise keeps retrying; Settings → General → GitHub accounts shows the error.`,
     path: FRONT_PAGE,
+    target: { settings: 'general' },
   }))
 }
 
@@ -199,6 +206,7 @@ export function chatWaiting(session: ChatSessionAlertContext, request: ChatReque
       ? `In ${sessionName(session.title)}: allow or deny ${clip(request.title, 120)}.`
       : `In ${sessionName(session.title)}: ${clip(request.question, 120)}`,
     path: FRONT_PAGE,
+    target: { chat: session.sessionId },
   }))
 }
 
@@ -219,5 +227,6 @@ export function chatTurnFinished(session: ChatSessionAlertContext, turn: { id: s
       ? `${sessionName(session.title)} is done after ${minutes(turn.durationMs)}.`
       : `${sessionName(session.title)} ended (${turn.stopReason.replace('_', ' ')}) after ${minutes(turn.durationMs)}.`,
     path: FRONT_PAGE,
+    target: { chat: session.sessionId },
   }))
 }
