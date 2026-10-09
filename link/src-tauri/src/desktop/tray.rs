@@ -142,11 +142,11 @@ impl Tray {
             },
             AUTOSTART => {
                 match self.autostart.is_checked() {
-                    Ok(on) => {
-                        if let Err(error) = controller.set_autostart(on) {
-                            log::error!("could not change start at login: {error}");
-                        }
-                    }
+                    Ok(on) => match controller.set_autostart(on) {
+                        Ok(()) if on => super::hand_over_to_launchd(app),
+                        Ok(()) => {}
+                        Err(error) => log::error!("could not change start at login: {error}"),
+                    },
                     Err(error) => log::error!("could not read the tray menu: {error}"),
                 }
                 self.show_autostart(controller.autostart_enabled());

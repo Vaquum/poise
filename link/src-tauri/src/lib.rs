@@ -13,6 +13,8 @@ pub mod credentials;
 pub mod duties;
 pub mod fsutil;
 pub mod http;
+#[cfg(unix)]
+pub mod launch_agent;
 pub mod link_api;
 pub mod pairing;
 pub mod platform;

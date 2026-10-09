@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use reqwest::Url;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
+#[cfg(not(target_os = "macos"))]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_opener::OpenerExt;
 
@@ -16,6 +17,8 @@ use crate::connection::Timing;
 use crate::controller::{Controller, Platform};
 use crate::credentials::OsCredentialStore;
 use crate::duties::snippets::espanso::Locator;
+#[cfg(target_os = "macos")]
+use crate::launch_agent::{self, Arrangement, LaunchAgent, Launchctl, Processes, Start};
 use crate::platform::{Autostart, Browser};
 use crate::status::{Connection, Status};
 use commands::StatusView;
@@ -24,28 +27,45 @@ use tray::Tray;
 
 /// Passed by the login item, so a start at login stays in the tray.
 const AUTOSTART_ARG: &str = "--autostart";
+/// What Poise Link's settings folder is named after.
+const IDENTIFIER: &str = "com.vaquum.poise.link";
 const MAIN_WINDOW: &str = "main";
 const STATUS_EVENT: &str = "status";
 const MAX_LOG_BYTES: u128 = 2 * 1024 * 1024;
+/// How long a copy handing over to launchd keeps running after start at login is turned on.
+#[cfg(target_os = "macos")]
+const HAND_OVER_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub fn run() {
     let autostarted = std::env::args().any(|arg| arg == AUTOSTART_ARG);
-    tauri::Builder::default()
+    // Before the tray or a window exists: with start at login on, launchd's copy is the one that runs.
+    #[cfg(target_os = "macos")]
+    let arranged = match arrange(autostarted) {
+        Ok(Start::HandedOver) => return,
+        Ok(Start::Here) => None,
+        Err(error) => Some(error),
+    };
+    let builder = tauri::Builder::default()
         // Registered first: a second launch only shows the running copy's window.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_window(app)
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // A start at login while Poise Link already runs asks for nothing.
+            if !args.iter().any(|arg| arg == AUTOSTART_ARG) {
+                show_window(app)
+            }
         }))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
                 .max_file_size(MAX_LOG_BYTES)
                 .build(),
-        )
-        // The launcher choice only matters on macOS; `init` takes it on every system.
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec![AUTOSTART_ARG]),
-        ))
+        );
+    // macOS has its own launch agent (crate::launch_agent), which also keeps Poise Link running.
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_autostart::init(
+        MacosLauncher::LaunchAgent,
+        Some(vec![AUTOSTART_ARG]),
+    ));
+    builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -65,6 +85,12 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            if let Some(error) = &arranged {
+                log::error!(
+                    "could not hand Poise Link to launchd, so nothing starts it again if it stops: {error}"
+                );
+            }
             setup(app, autostarted)?;
             Ok(())
         })
@@ -87,15 +113,18 @@ fn setup(app: &mut tauri::App, autostarted: bool) -> Result<(), Box<dyn std::err
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
     let identifier = app.config().identifier.clone();
-    let config_dir = dirs::config_dir()
-        .ok_or("the operating system reports no configuration folder")?
-        .join(&identifier);
+    let config_dir = settings_dir()?;
     let handle = app.handle().clone();
+    // A copy the person opened handed over to this one, which launchd started.
+    #[cfg(target_os = "macos")]
+    let asked_for_window = launch_agent::take_window_request(&config_dir);
+    #[cfg(not(target_os = "macos"))]
+    let asked_for_window = false;
     let platform = Platform {
         secrets: Box::new(OsCredentialStore::new(&identifier)),
         notifier: Arc::new(DesktopNotifier::new(handle.clone())),
         browser: Arc::new(SystemBrowser(handle.clone())),
-        autostart: Arc::new(LoginItem(handle.clone())),
+        autostart: Arc::new(login_item(&handle)?),
         espanso: Locator::system(),
     };
     let controller = Controller::new(platform, &config_dir, Timing::default())?;
@@ -108,11 +137,74 @@ fn setup(app: &mut tauri::App, autostarted: bool) -> Result<(), Box<dyn std::err
     // Reading the device token can wait on an unlock prompt, so not on the event loop.
     tauri::async_runtime::spawn_blocking(move || {
         let paired = controller.start();
-        if !paired || !autostarted {
+        if !paired || !autostarted || asked_for_window {
             show_window(&handle);
         }
     });
     Ok(())
+}
+
+fn settings_dir() -> Result<std::path::PathBuf, &'static str> {
+    Ok(dirs::config_dir()
+        .ok_or("the operating system reports no configuration folder")?
+        .join(IDENTIFIER))
+}
+
+/// Decides, before anything shows, whether this process runs Poise Link or
+/// hands over to launchd's copy (see crate::launch_agent).
+#[cfg(target_os = "macos")]
+fn arrange(autostarted: bool) -> Result<Start, String> {
+    let agent = LaunchAgent::for_this_user().map_err(|error| error.to_string())?;
+    let settings_dir = settings_dir()?;
+    launch_agent::arrange(&Arrangement {
+        agent: &agent,
+        launchd: &Launchctl::for_this_user(),
+        copies: &Processes,
+        by_launchd: launch_agent::by_launchd(),
+        show_window: !autostarted,
+        settings_dir: &settings_dir,
+        sleep: &std::thread::sleep,
+    })
+}
+
+/// Start at login was just turned on. On macOS, a copy launchd did not start
+/// hands over to launchd's, which launchd starts again if it ever stops.
+fn hand_over_to_launchd(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        if launch_agent::by_launchd() {
+            return;
+        }
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            // The notification that pairing succeeded, and the first sync, go first.
+            tokio::time::sleep(HAND_OVER_DELAY).await;
+            let agent = match LaunchAgent::for_this_user() {
+                Ok(agent) => agent,
+                Err(error) => {
+                    log::error!("could not find the launch agent: {error}");
+                    return;
+                }
+            };
+            if !agent.installed() {
+                // Start at login was turned off again meanwhile.
+                return;
+            }
+            match launch_agent::hand_over(&agent, &Launchctl::for_this_user()) {
+                Ok(()) => {
+                    log::info!(
+                        "launchd runs Poise Link from now on, and starts it again if it stops"
+                    );
+                    app.exit(0);
+                }
+                Err(error) => log::error!(
+                    "could not hand Poise Link to launchd, so nothing starts it again if it stops: {error}"
+                ),
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
 }
 
 /// Keeps the tray and the window in step with the core's status.
@@ -142,6 +234,9 @@ fn watch_status(app: AppHandle, controller: Arc<Controller>, tray: Arc<Tray>) {
                 // Paired: start at login was turned on and the window steps aside to the tray.
                 tray.show_autostart(controller.autostart_enabled());
                 hide_window(&app);
+                if controller.autostart_enabled() == Ok(true) {
+                    hand_over_to_launchd(&app);
+                }
             } else if previous.is_paired() && signed_out {
                 // Signed out or revoked: back to pairing.
                 show_window(&app);
@@ -192,8 +287,39 @@ impl Browser for SystemBrowser {
     }
 }
 
+/// Start at login: on macOS the launch agent, elsewhere the autostart plugin.
+#[cfg(target_os = "macos")]
+fn login_item(_app: &AppHandle) -> Result<LaunchAgentItem, std::io::Error> {
+    Ok(LaunchAgentItem(LaunchAgent::for_this_user()?))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn login_item(app: &AppHandle) -> Result<LoginItem, std::io::Error> {
+    Ok(LoginItem(app.clone()))
+}
+
+#[cfg(target_os = "macos")]
+struct LaunchAgentItem(LaunchAgent);
+
+#[cfg(target_os = "macos")]
+impl Autostart for LaunchAgentItem {
+    fn enable(&self) -> Result<(), String> {
+        self.0.install().map_err(|error| error.to_string())
+    }
+
+    fn disable(&self) -> Result<(), String> {
+        self.0.remove().map_err(|error| error.to_string())
+    }
+
+    fn is_enabled(&self) -> Result<bool, String> {
+        Ok(self.0.installed())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 struct LoginItem(AppHandle);
 
+#[cfg(not(target_os = "macos"))]
 impl Autostart for LoginItem {
     fn enable(&self) -> Result<(), String> {
         self.0
@@ -214,5 +340,15 @@ impl Autostart for LoginItem {
             .autolaunch()
             .is_enabled()
             .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_settings_folder_is_named_after_the_app() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        assert_eq!(config["identifier"], super::IDENTIFIER);
     }
 }
