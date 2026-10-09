@@ -26,7 +26,7 @@ def graph(number=1, kind='issue'):
             'createdAt': '2026-01-01T00:00:00Z', 'updatedAt': '2026-01-01T00:00:00Z',
             'closedAt': None, 'comments': page(), 'timelineItems': page()}
     if kind == 'pr':
-        node.update(mergedAt=None, mergedBy=None, isDraft=False,
+        node.update(mergedAt=None, mergedBy=None, isDraft=False, additions=3, deletions=1,
                     reviewRequests=page(), reviews=page(), reviewThreads=page(), commits=page())
     return node
 
@@ -47,6 +47,16 @@ class ItemGraphBatchTest(unittest.TestCase):
         self.assertEqual(len(output), 20)
         self.assertEqual(len(client.calls), 1)
         self.assertIn('reviewThreads(first: 20)', client.calls[0][0])
+        client.assert_exhausted()
+
+    def test_pull_request_size_is_read_and_kept(self):
+        pull = graph(1, 'pr')
+        client = ScriptedClient([{'repository': {'item_0': pull}}])
+        expanded = list(iter_expanded(GitHubOrgReader(client), repo_row(), [stub(pull)], 1))[0]
+        self.assertRegex(client.calls[0][0], r'\badditions\b')
+        self.assertRegex(client.calls[0][0], r'\bdeletions\b')
+        graphql = expanded['pull']['graphql']
+        self.assertEqual((graphql['additions'], graphql['deletions']), (3, 1))
         client.assert_exhausted()
 
     def test_all_associations_beyond_initial_pages_survive_without_duplicate_requests(self):
