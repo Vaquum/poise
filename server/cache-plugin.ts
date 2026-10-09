@@ -9,6 +9,7 @@ import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot, type 
 import { accountsChecked, claudeAuthStatusChanged } from './alerts/producers'
 import { pruneAlerts } from './alerts/store'
 import { checkNotices, dismissNotice, noticesState, silenceNotice, startNoticesRuntime, stopNoticesRuntime } from './alerts/notices'
+import { recordRunningRelease, runningRelease } from './running-release'
 import { LinkApi } from './link/api'
 import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
@@ -132,6 +133,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   if (!activeClaudeAuthRuntimes.has(auth)) activeClaudeAuthRuntimes.set(auth, auth.onStatus(claudeAuthStatusChanged))
   auth.start()
   pruneAlerts()
+  recordRunningRelease()
   setCallerAccounts(callerAccounts)
   startOrganizationsRuntime()
   startBehaviorsRuntime()
@@ -403,6 +405,12 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           } catch (error) {
             return json(res, httpStatus(error, 400), { error: (error as Error).message })
           }
+        }
+
+        // ── The running release ──
+        // The commit this Poise runs and since when, for the menu's first line.
+        if (path === '/api/release' && req.method === 'GET') {
+          return json(res, 200, runningRelease())
         }
 
         // ── Settings ──
