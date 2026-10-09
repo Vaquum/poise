@@ -14,6 +14,7 @@ import { fetchDevices } from './gateway-client'
 import { gatewayAccount } from './service-settings'
 import { poiseLinkSection, type PoiseLinkSection } from './views/poise-link'
 import type { TerminalPanel } from './views/terminal-panel'
+import { startDeviceLogin, type DeviceLogin } from './views/device-login'
 import './views/onboarding.css'
 
 type StepId = 'theme' | 'github' | 'agent' | 'organizations' | 'time' | 'ai' | 'models' | 'link' | 'finish'
@@ -141,14 +142,17 @@ function themeStep(ctx: StepContext): StepView {
   }
 }
 
-/** A GitHub account's connection: a status card, how to connect it, and the
- *  check that proves it works. Shared by your account and the agent account. */
+/** A GitHub account's connection: a status card, how to connect it, the
+ *  one-time code of GitHub's device sign-in, and the check that proves the
+ *  account works. Shared by your account and the agent account. */
 function githubConnection(ctx: StepContext, options: {
   role: 'me' | 'agent'
   login: () => string
   steps: string
   connectLabel: string
-}): { element: HTMLElement, connected: () => boolean, check: (quiet: boolean) => Promise<void>, reset: () => void } {
+  /** Your own account signs in in this browser; the agent account in a private window. */
+  openHere: boolean
+}): { element: HTMLElement, connected: () => boolean, check: (quiet: boolean) => Promise<void>, reset: () => void, dispose: () => void } {
   const view = element('ob-connection-block', `
     <div class="ob-connection" data-state="checking">
       <span class="ob-connection-dot" aria-hidden="true"></span>
@@ -162,15 +166,40 @@ function githubConnection(ctx: StepContext, options: {
       <button type="button" class="st-save ob-connect">${escapeHtml(options.connectLabel)}</button>
       <button type="button" class="st-clear ob-recheck">Check again</button>
     </div>
+    <div class="ob-device" data-state="starting" hidden>
+      <div class="ob-device-label">One-time code</div>
+      <div class="ob-device-code ob-device-pending" aria-live="polite">····-····</div>
+      <div class="ob-device-actions">
+        <button type="button" class="st-save ob-device-copy" disabled>${options.openHere ? 'Copy code and open GitHub' : 'Copy code'}</button>
+        <button type="button" class="st-clear ob-device-cancel">Cancel</button>
+      </div>
+      <div class="ob-device-where">${options.openHere
+        ? 'GitHub opens in a new tab at github.com/login/device: paste the code there and approve.'
+        : 'In the private window, open <strong>github.com/login/device</strong>, paste the code and approve.'}</div>
+      <div class="ob-device-status"><span class="ob-device-dot" aria-hidden="true"></span><span class="ob-device-status-text" role="status" aria-live="polite">Starting GitHub's sign-in…</span></div>
+      <div class="ob-device-stuck" hidden>gh has not shown a code. <button type="button" class="ob-device-terminal">Answer it in a terminal</button></div>
+      <details class="ob-device-log"><summary>What gh says</summary><pre></pre></details>
+    </div>
     <div class="ob-terminal-slot"></div>`)
   const card = view.querySelector<HTMLElement>('.ob-connection')!
   const title = view.querySelector<HTMLElement>('.ob-connection-title')!
   const text = view.querySelector<HTMLElement>('.ob-connection-text')!
   const connect = view.querySelector<HTMLButtonElement>('.ob-connect')!
   const recheck = view.querySelector<HTMLButtonElement>('.ob-recheck')!
+  const actions = view.querySelector<HTMLElement>('.ob-actions')!
   const slot = view.querySelector<HTMLElement>('.ob-terminal-slot')!
+  const device = view.querySelector<HTMLElement>('.ob-device')!
+  const codeEl = view.querySelector<HTMLElement>('.ob-device-code')!
+  const copy = view.querySelector<HTMLButtonElement>('.ob-device-copy')!
+  const statusEl = view.querySelector<HTMLElement>('.ob-device-status-text')!
+  const stuck = view.querySelector<HTMLElement>('.ob-device-stuck')!
+  const log = view.querySelector<HTMLElement>('.ob-device-log pre')!
   let connected = false
   let generation = 0
+  let login: DeviceLogin | null = null
+  let code: string | null = null
+  let stuckTimer: ReturnType<typeof setTimeout> | null = null
+  let copyTimer: ReturnType<typeof setTimeout> | null = null
 
   const show = (state: 'checking' | 'connected' | 'missing' | 'error', heading: string, detail: string) => {
     card.dataset.state = state
@@ -181,43 +210,131 @@ function githubConnection(ctx: StepContext, options: {
     connect.classList.toggle('st-clear', state === 'connected')
   }
 
+  const deviceStatus = (state: 'starting' | 'waiting' | 'done' | 'error', message: string) => {
+    device.dataset.state = state
+    statusEl.textContent = message
+  }
+
+  const stopLogin = () => {
+    if (stuckTimer) clearTimeout(stuckTimer)
+    stuckTimer = null
+    login?.cancel()
+    login = null
+  }
+
   const check = async (quiet: boolean) => {
-    const login = options.login()
+    const account = options.login()
     const current = ++generation
     connected = false
     ctx.update()
-    if (!GITHUB_NAME.test(login)) {
+    if (!GITHUB_NAME.test(account)) {
       show('missing', 'No account yet', 'Enter the agent account\'s GitHub login above.')
       return
     }
-    show('checking', login, 'Checking the connection with GitHub…')
+    show('checking', account, 'Checking the connection with GitHub…')
     try {
-      const answer = await postJson<GitHubCheck>('/api/onboarding/github', { role: options.role, login })
+      const answer = await postJson<GitHubCheck>('/api/onboarding/github', { role: options.role, login: account })
       if (current !== generation) return
       if (answer.ok) {
         connected = true
-        show('connected', answer.login ?? login, answer.note
+        device.hidden = true
+        show('connected', answer.login ?? account, answer.note
           ? `Connected. GitHub confirms the account works. ${answer.note}`
           : options.role === 'me'
             ? 'Connected. GitHub confirms the account works, and Poise reads GitHub as it.'
             : 'Connected. GitHub confirms the account works; reviews and comments are posted as it.')
         await loadSettings()
       } else if (answer.reason === 'not-signed-in' && quiet) {
-        show('missing', login, 'Not connected yet.')
+        show('missing', account, 'Not connected yet.')
       } else {
-        show('error', login, answer.message ?? 'The connection could not be confirmed.')
+        show('error', account, answer.message ?? 'The connection could not be confirmed.')
       }
     } catch (error) {
-      if (current === generation) show('error', login, `Poise could not check the connection: ${(error as Error).message}`)
+      if (current === generation) show('error', account, `Poise could not check the connection: ${(error as Error).message}`)
     }
     ctx.update()
   }
 
-  connect.addEventListener('click', () => {
-    if (ctx.terminalRunning()) return
-    show('checking', options.login() || 'GitHub', 'Follow the terminal below. Poise checks the connection when it finishes.')
+  // gh asked something setup does not answer: hand it to a terminal, where the person can.
+  const toTerminal = () => {
+    stopLogin()
+    device.hidden = true
+    actions.hidden = false
+    show('checking', options.login() || 'GitHub', 'Answer gh in the terminal below. Poise checks the connection when it finishes.')
     void ctx.terminal('gh', slot, () => { void check(false) })
+  }
+
+  connect.addEventListener('click', () => {
+    if (login?.running || ctx.terminalRunning()) return
+    if (options.role === 'agent' && !GITHUB_NAME.test(options.login())) {
+      show('missing', 'No account yet', 'Enter the agent account\'s GitHub login above first.')
+      return
+    }
+    ctx.closeTerminal()
+    code = null
+    codeEl.textContent = '····-····'
+    codeEl.classList.add('ob-device-pending')
+    copy.disabled = true
+    copy.textContent = options.openHere ? 'Copy code and open GitHub' : 'Copy code'
+    stuck.hidden = true
+    log.textContent = ''
+    device.hidden = false
+    actions.hidden = true
+    deviceStatus('starting', 'Starting GitHub\'s sign-in…')
+    show('checking', options.login() || 'GitHub', 'Waiting for GitHub to approve the sign-in.')
+    stuckTimer = setTimeout(() => { if (!code) stuck.hidden = false }, 20_000)
+    login = startDeviceLogin({
+      code: (value) => {
+        code = value
+        codeEl.textContent = value
+        codeEl.classList.remove('ob-device-pending')
+        copy.disabled = false
+        stuck.hidden = true
+        deviceStatus('waiting', 'Waiting for you to approve at GitHub…')
+      },
+      output: (value) => { log.textContent = value.trim().split('\n').slice(-40).join('\n') },
+      end: (end) => {
+        if (stuckTimer) clearTimeout(stuckTimer)
+        stuckTimer = null
+        login = null
+        actions.hidden = false
+        if (end.ok) {
+          deviceStatus('done', 'GitHub approved. Checking the connection…')
+          void check(false)
+          return
+        }
+        const lines = (log.textContent ?? '').trim().split('\n').filter(Boolean)
+        const said = lines[lines.length - 1]
+        deviceStatus('error', `${end.message}${said && !end.ok && end.exitCode !== null ? ` gh said: ${said}` : ''} Choose ${options.connectLabel} to start again.`)
+        show('error', options.login() || 'GitHub', 'The sign-in did not finish.')
+        ctx.update()
+      },
+    })
   })
+  copy.addEventListener('click', async () => {
+    if (!code) return
+    try {
+      await navigator.clipboard.writeText(code)
+      copy.textContent = 'Copied'
+    } catch {
+      // Without clipboard access the code is selected, ready to copy by hand.
+      const range = document.createRange()
+      range.selectNodeContents(codeEl)
+      window.getSelection()?.removeAllRanges()
+      window.getSelection()?.addRange(range)
+      copy.textContent = 'Selected: copy it'
+    }
+    if (options.openHere) window.open('https://github.com/login/device', '_blank', 'noopener')
+    if (copyTimer) clearTimeout(copyTimer)
+    copyTimer = setTimeout(() => { copy.textContent = options.openHere ? 'Copy code and open GitHub' : 'Copy code' }, 2_400)
+  })
+  view.querySelector<HTMLButtonElement>('.ob-device-cancel')!.addEventListener('click', () => {
+    stopLogin()
+    device.hidden = true
+    actions.hidden = false
+    void check(true)
+  })
+  view.querySelector<HTMLButtonElement>('.ob-device-terminal')!.addEventListener('click', toTerminal)
   recheck.addEventListener('click', () => { void check(false) })
   return {
     element: view,
@@ -229,6 +346,10 @@ function githubConnection(ctx: StepContext, options: {
       show('missing', options.login() || 'No account yet', 'Not checked yet.')
       ctx.update()
     },
+    dispose: () => {
+      stopLogin()
+      if (copyTimer) clearTimeout(copyTimer)
+    },
   }
 }
 
@@ -237,15 +358,17 @@ function githubStep(ctx: StepContext): StepView {
     role: 'me',
     login: () => ctx.owner,
     connectLabel: 'Connect GitHub',
+    openHere: true,
     steps: `
-      <li>Choose <strong>Connect GitHub</strong>. A terminal opens below and shows a one-time code.</li>
-      <li>Open <a href="https://github.com/login/device" target="_blank" rel="noopener noreferrer">github.com/login/device</a>, signed in to GitHub as <strong>${escapeHtml(ctx.owner)}</strong>, and enter the code.</li>
-      <li>Answer the terminal's questions. When it finishes, Poise checks that GitHub accepts the connection.</li>`,
+      <li>Choose <strong>Connect GitHub</strong>. Poise starts GitHub's sign-in and shows a one-time code.</li>
+      <li>Choose <strong>Copy code and open GitHub</strong>, signed in to GitHub as <strong>${escapeHtml(ctx.owner)}</strong>, then paste the code and approve.</li>
+      <li>Poise notices the approval, checks the connection with GitHub, and you can continue.</li>`,
   })
   void connection.check(true)
   return {
     element: connection.element,
     ready: connection.connected,
+    dispose: connection.dispose,
   }
 }
 
@@ -261,10 +384,11 @@ function agentStep(ctx: StepContext): StepView {
     role: 'agent',
     login: () => input.value.trim(),
     connectLabel: 'Connect agent account',
+    openHere: false,
     steps: `
       <li>Open a <strong>private window</strong> in your browser and sign in to GitHub there as the agent account.</li>
-      <li>Choose <strong>Connect agent account</strong>. A terminal opens below and shows a one-time code.</li>
-      <li>In the private window, open <a href="https://github.com/login/device" target="_blank" rel="noopener noreferrer">github.com/login/device</a> and enter the code. Poise then checks that GitHub accepts the account.</li>`,
+      <li>Choose <strong>Connect agent account</strong> and copy the one-time code Poise shows.</li>
+      <li>In the private window, open <strong>github.com/login/device</strong>, paste the code and approve. Poise then checks that GitHub accepts the account.</li>`,
   })
   view.append(connection.element)
   input.addEventListener('input', () => connection.reset())
@@ -276,6 +400,7 @@ function agentStep(ctx: StepContext): StepView {
     ready: connection.connected,
     // An empty login is where to start; a filled one is checked already.
     focus: input.value ? undefined : () => input.focus(),
+    dispose: connection.dispose,
   }
 }
 

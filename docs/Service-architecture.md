@@ -411,9 +411,14 @@ middle of the screen with the rest of Poise dimmed and out of reach, in Poise's
 own look. It goes through, in order:
 
 1. **Theme**, applied at once.
-2. **GitHub:** gh's login in a terminal, after which Poise checks the
-   connection and makes the account your GitHub account.
-3. **The agent account,** connected and checked the same way.
+2. **GitHub:** GitHub's device sign-in. gh's own login runs through the
+   terminal socket with no terminal on screen. Setup answers its two
+   questions with their defaults and shows its one-time code with **Copy code
+   and open GitHub**. gh's output stays folded away under "What gh says", and
+   "Answer it in a terminal" takes over when gh shows no code. Poise then
+   checks the connection and makes the account your GitHub account.
+3. **The agent account,** connected the same way, with the code copied into
+   a private window signed in as that account, and checked the same way.
 4. **Organizations** to follow. Any that failed to activate before GitHub was
    connected are retried once.
 5. **Time zone and refresh rate.**

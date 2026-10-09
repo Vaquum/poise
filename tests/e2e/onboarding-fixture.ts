@@ -17,6 +17,8 @@ export interface SetupState {
   models: Record<string, Record<string, string>>
   organizations: Organization[]
   devices: PairedDevice[]
+  /** The accounts gh holds a working sign-in for. */
+  githubAccounts: string[]
   writes: Array<{ path: string, body: Record<string, unknown> }>
 }
 
@@ -61,6 +63,7 @@ export async function setupWorkspace(page: Page, initial: Partial<SetupState> = 
     models: {},
     organizations: [organization('acme', 'error', 'GitHub authentication is unavailable for octocat. Run gh auth login for that account and retry.')],
     devices: [],
+    githubAccounts: ['octocat', 'octo-agent'],
     writes: [],
     ...initial,
   }
@@ -86,6 +89,9 @@ export async function setupWorkspace(page: Page, initial: Partial<SetupState> = 
         return route.fulfill({ json: { available: true, status: state.status, step: state.step, owner: 'octocat', logins: state.logins, completedAt: null } })
       case '/api/onboarding/github': {
         const login = String(body?.login)
+        if (!state.githubAccounts.includes(login)) {
+          return route.fulfill({ json: { ok: false, reason: 'not-signed-in', message: `gh holds no sign-in for ${login} yet. Connect it while signed in to GitHub as ${login}.` } })
+        }
         if (body?.role === 'me') state.me = login
         else state.agentAccount = login
         return route.fulfill({ json: { ok: true, login, scopes: ['repo', 'read:org', 'gist'] } })
