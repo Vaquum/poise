@@ -159,7 +159,11 @@ recreates the gateway with the new settings.
 
 Open `https://poise.example.com/` and sign in with GitHub as one of the
 `POISE_ADMINS`. GitHub asks once whether to authorize the OAuth App. The home
-page then opens your workspace. In the workspace, Settings → Admin lists
+page then opens your workspace, where first-run setup takes you step by step
+through the theme, your GitHub account, the agent account, organizations, time,
+the AI accounts, models and pairing this computer with Poise Link (see
+[First-run setup](Service-architecture.md#first-run-setup)). In the workspace,
+Settings → Admin lists
 everyone who has signed in, how they got access, and their workspace's state
 and image, and lets you start, stop or restart a workspace, disable or enable a
 person, and change who may sign in. The same controls stay at

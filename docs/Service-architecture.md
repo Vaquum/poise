@@ -404,6 +404,58 @@ version, whether it is signed in and as whom.
   - A small Python helper (`python3`, standard library only) provides the
     pseudo-terminal, so the server needs no native Node module.
 
+## First-run setup
+
+A new workspace opens a setup dialog on the first sign-in. It sits in the
+middle of the screen with the rest of Poise dimmed and out of reach, in Poise's
+own look. It goes through, in order:
+
+1. **Theme**, applied at once.
+2. **GitHub:** gh's login in a terminal, after which Poise checks the
+   connection and makes the account your GitHub account.
+3. **The agent account,** connected and checked the same way.
+4. **Organizations** to follow. Any that failed to activate before GitHub was
+   connected are retried once.
+5. **Time zone and refresh rate.**
+6. **The AI accounts,** each with its own Connect terminal.
+7. **Models** for every place. Only signed-in providers can be chosen; the
+   others are dimmed.
+8. **Poise Link,** through the gateway API above.
+9. A finish that names Settings, in the menu, as where all of it can be
+   changed.
+
+Every step saves through the same API Settings uses, so Settings shows what
+setup chose. A step that connects something lets setup continue only once it
+works. Finish later closes the dialog until the next page load. Settings →
+General → Run setup again starts it over. `/?settings=link` opens it at
+Poise Link while it is unfinished.
+
+- `GET /api/onboarding` returns `{ available, status, step, owner, logins,
+  completedAt }`; outside service mode only `{ available: false, status:
+  "done" }`.
+  - `status` is decided once and stored: `done` for a workspace that already
+    had a ready GitHub account when it was first asked, `pending` otherwise.
+  - `step` is where it resumes.
+  - `logins` holds, per agent CLI, when its Connect terminal last exited with
+    code 0. The CLIs that report no sign-in (Grok, Muse, Antigravity) count as
+    signed in once that has happened.
+- `POST /api/onboarding` takes `{ step }`, `{ done: true }` or `{ restart: true
+  }` and answers like the GET.
+- `POST /api/onboarding/github` takes `{ role: "me" | "agent", login }`.
+  - It checks that gh holds a sign-in for `login` and that its token answers
+    GitHub's `/user` as that account, with the `repo` and `read:org` scopes
+    when the token reports scopes.
+  - It returns `{ ok: true, login, scopes, note? }`, or `{ ok: false, reason,
+    message }` with `reason` one of `not-signed-in`, `rejected`,
+    `other-account` or `scopes`.
+  - On success it saves the account as `me` or as the agent account. For `me`
+    it then runs `gh auth setup-git`. For the agent account it makes `me` gh's
+    active account again, since gh makes the account it signed in last the
+    active one, and git and gh's own defaults act as that account.
+  - `note` says when either gh command failed.
+  - The token never leaves the check.
+- Outside service mode these routes answer 404, except that GET.
+
 ## Behaviors
 
 **Repository opt-out.** Review new PRs, Approve PRs and Resolve unblocking

@@ -35,6 +35,7 @@ import { countDebate } from './service/caller-calls'
 import { DailyModelRefresh } from './service/model-refresh'
 import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
 import { invalidateAccounts, listAccounts, scheduleAccountsCheck } from './accounts'
+import { accountLogins, connectGitHubAccount, onboardingState, recordLogin, updateOnboarding } from './service/onboarding'
 import type { ConnectedAccount } from './accounts/types'
 import { TerminalSocketServer } from './terminal/server'
 import type { TerminalCommand } from './terminal/pty'
@@ -154,8 +155,10 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     terminalSockets = new TerminalSocketServer({ allowedHosts: opts.allowedHosts, service }, { command: opts.terminalCommand })
     // A login may have just changed an account. Claude's sign-in also gates
     // Claude-backed work, so it is verified now instead of at the next poll.
-    terminalSockets.on('exit', (preset) => {
+    terminalSockets.on('exit', (preset, code) => {
       invalidateAccounts()
+      // First-run setup counts a finished login for the CLIs that report no sign-in.
+      if (service) recordLogin(preset, code)
       if (preset === 'claude') void auth.check({ forceLive: true })
     })
     if (service) {
@@ -350,6 +353,27 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // gateway's own sections (Poise Link, and Admin for its admins).
         if (path === '/api/workspace' && req.method === 'GET') {
           return json(res, 200, service ? { mode: 'service', owner: service.owner } : { mode: 'local' })
+        }
+
+        // ── First-run setup: a step-by-step dialog a new workspace opens on
+        // first sign-in (server/service/onboarding.ts). Service mode only ──
+        if (path === '/api/onboarding' || path === '/api/onboarding/github') {
+          if (!service) {
+            if (path === '/api/onboarding' && req.method === 'GET') return json(res, 200, { available: false, status: 'done' })
+            return json(res, 404, { error: 'first-run setup exists only in service mode' })
+          }
+          const answer = () => ({ available: true, ...onboardingState(), owner: service.owner, logins: accountLogins() })
+          try {
+            if (path === '/api/onboarding' && req.method === 'GET') return json(res, 200, answer())
+            if (path === '/api/onboarding' && req.method === 'POST') {
+              updateOnboarding(await readJson(req))
+              return json(res, 200, answer())
+            }
+            if (req.method === 'POST') return json(res, 200, await connectGitHubAccount(await readJson(req)))
+            return json(res, 405, { error: 'method not allowed' })
+          } catch (error) {
+            return json(res, httpStatus(error, 400), { error: (error as Error).message })
+          }
         }
 
         // Activation returns immediately; progress survives closing Settings

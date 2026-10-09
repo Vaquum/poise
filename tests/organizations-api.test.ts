@@ -146,10 +146,13 @@ afterEach(async () => {
 })
 
 describe('organizations API', () => {
-  it('says this is a personal computer, so Settings adds no gateway sections', async () => {
+  it('says this is a personal computer, so Settings adds no gateway sections and setup never opens', async () => {
     const response = await fetch(`${base}/api/workspace`)
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual({ mode: 'local' })
+    expect(await (await fetch(`${base}/api/onboarding`)).json()).toEqual({ available: false, status: 'done' })
+    expect((await request('/api/onboarding', { step: 'github' })).status).toBe(404)
+    expect((await request('/api/onboarding/github', { role: 'me', login: 'octocat' })).status).toBe(404)
   })
 
   it('returns the existing organization unchanged through registry and Settings', async () => {

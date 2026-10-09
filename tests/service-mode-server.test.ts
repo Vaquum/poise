@@ -416,6 +416,31 @@ describe('Poise in service mode', () => {
     expect(await signInAlerts()).toMatchObject({ 'sign-in:codex': 'resolved', 'sign-in:gh:agent': 'open' })
   })
 
+  it('serves first-run setup to the owner\'s browser only, and counts a login that finished in a terminal', async () => {
+    const setup = await send('GET', '/api/onboarding', fromGateway())
+    expect(setup.status).toBe(200)
+    expect(setup.json).toMatchObject({ available: true, owner: OWNER })
+    expect((await send('POST', '/api/onboarding', fromGateway(), { step: 'ai' })).json).toMatchObject({ available: true, step: 'ai' })
+    expect((await send('POST', '/api/onboarding', fromGateway(), { step: 'admin' })).status).toBe(400)
+    for (const [caller, status] of [
+      [fromGateway('link'), 403],
+      [fromGateway('admin'), 403],
+      [{ peer: GATEWAY_PEER, origin: PUBLIC_ORIGIN }, 401],
+    ] as Array<[Caller, number]>) {
+      expect((await send('GET', '/api/onboarding', caller)).status).toBe(status)
+      expect((await send('POST', '/api/onboarding/github', caller, { role: 'me', login: 'octocat' })).status).toBe(status)
+    }
+
+    // Grok cannot report its sign-in, so setup counts its login once the terminal exits cleanly.
+    expect(setup.json.logins).not.toHaveProperty('grok')
+    const login = await runTerminal('grok', fromGateway())
+    expect(login.frames.at(-1)).toEqual({ type: 'exit', code: 0 })
+    await vi.waitFor(async () => expect((await send('GET', '/api/onboarding', fromGateway())).json.logins).toHaveProperty('grok'), { timeout: 2_000, interval: 20 })
+
+    // The GitHub check runs gh as the person's stored account; this fake gh holds no token for it.
+    expect((await send('POST', '/api/onboarding/github', fromGateway(), { role: 'me', login: 'octocat' })).json).toMatchObject({ ok: false, reason: 'not-signed-in' })
+  })
+
   it('verifies the Claude sign-in at once when Claude\'s login exits', async () => {
     const before = auth.liveChecks
     const login = await runTerminal('claude', fromGateway())

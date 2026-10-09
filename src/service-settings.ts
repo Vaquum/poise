@@ -3,7 +3,7 @@
 // tab. The gateway sends /link, /link/devices and its own admin link here as
 // /?settings=link and /?settings=admin, which open Settings at that place.
 
-import { openSettingsPanel } from './settings'
+import { closeSettingsPanel, openSettingsPanel } from './settings'
 import { fetchGatewayAccount, type GatewayAccount } from './gateway-client'
 import { workspaceMode } from './workspace-mode'
 import { poiseLinkSection, type PoiseLinkSection } from './views/poise-link'
@@ -95,8 +95,27 @@ export function takeServicePlace(): ServicePlace | null {
   return wanted
 }
 
+/** Settings → General → Setup: first-run setup again, from its first step. */
+function addSetupAgain(panel: HTMLElement, runSetup: () => void): void {
+  const general = panel.querySelector<HTMLElement>('.st-tab[data-tab="general"]')
+  if (!general || general.querySelector('.st-run-setup')) return
+  const label = document.createElement('div')
+  label.className = 'tp-group-label'
+  label.textContent = 'Setup'
+  const section = document.createElement('div')
+  section.className = 'tp-section'
+  section.innerHTML = `
+    <button type="button" class="st-clear st-run-setup">Run setup again</button>
+    <div class="st-help st-help-info">Walks through first-run setup again. Nothing is undone: every step shows what is already set.</div>`
+  section.querySelector('button')!.addEventListener('click', () => {
+    closeSettingsPanel()
+    runSetup()
+  })
+  general.append(label, section)
+}
+
 /** Adds the gateway's sections once service mode is confirmed. */
-export async function initServiceSettings(): Promise<void> {
+export async function initServiceSettings(options: { runSetup: () => void }): Promise<void> {
   const panel = document.getElementById('settings-panel')
   let gateway: GatewayAccount | null
   try {
@@ -105,5 +124,7 @@ export async function initServiceSettings(): Promise<void> {
     console.error('[settings] the gateway did not say who is signed in:', error)
     return
   }
-  if (panel && gateway) addSections(panel, gateway)
+  if (!panel || !gateway) return
+  addSections(panel, gateway)
+  addSetupAgain(panel, options.runSetup)
 }

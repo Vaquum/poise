@@ -16,6 +16,8 @@ export interface PoiseLinkSection {
 export interface PoiseLinkOptions {
   /** A computer finished pairing after a code was approved here. */
   onPaired?: (device: PairedDevice) => void
+  /** Inside first-run setup: its step already says what Poise Link is, and the two steps are numbered. */
+  guided?: boolean
 }
 
 // After an approval Poise Link collects its token on its next poll, every five
@@ -53,17 +55,21 @@ function devicesHtml(devices: PairedDevice[]): string {
     </div>`).join('')
 }
 
+// Settings and first-run setup can each hold a section at once.
+let sections = 0
+
 export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOptions = {}): PoiseLinkSection {
+  const codeId = `pl-code-${++sections}`
   const element = document.createElement('div')
   element.className = 'pl'
   const curl = `curl -fsSL ${account.link.installer} | sh`
   const wget = `wget -qO- ${account.link.installer} | sh`
   element.innerHTML = `
-    <div class="tp-section">
+    ${options.guided ? '' : `<div class="tp-section">
       <div class="st-help st-help-info pl-intro">Poise Link keeps your snippets on your computer and brings Poise's alerts to it.</div>
-    </div>
+    </div>`}
     <div class="tp-section">
-      <span class="tp-label">Install it</span>
+      <span class="tp-label">${options.guided ? '1. Install Poise Link' : 'Install it'}</span>
       <div class="pl-command">
         <code class="pl-command-text">${escapeHtml(curl)}</code>
         <button type="button" class="st-clear pl-copy">Copy</button>
@@ -71,8 +77,8 @@ export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOpti
       <div class="st-help st-help-info">Run it in a terminal on macOS, Debian 12+ or Ubuntu 24.04+. It installs Poise Link, and Espanso when it is missing, then opens Poise Link to pair. Without curl: <code>${escapeHtml(wget)}</code>. Windows installers are on the <a href="${escapeHtml(account.link.releases)}" target="_blank" rel="noopener noreferrer">release page</a>.</div>
     </div>
     <div class="tp-section">
-      <label class="tp-label" for="pl-code-${escapeHtml(account.handle)}">Enter the code Poise Link shows</label>
-      <input id="pl-code-${escapeHtml(account.handle)}" type="text" class="st-input pl-code" placeholder="XXXX-XXXX" maxlength="9" autocomplete="off" autocapitalize="characters" spellcheck="false" />
+      <label class="tp-label" for="${codeId}">${options.guided ? '2. Enter the code Poise Link shows' : 'Enter the code Poise Link shows'}</label>
+      <input id="${codeId}" type="text" class="st-input pl-code" placeholder="XXXX-XXXX" maxlength="9" autocomplete="off" autocapitalize="characters" spellcheck="false" />
       <div class="st-row pl-decide">
         <button type="button" class="st-save pl-approve">Approve</button>
         <button type="button" class="st-clear pl-deny">Deny</button>
