@@ -1,6 +1,6 @@
 [package]
 name = "poise-link"
-version = "0.1.0"
+version = "0.1.1"
 description = "Poise Link keeps Espanso in sync with Poise snippets and shows Poise alerts as native notifications."
 authors = ["Mikko Kotila"]
 license = "MIT"
