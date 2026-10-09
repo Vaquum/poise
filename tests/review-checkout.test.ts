@@ -3,7 +3,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { withProcessLock } from '../server/process-lock'
-import { pruneReviewCheckouts, resolveReviewCheckout, REVIEW_CHECKOUT_RETENTION_MS } from '../server/review-checkout'
+import {
+  pruneReviewCheckouts, resolveReviewCheckout, REVIEW_CHECKOUT_RETENTION_MS, startReviewCheckoutPruning, stopReviewCheckoutPruning,
+} from '../server/review-checkout'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
@@ -161,13 +163,25 @@ describe('review checkout retention', () => {
     expect(await entries()).toEqual([head])
   })
 
-  it('prunes in the background when a review resolves a checkout, at most once an hour', async () => {
+  it('prunes when Poise starts and every interval after, whether or not reviews run', async () => {
+    await provisioned('b'.repeat(40), 2 * day)
+    startReviewCheckoutPruning(50)
+    try {
+      await vi.waitFor(async () => expect(await entries()).toEqual([]))
+      await provisioned('c'.repeat(40), 2 * day)
+      await vi.waitFor(async () => expect(await entries()).toEqual([]))
+    } finally {
+      await stopReviewCheckoutPruning()
+    }
+    await provisioned('d'.repeat(40), 2 * day)
+    await settle()
+    expect(await entries()).toEqual(['d'.repeat(40)])
+  })
+
+  it('leaves pruning to its schedule, so a review never waits for it', async () => {
     await provisioned('b'.repeat(40), 2 * day)
     await resolveCheckout()
-    await vi.waitFor(async () => expect(await entries()).toEqual([head]))
-    await provisioned('c'.repeat(40), 2 * day)
-    await resolveCheckout()
     await settle()
-    expect(await entries()).toEqual([head, 'c'.repeat(40)].sort())
+    expect(await entries()).toEqual(['b'.repeat(40), head].sort())
   })
 })

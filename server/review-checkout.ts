@@ -16,7 +16,8 @@ const REMOVING_PREFIX = '.removing-'
 // A review marks its head used, and a prune judges and moves a head away,
 // only while holding this lock in review-checkouts.
 const MARK_LOCK = '.lock'
-const nextPruneAt = new Map<string, number>()
+let pruneTimer: ReturnType<typeof setInterval> | null = null
+let pruning: Promise<unknown> | null = null
 
 function errorCode(error: unknown): unknown {
   return (error as { code?: unknown })?.code
@@ -75,15 +76,34 @@ export async function pruneReviewCheckouts(root: string, now = Date.now()): Prom
   return removed
 }
 
-// At most once an hour per checkout root, in the background: a review never
-// waits for old checkouts to be deleted.
-function schedulePrune(root: string): void {
-  const now = Date.now()
-  if (now < (nextPruneAt.get(root) ?? 0)) return
-  nextPruneAt.set(root, now + PRUNE_INTERVAL_MS)
-  pruneReviewCheckouts(root, now).catch((error: unknown) => {
-    console.error('[review-checkout] prune failed:', (error as Error).message)
-  })
+/** Where Poise keeps its state: beside POISE_DB, or in ~/.poise. */
+function poiseRoot(): string {
+  return process.env.POISE_DB && process.env.POISE_DB !== ':memory:'
+    ? dirname(resolve(process.env.POISE_DB)) : join(homedir(), '.poise')
+}
+
+/**
+ * Prunes review checkouts now and every hour while Poise runs, whether or not
+ * reviews do, one prune at a time and in the background.
+ */
+export function startReviewCheckoutPruning(intervalMs = PRUNE_INTERVAL_MS): void {
+  if (pruneTimer) return
+  const run = () => {
+    if (pruning) return
+    pruning = pruneReviewCheckouts(poiseRoot())
+      .catch((error: unknown) => console.error('[review-checkout] prune failed:', (error as Error).message))
+      .finally(() => { pruning = null })
+  }
+  run()
+  pruneTimer = setInterval(run, intervalMs)
+  pruneTimer.unref()
+}
+
+/** Stops pruning, once a prune under way has finished. */
+export async function stopReviewCheckoutPruning(): Promise<void> {
+  if (pruneTimer) clearInterval(pruneTimer)
+  pruneTimer = null
+  await pruning
 }
 
 export async function resolveReviewCheckout(
@@ -110,8 +130,7 @@ export async function resolveReviewCheckout(
       || !failure.stderr.trim().endsWith(`: ${owner}/${repo}`)
       || !failure.stderr.trim().startsWith('error: checkout not found under ')) throw error
   }
-  const root = process.env.POISE_DB && process.env.POISE_DB !== ':memory:'
-    ? dirname(resolve(process.env.POISE_DB)) : join(homedir(), '.poise')
+  const root = poiseRoot()
   const headDirectory = join(root, 'review-checkouts', head)
   const base = join(headDirectory, owner.toLowerCase())
   const path = join(base, repo.toLowerCase())
@@ -123,7 +142,6 @@ export async function resolveReviewCheckout(
     const used = new Date()
     await utimes(headDirectory, used, used)
   })
-  schedulePrune(root)
   const verify = async (cwd: string): Promise<void> => {
     const origin = await runFile('git', ['remote', 'get-url', 'origin'], { cwd, signal, timeoutMs: 5_000 })
     const commit = await runFile('git', ['rev-parse', 'HEAD'], { cwd, signal, timeoutMs: 5_000 })
