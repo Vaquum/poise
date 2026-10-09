@@ -49,7 +49,11 @@ interface ModelsResponse {
   places: ModelPlace[]
   fixed: FixedPlace[]
   refresh: ModelRefreshReport | null
+  presets?: ModelPreset[]
 }
+
+// A saved model configuration: model choices kept under a name to switch to in one step.
+interface ModelPreset { name: string, models: Record<string, ModelChoice>, savedAt: string }
 
 let panelEl: HTMLElement | null = null
 let orgInput: HTMLInputElement | null = null
@@ -473,6 +477,7 @@ async function loadModels(signal?: AbortSignal): Promise<boolean> {
     if (!data.catalog || !Array.isArray(data.catalog.models) || !Array.isArray(data.places) || !Array.isArray(data.fixed)) throw new Error('The model catalogue response is unreadable')
     lastModels = data as ModelsResponse
     renderPlaces(lastModels)
+    renderPresets(lastModels.presets ?? [])
     return true
   } catch (err) {
     if (generation !== modelsGeneration) return false
@@ -481,6 +486,68 @@ async function loadModels(signal?: AbortSignal): Promise<boolean> {
     else setHelp(message + '; your model selections are kept.', 'error')
     return false
   }
+}
+
+function renderPresets(presets: ModelPreset[]): void {
+  const select = panelEl?.querySelector<HTMLSelectElement>('.st-preset-select')
+  if (!select) return
+  const chosen = select.value
+  select.innerHTML = presets.length
+    ? presets.map((preset) => `<option value="${escapeHtml(preset.name)}">${escapeHtml(preset.name)}</option>`).join('')
+    : '<option value="">No saved configurations yet</option>'
+  if (presets.some((preset) => preset.name === chosen)) select.value = chosen
+  for (const button of panelEl!.querySelectorAll<HTMLButtonElement>('.st-preset-use, .st-preset-delete')) button.disabled = !presets.length
+}
+
+async function postPresets(path: string, body: unknown): Promise<ModelPreset[] | null> {
+  try {
+    const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    const data = await res.json()
+    if (!res.ok) { setHelp(data.error || 'The configurations were not changed', 'error'); return null }
+    if (lastModels) lastModels.presets = data.presets
+    renderPresets(data.presets)
+    return data.presets as ModelPreset[]
+  } catch (err) {
+    setHelp('Network error: ' + (err as Error).message, 'error')
+    return null
+  }
+}
+
+async function savePreset(): Promise<void> {
+  const input = panelEl?.querySelector<HTMLInputElement>('.st-preset-name')
+  const name = input?.value.trim() || ''
+  const models = collectModels()
+  if (!name) { setHelp('Name the configuration first.', 'error'); return }
+  if (!models) { setHelp('There are no model choices to save yet.', 'error'); return }
+  if (await postPresets('/api/models/presets', { name, models })) {
+    input!.value = ''
+    panelEl!.querySelector<HTMLSelectElement>('.st-preset-select')!.value = name
+    setHelp(`Saved the model choices as "${name}".`, 'ok')
+  }
+}
+
+async function usePreset(): Promise<void> {
+  const name = panelEl?.querySelector<HTMLSelectElement>('.st-preset-select')?.value || ''
+  const preset = lastModels?.presets?.find((entry) => entry.name === name)
+  if (!preset) return
+  try {
+    // Saved like the Save button saves: the server validates every choice against today's catalog.
+    const res = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ models: preset.models }) })
+    const data = await res.json()
+    if (!res.ok) { setHelp(data.error || `"${name}" could not be used`, 'error'); return }
+    dirtyModels.clear()
+    setLocalSettings(data)
+    setHelp(`Using "${name}".`, 'ok')
+    window.dispatchEvent(new CustomEvent('poise:models-changed'))
+    void loadModels()
+  } catch (err) {
+    setHelp('Network error: ' + (err as Error).message, 'error')
+  }
+}
+
+async function deletePreset(): Promise<void> {
+  const name = panelEl?.querySelector<HTMLSelectElement>('.st-preset-select')?.value || ''
+  if (name && await postPresets('/api/models/presets/delete', { name })) setHelp(`Deleted "${name}".`, 'ok')
 }
 
 function collectModels(): Record<string, ModelChoice> | null {
@@ -744,6 +811,20 @@ function buildPanel(): HTMLElement {
       </section>
 
       <section class="st-tab" data-tab="models" hidden>
+        <div class="tp-group-label">Saved configurations</div>
+        <div class="tp-section st-presets">
+          <div class="st-row st-row-tight">
+            <select class="st-select st-preset-select" aria-label="Saved model configuration"></select>
+            <button type="button" class="st-clear st-preset-use">Use</button>
+            <button type="button" class="st-clear st-preset-delete">Delete</button>
+          </div>
+          <div class="st-row st-row-tight">
+            <input type="text" class="st-input st-preset-name" maxlength="40" autocomplete="off" spellcheck="false" placeholder="Name for the choices below" aria-label="Configuration name" />
+            <button type="button" class="st-clear st-preset-save">Save current</button>
+          </div>
+          <div class="st-help st-help-info">Save the model choices below under a name, then switch back to them in one step, for example when a provider's quota runs out.</div>
+        </div>
+
         <div class="tp-group-label">Where Poise launches a model</div>
         <div class="st-models"><div class="st-help st-help-info">Loading the catalog…</div></div>
 
@@ -805,6 +886,9 @@ function buildPanel(): HTMLElement {
   productionEl = panel.querySelector('.st-production')
   refreshBtn = panel.querySelector('.st-refresh-models') as HTMLButtonElement
   refreshBtn.addEventListener('click', () => { void refreshModels() })
+  panel.querySelector('.st-preset-save')!.addEventListener('click', () => { void savePreset() })
+  panel.querySelector('.st-preset-use')!.addEventListener('click', () => { void usePreset() })
+  panel.querySelector('.st-preset-delete')!.addEventListener('click', () => { void deletePreset() })
   accountsEl = panel.querySelector('.st-accounts')
   accountsStatusEl = panel.querySelector('.st-accounts-status')
   terminalSlot = panel.querySelector('.st-terminal-slot')

@@ -173,6 +173,44 @@ test('gives the gateway\'s admins an Admin tab that manages people and workspace
   expect(Math.max(...tabs.map((tab) => tab.right))).toBeLessThanOrEqual(panelRight)
 })
 
+test('saves the model choices under a name and switches back to them in one step', async ({ page }) => {
+  await setup(page, 'service')
+  const posts: Array<{ path: string, body: unknown }> = []
+  const chat = { key: 'chat', label: 'Chat', why: 'Card chats.', review: false, reviewers: false,
+    default: 'opus-5-max', fallback: 'gpt-6-astra-max', notes: [], stored: null, providers: null }
+  let presets = [{ name: 'Quota day', models: { chat: { default: 'gpt-6-astra-max', fallback: 'opus-5-max' } }, savedAt: '2026-10-09T12:00:00Z' }]
+  await page.route('**/api/models', (route) => route.fulfill({ json: { catalog: { models: [
+    { identity: 'opus-5-max', provider: 'claude', selector: 'claude-opus-5', effort: 'max' },
+    { identity: 'gpt-6-astra-max', provider: 'codex', selector: 'gpt-6-astra', effort: 'max' },
+  ], review_providers: [], path: '' }, places: [chat], fixed: [], refresh: null, presets } }))
+  await page.route('**/api/models/presets', (route) => {
+    const body = route.request().postDataJSON() as { name: string, models: Record<string, unknown> }
+    posts.push({ path: 'save', body })
+    presets = [...presets, { name: body.name, models: body.models as never, savedAt: '2026-10-09T13:00:00Z' }]
+    return route.fulfill({ json: { presets } })
+  })
+  await page.route('**/api/settings', (route) => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    posts.push({ path: 'settings', body: route.request().postDataJSON() })
+    return route.fulfill({ json: { org: '', me: 'octocat', agentAccount: '', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 }, organizations: [] } })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('[data-action="settings"]').click()
+  await page.locator('.st-tabs [data-tab="models"]').click()
+  await expect(page.getByLabel('Saved model configuration')).toHaveValue('Quota day')
+
+  await page.getByLabel('Configuration name').fill('Normal')
+  await page.getByRole('button', { name: 'Save current', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved the model choices as "Normal".')
+  expect(posts[0]).toEqual({ path: 'save', body: { name: 'Normal', models: { chat: { default: 'opus-5-max', fallback: 'gpt-6-astra-max' } } } })
+
+  await page.getByLabel('Saved model configuration').selectOption('Quota day')
+  await page.getByRole('button', { name: 'Use', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Using "Quota day".')
+  expect(posts[1]).toEqual({ path: 'settings', body: { models: { chat: { default: 'gpt-6-astra-max', fallback: 'opus-5-max' } } } })
+})
+
 test('adds no gateway sections on a personal computer', async ({ page }) => {
   const state = await setup(page, 'local')
   await page.goto('/')
