@@ -300,6 +300,127 @@ html.ob-open body { overflow: hidden; }
   margin-top: var(--sp-4);
 }
 
+.ob-actions[hidden] { display: none; }
+
+/* GitHub's device sign-in: the one-time code, large, and what happens next. */
+.ob-device {
+  margin-top: var(--sp-4);
+  padding: 18px 20px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.ob-device[hidden] { display: none; }
+
+.ob-device-label {
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+}
+
+.ob-device-code {
+  margin-top: 6px;
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 1.875rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  line-height: 1.2;
+  color: var(--text);
+  user-select: all;
+  transition: color var(--t-base) ease;
+}
+
+.ob-device-code.ob-device-pending { color: var(--text-tertiary); user-select: none; }
+
+.ob-device-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: 14px;
+}
+
+.ob-device-where {
+  margin-top: 10px;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.ob-device-where strong { font-weight: 600; color: var(--text); }
+
+.ob-device-status {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: 14px;
+  padding-top: 12px;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--hairline);
+}
+
+.ob-device-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--r-pill);
+  background: var(--text-tertiary);
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.ob-device[data-state="done"] .ob-device-dot { animation: none; background: var(--a3); box-shadow: 0 0 0 3px var(--tint-a3); }
+.ob-device[data-state="error"] .ob-device-dot { animation: none; background: var(--a5); box-shadow: 0 0 0 3px var(--tint-a5); }
+.ob-device[data-state="error"] .ob-device-status-text { color: var(--red); }
+
+.ob-device-stuck {
+  margin-top: 8px;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.ob-device-stuck[hidden] { display: none; }
+
+.ob-device-terminal {
+  font: inherit;
+  color: var(--text);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ob-device-log {
+  margin-top: 10px;
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+}
+
+.ob-device-log summary { cursor: pointer; width: max-content; }
+.ob-device-log summary:hover { color: var(--text-secondary); }
+
+.ob-device-log pre {
+  max-height: 160px;
+  margin-top: 6px;
+  padding: 8px 10px;
+  overflow: auto;
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.6875rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-secondary);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+}
+
+.ob-device-log pre:empty::before { content: 'Nothing yet.'; color: var(--text-tertiary); }
+
 .ob-agent .tp-section { margin-bottom: var(--sp-4); }
 
 .ob-terminal-slot:not(:empty) { margin-top: var(--sp-4); }

@@ -115,6 +115,69 @@ test('walks a new workspace through setup in order, saving each step where Setti
   await expect(page.locator('.ob-backdrop')).toHaveCount(0)
 })
 
+test('connects GitHub through its one-time code, with gh answered and out of sight', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  const state = await setupWorkspace(page, { step: 'github', githubAccounts: [] })
+  // gh's own sign-in, as the workspace's terminal socket relays it.
+  const inputs: string[] = []
+  let approve: (() => void) | null = null
+  await page.exposeFunction('approveAtGitHub', () => approve?.())
+  await page.routeWebSocket(/\/ws\/terminal\?preset=gh$/, (socket) => {
+    const out = (text: string) => socket.send(JSON.stringify({ type: 'output', data: Buffer.from(text).toString('base64') }))
+    socket.onMessage((message) => {
+      const frame = JSON.parse(String(message)) as { type: string, data?: string }
+      if (frame.type !== 'input') return
+      inputs.push(frame.data ?? '')
+      if (inputs.length === 1) {
+        out('\u001b[0;32m?\u001b[0m Authenticate Git with your GitHub credentials? \u001b[0;36mYes\u001b[0m\r\n\r\n'
+          + '\u001b[0;33m!\u001b[0m Failed to copy one-time code to clipboard\r\n'
+          + '\u001b[0;33m!\u001b[0m First copy your one-time code: \u001b[0;1;39m0281-B27E\u001b[0m\r\n'
+          + 'Press Enter to open https://github.com/login/device in your browser... ')
+      } else if (inputs.length === 2) {
+        out('\r\n\u001b[0;31m!\u001b[0m Failed opening a web browser at https://github.com/login/device\r\n')
+      }
+    })
+    out('\u001b[0;32m?\u001b[0m \u001b[0;1;39mAuthenticate Git with your GitHub credentials? \u001b[0m(Y/n) ')
+    // The person approves at GitHub; gh says so and exits.
+    approve = () => {
+      state.githubAccounts.push('octocat')
+      out('\u001b[0;32m\u2713\u001b[0m Authentication complete.\r\n\u001b[0;32m\u2713\u001b[0m Logged in as octocat\r\n')
+      socket.send(JSON.stringify({ type: 'exit', code: 0 }))
+      void socket.close({ code: 1000 })
+    }
+  })
+  await page.goto('/')
+  await expect(page.locator('.ob-title')).toHaveText('Connect your GitHub account')
+  await expect(page.locator('.ob-connection-text')).toHaveText('Not connected yet.')
+  await expect(next(page)).toBeDisabled()
+
+  await page.locator('.ob-connect').click()
+  await expect(page.locator('.ob-device')).toBeVisible()
+  await expect(page.locator('.ob-device-code')).toHaveText('0281-B27E')
+  // The code's own buttons are the only actions while it shows.
+  await expect(page.locator('.ob-connect')).toBeHidden()
+  await expect(page.locator('.ob-device-status-text')).toHaveText('Waiting for you to approve at GitHub…')
+  // gh's own output, its failed clipboard and browser included, stays folded away.
+  await expect(page.locator('.st-terminal')).toHaveCount(0)
+  await expect(page.locator('.ob-device-log')).not.toHaveAttribute('open', '')
+  await expect(page.locator('.ob-device-log pre')).toContainText('Failed opening a web browser')
+  expect(inputs).toEqual(['\r', '\r'])
+
+  // One click copies the code and opens GitHub's device page (stood in for: no test reaches GitHub).
+  await context.route(/^https:\/\/github\.com\//, (route) => route.fulfill({ contentType: 'text/html', body: '<title>GitHub</title>' }))
+  const popup = page.waitForEvent('popup')
+  await page.locator('.ob-device-copy').click()
+  expect((await popup).url()).toBe('https://github.com/login/device')
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('0281-B27E')
+
+  await page.evaluate(() => (window as unknown as { approveAtGitHub: () => void }).approveAtGitHub())
+  await expect(page.locator('.ob-connection')).toHaveAttribute('data-state', 'connected')
+  await expect(page.locator('.ob-device')).toBeHidden()
+  await expect(page.locator('.ob-connect')).toHaveText('Reconnect')
+  await expect(next(page)).toBeEnabled()
+  expect(state.me).toBe('octocat')
+})
+
 test('resumes where setup was left, and lets the steps be revisited with Back', async ({ page }) => {
   await setupWorkspace(page, { step: 'time', me: 'octocat' })
   await page.goto('/')
