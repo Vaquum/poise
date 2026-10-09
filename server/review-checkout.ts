@@ -1,8 +1,90 @@
-import { lstat, mkdir, mkdtemp, rename, rm } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import type { Dirent } from 'node:fs'
+import { lstat, mkdir, mkdtemp, readdir, rename, rm, utimes } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { runFile } from './process'
 import { withProcessLock } from './process-lock'
+
+// Each head's checkouts are removed a day after a review last resolved them.
+// Caller bounds every review's time and a retry follows within the hour, so
+// a review of a head is over long before; a later one provisions it again.
+export const REVIEW_CHECKOUT_RETENTION_MS = 24 * 60 * 60_000
+const PRUNE_INTERVAL_MS = 60 * 60_000
+const HEAD_PATTERN = /^[0-9a-f]{40}$/
+const REMOVING_PREFIX = '.removing-'
+// A review marks its head used, and a prune judges and moves a head away,
+// only while holding this lock in review-checkouts.
+const MARK_LOCK = '.lock'
+const nextPruneAt = new Map<string, number>()
+
+function errorCode(error: unknown): unknown {
+  return (error as { code?: unknown })?.code
+}
+
+/**
+ * Removes the checkouts of every head no review has resolved for
+ * REVIEW_CHECKOUT_RETENTION_MS, and returns those heads. A head is renamed
+ * out of reach before it is deleted, so a review resolving it afterwards
+ * provisions it anew rather than finding it half removed.
+ */
+export async function pruneReviewCheckouts(root: string, now = Date.now()): Promise<string[]> {
+  const checkouts = join(root, 'review-checkouts')
+  let entries: Dirent[]
+  try {
+    entries = await readdir(checkouts, { withFileTypes: true })
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return []
+    throw error
+  }
+  const removed: string[] = []
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const path = join(checkouts, entry.name)
+    try {
+      if (entry.name.startsWith(REMOVING_PREFIX)) {
+        // An earlier prune stopped before it finished.
+        await rm(path, { recursive: true, force: true })
+        continue
+      }
+      if (!HEAD_PATTERN.test(entry.name)) continue
+      // Resolving a head sets its directory's time; see resolveReviewCheckout.
+      if (now - (await lstat(path)).mtimeMs < REVIEW_CHECKOUT_RETENTION_MS) continue
+      const doomed = join(checkouts, `${REMOVING_PREFIX}${entry.name}-${randomUUID()}`)
+      // Judged again under the lock a review marks its head under: a review
+      // either marked it first, and it stays, or finds it gone and provisions
+      // it anew.
+      const moved = await withProcessLock({ path: join(checkouts, MARK_LOCK) }, async () => {
+        try {
+          if (now - (await lstat(path)).mtimeMs < REVIEW_CHECKOUT_RETENTION_MS) return false
+          await rename(path, doomed)
+          return true
+        } catch (error) {
+          // Another prune took it first.
+          if (errorCode(error) === 'ENOENT') return false
+          throw error
+        }
+      })
+      if (!moved) continue
+      await rm(doomed, { recursive: true, force: true })
+      removed.push(entry.name)
+    } catch (error) {
+      console.error(`[review-checkout] could not remove ${path}:`, (error as Error).message)
+    }
+  }
+  return removed
+}
+
+// At most once an hour per checkout root, in the background: a review never
+// waits for old checkouts to be deleted.
+function schedulePrune(root: string): void {
+  const now = Date.now()
+  if (now < (nextPruneAt.get(root) ?? 0)) return
+  nextPruneAt.set(root, now + PRUNE_INTERVAL_MS)
+  pruneReviewCheckouts(root, now).catch((error: unknown) => {
+    console.error('[review-checkout] prune failed:', (error as Error).message)
+  })
+}
 
 export async function resolveReviewCheckout(
   owner: string, repo: string, number: number, actor: string, head: string, signal?: AbortSignal,
@@ -30,9 +112,18 @@ export async function resolveReviewCheckout(
   }
   const root = process.env.POISE_DB && process.env.POISE_DB !== ':memory:'
     ? dirname(resolve(process.env.POISE_DB)) : join(homedir(), '.poise')
-  const base = join(root, 'review-checkouts', head, owner.toLowerCase())
+  const headDirectory = join(root, 'review-checkouts', head)
+  const base = join(headDirectory, owner.toLowerCase())
   const path = join(base, repo.toLowerCase())
   const remote = `https://github.com/${owner}/${repo}.git`
+  // Marks the head used, so its checkouts stay for a day after this review;
+  // see pruneReviewCheckouts.
+  await withProcessLock({ path: join(root, 'review-checkouts', MARK_LOCK) }, async () => {
+    await mkdir(base, { recursive: true })
+    const used = new Date()
+    await utimes(headDirectory, used, used)
+  })
+  schedulePrune(root)
   const verify = async (cwd: string): Promise<void> => {
     const origin = await runFile('git', ['remote', 'get-url', 'origin'], { cwd, signal, timeoutMs: 5_000 })
     const commit = await runFile('git', ['rev-parse', 'HEAD'], { cwd, signal, timeoutMs: 5_000 })

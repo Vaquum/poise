@@ -1,8 +1,9 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { resolveReviewCheckout } from '../server/review-checkout'
+import { withProcessLock } from '../server/process-lock'
+import { pruneReviewCheckouts, resolveReviewCheckout, REVIEW_CHECKOUT_RETENTION_MS } from '../server/review-checkout'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
@@ -84,5 +85,86 @@ describe('review checkout provisioning through Caller', () => {
   it('rejects path traversal before invoking any process', async () => {
     await expect(resolveReviewCheckout(owner, '..', 146, actor, head)).rejects.toThrow('Invalid review')
     expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+})
+describe('review checkout retention', () => {
+  const day = REVIEW_CHECKOUT_RETENTION_MS
+  const checkouts = () => join(root, 'review-checkouts')
+  // What review-checkouts holds besides the lock a review marks its head under.
+  const entries = async () => (await readdir(checkouts())).filter((name) => name !== '.lock').sort()
+  // A head's checkout as provisioning leaves it, last resolved `age` ago.
+  const provisioned = async (name: string, age: number): Promise<void> => {
+    const headPath = join(checkouts(), name)
+    await mkdir(join(headPath, owner, repo, '.git'), { recursive: true })
+    await writeFile(join(headPath, owner, repo, 'README.md'), 'checkout')
+    await writeFile(join(headPath, owner, `${repo}.lock`), '')
+    const when = new Date(Date.now() - age)
+    await utimes(headPath, when, when)
+  }
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 100))
+
+  it('removes a head a day after a review last resolved it, and keeps one resolved since', async () => {
+    await provisioned('b'.repeat(40), day + 60_000)
+    await provisioned('c'.repeat(40), day - 60_000)
+    expect(await pruneReviewCheckouts(root)).toEqual(['b'.repeat(40)])
+    expect(await entries()).toEqual(['c'.repeat(40)])
+  })
+
+  it('finishes what an interrupted prune left, and leaves what is not a head alone', async () => {
+    await mkdir(join(checkouts(), `.removing-${'d'.repeat(40)}-1`, owner, repo), { recursive: true })
+    await mkdir(join(checkouts(), 'notes'))
+    await writeFile(join(checkouts(), 'README'), 'mine')
+    expect(await pruneReviewCheckouts(root, Date.now() + 2 * day)).toEqual([])
+    expect(await entries()).toEqual(['README', 'notes'])
+  })
+
+  it('has nothing to remove before any review provisioned a checkout', async () => {
+    expect(await pruneReviewCheckouts(root)).toEqual([])
+  })
+
+  it('counts a day from the last review that resolved the head', async () => {
+    const path = await resolveCheckout()
+    const headPath = join(checkouts(), head)
+    const old = new Date(Date.now() - 2 * day)
+    await utimes(headPath, old, old)
+    expect(await resolveCheckout()).toBe(path)
+    expect(Date.now() - (await stat(headPath)).mtimeMs).toBeLessThan(60_000)
+    expect(await pruneReviewCheckouts(root)).toEqual([])
+    expect(await entries()).toEqual([head])
+  })
+
+  it('judges a head again under the lock, so it keeps one a review marked while the prune waited', async () => {
+    await provisioned('b'.repeat(40), 2 * day)
+    let pruning: Promise<string[]> | undefined
+    await withProcessLock({ path: join(checkouts(), '.lock') }, async () => {
+      pruning = pruneReviewCheckouts(root)
+      await settle()
+      // What a review does under this lock: mark its head used.
+      const now = new Date()
+      await utimes(join(checkouts(), 'b'.repeat(40)), now, now)
+    })
+    expect(await pruning).toEqual([])
+    expect(await entries()).toEqual(['b'.repeat(40)])
+  })
+
+  it('marks its head only under the lock a prune judges heads under', async () => {
+    let resolving: Promise<string> | undefined
+    await withProcessLock({ path: join(checkouts(), '.lock') }, async () => {
+      resolving = resolveCheckout()
+      await settle()
+      expect(await entries()).toEqual([])
+    })
+    expect(await resolving).toBe(join(checkouts(), head, owner, repo))
+    expect(await entries()).toEqual([head])
+  })
+
+  it('prunes in the background when a review resolves a checkout, at most once an hour', async () => {
+    await provisioned('b'.repeat(40), 2 * day)
+    await resolveCheckout()
+    await vi.waitFor(async () => expect(await entries()).toEqual([head]))
+    await provisioned('c'.repeat(40), 2 * day)
+    await resolveCheckout()
+    await settle()
+    expect(await entries()).toEqual([head, 'c'.repeat(40)].sort())
   })
 })

@@ -76,6 +76,10 @@ checkout is provisioned as your agent account, the reviewer, which Poise names
 to Caller with `--token-user`. CLI errors retain bounded, credential-redacted
 terminal diagnostics. Review receipts and launch claims remain authoritative;
 dependency repair never fabricates a verdict.
+Provisioned checkouts (`~/.poise/review-checkouts/<head>`) are removed a day
+after a review last resolved their head, checked at most hourly and in the
+background; a later review of that head provisions it again. User checkouts
+are never removed.
 
 A closed legacy failure can recover when Caller subsequently supplies an exact
 `not_started` / `preflight_failed` result. The same no-action rule applies before
