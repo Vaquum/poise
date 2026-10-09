@@ -92,7 +92,7 @@ describe('service health', () => {
     session(runtime.instance, false)
     session('poise-dev:another-database', true)
     const { service } = serviceOf(runtime)
-    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null })
+    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null })
 
     let finish!: () => void
     const debate = callerCalls.countDebate(() => new Promise<void>((resolve) => { finish = resolve }))
@@ -283,6 +283,23 @@ describe('switching to another release', () => {
     const { service } = switching(dir)
     expect(service.switchRelease('r1')).toEqual({ release: 'r1', switching: false })
     expect(existsSync(join(dir, 'next'))).toBe(false)
+  })
+
+  it('calls a pending switch off when asked for the release it runs', async () => {
+    const dir = await releases({ r1: 'b1', r2: 'b1' })
+    const { timer, restart, service } = switching(dir)
+    try {
+      service.switchRelease('r2')
+      expect(service.health().switching).toBe('r2')
+      expect(service.switchRelease('r1')).toEqual({ release: 'r1', switching: false })
+      expect(existsSync(join(dir, 'next'))).toBe(false)
+      expect(service.health().switching).toBeNull()
+      expect(timer.timers.size).toBe(0)
+      expect(restart).not.toHaveBeenCalled()
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
   })
 
   it('refuses a release not installed, one built for another base or that failed to start, and a server without the supervisor', async () => {

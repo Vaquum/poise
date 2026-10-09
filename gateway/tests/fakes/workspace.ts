@@ -17,6 +17,8 @@ export interface StubHealth {
   draining: boolean
   /** The release its supervisor runs; null for a workspace started without one. */
   release: string | null
+  /** The release a pending switch restarts it onto; null when none is pending. */
+  switching: string | null
 }
 
 /**
@@ -58,7 +60,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
   const stub: Omit<WorkspaceStub, 'port' | 'close'> = {
     reachable: true,
     healthStatus: 200,
-    health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, draining: false, release: null },
+    health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, draining: false, release: null, switching: null },
     switches: [],
     failedReleases: [],
     healthPadding: 0,
@@ -106,6 +108,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
           if (stub.failedReleases.includes(String(release))) {
             return json(res, 409, { error: `release ${release} failed to start in this workspace; it stays on release ${stub.health.release}` })
           }
+          stub.health.switching = release !== stub.health.release ? String(release) : null
           return json(res, 202, { release, switching: release !== stub.health.release })
         }
         if (url === '/api/service/health' || url === '/api/service/drain') {

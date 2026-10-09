@@ -707,6 +707,20 @@ describe('updates in place', () => {
     expect(h.workspace.switches).toHaveLength(1)
   })
 
+  it('calls off a pending switch to another release once the workspace runs the target release again', async () => {
+    await start()
+    const alice = h.docker.containers.get('poise-ws-alice')!
+    alice.imageId = CURRENT_IMAGE_ID
+    h.workspace.health.release = 'new-release'
+    h.workspace.health.switching = 'withdrawn-release'
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+    expect(h.workspace.health.switching).toBeNull()
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.withdrawn')).toMatchObject({ handle: 'alice', release: 'withdrawn-release', running: 'new-release' })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+  })
+
   it('waits for a workspace restarting onto the release it was asked for, and recreates one that stays unreachable', async () => {
     await start()
     const before = containerId()

@@ -6,7 +6,7 @@
 // lapses unless the gateway renews it, so a gateway that died mid-drain can
 // never leave the workspace refusing work for good.
 
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -31,6 +31,8 @@ export interface ServiceHealth {
   draining: boolean
   /** The installed release the supervisor started this server on (POISE_RELEASE); null without one. */
   release: string | null
+  /** The release a pending switch restarts this server onto; null when none is pending. */
+  switching: string | null
 }
 
 /** What POST /api/service/switch answers. */
@@ -121,6 +123,7 @@ export class ServiceControl {
       idle: calls.known && activeChatTurns + calls.count + backgroundWork === 0,
       draining: this.drainOn,
       release: this.release.name,
+      switching: this.switchTo,
     }
   }
 
@@ -148,7 +151,10 @@ export class ServiceControl {
     if (base !== this.release.base) throw new HttpError(409, `release ${release} was built for another base; recreate the container to update it`)
     // The supervisor marks a release that failed to start, and never runs it again.
     if (existsSync(join(dir, 'failed'))) throw new HttpError(409, `release ${release} failed to start in this workspace; it stays on release ${this.release.name}`)
-    if (release === this.release.name) return { release, switching: false }
+    if (release === this.release.name) {
+      this.withdrawSwitch()
+      return { release, switching: false }
+    }
     const next = join(this.releasesDir, 'next')
     writeFileSync(`${next}.tmp`, `${release}\n`)
     renameSync(`${next}.tmp`, next)
@@ -159,6 +165,16 @@ export class ServiceControl {
       this.pollSwitch()
     }
     return { release, switching: true }
+  }
+
+  /** Asked for the release it runs: a switch asked for before, to a release since withdrawn, is called off. */
+  private withdrawSwitch(): void {
+    rmSync(join(this.releasesDir, 'next'), { force: true })
+    if (this.switchTo === null) return
+    if (this.switchPoll !== null) this.timer.clearTimeout(this.switchPoll)
+    this.switchPoll = null
+    this.log(`[service] the switch to release ${this.switchTo} was withdrawn; staying on release ${this.release.name}`)
+    this.switchTo = null
   }
 
   private pollSwitch(): void {

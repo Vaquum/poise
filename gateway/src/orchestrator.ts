@@ -44,6 +44,8 @@ export interface ServiceHealth {
   draining: boolean
   /** The release the workspace's supervisor runs; null for a workspace started without one. */
   release: string | null
+  /** The release a pending switch restarts Poise onto; null when none is pending, or the workspace does not say. */
+  switching: string | null
 }
 
 /** A runtime image's release and the base it runs on, from its labels (deploy/runtime/Dockerfile). */
@@ -123,6 +125,7 @@ function parseHealth(text: string, what: string): ServiceHealth {
     idle: value.idle,
     draining: value.draining,
     release: typeof value.release === 'string' && value.release ? value.release : null,
+    switching: typeof value.switching === 'string' && value.switching ? value.switching : null,
   }
 }
 
@@ -426,6 +429,7 @@ export class Orchestrator {
     }
     if (health.release === null) return false
     if (health.release === target.release) {
+      await this.withdrawSwitch(handle, login, health, target)
       this.updating.delete(handle)
       return true
     }
@@ -450,6 +454,16 @@ export class Orchestrator {
     return true
   }
 
+  /**
+   * A workspace that runs the target release but still waits to switch to another, asked for before the
+   * target changed back, is asked for the release it runs, which calls the pending switch off.
+   */
+  private async withdrawSwitch(handle: string, login: string, health: ServiceHealth, target: ImageRelease): Promise<void> {
+    if (health.switching === null || health.switching === target.release) return
+    await this.requestSwitch(handle, login, target.release)
+    this.lifecycle('workspace.update.withdrawn', handle, { release: health.switching, running: target.release })
+  }
+
   /** Switches a running workspace on the current image that runs another release than the image's. */
   private async correctRelease(summary: ContainerSummary, target: ImageRelease): Promise<void> {
     const handle = summary.Labels['poise.workspace'] ?? ''
@@ -458,7 +472,10 @@ export class Orchestrator {
     try {
       const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
       if (health.release !== null && health.release !== target.release) await this.updateInPlace(handle, login, target)
-      else if (health.release === target.release) this.updating.delete(handle)
+      else if (health.release === target.release) {
+        await this.withdrawSwitch(handle, login, health, target)
+        this.updating.delete(handle)
+      }
     } catch (error) {
       this.deps.log.warn('workspace.update.check.failed', { handle, error: errorMessage(error) })
     }
