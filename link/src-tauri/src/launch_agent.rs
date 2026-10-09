@@ -247,51 +247,51 @@ fn user_id() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// Something for Poise Link's log. A start is arranged before the log is set
+/// up, so its notes are logged once it is.
+pub type Note = (log::Level, String);
+
 /// The other running copies of Poise Link of this person.
 pub trait Copies {
-    fn others(&self) -> Vec<u32>;
-    fn ask_to_quit(&self, pid: u32);
+    fn others(&self) -> Result<Vec<u32>, String>;
+    fn ask_to_quit(&self, pid: u32) -> Result<(), String>;
 }
 
 /// The processes of this person that run this program.
 pub struct Processes;
 
 impl Copies for Processes {
-    fn others(&self) -> Vec<u32> {
-        let Some(name) = std::env::current_exe().ok().and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        }) else {
-            return Vec::new();
-        };
-        let own = std::process::id();
-        match Command::new("/usr/bin/pgrep")
+    fn others(&self) -> Result<Vec<u32>, String> {
+        let name = std::env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .ok_or("could not tell this program's name, to find its other copies")?;
+        let output = Command::new("/usr/bin/pgrep")
             .args(["-x", "-U", &user_id().to_string(), &name])
             .output()
-        {
-            Ok(output) => String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|line| line.trim().parse().ok())
-                .filter(|pid| *pid != own)
-                .collect(),
-            Err(error) => {
-                log::warn!("could not list the running copies of Poise Link: {error}");
-                Vec::new()
-            }
-        }
+            .map_err(|error| format!("could not list the running copies of Poise Link: {error}"))?;
+        let own = std::process::id();
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .filter(|pid| *pid != own)
+            .collect())
     }
 
-    fn ask_to_quit(&self, pid: u32) {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return;
-        };
+    fn ask_to_quit(&self, pid: u32) -> Result<(), String> {
+        let process =
+            libc::pid_t::try_from(pid).map_err(|_| format!("{pid} is not a process ID"))?;
         // SAFETY: kill only sends a signal; the process is this person's own copy of Poise Link.
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-            log::warn!(
+        if unsafe { libc::kill(process, libc::SIGTERM) } != 0 {
+            return Err(format!(
                 "could not ask Poise Link {pid} to quit: {}",
                 io::Error::last_os_error()
-            );
+            ));
         }
+        Ok(())
     }
 }
 
@@ -302,6 +302,22 @@ pub enum Start {
     Here,
     /// launchd starts its copy instead, and this process quits.
     HandedOver,
+}
+
+/// An arranged start, with what to log about it once the log exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arranged {
+    pub start: Start,
+    pub notes: Vec<Note>,
+}
+
+impl From<Start> for Arranged {
+    fn from(start: Start) -> Self {
+        Self {
+            start,
+            notes: Vec::new(),
+        }
+    }
 }
 
 /// The start being arranged.
@@ -320,22 +336,24 @@ pub struct Arrangement<'a> {
 
 /// Decides who runs Poise Link while start at login is on: always the copy
 /// launchd started, which launchd restarts. Any other start hands over to it.
-pub fn arrange(start: &Arrangement) -> Result<Start, String> {
+pub fn arrange(start: &Arrangement) -> Result<Arranged, String> {
     start
         .agent
         .migrate()
         .map_err(|error| format!("could not replace Poise Link 0.1's login item: {error}"))?;
     if start.by_launchd {
-        take_over(start.copies, start.sleep);
-        return Ok(Start::Here);
+        return Ok(Arranged {
+            start: Start::Here,
+            notes: take_over(start.copies, start.sleep),
+        });
     }
     if !start.agent.installed() {
-        return Ok(Start::Here);
+        return Ok(Start::Here.into());
     }
     let job = start.launchd.job()?;
     if job == Job::Running {
         // The single-instance plugin passes this start on to launchd's copy.
-        return Ok(Start::Here);
+        return Ok(Start::Here.into());
     }
     if start.show_window {
         request_window(start.settings_dir)
@@ -346,7 +364,7 @@ pub fn arrange(start: &Arrangement) -> Result<Start, String> {
         take_window_request(start.settings_dir);
         return Err(error);
     }
-    Ok(Start::HandedOver)
+    Ok(Start::HandedOver.into())
 }
 
 /// Start at login was turned on in a copy launchd did not start: launchd
@@ -364,28 +382,56 @@ fn start_job(agent: &LaunchAgent, launchd: &dyn Launchd, job: Job) -> Result<(),
 }
 
 /// launchd's copy takes over from any other copy. A copy handing over quits
-/// at once; any other is asked to (SIGTERM) after [`QUIT_WAIT`].
-pub fn take_over(copies: &dyn Copies, sleep: &dyn Fn(Duration)) {
-    if wait_until_alone(copies, sleep) {
-        return;
+/// at once; any other is asked to (SIGTERM) after [`QUIT_WAIT`]. Says what
+/// happened, for the log.
+pub fn take_over(copies: &dyn Copies, sleep: &dyn Fn(Duration)) -> Vec<Note> {
+    let mut notes = Vec::new();
+    if wait_until_alone(copies, sleep, &mut notes) {
+        return notes;
     }
-    for pid in copies.others() {
-        log::warn!("asking Poise Link {pid}, which launchd did not start, to quit");
-        copies.ask_to_quit(pid);
+    match copies.others() {
+        Ok(others) => {
+            for pid in others {
+                notes.push(match copies.ask_to_quit(pid) {
+                    Ok(()) => (
+                        log::Level::Warn,
+                        format!("asked Poise Link {pid}, which launchd did not start, to quit"),
+                    ),
+                    Err(error) => (log::Level::Warn, error),
+                });
+            }
+        }
+        Err(error) => notes.push((log::Level::Warn, error)),
     }
-    if !wait_until_alone(copies, sleep) {
-        log::error!("another copy of Poise Link is still running");
+    if !wait_until_alone(copies, sleep, &mut notes) {
+        notes.push((
+            log::Level::Error,
+            "another copy of Poise Link is still running".to_owned(),
+        ));
     }
+    notes
 }
 
-fn wait_until_alone(copies: &dyn Copies, sleep: &dyn Fn(Duration)) -> bool {
+fn wait_until_alone(copies: &dyn Copies, sleep: &dyn Fn(Duration), notes: &mut Vec<Note>) -> bool {
     for _ in 0..QUIT_WAIT.as_millis() / POLL.as_millis() {
-        if copies.others().is_empty() {
+        if alone(copies, notes) {
             return true;
         }
         sleep(POLL);
     }
-    copies.others().is_empty()
+    alone(copies, notes)
+}
+
+/// No other copy runs. When the copies cannot be listed there is no one to
+/// wait for; the single-instance plugin still keeps a second copy from running.
+fn alone(copies: &dyn Copies, notes: &mut Vec<Note>) -> bool {
+    match copies.others() {
+        Ok(others) => others.is_empty(),
+        Err(error) => {
+            notes.push((log::Level::Warn, error));
+            true
+        }
+    }
 }
 
 /// Asks the copy launchd starts next to show its window.
@@ -464,6 +510,8 @@ mod tests {
     struct FakeCopies {
         running: RefCell<Vec<(u32, u32)>>,
         obeys: bool,
+        /// pgrep fails.
+        unlisted: bool,
         asked: RefCell<Vec<u32>>,
     }
 
@@ -472,28 +520,32 @@ mod tests {
             Self {
                 running: RefCell::new(copies.to_vec()),
                 obeys,
-                asked: RefCell::default(),
+                ..Self::default()
             }
         }
     }
 
     impl Copies for FakeCopies {
-        fn others(&self) -> Vec<u32> {
+        fn others(&self) -> Result<Vec<u32>, String> {
+            if self.unlisted {
+                return Err("pgrep failed".to_owned());
+            }
             let mut running = self.running.borrow_mut();
             running.retain(|(_, lasts)| *lasts > 0);
             for (_, lasts) in running.iter_mut() {
                 *lasts -= 1;
             }
-            running.iter().map(|(pid, _)| *pid).collect()
+            Ok(running.iter().map(|(pid, _)| *pid).collect())
         }
 
-        fn ask_to_quit(&self, pid: u32) {
+        fn ask_to_quit(&self, pid: u32) -> Result<(), String> {
             self.asked.borrow_mut().push(pid);
             if self.obeys {
                 self.running
                     .borrow_mut()
                     .retain(|(running, _)| *running != pid);
             }
+            Ok(())
         }
     }
 
@@ -527,6 +579,16 @@ mod tests {
         by_launchd: bool,
         show_window: bool,
     ) -> Result<Start, String> {
+        arranged(fixture, launchd, copies, by_launchd, show_window).map(|arranged| arranged.start)
+    }
+
+    fn arranged(
+        fixture: &Fixture,
+        launchd: &FakeLaunchd,
+        copies: &FakeCopies,
+        by_launchd: bool,
+        show_window: bool,
+    ) -> Result<Arranged, String> {
         arrange(&Arrangement {
             agent: &fixture.agent,
             launchd,
@@ -674,30 +736,69 @@ mod tests {
         fixture.agent.install().unwrap();
         let launchd = FakeLaunchd::with(Job::Running);
         let copies = FakeCopies::running(&[(41, 5)], true);
-        let start = arrange_with(&fixture, &launchd, &copies, true, false);
-        assert_eq!(start, Ok(Start::Here));
+        let arranged = arranged(&fixture, &launchd, &copies, true, false);
+        assert_eq!(arranged, Ok(Start::Here.into()));
         assert!(copies.asked.borrow().is_empty());
-        assert!(copies.others().is_empty());
+        assert_eq!(copies.others(), Ok(Vec::new()));
         assert!(launchd.calls().is_empty());
+    }
+
+    #[test]
+    fn what_launchds_copy_did_to_take_over_reaches_the_log() {
+        // The start is arranged before the log is set up: the caller logs these once it is.
+        let fixture = fixture();
+        let copies = FakeCopies::running(&[(41, u32::MAX)], false);
+        let arranged = arranged(&fixture, &FakeLaunchd::default(), &copies, true, false).unwrap();
+        assert_eq!(arranged.start, Start::Here);
+        assert_eq!(
+            arranged.notes,
+            [
+                (
+                    log::Level::Warn,
+                    "asked Poise Link 41, which launchd did not start, to quit".to_owned()
+                ),
+                (
+                    log::Level::Error,
+                    "another copy of Poise Link is still running".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn launchds_copy_runs_when_the_copies_cannot_be_listed_and_says_so() {
+        let copies = FakeCopies {
+            unlisted: true,
+            ..FakeCopies::default()
+        };
+        let notes = take_over(&copies, &|_| {});
+        assert_eq!(notes, [(log::Level::Warn, "pgrep failed".to_owned())]);
+        assert!(copies.asked.borrow().is_empty());
     }
 
     #[test]
     fn launchds_copy_asks_a_copy_that_stays_to_quit() {
         let copies = FakeCopies::running(&[(41, u32::MAX), (42, u32::MAX)], true);
         let slept = Cell::new(Duration::ZERO);
-        take_over(&copies, &|delay| slept.set(slept.get() + delay));
+        let notes = take_over(&copies, &|delay| slept.set(slept.get() + delay));
         assert_eq!(*copies.asked.borrow(), [41, 42]);
-        assert!(copies.others().is_empty());
+        assert_eq!(copies.others(), Ok(Vec::new()));
         assert_eq!(slept.get(), QUIT_WAIT);
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().all(|(level, _)| *level == log::Level::Warn));
     }
 
     #[test]
     fn launchds_copy_gives_up_waiting_on_a_copy_that_will_not_quit() {
         let copies = FakeCopies::running(&[(41, u32::MAX)], false);
         let slept = Cell::new(Duration::ZERO);
-        take_over(&copies, &|delay| slept.set(slept.get() + delay));
+        let notes = take_over(&copies, &|delay| slept.set(slept.get() + delay));
         assert_eq!(*copies.asked.borrow(), [41]);
         assert_eq!(slept.get(), QUIT_WAIT * 2);
+        assert_eq!(
+            notes.last().map(|(level, _)| *level),
+            Some(log::Level::Error)
+        );
     }
 
     #[test]

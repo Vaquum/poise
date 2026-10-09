@@ -18,7 +18,7 @@ use crate::controller::{Controller, Platform};
 use crate::credentials::OsCredentialStore;
 use crate::duties::snippets::espanso::Locator;
 #[cfg(target_os = "macos")]
-use crate::launch_agent::{self, Arrangement, LaunchAgent, Launchctl, Processes, Start};
+use crate::launch_agent::{self, Arranged, Arrangement, LaunchAgent, Launchctl, Processes, Start};
 use crate::platform::{Autostart, Browser};
 use crate::status::{Connection, Status};
 use commands::StatusView;
@@ -40,10 +40,18 @@ pub fn run() {
     let autostarted = std::env::args().any(|arg| arg == AUTOSTART_ARG);
     // Before the tray or a window exists: with start at login on, launchd's copy is the one that runs.
     #[cfg(target_os = "macos")]
-    let arranged = match arrange(autostarted) {
-        Ok(Start::HandedOver) => return,
-        Ok(Start::Here) => None,
-        Err(error) => Some(error),
+    let notes = match arrange(autostarted) {
+        Ok(Arranged {
+            start: Start::HandedOver,
+            ..
+        }) => return,
+        Ok(Arranged { notes, .. }) => notes,
+        Err(error) => vec![(
+            log::Level::Error,
+            format!(
+                "could not hand Poise Link to launchd, so nothing starts it again if it stops: {error}"
+            ),
+        )],
     };
     let builder = tauri::Builder::default()
         // Registered first: a second launch only shows the running copy's window.
@@ -85,11 +93,10 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // The start was arranged before the log was set up.
             #[cfg(target_os = "macos")]
-            if let Some(error) = &arranged {
-                log::error!(
-                    "could not hand Poise Link to launchd, so nothing starts it again if it stops: {error}"
-                );
+            for (level, note) in &notes {
+                log::log!(*level, "{note}");
             }
             setup(app, autostarted)?;
             Ok(())
@@ -153,7 +160,7 @@ fn settings_dir() -> Result<std::path::PathBuf, &'static str> {
 /// Decides, before anything shows, whether this process runs Poise Link or
 /// hands over to launchd's copy (see crate::launch_agent).
 #[cfg(target_os = "macos")]
-fn arrange(autostarted: bool) -> Result<Start, String> {
+fn arrange(autostarted: bool) -> Result<Arranged, String> {
     let agent = LaunchAgent::for_this_user().map_err(|error| error.to_string())?;
     let settings_dir = settings_dir()?;
     launch_agent::arrange(&Arrangement {
