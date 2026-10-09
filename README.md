@@ -31,6 +31,7 @@ and `deploy/restore.sh` back it up and restore it.
 - **Behaviors** — scheduled review, approval, unblocking, and issue-review automations.
 - **Snippets** — simple Espanso trigger management, and Import from an existing Espanso file.
 - **Editor** — atomic Markdown storage, annotations, and agent-backed chat.
+- **Analytics** — headline numbers for Current's time ranges, from the burger menu: issues opened and closed, pull requests merged, lines changed and time to merge, and per merged pull request the comments, median lines and completed behavior reviews and approvals. See [Analytics](docs/Analytics.md).
 - **Notifications** — what needs you, one thing at a time at the top of the page: a failed behavior, a sign-in or a Chat waiting for you, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. See [Notifications](docs/Notifications.md).
 
 ## Requirements
