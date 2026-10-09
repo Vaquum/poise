@@ -21,9 +21,15 @@ export interface OnboardingState {
 }
 
 /** When each agent CLI's login last finished successfully in a Connect
- *  terminal. Grok, Muse and Antigravity report no sign-in status, so this is
- *  how setup knows which of them were signed in here. */
+ *  terminal, or the person said it had. Grok, Muse and Antigravity report no
+ *  sign-in status, so this is how setup knows which of them were signed in here. */
 export type AccountLogins = Partial<Record<AccountId, string>>
+
+/** The CLIs with no command that reports a sign-in (server/accounts/status.ts). */
+export const UNREPORTED_SIGN_IN: readonly AccountId[] = ['grok', 'muse', 'antigravity']
+// Antigravity has no login command: its Connect terminal runs the app itself,
+// which exits cleanly whether or not a sign-in finished. Only the person can say.
+const EXIT_IS_NO_LOGIN: ReadonlySet<string> = new Set(['antigravity'])
 
 const STATE_KEY = 'onboarding'
 const LOGINS_KEY = 'account_logins'
@@ -70,9 +76,13 @@ export function onboardingState(): OnboardingState {
 }
 
 export function updateOnboarding(input: unknown): OnboardingState {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('send { step }, { done: true } or { restart: true }')
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('send { step }, { done: true }, { restart: true } or { account, signedIn }')
   const body = input as Record<string, unknown>
   const current = onboardingState()
+  if ('account' in body) {
+    markLogin(body.account, body.signedIn)
+    return current
+  }
   if (body.restart === true) return save({ status: 'pending', step: 'theme', completedAt: current.completedAt })
   if (body.done === true) return save({ status: 'done', step: 'finish', completedAt: new Date().toISOString() })
   if (!isStep(body.step)) throw new Error(`step must be one of ${ONBOARDING_STEPS.join(', ')}`)
@@ -90,10 +100,23 @@ export function accountLogins(): AccountLogins {
   }
 }
 
-/** A Connect terminal's login exited with `code`; a clean exit is a finished login. */
+/** A Connect terminal's login exited with `code`; a clean exit is a finished
+ *  login, except where the terminal runs a whole app rather than a login. */
 export function recordLogin(preset: string, code: number): void {
-  if (code !== 0 || !isAccountId(preset)) return
+  if (code !== 0 || !isAccountId(preset) || EXIT_IS_NO_LOGIN.has(preset)) return
   setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [preset]: new Date().toISOString() }))
+}
+
+/** The person says whether a CLI that reports no sign-in is signed in. */
+export function markLogin(account: unknown, signedIn: unknown): void {
+  if (typeof account !== 'string' || !(UNREPORTED_SIGN_IN as readonly string[]).includes(account)) {
+    throw new Error(`account must be one of ${UNREPORTED_SIGN_IN.join(', ')}: the others report their own sign-in`)
+  }
+  if (typeof signedIn !== 'boolean') throw new Error('signedIn must be true or false')
+  const logins: AccountLogins = { ...accountLogins() }
+  if (signedIn) logins[account as AccountId] = new Date().toISOString()
+  else delete logins[account as AccountId]
+  setMeta(LOGINS_KEY, JSON.stringify(logins))
 }
 
 export type GitHubRole = 'me' | 'agent'

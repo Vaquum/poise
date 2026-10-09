@@ -602,6 +602,11 @@ function aiStep(ctx: StepContext): StepView {
     list.innerHTML = PROVIDERS.map((id) => accounts!.find((account) => account.id === id)).filter((account): account is ConnectedAccount => !!account).map((account) => {
       const { text, tone } = accountState(account, logins)
       const label = tone === 'on' ? 'Reconnect' : 'Connect'
+      // A CLI that cannot report its sign-in counts as signed in when the person says so.
+      const marked = !!logins[account.id]
+      const mark = account.installed && account.signedIn === null
+        ? `<button type="button" class="st-clear ob-ai-mark" data-mark="${account.id}" data-signed-in="${!marked}" aria-label="${escapeHtml(NAMES[account.id])}: ${marked ? 'not signed in' : 'I have signed in'}">${marked ? 'Not signed in' : 'I\'ve signed in'}</button>`
+        : ''
       return `
         <div class="ob-ai-row" data-account="${account.id}">
           <span class="ob-ai-dot ob-ai-dot-${tone}" aria-hidden="true"></span>
@@ -609,6 +614,7 @@ function aiStep(ctx: StepContext): StepView {
             <div class="ob-ai-name">${escapeHtml(NAMES[account.id])}${account.version ? `<span class="ob-ai-version">${escapeHtml(account.version)}</span>` : ''}</div>
             <div class="ob-ai-state">${escapeHtml(text)}</div>
           </div>
+          ${mark}
           <button type="button" class="${tone === 'on' ? 'st-clear' : 'st-save'} ob-ai-connect" data-connect="${account.id}"${!account.installed || ctx.terminalRunning() ? ' disabled' : ''} aria-label="${label} ${escapeHtml(NAMES[account.id])}">${label}</button>
         </div>`
     }).join('')
@@ -626,9 +632,24 @@ function aiStep(ctx: StepContext): StepView {
   }
 
   list.addEventListener('click', (event) => {
+    const mark = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-mark]')
+    if (mark) {
+      mark.disabled = true
+      void postJson('/api/onboarding', { account: mark.dataset.mark, signedIn: mark.dataset.signedIn === 'true' })
+        .then(() => refresh(false))
+        .catch((error: unknown) => {
+          mark.disabled = false
+          ctx.status(`That was not saved: ${(error as Error).message}`, 'error')
+        })
+      return
+    }
     const id = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-connect]')?.dataset.connect as AccountId | undefined
     if (!id || ctx.terminalRunning()) return
-    void ctx.terminal(id, slot, () => { void refresh(true) }).then(render)
+    void ctx.terminal(id, slot, () => {
+      // Antigravity's terminal runs the app itself, which exits the same way whether or not a sign-in finished.
+      if (id === 'antigravity') ctx.status('Antigravity cannot say whether its sign-in finished. If it did, choose I\'ve signed in.', 'info')
+      void refresh(true)
+    }).then(render)
     render()
   })
   void refresh(false)

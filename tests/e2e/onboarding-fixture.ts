@@ -83,7 +83,10 @@ export async function setupWorkspace(page: Page, initial: Partial<SetupState> = 
     switch (url.pathname) {
       case '/api/workspace': return route.fulfill({ json: { mode: 'service', owner: 'octocat' } })
       case '/api/onboarding':
-        if (body?.done === true) { state.status = 'done'; state.step = 'finish' }
+        if (typeof body?.account === 'string') {
+          if (body.signedIn === true) state.logins = { ...state.logins, [body.account]: '2026-10-09T07:00:00Z' }
+          else state.logins = Object.fromEntries(Object.entries(state.logins).filter(([id]) => id !== body.account))
+        } else if (body?.done === true) { state.status = 'done'; state.step = 'finish' }
         else if (body?.restart === true) { state.status = 'pending'; state.step = 'theme' }
         else if (typeof body?.step === 'string') state.step = body.step
         return route.fulfill({ json: { available: true, status: state.status, step: state.step, owner: 'octocat', logins: state.logins, completedAt: null } })

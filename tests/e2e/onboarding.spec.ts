@@ -178,6 +178,33 @@ test('connects GitHub through its one-time code, with gh answered and out of sig
   expect(state.me).toBe('octocat')
 })
 
+test('lets the person say whether a CLI that cannot report its sign-in is signed in', async ({ page }) => {
+  const state = await setupWorkspace(page, { step: 'ai', me: 'octocat' })
+  await page.goto('/')
+  const row = (id: string) => page.locator(`.ob-ai-row[data-account="${id}"]`)
+  await expect(row('muse').locator('.ob-ai-state')).toHaveText('Not signed in yet')
+  await expect(row('grok').locator('.ob-ai-state')).toHaveText('Signed in here')
+  // Claude and Codex report their own sign-in; an uninstalled CLI has nothing to mark.
+  await expect(row('claude').locator('.ob-ai-mark')).toHaveCount(0)
+  await expect(row('codex').locator('.ob-ai-mark')).toHaveCount(0)
+  await expect(row('antigravity').locator('.ob-ai-mark')).toHaveCount(0)
+
+  await row('muse').locator('.ob-ai-mark').click()
+  await expect(row('muse').locator('.ob-ai-state')).toHaveText('Signed in here')
+  await expect(row('muse').locator('.ob-ai-mark')).toHaveText('Not signed in')
+  await row('grok').locator('.ob-ai-mark').click()
+  await expect(row('grok').locator('.ob-ai-state')).toHaveText('Not signed in yet')
+  expect(Object.keys(state.logins)).toEqual(['muse'])
+  expect(state.writes.filter((write) => 'account' in write.body).map((write) => write.body)).toEqual([
+    { account: 'muse', signedIn: true },
+    { account: 'grok', signedIn: false },
+  ])
+
+  // Models offers what is signed in now.
+  await next(page).click()
+  await expect(page.locator('.ob-chip-on')).toHaveText(['Claude', 'Muse'])
+})
+
 test('resumes where setup was left, and lets the steps be revisited with Back', async ({ page }) => {
   await setupWorkspace(page, { step: 'time', me: 'octocat' })
   await page.goto('/')

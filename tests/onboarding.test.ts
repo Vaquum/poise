@@ -27,7 +27,7 @@ vi.mock('../server/settings', () => ({
   },
 }))
 
-const { accountLogins, checkGitHubAccount, connectGitHubAccount, onboardingState, recordLogin, updateOnboarding } = await import('../server/service/onboarding')
+const { accountLogins, checkGitHubAccount, connectGitHubAccount, markLogin, onboardingState, recordLogin, updateOnboarding } = await import('../server/service/onboarding')
 
 type Call = { args: readonly string[], env: NodeJS.ProcessEnv | undefined }
 let calls: Call[] = []
@@ -104,6 +104,23 @@ describe('the logins setup counts', () => {
     recordLogin('not-a-cli', 0)
     expect(Object.keys(accountLogins())).toEqual(['grok'])
     expect(Date.parse(accountLogins().grok ?? '')).not.toBeNaN()
+  })
+
+  it('never counts Antigravity\'s exit, since its terminal runs the app itself', () => {
+    recordLogin('antigravity', 0)
+    expect(accountLogins()).toEqual({})
+  })
+
+  it('takes the person\'s word for a CLI that reports no sign-in, both ways', () => {
+    markLogin('antigravity', true)
+    recordLogin('grok', 0)
+    expect(Object.keys(accountLogins()).sort()).toEqual(['antigravity', 'grok'])
+    expect(updateOnboarding({ account: 'grok', signedIn: false })).toEqual(onboardingState())
+    expect(Object.keys(accountLogins())).toEqual(['antigravity'])
+    // The CLIs with a status command say for themselves.
+    expect(() => markLogin('claude', true)).toThrow(/grok, muse, antigravity/)
+    expect(() => markLogin('antigravity', 'yes')).toThrow(/signedIn/)
+    expect(() => updateOnboarding({ account: 'nobody', signedIn: true })).toThrow(/account must be one of/)
   })
 
   it('ignores a stored record it cannot read', () => {

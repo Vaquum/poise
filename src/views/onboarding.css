@@ -510,6 +510,8 @@ html.ob-open body { overflow: hidden; }
 }
 
 .ob-ai-row button { flex: none; padding: 5px 12px; }
+.ob-ai-row .ob-ai-mark { color: var(--text-tertiary); border-color: transparent; background: transparent; }
+.ob-ai-row .ob-ai-mark:hover { color: var(--text); border-color: var(--border); }
 
 /* ── Models ── */
 
