@@ -222,6 +222,14 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     }
   })
 
+  // Escape closes the menu and gives focus back to the burger, as it closes dialogs elsewhere in Poise.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || menu.hidden || e.defaultPrevented) return
+    e.preventDefault()
+    closeMenu()
+    toggle.focus()
+  })
+
   // Click outside → close menu (panels only close via X button / burger)
   document.addEventListener('click', (e) => {
     if (!menu.hidden && !menu.contains(e.target as Node) && e.target !== toggle && !toggle.contains(e.target as Node)) {

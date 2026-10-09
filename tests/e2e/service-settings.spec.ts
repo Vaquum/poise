@@ -117,6 +117,24 @@ test('pairs Poise Link from Settings, where the gateway sends /link, and revokes
   await expect(page.locator('.pl-revoke')).toHaveCount(0)
 })
 
+test('Escape closes the top-right menu, and Settings opened from it', async ({ page }) => {
+  await setup(page, 'service')
+  await page.goto('/')
+  const toggle = page.getByRole('button', { name: 'Menu', exact: true })
+  const menu = page.locator('#menu-popover')
+  await toggle.click()
+  await expect(menu).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(menu).toBeHidden()
+  await expect(toggle).toBeFocused()
+
+  await toggle.click()
+  await page.locator('[data-action="settings"]').click()
+  await expect(page.locator('#settings-panel')).toHaveClass(/open/)
+  await page.keyboard.press('Escape')
+  await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)
+})
+
 test('gives the gateway\'s admins an Admin tab that manages people and workspaces', async ({ page }) => {
   const state = await setup(page, 'service', true)
   await page.goto('/?settings=admin')
