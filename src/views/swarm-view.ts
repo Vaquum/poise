@@ -1103,7 +1103,7 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
   }
 }
 
-const highlightTimers = new WeakMap<HTMLTableRowElement, ReturnType<typeof window.setTimeout>>()
+const highlightTimers = new WeakMap<HTMLTableRowElement, number>()
 
 function highlightRow(row: HTMLTableRowElement): void {
   row.scrollIntoView({ behavior: 'smooth', block: 'center' })
