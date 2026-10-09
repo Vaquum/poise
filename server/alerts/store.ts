@@ -226,18 +226,34 @@ export function dismissAlert(seq: number, now = Date.now()): boolean {
     .run(new Date(now).toISOString(), seq).changes === 1
 }
 
-/** The person asked to hear no more about unresolved alert `seq`. False when
- *  there is no such unresolved alert. */
+/** The person asked to hear no more about unresolved alert `seq`: its
+ *  condition stays silenced, beyond the alert's own 30 days, until
+ *  forgetSilence. False when there is no such unresolved alert. */
 export function silenceAlert(seq: number, now = Date.now()): boolean {
-  return db.prepare('UPDATE alerts SET silenced_at = ? WHERE id = ? AND resolved_at IS NULL')
-    .run(new Date(now).toISOString(), seq).changes === 1
+  const at = new Date(now).toISOString()
+  return db.transaction(() => {
+    const row = db.prepare('SELECT dedupe_key FROM alerts WHERE id = ? AND resolved_at IS NULL').get(seq) as { dedupe_key: string } | undefined
+    if (!row) return false
+    db.prepare('UPDATE alerts SET silenced_at = ? WHERE id = ?').run(at, seq)
+    db.prepare('INSERT INTO alert_silences(dedupe_key, silenced_at) VALUES(?, ?) ON CONFLICT(dedupe_key) DO NOTHING').run(row.dedupe_key, at)
+    return true
+  })()
 }
 
-/** Whether the newest alert under `dedupeKey`, resolved or not, was silenced. */
+/** Whether the person silenced the condition behind `dedupeKey`. */
 export function silenced(dedupeKey: string): boolean {
-  const row = db.prepare('SELECT silenced_at FROM alerts WHERE dedupe_key = ? ORDER BY id DESC LIMIT 1')
-    .get(dedupeKey) as { silenced_at: string | null } | undefined
-  return !!row?.silenced_at
+  return !!db.prepare('SELECT 1 FROM alert_silences WHERE dedupe_key = ?').get(dedupeKey)
+}
+
+/** The silenced conditions whose dedupe key starts with `prefix`. */
+export function silencedKeys(prefix: string): string[] {
+  return (db.prepare('SELECT dedupe_key FROM alert_silences WHERE substr(dedupe_key, 1, ?) = ?').all(prefix.length, prefix) as Array<{ dedupe_key: string }>)
+    .map((row) => row.dedupe_key)
+}
+
+/** The condition's subject is gone: a later one under the same key alerts. */
+export function forgetSilence(dedupeKey: string): void {
+  db.prepare('DELETE FROM alert_silences WHERE dedupe_key = ?').run(dedupeKey)
 }
 
 /** The kind of alert `seq`, unresolved or not; null when there is none. */

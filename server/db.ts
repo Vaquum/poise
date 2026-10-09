@@ -12,6 +12,7 @@ import { join, dirname } from 'path'
 //   content_launches — pre-spawn /content intent and call correlation
 //   alerts         — what Poise Link shows as desktop notifications, and Poise
 //                    as notices at the top of the page (server/alerts)
+//   alert_silences — the alerts the person silenced, until their subject is gone
 //
 // Everything else (issues, PRs, reviews, files) lives in the user's external
 // /github service. Older Poise versions kept a full mirror of GitHub data
@@ -150,6 +151,14 @@ db.exec(`
     created_at TEXT NOT NULL,
     dedupe_key TEXT NOT NULL,
     resolved_at TEXT
+  );
+
+  -- Conditions the person asked to hear no more about, by alert dedupe key
+  -- (server/alerts/notices.ts): kept apart from alerts, which are pruned after
+  -- 30 days, until the condition's subject is gone.
+  CREATE TABLE IF NOT EXISTS alert_silences (
+    dedupe_key TEXT PRIMARY KEY,
+    silenced_at TEXT NOT NULL
   );
 `)
 

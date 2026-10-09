@@ -15,7 +15,7 @@ import { readOwnPullRequests, type OwnPullRequest } from '../gh'
 import { HttpError } from '../http'
 import { getNotificationSettings } from '../settings'
 import {
-  alertKind, alertSeq, dismissAlert, openAlerts, raiseAlert, resolveAlert, silenceAlert, silenced,
+  alertKind, alertSeq, dismissAlert, forgetSilence, openAlerts, raiseAlert, resolveAlert, silenceAlert, silenced, silencedKeys,
   type AlertKind, type AlertTarget, type OpenAlert,
 } from './store'
 
@@ -106,7 +106,7 @@ export function dismissNotice(id: string, now = Date.now()): void {
 }
 
 /** The person asked to hear no more about a ready pull request, until it is
- *  merged or closed. */
+ *  merged or closed: checkReadyPullRequests forgets the silence then. */
 export function silenceNotice(id: string, now = Date.now()): void {
   const seq = storedSeq(id)
   const kind = alertKind(seq)
@@ -155,13 +155,18 @@ export async function checkReadyPullRequests(
   }
   const complete = new Set(listed.map((login) => login.toLowerCase()))
   const followed = new Set(tracked.map((login) => login.toLowerCase()))
+  // Missing from a complete list: merged or closed. Missing because its
+  // account is starting or failed to read: not known yet.
+  const gone = (dedupeKey: string) => {
+    if (open.has(dedupeKey)) return false
+    const owner = dedupeKey.slice(READY_PREFIX.length).split('/')[0].toLowerCase()
+    return !followed.has(owner) || complete.has(owner)
+  }
   for (const alert of openAlerts({ kind: 'pr_ready', now: now() })) {
-    if (open.has(alert.dedupeKey)) continue
-    const owner = alert.dedupeKey.slice(READY_PREFIX.length).split('/')[0].toLowerCase()
-    // Missing from a complete list: merged or closed. Missing because its
-    // account is starting or failed to read: not known yet.
-    if (followed.has(owner) && !complete.has(owner)) continue
-    resolveAlert(alert.dedupeKey, now())
+    if (gone(alert.dedupeKey)) resolveAlert(alert.dedupeKey, now())
+  }
+  for (const dedupeKey of silencedKeys(READY_PREFIX)) {
+    if (gone(dedupeKey)) forgetSilence(dedupeKey)
   }
 }
 

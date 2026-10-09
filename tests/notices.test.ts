@@ -26,6 +26,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   database.db.prepare('DELETE FROM alerts').run()
+  database.db.prepare('DELETE FROM alert_silences').run()
   database.db.prepare('DELETE FROM behavior_dead_letters').run()
   database.db.prepare("DELETE FROM meta WHERE key = 'notification_settings'").run()
 })
@@ -226,6 +227,27 @@ describe('the check for pull requests ready to merge', () => {
     await check(all([pr(1, 'green')]), at(0))
     await check({ pullRequests: [], read: [], tracked: [] }, at(2))
     expect(open()).toEqual([])
+  })
+
+  it('remembers a silence beyond the 30 days alerts are kept, while the pull request stays open', async () => {
+    const DAY = 24 * 60
+    await check(all([pr(1, 'green')]), at(0))
+    notices.silenceNotice(shown(at(1))[0].id, at(1))
+    expect(store.pruneAlerts(at(31 * DAY))).toBe(1)
+    await check(all([pr(1, 'green')]), at(31 * DAY))
+    expect(store.openAlerts({ kind: 'pr_ready', now: at(31 * DAY) })).toEqual([])
+    expect(shown(at(31 * DAY + 20))).toEqual([])
+  })
+
+  it('forgets a silence once the pull request is merged or closed', async () => {
+    await check(all([pr(1, 'green')]), at(0))
+    notices.silenceNotice(shown(at(1))[0].id, at(1))
+    // Missing while its account could not be read: still silenced.
+    await check({ pullRequests: [], read: [], tracked: ['acme'] }, at(2))
+    expect(store.silenced('pr-ready:acme/api#1')).toBe(true)
+    // Missing from a complete list: gone, and so is the silence.
+    await check(all([]), at(4))
+    expect(store.silenced('pr-ready:acme/api#1')).toBe(false)
   })
 
   it('stays silent about a silenced pull request while it is open, however often it is ready again', async () => {
