@@ -34,6 +34,8 @@ export interface FakeDocker {
   /** The task containers run so far, and the exit code the next one ends with. */
   tasks: FakeTask[]
   taskExitCode: number
+  /** Each volume's size in bytes, as /system/df reports it. */
+  volumeSizes: Map<string, number>
   volumes: Set<string>
   networks: Set<string>
   containers: Map<string, FakeContainer>
@@ -83,6 +85,7 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
     imageLabels,
     tasks: [],
     taskExitCode: 0,
+    volumeSizes: new Map(),
     volumes,
     networks,
     containers,
@@ -185,6 +188,9 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
           containers.delete(container.name)
           return send(res, 204)
         }
+      }
+      if (method === 'GET' && path === '/system/df' && url.searchParams.get('type') === 'volume') {
+        return send(res, 200, { Volumes: [...volumes].map((name) => ({ Name: name, UsageData: { Size: fake.volumeSizes.get(name) ?? 0, RefCount: 1 } })) })
       }
       if (method === 'GET' && (match = /^\/volumes\/([^/]+)$/.exec(path))) {
         const name = decodeURIComponent(match[1])

@@ -27,7 +27,35 @@ function action(user: AdminUser, change: AdminChange, label: string, danger = fa
   return `<button type="button" class="st-clear${danger ? ' ad-danger' : ''}" data-change="${change}" data-handle="${escapeHtml(user.handle)}">${label}</button>`
 }
 
-function userHtml(user: AdminUser, self: string): string {
+/** Bytes as a person reads them: 2.4 GB. */
+export function size(bytes: number): string {
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return unit === 0 ? `${value} bytes` : `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`
+}
+
+function diskHtml(view: AdminOverview): string {
+  const disk = view.disk
+  if (!disk || disk.free === null || disk.total === null) return ''
+  const text = `Server disk: ${size(disk.free)} free of ${size(disk.total)}, measured ${moment(disk.measuredAt)}.`
+  return disk.low
+    ? `<div class="st-help st-help-error">${escapeHtml(text)} Less than a tenth is free.</div>`
+    : `<div class="st-help st-help-info">${escapeHtml(text)}</div>`
+}
+
+function userDiskHtml(user: AdminUser, budget: number): string {
+  if (!user.disk) return ''
+  return user.disk.overBudget
+    ? `<div class="st-help st-help-error">${escapeHtml(`${size(user.disk.bytes)} on disk, over its ${size(budget)} budget`)}</div>`
+    : `<div class="st-help st-help-info">${escapeHtml(`${size(user.disk.bytes)} on disk`)}</div>`
+}
+
+function userHtml(user: AdminUser, self: string, budget = 0): string {
   const state = user.workspace?.state ?? 'unknown'
   return `
     <div class="ad-user" data-user="${escapeHtml(user.handle)}">
@@ -38,6 +66,7 @@ function userHtml(user: AdminUser, self: string): string {
       </div>
       <div class="st-help st-help-info">${escapeHtml(user.access)} · last sign-in ${escapeHtml(moment(user.lastLoginAt))}</div>
       ${user.workspace?.image ? `<div class="st-help st-help-info">Image <code>${escapeHtml(user.workspace.image)}</code></div>` : ''}
+      ${userDiskHtml(user, budget)}
       ${user.lastError ? `<div class="st-help st-help-error">${escapeHtml(user.lastError)}</div>` : ''}
       <div class="ad-actions">
         ${action(user, 'workspaces/start', 'Start')}
@@ -64,6 +93,7 @@ export function adminSection(account: GatewayAccount): AdminSection {
   element.innerHTML = `
     <div class="tp-group-label">People and workspaces</div>
     <div class="st-help st-help-error ad-docker" hidden></div>
+    <div class="ad-disk"></div>
     <div class="ad-users" aria-live="polite"><div class="st-help st-help-info">Reading who has signed in…</div></div>
 
     <div class="tp-group-label">Who may sign in</div>
@@ -79,6 +109,7 @@ export function adminSection(account: GatewayAccount): AdminSection {
 
   const usersEl = element.querySelector<HTMLElement>('.ad-users')!
   const dockerEl = element.querySelector<HTMLElement>('.ad-docker')!
+  const diskEl = element.querySelector<HTMLElement>('.ad-disk')!
   const noteEl = element.querySelector<HTMLElement>('.ad-allow-note')!
   const allowedEl = element.querySelector<HTMLElement>('.ad-allowed')!
   const allowInput = element.querySelector<HTMLInputElement>('.ad-allow-input')!
@@ -97,8 +128,9 @@ export function adminSection(account: GatewayAccount): AdminSection {
   const render = (view: AdminOverview) => {
     dockerEl.hidden = !view.dockerError
     dockerEl.textContent = view.dockerError ? `Docker Engine: ${view.dockerError}` : ''
+    diskEl.innerHTML = diskHtml(view)
     usersEl.innerHTML = view.users.length
-      ? view.users.map((user) => userHtml(user, account.handle)).join('')
+      ? view.users.map((user) => userHtml(user, account.handle, view.disk?.budget ?? 0)).join('')
       : '<div class="st-help st-help-info">Nobody has signed in yet.</div>'
     noteEl.textContent = `Admins (${view.admins.join(', ')}) may always sign in.${view.allowedOrgs.length ? ` Members of ${view.allowedOrgs.join(', ')} may sign in too.` : ''}`
     allowedEl.innerHTML = allowedHtml(view)

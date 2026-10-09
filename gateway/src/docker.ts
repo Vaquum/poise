@@ -81,6 +81,8 @@ export interface TaskSpec {
 const TIMEOUT_MS = 60_000
 /** How long a task container may run before the gateway gives up waiting for it. */
 const TASK_TIMEOUT_MS = 10 * 60_000
+/** Sizing every volume reads every file in them. */
+const DISK_USAGE_TIMEOUT_MS = 10 * 60_000
 
 /**
  * The slice of the Docker Engine API the gateway needs, over the Engine's unix socket.
@@ -110,6 +112,14 @@ export class DockerClient {
   async listManagedContainers(): Promise<ContainerSummary[]> {
     const filters = encodeURIComponent(JSON.stringify({ label: ['poise.managed=true'] }))
     return (await this.call('GET', `/containers/json?all=true&filters=${filters}`)).body as ContainerSummary[]
+  }
+
+  /** Each volume's size in bytes, as Docker measures it; -1 for one it did not. Docker walks every volume. */
+  async volumeSizes(): Promise<Map<string, number>> {
+    const body = (await this.call('GET', '/system/df?type=volume', undefined, [], DISK_USAGE_TIMEOUT_MS)).body as {
+      Volumes?: Array<{ Name: string; UsageData?: { Size?: number } | null }> | null
+    }
+    return new Map((body.Volumes ?? []).map((volume) => [volume.Name, volume.UsageData?.Size ?? -1]))
   }
 
   async volumeExists(name: string): Promise<boolean> {
