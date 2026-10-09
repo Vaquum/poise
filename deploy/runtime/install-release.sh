@@ -26,6 +26,9 @@ if [ ! -f "$releases/$release/installed" ] || [ "$(cat "$releases/$release/base"
 fi
 
 if [ "${1:-}" = --activate ]; then
+  # Dated to now, as the supervisor dates a release it switches away from: the pruning below counts from it.
+  previous=$(cat "$releases/current" 2>/dev/null || true)
+  case $previous in ''|*/*|.*) ;; *) [ "$previous" = "$release" ] || [ ! -d "$releases/$previous" ] || touch "$releases/$previous" ;; esac
   printf '%s\n' "$release" > "$releases/current.tmp"
   mv "$releases/current.tmp" "$releases/current"
   # A switch queued before the workspace stopped would start ahead of current.
@@ -33,8 +36,9 @@ if [ "${1:-}" = --activate ]; then
 fi
 
 # Older releases go once five newer ones exist and three hours have passed
-# since they were installed, so an agent still running from one keeps its
-# files. The current release and this one always stay.
+# since they were last current (a release's directory is dated to the moment
+# it stopped being current, or its install), so an agent still running from
+# one keeps its files. The current release and this one always stay.
 current=$(cat "$releases/current" 2>/dev/null || true)
 find "$releases" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %f\n' | sort -rn | tail -n +6 |
   while read -r _ old; do

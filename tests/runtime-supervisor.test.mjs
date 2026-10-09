@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -100,6 +100,26 @@ describe('the workspace supervisor', () => {
     expect((await nth(0)).release.name).toBe('r2')
     instance.stop('SIGTERM')
     started[0].child.exit(0)
+    await running
+  })
+
+  it('dates the release it switches away from to that moment, so pruning keeps it for the agents it launched', async () => {
+    await install('r2', 'B')
+    await install('r3', 'B')
+    await pointer('current', 'r2')
+    // Installed long ago, and current until now.
+    await utimes(join(home, '.poise', 'releases', 'r2'), 1_000, 1_000)
+    const instance = supervise()
+    const running = instance.run()
+    const first = await nth(0)
+    expect(first.release.name).toBe('r2')
+    await pointer('next', 'r3')
+    clock = 1_800_000_000_000
+    first.child.exit(UPDATE_EXIT_CODE)
+    expect((await nth(1)).release.name).toBe('r3')
+    expect((await stat(join(home, '.poise', 'releases', 'r2'))).mtimeMs).toBe(clock)
+    instance.stop('SIGTERM')
+    started[1].child.exit(0)
     await running
   })
 

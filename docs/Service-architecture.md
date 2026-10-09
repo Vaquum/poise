@@ -277,8 +277,9 @@ reconciles them as after any restart.
   base, the gateway runs `install-release.sh` in a short-lived container of
   the new image, as uid 10001 with the workspace's home volume and no
   network. It copies the release into `~/.poise/releases/<release>/` and
-  keeps older ones for at least three hours, so an agent still running from
-  one keeps its files.
+  keeps an older one for at least three hours after it was last current, so
+  an agent still running from it keeps its files. The supervisor dates a
+  release it switches away from to that moment.
 - **Switching.** The gateway then sends `POST /api/service/switch` with
   `{ release }` (`admin` scope or loopback; 202 `{ release, switching }`,
   409 for a release not installed for this base or a server started without

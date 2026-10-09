@@ -10,7 +10,7 @@
 // runs and `next` the one a switch asked for; Poise exits with 75 to switch.
 
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { constants } from 'node:os'
 import { join } from 'node:path'
 
@@ -55,12 +55,27 @@ export function supervisor({
     return existsSync(join(dir, 'installed')) && !existsSync(join(dir, 'failed')) && read(join(dir, 'base')) === base
   }
 
+  /**
+   * Dates a release it switches away from to that moment: install-release.sh keeps a release for three
+   * hours after it was last current, so the agents it launched keep their files.
+   */
+  const retire = (name, successor) => {
+    if (!name || name === successor || !RELEASE_NAME.test(name)) return
+    const seconds = now() / 1000
+    try {
+      utimesSync(join(releases, name), seconds, seconds)
+    } catch {
+      // Gone already, or never installed here: nothing to keep.
+    }
+  }
+
   /** The release a switch asked for, else the current one, else this image's own. */
   const choose = () => {
     const next = read(join(releases, 'next'))
     if (next !== null) {
       rmSync(join(releases, 'next'), { force: true })
       if (usable(next)) {
+        retire(read(join(releases, 'current')), next)
         replace(join(releases, 'current'), next)
         return installed(next)
       }
