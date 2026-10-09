@@ -523,7 +523,10 @@ those happen in place: the gateway installs the new release into each
 running workspace, and Poise restarts on it alone within seconds, at a moment
 no Chat turn runs. Agents and reviews keep running through it, and the open
 page shows "Updating to the latest version" until it reloads into the new
-version (docs/Service-architecture.md, "Updates in place").
+version (docs/Service-architecture.md, "Updates in place"). The first line of
+Poise's menu (☰) says which commit a workspace runs, linked to it on
+autonomio/poise, and when the workspace was updated to it, as in
+`46815bf · 9 Oct 21:40`.
 
 An upgrade that changes the system itself, the files under `deploy/runtime/`,
 gets a new container instead. The gateway drains a running workspace first:
