@@ -849,7 +849,7 @@ function buildPanel(): HTMLElement {
         <div class="tp-group-label">Notifications</div>
 
         <div class="tp-section">
-          <label class="tp-label" id="st-notifications-label">Notifications</label>
+          <label class="tp-label" id="st-notifications-label">Show notifications</label>
           <div class="range-picker st-notifications-picker" role="group" aria-labelledby="st-notifications-label">
             <button type="button" data-notifications="on" class="active" aria-pressed="true">On</button>
             <button type="button" data-notifications="off" aria-pressed="false">Off</button>

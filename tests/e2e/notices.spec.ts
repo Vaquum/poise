@@ -128,7 +128,7 @@ test('is gone with nothing to show, and turns off and on from Settings', async (
 
   await page.getByRole('button', { name: 'Menu' }).click()
   await page.getByRole('button', { name: 'Settings' }).click()
-  const picker = page.locator('#settings-panel').getByRole('group', { name: 'Notifications' })
+  const picker = page.locator('#settings-panel').getByRole('group', { name: 'Show notifications' })
   await expect(picker.getByRole('button', { name: 'On' })).toHaveAttribute('aria-pressed', 'true')
   await picker.getByRole('button', { name: 'Off' }).click()
   await expect(island(page)).toBeHidden()

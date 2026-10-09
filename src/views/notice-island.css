@@ -57,10 +57,18 @@
   gap: 2px;
   padding: 0 3px;
   white-space: nowrap;
-  transition: opacity var(--t-base) var(--ease), transform var(--t-base) var(--ease);
+  /* The arriving notice waits for the leaving one to be mostly gone, so the
+     two never read on top of each other. */
+  transition: opacity var(--t-base) var(--ease) calc(var(--t-quick) / 2), transform var(--t-base) var(--ease) calc(var(--t-quick) / 2);
 }
 .ni-content.ni-arriving { opacity: 0; transform: translateY(6px); }
-.ni-content.ni-leaving { opacity: 0; transform: translateY(-6px); pointer-events: none; }
+.ni-content.ni-leaving {
+  opacity: 0;
+  transform: translateY(-6px);
+  pointer-events: none;
+  transition-duration: var(--t-quick);
+  transition-delay: 0s;
+}
 
 .ni-content[data-kind="chat_waiting"]           { --ni-tone: var(--a1); }
 .ni-content[data-kind="sign_in_needed"]         { --ni-tone: var(--a4); }
