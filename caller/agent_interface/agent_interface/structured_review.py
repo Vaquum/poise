@@ -18,7 +18,7 @@ from uuid import UUID
 from pathlib import Path
 from time import monotonic
 
-from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, expected_head, pr_ref
+from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, expected_head, pr_ref, provider_blocked
 from .model_catalog import Model
 from .review_watch import ReviewWatch
 from . import progress, review_budget, review_receipt
@@ -39,9 +39,7 @@ class InvalidVerdict(ValueError):
 
 
 def provider_failure(message: str) -> None:
-    if ("MUSE GUARD: Muse provider access is latched off locally" in message
-            or "Grok Build usage balance exhausted" in message
-            or "safeguards flagged this message" in message):
+    if provider_blocked(message):
         raise AgentPreflightError(message, "review_provider_blocked")
     raise ValueError(message)
 

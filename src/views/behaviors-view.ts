@@ -11,6 +11,7 @@
 
 import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
 import { organizationErrors } from '../organizations'
+import { failureCause } from '../behavior-failure-cause'
 
 let viewEl: HTMLElement
 let initialized = false
@@ -992,13 +993,6 @@ async function fetchBehaviorOwners() {
   }
 }
 
-function diagnosticCause(error: string): string {
-  const lines = error.trim().split('\n').filter((line) => line.trim())
-  const cause = [...lines].reverse().find((line) => /(?:Error|Timeout|review_packet_too_large):?/.test(line))
-    ?? lines[lines.length - 1] ?? error
-  return cause.trim().slice(0, 300)
-}
-
 function renderDiagnostics() {
   const el = viewEl.querySelector<HTMLElement>('#behavior-diagnostics')
   if (!el) return
@@ -1021,9 +1015,9 @@ function renderDiagnostics() {
     diagnostics.datastore.error ? `Datastore: ${diagnostics.datastore.error}` : '',
     diagnostics.identity.error ? `Identity: ${diagnostics.identity.error}` : '',
     ...diagnostics.failures.map((failure) =>
-      `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}${failure.target ? ` ${failure.target}` : ''}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s)${failure.error ? ` — ${diagnosticCause(failure.error)}` : ''}`),
+      `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}${failure.target ? ` ${failure.target}` : ''}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s)${failure.error ? ` — ${failureCause(failure.error)}` : ''}`),
     ...diagnostics.deadLetters.slice(0, DEAD_LETTERS_SHOWN).map((letter) =>
-      `${letter.behavior} ${letter.target}: ${diagnosticCause(letter.error)}${(letter.attemptCount ?? 1) > 1 ? ` (${letter.attemptCount} attempts)` : ''}`),
+      `${letter.behavior} ${letter.target}: ${failureCause(letter.error)}${(letter.attemptCount ?? 1) > 1 ? ` (${letter.attemptCount} attempts)` : ''}`),
     // A dead letter is a target the behaviour permanently gave up on. Showing
     // the newest few and nothing else made an older one drop off the only
     // surface that names it, with the panel reading as if it were complete.
