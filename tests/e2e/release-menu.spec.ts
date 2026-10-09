@@ -52,6 +52,8 @@ test('a build without a commit opens the menu on Settings', async ({ page }) => 
   release.commit = COMMIT
   release.since = '2026-10-09T18:40:00Z'
   await page.keyboard.press('Escape')
+  // Closed for good before it opens again: a click while it is still closing closes it.
+  await expect(page.locator('#menu-popover')).toBeHidden()
   await page.getByRole('button', { name: 'Menu' }).click()
   await expect(page.locator('#menu-popover .menu-release')).toBeVisible()
   await expect(page.locator('#menu-popover .menu-release-divider')).toBeVisible()
