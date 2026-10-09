@@ -306,19 +306,51 @@ server: the checkout fetches with the run's own token, which expires with the
 run, and the settings reach the server over SSH alone, never on a command
 line.
 
-**Keeping up with autonomio/poise.** Set the variable `POISE_UPSTREAM_SYNC`
-to `true`. The Sync workflow then merges autonomio/poise's main into the
-fork's main every five minutes, as the **Sync fork** button on the fork's page
-does, and deploys what that brought in, so a merged change reaches the server
-within minutes. GitHub may start a scheduled run some minutes late when it is
-busy. A change to Poise alone then reaches the running workspaces within five
-more minutes. A change to the system under `deploy/runtime/` first waits for
-their running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)). GitHub lets no workflow's own token change
-a workflow file, so when autonomio/poise changes one, the sync fails until
-you press **Sync fork**, or give the fork a `POISE_SYNC_TOKEN` secret: a
-fine-grained personal access token for the fork with read and write access
-to its contents and workflows. A fork with commits of its own can conflict
-with autonomio/poise; the sync then fails and leaves the merge to you.
+**Keeping up with autonomio/poise.** For the fork to update itself, it needs
+both of these:
+
+| Name | Kind | Value |
+| --- | --- | --- |
+| `POISE_UPSTREAM_SYNC` | variable | `true` |
+| `POISE_SYNC_TOKEN` | secret | A fine-grained personal access token for the fork, made as below |
+
+The Sync workflow then merges autonomio/poise's main into the fork's main
+every five minutes, as the **Sync fork** button on the fork's page does, and
+deploys what that brought in, so a merged change reaches the server within
+minutes. GitHub may start a scheduled run some minutes late when it is busy.
+A change to Poise alone then reaches the running workspaces within five more
+minutes. A change to the system under `deploy/runtime/` first waits for their
+running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)).
+
+The token is required because GitHub never lets a workflow's own token change
+a workflow file, anything under `.github/workflows/`. autonomio/poise changes
+its workflows from time to time. Without the token, the first such change
+stops the sync, and the fork stays on the commit before it until someone
+presses **Sync fork**. The workflow uses the token for its merges only.
+
+To make the token, open GitHub → Settings → Developer settings → Personal
+access tokens → **Fine-grained tokens** → **Generate new token**, or this
+link, which fills in all but the repository (replace `<owner>` with the fork's
+owner):
+`https://github.com/settings/personal-access-tokens/new?name=Poise+fork+sync&target_name=<owner>&expires_in=366&contents=write&workflows=write`
+
+- **Resource owner:** the fork's owner.
+- **Repository access:** **Only select repositories**, and the fork.
+- **Permissions**, under Repositories: **Contents**: Write, and
+  **Workflows**: Write. GitHub adds **Metadata**: Read by itself.
+- **Expiration:** at most a year. When it expires the sync stops, until a new
+  token replaces it.
+
+Save it in the fork as a repository secret named `POISE_SYNC_TOKEN`: the
+fork's Settings → Secrets and variables → **Actions** → **New repository
+secret**. A secret saved under Dependabot or Codespaces does not reach the
+workflow. An organization secret does only when its repository access
+includes the fork; one limited to private repositories never reaches a public
+fork. To check, run the Sync workflow by hand: its log shows
+`WORKFLOW_TOKEN_ONLY: false` once it has the token.
+
+A fork with commits of its own can conflict with autonomio/poise; the sync
+then fails and leaves the merge to you.
 
 ## In a virtual machine on a shared server
 
