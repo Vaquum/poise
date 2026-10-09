@@ -285,8 +285,9 @@ describe('switching to another release', () => {
     expect(existsSync(join(dir, 'next'))).toBe(false)
   })
 
-  it('calls a pending switch off when asked for the release it runs', async () => {
-    const dir = await releases({ r1: 'b1', r2: 'b1' })
+  it('calls a pending switch off when asked for the release it runs, its image\'s own uninstalled one included', async () => {
+    // r1, the release it runs, is the image's own: nothing in the home volume names it installed.
+    const dir = await releases({ r2: 'b1' })
     const { timer, restart, service } = switching(dir)
     try {
       service.switchRelease('r2')

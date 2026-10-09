@@ -140,6 +140,11 @@ export class ServiceControl {
     if (!(this.options.canRestart ?? canRestartForUpdate)() || !this.release.base) {
       throw new HttpError(409, 'this workspace was not started by the release supervisor; recreate its container to update it')
     }
+    // The release it runs, its image's own included, needs no install: asking for it calls a pending switch off.
+    if (release === this.release.name) {
+      this.withdrawSwitch()
+      return { release, switching: false }
+    }
     const dir = join(this.releasesDir, release)
     let base: string
     try {
@@ -151,10 +156,6 @@ export class ServiceControl {
     if (base !== this.release.base) throw new HttpError(409, `release ${release} was built for another base; recreate the container to update it`)
     // The supervisor marks a release that failed to start, and never runs it again.
     if (existsSync(join(dir, 'failed'))) throw new HttpError(409, `release ${release} failed to start in this workspace; it stays on release ${this.release.name}`)
-    if (release === this.release.name) {
-      this.withdrawSwitch()
-      return { release, switching: false }
-    }
     const next = join(this.releasesDir, 'next')
     writeFileSync(`${next}.tmp`, `${release}\n`)
     renameSync(`${next}.tmp`, next)
