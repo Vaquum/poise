@@ -54,7 +54,7 @@ const greenCache = new Map<string, { status: PrStatus, expiry: number }>()
 
 // Subset of fields the datastore returns. Pr-only and issue-only fields
 // are optional; the user-footprint view adds `item_type` and `reasons`.
-interface DatastoreRecord {
+export interface DatastoreRecord {
   repo: string
   number: number
   status: 'open' | 'closed' | 'merged'
@@ -72,6 +72,9 @@ interface DatastoreRecord {
   payload_ref?: number
   review_comments_count?: number
   commits_count?: number
+  // null for a pull request the datastore stored before it read sizes
+  additions?: number | null
+  deletions?: number | null
   owner_login?: string | null
   owner_avatar?: string | null
   // Issue-only
@@ -110,7 +113,7 @@ interface GhRecord {
   owner_avatar: string | null
 }
 
-async function runCli(org: Organization, args: string[]): Promise<DatastoreRecord[]> {
+export async function runCli(org: Organization, args: string[]): Promise<DatastoreRecord[]> {
   const { stdout } = await runFile(CLI, organizationArgs(org, args), {
     timeoutMs: 30_000,
     maxOutputBytes: 32 * 1024 * 1024,
@@ -384,17 +387,13 @@ async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promi
   return { records: results, errors: read.errors }
 }
 
-// Query each ready organization's own datastore. Full repository identities
-// survive merging; the final pagination applies only after the combined sort.
-async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: Organization[]): Promise<{ records: GhRecord[], errors: OrganizationReadError[] }> {
-  // Scope(s) selecting WHICH records — the leading CLI args that differ
-  // per query. The common filters (status / since / limit / format) are
-  // appended identically to each scope below.
-  //
-  // When body.author is set, scope is "PRs/issues authored by X across
-  // the org" (uses views.pr / views.issue with --author). The author
-  // path lets behaviors target a specific user (e.g. the Poise account)
-  // even when the configured `me` is a different user — no agent union.
+/** The datastore queries that select what Current shows: what `me` is
+ *  involved in, plus what the agent account authored on their behalf. */
+export function involvementScopes(itemType: 'pr' | 'issue', me: string, author?: string): string[][] {
+  // When author is set, scope is "PRs/issues authored by X across the org"
+  // (uses views.pr / views.issue with --author). The author path lets
+  // behaviors target a specific user (e.g. the Poise account) even when the
+  // configured `me` is a different user — no agent union.
   //
   // Otherwise scope is "things `me` is involved in" via views.user. The
   // agent account acts on the user's behalf, so we also union what IT
@@ -406,19 +405,22 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: 
   // involvement view: github-datastore only populates views.user for the
   // configured user, so the agent's involvement comes back empty — and
   // "authored" is the semantic we want anyway (what the agent produced for
-  // us, not every PR it merely reviewed). Deduped by repo#number below.
-  const scopes: string[][] = []
+  // us, not every PR it merely reviewed). Callers dedupe by repo#number.
+  if (author) return [[itemType, '--author', author]]
+  if (!me) return [[itemType]]
+  const scopes = [['user', '--username', me, '--item-type', itemType]]
   const agent = agentAccount()
-  if (body.author) {
-    scopes.push([itemType, '--author', String(body.author)])
-  } else if (me) {
-    scopes.push(['user', '--username', me, '--item-type', itemType])
-    if (agent && agent !== me) {
-      scopes.push([itemType, '--author', agent])
-    }
-  } else {
-    scopes.push([itemType])
-  }
+  if (agent && agent !== me) scopes.push([itemType, '--author', agent])
+  return scopes
+}
+
+// Query each ready organization's own datastore. Full repository identities
+// survive merging; the final pagination applies only after the combined sort.
+async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: Organization[]): Promise<{ records: GhRecord[], errors: OrganizationReadError[] }> {
+  // Scope(s) selecting WHICH records — the leading CLI args that differ
+  // per query. The common filters (status / since / limit / format) are
+  // appended identically to each scope below.
+  const scopes = involvementScopes(itemType, me, body.author ? String(body.author) : undefined)
 
   const common: string[] = []
   if (body.record_state === 'open') common.push('--status', 'open')

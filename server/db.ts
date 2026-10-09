@@ -910,6 +910,27 @@ export function completeBehaviorLaunchOwned(input: {
   })()
 }
 
+/** A review or approval a behavior completed on a pull request. */
+export interface CompletedBehaviorAction {
+  repo: string
+  pr: number
+  action: BehaviorLaunchAction
+  completedAt: string
+}
+
+// Only launches whose agent reported the typed result count: a launch that
+// failed, was superseded or never finished did nothing on GitHub.
+export function listCompletedBehaviorActions(): CompletedBehaviorAction[] {
+  return (db.prepare(`
+    SELECT launch_repo AS repo, launch_pr AS pr, launch_action AS action, launch_completed_at AS completedAt
+    FROM behavior_seen
+    WHERE launch_behavior IN ('pr_review', 'pr_approve')
+      AND launch_completed_at IS NOT NULL
+      AND (launch_action, launch_outcome) IN (
+        VALUES ('reviewed_clean', 'clean'), ('requested_changes', 'changes_requested'), ('approved', 'approved'))
+  `).all() as CompletedBehaviorAction[])
+}
+
 // An issue review ends in comments rather than a review on a head.
 export function completeIssueReviewLaunchOwned(input: {
   key: string

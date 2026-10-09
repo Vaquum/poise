@@ -239,6 +239,8 @@ PR_GRAPH_FIELDS = f"""
       mergedAt
       mergedBy {{ login }}
       isDraft
+      additions
+      deletions
       comments(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{

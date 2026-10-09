@@ -70,7 +70,13 @@ payload_ref
 comments_count
 review_comments_count
 commits_count
+additions
+deletions
 ```
+
+`additions` and `deletions` are the pull request's line counts as GitHub
+reports them. They are `null` for a pull request not read since they were
+added; the next full reconcile reads every pull request again.
 
 ### `views.issue(...)`
 
