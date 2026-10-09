@@ -1,6 +1,6 @@
 [package]
 name = "poise-link"
-version = "0.1.1"
+version = "0.1.2"
 description = "Poise Link keeps Espanso in sync with Poise snippets and shows Poise alerts as native notifications."
 authors = ["Mikko Kotila"]
 license = "MIT"
@@ -39,6 +39,11 @@ thiserror = "2.0"
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+# The macOS launch agent asks launchd about this user's session (getuid) and asks another copy of
+# Poise Link to quit (kill).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
 
 # reqwest's TLS uses aws-lc, whose 64-bit Windows build needs the NASM assembler. Its prebuilt
 # objects let Windows builds (including CI's runners, which lack NASM) work without it.
