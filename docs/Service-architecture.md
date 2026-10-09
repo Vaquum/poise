@@ -442,10 +442,15 @@ Poise Link while it is unfinished.
     had a ready GitHub account when it was first asked, `pending` otherwise.
   - `step` is where it resumes.
   - `logins` holds, per agent CLI, when its Connect terminal last exited with
-    code 0. The CLIs that report no sign-in (Grok, Muse, Antigravity) count as
-    signed in once that has happened.
-- `POST /api/onboarding` takes `{ step }`, `{ done: true }` or `{ restart: true
-  }` and answers like the GET.
+    code 0, or when the person said it is signed in. Antigravity is the
+    exception to the first: its terminal runs the app itself, which exits
+    cleanly whether or not a sign-in finished.
+  - The CLIs that report no sign-in (Grok, Muse, Antigravity) count as signed
+    in once that has happened. Setup lets the person say so, or take it back,
+    with `POST /api/onboarding` and `{ account, signedIn }`; for any other
+    `account` that answers 400.
+- `POST /api/onboarding` takes `{ step }`, `{ done: true }`, `{ restart: true
+  }` or `{ account, signedIn }`, and answers like the GET.
 - `POST /api/onboarding/github` takes `{ role: "me" | "agent", login }`.
   - It checks that gh holds a sign-in for `login` and that its token answers
     GitHub's `/user` as that account, with the `repo` and `read:org` scopes
