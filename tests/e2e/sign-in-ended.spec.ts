@@ -9,7 +9,14 @@ type SignIn = 'valid' | 'ended' | 'redirected'
 
 const PORTAL = 'https://portal.example.test'
 
-async function workspace(page: Page, state: { signIn: SignIn, claudeReachable?: boolean }): Promise<void> {
+interface State {
+  signIn: SignIn
+  claudeReachable?: boolean
+  /** Answers to /api/workspace that fail first, as while a workspace starts or updates. */
+  workspaceFailures?: number
+}
+
+async function workspace(page: Page, state: State): Promise<void> {
   await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'main') })
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com|github\.com)\//, (route) => route.abort())
   // The login page of a proxy in front of Poise: on another origin, so the page's own requests cannot read it.
@@ -22,7 +29,13 @@ async function workspace(page: Page, state: { signIn: SignIn, claudeReachable?: 
     if (state.signIn === 'redirected') {
       return route.fulfill({ status: 303, headers: { location: `${PORTAL}/login?next=${encodeURIComponent(url.href)}` } })
     }
-    if (url.pathname === '/api/workspace') return route.fulfill({ json: { mode: 'service', owner: 'octocat' } })
+    if (url.pathname === '/api/workspace') {
+      if (state.workspaceFailures) {
+        state.workspaceFailures -= 1
+        return route.fulfill({ status: 503, json: { error: 'workspace_starting', message: 'Your workspace is starting. Try again in a moment.' } })
+      }
+      return route.fulfill({ json: { mode: 'service', owner: 'octocat' } })
+    }
     if (url.pathname === '/api/claude-auth') {
       if (state.claudeReachable === false) return route.abort('connectionrefused')
       return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
@@ -42,7 +55,7 @@ async function untilNoticed(page: Page): Promise<void> {
 
 for (const signIn of ['ended', 'redirected'] as const) {
   test(`says the sign-in has ended when ${signIn === 'ended' ? 'the gateway answers 401' : 'a login proxy redirects'}, and signs in again by reloading`, async ({ page }) => {
-    const state: { signIn: SignIn } = { signIn: 'valid' }
+    const state: State = { signIn: 'valid' }
     await workspace(page, state)
     await page.goto('/')
     await expect(page.locator('#app')).toBeVisible()
@@ -62,6 +75,16 @@ for (const signIn of ['ended', 'redirected'] as const) {
     await expect(page.locator('.up-backdrop')).toHaveCount(0)
   })
 }
+
+test('notices an ended sign-in even when the page\'s first look at the workspace failed', async ({ page }) => {
+  const state: State = { signIn: 'valid', workspaceFailures: 1 }
+  await workspace(page, state)
+  await page.goto('/')
+  await expect(page.locator('#app')).toBeVisible()
+  state.signIn = 'ended'
+  await untilNoticed(page)
+  await expect(page.getByRole('alertdialog', { name: 'Your sign-in has ended' })).toBeVisible()
+})
 
 test('offers no Claude reconnect when Poise\'s own server cannot be reached, and claims no ended sign-in', async ({ page }) => {
   await workspace(page, { signIn: 'valid', claudeReachable: false })
