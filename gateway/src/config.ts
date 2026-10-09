@@ -27,6 +27,8 @@ export interface Config {
   admins: string[]
   runtimeImage: string
   workspaceMemoryBytes: number
+  /** A workspace's home volume past this many bytes is reported (POISE_WORKSPACE_DISK_BUDGET); 0 reports none. */
+  workspaceDiskBudgetBytes: number
   workspaceNanoCpus: number
   workspacePids: number
   workspaceRuntime: string | null
@@ -194,6 +196,12 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     return parsed
   }
   const workspacePids = wholeNumber('POISE_WORKSPACE_PIDS', 4096)
+  const budgetValue = read('POISE_WORKSPACE_DISK_BUDGET') ?? '50g'
+  const budgetMatch = /^(\d+(?:\.\d+)?)([bkmg]?)$/i.exec(budgetValue)
+  const workspaceDiskBudgetBytes = budgetMatch ? Math.floor(Number(budgetMatch[1]) * SIZE_UNITS[budgetMatch[2].toLowerCase()]) : -1
+  if (workspaceDiskBudgetBytes < 0) {
+    problems.push(`POISE_WORKSPACE_DISK_BUDGET must be a size such as 50g or 500m, or 0 for none; got "${budgetValue}"`)
+  }
   // Workspaces get this value and refuse to start with more than a week.
   const drainTimeoutSeconds = wholeNumber('POISE_DRAIN_TIMEOUT', 30 * 60, MAX_DRAIN_TIMEOUT_SECONDS)
   const port = wholeNumber('PORT', 8080, 65535)
@@ -250,6 +258,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     admins,
     runtimeImage,
     workspaceMemoryBytes,
+    workspaceDiskBudgetBytes,
     workspaceNanoCpus: Math.round(cpus * 1e9),
     workspacePids,
     workspaceRuntime,

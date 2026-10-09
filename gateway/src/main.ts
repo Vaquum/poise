@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { ConfigError, loadConfig, type Config } from './config.js'
+import { DiskWatch } from './disk.js'
 import { DockerClient } from './docker.js'
 import { createGateway } from './gateway.js'
 import { GitHubClient } from './github.js'
@@ -39,6 +40,7 @@ const docker = new DockerClient(config.dockerSocket)
 const workspaceResolvConf = await prepareWorkspaceDns(config, docker)
 if (workspaceResolvConf) log.info('workspace.dns.configured', { resolvers: config.workspaceDns, file: workspaceResolvConf })
 const orchestrator = new Orchestrator({ config, docker, store, keys, log, now, upstream: workspaceUpstream, workspaceResolvConf })
+const disk = new DiskWatch({ config, docker, log, now })
 const gateway = createGateway({
   config,
   store,
@@ -46,6 +48,7 @@ const gateway = createGateway({
   github: new GitHubClient(config),
   docker,
   orchestrator,
+  disk,
   log,
   now,
   upstream: workspaceUpstream,
@@ -58,11 +61,13 @@ gateway.server.listen(config.port, () => {
   log.info('gateway.listening', { port: config.port, domain: config.domain, image: config.runtimeImage })
 })
 const stopUpgrades = orchestrator.startUpgradeLoop()
+const stopDiskWatch = disk.start()
 const stopPurging = startPurgeLoop(store, log, PURGE_INTERVAL_MS)
 
 function shutdown(signal: string): void {
   log.info('gateway.stopping', { signal })
   stopUpgrades()
+  stopDiskWatch()
   stopPurging()
   gateway.close().then(
     () => {

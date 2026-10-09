@@ -92,13 +92,27 @@ function adminJson(view: AdminOverview) {
         // null while the Docker Engine cannot be asked; dockerError says why.
         workspace: view.workspaces === null ? null : workspace ?? { state: 'not created', image: null },
         lastError: view.records.get(user.handle)?.lastError ?? null,
+        // Bytes in their home volume, and whether that is over POISE_WORKSPACE_DISK_BUDGET; null until measured.
+        disk: diskOf(view, user.handle),
       }
     }),
     allowed: view.allowed.map(({ handle, source, addedBy, addedAt }) => ({ handle, source, addedBy, addedAt })),
     admins: view.admins,
     allowedOrgs: view.allowedOrgs,
     dockerError: view.dockerError,
+    disk: view.disk === null ? null : {
+      measuredAt: view.disk.measuredAt,
+      free: view.disk.free,
+      total: view.disk.total,
+      low: view.disk.low,
+      budget: view.diskBudget,
+    },
   }
+}
+
+function diskOf(view: AdminOverview, handle: string): { bytes: number; overBudget: boolean } | null {
+  const bytes = view.disk?.workspaces.get(handle)
+  return bytes === undefined ? null : { bytes, overBudget: view.diskBudget > 0 && bytes > view.diskBudget }
 }
 
 function adminChange(change: (ctx: Context, principal: Principal, body: Record<string, unknown>) => void | Promise<void>): Route {

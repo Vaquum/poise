@@ -7,6 +7,7 @@ import type { GitHubClient } from './github.js'
 import { header, HttpError, safeEqual } from './http.js'
 import type { GatewayKeys } from './keys.js'
 import type { Logger } from './log.js'
+import type { DiskWatch } from './disk.js'
 import type { Orchestrator, UpstreamResolver } from './orchestrator.js'
 import { FONT_ORIGIN } from './pages.js'
 import type { Session, Store, User } from './store.js'
@@ -26,6 +27,8 @@ export interface GatewayDeps {
   github: GitHubClient
   docker: DockerClient
   orchestrator: Orchestrator
+  /** What the gateway last measured of disk use; absent where nothing measures it. */
+  disk?: DiskWatch
   log: Logger
   now: () => number
   upstream: UpstreamResolver

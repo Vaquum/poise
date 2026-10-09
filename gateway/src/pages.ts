@@ -1,4 +1,5 @@
 import type { AllowedLogin, User, WorkspaceRecord } from './store.js'
+import type { DiskReport } from './disk.js'
 
 /** Markup that is already safe to emit. Everything else interpolated into `html` is escaped. */
 export class Html {
@@ -219,6 +220,38 @@ export interface AdminView {
   records: Map<string, WorkspaceRecord>
   access: Map<string, string>
   dockerError: string | null
+  /** What the gateway last measured of disk use; null before the first measurement. */
+  disk: DiskReport | null
+  /** POISE_WORKSPACE_DISK_BUDGET in bytes; 0 for none. */
+  diskBudget: number
+}
+
+/** Bytes as a person reads them: 2.4 GB. */
+export function size(bytes: number): string {
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return unit === 0 ? `${value} bytes` : `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`
+}
+
+function diskLine(view: AdminView): Html | string {
+  const { disk } = view
+  if (!disk || disk.free === null || disk.total === null) return ''
+  const text = `Server disk: ${size(disk.free)} free of ${size(disk.total)}, measured ${when(disk.measuredAt)}.`
+  return disk.low ? html`<p class="error">${text} Less than a tenth is free.</p>` : html`<p class="muted">${text}</p>`
+}
+
+function workspaceDisk(view: AdminView, handle: string): Html | string {
+  const bytes = view.disk?.workspaces.get(handle)
+  if (bytes === undefined) return ''
+  const over = view.diskBudget > 0 && bytes > view.diskBudget
+  return over
+    ? html`<br><span class="error">${size(bytes)} on disk, over its ${size(view.diskBudget)} budget</span>`
+    : html`<br><span class="muted">${size(bytes)} on disk</span>`
 }
 
 function actionButton(csrf: string, action: string, handle: string, label: string, style = 'secondary'): Html {
@@ -239,7 +272,7 @@ export function adminPage(view: AdminView): string {
     const record = view.records.get(user.handle)
     return html`<tr>
 <td><strong>${user.login}</strong>${view.admins.includes(user.handle) ? html` <span class="muted">admin</span>` : ''}<br><span class="muted">${view.access.get(user.handle) ?? ''} · last sign-in ${when(user.lastLoginAt)}</span></td>
-<td>${view.workspaces === null ? html`<span class="muted">unknown</span>` : workspace ? workspace.state : 'not created'}
+<td>${view.workspaces === null ? html`<span class="muted">unknown</span>` : workspace ? workspace.state : 'not created'}${workspaceDisk(view, user.handle)}
 ${record?.lastError ? html`<br><span class="error">${record.lastError}</span>` : ''}</td>
 <td>${workspace ? html`<code>${workspace.image}</code>` : ''}</td>
 <td>${actionButton(view.csrf, 'workspaces/start', user.handle, 'Start')} ${actionButton(view.csrf, 'workspaces/stop', user.handle, 'Stop')} ${actionButton(view.csrf, 'workspaces/restart', user.handle, 'Restart')}
@@ -262,6 +295,7 @@ ${user.disabledAt === null
   return page('Admin', html`<div class="card">
 <div class="label">Users and workspaces</div>
 ${view.dockerError ? html`<p class="error">Docker Engine: ${view.dockerError}</p>` : ''}
+${diskLine(view)}
 ${view.users.length === 0
     ? html`<p class="muted">Nobody has signed in yet.</p>`
     : html`<table><tr><th>User</th><th>Workspace</th><th>Image</th><th></th></tr>${userRows}</table>`}

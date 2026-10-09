@@ -594,6 +594,20 @@ docker volume rm poise-gateway-data $(docker volume ls --quiet --filter name=poi
 ./install.sh
 ```
 
+## Disk
+
+The gateway measures every workspace's home volume and the free space of the
+disk its data lives on when it starts and every hour. Settings → Admin and
+the admin page show both. The gateway logs `disk.workspace.over_budget` when
+a workspace grows past `POISE_WORKSPACE_DISK_BUDGET` (50 GB by default), and
+`disk.low` when less than a tenth of the disk is free. Each is logged once,
+until it clears.
+
+What grows in a home volume is each person's own: their provider CLIs, Chat
+history, the GitHub indexes Poise reads, and the repositories agents check
+out. Review checkouts are removed a day after their last use. Old images and
+build cache are removed after each deploy ([Upgrades](#upgrades)).
+
 ## Logs
 
 From `deploy/`:

@@ -55,6 +55,8 @@ export interface ContainerSpec {
 }
 
 const TIMEOUT_MS = 60_000
+/** Sizing every volume reads every file in them. */
+const DISK_USAGE_TIMEOUT_MS = 10 * 60_000
 
 /**
  * The slice of the Docker Engine API the gateway needs, over the Engine's unix socket.
@@ -77,6 +79,14 @@ export class DockerClient {
   async listManagedContainers(): Promise<ContainerSummary[]> {
     const filters = encodeURIComponent(JSON.stringify({ label: ['poise.managed=true'] }))
     return (await this.call('GET', `/containers/json?all=true&filters=${filters}`)).body as ContainerSummary[]
+  }
+
+  /** Each volume's size in bytes, as Docker measures it; -1 for one it did not. Docker walks every volume. */
+  async volumeSizes(): Promise<Map<string, number>> {
+    const body = (await this.call('GET', '/system/df?type=volume', undefined, [], DISK_USAGE_TIMEOUT_MS)).body as {
+      Volumes?: Array<{ Name: string; UsageData?: { Size?: number } | null }> | null
+    }
+    return new Map((body.Volumes ?? []).map((volume) => [volume.Name, volume.UsageData?.Size ?? -1]))
   }
 
   async volumeExists(name: string): Promise<boolean> {
@@ -121,7 +131,7 @@ export class DockerClient {
     await this.call('DELETE', `/containers/${encodeURIComponent(name)}`)
   }
 
-  private call(method: string, path: string, body?: unknown, accepted: number[] = []): Promise<{ status: number; body: unknown }> {
+  private call(method: string, path: string, body?: unknown, accepted: number[] = [], timeoutMs = TIMEOUT_MS): Promise<{ status: number; body: unknown }> {
     const operation = `${method} ${path.split('?')[0]}`
     return new Promise((resolve, reject) => {
       const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body))
@@ -159,7 +169,7 @@ export class DockerClient {
           reject(new DockerError(status, `Docker Engine ${operation} failed with HTTP ${status}: ${message}`))
         })
       })
-      req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error(`timed out after ${TIMEOUT_MS / 1000} seconds`)))
+      req.setTimeout(timeoutMs, () => req.destroy(new Error(`timed out after ${timeoutMs / 1000} seconds`)))
       req.on('error', (error) => reject(new Error(`Docker Engine ${operation} at ${this.socketPath} failed: ${error.message}`)))
       req.end(payload)
     })

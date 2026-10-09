@@ -26,13 +26,14 @@ function device(id: string, state: PairedDevice['state'] = 'active'): PairedDevi
 
 const ADMIN: AdminOverview = {
   users: [
-    { handle: 'octocat', login: 'octocat', admin: true, access: 'admin', lastLoginAt: Date.parse('2026-10-09T06:00:00Z'), disabled: false, workspace: { state: 'running', image: '111111111111 (current)' }, lastError: null },
-    { handle: 'alice', login: 'Alice', admin: false, access: 'allow list', lastLoginAt: Date.parse('2026-10-08T06:00:00Z'), disabled: false, workspace: { state: 'exited', image: '000000000000 (outdated)' }, lastError: 'the last start timed out' },
+    { handle: 'octocat', login: 'octocat', admin: true, access: 'admin', lastLoginAt: Date.parse('2026-10-09T06:00:00Z'), disabled: false, workspace: { state: 'running', image: '111111111111 (current)' }, lastError: null, disk: { bytes: 2.4 * 1024 ** 3, overBudget: false } },
+    { handle: 'alice', login: 'Alice', admin: false, access: 'allow list', lastLoginAt: Date.parse('2026-10-08T06:00:00Z'), disabled: false, workspace: { state: 'exited', image: '000000000000 (outdated)' }, lastError: 'the last start timed out', disk: { bytes: 61 * 1024 ** 3, overBudget: true } },
   ],
   allowed: [{ handle: 'alice', source: 'admin', addedBy: 'octocat', addedAt: Date.parse('2026-10-01T06:00:00Z') }],
   admins: ['octocat'],
   allowedOrgs: [],
   dockerError: null,
+  disk: { measuredAt: Date.parse('2026-10-09T07:00:00Z'), free: 20 * 1024 ** 3, total: 290 * 1024 ** 3, low: true, budget: 50 * 1024 ** 3 },
 }
 
 async function setup(page: Page, mode: 'service' | 'local', isAdmin = false) {
@@ -126,6 +127,11 @@ test('gives the gateway\'s admins an Admin tab that manages people and workspace
   await expect(alice).toContainText('allow list')
   await expect(alice).toContainText('000000000000 (outdated)')
   await expect(alice).toContainText('the last start timed out')
+  // Disk use, as the gateway last measured it.
+  await expect(alice).toContainText('61 GB on disk, over its 50 GB budget')
+  await expect(page.locator('.ad-user[data-user="octocat"]')).toContainText('2.4 GB on disk')
+  await expect(page.locator('.ad-disk')).toContainText('Server disk: 20 GB free of 290 GB')
+  await expect(page.locator('.ad-disk')).toContainText('Less than a tenth is free.')
   // An admin cannot disable themselves.
   await expect(page.locator('.ad-user[data-user="octocat"] [data-change="users/disable"]')).toHaveCount(0)
   await expect(page.locator('.ad-allowed-row')).toContainText('added by octocat')

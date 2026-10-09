@@ -34,6 +34,7 @@ describe('configuration', () => {
       admins: ['root'],
       runtimeImage: 'poise-runtime:latest',
       workspaceMemoryBytes: 8 * 1024 ** 3,
+      workspaceDiskBudgetBytes: 50 * 1024 ** 3,
       workspaceNanoCpus: 4_000_000_000,
       workspacePids: 4096,
       workspaceRuntime: null,
@@ -187,6 +188,14 @@ describe('configuration', () => {
     expect(loadConfig({ ...BASE, POISE_DRAIN_TIMEOUT: '604800' }).drainTimeoutSeconds).toBe(604800)
     expect(problems({ ...BASE, POISE_DRAIN_TIMEOUT: '604801' })).toEqual([
       'POISE_DRAIN_TIMEOUT must be a whole number from 1 to 604800; got "604801"',
+    ])
+  })
+
+  it('takes a disk budget as a size, or 0 for none', () => {
+    expect(loadConfig({ ...BASE, POISE_WORKSPACE_DISK_BUDGET: '500m' }).workspaceDiskBudgetBytes).toBe(500 * 1024 ** 2)
+    expect(loadConfig({ ...BASE, POISE_WORKSPACE_DISK_BUDGET: '0' }).workspaceDiskBudgetBytes).toBe(0)
+    expect(problems({ ...BASE, POISE_WORKSPACE_DISK_BUDGET: 'lots' })).toEqual([
+      'POISE_WORKSPACE_DISK_BUDGET must be a size such as 50g or 500m, or 0 for none; got "lots"',
     ])
   })
 

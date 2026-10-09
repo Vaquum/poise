@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { expect } from 'vitest'
 import type { AssertionClaims } from '../src/assertion.js'
 import { loadConfig, type Config } from '../src/config.js'
+import { DiskWatch } from '../src/disk.js'
 import { DockerClient } from '../src/docker.js'
 import { createGateway, type Gateway } from '../src/gateway.js'
 import { GitHubClient } from '../src/github.js'
@@ -53,6 +54,8 @@ export interface Harness {
   docker: FakeDocker
   workspace: WorkspaceStub
   orchestrator: Orchestrator
+  /** The server's filesystem reads 200 GB free of 290 GB. */
+  disk: DiskWatch
   logs: Array<Record<string, unknown>>
   port: number
   advance(ms: number): void
@@ -183,8 +186,9 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     config, docker: dockerClient, store, keys, log, now, upstream, workspaceResolvConf,
     drainPollMs: options.drainPollMs ?? 10, drainRenewMs: options.drainRenewMs,
   })
+  const disk = new DiskWatch({ config, docker: dockerClient, log, now, space: async () => ({ free: 200 * 1024 ** 3, total: 290 * 1024 ** 3 }) })
   const gateway: Gateway = createGateway({
-    config, store, keys, github: new GitHubClient(config), docker: dockerClient, orchestrator, log, now, upstream,
+    config, store, keys, github: new GitHubClient(config), docker: dockerClient, orchestrator, disk, log, now, upstream,
   })
   await new Promise<void>((resolve) => gateway.server.listen(0, '127.0.0.1', resolve))
   const { port } = gateway.server.address() as AddressInfo
@@ -233,6 +237,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     docker,
     workspace,
     orchestrator,
+    disk,
     logs,
     port,
     advance: (ms) => {
