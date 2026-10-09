@@ -126,6 +126,16 @@ fn watch_status(app: AppHandle, controller: Arc<Controller>, tray: Arc<Tray>) {
             if let Err(error) = app.emit(STATUS_EVENT, StatusView::from(&status)) {
                 log::error!("could not update the window: {error}");
             }
+            let code = status.pairing_code();
+            if code.is_some() && code != previous.pairing_code() {
+                // A code to enter in Poise: a tray app has no Dock icon to find the
+                // window by, so it comes forward and stays above other windows
+                // until pairing ends.
+                show_window(&app);
+                keep_on_top(&app, true);
+            } else if code.is_none() && previous.pairing_code().is_some() {
+                keep_on_top(&app, false);
+            }
             let was_pairing = matches!(previous.connection, Connection::Pairing { .. });
             let signed_out = matches!(status.connection, Connection::SignedOut { .. });
             if was_pairing && status.is_paired() {
@@ -152,6 +162,14 @@ fn show_window(app: &AppHandle) {
         .and_then(|()| window.set_focus())
     {
         log::error!("could not show the window: {error}");
+    }
+}
+
+fn keep_on_top(app: &AppHandle, on_top: bool) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW)
+        && let Err(error) = window.set_always_on_top(on_top)
+    {
+        log::error!("could not change whether the window stays on top: {error}");
     }
 }
 

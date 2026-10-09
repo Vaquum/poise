@@ -66,6 +66,17 @@ pub struct Status {
 }
 
 impl Status {
+    /// The code a pairing in progress shows, once the server has issued it.
+    pub fn pairing_code(&self) -> Option<&str> {
+        match &self.connection {
+            Connection::Pairing {
+                user_code: Some(code),
+                ..
+            } => Some(code),
+            _ => None,
+        }
+    }
+
     /// Whether a device token is in use (connected or trying to be).
     pub fn is_paired(&self) -> bool {
         matches!(
@@ -186,6 +197,27 @@ mod tests {
         assert_eq!(
             line(Snippets::Rejected { reason: "x".into() }),
             "Snippets rejected, kept the previous file"
+        );
+    }
+
+    #[test]
+    fn has_a_pairing_code_only_once_the_server_has_issued_one() {
+        let waiting = Connection::Pairing {
+            user_code: None,
+            verification_uri: None,
+        };
+        assert_eq!(status(waiting, Snippets::NotSynced).pairing_code(), None);
+        let issued = Connection::Pairing {
+            user_code: Some("WDJB-MJHT".into()),
+            verification_uri: None,
+        };
+        assert_eq!(
+            status(issued, Snippets::NotSynced).pairing_code(),
+            Some("WDJB-MJHT")
+        );
+        assert_eq!(
+            status(Connection::Connected, Snippets::NotSynced).pairing_code(),
+            None
         );
     }
 
