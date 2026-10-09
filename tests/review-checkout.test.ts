@@ -90,8 +90,9 @@ describe('review checkout provisioning through Caller', () => {
 describe('review checkout retention', () => {
   const day = REVIEW_CHECKOUT_RETENTION_MS
   const checkouts = () => join(root, 'review-checkouts')
-  // What review-checkouts holds besides the lock a review marks its head under.
-  const entries = async () => (await readdir(checkouts())).filter((name) => name !== '.lock').sort()
+  // What review-checkouts holds besides the lock a review marks its head
+  // under, and the journal SQLite keeps beside it.
+  const entries = async () => (await readdir(checkouts())).filter((name) => !name.startsWith('.lock')).sort()
   // A head's checkout as provisioning leaves it, last resolved `age` ago.
   const provisioned = async (name: string, age: number): Promise<void> => {
     const headPath = join(checkouts(), name)
@@ -149,12 +150,14 @@ describe('review checkout retention', () => {
 
   it('marks its head only under the lock a prune judges heads under', async () => {
     let resolving: Promise<string> | undefined
+    let whileLocked: string[] = []
     await withProcessLock({ path: join(checkouts(), '.lock') }, async () => {
       resolving = resolveCheckout()
       await settle()
-      expect(await entries()).toEqual([])
+      whileLocked = await entries()
     })
     expect(await resolving).toBe(join(checkouts(), head, owner, repo))
+    expect(whileLocked).toEqual([])
     expect(await entries()).toEqual([head])
   })
 
