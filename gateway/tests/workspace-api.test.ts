@@ -56,6 +56,24 @@ describe('the gateway API on a workspace host', () => {
     expect(h.workspace.requests).toHaveLength(0)
   })
 
+  it('shows admins each workspace\'s disk use against its budget and the server\'s free space, once measured', async () => {
+    const alice = await h.openWorkspace('Alice')
+    expect((await api(h, ROOT, root, 'admin')).json<{ disk: unknown }>().disk).toBeNull()
+    h.docker.volumes.add('poise-home-alice')
+    h.docker.volumeSizes.set('poise-home-alice', 60 * 1024 ** 3)
+    h.docker.volumes.add('poise-home-root')
+    h.docker.volumeSizes.set('poise-home-root', 2 * 1024 ** 3)
+    await h.disk.measure()
+    const view = (await api(h, ROOT, root, 'admin')).json<{ users: Array<{ handle: string; disk: unknown }>; disk: unknown }>()
+    expect(view.disk).toMatchObject({ free: 200 * 1024 ** 3, total: 290 * 1024 ** 3, low: false, budget: 50 * 1024 ** 3 })
+    expect(view.users.find((user) => user.handle === 'alice')?.disk).toEqual({ bytes: 60 * 1024 ** 3, overBudget: true })
+    expect(view.users.find((user) => user.handle === 'root')?.disk).toEqual({ bytes: 2 * 1024 ** 3, overBudget: false })
+    expect((await api(h, ALICE, alice.workspaceCookie, 'admin')).status).toBe(403)
+    const page = await h.request({ host: APEX, path: '/admin', headers: { cookie: (await h.signIn('root')).apexCookie, accept: 'text/html' } })
+    expect(page.body).toContain('60 GB on disk, over its 50 GB budget')
+    expect(page.body).toContain('Server disk: 200 GB free of 290 GB')
+  })
+
   it('refuses device tokens, other people, unknown paths, wrong methods and pages from elsewhere', async () => {
     const alice = await h.openWorkspace('Alice')
     expect((await api(h, ROOT, root, 'account', undefined, { authorization: 'Bearer anything' })).status).toBe(401)

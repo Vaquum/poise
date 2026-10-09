@@ -27,6 +27,7 @@ Everything comes from the environment and is validated at startup. Every problem
 | `POISE_WORKSPACE_DNS` | | | One to three resolver IP addresses the workspaces use instead of Docker's embedded DNS, which gVisor cannot reach; required with `runsc`. The gateway writes them to `workspace-resolv.conf` in its data directory and mounts that file read-only over each workspace's `/etc/resolv.conf`, so the data directory must be a mount when the gateway runs in a container |
 | `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` | | | `1` passes `POISE_SKIP_CLI_BOOTSTRAP=1` to new workspaces, so they install no provider CLIs; for end-to-end tests, which need no CLIs |
 | `POISE_DRAIN_TIMEOUT` | | `1800` | Seconds to wait for a workspace to go idle before it is recreated, at most `604800` (a week); passed to every workspace, and a workspace created with another value is recreated, drained, like one on an outdated image |
+| `POISE_WORKSPACE_DISK_BUDGET` | | `50g` | Disk a workspace's home volume may use before Settings → Admin, the admin page and the log (`disk.workspace.over_budget`) flag it; `0` flags none. The gateway measures every volume hourly, and the free space of the filesystem its data directory is on (`disk.low` below a tenth) |
 | `POISE_GATEWAY_DATA` | | `/data` | Data directory |
 | `POISE_DOCKER_SOCKET` | | `/var/run/docker.sock` | Docker Engine socket |
 | `PORT` | | `8080` | Listening port |

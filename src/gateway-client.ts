@@ -33,6 +33,8 @@ export interface AdminUser {
   /** null while the Docker Engine cannot be asked; `dockerError` says why. */
   workspace: { state: string, image: string | null } | null
   lastError: string | null
+  /** Bytes in their home volume, and whether that is over the budget; null until the gateway measured it. */
+  disk?: { bytes: number, overBudget: boolean } | null
 }
 
 export interface AdminOverview {
@@ -41,6 +43,8 @@ export interface AdminOverview {
   admins: string[]
   allowedOrgs: string[]
   dockerError: string | null
+  /** The server's disk as the gateway last measured it, hourly; null before the first measurement. */
+  disk?: { measuredAt: number, free: number | null, total: number | null, low: boolean, budget: number } | null
 }
 
 export type AdminChange =

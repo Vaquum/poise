@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { pagePrincipal, postPrincipal } from './auth.js'
 import { isGitHubName, RESERVED_HANDLES } from './config.js'
 import type { Context, Principal } from './context.js'
+import type { DiskReport } from './disk.js'
 import { HttpError, readForm, redirect, sendHtml } from './http.js'
 import { errorMessage } from './log.js'
 import { adminPage, type AdminWorkspaceView } from './pages.js'
@@ -20,6 +21,10 @@ export interface AdminOverview {
   records: Map<string, WorkspaceRecord>
   access: Map<string, string>
   dockerError: string | null
+  /** What the gateway last measured of disk use; null before the first measurement. */
+  disk: DiskReport | null
+  /** POISE_WORKSPACE_DISK_BUDGET in bytes; 0 for none. */
+  diskBudget: number
 }
 
 /** How a person gets in today, as the admin page shows it. */
@@ -62,7 +67,11 @@ export async function adminOverview(ctx: Context): Promise<AdminOverview> {
     if (record) records.set(user.handle, record)
     access.set(user.handle, accessOf(ctx, user))
   }
-  return { users, allowed: store.listAllowed(), admins: config.admins, allowedOrgs: config.allowedOrgs, workspaces, records, access, dockerError }
+  return {
+    users, allowed: store.listAllowed(), admins: config.admins, allowedOrgs: config.allowedOrgs, workspaces, records, access, dockerError,
+    disk: ctx.deps.disk?.current() ?? null,
+    diskBudget: config.workspaceDiskBudgetBytes,
+  }
 }
 
 export async function overview(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
