@@ -107,8 +107,9 @@ type Listener = (state: NoticesState) => void
 
 /** A notice this tab put away, kept away until an answer that knows of it. */
 interface PutAway {
-  /** The showing put away: a later reminder of the same notice shows. */
-  due: string
+  /** The showing dismissed: a later reminder of the same notice shows. Null
+   *  for a silence, which no reminder of that notice outlasts. */
+  due: string | null
   /** The request count once the server had taken it; null while it is being sent. */
   settledAt: number | null
 }
@@ -196,7 +197,7 @@ export class NoticeFeed {
 
   private async act(id: string, action: 'dismiss' | 'silence'): Promise<void> {
     const due = this.state.notices.find((notice) => notice.id === id)?.due ?? ''
-    const away: PutAway = { due, settledAt: null }
+    const away: PutAway = { due: action === 'silence' ? null : due, settledAt: null }
     this.putAway.set(id, away)
     this.publish()
     const sent = ++this.sent
@@ -229,7 +230,11 @@ export class NoticeFeed {
   }
 
   private publish(): void {
-    const next = { ...this.server, notices: this.server.notices.filter((notice) => this.putAway.get(notice.id)?.due !== notice.due) }
+    const hidden = (notice: Notice) => {
+      const away = this.putAway.get(notice.id)
+      return !!away && (away.due === null || away.due === notice.due)
+    }
+    const next = { ...this.server, notices: this.server.notices.filter((notice) => !hidden(notice)) }
     this.state = next
     for (const listener of this.listeners) listener(next)
   }

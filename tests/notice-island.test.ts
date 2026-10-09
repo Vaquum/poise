@@ -207,6 +207,18 @@ describe('the notices this tab shows', () => {
     expect(feed.current).toEqual({ enabled: false, notices: [] })
   })
 
+  it('keeps a pull request being silenced hidden, even when its next reminder comes due meanwhile', async () => {
+    const { calls, feed } = await shown(c)
+    const silenced = feed.silence('c')
+    const meanwhile = feed.read()
+    calls[2].answer(state({ ...c, due: iso(30) }))
+    await meanwhile
+    expect(ids(feed)).toEqual([])
+    calls[1].answer(state())
+    await silenced
+    expect(ids(feed)).toEqual([])
+  })
+
   it('shows the next reminder of a pull request put away until then', async () => {
     const { calls, feed } = await shown(c)
     const dismissed = feed.dismiss('c')
