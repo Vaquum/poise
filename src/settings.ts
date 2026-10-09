@@ -75,6 +75,8 @@ let focusTimer: ReturnType<typeof setTimeout> | null = null
 const dirtyModels = new Set<string>()
 let modelRefreshActive = false
 let modelsGeneration = 0
+// Bumped by each saved or deleted configuration: a catalog read that started before it brings older ones.
+let presetsGeneration = 0
 let lastModels: ModelsResponse | null = null
 let accountsEl: HTMLElement | null = null
 let accountsStatusEl: HTMLElement | null = null
@@ -469,13 +471,16 @@ function renderCatalogStatus(data: ModelsResponse) {
 async function loadModels(signal?: AbortSignal): Promise<boolean> {
   if (!modelsEl) return false
   const generation = ++modelsGeneration
+  const presetsAt = presetsGeneration
   try {
     const res = await fetch('/api/models', { signal })
     const data = await res.json()
     if (generation !== modelsGeneration) return false
     if (!res.ok) throw new Error(data.error || 'Model catalog unavailable')
     if (!data.catalog || !Array.isArray(data.catalog.models) || !Array.isArray(data.places) || !Array.isArray(data.fixed)) throw new Error('The model catalogue response is unreadable')
-    lastModels = data as ModelsResponse
+    const fresh = data as ModelsResponse
+    if (presetsAt !== presetsGeneration) fresh.presets = lastModels?.presets ?? fresh.presets
+    lastModels = fresh
     renderPlaces(lastModels)
     renderPresets(lastModels.presets ?? [])
     return true
@@ -504,6 +509,7 @@ async function postPresets(path: string, body: unknown): Promise<ModelPreset[] |
     const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
     const data = await res.json()
     if (!res.ok) { setHelp(data.error || 'The configurations were not changed', 'error'); return null }
+    presetsGeneration++
     if (lastModels) lastModels.presets = data.presets
     renderPresets(data.presets)
     return data.presets as ModelPreset[]
@@ -537,6 +543,14 @@ async function usePreset(): Promise<void> {
     if (!res.ok) { setHelp(data.error || `"${name}" could not be used`, 'error'); return }
     dirtyModels.clear()
     setLocalSettings(data)
+    // Shown at once, so a Save before the reload below lands posts these choices, not the previous ones.
+    if (lastModels) {
+      for (const place of lastModels.places) {
+        const choice = preset.models[place.key]
+        if (choice) Object.assign(place, choice)
+      }
+      renderPlaces(lastModels)
+    }
     setHelp(`Using "${name}".`, 'ok')
     window.dispatchEvent(new CustomEvent('poise:models-changed'))
     void loadModels()
