@@ -75,6 +75,8 @@ export function noticeHtml(notice: Notice, more: number, now: number): string {
 
 export interface IslandActions {
   open(target: NoticeTarget): void
+  /** Whether what a notice is about is on screen already, so it need not be shown. */
+  inView?(target: NoticeTarget): boolean
 }
 
 // In step with the design system's motion tokens (src/style.css): the shape
@@ -241,7 +243,7 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
 
   function update(state: NoticesState): void {
     const previous = notices
-    notices = state.enabled ? state.notices : []
+    notices = state.enabled ? state.notices.filter((notice) => !notice.target || !actions.inView?.(notice.target)) : []
     shownId = chooseShown(previous, notices, shownId)
     render()
   }

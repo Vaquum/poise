@@ -7,7 +7,7 @@ import { initMenu } from './menu'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
 import { initCurrentView, stopCurrentPolling } from './views/current-view'
 import { initSwarmView, stopSwarmRefresh, focusRow as focusSwarmRow } from './views/swarm-view'
-import { initChatView, stopChatRefresh, openChatSession, openChatWithContext, type NewSessionPrefill } from './views/chat-view'
+import { initChatView, stopChatRefresh, openChatSession, openChatWithContext, chatSessionInView, type NewSessionPrefill } from './views/chat-view'
 import { initBehaviorsView, stopBehaviorsRefresh } from './views/behaviors-view'
 import { initSnippetsView } from './views/snippets-view'
 import { initEditorView, stopEditorRefresh } from './views/editor-view'
@@ -147,7 +147,8 @@ function openNotice(target: NoticeTarget): void {
   else if ('chat' in target) window.dispatchEvent(new CustomEvent('poise:open-chat-session', { detail: { id: target.chat } }))
   else window.open(target.pullRequest, '_blank', 'noopener,noreferrer')
 }
-mountNoticeIsland(notices, { open: openNotice })
+// A Chat session on screen already shows what its notice would say.
+mountNoticeIsland(notices, { open: openNotice, inView: (target) => 'chat' in target && chatSessionInView() === target.chat })
 window.addEventListener('poise:notifications-changed', () => { void notices.read() })
 
 // On load: pull settings first so views render with the correct org/me/timezone,
