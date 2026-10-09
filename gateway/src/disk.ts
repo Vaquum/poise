@@ -18,7 +18,7 @@ export interface DiskReport {
   /** The filesystem the gateway's data directory is on, which Docker's volumes share unless the operator moved them. */
   free: number | null
   total: number | null
-  /** Whether free space is below LOW_FREE_SHARE of the filesystem. */
+  /** Whether free space is below LOW_FREE_SHARE of the filesystem; the last known answer when it could not be read. */
   low: boolean
 }
 
@@ -73,7 +73,8 @@ export class DiskWatch {
       if (over) this.overBudget.add(handle)
       else this.overBudget.delete(handle)
     }
-    const low = free !== null && total !== null && total > 0 && free / total < LOW_FREE_SHARE
+    // A failed reading says nothing about the disk: the last known state stands, so it neither clears nor repeats a warning.
+    const low = free !== null && total !== null && total > 0 ? free / total < LOW_FREE_SHARE : this.low
     if (low && !this.low) log.warn('disk.low', { free, total })
     if (!low && this.low) log.info('disk.recovered', { free, total })
     this.low = low

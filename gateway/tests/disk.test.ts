@@ -60,6 +60,16 @@ describe('the disk watch', () => {
     expect(events()).toEqual(['disk.low', 'disk.recovered'])
   })
 
+  it('keeps a low disk low through a reading that fails, without a recovery or a second warning', async () => {
+    const { disk, state, events } = watch({}, { free: 0.09 * 290 * GB, total: 290 * GB })
+    await disk.measure()
+    state.space = new Error('EIO')
+    expect(await disk.measure()).toMatchObject({ free: null, total: null, low: true })
+    state.space = { free: 0.08 * 290 * GB, total: 290 * GB }
+    await disk.measure()
+    expect(events()).toEqual(['disk.low', 'disk.space.unknown'])
+  })
+
   it('reports no budget with 0, and workspaces without free space when the filesystem cannot be asked', async () => {
     const { disk, events } = watch({ 'poise-home-alice': 500 * GB }, new Error('ENOSYS'), '0')
     const report = await disk.measure()

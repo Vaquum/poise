@@ -121,10 +121,16 @@ the workspace.
 - `POST /_poise/api/devices/revoke` with `{ id }` returns `{ devices }`, or 404
   for a device that is not the owner's.
 - For admins only (403 otherwise): `GET /_poise/api/admin` returns `{ users,
-  allowed, admins, allowedOrgs, dockerError }`. Each user is `{ handle, login,
-  admin, access, lastLoginAt, disabled, workspace, lastError }`, where
-  `workspace` is `{ state, image }` or `null` while the Docker Engine cannot be
-  asked.
+  allowed, admins, allowedOrgs, dockerError, disk }`. Each user is `{ handle,
+  login, admin, access, lastLoginAt, disabled, workspace, lastError, disk }`,
+  where `workspace` is `{ state, image }` or `null` while the Docker Engine
+  cannot be asked.
+  - The user's `disk` is `{ bytes, overBudget }`, the size of their home volume
+    at the last measurement, or `null` while it has not been measured.
+  - The top-level `disk` is `{ measuredAt, free, total, low, budget }`, or
+    `null` before the first measurement. `free` and `total` are in bytes, or
+    `null` when the filesystem could not be read; `low` then keeps the last
+    known answer. `budget` is POISE_WORKSPACE_DISK_BUDGET in bytes, 0 for none.
   - `POST /_poise/api/admin/allow` and `/_poise/api/admin/allow/remove` take
     `{ login }`.
   - `POST /_poise/api/admin/workspaces/start`, `…/stop`, `…/restart`,
