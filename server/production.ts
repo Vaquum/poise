@@ -6,6 +6,7 @@ import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { HttpError, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
 import { assertCallerRelease } from './caller-release'
+import { onUpdateRestart } from './service/restart'
 import { assertSecureDotenv, loadSecureDotenv, validateConfabUrl } from './runtime-config'
 import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'
@@ -355,13 +356,14 @@ export function shutdownProductionServer(server: Server): Promise<void> {
   return shutdown
 }
 
+/** Shuts the server down and exits with `exitCode` (0 unless a release switch asks for another), or 1 on failure. */
 export function createProductionShutdown(
   server: Server,
   exit: (code: number) => void = (code) => process.exit(code),
-): () => void {
+): (exitCode?: number) => void {
   let started = false
   let finished = false
-  return () => {
+  return (exitCode = 0) => {
     if (started) return
     started = true
     const deadline = setTimeout(() => {
@@ -376,7 +378,7 @@ export function createProductionShutdown(
       if (finished) return
       finished = true
       clearTimeout(deadline)
-      exit(0)
+      exit(exitCode)
     }, (error: unknown) => {
       if (finished) return
       finished = true
@@ -497,8 +499,10 @@ const isEntrypoint = process.argv[1]
 if (isEntrypoint) {
   startProductionServer().then((server) => {
     const shutdown = createProductionShutdown(server)
-    process.once('SIGINT', shutdown)
-    process.once('SIGTERM', shutdown)
+    // A release switch shuts down the same way, then exits for the supervisor to start the new release.
+    onUpdateRestart((exitCode) => shutdown(exitCode))
+    process.once('SIGINT', () => shutdown())
+    process.once('SIGTERM', () => shutdown())
   }).catch(async (error: unknown) => {
     await settleRuntimeStop()
     closeDatabaseOnce()

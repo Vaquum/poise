@@ -272,7 +272,7 @@ describe('Poise in service mode', () => {
     const health = await send('GET', '/api/service/health')
     expect(health.status).toBe(200)
     // Background passes (the /content finalizer every two seconds) can count for a moment.
-    expect(health.json).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: expect.any(Number), idle: expect.any(Boolean), draining: false })
+    expect(health.json).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: expect.any(Number), idle: expect.any(Boolean), draining: false, release: null, switching: null })
     expect(health.json.idle).toBe(health.json.backgroundWork === 0)
     expect(await send('GET', '/api/service/health', fromGateway('admin'))).toMatchObject({ status: 200, json: { mode: 'service' } })
     expect((await send('GET', '/api/service/health', fromGateway('browser'))).status).toBe(403)

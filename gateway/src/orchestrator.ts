@@ -2,7 +2,7 @@ import http from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { signAssertion } from './assertion.js'
 import type { Config } from './config.js'
-import type { ContainerDetails, ContainerMount, ContainerSpec, ContainerSummary, DockerClient } from './docker.js'
+import type { ContainerDetails, ContainerMount, ContainerSpec, ContainerSummary, DockerClient, TaskSpec } from './docker.js'
 import type { GatewayKeys } from './keys.js'
 import { errorMessage, type LogFields, type Logger } from './log.js'
 import type { Store } from './store.js'
@@ -42,7 +42,28 @@ export interface ServiceHealth {
   /** True only when activeChatTurns, runningCallerCalls and backgroundWork are all 0. */
   idle: boolean
   draining: boolean
+  /** The release the workspace's supervisor runs; null for a workspace started without one. */
+  release: string | null
+  /** The release a pending switch restarts Poise onto; null when none is pending, or the workspace does not say. */
+  switching: string | null
 }
+
+/** A runtime image's release and the base it runs on, from its labels (deploy/runtime/Dockerfile). */
+export interface ImageRelease {
+  release: string
+  base: string
+}
+
+export function imageRelease(labels: Record<string, string> | null): ImageRelease | null {
+  const release = labels?.['poise.release']
+  const base = labels?.['poise.base']
+  return release && base ? { release, base } : null
+}
+
+/** Where a release is installed from: the image's own copy, by deploy/runtime/install-release.sh. */
+const INSTALL_RELEASE = '/opt/poise-runtime/install-release.sh'
+/** How long a workspace asked to switch may stay unreachable before it counts as hung and gets a new container. */
+const SWITCH_GRACE_MS = 10 * 60_000
 
 /** The workspace answered, but not with a usable 200. Unlike a refused connection, this is not a slow start. */
 export class WorkspaceAnswerError extends Error {
@@ -103,13 +124,15 @@ function parseHealth(text: string, what: string): ServiceHealth {
     backgroundWork: value.backgroundWork,
     idle: value.idle,
     draining: value.draining,
+    release: typeof value.release === 'string' && value.release ? value.release : null,
+    switching: typeof value.switching === 'string' && value.switching ? value.switching : null,
   }
 }
 
 /** A health or drain answer is a few hundred bytes; a workspace sending more is not read further. */
 export const MAX_SERVICE_ANSWER_BYTES = 64 * 1024
 
-function request(target: Upstream, method: string, path: string, headers: http.OutgoingHttpHeaders): Promise<{ status: number; text: string }> {
+function request(target: Upstream, method: string, path: string, headers: http.OutgoingHttpHeaders, body?: string): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: target.host, port: target.port, method, path, headers, agent: false }, (res) => {
       const chunks: Buffer[] = []
@@ -127,7 +150,7 @@ function request(target: Upstream, method: string, path: string, headers: http.O
     })
     req.setTimeout(SERVICE_TIMEOUT_MS, () => req.destroy(new Error(`no answer within ${SERVICE_TIMEOUT_MS} ms`)))
     req.on('error', reject)
-    req.end()
+    req.end(body)
   })
 }
 
@@ -141,6 +164,12 @@ export class Orchestrator {
   private readonly drainPollMs: number
   private readonly drainRenewMs: number
   private upgrading = false
+  /** The release each workspace was asked to switch to, and when, until it runs it; see updateInPlace. */
+  private readonly updating = new Map<string, { release: string; since: number }>()
+  /** The release last installed into each workspace's home volume. */
+  private readonly installed = new Map<string, string>()
+  /** A release a workspace refused because it failed to start there, so it is not asked for again. */
+  private readonly refused = new Map<string, string>()
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.drainPollMs = deps.drainPollMs ?? DRAIN_POLL_MS
@@ -196,6 +225,11 @@ export class Orchestrator {
     this.ready.delete(handle)
   }
 
+  /** The release a workspace is switching to, while it restarts onto it; null otherwise. */
+  updatingTo(handle: string): string | null {
+    return this.updating.get(handle)?.release ?? null
+  }
+
   /** Whether the workspace answers its health check; a refused connection just means it is not up yet. */
   async readiness(handle: string, login: string): Promise<Readiness> {
     let health: ServiceHealth
@@ -216,6 +250,10 @@ export class Orchestrator {
       return { ready: false, problem: error.message }
     }
     if (!health.ok) return { ready: false, problem: null }
+    if (health.release !== null && this.updating.get(handle)?.release === health.release) {
+      this.updating.delete(handle)
+      this.lifecycle('workspace.update.finished', handle, { release: health.release })
+    }
     this.ready.add(handle)
     this.deps.log.info('workspace.ready', { handle })
     return { ready: true }
@@ -336,11 +374,17 @@ export class Orchestrator {
         log.error('workspace.upgrade.image.missing', { image: config.runtimeImage })
         return
       }
+      const target = imageRelease(await docker.imageLabels(config.runtimeImage))
       for (const summary of await docker.listManagedContainers()) {
         // The list shows a container's image but not its environment, which holds its drain timeout.
         const details = await docker.inspectContainer(summary.Id)
         const reason = details && this.outdated(details, imageId)
-        if (!reason) continue
+        if (!reason) {
+          // A container of the current image whose volume still named an older release when it started runs
+          // that one; it switches like any other.
+          if (details?.State.Running && target) await this.correctRelease(summary, target)
+          continue
+        }
         const handle = summary.Labels['poise.workspace'] ?? ''
         const login = store.getWorkspace(handle)?.login
         if (!login) {
@@ -348,7 +392,12 @@ export class Orchestrator {
           continue
         }
         try {
-          await this.upgrade(handle, login, imageId, reason)
+          // A running workspace on the same base takes a new release in place: only Poise restarts, and the
+          // agents it started keep running. Anything else needs a new container.
+          if (reason === 'outdated image' && details.State.Running && target && this.changedSetting(details) === null
+            && imageRelease(await docker.imageLabels(details.Image))?.base === target.base
+            && await this.updateInPlace(handle, login, target)) continue
+          await this.upgrade(handle, login, imageId, reason, target)
         } catch (error) {
           log.error('workspace.upgrade.failed', { handle, error: errorMessage(error) })
           store.noteWorkspaceError(handle, `upgrade failed: ${errorMessage(error)}`)
@@ -359,9 +408,147 @@ export class Orchestrator {
     }
   }
 
-  private async upgrade(handle: string, login: string, imageId: string, reason: string): Promise<void> {
+  /**
+   * Installs the target release into the workspace's home volume and asks Poise to switch to it, which it
+   * does once no Chat turn and no work of its own runs; detached agent calls carry on. Asked again on later
+   * passes until the workspace runs it, since the request is idempotent. False when the workspace runs
+   * without a release supervisor and needs a new container instead.
+   */
+  private async updateInPlace(handle: string, login: string, target: ImageRelease): Promise<boolean> {
+    let health: ServiceHealth
+    try {
+      health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+    } catch (error) {
+      if (error instanceof WorkspaceNetworkError) throw error
+      // Restarting onto a release it was asked for takes seconds; a workspace that stays unreachable is hung
+      // or crashing, and gets a new container, as before releases switched in place.
+      const asked = this.updating.get(handle)
+      if (asked && this.deps.now() - asked.since < SWITCH_GRACE_MS) return true
+      this.deps.log.warn('workspace.update.unreachable', { handle, error: errorMessage(error) })
+      return false
+    }
+    if (health.release === null) return false
+    if (health.release === target.release) {
+      await this.withdrawSwitch(handle, login, health, target)
+      this.updating.delete(handle)
+      return true
+    }
+    if (this.refused.get(handle) === target.release) return true
+    if (this.installed.get(handle) !== target.release) {
+      await this.installRelease(handle, false)
+      this.installed.set(handle, target.release)
+    }
+    const answer = await this.requestSwitch(handle, login, target.release)
+    if (answer === 'failed') {
+      // The release failed to start there before; the workspace keeps the one it runs until a newer image.
+      this.refused.set(handle, target.release)
+      this.updating.delete(handle)
+      this.deps.log.error('workspace.update.refused', { handle, release: target.release, running: health.release })
+      this.deps.store.noteWorkspaceError(handle, `release ${target.release} failed to start; staying on ${health.release}`)
+      return true
+    }
+    if (this.updating.get(handle)?.release !== target.release) {
+      this.updating.set(handle, { release: target.release, since: this.deps.now() })
+      this.lifecycle('workspace.update.requested', handle, { release: target.release, from: health.release })
+    }
+    return true
+  }
+
+  /**
+   * A workspace that runs the target release but still waits to switch to another, asked for before the
+   * target changed back, is asked for the release it runs, which calls the pending switch off.
+   */
+  private async withdrawSwitch(handle: string, login: string, health: ServiceHealth, target: ImageRelease): Promise<void> {
+    if (health.switching === null || health.switching === target.release) return
+    await this.requestSwitch(handle, login, target.release)
+    this.lifecycle('workspace.update.withdrawn', handle, { release: health.switching, running: target.release })
+  }
+
+  /** Switches a running workspace on the current image that runs another release than the image's. */
+  private async correctRelease(summary: ContainerSummary, target: ImageRelease): Promise<void> {
+    const handle = summary.Labels['poise.workspace'] ?? ''
+    const login = this.deps.store.getWorkspace(handle)?.login
+    if (!handle || !login) return
+    try {
+      const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+      if (health.release !== null && health.release !== target.release) await this.updateInPlace(handle, login, target)
+      else if (health.release === target.release) {
+        await this.withdrawSwitch(handle, login, health, target)
+        this.updating.delete(handle)
+      }
+    } catch (error) {
+      this.deps.log.warn('workspace.update.check.failed', { handle, error: errorMessage(error) })
+    }
+  }
+
+  /**
+   * Installs the runtime image's release into a workspace's home volume, in a short-lived container of that
+   * image; with `activate`, also makes it the release the workspace's next start runs.
+   */
+  private async installRelease(handle: string, activate: boolean): Promise<void> {
+    const { config, docker } = this.deps
+    const { volume } = workspaceNames(handle)
+    const spec: TaskSpec = {
+      Image: config.runtimeImage,
+      User: '10001',
+      Entrypoint: [INSTALL_RELEASE],
+      Cmd: activate ? ['--activate'] : [],
+      Env: ['HOME=/home/poise'],
+      Labels: { 'poise.task': 'install-release', 'poise.workspace': handle },
+      HostConfig: {
+        SecurityOpt: ['no-new-privileges'],
+        CapDrop: ['ALL'],
+        Memory: 1024 ** 3,
+        NanoCpus: 2e9,
+        PidsLimit: 256,
+        ...(config.workspaceRuntime ? { Runtime: config.workspaceRuntime } : {}),
+        Mounts: [{ Type: 'volume', Source: volume, Target: '/home/poise' }],
+        NetworkMode: 'none',
+      },
+    }
+    const code = await docker.runTask(`poise-release-${handle}`, spec)
+    if (code !== 0) throw new Error(`installing the release of ${config.runtimeImage} into ${volume} exited with ${code}`)
+    this.lifecycle('workspace.release.installed', handle, { image: config.runtimeImage, activate })
+  }
+
+  /** Before a workspace gets a new container: the new image's release becomes the one it starts. */
+  private async activateRelease(handle: string, target: ImageRelease | null): Promise<void> {
+    if (!target) return
+    try {
+      await this.installRelease(handle, true)
+      this.installed.set(handle, target.release)
+    } catch (error) {
+      // The container then starts its image's own release, or an installed one the next pass corrects.
+      this.deps.log.warn('workspace.release.activate.failed', { handle, error: errorMessage(error) })
+    }
+  }
+
+  /** 'failed' when the workspace refuses a release that failed to start there. */
+  private async requestSwitch(handle: string, login: string, release: string): Promise<'switching' | 'failed'> {
+    await this.ensureOnNetwork(handle)
+    const { config, keys, now } = this.deps
+    const publicHost = `${handle}.${config.domain}`
+    const body = JSON.stringify({ release })
+    const response = await request(this.deps.upstream(handle), 'POST', '/api/service/switch', {
+      host: publicHost,
+      'x-forwarded-host': publicHost,
+      'x-forwarded-proto': config.insecureHttp ? 'http' : 'https',
+      'x-poise-identity': signAssertion(keys.privateKey, { handle, login, scope: 'admin' }, now()),
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+    }, body)
+    if (response.status === 409 && response.text.includes('failed to start')) return 'failed'
+    if (response.status !== 202) {
+      throw new WorkspaceAnswerError(`the workspace answered POST /api/service/switch with HTTP ${response.status}: ${response.text.slice(0, 300)}`)
+    }
+    return 'switching'
+  }
+
+  private async upgrade(handle: string, login: string, imageId: string, reason: string, target: ImageRelease | null): Promise<void> {
     this.lifecycle('workspace.upgrade.started', handle, { image: imageId, reason })
-    let drained = false
+    // null until drained; then whether the drain left the workspace idle rather than timing out.
+    let drainedIdle: boolean | null = null
     for (;;) {
       // Decided under the lock, so a lazy start or an admin action in between cannot be stopped undrained.
       const outcome = await this.withLock(handle, async (): Promise<'needs-drain' | 'done' | 'skipped'> => {
@@ -377,7 +564,12 @@ export class Orchestrator {
           return 'skipped'
         }
         const running = details.State.Running
-        if (running && !drained) return 'needs-drain'
+        if (running && drainedIdle === null) return 'needs-drain'
+        await this.activateRelease(handle, target)
+        // Activation can restart Poise: a switch queued before the drain fires once the drain leaves it
+        // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
+        // idle. A drain that timed out cuts its work anyway.
+        if (running && drainedIdle && !(await this.idleUnderDrain(handle, login))) return 'needs-drain'
         this.ready.delete(handle)
         if (running) {
           await docker.stopContainer(container)
@@ -396,8 +588,18 @@ export class Orchestrator {
         return 'done'
       })
       if (outcome !== 'needs-drain') return
-      await this.drain(handle, login)
-      drained = true
+      drainedIdle = await this.drain(handle, login)
+    }
+  }
+
+  /** Drains again and says whether the workspace is idle; false when it cannot tell. */
+  private async idleUnderDrain(handle: string, login: string): Promise<boolean> {
+    try {
+      return (await this.serviceCall(handle, login, 'POST', '/api/service/drain')).idle
+    } catch (error) {
+      if (error instanceof WorkspaceNetworkError) throw error
+      this.deps.log.warn('workspace.drain.recheck.failed', { handle, error: errorMessage(error) })
+      return false
     }
   }
 
@@ -405,9 +607,10 @@ export class Orchestrator {
    * Asks the workspace to stop admitting work, then waits until it reports idle or POISE_DRAIN_TIMEOUT
    * passes. The workspace lets a drain lapse unless it is renewed, so it is re-requested while waiting.
    * A network the gateway cannot join fails the upgrade instead: waiting would drain nothing, and the
-   * timeout would then recreate the workspace with its work cut off.
+   * timeout would then recreate the workspace with its work cut off. Resolves true once the workspace
+   * is idle, false when the timeout passed first.
    */
-  private async drain(handle: string, login: string): Promise<void> {
+  private async drain(handle: string, login: string): Promise<boolean> {
     const { config, log, now } = this.deps
     const deadline = now() + config.drainTimeoutSeconds * 1000
     let requestedAt = now()
@@ -418,7 +621,7 @@ export class Orchestrator {
         runningCallerCalls: health.runningCallerCalls,
         backgroundWork: health.backgroundWork,
       })
-      if (health.idle) return
+      if (health.idle) return true
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       log.error('workspace.drain.request.failed', { handle, error: errorMessage(error) })
@@ -433,7 +636,7 @@ export class Orchestrator {
         if (renew) requestedAt = now()
         if (health.idle) {
           this.lifecycle('workspace.drain.idle', handle)
-          return
+          return true
         }
       } catch (error) {
         if (error instanceof WorkspaceNetworkError) throw error
@@ -441,6 +644,7 @@ export class Orchestrator {
       }
     }
     log.warn('workspace.drain.timeout', { handle, timeoutSeconds: config.drainTimeoutSeconds })
+    return false
   }
 
   private async startLocked(handle: string, login: string): Promise<void> {
@@ -453,6 +657,7 @@ export class Orchestrator {
     const outdated = details && this.outdated(details, await this.currentImageId())
     if (outdated) {
       // A stopped container that is out of date has nothing to drain: recreate it before it starts.
+      await this.activateRelease(handle, imageRelease(await docker.imageLabels(config.runtimeImage)))
       await docker.removeContainer(container)
       this.lifecycle('workspace.container.removed', handle, { reason: outdated })
       details = null
@@ -534,6 +739,11 @@ export class Orchestrator {
   /** What makes a workspace container differ from the one the gateway would create now, or null. */
   private outdated(details: ContainerDetails, imageId: string): string | null {
     if (details.Image !== imageId) return 'outdated image'
+    return this.changedSetting(details)
+  }
+
+  /** A container setting that differs from what the gateway would create now; only a new container applies it. */
+  private changedSetting(details: ContainerDetails): string | null {
     if (!(details.Config.Env ?? []).includes(this.drainTimeoutEnv())) return 'changed drain timeout'
     const resolver = details.Mounts?.find((mount) => mount.Destination === WORKSPACE_RESOLV_CONF)?.Source ?? null
     if (resolver !== (this.deps.workspaceResolvConf ?? null) || (details.Config.Labels?.['poise.dns'] ?? '') !== this.dnsLabel()) {

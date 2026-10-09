@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -44,7 +45,11 @@ function session(instance: string, openTurn: boolean): string {
 }
 
 function fakeRuntime(instance = `poise-production:${randomUUID()}`) {
-  return { instance, busyNow: 0, busy() { return this.busyNow }, startDrain: vi.fn(), endDrain: vi.fn() }
+  return {
+    instance, busyNow: 0, workingNow: 0,
+    busy() { return this.busyNow }, working() { return this.workingNow },
+    startDrain: vi.fn(), endDrain: vi.fn(),
+  }
 }
 
 class FakeTimer {
@@ -87,7 +92,7 @@ describe('service health', () => {
     session(runtime.instance, false)
     session('poise-dev:another-database', true)
     const { service } = serviceOf(runtime)
-    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false })
+    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null })
 
     let finish!: () => void
     const debate = callerCalls.countDebate(() => new Promise<void>((resolve) => { finish = resolve }))
@@ -114,6 +119,20 @@ describe('service health', () => {
     launch()
     launch()
     expect(service.health()).toMatchObject({ backgroundWork: 0, idle: true })
+  })
+
+  it('is never idle while Caller\'s records cannot be read, since an earlier server\'s calls may still run', async () => {
+    const { service } = serviceOf()
+    const records = join(root, 'caller-records')
+    await mkdir(records, { recursive: true })
+    await writeFile(join(records, 'calls.sqlite3'), 'not a database')
+    vi.stubEnv('AGENT_INTERFACE_DATA_DIR', records)
+    try {
+      expect(service.health()).toMatchObject({ runningCallerCalls: 0, idle: false })
+    } finally {
+      vi.stubEnv('AGENT_INTERFACE_DATA_DIR', '')
+    }
+    expect(service.health()).toMatchObject({ idle: true })
   })
 })
 
@@ -200,5 +219,129 @@ describe('service endpoints', () => {
     expect(call('GET', '/api/service/drain', { kind: 'local' }, service)).toMatchObject({ status: 405, allow: 'POST' })
     expect(call('GET', '/api/service/resume', { kind: 'local' }, service)).toMatchObject({ status: 405, allow: 'POST' })
     expect(call('GET', '/api/service/unknown', { kind: 'local' }, service)).toMatchObject({ status: 404 })
+  })
+})
+
+describe('switching to another release', () => {
+  // Releases as the gateway installs them: a directory with its base and an installed marker.
+  async function releases(installed: Record<string, string>): Promise<string> {
+    const dir = await mkdtemp(join(root, 'releases-'))
+    for (const [name, base] of Object.entries(installed)) {
+      await mkdir(join(dir, name))
+      await writeFile(join(dir, name, 'base'), `${base}\n`)
+      await writeFile(join(dir, name, 'installed'), '')
+    }
+    return dir
+  }
+
+  function switching(dir: string, options: { restart?: () => boolean, canRestart?: () => boolean, name?: string } = {}) {
+    const runtime = fakeRuntime()
+    const timer = new FakeTimer()
+    const restart = vi.fn(options.restart ?? (() => true))
+    const service = new control.ServiceControl(runtime as unknown as ChatRuntime, {
+      drainTimeoutSeconds: 1800, timer, log: vi.fn(), releasesDir: dir,
+      release: { name: options.name ?? 'r1', base: 'b1' }, restart, canRestart: options.canRestart ?? (() => true),
+    })
+    return { runtime, timer, restart, service }
+  }
+
+  it('restarts onto an installed release of its base once no Chat turn or work of its own runs', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { runtime, timer, restart, service } = switching(dir)
+    try {
+      expect(service.switchRelease('r2')).toEqual({ release: 'r2', switching: true })
+      expect((await readFile(join(dir, 'next'), 'utf8')).trim()).toBe('r2')
+      // Nothing is refused while it waits, behavior ticks included.
+      expect(background.releaseBackgroundPaused()).toBe(false)
+      const launch = service.admitLaunch('POST', '/api/chat')
+      expect(launch).toEqual(expect.any(Function))
+      ;(launch as () => void)()
+      runtime.workingNow = 1
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      // Agent processes idle between turns do not hold it back; work in a turn does.
+      runtime.workingNow = 0
+      runtime.busyNow = 3
+      const sessionId = session(runtime.instance, true)
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      storage.setOpenTurn(sessionId, null, null)
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(runtime.startDrain).toHaveBeenCalledWith('service')
+      expect(background.releaseBackgroundPaused()).toBe(true)
+      expect(service.health().draining).toBe(true)
+      expect(timer.timers.size).toBe(0)
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('does nothing for the release it already runs', async () => {
+    const dir = await releases({ r1: 'b1' })
+    const { service } = switching(dir)
+    expect(service.switchRelease('r1')).toEqual({ release: 'r1', switching: false })
+    expect(existsSync(join(dir, 'next'))).toBe(false)
+  })
+
+  it('calls a pending switch off when asked for the release it runs, its image\'s own uninstalled one included', async () => {
+    // r1, the release it runs, is the image's own: nothing in the home volume names it installed.
+    const dir = await releases({ r2: 'b1' })
+    const { timer, restart, service } = switching(dir)
+    try {
+      service.switchRelease('r2')
+      expect(service.health().switching).toBe('r2')
+      expect(service.switchRelease('r1')).toEqual({ release: 'r1', switching: false })
+      expect(existsSync(join(dir, 'next'))).toBe(false)
+      expect(service.health().switching).toBeNull()
+      expect(timer.timers.size).toBe(0)
+      expect(restart).not.toHaveBeenCalled()
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('refuses a release not installed, one built for another base or that failed to start, and a server without the supervisor', async () => {
+    const dir = await releases({ r2: 'b1', r3: 'b2', r4: 'b1' })
+    await writeFile(join(dir, 'r4', 'failed'), 'exited with 1 within a minute of starting\n')
+    expect(() => switching(dir).service.switchRelease('r4')).toThrow(expect.objectContaining({ statusCode: 409, message: expect.stringContaining('failed to start') }))
+    expect(() => switching(dir).service.switchRelease('r9')).toThrow(expect.objectContaining({ statusCode: 409 }))
+    expect(() => switching(dir).service.switchRelease('r3')).toThrow(expect.objectContaining({ statusCode: 409 }))
+    expect(() => switching(dir).service.switchRelease('../r2')).toThrow(expect.objectContaining({ statusCode: 400 }))
+    expect(() => switching(dir, { canRestart: () => false }).service.switchRelease('r2')).toThrow(expect.objectContaining({ statusCode: 409 }))
+    expect(existsSync(join(dir, 'next'))).toBe(false)
+  })
+
+  it('stays on its release and admits work again when the restart is refused', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { timer, restart, service } = switching(dir, { restart: () => false })
+    try {
+      service.switchRelease('r2')
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(service.health().draining).toBe(false)
+      expect(background.releaseBackgroundPaused()).toBe(false)
+    } finally {
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('takes a switch only from the gateway\'s admin scope or loopback, as JSON over POST', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { service } = switching(dir)
+    try {
+      expect(() => call('POST', '/api/service/switch', { kind: 'gateway', scope: 'browser' }, service)).toThrow(expect.objectContaining({ statusCode: 403 }))
+      expect(call('GET', '/api/service/switch', { kind: 'local' }, service)).toMatchObject({ status: 405, allow: 'POST' })
+      const res = response()
+      const req = Object.assign(Readable.from([Buffer.from(JSON.stringify({ release: 'r2' }))]), { method: 'POST', headers: { 'content-type': 'application/json' } }) as unknown as IncomingMessage
+      await control.handleServiceApi(req, res as unknown as ServerResponse, '/api/service/switch', { kind: 'gateway', scope: 'admin' }, service)
+      expect(res.statusCode).toBe(202)
+      expect(JSON.parse(res.body)).toEqual({ release: 'r2', switching: true })
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
   })
 })

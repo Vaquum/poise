@@ -29,6 +29,7 @@ import type {
 import type { SelfChange, SelfUpdateStatus } from './self-update-types'
 import { parseMessageQueue } from './chat-queue'
 import { parseChange, parseSelfUpdateStatus } from './self-update-state'
+import { probeForUpdate } from './updating'
 
 export type ConnectionState = 'connecting' | 'open' | 'closed'
 
@@ -214,6 +215,8 @@ export class ChatClient {
       this.socket = null
       this.clearHandshake()
       this.setState('closed')
+      // Poise may be restarting onto a new version; the gateway says so.
+      void probeForUpdate()
       this.scheduleReconnect()
     }
     socket.onerror = () => { /* onclose follows and schedules the retry */ }

@@ -174,7 +174,7 @@ describe('lazy start', () => {
       'POISE_HOST=0.0.0.0',
       'POISE_PORT=5555',
       'HOME=/home/poise',
-      'POISE_DRAIN_TIMEOUT=1800',
+      'POISE_DRAIN_TIMEOUT=5400',
       'POISE_SKIP_CLI_BOOTSTRAP=1',
     ])
   })
@@ -298,6 +298,8 @@ describe('lazy start', () => {
     expect(dockerCalls(h).slice(5)).toEqual([
       'GET /containers/poise-ws-alice/json',
       'GET /images/poise-runtime:latest/json',
+      // Its release, made current before the new container starts; this image names none.
+      'GET /images/poise-runtime:latest/json',
       'DELETE /containers/poise-ws-alice',
       'POST /containers/create',
       'POST /containers/poise-ws-alice/start',
@@ -313,6 +315,8 @@ describe('lazy start', () => {
     await h.orchestrator.startInProgress('alice')
     expect(dockerCalls(h).slice(5)).toEqual([
       'GET /containers/poise-ws-alice/json',
+      'GET /images/poise-runtime:latest/json',
+      // Its release, made current before the new container starts; this image names none.
       'GET /images/poise-runtime:latest/json',
       'DELETE /containers/poise-ws-alice',
       'POST /containers/create',
@@ -380,10 +384,14 @@ describe('image upgrades', () => {
     expect(drain.headers.host).toBe(ALICE)
     expect(verifyAssertion(String(drain.headers['x-poise-identity']), h.keys.publicKeyBase64))
       .toMatchObject({ aud: 'workspace:alice', sub: 'Alice', scope: 'admin' })
-    expect(h.workspace.serviceRequests.slice(1).every((request) => request.url === '/api/service/health')).toBe(true)
-    expect(h.workspace.serviceRequests.length).toBeGreaterThan(1)
+    // Health while it waits, then the drain again just before the container stops.
+    expect(h.workspace.serviceRequests.slice(1, -1).every((request) => request.url === '/api/service/health')).toBe(true)
+    expect(h.workspace.serviceRequests.at(-1)).toMatchObject({ method: 'POST', url: '/api/service/drain' })
+    expect(h.workspace.serviceRequests.length).toBeGreaterThan(2)
 
     expect(dockerCalls(h)).toEqual([
+      'GET /images/poise-runtime:latest/json',
+      // The release it carries, if it names one; this image does not, so every update needs a new container.
       'GET /images/poise-runtime:latest/json',
       'GET /containers/json',
       `GET /containers/${aliceId}/json`,
@@ -476,7 +484,7 @@ describe('image upgrades', () => {
       expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.started' && entry.handle === handle))
         .toMatchObject({ reason: 'changed drain timeout' })
       expect(h.workspace.serviceRequests.filter((request) => request.headers.host === workspaceHost(handle)).map((request) => request.url))
-        .toEqual(['/api/service/drain'])
+        .toEqual(['/api/service/drain', '/api/service/drain'])
       expect(containerEnv(h, handle)).toContain('POISE_DRAIN_TIMEOUT=600')
       expect(h.docker.containers.get(`poise-ws-${handle}`)).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
     }
@@ -531,6 +539,207 @@ describe('image upgrades', () => {
     } finally {
       stop()
     }
+  })
+})
+
+describe('updates in place', () => {
+  let h: Harness
+  const BASE = 'base-1'
+  const start = async (options: { oldBase?: string | null; running?: boolean; release?: string | null } = {}) => {
+    const { oldBase = BASE, running = true, release = 'old-release' } = options
+    // A workspace that does not answer is drained until this timeout, then recreated.
+    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1' } })
+    await h.openWorkspace('Alice')
+    h.store.noteWorkspace('alice', 'Alice')
+    h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': BASE })
+    if (oldBase !== null) h.docker.imageLabels.set(OLD_IMAGE_ID, { 'poise.release': 'old-release', 'poise.base': oldBase })
+    addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, running)
+    h.workspace.health.release = release
+  }
+  const containerId = () => h.docker.containers.get('poise-ws-alice')?.id
+  afterEach(async () => {
+    await h.close()
+  })
+
+  it('installs a new release of the same base into a running workspace and asks Poise to switch, keeping its container', async () => {
+    await start()
+    const before = containerId()
+    await h.orchestrator.upgradePass()
+
+    expect(h.docker.tasks).toHaveLength(1)
+    expect(h.docker.tasks[0]).toMatchObject({
+      name: 'poise-release-alice',
+      spec: {
+        Image: 'poise-runtime:latest',
+        User: '10001',
+        Entrypoint: ['/opt/poise-runtime/install-release.sh'],
+        Cmd: [],
+        Labels: { 'poise.task': 'install-release', 'poise.workspace': 'alice' },
+        HostConfig: { NetworkMode: 'none', CapDrop: ['ALL'], Mounts: [{ Type: 'volume', Source: 'poise-home-alice', Target: '/home/poise' }] },
+      },
+    })
+    expect(h.docker.containers.has('poise-release-alice')).toBe(false)
+    expect(h.workspace.switches).toEqual(['new-release'])
+    expect(containerId()).toBe(before)
+    expect(h.workspace.serviceRequests.some((request) => request.url === '/api/service/drain')).toBe(false)
+    expect(h.orchestrator.updatingTo('alice')).toBe('new-release')
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.requested')).toMatchObject({ handle: 'alice', release: 'new-release', from: 'old-release' })
+
+    // Asked again until it runs the release, but installed only once.
+    await h.orchestrator.upgradePass()
+    expect(h.docker.tasks).toHaveLength(1)
+    expect(h.workspace.switches).toEqual(['new-release', 'new-release'])
+
+    // Poise restarted on the new release.
+    h.workspace.health.release = 'new-release'
+    h.orchestrator.markNotReady('alice')
+    expect(await h.orchestrator.readiness('alice', 'Alice')).toEqual({ ready: true })
+    expect(h.orchestrator.updatingTo('alice')).toBeNull()
+    expect(events(h.logs, 'workspace.update')).toEqual(['workspace.update.requested', 'workspace.update.finished'])
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toHaveLength(2)
+    expect(containerId()).toBe(before)
+  })
+
+  it('says Poise is updating while the workspace restarts onto the new release', async () => {
+    await start()
+    const { workspaceCookie } = await h.openWorkspace('Alice')
+    await h.orchestrator.upgradePass()
+    h.workspace.reachable = false
+    h.orchestrator.markNotReady('alice')
+
+    const page = await h.request({ host: ALICE, path: '/', headers: { cookie: workspaceCookie, ...NAVIGATE } })
+    expect(page.status).toBe(503)
+    expect(page.headers['x-poise-updating']).toBe('1')
+    expect(page.body).toContain('Updating to the latest version')
+    const call = await h.request({ host: ALICE, path: '/api/workspace', headers: { cookie: workspaceCookie } })
+    expect(call.status).toBe(503)
+    expect(call.headers['x-poise-updating']).toBe('1')
+    expect(call.json()).toMatchObject({ error: 'workspace_updating' })
+  })
+
+  it('recreates the container when the new image has another base, its release made current first', async () => {
+    await start({ oldBase: 'base-0' })
+    const before = containerId()
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate']])
+    const calls = dockerCalls(h)
+    expect(calls.indexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(calls.indexOf('POST /containers/poise-ws-alice/stop'))
+    expect(containerId()).not.toBe(before)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('drains again when activation restarts Poise, and stops the container only once it is idle again', async () => {
+    await start({ oldBase: 'base-0' })
+    h.docker.onTask = () => {
+      // A switch queued before the drain restarts Poise while the release activates; the new Poise takes a call.
+      h.workspace.health.runningCallerCalls = 1
+      setTimeout(() => { h.workspace.health.runningCallerCalls = 0 }, 60)
+      h.docker.onTask = undefined
+    }
+    await h.orchestrator.upgradePass()
+    const calls = h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)
+    expect(calls.filter((call) => call === 'POST /api/service/drain').length).toBeGreaterThanOrEqual(3)
+    expect(events(h.logs, 'workspace.drain')).toEqual(['workspace.drain.requested', 'workspace.drain.requested', 'workspace.drain.idle'])
+    // Activated again once idle, and only then stopped.
+    expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate'], ['--activate']])
+    const docker = dockerCalls(h)
+    expect(docker.lastIndexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(docker.indexOf('POST /containers/poise-ws-alice/stop'))
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('recreates a workspace whose image names no release, or that runs without the supervisor', async () => {
+    await start({ oldBase: null })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(h.docker.containers.get('poise-ws-alice')?.imageId).toBe(CURRENT_IMAGE_ID)
+    await h.close()
+
+    await start({ release: null })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(h.docker.containers.get('poise-ws-alice')?.imageId).toBe(CURRENT_IMAGE_ID)
+  })
+
+  it('leaves the workspace on its release when installing the new one fails, and tries again', async () => {
+    await start()
+    h.docker.taskExitCode = 1
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.failed')).toMatchObject({ handle: 'alice', error: expect.stringContaining('exited with 1') })
+    expect(h.docker.containers.has('poise-release-alice')).toBe(false)
+    h.docker.taskExitCode = 0
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+  })
+
+  it('stops asking for a release that failed to start in the workspace, which stays on its own', async () => {
+    await start()
+    h.workspace.failedReleases.push('new-release')
+    await h.orchestrator.upgradePass()
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+    expect(h.orchestrator.updatingTo('alice')).toBeNull()
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.refused')).toMatchObject({ handle: 'alice', release: 'new-release', running: 'old-release' })
+    expect(h.store.getWorkspace('alice')?.lastError).toContain('failed to start')
+  })
+
+  it('recreates a workspace of the same base whose container settings changed', async () => {
+    await start()
+    const before = containerId()
+    h.docker.containers.get('poise-ws-alice')!.spec = { ...h.docker.containers.get('poise-ws-alice')!.spec, Env: ['POISE_DRAIN_TIMEOUT=60'] }
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual([])
+    expect(containerId()).not.toBe(before)
+    expect(containerEnv(h, 'alice')).toContain(`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`)
+  })
+
+  it('switches a workspace on the current image that still runs an older release', async () => {
+    await start()
+    const alice = h.docker.containers.get('poise-ws-alice')!
+    alice.imageId = CURRENT_IMAGE_ID
+    await h.orchestrator.upgradePass()
+    expect(h.docker.tasks).toHaveLength(1)
+    expect(h.workspace.switches).toEqual(['new-release'])
+    h.workspace.health.release = 'new-release'
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toHaveLength(1)
+  })
+
+  it('calls off a pending switch to another release once the workspace runs the target release again', async () => {
+    await start()
+    const alice = h.docker.containers.get('poise-ws-alice')!
+    alice.imageId = CURRENT_IMAGE_ID
+    h.workspace.health.release = 'new-release'
+    h.workspace.health.switching = 'withdrawn-release'
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+    expect(h.workspace.health.switching).toBeNull()
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.withdrawn')).toMatchObject({ handle: 'alice', release: 'withdrawn-release', running: 'new-release' })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+  })
+
+  it('waits for a workspace restarting onto the release it was asked for, and recreates one that stays unreachable', async () => {
+    await start()
+    const before = containerId()
+    await h.orchestrator.upgradePass()
+    h.workspace.reachable = false
+    h.orchestrator.markNotReady('alice')
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    h.advance(11 * 60_000)
+    await h.orchestrator.upgradePass()
+    expect(containerId()).not.toBe(before)
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
+  })
+
+  it('recreates a stopped workspace on the new image, with the new release current', async () => {
+    await start({ running: false })
+    await h.orchestrator.upgradePass()
+    expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate']])
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: false })
   })
 })
 
@@ -623,7 +832,8 @@ describe('a recreated gateway container', () => {
     await start({ POISE_DRAIN_TIMEOUT: '2' })
     addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true, { gatewayJoined: false })
     await h.orchestrator.upgradePass()
-    expect(h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)).toEqual(['POST /api/service/drain'])
+    // The drain, and the drain again just before the container stops.
+    expect(h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)).toEqual(['POST /api/service/drain', 'POST /api/service/drain'])
     expect(events(h.logs, 'workspace.')).toEqual([
       'workspace.upgrade.started',
       'workspace.network.connected',

@@ -28,10 +28,13 @@ docker build --file deploy/runtime/Dockerfile --tag poise-runtime \
 
 - Node 22 and Poise in `/opt/poise`: the built `dist/`, the production
   `node_modules`, `scripts/` and `caller/`, which is agent-interface's working
-  directory (`AGENT_INTERFACE_ROOT`).
-- Python 3.13 and Caller's three CLIs in the virtualenv `/opt/caller/venv`
-  (`CALLER_BIN_ROOT`); agent-interface keeps its data in
+  directory (`AGENT_INTERFACE_ROOT`). `/opt/poise/RELEASE` names this release.
+- Python 3.13 and Caller's three CLIs in the relocatable virtualenv
+  `/opt/caller/venv` (`CALLER_BIN_ROOT`); agent-interface keeps its data in
   `~/.poise/agent-interface` (`AGENT_INTERFACE_DATA_DIR`).
+- `/opt/poise-runtime`: `supervisor.mjs`, `install-release.sh` and `BASE`, the
+  base every release of this image runs on
+  ([Updates in place](../../docs/Service-architecture.md#updates-in-place)).
 - `gh` from GitHub's apt repository, `git`, `build-essential`,
   `openssh-client`, `curl`, `ripgrep`, `jq`, `unzip`, `xz-utils`, `less`,
   `procps`, `tini` and the `en_US.UTF-8` locale.
@@ -50,8 +53,11 @@ running `entrypoint.sh`. That script
 2. creates `~/.poise` (mode 700), `~/.poise/logs`, `~/.local/bin` and `~/.cache`;
 3. starts `install-clis.sh` in the background unless
    `POISE_SKIP_CLI_BOOTSTRAP=1`;
-4. becomes `node /opt/poise/dist/server.js`. The image never rebuilds Poise
-   the way `scripts/start-production.mjs` does on a personal computer.
+4. becomes `node /opt/poise-runtime/supervisor.mjs`, which runs Poise from
+   the current release, or this image's own, and restarts it onto a newly
+   installed release while the agents it started keep running. The image
+   never rebuilds Poise the way `scripts/start-production.mjs` does on a
+   personal computer.
 
 The health check is `GET /api/service/health` over loopback.
 

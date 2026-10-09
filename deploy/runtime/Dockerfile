@@ -28,8 +28,10 @@ FROM debian:bookworm-slim AS caller
 COPY --from=ghcr.io/astral-sh/uv:0.12.22 /uv /usr/local/bin/uv
 ENV UV_PYTHON_INSTALL_DIR=/opt/python UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 UV_NO_CACHE=1
 COPY caller /src/caller
+# Relocatable, so the gateway can install it as part of a release in the
+# workspace's home volume (deploy/runtime/install-release.sh).
 RUN uv python install 3.13 \
- && uv venv --python 3.13 /opt/caller/venv \
+ && uv venv --relocatable --python 3.13 /opt/caller/venv \
  && uv pip install --python /opt/caller/venv/bin/python \
       /src/caller/agent_interface /src/caller/github_interface /src/caller/github_datastore
 
@@ -101,6 +103,9 @@ COPY --from=poise /src/dist /opt/poise/dist
 COPY scripts /opt/poise/scripts
 COPY caller /opt/poise/caller
 COPY deploy/runtime/entrypoint.sh deploy/runtime/install-clis.sh /opt/poise/deploy/runtime/
+# The base every release of this image runs on: the supervisor, which runs
+# the current release, and the script the gateway installs a release with.
+COPY deploy/runtime/supervisor.mjs deploy/runtime/install-release.sh /opt/poise-runtime/
 
 # The provider CLIs come first on PATH: they live in the home volume and
 # update themselves there. No identity is baked in; the gateway passes it.
@@ -116,6 +121,18 @@ ENV HOME=/home/poise \
     AGENT_INTERFACE_DATA_DIR=/home/poise/.poise/agent-interface \
     POISE_HOST=0.0.0.0 \
     POISE_PORT=5555
+
+# The release this image carries, and the base it runs on. deploy/lib.sh
+# names the release by its commit and the base by the files that build it; a
+# workspace takes a newer image of the same base in place, without a new
+# container (docs/Service-architecture.md, "Updates in place"). A build that
+# names neither, as a plain `docker build` does, carries no release: a
+# workspace on it is never switched, and every new image gets a new container.
+ARG POISE_RELEASE=
+ARG POISE_BASE=
+RUN printf '%s\n' "$POISE_RELEASE" > /opt/poise/RELEASE \
+ && printf '%s\n' "$POISE_BASE" > /opt/poise-runtime/BASE
+LABEL poise.image=runtime poise.release=$POISE_RELEASE poise.base=$POISE_BASE
 
 USER 10001:10001
 WORKDIR /opt/poise

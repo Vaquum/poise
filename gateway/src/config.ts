@@ -203,7 +203,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     problems.push(`POISE_WORKSPACE_DISK_BUDGET must be a size such as 50g or 500m, or 0 for none; got "${budgetValue}"`)
   }
   // Workspaces get this value and refuse to start with more than a week.
-  const drainTimeoutSeconds = wholeNumber('POISE_DRAIN_TIMEOUT', 30 * 60, MAX_DRAIN_TIMEOUT_SECONDS)
+  // Longer than an issue review may run (an hour), so a drain should cut only a hung call.
+  const drainTimeoutSeconds = wholeNumber('POISE_DRAIN_TIMEOUT', 90 * 60, MAX_DRAIN_TIMEOUT_SECONDS)
   const port = wholeNumber('PORT', 8080, 65535)
 
   const proxyListenValue = read('POISE_PROXY_LISTEN')

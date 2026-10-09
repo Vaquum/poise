@@ -232,7 +232,7 @@ Environment the gateway passes:
 | `POISE_HOST` | `0.0.0.0` |
 | `POISE_PORT` | `5555` |
 | `HOME` | `/home/poise` |
-| `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 1800), so both sides time a drain alike |
+| `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 5400), so both sides time a drain alike |
 | `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
@@ -252,6 +252,51 @@ networks the one it replaced had joined, so the gateway joins them itself:
   shows it, and an upgrade stops there (`workspace.upgrade.failed`) and tries
   again on the next pass, instead of waiting out the drain and recreating the
   workspace undrained.
+
+## Updates in place
+
+A workspace takes a new image without a new container when the image's
+system base is the one its container runs, so the agents in it are never cut
+off. Agent calls (behavior runs, manual reviews, replays) are processes Poise
+starts detached; they keep running while Poise restarts, and the next Poise
+reconciles them as after any restart.
+
+- **Releases.** The image carries one release, Poise (`/opt/poise`) and
+  Caller's relocatable virtualenv (`/opt/caller/venv`), and labels it
+  `poise.release` (the commit `deploy/lib.sh` built it from) and `poise.base`
+  (a digest of the files that build the system around it:
+  `deploy/runtime/Dockerfile`, `entrypoint.sh`, `install-clis.sh`,
+  `supervisor.mjs` and `install-release.sh`).
+- **The supervisor.** `entrypoint.sh` becomes `supervisor.mjs`, which runs
+  Poise from `~/.poise/releases/current` when that release is installed for
+  its base, and from the image's own release otherwise. When Poise exits with
+  75, it starts the release named in `~/.poise/releases/next` and makes it
+  current. A release that exits on its own within a minute of starting is
+  marked failed and never run again; the image's own release takes over.
+- **Installing.** For a running workspace whose image has the new image's
+  base, the gateway runs `install-release.sh` in a short-lived container of
+  the new image, as uid 10001 with the workspace's home volume and no
+  network. It copies the release into `~/.poise/releases/<release>/` and
+  keeps an older one for at least three hours after it was last current, so
+  an agent still running from it keeps its files. The supervisor dates a
+  release it switches away from to that moment.
+- **Switching.** The gateway then sends `POST /api/service/switch` with
+  `{ release }` (`admin` scope or loopback; 202 `{ release, switching }`,
+  409 for a release not installed for this base or a server started without
+  the supervisor). Poise writes `next`, stops admitting new background ticks,
+  and restarts at the first moment no Chat turn and no work of its own runs;
+  it waits for no agent call. The gateway asks again on later passes until
+  health reports the release, which the request makes idempotent.
+- **Meanwhile.** While the workspace restarts, the gateway answers for it
+  with `x-poise-updating: 1`: "Updating to the latest version" for a page, 503
+  `workspace_updating` for anything else. Poise dims the open page with the
+  same notice and reloads it once Poise answers again (`src/updating.ts`).
+- **Everything else.** An image of another base, a workspace started without
+  the supervisor, or a changed container setting still gets a new container,
+  drained first ([Deployment](#deployment)). The gateway makes the new image's
+  release current before it creates the container. `runningCallerCalls`
+  counts agent calls by Caller's own records and live processes, so a drain
+  also waits for the calls an earlier release started.
 
 ## Poise in service mode
 
@@ -314,16 +359,23 @@ otherwise offer it):
 **Service endpoints** (loopback, or the `admin` scope; the owner's `browser`
 assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
-  runningCallerCalls, backgroundWork, idle, draining }`. `idle` is true only
+  runningCallerCalls, backgroundWork, idle, draining, release, switching }`. `idle` is true only
   when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
   It backs the container health check and the gateway's readiness check.
   - `version` is the commit the running bundle was built from, `null` for a
     development build.
+  - `release` is the installed release the supervisor started this server on
+    ([Updates in place](#updates-in-place)), `null` without one.
+  - `switching` is the release a pending switch restarts this server onto,
+    `null` when none is pending. Asking to switch to the release it runs calls
+    a pending switch off; the gateway does so when the target changes back.
   - `activeChatTurns` counts the Chat turns recorded open: reserved before
     their first write, closed once their outcome is recorded.
   - `runningCallerCalls` counts the Caller processes Poise launched for agent
     work (behavior runs, manual reviews and replays, card chats, `/content`)
-    that it has not seen exit, plus `/consensus` debates still running.
+    that it has not seen exit, plus `/consensus` debates still running, or,
+    when more, the calls Caller records as running with their process alive,
+    which include those an earlier release started.
   - `backgroundWork` counts everything else a restart would cut: the Chat
     runtime's startups, operations and agent processes, process-owned
     background work (behavior ticks, provider CLI updates, the model check),
@@ -332,13 +384,14 @@ assertion may only resume, and anything else is refused with 403):
   launches, then returns the same fields. A drain lapses unless it is renewed:
   while the gateway polls health it re-POSTs `/api/service/drain` at least
   every 5 minutes. It recreates the container once `idle` is true or
-  `POISE_DRAIN_TIMEOUT` seconds (default 1800, 30 minutes) have passed.
+  `POISE_DRAIN_TIMEOUT` seconds (default 5400, 90 minutes: longer than an
+  issue review may run, so it should cut only a hung call) have passed.
   - New Chat turns include queued messages, and launches include the
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
     `/api/debate`, `/api/chat`, `/api/models/refresh`). Refused work answers
     503 with code `draining`; work already running continues.
   - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
-    1800) plus five minutes after the last drain call, so a gateway that
+    5400) plus five minutes after the last drain call, so a gateway that
     stopped renewing it cannot leave the workspace refusing work.
 - `POST /api/service/resume` lifts a drain. The owner's browser may call it
   too, to lift a drain a gateway left behind.

@@ -20,9 +20,22 @@ export interface DockerCall {
 }
 
 /** The subset of the Docker Engine API the gateway calls, on a unix socket, recording every request. */
+/** A task container the gateway ran to its end (DockerClient.runTask). */
+export interface FakeTask {
+  name: string
+  spec: Record<string, unknown>
+}
+
 export interface FakeDocker {
   socketPath: string
   images: Map<string, string>
+  /** Each image's labels, by image ID. */
+  imageLabels: Map<string, Record<string, string>>
+  /** The task containers run so far, and the exit code the next one ends with. */
+  tasks: FakeTask[]
+  taskExitCode: number
+  /** Called as each task container runs, before it ends. */
+  onTask?: (task: FakeTask) => void
   /** Each volume's size in bytes, as /system/df reports it. */
   volumeSizes: Map<string, number>
   volumes: Set<string>
@@ -62,6 +75,7 @@ function inspect(container: FakeContainer): unknown {
 export async function startFakeDocker(dir: string): Promise<FakeDocker> {
   const socketPath = join(dir, 'docker.sock')
   const images = new Map<string, string>()
+  const imageLabels = new Map<string, Record<string, string>>()
   const volumes = new Set<string>()
   const networks = new Set<string>(['bridge'])
   const containers = new Map<string, FakeContainer>()
@@ -70,6 +84,9 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
   const fake: FakeDocker = {
     socketPath,
     images,
+    imageLabels,
+    tasks: [],
+    taskExitCode: 0,
     volumeSizes: new Map(),
     volumes,
     networks,
@@ -100,8 +117,19 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
       let match: RegExpExecArray | null
 
       if (method === 'GET' && (match = /^\/images\/(.+)\/json$/.exec(path))) {
-        const id = images.get(decodeURI(match[1]))
-        return id ? send(res, 200, { Id: id }) : send(res, 404, { message: `No such image: ${match[1]}` })
+        const ref = decodeURI(match[1])
+        const id = images.get(ref) ?? ([...images.values()].includes(ref) || imageLabels.has(ref) ? ref : undefined)
+        return id
+          ? send(res, 200, { Id: id, Config: { Labels: imageLabels.get(id) ?? null } })
+          : send(res, 404, { message: `No such image: ${match[1]}` })
+      }
+      if (method === 'POST' && (match = /^\/containers\/([^/]+)\/wait$/.exec(path))) {
+        const container = containers.get(decodeURIComponent(match[1]))
+        if (!container) return send(res, 404, { message: `No such container: ${match[1]}` })
+        fake.tasks.push({ name: container.name, spec: container.spec })
+        fake.onTask?.(fake.tasks[fake.tasks.length - 1])
+        container.running = false
+        return send(res, 200, { StatusCode: fake.taskExitCode, Error: null })
       }
       if (method === 'GET' && path === '/containers/json') {
         const filters = JSON.parse(url.searchParams.get('filters') ?? '{}') as { label?: string[] }
@@ -159,7 +187,7 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
           return send(res, 204)
         }
         if (method === 'DELETE' && action === undefined) {
-          if (container.running) return send(res, 409, { message: 'You cannot remove a running container' })
+          if (container.running && url.searchParams.get('force') !== 'true') return send(res, 409, { message: 'You cannot remove a running container' })
           containers.delete(container.name)
           return send(res, 204)
         }

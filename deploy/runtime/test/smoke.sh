@@ -7,12 +7,13 @@
 #
 #   deploy/runtime/test/smoke.sh contract IMAGE   health, identity, user, tools, entrypoint
 #   deploy/runtime/test/smoke.sh offline IMAGE    a failed CLI bootstrap leaves Poise running
+#   deploy/runtime/test/smoke.sh switch IMAGE     a release switch restarts Poise alone; the container and its processes stay
 #   deploy/runtime/test/smoke.sh bootstrap IMAGE  installs the provider CLIs (needs the internet)
 #   deploy/runtime/test/smoke.sh logs IMAGE       prints what every smoke container logged
 set -euo pipefail
 
 if [ $# -ne 2 ]; then
-  sed -n '8,11p' "$0" >&2
+  sed -n '8,12p' "$0" >&2
   exit 2
 fi
 mode=$1
@@ -310,6 +311,50 @@ offline() {
   pass "every install failed and was logged with its command and exit code; Poise kept running"
 }
 
+# What /api/service/health in CONTAINER says the running release is.
+running_release() {
+  docker exec "$1" curl --silent --max-time 5 http://127.0.0.1:5555/api/service/health 2>/dev/null | jq -r '.release // empty' || true
+}
+
+# A release switch restarts Poise alone (deploy/runtime/supervisor.mjs): the
+# container stays, Poise comes back on the release the switch named, and a
+# process Poise does not wait for, as it does not wait for a detached agent
+# call, keeps running.
+switch() {
+  local container=poise-ws-switch volume=poise-home-switch public_key before own now=''
+  fresh "$container" "$volume" none
+  public_key=$(node "$here/identity.mjs" key "$work/gateway.pem")
+  start_workspace "$container" "$volume" none "https://$host" "$public_key" --env POISE_SKIP_CLI_BOOTSTRAP=1
+  wait_healthy "$container"
+  before=$(docker inspect --format '{{.Id}}' "$container")
+  own=$(docker exec "$container" cat /opt/poise/RELEASE)
+  [ "$(running_release "$container")" = "$own" ] || fail "Poise does not report its image's release $own"
+  # As the gateway installs a newer image's release; a copy under another name stands in for one.
+  docker run --rm --volumes-from "$container" --user 10001 --network none --env HOME=/home/poise \
+    --entrypoint /opt/poise-runtime/install-release.sh "$image" >/dev/null || fail "install-release.sh failed"
+  docker exec "$container" cp -a "/home/poise/.poise/releases/$own" /home/poise/.poise/releases/smoke-next
+  docker exec --detach "$container" setsid sleep 3600
+  docker exec "$container" curl --fail --silent --show-error --request POST --header 'content-type: application/json' \
+    --data '{"release":"smoke-next"}' http://127.0.0.1:5555/api/service/switch >/dev/null || fail "the switch was refused"
+  for _ in $(seq 1 60); do
+    now=$(running_release "$container")
+    [ "$now" = smoke-next ] && break
+    sleep 1
+  done
+  [ "$now" = smoke-next ] || fail "Poise did not come back on release smoke-next within a minute (it reports '$now')"
+  [ "$(docker inspect --format '{{.Id}}' "$container")" = "$before" ] || fail "the switch replaced the container"
+  [ "$(docker exec "$container" cat /home/poise/.poise/releases/current)" = smoke-next ] || fail "current does not name smoke-next"
+  docker exec "$container" pgrep -f 'sleep 3600' >/dev/null || fail "a running process did not survive the switch"
+  # A workspace stopped mid-switch keeps its queued `next`; --activate, run for its next start, must win over it.
+  docker exec "$container" sh -c "printf '%s\\n' smoke-next > /home/poise/.poise/releases/next"
+  docker run --rm --volumes-from "$container" --user 10001 --network none --env HOME=/home/poise \
+    --entrypoint /opt/poise-runtime/install-release.sh "$image" --activate >/dev/null || fail "install-release.sh --activate failed"
+  docker exec "$container" test ! -e /home/poise/.poise/releases/next || fail "--activate left a queued switch to smoke-next"
+  [ "$(docker exec "$container" cat /home/poise/.poise/releases/current)" = "$own" ] || fail "--activate did not make $own current"
+  check_no_restarts "$container"
+  pass "the switch restarted Poise alone on release smoke-next; the container and its other processes stayed; --activate cleared a queued switch"
+}
+
 # Poise's own updater (scripts/provider-cli-updates.mjs) must find each CLI
 # where the bootstrap put it and read its version. Whether a vendor's update
 # command then succeeds is that vendor's affair, so it is printed, not judged.
@@ -373,10 +418,11 @@ logs() {
 case "$mode" in
   contract) contract ;;
   offline) offline ;;
+  switch) switch ;;
   bootstrap) bootstrap ;;
   logs) logs ;;
   *)
-    sed -n '8,11p' "$0" >&2
+    sed -n '8,12p' "$0" >&2
     exit 2
     ;;
 esac

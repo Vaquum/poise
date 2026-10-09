@@ -4,7 +4,7 @@ import { heldBindings, isSafePath } from './auth.js'
 import { WORKSPACE_COOKIE, type Context } from './context.js'
 import { header, HttpError, isNavigation, readForm, redirect, safeEqual, sendHtml, sendJson } from './http.js'
 import { errorMessage } from './log.js'
-import { messagePage, signOutPage, startingPage } from './pages.js'
+import { messagePage, signOutPage, startingPage, updatingPage } from './pages.js'
 import { forwardHeaders, isUnreachable, MAX_REQUEST_BODY_BYTES, proxyRequest, proxyUpgrade, rejectUpgrade, RequestTooLargeError } from './proxy.js'
 import { deviceState, hashSecret, type Session, type User } from './store.js'
 import { workspaceApi, WORKSPACE_API_PREFIX } from './workspace-api.js'
@@ -31,6 +31,9 @@ function framingProblem(req: IncomingMessage): string | null {
   return null
 }
 const STARTING = { error: 'workspace_starting', message: 'Your workspace is starting. Try again in a moment.' }
+const UPDATING = { error: 'workspace_updating', message: 'Poise is updating to the latest version. It is back in a few seconds.' }
+/** Marks every answer given while a workspace restarts onto a new release, for Poise's page to notice. */
+export const UPDATING_HEADER = 'x-poise-updating'
 
 /** /api/link/* exactly as written: no dot segments or backslashes that a URL parser would resolve elsewhere. */
 export function isLinkPath(target: string): boolean {
@@ -98,6 +101,16 @@ function refuse(ctx: Context, req: IncomingMessage, res: ServerResponse, owner: 
 /** Starts the workspace in the background and tells the caller to come back shortly. */
 function starting(ctx: Context, req: IncomingMessage, res: ServerResponse, owner: User, problem: string | null): void {
   ctx.deps.orchestrator.startInBackground(owner.handle, owner.login)
+  // Restarting onto a new release takes seconds; the page says so and reloads into the new version.
+  if (ctx.deps.orchestrator.updatingTo(owner.handle) !== null) {
+    if (!isNavigation(req)) {
+      sendJson(res, 503, UPDATING, { 'retry-after': '2', [UPDATING_HEADER]: '1' })
+      return
+    }
+    sendHtml(res, 503, updatingPage({ workspaceHost: `${owner.handle}.${ctx.deps.config.domain}` }),
+      { ...ctx.pageHeaders, 'retry-after': '2', [UPDATING_HEADER]: '1' })
+    return
+  }
   if (!isNavigation(req)) {
     sendJson(res, 503, STARTING, { 'retry-after': '2' })
     return

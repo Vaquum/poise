@@ -506,6 +506,20 @@ export class ChatRuntime extends EventEmitter {
     return count
   }
 
+  /**
+   * The work a server restart would cut: what busy() counts, except agent
+   * processes that sit idle between turns, which the next turn starts again.
+   * A release switch waits for this alone.
+   */
+  working(): number {
+    let count = this.inflightOps + (this.recovering ? 1 : 0)
+    for (const session of this.live.values()) {
+      const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
+      count += own > 0 ? own : ACTIVE_STATUSES.includes(session.record.status) ? 1 : 0
+    }
+    return count
+  }
+
   private assertAcceptingWork(): void {
     if (this.drainState) throw new ChatError(503, 'Poise is installing an update; new work is refused until it restarts', 'draining')
   }

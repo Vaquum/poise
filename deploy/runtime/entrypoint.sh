@@ -42,5 +42,7 @@ else
   (/opt/poise/deploy/runtime/install-clis.sh &)
 fi
 
+# The supervisor runs Poise from the current release and restarts it onto a
+# newly installed one, while the agents Poise started keep running.
 cd /opt/poise
-exec node /opt/poise/dist/server.js
+exec node /opt/poise-runtime/supervisor.mjs

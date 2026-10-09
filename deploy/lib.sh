@@ -134,16 +134,27 @@ $(head -n 10 <<<"$changes")"
   printf '%s' "$head"
 }
 
+# The base a workspace image's releases run on: a digest of the files that
+# build the system around Poise. A workspace takes a new image of the same
+# base in place; a new base recreates its container.
+runtime_base() {
+  (cd "$root/deploy/runtime" && cat Dockerfile entrypoint.sh install-clis.sh supervisor.mjs install-release.sh) \
+    | sha256sum | cut -c1-16
+}
+
 # Builds the workspace image as IMAGE and, for a commit SHA, also as
-# <IMAGE without its tag>:<SHA>.
+# <IMAGE without its tag>:<SHA>. Its release is the commit, or a development
+# build's own name.
 build_runtime_image() {
-  local image=$1 sha=$2 tags=(--tag "$1") name=$1
+  local image=$1 sha=$2 tags=(--tag "$1") name=$1 release
   if [ -n "$sha" ]; then
     if [[ ${image##*/} == *:* ]]; then name=${image%:*}; fi
     tags+=(--tag "$name:$sha")
   fi
+  release=${sha:-development-$(date -u +%Y%m%d%H%M%S)}
   say "Building the workspace image $image${sha:+ at $sha}. The first build takes several minutes."
-  docker build --file "$root/deploy/runtime/Dockerfile" --build-arg "POISE_SOURCE_SHA=$sha" "${tags[@]}" "$root"
+  docker build --file "$root/deploy/runtime/Dockerfile" --build-arg "POISE_SOURCE_SHA=$sha" \
+    --build-arg "POISE_RELEASE=$release" --build-arg "POISE_BASE=$(runtime_base)" "${tags[@]}" "$root"
 }
 
 # Docker's build cache may keep this much once a deploy finishes: the layers
