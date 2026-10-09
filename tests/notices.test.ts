@@ -250,6 +250,14 @@ describe('the check for pull requests ready to merge', () => {
     expect(store.silenced('pr-ready:acme/api#1')).toBe(false)
   })
 
+  it('notices nothing more once notifications are turned off while GitHub is being asked', async () => {
+    await notices.checkReadyPullRequests(async () => {
+      settings.setSettings({ notifications: { enabled: false } })
+      return all([pr(1, 'green')])
+    }, () => at(0))
+    expect(store.openAlerts()).toEqual([])
+  })
+
   it('stays silent about a silenced pull request while it is open, however often it is ready again', async () => {
     await check(all([pr(1, 'green')]), at(0))
     notices.silenceNotice(shown(at(1))[0].id, at(1))

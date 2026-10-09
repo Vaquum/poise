@@ -133,6 +133,8 @@ export async function checkReadyPullRequests(
   now = () => Date.now(),
 ): Promise<void> {
   const { pullRequests, read: listed, tracked } = await read()
+  // Turned off while GitHub was being asked: nothing more is noticed, on the desktop either.
+  if (!getNotificationSettings().enabled) return
   const open = new Set<string>()
   for (const pr of pullRequests) {
     const dedupeKey = readyKey(pr)
