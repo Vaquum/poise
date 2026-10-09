@@ -345,8 +345,14 @@ switch() {
   [ "$(docker inspect --format '{{.Id}}' "$container")" = "$before" ] || fail "the switch replaced the container"
   [ "$(docker exec "$container" cat /home/poise/.poise/releases/current)" = smoke-next ] || fail "current does not name smoke-next"
   docker exec "$container" pgrep -f 'sleep 3600' >/dev/null || fail "a running process did not survive the switch"
+  # A workspace stopped mid-switch keeps its queued `next`; --activate, run for its next start, must win over it.
+  docker exec "$container" sh -c "printf '%s\\n' smoke-next > /home/poise/.poise/releases/next"
+  docker run --rm --volumes-from "$container" --user 10001 --network none --env HOME=/home/poise \
+    --entrypoint /opt/poise-runtime/install-release.sh "$image" --activate >/dev/null || fail "install-release.sh --activate failed"
+  docker exec "$container" test ! -e /home/poise/.poise/releases/next || fail "--activate left a queued switch to smoke-next"
+  [ "$(docker exec "$container" cat /home/poise/.poise/releases/current)" = "$own" ] || fail "--activate did not make $own current"
   check_no_restarts "$container"
-  pass "the switch restarted Poise alone on release smoke-next; the container and its other processes stayed"
+  pass "the switch restarted Poise alone on release smoke-next; the container and its other processes stayed; --activate cleared a queued switch"
 }
 
 # Poise's own updater (scripts/provider-cli-updates.mjs) must find each CLI

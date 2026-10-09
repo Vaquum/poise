@@ -28,6 +28,8 @@ fi
 if [ "${1:-}" = --activate ]; then
   printf '%s\n' "$release" > "$releases/current.tmp"
   mv "$releases/current.tmp" "$releases/current"
+  # A switch queued before the workspace stopped would start ahead of current.
+  rm -f "$releases/next"
 fi
 
 # Older releases go once five newer ones exist and three hours have passed
