@@ -170,6 +170,12 @@ launchd_runs_link() {
 	[ "$OS" = Darwin ] && has launchctl && launchctl print "gui/$(id -u)/$LAUNCH_AGENT" >/dev/null 2>&1
 }
 
+# The program launchd runs for Poise Link, as the agent it loaded names it.
+launchd_link_program() {
+	tab=$(printf '\t')
+	launchctl print "gui/$(id -u)/$LAUNCH_AGENT" 2>/dev/null | sed -n "s/^${tab}program = //p"
+}
+
 # The running Poise Link is the previous version once the new one is in
 # place: launchd restarts its copy, and any other copy is quit and the new one
 # opened. Nothing stops Poise Link before the new version is installed, so a
@@ -177,10 +183,18 @@ launchd_runs_link() {
 restart_link() {
 	if launchd_runs_link; then
 		step "Restarting Poise Link"
-		launchctl kickstart -k "gui/$(id -u)/$LAUNCH_AGENT" ||
-			fail "launchd could not restart Poise Link. Quit it from its menu and open Poise Link again to use the new version."
-		LINK_OPEN=1
-		link_started "Open it from $APP_DIR to see what macOS says."
+		if [ "$(launchd_link_program)" = "$APP_DIR/Poise Link.app/Contents/MacOS/poise-link" ]; then
+			launchctl kickstart -k "gui/$(id -u)/$LAUNCH_AGENT" ||
+				fail "launchd could not restart Poise Link. Quit it from its menu and open Poise Link again to use the new version."
+			LINK_OPEN=1
+			link_started "Open it from $APP_DIR to see what macOS says."
+		else
+			# launchd runs a Poise Link from another folder. Unloading its agent
+			# stops it, and the new one takes the agent over when it opens.
+			launchctl bootout "gui/$(id -u)/$LAUNCH_AGENT" ||
+				fail "launchd could not stop the Poise Link it runs from another folder. Quit that one from its menu, then open Poise Link from $APP_DIR."
+			open_link
+		fi
 		return
 	fi
 	link_pids=$(running poise-link) || return 0

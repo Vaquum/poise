@@ -166,7 +166,8 @@ the pairing window again. Espanso keeps the last snippets it received.
   stopped any way but Quit, for example with `kill`, launchd starts it again
   within seconds. While it is on, launchd's copy is the one that runs: opening
   Poise Link from the Finder has launchd start it, and launchd's copy asks any
-  other copy to quit. Turning it off leaves the running copy as it is; it is
+  other copy to quit. A Poise Link opened from another folder than before,
+  because it was moved or installed elsewhere, takes the agent over. Turning it off leaves the running copy as it is; it is
   not started at the next login.
 - **Sign out** forgets the pairing on this computer. Revoke the device in Poise
   as well to invalidate its token.
@@ -224,7 +225,9 @@ notification. Import that file in Poise under Snippets to keep those snippets.
 1. In the tray menu, turn off **Start at login**, then choose **Sign out** and
    **Quit**. Turning off Start at login removes the LaunchAgent, Run key value
    or autostart entry listed above; if the app is already gone, delete that
-   entry by hand.
+   entry by hand. On macOS, also run
+   `launchctl bootout gui/$(id -u)/com.vaquum.poise.link` then, or launchd
+   keeps the agent it loaded until you log out.
 2. Revoke the device in Poise under Settings → Accounts → Poise Link.
 3. Remove the app: drag it from Applications to the Trash (macOS), use
    Settings → Apps → Installed apps (Windows), or `sudo apt remove poise-link`

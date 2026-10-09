@@ -129,11 +129,16 @@ esac
     'sudo': r'''
 exec env "$@"
 ''',
-    # launchd: the agent is loaded when $STATE/launch-agent-loaded exists, and kickstart -k replaces its copy.
+    # launchd: the agent is loaded when $STATE/launch-agent-loaded exists, for the program in
+    # $STATE/launch-agent-program or else the one in the app folder. kickstart -k replaces its copy,
+    # and bootout stops it and unloads the agent.
     'launchctl': r'''
 case $1 in
 print)
 	[ -f "$STATE/launch-agent-loaded" ] || exit 113
+	program="$POISE_LINK_APP_DIR/Poise Link.app/Contents/MacOS/poise-link"
+	[ ! -f "$STATE/launch-agent-program" ] || program=$(cat "$STATE/launch-agent-program")
+	printf 'gui/501/com.vaquum.poise.link = {\n\tstate = running\n\tprogram = %s\n}\n' "$program"
 	;;
 kickstart)
 	[ ! -f "$STATE/kickstart-fails" ] || exit 1
@@ -141,6 +146,12 @@ kickstart)
 		kill "$pid" 2>/dev/null || :
 	done
 	start_link
+	;;
+bootout)
+	rm -f "$STATE/launch-agent-loaded"
+	for pid in $(cat "$STATE/pids.poise-link" 2>/dev/null); do
+		kill "$pid" 2>/dev/null || :
+	done
 	;;
 esac
 ''',
@@ -505,6 +516,24 @@ class MacTest(InstallerTest):
         self.assertFalse(alive(link), 'launchd replaced the previous Poise Link')
         self.assertEqual(mac.calls('open'), [], 'launchd starts Poise Link; the installer opens nothing')
         self.assertIn('<string>0.1.0</string>', (old / 'Contents/Info.plist').read_text())
+        self.assertTrue(mac.started() and all(alive(pid) for pid in mac.started()), 'the new Poise Link runs')
+
+    def test_moves_poise_link_to_the_folder_it_was_installed_in(self):
+        mac = Installer(self, 'Darwin', 'arm64')
+        (mac.apps / 'Espanso.app').mkdir(parents=True)
+        (mac.home / 'Library/Application Support/espanso/match').mkdir(parents=True)
+        mac.running('espanso')
+        link = mac.running('poise-link')
+        mac.set('launch-agent-loaded')
+        mac.set('launch-agent-program', '/Users/someone/Applications/Poise Link.app/Contents/MacOS/poise-link')
+
+        result = mac.run()
+        self.assert_ok(result)
+        launchctl = mac.calls('launchctl')
+        self.assertIn(['launchctl', 'bootout', 'gui/501/com.vaquum.poise.link'], launchctl)
+        self.assertNotIn('kickstart', [call[1] for call in launchctl], 'kickstart would restart the copy in the other folder')
+        self.assertFalse(alive(link), 'the Poise Link in the other folder was stopped')
+        self.assertEqual([call[1] for call in mac.calls('open')], [str(mac.apps / 'Poise Link.app')], 'the new one opens and takes the agent over')
         self.assertTrue(mac.started() and all(alive(pid) for pid in mac.started()), 'the new Poise Link runs')
 
     def test_has_launchd_start_a_poise_link_that_was_quit(self):

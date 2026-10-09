@@ -107,6 +107,11 @@ impl LaunchAgent {
         self.dir.join(file_name())
     }
 
+    /// The Poise Link the agent is written for.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
     /// Start at login is on.
     pub fn installed(&self) -> bool {
         self.path().is_file()
@@ -152,15 +157,21 @@ fn file_name() -> String {
 }
 
 /// The agent's state in launchd.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Job {
     /// Not loaded: no login has read the file since it was written, and
     /// nothing loaded it.
     NotLoaded,
-    /// Loaded, and its copy does not run: it was quit, or launchd waits
-    /// before starting it again.
-    Stopped,
-    Running,
+    /// Loaded as the file was then, for `program`. When its copy does not
+    /// run, it was quit, or launchd waits before starting it again.
+    Loaded { running: bool, program: PathBuf },
+}
+
+impl Job {
+    /// launchd's copy of `program` runs.
+    pub fn runs(&self, program: &Path) -> bool {
+        matches!(self, Job::Loaded { running: true, program: loaded } if loaded == program)
+    }
 }
 
 /// What Poise Link asks of launchd.
@@ -170,6 +181,8 @@ pub trait Launchd {
     fn bootstrap(&self, plist: &Path) -> Result<(), String>;
     /// Starts the copy of a loaded agent.
     fn kickstart(&self) -> Result<(), String>;
+    /// Unloads the agent, which stops its copy.
+    fn bootout(&self) -> Result<(), String>;
 }
 
 /// `launchctl`, in the person's login session.
@@ -222,6 +235,10 @@ impl Launchd for Launchctl {
     fn kickstart(&self) -> Result<(), String> {
         self.succeed(&["kickstart", &self.service()])
     }
+
+    fn bootout(&self) -> Result<(), String> {
+        self.succeed(&["bootout", &self.service()])
+    }
 }
 
 fn failure(command: &str, output: &Output) -> String {
@@ -232,13 +249,16 @@ fn failure(command: &str, output: &Output) -> String {
     )
 }
 
-/// The state `launchctl print` reports for a loaded service: a top-level
-/// `state = running` line while its copy runs.
+/// A loaded service as `launchctl print` reports it: its top-level `program`
+/// line, and a `state = running` line while its copy runs.
 pub fn job_state(print: &str) -> Job {
-    if print.lines().any(|line| line == "\tstate = running") {
-        Job::Running
-    } else {
-        Job::Stopped
+    Job::Loaded {
+        running: print.lines().any(|line| line == "\tstate = running"),
+        program: print
+            .lines()
+            .find_map(|line| line.strip_prefix("\tprogram = "))
+            .map(PathBuf::from)
+            .unwrap_or_default(),
     }
 }
 
@@ -350,8 +370,16 @@ pub fn arrange(start: &Arrangement) -> Result<Arranged, String> {
     if !start.agent.installed() {
         return Ok(Start::Here.into());
     }
+    // A Poise Link opened from another place than the agent names (moved, or
+    // installed elsewhere) is the one that runs from now on.
+    start.agent.install().map_err(|error| {
+        format!(
+            "could not point the launch agent at {}: {error}",
+            start.agent.program().display()
+        )
+    })?;
     let job = start.launchd.job()?;
-    if job == Job::Running {
+    if job.runs(start.agent.program()) {
         // The single-instance plugin passes this start on to launchd's copy.
         return Ok(Start::Here.into());
     }
@@ -359,7 +387,7 @@ pub fn arrange(start: &Arrangement) -> Result<Arranged, String> {
         request_window(start.settings_dir)
             .map_err(|error| format!("could not ask launchd's copy to show its window: {error}"))?;
     }
-    if let Err(error) = start_job(start.agent, start.launchd, job) {
+    if let Err(error) = start_job(start.agent, start.launchd, &job) {
         // This process runs Poise Link after all, and shows its own window.
         take_window_request(start.settings_dir);
         return Err(error);
@@ -370,14 +398,20 @@ pub fn arrange(start: &Arrangement) -> Result<Arranged, String> {
 /// Start at login was turned on in a copy launchd did not start: launchd
 /// starts its copy, which takes over from this one. The caller then quits.
 pub fn hand_over(agent: &LaunchAgent, launchd: &dyn Launchd) -> Result<(), String> {
-    start_job(agent, launchd, launchd.job()?)
+    start_job(agent, launchd, &launchd.job()?)
 }
 
-fn start_job(agent: &LaunchAgent, launchd: &dyn Launchd, job: Job) -> Result<(), String> {
+fn start_job(agent: &LaunchAgent, launchd: &dyn Launchd, job: &Job) -> Result<(), String> {
     match job {
         Job::NotLoaded => launchd.bootstrap(&agent.path()),
-        Job::Stopped => launchd.kickstart(),
-        Job::Running => Ok(()),
+        // Loaded for a Poise Link in another place: loading the agent again,
+        // as it is now, stops that copy and starts this one.
+        Job::Loaded { program, .. } if program != agent.program() => {
+            launchd.bootout()?;
+            launchd.bootstrap(&agent.path())
+        }
+        Job::Loaded { running: false, .. } => launchd.kickstart(),
+        Job::Loaded { running: true, .. } => Ok(()),
     }
 }
 
@@ -456,9 +490,27 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
 
+    const PROGRAM: &str = "/Applications/Poise Link.app/Contents/MacOS/poise-link";
+    const ELSEWHERE: &str = "/Users/someone/Applications/Poise Link.app/Contents/MacOS/poise-link";
+
+    /// The agent loaded for this Poise Link, or for one in another place.
+    fn loaded(running: bool) -> Job {
+        Job::Loaded {
+            running,
+            program: PathBuf::from(PROGRAM),
+        }
+    }
+
+    fn loaded_elsewhere(running: bool) -> Job {
+        Job::Loaded {
+            running,
+            program: PathBuf::from(ELSEWHERE),
+        }
+    }
+
     #[derive(Default)]
     struct FakeLaunchd {
-        job: Cell<Option<Job>>,
+        job: RefCell<Option<Job>>,
         fails: Cell<bool>,
         calls: RefCell<Vec<String>>,
     }
@@ -466,7 +518,7 @@ mod tests {
     impl FakeLaunchd {
         fn with(job: Job) -> Self {
             let launchd = Self::default();
-            launchd.job.set(Some(job));
+            launchd.job.replace(Some(job));
             launchd
         }
 
@@ -479,7 +531,8 @@ mod tests {
         fn job(&self) -> Result<Job, String> {
             self.calls.borrow_mut().push("print".to_owned());
             self.job
-                .get()
+                .borrow()
+                .clone()
                 .ok_or_else(|| "launchctl print failed".to_owned())
         }
 
@@ -490,7 +543,8 @@ mod tests {
             if self.fails.get() {
                 return Err("launchctl bootstrap failed".to_owned());
             }
-            self.job.set(Some(Job::Running));
+            // The agent on disk names this program: the fixtures write it so.
+            self.job.replace(Some(loaded(true)));
             Ok(())
         }
 
@@ -499,7 +553,16 @@ mod tests {
             if self.fails.get() {
                 return Err("launchctl kickstart failed".to_owned());
             }
-            self.job.set(Some(Job::Running));
+            let mut job = self.job.borrow_mut();
+            if let Some(Job::Loaded { running, .. }) = job.as_mut() {
+                *running = true;
+            }
+            Ok(())
+        }
+
+        fn bootout(&self) -> Result<(), String> {
+            self.calls.borrow_mut().push("bootout".to_owned());
+            self.job.replace(Some(Job::NotLoaded));
             Ok(())
         }
     }
@@ -560,10 +623,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let agents = dir.path().join("LaunchAgents");
         let settings = dir.path().join("com.vaquum.poise.link");
-        let agent = LaunchAgent::new(
-            agents.clone(),
-            PathBuf::from("/Applications/Poise Link.app/Contents/MacOS/poise-link"),
-        );
+        let agent = LaunchAgent::new(agents.clone(), PathBuf::from(PROGRAM));
         Fixture {
             _dir: dir,
             agents,
@@ -673,10 +733,10 @@ mod tests {
 
     #[test]
     fn a_copy_opened_by_the_person_has_launchd_start_its_own_and_show_the_window() {
-        for (job, call) in [(Job::NotLoaded, "bootstrap"), (Job::Stopped, "kickstart")] {
+        for (job, call) in [(Job::NotLoaded, "bootstrap"), (loaded(false), "kickstart")] {
             let fixture = fixture();
             fixture.agent.install().unwrap();
-            let launchd = FakeLaunchd::with(job);
+            let launchd = FakeLaunchd::with(job.clone());
             let start = arrange_with(&fixture, &launchd, &FakeCopies::default(), false, true);
             assert_eq!(start, Ok(Start::HandedOver), "{job:?}");
             assert!(
@@ -712,7 +772,7 @@ mod tests {
     fn a_copy_opened_while_launchds_runs_passes_the_start_on() {
         let fixture = fixture();
         fixture.agent.install().unwrap();
-        let launchd = FakeLaunchd::with(Job::Running);
+        let launchd = FakeLaunchd::with(loaded(true));
         let start = arrange_with(&fixture, &launchd, &FakeCopies::default(), false, true);
         assert_eq!(start, Ok(Start::Here));
         assert_eq!(launchd.calls(), ["print"]);
@@ -723,7 +783,7 @@ mod tests {
     fn when_launchd_cannot_start_its_copy_this_one_runs_and_shows_its_own_window() {
         let fixture = fixture();
         fixture.agent.install().unwrap();
-        let launchd = FakeLaunchd::with(Job::Stopped);
+        let launchd = FakeLaunchd::with(loaded(false));
         launchd.fails.set(true);
         let start = arrange_with(&fixture, &launchd, &FakeCopies::default(), false, true);
         assert_eq!(start, Err("launchctl kickstart failed".to_owned()));
@@ -734,7 +794,7 @@ mod tests {
     fn launchds_copy_waits_for_a_copy_that_hands_over() {
         let fixture = fixture();
         fixture.agent.install().unwrap();
-        let launchd = FakeLaunchd::with(Job::Running);
+        let launchd = FakeLaunchd::with(loaded(true));
         let copies = FakeCopies::running(&[(41, 5)], true);
         let arranged = arranged(&fixture, &launchd, &copies, true, false);
         assert_eq!(arranged, Ok(Start::Here.into()));
@@ -805,31 +865,59 @@ mod tests {
     fn turning_start_at_login_on_hands_the_running_copy_to_launchd() {
         let fixture = fixture();
         fixture.agent.install().unwrap();
+        let bootstrap = format!("bootstrap {}", fixture.agent.path().display());
         for (job, calls) in [
+            (Job::NotLoaded, vec!["print", &bootstrap]),
+            (loaded(false), vec!["print", "kickstart"]),
+            (loaded(true), vec!["print"]),
+            // Loaded for a Poise Link in another place: reloaded for this one.
             (
-                Job::NotLoaded,
-                vec![
-                    "print".to_owned(),
-                    format!("bootstrap {}", fixture.agent.path().display()),
-                ],
+                loaded_elsewhere(false),
+                vec!["print", "bootout", &bootstrap],
             ),
-            (
-                Job::Stopped,
-                vec!["print".to_owned(), "kickstart".to_owned()],
-            ),
-            (Job::Running, vec!["print".to_owned()]),
         ] {
-            let launchd = FakeLaunchd::with(job);
+            let launchd = FakeLaunchd::with(job.clone());
             assert_eq!(hand_over(&fixture.agent, &launchd), Ok(()), "{job:?}");
             assert_eq!(launchd.calls(), calls, "{job:?}");
         }
     }
 
     #[test]
-    fn launchctl_print_tells_a_running_copy_from_a_stopped_one() {
-        let running = "gui/501/com.vaquum.poise.link = {\n\tactive count = 1\n\tstate = running\n\tpid = 501\n\tendpoints = {\n\t\tstate = active\n\t}\n}\n";
-        let stopped = "gui/501/com.vaquum.poise.link = {\n\tactive count = 0\n\tstate = not running\n\tendpoints = {\n\t\tstate = active\n\t}\n}\n";
-        assert_eq!(job_state(running), Job::Running);
-        assert_eq!(job_state(stopped), Job::Stopped);
+    fn a_poise_link_opened_from_another_place_takes_the_agent_over() {
+        for job in [loaded_elsewhere(true), loaded_elsewhere(false)] {
+            let fixture = fixture();
+            // Installed elsewhere first, or moved since: the agent names that copy.
+            LaunchAgent::new(fixture.agents.clone(), PathBuf::from(ELSEWHERE))
+                .install()
+                .unwrap();
+            let launchd = FakeLaunchd::with(job.clone());
+            let start = arrange_with(&fixture, &launchd, &FakeCopies::default(), false, true);
+            assert_eq!(start, Ok(Start::HandedOver), "{job:?}");
+            assert_eq!(
+                launchd.calls(),
+                [
+                    "print".to_owned(),
+                    "bootout".to_owned(),
+                    format!("bootstrap {}", fixture.agent.path().display()),
+                ],
+                "{job:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.agent.path()).unwrap(),
+                plist(Path::new(PROGRAM)),
+                "{job:?}"
+            );
+            assert!(take_window_request(&fixture.settings), "{job:?}");
+        }
+    }
+
+    #[test]
+    fn launchctl_print_tells_which_copy_is_loaded_and_whether_it_runs() {
+        let running = "gui/501/com.vaquum.poise.link = {\n\tactive count = 1\n\tpath = /Users/me/Library/LaunchAgents/com.vaquum.poise.link.plist\n\tstate = running\n\n\tprogram = /Applications/Poise Link.app/Contents/MacOS/poise-link\n\targuments = {\n\t\t/Applications/Poise Link.app/Contents/MacOS/poise-link\n\t\t--autostart\n\t}\n\tpid = 501\n\tendpoints = {\n\t\tstate = active\n\t}\n}\n";
+        let stopped = "gui/501/com.vaquum.poise.link = {\n\tactive count = 0\n\tstate = not running\n\n\tprogram = /Users/someone/Applications/Poise Link.app/Contents/MacOS/poise-link\n\tendpoints = {\n\t\tstate = active\n\t}\n}\n";
+        assert_eq!(job_state(running), loaded(true));
+        assert_eq!(job_state(stopped), loaded_elsewhere(false));
+        assert!(job_state(running).runs(Path::new(PROGRAM)));
+        assert!(!job_state(stopped).runs(Path::new(ELSEWHERE)));
     }
 }
