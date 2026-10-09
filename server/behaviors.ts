@@ -1326,8 +1326,10 @@ async function reconcileBehaviorLaunchClaims(
       const message = call.error || `agent call terminated with status ${status}`
       if (deadLetterClaim(claim, message)) {
         recordBehaviorFailure(behavior, 'worker', message, claim.target)
-        // A run the user stopped from Swarm says nothing about the provider.
-        if (call.error_code !== 'stopped' && needsClaude(catalogForCalls, call.model)) claudeAuth.observeProcessFailure(message)
+        // A run the user stopped from Swarm, or one a restart cut off, says nothing about the provider.
+        if (call.error_code !== 'stopped' && call.error_code !== 'interrupted' && needsClaude(catalogForCalls, call.model)) {
+          claudeAuth.observeProcessFailure(message)
+        }
       }
     } else if (RUNNING_AGENT_STATUSES.has(status)) {
       setBehaviorLaunchErrorOwned(claim.key, claim.target, claim.claimId, null)
