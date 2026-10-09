@@ -4,6 +4,7 @@ installIconTooltips()
 import { initTypography, toggleTypographyPanel, closeTypographyPanel } from './typo'
 import { initSettings, toggleSettingsPanel, openSettingsPanel, openSettingsAt, closeSettingsPanel, isFullyConfigured } from './settings'
 import { initMenu } from './menu'
+import { initAnalytics, toggleAnalyticsPanel, closeAnalyticsPanel } from './analytics'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
 import { initCurrentView, stopCurrentPolling } from './views/current-view'
 import { initSwarmView, stopSwarmRefresh, focusRow as focusSwarmRow } from './views/swarm-view'
@@ -127,15 +128,17 @@ document.addEventListener('error', (e) => {
 
 initClaudeAuth()
 
-// Init order: typography → settings → menu → initial view
+// Init order: typography → settings → analytics → menu → initial view
 initTypography()
 initSettings()
+initAnalytics()
 
 const menu = initMenu({
   onSelectView: (v) => showView(v),
   onOpenTypography: () => toggleTypographyPanel(),
   onOpenSettings: () => toggleSettingsPanel(),
-  onClosePanels: () => { closeTypographyPanel(); closeSettingsPanel() },
+  onOpenAnalytics: () => toggleAnalyticsPanel(),
+  onClosePanels: () => { closeTypographyPanel(); closeSettingsPanel(); closeAnalyticsPanel() },
 })
 
 // The notification island at the top of the page, and where each notice in it

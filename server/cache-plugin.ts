@@ -14,6 +14,7 @@ import { LinkApi } from './link/api'
 import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
+import { parseWindow, readAnalytics } from './analytics'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
@@ -784,6 +785,18 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             return json(res, 200, await listOrganizationsRepos(selectedOrg))
           } catch (err: any) {
             return json(res, 502, { error: 'listOrgRepos failed: ' + (err.message || String(err)) })
+          }
+        }
+
+        // ── /api/analytics — the Analytics panel's headline numbers ──
+        // ?since=&until= bound the window (ISO with a timezone, either may be
+        // absent); ?org= narrows to one account like every other read.
+        if (path === '/api/analytics' && req.method === 'GET') {
+          try {
+            const query = new URLSearchParams(url.split('?')[1] || '')
+            return json(res, 200, await readAnalytics(parseWindow(query.get('since'), query.get('until')), selectedOrg))
+          } catch (err: any) {
+            return json(res, httpStatus(err, 502), { error: err.message || String(err) })
           }
         }
 

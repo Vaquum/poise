@@ -17,7 +17,7 @@ def default_db() -> str:
 
 
 DEFAULT_DB = default_db()
-VIEW_SCHEMA_VERSION = 2
+VIEW_SCHEMA_VERSION = 3
 VIEW_NAMES = frozenset({"user_associations", "prs", "issues", "user_items"})
 
 
@@ -230,7 +230,11 @@ SELECT
     i.item_id AS payload_ref,
     (SELECT count(*) FROM comments c WHERE c.item_id = i.item_id) AS comments_count,
     (SELECT count(*) FROM review_comments rc WHERE rc.item_id = i.item_id) AS review_comments_count,
-    (SELECT count(*) FROM pr_commits pc WHERE pc.item_id = i.item_id) AS commits_count
+    (SELECT count(*) FROM pr_commits pc WHERE pc.item_id = i.item_id) AS commits_count,
+    -- NULL until the pull request is read again after these fields were added
+    -- to the query: a size nobody fetched is unknown, not zero.
+    CAST(json_extract(i.expanded_json, '$.pull.graphql.additions') AS INTEGER) AS additions,
+    CAST(json_extract(i.expanded_json, '$.pull.graphql.deletions') AS INTEGER) AS deletions
 FROM items i
 WHERE i.item_type = 'pr';
 

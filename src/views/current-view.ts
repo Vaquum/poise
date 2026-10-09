@@ -6,7 +6,8 @@
 // unaffected. The Issue lane has a richer composer (title / body / repo)
 // that opens a real GitHub issue via the proxy.
 
-import { midnightInZone, startOfWeekInZone, getSettings } from '../config'
+import { getSettings } from '../config'
+import { CURRENT_FILTER_KEY, TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../time-range'
 import { mountOrganizationFilter, organizationPayload, organizationUrl, getSelectedOrganization, organizationErrors } from '../organizations'
 
 type Lane = 'idea' | 'concept' | 'plan' | 'issue' | 'pr'
@@ -62,10 +63,10 @@ interface GhRecord {
 type PrStatus = 'mergeable' | 'caution'
 const FRESH_WINDOW_MS = 6 * 60 * 60 * 1000   // PRs created in the last 6h read as "just opened"
 
-type TimeFilter = 'all' | 'today' | 'yesterday' | 'week'
+type TimeFilter = TimeRange
 type StatusFilter = 'all' | 'open'
 
-const FILTER_KEY = 'poise-current-filters'
+const FILTER_KEY = CURRENT_FILTER_KEY
 const LIVE_LIMIT = 200            // upper bound; time / status filters narrow further
 
 let initialized = false
@@ -157,10 +158,7 @@ function manualInLane(lane: 'idea' | 'concept' | 'plan'): ManualCard[] {
 }
 
 function timeWindow(): { since?: string; until?: string } {
-  if (timeFilter === 'today')     return { since: midnightInZone(0).toISOString() }
-  if (timeFilter === 'yesterday') return { since: midnightInZone(-1).toISOString(), until: midnightInZone(0).toISOString() }
-  if (timeFilter === 'week')      return { since: startOfWeekInZone().toISOString() }
-  return {}
+  return timeRangeWindow(timeFilter)
 }
 
 function liveInLane(lane: 'issue' | 'pr'): LiveItem[] {
@@ -220,7 +218,7 @@ function loadFilters() {
     const raw = localStorage.getItem(FILTER_KEY)
     if (!raw) return
     const parsed = JSON.parse(raw)
-    if (['all', 'today', 'yesterday', 'week'].includes(parsed.time)) timeFilter = parsed.time
+    if (isTimeRange(parsed.time)) timeFilter = parsed.time
     if (['all', 'open'].includes(parsed.status)) statusFilter = parsed.status
   } catch { /* ignore */ }
 }
@@ -253,10 +251,7 @@ function renderShell(): string {
           <button data-status="open" class="${statusFilter === 'open' ? 'active' : ''}">Open</button>
         </div>
         <div class="range-picker" id="current-time-picker">
-          <button data-time="all" class="${timeFilter === 'all' ? 'active' : ''}">Any time</button>
-          <button data-time="today" class="${timeFilter === 'today' ? 'active' : ''}">Today</button>
-          <button data-time="yesterday" class="${timeFilter === 'yesterday' ? 'active' : ''}">Yesterday</button>
-          <button data-time="week" class="${timeFilter === 'week' ? 'active' : ''}">This week</button>
+          ${TIME_RANGES.map((range) => `<button data-time="${range.key}" class="${timeFilter === range.key ? 'active' : ''}">${range.label}</button>`).join('')}
         </div>
         <input class="search-input" id="current-search" type="search" placeholder="Filter…" autocomplete="off" spellcheck="false" aria-label="Filter cards" />
       </div>

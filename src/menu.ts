@@ -1,7 +1,7 @@
 // Top-right chrome — three view-nav items inline (Current · Swarm ·
-// Archive) with the burger toggle as a sibling. The burger only opens
-// Settings + Typography now; view switching happens via the inline nav.
-// Its first line says which commit Poise runs and since when.
+// Archive) with the burger toggle as a sibling. The burger opens the side
+// panels (Analytics, Settings, Typography); view switching happens via the
+// inline nav. Its first line says which commit Poise runs and since when.
 
 import { effectiveTimezone } from './config'
 import { releaseLine } from './release'
@@ -11,6 +11,7 @@ type ViewName = 'current' | 'swarm' | 'chat' | 'main' | 'behaviors' | 'snippets'
 const VIEW_KEY = 'poise-view'
 
 const ICON_TYPO  = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 3h10M4 3v8M10 3v8M4 11h1.5M8.5 11H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
+const ICON_ANALYTICS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 12h10M3.5 10V7M7 10V3M10.5 10V5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
 const ICON_SETTINGS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M7 1v1.8M7 11.2V13M1 7h1.8M11.2 7H13M2.76 2.76l1.27 1.27M9.97 9.97l1.27 1.27M2.76 11.24l1.27-1.27M9.97 4.03l1.27-1.27" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
 const ICON_BURGER = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 5h10M3 8h10M3 11h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
 const ICON_CLOSE = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
@@ -49,6 +50,7 @@ export interface MenuCallbacks {
   onSelectView: (view: ViewName) => void
   onOpenTypography: () => void
   onOpenSettings: () => void
+  onOpenAnalytics: () => void
   /** Close whatever panel is open, through its own close path. The burger
    *  used to strip the `open` class off the panels directly, which skipped
    *  the close functions and left them focusable and announced while
@@ -57,7 +59,7 @@ export interface MenuCallbacks {
 }
 
 function anyPanelOpen(): boolean {
-  return !!document.querySelector('#typo-panel.open, #settings-panel.open')
+  return !!document.querySelector('#typo-panel.open, #settings-panel.open, #analytics-panel.open')
 }
 let closePanelsCallback: (() => void) | null = null
 function closeAllPanels() {
@@ -75,7 +77,7 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     <button class="nav-item" data-view="${v.key}">${v.label}</button>
   `).join('')
 
-  // Burger toggle. Only opens Settings + Typography.
+  // Burger toggle. Opens the side panels.
   const toggle = document.createElement('button')
   toggle.id = 'menu-toggle'
   toggle.innerHTML = ICON_BURGER
@@ -94,7 +96,7 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
   globalBar.append(nav, toggle)
   document.body.appendChild(globalBar)
 
-  // Menu popover — Settings + Typography only.
+  // Menu popover — the side panels.
   const menu = document.createElement('div')
   menu.id = 'menu-popover'
   menu.hidden = true
@@ -103,6 +105,9 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
       <a class="menu-release-commit" target="_blank" rel="noopener noreferrer"></a><span class="menu-release-when"></span>
     </div>
     <div class="menu-divider menu-release-divider" hidden></div>
+    <button class="menu-item" data-action="analytics">
+      <span class="menu-icon">${ICON_ANALYTICS}</span><span class="menu-text">Analytics</span>
+    </button>
     <button class="menu-item" data-action="settings">
       <span class="menu-icon">${ICON_SETTINGS}</span><span class="menu-text">Settings</span>
     </button>
@@ -212,12 +217,9 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     const el = document.getElementById(id)
     if (el) panelObserver.observe(el, { attributes: true, attributeFilter: ['class'] })
   }
-  observePanel('typo-panel')
-  observePanel('settings-panel')
-  document.addEventListener('DOMContentLoaded', () => {
-    observePanel('typo-panel')
-    observePanel('settings-panel')
-  })
+  const PANEL_IDS = ['typo-panel', 'settings-panel', 'analytics-panel']
+  PANEL_IDS.forEach(observePanel)
+  document.addEventListener('DOMContentLoaded', () => PANEL_IDS.forEach(observePanel))
 
   toggle.addEventListener('click', (e) => {
     e.stopPropagation()
@@ -253,6 +255,9 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     } else if (btn.dataset.action === 'settings') {
       closeMenu()
       callbacks.onOpenSettings()
+    } else if (btn.dataset.action === 'analytics') {
+      closeMenu()
+      callbacks.onOpenAnalytics()
     }
   })
 

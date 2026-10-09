@@ -135,6 +135,40 @@ class ViewsTest(unittest.TestCase):
             self.assertNotIn("USE TEMP B-TREE FOR GROUP BY", plan)
             self.assertTrue(any("SEARCH associations USING COVERING INDEX" in step for step in plan), plan)
 
+    def test_pr_view_shows_the_size_github_reported_and_null_when_never_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            sized = base_expanded("@mikkokotila", [])
+            sized["is_pr"] = True
+            sized["issue"] = dict(sized["issue"], id=101, node_id="I_101", number=2)
+            sized["pull"] = {
+                "id": 101,
+                "node_id": "I_101",
+                "graphql": {"isDraft": False, "additions": 120, "deletions": 0},
+                "requested_reviewers": [],
+                "assignees": [],
+                "merged_by": None,
+                "updated_at": "2026-01-02T00:00:00Z",
+            }
+            sized["issue"]["pull_request"] = {"node_id": "I_101"}
+            # Stored before the query asked for a size.
+            unsized = base_expanded("@mikkokotila", [])
+            unsized["is_pr"] = True
+            unsized["issue"] = dict(unsized["issue"], id=102, node_id="I_102", number=3)
+            unsized["pull"] = dict(sized["pull"], id=102, node_id="I_102", graphql={"isDraft": False})
+            unsized["issue"]["pull_request"] = {"node_id": "I_102"}
+            with conn:
+                upsert_repo(conn, sized["repo"])
+            store_expanded(conn, sized)
+            store_expanded(conn, unsized)
+            conn.close()
+
+            rows = {row["number"]: row for row in json.loads(views.pr(db_path=db_path))}
+            self.assertEqual((rows[2]["additions"], rows[2]["deletions"]), (120, 0))
+            self.assertEqual((rows[3]["additions"], rows[3]["deletions"]), (None, None))
+
     def test_existing_databases_get_the_current_views(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "db.sqlite"
@@ -149,6 +183,23 @@ class ViewsTest(unittest.TestCase):
             columns = [column[0] for column in conn.execute("SELECT * FROM user_items LIMIT 0").description]
             conn.close()
             self.assertIn("evidence_count", columns)
+
+    def test_a_version_2_database_gets_pull_request_sizes(self) -> None:
+        # A version-2 database has every view name, so only the version
+        # number tells init_db that its prs view lacks the size columns.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            conn.execute("DROP VIEW prs")
+            conn.execute("CREATE VIEW prs AS SELECT item_id AS pr_ref FROM items WHERE item_type = 'pr'")
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+            init_db(conn)
+            pr_columns = [column[0] for column in conn.execute("SELECT * FROM prs LIMIT 0").description]
+            conn.close()
+            self.assertIn("additions", pr_columns)
+            self.assertIn("deletions", pr_columns)
 
     def test_views_fail_on_invalid_datetime(self) -> None:
         with self.assertRaises(ValueError):
