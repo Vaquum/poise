@@ -1,16 +1,18 @@
 import os
-import subprocess
 import tempfile
 from pathlib import Path
+from time import time
 from unittest import TestCase
 from unittest.mock import patch
 
 import agent_interface
 
+AGENT = "/venv/bin/python /venv/bin/agent-interface --pr-review"
+
 
 class InterruptedCallsCase(TestCase):
-    """Calls whose process a container restart or a crash ended read as failed
-    and interrupted, so what launched them tries again."""
+    """A call nothing of which can still run reads as failed, so what launched
+    it tries again; one whose providers may live on stays running."""
 
     def setUp(self):
         self.work = tempfile.TemporaryDirectory()
@@ -25,41 +27,77 @@ class InterruptedCallsCase(TestCase):
             target.start()
             self.addCleanup(target.stop)
         agent_interface.init_db()
+        self.now = time()
+        # This container's init started an hour ago.
+        init = patch.object(agent_interface, "init_started_at", return_value=self.now - 3600)
+        init.start()
+        self.addCleanup(init.stop)
 
-    def call(self, pid, status="running", runner=None):
+    def call(self, started_ago, pid="4242", status="running", runner=None, error_code=None):
         id_ = agent_interface.track("opus-5-max", "review", repo="acme/app", pr_id="7", behavior="pr_review", runner=runner)
         with agent_interface.db() as conn:
-            conn.execute("update calls set pid=?, status=? where id=?", (pid, status, id_))
+            conn.execute(
+                "update calls set pid=?, status=?, started_at=?, error_code=? where id=?",
+                (pid, status, self.now - started_ago, error_code, id_),
+            )
         return id_
 
     def row(self, id_):
         with agent_interface.db() as conn:
             return conn.execute("select status, error, error_code, ended_at from calls where id=?", (id_,)).fetchone()
 
-    def test_a_call_whose_process_is_gone_reads_as_interrupted(self):
-        gone = subprocess.Popen(["true"])
-        gone.wait()
-        id_ = self.call(str(gone.pid))
-        entries = {entry["id"]: entry for entry in agent_interface.logs()}
+    def test_a_call_from_before_the_container_restarted_reads_as_interrupted(self):
+        id_ = self.call(started_ago=2 * 3600)
+        with patch.object(agent_interface, "process_command", return_value=AGENT):
+            entries = {entry["id"]: entry for entry in agent_interface.logs()}
         self.assertEqual(entries[id_]["status"], "failed")
         self.assertEqual(entries[id_]["error_code"], "interrupted")
         self.assertEqual(entries[id_]["error"], agent_interface.INTERRUPTED_ERROR)
         self.assertIsNotNone(self.row(id_)["ended_at"])
 
-    def test_a_reused_pid_does_not_keep_a_call_running(self):
-        id_ = self.call("4242")
-        with patch.object(agent_interface, "process_command", return_value="sleep 100"):
+    def test_a_gone_supervisor_waits_for_its_providers_before_it_reads_as_interrupted(self):
+        recent = self.call(started_ago=600)
+        orphaned = self.call(started_ago=agent_interface.ORPHAN_AFTER_SECONDS + 60)
+        with patch.object(agent_interface, "init_started_at", return_value=self.now - 30 * 3600), \
+                patch.object(agent_interface, "process_command", return_value=None):
             self.assertEqual(agent_interface.reap_interrupted(), 1)
-        self.assertEqual(self.row(id_)["error_code"], "interrupted")
+        self.assertEqual(self.row(recent)["status"], "running")
+        self.assertEqual(self.row(orphaned)["error_code"], "interrupted")
 
-    def test_a_live_worker_and_everything_else_stay_as_they_are(self):
-        live = self.call("4242")
-        done = self.call("4243", status="completed")
-        turn = self.call(None, runner=agent_interface.EXTERNAL_RUNNER)
-        old = self.call(None)
-        with patch.object(agent_interface, "process_command", return_value="/venv/bin/python /venv/bin/agent-interface --pr-review"):
-            self.assertEqual(agent_interface.reap_interrupted(), 0)
+    def test_a_reused_pid_does_not_keep_an_old_call_running_but_a_live_worker_does(self):
+        reused = self.call(started_ago=agent_interface.ORPHAN_AFTER_SECONDS + 60, pid="4242")
+        live = self.call(started_ago=agent_interface.ORPHAN_AFTER_SECONDS + 60, pid="4243")
+        commands = {4242: "sleep 100", 4243: AGENT}
+        with patch.object(agent_interface, "init_started_at", return_value=None), \
+                patch.object(agent_interface, "process_command", side_effect=commands.get):
+            self.assertEqual(agent_interface.reap_interrupted(), 1)
+        self.assertEqual(self.row(reused)["error_code"], "interrupted")
         self.assertEqual(self.row(live)["status"], "running")
+
+    def test_a_call_being_stopped_reads_as_stopped(self):
+        id_ = self.call(started_ago=2 * 3600, error_code="stopping")
+        agent_interface.reap_interrupted()
+        self.assertEqual((self.row(id_)["error"], self.row(id_)["error_code"]), ("Stopped by user", "stopped"))
+
+    def test_a_stop_stays_a_stop_when_the_call_is_reaped_meanwhile(self):
+        id_ = self.call(started_ago=60)
+
+        def reaped_meanwhile(pid, signum):
+            # The container's init is newer than the call now, as after a restart mid-stop.
+            with patch.object(agent_interface, "init_started_at", return_value=self.now):
+                agent_interface.reap_interrupted()
+
+        with patch.object(agent_interface, "process_command", side_effect=[AGENT, None, None]), \
+                patch.object(agent_interface, "signal_group", side_effect=reaped_meanwhile):
+            result = agent_interface.stop_call(id_)
+        self.assertEqual(result, {"id": id_, "stopped": True, "status": "failed", "error_code": "stopped"})
+        self.assertEqual(self.row(id_)["error_code"], "stopped")
+
+    def test_finished_calls_turns_and_calls_without_a_pid_are_left_alone(self):
+        done = self.call(started_ago=2 * 3600, status="completed")
+        turn = self.call(started_ago=2 * 3600, pid=None, runner=agent_interface.EXTERNAL_RUNNER)
+        old = self.call(started_ago=2 * 3600, pid=None)
+        self.assertEqual(agent_interface.reap_interrupted(), 0)
         self.assertEqual(self.row(done)["status"], "completed")
         self.assertEqual(self.row(turn)["status"], "running")
         self.assertEqual(self.row(old)["status"], "running")

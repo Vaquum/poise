@@ -315,6 +315,9 @@ def stop_call(id_: str) -> dict:
     command = process_command(pid)
     if command is not None and STOP_COMMAND_MARK not in command:
         raise RuntimeError(f"pid {pid} now belongs to another process; the call is not running")
+    # Marked first, so a call that ends meanwhile reads as stopped, never as interrupted.
+    with db() as conn:
+        conn.execute("update calls set error_code='stopping' where id=? and status='running'", (id_,))
     if command is not None:
         signal_group(pid, signal.SIGTERM)
         if not wait_gone(pid, STOP_GRACE_SECONDS):
@@ -326,8 +329,9 @@ def stop_call(id_: str) -> dict:
             "update calls set status='failed', ended_at=?, error='Stopped by user', error_code='stopped', progress=coalesce(?, progress) where id=? and status='running'",
             (time(), progress.terminal("failed"), id_),
         ).rowcount
-        status = conn.execute("select status from calls where id=?", (id_,)).fetchone()["status"]
-    return {"id": id_, "stopped": changed == 1, "status": status, "error_code": "stopped" if changed == 1 else None}
+        after = conn.execute("select status, error_code from calls where id=?", (id_,)).fetchone()
+    stopped = changed == 1 or (after["status"] == "failed" and after["error_code"] == "stopped")
+    return {"id": id_, "stopped": stopped, "status": after["status"], "error_code": "stopped" if stopped else None}
 
 
 def finish(
@@ -353,39 +357,64 @@ def finish(
 
 
 INTERRUPTED_ERROR = "The agent process ended without recording a result"
+# A call still running this long after it started, with its agent-interface
+# process gone, is over: no review or reply runs anywhere near this long, and
+# its providers, which outlive their supervisor in sessions of their own, have
+# long finished too.
+ORPHAN_AFTER_SECONDS = 6 * 3600
+
+
+def init_started_at() -> float | None:
+    """When this PID namespace's init started: the container's start inside
+    one, the boot outside. None where /proc does not say."""
+    try:
+        fields = Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()
+        ticks = int(fields[19])
+        btime = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime "))
+        return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
 
 
 def reap_interrupted() -> int:
-    """Marks a running call failed and `interrupted` once its process is gone,
-    or its pid belongs to another process: a container restart or a crash
-    ended it before it could record a result. Without this the call would
-    read as running for good, and what launched it would never try again;
-    Poise retries an interrupted call as it does any failed one. Calls Poise
-    runs itself record no pid and are left to it."""
+    """Marks a running call failed once nothing of it can still run, so what
+    launched it tries again rather than reading it as running for good: it
+    started before this container's init did, so a restart ended all its
+    processes; or its agent-interface process has been gone after
+    ORPHAN_AFTER_SECONDS. A supervisor gone sooner is not enough, since its
+    providers may live on and still post. A call being stopped reads as
+    stopped, as stop_call would have recorded it; any other as interrupted.
+    Calls Poise runs itself record no pid and are left to it."""
+    init = init_started_at()
+    now = time()
     with db() as conn:
         rows = conn.execute(
-            "select id, pid from calls where status='running' and runner is null and pid is not null"
+            "select id, pid, started_at, error_code from calls where status='running' and runner is null and pid is not null"
         ).fetchall()
-    gone = []
+    ended = []
     for row in rows:
-        try:
-            pid = int(row["pid"])
-        except (TypeError, ValueError):
-            continue
-        command = process_command(pid)
-        if command is None or STOP_COMMAND_MARK not in command:
-            gone.append(row["id"])
-    if not gone:
-        return 0
+        started = float(row["started_at"] or 0)
+        if init is None or started >= init:
+            if now - started < ORPHAN_AFTER_SECONDS:
+                continue
+            try:
+                pid = int(row["pid"])
+            except (TypeError, ValueError):
+                continue
+            command = process_command(pid)
+            if command is not None and STOP_COMMAND_MARK in command:
+                continue
+        ended.append((row["id"], row["error_code"] == "stopping"))
+    count = 0
     with db() as conn:
-        return sum(
-            conn.execute(
-                "update calls set status='failed', ended_at=?, error=?, error_code='interrupted', "
+        for id_, stopping in ended:
+            error, code = ("Stopped by user", "stopped") if stopping else (INTERRUPTED_ERROR, "interrupted")
+            count += conn.execute(
+                "update calls set status='failed', ended_at=?, error=?, error_code=?, "
                 "progress=coalesce(?, progress) where id=? and status='running'",
-                (time(), INTERRUPTED_ERROR, progress.terminal("failed"), id_),
+                (now, error, code, progress.terminal("failed"), id_),
             ).rowcount
-            for id_ in gone
-        )
+    return count
 
 
 def logs():
