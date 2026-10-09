@@ -142,7 +142,7 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
     el.style.width = 'max-content'
     const natural = Math.ceil(el.getBoundingClientRect().width)
     el.style.width = ''
-    return Math.min(natural, MAX_WIDTH, window.innerWidth - 24)
+    return Math.min(natural, MAX_WIDTH, document.documentElement.clientWidth - 24)
   }
 
   function announce(notice: Notice): void {
@@ -265,11 +265,22 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
 
   // A reminder's "for N min" keeps counting between reads.
   const clock = window.setInterval(() => { if (content && shownId) render() }, 30_000)
+  // A narrower window, or a phone turned, narrows the pill with it.
+  let fitting = 0
+  const fit = () => {
+    cancelAnimationFrame(fitting)
+    fitting = requestAnimationFrame(() => {
+      if (content && island.dataset.state === 'shown') shell.style.width = `${measure(content)}px`
+    })
+  }
+  window.addEventListener('resize', fit)
   const unsubscribe = feed.subscribe(update)
   update(feed.current)
   return () => {
     unsubscribe()
     window.clearInterval(clock)
+    window.removeEventListener('resize', fit)
+    cancelAnimationFrame(fitting)
     cancelLeaving?.()
     island.remove()
     live.remove()

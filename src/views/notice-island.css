@@ -28,6 +28,8 @@
   position: relative;
   /* The dot it grows out of and shrinks back into. */
   width: var(--ni-h);
+  /* Never wider than the window, even before it is measured again. */
+  max-width: calc(100vw - 24px);
   height: var(--ni-h);
   border-radius: var(--r-pill);
   background: var(--ni-bg);
