@@ -15,7 +15,7 @@ vi.mock('../server/organizations', () => ({
   readyOrganizations: () => mocks.orgs.filter((org) => org.status === 'ready'),
   organizationArgs: (org: { datastorePath: string }, args: string[]) => ['--db', org.datastorePath, ...args],
 }))
-const { handleGhBody, invalidateRepoListCache, listOrganizationsRepos, listOrgRepos } = await import('../server/gh')
+const { handleGhBody, invalidateRepoListCache, listOrganizationsRepos, listOrgRepos, readOwnPullRequests } = await import('../server/gh')
 
 function record(org: string, number: number, day: number) {
   const date = `2026-09-${String(day).padStart(2, '0')}T00:00:00Z`
@@ -121,6 +121,39 @@ describe('the accounts GitHub is read as', () => {
       : { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', 2, 5), record('alpha', 3, 4)] : []), stderr: '' })
     const result = await handleGhBody({ operation: 'green_pr' })
     expect(result.body).toEqual({ records: [{ repo: 'alpha/same', number: 2, status: 'yellow' }], errors: [] })
+  })
+
+  it('reads your own open pull requests, and leaves one GitHub is still working out unknown', async () => {
+    mocks.meta = { me: 'octocat', agentAccount: 'review-bot' }
+    const answers: Record<string, unknown> = {
+      '#7': { action: 'mergeable', mergeable: true, github_mergeable: true, github_mergeable_state: 'clean', state: 'open', status: 'green' },
+      '#8': { action: 'mergeable', mergeable: false, github_mergeable: null, github_mergeable_state: 'unknown', state: 'open', status: null },
+      '#9': { action: 'mergeable', mergeable: false, github_mergeable: true, github_mergeable_state: 'blocked', state: 'open', status: null },
+    }
+    const pull = (number: number, author: string) => ({ ...record('alpha', number, 5), author })
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => command === 'github-interface'
+      ? { stdout: JSON.stringify(answers[args[1]]), stderr: '' }
+      : { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [pull(7, 'octocat'), pull(8, 'review-bot'), pull(9, 'octocat'), pull(10, 'someone-else')] : []), stderr: '' })
+    expect(await readOwnPullRequests()).toEqual({
+      pullRequests: [
+        { repo: 'alpha/same', number: 7, title: 'alpha 7', status: 'green' },
+        { repo: 'alpha/same', number: 8, title: 'alpha 8', status: undefined },
+        { repo: 'alpha/same', number: 9, title: 'alpha 9', status: null },
+      ],
+      read: ['alpha', 'beta'],
+      tracked: ['alpha', 'beta'],
+    })
+    // Someone else's pull request is not asked about.
+    const asked = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface').map(([, args]) => args[1])
+    expect(asked).toEqual(['#7', '#8', '#9'])
+    // Current colours only what is known.
+    expect((await handleGhBody({ operation: 'green_pr' })).body).toEqual({ records: [{ repo: 'alpha/same', number: 7, status: 'green' }], errors: [] })
+  })
+
+  it('reads no pull requests of yours until both GitHub accounts are set', async () => {
+    mocks.meta = { me: 'octocat' }
+    expect(await readOwnPullRequests()).toEqual({ pullRequests: [], read: [], tracked: [] })
+    expect(mocks.runFile).not.toHaveBeenCalled()
   })
 
   it('says the agent account is missing instead of reporting nothing green', async () => {

@@ -304,10 +304,15 @@ async function checkPrStatus(owner: string, repo: string, number: number, agent:
       maxOutputBytes: 1 * 1024 * 1024,
     })
     const result = JSON.parse(stdout)
-    // A github-interface that reports no status says only whether the PR is clean: green.
-    const status: PrStatus = result.status === 'green' || result.status === 'yellow'
-      ? result.status
-      : result.status === undefined && result.mergeable ? 'green' : null
+    // GitHub works out whether an open pull request can merge after a push to it
+    // or its base; until it has, nothing is known. A github-interface that
+    // reports no status says only whether the PR is clean: green.
+    const computing = result.state === 'open' && (result.github_mergeable === null || result.github_mergeable_state === 'unknown')
+    const status: PrStatus = computing
+      ? undefined
+      : result.status === 'green' || result.status === 'yellow'
+        ? result.status
+        : result.status === undefined && result.mergeable ? 'green' : null
     greenCache.set(key, { status, expiry: now + GREEN_TTL_MS })
     return status
   } catch {
