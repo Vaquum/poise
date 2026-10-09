@@ -20,6 +20,8 @@ export interface PairedDevice {
   lastUsedAt: number | null
   revokedAt: number | null
   state: 'active' | 'revoked' | 'expired'
+  /** Its Poise Link holds the event stream open right now; paired alone does not mean running. */
+  connected: boolean
 }
 
 export interface AdminUser {

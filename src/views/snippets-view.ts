@@ -12,6 +12,9 @@
 
 import { chatClient } from '../chat-client'
 import { parseChatSwitches, type ChatSwitches } from '../chat-switches'
+import { fetchDevices } from '../gateway-client'
+import { openServicePlace } from '../service-settings'
+import { linkStanding } from './poise-link'
 
 interface Snippet { trigger: string; replace: string }
 interface SnippetState { snippets: Snippet[]; version: string; skills?: ChatSwitches }
@@ -27,6 +30,11 @@ let espansoOk = true
 // Service mode: no Espanso runs beside the server; Poise Link brings the
 // snippets to the person's desktop.
 let viaPoiseLink = false
+// Whether that Poise Link is connected decides whether a change made here
+// reaches the desktop now; it is read again while the view is on screen.
+const LINK_REFRESH_MS = 10_000
+let linkGeneration = 0
+let linkTimer: ReturnType<typeof setInterval> | null = null
 let skills: ChatSwitches = { revision: 0, switches: [] }
 let saving = false
 let loadGeneration = 0
@@ -56,6 +64,7 @@ function renderShell(): string {
         <span class="filter-count" id="snippets-count"></span>
         <span class="st-help st-help-info snip-espanso-hint" hidden>Chat skills work without Espanso. Install Espanso for system-wide text expansion.</span>
         <span class="st-help st-help-info snip-link-hint" hidden>Snippets reach your desktop through Poise Link, which keeps Espanso there in sync.</span>
+        <button type="button" class="st-clear snip-link-settings" hidden>Poise Link settings</button>
       </div>
     </header>
     <main>
@@ -155,12 +164,39 @@ function renderRows() {
   viewEl.querySelector<HTMLElement>('.snip-empty')!.hidden = failed || n > 0
   viewEl.querySelector<HTMLElement>('.snip-espanso-hint')!.hidden = failed || espansoOk
   viewEl.querySelector<HTMLElement>('.snip-link-hint')!.hidden = failed || !viaPoiseLink
+  if (failed || !viaPoiseLink) viewEl.querySelector<HTMLElement>('.snip-link-settings')!.hidden = true
+  else void showLinkStanding()
 
   const errorBox = viewEl.querySelector<HTMLElement>('.snip-load-error')!
   errorBox.hidden = !failed
   if (failed) {
     viewEl.querySelector<HTMLElement>('.snip-load-error-detail')!.textContent = loadError!
   }
+}
+
+// Says whether Poise Link is connected: paired alone does not mean a change
+// made here reaches the desktop.
+async function showLinkStanding(): Promise<void> {
+  const generation = ++linkGeneration
+  let standing: { text: string, tone: string, act: boolean }
+  try {
+    standing = linkStanding(await fetchDevices())
+  } catch (error) {
+    standing = { text: `Could not check whether Poise Link is connected: ${(error as Error).message}`, tone: 'error', act: false }
+  }
+  if (generation !== linkGeneration || !viaPoiseLink || loadError !== null) return
+  const hint = viewEl.querySelector<HTMLElement>('.snip-link-hint')!
+  hint.textContent = standing.text
+  hint.className = `st-help st-help-${standing.tone} snip-link-hint`
+  viewEl.querySelector<HTMLElement>('.snip-link-settings')!.hidden = !standing.act
+}
+
+function followLinkStanding(): void {
+  if (linkTimer) return
+  linkTimer = setInterval(() => {
+    if (!viaPoiseLink || loadError !== null || viewEl.hidden || document.visibilityState !== 'visible') return
+    void showLinkStanding()
+  }, LINK_REFRESH_MS)
 }
 
 // ── inline edit row (expand-to-edit) ──────────────────────────────────────
@@ -558,6 +594,7 @@ function attachHandlers() {
   viewEl.querySelector('.snip-retry')!.addEventListener('click', () => {
     void fetchSnippets().then(() => renderRows())
   })
+  viewEl.querySelector<HTMLButtonElement>('.snip-link-settings')!.addEventListener('click', () => void openServicePlace('link'))
   importEl('.snip-import-open').addEventListener('click', () => toggleImport(importEl('.snip-import').hidden))
   importEl('.snip-import-close').addEventListener('click', () => toggleImport(false))
   importEl('.snip-import-run').addEventListener('click', () => void runImport())
@@ -614,6 +651,7 @@ export async function initSnippetsView() {
     chatClient.on('switches', libraryChanged)
     chatClient.on('restart', refreshLibraryView)
     chatClient.start()
+    followLinkStanding()
   }
   // Re-entering the view re-renders the table from scratch, and renderRows
   // starts by emptying the tbody — which threw away an open editor and every

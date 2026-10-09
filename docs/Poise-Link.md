@@ -137,6 +137,15 @@ are fetched when they change and checked every ten minutes. Alerts are shown
 once, even across reconnects and restarts. Opening Poise Link again shows its
 window with the pairing and sync status.
 
+Paired is not the same as running. Settings → Accounts → Poise Link shows a
+paired computer as **Connected** while its Poise Link holds that event stream
+open. Otherwise it shows **Not connected**, with when it was last seen: Poise
+Link is not running on that computer, or it cannot reach Poise. Snippets and
+alerts reach it once it connects again. The list follows computers connecting
+and going away while it is on screen. The Snippets view says the same in one
+line: whether a change made there reaches your computer in seconds, or waits
+for Poise Link.
+
 If the device is revoked in Poise (Settings → Accounts → Poise Link), Poise Link notices on
 its next request, says so once in a notification, forgets the token and shows
 the pairing window again. Espanso keeps the last snippets it received.

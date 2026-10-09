@@ -557,7 +557,9 @@ refusal under the row whose Replay was pressed.
 **Snippets are edited only in Poise:** the Snippets view, Chat's `/create`, and
 the Editor's "save selection as snippet". The desktop copy is generated.
 Snippets view → Import takes an Espanso YAML file once and adds its simple
-trigger/replace pairs, reporting any it skipped.
+trigger/replace pairs, reporting any it skipped. In a workspace the Snippets
+view says, from the devices answer, whether Poise Link is connected, so whether
+a change reaches the desktop now or once Poise Link runs there.
 
 **Device pairing** (gateway, on the apex):
 1. `POST /link/device/code` returns

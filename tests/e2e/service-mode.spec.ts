@@ -36,6 +36,10 @@ async function serviceModeApi(page: Page, calls: string[]): Promise<void> {
       await route.fulfill({ json: { snippets: [{ trigger: ';sig', replace: 'Kind regards' }], version: 'a'.repeat(64), skills: { revision: 0, switches: [] }, desktop: 'poise-link' } })
       return
     }
+    if (url.pathname === '/_poise/api/devices') {
+      await route.fulfill({ json: { devices: [] } })
+      return
+    }
     if (url.pathname === '/api/gh') {
       const body = route.request().postDataJSON() as { count_only?: boolean }
       await route.fulfill({ json: body.count_only ? { count: 0 } : { records: [] } })
@@ -103,6 +107,6 @@ test('says snippets reach the desktop through Poise Link, not an Espanso on the 
   const view = page.locator('#view-snippets')
   await expect(view.locator('.snip-row[data-trigger=";sig"]')).toBeVisible()
   await expect(view.locator('.snip-link-hint')).toBeVisible()
-  await expect(view.locator('.snip-link-hint')).toHaveText('Snippets reach your desktop through Poise Link, which keeps Espanso there in sync.')
+  await expect(view.locator('.snip-link-hint')).toHaveText('No computer is paired with Poise Link, so snippets reach no desktop.')
   await expect(view.locator('.snip-espanso-hint')).toBeHidden()
 })

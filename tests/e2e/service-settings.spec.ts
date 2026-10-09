@@ -19,9 +19,14 @@ function account(isAdmin: boolean): GatewayAccount {
   }
 }
 
-function device(id: string, state: PairedDevice['state'] = 'active'): PairedDevice {
+function device(id: string, state: PairedDevice['state'] = 'active', connected = state === 'active'): PairedDevice {
   const paired = Date.parse('2026-10-09T07:00:00Z')
-  return { id, label: 'PoiseLink/0.3.1', createdAt: paired, lastUsedAt: null, revokedAt: state === 'revoked' ? paired : null, state }
+  return { id, label: 'PoiseLink/0.3.1', createdAt: paired, lastUsedAt: null, revokedAt: state === 'revoked' ? paired : null, state, connected }
+}
+
+/** A computer whose Poise Link was last connected at 07:53 and is not running now. */
+function stopped(id: string): PairedDevice {
+  return { ...device(id, 'active', false), lastUsedAt: Date.parse('2026-10-09T07:53:00Z') }
 }
 
 const ADMIN: AdminOverview = {
@@ -75,6 +80,9 @@ async function setup(page: Page, mode: 'service' | 'local', isAdmin = false) {
       return route.fulfill({ json: { org: '', me: 'octocat', timezone: 'UTC', organizations: [{ login: 'acme', managed: true, status: 'ready', stage: 'ready', error: null, activatedAt: '2026-10-01T08:00:00Z' }], models: {} } })
     }
     if (url.pathname === '/api/accounts') return route.fulfill({ json: { accounts: [] } })
+    if (url.pathname === '/api/snippets') {
+      return route.fulfill({ json: { snippets: [{ trigger: ';combo', replace: 'Work closely together.' }], version: 'a'.repeat(64), skills: { revision: 0, switches: [] }, desktop: 'poise-link' } })
+    }
     if (url.pathname === '/api/models') return route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } })
     if (url.pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (url.pathname === '/api/gh') return route.fulfill({ json: { records: [], count: 0, errors: [] } })
@@ -106,7 +114,7 @@ test('pairs Poise Link from Settings, where the gateway sends /link, and revokes
   await expect(page.locator('.pl-status')).toContainText('Approved.')
   await expect(page.locator('.pl-status')).toHaveText('Poise Link 0.3.1 is paired. Your snippets and alerts now reach that computer.', { timeout: 10_000 })
   await expect(page.locator('.pl-device')).toHaveCount(1)
-  await expect(page.locator('.pl-device-state')).toHaveText('Paired')
+  await expect(page.locator('.pl-device-state')).toHaveText('Connected')
   expect(state.gatewayCalls.filter((call) => call.path === 'devices/pair').map((call) => call.body)).toEqual([
     { userCode: 'BCDF-GGGG', decision: 'approve' },
     { userCode: 'BCDF-GHJK', decision: 'approve' },
@@ -115,6 +123,58 @@ test('pairs Poise Link from Settings, where the gateway sends /link, and revokes
   await page.locator('.pl-revoke').click()
   await expect(page.locator('.pl-device-state')).toHaveText('Revoked')
   await expect(page.locator('.pl-revoke')).toHaveCount(0)
+})
+
+test('says a paired computer whose Poise Link is not running is not connected, and follows it connecting', async ({ page }) => {
+  const state = await setup(page, 'service')
+  state.devices = [stopped('laptop')]
+  await page.clock.install()
+  await page.goto('/?settings=link')
+  const card = page.locator('.pl-device')
+  await expect(card.locator('.pl-device-state')).toHaveText('Not connected')
+  await expect(card.locator('.pl-device-state')).toHaveClass(/pl-device-state-disconnected/)
+  await expect(card.locator('.pl-device-times')).toHaveText(/^Paired Oct 9, 2026, 7:00\sAM · last seen Oct 9, 2026, 7:53\sAM$/)
+  await expect(card).toContainText('Poise Link is not running on that computer, or it cannot reach Poise. Snippets and alerts reach it once it connects again.')
+
+  // Poise Link starts on that computer while Settings stays open.
+  state.devices = [device('laptop')]
+  await page.clock.fastForward(10_000)
+  await expect(card.locator('.pl-device-state')).toHaveText('Connected')
+  await expect(card.locator('.pl-device-times')).toHaveText('Paired Oct 9, 2026, 7:00 AM')
+  await expect(card).not.toContainText('Poise Link is not running')
+})
+
+test('says in Snippets whether a change reaches the desktop now, and opens Poise Link in Settings when it does not', async ({ page }) => {
+  const state = await setup(page, 'service')
+  state.devices = [stopped('laptop')]
+  await page.addInitScript(() => localStorage.setItem('poise-view', 'snippets'))
+  await page.clock.install()
+  await page.goto('/')
+  const view = page.locator('#view-snippets')
+  const hint = view.locator('.snip-link-hint')
+  await expect(view.locator('.snip-row[data-trigger=";combo"]')).toBeVisible()
+  await expect(hint).toHaveText(/^Poise Link is not connected \(last seen Oct 9, 2026, 7:53\sAM\)\. Changes reach your computer once Poise Link runs there\.$/)
+  await expect(hint).toHaveClass(/st-help-warn/)
+  await expect(view.locator('.snip-espanso-hint')).toBeHidden()
+
+  // Poise Link starts on that computer while the view is open.
+  state.devices = [device('laptop')]
+  await page.clock.fastForward(10_000)
+  await expect(hint).toHaveText('Poise Link is connected: changes reach your computer in seconds.')
+  await expect(hint).toHaveClass(/st-help-ok/)
+  await expect(view.locator('.snip-link-settings')).toBeHidden()
+
+  state.devices = [device('laptop'), device('desktop')]
+  await page.clock.fastForward(10_000)
+  await expect(hint).toHaveText('Poise Link is connected on 2 computers: changes reach them in seconds.')
+
+  state.devices = [device('laptop', 'revoked')]
+  await page.clock.fastForward(10_000)
+  await expect(hint).toHaveText('No computer is paired with Poise Link, so snippets reach no desktop.')
+  await view.locator('.snip-link-settings').click()
+  await expect(page.locator('#settings-panel')).toHaveClass(/open/)
+  await expect(page.locator('.st-tabs [data-tab="accounts"]')).toHaveAttribute('aria-selected', 'true')
+  await expect(page.locator('.pl-device-state')).toHaveText('Revoked')
 })
 
 test('Escape closes the top-right menu, and Settings opened from it', async ({ page }) => {
