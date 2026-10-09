@@ -270,6 +270,23 @@ describe('the notifications setting', () => {
     expect(settings.getNotificationSettings()).toEqual({ enabled: false })
   })
 
+  it('keeps checking after a pass that failed before it read anything', async () => {
+    const epoch = database.getMeta(database.ALERT_ID_EPOCH_KEY)!
+    const read = vi.fn(async () => ({ pullRequests: [], read: ['acme'], tracked: ['acme'] }))
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    // Without the alert id prefix, reading alerts throws at once.
+    database.db.prepare('DELETE FROM meta WHERE key = ?').run(database.ALERT_ID_EPOCH_KEY)
+    try {
+      await notices.checkNotices(read)
+    } finally {
+      database.setMeta(database.ALERT_ID_EPOCH_KEY, epoch)
+    }
+    expect(logged).toHaveBeenCalledWith('[notices] could not check what needs attention:', expect.any(Error))
+    expect(read).not.toHaveBeenCalled()
+    await notices.checkNotices(read)
+    expect(read).toHaveBeenCalledTimes(1)
+  })
+
   it('stops the check of pull requests while off', async () => {
     const read = vi.fn(async () => ({ pullRequests: [{ repo: 'acme/api', number: 1, title: 'Change 1', status: 'green' as const }], read: ['acme'], tracked: ['acme'] }))
     settings.setSettings({ notifications: { enabled: false } })

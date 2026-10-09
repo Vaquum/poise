@@ -183,21 +183,26 @@ let timer: ReturnType<typeof setInterval> | null = null
 let firstCheck: ReturnType<typeof setTimeout> | null = null
 let pass: Promise<void> | null = null
 
+async function runPass(read: typeof readOwnPullRequests): Promise<void> {
+  try {
+    retireClearedBehaviorAlerts()
+    await checkReadyPullRequests(read)
+  } catch (error) {
+    console.error('[notices] could not check what needs attention:', error)
+  }
+}
+
 /** One pass, unless one is already running or notifications are off. */
 export function checkNotices(read: typeof readOwnPullRequests = readOwnPullRequests): Promise<void> {
   if (pass) return pass
   if (!getNotificationSettings().enabled) return Promise.resolve()
-  pass = (async () => {
-    try {
-      retireClearedBehaviorAlerts()
-      await checkReadyPullRequests(read)
-    } catch (error) {
-      console.error('[notices] could not check what needs attention:', error)
-    } finally {
-      pass = null
-    }
-  })()
-  return pass
+  // Cleared once settled, never before it is recorded: a pass that fails before
+  // its first await has already finished by the time runPass returns.
+  const current: Promise<void> = runPass(read).finally(() => {
+    if (pass === current) pass = null
+  })
+  pass = current
+  return current
 }
 
 export function startNoticesRuntime(): void {
