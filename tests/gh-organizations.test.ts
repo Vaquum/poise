@@ -143,9 +143,9 @@ describe('the accounts GitHub is read as', () => {
       read: ['alpha', 'beta'],
       tracked: ['alpha', 'beta'],
     })
-    // Someone else's pull request is not asked about.
+    // Someone else's pull request is not asked about. The checks run side by side.
     const asked = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface').map(([, args]) => args[1])
-    expect(asked).toEqual(['#7', '#8', '#9'])
+    expect(asked.sort()).toEqual(['#7', '#8', '#9'])
     // Current colours only what is known.
     expect((await handleGhBody({ operation: 'green_pr' })).body).toEqual({ records: [{ repo: 'alpha/same', number: 7, status: 'green' }], errors: [] })
   })
