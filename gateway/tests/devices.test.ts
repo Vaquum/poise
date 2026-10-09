@@ -149,6 +149,14 @@ describe('device pairing', () => {
     expect(signedOutPage.headers.location).toBe('/auth/login?next=%2Flink')
   })
 
+  it('serves its forms under a referrer policy that lets a browser send their origin', async () => {
+    // Under no-referrer, browsers send `Origin: null` with every form post, which the check above refuses.
+    const page = await h.request({ host: APEX, path: '/link', headers: { cookie: alice.apexCookie } })
+    expect(page.status).toBe(200)
+    expect(page.body).toContain('<form method="post" action="/link">')
+    expect(page.headers['referrer-policy']).toBe('same-origin')
+  })
+
   it('lets a device token reach /api/link/* with the link scope and nothing else', async () => {
     const token = await pair(h, alice.apexCookie)
     const hello = await h.request({ host: ALICE, path: '/api/link/hello', headers: { authorization: `Bearer ${token}` } })
