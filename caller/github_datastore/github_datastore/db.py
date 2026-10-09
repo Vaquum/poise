@@ -17,7 +17,7 @@ def default_db() -> str:
 
 
 DEFAULT_DB = default_db()
-VIEW_SCHEMA_VERSION = 1
+VIEW_SCHEMA_VERSION = 2
 VIEW_NAMES = frozenset({"user_associations", "prs", "issues", "user_items"})
 
 
@@ -294,23 +294,21 @@ SELECT
         WHEN i.item_type = 'pr' THEN 'https://github.com/' || i.repo_full_name || '/pull/' || i.number
         ELSE 'https://github.com/' || i.repo_full_name || '/issues/' || i.number
     END AS url,
-    group_concat(DISTINCT a.association_type) AS reasons,
-    count(*) AS evidence_count,
+    a.reasons,
+    a.evidence_count,
     CAST((julianday('now') - julianday(i.updated_at)) * 24 * 60 AS INTEGER) AS updated_minutes_ago
-FROM associations a
-JOIN items i ON i.item_id = a.item_id
-GROUP BY
-    a.username,
-    i.item_id,
-    i.item_type,
-    i.repo_full_name,
-    i.number,
-    i.state,
-    i.author_login,
-    i.updated_at,
-    i.created_at,
-    i.closed_at,
-    i.title;
+-- Evidence is grouped before items are joined: grouping the joined rows sorted
+-- every evidence row with its item's whole payload, gigabytes for a busy user.
+FROM (
+    SELECT
+        username,
+        item_id,
+        group_concat(DISTINCT association_type) AS reasons,
+        count(*) AS evidence_count
+    FROM associations
+    GROUP BY username, item_id
+) a
+JOIN items i ON i.item_id = a.item_id;
 """
 
 
