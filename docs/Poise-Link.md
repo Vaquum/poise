@@ -165,8 +165,8 @@ the pairing window again. Espanso keeps the last snippets it received.
   agent that also keeps Poise Link running: when Poise Link crashes or is
   stopped any way but Quit, for example with `kill`, launchd starts it again
   within seconds. While it is on, launchd's copy is the one that runs: opening
-  Poise Link from the Finder has launchd start it, and launchd's copy asks any
-  other copy to quit. A Poise Link opened from another folder than before,
+  Poise Link from the Finder has launchd start it, or has the copy launchd
+  runs show its window, and launchd's copy asks any other copy to quit. A Poise Link opened from another folder than before,
   because it was moved or installed elsewhere, takes the agent over. Turning it off leaves the running copy as it is; it is
   not started at the next login.
 - **Sign out** forgets the pairing on this computer. Revoke the device in Poise

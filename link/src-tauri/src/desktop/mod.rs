@@ -142,6 +142,9 @@ fn setup(app: &mut tauri::App, autostarted: bool) -> Result<(), Box<dyn std::err
     watch_status(handle.clone(), Arc::clone(&controller), tray);
 
     // Reading the device token can wait on an unlock prompt, so not on the event loop.
+    #[cfg(target_os = "macos")]
+    watch_window_requests(handle.clone(), config_dir.clone());
+
     tauri::async_runtime::spawn_blocking(move || {
         let paired = controller.start();
         if !paired || !autostarted || asked_for_window {
@@ -149,6 +152,20 @@ fn setup(app: &mut tauri::App, autostarted: bool) -> Result<(), Box<dyn std::err
         }
     });
     Ok(())
+}
+
+/// A Poise Link opened while launchd's copy runs leaves a request for its
+/// window and quits (crate::launch_agent::arrange).
+#[cfg(target_os = "macos")]
+fn watch_window_requests(app: AppHandle, settings_dir: std::path::PathBuf) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(launch_agent::WINDOW_REQUEST_POLL).await;
+            if launch_agent::take_window_request(&settings_dir) {
+                show_window(&app);
+            }
+        }
+    });
 }
 
 fn settings_dir() -> Result<std::path::PathBuf, &'static str> {

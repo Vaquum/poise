@@ -7,7 +7,8 @@
 //! launchd restarts only the copy it started itself, so while the agent is
 //! installed that copy is the one that runs:
 //! - A copy started another way (from the Finder, or by the installer) asks
-//!   launchd to start its copy, and quits ([`arrange`]).
+//!   launchd to start its copy, or asks the copy launchd runs for its window,
+//!   and quits ([`arrange`]).
 //! - Turning start at login on hands the running copy over to launchd
 //!   ([`hand_over`]).
 //! - launchd's copy asks any other copy to quit before it takes over
@@ -35,6 +36,8 @@ pub const WINDOW_REQUEST_FILE_NAME: &str = "show-window";
 /// How long launchd's copy waits for another copy to quit, before asking it to and again after.
 pub const QUIT_WAIT: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(100);
+/// How often launchd's copy looks for a window request while it runs.
+pub const WINDOW_REQUEST_POLL: Duration = Duration::from_secs(1);
 /// `launchctl print` for a service launchd does not know.
 const NO_SUCH_SERVICE: i32 = 113;
 
@@ -380,8 +383,15 @@ pub fn arrange(start: &Arrangement) -> Result<Arranged, String> {
     })?;
     let job = start.launchd.job()?;
     if job.runs(start.agent.program()) {
-        // The single-instance plugin passes this start on to launchd's copy.
-        return Ok(Start::Here.into());
+        // launchd's copy may still be starting, before it listens for a
+        // second launch: never run beside it. It looks for the request every
+        // second, and as it starts.
+        if start.show_window {
+            request_window(start.settings_dir).map_err(|error| {
+                format!("could not ask launchd's copy to show its window: {error}")
+            })?;
+        }
+        return Ok(Start::HandedOver.into());
     }
     if start.show_window {
         request_window(start.settings_dir)
@@ -475,7 +485,8 @@ pub fn request_window(settings_dir: &Path) -> io::Result<()> {
 }
 
 /// Whether a copy the person opened asked this one to show its window. The
-/// request is used up.
+/// request is used up. launchd's copy looks when it starts and every
+/// [`WINDOW_REQUEST_POLL`] after.
 pub fn take_window_request(settings_dir: &Path) -> bool {
     fs::remove_file(settings_dir.join(WINDOW_REQUEST_FILE_NAME)).is_ok()
 }
@@ -769,13 +780,24 @@ mod tests {
     }
 
     #[test]
-    fn a_copy_opened_while_launchds_runs_passes_the_start_on() {
+    fn a_copy_opened_while_launchds_runs_asks_it_for_its_window_and_quits() {
+        // Never runs beside launchd's copy, which may still be starting and taking over.
         let fixture = fixture();
         fixture.agent.install().unwrap();
         let launchd = FakeLaunchd::with(loaded(true));
         let start = arrange_with(&fixture, &launchd, &FakeCopies::default(), false, true);
-        assert_eq!(start, Ok(Start::Here));
+        assert_eq!(start, Ok(Start::HandedOver));
         assert_eq!(launchd.calls(), ["print"]);
+        assert!(take_window_request(&fixture.settings));
+    }
+
+    #[test]
+    fn a_start_at_login_while_launchds_copy_runs_quits_without_a_window() {
+        let fixture = fixture();
+        fixture.agent.install().unwrap();
+        let launchd = FakeLaunchd::with(loaded(true));
+        let start = arrange_with(&fixture, &launchd, &FakeCopies::default(), false, false);
+        assert_eq!(start, Ok(Start::HandedOver));
         assert!(!take_window_request(&fixture.settings));
     }
 
