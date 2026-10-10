@@ -30,6 +30,10 @@ GitHub account or the agent account opened, with the rule Current uses for
 green: the merge button is green, no check fails or is still running, and no
 conversation is unresolved.
 
+Current and notifications share a simultaneous check of the same pull request
+when both use the same agent GitHub account. Its answer is cached for 60 seconds
+from the start of the check; a different agent account gets its own check.
+
 - A pull request that becomes ready is noticed at once, and Poise Link shows
   it once.
 - Its notice comes back every 15 minutes, counted from when it became ready,

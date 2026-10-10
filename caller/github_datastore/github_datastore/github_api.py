@@ -543,17 +543,105 @@ class GitHubOrgReader:
                 """)
             query = "query(" + ", ".join(declarations) + ") {" + "".join(fields) + "}"
             data = self.client.graphql(query, variables)
+            repositories = {}
             for index, full_name in enumerate(names):
                 repo = data.get(f"repo_{index}")
                 if not isinstance(repo, dict):
                     raise GitHubApiError(f"missing repository batch result: {full_name}")
                 if str(repo.get("nameWithOwner", "")).casefold() != full_name.casefold():
                     raise GitHubApiError(f"repository batch result does not match: {full_name}")
-                owner, name = split_full_name(full_name)
-                issues, pulls = self._complete_changed_issue_and_pull_nodes(owner, name, since, repo)
+                repositories[full_name] = repo
+            completed = self._complete_changed_repository_batch(names, since, repositories)
+            for full_name, (issues, pulls) in completed.items():
                 pulls = self._changed_pull_nodes(full_name, pulls, stored_pr_updated_at.get(full_name, {}))
                 result[full_name] = self._merge_item_nodes(full_name, issues, pulls)
         return result
+
+    def _complete_changed_repository_batch(
+        self,
+        full_names: list[str],
+        since: str,
+        repositories: dict[str, dict[str, Any]],
+    ) -> dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
+        nodes = {}
+        totals = {}
+        cursors = {}
+        seen_cursors = {}
+        since_at = parse_graphql_datetime(since, "repository batch watermark")
+        for full_name in full_names:
+            owner, name = split_full_name(full_name)
+            for key in ("issues", "pullRequests"):
+                identity = (full_name, key)
+                conn = repositories[full_name][key]
+                nodes[identity] = list(conn["nodes"])
+                totals[identity] = required_total_count(conn, owner, name, key)
+                seen_cursors[identity] = set()
+                if conn["pageInfo"]["hasNextPage"]:
+                    cursor = required_next_cursor(conn["pageInfo"], None, owner, name, key)
+                    cursors[identity] = cursor
+                    seen_cursors[identity].add(cursor)
+
+        # Each selection follows a cursor GitHub already returned. Independent
+        # connections share a request, while each connection's page order stays intact.
+        while cursors:
+            pending = list(cursors)
+            for start in range(0, len(pending), 20):
+                batch = pending[start:start + 20]
+                declarations = ["$since: DateTime!"] if any(key == "issues" for _, key in batch) else []
+                variables = {"since": since} if declarations else {}
+                selections = []
+                for index, (full_name, key) in enumerate(batch):
+                    owner, name = split_full_name(full_name)
+                    declarations.extend([f"$owner{index}: String!", f"$name{index}: String!", f"$cursor{index}: String!"])
+                    variables.update({f"owner{index}": owner, f"name{index}": name, f"cursor{index}": cursors[(full_name, key)]})
+                    states = "OPEN, CLOSED" if key == "issues" else "OPEN, CLOSED, MERGED"
+                    filter_by = ", filterBy: {since: $since}" if key == "issues" else ""
+                    fields = ISSUE_STUB_FIELDS if key == "issues" else PULL_STUB_FIELDS
+                    selections.append(f"""
+                      page_{index}: repository(owner: $owner{index}, name: $name{index}) {{
+                        nameWithOwner
+                        {key}(first: 100, after: $cursor{index}, states: [{states}]{filter_by}, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
+                          totalCount
+                          pageInfo {{ hasNextPage endCursor }}
+                          nodes {{ {fields} }}
+                        }}
+                      }}
+                    """)
+                query = "query(" + ", ".join(declarations) + ") {" + "".join(selections) + "}"
+                data = self.client.graphql(query, variables)
+                for index, (full_name, key) in enumerate(batch):
+                    identity = (full_name, key)
+                    owner, name = split_full_name(full_name)
+                    repo = data.get(f"page_{index}")
+                    if not isinstance(repo, dict):
+                        raise GitHubApiError(f"missing repository batch result: {full_name}")
+                    if str(repo.get("nameWithOwner", "")).casefold() != full_name.casefold():
+                        raise GitHubApiError(f"repository batch result does not match: {full_name}")
+                    conn = repo[key]
+                    total_count = required_total_count(conn, owner, name, key)
+                    if total_count != totals[identity]:
+                        raise GitHubApiError(f"{key} totalCount changed while enumerating {full_name}: {totals[identity]} to {total_count}")
+                    for node in conn["nodes"]:
+                        updated_at = parse_graphql_datetime(node.get("updatedAt"), f"{full_name} {key} node")
+                        if key == "pullRequests" or updated_at >= since_at:
+                            nodes[identity].append(node)
+                    if conn["pageInfo"]["hasNextPage"]:
+                        cursor = required_next_cursor(conn["pageInfo"], cursors[identity], owner, name, key)
+                        if cursor in seen_cursors[identity]:
+                            raise GitHubApiError(f"{full_name} {key} returned a cyclic page cursor")
+                        seen_cursors[identity].add(cursor)
+                        cursors[identity] = cursor
+                    else:
+                        del cursors[identity]
+
+        completed = {}
+        for full_name in full_names:
+            for key, label in (("issues", "issue"), ("pullRequests", "pull request")):
+                identity = (full_name, key)
+                if len(nodes[identity]) != totals[identity]:
+                    raise GitHubApiError(f"{label} enumeration count mismatch for {full_name}: expected {totals[identity]}, received {len(nodes[identity])}")
+            completed[full_name] = (nodes[(full_name, "issues")], nodes[(full_name, "pullRequests")])
+        return completed
 
     def _list_changed_issue_and_pull_nodes(
         self,

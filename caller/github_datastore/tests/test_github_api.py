@@ -457,6 +457,10 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
     def batch_result(full_name: str, issues: list[dict], pulls: list[dict], **kwargs) -> dict:
         return {"nameWithOwner": full_name, **incremental_response(issues, pulls, **kwargs)["repository"]}
 
+    @staticmethod
+    def batch_page(full_name: str, key: str, nodes: list[dict], has_next: bool, cursor: str | None, total: int | None) -> dict:
+        return {"nameWithOwner": full_name, **repository_page(key, nodes, has_next, cursor, total)["repository"]}
+
     def test_batch_matches_individual_complete_changed_items(self) -> None:
         first = incremental_response([issue_stub(1, WATERMARK)], [pull_stub(1, WATERMARK), pull_stub(2, WATERMARK)])
         second = incremental_response([], [pull_stub(3, WATERMARK)])
@@ -495,14 +499,70 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
         client = ScriptedClient([
             {"repo_0": self.batch_result(names[0], issues[:1], [], issue_has_next=True, issue_cursor="issue-cursor", issue_total_count=2),
              "repo_1": self.batch_result(names[1], [], pulls[:1], pull_has_next=True, pull_cursor="pull-cursor", pull_total_count=2)},
-            repository_page("issues", issues[1:], False, None, 2),
-            repository_page("pullRequests", pulls[1:], False, None, 2),
+            {"page_0": self.batch_page(names[0], "issues", issues[1:], False, None, 2),
+             "page_1": self.batch_page(names[1], "pullRequests", pulls[1:], False, None, 2)},
         ])
         result = GitHubOrgReader(client).list_repos_changed_items(names, WATERMARK, {})
         self.assertEqual([item["number"] for item in result[names[0]]], [1, 2])
         self.assertEqual([item["number"] for item in result[names[1]]], [3, 4])
-        self.assertEqual(client.calls[1][1], {"owner": "owner", "name": "first", "cursor": "issue-cursor", "since": WATERMARK})
-        self.assertEqual(client.calls[2][1], {"owner": "owner", "name": "second", "cursor": "pull-cursor", "since": None})
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1][1], {"since": WATERMARK, "owner0": "owner", "name0": "first", "cursor0": "issue-cursor", "owner1": "owner", "name1": "second", "cursor1": "pull-cursor"})
+        self.assertNotIn("body", client.calls[1][0])
+        client.assert_exhausted()
+
+    def test_continuations_match_individual_enumeration_with_uneven_pages(self) -> None:
+        names = ["owner/first", "owner/second"]
+        issues = [issue_stub(number, WATERMARK) for number in range(1, 202)]
+        pulls = [pull_stub(number, "2026-08-29T11:00:00Z") for number in range(1001, 1102)]
+        other_pulls = [pull_stub(number, WATERMARK) for number in range(2001, 2202)]
+        first = incremental_response(issues[:100], pulls[:100], True, "issue-100", True, "pull-100", 201, 101)
+        second = incremental_response([], other_pulls[:100], pull_has_next=True, pull_cursor="other-100", pull_total_count=201)
+        stored = {names[0]: {int(pulls[0]["fullDatabaseId"]): pulls[0]["updatedAt"]}, names[1]: {}}
+        individual_client = ScriptedClient([
+            first,
+            repository_page("issues", issues[100:200], True, "issue-200", 201),
+            repository_page("issues", issues[200:], False, None, 201),
+            repository_page("pullRequests", pulls[100:], False, None, 101),
+            second,
+            repository_page("pullRequests", other_pulls[100:200], True, "other-200", 201),
+            repository_page("pullRequests", other_pulls[200:], False, None, 201),
+        ])
+        individual = GitHubOrgReader(individual_client)
+        expected = {name: individual.list_repo_changed_items(name, WATERMARK, stored[name]) for name in names}
+        client = ScriptedClient([
+            {"repo_0": {"nameWithOwner": names[0], **first["repository"]},
+             "repo_1": {"nameWithOwner": names[1], **second["repository"]}},
+            {"page_0": self.batch_page(names[0], "issues", issues[100:200], True, "issue-200", 201),
+             "page_1": self.batch_page(names[0], "pullRequests", pulls[100:], False, None, 101),
+             "page_2": self.batch_page(names[1], "pullRequests", other_pulls[100:200], True, "other-200", 201)},
+            {"page_0": self.batch_page(names[0], "issues", issues[200:], False, None, 201),
+             "page_1": self.batch_page(names[1], "pullRequests", other_pulls[200:], False, None, 201)},
+        ])
+        actual = GitHubOrgReader(client).list_repos_changed_items(names, WATERMARK, stored)
+        self.assertEqual(actual, expected)
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(len(individual_client.calls), 7)
+        self.assertEqual(client.calls[2][1]["cursor0"], "issue-200")
+        self.assertEqual(client.calls[2][1]["cursor1"], "other-200")
+        self.assertTrue(any(item["updated_at"] < WATERMARK for item in actual[names[0]]))
+        client.assert_exhausted()
+        individual_client.assert_exhausted()
+
+    def test_continuation_batches_limit_independent_connections_to_twenty(self) -> None:
+        names = [f"owner/repo{index}" for index in range(20)]
+        first = {f"repo_{index}": self.batch_result(name, [issue_stub(1, WATERMARK)], [pull_stub(3, WATERMARK)],
+                  issue_has_next=True, issue_cursor=f"issue-{index}", issue_total_count=2,
+                  pull_has_next=True, pull_cursor=f"pull-{index}", pull_total_count=2)
+                 for index, name in enumerate(names)}
+        identities = [(name, key) for name in names for key in ("issues", "pullRequests")]
+        continuations = [{f"page_{index}": self.batch_page(name, key, [issue_stub(2, WATERMARK) if key == "issues" else pull_stub(4, WATERMARK)], False, None, 2)
+                          for index, (name, key) in enumerate(identities[start:start + 20])}
+                         for start in range(0, len(identities), 20)]
+        client = ScriptedClient([first, *continuations])
+        result = GitHubOrgReader(client).list_repos_changed_items(names, WATERMARK, {})
+        self.assertEqual(len(client.calls), 3)
+        self.assertTrue(all(len(items) == 4 for items in result.values()))
+        self.assertEqual([query.count("page_") for query, _ in client.calls[1:]], [20, 20])
         client.assert_exhausted()
 
     def test_missing_null_or_wrong_repository_alias_fails(self) -> None:
@@ -528,13 +588,39 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
             (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)]), [], {999: WATERMARK}),
             (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)] * 2), [], {}),
             (self.batch_result("owner/repo", [], [], pull_has_next=True, pull_cursor="cursor", pull_total_count=2),
-             [repository_page("pullRequests", [pull_stub(1, WATERMARK)], True, "cursor", 2)], {}),
+             [{"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], True, "cursor", 2)}], {}),
             (self.batch_result("owner/repo", [], [], pull_has_next=True, pull_cursor="cursor", pull_total_count=2),
-             [repository_page("pullRequests", [pull_stub(1, WATERMARK)], False, None, 3)], {}),
+             [{"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], False, None, 3)}], {}),
         ]
         for first, continuations, stored in cases:
             with self.subTest(first=first, continuations=continuations, stored=stored), self.assertRaises(GitHubApiError):
                 GitHubOrgReader(ScriptedClient([{"repo_0": first}, *continuations])).list_repos_changed_items(["owner/repo"], WATERMARK, {"owner/repo": stored})
+
+    def test_continuations_reject_incomplete_duplicate_and_inaccessible_data(self) -> None:
+        first = self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)], pull_has_next=True, pull_cursor="first", pull_total_count=2)
+        cases = [
+            {},
+            {"page_0": None},
+            {"page_0": self.batch_page("other/repo", "pullRequests", [pull_stub(2, WATERMARK)], False, None, 2)},
+            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, WATERMARK)], False, None, None)},
+            {"page_0": self.batch_page("owner/repo", "pullRequests", [], False, None, 2)},
+            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], False, None, 2)},
+            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, "invalid")], False, None, 2)},
+            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, WATERMARK)], True, None, 2)},
+        ]
+        for continuation in cases:
+            with self.subTest(continuation=continuation), self.assertRaises(GitHubApiError):
+                GitHubOrgReader(ScriptedClient([{"repo_0": first}, continuation])).list_repos_changed_items(["owner/repo"], WATERMARK, {})
+
+    def test_continuations_reject_cyclic_cursors(self) -> None:
+        client = ScriptedClient([
+            {"repo_0": self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)], pull_has_next=True, pull_cursor="first", pull_total_count=3)},
+            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, WATERMARK)], True, "second", 3)},
+            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(3, WATERMARK)], True, "first", 3)},
+        ])
+        with self.assertRaisesRegex(GitHubApiError, "cyclic page cursor"):
+            GitHubOrgReader(client).list_repos_changed_items(["owner/repo"], WATERMARK, {})
+        client.assert_exhausted()
 
 
 if __name__ == "__main__":

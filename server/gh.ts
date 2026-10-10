@@ -51,6 +51,7 @@ type PrColour = 'green' | 'yellow'
 // Null: neither colour. Undefined: GitHub could not be asked, so nothing is known.
 type PrStatus = PrColour | null | undefined
 const greenCache = new Map<string, { status: PrStatus, expiry: number }>()
+const greenReads = new Map<string, Promise<PrStatus>>()
 
 // Subset of fields the datastore returns. Pr-only and issue-only fields
 // are optional; the user-footprint view adds `item_type` and `reasons`.
@@ -293,38 +294,46 @@ export async function getHeadSha(
 // or git remote is available. We just point cwd at a tmp directory whose
 // last two parts are `<owner>/<repo>` and the CLI picks it up.
 async function checkPrStatus(owner: string, repo: string, number: number, agent: string): Promise<PrStatus> {
-  const key = `${owner}/${repo}#${number}`
+  const key = `${agent.toLowerCase()}:${owner}/${repo}#${number}`
   const now = Date.now()
   const cached = greenCache.get(key)
   if (cached && cached.expiry > now) return cached.status
+  const pending = greenReads.get(key)
+  if (pending) return pending
 
-  const cwd = join(GH_INTERFACE_CWD_ROOT, owner, repo)
-  try {
-    await mkdir(cwd, { recursive: true })
-    const { stdout } = await runFile(GH_INTERFACE, ['--mergeable', `#${number}`, '--token-user', agent], {
-      cwd,
-      timeoutMs: 30_000,
-      maxOutputBytes: 1 * 1024 * 1024,
-    })
-    const result = JSON.parse(stdout)
-    // GitHub works out whether an open pull request can merge after a push to it
-    // or its base; until it has, nothing is known. A github-interface that
-    // reports no status says only whether the PR is clean: green.
-    const computing = result.state === 'open' && (result.github_mergeable === null || result.github_mergeable_state === 'unknown')
-    const status: PrStatus = computing
-      ? undefined
-      : result.status === 'green' || result.status === 'yellow'
-        ? result.status
-        : result.status === undefined && result.mergeable ? 'green' : null
-    greenCache.set(key, { status, expiry: now + GREEN_TTL_MS })
-    return status
-  } catch {
-    // Network blip / API error / parse failure — cache it so we don't hammer
-    // on every retry. Current shows such a PR uncoloured: better to
-    // under-show green than to over-show it.
-    greenCache.set(key, { status: undefined, expiry: now + GREEN_TTL_MS })
-    return undefined
-  }
+  // Current and ready-PR notifications can miss the cache together. Share
+  // their read only when it uses the same authenticated account.
+  const read = (async (): Promise<PrStatus> => {
+    const cwd = join(GH_INTERFACE_CWD_ROOT, owner, repo)
+    try {
+      await mkdir(cwd, { recursive: true })
+      const { stdout } = await runFile(GH_INTERFACE, ['--mergeable', `#${number}`, '--token-user', agent], {
+        cwd,
+        timeoutMs: 30_000,
+        maxOutputBytes: 1 * 1024 * 1024,
+      })
+      const result = JSON.parse(stdout)
+      // GitHub works out whether an open pull request can merge after a push to it
+      // or its base; until it has, nothing is known. A github-interface that
+      // reports no status says only whether the PR is clean: green.
+      const computing = result.state === 'open' && (result.github_mergeable === null || result.github_mergeable_state === 'unknown')
+      const status: PrStatus = computing
+        ? undefined
+        : result.status === 'green' || result.status === 'yellow'
+          ? result.status
+          : result.status === undefined && result.mergeable ? 'green' : null
+      greenCache.set(key, { status, expiry: now + GREEN_TTL_MS })
+      return status
+    } catch {
+      // Network blip / API error / parse failure — cache it so we don't hammer
+      // on every retry. Current shows such a PR uncoloured: better to
+      // under-show green than to over-show it.
+      greenCache.set(key, { status: undefined, expiry: now + GREEN_TTL_MS })
+      return undefined
+    }
+  })().finally(() => { greenReads.delete(key) })
+  greenReads.set(key, read)
+  return read
 }
 
 /** One of the person's own open pull requests: authored by their GitHub
