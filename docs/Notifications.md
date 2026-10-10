@@ -41,9 +41,14 @@ conversation is unresolved.
 
 ## Acting on a notice
 
-- **Click it** to open what it is about and put it away: Behaviors, Settings
+- **Click it** to open what it is about and put it away: Swarm, Settings
   (Accounts or General), the Chat session, or the pull request on GitHub in a
   new tab.
+  A failed behavior scrolls to its exact run in Swarm, briefly highlights it,
+  and opens the failure detail, including when Swarm is already on screen.
+  Search and account filters that hide the run are cleared, and a collapsed
+  group opens to reveal it. An incident without a recorded agent call opens
+  Behaviors, where its diagnostic is shown.
 - **×** puts it away: for good, or for a ready pull request until its next
   reminder.
 - **The crossed-out bell**, on a ready pull request only, silences it: no more
@@ -64,7 +69,8 @@ pull requests at once. Poise Link's other alerts go on as before.
 - `GET /api/notices` answers `{ enabled, notices }`, the most pressing first.
   - A notice is `{ id, kind, title, body, since, due, silenceable, target }`.
   - `due` is `since`, or the latest reminder of a ready pull request.
-  - `target` is `{ view: "behaviors" }`, `{ settings: "general" | "accounts" }`,
+  - `target` is `{ swarm: <call id> }`, `{ view: "behaviors" }` for an incident
+    without a recorded call, `{ settings: "general" | "accounts" }`,
     `{ chat: <session id> }`, `{ pullRequest: <GitHub URL> }`, or null when
     the notice only informs.
 - `POST /api/notices/:id/dismiss` and `POST /api/notices/:id/silence` answer

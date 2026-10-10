@@ -149,6 +149,45 @@ describe('the notices', () => {
 })
 
 describe('an alert target', () => {
+  it('opens the current failed call for an existing behavior alert', () => {
+    store.raiseAlert(held, at(0))
+    const insert = database.db.prepare(`
+      INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, call_id, error, created_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    insert.run('first', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-1', 'Review failed', new Date(at(0)).toISOString())
+    // Another behavior on the same PR must never become this notice's target.
+    insert.run('unrelated', 'approve-prs', 'acme/api#9', 'acme/api', 9, 'approval-call', 'Approval failed', new Date(at(1)).toISOString())
+    expect(shown(at(2))[0]).toMatchObject({ target: { swarm: 'failed-call-1' }, body: 'Open Swarm in Poise to see what happened.' })
+    insert.run('second', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-2', 'Review failed again', new Date(at(3)).toISOString())
+    expect(shown(at(4))[0].target).toEqual({ swarm: 'failed-call-2' })
+  })
+
+  it('keeps a pre-launch failure on its diagnostic when no Swarm call exists', () => {
+    store.raiseAlert(held, at(0))
+    database.db.prepare(`
+      INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, error, created_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?)
+    `).run('pre-launch', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'Could not launch', new Date(at(0)).toISOString())
+    expect(shown(at(1))[0].target).toEqual({ view: 'behaviors' })
+  })
+
+  it('opens an older notice beyond the first 500 active incidents', () => {
+    store.raiseAlert(held, at(0))
+    const insert = database.db.prepare(`
+      INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, call_id, error, created_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    insert.run('old', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'old-call', 'Review failed', new Date(at(0)).toISOString())
+    database.db.transaction(() => {
+      for (let number = 10; number < 511; number++) {
+        insert.run(`new-${number}`, 'review-new-prs', `acme/api#${number}`, 'acme/api', number, `new-call-${number}`, 'Review failed', new Date(at(1)).toISOString())
+      }
+    })()
+    expect(database.listBehaviorIncidents(500).some((incident) => incident.callId === 'old-call')).toBe(false)
+    expect(shown(at(2))[0].target).toEqual({ swarm: 'old-call' })
+  })
+
   it('is kept with the alert and refused when it could open anything else', () => {
     store.raiseAlert(held, at(0))
     expect(shown(at(1))[0].target).toEqual({ view: 'behaviors' })
@@ -157,6 +196,11 @@ describe('an alert target', () => {
       { settings: 'admin' },
       { chat: '' },
       { chat: 'a b' },
+      { swarm: '' },
+      { swarm: 'a b' },
+      { swarm: '<img>' },
+      { swarm: 'a'.repeat(201) },
+      { swarm: 7 },
       { pullRequest: 'https://example.com/acme/api/pull/1' },
       { pullRequest: 'javascript:alert(1)' },
       { pullRequest: 'https://github.com/acme/api/issues/1' },
@@ -164,6 +208,11 @@ describe('an alert target', () => {
     ]) {
       expect(() => store.raiseAlert({ ...waiting, dedupeKey: `bad:${JSON.stringify(target)}`, target: target as never }), JSON.stringify(target)).toThrow(/cannot open/)
     }
+  })
+
+  it('keeps an exact Swarm call target with the alert', () => {
+    store.raiseAlert({ ...held, target: { swarm: 'failed-call' } }, at(0))
+    expect(shown(at(1))[0].target).toEqual({ swarm: 'failed-call' })
   })
 
   it('is absent for alerts raised without one', () => {

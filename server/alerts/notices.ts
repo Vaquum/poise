@@ -10,7 +10,7 @@
 // Settings → General → Notifications turns this off: the page shows nothing
 // and nothing here checks GitHub. Poise Link's other alerts go on as before.
 
-import { listBehaviorIncidents } from '../db'
+import { getBehaviorIncident, listBehaviorIncidents } from '../db'
 import { readOwnPullRequests, type OwnPullRequest } from '../gh'
 import { HttpError } from '../http'
 import { getNotificationSettings } from '../settings'
@@ -77,15 +77,20 @@ export function noticesState(now = Date.now()): NoticesState {
   const notices = openAlerts({ now }).flatMap((alert): Notice[] => {
     const due = dueAt(alert, now)
     if (due === null) return []
+    // A notice may outlive the incident list's first page. Look up its exact
+    // current incident, including alerts recorded before Swarm navigation.
+    const held = alert.kind === 'behavior_held' ? /^behavior-held:([^:]+):(.+)$/.exec(alert.dedupeKey) : null
+    const incident = held ? getBehaviorIncident(held[1], held[2]) : null
+    const target: AlertTarget | null = incident?.callId ? { swarm: incident.callId } : alert.target
     return [{
       id: alert.id,
       kind: alert.kind,
       title: alert.title,
-      body: alert.body,
+      body: target && 'swarm' in target ? 'Open Swarm in Poise to see what happened.' : alert.body,
       since: alert.createdAt,
       due: new Date(due).toISOString(),
       silenceable: SILENCEABLE.has(alert.kind),
-      target: alert.target,
+      target,
     }]
   })
   // Within a kind, the one that most recently came due leads.
