@@ -24,6 +24,7 @@ const ICON_SILENCE = '<svg width="13" height="13" viewBox="0 0 13 13" fill="none
 // Where a notice goes, as assistive technology reads it.
 function destination(target: NoticeTarget): string {
   if ('view' in target) return 'Open Behaviors'
+  if ('swarm' in target) return 'Open the failed run in Swarm'
   if ('settings' in target) return target.settings === 'accounts' ? 'Open Settings, Accounts' : 'Open Settings'
   if ('chat' in target) return 'Open the Chat session'
   return 'Open the pull request on GitHub'

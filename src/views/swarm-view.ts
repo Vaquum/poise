@@ -1,4 +1,4 @@
-import { mountOrganizationFilter, organizationUrl, getSelectedOrganization } from '../organizations'
+import { mountOrganizationFilter, organizationUrl, getSelectedOrganization, setSelectedOrganization } from '../organizations'
 // Swarm — log of agent calls. Identical finished calls share a row: model, prompt
 // (truncated), status, time elapsed, response (View → expand row to
 // reveal the full response text underneath).
@@ -1093,10 +1093,7 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
     notFocusable(`The run for ${repo}#${pr_id} is not in the current list.`)
     return
   }
-  row.scrollIntoView({ behavior: 'smooth', block: 'center' })
-  // Highlight briefly so the eye lands on the right row.
-  row.classList.add('agent-row-focus')
-  window.setTimeout(() => row.classList.remove('agent-row-focus'), 1500)
+  highlightRow(row)
   // If the run is finished and has a response body, expand it inline.
   // Otherwise (running / failed-without-body) just show the row.
   if (match.status === 'completed' && match.response && !expanded.has(match.id)) {
@@ -1104,6 +1101,67 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
     if (btn) { btn.classList.add('open'); btn.setAttribute('aria-expanded', 'true') }
     loadResponse(match.id)
   }
+}
+
+const highlightTimers = new WeakMap<HTMLTableRowElement, number>()
+
+function highlightRow(row: HTMLTableRowElement): void {
+  row.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  const previous = highlightTimers.get(row)
+  if (previous !== undefined) window.clearTimeout(previous)
+  // A second navigation to the same row starts its pulse again.
+  row.classList.remove('agent-row-focus')
+  void row.offsetWidth
+  row.classList.add('agent-row-focus')
+  highlightTimers.set(row, window.setTimeout(() => {
+    row.classList.remove('agent-row-focus')
+    highlightTimers.delete(row)
+  }, 1500))
+}
+
+let callFocusSequence = 0
+
+/** Open the exact run a notification names, including an earlier grouped
+ *  failure. The caller makes Swarm visible before asking for it. */
+export async function focusCall(callId: string): Promise<void> {
+  const mine = ++callFocusSequence
+  if (!viewEl || !bodyEl) return
+  await pollOnce()
+  if (mine !== callFocusSequence || viewEl.hidden) return
+  let match = entries.find((entry) => entry.id === callId)
+  if (!match && getSelectedOrganization()) {
+    setSelectedOrganization('')
+    await pollOnce()
+    if (mine !== callFocusSequence || viewEl.hidden) return
+    match = entries.find((entry) => entry.id === callId)
+  }
+  if (!match) {
+    notFocusable(`No run found for call ${callId}.`)
+    return
+  }
+  if (searchDebounce) {
+    clearTimeout(searchDebounce)
+    searchDebounce = null
+  }
+  searchQuery = ''
+  if (searchEl) searchEl.value = ''
+  const group = groupRuns(entries).find((candidate) => candidate.entries.some((entry) => entry.id === callId))
+  if (group && group.entries[0].id !== callId) expandedGroups.add(group.key)
+  render()
+  const row = bodyEl.querySelector<HTMLTableRowElement>(`tr.agent-row[data-id="${CSS.escape(callId)}"]`)
+  if (!row) {
+    notFocusable(`The run for call ${callId} is not in the current list.`)
+    return
+  }
+  const detail = row.querySelector<HTMLButtonElement>('.expand-btn')
+  if (hasDetail(match) && !expanded.has(callId)) {
+    detail?.classList.add('open')
+    detail?.setAttribute('aria-expanded', 'true')
+    void loadResponse(callId)
+  }
+  row.tabIndex = -1
+  ;(detail ?? row).focus({ preventScroll: true })
+  highlightRow(row)
 }
 
 // Following a link and landing on nothing, with no explanation, is worse than

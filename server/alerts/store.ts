@@ -17,6 +17,7 @@ export type AlertKind = typeof ALERT_KINDS[number]
  *  tab, a Chat session, or a pull request on GitHub. */
 export type AlertTarget =
   | { view: 'behaviors' }
+  | { swarm: string }
   | { settings: 'general' | 'accounts' }
   | { chat: string }
   | { pullRequest: string }
@@ -29,6 +30,7 @@ export function isAlertTarget(value: unknown): value is AlertTarget {
   const keys = Object.keys(target)
   if (keys.length !== 1) return false
   if ('view' in target) return target.view === 'behaviors'
+  if ('swarm' in target) return typeof target.swarm === 'string' && /^[A-Za-z0-9._:-]{1,200}$/.test(target.swarm)
   if ('settings' in target) return target.settings === 'general' || target.settings === 'accounts'
   if ('chat' in target) return typeof target.chat === 'string' && /^[A-Za-z0-9._:-]{1,200}$/.test(target.chat)
   if ('pullRequest' in target) return typeof target.pullRequest === 'string' && PULL_REQUEST_URL.test(target.pullRequest)
