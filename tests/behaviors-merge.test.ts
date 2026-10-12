@@ -35,7 +35,7 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
     if (healthError) throw healthError
     const now = new Date().toISOString()
     return json({ action: 'health', status: 'healthy', healthy: true, age_seconds: 1,
-      database: join(root, 'github.sqlite'), max_age_seconds: 120,
+      database: args.includes('--db') ? args[args.indexOf('--db') + 1] : join(root, 'github.sqlite'), max_age_seconds: 120,
       last_sync_at: now, last_success_at: now, checked_at: now })
   }
   if (command === 'github-datastore' && args.includes('view')) return json(pulls)
