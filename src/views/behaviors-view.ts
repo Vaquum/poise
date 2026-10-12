@@ -160,10 +160,16 @@ function lastTriggeredUnavailable(): boolean {
 
 function lastTriggeredCell(key: BehaviorKey): string {
   const last = getLastTriggered(key)
-  if (!last && lastTriggeredUnavailable()) {
+  if (!last && key !== 'merge-prs' && lastTriggeredUnavailable()) {
     return '<span class="last-dash" title="The agent log could not be read, so this is unknown — not necessarily never.">?</span>'
   }
   if (!last) return '<span class="last-dash">—</span>'
+  if (key === 'merge-prs') {
+    const match = last.target.match(/^([^/\s]+\/[^#\s]+)#(\d+)$/)
+    if (!match) return '<span class="last-dash">?</span>'
+    const href = `https://github.com/${match[1]}/pull/${match[2]}`
+    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
+  }
   return `<a class="behavior-last-link" href="#" data-target="${escapeHtml(last.target)}" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
 }
 
@@ -1110,7 +1116,7 @@ function attachHandlers() {
     // The actual view-switch + focus is bridged through main.ts so this
     // module doesn't need to know about the menu.
     const link = (e.target as HTMLElement).closest<HTMLAnchorElement>('.behavior-last-link')
-    if (!link) return
+    if (!link || link.hasAttribute('data-merged-pr')) return
     e.preventDefault()
     const targetStr = link.dataset.target || ''
     const m = targetStr.match(/^(.+)#(\d+)$/)

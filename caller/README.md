@@ -7,7 +7,7 @@ tests and contract documents.
 | Package | CLI | What Poise uses it for |
 | --- | --- | --- |
 | `agent_interface/` | `agent-interface` | Runs the model CLIs for PR reviews, approvals, issue reviews, `/content` and `/consensus`; keeps the calls log Swarm shows; exports the model catalog |
-| `github_interface/` | `github-interface` | Repository lists, checkouts, pull request state and sub-issues for the behaviors; resolves non-blocking review conversations. `agent-interface` posts its reviews and comments through it |
+| `github_interface/` | `github-interface` | Repository lists, checkouts, pull request state and sub-issues for the behaviors; resolves non-blocking review conversations and merges ready pull requests. `agent-interface` posts its reviews and comments through it |
 | `github_datastore/` | `github-datastore` | The per-account SQLite index of issues and pull requests behind Current, Archive and the behaviors |
 
 Each package's own README, AGENTS and (for the datastore) CONSUMER_CONTRACT
@@ -37,6 +37,18 @@ which must be `GITHUB_INTERFACE_AGENT_USER`, and `github-datastore` reads
 GitHub only as the account whose token `GH_TOKEN` holds. Poise sets all of
 these from Settings → GitHub.
 
+## Automatic merge primitive
+
+`github-interface --merge-if-ready '#7' --expected-head SHA --author USER
+--token-user AGENT` (from a repository checkout or an `owner/repo` directory)
+merges only the named author's open, non-draft, green head. It rereads checks,
+conversation completeness and merge state without Poise's display cache, and
+sends the expected SHA to GitHub's merge endpoint. GitHub enforces protections.
+The method is the first allowed of squash, merge and rebase. The JSON outcome
+is `merged` with `merge_sha`, `not_ready`, `superseded`, or `already_merged`.
+API errors fail visibly; a lost merge response can be reconciled by the next
+read without merging twice. This operation requires an explicit acting account.
+
 ## Setup
 
 Caller needs Python 3.13 (`brew install python@3.13`; `POISE_PYTHON` names
@@ -65,3 +77,12 @@ The checkout-lock interop tests drive this repository's TypeScript lock with
 Node 22, so `npm ci` comes first. The Caller workflow
 (`.github/workflows/caller.yml`) runs the same suites on Python 3.13, parses
 every Python file and checks each CLI's `--help`.
+
+`github-interface --merge-candidates --requests-json
+'[{"repository":"owner/repo","number":7}]' --token-user AGENT` reads up to 50
+explicit targets in one GraphQL query. It returns the acting account,
+`graphql_cost` in GitHub points, and ordered records with `repository`, `number`,
+`head_sha`, `author`, `ready` and `error`. The green predicate is shared with the
+merge primitive. A partial query error is returned on its affected target;
+unscoped errors and missing identity/cost evidence fail the operation visibly.
+The read does not merge or use REST polling. An empty list adds no API requests.

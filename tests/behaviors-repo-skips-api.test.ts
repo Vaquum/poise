@@ -143,6 +143,25 @@ afterEach(async () => {
 })
 
 describe('Skip repositories API', () => {
+  it.each(['[broken', JSON.stringify({ at: 'invalid', target: 7 })])('keeps behavior controls readable when merge history is corrupt: %s', async (value) => {
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    database!.setMeta('behavior_merge_prs_last_fired', value)
+    const state = await behaviorState()
+    expect(state['merge-prs']!.lastTriggered).toBeNull()
+    expect(state['approve-prs']!.enabled).toBe(false)
+    expect(logged).toHaveBeenCalledWith('[behaviors] merge-prs last triggered could not be read:', expect.any(Error))
+  })
+
+  it('starts merging off and persists its global toggle and repository exclusions', async () => {
+    expect((await behaviorState())['merge-prs']).toMatchObject({ enabled: false, scratchpad: null, lastTriggered: null, skipRepos: [] })
+    expect((await post('/api/behaviors/merge-prs?org=beta', { enabled: true, skipRepos: [REPO] })).status).toBe(200)
+    for (const query of ['', '?org=beta']) {
+      expect((await behaviorState(query))['merge-prs']).toMatchObject({ enabled: true, skipRepos: [REPO] })
+    }
+    expect((await post('/api/behaviors/merge-prs', { enabled: false })).status).toBe(200)
+    expect((await behaviorState())['merge-prs']!.enabled).toBe(false)
+  })
+
   it('saves a list per PR behavior and serves the same lists to every account', async () => {
     const saved = await post('/api/behaviors/review-new-prs?org=beta', { skipRepos: ['beta/app', REPO, 'legacy/SAME-REPO'] })
     expect(saved.status, JSON.stringify(saved.body)).toBe(200)
@@ -175,7 +194,7 @@ describe('Skip repositories API', () => {
 
   it('refuses a skip list for Review New Issues, which stays opt-in', async () => {
     expect(await post('/api/behaviors/review-new-issues', { skipRepos: [REPO] })).toEqual({
-      status: 400, body: { error: 'only review-new-prs, approve-prs and resolve-unblocking skip repositories' },
+      status: 400, body: { error: 'only pull-request behaviors skip repositories' },
     })
   })
 

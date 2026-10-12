@@ -25,6 +25,22 @@ def status(pull: dict[str, Any], checks_state: str | None, unresolved: int, all_
     return "green" if checks_state in (None, "SUCCESS") and unresolved == 0 and all_threads_read else "yellow"
 
 
+def readiness_status(readiness: dict[str, Any]) -> str | None:
+    nodes = (readiness.get("commits") or {}).get("nodes") or []
+    if not nodes or not nodes[0].get("commit"):
+        return None
+    commit = nodes[0]["commit"]
+    if "statusCheckRollup" not in commit:
+        return None
+    threads = readiness["reviewThreads"]
+    unresolved = sum(not thread["isResolved"] and not thread["isOutdated"] for thread in threads["nodes"])
+    return status({
+        "state": readiness["state"].lower(), "draft": readiness["isDraft"],
+        "mergeable": readiness["mergeable"] == "MERGEABLE",
+        "mergeable_state": readiness["mergeStateStatus"].lower(),
+    }, (commit["statusCheckRollup"] or {}).get("state"), unresolved, not threads["pageInfo"]["hasNextPage"])
+
+
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     owner, repo = repository(payload)
     pull_number = parse_pull_number(payload)

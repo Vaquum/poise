@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
 
-// Skip lists of the three PR behaviors, and the check a Swarm replay shares
+// Skip lists of the PR behaviors, and the check a Swarm replay shares
 // with the scheduler. Caller is faked at the process boundary: the datastore
 // and github-interface answer from the rows each test sets, and every call is
 // recorded, so a test can prove what was never asked.
@@ -23,8 +23,8 @@ vi.mock('../server/claude-auth', () => ({
   },
 }))
 
-type Skippable = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking'
-const SKIPPABLE: Skippable[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking']
+type Skippable = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs'
+const SKIPPABLE: Skippable[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs']
 const ME = 'poise-user'
 const AGENT = 'review-bot'
 const HEAD = 'a'.repeat(40)
@@ -130,6 +130,12 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
         resolved_count: 0, unresolved_count: unresolvedConversations, conversations: [],
       })
     }
+    if (args[0] === '--merge-candidates') {
+      const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
+      return json({ action: 'merge_candidates', actor: AGENT, graphql_cost: 1,
+        records: requests.map((request) => ({ ...request, head_sha: HEAD, author: ME, ready: true, error: null })) })
+    }
+    if (args[0] === '--merge-if-ready') return json({ action: 'merge_if_ready', repository, pull_number: number, head_sha: HEAD, outcome: 'merged', merge_sha: 'b'.repeat(40) })
     if (args[0] === '--sub-issues') return json({ action: 'sub_issues', repository, issue_number: number, sub_issues: [] })
   }
   throw new Error(`unexpected CLI call: ${command} ${all.join(' ')}`)
@@ -170,9 +176,10 @@ function enable(db: typeof import('../server/db'), behavior: Skippable | 'review
 // What a behavior did to a pull request: a launched agent, or for Resolve
 // Unblocking the resolution call that is its action.
 function actedOn(behavior: Skippable): string[] {
-  if (behavior === 'resolve-unblocking') {
+  if (behavior === 'resolve-unblocking' || behavior === 'merge-prs') {
+    const action = behavior === 'merge-prs' ? '--merge-if-ready' : '--resolve-nonblocking-conversations-if-ready'
     return mocks.runFile.mock.calls
-      .filter(([command, args]) => command === 'github-interface' && args[0] === '--resolve-nonblocking-conversations-if-ready')
+      .filter(([command, args]) => command === 'github-interface' && args[0] === action)
       .map(([, args, options]) => `${githubRepository(args, options)}${args[1]}`)
   }
   const flag = behavior === 'review-new-prs' ? '--pr-review' : '--pr-approve'
@@ -248,6 +255,7 @@ describe('Skip repositories', () => {
     ['review-new-prs', '--head-sha'],
     ['approve-prs', '--head-sha'],
     ['resolve-unblocking', '--review-activity-since'],
+    ['merge-prs', '--merge-candidates'],
   ] as const)('%s leaves a repository skipped while its launch is prepared', async (behavior, subcommand) => {
     const { db, runtime } = await start()
     pulls = [pull(API, 1)]

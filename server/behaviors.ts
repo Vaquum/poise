@@ -112,9 +112,9 @@ function organizationOwns(repoOrTarget: string): boolean {
 }
 
 function isGlobalPreference(key: string): boolean {
-  return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|review_new_issues)_(?:enabled|setting|reviewers|scratchpad)$/.test(key)
+  return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|review_new_issues)_(?:enabled|setting|reviewers|scratchpad)$/.test(key)
     || /^behavior_review_new_issues_(?:repos|authors|slot_since)$/.test(key)
-    || /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking)_skip_repos$/.test(key)
+    || /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs)_skip_repos$/.test(key)
 }
 
 function scopedMetaKey(key: string): string {
@@ -241,8 +241,8 @@ async function withBehaviorProcessLock<T>(
   }, operation)
 }
 
-export type BehaviorKey = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'review-new-issues'
-export const BEHAVIOR_KEYS: BehaviorKey[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'review-new-issues']
+export type BehaviorKey = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'review-new-issues'
+export const BEHAVIOR_KEYS: BehaviorKey[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'review-new-issues']
 
 let behaviorAbortController: AbortController | null = null
 const behaviorOperationSignal = new AsyncLocalStorage<AbortSignal>()
@@ -538,8 +538,8 @@ function noteArgs(key: BehaviorKey): string[] {
 // new ones are — those opened since the baseline are reviewed, the backlog the
 // baseline recorded never is.
 
-export type SkippableBehavior = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking'
-export const SKIPPABLE_BEHAVIORS: readonly SkippableBehavior[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking']
+export type SkippableBehavior = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs'
+export const SKIPPABLE_BEHAVIORS: readonly SkippableBehavior[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs']
 // "Select all" across large accounts produces long lists; this bound keeps a
 // list inside the API's request body limit.
 export const MAX_SKIPPED_REPOSITORIES = 5000
@@ -547,6 +547,7 @@ const SKIPPABLE_LABELS: Record<SkippableBehavior, string> = {
   'review-new-prs': 'Review New Pull Requests',
   'approve-prs': 'Approve Pull Requests',
   'resolve-unblocking': 'Resolve Unblocking Conversations',
+  'merge-prs': 'Merge Pull Requests',
 }
 
 export function isSkippableBehavior(key: string): key is SkippableBehavior {
@@ -1512,7 +1513,7 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
     return pr
   })
   retireBehaviorDeadLettersForClosedPrs(seen, undefined, currentOrganization()?.login)
-  retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking'])
+  retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs'])
   return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(author, `${pr.repo}#${pr.number}`, pr))
 }
 
@@ -2891,6 +2892,131 @@ async function tickResolveUnblocking(): Promise<void> {
   }
 }
 
+const MERGE_LAST_FIRED_KEY = 'behavior_merge_prs_last_fired'
+
+export function getMergePrsLastFired(): { at: string, target: string } | null {
+  if (behaviorOrganization.getStore() === undefined) {
+    const events = readyOrganizations().map((org) => behaviorOrganization.run(org, getMergePrsLastFired))
+      .filter((event): event is { at: string, target: string } => event !== null)
+    return events.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0] ?? null
+  }
+  const raw = getMeta(MERGE_LAST_FIRED_KEY)
+  if (raw === null) return null
+  try {
+    const event = objectValue(parseJson(raw, MERGE_LAST_FIRED_KEY), MERGE_LAST_FIRED_KEY)
+    if (typeof event.at !== 'string' || !Number.isFinite(Date.parse(event.at)) || typeof event.target !== 'string') {
+      throw new Error('merge-prs last triggered is malformed')
+    }
+    return { at: event.at, target: event.target }
+  } catch (error) {
+    console.error('[behaviors] merge-prs last triggered could not be read:', error)
+    return null
+  }
+}
+
+export const MERGE_CANDIDATE_BATCH_SIZE = 50
+
+interface MergeCandidate {
+  pr: DatastorePr
+  ready: boolean
+  head: string | null
+  author: string | null
+  error: string | null
+}
+
+async function readMergeCandidates(prs: DatastorePr[], actor: string): Promise<MergeCandidate[]> {
+  const { stdout } = await runFile(GH_INTERFACE, [
+    '--merge-candidates', '--requests-json', JSON.stringify(prs.map((pr) => ({ repository: pr.repo, number: pr.number }))),
+    '--token-user', actor,
+  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+  const result = objectValue(parseJson(stdout, 'github-interface --merge-candidates'), 'merge candidates')
+  if (result.action !== 'merge_candidates' || typeof result.actor !== 'string'
+    || result.actor.toLowerCase() !== actor.toLowerCase()
+    || !Number.isSafeInteger(result.graphql_cost) || Number(result.graphql_cost) < 1
+    || !Array.isArray(result.records) || result.records.length !== prs.length) {
+    throw new Error('github-interface --merge-candidates returned malformed batch evidence')
+  }
+  return result.records.map((row: unknown, index: number) => {
+    const record = objectValue(row, 'merge candidate')
+    const pr = prs[index]!
+    if (record.repository !== pr.repo || record.number !== pr.number || typeof record.ready !== 'boolean'
+      || !(record.head_sha === null || (typeof record.head_sha === 'string' && SHA_PATTERN.test(record.head_sha)))
+      || !(record.author === null || typeof record.author === 'string')
+      || !(record.error === null || (typeof record.error === 'string' && record.error.length > 0))
+      || (record.ready && (record.head_sha === null || !record.author || record.error !== null))) {
+      throw new Error('github-interface --merge-candidates returned malformed candidate evidence')
+    }
+    return { pr, ready: record.ready, head: record.head_sha as string | null,
+      author: record.author as string | null, error: record.error as string | null }
+  })
+}
+
+async function tickMergePrs(): Promise<void> {
+  if (!isEnabled('merge-prs')) return
+  const author = getMeta('me') || ''
+  if (!author) return
+  const prs = await listEligiblePrs('merge-prs', author)
+  const cursor = getMeta('behavior_merge_prs_cursor')
+  const start = (prs.findIndex((pr) => `${pr.repo}#${pr.number}` === cursor) + 1) % Math.max(prs.length, 1)
+  const ordered = [...prs.slice(start), ...prs.slice(0, start)]
+  const actor = configuredReviewer()
+  for (let offset = 0; offset < ordered.length; offset += MERGE_CANDIDATE_BATCH_SIZE) {
+    if (!isEnabled('merge-prs') || behaviorAborted()) return
+    const batch = ordered.slice(offset, offset + MERGE_CANDIDATE_BATCH_SIZE)
+    // A timed-out batch must not repeatedly hide the later batches.
+    const last = batch[batch.length - 1]!
+    setMeta('behavior_merge_prs_cursor', `${last.repo}#${last.number}`)
+    const candidates = await readMergeCandidates(batch, actor)
+    for (const candidate of candidates) {
+      if (!isEnabled('merge-prs') || behaviorAborted()) return
+      const pr = candidate.pr
+      const target = `${pr.repo}#${pr.number}`
+      setMeta('behavior_merge_prs_cursor', target)
+      if (!stillEligible('merge-prs', pr) || !behaviorRetryDue('merge-prs', target)) continue
+      if (candidate.error !== null) {
+        recordBehaviorFailure('merge-prs', 'operation', candidate.error, target)
+        continue
+      }
+      if (!candidate.ready || candidate.author?.toLowerCase() !== author.toLowerCase()) {
+        clearBehaviorFailure('merge-prs', target)
+        continue
+      }
+      const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
+      if (!operationId) continue
+      try {
+        const expectedHead = candidate.head!
+        const [owner, name] = pr.repo.split('/', 2)
+        const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
+        await mkdir(cwd, { recursive: true })
+        if (!isEnabled('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', pr)
+          || configuredReviewer() !== actor) continue
+        const { stdout } = await runFile(GH_INTERFACE, [
+          '--merge-if-ready', `#${pr.number}`, '--expected-head', expectedHead,
+          '--author', author, '--token-user', actor,
+        ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() })
+        const result = objectValue(parseJson(stdout, 'github-interface --merge-if-ready'), 'merge-if-ready')
+        if (result.action !== 'merge_if_ready' || result.repository !== pr.repo
+          || result.pull_number !== pr.number || result.head_sha !== expectedHead
+          || !['merged', 'already_merged', 'not_ready', 'superseded'].includes(String(result.outcome))
+          || (result.outcome === 'merged' && (typeof result.merge_sha !== 'string' || !SHA_PATTERN.test(result.merge_sha)))) {
+          throw new Error('github-interface --merge-if-ready returned malformed state')
+        }
+        if (result.outcome === 'merged') {
+          setMeta(MERGE_LAST_FIRED_KEY, JSON.stringify({ at: new Date().toISOString(), target }))
+          console.log(`[behaviors] merge-prs merged ${target}`)
+        }
+        clearBehaviorFailure('merge-prs', target)
+      } catch (error) {
+        if (behaviorAborted()) return
+        recordBehaviorFailure('merge-prs', 'operation', error, target)
+        console.error(`[behaviors] merge-prs failed for ${target}:`, error)
+      } finally {
+        releasePrOperationOwned(operationId)
+      }
+    }
+  }
+}
+
 // ── review-new-issues implementation ────────────────────────────────────
 //
 // Opt-in per repository. A new issue in a selected repository, opened by a
@@ -4029,6 +4155,15 @@ export async function runEnabledBehaviorsOnce(
     operations.push(runBehaviorCycle('resolve-unblocking', async () => {
       return await withBehaviorProcessLock('resolve-unblocking', async () => {
         await tickResolveUnblocking()
+        return true
+      })
+    }))
+  }
+  if (isEnabled('merge-prs')
+    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('merge-prs')))) {
+    operations.push(runBehaviorCycle('merge-prs', async () => {
+      return await withBehaviorProcessLock('merge-prs', async () => {
+        await tickMergePrs()
         return true
       })
     }))
