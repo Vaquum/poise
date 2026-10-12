@@ -70,6 +70,7 @@ beforeEach(async () => {
 })
 afterEach(async () => {
   await runtime.stopBehaviorsRuntime()
+  vi.useRealTimers()
   db.closeDatabase()
   delete process.env.POISE_DB
   vi.resetModules()
@@ -147,6 +148,17 @@ describe('Merge Pull Requests', () => {
     db.releasePrOperationOwned(lock)
     await runtime.runEnabledBehaviorsOnce()
     expect(mergeCalls()).toHaveLength(1)
+  })
+  it('resumes after a slow prefix when the scan deadline expires', async () => {
+    enable(); pulls.push(pull(REPO, 8))
+    vi.useFakeTimers()
+    const held = await heldHead()
+    await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
+    held.release(); await held.tick
+    expect(mergeCalls()).toEqual([])
+    headGate = null
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls().map(([, args]) => args[1])).toEqual(['#8', '#7'])
   })
   it('holds on unreadable datastore state', async () => {
     enable(); healthError = new Error('datastore is stale')

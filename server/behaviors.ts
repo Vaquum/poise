@@ -2914,13 +2914,18 @@ async function tickMergePrs(): Promise<void> {
   const author = getMeta('me') || ''
   if (!author) return
   const prs = await listEligiblePrs('merge-prs', author)
+  // Resume after the last attempted PR if the shared deadline cuts a scan short.
+  const cursor = getMeta('behavior_merge_prs_cursor')
+  const start = (prs.findIndex((pr) => `${pr.repo}#${pr.number}` === cursor) + 1) % Math.max(prs.length, 1)
+  const ordered = [...prs.slice(start), ...prs.slice(0, start)]
   // Each merge can change readiness for the next PR in the same repository.
-  for (const pr of prs) {
+  for (const pr of ordered) {
     if (!isEnabled('merge-prs') || behaviorAborted()) return
     const target = `${pr.repo}#${pr.number}`
     if (!behaviorRetryDue('merge-prs', target)) continue
     const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
     if (!operationId) continue
+    setMeta('behavior_merge_prs_cursor', target)
     try {
       const actor = configuredReviewer()
       const expectedHead = await currentHeadSha(pr.repo, pr.number, actor)

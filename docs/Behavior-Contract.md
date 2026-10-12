@@ -60,6 +60,8 @@ A confirmed `merged` receipt alone updates the per-account Last triggered event;
 operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
+A per-account cursor advances before each attempt so a scan cut short by its
+deadline resumes at the next candidate instead of starving later ready PRs.
 
 New behaviors must add the required atomic fact or mutation upstream first.
 They must not add GitHub authentication, GraphQL, REST, or repository-source
