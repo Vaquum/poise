@@ -2902,11 +2902,16 @@ export function getMergePrsLastFired(): { at: string, target: string } | null {
   }
   const raw = getMeta(MERGE_LAST_FIRED_KEY)
   if (raw === null) return null
-  const event = objectValue(parseJson(raw, MERGE_LAST_FIRED_KEY), MERGE_LAST_FIRED_KEY)
-  if (typeof event.at !== 'string' || !Number.isFinite(Date.parse(event.at)) || typeof event.target !== 'string') {
-    throw new Error('merge-prs last triggered is malformed')
+  try {
+    const event = objectValue(parseJson(raw, MERGE_LAST_FIRED_KEY), MERGE_LAST_FIRED_KEY)
+    if (typeof event.at !== 'string' || !Number.isFinite(Date.parse(event.at)) || typeof event.target !== 'string') {
+      throw new Error('merge-prs last triggered is malformed')
+    }
+    return { at: event.at, target: event.target }
+  } catch (error) {
+    console.error('[behaviors] merge-prs last triggered could not be read:', error)
+    return null
   }
-  return { at: event.at, target: event.target }
 }
 
 async function tickMergePrs(): Promise<void> {
@@ -2925,8 +2930,8 @@ async function tickMergePrs(): Promise<void> {
     if (!behaviorRetryDue('merge-prs', target)) continue
     const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
     if (!operationId) continue
-    setMeta('behavior_merge_prs_cursor', target)
     try {
+      setMeta('behavior_merge_prs_cursor', target)
       const actor = configuredReviewer()
       const expectedHead = await currentHeadSha(pr.repo, pr.number, actor)
       const [owner, name] = pr.repo.split('/', 2)

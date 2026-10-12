@@ -143,6 +143,15 @@ afterEach(async () => {
 })
 
 describe('Skip repositories API', () => {
+  it.each(['[broken', JSON.stringify({ at: 'invalid', target: 7 })])('keeps behavior controls readable when merge history is corrupt: %s', async (value) => {
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    database!.setMeta('behavior_merge_prs_last_fired', value)
+    const state = await behaviorState()
+    expect(state['merge-prs']!.lastTriggered).toBeNull()
+    expect(state['approve-prs']!.enabled).toBe(false)
+    expect(logged).toHaveBeenCalledWith('[behaviors] merge-prs last triggered could not be read:', expect.any(Error))
+  })
+
   it('starts merging off and persists its global toggle and repository exclusions', async () => {
     expect((await behaviorState())['merge-prs']).toMatchObject({ enabled: false, scratchpad: null, lastTriggered: null, skipRepos: [] })
     expect((await post('/api/behaviors/merge-prs?org=beta', { enabled: true, skipRepos: [REPO] })).status).toBe(200)

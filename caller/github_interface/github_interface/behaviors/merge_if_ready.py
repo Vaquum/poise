@@ -44,7 +44,12 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     readiness = await get_pr_readiness_state(client, owner, repo, number)
     if readiness["headRefOid"] != head:
         return {**result, "outcome": "superseded"}
-    commit = readiness["commits"]["nodes"][0]["commit"]
+    nodes = (readiness.get("commits") or {}).get("nodes") or []
+    if not nodes or not nodes[0].get("commit"):
+        return result
+    commit = nodes[0]["commit"]
+    if "statusCheckRollup" not in commit:
+        return result
     checks = (commit["statusCheckRollup"] or {}).get("state")
     threads = readiness["reviewThreads"]
     unresolved = sum(not thread["isResolved"] and not thread["isOutdated"] for thread in threads["nodes"])

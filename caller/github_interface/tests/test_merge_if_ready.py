@@ -63,6 +63,13 @@ class TestMergeIfReady(IsolatedAsyncioTestCase):
                 self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['outcome'], 'not_ready')
                 self.client.request.assert_not_awaited()
 
+    async def test_missing_commit_evidence_is_not_ready(self):
+        for commits in [None, {}, {'nodes': []}, {'nodes': [{'commit': None}]}, {'nodes': [{'commit': {'oid': HEAD}}]}]:
+            with self.subTest(commits=commits):
+                self.ready['commits'] = commits
+                self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['outcome'], 'not_ready')
+                self.client.request.assert_not_awaited()
+
     async def test_no_checks_is_ready_like_the_green_status(self):
         self.ready['commits']['nodes'][0]['commit']['statusCheckRollup'] = None
         self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['outcome'], 'merged')
