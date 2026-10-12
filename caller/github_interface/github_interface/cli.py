@@ -6,7 +6,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from .interface import checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, mergeable, post_pr_comment, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
+from .interface import checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, merge_if_ready, mergeable, post_pr_comment, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
 
 TOP_HELP = """usage: github-interface BEHAVIOR ...
 
@@ -34,6 +34,7 @@ behaviors:
   --create-pr-linked-issue PR --title TITLE --body BODY --token-user USER
   --post-pr-comment PR --body BODY
   --mergeable PR
+  --merge-if-ready PR --expected-head SHA --author USER --token-user USER
   --current-pr [--token-user USER]
   --pr-readiness PR --username USER --expected-head SHA [--token-user USER]
   --local-checkout-path ORG REPO
@@ -63,7 +64,7 @@ def main() -> None:
     if argv in (["-h"], ["--help"]):
         print(TOP_HELP)
         return
-    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context"}:
+    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context"}:
         print("error: first argument must be a behavior switch\n", file=sys.stderr)
         print(TOP_HELP, file=sys.stderr)
         raise SystemExit(2)
@@ -114,6 +115,7 @@ def main() -> None:
         "--create-pr-linked-issue": create_pr_linked_issue,
         "--post-pr-comment": post_pr_comment,
         "--mergeable": mergeable,
+        "--merge-if-ready": merge_if_ready,
         "--current-pr": current_pr,
         "--pr-readiness": pr_readiness,
         "--local-checkout-path": local_checkout_path,
@@ -206,6 +208,12 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior in {"--approve-pr", "--reviewed-clean"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
+        _add_expected_head(parser)
+        return parser
+
+    if behavior == "--merge-if-ready":
+        parser = argparse.ArgumentParser(prog="github-interface --merge-if-ready PR")
+        parser.add_argument("--author", required=True)
         _add_expected_head(parser)
         return parser
 

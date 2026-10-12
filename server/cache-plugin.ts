@@ -21,7 +21,7 @@ import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentRe
 import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, getOrCreateChatSession, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
-import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
+import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
 import { ContentLaunchPendingError, getContentJobResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
@@ -634,6 +634,15 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               scratchpad: null,
               lastTriggered: getResolveUnblockingLastFired(),
             },
+            'merge-prs': {
+              owner,
+              enabled: enabled['merge-prs'],
+              setting: null,
+              reviewers: null,
+              skipRepos: getRepositorySkips('merge-prs'),
+              scratchpad: null,
+              lastTriggered: getMergePrsLastFired(),
+            },
             // Review New Issues is opt-in per repository: nothing triggers
             // until `repos` names one. `authors` are the trusted accounts
             // whose issues it reviews.
@@ -719,7 +728,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             }
             if ('skipRepos' in body) {
               if (!isSkippableBehavior(key)) {
-                return json(res, 400, { error: 'only review-new-prs, approve-prs and resolve-unblocking skip repositories' })
+                return json(res, 400, { error: 'only pull-request behaviors skip repositories' })
               }
               if (!isValidRepositoryList(body.skipRepos)) {
                 return json(res, 400, { error: `skipRepos must be a list of up to ${MAX_SKIPPED_REPOSITORIES} owner/name repositories` })

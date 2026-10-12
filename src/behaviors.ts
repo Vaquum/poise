@@ -5,7 +5,7 @@
 // reliably (browser tabs close, reload, get backgrounded). This
 // module is just labels + an HTTP client for the toggle.
 
-export type BehaviorKey = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'review-new-issues'
+export type BehaviorKey = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'review-new-issues'
 
 export interface BehaviorMeta {
   key: BehaviorKey
@@ -33,14 +33,14 @@ export interface BehaviorMeta {
   reviews?: { place: string, item: string }
 }
 
-// The trilogy: initial review → follow-up review/approval → final
-// gate-clearing so a human can merge, then the issue review that stands
-// apart from it. Order matters for display since the view renders rows in
+// Pull-request review, approval, conversation resolution and optional merging,
+// then the issue review that stands apart from them. Order matters for display since the view renders rows in
 // the listed sequence.
 export const BEHAVIORS: BehaviorMeta[] = [
   { key: 'review-new-prs',     label: 'Review New Pull Requests',      hasSetting: true,  hasReviewers: true,  hasMemory: true,  hasTriggers: false, hasSkips: true,  reviews: { place: 'PR review', item: 'pull request' } },
   { key: 'approve-prs',        label: 'Approve Pull Requests',         hasSetting: false, hasReviewers: false, hasMemory: true,  hasTriggers: false, hasSkips: true },
   { key: 'resolve-unblocking', label: 'Resolve Unblocking Conversations', hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'merge-prs',          label: 'Merge Pull Requests',           hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
   { key: 'review-new-issues',  label: 'Review New Issues',             hasSetting: false, hasReviewers: true,  hasMemory: true,  hasTriggers: true,  hasSkips: false, reviews: { place: 'Issue review', item: 'issue' } },
 ]
 

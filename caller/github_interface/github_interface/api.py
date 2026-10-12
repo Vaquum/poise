@@ -4,7 +4,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
-from .interface import UnknownBehavior, approve_pr, assign_issue, checkout_pr_head, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, list_failing_ci, list_test_files, local_checkout_path, mergeable, post_pr_comment, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, run_behavior, view_repos, write_file
+from .interface import UnknownBehavior, approve_pr, assign_issue, checkout_pr_head, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, list_failing_ci, list_test_files, local_checkout_path, merge_if_ready, mergeable, post_pr_comment, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, run_behavior, view_repos, write_file
 
 app = FastAPI()
 
@@ -209,6 +209,16 @@ async def pr_conversations_resolve(payload: dict[str, Any]) -> Any:
 async def nonblocking_conversations_resolve(payload: dict[str, Any]) -> Any:
     try:
         return await resolve_nonblocking_conversations_if_ready(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.post("/merge_if_ready")
+async def ready_pull_merge(payload: dict[str, Any]) -> Any:
+    try:
+        return await merge_if_ready(payload)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except RuntimeError as error:

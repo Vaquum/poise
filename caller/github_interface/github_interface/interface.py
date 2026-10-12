@@ -122,6 +122,10 @@ async def resolve_nonblocking_conversations_if_ready(payload: dict[str, Any]) ->
     return await run_behavior("resolve_nonblocking_conversations_if_ready", payload)
 
 
+async def merge_if_ready(payload: dict[str, Any]) -> Any:
+    return await run_behavior("merge_if_ready", payload)
+
+
 async def mergeable(payload: dict[str, Any]) -> Any:
     return await run_behavior("mergeable", payload)
 
