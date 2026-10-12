@@ -20,7 +20,9 @@ let error: Error | null = null
 let healthError: Error | null = null
 let response: Record<string, unknown> = {}
 let pulls: Array<Record<string, unknown>> = []
-let headGate: { reached: () => void, wait: Promise<void> } | null = null
+let readyNumbers: Set<number> | null = null
+let unreadableNumbers = new Set<number>()
+let batchGate: { reached: () => void, wait: Promise<void> } | null = null
 
 function pull(repo = REPO, number = 7, fields: Record<string, unknown> = {}) {
   return { repo, number, url: `https://github.com/${repo}/pull/${number}`, status: 'open', draft: 0, author: 'octocat', ...fields }
@@ -42,9 +44,13 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
   const parts = options.cwd?.split('/') ?? []
   const repo = `${parts.at(-2)}/${parts.at(-1)}`
   const number = Number(args[1]?.slice(1))
-  if (command === 'github-interface' && args[0] === '--head-sha') {
-    if (headGate) { headGate.reached(); await headGate.wait }
-    return json({ action: 'head_sha', repository: repo, pull_number: number, head_sha: HEAD })
+  if (command === 'github-interface' && args[0] === '--merge-candidates') {
+    if (batchGate) { batchGate.reached(); await batchGate.wait }
+    const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
+    return json({ action: 'merge_candidates', actor: 'review-bot', graphql_cost: 1, records: requests.map((request) => ({
+      ...request, head_sha: HEAD, author: 'octocat', ready: !unreadableNumbers.has(request.number) && (readyNumbers === null || readyNumbers.has(request.number)),
+      error: unreadableNumbers.has(request.number) ? 'GitHub could not read this target' : null,
+    })) })
   }
   if (command === 'github-interface' && args[0] === '--merge-if-ready') {
     if (error) throw error
@@ -58,7 +64,8 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-merge-'))
   process.env.POISE_DB = join(root, 'cache.db')
   pulls = [pull()]
-  outcome = 'merged'; error = null; healthError = null; response = {}; headGate = null
+  outcome = 'merged'; error = null; healthError = null; response = {}; batchGate = null
+  readyNumbers = null; unreadableNumbers = new Set()
   mocks.runFile.mockReset().mockImplementation(cli)
   mocks.spawnDetached.mockReset()
   vi.spyOn(console, 'log').mockImplementation(() => undefined)
@@ -78,11 +85,11 @@ afterEach(async () => {
 })
 function enable() { db.setMeta('behavior_merge_prs_enabled', '1') }
 
-async function heldHead() {
+async function heldBatch() {
   let reached!: () => void
   let release!: () => void
   const started = new Promise<void>((resolve) => { reached = resolve })
-  headGate = { reached, wait: new Promise<void>((resolve) => { release = resolve }) }
+  batchGate = { reached, wait: new Promise<void>((resolve) => { release = resolve }) }
   const tick = runtime.runEnabledBehaviorsOnce()
   await started
   return { tick, release }
@@ -124,18 +131,20 @@ describe('Merge Pull Requests', () => {
     expect(mergeCalls()).toHaveLength(1)
     const reads = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')
     expect(reads).toHaveLength(2)
-    expect(reads.every(([, args]) => args[1] === '#7')).toBe(true)
+    expect(reads[0]![1][0]).toBe('--merge-candidates')
+    expect(JSON.parse(reads[0]![1][2])).toEqual([{ repository: REPO, number: 7 }])
+    expect(reads[1]![1][1]).toBe('#7')
   })
-  it('stops a merge disabled while the head is being read', async () => {
+  it('stops a merge disabled while the batch is being read', async () => {
     enable()
-    const held = await heldHead()
+    const held = await heldBatch()
     const disabled = runtime.setEnabled('merge-prs', false)
     held.release(); await held.tick; await disabled
     expect(mergeCalls()).toEqual([])
   })
-  it('stops a merge skipped while the head is being read', async () => {
+  it('stops a merge skipped while the batch is being read', async () => {
     enable()
-    const held = await heldHead()
+    const held = await heldBatch()
     runtime.setRepositorySkips('merge-prs', [REPO])
     held.release(); await held.tick
     expect(mergeCalls()).toEqual([])
@@ -149,16 +158,45 @@ describe('Merge Pull Requests', () => {
     await runtime.runEnabledBehaviorsOnce()
     expect(mergeCalls()).toHaveLength(1)
   })
-  it('resumes after a slow prefix when the scan deadline expires', async () => {
-    enable(); pulls.push(pull(REPO, 8))
+  it('resumes after a timed-out batch without starving the next batch', async () => {
+    enable(); pulls = Array.from({ length: 51 }, (_, index) => pull(REPO, index + 1))
+    readyNumbers = new Set([51])
     vi.useFakeTimers()
-    const held = await heldHead()
+    const held = await heldBatch()
     await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
     held.release(); await held.tick
     expect(mergeCalls()).toEqual([])
-    headGate = null
+    batchGate = null
     await runtime.runEnabledBehaviorsOnce()
-    expect(mergeCalls().map(([, args]) => args[1])).toEqual(['#8', '#7'])
+    expect(mergeCalls().map(([, args]) => args[1])).toEqual(['#51'])
+    const requests = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--merge-candidates').map(([, args]) => JSON.parse(args[2]))
+    expect(requests[1][0]).toEqual({ repository: REPO, number: 51 })
+    expect(requests[1]).toHaveLength(50)
+    expect(requests[2]).toHaveLength(1)
+  })
+  it('checks ten blocked PRs with one batch call and no individual GitHub calls', async () => {
+    enable(); pulls = Array.from({ length: 10 }, (_, index) => pull(REPO, index + 1)); readyNumbers = new Set()
+    await runtime.runEnabledBehaviorsOnce()
+    const calls = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]![1][0]).toBe('--merge-candidates')
+    expect(JSON.parse(calls[0]![1][2])).toHaveLength(10)
+    expect(mergeCalls()).toEqual([])
+  })
+  it('keeps evaluating unchanged heads until checks finish and then merges them', async () => {
+    enable(); readyNumbers = new Set()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toEqual([])
+    readyNumbers.add(7)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    expect(mergeCalls()[0]![1]).toContain(HEAD)
+  })
+  it('merges a readable ready PR while recording a different target\'s partial read error', async () => {
+    enable(); pulls.push(pull(REPO, 8)); unreadableNumbers.add(8)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ target: `${REPO}#8`, error: 'GitHub could not read this target' })])
   })
   it('holds on unreadable datastore state', async () => {
     enable(); healthError = new Error('datastore is stale')

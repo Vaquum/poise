@@ -81,6 +81,10 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
                     record["error"] = "GitHub returned missing or malformed pull request head evidence"
                 else:
-                    record.update(head_sha=head, author=author, ready=readiness_status(pull) == "green")
+                    record.update(head_sha=head, author=author)
+                    try:
+                        record["ready"] = bool(author) and readiness_status(pull) == "green"
+                    except (KeyError, TypeError, AttributeError) as error:
+                        record["error"] = f"GitHub returned malformed pull request readiness evidence: {error}"
         result["records"].append(record)
     return result

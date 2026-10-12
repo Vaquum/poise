@@ -77,3 +77,12 @@ The checkout-lock interop tests drive this repository's TypeScript lock with
 Node 22, so `npm ci` comes first. The Caller workflow
 (`.github/workflows/caller.yml`) runs the same suites on Python 3.13, parses
 every Python file and checks each CLI's `--help`.
+
+`github-interface --merge-candidates --requests-json
+'[{"repository":"owner/repo","number":7}]' --token-user AGENT` reads up to 50
+explicit targets in one GraphQL query. It returns the acting account,
+`graphql_cost` in GitHub points, and ordered records with `repository`, `number`,
+`head_sha`, `author`, `ready` and `error`. The green predicate is shared with the
+merge primitive. A partial query error is returned on its affected target;
+unscoped errors and missing identity/cost evidence fail the operation visibly.
+The read does not merge or use REST polling. An empty list adds no API requests.

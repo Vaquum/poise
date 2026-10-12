@@ -48,7 +48,13 @@ mutation.
 
 `merge-prs` is disabled unless `behavior_merge_prs_enabled` is explicitly `1`.
 It uses Caller directly without a model launch: after fresh datastore eligibility,
-it holds the shared per-PR operation lock, reads the head, and calls
+it discovers up to 50 eligible PRs per ready account with one fresh
+`--merge-candidates --requests-json JSON --token-user AGENT` GraphQL read.
+The packet carries current head, author and the existing green readiness predicate;
+unchanged heads are still reevaluated for completed checks and conversations.
+Scoped GraphQL errors hold only their target; identity or unscoped errors hold the
+whole batch visibly. Discovery sends no REST reads or writes. For a ready candidate
+it holds the shared per-PR operation lock, then calls
 `--merge-if-ready PR --expected-head SHA --author USER --token-user AGENT`.
 Caller uses the existing green predicate with fresh head-pinned readiness and
 rechecks the pull request before a SHA-pinned merge request. Unknown readiness,
@@ -60,8 +66,12 @@ A confirmed `merged` receipt alone updates the per-account Last triggered event;
 operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
-A per-account cursor advances before each attempt so a scan cut short by its
-deadline resumes at the next candidate instead of starving later ready PRs.
+A per-account cursor advances before each batch read and each merge attempt, so
+a scan cut short by its deadline resumes beyond the blocked batch or candidate.
+Ten blocked PRs in one account add 60 GraphQL queries per hour at the one-minute
+cadence. Each successful merge adds three REST reads, one GraphQL query and one
+REST write; transient retries may add requests. GitHub's returned query cost is
+exposed in the Caller batch packet.
 
 New behaviors must add the required atomic fact or mutation upstream first.
 They must not add GitHub authentication, GraphQL, REST, or repository-source
