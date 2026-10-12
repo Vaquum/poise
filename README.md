@@ -247,11 +247,11 @@ persistent incidents keep holds visible after the source logs disappear.
 ## Behaviors
 
 Behaviors runs the automations that act as your agent account: Review New Pull
-Requests, Approve Pull Requests, Resolve Unblocking Conversations and Review
-New Issues. Each row's Setting cell opens a dropdown, saved by every way of
+Requests, Approve Pull Requests, Resolve Unblocking Conversations, Merge Pull
+Requests and Review New Issues. Each row's Setting cell opens a dropdown, saved by every way of
 closing it.
 
-The three pull-request behaviors act on your open pull requests in every
+The four pull-request behaviors act on your open pull requests in every
 repository of your ready accounts except the ones ticked under **Skip
 repositories**. The list groups repositories by account, with Select all for
 each account and for the whole list; Select all ticks the repositories listed
@@ -264,6 +264,17 @@ baseline Review New Pull Requests took when it was first turned on still
 holds, so the pull requests that were already open then are not reviewed.
 Several people's automations can work in the same repository: each acts only
 as its own agent account.
+
+**Merge Pull Requests** is off by default. Turn it on to merge your eligible
+pull requests automatically on the server's one-minute tick, including ones
+already open. It follows Current's green status: the merge button is available,
+checks have passed (or none exist), and no live conversation remains unresolved.
+Yellow or unknown pull requests wait. Caller rereads readiness and pins the head
+SHA when merging; GitHub still enforces repository protections. It prefers squash
+when allowed, then a merge commit, then rebase. Skip repositories applies here too.
+Last triggered links to the confirmed merged pull request. Merge failures appear
+in Behaviors diagnostics and retry with backoff. It runs without an agent model or
+an open browser tab. Turning it off stops subsequent merge launches.
 
 Replay in Swarm runs only what the scheduler itself would run. A pull request
 must be open, not a draft, yours, and outside that behavior's skipped

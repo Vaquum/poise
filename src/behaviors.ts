@@ -34,8 +34,7 @@ export interface BehaviorMeta {
 }
 
 // Pull-request review, approval, conversation resolution and optional merging,
-// then the issue review that stands apart from them. Order matters for display since the view renders rows in
-// the listed sequence.
+// then the issue review that stands apart from them. Rows use this order.
 export const BEHAVIORS: BehaviorMeta[] = [
   { key: 'review-new-prs',     label: 'Review New Pull Requests',      hasSetting: true,  hasReviewers: true,  hasMemory: true,  hasTriggers: false, hasSkips: true,  reviews: { place: 'PR review', item: 'pull request' } },
   { key: 'approve-prs',        label: 'Approve Pull Requests',         hasSetting: false, hasReviewers: false, hasMemory: true,  hasTriggers: false, hasSkips: true },
