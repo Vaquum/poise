@@ -1,7 +1,7 @@
 from typing import Any
 
 from github_interface.atoms.pulls import get_pr_readiness_state, get_pull
-from github_interface.behaviors.mergeable import status
+from github_interface.behaviors.mergeable import readiness_status, status
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head
 from github_interface.context import pull_number as parse_pull_number
@@ -36,21 +36,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     readiness = await get_pr_readiness_state(client, owner, repo, number)
     if readiness["headRefOid"] != head:
         return {**result, "outcome": "superseded"}
-    nodes = (readiness.get("commits") or {}).get("nodes") or []
-    if not nodes or not nodes[0].get("commit"):
-        return result
-    commit = nodes[0]["commit"]
-    if "statusCheckRollup" not in commit:
-        return result
-    checks = (commit["statusCheckRollup"] or {}).get("state")
-    threads = readiness["reviewThreads"]
-    unresolved = sum(not thread["isResolved"] and not thread["isOutdated"] for thread in threads["nodes"])
-    current = {
-        "state": readiness["state"].lower(), "draft": readiness["isDraft"],
-        "mergeable": readiness["mergeable"] == "MERGEABLE",
-        "mergeable_state": readiness["mergeStateStatus"].lower(),
-    }
-    if status(current, checks, unresolved, not threads["pageInfo"]["hasNextPage"]) != "green":
+    if readiness_status(readiness) != "green":
         return result
 
     config = await client.get(f"/repos/{owner}/{repo}")
@@ -64,7 +50,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     pull = await get_pull(client, owner, repo, number)
     if (pull.get("head") or {}).get("sha") != head:
         return {**result, "outcome": "superseded"}
-    if status(pull, checks, unresolved) != "green" or str((pull.get("user") or {}).get("login") or "").lower() != author.lower():
+    if status(pull, None, 0) != "green" or str((pull.get("user") or {}).get("login") or "").lower() != author.lower():
         return result
     merged = await client.request(
         "PUT", f"/repos/{owner}/{repo}/pulls/{number}/merge",
