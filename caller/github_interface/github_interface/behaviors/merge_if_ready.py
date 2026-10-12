@@ -32,14 +32,6 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     if status(pull, None, 0) != "green":
         return result
 
-    config = await client.get(f"/repos/{owner}/{repo}")
-    method = next((method for method, flag in (
-        ("squash", "allow_squash_merge"), ("merge", "allow_merge_commit"),
-        ("rebase", "allow_rebase_merge"),
-    ) if config.get(flag) is True), None)
-    if method is None:
-        raise RuntimeError("repository has no allowed merge method")
-
     # The uncached packet pins checks and conversations to the same head.
     readiness = await get_pr_readiness_state(client, owner, repo, number)
     if readiness["headRefOid"] != head:
@@ -60,6 +52,14 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     }
     if status(current, checks, unresolved, not threads["pageInfo"]["hasNextPage"]) != "green":
         return result
+
+    config = await client.get(f"/repos/{owner}/{repo}")
+    method = next((method for method, flag in (
+        ("squash", "allow_squash_merge"), ("merge", "allow_merge_commit"),
+        ("rebase", "allow_rebase_merge"),
+    ) if config.get(flag) is True), None)
+    if method is None:
+        raise RuntimeError("repository has no allowed merge method")
 
     pull = await get_pull(client, owner, repo, number)
     if (pull.get("head") or {}).get("sha") != head:

@@ -276,6 +276,17 @@ Last triggered links to the confirmed merged pull request. Merge failures appear
 in Behaviors diagnostics and retry with backoff. It runs without an agent model or
 an open browser tab. Turning it off stops subsequent merge launches.
 
+When off, this behavior adds no GitHub API requests. When on, each eligible PR
+uses two REST reads per evaluation. A candidate with an available merge button
+also needs one GraphQL readiness query. Only a green candidate reads the
+repository's merge settings, rereads the PR and sends the merge request: four
+REST reads, one GraphQL query and one REST write for a successful merge.
+At the one-minute cadence, ten continuously blocked PRs add about 1,200 REST
+reads per hour; ten waiting on checks add those reads plus 600 GraphQL queries.
+These are normal-path counts; transient retries can add requests. Skipped,
+draft and foreign-author candidates are excluded from this scan locally.
+The scan deadline and resume cursor may defer some evaluations to the next tick.
+
 Replay in Swarm runs only what the scheduler itself would run. A pull request
 must be open, not a draft, yours, and outside that behavior's skipped
 repositories; an issue must be open, by a trusted author, in a repository
