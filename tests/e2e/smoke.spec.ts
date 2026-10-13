@@ -203,8 +203,7 @@ test('saves a review model choice and restores it after reload', async ({ page }
   })
   await page.goto('/')
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
-  await page.getByRole('tab', { name: 'Models' }).click()
+  await page.locator('[data-settings="models"]').click()
   const model = page.getByLabel('PR review default model')
   await expect(model).toHaveValue('opus-5-xhigh')
   await expect(page.getByLabel('PR review fallback model')).toHaveValue('gpt-6-astra-ultra')
@@ -227,8 +226,7 @@ test('saves a review model choice and restores it after reload', async ({ page }
   expect(settings.models.pr_review).toEqual({ default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh', secondary: 'muse-spark-1.3-contributor-max', tertiary: 'grok-4.6-xhigh' })
   await page.reload()
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
-  await page.getByRole('tab', { name: 'Models' }).click()
+  await page.locator('[data-settings="models"]').click()
   await expect(page.getByLabel('PR review default model')).toHaveValue('gpt-6-astra-ultra')
   await expect(page.getByLabel('PR review fallback model')).toHaveValue('opus-5-xhigh')
   await expect(page.getByLabel('PR review secondary reviewer')).toHaveValue('muse-spark-1.3-contributor-max')
@@ -246,14 +244,14 @@ test('keeps your GitHub account and the agent account under GitHub in Settings',
   })
   await page.goto('/')
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
+  await page.locator('[data-settings="general"]').click()
   const panel = page.locator('#settings-panel')
   await expect(panel.locator('.tp-group-label').first()).toHaveText('GitHub')
   const yours = page.getByLabel('Your GitHub account')
-  const agent = page.getByLabel('Agent account')
+  const agent = page.getByLabel('GitHub automation account')
   await expect(yours).toHaveValue('octocat')
   await expect(agent).toHaveValue('review-bot')
-  await expect(agent.locator('xpath=..')).toContainText('The GitHub user your reviews and comments are posted as. It must be signed in to gh here.')
+  await expect(panel.locator('label[for="st-agent-account"]')).toHaveAttribute('data-help', 'The GitHub account that posts automated reviews and comments. Connect it under Accounts.')
 
   await agent.fill('https://github.com/other-bot')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
@@ -268,8 +266,8 @@ test('keeps your GitHub account and the agent account under GitHub in Settings',
 
   await page.reload()
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
-  await expect(page.getByLabel('Agent account')).toHaveValue('other-bot')
+  await page.locator('[data-settings="general"]').click()
+  await expect(page.getByLabel('GitHub automation account')).toHaveValue('other-bot')
 })
 
 test('shows in Settings whether production is on main', async ({ page }) => {
@@ -288,7 +286,7 @@ test('shows in Settings whether production is on main', async ({ page }) => {
   })
   await page.goto('/')
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
+  await page.locator('[data-settings="general"]').click()
   const line = page.locator('.st-production')
   await expect(line).toBeVisible()
   await expect(line).toContainText('Deployed bbbbbbb · main ccccccc — 2 commits behind; updater failing since')
@@ -300,7 +298,7 @@ test('shows in Settings whether production is on main', async ({ page }) => {
   production = { ...production, status: 'current', remoteCommit: deployed, behind: 0, failingSince: null, error: null }
   await page.reload()
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
+  await page.locator('[data-settings="general"]').click()
   await expect(line).toHaveText('Deployed bbbbbbb · main bbbbbbb — up to date, checked just now.')
   await expect(line).toHaveClass(/st-help-info/)
 
@@ -308,8 +306,8 @@ test('shows in Settings whether production is on main', async ({ page }) => {
   production = { status: 'unknown', checkedAt: null, deployedCommit: null, remoteCommit: null, behind: null, failingSince: null, error: null }
   await page.reload()
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
-  await expect(page.getByRole('tab', { name: 'General' })).toBeVisible()
+  await page.locator('[data-settings="general"]').click()
+  await expect(page.locator('#settings-panel')).toHaveAttribute('data-section', 'general')
   await expect(page.locator('.st-production-group')).toBeHidden()
 })
 

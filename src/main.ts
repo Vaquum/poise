@@ -2,7 +2,7 @@ import './style.css'
 import { installIconTooltips } from './icon-tooltips'
 installIconTooltips()
 import { initTypography, toggleTypographyPanel, closeTypographyPanel } from './typo'
-import { initSettings, toggleSettingsPanel, openSettingsPanel, openSettingsAt, closeSettingsPanel, isFullyConfigured } from './settings'
+import { initSettings, openSettingsPanel, openSettingsAt, closeSettingsPanel, isFullyConfigured } from './settings'
 import { initMenu } from './menu'
 import { initAnalytics, toggleAnalyticsPanel, closeAnalyticsPanel } from './analytics'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
@@ -136,7 +136,7 @@ initAnalytics()
 const menu = initMenu({
   onSelectView: (v) => showView(v),
   onOpenTypography: () => toggleTypographyPanel(),
-  onOpenSettings: () => toggleSettingsPanel(),
+  onOpenSettings: (section) => openSettingsAt(section),
   onOpenAnalytics: () => toggleAnalyticsPanel(),
   onClosePanels: () => { closeTypographyPanel(); closeSettingsPanel(); closeAnalyticsPanel() },
 })

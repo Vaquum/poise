@@ -990,9 +990,9 @@ tr:hover .review-btn { opacity: 1; }
 }
 
 /* ── Analytics panel ── */
-.analytics-range { margin-bottom: var(--sp-5); }
+#analytics-panel .analytics-range { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-1); border-radius: var(--r-md); margin-bottom: var(--sp-5); }
 /* Four ranges share the panel's width evenly instead of overflowing it. */
-#analytics-panel .analytics-range button { flex: 1 1 0; min-width: 0; padding-inline: 4px; white-space: nowrap; }
+#analytics-panel .analytics-range button { min-width: 0; width: 100%; padding: var(--sp-2) var(--sp-3); white-space: normal; border: var(--b-base); border-radius: var(--r-sm); }
 .analytics-status { margin: 0 0 var(--sp-4); }
 .analytics-groups { transition: opacity var(--t-base) ease; }
 /* The previous range's numbers stay in place while the next ones load,
@@ -1015,6 +1015,7 @@ tr:hover .review-btn { opacity: 1; }
   margin-bottom: 2px;
 }
 .analytics-value {
+  overflow-wrap: anywhere;
   margin: 0;
   font-size: 1.375rem;
   font-weight: 600;
@@ -1294,16 +1295,6 @@ tr:hover .review-btn { opacity: 1; }
    nothing to hide from — and navigation stays available with a panel
    open, which is what you'd expect. */
 
-/* The memory panel carries its own × close button, so hide the burger
-   while it's open — menu.ts doesn't manage this panel, so the burger
-   would otherwise sit unmanaged over the panel header. (Typography and
-   Settings keep the burger: there it morphs into their × control.) */
-body:has(#behavior-memory-panel.open) #menu-toggle {
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--t-base) ease;
-}
-
 /* Burger toggle — top right, aligned to the view-header's filter row. */
 #menu-toggle {
   flex: 0 0 auto;                     /* last item in the bar's right half */
@@ -1331,26 +1322,117 @@ body:has(#behavior-memory-panel.open) #menu-toggle {
   border-color: var(--text);
 }
 
-/* Menu popover */
-#menu-popover {
-  position: absolute;
-  top: calc(100% + var(--sp-2));
-  right: 0;
-  min-width: 180px;
+/* The burger is the cap of one continuous menu/panel surface. */
+#menu-toggle.is-close {
+  position: relative;
+  z-index: 112;
+  border-color: var(--border);
+  border-bottom-color: var(--surface);
+  border-radius: var(--r-md) var(--r-md) 0 0;
+  background: var(--surface);
+}
+#menu-surface {
+  position: fixed;
+  z-index: 131;
+  width: 252px;
   background: var(--surface);
   border: var(--b-base);
-  border-radius: var(--r-md);
+  border-radius: var(--r-md) 0 var(--r-md) var(--r-md);
   box-shadow: var(--e-2);
-  padding: 4px;
-  z-index: 101;
+  overflow: hidden;
+  transform-origin: top right;
+  transform: translateX(-100%) scale(.96, .92);
   opacity: 0;
-  transform: translateY(-4px);
-  transition: opacity var(--t-base) ease, transform var(--t-base) ease;
+  transition: width 260ms var(--ease), height 260ms var(--ease), transform 220ms var(--ease), opacity 160ms ease;
 }
-
-#menu-popover.open {
-  opacity: 1;
-  transform: translateY(0);
+#menu-surface.open { opacity: 1; transform: translateX(-100%); }
+#menu-surface[hidden], #menu-popover[hidden], #menu-surface .menu-panel:not(.open) { display: none; }
+#menu-popover {
+  padding: var(--sp-2);
+  max-height: 100%;
+  overflow-y: auto;
+}
+#menu-surface .menu-panel {
+  position: static;
+  width: 100%;
+  height: 100%;
+  transform: none;
+  border: none;
+  box-shadow: none;
+  transition: none;
+  background: transparent;
+  animation: menu-panel-enter 220ms var(--ease);
+}
+@keyframes menu-panel-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+#menu-surface .tp-header {
+  padding: var(--sp-3) var(--sp-4);
+  gap: var(--sp-2);
+  border-bottom: var(--b-hair);
+}
+#menu-surface .tp-title { margin-right: auto; font-size: .875rem; }
+#menu-surface .tp-body { min-height: 0; padding: var(--sp-4) var(--sp-5) var(--sp-5); overscroll-behavior: contain; }
+.tp-back {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.tp-back:hover { background: var(--hover); color: var(--text); }
+.menu-group-label {
+  padding: var(--sp-3) var(--sp-3) var(--sp-2);
+  font-size: .625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text-tertiary);
+}
+#menu-surface .st-footer {
+  flex: 0 0 auto;
+  align-items: center;
+  padding: var(--sp-3) var(--sp-5);
+  margin: 0;
+  border-top: var(--b-hair);
+}
+#menu-surface .st-footer[hidden] { display: none; }
+#menu-surface .st-footer .st-status { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+#menu-surface .st-row-tight { flex-wrap: wrap; align-items: center; }
+#menu-surface .st-row-tight .st-select,
+#menu-surface .st-row-tight .st-input { flex: 1 1 180px; min-width: 0; width: auto; margin-top: 0; }
+#menu-surface .st-input, #menu-surface .st-select { border-radius: var(--r-sm); }
+#menu-surface .st-save, #menu-surface .st-clear { border-radius: var(--r-sm); }
+#menu-surface .tp-group-label { border-bottom: var(--b-hair); }
+#menu-surface .tp-section:has(.st-model-default) { padding-bottom: var(--sp-3); border-bottom: var(--b-hair); }
+#menu-surface .st-help:empty, #menu-surface .st-clear[hidden], #menu-surface .st-fixed-heading[hidden] { display: none; }
+#menu-surface .st-production-updater { display: inline-block; font-size: .6875rem; color: var(--text-tertiary); margin-top: var(--sp-2); }
+#menu-surface .st-production-updater[hidden], .menu-item[hidden] { display: none; }
+#menu-surface .st-tab { min-width: 0; }
+#menu-surface .st-tab[hidden] { display: none; }
+#menu-surface .tp-row { gap: var(--sp-3); }
+#menu-surface .tp-val { flex-shrink: 0; }
+#menu-surface [data-help] { cursor: help; }
+#menu-surface .tp-label[data-help], #menu-surface .analytics-label[data-help] {
+  text-decoration: underline dotted var(--border);
+  text-underline-offset: 4px;
+}
+#menu-surface :is(button, input, select, [tabindex="0"]):focus-visible {
+  outline-width: 2px;
+  outline-style: solid;
+  outline-color: var(--a1);
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  #menu-surface, #menu-surface .menu-panel { transition: none; animation: none; }
+  #menu-surface { transform: translateX(-100%); }
 }
 
 .menu-item {
@@ -1406,7 +1488,7 @@ body:has(#behavior-memory-panel.open) #menu-toggle {
   font-size: 0.6875rem;
   line-height: 1.4;
   color: var(--text-tertiary);
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .menu-release-commit {
   color: inherit;
@@ -2032,14 +2114,6 @@ body:has(#behavior-memory-panel.open) #menu-toggle {
 }
 
 .st-help-info  { color: var(--text-tertiary); }
-
-/* Settings tabs: the pill picker, stretched across the panel. */
-.st-tabs {
-  margin-bottom: 16px;
-}
-.st-tabs button {
-  flex: 1;
-}
 
 /* Models tab: a place is a label, why, then its default and fallback. */
 .st-sublabel {
@@ -6403,6 +6477,7 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 .chat-safe-mode-status { padding: var(--sp-1) var(--sp-3); color: var(--text-secondary); }
 .icon-tooltip { position: fixed; z-index: 1000; pointer-events: none; max-width: calc(100vw - 16px); padding: 5px 8px; border: 1px solid var(--hairline); border-radius: var(--r-sm); background: var(--surface); color: var(--text-secondary); font: inherit; font-size: .6875rem; line-height: 1.4; white-space: nowrap; box-shadow: var(--e-1); }
 .icon-tooltip[hidden] { display: none; }
+.icon-tooltip.context-tooltip { white-space: normal; max-width: min(320px, calc(100vw - 24px)); padding: var(--sp-2) var(--sp-3); font-size: .75rem; line-height: 1.5; overflow-wrap: anywhere; }
 
 /* Command choices sit in the same quiet extension as message history. */
 .chat-command-chips { display: flex; flex-wrap: wrap; gap: var(--sp-1); padding: var(--sp-2) var(--sp-3) 0; min-width: 0; }

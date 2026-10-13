@@ -82,7 +82,7 @@ function allowedHtml(view: AdminOverview): string {
   return view.allowed.map((entry) => `
     <div class="ad-allowed-row">
       <span class="ad-allowed-login">${escapeHtml(entry.handle)}</span>
-      <span class="st-help st-help-info">${entry.source === 'env' ? 'POISE_ALLOWED_USERS' : `added by ${escapeHtml(entry.addedBy ?? 'an admin')}`}</span>
+      <span class="st-help st-help-info">${entry.source === 'env' ? 'Server configuration' : `added by ${escapeHtml(entry.addedBy ?? 'an admin')}`}</span>
       ${entry.source === 'env' ? '' : `<button type="button" class="st-clear ad-danger" data-change="allow/remove" data-login="${escapeHtml(entry.handle)}">Remove</button>`}
     </div>`).join('')
 }
@@ -105,7 +105,7 @@ export function adminSection(account: GatewayAccount): AdminSection {
     </div>
     <div class="st-help ad-status" role="status" aria-live="polite"></div>
 
-    <div class="tp-hint">If your own workspace will not open, the same controls are on the gateway's <a href="${escapeHtml(account.apexOrigin)}/admin" target="_blank" rel="noopener noreferrer">admin page</a>.</div>`
+    <div class="tp-hint"><a href="${escapeHtml(account.apexOrigin)}/admin" target="_blank" rel="noopener noreferrer" data-help="Manage the service here when your workspace is unavailable.">Gateway administration</a></div>`
 
   const usersEl = element.querySelector<HTMLElement>('.ad-users')!
   const dockerEl = element.querySelector<HTMLElement>('.ad-docker')!

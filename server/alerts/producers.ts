@@ -8,7 +8,7 @@
 // Connected accounts opens Settings there. Each alert's notice in the page
 // opens its own target: the view, Settings tab or Chat session it is about.
 
-import { CONNECTED_ACCOUNTS_PATH, type AccountId, type ConnectedAccount } from '../accounts/types'
+import { CONNECTED_ACCOUNTS_PATH, GITHUB_AUTOMATION_SIGN_IN_TITLE, type AccountId, type ConnectedAccount } from '../accounts/types'
 import type { ClaudeAuthStatus } from '../claude-auth'
 import type { StopReason } from '../chat/protocol'
 import { isServiceMode } from '../service/config'
@@ -88,7 +88,7 @@ const GH_ROLES = [
   {
     key: 'sign-in:gh:agent',
     login: (identities: GitHubIdentities) => identities.agentAccount,
-    title: 'The agent account is not signed in to gh',
+    title: GITHUB_AUTOMATION_SIGN_IN_TITLE,
     body: (login: string) => `Reviews and comments are posted as ${login}, which gh does not hold signed in. Connect GitHub in Settings → Accounts and sign in as ${login}.`,
   },
 ]

@@ -8,6 +8,9 @@
   margin-bottom: var(--sp-3);
 }
 
+.st-account-group { display: grid; gap: var(--sp-2); min-width: 0; }
+.st-account-group .tp-group-label { margin-bottom: 0; }
+
 .st-account {
   padding: var(--sp-3);
   border: var(--b-base);
@@ -16,7 +19,8 @@
 
 .st-account-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  flex-wrap: wrap;
   gap: var(--sp-2);
 }
 
@@ -30,6 +34,8 @@
   font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
   font-size: 0.625rem;
   color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .st-account-head .st-clear {
@@ -122,12 +128,6 @@
 .st-account-actions {
   display: flex;
   gap: var(--sp-2);
-}
-
-/* A terminal needs room for a login's lines: the panel widens while one is
-   open, as far as the window allows. */
-#settings-panel.st-terminal-open {
-  width: min(640px, 100vw);
 }
 
 .st-accounts-status:empty { display: none; }

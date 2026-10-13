@@ -234,7 +234,7 @@ test('never opens setup in a workspace that is already set up, and offers to run
   await expect(page.locator('#view-current')).toBeVisible()
   await expect(page.locator('.ob-backdrop')).toHaveCount(0)
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
+  await page.locator('[data-settings="general"]').click()
   await page.locator('.st-run-setup').click()
   await expect(page.locator('.ob-title')).toHaveText('Choose how Poise looks')
   await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)

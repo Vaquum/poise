@@ -27,28 +27,39 @@ function missing(html: string): string[] {
 }
 
 describe('the gh row', () => {
+  it('separates GitHub sign-ins from AI provider sign-ins', () => {
+    const provider: ConnectedAccount = { ...gh(undefined), id: 'codex', identity: null }
+    const html = accountsHtml([provider, gh([held('octocat')])], { me: 'octocat', agentAccount: '' }, false)
+    const groups = [...html.matchAll(/<section class="st-account-group" aria-label="([^"]+)">([\s\S]*?)<\/section>/g)]
+    expect(groups.map((group) => group[1])).toEqual(['AI accounts', 'GitHub accounts'])
+    expect(groups[0][2]).toContain('data-account="codex"')
+    expect(groups[0][2]).not.toContain('data-account="gh"')
+    expect(groups[1][2]).toContain('data-account="gh"')
+    expect(groups[1][2]).not.toContain('data-account="codex"')
+  })
+
   it('marks which held account is yours and which is the agent account', () => {
     const html = accountsHtml([gh([held('OctoCat', true), held('octo-agent'), held('someone-else')])], { me: 'octocat', agentAccount: 'Octo-Agent' }, false)
     expect(notes(html, 'OctoCat')).toBe('active · your GitHub account')
-    expect(notes(html, 'octo-agent')).toBe('agent account')
+    expect(notes(html, 'octo-agent')).toBe('automation account')
     expect(notes(html, 'someone-else')).toBeNull()
     expect(missing(html)).toEqual([])
   })
 
   it('says when your account or the agent account is not signed in to gh', () => {
     const html = accountsHtml([gh([held('octocat', true)])], { me: 'octocat', agentAccount: 'octo-agent' }, false)
-    expect(missing(html)).toEqual(['The agent account octo-agent is not signed in to gh.'])
+    expect(missing(html)).toEqual(['Your GitHub automation account octo-agent is not signed in.'])
     expect(missing(accountsHtml([gh([])], { me: 'octocat', agentAccount: 'octo-agent' }, false))).toEqual([
-      'Your GitHub account octocat is not signed in to gh.',
-      'The agent account octo-agent is not signed in to gh.',
+      'Your GitHub account octocat is not signed in.',
+      'Your GitHub automation account octo-agent is not signed in.',
     ])
   })
 
   it('counts an account gh holds but cannot use as not signed in', () => {
     const html = accountsHtml([gh([held('octocat', true), held('octo-agent', false, false)])], { me: 'octocat', agentAccount: 'octo-agent' }, false)
-    expect(notes(html, 'octo-agent')).toBe('agent account')
+    expect(notes(html, 'octo-agent')).toBe('automation account')
     expect(html).toContain('HTTP 401: Bad credentials')
-    expect(missing(html)).toEqual(['The agent account octo-agent is not signed in to gh.'])
+    expect(missing(html)).toEqual(['Your GitHub automation account octo-agent is not signed in.'])
   })
 
   it('says nothing about either account while gh\'s status is unknown, or when none is set', () => {

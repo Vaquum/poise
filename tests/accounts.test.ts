@@ -174,7 +174,11 @@ describe('GET /api/accounts', () => {
     await writeFakeClis(bin, home, {})
     await writeFile(join(bin, 'codex'), `#!/bin/sh\nif [ "$1" = --version ]; then echo 'codex-cli 0.160.0'; exit 0; fi\necho $$ > "$HOME/codex.pid"\nexec /bin/sleep 30\n`)
     await chmod(join(bin, 'codex'), 0o755)
-    const run: RunCommand = (command, args, options) => runFile(command, args, { ...options, timeoutMs: 500 })
+    // Only the deliberately hung status probe needs a short deadline;
+    // version discovery keeps its normal startup budget under suite load.
+    const run: RunCommand = (command, args, options) => runFile(command, args, {
+      ...options, ...(args.join(' ') === 'login status' ? { timeoutMs: 500 } : {}),
+    })
 
     const accounts = byId(await probeAccounts(run))
     expect(accounts.codex).toMatchObject({ installed: true, version: '0.160.0', signedIn: null, detail: '`codex login status` did not answer within 0.5 seconds' })

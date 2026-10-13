@@ -12,6 +12,7 @@ export function isAccountId(value: unknown): value is AccountId {
 /** The page that opens on Settings → Connected accounts. Sign-in alerts link
  *  here; Settings reads the query when the page loads. */
 export const CONNECTED_ACCOUNTS_PATH = '/?settings=accounts'
+export const GITHUB_AUTOMATION_SIGN_IN_TITLE = 'Your GitHub automation account is not signed in'
 
 /** Each CLI's own login as the person reads it, checked against the CLI's
  *  --help; a Connect terminal runs exactly this. agy has no login subcommand:

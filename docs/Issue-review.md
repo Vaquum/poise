@@ -5,7 +5,7 @@ every sub-issue it makes part of itself. One to three reviewers work on each
 issue at the same time. Each is its provider's own coding-agent CLI with full
 access to a fresh checkout of the repository: it reads the whole codebase and
 its history, builds, and runs the tests. Every comment is posted as your agent
-account (Settings → GitHub → Agent account).
+account (Menu → Settings → General → GitHub automation account).
 
 The instruction each reviewer gets is fixed:
 

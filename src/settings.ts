@@ -1,9 +1,6 @@
 import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } from './model-refresh'
-// Settings panel — three tabs: General (your GitHub account, the agent account,
-// GitHub accounts, timezone, refresh rate, notifications, theme), Models (which model each
-// place in Poise launches, with a fallback) and Accounts (Connected accounts:
-// each agent CLI's sign-in, and a terminal for its login). Slides in from the
-// right, same pattern as the typography panel.
+// General, Models and Accounts are direct destinations in the burger menu.
+// They share one panel and keep their drafts while moving between destinations.
 //
 // GitHub credentials stay in gh; Poise asks it for the account it acts as.
 // Your account scopes the views to your user-footprint (things you're
@@ -72,10 +69,10 @@ let productionEl: HTMLElement | null = null
 let refreshBtn: HTMLButtonElement | null = null
 let notificationsPicker: HTMLElement | null = null
 let notificationsStatusEl: HTMLElement | null = null
-let focusTimer: ReturnType<typeof setTimeout> | null = null
 // A model select someone has changed keeps its value across background
 // reloads until Save, exactly like the text fields keep typed text.
 const dirtyModels = new Set<string>()
+const dirtyFields = new Set<HTMLInputElement | HTMLSelectElement>()
 let modelRefreshActive = false
 let modelsGeneration = 0
 // Bumped by each saved or deleted configuration: a catalog read that started before it brings older ones.
@@ -111,14 +108,14 @@ function syncFieldsFromCache() {
   // first characters someone has already typed into an empty field. Only fill
   // a field the person is not currently in.
   const active = document.activeElement
-  if (meInput && meInput !== active) meInput.value = s.me
-  if (agentInput && agentInput !== active) agentInput.value = s.agentAccount ?? ''
-  if (tzSelect && tzSelect !== active) {
+  if (meInput && meInput !== active && !dirtyFields.has(meInput)) meInput.value = s.me
+  if (agentInput && agentInput !== active && !dirtyFields.has(agentInput)) agentInput.value = s.agentAccount ?? ''
+  if (tzSelect && tzSelect !== active && !dirtyFields.has(tzSelect)) {
     const fallback = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return 'UTC' } })()
     tzSelect.value = ensureTimezoneOption(s.timezone || fallback)
   }
-  if (branchPrefixInput && branchPrefixInput !== active) branchPrefixInput.value = s.chat?.branchPrefix ?? CHAT_DEFAULTS.branchPrefix
-  if (idleTimeoutInput && idleTimeoutInput !== active) idleTimeoutInput.value = String(s.chat?.idleTimeoutMinutes ?? CHAT_DEFAULTS.idleTimeoutMinutes)
+  if (branchPrefixInput && branchPrefixInput !== active && !dirtyFields.has(branchPrefixInput)) branchPrefixInput.value = s.chat?.branchPrefix ?? CHAT_DEFAULTS.branchPrefix
+  if (idleTimeoutInput && idleTimeoutInput !== active && !dirtyFields.has(idleTimeoutInput)) idleTimeoutInput.value = String(s.chat?.idleTimeoutMinutes ?? CHAT_DEFAULTS.idleTimeoutMinutes)
   showNotificationsChoice(s.notifications?.enabled !== false)
 }
 
@@ -191,6 +188,10 @@ function setHelp(text: string, cls: 'info' | 'error' | 'ok' = 'info') {
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
+}
+
+function helpAttributes(text: string): string {
+  return `data-help="${escapeHtml(text)}" tabindex="0"`
 }
 
 let organizationsPollTimer: ReturnType<typeof setTimeout> | null = null
@@ -414,7 +415,7 @@ async function connect(preset: TerminalPreset): Promise<void> {
 }
 
 function accountsTabSelected(): boolean {
-  return !!panelEl?.querySelector('.st-tabs [data-tab="accounts"].active')
+  return panelEl?.dataset.section === 'accounts'
 }
 
 // A sign-in alert opens the workspace at CONNECTED_ACCOUNTS_PATH. The query is
@@ -428,7 +429,7 @@ function openFromAddress(): void {
   const query = params.toString()
   history.replaceState(history.state, '', `${location.pathname}${query ? `?${query}` : ''}${location.hash}`)
   openSettingsPanel()
-  selectTab(panelEl, 'accounts')
+  selectSection(panelEl, 'accounts')
 }
 
 // ── Models tab ──────────────────────────────────────────────────────────
@@ -474,11 +475,10 @@ function renderPlaces(data: ModelsResponse) {
       : ''
     return `
       <div class="tp-section st-place" data-place="${escapeHtml(place.key)}">
-        <label class="tp-label">${escapeHtml(place.label)}</label>
-        <div class="st-help st-help-info">${escapeHtml(place.why)}</div>
+        <label class="tp-label" ${helpAttributes(place.why)}>${escapeHtml(place.label)}</label>
         <label class="st-sublabel">Default</label>
         <select class="st-select st-model-default" aria-label="${escapeHtml(place.label)} default model">${modelOptions(data.catalog.models, place, data.catalog.review_providers, current.default)}</select>
-        <label class="st-sublabel">Fallback</label>
+        <label class="st-sublabel" ${helpAttributes("Used when the default model cannot complete the request.")}>Fallback</label>
         <select class="st-select st-model-fallback" aria-label="${escapeHtml(place.label)} fallback model">${modelOptions(data.catalog.models, place, data.catalog.review_providers, current.fallback)}</select>
         ${reviewers}
         ${notes}
@@ -489,10 +489,11 @@ function renderPlaces(data: ModelsResponse) {
   }
   fixedEl.innerHTML = data.fixed.map((place) => `
       <div class="tp-section">
-        <label class="tp-label">${escapeHtml(place.label)}</label>
+        <label class="tp-label" ${helpAttributes(place.why)}>${escapeHtml(place.label)}</label>
         <div class="st-fixed-model"><code>${escapeHtml(place.model)}</code></div>
-        <div class="st-help st-help-info">${escapeHtml(place.why)}</div>
       </div>`).join('')
+  const fixedHeading = panelEl?.querySelector<HTMLElement>('.st-fixed-heading')
+  if (fixedHeading) fixedHeading.hidden = data.fixed.length === 0
   renderCatalogStatus(data)
 }
 
@@ -507,7 +508,16 @@ function renderCatalogStatus(data: ModelsResponse) {
     const versions = Object.entries(report.cli_updates || {}).filter(([, item]) => item.after).map(([name, item]) => `${name} ${item.after}`).join(', ')
     line += `${stamp} ${summary.text}${versions ? ` CLI versions: ${versions}.` : ''}`
   } else line += ' Not checked yet; the daily check runs at 07:00.'
-  catalogStatusEl.textContent = line
+  catalogStatusEl.dataset.help = line
+  catalogStatusEl.tabIndex = 0
+  const failed = report && modelRefreshSummary(report).level === 'error'
+  const checkedAt = report?.completed_at || report?.checked_at
+  const when = checkedAt ? new Date(checkedAt) : null
+  const checked = when && !Number.isNaN(when.getTime()) ? `Checked ${when.toLocaleDateString()}` : 'Checked'
+  catalogStatusEl.textContent = failed
+    ? modelRefreshSummary(report).text
+    : `${data.catalog.models.length} models · ${report ? checked : 'Not checked yet'}`
+  catalogStatusEl.classList.toggle('st-help-error', !!failed)
 }
 
 async function loadModels(signal?: AbortSignal): Promise<boolean> {
@@ -541,9 +551,13 @@ function renderPresets(presets: ModelPreset[]): void {
   const chosen = select.value
   select.innerHTML = presets.length
     ? presets.map((preset) => `<option value="${escapeHtml(preset.name)}">${escapeHtml(preset.name)}</option>`).join('')
-    : '<option value="">No saved configurations yet</option>'
+    : '<option value="">None saved</option>'
+  select.disabled = !presets.length
   if (presets.some((preset) => preset.name === chosen)) select.value = chosen
-  for (const button of panelEl!.querySelectorAll<HTMLButtonElement>('.st-preset-use, .st-preset-delete')) button.disabled = !presets.length
+  for (const button of panelEl!.querySelectorAll<HTMLButtonElement>('.st-preset-use, .st-preset-delete')) {
+    button.disabled = !presets.length
+    button.hidden = !presets.length
+  }
 }
 
 // One configuration action at a time: overlapping saves, uses and deletes could
@@ -740,6 +754,8 @@ async function saveAll() {
   }
 
   saving = true
+  const savedValues = new Map([meInput, agentInput, tzSelect, branchPrefixInput, idleTimeoutInput]
+    .filter((field) => field !== null).map((field) => [field, field.value] as const))
   saveBtn.disabled = true
   saveBtn.textContent = 'Saving…'
   try {
@@ -753,6 +769,9 @@ async function saveAll() {
       return
     }
     dirtyModels.clear()
+    for (const [field, value] of savedValues) {
+      if (field.value === value) dirtyFields.delete(field)
+    }
     setLocalSettings(data)
     renderOrganizations()
     renderAccounts()
@@ -777,126 +796,128 @@ function timezoneOptions(): string[] {
   return ['UTC', 'Europe/Helsinki', 'Europe/London', 'Europe/Berlin', 'America/New_York', 'America/Los_Angeles', 'Asia/Tokyo', 'Asia/Singapore']
 }
 
-function selectTab(panel: HTMLElement, tab: string) {
-  for (const btn of panel.querySelectorAll<HTMLButtonElement>('.st-tabs [data-tab]')) {
-    const on = btn.dataset.tab === tab
-    btn.classList.toggle('active', on)
-    btn.setAttribute('aria-selected', on ? 'true' : 'false')
-  }
+export type SettingsSection = 'general' | 'models' | 'accounts' | 'admin'
+
+function selectSection(panel: HTMLElement, tab: SettingsSection) {
+  if (!panel.querySelector(`.st-tab[data-tab="${tab}"]`)) return
+  panel.dataset.section = tab
+  const title = tab[0].toUpperCase() + tab.slice(1)
+  panel.querySelector('.tp-title')!.textContent = title
+  panel.setAttribute('aria-label', `Settings: ${title}`)
   for (const section of panel.querySelectorAll<HTMLElement>('.st-tab')) {
     section.hidden = section.dataset.tab !== tab
   }
+  panel.querySelector<HTMLElement>('.st-footer')!.hidden = tab === 'accounts' || tab === 'admin'
   if (tab === 'accounts') void loadAccounts()
+  window.dispatchEvent(new CustomEvent('poise:settings-section-changed', { detail: { section: tab } }))
 }
 
 function buildPanel(): HTMLElement {
   const panel = document.createElement('aside')
   panel.id = 'settings-panel'
+  panel.dataset.section = 'general'
+  panel.setAttribute('aria-label', 'Settings: General')
 
   const tzList = timezoneOptions()
   const browserTz = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return 'UTC' } })()
   const tzOptionsHtml = tzList.map((z) => `<option value="${z}">${z}</option>`).join('')
 
   panel.innerHTML = `
-    <div class="tp-header"><span class="tp-title">Settings</span></div>
+    <div class="tp-header"><span class="tp-title">General</span>
+      <button class="tp-close" type="button" aria-label="Close settings">&times;</button></div>
     <div class="tp-body">
-      <div class="range-picker st-tabs" role="tablist" aria-label="Settings sections">
-        <button type="button" role="tab" data-tab="general" class="active" aria-selected="true">General</button>
-        <button type="button" role="tab" data-tab="models" aria-selected="false">Models</button>
-        <button type="button" role="tab" data-tab="accounts" aria-selected="false">Accounts</button>
-      </div>
 
       <section class="st-tab" data-tab="general">
         <div class="tp-group-label">GitHub</div>
 
         <div class="tp-section">
-          <label class="tp-label" for="st-username">Your GitHub account</label>
+          <label class="tp-label" for="st-username" ${helpAttributes("Shows the issues and pull requests you are involved in. Connect this GitHub account under Accounts.")}>Your GitHub account</label>
           <input id="st-username" type="text" class="st-input st-input-me" autocomplete="off" spellcheck="false" placeholder="octocat" />
-          <div class="st-help st-help-info">Scopes Current and Archive to your user-footprint (PRs and issues you're involved in). Poise reads GitHub as this account, so it must be signed in to <code>gh</code> here.</div>
+
         </div>
 
         <div class="tp-section">
-          <label class="tp-label" for="st-agent-account">Agent account</label>
+          <label class="tp-label" for="st-agent-account" ${helpAttributes("The GitHub account that posts automated reviews and comments. Connect it under Accounts.")}>GitHub automation account</label>
           <input id="st-agent-account" type="text" class="st-input st-input-agent" autocomplete="off" spellcheck="false" />
-          <div class="st-help st-help-info">The GitHub user your reviews and comments are posted as. It must be signed in to <code>gh</code> here.</div>
+
         </div>
 
         <div class="tp-section">
-          <label class="tp-label" for="st-organization">GitHub accounts</label>
+          <label class="tp-label" for="st-organization" ${helpAttributes("Organizations and personal accounts to follow. Initial indexing can take a few minutes.")}>Following</label>
           <div class="st-organizations" aria-live="polite"></div>
           <div class="st-org-add-row">
             <input id="st-organization" type="text" class="st-input st-input-org" aria-label="New GitHub account" autocomplete="off" spellcheck="false" placeholder="acme-corp or octocat" />
             <button type="button" class="st-clear st-add-organization">Add</button>
           </div>
-          <div class="st-help st-help-info">Add an organization name or personal username. Poise activates its datastore; initial sync may take a few minutes. Existing accounts keep working. Shared behavior settings apply when the new account is ready.</div>
+
           <div class="st-help st-help-info st-org-status" role="status"></div>
         </div>
 
         <div class="tp-group-label">Time</div>
 
         <div class="tp-section">
-          <label class="tp-label">Timezone</label>
-          <select class="st-select st-input-tz">${tzOptionsHtml}</select>
-          <div class="st-help st-help-info">Used to cut "today / yesterday / this week" in Main.</div>
+          <label class="tp-label" for="st-timezone" ${helpAttributes("Sets the day and week boundaries in Current, Archive and Analytics.")}>Time zone</label>
+          <select id="st-timezone" class="st-select st-input-tz">${tzOptionsHtml}</select>
+
         </div>
 
         <div class="tp-section">
-          <label class="tp-label">Refresh rate</label>
-          <div class="range-picker st-refresh-picker">
-            <button type="button" data-rate="1m" class="${getRefreshRate() === '1m' ? 'active' : ''}">1m</button>
-            <button type="button" data-rate="5m" class="${getRefreshRate() === '5m' ? 'active' : ''}">5m</button>
+          <label class="tp-label" id="st-refresh-label" ${helpAttributes("How often Current, Swarm and Archive read fresh data.")}>Refresh rate</label>
+          <div class="range-picker st-refresh-picker" role="group" aria-labelledby="st-refresh-label">
+            <button type="button" data-rate="1m" class="${getRefreshRate() === '1m' ? 'active' : ''}">1 min</button>
+            <button type="button" data-rate="5m" class="${getRefreshRate() === '5m' ? 'active' : ''}">5 min</button>
           </div>
-          <div class="st-help st-help-info">How often Current, Swarm, and Archive pull fresh data.</div>
+
         </div>
 
         <div class="tp-group-label">Notifications</div>
 
         <div class="tp-section">
-          <label class="tp-label" id="st-notifications-label">Show notifications</label>
+          <label class="tp-label" id="st-notifications-label" ${helpAttributes("Alerts for sign-ins, failed behaviors, chats waiting for you and pull requests ready to merge. Ready pull requests remind you every 15 minutes until merged or silenced.")}>Notifications</label>
           <div class="range-picker st-notifications-picker" role="group" aria-labelledby="st-notifications-label">
             <button type="button" data-notifications="on" class="active" aria-pressed="true">On</button>
             <button type="button" data-notifications="off" aria-pressed="false">Off</button>
           </div>
-          <div class="st-help st-help-info">One at a time at the top of Poise: a failed behavior, a sign-in or a chat waiting for you, and your pull requests once they are ready to merge, again every 15 minutes until you merge or silence them. Applies instantly.</div>
+
           <div class="st-help st-help-error st-notifications-status" role="status" hidden></div>
         </div>
 
         <div class="tp-group-label">Chat</div>
 
         <div class="tp-section">
-          <label class="tp-label" for="st-chat-branch-prefix">Branch prefix for new chat sessions</label>
+          <label class="tp-label" for="st-chat-branch-prefix" ${helpAttributes("Names the branch created for each new chat session.")}>Branch prefix</label>
           <input type="text" id="st-chat-branch-prefix" class="st-input st-input-branch-prefix" autocomplete="off" spellcheck="false" placeholder="chat/" />
-          <div class="st-help st-help-info">Every new session gets its own branch cut from the default branch, named with this prefix.</div>
+
         </div>
 
         <div class="tp-section">
-          <label class="tp-label" for="st-chat-idle-timeout">Idle timeout (minutes)</label>
+          <label class="tp-label" for="st-chat-idle-timeout" ${helpAttributes("Closes an idle agent process after this many minutes. The chat resumes when you send another message.")}>Idle timeout (minutes)</label>
           <input type="number" id="st-chat-idle-timeout" class="st-input st-input-idle-timeout" min="1" step="1" placeholder="120" />
-          <div class="st-help st-help-info">An idle session's agent process is closed after this long; the session itself stays and resumes on the next message.</div>
+
         </div>
 
         <div class="tp-group-label">Appearance</div>
 
         <div class="tp-section">
-          <label class="tp-label">Theme</label>
-          <div class="range-picker st-theme-picker">
+          <label class="tp-label" id="st-theme-label">Theme</label>
+          <div class="range-picker st-theme-picker" role="group" aria-labelledby="st-theme-label">
             <button type="button" data-theme="light" class="${getTheme() === 'light' ? 'active' : ''}">Light</button>
             <button type="button" data-theme="dark"  class="${getTheme() === 'dark'  ? 'active' : ''}">Dark</button>
           </div>
-          <div class="st-help st-help-info">Applies instantly. Stored locally; no reload needed.</div>
+
         </div>
 
         <div class="st-production-group" hidden>
           <div class="tp-group-label">Production</div>
           <div class="tp-section">
             <div class="st-help st-help-info st-production" role="status" aria-live="polite"></div>
-            <div class="st-help st-help-info st-production-updater">Production follows <code>main</code>: a launchd job fast-forwards its checkout and rebuilds every minute. A failing or silent updater also raises a desktop notification.</div>
+            <span class="st-production-updater" data-help="Updates from main automatically. An updater failure raises a desktop notification." tabindex="0">Automatic updates</span>
           </div>
         </div>
       </section>
 
       <section class="st-tab" data-tab="models" hidden>
-        <div class="tp-group-label">Saved configurations</div>
+        <div class="tp-group-label" ${helpAttributes("Save the model choices below under a name, then restore them with Use.")}>Saved configurations</div>
         <div class="tp-section st-presets">
           <div class="st-row st-row-tight">
             <select class="st-select st-preset-select" aria-label="Saved model configuration"></select>
@@ -904,58 +925,47 @@ function buildPanel(): HTMLElement {
             <button type="button" class="st-clear st-preset-delete">Delete</button>
           </div>
           <div class="st-row st-row-tight">
-            <input type="text" class="st-input st-preset-name" maxlength="40" autocomplete="off" spellcheck="false" placeholder="Name for the choices below" aria-label="Configuration name" />
+            <input type="text" class="st-input st-preset-name" maxlength="40" autocomplete="off" spellcheck="false" placeholder="Name" aria-label="Configuration name" />
             <button type="button" class="st-clear st-preset-save">Save current</button>
           </div>
-          <div class="st-help st-help-info">Save the model choices below under a name, then switch back to them in one step, for example when a provider's quota runs out.</div>
+
         </div>
 
-        <div class="tp-group-label">Where Poise launches a model</div>
+        <div class="tp-group-label">Model choices</div>
         <div class="st-models"><div class="st-help st-help-info">Loading the catalog…</div></div>
 
-        <div class="tp-group-label">Set by Caller</div>
+        <div class="tp-group-label st-fixed-heading" ${helpAttributes("These model choices are fixed by Caller.")} hidden>Fixed models</div>
         <div class="st-models-fixed"></div>
 
-        <div class="tp-group-label">Catalog</div>
+        <div class="tp-group-label" ${helpAttributes("Models are checked daily at 07:00 in your time zone. Check now refreshes provider CLIs and the model list.")}>Model catalog</div>
         <div class="tp-section">
           <div class="st-help st-help-info st-catalog-status"></div>
           <div class="st-row st-row-tight">
             <button type="button" class="st-clear st-refresh-models">Check now</button>
           </div>
-          <div class="st-help st-help-info">Provider CLIs are updated and verified before model discovery, automatically at 07:00 and whenever you choose Check now. New agent processes also check their CLI before starting.</div>
+
         </div>
       </section>
 
       <section class="st-tab" data-tab="accounts" hidden>
-        <div class="tp-group-label">Connected accounts</div>
-        <div class="tp-section">
-          <div class="st-help st-help-info st-accounts-intro">Each agent CLI keeps its own sign-in. Connect opens a terminal here that runs the CLI's own login; the CLI keeps what it signs in with in its own files, and Poise never reads them.</div>
-        </div>
         <div class="st-terminal-slot"></div>
         <div class="st-accounts" aria-live="polite"></div>
         <div class="st-help st-help-info st-accounts-status" role="status"></div>
 
-        <div class="tp-group-label">Terminal</div>
+        <div class="tp-group-label" ${helpAttributes("A shell in your workspace for connections the account buttons do not cover. Two terminals can run at once; an idle terminal closes after 15 minutes.")}>Terminal</div>
         <div class="tp-section">
           <div class="st-account-actions">
             <button type="button" class="st-clear st-open-shell">Open a shell</button>
           </div>
-          <div class="st-help st-help-info">Your login shell, for what the logins above do not cover. At most two terminals run at once, and one closes after 15 idle minutes.</div>
+
         </div>
       </section>
 
-      <div class="st-row">
-        <button class="st-save">Save</button>
+      </div>
+      <div class="st-row st-footer">
+        <button class="st-save" type="button">Save</button>
         <span class="st-help st-help-info st-status" role="status" aria-live="polite"></span>
       </div>
-
-      <div class="tp-hint">
-        Your GitHub account, the agent account, GitHub accounts, timezone,
-        notifications and model choices are stored in
-        <code>~/.poise/cache.db</code>. Refresh rate and theme are kept by this
-        browser, so they do not follow you to another one.
-      </div>
-    </div>
   `
 
   orgInput = panel.querySelector('.st-input-org') as HTMLInputElement
@@ -1009,12 +1019,13 @@ function buildPanel(): HTMLElement {
   for (const inp of [meInput, agentInput, branchPrefixInput, idleTimeoutInput]) {
     inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveAll() })
   }
+  for (const field of [meInput, agentInput, tzSelect, branchPrefixInput, idleTimeoutInput]) {
+    if (!field) continue
+    field.addEventListener('input', () => dirtyFields.add(field))
+    field.addEventListener('change', () => dirtyFields.add(field))
+  }
 
-  panel.querySelector<HTMLElement>('.st-tabs')!.addEventListener('click', (e) => {
-    const btn = (e.target as HTMLElement).closest('button')
-    if (!btn || !btn.dataset.tab) return
-    selectTab(panel, btn.dataset.tab)
-  })
+  panel.querySelector('.tp-close')!.addEventListener('click', closeSettingsPanel)
 
   // Refresh-rate toggle — applies live (no Save needed); each view's
   // running timer restarts via the `poise:refresh-rate-changed` event.
@@ -1059,7 +1070,7 @@ export function initSettings() {
     const preset = (event as CustomEvent<{ id?: string }>).detail?.id
     if (!panelEl || !isTerminalPreset(preset)) return
     openSettingsPanel()
-    selectTab(panelEl, 'accounts')
+    selectSection(panelEl, 'accounts')
     void connect(preset)
   })
   openFromAddress()
@@ -1067,6 +1078,7 @@ export function initSettings() {
 
 export function openSettingsPanel() {
   if (!panelEl) return
+  window.dispatchEvent(new CustomEvent('poise:panel-opening', { detail: { id: panelEl.id } }))
   panelEl.removeAttribute('inert')
   panelEl.removeAttribute('aria-hidden')
   panelEl.classList.add('open')
@@ -1076,34 +1088,19 @@ export function openSettingsPanel() {
   void loadProduction()
   void pollOrganizations()
   if (accountsTabSelected()) void loadAccounts()
-  if (focusTimer) clearTimeout(focusTimer)
-  const openingFocus = document.activeElement
-  focusTimer = setTimeout(() => {
-    focusTimer = null
-    // The entrance must not redirect typing into the account field after the
-    // person has already selected another field or returned to the console.
-    if (!panelEl?.classList.contains('open')) return
-    if (document.activeElement !== openingFocus && document.activeElement !== document.body) return
-    // Focus the first empty required field
-    if (!orgInput || !meInput) return
-    if (!meInput.value) meInput.focus()
-    else orgInput.focus()
-  }, 200)
 }
 
-/** Settings, opened at one of its tabs. */
-export function openSettingsAt(tab: 'general' | 'accounts'): void {
+/** Direct destination from the menu, a notification or a gateway link. */
+export function openSettingsAt(tab: SettingsSection): void {
   if (!panelEl) return
+  selectSection(panelEl, tab)
   openSettingsPanel()
-  selectTab(panelEl, tab)
 }
 
 export function closeSettingsPanel() {
   organizationsPollGeneration++
   if (organizationsPollTimer) clearTimeout(organizationsPollTimer)
   organizationsPollTimer = null
-  if (focusTimer) clearTimeout(focusTimer)
-  focusTimer = null
   if (!panelEl) return
   panelEl.classList.remove('open')
   // Translated off-screen is not gone: without this the closed panel keeps its

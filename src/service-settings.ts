@@ -1,9 +1,9 @@
 // Service mode adds the gateway's parts to Settings: Poise Link under Accounts
 // (pairing and the paired computers) and, for the gateway's admins, an Admin
-// tab. The gateway sends /link, /link/devices and its own admin link here as
+// destination. The gateway sends /link, /link/devices and its own admin link here as
 // /?settings=link and /?settings=admin, which open Settings at that place.
 
-import { closeSettingsPanel, openSettingsPanel } from './settings'
+import { closeSettingsPanel, openSettingsAt } from './settings'
 import { fetchGatewayAccount, type GatewayAccount } from './gateway-client'
 import { workspaceMode } from './workspace-mode'
 import { poiseLinkSection, type PoiseLinkSection } from './views/poise-link'
@@ -25,10 +25,6 @@ export function gatewayAccount(): Promise<GatewayAccount | null> {
   return account
 }
 
-function selectTab(panel: HTMLElement, tab: string): void {
-  panel.querySelector<HTMLButtonElement>(`.st-tabs [data-tab="${tab}"]`)?.click()
-}
-
 function addSections(panel: HTMLElement, gateway: GatewayAccount): void {
   const accountsTab = panel.querySelector<HTMLElement>('.st-tab[data-tab="accounts"]')
   if (!accountsTab || link) return
@@ -42,28 +38,19 @@ function addSections(panel: HTMLElement, gateway: GatewayAccount): void {
   accountsTab.insertBefore(label, terminalLabel)
   accountsTab.insertBefore(link.element, terminalLabel)
 
-  const tabs = panel.querySelector<HTMLElement>('.st-tabs')
-  tabs?.addEventListener('click', (event) => {
-    const tab = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-tab]')?.dataset.tab
+  window.addEventListener('poise:settings-section-changed', (event) => {
+    const tab = (event as CustomEvent<{ section: string }>).detail.section
     if (tab === 'accounts') void link?.refresh()
     else if (tab === 'admin') void admin?.refresh()
   })
-  if (!gateway.isAdmin || !tabs) return
-  const button = document.createElement('button')
-  button.type = 'button'
-  button.setAttribute('role', 'tab')
-  button.setAttribute('aria-selected', 'false')
-  button.dataset.tab = 'admin'
-  button.textContent = 'Admin'
-  tabs.append(button)
-  tabs.classList.add('st-tabs-four')
+  if (!gateway.isAdmin) return
   const section = document.createElement('section')
   section.className = 'st-tab'
   section.dataset.tab = 'admin'
   section.hidden = true
   admin = adminSection(gateway)
   section.append(admin.element)
-  panel.querySelector('.tp-body > .st-row')?.before(section)
+  panel.querySelector('.tp-body')?.append(section)
 }
 
 /** Opens Settings at Poise Link or, for an admin, at Admin. */
@@ -72,12 +59,11 @@ export async function openServicePlace(place: ServicePlace): Promise<void> {
   const gateway = await gatewayAccount()
   if (!panel || !gateway) return
   addSections(panel, gateway)
-  openSettingsPanel()
   if (place === 'admin' && gateway.isAdmin) {
-    selectTab(panel, 'admin')
+    openSettingsAt('admin')
     return
   }
-  selectTab(panel, 'accounts')
+  openSettingsAt('accounts')
   requestAnimationFrame(() => {
     link?.element.previousElementSibling?.scrollIntoView({ block: 'start' })
     link?.element.querySelector<HTMLInputElement>('.pl-code')?.focus({ preventScroll: true })
@@ -105,8 +91,7 @@ function addSetupAgain(panel: HTMLElement, runSetup: () => void): void {
   const section = document.createElement('div')
   section.className = 'tp-section'
   section.innerHTML = `
-    <button type="button" class="st-clear st-run-setup">Run setup again</button>
-    <div class="st-help st-help-info">Walks through first-run setup again. Nothing is undone: every step shows what is already set.</div>`
+    <button type="button" class="st-clear st-run-setup" data-help="Walk through setup with your current choices prefilled.">Run setup again</button>`
   section.querySelector('button')!.addEventListener('click', () => {
     closeSettingsPanel()
     runSetup()

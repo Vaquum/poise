@@ -65,8 +65,7 @@ export function analyticsGroups(report: AnalyticsReport): AnalyticsGroup[] {
   const linesTotal = none ? '0' : lines.total === null ? UNKNOWN : formatCount(lines.total)
   let linesNote: string | undefined
   if (!none && lines.counted < pr.merged) {
-    linesNote = `From ${formatCount(lines.counted)} of ${plural(pr.merged, 'pull request', 'pull requests')}; `
-      + 'the rest get their size at the datastore\'s next full sync.'
+    linesNote = `From ${formatCount(lines.counted)} of ${plural(pr.merged, 'pull request', 'pull requests')}`
   }
 
   return [

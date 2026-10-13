@@ -116,7 +116,7 @@ anywhere in Poise or Caller:
 - **Your GitHub account** scopes Current and Archive to what you are involved
   in. Reads done as you — repository lists and account indexing — and the
   issues you open from Current or the Editor use it.
-- **Agent account** is the GitHub user your reviews and comments are posted
+- **GitHub automation account** is the GitHub user your reviews and comments are posted
   as: PR reviews and approvals, conversation resolution, issue reviews, and
   the checkouts and reads they need. It is optional to save, but every
   automation and manual review that posts fails, saying where to set it, while
@@ -657,3 +657,6 @@ with Noul, Choice and Score questions, rather than send chat messages. The
 builder supports mixed question batches, typed result cards, request JSON,
 reusable Snippets templates and saved evaluation history. Configure the
 server-only `JEV_API_KEY` in `.env`. See [JEV primitive workspaces](docs/Jev-primitives.md).
+
+[Menu and Settings](docs/Menu.md) describes the direct Settings destinations,
+attached panels and contextual help.

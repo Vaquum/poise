@@ -488,7 +488,7 @@ test.describe('on a release build', () => {
   const NEW_BUILD = { status: 'ok', build: { sha: SHA_B, releaseId: 'r2' } }
   const openSettings = async (page: Page) => {
     await page.getByRole('button', { name: 'Menu', exact: true }).click()
-    await page.locator('[data-action="settings"]').click()
+    await page.locator('[data-settings="general"]').click()
     await expect(page.locator('#settings-panel')).toHaveClass(/open/)
   }
 

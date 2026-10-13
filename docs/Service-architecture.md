@@ -410,7 +410,7 @@ assertion may only resume, and anything else is refused with 403):
 
 ## Accounts, identities and the terminal
 
-**Identities are user-level settings.** Settings → GitHub holds two accounts:
+**Identities are user-level settings.** Menu → Settings → General → GitHub holds two accounts:
 - the person's own GitHub account (`me`);
 - the agent account their automations review and comment as.
 
@@ -441,7 +441,7 @@ version, whether it is signed in and as whom.
     whenever a terminal exits.
   - Every read records sign-in alerts (`sign_in_needed`): one for an
     installed CLI that says it is not signed in, and one each for the
-    person's own account and the agent account while gh does not hold it
+    person's own account and the GitHub automation account while gh does not hold it
     signed in. Each clears once signed in again; Claude's alert stays its
     auth monitor's. In service mode Poise also reads the accounts every 15
     minutes, so the alerts come while the browser is closed. They open

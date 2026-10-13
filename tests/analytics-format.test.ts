@@ -56,14 +56,14 @@ describe('Analytics wording', () => {
   it('says how many pull requests the line counts come from when some have no size yet', () => {
     const groups = analyticsGroups(report({ merged: 52, lines: { total: 900, median: 20, counted: 40 } }))
     expect(tile(groups, 'Lines changed').value).toBe('900')
-    expect(groups[1].note).toBe('From 40 of 52 pull requests; the rest get their size at the datastore\'s next full sync.')
+    expect(groups[1].note).toBe('From 40 of 52 pull requests')
   })
 
   it('shows an unknown total, not zero, when no merged pull request has a size yet', () => {
     const groups = analyticsGroups(report({ merged: 1, lines: { total: null, median: null, counted: 0 } }))
     expect(tile(groups, 'Lines changed').value).toBe('—')
     expect(tile(groups, 'Median lines').value).toBe('—')
-    expect(groups[1].note).toBe('From 0 of 1 pull request; the rest get their size at the datastore\'s next full sync.')
+    expect(groups[1].note).toBe('From 0 of 1 pull request')
   })
 
   it('says nothing was merged instead of showing averages of nothing', () => {

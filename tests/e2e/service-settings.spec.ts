@@ -95,14 +95,14 @@ test('pairs Poise Link from Settings, where the gateway sends /link, and revokes
   const state = await setup(page, 'service')
   await page.goto('/?settings=link')
   await expect(page.locator('#settings-panel')).toHaveClass(/open/)
-  await expect(page.locator('.st-tabs [data-tab="accounts"]')).toHaveAttribute('aria-selected', 'true')
+  await expect(page.locator('#settings-panel')).toHaveAttribute('data-section', 'accounts')
   // The address is consumed, so a reload does not open Settings again.
   await expect(page).toHaveURL(/\/$/)
   await expect(page.locator('.st-link-label')).toHaveText('Poise Link')
   await expect(page.locator('.pl-command-text')).toHaveText(`curl -fsSL ${INSTALLER} | sh`)
   await expect(page.locator('.pl-devices')).toContainText('No computer is paired yet.')
   await expect(page.locator('.pl-code')).toBeFocused()
-  await expect(page.locator('.st-tabs [data-tab="admin"]')).toHaveCount(0)
+  await expect(page.locator('#settings-panel [data-tab="admin"]')).toHaveCount(0)
 
   await page.locator('.pl-code').fill('bcdf-gggg')
   await page.locator('.pl-approve').click()
@@ -134,14 +134,14 @@ test('says a paired computer whose Poise Link is not running is not connected, a
   await expect(card.locator('.pl-device-state')).toHaveText('Not connected')
   await expect(card.locator('.pl-device-state')).toHaveClass(/pl-device-state-disconnected/)
   await expect(card.locator('.pl-device-times')).toHaveText(/^Paired Oct 9, 2026, 7:00\sAM · last seen Oct 9, 2026, 7:53\sAM$/)
-  await expect(card).toContainText('Poise Link is not running on that computer, or it cannot reach Poise. Snippets and alerts reach it once it connects again.')
+  await expect(card.locator('.pl-device-state')).toHaveAttribute('data-help', 'Poise Link is not running on that computer, or it cannot reach Poise. Snippets and alerts reach it once it connects again.')
 
   // Poise Link starts on that computer while Settings stays open.
   state.devices = [device('laptop')]
   await page.clock.fastForward(10_000)
   await expect(card.locator('.pl-device-state')).toHaveText('Connected')
   await expect(card.locator('.pl-device-times')).toHaveText('Paired Oct 9, 2026, 7:00 AM')
-  await expect(card).not.toContainText('Poise Link is not running')
+  await expect(card.locator('.pl-device-state')).not.toHaveAttribute('data-help', /Poise Link is not running/)
 })
 
 test('says in Snippets whether a change reaches the desktop now, and opens Poise Link in Settings when it does not', async ({ page }) => {
@@ -173,7 +173,7 @@ test('says in Snippets whether a change reaches the desktop now, and opens Poise
   await expect(hint).toHaveText('No computer is paired with Poise Link, so snippets reach no desktop.')
   await view.locator('.snip-link-settings').click()
   await expect(page.locator('#settings-panel')).toHaveClass(/open/)
-  await expect(page.locator('.st-tabs [data-tab="accounts"]')).toHaveAttribute('aria-selected', 'true')
+  await expect(page.locator('#settings-panel')).toHaveAttribute('data-section', 'accounts')
   await expect(page.locator('.pl-device-state')).toHaveText('Revoked')
 })
 
@@ -189,7 +189,7 @@ test('Escape closes the top-right menu, and Settings opened from it', async ({ p
   await expect(toggle).toBeFocused()
 
   await toggle.click()
-  await page.locator('[data-action="settings"]').click()
+  await page.locator('[data-settings="general"]').click()
   await expect(page.locator('#settings-panel')).toHaveClass(/open/)
   await page.keyboard.press('Escape')
   await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)
@@ -199,7 +199,7 @@ test('gives the gateway\'s admins an Admin tab that manages people and workspace
   const state = await setup(page, 'service', true)
   await page.goto('/?settings=admin')
   await expect(page.locator('#settings-panel')).toHaveClass(/open/)
-  await expect(page.locator('.st-tabs [data-tab="admin"]')).toHaveAttribute('aria-selected', 'true')
+  await expect(page.locator('#settings-panel')).toHaveAttribute('data-section', 'admin')
   const alice = page.locator('.ad-user[data-user="alice"]')
   await expect(alice).toContainText('Alice')
   await expect(alice).toContainText('allow list')
@@ -223,14 +223,9 @@ test('gives the gateway\'s admins an Admin tab that manages people and workspace
   await expect(alice.locator('[data-change="users/enable"]')).toHaveText('Enable')
   expect(state.gatewayCalls.filter((call) => call.path === 'admin/users/disable').map((call) => call.body)).toEqual([{ handle: 'alice' }])
 
-  // The tabs still fit the panel side by side.
-  const tabs = await page.locator('.st-tabs button').evaluateAll((buttons) => buttons.map((button) => {
-    const box = button.getBoundingClientRect()
-    return { top: Math.round(box.top), right: box.right }
-  }))
-  expect(new Set(tabs.map((tab) => tab.top)).size).toBe(1)
-  const panelRight = await page.locator('#settings-panel .tp-body').evaluate((body) => body.getBoundingClientRect().right)
-  expect(Math.max(...tabs.map((tab) => tab.right))).toBeLessThanOrEqual(panelRight)
+  await expect(page.locator('.st-tabs')).toHaveCount(0)
+  await page.getByRole('button', { name: 'Back to menu' }).click()
+  await expect(page.locator('#menu-popover [data-settings="admin"]')).toBeVisible()
 })
 
 test('saves the model choices under a name and switches back to them in one step', async ({ page }) => {
@@ -271,8 +266,7 @@ test('saves the model choices under a name and switches back to them in one step
   })
   await page.goto('/')
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
-  await page.locator('.st-tabs [data-tab="models"]').click()
+  await page.locator('[data-settings="models"]').click()
   const saved = page.getByLabel('Saved model configuration')
   await expect(saved).toHaveValue('Quota day')
 
@@ -306,10 +300,9 @@ test('adds no gateway sections on a personal computer', async ({ page }) => {
   const state = await setup(page, 'local')
   await page.goto('/')
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
-  await page.locator('.st-tabs [data-tab="accounts"]').click()
-  await expect(page.locator('.st-tab[data-tab="accounts"] .tp-group-label').first()).toHaveText('Connected accounts')
+  await page.locator('[data-settings="accounts"]').click()
+  await expect(page.locator('#settings-panel .tp-title')).toHaveText('Accounts')
   await expect(page.locator('.st-link-label')).toHaveCount(0)
-  await expect(page.locator('.st-tabs [data-tab="admin"]')).toHaveCount(0)
+  await expect(page.locator('#settings-panel [data-tab="admin"]')).toHaveCount(0)
   expect(state.gatewayCalls).toEqual([])
 })

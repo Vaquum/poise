@@ -1,4 +1,4 @@
-/** Short, delayed tooltips for icon-only controls, including newly rendered ones. */
+/** Delayed icon labels and contextual help, including newly rendered controls. */
 export function installIconTooltips(root: HTMLElement = document.body): () => void {
   const tip = document.createElement('div')
   tip.id = 'poise-icon-tooltip'
@@ -9,12 +9,16 @@ export function installIconTooltips(root: HTMLElement = document.body): () => vo
   let target: HTMLElement | null = null
   let timer: ReturnType<typeof setTimeout> | undefined
   function icon(node: EventTarget | null): HTMLElement | null {
+    const help = node instanceof Element ? node.closest<HTMLElement>('[data-help]') : null
+    if (help && root.contains(help)) return help
     const button = node instanceof Element ? node.closest<HTMLElement>('button, [role="button"]') : null
     if (!button || !root.contains(button)) return null
+    if (button.id === 'menu-toggle' && button.getAttribute('aria-expanded') === 'true') return null
     return button.matches('.chat-icon-btn, .chat-copy-btn, .chat-attachment-remove, .chat-session-delete, [data-tooltip]')
       || (!!button.querySelector('svg') && !button.textContent?.trim()) ? button : null
   }
   function label(button: HTMLElement): string {
+    if (button.dataset.help) return button.dataset.help
     const text = button.dataset.tooltip || button.getAttribute('aria-label') || button.title
     return (text || '').replace(/[.…]+$/g, '').trim().split(/\s+/).slice(0, 2).join(' ')
   }
@@ -40,6 +44,7 @@ export function installIconTooltips(root: HTMLElement = document.body): () => vo
     timer = setTimeout(() => {
       if (target !== button || !button.isConnected || button.closest('[hidden], [inert]')) return hide()
       tip.textContent = label(button)
+      tip.classList.toggle('context-tooltip', !!button.dataset.help)
       tip.hidden = false
       const box = button.getBoundingClientRect()
       const width = tip.offsetWidth
@@ -47,7 +52,7 @@ export function installIconTooltips(root: HTMLElement = document.body): () => vo
       tip.style.left = `${Math.max(8, Math.min(box.x + box.width / 2 - width / 2, innerWidth - width - 8))}px`
       tip.style.top = `${box.bottom + height + 8 <= innerHeight ? box.bottom + 6 : Math.max(8, box.top - height - 6)}px`
       button.setAttribute('aria-describedby', [button.getAttribute('aria-describedby'), tip.id].filter(Boolean).join(' '))
-    }, 1000)
+    }, button.dataset.help ? 500 : 1000)
   }
   const over = (event: Event) => { const button = icon(event.target); if (button) show(button) }
   const out = (event: MouseEvent) => { if (target && !(event.relatedTarget instanceof Node && target.contains(event.relatedTarget))) hide() }
@@ -60,8 +65,8 @@ export function installIconTooltips(root: HTMLElement = document.body): () => vo
   document.addEventListener('keydown', key, true)
   document.addEventListener('scroll', hide, true)
   window.addEventListener('resize', hide)
-  const observer = new MutationObserver(() => { if (target && (!target.isConnected || target.closest('[hidden], [inert]'))) hide() })
-  observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden', 'inert'] })
+  const observer = new MutationObserver(() => { if (target && (!target.isConnected || target.closest('[hidden], [inert]') || target.id === 'menu-toggle' && target.getAttribute('aria-expanded') === 'true')) hide() })
+  observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden', 'inert', 'aria-expanded'] })
   return () => {
     hide()
     observer.disconnect()

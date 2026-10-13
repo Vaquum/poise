@@ -482,7 +482,7 @@ container and the volume: `docker rm poise-ws-<handle>` and
    that CLI's own login. Connect GitHub twice: sign in once as your own GitHub
    account and once as your agent account.
 3. In **Settings → General → GitHub**, set **Your GitHub account** and
-   **Agent account**. Both must be signed in to `gh` in the workspace. Poise
+   **GitHub automation account**. Both must be signed in to `gh` in the workspace. Poise
    acts on GitHub only as these two accounts, and every automation that posts
    reviews or comments fails, saying so, until the agent account is set.
    There is no server-wide default: `REVIEW_AGENT_USERNAME` only seeds the

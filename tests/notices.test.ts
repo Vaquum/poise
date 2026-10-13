@@ -60,6 +60,21 @@ const shown = (now: number) => notices.noticesState(now).notices
 const titles = (now: number) => shown(now).map((notice) => notice.title)
 
 describe('the notices', () => {
+  it('names GitHub in an existing automation warning without changing its identity or dismissal', () => {
+    const alert = store.raiseAlert({
+      kind: 'sign_in_needed', dedupeKey: 'sign-in:gh:agent',
+      title: 'The agent account is not signed in to gh', body: 'Sign in as octo-agent.',
+      path: '/?settings=accounts', target: { settings: 'accounts' },
+    }, T0)!
+    expect(shown(at(1))).toEqual([{
+      id: alert.id, kind: 'sign_in_needed', title: 'Your GitHub automation account is not signed in',
+      body: 'Sign in as octo-agent.', since: alert.createdAt, due: alert.createdAt,
+      silenceable: false, target: { settings: 'accounts' },
+    }])
+    notices.dismissNotice(alert.id, at(2))
+    expect(shown(at(3))).toEqual([])
+    expect(store.latestAlertSeq()).toBe(alert.seq)
+  })
   it('shows the unresolved alerts, the most pressing first, the newest first within a kind', () => {
     store.raiseAlert(finished, at(0))
     store.raiseAlert(ready(1), at(1))

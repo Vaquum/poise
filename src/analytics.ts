@@ -22,7 +22,7 @@ function buildPanel(): HTMLElement {
   panel.id = 'analytics-panel'
   panel.setAttribute('aria-label', 'Analytics')
   panel.innerHTML = `
-    <div class="tp-header"><span class="tp-title">Analytics</span>
+    <div class="tp-header"><span class="tp-title" data-help="Counts the work shown in Current. Per-PR numbers cover pull requests merged in the selected range." tabindex="0">Analytics</span>
       <button class="tp-close" type="button" aria-label="Close analytics">&times;</button></div>
     <div class="tp-body">
       <div class="range-picker analytics-range" role="group" aria-label="Time range">
@@ -30,7 +30,6 @@ function buildPanel(): HTMLElement {
       </div>
       <p class="analytics-status st-help" role="status" hidden></p>
       <div class="analytics-groups" aria-live="polite"></div>
-      <p class="tp-hint analytics-scope">Counts what Current shows: what you are involved in and what the agent account opened. Per-PR numbers are over the pull requests merged in the range.</p>
     </div>`
   panel.querySelector('.tp-close')!.addEventListener('click', () => closeAnalyticsPanel())
   panel.querySelector('.analytics-range')!.addEventListener('click', (e) => {
@@ -64,9 +63,8 @@ function renderReport(panel: HTMLElement, report: AnalyticsReport): void {
       <dl class="analytics-tiles">
         ${group.tiles.map((tile) => `
           <div class="analytics-tile">
-            <dt class="analytics-label">${escapeHtml(tile.label)}</dt>
+            <dt class="analytics-label"${tile.note ? ` data-help="${escapeHtml(tile.note)}" tabindex="0"` : ''}>${escapeHtml(tile.label)}</dt>
             <dd class="analytics-value">${escapeHtml(tile.value)}</dd>
-            ${tile.note ? `<dd class="analytics-note">${escapeHtml(tile.note)}</dd>` : ''}
           </div>`).join('')}
       </dl>
       ${group.note ? `<p class="analytics-group-note">${escapeHtml(group.note)}</p>` : ''}
@@ -134,6 +132,7 @@ export function initAnalytics(): void {
 
 export function openAnalyticsPanel(): void {
   if (!panelEl) return
+  window.dispatchEvent(new CustomEvent('poise:panel-opening', { detail: { id: panelEl.id } }))
   range = currentViewTimeRange()
   panelEl.removeAttribute('inert')
   panelEl.removeAttribute('aria-hidden')

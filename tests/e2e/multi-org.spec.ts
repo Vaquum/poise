@@ -87,7 +87,7 @@ async function setup(page: Page, initial = [organization('acme')], me = 'octocat
 
 async function openSettings(page: Page) {
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('[data-action="settings"]').click()
+  await page.locator('[data-settings="general"]').click()
   await expect(page.locator('#settings-panel')).toHaveClass(/open/)
 }
 
@@ -244,7 +244,7 @@ test('keeps shared behavior memory editable when one account loses readiness', a
   // Keyboard navigation preserves the open memory draft while Settings reloads.
   await page.getByRole('button', { name: 'Menu', exact: true }).focus()
   await page.keyboard.press('Enter')
-  await page.locator('[data-action="settings"]').focus()
+  await page.locator('[data-settings="general"]').focus()
   await page.keyboard.press('Enter')
   await expect(page.locator('#settings-panel')).toHaveClass(/open/)
   await expect(page.locator('.st-organization[data-org="beta"]')).toContainText('Activating…')
@@ -298,8 +298,8 @@ test('adds a personal GitHub account alongside an organization with shared behav
   const state = await setup(page)
   await page.goto('/')
   await openSettings(page)
-  await expect(page.locator('#settings-panel')).toContainText('GitHub accounts')
-  await expect(page.locator('#settings-panel')).toContainText('Add an organization name or personal username.')
+  await expect(page.locator('label[for="st-organization"]')).toHaveText('Following')
+  await expect(page.locator('label[for="st-organization"]')).toHaveAttribute('data-help', /Organizations and personal accounts to follow/)
   await page.getByLabel('New GitHub account').fill('mikkokotila')
   await page.locator('.st-add-organization').click()
   const personal = page.locator('.st-organization[data-org="mikkokotila"]')

@@ -71,7 +71,7 @@ test('connects a CLI from Settings in a terminal and shows its new sign-in', asy
     // Where a sign-in alert opens the workspace: Settings → Connected accounts.
     await page.goto(`${fixture.origin}/?settings=accounts`)
     await expect(page.locator('#settings-panel')).toHaveClass(/open/)
-    await expect(page.getByRole('tab', { name: 'Accounts' })).toHaveAttribute('aria-selected', 'true')
+    await expect(page.locator('#settings-panel')).toHaveAttribute('data-section', 'accounts')
     await expect(page).toHaveURL(`${fixture.origin}/`)
 
     const row = (id: string) => page.locator(`.st-account[data-account="${id}"]`)
@@ -81,11 +81,11 @@ test('connects a CLI from Settings in a terminal and shows its new sign-in', asy
     await expect(row('claude')).toContainText('2.1.288')
     await expect(row('claude')).toContainText('Claude Max subscription')
     await expect(row('codex').locator('.st-account-state')).toHaveText('Not signed in')
-    await expect(row('codex')).toContainText('Runs codex login --device-auth')
+    await expect(row('codex').getByRole('button', { name: 'Connect Codex' })).toHaveAttribute('data-help', 'Opens a sign-in terminal: codex login --device-auth')
     await expect(row('gh').locator('.st-account-state')).toHaveText('Signed in as octocat')
     // Settings → General names octocat as your account and octo-agent as the agent's.
     await expect(row('gh').locator('.st-gh-account[data-login="octocat"] .st-gh-notes')).toHaveText('active · your GitHub account')
-    await expect(row('gh').locator('.st-gh-account[data-login="octo-agent"] .st-gh-notes')).toHaveText('agent account')
+    await expect(row('gh').locator('.st-gh-account[data-login="octo-agent"] .st-gh-notes')).toHaveText('automation account')
     await expect(row('gh').locator('.st-gh-missing')).toHaveCount(0)
     await expect(row('grok').locator('.st-account-state')).toHaveText('Sign-in not reported')
     await expect(row('grok')).toContainText('Grok\'s CLI has no command that reports whether it is signed in.')
@@ -103,6 +103,12 @@ test('connects a CLI from Settings in a terminal and shows its new sign-in', asy
     await expect(terminal.locator('.xterm-rows')).toContainText('ABCD-1234')
     await expect(terminal.locator('.st-terminal-status')).toHaveText('Running in your workspace. Close ends it.')
     await expect(page.locator('#settings-panel')).toHaveClass(/st-terminal-open/)
+    await page.setViewportSize({ width: 420, height: 820 })
+    await expect.poll(() => page.locator('#settings-panel').evaluate((panel) => {
+      const frame = document.getElementById('menu-surface')!
+      return panel.scrollWidth - frame.clientWidth
+    })).toBeLessThanOrEqual(1)
+    await page.setViewportSize({ width: 1280, height: 720 })
     // One login at a time from here.
     await expect(page.getByRole('button', { name: 'Reconnect Claude' })).toBeDisabled()
     for (const theme of ['light', 'dark']) {

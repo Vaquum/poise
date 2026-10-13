@@ -85,7 +85,7 @@ describe('sign-in alerts from Connected accounts', () => {
       },
       {
         kind: 'sign_in_needed', key: 'sign-in:gh:agent', resolved: null, url: '/?settings=accounts',
-        title: 'The agent account is not signed in to gh',
+        title: 'Your GitHub automation account is not signed in',
         body: 'Reviews and comments are posted as octo-agent, which gh does not hold signed in. Connect GitHub in Settings → Accounts and sign in as octo-agent.',
       },
     ])

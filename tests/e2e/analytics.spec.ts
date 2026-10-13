@@ -90,7 +90,7 @@ test('opens on Current\'s range and reads another range without changing Current
   await expect(value(page, 'Comments')).toHaveText('3.3')
   await expect(value(page, 'Median lines')).toHaveText('180')
   await expect(value(page, 'Behaviors')).toHaveText('2.0')
-  await expect(panel).toContainText('4 approvals · 4 reviews · 0 change requests')
+  await expect(panel.locator('.analytics-label').filter({ hasText: /^Behaviors$/ })).toHaveAttribute('data-help', '4 approvals · 4 reviews · 0 change requests')
   await expect(panel).toContainText('From 3 of 4 pull requests')
   expect(state.reads).toEqual([{ since: '2026-10-05T00:00:00.000Z', until: null, org: null }])
 

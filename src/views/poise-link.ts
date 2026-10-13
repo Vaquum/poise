@@ -63,10 +63,9 @@ function devicesHtml(devices: PairedDevice[]): string {
     <div class="pl-device" data-device="${escapeHtml(device.id)}">
       <div class="pl-device-head">
         <span class="pl-device-name">${escapeHtml(deviceName(device))}</span>
-        <span class="pl-device-state pl-device-state-${state.tone}">${state.text}</span>
+        <span class="pl-device-state pl-device-state-${state.tone}"${device.state === 'active' && !device.connected ? ` data-help="${NOT_CONNECTED_HELP}" tabindex="0"` : ''}>${state.text}</span>
       </div>
       <div class="st-help st-help-info pl-device-times">Paired ${escapeHtml(moment(device.createdAt))}${escapeHtml(seen(device))}</div>
-      ${device.state === 'active' && !device.connected ? `<div class="st-help st-help-info">${NOT_CONNECTED_HELP}</div>` : ''}
       ${device.state === 'active'
         ? `<button type="button" class="st-clear pl-revoke" data-revoke="${escapeHtml(device.id)}">Revoke</button>`
         : device.state === 'expired' ? '<div class="st-help st-help-info">Pair it again in Poise Link.</div>' : ''}
@@ -106,16 +105,14 @@ export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOpti
   const curl = `curl -fsSL ${account.link.installer} | sh`
   const wget = `wget -qO- ${account.link.installer} | sh`
   element.innerHTML = `
-    ${options.guided ? '' : `<div class="tp-section">
-      <div class="st-help st-help-info pl-intro">Poise Link keeps your snippets on your computer and brings Poise's alerts to it.</div>
-    </div>`}
     <div class="tp-section">
-      <span class="tp-label">${options.guided ? '1. Install Poise Link' : 'Install it'}</span>
+      <span class="tp-label" data-help="Poise Link syncs snippets and delivers alerts to your computer. The command installs it on macOS, Debian 12+ or Ubuntu 24.04+, with Espanso when needed." tabindex="0">${options.guided ? '1. Install Poise Link' : 'Install Poise Link'}</span>
       <div class="pl-command">
         <code class="pl-command-text">${escapeHtml(curl)}</code>
         <button type="button" class="st-clear pl-copy">Copy</button>
       </div>
-      <div class="st-help st-help-info">Run it in a terminal on macOS, Debian 12+ or Ubuntu 24.04+. It installs Poise Link, and Espanso when it is missing, then opens Poise Link to pair. Without curl: <code>${escapeHtml(wget)}</code>. Windows installers are on the <a href="${escapeHtml(account.link.releases)}" target="_blank" rel="noopener noreferrer">release page</a>.</div>
+      <div class="st-help st-help-info">Run on your computer. <a href="${escapeHtml(account.link.releases)}" target="_blank" rel="noopener noreferrer">Windows installer</a></div>
+      <details class="pl-install-options"><summary>Without curl</summary><code>${escapeHtml(wget)}</code></details>
     </div>
     <div class="tp-section">
       <label class="tp-label" for="${codeId}">${options.guided ? '2. Enter the code Poise Link shows' : 'Enter the code Poise Link shows'}</label>

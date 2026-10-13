@@ -64,6 +64,7 @@
 .pl-device-head {
   display: flex;
   align-items: baseline;
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: var(--sp-2);
   width: 100%;
@@ -98,3 +99,7 @@
 }
 
 .pl a:hover { color: var(--text); }
+
+.pl-install-options { margin-top: var(--sp-2); font-size: .6875rem; color: var(--text-secondary); }
+.pl-install-options summary { cursor: pointer; }
+.pl-install-options code { display: block; margin-top: var(--sp-2); overflow-wrap: anywhere; }

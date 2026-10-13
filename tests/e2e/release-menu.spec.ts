@@ -32,7 +32,7 @@ test('the menu opens on the commit Poise runs and since when', async ({ page }) 
   await expect(link).toHaveAttribute('target', '_blank')
   // Above Settings and Typography.
   const first = await line.boundingBox()
-  const settings = await page.locator('#menu-popover').getByRole('button', { name: 'Settings' }).boundingBox()
+  const settings = await page.locator('#menu-popover').getByRole('button', { name: 'General', exact: true }).boundingBox()
   expect(first!.y + first!.height).toBeLessThanOrEqual(settings!.y)
 })
 
@@ -45,7 +45,7 @@ test('a build without a commit opens the menu on Settings', async ({ page }) => 
   await answered
   // The line starts hidden: look only once the page has handled the answer.
   await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 50)))
-  await expect(page.locator('#menu-popover').getByRole('button', { name: 'Settings' })).toBeVisible()
+  await expect(page.locator('#menu-popover').getByRole('button', { name: 'General', exact: true })).toBeVisible()
   await expect(page.locator('#menu-popover .menu-release')).toBeHidden()
   await expect(page.locator('#menu-popover .menu-release-divider')).toBeHidden()
   // The same menu shows the line as soon as there is a commit to show.

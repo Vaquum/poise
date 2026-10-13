@@ -309,6 +309,7 @@ function apply() {
 function buildPanel(): HTMLElement {
   const panel = document.createElement('aside')
   panel.id = 'typo-panel'
+  panel.setAttribute('aria-label', 'Typography')
   panel.innerHTML = `<div class="tp-header"><span class="tp-title">Typography</span>`
     + `<button class="tp-close" type="button" aria-label="Close typography">&times;</button></div>`
     + `<div class="tp-body"></div>`
@@ -318,7 +319,7 @@ function buildPanel(): HTMLElement {
   // Archetype selector
   const archSection = document.createElement('div')
   archSection.className = 'tp-section'
-  archSection.innerHTML = `<label class="tp-label">Archetype</label><select class="tp-select"></select>`
+  archSection.innerHTML = `<label class="tp-label" for="tp-archetype" data-help="A coordinated set of fonts for body text and headings." tabindex="0">Font style</label><select id="tp-archetype" class="tp-select"></select>`
   const sel = archSection.querySelector('select')!
   for (const [key, arch] of Object.entries(ARCHETYPES)) {
     const opt = document.createElement('option')
@@ -347,9 +348,18 @@ function buildPanel(): HTMLElement {
     const section = document.createElement('div')
     section.className = 'tp-section'
     const val = config[def.key] as number
+    const id = `tp-${def.key}`
+    const help: Partial<Record<keyof TypoConfig, string>> = {
+      headingSpacing: 'Space before and after editor headings, proportional to their size.',
+      paragraphSpacing: 'Extra space after editor paragraphs. Negative values bring paragraphs closer.',
+      headingLineHeight: 'Distance between lines in editor headings.',
+      contentWidth: 'Maximum width of the main workspace.',
+      rowPadding: 'Space above and below each table row.',
+      commentLines: 'Maximum visible lines in card comment previews.',
+    }
     section.innerHTML = `
-      <div class="tp-row"><label class="tp-label">${def.label}</label><span class="tp-val">${def.fmt(val)}</span></div>
-      <input type="range" class="tp-range" min="${def.min}" max="${def.max}" step="${def.step}" value="${val}">
+      <div class="tp-row"><label class="tp-label" for="${id}"${help[def.key] ? ` data-help="${help[def.key]}" tabindex="0"` : ''}>${def.label}</label><span class="tp-val">${def.fmt(val)}</span></div>
+      <input id="${id}" type="range" class="tp-range" min="${def.min}" max="${def.max}" step="${def.step}" value="${val}">
     `
     const input = section.querySelector('input')!
     const valEl = section.querySelector('.tp-val')!
@@ -433,6 +443,7 @@ function onTypoKeydown(e: KeyboardEvent) {
 
 export function openTypographyPanel() {
   if (!panelEl) return
+  window.dispatchEvent(new CustomEvent('poise:panel-opening', { detail: { id: panelEl.id } }))
   panelEl.removeAttribute('inert')
   panelEl.removeAttribute('aria-hidden')
   panelEl.classList.add('open')

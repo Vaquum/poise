@@ -10,6 +10,7 @@
 // Settings → General → Notifications turns this off: the page shows nothing
 // and nothing here checks GitHub. Poise Link's other alerts go on as before.
 
+import { GITHUB_AUTOMATION_SIGN_IN_TITLE } from '../accounts/types'
 import { getBehaviorIncident, listBehaviorIncidents } from '../db'
 import { readOwnPullRequests, type OwnPullRequest } from '../gh'
 import { HttpError } from '../http'
@@ -85,7 +86,8 @@ export function noticesState(now = Date.now()): NoticesState {
     return [{
       id: alert.id,
       kind: alert.kind,
-      title: alert.title,
+      title: alert.kind === 'sign_in_needed' && alert.dedupeKey === 'sign-in:gh:agent'
+        ? GITHUB_AUTOMATION_SIGN_IN_TITLE : alert.title,
       body: target && 'swarm' in target ? 'Open Swarm in Poise to see what happened.' : alert.body,
       since: alert.createdAt,
       due: new Date(due).toISOString(),

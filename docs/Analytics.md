@@ -60,3 +60,8 @@ comment on issues, not pull requests, and are not counted either.
 (inclusive) and `until` (exclusive) are times with a timezone, and either may
 be left out; `org` narrows to one account. Implemented in
 `server/analytics.ts`.
+
+The menu and panel share a surface attached to the burger. Time ranges use a
+two-column picker. Metric explanations appear after half a second on hover
+or on keyboard focus; missing data and coverage notes remain visible. See
+[Menu and Settings](Menu.md).
