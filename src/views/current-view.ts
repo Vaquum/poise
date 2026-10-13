@@ -102,6 +102,7 @@ const PENDING_TTL_MS = 60 * 60 * 1000
 // when navigating away. Single shared clock — see startRefreshTicker().
 const onLiveTick = () => pollLiveTick()
 let liveListening = false
+let currentLoadSequence = 0
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -505,9 +506,10 @@ function restoreOpenEdit(draft: EditDraft | null): void {
   startEdit(cardEl, draft)
 }
 
-function renderAll() {
+function renderAll(type?: LaneType) {
   const draft = captureOpenEdit() ?? openEditDraft
   for (const l of LANES) {
+    if (type && l.type !== type) continue
     const list = laneListEl(l.key)
     list.innerHTML = ''
     let count = 0
@@ -527,7 +529,7 @@ function renderAll() {
       : ''
     renderLaneEmptyState(l, count)
   }
-  restoreOpenEdit(draft)
+  if (type !== 'live') restoreOpenEdit(draft)
 }
 
 // An empty lane and a lane emptied by a filter look identical, and the second
@@ -675,34 +677,32 @@ async function api<T>(method: string, path: string, body?: unknown): Promise<T> 
   return res.json()
 }
 
-async function fetchManual() {
+async function fetchManual(sequence = currentLoadSequence) {
   const org = getSelectedOrganization()
   const res = await fetch(organizationUrl('/api/current'))
   if (!res.ok) throw new Error(`/api/current ${res.status}`)
   const data = await res.json()
-  if (org !== getSelectedOrganization()) return
+  if (org !== getSelectedOrganization() || sequence !== currentLoadSequence) return
   manualCards = data.cards.filter((c: ManualCard) => c.lane === 'idea' || c.lane === 'concept' || c.lane === 'plan')
 }
 
-// Fill the org-wide repo list. Server caches 5 min so this is cheap on
-// every view init. Silently swallows errors — composers fall back to
-// the involvement-derived list.
-async function fetchAllRepos() {
+// Repository discovery can paginate GitHub for several seconds on a cache
+// miss. It feeds composers, never the board's first paint.
+async function fetchAllRepos(sequence = currentLoadSequence) {
   const org = getSelectedOrganization()
-  try {
-    const res = await fetch(organizationUrl('/api/repos'))
-    if (!res.ok) return
-    const data = await res.json()
-    if (org !== getSelectedOrganization()) return
-    repoLoadWarning = organizationErrors(data)
-    allRepos = Array.isArray(data.repos) ? data.repos : []
-  } catch { /* ignore */ }
+  const res = await fetch(organizationUrl('/api/repos'))
+  if (!res.ok) throw new Error(`/api/repos ${res.status}`)
+  const data = await res.json()
+  if (org !== getSelectedOrganization() || sequence !== currentLoadSequence) return
+  repoLoadWarning = organizationErrors(data)
+  allRepos = Array.isArray(data.repos) ? data.repos : []
+  refreshRepositorySelectors()
 }
 
 // Pull /api/agent-logs and rebuild the set of running-job keys. Called
 // alongside fetchLive on each refresh tick. Errors are swallowed —
 // the breathing accent simply doesn't show.
-async function fetchAgentActive() {
+async function fetchAgentActive(sequence = currentLoadSequence) {
   const org = getSelectedOrganization()
   try {
     const res = await fetch(organizationUrl('/api/agent-logs'))
@@ -714,7 +714,7 @@ async function fetchAgentActive() {
         next.add(`${e.repo}#${e.pr_id}`)
       }
     }
-    if (org !== getSelectedOrganization()) return
+    if (org !== getSelectedOrganization() || sequence !== currentLoadSequence) return
     agentActiveKeys = next
   } catch { /* ignore */ }
 }
@@ -777,6 +777,7 @@ function applyPrStatusClasses() {
 }
 
 export function stopCurrentPolling() {
+  currentLoadSequence++
   if (liveListening) {
     window.removeEventListener('poise:refresh-tick', onLiveTick)
     liveListening = false
@@ -927,12 +928,25 @@ function attachAddHandlers() {
 // only if /api/repos hasn't loaded yet (cold start race).
 function manualRepoOptionsHtml(selected: string | null = null): string {
   const repos = allRepos.length > 0 ? allRepos : distinctRepos()
-  const opts = ['<option value="">— no repo —</option>']
-  for (const r of repos) {
-    const sel = selected === r ? ' selected' : ''
-    opts.push(`<option value="${escapeHtml(r)}"${sel}>${escapeHtml(r)}</option>`)
+  return '<option value="">— no repo —</option>' + repositoryOptionsHtml(repos, selected || '')
+}
+
+function repositoryOptionsHtml(repos: string[], selected: string): string {
+  // A card's linked repository is intent, even before discovery can confirm
+  // it. Never substitute the first live-feed repository for that selection.
+  const choices = [...new Set([...repos, ...(selected ? [selected] : [])])]
+  return choices.map((repo) => `<option value="${escapeHtml(repo)}"${repo === selected ? ' selected' : ''}>${escapeHtml(repo)}</option>`).join('')
+}
+
+function refreshRepositorySelectors(): void {
+  const repos = allRepos.length > 0 ? allRepos : distinctRepos()
+  for (const select of viewEl.querySelectorAll<HTMLSelectElement>('.manual-repo')) {
+    select.innerHTML = manualRepoOptionsHtml(select.value || null)
   }
-  return opts.join('')
+  for (const select of viewEl.querySelectorAll<HTMLSelectElement>('.issue-repo')) {
+    select.innerHTML = repositoryOptionsHtml(repos, select.value)
+      || '<option value="">(no repos available)</option>'
+  }
 }
 
 function openManualComposer(lane: 'idea' | 'concept' | 'plan') {
@@ -1041,9 +1055,8 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
   // pre-select it; the user can still change it before submitting.
   const repos = allRepos.length > 0 ? allRepos : distinctRepos()
   const wantRepo = prefill?.repo || ''
-  const repoOptions = repos.length === 0
-    ? '<option value="">(no repos available)</option>'
-    : repos.map((r) => `<option value="${escapeHtml(r)}"${r === wantRepo ? ' selected' : ''}>${escapeHtml(r)}</option>`).join('')
+  const repoOptions = repositoryOptionsHtml(repos, wantRepo)
+    || '<option value="">(no repos available)</option>'
 
   const composer = document.createElement('div')
   composer.className = 'composer composer-issue'
@@ -1073,15 +1086,8 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
   // is required" with no way out but closing the composer and losing the text.
   // Fill it in when the real list lands.
   if (allRepos.length === 0) {
-    void fetchAllRepos().then(() => {
-      if (!composer.isConnected || allRepos.length === 0) return
-      const chosen = repoSel.value
-      repoSel.innerHTML = allRepos
-        .map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`)
-        .join('')
-      // Keep whatever was already picked if it survived into the real list.
-      if (chosen && allRepos.includes(chosen)) repoSel.value = chosen
-      else if (wantRepo && allRepos.includes(wantRepo)) repoSel.value = wantRepo
+    void fetchAllRepos().catch((error: unknown) => {
+      if (composer.isConnected) showError(`Could not load repositories — ${(error as Error).message}`)
     })
   }
 
@@ -1713,6 +1719,7 @@ function attachFilterHandlers() {
 
 export async function initCurrentView() {
   const org = getSelectedOrganization()
+  const sequence = ++currentLoadSequence
   viewEl = document.getElementById('view-current')!
   if (!initialized) {
     initialized = true
@@ -1736,30 +1743,33 @@ export async function initCurrentView() {
       if (!viewEl.hidden) void initCurrentView()
     })
   }
-  // Promise.all rejects on the first failure, so a single unreachable GitHub
-  // cache skipped renderAll entirely and the board stayed blank — including
-  // the person's own cards, which had loaded from SQLite perfectly well. Let
-  // each source fail on its own, paint whatever arrived, and say what did not.
-  const [manual, live, repos, active] = await Promise.allSettled([
-    fetchManual(), fetchLive(), fetchAllRepos(), fetchAgentActive(),
-  ])
-  if (org !== getSelectedOrganization()) return
-  renderAll()
-  const failures: string[] = []
-  if (manual.status === 'rejected') failures.push('your cards')
-  if (live.status === 'rejected') failures.push('GitHub issues and pull requests')
-  if (repos.status === 'rejected') failures.push('the repository list')
-  if (active.status === 'rejected') failures.push('agent activity')
-  showLoadError(failures.length
-    ? `Could not load ${failures.join(', ')}. Showing what is available.`
-    : liveLoadWarning || repoLoadWarning)
-  fetchPrStatus()                    // first PR-status pull, intentionally not awaited
-  // Combined refresh at the user-chosen cadence (1m or 5m, from
-  // Settings). Re-fetch live items + PR-status, re-render the live
-  // lanes through the FLIP animator so cards glide to their new
-  // updated_at order. Cancelled on view leave; restarted whenever the
-  // rate changes.
+  // Attach before the reads: a slow completion after leaving must never
+  // reattach polling. Each source paints independently of the others.
   startLiveTimer()
+  const current = () => sequence === currentLoadSequence && org === getSelectedOrganization()
+  const failures = new Set<string>()
+  const load = async (label: string, read: Promise<void>, paint: () => void) => {
+    try {
+      await read
+      if (!current()) return
+      paint()
+    } catch {
+      if (!current()) return
+      failures.add(label)
+    }
+    showLoadError(failures.size
+      ? `Could not load ${[...failures].join(', ')}. Showing what is available.`
+      : liveLoadWarning || repoLoadWarning)
+  }
+  await Promise.all([
+    load('your cards', fetchManual(sequence), () => renderAll('manual')),
+    load('GitHub issues and pull requests', fetchLive(), () => {
+      renderAll('live')
+      void fetchPrStatus()
+    }),
+    load('the repository list', fetchAllRepos(sequence), () => {}),
+    load('agent activity', fetchAgentActive(sequence), applyActiveClasses),
+  ])
 }
 
 function startLiveTimer() {

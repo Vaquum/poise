@@ -458,42 +458,44 @@ async function fetchPage(): Promise<void> {
   loader.hidden = false
   try {
     const payload = buildListPayload()
-    const [pageRes, countRes] = await Promise.all([
-      fetch('/api/gh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }),
-      // Total count is a separate call so the page payload doesn't carry it.
-      // count_only ignores limit/offset — it returns the size of the full
-      // filtered set so the "20 / 1083" pill stays honest as the user pages.
-      fetch('/api/gh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...payload, count_only: true, limit: undefined, offset: undefined }),
-      }),
-    ])
+    // Start the full-history count alongside the page, but paint the bounded
+    // page first. A count failure must not discard rows already available.
+    const countRead = fetch('/api/gh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, count_only: true, limit: undefined, offset: undefined }),
+    }).catch(() => null)
+    const pageRes = await fetch('/api/gh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
     if (!pageRes.ok) throw new Error(`Github ${pageRes.status}`)
     const pageData  = await pageRes.json()
-    // The count is a separate request and only feeds the "20 / 1083" pill.
-    // Failing the whole page on it threw away rows that had arrived perfectly
-    // well; the page is the thing the person came for.
-    const countData = countRes.ok ? await countRes.json().catch(() => ({})) : {}
     // The filters moved while this was out; these rows answer a question
     // nobody is asking any more.
     if (mine !== queryGeneration) return
-    const countComplete = countRes.ok && typeof countData.count === 'number' && !organizationErrors(countData)
-    partialResults = !countComplete || !!organizationErrors(pageData)
+    partialResults = true
     const newItems: PrRow[] = (pageData.records as GhRecord[] || []).map(recordToRow)
-    total = typeof countData.count === 'number' ? countData.count : items.length + newItems.length
+    total = items.length + newItems.length
     items.push(...newItems)
     offset += newItems.length
-    if (newItems.length < PAGE_SIZE || (countComplete && items.length >= total)) done = true
+    if (newItems.length < PAGE_SIZE) done = true
 
     consecutiveFailures = 0
-    showLoadError(organizationErrors(pageData) || organizationErrors(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
+    showLoadError(organizationErrors(pageData))
     loader.hidden = done
     appendRows(newItems)
+    const countRes = await countRead
+    const countData = countRes?.ok ? await countRes.json().catch(() => ({})) : {}
+    if (mine !== queryGeneration) return
+    const countComplete = !!countRes?.ok && typeof countData.count === 'number' && !organizationErrors(countData)
+    partialResults = !countComplete || !!organizationErrors(pageData)
+    if (typeof countData.count === 'number') total = countData.count
+    if (countComplete && items.length >= total) done = true
+    loader.hidden = done
+    updateCount()
+    showLoadError(organizationErrors(pageData) || organizationErrors(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
   } catch (err) {
     if (mine !== queryGeneration) return
     loader.hidden = true
@@ -732,27 +734,23 @@ async function refreshMainSoft() {
     if (win.until)   payload.updated_until = win.until
     if (searchQuery) payload.q = searchQuery
 
-    const [pageRes, countRes] = await Promise.all([
-      fetch('/api/gh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }),
-      fetch('/api/gh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...payload, count_only: true, limit: undefined, offset: undefined }),
-      }),
-    ])
+    const countRead = fetch('/api/gh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, count_only: true, limit: undefined, offset: undefined }),
+    }).catch(() => null)
+    const pageRes = await fetch('/api/gh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
     // A bare `return` here left an HTTP failure of the background refresh
     // silent, which is the case that most needs saying.
     if (!pageRes.ok)  throw new Error(`Github ${pageRes.status}`)
     if (mine !== queryGeneration) return
     const pageData  = await pageRes.json()
-    const countData = countRes.ok ? await countRes.json().catch(() => ({})) : {}
     if (mine !== queryGeneration) return
-    const countComplete = countRes.ok && typeof countData.count === 'number' && !organizationErrors(countData)
-    partialResults = !countComplete || !!organizationErrors(pageData)
+    partialResults = true
     const newTop: PrRow[] = (pageData.records as GhRecord[] || []).map(recordToRow)
 
     // Stitch: the refreshed top, then every row already held that is not in
@@ -764,22 +762,12 @@ async function refreshMainSoft() {
     const tail = items.filter((i) => !newKeyset.has(rowKey(i)))
     const next = [...newTop, ...tail]
 
-    total = typeof countData.count === 'number' ? countData.count : next.length
+    total = next.length
     items = next
     offset = items.length
     const wasDone = done
-    done = countComplete ? items.length >= total : newTop.length < PAGE_SIZE
+    done = newTop.length < PAGE_SIZE
     loader.hidden = done
-    // When a refresh reopens paging — new rows arrived, so there is more to
-    // load again — the IntersectionObserver does not re-fire on its own: it
-    // reports state changes, and the sentinel never left the viewport. Without
-    // a nudge the loader spins forever and scrolling loads nothing.
-    if (wasDone && !done) {
-      requestAnimationFrame(() => {
-        if (mine === queryGeneration && sentinelNeedsFetch()) void fetchPage()
-      })
-    }
-
     if (next.length === 0) {
       tbody.innerHTML = ''
       table.hidden = true
@@ -790,7 +778,25 @@ async function refreshMainSoft() {
       applyMainFlip(next)
     }
     updateCount()
+    showLoadError(organizationErrors(pageData))
+    const countRes = await countRead
+    const countData = countRes?.ok ? await countRes.json().catch(() => ({})) : {}
+    if (mine !== queryGeneration) return
+    const countComplete = !!countRes?.ok && typeof countData.count === 'number' && !organizationErrors(countData)
+    partialResults = !countComplete || !!organizationErrors(pageData)
+    if (typeof countData.count === 'number') total = countData.count
+    done = countComplete ? items.length >= total : newTop.length < PAGE_SIZE
+    loader.hidden = done
+    updateCount()
     showLoadError(organizationErrors(pageData) || organizationErrors(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
+    // Schedule after the count settles, when finally can release `fetching`.
+    // Scheduling before that await would run into the paging guard and lose
+    // the only nudge when a previously finished archive has gained new rows.
+    if (wasDone && !done) {
+      requestAnimationFrame(() => {
+        if (mine === queryGeneration && sentinelNeedsFetch()) void fetchPage()
+      })
+    }
   } catch (err) {
     // A failing background refresh was completely invisible once the table had
     // rows: it froze on the last good page while the relative times kept

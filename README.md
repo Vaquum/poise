@@ -164,7 +164,10 @@ minutes. See [Connected accounts](docs/Connected-accounts.md).
 Current, Archive, and Swarm combine GitHub accounts and offer an account
 filter. Repository labels include their owner. Repository-free manual cards,
 Editor, Snippets, and local chats remain personal. If one account's reads
-fail, available results remain visible with an explicit error.
+fail, available results remain visible with an explicit error. Current paints personal cards and GitHub lanes as
+each read arrives; repository discovery and agent activity do not delay them.
+Archive paints its page before the full-history total is available, showing
+an available-row count until that read finishes.
 
 Behaviors uses one shared set of enabled flags, review settings, repository
 selections, skipped repositories, trusted authors, and memory across all ready
