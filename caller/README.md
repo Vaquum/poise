@@ -86,3 +86,29 @@ explicit targets in one GraphQL query. It returns the acting account,
 merge primitive. A partial query error is returned on its affected target;
 unscoped errors and missing identity/cost evidence fail the operation visibly.
 The read does not merge or use REST polling. An empty list adds no API requests.
+
+## Grey CI recovery
+
+`github-interface --grey-ci-candidates --requests-json
+'[{"repository":"owner/repo","number":7}]' --token-user AGENT` discovers completed
+cancelled/stale GitHub Actions workflows on current PR heads. Up to 50 PRs share
+one GraphQL query; truncated check workflow inventories get extra pages. JSON
+includes `actor`, actual `graphql_cost`, and ordered records with `head_sha`,
+`author`, `runs` and `error`. The newest workflow/event run supersedes older ones.
+
+`github-interface --rerun-grey-ci-if-ready '#7' --run-id ID --run-attempt N
+--expected-head SHA --author USER --token-user AGENT` revalidates current PR
+identity/head, completed cancelled/stale workflow state, exact attempt, all jobs
+and the latest replacement run before a POST to the workflow rerun endpoint.
+A failure, timeout, active or unknown job refuses recovery. Outcomes are
+`rerun_requested`, `not_ready`, `superseded` and `read_failed`; the successful outcome means
+GitHub accepted a request, not that CI passed. Writes are never blindly retried.
+Poise owns the persistent once-per-workflow/head/event intent and ambiguity hold.
+
+Grey CI recovery intents are shared by repository, workflow, event and head,
+independent of PR number or changes to the acting account. Intent is persisted
+before launch; a restart rehydrates unconfirmed requests as visible holds even
+if the workflow is now running or green. Diagnostics belong to each workflow,
+so a different successful rerun cannot clear an unresolved hold. A `read_failed`
+receipt proves no write occurred: its intent is released and the visible read
+failure retries with backoff. Errors after the write begins remain held.

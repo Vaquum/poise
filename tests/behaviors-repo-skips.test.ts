@@ -130,6 +130,11 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
         resolved_count: 0, unresolved_count: unresolvedConversations, conversations: [],
       })
     }
+    if (args[0] === '--grey-ci-candidates') {
+      const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
+      return json({ action: 'grey_ci_candidates', actor: AGENT, graphql_cost: 1,
+        records: requests.map((request) => ({ ...request, head_sha: HEAD, author: ME, runs: [], error: null })) })
+    }
     if (args[0] === '--merge-candidates') {
       const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
       return json({ action: 'merge_candidates', actor: AGENT, graphql_cost: 1,

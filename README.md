@@ -248,10 +248,10 @@ persistent incidents keep holds visible after the source logs disappear.
 
 Behaviors runs the automations that act as your agent account: Review New Pull
 Requests, Approve Pull Requests, Resolve Unblocking Conversations, Merge Pull
-Requests and Review New Issues. Each row's Setting cell opens a dropdown, saved by every way of
+Requests, Rerun Grey CI and Review New Issues. Each row's Setting cell opens a dropdown, saved by every way of
 closing it.
 
-The four pull-request behaviors act on your open pull requests in every
+The five pull-request behaviors act on your open pull requests in every
 repository of your ready accounts except the ones ticked under **Skip
 repositories**. The list groups repositories by account, with Select all for
 each account and for the whole list; Select all ticks the repositories listed
@@ -288,6 +288,25 @@ batch read. These are normal-path counts; transient retries can add requests.
 Skipped, draft and foreign-author candidates are excluded from discovery locally.
 A partial target-read failure is visible without holding other readable targets.
 The scan deadline and resume cursor may defer some evaluations to the next tick.
+
+**Rerun Grey CI** is off by default. Enable it to request one rerun of an eligible
+current-head workflow that completed as cancelled or stale. Failed/timed-out,
+successful, active, intentionally skipped and neutral workflows are excluded.
+Caller verifies the PR, author, head, workflow attempt, every job and the latest
+replacement run before requesting recovery. A workflow containing a failed or
+active job is refused. The behavior never cancels a running workflow.
+Repository skips apply. Last triggered links to the requested workflow rerun;
+it confirms the request, not that CI passed. No model is launched.
+
+Discovery checks up to 50 PRs per ready account in one GraphQL query each minute,
+with zero per-PR REST polling. A positive candidate normally adds five REST reads
+and one rerun write; large workflow/job inventories require extra pages. Transient
+read retries may add calls. When disabled, this behavior adds zero requests.
+This is additional discovery traffic when Merge Pull Requests is also enabled.
+A durable workflow/head/event marker allows one automatic recovery on that head,
+including across restarts or disable/enable. If a write receipt is uncertain,
+the marker and a visible diagnostic hold it rather than risk duplicate reruns.
+A manual rerun or new head remains available through GitHub.
 
 Replay in Swarm runs only what the scheduler itself would run. A pull request
 must be open, not a draft, yours, and outside that behavior's skipped
@@ -660,3 +679,11 @@ server-only `JEV_API_KEY` in `.env`. See [JEV primitive workspaces](docs/Jev-pri
 
 [Menu and Settings](docs/Menu.md) describes the direct Settings destinations,
 attached panels and contextual help.
+
+Grey CI recovery intents are shared by repository, workflow, event and head,
+independent of PR number or changes to the acting account. Intent is persisted
+before launch; a restart rehydrates unconfirmed requests as visible holds even
+if the workflow is now running or green. Diagnostics belong to each workflow,
+so a different successful rerun cannot clear an unresolved hold. A `read_failed`
+receipt proves no write occurred: its intent is released and the visible read
+failure retries with backoff. Errors after the write begins remain held.

@@ -6,7 +6,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from .interface import checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, merge_candidates, merge_if_ready, mergeable, post_pr_comment, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
+from .interface import checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, grey_ci_candidates, rerun_grey_ci_if_ready, merge_candidates, merge_if_ready, mergeable, post_pr_comment, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
 
 TOP_HELP = """usage: github-interface BEHAVIOR ...
 
@@ -34,6 +34,8 @@ behaviors:
   --create-pr-linked-issue PR --title TITLE --body BODY --token-user USER
   --post-pr-comment PR --body BODY
   --mergeable PR
+  --grey-ci-candidates --requests-json JSON --token-user USER
+  --rerun-grey-ci-if-ready PR --run-id ID --run-attempt N --expected-head SHA --author USER --token-user USER
   --merge-candidates --requests-json JSON --token-user USER
   --merge-if-ready PR --expected-head SHA --author USER --token-user USER
   --current-pr [--token-user USER]
@@ -65,18 +67,18 @@ def main() -> None:
     if argv in (["-h"], ["--help"]):
         print(TOP_HELP)
         return
-    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--merge-candidates", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context"}:
+    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--merge-candidates", "--grey-ci-candidates", "--rerun-grey-ci-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context"}:
         print("error: first argument must be a behavior switch\n", file=sys.stderr)
         print(TOP_HELP, file=sys.stderr)
         raise SystemExit(2)
     if len(argv) > 1 and argv[1] in ("-h", "--help"):
         _parser(argv[0]).print_help()
         return
-    if argv[0] not in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates"} and len(argv) < 2:
+    if argv[0] not in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates"} and len(argv) < 2:
         _parser(argv[0]).print_help()
         return
 
-    if argv[0] in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates"}:
+    if argv[0] in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates"}:
         args = _parser(argv[0]).parse_args(argv[1:])
         payload: dict[str, Any] = vars(args)
     else:
@@ -84,7 +86,7 @@ def main() -> None:
         key = "path" if argv[0] in {"--read-file", "--write-file"} else "issue" if argv[0] in {"--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues"} else "repository" if argv[0] == "--checkout-repo" else "log_id" if argv[0] == "--read-failing-ci-log" else "conversation" if argv[0] == "--resolve-conversation" else "pr"
         payload = {key: argv[1], **vars(args)}
 
-    if argv[0] == "--merge-candidates":
+    if argv[0] in {"--merge-candidates", "--grey-ci-candidates"}:
         try:
             payload["requests"] = json.loads(payload.pop("requests_json"))
         except json.JSONDecodeError as error:
@@ -124,6 +126,8 @@ def main() -> None:
         "--mergeable": mergeable,
         "--merge-if-ready": merge_if_ready,
         "--merge-candidates": merge_candidates,
+        "--grey-ci-candidates": grey_ci_candidates,
+        "--rerun-grey-ci-if-ready": rerun_grey_ci_if_ready,
         "--current-pr": current_pr,
         "--pr-readiness": pr_readiness,
         "--local-checkout-path": local_checkout_path,
@@ -219,9 +223,17 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
         _add_expected_head(parser)
         return parser
 
-    if behavior == "--merge-candidates":
-        parser = argparse.ArgumentParser(prog="github-interface --merge-candidates")
+    if behavior in {"--merge-candidates", "--grey-ci-candidates"}:
+        parser = argparse.ArgumentParser(prog=f"github-interface {behavior}")
         parser.add_argument("--requests-json", required=True)
+        return parser
+
+    if behavior == "--rerun-grey-ci-if-ready":
+        parser = argparse.ArgumentParser(prog="github-interface --rerun-grey-ci-if-ready PR")
+        parser.add_argument("--run-id", type=int, required=True)
+        parser.add_argument("--run-attempt", type=int, required=True)
+        parser.add_argument("--author", required=True)
+        _add_expected_head(parser)
         return parser
 
     if behavior == "--merge-if-ready":

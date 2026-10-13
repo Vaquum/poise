@@ -188,3 +188,11 @@ async def checkout_review(payload: dict[str, Any]) -> Any:
 
 async def review_context(payload: dict[str, Any]) -> Any:
     return await run_behavior("review_context", payload)
+
+
+async def grey_ci_candidates(payload: dict[str, Any]) -> Any:
+    return await run_behavior("grey_ci_candidates", payload)
+
+
+async def rerun_grey_ci_if_ready(payload: dict[str, Any]) -> Any:
+    return await run_behavior("rerun_grey_ci_if_ready", payload)

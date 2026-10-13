@@ -101,6 +101,28 @@ cadence. Each successful merge adds three REST reads, one GraphQL query and one
 REST write; transient retries may add requests. GitHub's returned query cost is
 exposed in the Caller batch packet.
 
+`rerun-grey-ci` is off unless `behavior_rerun_grey_ci_enabled` is `1`. It reads
+`--grey-ci-candidates --requests-json JSON --token-user AGENT` in batches of 50
+with no REST polling. Current-head workflow check suites identify only completed
+cancelled/stale GitHub Actions runs. Additional GraphQL pages complete truncated
+workflow inventories. The latest run per workflow/event excludes superseded
+interruptions; third-party checks and intentional skips do not become reruns.
+
+A ready candidate takes the shared PR operation lock. Immediately before launch,
+Poise rereads skips, enable and acting identity, then atomically records a durable
+workflow/head/event intent. Caller `--rerun-grey-ci-if-ready` rechecks the author,
+head, exact run/attempt, every job and latest replacement run, then requests one
+workflow rerun. Failed/timed-out/unknown or active jobs refuse recovery. The normal
+path uses five REST reads and one write; paginated job lists add reads. The API
+has no atomic expected-head parameter, so the PR head is rechecked immediately
+before the final workflow read and write.
+
+Only `rerun_requested` updates Last triggered with a workflow URL. `not_ready`
+and `superseded` prove no write and release the exact intent. Missing/malformed
+receipts preserve the intent and visible held diagnostics across restarts. There
+is one automatic recovery per workflow, event and head; no running CI is cancelled.
+The behavior needs no model and adds zero GitHub traffic when disabled.
+
 New behaviors must add the required atomic fact or mutation upstream first.
 They must not add GitHub authentication, GraphQL, REST, or repository-source
 access to Poise.
@@ -144,14 +166,14 @@ an exact proof that this particular run never submitted.
 
 ## Where the pull-request behaviors act
 
-`review-new-prs`, `approve-prs`, `resolve-unblocking` and `merge-prs` each have a Skip
+`review-new-prs`, `approve-prs`, `resolve-unblocking`, `merge-prs` and `rerun-grey-ci` each have a Skip
 repositories list (`behavior_<behavior>_skip_repos`): `owner/repo` names, one
 list per behavior shared by every ready account. Before a scan claims, reads or
 launches anything, it keeps only the pull requests that pass one check: open,
 not a draft, authored by your GitHub account, and outside the behavior's
 skipped repositories. A skipped pull request is never claimed, dead-lettered or
 counted toward a retry. The list is read again immediately before a launch or a
-resolution or merge, so a repository skipped while a scan is under way is left alone too.
+resolution or merge or CI rerun, so a repository skipped while a scan is under way is left alone too.
 
 `review-new-prs` takes its anti-flood baseline (`behavior_seen`,
 `__snapshot_v3__` and the pull requests recorded with it) over every open pull
@@ -160,7 +182,7 @@ already open when the behavior began, wherever it is. Saving a skip list never
 retakes the baseline or clears the ledger. Unskipping a repository therefore
 makes its open pull requests eligible on the next tick exactly as new ones are:
 those opened since the baseline are reviewed, and the backlog it recorded is
-not. `approve-prs`, `resolve-unblocking` and `merge-prs` have no baseline; an unskipped
+not. `approve-prs`, `resolve-unblocking`, `merge-prs` and `rerun-grey-ci` have no baseline; an unskipped
 repository's pull requests are evaluated on the next tick like any other.
 
 ## Replays
@@ -180,3 +202,11 @@ each kind of target, so the two cannot drift apart.
 
 A repository outside every ready account is refused the same way. When the
 facts cannot be read, the replay answers 502 and launches nothing.
+
+Grey CI recovery intents are shared by repository, workflow, event and head,
+independent of PR number or changes to the acting account. Intent is persisted
+before launch; a restart rehydrates unconfirmed requests as visible holds even
+if the workflow is now running or green. Diagnostics belong to each workflow,
+so a different successful rerun cannot clear an unresolved hold. A `read_failed`
+receipt proves no write occurred: its intent is released and the visible read
+failure retries with backoff. Errors after the write begins remain held.

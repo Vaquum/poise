@@ -152,6 +152,12 @@ describe('Skip repositories API', () => {
     expect(logged).toHaveBeenCalledWith('[behaviors] merge-prs last triggered could not be read:', expect.any(Error))
   })
 
+  it('starts grey CI recovery off and persists its global toggle and repository skips', async () => {
+    expect((await behaviorState())['rerun-grey-ci']).toMatchObject({ enabled: false, skipRepos: [], lastTriggered: null })
+    expect((await post('/api/behaviors/rerun-grey-ci?org=beta', { enabled: true, skipRepos: [REPO] })).status).toBe(200)
+    expect((await behaviorState())['rerun-grey-ci']).toMatchObject({ enabled: true, skipRepos: [REPO] })
+  })
+
   it('starts merging off and persists its global toggle and repository exclusions', async () => {
     expect((await behaviorState())['merge-prs']).toMatchObject({ enabled: false, scratchpad: null, lastTriggered: null, skipRepos: [] })
     expect((await post('/api/behaviors/merge-prs?org=beta', { enabled: true, skipRepos: [REPO] })).status).toBe(200)

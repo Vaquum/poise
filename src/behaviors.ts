@@ -7,7 +7,7 @@
 
 import { classifyBehaviorDiagnostic, type DiagnosticClassification } from './behavior-failure-cause'
 
-export type BehaviorKey = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'review-new-issues'
+export type BehaviorKey = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci' | 'review-new-issues'
 
 export interface BehaviorMeta {
   key: BehaviorKey
@@ -41,13 +41,14 @@ export const BEHAVIORS: BehaviorMeta[] = [
   { key: 'review-new-prs',     label: 'Review New Pull Requests',      hasSetting: true,  hasReviewers: true,  hasMemory: true,  hasTriggers: false, hasSkips: true,  reviews: { place: 'PR review', item: 'pull request' } },
   { key: 'approve-prs',        label: 'Approve Pull Requests',         hasSetting: false, hasReviewers: false, hasMemory: true,  hasTriggers: false, hasSkips: true },
   { key: 'resolve-unblocking', label: 'Resolve Unblocking Conversations', hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'rerun-grey-ci',      label: 'Rerun Grey CI',                hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
   { key: 'merge-prs',          label: 'Merge Pull Requests',           hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
   { key: 'review-new-issues',  label: 'Review New Issues',             hasSetting: false, hasReviewers: true,  hasMemory: true,  hasTriggers: true,  hasSkips: false, reviews: { place: 'Issue review', item: 'issue' } },
 ]
 
 export type BehaviorSetting = 'p0' | 'p1' | 'p2' | 'p3' | 'p4'
 export type ReviewerCount = 1 | 2 | 3
-export interface LastTriggered { at: string; target: string }
+export interface LastTriggered { at: string; target: string; url?: string }
 export interface BehaviorDiagnostics {
   status: 'ok' | 'degraded' | 'unknown'
   agentLogsError: string | null

@@ -158,10 +158,14 @@ function lastTriggeredUnavailable(): boolean {
 
 function lastTriggeredCell(key: BehaviorKey): string {
   const last = getLastTriggered(key)
-  if (!last && (stateUnknown() || key !== 'merge-prs' && lastTriggeredUnavailable())) {
+  if (!last && (stateUnknown() || key !== 'merge-prs' && key !== 'rerun-grey-ci' && lastTriggeredUnavailable())) {
     return '<span class="last-dash" title="The latest history could not be read, so this is unknown — not necessarily never.">?</span>'
   }
   if (!last) return '<span class="last-dash">—</span>'
+  if (key === 'rerun-grey-ci') {
+    if (!last.url || !/^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/actions\/runs\/[1-9]\d*$/.test(last.url)) return '<span class="last-dash">?</span>'
+    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(last.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
+  }
   if (key === 'merge-prs') {
     const match = last.target.match(/^([^/\s]+\/[^#\s]+)#(\d+)$/)
     if (!match) return '<span class="last-dash">?</span>'
