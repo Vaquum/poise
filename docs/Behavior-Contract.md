@@ -5,13 +5,15 @@ construct reviews, or mutate review threads itself.
 
 ## Diagnostic severity
 
-Behaviors separates **Errors** from collapsed **Warnings**, grouped by target
-and cause. Repository access failures shared by several checks appear once,
-with every check and retry time available under Details. Severity is a fixed
-allowlist: provider capacity, PR head/base changes during preparation, upstream
-429/5xx responses and recognized transport interruptions are warnings. Access,
-authentication, configuration, invalid results, held work and unknown causes
-remain errors. Counts and elapsed time never downgrade an error.
+Behaviors shows a compact Activity log grouped by target and cause. **Poise
+faults** are red and mean the scheduler or Poise's launch/result integration needs repair.
+**Needs attention** is yellow for repository access, sign-in, provider limits
+and uncertain outcomes, including unusable model verdicts and exhausted review
+recovery. **Automatic** is grey and folded for known capacity,
+head changes, upstream 429/5xx and transport interruptions that Poise rechecks.
+Unknown causes stay yellow until their cause is established; a process exit or
+retry count alone never proves Poise is broken. Each row expands to its full
+diagnostic details, retaining its expansion through refresh.
 
 The last terminal provider event is selected before redaction and the
 300-character display bound. Old summaries are refreshed only from an exact,
@@ -21,15 +23,28 @@ view; uncertain held work and the audit history remain. Severity changes no
 launch, retry, ownership or publication rule.
 Recovered attempts carry `recovered: true` in the diagnostic payload so their
 exact audit identities can still suppress duplicate incidents. The view shows
-neither as an active problem; unrelated held attempts remain errors.
+neither as an active problem; unrelated held attempts still need attention.
+Retained incidents are classified independently of active failure summaries.
+A grey no-action PR incident requires one validated Caller row matching its
+call, correlation, actor, repository, PR, behavior and source, with
+`not_started` / `preflight_failed`, a pinned expected head, and no executed head
+or review/posting receipts. Missing, conflicting or quarantined evidence stays
+visible under Needs attention. Classification never authorizes a retry.
+Distinct attempts are read before visual grouping, so a newer automatic event
+cannot hide an older held reviewer. Persisted launch contract and quarantine
+evidence overrides Caller no-action text; a matching correlation must identify
+exactly one Caller row. Stronger current incident evidence also overrides a
+cached automatic failure summary.
 
 If the browser cannot read `/api/behaviors`, it reports one request diagnostic
 and retains its last known snapshot. It does not infer agent-log, datastore or
 identity failures from that request. Controls remain unavailable until a
 successful read restores current state.
 An initial unread runtime has `status: 'unknown'`. A previously observed
-degraded runtime remains an error alongside the request diagnostic until a
+degraded runtime remains visible alongside the request diagnostic until a
 successful read supplies new health evidence.
+The API supplies `runtimeError` only for a stopped/stale scheduler or an overdue
+operation. A degraded status without a known runtime cause is yellow.
 
 An operator can POST `/api/behaviors/retry-pr-reviews` with 1-3 `callIds`
 from failed automated slots on one PR/head. Poise verifies exact launch

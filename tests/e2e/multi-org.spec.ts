@@ -366,7 +366,7 @@ test('reports failures across accounts in global behavior diagnostics', async ({
   expect(state.reads.filter((read) => read.path === '/api/behaviors').every((read) => read.org === '')).toBe(true)
 })
 
-test('groups actionable repository errors and collapses transient warnings', async ({ page }) => {
+test('groups conditions needing attention and folds automatic recovery in the Activity log', async ({ page }) => {
   const state = await setup(page)
   state.diagnostics = { status: 'ok', agentLogsError: null,
     datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
@@ -386,17 +386,20 @@ test('groups actionable repository errors and collapses transient warnings', asy
   await page.goto('/')
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
   const diagnostics = page.locator('#behavior-diagnostics')
-  await expect(diagnostics.locator('.behavior-errors > strong')).toHaveText('Errors (1)')
-  await expect(diagnostics.locator('.behavior-errors > ul > li')).toHaveCount(1)
-  await expect(diagnostics.locator('.behavior-errors')).toContainText('acme/private: GitHub target is unavailable to bit-mis')
-  const warnings = diagnostics.locator('.behavior-warnings')
-  await expect(warnings.locator(':scope > summary')).toHaveText('Warnings (2)')
-  await expect(warnings).not.toHaveAttribute('open', '')
-  await warnings.locator(':scope > summary').click()
-  await expect(warnings).toContainText('Selected model is at capacity.')
-  await expect(warnings).toContainText('PR changed during review preparation')
-  await diagnostics.locator('.behavior-errors summary').click()
-  await expect(diagnostics.locator('.behavior-errors details')).toContainText('acme/private#21:secondary:check')
+  await expect(diagnostics.locator('.behavior-errors')).toHaveCount(0)
+  await expect(diagnostics.locator('.behavior-warnings > ul > li')).toHaveCount(1)
+  await expect(diagnostics.locator('.behavior-warnings')).toContainText('GitHub target is unavailable to bit-mis')
+  const automatic = diagnostics.locator('.behavior-info')
+  await expect(automatic.locator(':scope > summary')).toContainText('Automatic')
+  await expect(automatic).not.toHaveAttribute('open', '')
+  await automatic.locator(':scope > summary').click()
+  await expect(automatic).toContainText('The model is busy. Poise will try again.')
+  await expect(automatic).toContainText('PR updated. Poise will reconsider the latest revision.')
+  await diagnostics.locator('.behavior-warnings details summary').click()
+  await expect(diagnostics.locator('.behavior-warnings details')).toContainText('acme/private#21:secondary:check')
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(diagnostics.locator('.behavior-warnings details')).toHaveAttribute('open', '')
+  await expect(automatic).toHaveAttribute('open', '')
 })
 
 test('shows one API availability warning and clears it on a successful refresh', async ({ page }) => {
@@ -407,10 +410,10 @@ test('shows one API availability warning and clears it on a successful refresh',
   await page.goto('/')
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
   const diagnostics = page.locator('#behavior-diagnostics')
-  await expect(diagnostics.locator('.behavior-warnings > summary')).toHaveText('Warnings (1)')
+  await expect(diagnostics.locator('.behavior-info > summary')).toContainText('Automatic')
   await expect(diagnostics.locator('.behavior-errors')).toHaveCount(0)
-  await diagnostics.locator('.behavior-warnings > summary').click()
-  await expect(diagnostics).toContainText('Behaviors: Status could not be refreshed (HTTP 502).')
+  await diagnostics.locator('.behavior-info > summary').click()
+  await expect(diagnostics).toContainText('Status could not be refreshed (HTTP 502).')
   await expect(diagnostics).not.toContainText('Datastore:')
   await expect(diagnostics).not.toContainText('Identity:')
   await expect(diagnostics).not.toContainText('Agent log:')
@@ -425,7 +428,7 @@ test('shows one API availability warning and clears it on a successful refresh',
 
 test('keeps the last-known runtime error visible alongside a later API outage', async ({ page }) => {
   const state = await setup(page)
-  state.diagnostics = { status: 'degraded', agentLogsError: null,
+  state.diagnostics = { status: 'degraded', runtimeError: 'Behavior runtime is degraded.', agentLogsError: null,
     datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
     identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [] }
   let unavailable = false
@@ -437,14 +440,51 @@ test('keeps the last-known runtime error visible alongside a later API outage', 
   await expect(diagnostics.locator('.behavior-errors')).toContainText('Behavior runtime is degraded.')
   unavailable = true
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
-  await expect(diagnostics.locator('.behavior-warnings > summary')).toHaveText('Warnings (1)')
-  await expect(diagnostics.locator('.behavior-errors > strong')).toHaveText('Errors (1)')
+  await expect(diagnostics.locator('.behavior-info > summary')).toContainText('Automatic')
+  await expect(diagnostics.locator('.behavior-errors .behavior-diagnostic-section-label')).toContainText('Poise faults')
   await expect(diagnostics.locator('.behavior-errors')).toContainText('Behavior runtime is degraded.')
   unavailable = false
   state.diagnostics.status = 'ok'
+  state.diagnostics.runtimeError = null
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
   await expect(diagnostics).toBeHidden()
 })
+
+for (const theme of ['light', 'dark']) {
+  test(`renders distinct Poise faults, attention and automatic activity in ${theme} mode`, async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 1040 })
+    const state = await setup(page)
+    state.diagnostics = { status: 'degraded', runtimeError: 'The behavior scheduler is no longer responding.', agentLogsError: null,
+      datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+      identity: { status: 'valid', actor: 'bit-mis', error: null },
+      failures: [{ behavior: 'review-new-prs', target: 'acme/private#21', kind: 'operation', consecutiveFailures: 19,
+        lastFailureAt: '', nextRetryAt: '', error: 'GitHub 404: Not Found' }],
+      deadLetters: [{ id: 'audit', behavior: 'review-new-prs', target: 'velocinbio/portal-velocin-fi#18',
+        error: `pull-request head changed: expected ${'a'.repeat(40)}, got ${'b'.repeat(40)}`, createdAt: '', attemptCount: 3,
+        diagnostic: { severity: 'info', code: 'head_changed' } }],
+    }
+    await page.addInitScript((value) => localStorage.setItem('poise-theme', value), theme)
+    await page.goto('/')
+    await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+    await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+    const diagnostics = page.locator('#behavior-diagnostics')
+    await expect(diagnostics.locator('[data-severity="error"]')).toHaveCount(1)
+    await expect(diagnostics.locator('[data-severity="warning"]')).toHaveCount(1)
+    await expect(diagnostics.locator('[data-severity="info"]')).toHaveCount(1)
+    await expect(diagnostics.locator('.behavior-info')).not.toHaveAttribute('open', '')
+    await diagnostics.locator('.behavior-info > summary').focus()
+    await page.keyboard.press('Enter')
+    await expect(diagnostics.locator('.behavior-info')).toHaveAttribute('open', '')
+    await diagnostics.locator('.behavior-info .behavior-diagnostic-row summary').click()
+    await expect(diagnostics.locator('.behavior-info .behavior-diagnostic-details')).toBeVisible()
+    await page.screenshot({ path: test.info().outputPath(`behavior-activity-${theme}.png`), fullPage: true })
+    await page.setViewportSize({ width: 390, height: 844 })
+    await expect(diagnostics).toBeVisible()
+    const width = await diagnostics.evaluate((element) => ({ client: element.clientWidth, scroll: element.scrollWidth }))
+    expect(width.scroll).toBeLessThanOrEqual(width.client)
+    await page.screenshot({ path: test.info().outputPath(`behavior-activity-${theme}-narrow.png`), fullPage: true })
+  })
+}
 
 test('preserves selected repositories when one account cannot be listed', async ({ page }) => {
   const state = await setup(page, [organization('acme'), organization('mikkokotila')])

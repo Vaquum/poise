@@ -1013,12 +1013,26 @@ function renderDiagnostics() {
   const groups = behaviorDiagnosticGroups(diagnostics)
   const errors = groups.filter((group) => group.severity === 'error')
   const warnings = groups.filter((group) => group.severity === 'warning')
-  const list = (entries: BehaviorDiagnosticGroup[]) => `<ul>${entries.map((group) => `
-    <li><span>${escapeHtml(group.scope)}: ${escapeHtml(group.message)}</span>
-      <details><summary>Details (${group.details.length})</summary><ul>${group.details.map((detail) => `<li>${escapeHtml(detail)}</li>`).join('')}</ul></details>
-    </li>`).join('')}</ul>`
-  el.innerHTML = `${errors.length ? `<section class="behavior-errors" aria-label="Errors"><strong>Errors (${errors.length})</strong>${list(errors)}</section>` : ''}
-    ${warnings.length ? `<details class="behavior-warnings" aria-label="Warnings"><summary>Warnings (${warnings.length})</summary>${list(warnings)}</details>` : ''}`
+  const automatic = groups.filter((group) => group.severity === 'info')
+  const open = new Set([...el.querySelectorAll<HTMLDetailsElement>('details[open][data-diagnostic-id]')]
+    .map((detail) => detail.dataset.diagnosticId))
+  const list = (entries: BehaviorDiagnosticGroup[]) => `<ul class="behavior-diagnostic-list">${entries.map((group) => {
+    const id = JSON.stringify([group.code, group.scope, group.message])
+    return `<li class="behavior-diagnostic-row" data-severity="${group.severity}">
+      <span class="behavior-diagnostic-dot" aria-hidden="true"></span>
+      <details data-diagnostic-id="${escapeHtml(id)}"${open.has(id) ? ' open' : ''}>
+        <summary><span class="behavior-diagnostic-copy"><span class="behavior-diagnostic-scope">${escapeHtml(group.scope)}</span>
+          <span class="behavior-diagnostic-message">${escapeHtml(group.message)}</span></span>
+          <span class="behavior-diagnostic-count">${group.details.length} ${group.details.length === 1 ? 'event' : 'events'}</span>
+          <span class="behavior-diagnostic-chevron" aria-hidden="true">›</span></summary>
+        <ul class="behavior-diagnostic-details">${group.details.map((detail) => `<li>${escapeHtml(detail)}</li>`).join('')}</ul>
+      </details></li>`
+  }).join('')}</ul>`
+  const section = (label: string, entries: BehaviorDiagnosticGroup[], css: string) => entries.length
+    ? `<section class="${css}" aria-label="${label}"><div class="behavior-diagnostic-section-label">${label}<span>${entries.length}</span></div>${list(entries)}</section>` : ''
+  el.innerHTML = `<div class="behavior-diagnostic-header"><span>Activity</span><span class="behavior-diagnostic-caption">${errors.length ? 'Poise needs repair' : warnings.length ? 'Needs your attention' : 'Poise is handling this'}</span></div>
+    ${section('Poise faults', errors, 'behavior-errors')}${section('Needs attention', warnings, 'behavior-warnings')}
+    ${automatic.length ? `<details class="behavior-info" data-diagnostic-id="automatic"${open.has('automatic') ? ' open' : ''}><summary class="behavior-diagnostic-section-label">Automatic<span>${automatic.length}</span><span class="behavior-diagnostic-chevron" aria-hidden="true">›</span></summary>${list(automatic)}</details>` : ''}`
   el.hidden = groups.length === 0
 }
 

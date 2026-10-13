@@ -46,14 +46,14 @@ describe('Behaviors availability diagnostics', () => {
     await behaviors.refreshState()
     expect(behaviors.getBehaviorDiagnostics()).toMatchObject({
       status: 'unknown',
-      apiError: { severity: 'warning', code: 'upstream_unavailable', message: 'HTTP 502' },
+      apiError: { severity: 'info', code: 'upstream_unavailable', message: 'HTTP 502' },
       agentLogsError: null, datastore: { status: 'unchecked', error: null }, identity: { status: 'unknown', error: null },
     })
     expect(behaviorDiagnosticGroups(behaviors.getBehaviorDiagnostics()!).map((group) => group.code)).toEqual(['upstream_unavailable'])
     expect(behaviors.isBehaviorStateLoaded()).toBe(false)
   })
   it('keeps a known degraded runtime visible through a 502 until a healthy read', async () => {
-    const snapshot = { status: 'degraded', agentLogsError: null,
+    const snapshot = { status: 'degraded', runtimeError: 'Behavior runtime is degraded.', agentLogsError: null,
       datastore: { status: 'healthy', error: null }, identity: { status: 'valid', actor: 'reviewer', error: null },
       failures: [], deadLetters: [] }
     let outage = false
@@ -69,6 +69,7 @@ describe('Behaviors availability diagnostics', () => {
     expect(during.map((group) => group.code)).toEqual(['runtime_unhealthy', 'upstream_unavailable'])
     outage = false
     snapshot.status = 'ok'
+    snapshot.runtimeError = ''
     await behaviors.refreshState()
     expect(behaviorDiagnosticGroups(behaviors.getBehaviorDiagnostics()!)).toEqual([])
   })
@@ -91,7 +92,7 @@ describe('Behaviors availability diagnostics', () => {
   it('keeps malformed successful responses as errors rather than network warnings', async () => {
     vi.stubGlobal('fetch', async () => ({ ok: true, json: async () => null }))
     await behaviors.refreshState()
-    expect(behaviors.getBehaviorDiagnostics()?.apiError?.severity).toBe('error')
+    expect(behaviors.getBehaviorDiagnostics()?.apiError?.severity).toBe('warning')
   })
 })
 

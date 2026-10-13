@@ -21,6 +21,7 @@ import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentRe
 import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, getOrCreateChatSession, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
+import { getBehaviorDiagnosticIncidents } from './behaviors'
 import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
 import { ContentLaunchPendingError, getContentJobResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
@@ -566,9 +567,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const settings = getSettingMap()
           const scratch = getScratchpadMap()
           let logs: Awaited<ReturnType<typeof fetchAgentLogs>> = []
+          let snapshot: Awaited<ReturnType<typeof fetchAgentLogSnapshot>> | null = null
           let agentLogsError: string | null = null
           try {
-            const snapshot = await fetchAgentLogSnapshot()
+            snapshot = await fetchAgentLogSnapshot()
             logs = snapshot.entries
             if (snapshot.quarantined.length > 0) agentLogsError = `${snapshot.quarantined.length} unreadable worker log row(s) quarantined`
           } catch (error) {
@@ -663,11 +665,12 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             },
             diagnostics: {
               status: runtime.status,
+              runtimeError: runtime.runtimeError,
               agentLogsError,
               datastore: runtime.datastore,
               identity: runtime.identity,
               failures: runtime.failures,
-              deadLetters: runtime.deadLetters,
+              deadLetters: getBehaviorDiagnosticIncidents(snapshot),
             },
           })
         }

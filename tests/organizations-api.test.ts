@@ -338,6 +338,49 @@ describe('global behavior settings API', () => {
     }])
   })
 
+  it('classifies retained no-action incidents even after their failure summary is gone', async () => {
+    const target = 'Legacy/same-repo#18'
+    const claimId = database!.claimSeenOwned('review-new-prs', target)!
+    const error = `pull-request head changed: expected ${'a'.repeat(40)}, got ${'b'.repeat(40)}`
+    expect(database!.markBehaviorLaunchIntentOwned({ key: 'review-new-prs', target, claimId,
+      launchBehavior: 'pr_review', repo: 'Legacy/same-repo', pr: 18, requestedAt: '2026-10-13T14:08:00Z',
+      expectedHead: 'a'.repeat(40), actor: 'review-bot', source: 'poise:review-new-prs', correlationId: claimId })).toBe(true)
+    const claim = database!.listBehaviorLaunchClaims('review-new-prs').find((row) => row.target === target)!
+    const callId = 'd'.repeat(32)
+    database!.recordBehaviorDeadLetter(claim, error, callId)
+    behaviorLogs = [{ id: callId, model: 'test', prompt: '', time_elapsed: '4s', behavior: 'pr_review',
+      repo: 'Legacy/same-repo', pr_id: '18', actor: 'review-bot', source: 'poise:review-new-prs',
+      correlation_id: claimId, started_at: '2026-10-13T14:08:00Z', completed_at: '2026-10-13T14:08:04Z',
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', expected_head: 'a'.repeat(40),
+      head_sha: null, review_id: null, receipts: null, error }]
+    const response = await (await fetch(`${base}/api/behaviors`)).json()
+    expect(response.diagnostics.failures).toEqual([])
+    expect(response.diagnostics.deadLetters).toContainEqual(expect.objectContaining({ callId,
+      diagnostic: { severity: 'info', code: 'head_changed' } }))
+    behaviorLogs = []
+    const unread = await (await fetch(`${base}/api/behaviors`)).json()
+    expect(unread.diagnostics.deadLetters).toContainEqual(expect.objectContaining({ callId,
+      diagnostic: { severity: 'warning', code: 'held_result' } }))
+    const secondTarget = `${target}:secondary`
+    const secondId = database!.claimSeenOwned('review-new-prs', secondTarget)!
+    expect(database!.markBehaviorLaunchIntentOwned({ key: 'review-new-prs', target: secondTarget, claimId: secondId,
+      launchBehavior: 'pr_review', repo: 'Legacy/same-repo', pr: 18, requestedAt: '2026-10-13T14:09:00Z',
+      expectedHead: 'b'.repeat(40), actor: 'review-bot', source: 'poise:review-new-prs', correlationId: secondId })).toBe(true)
+    const second = database!.listBehaviorLaunchClaims('review-new-prs').find((row) => row.target === secondTarget)!
+    database!.recordBehaviorDeadLetter(second, error, 'e'.repeat(32))
+    database!.quarantineBehaviorLaunchOwned('review-new-prs', target, claimId, 'invalid_result', 'launch contract mismatch', false)
+    behaviorLogs = [{ id: 'e'.repeat(32), model: 'test', prompt: '', time_elapsed: '4s', behavior: 'pr_review',
+      repo: 'Legacy/same-repo', pr_id: '18', actor: 'review-bot', source: 'poise:review-new-prs',
+      correlation_id: secondId, started_at: '2026-10-13T14:09:00Z', completed_at: '2026-10-13T14:09:04Z',
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', expected_head: 'b'.repeat(40),
+      head_sha: null, review_id: null, receipts: null, error }]
+    const separate = await (await fetch(`${base}/api/behaviors`)).json()
+    expect(separate.diagnostics.deadLetters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ callId, diagnostic: { severity: 'error', code: 'invalid_agent_result' } }),
+      expect.objectContaining({ callId: 'e'.repeat(32), diagnostic: { severity: 'info', code: 'head_changed' } }),
+    ]))
+  })
+
   it('shows latest behavior activity across configured accounts', async () => {
     await addSecondAccount()
     behaviorLogs = ['Legacy', 'beta', 'unconfigured'].map((owner, index) => ({

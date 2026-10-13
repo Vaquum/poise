@@ -2757,7 +2757,7 @@ describe('behavior launch claims', () => {
     ['httpx.ReadTimeout', 'network_interruption'],
     ['Selected model is at capacity. Please try a different model.', 'provider_capacity'],
     ['error: pull-request head or base changed while building review packet', 'head_changed'],
-  ])('retries a no-action approval and classifies %s as a warning', async (error, code) => {
+  ])('retries a no-action approval and classifies %s as automatic', async (error, code) => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
     const launched = await launchApprovalBeforeCrash()
@@ -2783,7 +2783,7 @@ describe('behavior launch claims', () => {
 
     expect(db.hasSeen('approve-prs', launched.target)).toBe(false)
     expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
-      target: launched.target, diagnostic: { severity: 'warning', code },
+      target: launched.target, diagnostic: { severity: 'info', code },
     }))
     expect(mocks.observeAuthFailure).not.toHaveBeenCalled()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
@@ -2828,7 +2828,7 @@ describe('behavior launch claims', () => {
     call.correlation_id = launched.correlationId
     await runtime.runEnabledBehaviorsOnce()
     expect(JSON.parse(db.getMeta(key)!)).toEqual({ ...stored,
-      diagnostic: { severity: 'warning', code: 'provider_capacity' },
+      diagnostic: { severity: 'info', code: 'provider_capacity' },
       error: 'Selected model is at capacity. Please try a different model.' })
   })
 
@@ -2866,7 +2866,7 @@ describe('behavior launch claims', () => {
     await runtime.runEnabledBehaviorsOnce()
     expect(JSON.parse(db.getMeta(key)!)).toEqual(stored)
     expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
-      error: latest.error, callId: latest.id, diagnostic: { severity: 'warning', code: 'provider_capacity' },
+      error: latest.error, callId: latest.id, diagnostic: { severity: 'info', code: 'provider_capacity' },
     }))
   })
 
@@ -2878,7 +2878,7 @@ describe('behavior launch claims', () => {
     const key = `behavior_approve_prs_failure:${launched.target}`
     db.setMeta(key, JSON.stringify({ kind: 'worker', consecutiveFailures: 1,
       lastFailureAtMs: Date.now() - 1_000, nextRetryAtMs: Date.now() + 60_000,
-      error: 'Selected model is at capacity.', callId: 'd'.repeat(32), diagnostic: { severity: 'warning', code: 'provider_capacity' } }))
+      error: 'Selected model is at capacity.', callId: 'd'.repeat(32), diagnostic: { severity: 'info', code: 'provider_capacity' } }))
     expect(runtime.getBehaviorsRuntimeHealth().failures).toHaveLength(1)
     const target = `${pr.repo}#${pr.number}@head=${NEXT_HEAD_SHA}`
     const claimId = db.claimSeenOwned('approve-prs', target)!
@@ -2899,7 +2899,7 @@ describe('behavior launch claims', () => {
     expect(db.listBehaviorDeadLetters()).toHaveLength(1)
     db.db.prepare("UPDATE behavior_seen SET launch_quarantine = 'unreadable' WHERE key = 'approve-prs' AND target = ?").run(launched.target)
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({
-      diagnostic: { severity: 'error', code: 'held_result' },
+      diagnostic: { severity: 'warning', code: 'held_result' },
     })])
   })
 
@@ -2934,8 +2934,8 @@ describe('behavior launch claims', () => {
       error: 'httpx.ReadTimeout', receipts: receipts ? [] : null })]
     await runtime.runEnabledBehaviorsOnce()
     expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
-      behavior: 'review-new-issues', diagnostic: receipts ? { severity: 'error', code: 'held_result' }
-        : { severity: 'warning', code: 'network_interruption' },
+      behavior: 'review-new-issues', diagnostic: receipts ? { severity: 'warning', code: 'held_result' }
+        : { severity: 'info', code: 'network_interruption' },
     }))
   })
 

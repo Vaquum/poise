@@ -67,8 +67,8 @@ import {
   type BehaviorLaunchClaim,
 } from './db'
 import { HttpError } from './http'
-import { behaviorErrorMessage } from './behavior-diagnostics'
-import { classifyBehaviorDiagnostic, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
+import { behaviorErrorMessage, behaviorIncidentDiagnostics } from './behavior-diagnostics'
+import { classifyBehaviorDiagnostic, diagnosticClassification, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { resolveReviewCheckout } from './review-checkout'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
@@ -368,8 +368,8 @@ function readBehaviorFailure(key: BehaviorKey, target?: string): PersistedBehavi
       lastFailureAtMs: Number(value.lastFailureAtMs),
       nextRetryAtMs: Number(value.nextRetryAtMs),
       ...(typeof value.error === 'string' && value.error ? { error: value.error.slice(0, 300) } : {}),
-      ...(value.diagnostic && ['error', 'warning'].includes(value.diagnostic.severity)
-        && typeof value.diagnostic.code === 'string' ? { diagnostic: value.diagnostic } : {}),
+      ...(value.diagnostic && ['error', 'warning', 'info'].includes(value.diagnostic.severity)
+        && typeof value.diagnostic.code === 'string' ? { diagnostic: diagnosticClassification(value.diagnostic.code) } : {}),
       ...(typeof value.callId === 'string' && /^[a-f0-9]{32}$/.test(value.callId) ? { callId: value.callId } : {}),
     }
   } catch {
@@ -4391,6 +4391,7 @@ function scheduleNextTick(generation: number) {
 
 export interface BehaviorsRuntimeHealth {
   status: 'ok' | 'degraded'
+  runtimeError: string | null
   running: boolean
   startedAt: string | null
   lastTickAt: string | null
@@ -4437,12 +4438,12 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     return [undefined, ...behaviorFailureTargets(behavior)].flatMap((target) => {
       const failure = readBehaviorFailure(behavior, target)
       let recovered = false
-      if (failure?.kind === 'worker' && failure.diagnostic?.severity === 'warning' && target
+      if (failure?.kind === 'worker' && failure.diagnostic?.severity === 'info' && target
         && db.prepare('SELECT 1 FROM behavior_seen WHERE key = ? AND target = ? AND launch_quarantine IS NOT NULL')
           .get(behavior, target)) {
-        failure.diagnostic = { severity: 'error', code: 'held_result' }
+        failure.diagnostic = diagnosticClassification('held_result')
       }
-      if (failure?.kind === 'worker' && failure.diagnostic?.severity === 'warning' && target) {
+      if (failure?.kind === 'worker' && failure.diagnostic?.severity === 'info' && target) {
         const ref = /^([^#]+)#(\d+)/.exec(target)
         if (ref && db.prepare(`
           SELECT 1 FROM behavior_seen recovered
@@ -4505,6 +4506,9 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   }
   const datastoreUnavailable = anyEnabled && datastoreFreshness().status === 'unavailable'
   return {
+    runtimeError: !tickerStarted ? 'The behavior scheduler has stopped.'
+      : heartbeatStale ? 'The behavior scheduler is no longer responding.'
+        : operationStale ? 'A behavior operation exceeded its execution deadline.' : null,
     status: tickerStarted
       && !heartbeatStale
       && !operationStale
@@ -4527,6 +4531,14 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   }
 }
 
+export function getBehaviorDiagnosticIncidents(snapshot: AgentLogSnapshot | null) {
+  const scoped = () => behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot,
+    BEHAVIOR_KEYS.flatMap((behavior) => [...listBehaviorLaunchClaims(behavior), ...failedBehaviorLaunches(behavior)]))
+  if (behaviorOrganization.getStore() !== undefined) return scoped()
+  const organizations = readyOrganizations()
+  return organizations.length ? organizations.flatMap((org) => behaviorOrganization.run(org, scoped)) : scoped()
+}
+
 export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   if (behaviorOrganization.getStore() !== undefined) return scopedBehaviorsRuntimeHealth()
   const health = readyOrganizations().map((org) => ({
@@ -4538,6 +4550,7 @@ export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   if (health.length === 1) return first
   return {
     ...first,
+    runtimeError: health.find((entry) => entry.health.runtimeError)?.health.runtimeError ?? null,
     status: health.some((entry) => entry.health.status === 'degraded') ? 'degraded' : 'ok',
     busy: health.flatMap((entry) => entry.health.busy.map((item) => ({ ...item, org: entry.org }))),
     failures: health.flatMap((entry) => entry.health.failures.map((item) => ({ ...item, org: entry.org }))),

@@ -31,7 +31,7 @@ const CAPACITY_STREAM = 'codex review produced no submitted verdict: {"type":"th
 describe('deterministic behavior severity', () => {
   it('uses the terminal turn failure instead of startup notices or intermediate reconnects', () => {
     expect(failureCause(CAPACITY_STREAM)).toBe('Selected model is at capacity. Please try a different model.')
-    expect(classifyBehaviorDiagnostic(CAPACITY_STREAM)).toEqual({ severity: 'warning', code: 'provider_capacity' })
+    expect(classifyBehaviorDiagnostic(CAPACITY_STREAM)).toEqual({ severity: 'info', code: 'provider_capacity' })
   })
   it.each([
     ['error: pull-request head or base changed while building review packet', 'head_changed'],
@@ -41,27 +41,33 @@ describe('deterministic behavior severity', () => {
     ['GitHub 429: rate limited', 'rate_limit'], ['HTTP 502', 'upstream_unavailable'],
     ['GitHub 503: Service Unavailable', 'upstream_unavailable'], ['Traceback\nhttpx.ReadTimeout', 'network_interruption'],
   ])('recognizes the transient cause %s', (error, code) => {
-    expect(classifyBehaviorDiagnostic(error)).toEqual({ severity: 'warning', code })
+    expect(classifyBehaviorDiagnostic(error)).toEqual({ severity: 'info', code })
   })
   it.each(['GitHub 404: Not Found', 'HTTP 401', 'invalid verdict', 'warning: an unknown problem',
-    'Code Mode is unavailable because code-mode host is disabled.'])('keeps actionable or unknown evidence as an error: %s', (error) => {
-    expect(classifyBehaviorDiagnostic(error).severity).toBe('error')
+    'Code Mode is unavailable because code-mode host is disabled.'])('keeps actionable or unknown evidence as needing attention: %s', (error) => {
+    expect(classifyBehaviorDiagnostic(error).severity).toBe('warning')
   })
   it('never downgrades a held outcome or a structured account block based on transient text', () => {
-    expect(classifyBehaviorDiagnostic(CAPACITY_STREAM, { held: true }).severity).toBe('error')
-    expect(classifyBehaviorDiagnostic(CAPACITY_STREAM, { errorCode: 'review_provider_blocked' }).severity).toBe('error')
+    expect(classifyBehaviorDiagnostic(CAPACITY_STREAM, { held: true }).severity).toBe('warning')
+    expect(classifyBehaviorDiagnostic(CAPACITY_STREAM, { errorCode: 'review_provider_blocked' }).severity).toBe('warning')
     expect(classifyBehaviorDiagnostic(CAPACITY_STREAM, { errorCode: 'invalid_agent_result' }).severity).toBe('error')
+  })
+  it.each(['invalid_agent_result'])('reserves red for the confirmed integration fault %s', (errorCode) => {
+    expect(classifyBehaviorDiagnostic('worker failed', { errorCode, held: true })).toEqual({ severity: 'error', code: errorCode })
+  })
+  it.each(['review_contract_violation', 'review_recovery_failed', 'review_provider_blocked', 'review_packet_too_large', 'review_budget_exhausted', 'model_output_limit'])('keeps the external worker condition %s yellow', (errorCode) => {
+    expect(classifyBehaviorDiagnostic('worker failed', { errorCode, held: true })).toEqual({ severity: 'warning', code: errorCode })
   })
   it('does not lose an unknown terminal cause behind an earlier capacity message', () => {
     const error = CAPACITY_STREAM + '\n{"type":"turn.failed","error":{"message":"invalid result contract"}}'
-    expect(classifyBehaviorDiagnostic(error).severity).toBe('error')
+    expect(classifyBehaviorDiagnostic(error).severity).toBe('warning')
     expect(failureCause(error)).toBe('invalid result contract')
   })
-  it('keeps an unknown structured failure or quoted capacity text as an error', () => {
-    expect(classifyBehaviorDiagnostic('Selected model is at capacity.', { errorCode: 'new_unknown_failure' }).severity).toBe('error')
-    expect(classifyBehaviorDiagnostic('Invalid result: "Selected model is at capacity."').severity).toBe('error')
-    expect(classifyBehaviorDiagnostic(`pull-request head changed: expected ${'a'.repeat(40)}, got missing`).severity).toBe('error')
+  it('keeps an unknown structured failure or quoted capacity text as needing attention', () => {
+    expect(classifyBehaviorDiagnostic('Selected model is at capacity.', { errorCode: 'new_unknown_failure' }).severity).toBe('warning')
+    expect(classifyBehaviorDiagnostic('Invalid result: "Selected model is at capacity."').severity).toBe('warning')
+    expect(classifyBehaviorDiagnostic(`pull-request head changed: expected ${'a'.repeat(40)}, got missing`).severity).toBe('warning')
     expect(classifyBehaviorDiagnostic('Selected model is at capacity.', { errorCode: 'authentication_failed' }))
-      .toEqual({ severity: 'error', code: 'authentication' })
+      .toEqual({ severity: 'warning', code: 'authentication' })
   })
 })

@@ -51,6 +51,7 @@ export type ReviewerCount = 1 | 2 | 3
 export interface LastTriggered { at: string; target: string; url?: string }
 export interface BehaviorDiagnostics {
   status: 'ok' | 'degraded' | 'unknown'
+  runtimeError?: string | null
   agentLogsError: string | null
   apiError?: DiagnosticClassification & { message: string }
   datastore: {
@@ -86,6 +87,7 @@ export interface BehaviorDiagnostics {
     createdAt: string
     attemptCount?: number
     callId?: string | null
+    diagnostic?: DiagnosticClassification
   }>
 }
 

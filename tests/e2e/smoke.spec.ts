@@ -369,7 +369,8 @@ test('shows the agent account as the Behaviors owner and follows it when it chan
   owner = null
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
   await expect(cell).toHaveText('—')
-  await expect(page.locator('#behavior-diagnostics')).toContainText(`Identity: ${missing}`)
+  await expect(page.locator('#behavior-diagnostics .behavior-warnings')).toContainText(missing)
+  await expect(page.locator('#behavior-diagnostics .behavior-diagnostic-scope')).toContainText('Identity')
 })
 
 test('opts repositories and trusted authors into Review New Issues from Behaviors', async ({ page }) => {

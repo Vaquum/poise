@@ -3190,28 +3190,89 @@ tr:hover .stop-btn { opacity: 1; }
 
 .behavior-diagnostics {
   margin: var(--sp-4) var(--sp-6);
-  font-size: var(--text-sm);
-  line-height: 1.45;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--text);
 }
 
-.behavior-errors, .behavior-warnings {
+.behavior-diagnostic-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-4);
   padding: var(--sp-3) var(--sp-4);
-  border: 1px solid var(--danger-border, #8b3a3a);
-  border-radius: var(--radius-sm);
-  color: var(--danger, #d86b6b);
-  background: color-mix(in srgb, currentColor 8%, transparent);
+  background: var(--surface);
+  font-weight: 600;
+  border-bottom: 1px solid var(--hairline);
 }
 
-.behavior-warnings {
-  margin-top: var(--sp-3);
+.behavior-diagnostic-caption { color: var(--text-secondary); font-size: 0.75rem; font-weight: 400; }
+.behavior-diagnostic-section-label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
   color: var(--text-secondary);
-  border-color: var(--border);
+  font-size: 0.75rem;
+  font-weight: 600;
 }
-
-.behavior-diagnostics ul { margin: var(--sp-2) 0 0; padding-left: var(--sp-4); }
-.behavior-diagnostics li + li { margin-top: var(--sp-2); }
-.behavior-diagnostics details details, .behavior-errors details { margin-top: var(--sp-1); }
-.behavior-diagnostics summary { cursor: pointer; }
+.behavior-errors .behavior-diagnostic-section-label { color: var(--red); }
+.behavior-warnings .behavior-diagnostic-section-label { color: var(--amber); }
+.behavior-diagnostic-section-label > span:not(.behavior-diagnostic-chevron) {
+  border-radius: var(--r-pill);
+  padding: 0 6px;
+  background: var(--surface);
+  font-variant-numeric: tabular-nums;
+}
+.behavior-info > summary { padding-bottom: var(--sp-3); cursor: pointer; }
+.behavior-info { border-top: 1px solid var(--hairline); }
+.behavior-diagnostics ul { margin: 0; padding: 0; list-style: none; }
+.behavior-diagnostic-list { padding-bottom: var(--sp-2) !important; }
+.behavior-diagnostic-row { display: flex; gap: var(--sp-3); padding: 0 var(--sp-4); }
+.behavior-diagnostic-dot { flex: 0 0 6px; height: 6px; margin-top: 24px; border-radius: 50%; background: var(--text-tertiary); }
+.behavior-diagnostic-row[data-severity="error"] .behavior-diagnostic-dot { background: var(--red); }
+.behavior-diagnostic-row[data-severity="warning"] .behavior-diagnostic-dot { background: var(--amber); }
+.behavior-diagnostic-row > details { flex: 1; min-width: 0; border-bottom: 1px solid var(--hairline); }
+.behavior-diagnostic-row:last-child > details { border-bottom: 0; }
+.behavior-diagnostic-row summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) 0;
+  cursor: pointer;
+}
+.behavior-diagnostics summary { list-style: none; }
+.behavior-diagnostics summary::-webkit-details-marker { display: none; }
+.behavior-diagnostics summary:hover .behavior-diagnostic-message { color: var(--accent); }
+.behavior-diagnostics summary:focus-visible { outline-width: 2px; outline-style: solid; outline-color: var(--a1); outline-offset: 2px; border-radius: var(--r-sm); }
+.behavior-diagnostic-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
+.behavior-diagnostic-scope { font-size: 0.75rem; color: var(--text-secondary); overflow-wrap: anywhere; }
+.behavior-diagnostic-message { overflow-wrap: anywhere; }
+.behavior-diagnostic-count { color: var(--text-tertiary); font-size: 0.75rem; white-space: nowrap; }
+.behavior-diagnostic-chevron { margin-left: auto; color: var(--text-tertiary); font-size: 18px; transition: transform var(--t-quick) var(--ease); }
+.behavior-diagnostics details[open] > summary > .behavior-diagnostic-chevron { transform: rotate(90deg); }
+.behavior-diagnostics .behavior-diagnostic-details {
+  padding: var(--sp-3);
+  margin-bottom: var(--sp-3);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-family: var(--font-mono, monospace);
+  max-height: 200px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+.behavior-diagnostic-details li + li { margin-top: var(--sp-2); }
+@media (max-width: 600px) {
+  .behavior-diagnostics { margin: var(--sp-3) var(--sp-3); }
+  .behavior-diagnostic-header { flex-direction: column; gap: 2px; }
+  .behavior-diagnostic-count { display: none; }
+}
 
 /* The universal `td:nth-last-child(2) { text-align: right }` rule is
    meant for Archive's "Updated" column — it shouldn't apply here.

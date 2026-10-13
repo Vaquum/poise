@@ -540,8 +540,11 @@ Poise Link while it is unfinished.
 
 ## Behaviors
 
-Behaviors presents deterministic Errors and collapsed Warnings, with grouped
-target/cause details. An unavailable Behaviors API request is one availability
+Behaviors presents an Activity log: red Poise faults, yellow conditions needing
+attention and folded grey automatic recovery, with grouped target/cause details.
+The API carries an explicit `runtimeError` for scheduler faults and classifies
+retained incidents from its validated Caller snapshot independently of active
+failure summaries. An unavailable Behaviors API request is one availability
 diagnostic; it cannot establish datastore or identity failure. Last-known runtime
 degradation remains visible; an initial unread runtime is unknown. The classification
 and evidence rules are in [Behavior integration contract](Behavior-Contract.md#diagnostic-severity).
