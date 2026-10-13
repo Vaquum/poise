@@ -3,6 +3,34 @@
 Poise is a trigger and orchestration layer. It does not read GitHub source,
 construct reviews, or mutate review threads itself.
 
+## Diagnostic severity
+
+Behaviors separates **Errors** from collapsed **Warnings**, grouped by target
+and cause. Repository access failures shared by several checks appear once,
+with every check and retry time available under Details. Severity is a fixed
+allowlist: provider capacity, PR head/base changes during preparation, upstream
+429/5xx responses and recognized transport interruptions are warnings. Access,
+authentication, configuration, invalid results, held work and unknown causes
+remain errors. Counts and elapsed time never downgrade an error.
+
+The last terminal provider event is selected before redaction and the
+300-character display bound. Old summaries are refreshed only from an exact,
+validated Caller identity, without changing failure counts or retry clocks.
+A later authoritative completion removes transient warnings from the current
+view; uncertain held work and the audit history remain. Severity changes no
+launch, retry, ownership or publication rule.
+Recovered attempts carry `recovered: true` in the diagnostic payload so their
+exact audit identities can still suppress duplicate incidents. The view shows
+neither as an active problem; unrelated held attempts remain errors.
+
+If the browser cannot read `/api/behaviors`, it reports one request diagnostic
+and retains its last known snapshot. It does not infer agent-log, datastore or
+identity failures from that request. Controls remain unavailable until a
+successful read restores current state.
+An initial unread runtime has `status: 'unknown'`. A previously observed
+degraded runtime remains an error alongside the request diagnostic until a
+successful read supplies new health evidence.
+
 An operator can POST `/api/behaviors/retry-pr-reviews` with 1-3 `callIds`
 from failed automated slots on one PR/head. Poise verifies exact launch
 ownership, unchanged live head, no active worker, and no unclaimed or pending

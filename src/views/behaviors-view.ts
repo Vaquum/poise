@@ -11,7 +11,7 @@
 
 import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
 import { organizationErrors } from '../organizations'
-import { failureCause } from '../behavior-failure-cause'
+import { behaviorDiagnosticGroups, type BehaviorDiagnosticGroup } from '../behavior-diagnostics'
 
 let viewEl: HTMLElement
 let initialized = false
@@ -64,8 +64,6 @@ function ownerCell(username: string | null): string {
 // checkbox — dropping the guard that stops a second click while the first is
 // still travelling. Rendering consults this so the guard survives a repaint.
 const togglesInFlight = new Set<BehaviorKey>()
-
-const DEAD_LETTERS_SHOWN = 5
 
 function stateUnknown(): boolean {
   return !isBehaviorStateLoaded()
@@ -155,13 +153,13 @@ function relTime(iso: string): string {
 // from "this has never run". Say the truth instead: unknown, not never.
 function lastTriggeredUnavailable(): boolean {
   const d = getBehaviorDiagnostics()
-  return !!d?.agentLogsError
+  return stateUnknown() || !!d?.agentLogsError
 }
 
 function lastTriggeredCell(key: BehaviorKey): string {
   const last = getLastTriggered(key)
-  if (!last && key !== 'merge-prs' && lastTriggeredUnavailable()) {
-    return '<span class="last-dash" title="The agent log could not be read, so this is unknown — not necessarily never.">?</span>'
+  if (!last && (stateUnknown() || key !== 'merge-prs' && lastTriggeredUnavailable())) {
+    return '<span class="last-dash" title="The latest history could not be read, so this is unknown — not necessarily never.">?</span>'
   }
   if (!last) return '<span class="last-dash">—</span>'
   if (key === 'merge-prs') {
@@ -1008,43 +1006,16 @@ function renderDiagnostics() {
     el.textContent = ''
     return
   }
-  // Build the messages first and hide only when there are none. Returning
-  // early on `status === 'ok'` made two of the lines below unreachable: the
-  // runtime's status is computed from the ticker, the heartbeat, stalled
-  // operations, failures, identity and the datastore — it does not consider
-  // agentLogsError or deadLetters at all. So a real agent-log error, and any
-  // dead letter (a behaviour that gave up on a target), sat in the payload
-  // while the panel stayed hidden and empty. Observed on a live instance:
-  // status "ok" alongside `agent-interface log row 0 has invalid expected_head`.
-  const messages = [
-    diagnostics.agentLogsError ? `Agent log: ${diagnostics.agentLogsError}` : '',
-    diagnostics.datastore.error ? `Datastore: ${diagnostics.datastore.error}` : '',
-    diagnostics.identity.error ? `Identity: ${diagnostics.identity.error}` : '',
-    ...diagnostics.failures.map((failure) =>
-      `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}${failure.target ? ` ${failure.target}` : ''}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s)${failure.error ? ` — ${failureCause(failure.error)}` : ''}`),
-    ...diagnostics.deadLetters.slice(0, DEAD_LETTERS_SHOWN).map((letter) =>
-      `${letter.behavior} ${letter.target}: ${failureCause(letter.error)}${(letter.attemptCount ?? 1) > 1 ? ` (${letter.attemptCount} attempts)` : ''}`),
-    // A dead letter is a target the behaviour permanently gave up on. Showing
-    // the newest few and nothing else made an older one drop off the only
-    // surface that names it, with the panel reading as if it were complete.
-    diagnostics.deadLetters.length > DEAD_LETTERS_SHOWN
-      ? `${diagnostics.deadLetters.length - DEAD_LETTERS_SHOWN} more affected pull request(s) or issue(s) not shown`
-      : '',
-  ].filter(Boolean)
-  if (messages.length === 0) {
-    // Nothing specific to report. Say something only when the runtime itself
-    // is unhealthy, so an "ok" runtime stays quiet.
-    if (diagnostics.status === 'ok') {
-      el.hidden = true
-      el.textContent = ''
-      return
-    }
-    el.textContent = 'Behavior runtime is degraded.'
-    el.hidden = false
-    return
-  }
-  el.textContent = messages.join(' · ')
-  el.hidden = false
+  const groups = behaviorDiagnosticGroups(diagnostics)
+  const errors = groups.filter((group) => group.severity === 'error')
+  const warnings = groups.filter((group) => group.severity === 'warning')
+  const list = (entries: BehaviorDiagnosticGroup[]) => `<ul>${entries.map((group) => `
+    <li><span>${escapeHtml(group.scope)}: ${escapeHtml(group.message)}</span>
+      <details><summary>Details (${group.details.length})</summary><ul>${group.details.map((detail) => `<li>${escapeHtml(detail)}</li>`).join('')}</ul></details>
+    </li>`).join('')}</ul>`
+  el.innerHTML = `${errors.length ? `<section class="behavior-errors" aria-label="Errors"><strong>Errors (${errors.length})</strong>${list(errors)}</section>` : ''}
+    ${warnings.length ? `<details class="behavior-warnings" aria-label="Warnings"><summary>Warnings (${warnings.length})</summary>${list(warnings)}</details>` : ''}`
+  el.hidden = groups.length === 0
 }
 
 function renderRows() {

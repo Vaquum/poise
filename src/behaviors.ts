@@ -5,6 +5,8 @@
 // reliably (browser tabs close, reload, get backgrounded). This
 // module is just labels + an HTTP client for the toggle.
 
+import { classifyBehaviorDiagnostic, type DiagnosticClassification } from './behavior-failure-cause'
+
 export type BehaviorKey = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'review-new-issues'
 
 export interface BehaviorMeta {
@@ -47,8 +49,9 @@ export type BehaviorSetting = 'p0' | 'p1' | 'p2' | 'p3' | 'p4'
 export type ReviewerCount = 1 | 2 | 3
 export interface LastTriggered { at: string; target: string }
 export interface BehaviorDiagnostics {
-  status: 'ok' | 'degraded'
+  status: 'ok' | 'degraded' | 'unknown'
   agentLogsError: string | null
+  apiError?: DiagnosticClassification & { message: string }
   datastore: {
     status: 'unchecked' | 'healthy' | 'unavailable'
     checkedAt: string
@@ -57,7 +60,7 @@ export interface BehaviorDiagnostics {
     error: string | null
   }
   identity: {
-    status: 'valid' | 'invalid'
+    status: 'valid' | 'invalid' | 'unknown'
     actor: string | null
     error: string | null
   }
@@ -70,6 +73,9 @@ export interface BehaviorDiagnostics {
     lastFailureAt: string
     nextRetryAt: string
     error?: string
+    diagnostic?: DiagnosticClassification
+    callId?: string
+    recovered?: boolean
   }>
   deadLetters: Array<{
     id: string
@@ -78,6 +84,7 @@ export interface BehaviorDiagnostics {
     error: string
     createdAt: string
     attemptCount?: number
+    callId?: string | null
   }>
 }
 
@@ -330,6 +337,7 @@ export function getBehaviorOwner(key: BehaviorKey): string | null {
 let refreshSequence = 0
 
 export async function refreshState(): Promise<void> {
+  let requestFailure: DiagnosticClassification | undefined
   const mine = ++refreshSequence
   const keys = BEHAVIORS.map((behavior) => behavior.key)
   // Snapshot the write counters before asking, so the answer can be checked
@@ -339,7 +347,10 @@ export async function refreshState(): Promise<void> {
     busy: (writesInFlight[k] ?? 0) > 0,
   }]))
   try {
-    const res = await fetch('/api/behaviors')
+    const res = await fetch('/api/behaviors').catch((cause: unknown) => {
+      requestFailure = classifyBehaviorDiagnostic(cause instanceof TypeError ? 'ECONNRESET' : String(cause))
+      throw cause
+    })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     // A newer refresh already answered; this one is history.
@@ -372,18 +383,24 @@ export async function refreshState(): Promise<void> {
     if (mine !== refreshSequence) return
     stateLoadOk = false
     diagnostics = {
-      status: 'degraded',
-      agentLogsError: error instanceof Error ? error.message : String(error),
-      datastore: {
-        status: 'unavailable',
-        checkedAt: new Date().toISOString(),
-        ageSeconds: null,
-        lastSuccessAt: null,
-        error: 'Behaviors API unavailable',
+      ...(diagnostics ?? {
+        status: 'unknown',
+        agentLogsError: null,
+        datastore: {
+          status: 'unchecked',
+          checkedAt: new Date().toISOString(),
+          ageSeconds: null,
+          lastSuccessAt: null,
+          error: null,
+        },
+        identity: { status: 'unknown', actor: null, error: null },
+        failures: [],
+        deadLetters: [],
+      }),
+      apiError: {
+        ...(requestFailure ?? classifyBehaviorDiagnostic(error instanceof Error ? error.message : String(error))),
+        message: error instanceof Error ? error.message : String(error),
       },
-      identity: { status: 'invalid', actor: null, error: 'Behaviors API unavailable' },
-      failures: [],
-      deadLetters: [],
     }
   }
 }

@@ -3,6 +3,12 @@ import { behaviorErrorMessage } from '../server/behavior-diagnostics'
 
 afterEach(() => vi.unstubAllEnvs())
 describe('behavior CLI diagnostics', () => {
+  it('extracts and redacts the terminal event before truncating a long provider stream', () => {
+    vi.stubEnv('GH_TOKEN', 'terminal-secret-value')
+    const stream = '{"type":"item.completed","item":{"type":"error","message":"Code Mode disabled"}}\n'
+      + 'startup '.repeat(100) + '\n{"type":"turn.failed","error":{"message":"Selected model is at capacity. terminal-secret-value"}}'
+    expect(behaviorErrorMessage(stream)).toBe('Selected model is at capacity. [redacted]')
+  })
   it.each([
     'error: checkout not found under /Users/example/dev: autonomio/autonomio',
     'error: GitHub 404: Not Found',

@@ -540,6 +540,12 @@ Poise Link while it is unfinished.
 
 ## Behaviors
 
+Behaviors presents deterministic Errors and collapsed Warnings, with grouped
+target/cause details. An unavailable Behaviors API request is one availability
+diagnostic; it cannot establish datastore or identity failure. Last-known runtime
+degradation remains visible; an initial unread runtime is unknown. The classification
+and evidence rules are in [Behavior integration contract](Behavior-Contract.md#diagnostic-severity).
+
 **Repository opt-out.** Review new PRs, Approve PRs and Resolve unblocking
 each have a "Skip repositories" list:
 - The list is chosen from all repositories of the person's ready accounts.

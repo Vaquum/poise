@@ -3190,14 +3190,28 @@ tr:hover .stop-btn { opacity: 1; }
 
 .behavior-diagnostics {
   margin: var(--sp-4) var(--sp-6);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
+.behavior-errors, .behavior-warnings {
   padding: var(--sp-3) var(--sp-4);
   border: 1px solid var(--danger-border, #8b3a3a);
   border-radius: var(--radius-sm);
   color: var(--danger, #d86b6b);
   background: color-mix(in srgb, currentColor 8%, transparent);
-  font-size: var(--text-sm);
-  line-height: 1.45;
 }
+
+.behavior-warnings {
+  margin-top: var(--sp-3);
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+
+.behavior-diagnostics ul { margin: var(--sp-2) 0 0; padding-left: var(--sp-4); }
+.behavior-diagnostics li + li { margin-top: var(--sp-2); }
+.behavior-diagnostics details details, .behavior-errors details { margin-top: var(--sp-1); }
+.behavior-diagnostics summary { cursor: pointer; }
 
 /* The universal `td:nth-last-child(2) { text-align: right }` rule is
    meant for Archive's "Updated" column — it shouldn't apply here.

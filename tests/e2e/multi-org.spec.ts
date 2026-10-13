@@ -366,6 +366,86 @@ test('reports failures across accounts in global behavior diagnostics', async ({
   expect(state.reads.filter((read) => read.path === '/api/behaviors').every((read) => read.org === '')).toBe(true)
 })
 
+test('groups actionable repository errors and collapses transient warnings', async ({ page }) => {
+  const state = await setup(page)
+  state.diagnostics = { status: 'ok', agentLogsError: null,
+    datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+    identity: { status: 'valid', actor: 'bit-mis', error: null }, deadLetters: [],
+    failures: [
+      ...['', ':secondary', ':tertiary'].map((slot) => ({ behavior: 'review-new-prs' as const,
+        target: `acme/private#21${slot}:check`, kind: 'operation', consecutiveFailures: 19,
+        lastFailureAt: '', nextRetryAt: '', error: 'GitHub 404: Not Found' })),
+      { behavior: 'approve-prs', target: 'acme/public#7', kind: 'worker', consecutiveFailures: 1,
+        lastFailureAt: '', nextRetryAt: '', error: 'Selected model is at capacity. Please try a different model.',
+        diagnostic: { severity: 'warning', code: 'provider_capacity' } },
+      { behavior: 'approve-prs', target: 'acme/public#8', kind: 'worker', consecutiveFailures: 1,
+        lastFailureAt: '', nextRetryAt: '', error: 'error: pull-request head or base changed while building review packet',
+        diagnostic: { severity: 'warning', code: 'head_changed' } },
+    ],
+  }
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  const diagnostics = page.locator('#behavior-diagnostics')
+  await expect(diagnostics.locator('.behavior-errors > strong')).toHaveText('Errors (1)')
+  await expect(diagnostics.locator('.behavior-errors > ul > li')).toHaveCount(1)
+  await expect(diagnostics.locator('.behavior-errors')).toContainText('acme/private: GitHub target is unavailable to bit-mis')
+  const warnings = diagnostics.locator('.behavior-warnings')
+  await expect(warnings.locator(':scope > summary')).toHaveText('Warnings (2)')
+  await expect(warnings).not.toHaveAttribute('open', '')
+  await warnings.locator(':scope > summary').click()
+  await expect(warnings).toContainText('Selected model is at capacity.')
+  await expect(warnings).toContainText('PR changed during review preparation')
+  await diagnostics.locator('.behavior-errors summary').click()
+  await expect(diagnostics.locator('.behavior-errors details')).toContainText('acme/private#21:secondary:check')
+})
+
+test('shows one API availability warning and clears it on a successful refresh', async ({ page }) => {
+  await setup(page)
+  let unavailable = true
+  await page.route(/\/api\/behaviors(?:\?.*)?$/, async (route) => unavailable
+    ? route.fulfill({ status: 502, body: 'Bad Gateway' }) : route.fallback())
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  const diagnostics = page.locator('#behavior-diagnostics')
+  await expect(diagnostics.locator('.behavior-warnings > summary')).toHaveText('Warnings (1)')
+  await expect(diagnostics.locator('.behavior-errors')).toHaveCount(0)
+  await diagnostics.locator('.behavior-warnings > summary').click()
+  await expect(diagnostics).toContainText('Behaviors: Status could not be refreshed (HTTP 502).')
+  await expect(diagnostics).not.toContainText('Datastore:')
+  await expect(diagnostics).not.toContainText('Identity:')
+  await expect(diagnostics).not.toContainText('Agent log:')
+  await expect(page.locator('input[data-behavior="review-new-prs"]')).toBeDisabled()
+  await expect(page.locator('tr[data-behavior="review-new-prs"] .last-dash[title*="unknown"]')).toHaveText('?')
+  unavailable = false
+  await page.reload()
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  await expect(diagnostics).toBeHidden()
+  await expect(page.locator('input[data-behavior="review-new-prs"]')).toBeEnabled()
+})
+
+test('keeps the last-known runtime error visible alongside a later API outage', async ({ page }) => {
+  const state = await setup(page)
+  state.diagnostics = { status: 'degraded', agentLogsError: null,
+    datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+    identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [] }
+  let unavailable = false
+  await page.route(/\/api\/behaviors(?:\?.*)?$/, async (route) => unavailable
+    ? route.fulfill({ status: 502, body: 'Bad Gateway' }) : route.fallback())
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  const diagnostics = page.locator('#behavior-diagnostics')
+  await expect(diagnostics.locator('.behavior-errors')).toContainText('Behavior runtime is degraded.')
+  unavailable = true
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(diagnostics.locator('.behavior-warnings > summary')).toHaveText('Warnings (1)')
+  await expect(diagnostics.locator('.behavior-errors > strong')).toHaveText('Errors (1)')
+  await expect(diagnostics.locator('.behavior-errors')).toContainText('Behavior runtime is degraded.')
+  unavailable = false
+  state.diagnostics.status = 'ok'
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(diagnostics).toBeHidden()
+})
+
 test('preserves selected repositories when one account cannot be listed', async ({ page }) => {
   const state = await setup(page, [organization('acme'), organization('mikkokotila')])
   state.behaviors['review-new-issues'] = { repos: ['mikkokotila/same-repo'] }

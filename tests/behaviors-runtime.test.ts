@@ -2753,7 +2753,11 @@ describe('behavior launch claims', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
   })
 
-  it('retries an approval after Caller reports that preflight failed before any action', async () => {
+  it.each([
+    ['httpx.ReadTimeout', 'network_interruption'],
+    ['Selected model is at capacity. Please try a different model.', 'provider_capacity'],
+    ['error: pull-request head or base changed while building review packet', 'head_changed'],
+  ])('retries a no-action approval and classifies %s as a warning', async (error, code) => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
     const launched = await launchApprovalBeforeCrash()
@@ -2766,7 +2770,7 @@ describe('behavior launch claims', () => {
       status: 'failed',
       action: 'not_started',
       outcome: 'preflight_failed',
-      error: 'GitHub read timed out',
+      error,
       expected_head: launched.expectedHead,
       actor: launched.actor,
       source: launched.source,
@@ -2778,6 +2782,9 @@ describe('behavior launch claims', () => {
     await runtime.runEnabledBehaviorsOnce()
 
     expect(db.hasSeen('approve-prs', launched.target)).toBe(false)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
+      target: launched.target, diagnostic: { severity: 'warning', code },
+    }))
     expect(mocks.observeAuthFailure).not.toHaveBeenCalled()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     expect(db.listBehaviorDeadLetters()).toEqual([
@@ -2785,7 +2792,7 @@ describe('behavior launch claims', () => {
         behavior: 'approve-prs',
         target: launched.target,
         callId,
-        error: 'GitHub read timed out',
+        error,
       }),
     ])
 
@@ -2794,6 +2801,142 @@ describe('behavior launch claims', () => {
     await runtime.runEnabledBehaviorsOnce()
 
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+  })
+
+  it('rehydrates a truncated warning only from the exact Caller attempt, preserving its retry clock', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
+    const launched = await launchApprovalBeforeCrash()
+    const error = 'codex review produced no submitted verdict: {"type":"item.completed","item":{"type":"error","message":"Code Mode disabled"}}\n'
+      + '{"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}'
+    const call = agentLog({ id: 'e'.repeat(32), behavior: 'pr_approve',
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', error,
+      expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
+    agentLogs = [call]
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    const key = `behavior_approve_prs_failure:${launched.target}`
+    const stored = JSON.parse(db.getMeta(key)!)
+    const { diagnostic: _diagnostic, ...legacy } = stored
+    legacy.error = error.slice(0, 120)
+    db.setMeta(key, JSON.stringify(legacy))
+    call.correlation_id = 'unrelated-attempt'
+    await runtime.runEnabledBehaviorsOnce()
+    expect(JSON.parse(db.getMeta(key)!)).toEqual(legacy)
+    call.correlation_id = launched.correlationId
+    await runtime.runEnabledBehaviorsOnce()
+    expect(JSON.parse(db.getMeta(key)!)).toEqual({ ...stored,
+      diagnostic: { severity: 'warning', code: 'provider_capacity' },
+      error: 'Selected model is at capacity. Please try a different model.' })
+  })
+
+  it('binds a legacy failure summary to the newest attempt instead of overwriting it with an older cause', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
+    const launched = await launchReviewBeforeCrash()
+    const old = agentLog({ id: 'd'.repeat(32),
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      status: 'failed', action: 'not_started', outcome: 'preflight_failed', error: 'Older invalid result',
+      expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
+    agentLogs = [old]
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    vi.setSystemTime(new Date(Date.now() + runtime.BEHAVIOR_RETRY_BASE_MS))
+    await runtime.runEnabledBehaviorsOnce()
+    const current = db.listBehaviorLaunchClaims('review-new-prs').find((claim) => claim.target === launched.target)!
+    expect(current).toBeDefined()
+    const latest = agentLog({ id: 'e'.repeat(32),
+      started_at: current.launchRequestedAt, status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error: 'Selected model is at capacity. Please try a different model.',
+      expected_head: current.launchExpectedHead, actor: current.launchActor, source: current.launchSource,
+      correlation_id: current.launchCorrelationId })
+    agentLogs = [latest, old]
+    await runtime.runEnabledBehaviorsOnce()
+    const key = `behavior_review_new_prs_failure:${launched.target}`
+    const stored = JSON.parse(db.getMeta(key)!)
+    expect(stored.consecutiveFailures).toBe(2)
+    const legacy = { ...stored }
+    delete legacy.diagnostic
+    delete legacy.callId
+    legacy.error = 'truncated legacy cause'
+    db.setMeta(key, JSON.stringify(legacy))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(JSON.parse(db.getMeta(key)!)).toEqual(stored)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
+      error: latest.error, callId: latest.id, diagnostic: { severity: 'warning', code: 'provider_capacity' },
+    }))
+  })
+
+  it('hides an old transient approval warning only after later authoritative completion, retaining held evidence and history', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
+    const launched = await launchApprovalBeforeCrash()
+    const { database: db, behaviors: runtime } = launched
+    const key = `behavior_approve_prs_failure:${launched.target}`
+    db.setMeta(key, JSON.stringify({ kind: 'worker', consecutiveFailures: 1,
+      lastFailureAtMs: Date.now() - 1_000, nextRetryAtMs: Date.now() + 60_000,
+      error: 'Selected model is at capacity.', callId: 'd'.repeat(32), diagnostic: { severity: 'warning', code: 'provider_capacity' } }))
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toHaveLength(1)
+    const target = `${pr.repo}#${pr.number}@head=${NEXT_HEAD_SHA}`
+    const claimId = db.claimSeenOwned('approve-prs', target)!
+    expect(db.markBehaviorLaunchIntentOwned({ key: 'approve-prs', target, claimId,
+      launchBehavior: 'pr_approve', repo: pr.repo, pr: pr.number, requestedAt: new Date().toISOString(),
+      expectedHead: NEXT_HEAD_SHA, actor: launched.actor, source: launched.source, correlationId: claimId })).toBe(true)
+    expect(db.completeBehaviorLaunchOwned({ key: 'approve-prs', target, claimId,
+      action: 'approved', outcome: 'approved', completedAt: new Date().toISOString(), headSha: NEXT_HEAD_SHA })).toBe(true)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ recovered: true })])
+    expect(db.getMeta(key)).not.toBeNull()
+    // An audit can be recreated after completion during log reconciliation.
+    // It must not turn an already recovered no-action attempt into an error.
+    vi.setSystemTime(new Date(Date.now() + 1_000))
+    const original = db.listBehaviorLaunchClaims('approve-prs').find((claim) => claim.target === launched.target)!
+    db.recordBehaviorDeadLetter(original, 'Selected model is at capacity.', 'd'.repeat(32))
+    const { behaviorDiagnosticGroups } = await import('../src/behavior-diagnostics')
+    expect(behaviorDiagnosticGroups({ ...runtime.getBehaviorsRuntimeHealth(), agentLogsError: null })).toEqual([])
+    expect(db.listBehaviorDeadLetters()).toHaveLength(1)
+    db.db.prepare("UPDATE behavior_seen SET launch_quarantine = 'unreadable' WHERE key = 'approve-prs' AND target = ?").run(launched.target)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({
+      diagnostic: { severity: 'error', code: 'held_result' },
+    })])
+  })
+
+  it.each([{ receipts: null }, { receipts: [] }])('classifies the first issue-review timeout from its recorded posting state: %j', async ({ receipts }) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
+    arrangeCli(false)
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-datastore' && args[0] === 'view' && args[1] === 'issue') {
+        return { stdout: JSON.stringify([{ ...pr, url: `https://github.com/${pr.repo}/issues/${pr.number}`, title: 'Review retry diagnostics',
+          created_at: new Date(Date.now() - 20 * 60_000).toISOString(),
+          updated_at: new Date(Date.now() - 20 * 60_000).toISOString(), comments_count: 0 }]), stderr: '' }
+      }
+      if (command === 'github-interface' && args[0] === '--sub-issues') {
+        return { stdout: JSON.stringify({ action: 'sub_issues', repository: pr.repo, issue_number: pr.number, sub_issues: [] }), stderr: '' }
+      }
+      return original(command, args, options)
+    })
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_issues_enabled', '1')
+    db.setMeta('behavior_review_new_issues_repos', JSON.stringify([{ repo: pr.repo, since: new Date(Date.now() - 60 * 60_000).toISOString() }]))
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    const claim = db.listBehaviorLaunchClaims('review-new-issues')[0]!
+    expect(claim).toBeDefined()
+    agentLogs = [agentLog({ id: 'e'.repeat(32), behavior: 'issue_review', repo: pr.repo, pr_id: String(pr.number),
+      actor: claim.launchActor, source: claim.launchSource, correlation_id: claim.launchCorrelationId,
+      started_at: claim.launchRequestedAt, status: 'failed', action: null, outcome: null, expected_head: null,
+      error: 'httpx.ReadTimeout', receipts: receipts ? [] : null })]
+    await runtime.runEnabledBehaviorsOnce()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
+      behavior: 'review-new-issues', diagnostic: receipts ? { severity: 'error', code: 'held_result' }
+        : { severity: 'warning', code: 'network_interruption' },
+    }))
   })
 
   it.each(['review-new-prs', 'approve-prs'] as const)('holds an oversized %s packet across restart until the head changes', async (behavior) => {
