@@ -1,3 +1,5 @@
+import { patchContent } from './dom-patch'
+import { reveal } from './motion'
 // Global Claude subscription health prompt.
 //
 // The server owns credential checks and the browser only renders its cached
@@ -170,6 +172,7 @@ function renderBanner(): void {
     bannerEl.setAttribute('aria-live', 'assertive')
     bannerEl.setAttribute('aria-atomic', 'true')
     document.body.appendChild(bannerEl)
+    reveal(bannerEl, { distance: 8 })
   }
 
   if (bannerEl) bannerEl.dataset.detail = localFailureDetail
@@ -185,7 +188,7 @@ function renderBanner(): void {
   message.textContent = copy.message
   text.append(title, message)
 
-  bannerEl.replaceChildren(text)
+  if (!LOGIN_STATUSES.has(status) || localFailureDetail) patchContent(bannerEl, text.outerHTML)
   // Not reaching Poise's own server is not fixed by reconnecting Claude: offer nothing to click.
   if (!LOGIN_STATUSES.has(status) || localFailureDetail) return
   if (browserLoginUnavailable) {
@@ -198,11 +201,11 @@ function renderBanner(): void {
   button.type = 'button'
   button.className = 'claude-auth-login'
   button.textContent = status === 'reauth_required' ? 'Sign in with Claude' : 'Reconnect Claude'
-  button.addEventListener('click', () => {
+  patchContent(bannerEl, text.outerHTML + button.outerHTML)
+  bannerEl.querySelector<HTMLButtonElement>('.claude-auth-login')!.onclick = () => {
     if (browserLoginUnavailable) connectInSettings()
     else void startLogin()
-  })
-  bannerEl.appendChild(button)
+  }
 }
 
 // Settings listens for this and opens Connected accounts with the terminal.

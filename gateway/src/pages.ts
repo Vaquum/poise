@@ -1,3 +1,4 @@
+import { MOTION_CSS } from './motion-model.js'
 import type { AllowedLogin, User, WorkspaceRecord } from './store.js'
 import type { DiskReport } from './disk.js'
 
@@ -43,7 +44,8 @@ const STYLE = `
     --text: #2F353D; --text-secondary: #5C636D; --text-tertiary: #8E959E;
     --n0: #F7F8F9; --n5: #5C636D; --n6: #2F353D; --a1: #3A72B0; --a5: #B85048;
     --e-3: 0 12px 24px rgba(22, 26, 32, .14), 0 4px 8px rgba(22, 26, 32, .06);
-    --ease: cubic-bezier(0.2, 0, 0, 1);
+    ${MOTION_CSS}
+    --ease: var(--flow-spring);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -61,9 +63,9 @@ const STYLE = `
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; line-height: 1.5;
     color: var(--text); background: var(--bg);
   }
-  main { width: min(400px, 100%); display: flex; flex-direction: column; gap: 20px; animation: enter 250ms var(--ease) both; }
+  main { width: min(400px, 100%); display: flex; flex-direction: column; gap: 20px; animation: enter var(--flow-settle) var(--flow-spring) both; }
   main.wide { width: min(960px, 100%); }
-  @keyframes enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @keyframes enter { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: none; } }
   .brand { text-align: center; font-size: 1.25rem; font-weight: 600; letter-spacing: -0.015em; color: var(--text); }
   .card {
     display: flex; flex-direction: column; gap: 12px; padding: 24px;
@@ -88,7 +90,7 @@ const STYLE = `
     display: inline-block; padding: 8px 14px; font: inherit; font-size: 0.75rem; font-weight: 600; line-height: 1.5;
     text-align: center; text-decoration: none; cursor: pointer; border-radius: 8px;
     color: var(--n0); background: var(--n5); border: 1px solid var(--n5);
-    transition: background 180ms ease, border-color 180ms ease, color 180ms ease;
+    transition: background var(--flow-feedback) ease-out, border-color var(--flow-feedback) ease-out, color var(--flow-feedback) ease-out;
   }
   .button:hover, button:hover { color: var(--n0); background: var(--n6); border-color: var(--n6); }
   .button.secondary, button.secondary { color: var(--text-secondary); background: var(--surface); border-color: var(--border); }
@@ -98,7 +100,7 @@ const STYLE = `
   :focus-visible { outline: 2px solid var(--a1); outline-offset: 2px; }
   :focus:not(:focus-visible) { outline: none; }
   .loader { display: flex; justify-content: center; gap: 6px; padding: 8px 0; }
-  .loader span { width: 5px; height: 5px; border-radius: 999px; background: var(--text-tertiary); animation: pulse 1s ease-in-out infinite; }
+  .loader span { width: 5px; height: 5px; border-radius: 999px; background: var(--text-tertiary); opacity: .65; }
   .loader span:nth-child(2) { animation-delay: 0.15s; }
   .loader span:nth-child(3) { animation-delay: 0.3s; }
   @keyframes pulse { 0%, 100% { opacity: 0.2; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
@@ -116,7 +118,8 @@ const STYLE = `
   }
   td { padding: 11px 12px 11px 0; font-size: 0.8125rem; vertical-align: top; border-bottom: 1px solid var(--hairline); }
   td form.inline + form.inline { margin-left: 4px; }
-  @media (prefers-reduced-motion: reduce) { main, .loader span { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+  main.refreshing { animation: none; }
 `
 
 export function page(title: string, body: Html, options: { refreshSeconds?: number; wide?: boolean; footer?: string } = {}): string {
@@ -131,7 +134,7 @@ ${options.refreshSeconds ? html`<meta http-equiv="refresh" content="${options.re
 <link rel="stylesheet" href="${FONT_ORIGIN}/inter/inter.css">
 <style>${new Html(STYLE)}</style>
 </head>
-<body><main${options.wide ? html` class="wide"` : ''}>
+<body><main class="${options.wide ? 'wide ' : ''}${options.refreshSeconds ? 'refreshing' : ''}">
 <div class="brand">Poise</div>
 ${body}
 ${options.footer ? html`<div class="footer">${options.footer}</div>` : ''}

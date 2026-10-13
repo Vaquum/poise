@@ -1,3 +1,4 @@
+import { patchContent } from './dom-patch'
 // Analytics — a side panel of headline numbers, opened from the burger menu.
 // It offers Current's time ranges and opens on the one Current shows; picking
 // another here leaves Current as it is. The numbers come from /api/analytics
@@ -55,7 +56,7 @@ function showStatus(panel: HTMLElement, message: string, isError = false): void 
 }
 
 function renderReport(panel: HTMLElement, report: AnalyticsReport): void {
-  panel.querySelector('.analytics-groups')!.innerHTML = analyticsGroups(report).map((group) => `
+  patchContent(panel.querySelector('.analytics-groups')!, analyticsGroups(report).map((group) => `
     <section class="analytics-group">
       <h3 class="tp-group-label">${escapeHtml(group.label)}</h3>
       <dl class="analytics-tiles">
@@ -66,7 +67,7 @@ function renderReport(panel: HTMLElement, report: AnalyticsReport): void {
           </div>`).join('')}
       </dl>
       ${group.note ? `<p class="analytics-group-note">${escapeHtml(group.note)}</p>` : ''}
-    </section>`).join('')
+    </section>`).join(''))
 }
 
 async function readAnalytics(): Promise<void> {

@@ -1,3 +1,5 @@
+import { scrollToActor } from './motion'
+import { retire, reveal, resizeContent } from './motion'
 // First-run setup (docs/Service-architecture.md, "First-run setup"): a new
 // workspace opens a dialog in the middle of the screen, with everything else
 // dimmed, that takes the person through what Poise needs in the order it
@@ -1017,7 +1019,7 @@ class Onboarding {
       })
       this.terminal = panel
       slot.replaceChildren(panel.element)
-      panel.element.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+      scrollToActor(panel.element)
     } catch (error) {
       this.status(`Could not open the terminal: ${(error as Error).message}`, 'error')
     } finally {
@@ -1076,9 +1078,9 @@ class Onboarding {
       node.classList.toggle('ob-rail-current', position === index)
     }
     this.dialog.dataset.step = step.id
-    this.body.replaceChildren(this.view.element)
+    resizeContent(this.body, () => this.body.replaceChildren(this.view!.element))
     this.body.scrollTop = 0
-    this.view.element.classList.add('ob-step-enter')
+    reveal(this.view.element, { distance: 8 })
     this.footer()
     requestAnimationFrame(() => {
       if (this.view?.focus) this.view.focus()
@@ -1104,18 +1106,18 @@ class Onboarding {
     this.closeTerminal()
     this.view?.dispose?.()
     this.view = null
+    // The inert copy keeps the dialog's presented pose, including an unfinished entrance.
+    this.dialog.style.transform = getComputedStyle(this.dialog).transform
+    this.dialog.style.transition = 'none'
+    retire(this.root)
     for (const node of this.inerted) node.removeAttribute('inert')
     document.documentElement.classList.remove('ob-open')
-    this.root.classList.remove('ob-visible')
-    this.root.classList.add('ob-leaving')
-    window.setTimeout(() => this.root.remove(), 260)
     active = null
     window.dispatchEvent(new CustomEvent('poise:synced'))
     if (finished) {
       // Point once at where everything set here lives.
       const toggle = document.getElementById('menu-toggle')
-      toggle?.classList.add('ob-pulse')
-      window.setTimeout(() => toggle?.classList.remove('ob-pulse'), 3200)
+      if (toggle) reveal(toggle, { distance: 0 })
     }
   }
 }

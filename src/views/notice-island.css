@@ -36,16 +36,7 @@
   color: var(--ni-ink);
   box-shadow: var(--e-2);
   overflow: hidden;
-  transition:
-    width var(--t-slow) var(--ease),
-    opacity var(--t-slow) var(--ease),
-    transform var(--t-slow) var(--ease);
-}
-#notice-island[data-state="entering"] .ni-shell,
-#notice-island[data-state="leaving"] .ni-shell {
-  width: var(--ni-h);
-  opacity: 0;
-  transform: scale(0.6);
+  transition: none;
 }
 
 /* Each notice's content. Two overlap while one gives way to the next. */
@@ -57,17 +48,10 @@
   gap: 2px;
   padding: 0 3px;
   white-space: nowrap;
-  /* The arriving notice waits for the leaving one to be mostly gone, so the
-     two never read on top of each other. */
-  transition: opacity var(--t-base) var(--ease) calc(var(--t-quick) / 2), transform var(--t-base) var(--ease) calc(var(--t-quick) / 2);
+  transition: none;
 }
-.ni-content.ni-arriving { opacity: 0; transform: translateY(6px); }
 .ni-content.ni-leaving {
-  opacity: 0;
-  transform: translateY(-6px);
   pointer-events: none;
-  transition-duration: var(--t-quick);
-  transition-delay: 0s;
 }
 
 .ni-content[data-kind="chat_waiting"]           { --ni-tone: var(--a1); }
@@ -94,7 +78,7 @@
 }
 button.ni-main {
   cursor: pointer;
-  transition: background var(--t-quick) ease;
+  transition: background var(--flow-feedback) ease-out;
 }
 button.ni-main:hover { background: var(--ni-hover); }
 
@@ -152,7 +136,7 @@ button.ni-main:hover { background: var(--ni-hover); }
   color: var(--ni-muted);
   font: inherit;
   cursor: pointer;
-  transition: color var(--t-quick) ease, background var(--t-quick) ease;
+  transition: color var(--flow-feedback) ease-out, background var(--flow-feedback) ease-out;
 }
 .ni-action:hover {
   color: var(--ni-ink);
@@ -174,7 +158,6 @@ button.ni-main:hover { background: var(--ni-hover); }
   from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ni-tone) 70%, transparent); }
   to { box-shadow: 0 0 0 7px color-mix(in srgb, var(--ni-tone) 0%, transparent); }
 }
-#notice-island.ni-remind .ni-shell { animation: ni-swell var(--t-slow) var(--ease) 2 alternate; }
 #notice-island.ni-remind .ni-content:not(.ni-leaving) .ni-icon { animation: ni-ring calc(var(--t-slow) * 2) var(--ease) 1; }
 
 /* Visually hidden, read aloud. */

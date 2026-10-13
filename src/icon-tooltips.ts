@@ -1,3 +1,4 @@
+import { reveal } from './motion'
 /** Delayed icon labels and contextual help, including newly rendered controls. */
 export function installIconTooltips(root: HTMLElement = document.body): () => void {
   const tip = document.createElement('div')
@@ -51,6 +52,7 @@ export function installIconTooltips(root: HTMLElement = document.body): () => vo
       const height = tip.offsetHeight
       tip.style.left = `${Math.max(8, Math.min(box.x + box.width / 2 - width / 2, innerWidth - width - 8))}px`
       tip.style.top = `${box.bottom + height + 8 <= innerHeight ? box.bottom + 6 : Math.max(8, box.top - height - 6)}px`
+      reveal(tip, { distance: 8 })
       button.setAttribute('aria-describedby', [button.getAttribute('aria-describedby'), tip.id].filter(Boolean).join(' '))
     }, button.dataset.help ? 500 : 1000)
   }

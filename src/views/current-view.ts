@@ -7,6 +7,8 @@
 // that opens a real GitHub issue via the proxy.
 
 import { getSettings } from '../config'
+import { disclosure, layout, retire, reveal } from '../motion'
+import { patchContent } from '../dom-patch'
 import { CURRENT_FILTER_KEY, TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../time-range'
 import { mountOrganizationFilter, organizationPayload, organizationUrl, getSelectedOrganization, organizationErrors } from '../organizations'
 
@@ -458,7 +460,7 @@ function paintLiveItem(el: HTMLElement, item: LiveItem): void {
   // action strip; issue cards have no primary action — only the
   // tools row.
   const primary = item.is_pr === 1 ? reviewButton(item) : ''
-  el.innerHTML = `
+  patchContent(el, `
     <a class="card-link" href="${safeHttpsUrl(item.url)}" target="_blank" rel="noopener">
       <div class="card-text">${escapeHtml(item.title)}</div>
       <div class="card-meta">
@@ -475,7 +477,7 @@ function paintLiveItem(el: HTMLElement, item: LiveItem): void {
       tools: chatSessionButton(item),
       primary,
     })}
-  `
+  `)
 }
 
 // An open card editor is a child of its card, and renderAll empties every
@@ -508,161 +510,83 @@ function restoreOpenEdit(draft: EditDraft | null): void {
 
 function renderAll(type?: LaneType) {
   const draft = captureOpenEdit() ?? openEditDraft
-  for (const l of LANES) {
-    if (type && l.type !== type) continue
-    const list = laneListEl(l.key)
-    list.innerHTML = ''
-    let count = 0
-    if (l.type === 'manual') {
-      const items = manualInLane(l.key as 'idea' | 'concept' | 'plan')
-      for (const c of items) list.appendChild(renderManualCard(c))
-      count = items.length
-    } else {
-      const items = liveInLane(l.key as 'issue' | 'pr')
-      for (const i of items) list.appendChild(renderLiveItem(i))
-      count = items.length
+  layout(viewEl, () => {
+    const existing = new Map([...viewEl.querySelectorAll<HTMLElement>('.lane-list > .card')].map(el => [el.dataset.id!, el]))
+    const keep = new Set<HTMLElement>()
+    for (const lane of LANES) {
+      const list = laneListEl(lane.key)
+      if (type && lane.type !== type) { for (const actor of list.querySelectorAll<HTMLElement>(':scope > .card')) keep.add(actor); continue }
+      let cursor = list.firstChild
+      const place = (actor: HTMLElement) => {
+        keep.add(actor)
+        if (actor !== cursor) list.insertBefore(actor, cursor)
+        cursor = actor.nextSibling
+      }
+      const manual = lane.type === 'manual' ? manualInLane(lane.key as 'idea' | 'concept' | 'plan') : []
+      const live = lane.type === 'live' ? liveInLane(lane.key as 'issue' | 'pr') : []
+      for (const card of manual) {
+        const fresh = renderManualCard(card)
+        const actor = existing.get(String(card.id)) ?? fresh
+        if (actor !== fresh && !actor.classList.contains('editing')) patchContent(actor, fresh.innerHTML)
+        actor.dataset.lane = lane.key
+        place(actor)
+      }
+      for (const item of live) {
+        const actor = existing.get(prKey(item)) ?? renderLiveItem(item)
+        if (existing.has(prKey(item))) paintLiveItem(actor, item)
+        place(actor)
+      }
+      const count = manual.length + live.length
+      laneCountEl(lane.key).textContent = lane.type === 'live' && liveTruncated ? `${count}+` : String(count)
+      laneCountEl(lane.key).title = lane.type === 'live' && liveTruncated ? `Showing the ${LIVE_LIMIT} most recently updated issues and pull requests combined; older ones are not loaded.` : ''
+      renderLaneEmptyState(lane, count)
     }
-    // Say the count is a floor, not a total, when the read was capped.
-    laneCountEl(l.key).textContent = l.type === 'live' && liveTruncated ? `${count}+` : String(count)
-    laneCountEl(l.key).title = l.type === 'live' && liveTruncated
-      ? `Showing the ${LIVE_LIMIT} most recently updated issues and pull requests combined; older ones are not loaded.`
-      : ''
-    renderLaneEmptyState(l, count)
-  }
-  if (type !== 'live') restoreOpenEdit(draft)
+    for (const actor of existing.values()) if (!keep.has(actor)) retire(actor)
+  }, '.lane-list > .card')
+  if (type !== 'live' && !viewEl.querySelector('.card.editing')) restoreOpenEdit(draft)
 }
 
 // An empty lane and a lane emptied by a filter look identical, and the second
 // one is the confusing case: the board looks like it has lost your work.
 function renderLaneEmptyState(l: LaneConfig, count: number): void {
   const list = laneListEl(l.key)
-  if (count > 0) return
+  const existing = list.querySelector<HTMLParagraphElement>('.lane-empty')
+  if (count > 0) { existing?.remove(); return }
   const filtered = l.type === 'manual'
     ? !!searchQuery
     : !!searchQuery || timeFilter !== 'all' || statusFilter !== 'all'
-  const note = document.createElement('p')
+  const note = existing ?? document.createElement('p')
   note.className = 'lane-empty'
   note.textContent = filtered
     ? (l.type === 'live' && liveTruncated
         ? 'Nothing matches — and this lane is capped, so older items are not loaded.'
         : 'Nothing matches the current filter.')
     : (l.type === 'manual' ? 'No cards yet.' : 'Nothing here.')
-  list.appendChild(note)
+  if (!existing) list.appendChild(note)
 }
 
-// Re-render only the live lanes. Two modes:
-//   - snap (animate=false): clear + rebuild — used for filter / search
-//     changes, where the user initiated the change and expects a hard
-//     update.
-//   - animated (animate=true): used by the once-a-minute background
-//     refresh. Re-orders existing card nodes via a FLIP transition so
-//     they glide to their new positions; new cards drop-and-fade in;
-//     leaving cards just disappear (rare, and the FLIP handles the gap).
-function renderLiveOnly(opts: { animate?: boolean } = {}) {
-  for (const l of LANES) {
-    if (l.type !== 'live') continue
-    if (opts.animate) renderLiveLaneAnimated(l.key as 'issue' | 'pr')
-    else              renderLiveLaneSnap(l.key as 'issue' | 'pr')
-  }
+function renderLiveOnly() {
+  for (const lane of LANES) if (lane.type === 'live') renderLiveLaneAnimated(lane.key as 'issue' | 'pr')
 }
-
-function renderLiveLaneSnap(laneKey: 'issue' | 'pr') {
-  const list = laneListEl(laneKey)
-  list.innerHTML = ''
-  const items = liveInLane(laneKey)
-  for (const i of items) list.appendChild(renderLiveItem(i))
-  laneCountEl(laneKey).textContent = String(items.length)
-}
-
-// FLIP — First, Last, Invert, Play. The single piece of motion in the
-// app that earns its time on screen. ~700ms with the standard ease so
-// it reads as a deliberate settling, not a glitch. No stagger — the
-// whole column shifts together so the eye locks onto the new ordering
-// rather than chasing individual cards.
-const FLIP_MS = 700
 
 function renderLiveLaneAnimated(laneKey: 'issue' | 'pr') {
   const list = laneListEl(laneKey)
-  const newItems = liveInLane(laneKey)
-
-  // 1. First — capture current bounding rects of every visible card
-  const firstRects = new Map<string, DOMRect>()
-  const existingEls = new Map<string, HTMLElement>()
-  for (const el of [...list.children] as HTMLElement[]) {
-    if (!el.classList.contains('card')) continue
-    const id = el.dataset.id
-    if (!id) continue
-    firstRects.set(id, el.getBoundingClientRect())
-    existingEls.set(id, el)
-  }
-
-  // 2. Last — reorder existing nodes + insert any new ones. Cards no
-  //    longer in newItems are dropped from the DOM (no leave animation
-  //    in v1; in practice the polling rarely sees a card disappear).
-  const newIds = new Set(newItems.map(prKey))
-  for (const [id, el] of existingEls) {
-    if (!newIds.has(id)) el.remove()
-  }
-  const fragment = document.createDocumentFragment()
-  for (const item of newItems) {
-    const idStr = prKey(item)
-    const existing = existingEls.get(idStr)
-    if (existing) {
-      // Refresh the contents before reusing the node — the element identity is
-      // what the FLIP needs, not its stale innards.
-      paintLiveItem(existing, item)
-      fragment.appendChild(existing)        // moved to its new index
-    } else {
-      const fresh = renderLiveItem(item)
-      fresh.classList.add('card-entering')   // CSS animation handles the fade-and-drop
-      // The keyframe uses `both`, so leaving the class on pins transform:none
-      // and the next FLIP cannot move the card. Take it off once it has played.
-      fresh.addEventListener('animationend', () => fresh.classList.remove('card-entering'), { once: true })
-      fragment.appendChild(fresh)
+  const items = liveInLane(laneKey)
+  layout(list, () => {
+    const existing = new Map([...list.querySelectorAll<HTMLElement>(':scope > .card')].map(el => [el.dataset.id!, el]))
+    const ids = new Set(items.map(prKey))
+    for (const [id, el] of existing) if (!ids.has(id)) retire(el)
+    let cursor = list.firstChild
+    for (const item of items) {
+      const el = existing.get(prKey(item)) ?? renderLiveItem(item)
+      if (existing.has(prKey(item))) paintLiveItem(el, item)
+      if (cursor !== el) list.insertBefore(el, cursor)
+      cursor = el.nextSibling
+      if (!existing.has(prKey(item))) reveal(el)
     }
-  }
-  list.appendChild(fragment)
-
-  // 3. Invert — for every card that existed before AND after, compute
-  //    the delta from old → new layout and apply the inverse transform
-  //    so the card LOOKS like it's still in its old position.
-  const movers: HTMLElement[] = []
-  for (const item of newItems) {
-    const cardEl = existingEls.get(prKey(item))
-    if (!cardEl) continue
-    const firstRect = firstRects.get(prKey(item))
-    if (!firstRect) continue
-    const lastRect = cardEl.getBoundingClientRect()
-    const dx = firstRect.left - lastRect.left
-    const dy = firstRect.top  - lastRect.top
-    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue   // didn't move
-    cardEl.style.transition = 'none'
-    cardEl.style.transform = `translate(${dx}px, ${dy}px)`
-    movers.push(cardEl)
-  }
-
-  // 4. Play — flush layout, then animate transform back to identity.
-  //    requestAnimationFrame guarantees the inverted position is painted
-  //    before the transition kicks in.
-  if (movers.length > 0) {
-    void list.offsetHeight   // force reflow so the transform is committed
-    requestAnimationFrame(() => {
-      for (const cardEl of movers) {
-        cardEl.style.transition = `transform ${FLIP_MS}ms cubic-bezier(0.4, 0, 0.2, 1)`
-        cardEl.style.transform = ''
-      }
-      // Clean up inline styles after the animation finishes so they
-      // don't interfere with future renders.
-      window.setTimeout(() => {
-        for (const cardEl of movers) {
-          cardEl.style.transition = ''
-          cardEl.style.transform = ''
-        }
-      }, FLIP_MS + 50)
-    })
-  }
-
-  laneCountEl(laneKey).textContent = String(newItems.length)
+    renderLaneEmptyState(LANES.find(lane => lane.key === laneKey)!, items.length)
+  }, ':scope > .card')
+  laneCountEl(laneKey).textContent = String(items.length)
 }
 
 // ── Data fetches ─────────────────────────────────────────────────────────────
@@ -791,7 +715,7 @@ export function stopCurrentPolling() {
 async function pollLiveTick() {
   try {
     await fetchLive()
-    renderLiveOnly({ animate: true })
+    renderLiveOnly()
     // A refresh that starts working again has to clear the notice it left —
     // otherwise the first failure's message stays on screen for the rest of
     // the session, outliving the problem it described.
@@ -972,13 +896,14 @@ function openManualComposer(lane: 'idea' | 'concept' | 'plan') {
     <p class="composer-error st-help st-help-error" role="alert" hidden></p>
   `
   laneNode.insertBefore(composer, addBtn)
+  disclosure(composer, true, undefined, 0)
   const ta = composer.querySelector<HTMLTextAreaElement>('textarea')!
   const repoSel = composer.querySelector<HTMLSelectElement>('.manual-repo')!
   const addB = composer.querySelector<HTMLButtonElement>('.composer-add')!
   const cancelB = composer.querySelector<HTMLButtonElement>('.composer-cancel')!
   const errEl = composer.querySelector<HTMLElement>('.composer-error')!
 
-  const close = () => { composer.remove(); addBtn.hidden = false }
+  const close = () => { retire(composer); addBtn.hidden = false }
   let adding = false
   const submit = async () => {
     if (adding) return
@@ -1072,6 +997,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
     <div class="composer-error" hidden></div>
   `
   laneNode.insertBefore(composer, addBtn)
+  disclosure(composer, true, undefined, 0)
   const titleInput = composer.querySelector<HTMLInputElement>('.issue-title')!
   const bodyTa = composer.querySelector<HTMLTextAreaElement>('.issue-body')!
   const repoSel = composer.querySelector<HTMLSelectElement>('.issue-repo')!
@@ -1099,7 +1025,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
   // the source card still deleted — the person just never saw either happen.
   const close = () => {
     if (submitting) { showError('Still opening the issue — wait for it to finish.'); return }
-    composer.remove()
+    retire(composer)
     addBtn.hidden = false
   }
   const showError = (msg: string) => {
@@ -1172,7 +1098,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
       }
       close()
       await fetchLive()
-      renderLiveOnly({ animate: true })
+      renderLiveOnly()
       // Created, but the active filter excludes it — otherwise the composer
       // just closes and nothing appears, which reads as a failed write.
       const created = pendingLiveItems.find((p) => p.repo === repo)
@@ -1243,13 +1169,14 @@ function startEdit(cardEl: HTMLElement, draft?: EditDraft) {
   if (metaNode) metaNode.hidden = true
   if (deleteBtn) deleteBtn.hidden = true
   cardEl.appendChild(wrapper)
+  disclosure(wrapper, true, undefined, 0)
   ta.focus()
   ta.setSelectionRange(ta.value.length, ta.value.length)
 
   const close = () => {
     cardEl.classList.remove('editing')
     cardEl.draggable = true
-    wrapper.remove()
+    retire(wrapper)
     textNode.hidden = false
     if (metaNode) metaNode.hidden = false
     if (deleteBtn) deleteBtn.hidden = false

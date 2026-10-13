@@ -1,6 +1,7 @@
 import { effectiveTimezone } from './config'
 import { releaseLine } from './release'
 import type { SettingsSection } from './settings'
+import { cancelMotion, motionValue, reveal, spring } from './motion'
 
 type ViewName = 'current' | 'swarm' | 'chat' | 'main' | 'behaviors' | 'snippets' | 'editor'
 
@@ -61,7 +62,6 @@ const ICON_BACK = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" a
 
 export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) => void; currentView: () => ViewName } {
   let current: ViewName = loadView()
-  let closeTimer: ReturnType<typeof setTimeout> | undefined
   let positionFrame = 0
   let activePanel: HTMLElement | null = null
   let activeSection: string | undefined
@@ -133,9 +133,13 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     // Anchor by a measured coordinate: a reserved scrollbar gutter can make
     // viewport-relative right offsets differ even when clientWidth is unchanged.
     surface.style.left = `${box.right}px`
-    surface.style.width = `${Math.min(wantedWidth, box.right - 12)}px`
-    surface.style.height = `${panel ? Math.min(680, available) : Math.min(menu.scrollHeight + 2, available)}px`
     surface.style.maxHeight = `${available}px`
+    if (surface.hidden || surface.inert) return
+    const rect = surface.getBoundingClientRect()
+    spring(surface, 'size', { from: { width: rect.width || wantedWidth, height: rect.height || menu.scrollHeight + 2 },
+      to: () => ({ width: Math.min(wantedWidth, toggle.getBoundingClientRect().right - 12), height: panel ? Math.min(680, innerHeight - toggle.getBoundingClientRect().bottom - 12) : Math.min(menu.scrollHeight + 2, innerHeight - toggle.getBoundingClientRect().bottom - 12) }),
+      write: ({ width, height }) => { surface.style.width = `${Math.max(0, width)}px`; surface.style.height = `${Math.max(0, height)}px` },
+      complete: () => cancelMotion(surface, 'size') })
   }
 
   function queuePosition(): void {
@@ -146,7 +150,6 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
   function syncSurface(): void {
     const panel = openPanel()
     const opened = !menu.hidden || !!panel
-    clearTimeout(closeTimer)
     toggle.innerHTML = opened ? ICON_CLOSE : ICON_BURGER
     toggle.classList.toggle('is-close', opened)
     toggle.setAttribute('aria-expanded', String(opened))
@@ -155,22 +158,33 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     if (opened) {
       surface.hidden = false
       surface.removeAttribute('inert')
+      for (const retiring of surface.querySelectorAll<HTMLElement>('[data-flow-retained]')) delete retiring.dataset.flowRetained
       positionSurface()
       if (panel && (panel !== activePanel || panel.dataset.section !== activeSection)) {
         const body = panel.querySelector<HTMLElement>('.tp-body')
         if (body) body.scrollTop = 0
+        if (body) reveal(body, { distance: 8 })
       }
-      requestAnimationFrame(() => {
-        if (!menu.hidden || openPanel()) surface.classList.add('open')
-      })
+      surface.classList.add('open')
     } else {
+      if (surface.hidden) return
+      const retiring = activePanel ?? surface.querySelector<HTMLElement>('[data-flow-retained]') ?? menu
+      retiring.dataset.flowRetained = ''
       surface.classList.remove('open')
       surface.setAttribute('inert', '')
-      closeTimer = setTimeout(() => {
-        if (menu.hidden && !openPanel()) surface.hidden = true
-      }, 220)
       if (surface.contains(document.activeElement) || document.activeElement === document.body) toggle.focus({ preventScroll: true })
     }
+    const presented = motionValue(surface, 'visibility')?.progress ?? Number(getComputedStyle(surface).opacity)
+    spring(surface, 'visibility', { from: { progress: presented }, to: { progress: opened ? 1 : 0 },
+      write: ({ progress }) => { surface.style.opacity = String(Math.max(0, Math.min(1, progress))); surface.style.translate = `0 ${(1 - progress) * 20}px` },
+      complete: () => {
+        if (!opened) {
+          surface.hidden = true
+          cancelMotion(surface, 'size')
+          for (const retiring of surface.querySelectorAll<HTMLElement>('[data-flow-retained]')) delete retiring.dataset.flowRetained
+        }
+        cancelMotion(surface, 'visibility')
+      } })
     activePanel = panel
     activeSection = panel?.dataset.section
   }
@@ -236,7 +250,6 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     requestAnimationFrame(() => { mountQueued = false; mountGlobalControls() })
   }).observe(appEl, { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden'] })
   mountGlobalControls()
-  surface.addEventListener('transitionend', (event) => { if (event.propertyName === 'width') queuePosition() })
   window.addEventListener('resize', queuePosition)
   window.addEventListener('scroll', () => {
     document.body.classList.toggle('is-scrolled', window.scrollY > 2)
@@ -268,7 +281,6 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
   }
 
   function openMenu(): void {
-    clearTimeout(closeTimer)
     menu.hidden = false
     menu.classList.add('open')
     void showRelease()

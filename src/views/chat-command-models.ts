@@ -1,3 +1,4 @@
+import { disclosure } from '../motion'
 import type { AgentInfo } from '../chat-client'
 import { consoleModelLabel } from '../chat-catalog'
 
@@ -61,7 +62,7 @@ export function createCommandModels(input: HTMLTextAreaElement, handlers: Handle
     pointerSubmitting = false
     generation++
     if (el.hidden) return
-    el.hidden = true; loading = false
+    disclosure(el, false); loading = false
     input.removeAttribute('aria-activedescendant'); input.removeAttribute('aria-controls')
     handlers.changed()
   }
@@ -107,7 +108,7 @@ export function createCommandModels(input: HTMLTextAreaElement, handlers: Handle
     setAvailableHeight(pixels: number) { el.style.setProperty('--chat-history-available', `${Math.max(0, Math.floor(pixels))}px`); select(index) },
     show(nextQuery: string, identity: string): void {
       query = nextQuery; current = identity
-      if (el.hidden) { el.hidden = false; input.setAttribute('aria-controls', list.id); void load() }
+      if (el.hidden) { disclosure(el, true); input.setAttribute('aria-controls', list.id); void load() }
       else render()
     },
     key(event: KeyboardEvent): boolean {

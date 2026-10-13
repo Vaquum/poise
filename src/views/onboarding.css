@@ -19,11 +19,10 @@ html.ob-open body { overflow: hidden; }
   -webkit-backdrop-filter: blur(6px) saturate(0.9);
   backdrop-filter: blur(6px) saturate(0.9);
   opacity: 0;
-  transition: opacity var(--t-slow) var(--ease);
+  transition: opacity var(--flow-feedback) ease-out;
 }
 
 .ob-backdrop.ob-visible { opacity: 1; }
-.ob-backdrop.ob-leaving { opacity: 0; pointer-events: none; }
 
 .ob-dialog {
   width: min(620px, 100%);
@@ -37,11 +36,10 @@ html.ob-open body { overflow: hidden; }
   border-radius: 12px;
   box-shadow: var(--e-3), 0 32px 64px rgba(22, 26, 32, 0.10);
   transform: translateY(10px) scale(0.985);
-  transition: transform var(--t-slow) var(--ease);
+  transition: transform var(--flow-settle) var(--flow-spring);
 }
 
 .ob-visible .ob-dialog { transform: none; }
-.ob-leaving .ob-dialog { transform: translateY(6px) scale(0.99); }
 
 /* ── Head: the step rail, where you are, the step's title ── */
 
@@ -58,7 +56,7 @@ html.ob-open body { overflow: hidden; }
   height: 3px;
   border-radius: var(--r-pill);
   background: var(--hairline);
-  transition: background var(--t-base) ease;
+  transition: background var(--flow-feedback) ease-out;
 }
 
 .ob-rail-done { background: var(--n4); }
@@ -87,7 +85,7 @@ html.ob-open body { overflow: hidden; }
   cursor: pointer;
   text-decoration: underline;
   text-underline-offset: 2px;
-  transition: color var(--t-quick) ease;
+  transition: color var(--flow-feedback) ease-out;
 }
 
 .ob-later:hover { color: var(--text); }
@@ -183,7 +181,7 @@ html.ob-open body { overflow: hidden; }
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   cursor: pointer;
-  transition: border-color var(--t-base) ease, box-shadow var(--t-base) ease, color var(--t-base) ease;
+  transition: border-color var(--flow-feedback) ease-out, box-shadow var(--flow-feedback) ease-out, color var(--flow-feedback) ease-out;
 }
 
 .ob-theme:hover { border-color: var(--text-tertiary); }
@@ -246,12 +244,12 @@ html.ob-open body { overflow: hidden; }
   margin-top: 5px;
   border-radius: var(--r-pill);
   background: var(--text-tertiary);
-  transition: background var(--t-base) ease, box-shadow var(--t-base) ease;
+  transition: background var(--flow-feedback) ease-out, box-shadow var(--flow-feedback) ease-out;
 }
 
 .ob-connection[data-state="connected"] .ob-connection-dot { background: var(--a3); box-shadow: 0 0 0 3px var(--tint-a3); }
 .ob-connection[data-state="error"] .ob-connection-dot { background: var(--a5); box-shadow: 0 0 0 3px var(--tint-a5); }
-.ob-connection[data-state="checking"] .ob-connection-dot { animation: pulse 1s ease-in-out infinite; }
+.ob-connection[data-state="checking"] .ob-connection-dot { animation: none; }
 
 .ob-connection-copy { min-width: 0; }
 
@@ -330,7 +328,7 @@ html.ob-open body { overflow: hidden; }
   line-height: 1.2;
   color: var(--text);
   user-select: all;
-  transition: color var(--t-base) ease;
+  transition: color var(--flow-feedback) ease-out;
 }
 
 .ob-device-code.ob-device-pending { color: var(--text-tertiary); user-select: none; }
@@ -368,7 +366,7 @@ html.ob-open body { overflow: hidden; }
   height: 7px;
   border-radius: var(--r-pill);
   background: var(--text-tertiary);
-  animation: pulse 1s ease-in-out infinite;
+  animation: none;
 }
 
 .ob-device[data-state="done"] .ob-device-dot { animation: none; background: var(--a3); box-shadow: 0 0 0 3px var(--tint-a3); }

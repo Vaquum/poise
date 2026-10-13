@@ -103,7 +103,10 @@ test('walks a new workspace through setup in order, saving each step where Setti
   await next(page).click()
   await expect(page.locator('.ob-backdrop')).toHaveCount(0)
   await expect(page.locator('#app')).not.toHaveAttribute('inert', '')
-  await expect(page.locator('#menu-toggle')).toHaveClass(/ob-pulse/)
+  await expect(page.locator('#menu-toggle')).toBeVisible()
+  await page.locator('#menu-toggle').click()
+  await expect(page.locator('#menu-toggle')).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.locator('#menu-popover')).toBeVisible()
   expect(state.status).toBe('done')
   expect(state.writes.filter((write) => write.path === '/api/onboarding').map((write) => write.body.step ?? 'done')).toEqual([
     'github', 'agent', 'organizations', 'time', 'ai', 'models', 'link', 'finish', 'done',

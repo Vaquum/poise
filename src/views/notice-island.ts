@@ -1,3 +1,5 @@
+import { cancelMotion, finishMotion, reveal, spring } from '../motion'
+import { patchContent } from '../dom-patch'
 // The notification island: one pill at the top centre of the page, in the
 // band above every view's controls, that shows one notice at a time, the most
 // pressing first, and is gone when nothing needs the person.
@@ -80,40 +82,7 @@ export interface IslandActions {
   inView?(target: NoticeTarget): boolean
 }
 
-// In step with the design system's motion tokens (src/style.css): the shape
-// moves at --t-slow, the content at --t-base.
-const SHAPE_MS = 250
-const CONTENT_MS = 180
-// Long enough for a title and most of what follows it; longer reads as a banner.
 const MAX_WIDTH = 560
-
-function reducedMotion(): boolean {
-  return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
-}
-
-/** Runs `done` once `el`'s opacity transition has ended, or after `ms` and a
- *  margin should no transition run: a busy page delays the transition's start,
- *  and a timer alone would cut it short. */
-function afterFade(el: HTMLElement, ms: number, done: () => void): () => void {
-  let finished = false
-  const finish = () => {
-    if (finished) return
-    finished = true
-    el.removeEventListener('transitionend', onEnd)
-    window.clearTimeout(timer)
-    done()
-  }
-  const onEnd = (event: TransitionEvent) => {
-    if (event.target === el && event.propertyName === 'opacity') finish()
-  }
-  el.addEventListener('transitionend', onEnd)
-  const timer = window.setTimeout(finish, reducedMotion() ? 0 : ms + 200)
-  return () => {
-    finished = true
-    el.removeEventListener('transitionend', onEnd)
-    window.clearTimeout(timer)
-  }
-}
 
 export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () => void {
   const island = document.createElement('div')
@@ -135,7 +104,6 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
   let notices: Notice[] = []
   let shownId: string | null = null
   let content: HTMLElement | null = null
-  let cancelLeaving: (() => void) | null = null
   const announced = new Set<string>()
 
   function measure(el: HTMLElement): number {
@@ -158,10 +126,10 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
   function refresh(el: HTMLElement, html: string): void {
     if (el.dataset.html === html) return
     const focused = el.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.action : undefined
-    el.innerHTML = html
+    patchContent(el, html)
     el.dataset.html = html
     if (focused) el.querySelector<HTMLElement>(`[data-action="${focused}"]`)?.focus()
-    shell.style.width = `${measure(el)}px`
+    shape(measure(el), true)
   }
 
   function render(): void {
@@ -187,60 +155,48 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
     swap(shown, html)
   }
 
+  function shape(width: number, shown: boolean): void {
+    spring(shell, 'shape', { from: { width: shell.getBoundingClientRect().width, opacity: Number(getComputedStyle(shell).opacity) },
+      to: { width, opacity: shown ? 1 : 0 },
+      write: ({ width, opacity }) => { shell.style.width = `${Math.max(0, width)}px`; shell.style.opacity = String(Math.max(0, Math.min(1, opacity))) },
+      complete: () => {
+        if (!shown) { island.hidden = true; island.dataset.state = ''; shell.replaceChildren(); content = null }
+        cancelMotion(shell, 'shape')
+      } })
+  }
+
   function swap(notice: Notice, html: string): void {
-    cancelLeaving?.()
-    cancelLeaving = null
-    const appearing = island.hidden || island.dataset.state !== 'shown'
+    const appearing = island.hidden
     const next = document.createElement('div')
-    next.className = 'ni-content ni-arriving'
-    next.dataset.id = notice.id
-    next.dataset.due = notice.due
-    next.dataset.kind = notice.kind
-    next.dataset.html = html
+    next.className = 'ni-content'
+    next.dataset.id = notice.id; next.dataset.due = notice.due; next.dataset.kind = notice.kind; next.dataset.html = html
     next.innerHTML = html
     island.hidden = false
     island.classList.remove('ni-remind')
     const previous = content
-    // Focus on the notice going away moves to its successor, never to the page.
     const hadFocus = !!previous?.contains(document.activeElement)
     shell.append(next)
-    const width = measure(next)
     content = next
     if (previous) {
-      previous.classList.add('ni-leaving')
-      previous.setAttribute('inert', '')
-      previous.setAttribute('aria-hidden', 'true')
-      afterFade(previous, CONTENT_MS, () => previous.remove())
+      previous.classList.add('ni-leaving'); previous.inert = true; previous.setAttribute('aria-hidden', 'true')
+      spring(previous, 'entry', { from: { opacity: Number(getComputedStyle(previous).opacity), y: previous.getBoundingClientRect().top - shell.getBoundingClientRect().top }, to: { opacity: 0, y: -8 },
+        write: ({ opacity, y }) => { previous.dataset.flowEnter = ''; previous.style.opacity = String(Math.max(0, Math.min(1, opacity))); previous.style.setProperty('--flow-enter-y', `${y}px`) },
+        complete: () => { previous.remove(); cancelMotion(previous, 'entry') } })
     }
-    if (appearing) {
-      // Grow out of the dot: the shape first, then what it says.
-      island.dataset.state = 'entering'
-      shell.style.width = ''
-      void shell.offsetWidth
-      island.dataset.state = 'shown'
-    }
-    shell.style.width = `${width}px`
-    requestAnimationFrame(() => requestAnimationFrame(() => next.classList.remove('ni-arriving')))
-    if (hadFocus) next.querySelector<HTMLElement>('[data-action="dismiss"]')?.focus()
+    if (appearing) { shell.style.width = '28px'; shell.style.opacity = '0' }
+    island.dataset.state = 'shown'
+    shape(measure(next), true)
+    reveal(next, { distance: 8 })
+    if (hadFocus) next.querySelector<HTMLElement>('[data-action="dismiss"]')?.focus({ preventScroll: true })
   }
 
   function hide(): void {
     shownId = null
     if (island.hidden || island.dataset.state === 'leaving') return
     const hadFocus = island.contains(document.activeElement)
-    content?.classList.add('ni-leaving')
-    content?.setAttribute('inert', '')
-    content?.setAttribute('aria-hidden', 'true')
+    content?.classList.add('ni-leaving'); content?.setAttribute('inert', ''); content?.setAttribute('aria-hidden', 'true')
     island.dataset.state = 'leaving'
-    shell.style.width = ''
-    cancelLeaving = afterFade(shell, SHAPE_MS, () => {
-      cancelLeaving = null
-      island.hidden = true
-      island.dataset.state = ''
-      shell.replaceChildren()
-      content = null
-    })
-    // Focus that was in the island would otherwise fall to the page's start.
+    shape(28, false)
     if (hadFocus) (document.activeElement as HTMLElement | null)?.blur()
   }
 
@@ -273,7 +229,7 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
   const fit = () => {
     cancelAnimationFrame(fitting)
     fitting = requestAnimationFrame(() => {
-      if (content && island.dataset.state === 'shown') shell.style.width = `${measure(content)}px`
+      if (content && island.dataset.state === 'shown') { shape(measure(content), true); finishMotion(shell) }
     })
   }
   window.addEventListener('resize', fit)
@@ -284,7 +240,7 @@ export function mountNoticeIsland(feed: NoticeFeed, actions: IslandActions): () 
     window.clearInterval(clock)
     window.removeEventListener('resize', fit)
     cancelAnimationFrame(fitting)
-    cancelLeaving?.()
+    finishMotion(island)
     island.remove()
     live.remove()
   }

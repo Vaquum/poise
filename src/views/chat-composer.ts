@@ -1,3 +1,5 @@
+import { layout, retire, watchPanel } from '../motion'
+import { patchContent } from '../dom-patch'
 import type { ChatSwitch } from '../chat-switches'
 // Chat composer — the chat pane's composer habits (mode-lock chip, auto-
 // resize, attachment chips, Enter sends / Shift+Enter newline) plus what a
@@ -152,6 +154,7 @@ export function createComposer(handlers: ComposerHandlers): Composer {
     loadModels: handlers.loadModels, onSelect: identity => { selectedModel = undefined; renderSelectedModel(); handlers.onModelSelect(identity); changed() },
   })
   const popover = el.querySelector<HTMLElement>('.chat-popover')!
+  watchPanel(popover, () => !popover.hidden)
 
   let uploading = 0
   let attachments: Attachment[] = []
@@ -309,11 +312,11 @@ export function createComposer(handlers: ComposerHandlers): Composer {
       return
     }
     chipsEl.hidden = false
-    chipsEl.innerHTML = attachments.map((a) => `
-      <span class="chat-attachment-chip" title="${escapeHtml(a.path)} · ${a.size} bytes">
+    layout(chipsEl, () => patchContent(chipsEl, attachments.map((a) => `
+      <span class="chat-attachment-chip" data-key="${escapeHtml(a.id)}" title="${escapeHtml(a.path)} · ${a.size} bytes">
         <span class="chat-attachment-name">${escapeHtml(a.name)}</span>
         <button type="button" class="chat-attachment-remove" data-path="${escapeHtml(a.path)}" aria-label="Remove ${escapeHtml(a.name)}">×</button>
-      </span>`).join('')
+      </span>`).join(''), retire))
   }
 
   async function uploadFiles(files: File[]): Promise<void> {

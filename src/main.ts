@@ -1,4 +1,7 @@
 import './style.css'
+import './motion.css'
+import { finishMotion, initMotion, reveal } from './motion'
+initMotion()
 import { installIconTooltips } from './icon-tooltips'
 installIconTooltips()
 import { initTypography, toggleTypographyPanel, closeTypographyPanel } from './typo'
@@ -100,11 +103,9 @@ function showView(v: ViewSlug) {
   for (const el of all) {
     if (el === target) {
       el.hidden = false
-      el.classList.remove('view-entering')
-      void (el as HTMLElement).offsetWidth
-      el.classList.add('view-entering')
-      window.setTimeout(() => el.classList.remove('view-entering'), 300)
+      for (const child of el.querySelectorAll<HTMLElement>(':scope > :not(.view-header)')) reveal(child, { distance: v === 'chat' || v === 'editor' ? 0 : 20 })
     } else {
+      finishMotion(el, true)
       el.hidden = true
     }
   }

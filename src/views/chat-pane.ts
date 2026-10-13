@@ -1,3 +1,5 @@
+import { watchPanel } from '../motion'
+import { patchContent } from '../dom-patch'
 import { renderMarkdown, escapeHtml } from '../markdown'
 
 // Chat pane — slides in from the LEFT, occupies ~25vw (min 360px).
@@ -410,6 +412,7 @@ function renderShell() {
     </form>
   `
   document.body.appendChild(panelEl)
+  watchPanel(panelEl, () => !!panelEl?.classList.contains('open'), -1)
   loadChatWidth()
   attachResize(panelEl)
 
@@ -737,7 +740,7 @@ function renderMessages() {
   const distanceFromBottom = bodyEl.scrollHeight - bodyEl.scrollTop - bodyEl.clientHeight
   const wasAtBottom = distanceFromBottom <= STICK_TO_BOTTOM_PX
   const previousTop = bodyEl.scrollTop
-  bodyEl.innerHTML = html
+  patchContent(bodyEl, html)
   bodyEl.scrollTop = wasAtBottom ? bodyEl.scrollHeight : previousTop
 }
 

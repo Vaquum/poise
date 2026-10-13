@@ -1,3 +1,4 @@
+import { scrollToActor } from './motion'
 // Service mode adds the gateway's parts to Settings: Poise Link under Accounts
 // (pairing and the paired computers) and, for the gateway's admins, an Admin
 // destination. The gateway sends /link, /link/devices and its own admin link here as
@@ -65,7 +66,8 @@ export async function openServicePlace(place: ServicePlace): Promise<void> {
   }
   openSettingsAt('accounts')
   requestAnimationFrame(() => {
-    link?.element.previousElementSibling?.scrollIntoView({ block: 'start' })
+    const section = link?.element.previousElementSibling
+    if (section instanceof HTMLElement) scrollToActor(section)
     link?.element.querySelector<HTMLInputElement>('.pl-code')?.focus({ preventScroll: true })
   })
 }

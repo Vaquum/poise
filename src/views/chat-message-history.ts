@@ -1,3 +1,4 @@
+import { disclosure } from '../motion'
 import { MESSAGE_HISTORY_LIMIT, historyLabel, type MessageHistoryEntry, type MessageHistorySnapshot } from '../chat-message-history'
 
 interface HistoryHandlers {
@@ -69,9 +70,8 @@ export function createMessageHistory(input: HTMLTextAreaElement, handlers: Histo
   }
   function close(): void {
     if (el.hidden) return
-    el.hidden = true
+    disclosure(el, false)
     entries = []; index = -1; loading = false
-    list.replaceChildren()
     input.removeAttribute('aria-activedescendant')
     input.removeAttribute('aria-controls')
     input.removeAttribute('aria-describedby')
@@ -118,6 +118,7 @@ export function createMessageHistory(input: HTMLTextAreaElement, handlers: Histo
         input.setAttribute('aria-controls', list.id)
         input.setAttribute('aria-describedby', 'chat-history-help')
         fill(handlers.read())
+        disclosure(el, true)
         return true
       }
       if (event.key === 'Tab') { close(); return false }

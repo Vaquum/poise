@@ -497,6 +497,7 @@ test('preserves selected repositories when one account cannot be listed', async 
   await page.locator('tr[data-behavior="review-new-issues"] .behavior-triggers-btn').click()
   const dialog = page.getByRole('dialog', { name: /Review New Issues/ })
   await expect(dialog).toContainText('mikkokotila: Sync unavailable')
+  await expect.poll(() => dialog.evaluate(element => element.getBoundingClientRect().bottom <= innerHeight)).toBe(true)
   await expect(dialog.getByRole('checkbox', { name: 'mikkokotila/same-repo', exact: true })).toBeChecked()
   await dialog.getByRole('checkbox', { name: 'acme/same-repo', exact: true }).check()
   await dialog.getByRole('button', { name: 'Done' }).click()

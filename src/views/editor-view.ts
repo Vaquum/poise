@@ -1,3 +1,6 @@
+import { scrollToActor } from '../motion'
+import { retire, reveal, watchPanel } from '../motion'
+import { patchContent } from '../dom-patch'
 import { registerReloadGuard } from '../self-update-watch'
 // Editor — minimalist markdown writing surface.
 //
@@ -2147,13 +2150,14 @@ function renderDocMenu() {
       `)
     }
   }
-  menuEl.innerHTML = parts.join('')
+  patchContent(menuEl, parts.join(''))
 }
 
 function openMenu() {
   if (!menuEl || !triggerEl) return
   renderDocMenu()
   menuEl.hidden = false
+  reveal(menuEl, { distance: 8 })
   triggerEl.setAttribute('aria-expanded', 'true')
   // Defer install so the click that opened the menu doesn't
   // immediately close it. Escape works from anywhere while the menu
@@ -2611,7 +2615,7 @@ function showEditHoverHighlight(edit: EditCardData): void {
   // scrollIntoView with block: 'center' handles both directions and
   // the right scroll container automatically — no need to walk
   // overflow ancestors ourselves.
-  if (firstMark) firstMark.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  if (firstMark) scrollToActor(firstMark, 'center')
 }
 
 function clearEditHoverHighlight(): void {
@@ -2648,7 +2652,7 @@ function applyEditToDoc(edit: EditCardData, slug: string): 'applied' | 'conflict
   const lineIdx = locateLine(afterSnap.lineStarts, charRange.start)
   const lines = Array.from(docEl.children) as HTMLElement[]
   const target = lines[lineIdx]
-  if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  if (target) scrollToActor(target, 'center')
   // Refresh annotation overlay (line count / positions may have
   // shifted) and trigger the autosave so the change persists.
   renderAnnotationOverlay()
@@ -3333,7 +3337,7 @@ function placeComposerNearRect(el: HTMLElement, rect: DOMRect): void {
 
 function closeIssueComposer(): void {
   if (!issueComposerEl) return
-  issueComposerEl.remove()
+  retire(issueComposerEl)
   issueComposerEl = null
   // The selection-action buttons stay hidden — the selection has
   // collapsed by now (focus moved to the composer). Next non-collapsed
@@ -3378,6 +3382,7 @@ function openIssueComposerFromSelection(): void {
     <div class="composer-error" hidden></div>
   `
   document.body.appendChild(composer)
+  reveal(composer, { distance: 8 })
   issueComposerEl = composer
 
   const titleInput = composer.querySelector<HTMLInputElement>('.issue-title')!
@@ -3476,7 +3481,7 @@ function openIssueComposerFromSelection(): void {
 
 function closeSnippetComposer(): void {
   if (!snippetComposerEl) return
-  snippetComposerEl.remove()
+  retire(snippetComposerEl)
   snippetComposerEl = null
 }
 
@@ -3507,6 +3512,7 @@ function openSnippetComposerFromSelection(): void {
     <div class="composer-error" hidden></div>
   `
   document.body.appendChild(composer)
+  reveal(composer, { distance: 8 })
   snippetComposerEl = composer
 
   const triggerInput = composer.querySelector<HTMLInputElement>('.snippet-trigger')!
@@ -3768,7 +3774,7 @@ function renderPanelChat(): void {
       `)
     }
   }
-  log.innerHTML = parts.join('')
+  patchContent(log, parts.join(''))
   log.scrollTop = log.scrollHeight
 }
 
@@ -3980,7 +3986,6 @@ function closePanel(): void {
   discardPanelAnnotationIfEmpty()
   panelCreatedId = null
   panelEl.hidden = true
-  panelEl.innerHTML = ''
   panelForId = null
   panelMessages = []
   panelReplies.clear()
@@ -4490,6 +4495,7 @@ function attachHandlers() {
   })
 
   panelEl = viewEl.querySelector<HTMLElement>('#editor-annotation-panel')
+  if (panelEl) watchPanel(panelEl, () => !!panelEl && !panelEl.hidden)
 
   // Re-position annotation overlays on viewport changes. Resize and
   // scroll both invalidate the cached rects; they're cheap to redraw

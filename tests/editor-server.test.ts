@@ -113,7 +113,8 @@ async function acquireBlocker(path: string): Promise<InstanceType<typeof Databas
 }
 
 function releaseBlocker(blocker: InstanceType<typeof Database>): void {
-  if (blocker.inTransaction) blocker.exec('COMMIT')
+  // This reservation writes no data; release it without upgrading past waiting readers.
+  if (blocker.inTransaction) blocker.exec('ROLLBACK')
   if (blocker.open) blocker.close()
 }
 

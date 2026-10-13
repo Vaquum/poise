@@ -1,4 +1,5 @@
 import { createMemoriesEditor, readChatMemories, writeChatMemories } from '../chat-memories'
+import { cancelMotion, spring } from '../motion'
 
 const OPEN_KEY = 'poise-chat-memories-open'
 /** One pane for all sessions, kept mounted while the transcript streams. */
@@ -33,10 +34,16 @@ export function createMemoriesPane(view: HTMLElement, onChange: () => void) {
     onChange()
   }
   function visibility(focus = false) {
+    const width = el.getBoundingClientRect().width
+    const opacity = Number(getComputedStyle(el).opacity)
     view.classList.toggle('chat-memories-open', open)
     if (!open && el.contains(document.activeElement)) view.querySelector<HTMLButtonElement>('.chat-h-memories')?.focus()
     el.inert = !open
     el.setAttribute('aria-hidden', String(!open))
+    el.style.visibility = 'visible'
+    spring(el, 'memories', { from: { width, opacity }, to: () => ({ width: open ? getComputedStyle(el).position === 'absolute' ? Math.min(360, view.querySelector<HTMLElement>('.chat-layout')!.clientWidth - 24) : 320 : 0, opacity: open ? 1 : 0 }),
+      write: ({ width, opacity }) => { el.style.width = `${Math.max(0, width)}px`; el.style.opacity = String(Math.max(0, Math.min(1, opacity))); onChange() },
+      complete: () => { el.style.width = ''; el.style.opacity = ''; el.style.visibility = ''; cancelMotion(el, 'memories'); onChange() } })
     try { localStorage.setItem(OPEN_KEY, String(open)) } catch { /* optional preference */ }
     if (open) void editor.load(true).then(() => { if (open && focus) input.focus({ preventScroll: true }) }).catch(() => undefined)
     onChange()

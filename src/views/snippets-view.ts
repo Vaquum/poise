@@ -1,3 +1,5 @@
+import { disclosure, layout, retire } from '../motion'
+import { patchContent } from '../dom-patch'
 // Snippets — manage espanso text-expansion pairs from Poise.
 //
 // Same table contract as Behaviors / Swarm (the universal `table` /
@@ -150,10 +152,7 @@ function renderRow(s: Snippet): HTMLTableRowElement {
 let loadError: string | null = null
 
 function renderRows() {
-  tbodyEl.innerHTML = ''
-  const frag = document.createDocumentFragment()
-  for (const s of snippets) frag.appendChild(renderRow(s))
-  tbodyEl.appendChild(frag)
+  layout(tbodyEl, () => patchContent(tbodyEl, snippets.map(s => renderRow(s).outerHTML).join('')))
 
   const n = snippets.length
   const failed = loadError !== null
@@ -252,7 +251,7 @@ function collapseOpen() {
   const editRow = tbodyEl.querySelector('.snip-expand-row')
   if (!editRow) return
   const main = editRow.previousElementSibling as HTMLElement | null
-  editRow.remove()
+  retire(editRow as HTMLElement)
   if (main) {
     main.querySelector('.expand-btn')?.classList.remove('open')
     if (main.classList.contains('snip-draft')) main.remove()
@@ -280,7 +279,7 @@ function onTbodyClick(e: MouseEvent) {
   const isDraft = main.classList.contains('snip-draft')
   const snip = isDraft ? null : (snippets.find((s) => s.trigger === main.dataset.trigger) || null)
   const editRow = buildEditRow(snip, isDraft)
-  main.insertAdjacentElement('afterend', editRow)
+  layout(tbodyEl, () => main.insertAdjacentElement('afterend', editRow))
   main.querySelector('.expand-btn')?.classList.add('open')
   // Existing snippet → land in the body; draft/add → land in the trigger.
   const focusSel = snip ? '.snip-body-input' : '.snip-trigger-input'
@@ -475,7 +474,7 @@ function openAdd() {
   `
   tbodyEl.insertBefore(main, tbodyEl.firstChild)
   const editRow = buildEditRow(null, true)
-  main.insertAdjacentElement('afterend', editRow)
+  layout(tbodyEl, () => main.insertAdjacentElement('afterend', editRow))
   ;(editRow.querySelector('.snip-trigger-input') as HTMLElement | null)?.focus()
 }
 
@@ -505,7 +504,7 @@ function setImportStatus(text: string, cls: 'info' | 'ok' | 'error'): void {
 }
 
 function toggleImport(open: boolean): void {
-  importEl('.snip-import').hidden = !open
+  disclosure(importEl('.snip-import'), open)
   importEl('.snip-import-open').setAttribute('aria-expanded', String(open))
   if (open) importEl<HTMLTextAreaElement>('.snip-import-text').focus()
 }

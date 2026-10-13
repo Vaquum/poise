@@ -1,3 +1,4 @@
+import { watchPanel } from '../motion'
 import type { AgentInfo } from '../chat-client'
 import { consoleModelLabel } from '../chat-catalog'
 import { escapeHtml } from '../markdown'
@@ -10,6 +11,7 @@ export function attachModelPicker(container: HTMLElement, handlers: PickerHandle
   const trigger = container.querySelector<HTMLButtonElement>('.chat-default-model')!
   const label = trigger.querySelector<HTMLElement>('.chat-model-label')!
   const menu = container.querySelector<HTMLElement>('.chat-model-menu')!
+  watchPanel(menu, () => !menu.hidden)
   let state: PickerState = { identity: '', label: '', visible: false, disabled: true }
   let generation = 0
   let agents: AgentInfo[] = []

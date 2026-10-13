@@ -1,4 +1,6 @@
 import { createJevWorkspace } from './jev-workspace'
+import { cancelMotion, layout, motionValue, retire, spring } from '../motion'
+import { patchContent } from '../dom-patch'
 import { parseSwitchCreation, RESERVED_SWITCHES, type ChatSwitches } from '../chat-switches'
 // Chat — one view for a full coding-agent conversation with any installed
 // agent, running as itself under a Poise-native interface. Sessions live on
@@ -552,7 +554,7 @@ function renderSidebar(): void {
   const html = sidebarHtml()
   if (html === lastSidebarHtml) return
   lastSidebarHtml = html
-  listEl.innerHTML = html
+  layout(listEl, () => patchContent(listEl, html, retire))
 }
 
 function sidebarHtml(): string {
@@ -1875,6 +1877,10 @@ function render(): void {
   // A deploy card is content too: the console must not lift over it.
   const hasCard = !!e && (!!activeChange() || localChanges.has(e.record.id))
   const empty = !e || (!e.model.blocks.length && !e.loading && !hasCard)
+  const changedConsole = lastEmpty !== empty
+  const presentedLift = new DOMMatrixReadOnly(getComputedStyle(dockEl).transform).m42
+  const composerEl = composer.el
+  const presentedWidth = composerEl.getBoundingClientRect().width
   mainEl.classList.toggle('chat-empty-session', empty)
   // The fresh console sits slightly above centre. Its own height participates
   // in the calculation, so a taller draft never pushes it off-screen.
@@ -1905,6 +1911,16 @@ function render(): void {
   const desiredLift = contentHeight * 0.58 - dockHeight / 2
   const lift = Math.max(0, Math.min(desiredLift, contentHeight - dockHeight))
   mainEl.style.setProperty('--chat-dock-lift', `${Math.round(lift)}px`)
+  if (changedConsole) {
+    spring(dockEl, 'console', { from: { y: presentedLift, width: presentedWidth },
+      to: () => ({ y: mainEl.classList.contains('chat-empty-session') ? -parseFloat(mainEl.style.getPropertyValue('--chat-dock-lift')) : 0,
+        width: Math.min(mainEl.clientWidth - parseFloat(getComputedStyle(dockEl).paddingLeft) - parseFloat(getComputedStyle(dockEl).paddingRight), parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--typo-width')) || 960, mainEl.classList.contains('chat-empty-session') ? 640 : Infinity) }),
+      write: ({ y, width }) => { dockEl.style.transform = `translateY(${y}px)`; composerEl.style.maxWidth = `${Math.max(0, width)}px` },
+      complete: () => { dockEl.style.transform = ''; composerEl.style.maxWidth = ''; cancelMotion(dockEl, 'console') } })
+  } else if (!motionValue(dockEl, 'console')) {
+    // Input resizing owns the native writing surface directly.
+    dockEl.style.transform = ''; composerEl.style.maxWidth = ''
+  }
   viewEl.querySelector<HTMLElement>('.chat-transcript-loading')!.hidden = !(e && e.loading && !e.model.blocks.length)
   // Scrolling sticks to the bottom only for someone already reading there.
   const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight

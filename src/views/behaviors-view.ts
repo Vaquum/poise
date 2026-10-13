@@ -1,3 +1,5 @@
+import { patchContent } from '../dom-patch'
+import { layout, watchPanel } from '../motion'
 // Behaviors — a table view listing automations with on/off toggles.
 //
 // Visual contract matches Archive and Swarm exactly: universal `table`,
@@ -524,7 +526,13 @@ function positionTriggersPanel() {
   if (!button) return
   const rect = button.getBoundingClientRect()
   const width = triggersPanelEl.offsetWidth || 300
-  triggersPanelEl.style.top = `${Math.round(rect.bottom + 6)}px`
+  const ceiling = Math.max(16, viewEl.querySelector<HTMLElement>('.view-header')!.getBoundingClientRect().bottom + 8)
+  const available = Math.max(0, window.innerHeight - ceiling - 16)
+  triggersPanelEl.style.maxHeight = `${available}px`
+  const height = triggersPanelEl.offsetHeight
+  const below = rect.bottom + 6
+  const top = below + height <= window.innerHeight - 16 ? below : rect.top - height - 6
+  triggersPanelEl.style.top = `${Math.round(Math.max(ceiling, Math.min(top, window.innerHeight - height - 16)))}px`
   triggersPanelEl.style.left = `${Math.round(Math.max(16, Math.min(rect.right - width, window.innerWidth - width - 16)))}px`
 }
 
@@ -532,6 +540,8 @@ function openTriggersPanel(key: BehaviorKey) {
   if (!triggersPanelEl) {
     triggersPanelEl = buildTriggersPanel()
     document.body.appendChild(triggersPanelEl)
+    new ResizeObserver(positionTriggersPanel).observe(triggersPanelEl)
+    watchPanel(triggersPanelEl, () => !!triggersPanelEl?.classList.contains('open'))
   }
   const meta = behaviorMeta(key)
   const mode = meta.hasSkips ? 'skips' : 'triggers'
@@ -766,6 +776,7 @@ function openMemoryPanel(key: BehaviorKey) {
   if (!memoryPanelEl) {
     memoryPanelEl = buildMemoryPanel()
     document.body.appendChild(memoryPanelEl)
+    watchPanel(memoryPanelEl, () => !!memoryPanelEl?.classList.contains('open'), 1)
   }
   memoryKey = key
   const meta = BEHAVIORS.find((b) => b.key === key)
@@ -1038,10 +1049,7 @@ function renderDiagnostics() {
 
 function renderRows() {
   const tbody = viewEl.querySelector<HTMLTableSectionElement>('#behaviors-tbody')!
-  tbody.innerHTML = ''
-  const frag = document.createDocumentFragment()
-  for (const meta of BEHAVIORS) frag.appendChild(renderRow(meta))
-  tbody.appendChild(frag)
+  layout(tbody, () => patchContent(tbody, BEHAVIORS.map(meta => renderRow(meta).outerHTML).join('')))
 }
 
 function attachHandlers() {

@@ -1,3 +1,5 @@
+import { patchContent } from '../dom-patch'
+import { layout, retire } from '../motion'
 import type { MessageQueue, QueuedMessage } from '../../server/chat/protocol'
 import { AGENT_LABELS } from '../../server/chat/protocol'
 import type { AgentInfo } from '../chat-client'
@@ -59,15 +61,17 @@ export function createQueuePanel(handlers: QueueHandlers) {
       counts.set(sessionId, items.length)
       count.textContent = String(items.length)
       hint.textContent = queue?.waitingForRelease ? 'Waiting for the Poise release' : running || queue?.ready ? 'One at a time, after this turn' : 'Waiting for the next completed task'
+      layout(list, () => {
       const keep = new Set(items.map(item => item.id))
-      for (const [key, node] of nodes) if (!keep.has(key)) { node.el.remove(); nodes.delete(key) }
+      for (const [key, node] of nodes) if (!keep.has(key)) { retire(node.el); nodes.delete(key) }
       items.forEach((item, index) => {
         let node = nodes.get(item.id)
         if (!node) { const row = document.createElement('li'); row.dataset.queueItem = item.id; row.className = 'chat-queue-item'; node = { el: row, html: '' }; nodes.set(item.id, node) }
         const html = rowHtml(item, index, agents, pending.has(item.id))
-        if (node.html !== html) { node.html = html; node.el.innerHTML = html }
+        if (node.html !== html) { node.html = html; patchContent(node.el, html) }
         node.el.dataset.state = item.state
         if (list.children[index] !== node.el) list.insertBefore(node.el, list.children[index] || null)
+      })
       })
     },
   }

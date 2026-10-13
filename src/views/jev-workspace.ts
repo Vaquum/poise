@@ -1,3 +1,5 @@
+import { scrollToActor } from '../motion'
+import { patchContent, patchInformation } from '../dom-patch'
 import { jevApi, JevHttpError } from '../jev-client'
 import { emptyJevDraft, exampleJevDraft, parseJevDraft, requestFromDraft, draftFromRequest, type JevDraft } from '../jev-draft'
 import { validateJevRequest, type JevSession, type JevRun, type JevRequest } from '../jev-types'
@@ -60,7 +62,7 @@ export function createJevWorkspace(parent: HTMLElement, sidebar: HTMLElement, ha
   }
   function renderList() {
     list.hidden = entries.size === 0
-    list.innerHTML = [...entries.values()].sort((a, b) => b.session.createdAt.localeCompare(a.session.createdAt)).map(e => `<div role="listitem"><button type="button" class="jev-session-item ${visible && e.session.id === active ? 'active' : ''}" data-jev-id="${esc(e.session.id)}"><span>${esc(e.title)}</span><small>JEV · primitives</small></button></div>`).join('')
+    patchInformation(list, [...entries.values()].sort((a, b) => b.session.createdAt.localeCompare(a.session.createdAt)).map(e => `<div role="listitem" data-jev-id="${esc(e.session.id)}"><button type="button" class="jev-session-item ${visible && e.session.id === active ? 'active' : ''}" data-jev-id="${esc(e.session.id)}"><span>${esc(e.title)}</span><small>JEV · primitives</small></button></div>`).join(''))
   }
   function controls() {
     const e = current(); if (!e) return
@@ -156,7 +158,7 @@ export function createJevWorkspace(parent: HTMLElement, sidebar: HTMLElement, ha
     const select = panel.querySelector<HTMLSelectElement>('.jev-run-select')!
     select.innerHTML = runs.map(run => `<option value="${run.id}" ${run.id === selectedRun ? 'selected' : ''}>${esc(new Date(run.startedAt).toLocaleTimeString())} · ${Object.keys(run.request.questions).length} questions · ${run.status}</option>`).join('')
     const run = runs.find(run => run.id === selectedRun)
-    panel.querySelector<HTMLElement>('.jev-result')!.innerHTML = run ? renderJevRun(run) : ''
+    patchContent(panel.querySelector<HTMLElement>('.jev-result')!, run ? renderJevRun(run) : '')
     panel.querySelector<HTMLElement>('.jev-run-json pre')!.textContent = run ? JSON.stringify({ request: run.request, response: run.result || null }, null, 2) : ''
     panel.querySelector<HTMLElement>('.jev-older')!.hidden = !nextPage
     for (const button of panel.querySelectorAll<HTMLButtonElement>('[data-result]')) button.disabled = !run || (button.dataset.result !== 'edit' && !run.result)
@@ -181,7 +183,7 @@ export function createJevWorkspace(parent: HTMLElement, sidebar: HTMLElement, ha
         runs = [confirmed, ...runs.filter(old => old.id !== run.id)]; selectedRun = run.id; renderRuns()
         // Reveal the evaluation the person just requested, but never pull them
         // away from newer edits or a workspace they have since navigated to.
-        if (navigation === generation && JSON.stringify(e.draft) === draftSnapshot) el.querySelector<HTMLElement>('.jev-run-view')!.scrollIntoView({ block: 'start' })
+        if (navigation === generation && JSON.stringify(e.draft) === draftSnapshot) scrollToActor(el.querySelector<HTMLElement>('.jev-run-view')!)
         void loadRuns()
       }
     } catch (error) {

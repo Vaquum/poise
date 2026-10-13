@@ -293,6 +293,7 @@ test('keeps the request in the composer, sends no prompt and opens nothing when 
 })
 
 test('Poise: from a fresh console first creates an ordinary session on the chosen model, then only the command', async ({ page }) => {
+  const sidebar = page.locator('.chat-session-list')
   const state = makeState([])
   await installRoutes(page, state)
   const sock = await installSocket(page)
@@ -317,11 +318,11 @@ test('Poise: from a fresh console first creates an ordinary session on the chose
   expect(sock.framesOf('poise.change')[0].command).toMatchObject({ sessionId: 'new-1', text: 'Make the Behaviors table sortable' })
   expect(sock.framesOf('prompt')).toHaveLength(0)
   await sock.subscribed('change-session')
-  await expect(page.locator('.chat-session-item.active')).toContainText('Poise change')
+  await expect(sidebar.locator('.chat-session-item.active')).toContainText('Poise change')
   await expect(card(page)).toBeVisible()
   // An ordinary message still goes the ordinary way, mentions of Poise included.
-  await page.locator('.chat-session-item', { hasText: 'Poise: Make the Behaviors table sortable' }).click()
-  await expect(page.locator('.chat-session-item.active')).toContainText('Poise: Make')
+  await sidebar.locator('.chat-session-item', { hasText: 'Poise: Make the Behaviors table sortable' }).click()
+  await expect(sidebar.locator('.chat-session-item.active')).toContainText('Poise: Make')
   await input(page).fill('What does Poise: mean in the docs?')
   await input(page).press('Enter')
   await expect.poll(() => sock.framesOf('prompt').length).toBe(1)

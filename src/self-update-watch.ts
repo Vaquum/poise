@@ -1,3 +1,4 @@
+import { patchContent } from './dom-patch'
 // The tab-wide watch that moves a browser onto a newly promoted Poise build.
 // It polls `/api/health` for the served build's SHA, compares it with the SHA
 // this bundle was compiled from, and — only when the app reports nothing in
@@ -89,7 +90,7 @@ function renderBanner(plan: ReloadPlan, onRefresh: () => void): void {
     })
     document.body.appendChild(bannerEl)
   }
-  if (html !== lastBannerHtml) { lastBannerHtml = html; bannerEl.innerHTML = html }
+  if (html !== lastBannerHtml) { lastBannerHtml = html; patchContent(bannerEl, html) }
   bannerEl.hidden = false
 }
 

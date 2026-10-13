@@ -1,3 +1,5 @@
+import { reveal, resizeContent } from '../motion'
+import { patchContent } from '../dom-patch'
 // Chat transcript — folds the session's event stream into a model of turns
 // and renders it as keyed DOM. Every item carries a revision counter; the
 // renderer only rewrites an element whose revision moved, so a streaming
@@ -513,6 +515,7 @@ export interface TranscriptView {
 export function createTranscriptView(container: HTMLElement, handlers: TranscriptHandlers): TranscriptView {
   const nodes = new Map<string, { el: HTMLElement, rev: number }>()
   const ui = new Map<string, UiState>()
+  const disclosures = new Set<string>()
   const questionDraftKey = 'poise-chat-question-drafts'
   try {
     const saved = JSON.parse(sessionStorage.getItem(questionDraftKey) || '[]')
@@ -783,28 +786,33 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     let cursor = items.firstElementChild as HTMLElement | null
     for (const item of list) {
       keep.add(item.key)
-      const { el: node } = ensure(items, item.key, cursor, `chat-item chat-item-${item.kind}`)
+      const { el: node, fresh } = ensure(items, item.key, cursor, `chat-item chat-item-${item.kind}`)
       const focusedHere = focused !== null && (item.kind === 'permission' || item.kind === 'question') && item.id === focused.id
       // Expansion changes markup; request focus is only a CSS class.
       // Rebuilding a form on focus changes would erase a partially typed answer.
       const uiRev = (ui.get(item.key)?.expanded ? 1 : 0)
       const rev = item.rev * 4 + uiRev
       if (setRev(item.key, rev) || (item.kind === 'tool' && node.childElementCount === 0)) {
+        const paint = () => {
         switch (item.kind) {
-          case 'text': node.innerHTML = textHtml(item); break
-          case 'thought': node.innerHTML = thoughtHtml(item, item.key); break
-          case 'tool': node.innerHTML = toolHtml(item); break
-          case 'readgroup': node.innerHTML = readGroupHtml(item.key, item.tools); break
-          case 'plan': node.innerHTML = planHtml(item); break
-          case 'permission': node.innerHTML = permissionHtml(item, focusedHere); break
+          case 'text': patchContent(node, textHtml(item)); break
+          case 'thought': patchContent(node, thoughtHtml(item, item.key)); break
+          case 'tool': patchContent(node, toolHtml(item)); break
+          case 'readgroup': patchContent(node, readGroupHtml(item.key, item.tools)); break
+          case 'plan': patchContent(node, planHtml(item)); break
+          case 'permission': patchContent(node, permissionHtml(item, focusedHere)); break
           case 'question':
             rememberQuestion(node, item.key)
-            node.innerHTML = questionHtml(item, focusedHere)
+            patchContent(node, questionHtml(item, focusedHere))
             restoreQuestion(node, item.key)
             break
           case 'steer': node.innerHTML = `<div class="chat-msg chat-msg-user chat-msg-steer"><div class="chat-msg-body"><span class="chat-msg-mode-tag">steer</span>${escapeHtml(item.text)}${contextExtras(item)}</div></div>`; break
           case 'error': node.innerHTML = `<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(item.message)}</div></div>`; break
         }
+        }
+        if (disclosures.delete(item.key)) resizeContent(node, paint)
+        else paint()
+        if (fresh && item.kind !== 'text') reveal(node, { distance: 8 })
       }
       if (item.kind === 'question' && item.answered && ui.has(item.key)) delete ui.get(item.key)!.answers
       if (item.kind === 'question' || item.kind === 'permission') node.firstElementChild?.classList.toggle('focused', focusedHere)
@@ -846,7 +854,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     for (const b of model.blocks) if (b.kind === 'turn') lastTurnKey = b.key
     for (const b of model.blocks) {
       keep.add(b.key)
-      const { el } = ensure(container, b.key, cursor, b.kind === 'turn' ? 'chat-turn' : `chat-block chat-block-${b.kind}`)
+      const { el, fresh } = ensure(container, b.key, cursor, b.kind === 'turn' ? 'chat-turn' : `chat-block chat-block-${b.kind}`)
       if (b.kind === 'turn') {
         // The running flag and the focused request only affect the last turn
         // and the turn holding the request; both sit in the item revisions,
@@ -858,6 +866,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
           ? `<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(b.message)}</div></div>`
           : `<div class="chat-note">${escapeHtml(b.text)}</div>`
       }
+      if (fresh) reveal(el, { distance: 8 })
       cursor = el.nextElementSibling as HTMLElement | null
     }
     prune(container, keep)
@@ -907,6 +916,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       const key = toggle.dataset.toggle!
       const state = ui.get(key) || {}
       state.expanded = !state.expanded
+      disclosures.add(key)
       ui.set(key, state)
       // Re-render just this node from its current markup state: flip the
       // revision so the next render rewrites it, and ask for one now.
