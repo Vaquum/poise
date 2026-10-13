@@ -3,9 +3,12 @@
 The burger at the top right opens a surface attached to the button. Choose
 Analytics, or a destination under Settings: General, Models, Accounts or
 Typography. Service administrators also see Admin. There is no second tab
-strip inside Settings. Back returns to the menu on the same surface; the
-burger, the close button or Escape closes it. Escape inside an account
+strip inside Settings. Back returns to the menu on the same surface. The
+burger becomes the single close button while the menu or a panel is open;
+clicking it or pressing Escape closes the surface. Escape inside an account
 terminal belongs to the running program.
+If Writer mode is enabled with a panel open, the single close button remains
+visible until the surface is dismissed.
 
 General holds GitHub identities, accounts to follow, time, notifications,
 chat defaults and theme. Models holds named configurations and model choices.

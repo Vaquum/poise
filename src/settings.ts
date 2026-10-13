@@ -823,8 +823,7 @@ function buildPanel(): HTMLElement {
   const tzOptionsHtml = tzList.map((z) => `<option value="${z}">${z}</option>`).join('')
 
   panel.innerHTML = `
-    <div class="tp-header"><span class="tp-title">General</span>
-      <button class="tp-close" type="button" aria-label="Close settings">&times;</button></div>
+    <div class="tp-header"><span class="tp-title">General</span></div>
     <div class="tp-body">
 
       <section class="st-tab" data-tab="general">
@@ -1024,8 +1023,6 @@ function buildPanel(): HTMLElement {
     field.addEventListener('input', () => dirtyFields.add(field))
     field.addEventListener('change', () => dirtyFields.add(field))
   }
-
-  panel.querySelector('.tp-close')!.addEventListener('click', closeSettingsPanel)
 
   // Refresh-rate toggle — applies live (no Save needed); each view's
   // running timer restarts via the `poise:refresh-rate-changed` event.

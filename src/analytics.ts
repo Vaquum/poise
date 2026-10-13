@@ -22,8 +22,7 @@ function buildPanel(): HTMLElement {
   panel.id = 'analytics-panel'
   panel.setAttribute('aria-label', 'Analytics')
   panel.innerHTML = `
-    <div class="tp-header"><span class="tp-title" data-help="Counts the work shown in Current. Per-PR numbers cover pull requests merged in the selected range." tabindex="0">Analytics</span>
-      <button class="tp-close" type="button" aria-label="Close analytics">&times;</button></div>
+    <div class="tp-header"><span class="tp-title" data-help="Counts the work shown in Current. Per-PR numbers cover pull requests merged in the selected range." tabindex="0">Analytics</span></div>
     <div class="tp-body">
       <div class="range-picker analytics-range" role="group" aria-label="Time range">
         ${TIME_RANGES.map((r) => `<button type="button" data-range="${r.key}">${r.label}</button>`).join('')}
@@ -31,7 +30,6 @@ function buildPanel(): HTMLElement {
       <p class="analytics-status st-help" role="status" hidden></p>
       <div class="analytics-groups" aria-live="polite"></div>
     </div>`
-  panel.querySelector('.tp-close')!.addEventListener('click', () => closeAnalyticsPanel())
   panel.querySelector('.analytics-range')!.addEventListener('click', (e) => {
     const button = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-range]')
     if (!button || button.dataset.range === range) return

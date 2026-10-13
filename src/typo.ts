@@ -310,8 +310,7 @@ function buildPanel(): HTMLElement {
   const panel = document.createElement('aside')
   panel.id = 'typo-panel'
   panel.setAttribute('aria-label', 'Typography')
-  panel.innerHTML = `<div class="tp-header"><span class="tp-title">Typography</span>`
-    + `<button class="tp-close" type="button" aria-label="Close typography">&times;</button></div>`
+  panel.innerHTML = `<div class="tp-header"><span class="tp-title">Typography</span></div>`
     + `<div class="tp-body"></div>`
 
   const body = panel.querySelector('.tp-body')!
@@ -403,17 +402,10 @@ function buildPanel(): HTMLElement {
     panelEl.removeAttribute('inert')
     panelEl.removeAttribute('aria-hidden')
     panelEl.classList.add('open')
-    wireCloseButton(panelEl)
   })
   body.appendChild(reset)
 
-  wireCloseButton(panel)
   return panel
-}
-
-function wireCloseButton(panel: HTMLElement): void {
-  panel.querySelector<HTMLButtonElement>('.tp-close')
-    ?.addEventListener('click', () => closeTypographyPanel())
 }
 
 export function initTypography() {

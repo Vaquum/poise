@@ -4964,6 +4964,12 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
 body.editor-writer-mode #app-bar-global {
   display: none;
 }
+/* An open menu keeps its single close control until dismissed. */
+body.editor-writer-mode #app-bar-global:has(#menu-toggle.is-close) {
+  display: flex;
+  margin-left: auto;
+}
+body.editor-writer-mode #top-nav { display: none; }
 /* Nothing is left to separate from, so drop the bar's rule. The background
    stays opaque — it is the page colour, so it reads as bare, but text
    scrolling underneath still cannot show through the band. */
