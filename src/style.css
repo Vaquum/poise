@@ -2784,6 +2784,7 @@ tr:hover .review-btn { opacity: 1; }
    beside it, and every target and status was cut off. The negative
    margins pull <main> out to the same 24px inset the control bar and the
    kanban use; below the column width they resolve to zero. */
+#view-main main,
 #view-swarm main {
   margin-inline: calc(50% - 50vw + 24px);
 }
@@ -2998,6 +2999,7 @@ button.agent-target:hover {
 .agent-status-note.agent-progress-summary { color: var(--text-secondary); }
 
 /* A thousand rows scroll a long way; the headers have to stay. */
+#table thead th,
 #swarm-table thead th {
   position: sticky;
   top: 0;
@@ -6701,3 +6703,12 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 .st-org-state-error { color: var(--a5); }
 .st-org-state-initializing { color: var(--a4); }
 .st-org-status:empty { display: none; }
+
+/* Archive shares Swarm's linked identities, status typography and viewport inset. */
+#table .col-org { width: 9%; }
+#table .col-repo { width: 16%; }
+#table .col-last { width: 64px; }
+#table .col-owner { width: 12%; }
+#table .col-state { width: 110px; }
+#table td.updated-cell { text-align: right; }
+#main-actions-scope { margin-bottom: 16px; }

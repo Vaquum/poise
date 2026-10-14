@@ -24,7 +24,7 @@ async function setup(page: Page, initial = [organization('acme')], me = 'octocat
     partial: false,
   }
   await page.clock.setFixedTime(new Date('2026-10-01T08:00:10Z'))
-  await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'main') })
+  await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-filters-v2', JSON.stringify({ type: 'both', status: 'all', time: 'all' })); localStorage.setItem('poise-view', 'main') })
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com|github\.com)\//, (route) => route.abort())
   await page.route('**/api/**', async (route) => {
     const request = route.request()
@@ -104,7 +104,8 @@ test('adds an organization, saves the username, shows activation and refreshes t
   await expect(page.locator('.st-organization[data-org="acme"]')).toContainText('Ready')
   state.organizations = [organization('acme'), organization('beta')]
   await expect(page.locator('.st-organization[data-org="beta"]')).toContainText('Ready')
-  await expect(page.locator('#tbody .repo-name')).toHaveText(['acme/same-repo', 'beta/same-repo'])
+  await expect(page.locator('#tbody .repo-name')).toHaveText(['same-repo', 'same-repo'])
+  await expect(page.locator('#tbody .agent-org')).toHaveText(['acme', 'beta'])
   await page.keyboard.press('Escape')
   await expect(page.locator('#main-filters').getByLabel('Account filter')).toBeVisible()
 })
@@ -132,9 +133,11 @@ test('retries failed activation and resumes status checks after reopening Settin
 test('shares organization scope across Archive, Current and Swarm with full repository identities', async ({ page }) => {
   const state = await setup(page, [organization('acme'), organization('beta')])
   await page.goto('/')
-  await expect(page.locator('#tbody .repo-name')).toHaveText(['acme/same-repo', 'beta/same-repo'])
+  await expect(page.locator('#tbody .repo-name')).toHaveText(['same-repo', 'same-repo'])
+  await expect(page.locator('#tbody .agent-org')).toHaveText(['acme', 'beta'])
   await page.locator('#main-filters').getByLabel('Account filter').selectOption('beta')
-  await expect(page.locator('#tbody .repo-name')).toHaveText(['beta/same-repo'])
+  await expect(page.locator('#tbody .repo-name')).toHaveText(['same-repo'])
+  await expect(page.locator('#tbody .repo-name')).toHaveAttribute('title', 'beta/same-repo')
   await page.getByRole('button', { name: 'Current', exact: true }).click()
   await expect(page.locator('#current-filters').getByLabel('Account filter')).toHaveValue('beta')
   await expect(page.locator('#view-current .card-live .card-repo')).toHaveText(['beta/same-repo'])
@@ -280,17 +283,18 @@ test('discards a background Archive response whose JSON arrives after switching 
   await page.goto('/')
   const filter = page.locator('#main-filters').getByLabel('Account filter')
   await filter.selectOption('acme')
-  await expect(page.locator('#tbody .repo-name')).toHaveText(['acme/same-repo'])
+  await expect(page.locator('#tbody .repo-name')).toHaveText(['same-repo'])
+  await expect(page.locator('#tbody .agent-org')).toHaveText('acme')
   await page.evaluate(() => {
     ;(window as typeof window & { holdArchive?: boolean }).holdArchive = true
     window.dispatchEvent(new Event('poise:refresh-tick'))
   })
   await expect.poll(() => page.evaluate(() => !!(window as typeof window & { archiveWaiting?: boolean }).archiveWaiting)).toBe(true)
   await filter.selectOption('beta')
-  await expect(page.locator('#tbody .repo-name')).toHaveText(['beta/same-repo'])
+  await expect(page.locator('#tbody .agent-org')).toHaveText('beta')
   await page.evaluate(() => { (window as typeof window & { releaseArchive?: () => void }).releaseArchive?.() })
   await page.waitForTimeout(100)
-  await expect(page.locator('#tbody .repo-name')).toHaveText(['beta/same-repo'])
+  await expect(page.locator('#tbody .agent-org')).toHaveText('beta')
 })
 
 
@@ -308,11 +312,11 @@ test('adds a personal GitHub account alongside an organization with shared behav
   state.organizations = [organization('acme'), organization('mikkokotila')]
   await expect(personal).toContainText('Ready')
   await page.keyboard.press('Escape')
-  await expect(page.locator('#tbody .repo-name')).toHaveText(['acme/same-repo', 'mikkokotila/same-repo'])
+  await expect(page.locator('#tbody .repo-name')).toHaveText(['same-repo', 'same-repo'])
   const filter = page.locator('#main-filters').getByLabel('Account filter')
   await expect(filter.locator('option')).toHaveText(['All accounts', 'acme', 'mikkokotila'])
   await filter.selectOption('mikkokotila')
-  await expect(page.locator('#tbody .repo-name')).toHaveText(['mikkokotila/same-repo'])
+  await expect(page.locator('#tbody .repo-name')).toHaveText(['same-repo'])
   await page.getByRole('button', { name: 'Current', exact: true }).click()
   await expect(page.locator('#current-filters').getByLabel('Account filter')).toHaveValue('mikkokotila')
   await expect(page.locator('#view-current .card-live .card-repo')).toHaveText(['mikkokotila/same-repo'])

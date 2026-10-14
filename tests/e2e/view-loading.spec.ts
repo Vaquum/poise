@@ -15,7 +15,7 @@ const issue = {
 async function setup(page: Page, view = 'current') {
   const state = { currentReads: 0 }
   await page.addInitScript((initialView) => {
-    localStorage.clear()
+    localStorage.clear(); localStorage.setItem('poise-filters-v2', JSON.stringify({ type: 'both', status: 'all', time: 'all' }))
     localStorage.setItem('poise-view', initialView)
   }, view)
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com|github\.com)\//, (route) => route.abort())

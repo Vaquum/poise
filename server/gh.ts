@@ -24,6 +24,7 @@ import { HttpError } from './http'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { MAX_PROCESS_ARG_BYTES, runFile } from './process'
 import { agentAccount, requireAgentAccount } from './settings'
+import { invalidateActionRunCache, listActionRuns } from './action-runs'
 
 const CLI = 'github-datastore'
 const GH_INTERFACE = 'github-interface'
@@ -184,18 +185,19 @@ let repoCacheGeneration = 0
 export function invalidateRepoListCache(): void {
   repoCacheGeneration += 1
   repoListCache.clear()
+  invalidateActionRunCache()
 }
 const REPO_LIST_TTL_MS = 5 * 60 * 1000
 
 async function discoverOrgRepos(org: Organization): Promise<string[]> {
-  const key = org.login.toLowerCase()
+  const me = getMeta('me') || ''
+  if (!me) throw new Error('Set your GitHub account in Settings → GitHub to list repositories')
+  const key = `${me.toLowerCase()}:${org.login.toLowerCase()}`
   const now = Date.now()
   const cached = repoListCache.get(key)
   if (cached && cached.expiry > now) return cached.repos
   const generation = repoCacheGeneration
   // Repositories are listed as the person: what they can see.
-  const me = getMeta('me') || ''
-  if (!me) throw new Error('Set your GitHub account in Settings → GitHub to list repositories')
   const { stdout } = await runFile(GH_INTERFACE, ['--view-repos', org.login, '--token-user', me], {
     timeoutMs: 30_000, maxOutputBytes: 32 * 1024 * 1024,
   })
@@ -484,6 +486,8 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: 
 export async function handleGhBody(body: any): Promise<{ status: number, body: unknown }> {
   const op = body?.operation
   const me = getMeta('me') || ''
+
+  if (op === 'actions') return listActionRuns(body)
 
   if (op === 'list') {
     const orgs = selectOrganizations(body.org)

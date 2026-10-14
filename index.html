@@ -13,12 +13,14 @@
         <header class="view-header">
           <div class="filter-cluster" id="main-filters">
             <div class="range-picker" id="filter-type">
-              <button data-filter="both" class="active">All</button>
+              <button data-filter="action" class="active">Actions</button>
+              <button data-filter="both">Issues &amp; PRs</button>
               <button data-filter="issue">Issues</button>
               <button data-filter="pr">PRs</button>
             </div>
             <div class="range-picker" id="filter-status">
-              <button data-status="all" class="active">Any</button>
+              <button data-status="failed" class="active">Failed</button>
+              <button data-status="all">Any</button>
               <button data-status="open">Open</button>
             </div>
             <div class="range-picker" id="time-picker">
@@ -34,15 +36,17 @@
           </div>
         </header>
         <main>
+          <p id="main-actions-scope" class="st-help">Latest 100 failed runs per repository · cached for 5 minutes. Any shows all outcomes. Search and dates filter these runs.</p>
           <table id="table">
             <thead>
               <tr>
                 <th class="col-type"></th>
                 <th class="col-title">Title</th>
                 <th class="col-last">Author</th>
+                <th class="col-org">Org</th>
                 <th class="col-repo">Repo</th>
                 <th class="col-owner">Owner</th>
-                <th class="col-state">State</th>
+                <th class="col-state">Status</th>
                 <th class="col-updated">Updated</th>
                 <th class="col-action"></th>
               </tr>

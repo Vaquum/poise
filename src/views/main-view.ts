@@ -5,7 +5,7 @@ import { layout, retire, reveal } from '../motion'
 import { patchContent } from '../dom-patch'
 import { mountOrganizationFilter, organizationPayload, organizationErrors } from '../organizations'
 
-const STORAGE_KEY = 'poise-filters'
+const STORAGE_KEY = 'poise-filters-v2'
 const REVIEWED_KEY = 'poise-reviewed'
 const PAGE_SIZE = 20
 
@@ -29,6 +29,9 @@ const PLAY_SVG = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><p
 const SPIN_SVG = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" class="spin"><circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.5" stroke-dasharray="8 6" stroke-linecap="round"/></svg>'
 
 interface PrRow {
+  kind?: 'pr' | 'issue' | 'action'
+  branch?: string
+  event?: string
   repo: string
   number: number
   title: string
@@ -42,12 +45,12 @@ interface PrRow {
   merged_at: string | null
 }
 
-type TypeFilter = 'both' | 'issue' | 'pr'
-type StatusFilter = 'all' | 'open'
+type TypeFilter = 'both' | 'issue' | 'pr' | 'action'
+type StatusFilter = 'all' | 'open' | 'failed'
 type TimeFilter = 'all' | 'today' | 'yesterday' | 'week'
 
-let typeFilter: TypeFilter = 'both'
-let statusFilter: StatusFilter = 'all'
+let typeFilter: TypeFilter = 'action'
+let statusFilter: StatusFilter = 'failed'
 let timeFilter: TimeFilter = 'all'
 let searchQuery = ''
 let items: PrRow[] = []
@@ -57,6 +60,7 @@ let partialResults = false
 let done = false
 let fetching = false
 let initialized = false
+let organizationDirty = false
 let observer: IntersectionObserver | null = null
 let searchDebounce: ReturnType<typeof setTimeout> | null = null
 // Tick listener installed when the view is initialized; removed via
@@ -94,13 +98,13 @@ function loadFilters(): { type: TypeFilter; status: StatusFilter; time: TimeFilt
     if (raw) {
       const parsed = JSON.parse(raw)
       return {
-        type: ['both', 'issue', 'pr'].includes(parsed.type) ? parsed.type : 'both',
-        status: ['all', 'open'].includes(parsed.status) ? parsed.status : 'all',
+        type: ['both', 'issue', 'pr', 'action'].includes(parsed.type) ? parsed.type : 'action',
+        status: ['all', 'open', 'failed'].includes(parsed.status) ? parsed.status : 'failed',
         time: ['all', 'today', 'yesterday', 'week'].includes(parsed.time) ? parsed.time : 'all',
       }
     }
   } catch { /* ignore */ }
-  return { type: 'both', status: 'all', time: 'all' }
+  return { type: 'action', status: 'failed', time: 'all' }
 }
 
 function saveFilters() {
@@ -162,6 +166,13 @@ function safeHttpsUrl(value: string): string {
 }
 
 function stateLabel(item: PrRow): { text: string; cls: string } {
+  if (item.kind === 'action') {
+    const text = item.state.replace(/_/g, ' ')
+    const cls = item.state === 'failure' || item.state === 'timed_out' ? 'bad'
+      : item.state === 'success' ? 'ok'
+      : ['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(item.state) ? 'live' : 'flat'
+    return { text: text.charAt(0).toUpperCase() + text.slice(1), cls }
+  }
   if (item.is_pr === 1 && item.merged_at) return { text: 'Merged', cls: 'merged' }
   return item.state === 'open' ? { text: 'Open', cls: 'open' } : { text: 'Closed', cls: 'closed' }
 }
@@ -203,7 +214,7 @@ function lastCell(item: PrRow): string {
 // Stable identity for a row across refreshes. Matches the format Current
 // uses for live items so the FLIP path captures the same kind of key.
 function rowKey(item: PrRow): string {
-  return `${item.repo}#${item.number}`
+  return item.kind === 'action' ? `${item.repo}:action:${item.number}` : `${item.repo}#${item.number}`
 }
 
 // A settled pull request is not a review target. The button was rendered armed
@@ -247,14 +258,19 @@ function paintRow(tr: HTMLTableRowElement, item: PrRow): void {
   const st = stateLabel(item)
   const actionHtml = pr ? reviewButtonHtml(item, st) : ''
 
+  const action = item.kind === 'action'
+  const [org, repo] = item.repo.split('/', 2)
+  const repoUrl = `https://github.com/${encodeURIComponent(org)}/${encodeURIComponent(repo)}`
+  const tone = action ? st.cls : st.cls === 'open' ? 'live' : st.cls === 'merged' ? 'ok' : 'flat'
   patchContent(tr, `
-    <td><span class="type-toggle ${pr ? 'pr' : 'issue'}">${pr ? 'PR' : 'IS'}</span></td>
-    <td class="title-cell"><a href="${safeHttpsUrl(item.html_url)}" target="_blank" rel="noopener">${escapeHtml(item.title)}</a></td>
+    <td><span class="type-toggle ${pr ? 'pr' : action ? 'action' : 'issue'}">${pr ? 'PR' : action ? 'CI' : 'IS'}</span></td>
+    <td class="title-cell"><a href="${safeHttpsUrl(item.html_url)}" target="_blank" rel="noopener" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</a></td>
     <td class="last-cell">${lastCell(item)}</td>
-    <td><span class="repo-name">${escapeHtml(item.repo)}</span></td>
-    <td class="last-cell">${ownerCell(item)}</td>
-    <td><span class="state ${st.cls}">${st.text}</span></td>
-    <td><span class="date">${relativeDate(item.updated_at)}</span></td>
+    <td class="org-cell"><a class="agent-org" href="https://github.com/${encodeURIComponent(org)}" target="_blank" rel="noopener">${escapeHtml(org)}</a></td>
+    <td><a class="agent-repo repo-name" href="${repoUrl}" target="_blank" rel="noopener" title="${escapeHtml(item.repo)}">${escapeHtml(repo)}</a></td>
+    <td class="${action ? 'branch-cell' : 'last-cell'}">${action ? `<span class="agent-pr" title="${escapeHtml(item.event || '')}">${escapeHtml(item.branch || '—')}</span>` : ownerCell(item)}</td>
+    <td><span class="agent-status ${tone}"><span class="agent-status-label">${escapeHtml(st.text)}</span></span></td>
+    <td class="updated-cell"><span class="date" title="${escapeHtml(item.updated_at)}">${relativeDate(item.updated_at)}</span></td>
     <td class="action-cell">${actionHtml}</td>
   `)
 }
@@ -329,10 +345,12 @@ function sentinelNeedsFetch(): boolean {
 // Subset of the /api/gh record shape used by Archive. The proxy keeps
 // the legacy envelope; we only pluck what the table needs.
 interface GhRecord {
-  kind: 'pr' | 'issue'
+  kind: 'pr' | 'issue' | 'action'
+  branch?: string
+  event?: string
   repo: string                      // "acme/foo"
   number: number
-  state: 'open' | 'closed' | 'merged'
+  state: string
   title: string
   url: string
   updated_at: string
@@ -344,6 +362,9 @@ interface GhRecord {
 
 function recordToRow(r: GhRecord): PrRow {
   return {
+    kind: r.kind,
+    branch: r.branch,
+    event: r.event,
     repo: r.repo,
     number: r.number,
     title: r.title,
@@ -358,13 +379,26 @@ function recordToRow(r: GhRecord): PrRow {
   }
 }
 
+function readMessages(data: { errors?: Array<{ org: string, error: string }>, warnings?: string[] }): string {
+  return [organizationErrors(data), ...(data.warnings || [])].filter(Boolean).join(' ')
+}
+
+function updateFilterContext(): void {
+  const action = typeFilter === 'action'
+  clusterEl.querySelector<HTMLButtonElement>('[data-status="open"]')!.hidden = action
+  clusterEl.querySelector<HTMLButtonElement>('[data-status="failed"]')!.hidden = !action
+  document.querySelector('#table .col-owner')!.textContent = action ? 'Branch' : 'Owner'
+  document.getElementById('main-actions-scope')!.hidden = !action
+  document.getElementById('main-actions-scope')!.textContent = `Latest 100 ${statusFilter === 'failed' ? 'failed ' : ''}runs per repository · cached for 5 minutes. Search and dates filter these runs.`
+}
+
 function buildListPayload(): Record<string, unknown> {
   const win = timeWindow()
   const payload: Record<string, unknown> = {
-    operation: 'list',
+    operation: typeFilter === 'action' ? 'actions' : 'list',
     ...organizationPayload(),
     record_type: typeFilter === 'both' ? 'all' : (typeFilter === 'pr' ? 'pull_request' : 'issue'),
-    record_state: statusFilter === 'open' ? 'open' : 'all',
+    record_state: statusFilter === 'failed' ? 'failed' : statusFilter === 'open' ? 'open' : 'all',
     limit: PAGE_SIZE,
     offset,
   }
@@ -426,9 +460,15 @@ async function fetchPage(): Promise<void> {
     if (newItems.length < PAGE_SIZE) done = true
 
     consecutiveFailures = 0
-    showLoadError(organizationErrors(pageData))
+    showLoadError(readMessages(pageData))
     loader.hidden = done
     appendRows(newItems)
+    if (items.length === 0) {
+      table.hidden = true
+      empty.textContent = typeFilter === 'action' && statusFilter === 'failed'
+        ? 'No failed workflow runs for the current filters.' : 'No results for the current filters.'
+      empty.hidden = false
+    }
     const countRes = await countRead
     const countData = countRes?.ok ? await countRes.json().catch(() => ({})) : {}
     if (mine !== queryGeneration) return
@@ -438,7 +478,7 @@ async function fetchPage(): Promise<void> {
     if (countComplete && items.length >= total) done = true
     loader.hidden = done
     updateCount()
-    showLoadError(organizationErrors(pageData) || organizationErrors(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
+    showLoadError(readMessages(pageData) || readMessages(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
   } catch (err) {
     if (mine !== queryGeneration) return
     loader.hidden = true
@@ -449,7 +489,7 @@ async function fetchPage(): Promise<void> {
       cancelPendingRetry()
       retryTimer = setTimeout(() => {
         retryTimer = null
-        if (mine === queryGeneration && !done) void fetchPage()
+        if (mine === queryGeneration && !done && !document.getElementById('view-main')!.hidden) void fetchPage()
       }, delay)
     }
   } finally {
@@ -463,7 +503,7 @@ async function fetchPage(): Promise<void> {
   // failure is what produced the retry loop.
   if (!done && consecutiveFailures === 0 && mine === queryGeneration) {
     requestAnimationFrame(() => {
-      if (mine === queryGeneration && sentinelNeedsFetch()) fetchPage()
+      if (mine === queryGeneration && !document.getElementById('view-main')!.hidden && sentinelNeedsFetch()) fetchPage()
     })
   }
 }
@@ -513,6 +553,9 @@ function attachHandlers() {
       const next = btn.dataset.filter as TypeFilter
       if (next === typeFilter) return
       typeFilter = next
+      statusFilter = next === 'action' ? 'failed' : 'all'
+      updateFilterContext()
+      clusterEl.querySelectorAll<HTMLButtonElement>('[data-status]').forEach((b) => setPillActive(b, b.dataset.status === statusFilter))
       clusterEl.querySelectorAll<HTMLButtonElement>('[data-filter]').forEach((b) => setPillActive(b, false))
       setPillActive(btn, true)
       saveFilters()
@@ -522,6 +565,7 @@ function attachHandlers() {
       const next = btn.dataset.status as StatusFilter
       if (next === statusFilter) return
       statusFilter = next
+      updateFilterContext()
       clusterEl.querySelectorAll<HTMLButtonElement>('[data-status]').forEach((b) => setPillActive(b, false))
       setPillActive(btn, true)
       saveFilters()
@@ -616,7 +660,12 @@ export function initMainView() {
   // listener (it never did before, which is why this early return could get
   // away with skipping startMainTimer), so without this Archive would refresh
   // on its first visit of a session and never again.
-  if (initialized) { renderAll(); startMainTimer(); return }
+  if (initialized) {
+    startMainTimer()
+    if (organizationDirty) { organizationDirty = false; resetAndFetch() }
+    else { renderAll(); void refreshMainSoft() }
+    return
+  }
   initialized = true
 
   tbody = document.getElementById('tbody') as HTMLTableSectionElement
@@ -633,8 +682,12 @@ export function initMainView() {
   statusFilter = saved.status
   timeFilter = saved.time
 
+  updateFilterContext()
   mountOrganizationFilter(clusterEl)
-  window.addEventListener('poise:organization-filter-changed', resetAndFetch)
+  window.addEventListener('poise:organization-filter-changed', () => {
+    if (document.getElementById('view-main')!.hidden) organizationDirty = true
+    else resetAndFetch()
+  })
   initFilterButtons()
   attachHandlers()
 
@@ -643,7 +696,7 @@ export function initMainView() {
   sentinel.id = 'main-sentinel'
   table.parentElement!.appendChild(sentinel)
   observer = new IntersectionObserver((entries) => {
-    if (entries[0].isIntersecting && !done && !fetching) fetchPage()
+    if (entries[0].isIntersecting && !done && !fetching && !document.getElementById('view-main')!.hidden) fetchPage()
   }, { rootMargin: '400px' })
   observer.observe(sentinel)
 
@@ -666,11 +719,11 @@ async function refreshMainSoft() {
   try {
     const win = timeWindow()
     const payload: Record<string, unknown> = {
-      operation: 'list',
+      operation: typeFilter === 'action' ? 'actions' : 'list',
     ...organizationPayload(),
       record_type: typeFilter === 'both' ? 'all' : (typeFilter === 'pr' ? 'pull_request' : 'issue'),
-      record_state: statusFilter === 'open' ? 'open' : 'all',
-      limit: PAGE_SIZE,
+      record_state: statusFilter === 'failed' ? 'failed' : statusFilter === 'open' ? 'open' : 'all',
+      limit: typeFilter === 'action' ? Math.max(PAGE_SIZE, items.length) : PAGE_SIZE,
       offset: 0,
     }
     if (win.since)   payload.updated_since = win.since
@@ -702,13 +755,12 @@ async function refreshMainSoft() {
     // the old top-20 but was pushed out of the new one — it vanished from the
     // table, and paging could later fetch it again as a duplicate.
     const newKeyset = new Set(newTop.map(rowKey))
-    const tail = items.filter((i) => !newKeyset.has(rowKey(i)))
+    const tail = typeFilter === 'action' ? [] : items.filter((i) => !newKeyset.has(rowKey(i)))
     const next = [...newTop, ...tail]
 
     total = next.length
     items = next
     offset = items.length
-    const wasDone = done
     done = newTop.length < PAGE_SIZE
     loader.hidden = done
     if (next.length === 0) {
@@ -721,7 +773,7 @@ async function refreshMainSoft() {
       applyMainFlip(next)
     }
     updateCount()
-    showLoadError(organizationErrors(pageData))
+    showLoadError(readMessages(pageData))
     const countRes = await countRead
     const countData = countRes?.ok ? await countRes.json().catch(() => ({})) : {}
     if (mine !== queryGeneration) return
@@ -731,13 +783,13 @@ async function refreshMainSoft() {
     done = countComplete ? items.length >= total : newTop.length < PAGE_SIZE
     loader.hidden = done
     updateCount()
-    showLoadError(organizationErrors(pageData) || organizationErrors(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
+    showLoadError(readMessages(pageData) || readMessages(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
     // Schedule after the count settles, when finally can release `fetching`.
     // Scheduling before that await would run into the paging guard and lose
     // the only nudge when a previously finished archive has gained new rows.
-    if (wasDone && !done) {
+    if (!done) {
       requestAnimationFrame(() => {
-        if (mine === queryGeneration && sentinelNeedsFetch()) void fetchPage()
+        if (mine === queryGeneration && !document.getElementById('view-main')!.hidden && sentinelNeedsFetch()) void fetchPage()
       })
     }
   } catch (err) {

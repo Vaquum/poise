@@ -1,10 +1,12 @@
 import type { Page } from '@playwright/test'
 
-export async function workspace(page: Page, view = 'current', fontResponse?: Promise<void>): Promise<void> {
-  await page.addInitScript(view => {
+export async function workspace(page: Page, view = 'current', fontResponse?: Promise<void>, options: { preserveOnReload?: boolean } = {}): Promise<void> {
+  await page.addInitScript(({ view, preserveOnReload }) => {
+    if (preserveOnReload && sessionStorage.getItem('poise-workspace-initialized')) return
     localStorage.clear()
     localStorage.setItem('poise-view', view)
-  }, view)
+    sessionStorage.setItem('poise-workspace-initialized', '1')
+  }, { view, preserveOnReload: options.preserveOnReload })
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com)\//, async route => {
     if (!fontResponse) return route.abort()
     await fontResponse

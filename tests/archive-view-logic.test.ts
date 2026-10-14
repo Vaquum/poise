@@ -126,3 +126,13 @@ describe('rows are identified consistently', () => {
     expect(h.rowKey(pr())).toBe('owner/poise#42')
   })
 })
+
+
+describe('workflow run identity and outcome', () => {
+  it('does not collide with a PR number and colors failed and active runs', () => {
+    const action = pr({ kind: 'action', is_pr: 0, state: 'failure' })
+    expect(h.rowKey(action)).toBe('owner/poise:action:42')
+    expect(h.stateLabel(action)).toEqual({ text: 'Failure', cls: 'bad' })
+    expect(h.stateLabel({ ...action, state: 'in_progress' })).toEqual({ text: 'In progress', cls: 'live' })
+  })
+})

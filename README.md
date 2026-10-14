@@ -27,7 +27,7 @@ and `deploy/restore.sh` back it up and restore it.
 - **Current** — manual idea/concept/plan cards beside live issues and PRs.
 - **Swarm** — agent run status, live review activity, responses, and safe replay controls.
 - **Chat** — native coding-agent sessions with streaming, tools, permissions and checkout-bound work.
-- **Archive** — searchable GitHub issue and PR history.
+- **Archive** — failed GitHub Actions by default, plus searchable issue and PR history. Full-width tables follow Swarm, with separate linked Org and Repo columns.
 - **Behaviors** — scheduled review, approval, unblocking, and issue-review automations.
 - **Snippets** — simple Espanso trigger management, and Import from an existing Espanso file.
 - **Editor** — atomic Markdown storage, annotations, and agent-backed chat.
@@ -122,9 +122,10 @@ personal username (for example, `octocat`).
 Settings → General → GitHub holds two accounts, and no GitHub account is fixed
 anywhere in Poise or Caller:
 
-- **Your GitHub account** scopes Current and Archive to what you are involved
-  in. Reads done as you — repository lists and account indexing — and the
-  issues you open from Current or the Editor use it.
+- **Your GitHub account** scopes Current and Archive's issue/PR history to
+  what you are involved in. Archive's Actions tab reads workflows across ready
+  accounts independently of that involvement. Repository lists, account
+  indexing and issues opened from Current or the Editor also use your account.
 - **GitHub automation account** is the GitHub user your reviews and comments are posted
   as: PR reviews and approvals, conversation resolution, issue reviews, and
   the checkouts and reads they need. It is optional to save, but every
@@ -171,7 +172,8 @@ credentials. At most two terminals run at once, and one closes after 15 idle
 minutes. See [Connected accounts](docs/Connected-accounts.md).
 
 Current, Archive, and Swarm combine GitHub accounts and offer an account
-filter. Repository labels include their owner. Repository-free manual cards,
+filter. Repository identities retain their owner; Archive and Swarm show
+separate Org and Repo columns. Repository-free manual cards,
 Editor, Snippets, and local chats remain personal. If one account's reads
 fail, available results remain visible with an explicit error. Current paints personal cards and GitHub lanes as
 each read arrives; repository discovery and agent activity do not delay them.
@@ -710,3 +712,17 @@ if the workflow is now running or green. Diagnostics belong to each workflow,
 so a different successful rerun cannot clear an unresolved hold. A `read_failed`
 receipt proves no write occurred: its intent is released and the visible read
 failure retries with backoff. Errors after the write begins remain held.
+
+Archive's Actions tab reads workflow runs independently of PR involvement, including
+push and deployment runs after merge. Failed selects GitHub's `failure` conclusion;
+Any includes all conclusions and active runs. It reads at most the latest 100 runs
+per repository for the selected outcome, and reports truncated history and read
+failures. Search and date filters apply within that snapshot. Older runs remain
+available in GitHub. Workflow reads happen only while Actions is open, share a
+five-minute cache across pages, counts, search, date and account filters, and make
+one API request per discovered repository per outcome per cache interval.
+Repository discovery uses the existing cache; no workflow jobs or logs are polled.
+Healthy workflow snapshots expire five minutes after their reads complete;
+unavailable or partial reads retry after one minute, reusing healthy repositories.
+Expired reads send authenticated ETags: unchanged `304` responses reuse the
+verified snapshot and do not consume GitHub's primary REST rate limit.

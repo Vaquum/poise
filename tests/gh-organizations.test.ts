@@ -88,6 +88,18 @@ describe('organization data aggregation', () => {
 })
 
 describe('the accounts GitHub is read as', () => {
+  it('keys repository discovery by identity even when the owner stays unchanged', async () => {
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({
+      stdout: JSON.stringify({ repos: [{ full_name: `${args[1]}/${args[3]}` }] }), stderr: '',
+    }))
+    expect(await listOrgRepos('alpha')).toEqual(['alpha/octocat'])
+    mocks.meta.me = 'another-person'
+    expect(await listOrgRepos('alpha')).toEqual(['alpha/another-person'])
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    mocks.meta.me = ''
+    await expect(listOrgRepos('alpha')).rejects.toThrow('Set your GitHub account')
+  })
+
   it('lists repositories as your own account and not without it', async () => {
     mocks.runFile.mockImplementation(async (_cmd: string, args: string[]) => ({ stdout: JSON.stringify({ repos: [{ full_name: `${args[1]}/same` }] }), stderr: '' }))
     await listOrgRepos()
