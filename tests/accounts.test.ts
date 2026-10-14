@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AccountsCache, ACCOUNTS_CACHE_MS, ACCOUNTS_CHECK_MS, scheduleAccountsCheck } from '../server/accounts'
-import { probeAccounts, type RunCommand } from '../server/accounts/status'
+import { probeAccount, probeAccounts, type RunCommand } from '../server/accounts/status'
 import type { ConnectedAccount } from '../server/accounts/types'
 import { runFile } from '../server/process'
 import { STATUS, fakeCalls, script, writeFakeClis } from './fixtures/accounts/fake-clis'
@@ -49,6 +49,21 @@ function byId(accounts: ConnectedAccount[]): Record<string, ConnectedAccount> {
 }
 
 describe('GET /api/accounts', () => {
+  it('reads a fast account independently of a pending provider', async () => {
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const run: RunCommand = vi.fn(async (command, args) => {
+      if (command === 'gh') await held
+      return { stdout: args[0] === '--version' ? '1.2.3' : STATUS.codexChatGpt.stderr ?? '', stderr: 'Logged in using ChatGPT' }
+    })
+    const slow = probeAccount('gh', run)
+    try {
+      const fast = await probeAccount('codex', run)
+      expect(fast).toMatchObject({ id: 'codex', installed: true, signedIn: true })
+      expect(run).toHaveBeenCalledWith('codex', ['--version'], expect.anything())
+    } finally { release(); await slow }
+  })
+
   it('reports each CLI as its own status command does', async () => {
     await writeFakeClis(bin, home, {
       claude: script('claude', STATUS.claudeSubscription),

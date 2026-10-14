@@ -42,7 +42,7 @@ import { DailyModelRefresh } from './service/model-refresh'
 import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
 import { invalidateAccounts, listAccounts, scheduleAccountsCheck } from './accounts'
 import { accountLogins, connectGitHubAccount, onboardingState, recordLogin, updateOnboarding } from './service/onboarding'
-import type { ConnectedAccount } from './accounts/types'
+import { isAccountId, type AccountId, type ConnectedAccount } from './accounts/types'
 import { TerminalSocketServer } from './terminal/server'
 import type { TerminalCommand } from './terminal/pty'
 import type { TerminalPreset } from './terminal/protocol'
@@ -218,8 +218,8 @@ export async function stopPoiseRuntime(): Promise<void> {
 
 /** Connected accounts, read now or from the last few seconds, with their
  *  sign-in alerts recorded. */
-async function checkAccounts(): Promise<ConnectedAccount[]> {
-  const accounts = await listAccounts()
+async function checkAccounts(id?: AccountId): Promise<ConnectedAccount[]> {
+  const accounts = await listAccounts(id)
   accountsChecked(accounts, { me: getSettings().me, agentAccount: agentAccount() })
   return accounts
 }
@@ -351,8 +351,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // ── Connected accounts: each CLI's own status command, never its
         // credentials ──
         if (path === '/api/accounts' && req.method === 'GET') {
+          const id = new URLSearchParams(url.split('?')[1] || '').get('id')
+          if (id !== null && !isAccountId(id)) return json(res, 400, { error: 'id must name a connected account CLI' })
           try {
-            return json(res, 200, { accounts: await checkAccounts() })
+            return json(res, 200, { accounts: await checkAccounts(id ?? undefined) })
           } catch (err: any) {
             return json(res, 500, { error: err.message || String(err) })
           }

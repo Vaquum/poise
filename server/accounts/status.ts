@@ -200,5 +200,9 @@ async function probe(cli: AccountCli, run: RunCommand): Promise<ConnectedAccount
 
 /** Every CLI at once, each bounded by PROBE_TIMEOUT_MS per command. */
 export function probeAccounts(run: RunCommand): Promise<ConnectedAccount[]> {
-  return Promise.all(ACCOUNT_IDS.map((id) => probe(ACCOUNT_CLIS[id], run)))
+  return Promise.all(ACCOUNT_IDS.map((id) => probeAccount(id, run)))
+}
+
+export function probeAccount(id: AccountId, run: RunCommand): Promise<ConnectedAccount> {
+  return probe(ACCOUNT_CLIS[id], run)
 }

@@ -17,6 +17,22 @@ async function runtime(page: Page): Promise<void> {
   await page.evaluate(() => window.Motion.initMotion())
 }
 
+test('a large shared DOM patch retains controls without scanning prior siblings', async ({ page }) => {
+  await runtime(page)
+  const result = await page.evaluate(() => {
+    const host = document.createElement('section')
+    const markup = (last: string) => Array.from({ length: 8000 }, (_, i) => `<div><button>${i === 7999 ? last : `Row ${i}`}</button></div>`).join('')
+    host.innerHTML = markup('Before'); document.body.append(host)
+    const button = host.querySelector('button')!; button.focus()
+    const start = performance.now()
+    window.Patch.patchContent(host, markup('After'))
+    return { elapsed: performance.now() - start, retained: button === host.querySelector('button'), focused: button === document.activeElement, last: host.lastElementChild!.textContent }
+  })
+  console.log(`Shared DOM patch, 8000 rows: ${result.elapsed.toFixed(1)}ms`)
+  expect(result).toMatchObject({ retained: true, focused: true, last: 'After' })
+  expect(result.elapsed).toBeLessThan(150)
+})
+
 test('motion retains momentum on reversal and settles only the latest completion', async ({ page }) => {
   await runtime(page)
   const result = await page.evaluate(async () => {
@@ -519,7 +535,13 @@ test('animation frames batch geometry reads before writing row styles', async ({
   const before = await cdp.send('Performance.getMetrics')
   await page.evaluate(() => new Promise<void>(resolve => {
     let frames = 0
-    const sample = () => ++frames === 12 ? resolve() : requestAnimationFrame(sample)
+    const sample = () => {
+      if (++frames < 12) { requestAnimationFrame(sample); return }
+      // Stop at the sampled boundary; CDP delivery time must not count extra
+      // animation frames when other browser tests keep the runner busy.
+      window.Motion.finishMotion(document.getElementById('frame-batch')!)
+      resolve()
+    }
     requestAnimationFrame(sample)
   }))
   const after = await cdp.send('Performance.getMetrics')

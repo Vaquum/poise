@@ -30,7 +30,7 @@ describe('the gh row', () => {
   it('separates GitHub sign-ins from AI provider sign-ins', () => {
     const provider: ConnectedAccount = { ...gh(undefined), id: 'codex', identity: null }
     const html = accountsHtml([provider, gh([held('octocat')])], { me: 'octocat', agentAccount: '' }, false)
-    const groups = [...html.matchAll(/<section class="st-account-group" aria-label="([^"]+)">([\s\S]*?)<\/section>/g)]
+    const groups = [...html.matchAll(/<section class="st-account-group"[^>]*aria-label="([^"]+)"[^>]*>([\s\S]*?)<\/section>/g)]
     expect(groups.map((group) => group[1])).toEqual(['AI accounts', 'GitHub accounts'])
     expect(groups[0][2]).toContain('data-account="codex"')
     expect(groups[0][2]).not.toContain('data-account="gh"')

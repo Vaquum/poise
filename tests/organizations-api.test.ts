@@ -97,6 +97,37 @@ async function orgStatus(login: string, status: Organization['status']) {
   })
 }
 
+describe('independent account reads', () => {
+  it('returns a fast account while another provider is still being checked', async () => {
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const { invalidateAccounts } = await import('../server/accounts')
+    invalidateAccounts()
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'gh' && args[0] === '--version') { await held; return { stdout: '2.92.0', stderr: '' } }
+      if (command === 'gh' && args[0] === 'auth') return { stdout: '{"hosts":{"github.com":[]}}', stderr: '' }
+      if (command === 'codex') return { stdout: args[0] === '--version' ? '0.160.0' : '', stderr: 'Logged in using ChatGPT' }
+      return cli(command, args, options)
+    })
+    const slow = fetch(`${base}/api/accounts?id=gh`)
+    try {
+      await vi.waitFor(() => expect(mocks.runFile).toHaveBeenCalledWith('gh', ['--version'], expect.anything()))
+      const fast = await fetch(`${base}/api/accounts?id=codex`)
+      expect(fast.status).toBe(200)
+      expect((await fast.json()).accounts).toEqual([expect.objectContaining({ id: 'codex', signedIn: true })])
+    } finally { release(); await slow }
+  })
+
+  it.each(['', 'unknown', '../gh'])('rejects an invalid account id %s without starting probes', async id => {
+    const probes = () => mocks.runFile.mock.calls.filter(([, args]) => ['--version', 'auth', 'login'].includes(args[0]))
+    const before = probes().length
+    const response = await fetch(`${base}/api/accounts?id=${encodeURIComponent(id)}`)
+    expect(response.status).toBe(400)
+    expect((await response.json()).error).toContain('id must name')
+    expect(probes().length).toBe(before)
+  })
+})
+
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-organizations-api-'))
   process.env.POISE_DB = join(root, 'cache.db')

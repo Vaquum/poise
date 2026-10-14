@@ -245,7 +245,7 @@ function githubConnection(ctx: StepContext, options: {
           : options.role === 'me'
             ? 'Connected. GitHub confirms the account works, and Poise reads GitHub as it.'
             : 'Connected. GitHub confirms the account works; reviews and comments are posted as it.')
-        await loadSettings()
+        await loadSettings({ fresh: true })
       } else if (answer.reason === 'not-signed-in' && quiet) {
         show('missing', account, 'Not connected yet.')
       } else {
@@ -570,7 +570,7 @@ function timeStep(ctx: StepContext): StepView {
     leave: async () => {
       try {
         await postJson('/api/settings', { timezone: select.value })
-        await loadSettings()
+        await loadSettings({ fresh: true })
       } catch (error) {
         ctx.status(`The time zone was not saved: ${(error as Error).message}`, 'error')
         return false
@@ -784,7 +784,7 @@ function modelsStep(ctx: StepContext): StepView {
       }
       try {
         await postJson('/api/settings', { models })
-        await loadSettings()
+        await loadSettings({ fresh: true })
         window.dispatchEvent(new CustomEvent('poise:models-changed'))
         return true
       } catch (error) {

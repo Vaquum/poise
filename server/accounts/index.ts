@@ -3,8 +3,8 @@
 // drops them, since a login may have just changed one.
 
 import { runFile } from '../process'
-import { probeAccounts } from './status'
-import type { ConnectedAccount } from './types'
+import { probeAccount } from './status'
+import { ACCOUNT_IDS, type AccountId, type ConnectedAccount } from './types'
 
 export const ACCOUNTS_CACHE_MS = 15_000
 
@@ -49,12 +49,13 @@ export function scheduleAccountsCheck(check: () => Promise<unknown>, intervalMs 
   return () => clearInterval(timer)
 }
 
-const accounts = new AccountsCache(() => probeAccounts(runFile))
+const accounts = new Map(ACCOUNT_IDS.map(id => [id, new AccountsCache(async () => [await probeAccount(id, runFile)])]))
 
-export function listAccounts(): Promise<ConnectedAccount[]> {
-  return accounts.list()
+export async function listAccounts(id?: AccountId): Promise<ConnectedAccount[]> {
+  if (id) return accounts.get(id)!.list()
+  return (await Promise.all(ACCOUNT_IDS.map(id => accounts.get(id)!.list()))).flat()
 }
 
 export function invalidateAccounts(): void {
-  accounts.invalidate()
+  for (const cache of accounts.values()) cache.invalidate()
 }

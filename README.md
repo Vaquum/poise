@@ -34,6 +34,15 @@ and `deploy/restore.sh` back it up and restore it.
 - **Analytics** — headline numbers for Current's time ranges, from the burger menu: issues opened and closed, pull requests merged, lines changed and time to merge, and per merged pull request the comments, median lines and completed behavior reviews and approvals. See [Analytics](docs/Analytics.md).
 - **Notifications** — what needs you, one thing at a time at the top of the page: a failed behavior, a sign-in or a Chat waiting for you, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. See [Notifications](docs/Notifications.md).
 
+Settings reads only the selected section's expensive data. Accounts shows each
+CLI result independently, with pending checks and failures named alongside it.
+External font stylesheets load after first paint; system fonts keep the app
+usable while typography is unavailable or still loading.
+Returning to Editor keeps the open document, draft, selection and undo history;
+its document picker refreshes in the background. Other views keep their cached
+content usable while a refresh runs, and leaving stops their visible-only work
+even when an earlier read has not finished.
+
 ## Requirements
 
 - macOS, Linux, or WSL. Native Windows is not supported.

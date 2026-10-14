@@ -1,11 +1,15 @@
 import type { Page } from '@playwright/test'
 
-export async function workspace(page: Page, view = 'current'): Promise<void> {
+export async function workspace(page: Page, view = 'current', fontResponse?: Promise<void>): Promise<void> {
   await page.addInitScript(view => {
     localStorage.clear()
     localStorage.setItem('poise-view', view)
   }, view)
-  await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com)\//, (route) => route.abort())
+  await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com)\//, async route => {
+    if (!fontResponse) return route.abort()
+    await fontResponse
+    await route.fulfill({ contentType: 'text/css', body: '' })
+  })
   await page.route('**/api/**', (route) => {
     const path = new URL(route.request().url()).pathname
     const organizations = [{ login: 'acme', managed: true, status: 'ready', stage: 'ready', error: null, activatedAt: '2026-10-01T08:00:00Z' }]
@@ -33,6 +37,6 @@ export async function workspace(page: Page, view = 'current'): Promise<void> {
     } })
     return route.fulfill({ json: {} })
   })
-  await page.goto('/')
+  await page.goto('/', { waitUntil: fontResponse ? 'domcontentloaded' : 'load' })
 }
 

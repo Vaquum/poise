@@ -17,8 +17,8 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
 }
 
-export async function fetchAccounts(): Promise<ConnectedAccount[]> {
-  const res = await fetch('/api/accounts', { cache: 'no-store' })
+export async function fetchAccounts(id?: AccountId): Promise<ConnectedAccount[]> {
+  const res = await fetch(id ? `/api/accounts?id=${id}` : '/api/accounts', { cache: 'no-store' })
   let data: { accounts?: unknown, error?: unknown } | null = null
   try { data = await res.json() } catch { /* reported below */ }
   if (!res.ok) throw new Error(typeof data?.error === 'string' ? data.error : `HTTP ${res.status}`)
@@ -89,10 +89,10 @@ export function accountsHtml(accounts: ConnectedAccount[], identities: GitHubIde
     </div>`
   }).join('')
   return [
-    { label: 'AI accounts', entries: accounts.filter((account) => account.id !== 'gh') },
-    { label: 'GitHub accounts', entries: accounts.filter((account) => account.id === 'gh') },
+    { key: 'ai', label: 'AI accounts', entries: accounts.filter((account) => account.id !== 'gh') },
+    { key: 'github', label: 'GitHub accounts', entries: accounts.filter((account) => account.id === 'gh') },
   ].filter((group) => group.entries.length).map((group) => `
-    <section class="st-account-group" aria-label="${group.label}">
+    <section class="st-account-group" data-key="accounts-${group.key}" aria-label="${group.label}">
       <h3 class="tp-group-label">${group.label}</h3>
       ${rows(group.entries)}
     </section>`).join('')

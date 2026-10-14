@@ -217,6 +217,9 @@ function loadFont(name: string) {
   fontsLoaded.add(name)
   const link = document.createElement('link')
   link.rel = 'stylesheet'
+  // Remote typography must never hold the app's first paint or navigation.
+  link.media = 'print'
+  link.addEventListener('load', () => { link.media = 'all' }, { once: true })
   link.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(name)}:wght@400;500;600;700;800&display=swap`
   document.head.appendChild(link)
 }

@@ -18,16 +18,19 @@ for (const entering of [false, true]) test(`setup retirement preserves its ${ent
       return { x: box.x, y: box.y, width: box.width, height: box.height, transform: getComputedStyle(element).transform }
     }
     if (entering) {
-      const start = performance.now()
-      await new Promise<void>((resolve, reject) => {
-        const frame = () => {
-          const matrix = new DOMMatrix(getComputedStyle(dialog).transform)
-          if (matrix.m42 > .5 && matrix.m42 < 9 && Number(getComputedStyle(root).opacity) > 0) resolve()
-          else if (performance.now() - start < 5000) requestAnimationFrame(frame)
-          else reject(new Error('Setup did not present an unfinished entrance.'))
-        }
-        frame()
-      })
+      // Replay and pause the actual CSS entrance: a busy browser can finish
+      // the first entrance before Playwright delivers this evaluation.
+      dialog.style.transition = 'none'
+      root.classList.remove('ob-visible')
+      void dialog.offsetWidth
+      dialog.style.removeProperty('transition')
+      root.classList.add('ob-visible')
+      const entrance = dialog.getAnimations().find(animation => animation instanceof CSSTransition && animation.transitionProperty === 'transform')
+      if (!entrance) throw new Error('Setup did not present an unfinished entrance.')
+      entrance.pause()
+      entrance.currentTime = Number(entrance.effect!.getTiming().duration) * .1
+      const matrix = new DOMMatrix(getComputedStyle(dialog).transform)
+      if (!(matrix.m42 > .5 && matrix.m42 < 9)) throw new Error('Setup entrance was not captured in progress.')
     }
     const before = geometry(dialog)
     root.querySelector<HTMLButtonElement>('.ob-later')!.click()

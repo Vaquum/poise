@@ -15,7 +15,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 
 import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
 import { productionSummary, type ProductionUpdate } from './production-status'
-import { ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, type ConnectedAccount } from '../server/accounts/types'
+import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, type ConnectedAccount } from '../server/accounts/types'
 import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
 import { sendLatest } from './notices'
@@ -86,6 +86,7 @@ let terminalSlot: HTMLElement | null = null
 let shellBtn: HTMLButtonElement | null = null
 let accounts: ConnectedAccount[] | null = null
 let accountsGeneration = 0
+let accountsLoading: Promise<void> | null = null
 let terminal: TerminalPanel | null = null
 let terminalOpening = false
 
@@ -357,21 +358,44 @@ function accountsStatus(text: string, failed = false): void {
   accountsStatusEl.className = `st-help st-help-${failed ? 'error' : 'info'} st-accounts-status`
 }
 
-async function loadAccounts(): Promise<void> {
-  if (!accountsEl) return
+function accountChecksStatus(text: string, failed = false): void {
+  const el = panelEl?.querySelector<HTMLElement>('.st-account-checks-status')
+  if (!el) return
+  el.textContent = text
+  el.className = `st-help st-help-${failed ? 'error' : 'info'} st-account-checks-status`
+}
+
+function loadAccounts(force = false): Promise<void> {
+  if (!accountsEl) return Promise.resolve()
+  if (!force && accountsLoading) return accountsLoading
   const generation = ++accountsGeneration
-  if (!accounts) accountsEl.innerHTML = '<div class="st-help st-help-info">Checking each CLI…</div>'
-  try {
-    const next = await fetchAccounts()
-    if (generation !== accountsGeneration) return
-    accounts = next
-    renderAccounts()
-  } catch (error) {
-    if (generation !== accountsGeneration) return
-    const message = `Could not read the connected accounts: ${(error as Error).message}`
-    if (!accounts) accountsEl.innerHTML = `<div class="st-help st-help-error">${escapeHtml(message)}</div>`
-    else accountsStatus(message, true)
-  }
+  const pending = new Set<string>(ACCOUNT_IDS)
+  const errors: string[] = []
+  const status = () => accountChecksStatus([
+    pending.size ? `Checking ${[...pending].join(', ')}…` : '', ...errors,
+  ].filter(Boolean).join(' '), errors.length > 0)
+  status()
+  const loading = Promise.all(ACCOUNT_IDS.map(async id => {
+    try {
+      const next = await fetchAccounts(id)
+      if (generation !== accountsGeneration) return
+      const account = next.find(account => account.id === id)
+      if (!account) throw new Error('the answer is missing this account')
+      const byId = new Map((accounts ?? []).map(account => [account.id, account]))
+      byId.set(id, account)
+      accounts = ACCOUNT_IDS.flatMap(key => byId.has(key) ? [byId.get(key)!] : [])
+      renderAccounts()
+    } catch (error) {
+      if (generation !== accountsGeneration) return
+      errors.push(`Could not check ${id}: ${(error as Error).message}.`)
+    } finally {
+      if (generation === accountsGeneration) { pending.delete(id); status() }
+    }
+  })).then(() => undefined).finally(() => {
+    if (accountsLoading === loading) accountsLoading = null
+  })
+  accountsLoading = loading
+  return loading
 }
 
 function terminalTitle(preset: TerminalPreset): string {
@@ -397,7 +421,7 @@ async function connect(preset: TerminalPreset): Promise<void> {
       preset,
       title: terminalTitle(preset),
       // A login may have changed what the CLI's status says.
-      onEnd: () => { renderAccounts(); void loadAccounts() },
+      onEnd: () => { renderAccounts(); void loadAccounts(true) },
       onDispose: () => {
         if (terminal === opened) terminal = null
         panelEl?.classList.remove('st-terminal-open')
@@ -810,7 +834,9 @@ function selectSection(panel: HTMLElement, tab: SettingsSection) {
     section.hidden = section.dataset.tab !== tab
   }
   panel.querySelector<HTMLElement>('.st-footer')!.hidden = tab === 'accounts' || tab === 'admin'
-  if (tab === 'accounts') void loadAccounts()
+  if (panel.classList.contains('open')) {
+    if (tab === 'accounts') void loadAccounts()
+  }
   window.dispatchEvent(new CustomEvent('poise:settings-section-changed', { detail: { section: tab } }))
 }
 
@@ -951,6 +977,7 @@ function buildPanel(): HTMLElement {
       <section class="st-tab" data-tab="accounts" hidden>
         <div class="st-terminal-slot"></div>
         <div class="st-accounts" aria-live="polite"></div>
+        <div class="st-help st-help-info st-account-checks-status" role="status"></div>
         <div class="st-help st-help-info st-accounts-status" role="status"></div>
 
         <div class="tp-group-label" ${helpAttributes("A shell in your workspace for connections the account buttons do not cover. Two terminals can run at once; an idle terminal closes after 15 minutes.")}>Terminal</div>
@@ -1083,8 +1110,8 @@ export function openSettingsPanel() {
   panelEl.classList.add('open')
   document.addEventListener('keydown', onSettingsKeydown)
   void refreshStatus()
-  void loadModels()
-  void loadProduction()
+  if (panelEl.dataset.section === 'models') void loadModels()
+  if (panelEl.dataset.section === 'general') void loadProduction()
   void pollOrganizations()
   if (accountsTabSelected()) void loadAccounts()
 }

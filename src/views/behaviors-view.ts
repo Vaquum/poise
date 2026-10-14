@@ -199,7 +199,7 @@ function reviewersCell(meta: typeof BEHAVIORS[number]): string {
   const reviews = meta.reviews ?? { place: 'PR review', item: 'pull request' }
   const title = `How many of the ${reviews.place} models (Settings → Models) review each new ${reviews.item}, at the same time`
   return `
-    <select class="behavior-reviewers" data-behavior="${escapeHtml(meta.key)}" aria-label="Reviewers for ${escapeHtml(meta.key)}" title="${escapeHtml(title)}">
+    <select class="behavior-reviewers" data-behavior="${escapeHtml(meta.key)}" aria-label="Reviewers for ${escapeHtml(meta.key)}" title="${escapeHtml(title)}"${stateUnknown() || reviewersInFlight.has(meta.key) ? ' disabled' : ''}>
       ${opts}
     </select>
   `
@@ -214,7 +214,7 @@ function writeReviewers(key: BehaviorKey, value: ReviewerCount): void {
     const current = viewEl?.querySelector<HTMLSelectElement>(
       `select.behavior-reviewers[data-behavior="${key}"]`,
     )
-    if (current) current.value = String(getReviewers(key))
+    if (current) { current.value = String(getReviewers(key)); current.disabled = stateUnknown() }
   })
 }
 
@@ -686,7 +686,7 @@ function memoryCell(meta: typeof BEHAVIORS[number]): string {
   const filled = !!note
   const title = filled ? note.slice(0, 140) : 'Add behavior memory'
   return `
-    <button type="button" class="behavior-memory-btn${filled ? ' has-note' : ''}" data-behavior="${escapeHtml(meta.key)}" title="${escapeHtml(title)}" aria-label="Edit memory for ${escapeHtml(meta.key)}">
+    <button type="button" class="behavior-memory-btn${filled ? ' has-note' : ''}" data-behavior="${escapeHtml(meta.key)}" title="${escapeHtml(title)}" aria-label="Edit memory for ${escapeHtml(meta.key)}"${stateUnknown() ? ' disabled' : ''}>
       <span class="behavior-memory-dot" aria-hidden="true"></span>
       <span class="behavior-memory-label">${filled ? 'Edit' : 'Add'}</span>
     </button>
@@ -1147,7 +1147,10 @@ async function tickRefresh() {
     const toggle = tr.querySelector<HTMLInputElement>('input[type="checkbox"][data-behavior]')
     if (toggle) repaintToggle(meta.key, toggle)
     const reviewers = tr.querySelector<HTMLSelectElement>('select.behavior-reviewers[data-behavior]')
+    if (reviewers) reviewers.disabled = stateUnknown() || reviewersInFlight.has(meta.key)
     if (reviewers && !reviewersInFlight.has(meta.key)) reviewers.value = String(getReviewers(meta.key))
+    const memory = tr.querySelector<HTMLButtonElement>('.behavior-memory-btn')
+    if (memory) memory.disabled = stateUnknown()
     // An open dropdown holds the person's draft; the pill repaints once it closes.
     if ((meta.hasTriggers || meta.hasSkips) && triggersKey !== meta.key) refreshTriggersCell(meta.key)
   }
@@ -1172,9 +1175,8 @@ export async function initBehaviorsView() {
     // re-snapshot, programmatic toggle) so the UI never drifts.
     window.addEventListener('poise:behaviors-changed', () => renderRows())
   }
-  // Fetch the server-provided owner map first so the very first paint
-  // shows the right username/avatar instead of a flash of "—".
-  await fetchBehaviorOwners()
+  // Cached rows and explicitly unknown first-load controls do not wait for
+  // the runtime read. Attach cleanup-owned work before the first await.
   renderDiagnostics()
   renderRows()
   // Subscribe to the wall-clock-aligned ticker so the relative-time
@@ -1184,4 +1186,6 @@ export async function initBehaviorsView() {
     window.addEventListener('poise:refresh-tick', onTick)
     tickListening = true
   }
+  await fetchBehaviorOwners()
+  if (!viewEl.hidden) { renderDiagnostics(); renderRows() }
 }

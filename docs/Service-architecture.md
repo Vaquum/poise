@@ -424,6 +424,10 @@ variables, and Caller fails loudly when an account is needed and missing.
 `grok`, `muse` and `antigravity`. Each shows whether the CLI is installed, its
 version, whether it is signed in and as whom.
 - `GET /api/accounts` returns `{ accounts }`, one entry per CLI in that order.
+  `GET /api/accounts?id=<cli>` returns only that CLI, so Settings can show each
+  result as soon as it arrives. An unknown `id` answers 400. These reads share
+  each CLI's 15-second cache with the full list and sign-in alert checks;
+  terminal exit invalidates all of them.
   Each entry is `{ id, installed, version, signedIn: true | false | null,
   identity, detail, login: { label } }`; gh's also has `accounts: [{ login,
   active, signedIn, detail }]`, every account gh holds for github.com.

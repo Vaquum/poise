@@ -2190,15 +2190,17 @@ function onMenuKeydown(e: KeyboardEvent) {
   }
 }
 
-async function fetchDocs() {
+async function fetchDocs(): Promise<boolean> {
   try {
     const res = await fetch('/api/editor/docs')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     docs = (data.docs || []) as DocSummary[]
+    return true
   } catch (err) {
     console.error('[editor] fetchDocs failed:', err)
-    docs = []
+    setMeta('Could not load documents')
+    return false
   }
 }
 
@@ -4783,6 +4785,8 @@ if (typeof window !== 'undefined') {
   })
 }
 
+let editorInitialization: Promise<void> | null = null
+
 export async function initEditorView() {
   viewEl = document.getElementById('view-editor')!
   if (!initialized) {
@@ -4795,7 +4799,21 @@ export async function initEditorView() {
     metaEl         = viewEl.querySelector<HTMLElement>('#editor-meta')
     attachHandlers()
   }
-  await fetchDocs()
+  // The editor owns unsaved text, selection and undo history. A return only
+  // refreshes its picker; reopening the same file would replace that state.
+  if (currentSlug) {
+    void fetchDocs()
+    requestAnimationFrame(() => { if (!viewEl.hidden) renderAnnotationOverlay() })
+    return
+  }
+  if (editorInitialization) return editorInitialization
+  const loading = openInitialDocument()
+  editorInitialization = loading
+  try { await loading } finally { if (editorInitialization === loading) editorInitialization = null }
+}
+
+async function openInitialDocument(): Promise<void> {
+  if (!await fetchDocs() || viewEl.hidden || currentSlug) return
   let target: string | null = null
   try { target = localStorage.getItem(LAST_OPEN_KEY) } catch { /* ignore */ }
   if (!target || !docs.find((d) => d.slug === target)) {

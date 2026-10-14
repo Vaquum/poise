@@ -7,6 +7,7 @@ function identity(node: Node): string | null {
 }
 
 export function patchNode(current: Node, next: Node, onRemove?: (element: HTMLElement) => void): void {
+  if (current.isEqualNode(next)) return
   if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
     current.parentNode?.replaceChild(next.cloneNode(true), current)
     return
@@ -32,12 +33,27 @@ export function patchNode(current: Node, next: Node, onRemove?: (element: HTMLEl
     }
   }
   const old = [...current.childNodes]
-  const keyed = new Map(old.flatMap(node => { const key = identity(node); return key ? [[key, node] as const] : [] }))
+  const keyed = new Map<string, Node>()
+  const unkeyed = new Map<string, { nodes: Node[], index: number }>()
+  const kind = (node: Node) => `${node.nodeType}:${node.nodeName}`
+  // Consume matching unkeyed siblings in order. Repeatedly finding the first
+  // unused child rescanned every prior sibling and its identity attributes.
+  for (const node of old) {
+    const key = identity(node)
+    if (key) keyed.set(key, node)
+    else {
+      const type = kind(node)
+      let queue = unkeyed.get(type)
+      if (!queue) { queue = { nodes: [], index: 0 }; unkeyed.set(type, queue) }
+      queue.nodes.push(node)
+    }
+  }
   const used = new Set<Node>()
   let cursor = current.firstChild
   for (const child of [...next.childNodes]) {
     const key = identity(child)
-    const existing = key ? keyed.get(key) : old.find(node => !used.has(node) && !identity(node) && node.nodeType === child.nodeType && node.nodeName === child.nodeName)
+    const queue = key ? undefined : unkeyed.get(kind(child))
+    const existing = key ? keyed.get(key) : queue?.nodes[queue.index++]
     const actor = existing ?? child.cloneNode(true)
     if (existing) patchNode(existing, child)
     used.add(actor)
