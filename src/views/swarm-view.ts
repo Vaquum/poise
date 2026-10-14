@@ -688,12 +688,15 @@ function mainRowInnerHTML(e: LogEntry, group?: RunGroup): string {
   `
 }
 
-function buildMainRow(e: LogEntry): HTMLTableRowElement {
+const mainRowMarkup = new WeakMap<HTMLTableRowElement, string>()
+
+function buildMainRow(e: LogEntry, markup: string): HTMLTableRowElement {
   const tr = document.createElement('tr')
   tr.className = 'agent-row'
   tr.dataset.id = e.id
   tr.dataset.callId = e.response ? e.id : ''
-  tr.innerHTML = mainRowInnerHTML(e)
+  tr.innerHTML = markup
+  mainRowMarkup.set(tr, markup)
   return tr
 }
 
@@ -765,10 +768,14 @@ function reconcileRows(nextRows: RunRow[]): void {
     cursor = row.nextSibling
   }
   for (const { entry, group, repeat } of nextRows) {
-    const row = main.get(entry.id) || buildMainRow(entry)
+    const markup = mainRowInnerHTML(entry, group)
+    const row = main.get(entry.id) || buildMainRow(entry, markup)
     row.classList.toggle('agent-repeat-row', !!repeat)
     row.dataset.callId = entry.response ? entry.id : ''
-    patchContent(row, mainRowInnerHTML(entry, group))
+    if (mainRowMarkup.get(row) !== markup) {
+      patchContent(row, markup)
+      mainRowMarkup.set(row, markup)
+    }
     place(row)
     const refused = replayRefusals.get(entry.id)
     if (refused !== undefined) place(refusal.get(entry.id) ?? buildRefusalRow(entry.id, refused))

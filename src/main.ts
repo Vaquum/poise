@@ -36,6 +36,8 @@ const viewBehaviorsEl = document.getElementById('view-behaviors')!
 const viewSnippetsEl = document.getElementById('view-snippets')!
 const viewEditorEl = document.getElementById('view-editor')!
 
+const visitedViews = new WeakSet<HTMLElement>()
+
 type ViewSlug = 'main' | 'current' | 'swarm' | 'chat' | 'behaviors' | 'snippets' | 'editor'
 
 function showView(v: ViewSlug) {
@@ -103,12 +105,13 @@ function showView(v: ViewSlug) {
   for (const el of all) {
     if (el === target) {
       el.hidden = false
-      for (const child of el.querySelectorAll<HTMLElement>(':scope > :not(.view-header)')) reveal(child, { distance: v === 'chat' || v === 'editor' ? 0 : 20 })
+      if (!visitedViews.has(el)) for (const child of el.querySelectorAll<HTMLElement>(':scope > :not(.view-header)')) reveal(child, { distance: v === 'chat' || v === 'editor' ? 0 : 20 })
     } else {
       finishMotion(el, true)
       el.hidden = true
     }
   }
+  visitedViews.add(target)
   window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior })
 }
 

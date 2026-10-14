@@ -71,16 +71,23 @@ function complete(channel: Channel): void {
 function tick(now: number): void {
   const elapsed = Math.min(Math.max(0, (now - previousTime) / 1000), .032)
   previousTime = now
-  for (const channel of [...moving]) {
-    if (!channel.active) continue
-    if (channel.options.valid && !channel.options.valid()) { cancelMotion(channel.owner, channel.name); continue }
-    if (!channel.owner.isConnected || !channel.owner.getClientRects().length) {
+  // Read visibility and live targets before any channel writes animation styles.
+  // Interleaving these phases forces one synchronous layout per moving row.
+  const samples = [...moving].map(channel => {
+    const valid = !channel.options.valid || channel.options.valid()
+    const visible = channel.owner.isConnected && !!channel.owner.getClientRects().length
+    if (valid && visible && now >= channel.start) target(channel)
+    return { channel, valid, visible, generation: channel.generation }
+  })
+  for (const { channel, valid, visible, generation } of samples) {
+    if (!channel.active || channel.generation !== generation) continue
+    if (!valid) { cancelMotion(channel.owner, channel.name); continue }
+    if (!visible) {
       if (channel.name === 'scroll') cancelMotion(channel.owner, channel.name)
       else complete(channel)
       continue
     }
     if (now < channel.start) continue
-    target(channel)
     let resting = true
     for (const key of Object.keys(channel.target)) {
       const next = integrate(channel.value[key], channel.velocity[key], channel.target[key], elapsed)
@@ -128,12 +135,16 @@ export function cancelMotion(owner: HTMLElement, name: string): void {
 export function finishMotion(root?: HTMLElement, cancelScroll = document.hidden): void {
   // Scroll targets depend on the final geometry of panels and disclosures.
   const ordered = [...moving].sort((a, b) => Number(a.name === 'scroll') - Number(b.name === 'scroll') || (a.owner.contains(b.owner) ? 1 : b.owner.contains(a.owner) ? -1 : 0))
-  for (const channel of ordered) {
-    if (!channel.active) continue
-    if (root && channel.owner !== root && !root.contains(channel.owner)) continue
-    if (channel.options.valid && !channel.options.valid()) { cancelMotion(channel.owner, channel.name); continue }
-    if (channel.name === 'scroll' && (cancelScroll || !channel.owner.getClientRects().length)) { cancelMotion(channel.owner, channel.name); continue }
-    if (channel.owner.getClientRects().length) target(channel)
+  const samples = ordered.filter(channel => channel.active && (!root || channel.owner === root || root.contains(channel.owner)))
+    .map(channel => ({ channel, generation: channel.generation, valid: !channel.options.valid || channel.options.valid(), visible: !!channel.owner.getClientRects().length }))
+  for (const { channel, valid, visible } of samples) if (valid && visible && channel.name !== 'scroll') target(channel)
+  for (const { channel, generation, valid } of samples) {
+    if (!channel.active || channel.generation !== generation) continue
+    if (!valid) { cancelMotion(channel.owner, channel.name); continue }
+    if (channel.name === 'scroll') {
+      if (cancelScroll || channel.options.valid && !channel.options.valid() || !channel.owner.getClientRects().length) { cancelMotion(channel.owner, channel.name); continue }
+      target(channel)
+    }
     complete(channel)
   }
 }
@@ -175,6 +186,14 @@ function retirementClip(parent: Element | null, cache = new Map<Element, ClipBou
 
 export function layout<T>(root: HTMLElement, change: () => T, selector = ':scope > *', key: (element: HTMLElement) => string | HTMLElement = element => element): T {
   const active = document.activeElement
+  const restoreFocus = () => {
+    if (active instanceof HTMLElement && active.isConnected && root.contains(active) && document.activeElement !== active) active.focus({ preventScroll: true })
+  }
+  if (reducedMotion() || !root.getClientRects().length) {
+    const result = change()
+    restoreFocus()
+    return result
+  }
   const before = new Map([...root.querySelectorAll<HTMLElement>(selector)].map(element => [key(element), { element, box: element.getBoundingClientRect() }]))
   // Departures share the same pre-mutation geometry as surviving layout actors.
   const previousGeometry = retirementGeometry
@@ -185,16 +204,21 @@ export function layout<T>(root: HTMLElement, change: () => T, selector = ':scope
   })
   let result: T
   try { result = change() } finally { retirementGeometry = previousGeometry }
-  if (active instanceof HTMLElement && active.isConnected && root.contains(active) && document.activeElement !== active) active.focus({ preventScroll: true })
+  restoreFocus()
   const after = [...root.querySelectorAll<HTMLElement>(selector)]
   // Remove all old layout offsets before measuring any new destination.
   for (const element of after) { element.style.removeProperty('--flow-layout-x'); element.style.removeProperty('--flow-layout-y') }
-  for (const element of after) {
+  const destinations = after.map(element => ({ element, box: element.getBoundingClientRect() }))
+  const inViewport = (box: DOMRect) => box.width > 0 && box.height > 0 && box.bottom > 0 && box.top < innerHeight && box.right > 0 && box.left < innerWidth
+  for (const { element, box: next } of destinations) {
     const previous = before.get(key(element))
+    if (!inViewport(next) && (!previous || !inViewport(previous.box))) {
+      if (element.hasAttribute('data-motion-running')) finishMotion(element)
+      continue
+    }
     if (!previous) { reveal(element, { distance: MOTION.information }); continue }
     if (!previous.box.width || !previous.box.height) continue
     if (previous.element !== element) throw new Error('Motion layout requires retained semantic actor identity.')
-    const next = element.getBoundingClientRect()
     if (!next.width || !next.height) continue
     const x = previous.box.left - next.left, y = previous.box.top - next.top
     if (Math.abs(x) < .5 && Math.abs(y) < .5 && !motionValue(element, 'layout')) continue
@@ -216,10 +240,13 @@ export function retire(element: HTMLElement): void {
   const presentedGeometry = retirementGeometry.get(element)
   const box = presentedGeometry?.box ?? element.getBoundingClientRect()
   const clip = presentedGeometry?.clip ?? retirementClip(element.parentElement)
+  // Clipped rows already have pre-mutation geometry. Reading their styles
+  // after each preceding removal would force the whole table to lay out again.
+  if (!box.width || !box.height || clip.right <= clip.left || clip.bottom <= clip.top || box.right <= clip.left || box.left >= clip.right || box.bottom <= clip.top || box.top >= clip.bottom || reducedMotion()) { finishMotion(element); element.remove(); return }
   let opacity = Number(getComputedStyle(element).opacity)
   // The body still composites the fixed visual; intermediate ancestors no longer do.
   for (let parent = element.parentElement; parent && parent !== document.body; parent = parent.parentElement) opacity *= Number(getComputedStyle(parent).opacity)
-  if (!box.width || !box.height || !opacity || clip.right <= clip.left || clip.bottom <= clip.top || box.right <= clip.left || box.left >= clip.right || box.bottom <= clip.top || box.top >= clip.bottom || reducedMotion()) { finishMotion(element); element.remove(); return }
+  if (!opacity) { finishMotion(element); element.remove(); return }
   let ghost = element.cloneNode(true) as HTMLElement
   const descendants = [...element.querySelectorAll<HTMLElement>('*')]
   const copies = [...ghost.querySelectorAll<HTMLElement>('*')]

@@ -505,3 +505,86 @@ test('reordered results retain each question’s native distribution state', asy
   })
   expect(result).toEqual([{ question: 'Second', open: true, retained: false }, { question: 'First', open: false, retained: true }])
 })
+
+test('animation frames batch geometry reads before writing row styles', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'Chromium exposes the performance counters used by this regression.')
+  await runtime(page)
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Performance.enable')
+  await page.evaluate(() => {
+    const root = document.createElement('div'); root.id = 'frame-batch'; root.style.cssText = 'position:fixed;top:0;left:0;width:240px'
+    root.innerHTML = '<div style="height:4px">Row</div>'.repeat(80); document.body.append(root)
+    for (const actor of root.children) window.Motion.reveal(actor as HTMLElement)
+  })
+  const before = await cdp.send('Performance.getMetrics')
+  await page.evaluate(() => new Promise<void>(resolve => {
+    let frames = 0
+    const sample = () => ++frames === 12 ? resolve() : requestAnimationFrame(sample)
+    requestAnimationFrame(sample)
+  }))
+  const after = await cdp.send('Performance.getMetrics')
+  const layouts = (metrics: typeof before) => metrics.metrics.find(metric => metric.name === 'LayoutCount')!.value
+  expect(layouts(after) - layouts(before)).toBeLessThan(25)
+  const styles = (metrics: typeof before) => metrics.metrics.find(metric => metric.name === 'RecalcStyleCount')!.value
+  expect(styles(after) - styles(before)).toBeLessThan(25)
+})
+
+test('collection layout measures all destinations before animating visible actors', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'Chromium exposes the performance counters used by this regression.')
+  await runtime(page)
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Performance.enable')
+  await page.evaluate(() => {
+    const root = document.createElement('div'); root.id = 'layout-batch'; root.style.cssText = 'position:absolute;top:0;left:0;width:240px'
+    root.innerHTML = '<div style="height:40px">Row</div>'.repeat(1300); document.body.append(root)
+    root.getBoundingClientRect()
+  })
+  const before = await cdp.send('Performance.getMetrics')
+  const actors = await page.evaluate(() => {
+    const root = document.getElementById('layout-batch')!
+    window.Motion.layout(root, () => root.prepend(root.lastElementChild!))
+    return { total: root.children.length, moving: root.querySelectorAll('[data-motion-running]').length }
+  })
+  const after = await cdp.send('Performance.getMetrics')
+  const layouts = (metrics: typeof before) => metrics.metrics.find(metric => metric.name === 'LayoutCount')!.value
+  expect(actors.total).toBe(1300)
+  expect(actors.moving).toBeGreaterThan(0)
+  expect(actors.moving).toBeLessThan(25)
+  expect(layouts(after) - layouts(before)).toBeLessThan(10)
+})
+
+
+test('view departure batches presentation reads before completing rows', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'Chromium exposes the performance counters used by this regression.')
+  await runtime(page)
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Performance.enable')
+  await page.evaluate(() => {
+    const root = document.createElement('div'); root.id = 'finish-batch'; root.style.cssText = 'position:fixed;top:0;left:0;width:240px'
+    root.innerHTML = '<div style="height:4px">Row</div>'.repeat(80); document.body.append(root)
+    for (const actor of root.children) window.Motion.reveal(actor as HTMLElement)
+  })
+  const before = await cdp.send('Performance.getMetrics')
+  await page.evaluate(() => window.Motion.finishMotion(document.getElementById('finish-batch')!, true))
+  const after = await cdp.send('Performance.getMetrics')
+  const styles = (metrics: typeof before) => metrics.metrics.find(metric => metric.name === 'RecalcStyleCount')!.value
+  expect(styles(after) - styles(before)).toBeLessThan(10)
+  await expect(page.locator('#finish-batch [data-motion-running]')).toHaveCount(0)
+})
+
+
+for (const reduced of [false, true]) test(`retained table controls preserve focus with reduced motion ${reduced}`, async ({ page }) => {
+  if (reduced) await page.emulateMedia({ reducedMotion: 'reduce' })
+  await runtime(page)
+  const focused = await page.evaluate(() => {
+    const table = document.createElement('table'); table.style.cssText = 'position:fixed;top:0;left:0'
+    table.innerHTML = '<tbody><tr><td><button>Retained control</button></td></tr></tbody>'; document.body.append(table)
+    const body = table.tBodies[0], row = body.rows[0], button = row.querySelector('button')!
+    button.focus()
+    window.Motion.layout(body, () => {
+      const fragment = document.createDocumentFragment(); fragment.append(row); body.append(fragment)
+    })
+    return document.activeElement === button && button.isConnected
+  })
+  expect(focused).toBe(true)
+})
