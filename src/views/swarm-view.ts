@@ -689,6 +689,7 @@ function mainRowInnerHTML(e: LogEntry, group?: RunGroup): string {
 }
 
 const mainRowMarkup = new WeakMap<HTMLTableRowElement, string>()
+const preparedRows = new WeakMap<LogEntry, HTMLTableRowElement>()
 
 function buildMainRow(e: LogEntry, markup: string): HTMLTableRowElement {
   const tr = document.createElement('tr')
@@ -698,6 +699,21 @@ function buildMainRow(e: LogEntry, markup: string): HTMLTableRowElement {
   tr.innerHTML = markup
   mainRowMarkup.set(tr, markup)
   return tr
+}
+
+async function prepareRows(list: LogEntry[], current: () => boolean): Promise<void> {
+  const retained = new Set([...bodyEl.children].map(row => (row as HTMLElement).dataset.id))
+  const missing = list.filter(entry => !retained.has(entry.id))
+  if (missing.length <= 100) return
+  // Parsing a full history's cells in the layout mutation made its first
+  // mount one long task. Prepare detached rows while the preview stays usable.
+  for (let start = 0; start < missing.length; start += 50) {
+    if (!current()) return
+    for (const entry of missing.slice(start, start + 50)) {
+      preparedRows.set(entry, buildMainRow(entry, mainRowInnerHTML(entry)))
+    }
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+  }
 }
 
 function setExpandContent(tr: HTMLTableRowElement, id: string) {
@@ -769,7 +785,7 @@ function reconcileRows(nextRows: RunRow[]): void {
   }
   for (const { entry, group, repeat } of nextRows) {
     const markup = mainRowInnerHTML(entry, group)
-    const row = main.get(entry.id) || buildMainRow(entry, markup)
+    const row = main.get(entry.id) || preparedRows.get(entry) || buildMainRow(entry, markup)
     row.classList.toggle('agent-repeat-row', !!repeat)
     row.dataset.callId = entry.response ? entry.id : ''
     if (mainRowMarkup.get(row) !== markup) {
@@ -803,20 +819,24 @@ function render() {
   const countEl = viewEl.querySelector<HTMLElement>('#swarm-count')!
   if (entries.length === 0) {
     table.hidden = true
-    empty.textContent = quarantined.length > 0 ? 'No readable agent calls.' : 'No agent calls.'
+    empty.textContent = lastLoadError ? `Error: ${lastLoadError}`
+      : !lastLoadedAt ? 'Loading…' : quarantined.length > 0 ? 'No readable agent calls.' : 'No agent calls.'
     empty.hidden = false
     countEl.textContent = ''
     bodyEl.innerHTML = ''
     return
   }
   const runCount = list.length === entries.length ? `${entries.length}` : `${list.length} / ${entries.length}`
-  countEl.textContent = groups.length < list.length ? `${groups.length} groups · ${runCount} runs` : runCount
+  const count = groups.length < list.length ? `${groups.length} groups · ${runCount} runs` : runCount
+  countEl.textContent = incompleteTotal === null ? count : `${count} · ${entries.length} of ${incompleteTotal} runs loaded`
   // A filter matching nothing used to leave a bare header strip over blank
   // space, with only a small count pill to explain it. Archive says so in
   // words for exactly this case.
   if (list.length === 0) {
     table.hidden = true
-    empty.textContent = 'No runs match this filter.'
+    empty.textContent = incompleteTotal === null ? 'No runs match this filter.'
+      : loadingHistory ? 'No loaded runs match this filter. Older runs are still loading.'
+        : 'No loaded runs match this filter. Older runs are unavailable.'
     empty.hidden = false
     bodyEl.innerHTML = ''
     return
@@ -1165,36 +1185,61 @@ let pollInFlight: Promise<void> | null = null
 let pollOrganization = ''
 let pollSequence = 0
 
+interface LogFeed { logs?: LogEntry[], quarantined?: QuarantinedLog[], total?: number }
+let incompleteTotal: number | null = null
+let loadingHistory = false
+
+async function readLogFeed(org: string, recent = false): Promise<LogFeed> {
+  const res = await fetch(organizationUrl(recent ? '/api/agent-logs?limit=50' : '/api/agent-logs', org))
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    let detail = ''
+    try { detail = JSON.parse(text)?.error || '' } catch { detail = text.slice(0, 200) }
+    throw new Error(detail ? `${res.status}: ${detail}` : `/api/agent-logs ${res.status}`)
+  }
+  return res.json()
+}
+
+async function applyLogFeed(data: LogFeed, current: () => boolean): Promise<void> {
+  await prepareRows(data.logs || [], current)
+  if (!current()) return
+  entries = data.logs || []
+  incompleteTotal = typeof data.total === 'number' && data.total > entries.length ? data.total : null
+  loadingHistory = incompleteTotal !== null
+  lastLoadError = null
+  quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
+  lastLoadedAt = Date.now()
+  render()
+  for (const entry of entries) {
+    const state = expanded.get(entry.id)
+    if (state) void loadReasoning(entry.id)
+    if (state && !state.loading && state.body === null && entry.response) void loadResponse(entry.id, true)
+  }
+  renderStaleBanner()
+}
+
 function pollOnce(): Promise<void> {
   const org = getSelectedOrganization()
   if (pollInFlight && pollOrganization === org) return pollInFlight
   pollOrganization = org
   const mine = ++pollSequence
+  const current = () => mine === pollSequence && org === getSelectedOrganization()
   const run = (async () => {
     try {
-      const res = await fetch(organizationUrl('/api/agent-logs', org))
-      if (!res.ok) {
-        const text = await res.text().catch(() => '')
-        let detail = ''
-        try { detail = JSON.parse(text)?.error || '' } catch { detail = text.slice(0, 200) }
-        throw new Error(detail ? `${res.status}: ${detail}` : `/api/agent-logs ${res.status}`)
+      if (!lastLoadedAt) {
+        const recent = await readLogFeed(org, true)
+        if (!current()) return
+        await applyLogFeed(recent, current)
+        if (!current() || incompleteTotal === null) return
       }
-      const data = await res.json()
-      if (mine !== pollSequence || org !== getSelectedOrganization()) return
-      entries = (data.logs || []) as LogEntry[]
-      lastLoadError = null
-      quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
-      lastLoadedAt = Date.now()
-      render()
-      for (const entry of entries) {
-        const state = expanded.get(entry.id)
-        if (state) void loadReasoning(entry.id)
-        if (state && !state.loading && state.body === null && entry.response) void loadResponse(entry.id, true)
-      }
-      renderStaleBanner()
+      const data = await readLogFeed(org)
+      if (!current()) return
+      await applyLogFeed(data, current)
     } catch (err) {
-      if (mine !== pollSequence || org !== getSelectedOrganization()) return
+      if (!current()) return
+      loadingHistory = false
       lastLoadError = (err as Error).message
+      if (entries.length > 0) render()
       if (entries.length === 0) {
         const empty = viewEl?.querySelector<HTMLElement>('#swarm-empty')
         if (empty) {
@@ -1223,6 +1268,12 @@ function renderStaleBanner(): void {
   if (!viewEl) return
   const el = viewEl.querySelector<HTMLElement>('#swarm-stale')
   if (!el) return
+  if (!lastLoadError && loadingHistory) {
+    el.textContent = `Loading older runs… Showing ${entries.length} of ${incompleteTotal} runs.`
+      + (quarantined.length ? ` ${quarantined.length} unreadable worker log row(s) isolated.` : '')
+    el.hidden = false
+    return
+  }
   if (!lastLoadError && quarantined.length > 0) {
     el.textContent = `${quarantined.length} unreadable worker log row(s) isolated. Other runs continue updating.`
     el.hidden = false
@@ -1235,6 +1286,7 @@ function renderStaleBanner(): void {
   }
   const age = lastLoadedAt ? relFromMs(lastLoadedAt) : 'unknown'
   el.textContent = `Not updating — ${lastLoadError}. Showing the last successful read from ${age} ago.`
+    + (incompleteTotal === null ? '' : ` Only ${entries.length} of ${incompleteTotal} runs loaded.`)
   el.hidden = false
 }
 
@@ -1300,6 +1352,13 @@ export async function initSwarmView() {
       quarantined = []
       lastLoadError = null
       lastLoadedAt = 0
+      incompleteTotal = null
+      loadingHistory = false
+      bodyEl.replaceChildren()
+      viewEl.querySelector<HTMLElement>('#swarm-table')!.hidden = true
+      const empty = viewEl.querySelector<HTMLElement>('#swarm-empty')!
+      empty.textContent = 'Loading…'; empty.hidden = false
+      viewEl.querySelector<HTMLElement>('#swarm-count')!.textContent = ''
       expanded.clear()
       expandedGroups.clear()
       displayedGroups.clear()
@@ -1308,9 +1367,10 @@ export async function initSwarmView() {
       if (!viewEl.hidden) void pollOnce()
     })
   }
-  await pollOnce()
+  if (lastLoadedAt) queueMicrotask(() => { render(); renderStaleBanner() })
   startSwarmPolling()
   if (!startedTickTimer) startedTickTimer = setInterval(refreshStartedCells, STARTED_TICK_MS)
+  await pollOnce()
 }
 
 export function stopSwarmRefresh() {

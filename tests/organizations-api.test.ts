@@ -338,6 +338,36 @@ describe('global behavior settings API', () => {
     }])
   })
 
+  it('limits the newest scoped runs after validation without truncating diagnostics', async () => {
+    const row = (index: number, repo = 'Legacy/same-repo') => ({
+      id: index.toString(16).padStart(32, '0'), repo, pr_id: String(index), model: 'test',
+      behavior: 'pr_review', prompt: '', actor: 'review-bot', status: 'completed', outcome: null,
+      started_at: '2026-10-01T12:00:00Z', completed_at: '2026-10-01T12:01:00Z', time_elapsed: '1m',
+    })
+    behaviorLogs = [{ ...row(900), actor: 42 }, ...Array.from({ length: 80 }, (_, index) => row(index + 1)), row(901, 'beta/other')]
+    const data = await (await fetch(`${base}/api/agent-logs?org=Legacy&limit=2`)).json()
+    expect(data.logs.map((entry: { id: string }) => entry.id)).toEqual([row(80).id, row(79).id])
+    expect(data.total).toBe(80)
+    expect(data.quarantined).toMatchObject([{ id: row(900).id, error: expect.stringContaining('invalid actor') }])
+    const full = await (await fetch(`${base}/api/agent-logs?org=Legacy`)).json()
+    expect(full.logs).toHaveLength(80)
+    expect(full).not.toHaveProperty('total')
+    const conflict = { ...row(80), actor: 42 }
+    behaviorLogs.push(conflict)
+    const withheld = await (await fetch(`${base}/api/agent-logs?org=Legacy&limit=1`)).json()
+    expect(withheld.logs[0].id).toBe(row(79).id)
+    expect(withheld.total).toBe(79)
+    expect(withheld.quarantined).toEqual(expect.arrayContaining([expect.objectContaining({ id: row(80).id })]))
+  })
+
+  it.each(['0', '-1', '101', '1.5', 'abc', ''])('rejects invalid agent-log preview limit %s before reading Caller', async limit => {
+    const before = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs').length
+    const response = await fetch(`${base}/api/agent-logs?limit=${limit}`)
+    expect(response.status).toBe(400)
+    expect((await response.json()).error).toContain('limit must be an integer from 1 to 100')
+    expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs')).toHaveLength(before)
+  })
+
   it('classifies retained no-action incidents even after their failure summary is gone', async () => {
     const target = 'Legacy/same-repo#18'
     const claimId = database!.claimSeenOwned('review-new-prs', target)!

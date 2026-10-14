@@ -527,6 +527,11 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // under a `logs` envelope so the front-end can extend it later
         // without a breaking change.
         if (path === '/api/agent-logs' && req.method === 'GET') {
+          const limitText = new URLSearchParams(url.split('?')[1] || '').get('limit')
+          const limit = limitText === null ? undefined : Number(limitText)
+          if (limitText !== null && (!/^[1-9]\d*$/.test(limitText) || !Number.isSafeInteger(limit) || limit! > 100)) {
+            return json(res, 400, { error: 'limit must be an integer from 1 to 100' })
+          }
           try {
             const orgs = selectedOrg ? selectOrganizations(selectedOrg) : null
             const snapshot = await fetchAgentLogSnapshot()
@@ -537,7 +542,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
                 || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
             const logs = selected.filter((entry) => !snapshot.quarantined.some((row) => row.id === entry.id
                 || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
-            return json(res, 200, { logs, quarantined })
+            return json(res, 200, { logs: limit === undefined ? logs : logs.slice(0, limit), quarantined,
+              ...(limit === undefined ? {} : { total: logs.length }) })
           } catch (err: any) {
             return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })
           }

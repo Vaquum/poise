@@ -529,6 +529,17 @@ Needs a Caller release with `--stop`; older releases answer "Update Caller".
 
 ## Review activity in Swarm
 
+Swarm first shows the 50 newest readable calls, then loads the complete history.
+Large histories prepare their rows in batches so the recent calls and navigation
+stay usable while the remaining rows are prepared.
+The count and loading message identify the partial history; a failed full read
+keeps those calls visible and reports the missing history. Account scoping and
+quarantine checks apply before the preview limit, so unreadable/conflicting rows
+are never made actionable by the preview. Returning to Swarm paints received
+history immediately while a fresh read runs. The optional `limit=1` through
+`limit=100` on `GET /api/agent-logs` returns a newest-first preview and its
+`total` readable-run count. Unbounded reads retain the full-history response.
+
 With a current Caller release, review/approval rows show the last
 observed stage. Expand a row for timestamped activity, worker heartbeat age, last
 provider event age, and the current stage deadline. Active runs refresh every 15

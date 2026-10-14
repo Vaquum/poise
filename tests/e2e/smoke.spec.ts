@@ -524,7 +524,7 @@ test('stops a running run from Swarm after a second click, and settles the row',
   }
   const finished = { ...row, id: done, status: 'completed', completed_at: ago(60_000), outcome: 'reviewed_clean' }
   const stops: string[] = []
-  await page.route('**/api/agent-logs', async (route) => {
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: { logs: [row, finished] } })
   })
   await page.route('**/api/agent-stop', async (route) => {
@@ -564,7 +564,7 @@ test('shows live activity, preserves its expansion, and loads the final response
     },
   }
   let requests = 0
-  await page.route('**/api/agent-logs', async (route) => {
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, async (route) => {
     requests += 1
     await route.fulfill({ json: { logs: [row] } })
   })
@@ -604,7 +604,7 @@ test('says what each finished review did, and why a run was superseded', async (
   const at = new Date().toISOString()
   const row = (id: string, fields: Record<string, unknown>) => ({ id: id.repeat(32), model: 'astra', behavior: 'pr_review',
     repo: 'o/r', pr_id: '1', started_at: at, completed_at: at, response: '', error: '', ...fields })
-  await page.route('**/api/agent-logs', (route) => route.fulfill({ json: { logs: [
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, (route) => route.fulfill({ json: { logs: [
     row('a', { status: 'completed', outcome: 'clean' }),
     row('b', { status: 'completed', outcome: 'changes_requested', review_comments: 3 }),
     row('c', { status: 'superseded', outcome: 'superseded', expected_head: '1'.repeat(40), head_sha: '2'.repeat(40) }),
@@ -621,7 +621,7 @@ test('says what each finished review did, and why a run was superseded', async (
 test('keeps healthy Swarm rows live while identifying unreadable records', async ({ page }) => {
   const logs = [{ id: 'a'.repeat(32), model: 'astra', behavior: 'pr_review', repo: 'o/r', pr_id: '1',
     status: 'running', started_at: new Date().toISOString(), response: '', error: '' }]
-  await page.route('**/api/agent-logs', (route) => route.fulfill({ json: {
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, (route) => route.fulfill({ json: {
     logs, quarantined: [
       { index: 1, error: 'invalid terminal outcome', id: 'b'.repeat(32),
         repo: 'o/r', prId: '2', correlationId: 'claim-2', behavior: 'pr_review', sessionId: null },
@@ -653,7 +653,7 @@ test('keeps healthy Swarm rows live while identifying unreadable records', async
 test('shows conflicting identity diagnostics when no validated Swarm row remains, then clears recovered evidence', async ({ page }) => {
   const id = 'c'.repeat(32)
   let unreadable = true
-  await page.route('**/api/agent-logs', (route) => route.fulfill({ json: unreadable
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, (route) => route.fulfill({ json: unreadable
     ? { logs: [], quarantined: [{ index: 1, error: 'incomplete terminal outcome', id,
         repo: 'elsewhere/repo', prId: '1', correlationId: 'claim-1', behavior: 'pr_review', sessionId: null }] }
     : { logs: [{ id, model: 'astra', behavior: 'pr_review', repo: 'o/r', pr_id: '1',
@@ -690,7 +690,7 @@ test('shows missing worker heartbeat, refreshes failures, and stops polling when
       status: 'running', started_at: now, started_at_precise: now, response: '', error: '' },
   ]
   let requests = 0
-  await page.route('**/api/agent-logs', (route) => {
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, (route) => {
     requests += 1
     return route.fulfill({ json: { logs } })
   })
@@ -724,7 +724,7 @@ test('updates activity without detaching rows or collapsing provider reasoning',
       events: [{ at: now, message: 'Past minute: new reasoning activity (12 events)' }] } }
   let text = '<script>provider text</script>\n' + 'Evidence from the changed contract.\n'.repeat(100)
   let reads = 0
-  await page.route('**/api/agent-logs', (route) => route.fulfill({ json: { logs: [row] } }))
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, (route) => route.fulfill({ json: { logs: [row] } }))
   await page.route(`**/api/agent-reasoning/${id}`, (route) => {
     reads += 1
     return route.fulfill({ json: { id, body: text } })

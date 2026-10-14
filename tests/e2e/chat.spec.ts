@@ -493,7 +493,7 @@ test('opens a Chat session from a Swarm chat row, and changes model, mode and ha
   const state = makeState([session()], { s1: [] })
   await installRoutes(page, state)
   const now = new Date().toISOString()
-  await page.route('**/api/agent-logs', (route) => route.fulfill({ json: { logs: [
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, (route) => route.fulfill({ json: { logs: [
     { id: 'a'.repeat(32), model: 'opus-5-max', behavior: 'chat', source: 'poise:chat', session_id: 's1', repo: null, pr_id: null, actor: null, prompt: '',
       status: 'running', started_at: now, started_at_precise: now, completed_at: null, time_elapsed: '', outcome: null, response: '', error: '' },
   ] } }))
