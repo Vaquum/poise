@@ -57,6 +57,14 @@ export class PublishConfigError extends Error {
   }
 }
 
+/** A post on the site that cannot be read back: its frontmatter is not YAML fields. */
+export class PostFileError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'PostFileError'
+  }
+}
+
 /** What is wrong with the values given for a section, one sentence each. */
 export class PublishValueError extends Error {
   constructor(readonly problems: string[]) {
@@ -531,9 +539,9 @@ export function parsePost(source: string): PostFile {
   try {
     data = parseYaml(match[1] ?? '', { maxAliasCount: 0 }) ?? {}
   } catch (error) {
-    throw new Error(`the frontmatter on the site is not valid YAML: ${(error as Error).message.split('\n')[0]}`, { cause: error })
+    throw new PostFileError(`The file on the site has frontmatter that is not valid YAML: ${(error as Error).message.split('\n')[0]}`, { cause: error })
   }
-  if (!isMapping(data)) throw new Error('the frontmatter on the site is not a set of fields')
+  if (!isMapping(data)) throw new PostFileError('The file on the site has frontmatter that is not a set of fields.')
   return { data, body: normalizeBody(source.slice(match[0].length)) }
 }
 

@@ -33,7 +33,7 @@ function publication(site: typeof MIKKO | typeof JOURNAL, number: number, values
   }
 }
 
-async function openEditor(page: Page, sites: unknown[], answer: (body: any) => unknown): Promise<any[]> {
+async function openEditor(page: Page, sites: unknown[], answer: (body: any) => unknown, publications: unknown[] = []): Promise<any[]> {
   const sent: any[] = []
   await page.route('**/api/publishing/sites', (route) => route.fulfill({ json: { sites } }))
   await page.route('**/api/editor/**', async (route: Route) => {
@@ -42,7 +42,7 @@ async function openEditor(page: Page, sites: unknown[], answer: (body: any) => u
     if (path === '/api/editor/docs') return route.fulfill({ json: { docs: [{ slug: 'draft-1', title: 'A better question', updated_at: '2026-10-17T08:00:00Z', size: TEXT.length }] } })
     if (path === '/api/editor/doc/draft-1') return route.fulfill({ json: { slug: 'draft-1', content: TEXT, updated_at: '2026-10-17T08:00:00Z', version: VERSION } })
     if (path === '/api/editor/doc/draft-1/annotations') return route.fulfill({ json: { annotations: [], version: VERSION } })
-    if (path === '/api/editor/doc/draft-1/publishing') return route.fulfill({ json: { title: 'A better question', slug: 'a-better-question', today: '2026-10-17', publications: [] } })
+    if (path === '/api/editor/doc/draft-1/publishing') return route.fulfill({ json: { title: 'A better question', slug: 'a-better-question', today: '2026-10-17', publications } })
     if (path === '/api/editor/doc/draft-1/publish') {
       const body = request.postDataJSON()
       sent.push(body)
@@ -190,4 +190,37 @@ test('keeps what is typed for a site whose section name has a | in it', async ({
   await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
   await expect(dialog.getByRole('alert')).toContainText('Not now.')
   expect(sent[0].destinations[0]).toMatchObject({ section: 'Notes | Essays', values: { title: 'A better question', subtitle: 'Kept as typed' } })
+})
+
+test('asks for a required choice instead of showing one as chosen', async ({ page }) => {
+  await workspace(page)
+  const kinds = {
+    repo: 'acme/kinds', state: 'ready', source: 'settings', site: 'Kinds', description: 'version: 1\n',
+    sections: [{ name: 'Posts', firstLine: 'title', fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'kind', kind: 'choice', required: true, choices: ['essay', 'note'] },
+    ] }],
+  }
+  const sent = await openEditor(page, [kinds], (body) => ({ results: body.destinations.map((d: any) => ({ repo: d.repo, section: d.section, ok: false, error: 'Not now.' })) }))
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  const kind = dialog.getByLabel('kind')
+  await expect(kind).toHaveValue('')
+  await expect(kind.locator('option:checked')).toHaveText('Choose…')
+  await kind.selectOption('note')
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values).toMatchObject({ kind: 'note' })
+})
+
+test('lets the slug change where the earlier pull request was closed unmerged', async ({ page }) => {
+  await workspace(page)
+  const closed = { ...publication(MIKKO, 101, { type: 'essay' }), pullRequest: { number: 101, url: 'https://github.com/mikkokotila/mikkokotila-com/pull/101', state: 'closed' } }
+  await openEditor(page, [MIKKO], () => ({ results: [] }), [closed])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.locator('.ep-pr')).toHaveText('#101 closed')
+  const slug = dialog.getByLabel('Slug')
+  await expect(slug).not.toHaveAttribute('readonly', '')
+  await slug.fill('a-better-question-again')
+  await expect(slug).toHaveValue('a-better-question-again')
+  await expect(dialog.getByRole('button', { name: 'Publish', exact: true })).toBeVisible()
 })

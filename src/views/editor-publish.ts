@@ -85,6 +85,12 @@ function publicationOf(key: string): PublicationView | undefined {
   return state?.doc.publications.find((p) => keyOf(p.repo, p.section) === key)
 }
 
+/** A publication still on its way or on the site: one closed unmerged holds no slug. */
+function livePublicationOf(key: string): PublicationView | undefined {
+  const publication = publicationOf(key)
+  return publication && publication.pullRequest.state !== 'closed' ? publication : undefined
+}
+
 function asText(value: unknown): string | boolean {
   if (typeof value === 'boolean') return value
   if (Array.isArray(value)) return value.join(', ')
@@ -130,10 +136,15 @@ function fieldHtml(key: string, field: FieldView, value: string | boolean): stri
   const max = field.max && field.kind === 'text' ? ` maxlength="${field.max}"` : ''
   let control: string
   switch (field.kind) {
-    case 'choice':
-      control = `<select class="ep-input" ${data}>${field.required ? '' : '<option value=""></option>'}${field.choices!.map((c) =>
+    case 'choice': {
+      // Nothing chosen shows as nothing chosen, never as the first choice the browser would display.
+      const none = value === ''
+        ? `<option value="" selected${field.required ? ' disabled' : ''}>${field.required ? 'Choose…' : ''}</option>`
+        : field.required ? '' : '<option value=""></option>'
+      control = `<select class="ep-input" ${data}>${none}${field.choices!.map((c) =>
         `<option value="${escapeHtml(c)}"${c === value ? ' selected' : ''}>${escapeHtml(c)}</option>`).join('')}</select>`
       break
+    }
     case 'date':
       control = `<input type="date" class="ep-input" ${data} value="${escapeHtml(String(value))}"${required} />`
       break
@@ -218,7 +229,7 @@ function render(): void {
     uses('date') ? `<label class="ep-field"><span class="ep-label">Date</span><input type="date" class="ep-input" data-key="shared-date" data-shared="date" value="${escapeHtml(s.shared.date)}" /></label>` : '',
   ].join('')
   const destinations = chosen.map((c) => {
-    const publication = publicationOf(c.key)
+    const publication = livePublicationOf(c.key)
     const own = s.values.get(c.key)!
     return `
       <div class="ep-dest" data-key="${escapeHtml(c.key)}-fields">
@@ -228,7 +239,7 @@ function render(): void {
         ${resultHtml(s.results.get(c.key))}
       </div>`
   }).join('')
-  const updating = chosen.length > 0 && chosen.every((c) => publicationOf(c.key))
+  const updating = chosen.length > 0 && chosen.every((c) => livePublicationOf(c.key))
   const conflicted = [...s.results.values()].some((r) => r.conflicts?.length)
   const label = s.busy ? 'Publishing…' : updating ? 'Update' : 'Publish'
   patchContent(body, `
@@ -295,7 +306,7 @@ function onInput(event: Event): void {
     if (which === 'title') {
       // A slug follows the title until it is typed, or published.
       for (const choice of s.choices) {
-        if (!s.slugTyped.has(choice.key) && !publicationOf(choice.key)) s.slugs.set(choice.key, slugFromTitle(target.value))
+        if (!s.slugTyped.has(choice.key) && !livePublicationOf(choice.key)) s.slugs.set(choice.key, slugFromTitle(target.value))
       }
       render()
     }

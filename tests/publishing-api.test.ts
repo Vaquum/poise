@@ -193,6 +193,19 @@ sections:
       title: { kind: text, required: true }
       note: { kind: text, lines: many }
 `
+// A site whose address, not its path, carries the date.
+const DATED_YAML = `version: 1
+site: Dated
+sections:
+  - name: Posts
+    path: posts/{slug}.md
+    url: https://dated.example/{year}/{slug}/
+    slug: "^[a-z0-9-]+$"
+    first_line: title
+    fields:
+      title: { kind: text, required: true }
+      date: { kind: date, required: true }
+`
 const WRITING_YAML = 'topics:\n  - tag: machine-intelligence\n  - tag: ad-fraud\n'
 const POST = 'src/content/writing/a-better-question.md'
 
@@ -277,7 +290,7 @@ afterEach(async () => {
 describe('Settings → Publishing', () => {
   it('adds a site by its repository and shows what a writer fills in', async () => {
     expect(await request('/api/publishing/sites')).toEqual({ status: 200, body: { sites: [] } })
-    const added = await request('/api/publishing/sites', 'POST', { repo: 'https://github.com/mikkokotila/mikkokotila-com.git' })
+    const added = await request('/api/publishing/sites', 'POST', { repo: 'https://github.com/mikkokotila/mikkokotila-com.git/' })
     expect(added.status).toBe(200)
     expect(added.body.site).toEqual({
       repo: 'mikkokotila/mikkokotila-com',
@@ -548,6 +561,53 @@ describe('publishing a document', () => {
     const refused = await publish([{ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: 'x'.repeat(600_000) } }])
     expect(refused).toEqual({ status: 413, body: { error: 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.' } })
     expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
+  it('reports a site whose file cannot be read back, and publishes to the others', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    await publish([writing()])
+    merge('mikkokotila/mikkokotila-com', 101)
+    editOnSite('mikkokotila/mikkokotila-com', 'main', POST, (text) => text.replace('title: "A better question"', 'title: "unterminated'))
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    const published = await publish([writing(), { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])
+    expect(published.status).toBe(200)
+    expect(published.body.results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/^The file on the site has frontmatter that is not valid YAML/) })
+    expect(published.body.results[1].ok).toBe(true)
+  })
+
+  it('refuses a publication whose record would pass 1 MB on the way, not only at the end', async () => {
+    for (const [repo, site] of [['acme/notes', 'Notes'], ['acme/more', 'More notes']]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: NOTES_YAML.replace('site: Notes', `site: ${site}`) })
+    }
+    const note = (repo: string, text: string) => ({ repo, section: 'Notes', slug: 'a-better-question', values: { note: text } })
+    expect((await publish([note('acme/notes', 'x'.repeat(400_000))])).body.results[0].ok).toBe(true)
+    const before = calls.length
+    // A new large record first, then a smaller one in place of the old: the end fits, the step between does not.
+    const refused = await publish([note('acme/more', 'y'.repeat(400_000)), note('acme/notes', 'short')])
+    expect(refused.status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
+  it('corrects the original a copy names when the original fails to publish its new address', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = (date: string) => ({ repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date } })
+    expect((await publish([dated('2026-10-17')])).body.results[0].ok).toBe(true)
+    await writeDocument(DOC, `${TEXT}\nAnother thought.\n`)
+    // The copy goes first, naming the original's new address; the original then fails.
+    let commitsSeen = 0
+    failOn = (method, endpoint) => (endpoint === 'graphql' && ++commitsSeen === 2 ? 500 : null)
+    const results = (await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }, dated('2027-01-05')])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([true, false])
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
   })
 
   it('says nothing changed when the site has this version already', async () => {

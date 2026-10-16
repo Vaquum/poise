@@ -93,7 +93,9 @@ The Publish icon in the Editor bar opens the panel for the open document:
   field named `description`; Date its first date field. The title starts as
   the document's first line;
 - each chosen site's own fields and its slug. The slug follows the title until
-  you type one, and stays as it was once the piece is published there;
+  you type one, and stays as it was once the piece is published there (a
+  pull request closed unmerged does not count). A required choice with no
+  default asks for one;
 - one button: Publish, or Update when every chosen site has the piece.
 
 Publishing saves the document first. Every site's values are checked before
@@ -123,7 +125,8 @@ what is wrong.
   its path and address.
 - When the site has this version already, nothing is committed.
 - A file the document did not publish is never written over: choose another
-  slug.
+  slug. A file on the site whose frontmatter cannot be read is reported for
+  that site, and the other sites are still published.
 
 Each document's publications are kept beside it as `<slug>.publish.json` in
 the Editor folder: the site, path, branch and pull request, and what was

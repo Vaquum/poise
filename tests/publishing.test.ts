@@ -269,6 +269,12 @@ describe('suggestions and dates', () => {
     expect(() => suggestionsFrom('a: [', 'a')).toThrow(PublishConfigError)
   })
 
+  it('reads the starting description Settings offers, whatever the repository is called', async () => {
+    const { starterDescription } = await import('../src/publishing')
+    expect(parsePublishConfig(starterDescription('acme/123')).site).toBe('123')
+    expect(parsePublishConfig(starterDescription('acme/journal')).sections[0].name).toBe('Posts')
+  })
+
   it('takes today in the time zone set, and refuses one it does not know', () => {
     const instant = new Date('2026-10-16T22:30:00Z')
     expect(today('Europe/Helsinki', instant)).toBe('2026-10-17')

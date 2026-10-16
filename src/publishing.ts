@@ -140,7 +140,7 @@ export function slugFromTitle(title: string): string {
 export function starterDescription(repo: string): string {
   return [
     'version: 1',
-    `site: ${repo.split('/')[1]}`,
+    `site: ${JSON.stringify(repo.split('/')[1])}`,
     'sections:',
     '  - name: Posts',
     '    path: content/posts/{slug}.md',

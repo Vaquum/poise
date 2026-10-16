@@ -10,6 +10,7 @@ import { HttpError, readJson } from './http'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
 import {
   PUBLISH_FILE,
+  PostFileError,
   PublishConfigError,
   PublishValueError,
   documentParts,
@@ -235,7 +236,7 @@ async function listSites(): Promise<{ sites: SiteView[] }> {
 /** owner/name, also from a pasted GitHub address. */
 function repositoryName(value: unknown): string {
   const name = String(value ?? '').trim()
-    .replace(/^(?:https?:\/\/)?(?:www\.)?github\.com\//i, '').replace(/\.git$/i, '').replace(/\/+$/, '')
+    .replace(/^(?:https?:\/\/)?(?:www\.)?github\.com\//i, '').replace(/\/+$/, '').replace(/\.git$/i, '')
   if (!REPOSITORY.test(name)) throw new HttpError(400, 'Give the repository as owner/name.')
   return name
 }
@@ -501,7 +502,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       const kept = await record(target, await publishTo(session, target, parts, places, todayValue, replace, doc.content))
       published.push({ target, record: kept, places })
     } catch (error) {
-      if (!(error instanceof PublishValueError || error instanceof PublishConflictError || error instanceof GitHubError || error instanceof HttpError)) throw error
+      if (!(error instanceof PublishValueError || error instanceof PublishConflictError || error instanceof PostFileError || error instanceof GitHubError || error instanceof HttpError)) throw error
       results.set(target.key, resultFor(target, {
         error: error.message,
         ...(error instanceof PublishValueError ? { problems: error.problems } : {}),
@@ -516,11 +517,11 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // publish those again on their open pull requests, without it.
   const final = placesFor(going)
   for (const { target, record: kept, places } of published) {
-    if (!target.section.fields.some((f) => f.kind === 'places') || samePlaces(places, final)) continue
+    if (!target.section.fields.some((f) => f.kind === 'places' || f.kind === 'canonical') || samePlaces(places, final)) continue
     try {
       await record(target, await publishTo(session, { ...target, previous: kept, state: 'open' }, parts, final, todayValue, replace, doc.content))
     } catch (error) {
-      if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError)) throw error
+      if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError || error instanceof PostFileError)) throw error
       results.set(target.key, resultFor(target, {
         error: `Published as pull request #${kept.pullRequest.number}, but it still names a site that failed: ${error.message} Publish again to correct it.`,
       }))
@@ -550,10 +551,16 @@ function provisionalRecord(target: Target, filled: FilledPost): PublishRecord {
 // be written then would leave that pull request unknown, and the next publish
 // would open another; so a record that would not fit is refused first.
 function assertLedgerFits(records: PublishRecord[], provisional: PublishRecord[]): void {
-  const keys = new Set(provisional.map((r) => placeKey(r.repo, r.section)))
-  const next = { records: [...records.filter((r) => !keys.has(placeKey(r.repo, r.section))), ...provisional] }
-  if (Buffer.byteLength(JSON.stringify(next, null, 2), 'utf8') > MAX_PUBLISH_LEDGER_BYTES) {
-    throw new HttpError(413, 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.')
+  // Each record is written as its site is published, so every step on the way
+  // must fit, not only the last: a large new record can come before a smaller
+  // replacement of an old one.
+  let current = records
+  for (const record of provisional) {
+    const key = placeKey(record.repo, record.section)
+    current = [...current.filter((r) => placeKey(r.repo, r.section) !== key), record]
+    if (Buffer.byteLength(JSON.stringify({ records: current }, null, 2), 'utf8') > MAX_PUBLISH_LEDGER_BYTES) {
+      throw new HttpError(413, 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.')
+    }
   }
 }
 
