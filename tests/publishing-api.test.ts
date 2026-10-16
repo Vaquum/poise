@@ -192,6 +192,7 @@ sections:
     fields:
       title: { kind: text, required: true }
       note: { kind: text, lines: many }
+      words: { kind: list }
 `
 // A site whose address, not its path, carries the date.
 const DATED_YAML = `version: 1
@@ -679,6 +680,39 @@ describe('publishing a document', () => {
     expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
     const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
     expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
+  })
+
+  it("keeps what merged during a commit the document's when the new pull request is closed unmerged", async () => {
+    await publish([writing()])
+    await writeDocument(DOC, `${TEXT}\nA late thought.\n`)
+    beforeCommit = () => merge('mikkokotila/mikkokotila-com', 101)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    close('mikkokotila/mikkokotila-com', 102)
+    await writeDocument(DOC, `${TEXT}\nA later thought.\n`)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 103 } } })
+  })
+
+  it('lets a merged long note be shortened, though it was long', async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    const note = (text: string) => ({ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: text } })
+    expect((await publish([note('x'.repeat(400_000))])).body.results[0].ok).toBe(true)
+    merge('acme/notes', 101)
+    expect((await publish([note('y'.repeat(100_000))])).body.results[0].ok).toBe(true)
+  })
+
+  it('measures a record as it is written, where a long list outgrows a long text', async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    const at = (values: Record<string, unknown>) => ({ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values })
+    expect((await publish([at({ note: 'x'.repeat(400_000) })])).body.results[0].ok).toBe(true)
+    const before = calls.length
+    // Smaller than the note as compact JSON, larger than 1 MB as the record writes it.
+    const words = Array.from({ length: 40_000 }, (_, i) => `w${i}`)
+    expect((await publish([at({ words })])).status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
   })
 
   it('says nothing changed when the site has this version already', async () => {

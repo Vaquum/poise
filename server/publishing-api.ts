@@ -374,6 +374,8 @@ export interface PublishResult {
   conflicts?: string[]
 }
 
+type Landed = NonNullable<PublishRecord['landed']>
+
 interface Target {
   destination: Destination
   ready: ReadySite
@@ -383,6 +385,8 @@ interface Target {
   previous?: PublishRecord
   /** That pull request's state; new when there is none. */
   state: 'new' | 'open' | 'merged'
+  /** This document's side of the version on the site, when one was merged. */
+  landed?: Landed
 }
 
 function placeKey(repo: string, section: string): string {
@@ -445,12 +449,12 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     states.set(placeKey(record.repo, record.section), (await pullRequest(session, record.repo, record.pullRequest.number)).state)
   }))
   // A merged version stays on the site, and stays this document's, even when
-  // a later pull request is closed unmerged.
-  for (const record of ledger.records) {
-    if (states.get(placeKey(record.repo, record.section)) === 'merged') {
-      record.landed = { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url }
-    }
-  }
+  // a later pull request is closed unmerged. Worked out here, and written only
+  // with a record this publication writes.
+  const landedOf = (record: PublishRecord): Landed | undefined => record.landed
+    ?? (states.get(placeKey(record.repo, record.section)) === 'merged'
+      ? { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url }
+      : undefined)
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
 
   const targets: Target[] = []
@@ -464,7 +468,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     // Only an open pull request is still on its way; anything else that is
     // live is the merged version on the site.
     const state = !previous ? 'new' : states.get(key) === 'open' ? 'open' : 'merged'
-    targets.push({ destination, ready: read.ready, section, key, previous, state })
+    targets.push({ destination, ready: read.ready, section, key, previous, state, landed: previous && landedOf(previous) })
   }
 
   // Every place the piece is published, the original first: where it is live
@@ -535,7 +539,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   for (const { target, record: kept, places } of published) {
     if (!target.section.fields.some((f) => f.kind === 'places' || f.kind === 'canonical') || samePlaces(places, final)) continue
     try {
-      await record(target, await publishTo(session, { ...target, previous: kept, state: 'open' }, parts, final, todayValue, replace, doc.content))
+      await record(target, await publishTo(session, { ...target, previous: kept, state: 'open', landed: kept.landed }, parts, final, todayValue, replace, doc.content))
     } catch (error) {
       if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError || error instanceof PostFileError)) throw error
       results.set(target.key, resultFor(target, {
@@ -561,7 +565,7 @@ function provisionalRecord(target: Target, filled: FilledPost): PublishRecord {
     pullRequest: { number: 999_999, url: `https://github.com/${target.ready.repo}/pull/999999` },
     publishedAt: at, updatedAt: at, sourceSha: digest, values: target.destination.values, data: filled.frontmatter, bodySha: digest,
     // Kept by publishTo, so counted here.
-    ...(target.previous?.landed ? { landed: target.previous.landed } : {}),
+    ...(target.landed ? { landed: target.landed } : {}),
   }
 }
 
@@ -572,7 +576,8 @@ function assertLedgerFits(records: PublishRecord[], provisional: PublishRecord[]
   // Each record is written as its site is published, and any site can fail
   // and keep its old record: so the record must fit with every site at the
   // larger of its old and new versions, which covers every step and outcome.
-  const size = (record: PublishRecord) => Buffer.byteLength(JSON.stringify(record), 'utf8')
+  // Measured as written, indented within the record list: a long list grows more there than a long string.
+  const size = (record: PublishRecord) => Buffer.byteLength(JSON.stringify({ records: [record] }, null, 2), 'utf8')
   const worst = new Map(records.map((record) => [placeKey(record.repo, record.section), record]))
   for (const record of provisional) {
     const key = placeKey(record.repo, record.section)
@@ -606,7 +611,7 @@ interface Outcome {
  * unless `replace` says to use this document's version.
  */
 async function publishTo(session: GitHubSession, target: Target, parts: DocumentParts, places: Place[], todayValue: string, replace: boolean, content: string): Promise<Outcome> {
-  const { destination, ready, section, previous, state } = target
+  const { destination, ready, section, previous, state, landed } = target
   const filled = fillFor(target, parts, places, todayValue)
   const title = String(filled.frontmatter[section.firstLine ?? 'title'] ?? parts.title)
   const ours: PostFile = { data: filled.frontmatter, body: section.firstLine ? parts.rest : parts.whole }
@@ -629,7 +634,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   if (current && previous) {
     // On an open pull request, what this document last pushed there; on the
     // site, what of this document was last merged.
-    const base = state === 'open' ? previous : previous.landed ?? previous
+    const base = state === 'open' ? previous : landed ?? previous
     const merged = reconcile({ data: base.data, bodySha: base.bodySha }, ours, parsePost(current.text))
     if (merged.conflicts.length && !replace) throw new PublishConflictError(ready.config.site, merged.conflicts)
     file = merged
@@ -639,7 +644,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   if (current && current.text === text) {
     // The site has this version already: nothing to commit, nothing to open.
     return {
-      record: { ...previous!, site: ready.config.site, url: filled.url, sourceSha: sha256(content), values: destination.values, ...published, updatedAt: now },
+      record: { ...previous!, site: ready.config.site, url: filled.url, sourceSha: sha256(content), values: destination.values, ...published, ...(landed ? { landed } : {}), updatedAt: now },
       state: state as 'open' | 'merged',
       unchanged: true,
     }
@@ -660,6 +665,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   let branch: string
   let headRepo: string
   let pr: { number: number, url: string }
+  let kept = landed
   if (state === 'open') {
     branch = previous!.branch
     headRepo = previous!.headRepo
@@ -669,7 +675,9 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     const after = await pullRequest(session, upstream.fullName, previous!.pullRequest.number)
     if (after.state === 'open') pr = previous!.pullRequest
     else {
-      const opened = await open(headRepo, branch, after.state === 'merged' || previous!.landed !== undefined)
+      // Merged meanwhile: what it held is on the site now, and this document's.
+      if (after.state === 'merged') kept = { data: previous!.data, bodySha: previous!.bodySha, pullRequest: previous!.pullRequest.number, url: previous!.url }
+      const opened = await open(headRepo, branch, kept !== undefined)
       pr = { number: opened.number, url: opened.url }
     }
   } else {
@@ -689,7 +697,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       path: filled.path, url: filled.url, slug: destination.slug, pullRequest: pr,
       publishedAt: previous?.publishedAt ?? now, updatedAt: now,
       sourceSha: sha256(content), values: destination.values, ...published,
-      ...(previous?.landed ? { landed: previous.landed } : {}),
+      ...(kept ? { landed: kept } : {}),
     },
   }
 }
