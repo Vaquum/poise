@@ -12,6 +12,7 @@ type Helpers = {
   stateLabel: (item: any) => { text: string, cls: string }
   relativeDate: (iso: string) => string
   rowKey: (item: any) => string
+  retainUnchangedRows: (previous: ReturnType<typeof pr>[], incoming: ReturnType<typeof pr>[]) => ReturnType<typeof pr>[]
   markReviewing: (url: string, on: boolean) => void
 }
 
@@ -19,7 +20,7 @@ async function loadHelpers(): Promise<Helpers> {
   const source = await readFile(SRC, 'utf8')
   const patched = source + `
 export const __test = {
-  reviewButtonHtml, stateLabel, relativeDate, rowKey,
+  reviewButtonHtml, stateLabel, relativeDate, rowKey, retainUnchangedRows,
   markReviewing: (url: string, on: boolean) => { on ? reviewing.add(url) : reviewing.delete(url) },
 }
 `
@@ -135,4 +136,13 @@ describe('workflow run identity and outcome', () => {
     expect(h.stateLabel(action)).toEqual({ text: 'Failure', cls: 'bad' })
     expect(h.stateLabel({ ...action, state: 'in_progress' })).toEqual({ text: 'In progress', cls: 'live' })
   })
+})
+
+
+it('avoids repainting unchanged rows during progressive snapshot polling while updating changed outcomes', () => {
+  const old = pr({ kind: 'action', is_pr: 0, state: 'in_progress' })
+  expect(h.retainUnchangedRows([old], [{ ...old }])[0]).toBe(old)
+  const changed = h.retainUnchangedRows([old], [{ ...old, state: 'failure' }])[0]
+  expect(changed).not.toBe(old)
+  expect(h.stateLabel(changed)).toEqual({ text: 'Failure', cls: 'bad' })
 })

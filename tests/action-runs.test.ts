@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ runFile: vi.fn(), repos: vi.fn(), me: 'octocat', orgs: [{ login: 'acme' }, { login: 'beta' }] }))
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), repos: vi.fn(), meta: new Map<string, string>(), me: 'octocat', orgs: [{ login: 'acme' }, { login: 'beta' }] }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
-vi.mock('../server/db', () => ({ getMeta: () => mocks.me }))
+vi.mock('../server/db', () => ({ getMeta: (key: string) => key === 'me' ? mocks.me : mocks.meta.get(key), setMeta: (key: string, value: string) => { mocks.meta.set(key, value) } }))
 vi.mock('../server/gh', () => ({
   listOrganizationsRepos: mocks.repos,
   selectOrganizations: (org?: string) => {
@@ -25,6 +25,7 @@ function run(id = 1, conclusion: string | null = 'failure') {
 beforeEach(() => {
   vi.useRealTimers()
   invalidateActionRunCache()
+  mocks.meta.clear()
   mocks.me = 'octocat'
   mocks.runFile.mockReset()
   mocks.repos.mockReset().mockImplementation(async (org: string) => ({ repos: [`${org}/site`], errors: [] }))
@@ -190,5 +191,85 @@ it('does not extend healthy repository freshness when another repository recover
     vi.advanceTimersByTime(60_000)
     expect((await listActionRuns({ org: 'acme' })).body).toMatchObject({ records: [{ repo: 'acme/healthy', number: 2 }, { repo: 'acme/offline', number: 1 }] })
     expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(4)
+  } finally { vi.useRealTimers() }
+})
+
+
+it('returns cold and progressive snapshots without waiting for the slowest repository', async () => {
+  mocks.repos.mockResolvedValue({ repos: ['acme/fast', 'acme/slow'], errors: [] })
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
+    if (args[0] === 'auth') return { stdout: 'selected-secret' }
+    if (args[1].includes('/slow/')) await held
+    return { stdout: response() }
+  })
+  try {
+    let legacyComplete = false
+    const legacy = listActionRuns({ org: 'acme' }).then(result => { legacyComplete = true; return result })
+    const start = performance.now()
+    expect((await listActionRuns({ org: 'acme', snapshot: true })).body).toMatchObject({ pending: true })
+    const elapsed = performance.now() - start
+    expect(elapsed).toBeLessThan(100)
+    await new Promise(resolve => setTimeout(resolve, 200))
+    expect(legacyComplete).toBe(false)
+    console.log(`Archive snapshot: ${elapsed.toFixed(1)}ms; legacy read still blocked after 200ms`)
+    await vi.waitFor(async () => {
+      expect((await listActionRuns({ org: 'acme', snapshot: true })).body).toMatchObject({ records: [{ repo: 'acme/fast' }], pending: true })
+    })
+    release()
+    const complete = await legacy
+    expect(complete.body).toMatchObject({ records: [{ repo: 'acme/fast' }, { repo: 'acme/slow' }], pending: false })
+    expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(2)
+  } finally { release() }
+})
+
+it('serves a persisted snapshot immediately while an expired refresh is held', async () => {
+  mocks.meta.set('archive-actions:octocat:acme:true', JSON.stringify({ records: [{
+    kind: 'action', repo: 'acme/site', number: 1, title: 'Retained run', url: 'https://github.com/acme/site/actions/runs/1',
+    state: 'failure', author: 'octocat', updated_at: '2026-10-14T08:00:00Z', branch: 'main', event: 'push',
+  }], errors: [], warnings: [], expires: 0 }))
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  mocks.repos.mockImplementation(async () => { await held; return { repos: [], errors: [] } })
+  try {
+    expect((await listActionRuns({ org: 'acme', snapshot: true })).body).toMatchObject({ records: [{ title: 'Retained run' }], pending: true })
+  } finally { release(); await listActionRuns({ org: 'acme' }) }
+})
+
+
+it('retains the complete warm snapshot until every refreshed repository settles', async () => {
+  vi.useFakeTimers()
+  mocks.repos.mockResolvedValue({ repos: ['acme/fast', 'acme/slow'], errors: [] })
+  await listActionRuns({ org: 'acme' })
+  vi.advanceTimersByTime(5 * 60_000)
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
+    if (args[0] === 'auth') return { stdout: 'selected-secret' }
+    if (args[1].includes('/slow/')) await held
+    return { stdout: response([run(2)]) }
+  })
+  try {
+    const before = await listActionRuns({ org: 'acme', snapshot: true })
+    expect(before.body).toMatchObject({ records: [{ repo: 'acme/fast', number: 1 }, { repo: 'acme/slow', number: 1 }], count: 2, pending: true })
+    await vi.waitFor(() => expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(4))
+    expect((await listActionRuns({ org: 'acme', snapshot: true })).body).toMatchObject({ records: [{ number: 1 }, { number: 1 }], count: 2, pending: true })
+    release()
+    expect((await listActionRuns({ org: 'acme' })).body).toMatchObject({ records: [{ number: 2 }, { number: 2 }], pending: false })
+  } finally { release(); vi.useRealTimers() }
+})
+
+
+it('rejects a completely failed cold snapshot so the browser retries, then recovers after cache backoff', async () => {
+  vi.useFakeTimers()
+  mocks.runFile.mockRejectedValue(new Error('network offline'))
+  try {
+    expect((await listActionRuns({ org: 'acme', snapshot: true })).body).toMatchObject({ pending: true })
+    await vi.waitFor(async () => { await expect(listActionRuns({ org: 'acme', snapshot: true })).rejects.toThrow('network offline') })
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'selected-secret' : response() }))
+    vi.advanceTimersByTime(60_000)
+    await listActionRuns({ org: 'acme', snapshot: true })
+    expect((await listActionRuns({ org: 'acme' })).body).toMatchObject({ records: [{ kind: 'action', number: 1 }], pending: false })
   } finally { vi.useRealTimers() }
 })

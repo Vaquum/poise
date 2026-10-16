@@ -14,13 +14,15 @@
           <div class="filter-cluster" id="main-filters">
             <div class="range-picker" id="filter-type">
               <button data-filter="action" class="active">Actions</button>
-              <button data-filter="both">Issues &amp; PRs</button>
               <button data-filter="issue">Issues</button>
-              <button data-filter="pr">PRs</button>
+              <button data-filter="pr">PR</button>
             </div>
-            <div class="range-picker" id="filter-status">
-              <button data-status="failed" class="active">Failed</button>
-              <button data-status="all">Any</button>
+            <div class="range-picker" id="filter-action-status" aria-label="Actions outcome">
+              <button data-action-status="failed" class="active">Failed</button>
+              <button data-action-status="all">Any</button>
+            </div>
+            <div class="range-picker" id="filter-status" aria-label="Issue and PR status">
+              <button data-status="all" class="active">Any</button>
               <button data-status="open">Open</button>
             </div>
             <div class="range-picker" id="time-picker">
@@ -53,7 +55,7 @@
             </thead>
             <tbody id="tbody"></tbody>
           </table>
-          <div id="loader" class="loader"><span></span><span></span><span></span></div>
+          <div id="loader" class="loader" role="status" aria-label="Loading Archive"><span></span><span></span><span></span></div>
           <p id="main-load-error" class="st-help st-help-error" role="status" hidden></p>
           <p id="empty" hidden>No results.</p>
         </main>
