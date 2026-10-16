@@ -6712,3 +6712,12 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 #table .col-state { width: 110px; }
 #table td.updated-cell { text-align: right; }
 #main-actions-scope { margin-bottom: 16px; }
+
+/* Keep each Archive filter group intrinsic and its visible end caps intact. */
+#main-filters .range-picker { flex: 0 0 auto; }
+#main-filters .range-picker[hidden] { display: none; }
+#main-filters .range-picker button { white-space: nowrap; flex-shrink: 0; }
+#loader span { animation: pulse 1s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  #loader span { animation: none; }
+}

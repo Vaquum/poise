@@ -123,7 +123,7 @@ Settings → General → GitHub holds two accounts, and no GitHub account is fix
 anywhere in Poise or Caller:
 
 - **Your GitHub account** scopes Current and Archive's issue/PR history to
-  what you are involved in. Archive's Actions tab reads workflows across ready
+  what you are involved in. Archive's Actions filter reads workflows across ready
   accounts independently of that involvement. Repository lists, account
   indexing and issues opened from Current or the Editor also use your account.
 - **GitHub automation account** is the GitHub user your reviews and comments are posted
@@ -713,12 +713,12 @@ so a different successful rerun cannot clear an unresolved hold. A `read_failed`
 receipt proves no write occurred: its intent is released and the visible read
 failure retries with backoff. Errors after the write begins remain held.
 
-Archive's Actions tab reads workflow runs independently of PR involvement, including
+Archive's Actions filter reads workflow runs independently of PR involvement, including
 push and deployment runs after merge. Failed selects GitHub's `failure` conclusion;
 Any includes all conclusions and active runs. It reads at most the latest 100 runs
 per repository for the selected outcome, and reports truncated history and read
 failures. Search and date filters apply within that snapshot. Older runs remain
-available in GitHub. Workflow reads happen only while Actions is open, share a
+available in GitHub. Workflow reads start only while Actions is selected, share a
 five-minute cache across pages, counts, search, date and account filters, and make
 one API request per discovered repository per outcome per cache interval.
 Repository discovery uses the existing cache; no workflow jobs or logs are polled.
@@ -726,3 +726,12 @@ Healthy workflow snapshots expire five minutes after their reads complete;
 unavailable or partial reads retry after one minute, reusing healthy repositories.
 Expired reads send authenticated ETags: unchanged `304` responses reuse the
 verified snapshot and do not consume GitHub's primary REST rate limit.
+
+Archive's Actions, Issues and PR controls are independent toggles; PR selects only
+pull requests. Actions has its own Failed/Any outcome control, while Any/Open
+applies to issues and pull requests. Selected sources render independently and
+merge by update time. Query results remain in memory across toggles; full-history
+counts run after the first page and never block pagination. Actions returns a
+persisted snapshot immediately while refreshing expired data, publishes repository
+results progressively on a cold read, and shows an animated loader until that
+snapshot completes. Unavailable reads remain explicit beside retained results.

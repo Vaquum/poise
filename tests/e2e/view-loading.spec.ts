@@ -15,7 +15,7 @@ const issue = {
 async function setup(page: Page, view = 'current') {
   const state = { currentReads: 0 }
   await page.addInitScript((initialView) => {
-    localStorage.clear(); localStorage.setItem('poise-filters-v2', JSON.stringify({ type: 'both', status: 'all', time: 'all' }))
+    localStorage.clear(); localStorage.setItem('poise-filters-v2', JSON.stringify({ types: ['issue'], status: 'all', time: 'all' }))
     localStorage.setItem('poise-view', initialView)
   }, view)
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com|github\.com)\//, (route) => route.abort())
@@ -241,7 +241,7 @@ test('promoting a linked card preserves its intended repository before and after
   } finally { repos.release() }
 })
 
-test('a delayed count still reopens Archive paging when its sentinel stays visible', async ({ page }) => {
+test('Archive continues paging while a delayed count is pending', async ({ page }) => {
   await setup(page, 'main')
   await page.setViewportSize({ width: 1280, height: 1800 })
   const count = deferred()
@@ -256,7 +256,7 @@ test('a delayed count still reopens Archive paging when its sentinel stays visib
     }
     const offset = body.offset || 0
     offsets.push(offset)
-    return route.fulfill({ json: { records: Array.from({ length: 20 }, (_, index) => ({
+    return route.fulfill({ json: { records: Array.from({ length: Math.max(0, Math.min(20, 40 - offset)) }, (_, index) => ({
       ...issue, number: offset + index + 1, title: `Refresh issue ${offset + index + 1}`,
     })) } })
   })
@@ -267,9 +267,10 @@ test('a delayed count still reopens Archive paging when its sentinel stays visib
     await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
     await expect(page.locator('#tbody')).toContainText('Refresh issue 20')
     await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
-    count.release()
     await expect.poll(() => offsets.includes(20)).toBe(true)
     await expect(page.locator('#tbody > tr')).toHaveCount(40)
+    count.release()
+    await expect(page.locator('#count')).toHaveText('40 / 40')
   } finally { count.release() }
 })
 

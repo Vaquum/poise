@@ -1,7 +1,7 @@
 // Main table view — reads through /api/gh from the unified /github API.
 
-import { midnightInZone, startOfWeekInZone } from '../config'
-import { layout, retire, reveal } from '../motion'
+import { getSettings, getOrganizations, midnightInZone, startOfWeekInZone } from '../config'
+import { layout, retire } from '../motion'
 import { patchContent } from '../dom-patch'
 import { mountOrganizationFilter, organizationPayload, organizationErrors } from '../organizations'
 
@@ -45,16 +45,16 @@ interface PrRow {
   merged_at: string | null
 }
 
-type TypeFilter = 'both' | 'issue' | 'pr' | 'action'
-type StatusFilter = 'all' | 'open' | 'failed'
+type TypeFilter = 'issue' | 'pr' | 'action'
+type StatusFilter = 'all' | 'open'
 type TimeFilter = 'all' | 'today' | 'yesterday' | 'week'
 
-let typeFilter: TypeFilter = 'action'
-let statusFilter: StatusFilter = 'failed'
+let typeFilters = new Set<TypeFilter>(['action'])
+let statusFilter: StatusFilter = 'all'
+let actionStatus: 'all' | 'failed' = 'failed'
 let timeFilter: TimeFilter = 'all'
 let searchQuery = ''
 let items: PrRow[] = []
-let offset = 0
 let total = 0
 let partialResults = false
 let done = false
@@ -92,23 +92,22 @@ function showLoadError(message: string): void {
   loadErrorEl.hidden = !message
 }
 
-function loadFilters(): { type: TypeFilter; status: StatusFilter; time: TimeFilter } {
+function loadFilters(): void {
+  const raw = localStorage.getItem(STORAGE_KEY)
+  if (!raw) return
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      return {
-        type: ['both', 'issue', 'pr', 'action'].includes(parsed.type) ? parsed.type : 'action',
-        status: ['all', 'open', 'failed'].includes(parsed.status) ? parsed.status : 'failed',
-        time: ['all', 'today', 'yesterday', 'week'].includes(parsed.time) ? parsed.time : 'all',
-      }
-    }
-  } catch { /* ignore */ }
-  return { type: 'action', status: 'failed', time: 'all' }
+    const parsed = JSON.parse(raw)
+    const legacy = parsed.type === 'both' ? ['issue', 'pr'] : [parsed.type]
+    const types: unknown[] = Array.isArray(parsed.types) ? parsed.types : legacy
+    typeFilters = new Set(types.filter((type): type is TypeFilter => type === 'action' || type === 'issue' || type === 'pr'))
+    statusFilter = parsed.status === 'open' ? 'open' : 'all'
+    actionStatus = parsed.actionStatus === 'all' || (parsed.type === 'action' && parsed.status === 'all') ? 'all' : 'failed'
+    if (['all', 'today', 'yesterday', 'week'].includes(parsed.time)) timeFilter = parsed.time
+  } catch { /* Invalid stored preferences use the defaults. */ }
 }
 
 function saveFilters() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ type: typeFilter, status: statusFilter, time: timeFilter }))
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ types: [...typeFilters], status: statusFilter, actionStatus, time: timeFilter }))
 }
 
 function timeWindow(): { since?: string; until?: string } {
@@ -279,44 +278,6 @@ function updateCount() {
   countEl.textContent = partialResults ? `${items.length} available` : total > 0 ? `${Math.min(items.length, total)} / ${total}` : ''
 }
 
-function renderAll() {
-  tbody.innerHTML = ''
-  if (items.length === 0 && !fetching) {
-    table.hidden = true
-    // "Nothing here" and "a filter hid everything" looked identical, and the
-    // filters persist across reloads — so a sticky filter from a previous
-    // session presented as an empty archive.
-    const filtered = !!searchQuery || typeFilter !== 'both'
-      || statusFilter !== 'all' || timeFilter !== 'all'
-    empty.textContent = filtered
-      ? 'No results for the current filters.'
-      : 'No results.'
-    empty.hidden = false
-    updateCount()
-    return
-  }
-  table.hidden = false
-  empty.hidden = true
-  for (const item of items) {
-    tbody.appendChild(buildRow(item))
-  }
-  updateCount()
-}
-
-function appendRows(newItems: PrRow[]) {
-  table.hidden = false
-  empty.hidden = true
-  // Batch append in a fragment to reduce reflows
-  const frag = document.createDocumentFragment()
-  for (let i = 0; i < newItems.length; i++) {
-    const tr = buildRow(newItems[i])
-    frag.appendChild(tr)
-  }
-  tbody.appendChild(frag)
-  for (const row of [...tbody.querySelectorAll<HTMLElement>(':scope > tr')].slice(-newItems.length)) reveal(row, { distance: 8 })
-  updateCount()
-}
-
 function applyMainFlip(nextItems: PrRow[]) {
   layout(tbody, () => {
     const existingEls = new Map<string, HTMLTableRowElement>()
@@ -384,145 +345,220 @@ function readMessages(data: { errors?: Array<{ org: string, error: string }>, wa
 }
 
 function updateFilterContext(): void {
-  const action = typeFilter === 'action'
-  clusterEl.querySelector<HTMLButtonElement>('[data-status="open"]')!.hidden = action
-  clusterEl.querySelector<HTMLButtonElement>('[data-status="failed"]')!.hidden = !action
-  document.querySelector('#table .col-owner')!.textContent = action ? 'Branch' : 'Owner'
-  document.getElementById('main-actions-scope')!.hidden = !action
-  document.getElementById('main-actions-scope')!.textContent = `Latest 100 ${statusFilter === 'failed' ? 'failed ' : ''}runs per repository · cached for 5 minutes. Search and dates filter these runs.`
+  const action = typeFilters.has('action')
+  const history = typeFilters.has('pr') || typeFilters.has('issue')
+  document.getElementById('filter-status')!.hidden = !history
+  document.getElementById('filter-action-status')!.hidden = !action
+  document.querySelector('#table .col-owner')!.textContent = action ? history ? 'Owner / Branch' : 'Branch' : 'Owner'
+  const scope = document.getElementById('main-actions-scope')!
+  scope.hidden = !action
+  scope.textContent = `Latest 100 ${actionStatus === 'failed' ? 'failed ' : ''}runs per repository · refreshed every 5 minutes. Search and dates filter these runs.`
 }
 
-function buildListPayload(): Record<string, unknown> {
-  const win = timeWindow()
-  const payload: Record<string, unknown> = {
-    operation: typeFilter === 'action' ? 'actions' : 'list',
-    ...organizationPayload(),
-    record_type: typeFilter === 'both' ? 'all' : (typeFilter === 'pr' ? 'pull_request' : 'issue'),
-    record_state: statusFilter === 'failed' ? 'failed' : statusFilter === 'open' ? 'open' : 'all',
-    limit: PAGE_SIZE,
-    offset,
+interface SourceState {
+  type: TypeFilter
+  payload: Record<string, unknown>
+  rows: PrRow[]
+  total: number
+  partial: boolean
+  done: boolean
+  fetching: boolean
+  loaded: boolean
+  pending: boolean
+  error: string
+  countError: string
+  loadedAt: number
+  revision: number
+  failures: number
+  retryRefresh: boolean
+  timer?: ReturnType<typeof setTimeout>
+}
+
+// A source owns its rows and paging independently. A slow Actions repository or
+// history count cannot hold another source's first paint or subsequent pages.
+const sources = new Map<string, SourceState>()
+function selectedSources(): SourceState[] {
+  const selected = [...typeFilters].map((type) => {
+    const win = timeWindow()
+    const payload = {
+      operation: type === 'action' ? 'actions' : 'list', ...organizationPayload(),
+      record_type: type === 'pr' ? 'pull_request' : 'issue',
+      record_state: type === 'action' ? actionStatus : statusFilter,
+      ...(type === 'action' ? { snapshot: true } : {}),
+      ...(win.since ? { updated_since: win.since } : {}),
+      ...(win.until ? { updated_until: win.until } : {}),
+      ...(searchQuery ? { q: searchQuery } : {}),
+    }
+    const key = JSON.stringify([getSettings().me, getOrganizations().filter(org => org.status === 'ready').map(org => org.login), payload])
+    let source = sources.get(key)
+    if (!source) {
+      source = { type, payload, rows: [], total: 0, partial: true, done: false, fetching: false,
+        loaded: false, pending: false, error: '', countError: '', loadedAt: 0, revision: 0, failures: 0, retryRefresh: false }
+      sources.set(key, source)
+    }
+    return source
+  })
+  for (const [key, source] of sources) {
+    if (sources.size <= 24) break
+    if (!selected.includes(source) && !source.fetching && !source.timer) sources.delete(key)
   }
-  if (win.since)    payload.updated_since = win.since
-  if (win.until)    payload.updated_until = win.until
-  if (searchQuery)  payload.q = searchQuery
-  return payload
+  return selected
 }
 
-// Every reset — a filter pill, a search keystroke — starts a new query. A page
-// already on the wire belongs to the old one, and `resetAndFetch` only cleared
-// the `fetching` flag without cancelling it, so its rows were appended into the
-// new query's list and its `total` overwrote the new count. Round trips here
-// run to several seconds, so this was routine rather than rare.
-let queryGeneration = 0
+function mainVisible(): boolean { return !document.getElementById('view-main')!.hidden }
 
-// A page fetch that fails used to fall straight into the rAF chain below,
-// which re-fired immediately because the sentinel was still in view and no
-// rows had been added — an unbounded, backoff-free retry loop that also kept
-// running after the view was left. Back off instead, and stop after a few
-// attempts rather than hammering a datastore that is plainly down.
-let consecutiveFailures = 0
-const MAX_RETRIES = 4
-let retryTimer: ReturnType<typeof setTimeout> | null = null
+function paintSources(): void {
+  const selected = selectedSources()
+  const next = [...new Map(selected.flatMap(source => source.rows).map(item => [rowKey(item), item])).values()]
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+  const rowsChanged = next.length !== items.length || next.some((row, index) => row !== items[index])
+  items = next
+  total = selected.reduce((sum, source) => sum + source.total, 0)
+  partialResults = selected.some(source => source.partial || source.pending)
+  fetching = selected.some(source => source.fetching || source.pending)
+  done = selected.every(source => source.done)
+  loader.hidden = !fetching
+  showLoadError(selected.flatMap(source => [source.error, source.countError]).filter(Boolean).join(' '))
+  if (items.length) {
+    table.hidden = false
+    empty.hidden = true
+    if (rowsChanged) applyMainFlip(items)
+    else {
+      const byKey = new Map(items.map(item => [rowKey(item), item]))
+      for (const row of tbody.rows) {
+        const item = byKey.get(row.dataset.key || '')
+        const date = row.querySelector('.date')
+        if (item && date) {
+          const text = relativeDate(item.updated_at)
+          if (date.textContent !== text) date.textContent = text
+        }
+      }
+    }
+  } else {
+    tbody.replaceChildren()
+    table.hidden = true
+    empty.hidden = fetching
+    empty.textContent = !selected.length ? 'Select Actions, Issues or PR.'
+      : typeFilters.size === 1 && typeFilters.has('action') && actionStatus === 'failed'
+        ? 'No failed workflow runs for the current filters.' : 'No results for the current filters.'
+  }
+  updateCount()
+}
 
 function cancelPendingRetry(): void {
-  if (retryTimer !== null) { clearTimeout(retryTimer); retryTimer = null }
+  for (const source of sources.values()) {
+    if (source.timer) clearTimeout(source.timer)
+    source.timer = undefined
+  }
+}
+
+function scheduleRead(source: SourceState, delay: number, refresh: boolean): void {
+  if (source.timer) clearTimeout(source.timer)
+  if (!mainVisible() || !selectedSources().includes(source)) return
+  source.timer = setTimeout(() => {
+    source.timer = undefined
+    if (mainVisible() && selectedSources().includes(source)) void readSource(source, refresh)
+  }, delay)
+}
+
+async function postRead(payload: Record<string, unknown>) {
+  const response = await fetch('/api/gh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+  if (!response.ok) throw new Error(`Github ${response.status}`)
+  return response.json()
+}
+
+async function readCount(source: SourceState, revision: number): Promise<void> {
+  try {
+    const data = await postRead({ ...source.payload, count_only: true })
+    if (source.revision !== revision) return
+    source.partial = typeof data.count !== 'number' || !!organizationErrors(data) || source.error.startsWith('Some GitHub accounts')
+    source.countError = readMessages(data) || (source.partial ? 'Total count unavailable. Showing available results.' : '')
+    if (typeof data.count === 'number') source.total = data.count
+    if (!source.partial && source.rows.length >= source.total) source.done = true
+  } catch {
+    if (source.revision !== revision) return
+    source.partial = true
+    source.countError = 'Total count unavailable. Showing available results.'
+  }
+  if (mainVisible()) paintSources()
+}
+
+function retainUnchangedRows(previous: PrRow[], incoming: PrRow[]): PrRow[] {
+  const existing = new Map(previous.map(row => [rowKey(row), row]))
+  return incoming.map(row => {
+    const old = existing.get(rowKey(row))
+    return old && Object.entries(row).every(([key, value]) => old[key as keyof PrRow] === value) ? old : row
+  })
+}
+
+async function readSource(source: SourceState, refresh = false): Promise<void> {
+  if (source.fetching || (!refresh && source.done)) return
+  if (source.timer) clearTimeout(source.timer)
+  source.timer = undefined
+  source.fetching = true
+  const revision = refresh || !source.loaded ? ++source.revision : source.revision
+  const limit = refresh ? Math.max(PAGE_SIZE, source.rows.length) : PAGE_SIZE
+  const offset = refresh ? 0 : source.rows.length
+  if (mainVisible()) paintSources()
+  try {
+    const data = await postRead({ ...source.payload, limit, offset })
+    const rows = retainUnchangedRows(source.rows, (data.records as GhRecord[] || []).map(recordToRow))
+    // Actions is a bounded snapshot: replace it on refresh so recovered runs
+    // disappear. History refreshes retain the already paged tail.
+    const tail = refresh && source.type !== 'action'
+      ? source.rows.filter(item => !rows.some(row => rowKey(row) === rowKey(item))) : []
+    source.rows = refresh ? [...rows, ...tail] : [...source.rows, ...rows]
+    source.loaded = true
+    source.loadedAt = Date.now()
+    source.pending = data.pending === true
+    source.partial = source.pending || !!organizationErrors(data) || (typeof data.count !== 'number' && (offset === 0 || source.partial))
+    source.total = typeof data.count === 'number' ? data.count : offset === 0 ? source.rows.length : Math.max(source.total, source.rows.length)
+    source.done = !source.pending && (rows.length < limit || (!source.partial && source.rows.length >= source.total))
+    source.error = readMessages(data)
+    if (offset === 0) source.countError = ''
+    source.failures = 0
+    // Full-history counts start only after the bounded page is painted. They
+    // never hold the paging lock, and are read once per query/refresh.
+    if (source.type !== 'action' && (offset === 0)) void readCount(source, revision)
+    if (source.pending) scheduleRead(source, 250, true)
+  } catch (error) {
+    source.error = `${source.loaded ? 'Not updating —' : 'Could not load:'} ${(error as Error).message}`
+    source.pending = false
+    source.retryRefresh = refresh
+    if (++source.failures <= 4) scheduleRead(source, Math.min(30_000, 1000 * 2 ** (source.failures - 1)), refresh)
+  } finally {
+    source.fetching = false
+    if (mainVisible()) {
+      paintSources()
+      if (!source.pending && !source.failures) requestAnimationFrame(() => {
+        if (mainVisible() && sentinelNeedsFetch()) void fetchPage()
+      })
+    }
+  }
 }
 
 async function fetchPage(): Promise<void> {
-  if (done || fetching) return
-  const mine = queryGeneration
-  fetching = true
-  loader.hidden = false
-  try {
-    const payload = buildListPayload()
-    // Start the full-history count alongside the page, but paint the bounded
-    // page first. A count failure must not discard rows already available.
-    const countRead = fetch('/api/gh', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...payload, count_only: true, limit: undefined, offset: undefined }),
-    }).catch(() => null)
-    const pageRes = await fetch('/api/gh', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    if (!pageRes.ok) throw new Error(`Github ${pageRes.status}`)
-    const pageData  = await pageRes.json()
-    // The filters moved while this was out; these rows answer a question
-    // nobody is asking any more.
-    if (mine !== queryGeneration) return
-    partialResults = true
-    const newItems: PrRow[] = (pageData.records as GhRecord[] || []).map(recordToRow)
-    total = items.length + newItems.length
-    items.push(...newItems)
-    offset += newItems.length
-    if (newItems.length < PAGE_SIZE) done = true
-
-    consecutiveFailures = 0
-    showLoadError(readMessages(pageData))
-    loader.hidden = done
-    appendRows(newItems)
-    if (items.length === 0) {
-      table.hidden = true
-      empty.textContent = typeFilter === 'action' && statusFilter === 'failed'
-        ? 'No failed workflow runs for the current filters.' : 'No results for the current filters.'
-      empty.hidden = false
-    }
-    const countRes = await countRead
-    const countData = countRes?.ok ? await countRes.json().catch(() => ({})) : {}
-    if (mine !== queryGeneration) return
-    const countComplete = !!countRes?.ok && typeof countData.count === 'number' && !organizationErrors(countData)
-    partialResults = !countComplete || !!organizationErrors(pageData)
-    if (typeof countData.count === 'number') total = countData.count
-    if (countComplete && items.length >= total) done = true
-    loader.hidden = done
-    updateCount()
-    showLoadError(readMessages(pageData) || readMessages(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
-  } catch (err) {
-    if (mine !== queryGeneration) return
-    loader.hidden = true
-    consecutiveFailures++
-    showLoadError(`Could not load: ${(err as Error).message}`)
-    if (consecutiveFailures <= MAX_RETRIES) {
-      const delay = Math.min(30_000, 1000 * 2 ** (consecutiveFailures - 1))
-      cancelPendingRetry()
-      retryTimer = setTimeout(() => {
-        retryTimer = null
-        if (mine === queryGeneration && !done && !document.getElementById('view-main')!.hidden) void fetchPage()
-      }, delay)
-    }
-  } finally {
-    if (mine === queryGeneration) fetching = false
-  }
-
-  // IntersectionObserver only fires on *state change*. If the sentinel is still
-  // in view after this fetch (common when the batch doesn't fill the viewport),
-  // the observer won't re-fire. Chain the next fetch manually.
-  // Only chain when the last attempt actually succeeded — chaining after a
-  // failure is what produced the retry loop.
-  if (!done && consecutiveFailures === 0 && mine === queryGeneration) {
-    requestAnimationFrame(() => {
-      if (mine === queryGeneration && !document.getElementById('view-main')!.hidden && sentinelNeedsFetch()) fetchPage()
-    })
-  }
+  await Promise.all(selectedSources().filter(source => !source.pending && !source.timer && source.failures === 0).map(source => readSource(source)))
 }
 
 function resetAndFetch() {
-  // Retire whatever is on the wire: its rows belong to the previous query.
-  queryGeneration++
-  cancelPendingRetry()
-  consecutiveFailures = 0
-  items = []
-  offset = 0
-  total = 0
-  partialResults = false
-  done = false
-  fetching = false
-  tbody.innerHTML = ''
-  countEl.textContent = ''
-  showLoadError('')
-  fetchPage()
+  const selected = selectedSources()
+  for (const source of sources.values()) {
+    if (!selected.includes(source) && source.timer) {
+      clearTimeout(source.timer)
+      source.timer = undefined
+    }
+  }
+  paintSources()
+  for (const source of selected) {
+    if (source.timer) continue
+    if (source.failures > 0) {
+      if (source.failures <= 4) scheduleRead(source, Math.min(30_000, 1000 * 2 ** (source.failures - 1)), source.retryRefresh)
+    } else if (!source.loaded || source.pending || Date.now() - source.loadedAt > 60_000) void readSource(source, source.loaded)
+  }
+  requestAnimationFrame(() => {
+    if (mainVisible() && sentinelNeedsFetch()) void fetchPage()
+  })
 }
 
 // `active` is a class, which tells a screen reader nothing about which filter
@@ -534,10 +570,10 @@ function setPillActive(b: HTMLButtonElement, on: boolean): void {
 
 function initFilterButtons() {
   clusterEl.querySelectorAll<HTMLButtonElement>('[data-filter]').forEach((b) => {
-    setPillActive(b, b.dataset.filter === typeFilter)
+    setPillActive(b, typeFilters.has(b.dataset.filter as TypeFilter))
   })
-  clusterEl.querySelectorAll<HTMLButtonElement>('[data-status]').forEach((b) => {
-    setPillActive(b, b.dataset.status === statusFilter)
+  clusterEl.querySelectorAll<HTMLButtonElement>('[data-status], [data-action-status]').forEach((b) => {
+    setPillActive(b, (b.dataset.actionStatus ? b.dataset.actionStatus === actionStatus : b.dataset.status === statusFilter))
   })
   timePickerEl.querySelectorAll<HTMLButtonElement>('[data-time]').forEach((b) => {
     setPillActive(b, b.dataset.time === timeFilter)
@@ -551,23 +587,18 @@ function attachHandlers() {
     if (!btn) return
     if (btn.dataset.filter) {
       const next = btn.dataset.filter as TypeFilter
-      if (next === typeFilter) return
-      typeFilter = next
-      statusFilter = next === 'action' ? 'failed' : 'all'
+      if (typeFilters.has(next)) typeFilters.delete(next)
+      else typeFilters.add(next)
       updateFilterContext()
-      clusterEl.querySelectorAll<HTMLButtonElement>('[data-status]').forEach((b) => setPillActive(b, b.dataset.status === statusFilter))
-      clusterEl.querySelectorAll<HTMLButtonElement>('[data-filter]').forEach((b) => setPillActive(b, false))
-      setPillActive(btn, true)
+      initFilterButtons()
       saveFilters()
       resetAndFetch()
     }
-    if (btn.dataset.status) {
-      const next = btn.dataset.status as StatusFilter
-      if (next === statusFilter) return
-      statusFilter = next
+    if (btn.dataset.status || btn.dataset.actionStatus) {
+      if (btn.dataset.actionStatus) actionStatus = btn.dataset.actionStatus as 'all' | 'failed'
+      else statusFilter = btn.dataset.status as StatusFilter
       updateFilterContext()
-      clusterEl.querySelectorAll<HTMLButtonElement>('[data-status]').forEach((b) => setPillActive(b, false))
-      setPillActive(btn, true)
+      initFilterButtons()
       saveFilters()
       resetAndFetch()
     }
@@ -575,8 +606,7 @@ function attachHandlers() {
       const next = btn.dataset.time as TimeFilter
       if (next === timeFilter) return
       timeFilter = next
-      clusterEl.querySelectorAll<HTMLButtonElement>('[data-time]').forEach((b) => b.classList.remove('active'))
-      btn.classList.add('active')
+      initFilterButtons()
       saveFilters()
       resetAndFetch()
     }
@@ -662,8 +692,11 @@ export function initMainView() {
   // on its first visit of a session and never again.
   if (initialized) {
     startMainTimer()
-    if (organizationDirty) { organizationDirty = false; resetAndFetch() }
-    else { renderAll(); void refreshMainSoft() }
+    requestAnimationFrame(() => {
+      if (!mainVisible()) return
+      if (organizationDirty) { organizationDirty = false; resetAndFetch() }
+      else { paintSources(); void refreshMainSoft() }
+    })
     return
   }
   initialized = true
@@ -677,15 +710,14 @@ export function initMainView() {
   searchInput = document.getElementById('search-input') as HTMLInputElement
   countEl = document.getElementById('count') as HTMLSpanElement
 
-  const saved = loadFilters()
-  typeFilter = saved.type
-  statusFilter = saved.status
-  timeFilter = saved.time
+  loadFilters()
 
   updateFilterContext()
   mountOrganizationFilter(clusterEl)
   window.addEventListener('poise:organization-filter-changed', () => {
-    if (document.getElementById('view-main')!.hidden) organizationDirty = true
+    cancelPendingRetry()
+    sources.clear()
+    if (!mainVisible()) organizationDirty = true
     else resetAndFetch()
   })
   initFilterButtons()
@@ -696,117 +728,20 @@ export function initMainView() {
   sentinel.id = 'main-sentinel'
   table.parentElement!.appendChild(sentinel)
   observer = new IntersectionObserver((entries) => {
-    if (entries[0].isIntersecting && !done && !fetching && !document.getElementById('view-main')!.hidden) fetchPage()
+    if (entries[0].isIntersecting && !done && !document.getElementById('view-main')!.hidden) fetchPage()
   }, { rootMargin: '400px' })
   observer.observe(sentinel)
 
-  fetchPage()
+  resetAndFetch()
   startMainTimer()
 }
 
-// Background refresh at the user-chosen cadence (1m or 5m). Pulls page 1
-// only — the visible top of the table — and stitches it onto the tail of
-// what's already loaded so scroll position is preserved and the user
-// doesn't watch the table empty out and rebuild. Existing rows glide to
-// their new positions through the FLIP animator; new rows fade in;
-// expanded inline comments and other in-row state survive.
 async function refreshMainSoft() {
-  if (!initialized || fetching) return
-  // The guard was read here and never set, so a tick and a scroll-triggered
-  // page fetch could run at once and interleave their writes to `items`.
-  const mine = queryGeneration
-  fetching = true
-  try {
-    const win = timeWindow()
-    const payload: Record<string, unknown> = {
-      operation: typeFilter === 'action' ? 'actions' : 'list',
-    ...organizationPayload(),
-      record_type: typeFilter === 'both' ? 'all' : (typeFilter === 'pr' ? 'pull_request' : 'issue'),
-      record_state: statusFilter === 'failed' ? 'failed' : statusFilter === 'open' ? 'open' : 'all',
-      limit: typeFilter === 'action' ? Math.max(PAGE_SIZE, items.length) : PAGE_SIZE,
-      offset: 0,
-    }
-    if (win.since)   payload.updated_since = win.since
-    if (win.until)   payload.updated_until = win.until
-    if (searchQuery) payload.q = searchQuery
-
-    const countRead = fetch('/api/gh', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...payload, count_only: true, limit: undefined, offset: undefined }),
-    }).catch(() => null)
-    const pageRes = await fetch('/api/gh', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    // A bare `return` here left an HTTP failure of the background refresh
-    // silent, which is the case that most needs saying.
-    if (!pageRes.ok)  throw new Error(`Github ${pageRes.status}`)
-    if (mine !== queryGeneration) return
-    const pageData  = await pageRes.json()
-    if (mine !== queryGeneration) return
-    partialResults = true
-    const newTop: PrRow[] = (pageData.records as GhRecord[] || []).map(recordToRow)
-
-    // Stitch: the refreshed top, then every row already held that is not in
-    // it, in the order they were already in. The tail used to be taken from
-    // `items.slice(PAGE_SIZE)`, which threw away any row that had been inside
-    // the old top-20 but was pushed out of the new one — it vanished from the
-    // table, and paging could later fetch it again as a duplicate.
-    const newKeyset = new Set(newTop.map(rowKey))
-    const tail = typeFilter === 'action' ? [] : items.filter((i) => !newKeyset.has(rowKey(i)))
-    const next = [...newTop, ...tail]
-
-    total = next.length
-    items = next
-    offset = items.length
-    done = newTop.length < PAGE_SIZE
-    loader.hidden = done
-    if (next.length === 0) {
-      tbody.innerHTML = ''
-      table.hidden = true
-      empty.hidden = false
-    } else {
-      table.hidden = false
-      empty.hidden = true
-      applyMainFlip(next)
-    }
-    updateCount()
-    showLoadError(readMessages(pageData))
-    const countRes = await countRead
-    const countData = countRes?.ok ? await countRes.json().catch(() => ({})) : {}
-    if (mine !== queryGeneration) return
-    const countComplete = !!countRes?.ok && typeof countData.count === 'number' && !organizationErrors(countData)
-    partialResults = !countComplete || !!organizationErrors(pageData)
-    if (typeof countData.count === 'number') total = countData.count
-    done = countComplete ? items.length >= total : newTop.length < PAGE_SIZE
-    loader.hidden = done
-    updateCount()
-    showLoadError(readMessages(pageData) || readMessages(countData) || (!countComplete ? 'Total count unavailable. Showing available results.' : ''))
-    // Schedule after the count settles, when finally can release `fetching`.
-    // Scheduling before that await would run into the paging guard and lose
-    // the only nudge when a previously finished archive has gained new rows.
-    if (!done) {
-      requestAnimationFrame(() => {
-        if (mine === queryGeneration && !document.getElementById('view-main')!.hidden && sentinelNeedsFetch()) void fetchPage()
-      })
-    }
-  } catch (err) {
-    // A failing background refresh was completely invisible once the table had
-    // rows: it froze on the last good page while the relative times kept
-    // counting up, so a dead datastore read as a live one.
-    if (mine === queryGeneration) showLoadError(`Not updating — ${(err as Error).message}`)
-  } finally {
-    if (mine === queryGeneration) fetching = false
-  }
+  if (!initialized || !mainVisible()) return
+  await Promise.all(selectedSources().map(source => readSource(source, true)))
 }
 
-// Called by the idle timer at the user-chosen cadence (1m / 5m).
-// Soft-refreshes the visible top so the table updates feel like a
-// settling rather than a cold rebuild. Filter / search changes still go
-// through resetAndFetch (which clears + refetches) because the user
-// initiated the change and expects a hard reset.
+// Refresh the selected sources at the user-chosen cadence (1m / 5m).
 export function refreshMainView() {
   if (!initialized) return
   refreshMainSoft()

@@ -24,7 +24,7 @@ async function setup(page: Page, initial = [organization('acme')], me = 'octocat
     partial: false,
   }
   await page.clock.setFixedTime(new Date('2026-10-01T08:00:10Z'))
-  await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-filters-v2', JSON.stringify({ type: 'both', status: 'all', time: 'all' })); localStorage.setItem('poise-view', 'main') })
+  await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-filters-v2', JSON.stringify({ types: ['issue'], status: 'all', time: 'all' })); localStorage.setItem('poise-view', 'main') })
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com|github\.com)\//, (route) => route.abort())
   await page.route('**/api/**', async (route) => {
     const request = route.request()
@@ -220,6 +220,7 @@ for (const status of ['initializing', 'ready'] as const) {
 
 
 test('continues Archive pagination when an organization is missing only from the count', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 300 })
   await setup(page, [organization('acme'), organization('beta')])
   const records = Array.from({ length: 25 }, (_, i) => ({ ...record('acme'), number: i + 1, title: `Issue ${i + 1}`, url: `https://github.com/acme/same-repo/issues/${i + 1}` }))
   await page.route('**/api/gh', async (route) => {

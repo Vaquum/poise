@@ -1,4 +1,4 @@
-import { getMeta } from './db'
+import { getMeta, setMeta } from './db'
 import { listOrganizationsRepos, selectOrganizations, type OrganizationReadError } from './gh'
 import { HttpError } from './http'
 import { runFile } from './process'
@@ -24,13 +24,20 @@ interface Snapshot {
 }
 interface RepositoryRead extends Snapshot { etag?: string }
 interface Cached<T> { expires: number, read: Promise<T> }
+interface SnapshotCache extends Cached<Snapshot> { last?: Snapshot, pending: boolean, error?: string }
 interface RepositoryCache extends Cached<RepositoryRead> { last?: RepositoryRead }
 
 const TTL_MS = 5 * 60_000
 const ERROR_TTL_MS = 60_000
-const cache = new Map<string, Cached<Snapshot>>()
+const cache = new Map<string, SnapshotCache>()
 const repositoryCache = new Map<string, RepositoryCache>()
-export function invalidateActionRunCache(): void { cache.clear(); repositoryCache.clear() }
+export function invalidateActionRunCache(): void {
+  for (const [key, entry] of cache) {
+    if (entry.last) setMeta(`archive-actions:${key}`, JSON.stringify({ ...entry.last, expires: 0 }))
+  }
+  cache.clear()
+  repositoryCache.clear()
+}
 const credentialEnv = {
   GH_HOST: undefined, GH_TOKEN: undefined, GITHUB_TOKEN: undefined,
   GH_ENTERPRISE_TOKEN: undefined, GITHUB_ENTERPRISE_TOKEN: undefined,
@@ -99,7 +106,7 @@ async function readRepository(repo: string, token: string, failed: boolean, prev
   return { records, errors, warnings, etag: /^etag:\s*(.+)$/im.exec(headers)?.[1].trim() }
 }
 
-async function readSnapshot(me: string, org: string, failed: boolean): Promise<Snapshot> {
+async function readSnapshot(me: string, org: string, failed: boolean, progress: (snapshot: Snapshot) => void): Promise<Snapshot> {
   const discovery = await listOrganizationsRepos(org)
   if (!discovery.repos.length) return { records: [], errors: discovery.errors, warnings: [] }
   const token = (await runFile('gh', ['auth', 'token', '--hostname', 'github.com', '--user', me], {
@@ -139,6 +146,7 @@ async function readSnapshot(me: string, org: string, failed: boolean): Promise<S
         errors.push(...result.errors)
         warnings.push(...result.warnings)
         successfulReads++
+        progress({ records: [...records], errors: [...errors], warnings: [...warnings] })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         errors.push({ org: repo.split('/')[0], error: `${repo}: ${message.split(token).join('***')}` })
@@ -155,30 +163,56 @@ export async function listActionRuns(body: Record<string, unknown>): Promise<{ s
   const me = getMeta('me') || ''
   if (!me) throw new HttpError(400, 'Set your GitHub account in Settings → GitHub to read Actions')
   const failed = body.record_state !== 'all'
-  const results = await Promise.allSettled(orgs.map((org) => {
+  const entries = orgs.map((org) => {
     const key = `${me.toLowerCase()}:${org.login.toLowerCase()}:${failed}`
-    const existing = cache.get(key)
-    if (existing && existing.expires > Date.now()) return existing.read
-    // Pending reads never expire. Pages/counts share a snapshot, and a transient
-    // failure gets a one-minute backoff instead of poisoning the five-minute cache.
-    const read = readSnapshot(me, org.login, failed).then((result) => {
+    let existing = cache.get(key)
+    if (!existing) {
+      const saved = getMeta(`archive-actions:${key}`)
+      if (saved) {
+        const snapshot = JSON.parse(saved) as Snapshot
+        existing = { last: snapshot, expires: snapshot.expires ?? 0, pending: false, read: Promise.resolve(snapshot) }
+        cache.set(key, existing)
+      }
+    }
+    if (existing && existing.expires > Date.now()) return existing
+    const previous = existing?.last
+    const entry: SnapshotCache = { expires: Infinity, pending: true, last: previous, read: Promise.resolve({ records: [], errors: [], warnings: [] }) }
+    entry.read = readSnapshot(me, org.login, failed, (snapshot) => {
+      if (!previous) entry.last = snapshot
+    }).then((result) => {
       entry.expires = Math.min(Date.now() + (result.errors.length ? ERROR_TTL_MS : TTL_MS), result.expires ?? Infinity)
+      entry.pending = false
+      entry.last = result
+      if (cache.get(key) === entry) setMeta(`archive-actions:${key}`, JSON.stringify({ ...result, expires: entry.expires }))
       return result
-    }, (error: unknown) => {
+    }).catch((error: unknown) => {
       entry.expires = Date.now() + ERROR_TTL_MS
+      entry.pending = false
+      entry.error = error instanceof Error ? error.message : String(error)
       throw error
     })
-    const entry: Cached<Snapshot> = { expires: Infinity, read }
+    // Snapshot reads deliberately return before this background read settles.
+    void entry.read.catch(() => undefined)
     cache.set(key, entry)
-    return entry.read
-  }))
+    return entry
+  })
+  const results = body.snapshot === true
+    ? entries.map((entry): PromiseSettledResult<Snapshot> => {
+      if (entry.error) {
+        if (!entry.last) return { status: 'rejected', reason: new Error(entry.error) }
+        return { status: 'fulfilled', value: { records: entry.last.records, errors: [{ org: '', error: entry.error }], warnings: entry.last.warnings } }
+      }
+      return { status: 'fulfilled', value: entry.last ?? { records: [], errors: [], warnings: [] } }
+    })
+    : await Promise.allSettled(entries.map((entry) => entry.read))
+  const pending = entries.some((entry) => entry.pending)
   const errors: OrganizationReadError[] = []
   const warnings: string[] = []
   let records: ActionRun[] = []
   results.forEach((result, i) => {
     if (result.status === 'fulfilled') {
       records.push(...result.value.records)
-      errors.push(...result.value.errors)
+      errors.push(...result.value.errors.map((error) => ({ ...error, org: error.org || orgs[i].login })))
       warnings.push(...result.value.warnings)
     } else errors.push({ org: orgs[i].login, error: result.reason instanceof Error ? result.reason.message : String(result.reason) })
   })
@@ -191,5 +225,5 @@ export async function listActionRuns(body: Record<string, unknown>): Promise<{ s
   if (body.count_only) return { status: 200, body: { count: records.length, errors, warnings } }
   const offset = Math.max(0, Number(body.offset) || 0)
   const limit = Math.max(1, Number(body.limit) || 20)
-  return { status: 200, body: { records: records.slice(offset, offset + limit), errors, warnings } }
+  return { status: 200, body: { records: records.slice(offset, offset + limit), count: records.length, pending, errors, warnings } }
 }
