@@ -203,7 +203,7 @@ test('asks for a required choice instead of showing one as chosen', async ({ pag
   }
   const sent = await openEditor(page, [kinds], (body) => ({ results: body.destinations.map((d: any) => ({ repo: d.repo, section: d.section, ok: false, error: 'Not now.' })) }))
   const dialog = page.getByRole('dialog', { name: 'Publish' })
-  const kind = dialog.getByLabel('kind')
+  const kind = dialog.getByLabel('kind', { exact: true })
   await expect(kind).toHaveValue('')
   await expect(kind.locator('option:checked')).toHaveText('Choose…')
   await kind.selectOption('note')

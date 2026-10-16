@@ -663,7 +663,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     const after = await pullRequest(session, upstream.fullName, previous!.pullRequest.number)
     if (after.state === 'open') pr = previous!.pullRequest
     else {
-      const opened = await open(headRepo, branch, after.state === 'merged')
+      const opened = await open(headRepo, branch, after.state === 'merged' || previous!.landed !== undefined)
       pr = { number: opened.number, url: opened.url }
     }
   } else {

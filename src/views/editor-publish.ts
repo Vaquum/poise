@@ -131,7 +131,9 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
 
 function fieldHtml(key: string, field: FieldView, value: string | boolean): string {
   const name = escapeHtml(field.label ?? field.name)
-  const data = `data-field="${encode(key, field.name)}"`
+  // The label wraps the control; aria-label keeps its name to the field's
+  // name alone, without a select's options or a list's suggestions.
+  const data = `data-field="${encode(key, field.name)}" aria-label="${name}"`
   const required = field.required ? ' required' : ''
   const max = field.max && field.kind === 'text' ? ` maxlength="${field.max}"` : ''
   let control: string
