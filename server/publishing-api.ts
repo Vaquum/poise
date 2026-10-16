@@ -451,10 +451,9 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // A merged version stays on the site, and stays this document's, even when
   // a later pull request is closed unmerged. Worked out here, and written only
   // with a record this publication writes.
-  const landedOf = (record: PublishRecord): Landed | undefined => record.landed
-    ?? (states.get(placeKey(record.repo, record.section)) === 'merged'
-      ? { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url }
-      : undefined)
+  const landedOf = (record: PublishRecord): Landed | undefined => states.get(placeKey(record.repo, record.section)) === 'merged'
+    ? snapshotOf(record)
+    : record.landed
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
 
   const targets: Target[] = []
@@ -515,12 +514,13 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     return kept
   }
 
-  const published: Array<{ target: Target, record: PublishRecord, places: Place[] }> = []
+  const published: Array<{ target: Target, record: PublishRecord, places: Place[], state: Outcome['state'] }> = []
   for (const target of [...going]) {
     const places = placesFor(going)
     try {
-      const kept = await record(target, await publishTo(session, target, parts, places, todayValue, replace, doc.content))
-      published.push({ target, record: kept, places })
+      const outcome = await publishTo(session, target, parts, places, todayValue, replace, doc.content)
+      const kept = await record(target, outcome)
+      published.push({ target, record: kept, places, state: outcome.state })
     } catch (error) {
       if (!(error instanceof PublishValueError || error instanceof PublishConflictError || error instanceof PostFileError || error instanceof GitHubError || error instanceof HttpError)) throw error
       results.set(target.key, resultFor(target, {
@@ -536,10 +536,14 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // A site that failed after others were published is named in their files:
   // publish those again on their open pull requests, without it.
   const final = placesFor(going)
-  for (const { target, record: kept, places } of published) {
+  for (const { target, record: kept, places, state } of published) {
     if (!target.section.fields.some((f) => f.kind === 'places' || f.kind === 'canonical') || samePlaces(places, final)) continue
     try {
-      await record(target, await publishTo(session, { ...target, previous: kept, state: 'open', landed: kept.landed }, parts, final, todayValue, replace, doc.content))
+      // On its open pull request; a version already on the site gets an update of its own.
+      const again: Target = state === 'open'
+        ? { ...target, previous: kept, state: 'open', landed: kept.landed }
+        : { ...target, previous: kept, state: 'merged', landed: target.landed ?? snapshotOf(kept) }
+      await record(target, await publishTo(session, again, parts, final, todayValue, replace, doc.content))
     } catch (error) {
       if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError || error instanceof PostFileError)) throw error
       results.set(target.key, resultFor(target, {
@@ -548,6 +552,11 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     }
   }
   return { results: targets.map((target) => results.get(target.key)!) }
+}
+
+/** This document's side of a record's version, as it stands on the site once merged. */
+function snapshotOf(record: PublishRecord): Landed {
+  return { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url }
 }
 
 function samePlaces(a: Place[], b: Place[]): boolean {
@@ -564,8 +573,9 @@ function provisionalRecord(target: Target, filled: FilledPost): PublishRecord {
     slug: target.destination.slug, date: filled.date,
     pullRequest: { number: 999_999, url: `https://github.com/${target.ready.repo}/pull/999999` },
     publishedAt: at, updatedAt: at, sourceSha: digest, values: target.destination.values, data: filled.frontmatter, bodySha: digest,
-    // Kept by publishTo, so counted here.
-    ...(target.landed ? { landed: target.landed } : {}),
+    // Kept by publishTo, so counted here; an open pull request merged while
+    // its commit lands would add its own version.
+    ...(target.landed || (target.state === 'open' && target.previous) ? { landed: target.landed ?? snapshotOf(target.previous!) } : {}),
   }
 }
 
@@ -676,7 +686,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     if (after.state === 'open') pr = previous!.pullRequest
     else {
       // Merged meanwhile: what it held is on the site now, and this document's.
-      if (after.state === 'merged') kept = { data: previous!.data, bodySha: previous!.bodySha, pullRequest: previous!.pullRequest.number, url: previous!.url }
+      if (after.state === 'merged') kept = snapshotOf(previous!)
       const opened = await open(headRepo, branch, kept !== undefined)
       pr = { number: opened.number, url: opened.url }
     }

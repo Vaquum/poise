@@ -103,11 +103,16 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
   const published = (key: string) => doc.publications.find((p) => keyOf(p.repo, p.section) === key)
   const chosen = new Set(choices.filter((c) => published(c.key)).map((c) => c.key))
   if (!chosen.size && choices.length === 1) chosen.add(choices[0].key)
-  const first = doc.publications[0]
-  const firstChoice = first && choices.find((c) => c.key === keyOf(first.repo, first.section))
-  const remembered = (which: Shared) => {
-    const field = firstChoice && sharedField(firstChoice.section, which)
-    return field ? asText(first!.values[field]) : ''
+  // Each shared value from the first publication whose site has it: a site
+  // without a description says nothing about another's.
+  const remembered = (which: Shared): string => {
+    for (const publication of doc.publications) {
+      const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
+      const field = choice && sharedField(choice.section, which)
+      const value = field ? asText(publication.values[field]) : ''
+      if (value) return String(value)
+    }
+    return ''
   }
   const values = new Map<string, Record<string, string | boolean>>()
   const slugs = new Map<string, string>()
@@ -233,9 +238,9 @@ function render(): void {
   const chosen = s.choices.filter((c) => s.chosen.has(c.key))
   const uses = (which: Shared) => chosen.some((c) => sharedField(c.section, which))
   const shared = [
-    uses('title') ? `<label class="ep-field"><span class="ep-label">Title</span><input type="text" class="ep-input ep-title" data-key="shared-title" data-shared="title" value="${escapeHtml(s.shared.title)}" autocomplete="off" /></label>` : '',
-    uses('description') ? `<label class="ep-field"><span class="ep-label">Description</span><textarea class="ep-input" rows="2" data-key="shared-description" data-shared="description">${escapeHtml(s.shared.description)}</textarea></label>` : '',
-    uses('date') ? `<label class="ep-field"><span class="ep-label">Date</span><input type="date" class="ep-input" data-key="shared-date" data-shared="date" value="${escapeHtml(s.shared.date)}" /></label>` : '',
+    uses('title') ? `<label class="ep-field"><span class="ep-label">Title</span><input type="text" class="ep-input ep-title" data-key="shared-title" data-shared="title" aria-label="Title" value="${escapeHtml(s.shared.title)}" autocomplete="off" /></label>` : '',
+    uses('description') ? `<label class="ep-field"><span class="ep-label">Description</span><textarea class="ep-input" rows="2" data-key="shared-description" data-shared="description" aria-label="Description">${escapeHtml(s.shared.description)}</textarea></label>` : '',
+    uses('date') ? `<label class="ep-field"><span class="ep-label">Date</span><input type="date" class="ep-input" data-key="shared-date" data-shared="date" aria-label="Date" value="${escapeHtml(s.shared.date)}" /></label>` : '',
   ].join('')
   const destinations = chosen.map((c) => {
     const publication = livePublicationOf(c.key)
@@ -243,7 +248,7 @@ function render(): void {
     return `
       <div class="ep-dest" data-key="${escapeHtml(c.key)}-fields">
         ${chosen.length > 1 || ownFields(c.section).length ? `<div class="ep-dest-name">${escapeHtml(c.site.site ?? c.site.repo)}${sectionsOf(c.site.repo) > 1 ? ` · ${escapeHtml(c.section.name)}` : ''}</div>` : ''}
-        <label class="ep-field"><span class="ep-label">Slug</span><input type="text" class="ep-input ep-mono" data-slug="${escapeHtml(c.key)}" value="${escapeHtml(s.slugs.get(c.key) ?? '')}"${publication ? ' readonly title="Published under this slug"' : ''} autocomplete="off" spellcheck="false" /></label>
+        <label class="ep-field"><span class="ep-label">Slug</span><input type="text" class="ep-input ep-mono" data-slug="${escapeHtml(c.key)}" aria-label="Slug" value="${escapeHtml(s.slugs.get(c.key) ?? '')}"${publication ? ' readonly title="Published under this slug"' : ''} autocomplete="off" spellcheck="false" /></label>
         ${ownFields(c.section).map((f) => fieldHtml(c.key, f, own[f.name] ?? '')).join('')}
         ${resultHtml(s.results.get(c.key))}
       </div>`

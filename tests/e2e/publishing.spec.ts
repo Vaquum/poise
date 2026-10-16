@@ -227,3 +227,15 @@ test('lets the slug change where the earlier pull request was closed unmerged', 
   await expect(slug).toHaveValue('a-better-question-again')
   await expect(dialog.getByRole('button', { name: 'Publish', exact: true })).toBeVisible()
 })
+
+test('keeps each shared value from the publication that has it', async ({ page }) => {
+  await workspace(page)
+  // The journal, first, has no description or date; mikkokotila.com has both.
+  const journal = { ...publication(JOURNAL, 7, { title: 'A better question' }), publishedAt: '2026-10-01T08:00:00Z' }
+  const mikko = publication(MIKKO, 101, { type: 'essay', title: 'A better question', description: 'Kept as it was.', date: '2026-10-02' })
+  await openEditor(page, [MIKKO, JOURNAL], () => ({ results: [] }), [journal, mikko])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.getByLabel('Description', { exact: true })).toHaveValue('Kept as it was.')
+  await expect(dialog.getByLabel('Date', { exact: true })).toHaveValue('2026-10-02')
+  await expect(dialog.getByRole('button', { name: 'Update', exact: true })).toBeVisible()
+})

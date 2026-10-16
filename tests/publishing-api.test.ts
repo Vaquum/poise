@@ -715,6 +715,49 @@ describe('publishing a document', () => {
     expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
   })
 
+  it('reconciles with the latest merged version, so a reversion to an earlier one is published', async () => {
+    await publish([writing()])
+    merge('mikkokotila/mikkokotila-com', 101)
+    await writeDocument(DOC, TEXT.replace('More.', 'More, for a while.'))
+    expect((await publish([writing()])).body.results[0].publication.pullRequest.number).toBe(102)
+    merge('mikkokotila/mikkokotila-com', 102)
+    // Back to the first version.
+    await writeDocument(DOC, TEXT)
+    const reverted = (await publish([writing()])).body.results[0]
+    expect(reverted).toMatchObject({ ok: true, publication: { pullRequest: { number: 103 } } })
+    expect(reverted.unchanged).toBeUndefined()
+    const head = repos.get('mikkokotila/mikkokotila-com')!.pulls.get(103)!.head
+    expect(fileOn('mikkokotila/mikkokotila-com', head, POST)).not.toContain('for a while')
+  })
+
+  it('corrects a merged, unchanged copy on the site, not on its gone pull request branch', async () => {
+    for (const [repo, yaml] of [['acme/journal', JOURNAL_YAML], ['acme/dated', DATED_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const journal = { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }
+    expect((await publish([journal])).body.results[0].ok).toBe(true)
+    merge('acme/journal', 101)
+    repos.get('acme/journal')!.branches.delete('publish/a-better-question')
+    // The journal is the original and has this version; the new site fails.
+    failOn = (method, endpoint) => (method === 'POST' && endpoint === 'repos/acme/dated/git/refs' ? 500 : null)
+    const results = (await publish([journal, { repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date: '2026-10-17' } }])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([true, false])
+  })
+
+  it("counts what a merge during the commit would add to an open publication's record", async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    const note = (text: string) => ({ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: text } })
+    expect((await publish([note('x'.repeat(400_000))])).body.results[0].ok).toBe(true)
+    const before = calls.length
+    // Its open pull request could merge while the new 400,000 characters are committed.
+    expect((await publish([note('y'.repeat(400_000))])).status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
   it('says nothing changed when the site has this version already', async () => {
     await publish([writing()])
     const commitsBefore = calls.filter((call) => call.args[1] === 'graphql').length
