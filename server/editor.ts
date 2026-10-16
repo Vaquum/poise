@@ -466,13 +466,14 @@ export async function writeDoc(
 export async function deleteDoc(slug: string): Promise<{ ok: true }> {
   await editorReady
   const path = fileFor(slug)
-  // Take any side-cars with the doc — annotations and chat-session
-  // bookkeeping. All best-effort: ENOENT on a side-car is normal
-  // (most docs won't have annotations or an opened chat).
+  // Take any side-cars with the doc — annotations, chat-session and
+  // publishing bookkeeping. All best-effort: ENOENT on a side-car is
+  // normal (most docs won't have annotations, a chat or a publication).
   const annPath = annotationsFileFor(slug)
   const chatPath = chatSessionFileFor(slug)
+  const publishPath = publishLedgerFileFor(slug)
   await Promise.all(
-    [path, annPath, chatPath].map((target) => (
+    [path, annPath, chatPath, publishPath].map((target) => (
       serializeMutation(target, async () => {
         try { await unlink(target) }
         catch (err: any) { if (err.code !== 'ENOENT') throw err }
@@ -701,4 +702,81 @@ export async function getOrCreateChatSession(slug: string): Promise<ChatSessionF
 export function slugFromEditorSession(sessionId: string): string | null {
   const m = String(sessionId || '').match(/^editor-(.+)-\d+$/)
   return m && isCanonicalSlug(m[1]) ? m[1] : null
+}
+
+// ── Publishing ────────────────────────────────────────────────────────
+//
+// Where a document has been published (server/publishing-api.ts), one
+// record per site and section, kept as a fourth side-car:
+//   <slug>.publish.json  →  { records: [...] }
+// Publishing again finds the same pull request through it, and what was
+// published is what tells the site's own changes apart from the writer's.
+
+export const MAX_PUBLISH_LEDGER_BYTES = 1 * 1024 * 1024
+
+export interface PublishRecord {
+  repo: string                  // the site's repository
+  section: string
+  site: string                  // the site's name when published
+  headRepo: string              // where the branch is: the repository, or the writer's fork
+  branch: string
+  base: string                  // the branch the pull request goes to
+  path: string
+  url: string
+  slug: string
+  pullRequest: { number: number, url: string }
+  publishedAt: string           // first published there
+  updatedAt: string
+  sourceSha: string             // the document as it was published
+  values: Record<string, unknown>
+  data: Record<string, unknown> // the frontmatter as published
+  bodySha: string               // the text as published
+}
+
+export interface PublishLedger {
+  records: PublishRecord[]
+}
+
+function publishLedgerFileFor(slug: string): string {
+  return join(EDITOR_DIR, canonicalSlug(slug) + '.publish.json')
+}
+
+function isPublishRecord(value: unknown): value is PublishRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  const pr = record.pullRequest as Record<string, unknown> | undefined
+  return ['repo', 'section', 'site', 'headRepo', 'branch', 'base', 'path', 'url', 'slug', 'publishedAt', 'updatedAt', 'sourceSha', 'bodySha']
+    .every((key) => typeof record[key] === 'string')
+    && !!pr && Number.isSafeInteger(pr.number) && typeof pr.url === 'string'
+    && !!record.values && typeof record.values === 'object' && !Array.isArray(record.values)
+    && !!record.data && typeof record.data === 'object' && !Array.isArray(record.data)
+}
+
+export async function readPublishLedger(slug: string): Promise<PublishLedger> {
+  await editorReady
+  const path = publishLedgerFileFor(slug)
+  let raw: string
+  try {
+    raw = (await readUtf8Limited(path, MAX_PUBLISH_LEDGER_BYTES, 'publishing record')).content
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return { records: [] }
+    throw err
+  }
+  // A record that cannot be read is never taken for "not published": that
+  // would open a second pull request for a piece already on its way.
+  const parsed = JSON.parse(raw) as { records?: unknown }
+  if (!parsed || !Array.isArray(parsed.records) || !parsed.records.every(isPublishRecord)) {
+    throw new Error(`the publishing record beside ${canonicalSlug(slug)} is unreadable`)
+  }
+  return { records: parsed.records }
+}
+
+export async function writePublishLedger(slug: string, ledger: PublishLedger): Promise<void> {
+  const body = JSON.stringify({ records: ledger.records }, null, 2)
+  if (Buffer.byteLength(body, 'utf-8') > MAX_PUBLISH_LEDGER_BYTES) {
+    throw new Error(`publishing record too large (max ${MAX_PUBLISH_LEDGER_BYTES} bytes)`)
+  }
+  await editorReady
+  const path = publishLedgerFileFor(slug)
+  await serializeMutation(path, () => writeAtomic(path, body))
 }
