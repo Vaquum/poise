@@ -448,7 +448,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // a later pull request is closed unmerged.
   for (const record of ledger.records) {
     if (states.get(placeKey(record.repo, record.section)) === 'merged') {
-      record.landed = { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number }
+      record.landed = { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url }
     }
   }
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
@@ -470,9 +470,13 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // Every place the piece is published, the original first: where it is live
   // already, in the order it went there, then the sites it goes to now.
   const placesFor = (going: Target[]): Place[] => {
+    // A later update closed unmerged changed nothing on the site: name what landed there.
     const places: Place[] = [...live]
       .sort((a, b) => a.publishedAt.localeCompare(b.publishedAt))
-      .map((r) => ({ key: placeKey(r.repo, r.section), site: r.site, url: r.url }))
+      .map((r) => {
+        const key = placeKey(r.repo, r.section)
+        return { key, site: r.site, url: states.get(key) === 'closed' && r.landed ? r.landed.url : r.url }
+      })
     for (const target of going) {
       const { destination, section, ready } = target
       const place = { key: target.key, site: ready.config.site, url: placeUrl(section, destination.slug, postDate(section, destination.values, todayValue, target.previous?.date)) }
@@ -556,6 +560,8 @@ function provisionalRecord(target: Target, filled: FilledPost): PublishRecord {
     slug: target.destination.slug, date: filled.date,
     pullRequest: { number: 999_999, url: `https://github.com/${target.ready.repo}/pull/999999` },
     publishedAt: at, updatedAt: at, sourceSha: digest, values: target.destination.values, data: filled.frontmatter, bodySha: digest,
+    // Kept by publishTo, so counted here.
+    ...(target.previous?.landed ? { landed: target.previous.landed } : {}),
   }
 }
 

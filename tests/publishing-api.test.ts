@@ -651,6 +651,36 @@ describe('publishing a document', () => {
     expect((await editor!.readPublishLedger(DOC)).records[0].url).toMatch(/^https:\/\/journal\.example\.org\//)
   })
 
+  it("counts the merged version a record keeps when it checks the record's size", async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    const note = (text: string) => ({ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: text } })
+    expect((await publish([note('x'.repeat(300_000))])).body.results[0].ok).toBe(true)
+    merge('acme/notes', 101)
+    const before = calls.length
+    // 400,000 characters as values and as frontmatter, and the 300,000 that landed, pass 1 MB together.
+    expect((await publish([note('y'.repeat(400_000))])).status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
+  it('names the address that landed, not a later update closed unmerged', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = (date: string) => ({ repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date } })
+    expect((await publish([dated('2026-10-17')])).body.results[0].ok).toBe(true)
+    merge('acme/dated', 101)
+    await writeDocument(DOC, `${TEXT}\nAnother thought.\n`)
+    expect((await publish([dated('2027-01-05')])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    close('acme/dated', 102)
+    expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
+  })
+
   it('says nothing changed when the site has this version already', async () => {
     await publish([writing()])
     const commitsBefore = calls.filter((call) => call.args[1] === 'graphql').length
