@@ -5,7 +5,6 @@
 .ep-panel {
   position: fixed;
   z-index: 60;
-  max-height: 72vh;
   overflow-y: auto;
   background: var(--surface);
   border: 1px solid var(--border);

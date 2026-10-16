@@ -133,7 +133,10 @@ test('the Editor publishes to two sites at once and shows both pull requests', a
   await expect(dialog.getByLabel('Slug').first()).toHaveValue('a-better-question-asked')
   await dialog.getByLabel('Description').fill('One or two sentences.')
   await dialog.getByRole('button', { name: 'ad-fraud' }).click()
-  await expect(dialog.getByLabel('tags')).toHaveValue('ad-fraud')
+  await expect(dialog.getByLabel('Tags', { exact: true })).toHaveValue('ad-fraud')
+  // The panel sits wholly below the app's bar.
+  const bar = await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-bar-h')) || 0)
+  expect((await dialog.boundingBox())!.y).toBeGreaterThanOrEqual(bar)
   await page.screenshot({ path: info.outputPath('editor-publish.png') })
 
   await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
@@ -186,7 +189,7 @@ test('keeps what is typed for a site whose section name has a | in it', async ({
   const sent = await openEditor(page, [pipes], (body) => ({ results: body.destinations.map((d: any) => ({ repo: d.repo, section: d.section, ok: false, error: 'Not now.' })) }))
   const dialog = page.getByRole('dialog', { name: 'Publish' })
   await expect(dialog.getByLabel('Pipes')).toBeChecked()
-  await dialog.getByLabel('subtitle').fill('Kept as typed')
+  await dialog.getByLabel('Subtitle', { exact: true }).fill('Kept as typed')
   await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
   await expect(dialog.getByRole('alert')).toContainText('Not now.')
   expect(sent[0].destinations[0]).toMatchObject({ section: 'Notes | Essays', values: { title: 'A better question', subtitle: 'Kept as typed' } })
@@ -203,7 +206,7 @@ test('asks for a required choice instead of showing one as chosen', async ({ pag
   }
   const sent = await openEditor(page, [kinds], (body) => ({ results: body.destinations.map((d: any) => ({ repo: d.repo, section: d.section, ok: false, error: 'Not now.' })) }))
   const dialog = page.getByRole('dialog', { name: 'Publish' })
-  const kind = dialog.getByLabel('kind', { exact: true })
+  const kind = dialog.getByLabel('Kind', { exact: true })
   await expect(kind).toHaveValue('')
   await expect(kind.locator('option:checked')).toHaveText('Choose…')
   await kind.selectOption('note')

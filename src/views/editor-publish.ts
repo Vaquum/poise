@@ -129,8 +129,15 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
 
 /* ---------------------------------------------------------------- rendering */
 
+/** A field's own name read as a label: canonical_url reads Canonical url. */
+function labelOf(field: FieldView): string {
+  if (field.label) return field.label
+  const words = field.name.replace(/[_-]+/g, ' ').trim()
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
+
 function fieldHtml(key: string, field: FieldView, value: string | boolean): string {
-  const name = escapeHtml(field.label ?? field.name)
+  const name = escapeHtml(labelOf(field))
   // The label wraps the control; aria-label keeps its name to the field's
   // name alone, without a select's options or a list's suggestions.
   const data = `data-field="${encode(key, field.name)}" aria-label="${name}"`
@@ -352,9 +359,13 @@ function place(): void {
   if (!panel || !anchorEl) return
   const rect = anchorEl.getBoundingClientRect()
   const width = Math.min(380, window.innerWidth - 16)
+  // Below the app's bar, as the Editor's composers sit, never under it.
+  const bar = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-bar-h')) || 0
+  const top = Math.max(rect.bottom + 6, bar + 8)
   panel.style.width = `${width}px`
   panel.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`
-  panel.style.top = `${rect.bottom + 6}px`
+  panel.style.top = `${top}px`
+  panel.style.maxHeight = `${Math.max(160, window.innerHeight - top - 16)}px`
 }
 
 function onOutside(event: MouseEvent): void {
