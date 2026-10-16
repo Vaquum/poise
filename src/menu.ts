@@ -11,6 +11,7 @@ const ICON_TYPO  = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
 const ICON_ANALYTICS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 12h10M3.5 10V7M7 10V3M10.5 10V5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
 const ICON_MODELS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 3.5h10M2 7h10M2 10.5h10" stroke="currentColor" stroke-width="1.3"/><circle cx="5" cy="3.5" r="1.5" fill="var(--surface)" stroke="currentColor" stroke-width="1.3"/><circle cx="9" cy="7" r="1.5" fill="var(--surface)" stroke="currentColor" stroke-width="1.3"/><circle cx="5" cy="10.5" r="1.5" fill="var(--surface)" stroke="currentColor" stroke-width="1.3"/></svg>'
 const ICON_ACCOUNTS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="4" r="2.3" stroke="currentColor" stroke-width="1.3"/><path d="M2 12c0-2.8 2-4.5 5-4.5s5 1.7 5 4.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
+const ICON_PUBLISHING = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 9V2.5M4.25 5.25 7 2.5l2.75 2.75M2.5 9.5v2h9v-2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 const ICON_SETTINGS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M7 1v1.8M7 11.2V13M1 7h1.8M11.2 7H13M2.76 2.76l1.27 1.27M9.97 9.97l1.27 1.27M2.76 11.24l1.27-1.27M9.97 4.03l1.27-1.27" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
 const ICON_BURGER = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 5h10M3 8h10M3 11h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
 const ICON_CLOSE = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
@@ -108,6 +109,9 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     </button>
     <button type="button" class="menu-item" data-action="settings" data-settings="accounts">
       <span class="menu-icon">${ICON_ACCOUNTS}</span><span class="menu-text">Accounts</span>
+    </button>
+    <button type="button" class="menu-item" data-action="settings" data-settings="publishing">
+      <span class="menu-icon">${ICON_PUBLISHING}</span><span class="menu-text">Publishing</span>
     </button>
     <button type="button" class="menu-item" data-action="typography">
       <span class="menu-icon">${ICON_TYPO}</span><span class="menu-text">Typography</span>
