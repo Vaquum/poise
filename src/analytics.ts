@@ -1,15 +1,13 @@
 import { patchContent } from './dom-patch'
-// Analytics — a side panel of headline numbers, opened from the burger menu.
-// It offers Current's time ranges and opens on the one Current shows; picking
-// another here leaves Current as it is. The numbers come from /api/analytics
-// (server/analytics.ts) for the selected account.
-
+// Daily analytics, independently of Current's filters.
 import { analyticsGroups, type AnalyticsReport } from './analytics-format'
+import { analyticsDay } from './analytics-day'
 import { organizationErrors, organizationUrl } from './organizations'
-import { TIME_RANGES, currentViewTimeRange, timeRangeWindow, type TimeRange } from './time-range'
 
 let panelEl: HTMLElement | null = null
-let range: TimeRange = 'all'
+let dayOffset = 0
+let dayAnchor = new Date()
+let midnightTimer: ReturnType<typeof setTimeout> | undefined
 // Each read is numbered so a slow answer for an earlier range or account
 // never replaces the one for what is selected now.
 let readGeneration = 0
@@ -23,29 +21,23 @@ function buildPanel(): HTMLElement {
   panel.id = 'analytics-panel'
   panel.setAttribute('aria-label', 'Analytics')
   panel.innerHTML = `
-    <div class="tp-header"><span class="tp-title" data-help="Counts the work shown in Current. Per-PR numbers cover pull requests merged in the selected range." tabindex="0">Analytics</span></div>
+    <div class="tp-header"><span class="tp-title" data-help="Counts your work on the selected day. Per-PR numbers cover pull requests merged that day." tabindex="0">Analytics</span></div>
     <div class="tp-body">
-      <div class="range-picker analytics-range" role="group" aria-label="Time range">
-        ${TIME_RANGES.map((r) => `<button type="button" data-range="${r.key}">${r.label}</button>`).join('')}
-      </div>
+      <nav class="analytics-day" aria-label="Analytics day">
+        <button type="button" class="analytics-day-step" data-day="-1" aria-label="Previous day">←</button>
+        <span class="analytics-date" aria-live="polite"></span>
+        <button type="button" class="analytics-day-step" data-day="1" aria-label="Next day">→</button>
+      </nav>
       <p class="analytics-status st-help" role="status" hidden></p>
       <div class="analytics-groups" aria-live="polite"></div>
     </div>`
-  panel.querySelector('.analytics-range')!.addEventListener('click', (e) => {
-    const button = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-range]')
-    if (!button || button.dataset.range === range) return
-    range = button.dataset.range as TimeRange
+  panel.querySelector('.analytics-day')!.addEventListener('click', (e) => {
+    const button = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-day]')
+    if (!button || button.disabled) return
+    dayOffset += Number(button.dataset.day)
     void readAnalytics()
   })
   return panel
-}
-
-function showRange(panel: HTMLElement): void {
-  panel.querySelectorAll<HTMLButtonElement>('[data-range]').forEach((button) => {
-    const active = button.dataset.range === range
-    button.classList.toggle('active', active)
-    button.setAttribute('aria-pressed', String(active))
-  })
 }
 
 function showStatus(panel: HTMLElement, message: string, isError = false): void {
@@ -55,8 +47,8 @@ function showStatus(panel: HTMLElement, message: string, isError = false): void 
   status.classList.toggle('st-help-error', isError)
 }
 
-function renderReport(panel: HTMLElement, report: AnalyticsReport): void {
-  patchContent(panel.querySelector('.analytics-groups')!, analyticsGroups(report).map((group) => `
+function renderReport(panel: HTMLElement, report: AnalyticsReport, baseline: AnalyticsReport): void {
+  patchContent(panel.querySelector('.analytics-groups')!, analyticsGroups(report, baseline).map((group) => `
     <section class="analytics-group">
       <h3 class="tp-group-label">${escapeHtml(group.label)}</h3>
       <dl class="analytics-tiles">
@@ -64,6 +56,8 @@ function renderReport(panel: HTMLElement, report: AnalyticsReport): void {
           <div class="analytics-tile">
             <dt class="analytics-label"${tile.note ? ` data-help="${escapeHtml(tile.note)}" tabindex="0"` : ''}>${escapeHtml(tile.label)}</dt>
             <dd class="analytics-value">${escapeHtml(tile.value)}</dd>
+            ${tile.trend ? `<dd class="analytics-trend ${tile.trend.direction}"><span role="img" aria-label="${escapeHtml(tile.trend.description)}">${escapeHtml(tile.trend.text)}</span><span class="analytics-trend-caption" aria-hidden="true">${escapeHtml(tile.trend.caption)}</span></dd>` : ''}
+            ${tile.comparison ? `<dd class="analytics-note">${escapeHtml(tile.comparison)}</dd>` : ''}
           </div>`).join('')}
       </dl>
       ${group.note ? `<p class="analytics-group-note">${escapeHtml(group.note)}</p>` : ''}
@@ -75,24 +69,29 @@ async function readAnalytics(): Promise<void> {
   if (!panel) return
   const generation = ++readGeneration
   const groups = panel.querySelector<HTMLElement>('.analytics-groups')!
-  showRange(panel)
+  const day = analyticsDay(dayOffset, dayAnchor)
+  panel.querySelector('.analytics-date')!.textContent = day.label
+  panel.querySelector<HTMLButtonElement>('[data-day="1"]')!.disabled = day.isToday
   // With numbers on screen, dimming them says enough: a line above them
   // would push the panel down and back up on every switch.
   if (!groups.childElementCount) showStatus(panel, 'Reading…')
   groups.classList.add('is-stale')
   groups.setAttribute('aria-busy', 'true')
-  const bounds = timeRangeWindow(range)
-  const query = new URLSearchParams()
-  if (bounds.since) query.set('since', bounds.since)
-  if (bounds.until) query.set('until', bounds.until)
-  const path = query.toString() ? `/api/analytics?${query}` : '/api/analytics'
-  try {
-    const res = await fetch(organizationUrl(path))
+  const read = async (since: string, until: string): Promise<AnalyticsReport> => {
+    const query = new URLSearchParams({ since, until })
+    const res = await fetch(organizationUrl(`/api/analytics?${query}`))
     const data = await res.json().catch(() => null)
-    if (generation !== readGeneration) return
     if (!res.ok || !data) throw new Error(data?.error || `Analytics could not be read (HTTP ${res.status})`)
-    renderReport(panel, data as AnalyticsReport)
-    showStatus(panel, organizationErrors(data))
+    return data as AnalyticsReport
+  }
+  try {
+    const [data, baseline] = await Promise.all([
+      read(day.since, day.until),
+      read(day.baselineSince, day.since),
+    ])
+    if (generation !== readGeneration) return
+    renderReport(panel, data, baseline)
+    showStatus(panel, [organizationErrors(data), organizationErrors(baseline)].filter(Boolean).filter((error, i, all) => all.indexOf(error) === i).join('; '))
   } catch (error) {
     if (generation !== readGeneration) return
     // Numbers from the last range under the next range's name would be wrong.
@@ -129,10 +128,21 @@ export function initAnalytics(): void {
   window.addEventListener('poise:organization-filter-changed', onOrganizationChanged)
 }
 
+function scheduleMidnightRead(): void {
+  clearTimeout(midnightTimer)
+  const delay = Date.parse(analyticsDay(0).until) - Date.now()
+  midnightTimer = setTimeout(() => {
+    void readAnalytics()
+    scheduleMidnightRead()
+  }, delay + 10)
+}
+
 export function openAnalyticsPanel(): void {
   if (!panelEl) return
   window.dispatchEvent(new CustomEvent('poise:panel-opening', { detail: { id: panelEl.id } }))
-  range = currentViewTimeRange()
+  dayOffset = 0
+  dayAnchor = new Date()
+  scheduleMidnightRead()
   panelEl.removeAttribute('inert')
   panelEl.removeAttribute('aria-hidden')
   panelEl.classList.add('open')
@@ -144,6 +154,7 @@ export function closeAnalyticsPanel(): void {
   if (!panelEl) return
   if (panelEl.contains(document.activeElement)) (document.activeElement as HTMLElement | null)?.blur()
   readGeneration++
+  clearTimeout(midnightTimer)
   panelEl.classList.remove('open')
   markPanelClosed(panelEl)
   document.removeEventListener('keydown', onAnalyticsKeydown)

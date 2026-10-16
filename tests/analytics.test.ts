@@ -105,6 +105,7 @@ describe('the numbers', () => {
     expect(report.pullRequests.merged).toBe(3)
     expect(report.pullRequests.commentsPerPr).toBe(2)
     expect(report.pullRequests.lines).toEqual({ total: 610, median: 100, counted: 3 })
+    expect(report.pullRequests.medianTimeToMergeMs).toBe(4 * HOUR)
     // 2h, 5 days and 4h, averaged.
     expect(report.pullRequests.averageTimeToMergeMs).toBe((2 * HOUR + 120 * HOUR + 4 * HOUR) / 3)
   })
@@ -126,6 +127,14 @@ describe('the numbers', () => {
     })
     expect(report.pullRequests.merged).toBe(6)
     expect(report.pullRequests.lines).toEqual({ total: 170, median: 30, counted: 4 })
+  })
+
+  it('takes the midpoint of the two central merge durations', () => {
+    const report = computeAnalytics({ window: WEEK, issues: [], behaviors: [], prs: [
+      pr(1, '2026-10-05T00:00:00Z', '2026-10-05T02:00:00Z'),
+      pr(2, '2026-10-05T00:00:00Z', '2026-10-05T06:00:00Z'),
+    ] })
+    expect(report.pullRequests.medianTimeToMergeMs).toBe(4 * HOUR)
   })
 
   it('says a size nobody read is unknown rather than zero', () => {
@@ -172,6 +181,7 @@ describe('the numbers', () => {
         lines: { total: null, median: null, counted: 0 },
         behaviors: { perPr: null, approvals: 0, reviews: 0, changesRequested: 0 },
         averageTimeToMergeMs: null,
+        medianTimeToMergeMs: null,
       },
       errors: [],
     })

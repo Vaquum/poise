@@ -1,11 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import type { AnalyticsReport } from '../../src/analytics-format'
 
-// The Analytics panel (src/analytics.ts): opened from the burger menu on the
-// range Current shows, switching ranges, the account filter, an error, and
-// closing it. Poise's API is stood in for.
-
-function report(merged: number): AnalyticsReport {
+function report(merged: number, hours = 27): AnalyticsReport {
   return {
     window: { since: null, until: null },
     issues: { opened: 12, closed: 9 },
@@ -14,21 +10,22 @@ function report(merged: number): AnalyticsReport {
       commentsPerPr: merged ? 3.25 : null,
       lines: { total: merged ? 4210 : null, median: merged ? 180 : null, counted: merged ? merged - 1 : 0 },
       behaviors: { perPr: merged ? 2 : null, approvals: merged, reviews: merged, changesRequested: 0 },
-      averageTimeToMergeMs: merged ? 27 * 3_600_000 : null,
+      averageTimeToMergeMs: merged ? hours * 3_600_000 : null,
+      medianTimeToMergeMs: merged ? 6 * 3_600_000 : null,
     },
     errors: [],
   }
 }
 
 interface Workspace {
-  /** Each /api/analytics read: its since, until and org. */
   reads: Array<{ since: string | null, until: string | null, org: string | null }>
   fail: boolean
+  baselineHours: number
+  baselineMerged: number
 }
 
-async function workspace(page: Page): Promise<Workspace> {
-  const state: Workspace = { reads: [], fail: false }
-  // A Friday: the week began on Monday the 5th, in UTC as Settings says.
+async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
+  const state: Workspace = { reads: [], fail: false, baselineHours: 54, baselineMerged: 8 }
   await page.clock.setFixedTime(new Date('2026-10-09T12:00:00Z'))
   await page.addInitScript(() => {
     if (sessionStorage.getItem('seeded')) return
@@ -45,12 +42,10 @@ async function workspace(page: Page): Promise<Workspace> {
       const read = { since: url.searchParams.get('since'), until: url.searchParams.get('until'), org: url.searchParams.get('org') }
       state.reads.push(read)
       if (state.fail) return route.fulfill({ status: 502, json: { error: 'acme: datastore offline' } })
-      // The week has merged pull requests, the other ranges none.
-      return route.fulfill({ json: report(read.since === '2026-10-05T00:00:00.000Z' ? 4 : 0) })
+      const baseline = Date.parse(read.until!) - Date.parse(read.since!) > 2 * 86_400_000
+      return route.fulfill({ json: baseline ? report(state.baselineMerged, state.baselineHours) : report(read.since === '2026-10-08T00:00:00.000Z' ? 0 : 4) })
     }
-    if (url.pathname === '/api/settings') {
-      return route.fulfill({ json: { org: 'acme', me: 'octocat', timezone: 'UTC', organizations, models: {} } })
-    }
+    if (url.pathname === '/api/settings') return route.fulfill({ json: { org: 'acme', me: 'octocat', timezone, organizations, models: {} } })
     if (url.pathname === '/api/organizations') return route.fulfill({ json: { organizations } })
     if (url.pathname === '/api/gh') return route.fulfill({ json: { records: [], count: 0, errors: [] } })
     if (url.pathname === '/api/current') return route.fulfill({ json: { cards: [] } })
@@ -69,19 +64,23 @@ async function openAnalytics(page: Page) {
   await expect(page.locator('#analytics-panel')).toHaveClass(/open/)
 }
 
+function mergeTrend(page: Page) {
+  return page.locator('.analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: /^Time to merge$/ }) }).locator('.analytics-trend')
+}
+
 function value(page: Page, label: string) {
   return page.locator('#analytics-panel .analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: new RegExp(`^${label}$`) }) }).locator('.analytics-value')
 }
 
-test('opens on Current\'s range and reads another range without changing Current', async ({ page }) => {
+test('opens Today with a seven-day comparison and navigates days without changing Current', async ({ page }, info) => {
   const state = await workspace(page)
   await page.goto('/')
   await expect(page.locator('#current-time-picker [data-time="week"]')).toHaveClass(/active/)
   await expect(page.locator('#analytics-panel')).toHaveAttribute('inert', '')
-
   await openAnalytics(page)
   const panel = page.locator('#analytics-panel')
-  await expect(panel.getByRole('button', { name: 'This week' })).toHaveAttribute('aria-pressed', 'true')
+  await expect(panel.locator('.analytics-date')).toHaveText('Today')
+  await expect(panel.getByRole('button', { name: 'Next day' })).toBeDisabled()
   await expect(value(page, 'Opened')).toHaveText('12')
   await expect(value(page, 'Closed')).toHaveText('9')
   await expect(value(page, 'Merged')).toHaveText('4')
@@ -90,40 +89,82 @@ test('opens on Current\'s range and reads another range without changing Current
   await expect(value(page, 'Comments')).toHaveText('3.3')
   await expect(value(page, 'Median lines')).toHaveText('180')
   await expect(value(page, 'Behaviors')).toHaveText('2.0')
-  await expect(panel.locator('.analytics-label').filter({ hasText: /^Behaviors$/ })).toHaveAttribute('data-help', '4 approvals · 4 reviews · 0 change requests')
+  await expect(value(page, 'Median time')).toHaveText('6h')
+  await expect(panel.locator('.analytics-group').last().locator('.analytics-label').nth(3)).toHaveText('Median time')
+  await expect(mergeTrend(page)).toHaveClass(/good/)
+  await expect(mergeTrend(page)).toContainText('↓ 50%')
+  await expect(mergeTrend(page).getByRole('img')).toHaveAccessibleName('50% faster versus the preceding 7-day average')
+  await expect(panel).toContainText('7-day rolling average: 2d 6h · 8 PRs')
   await expect(panel).toContainText('From 3 of 4 pull requests')
-  expect(state.reads).toEqual([{ since: '2026-10-05T00:00:00.000Z', until: null, org: null }])
-
-  await panel.getByRole('button', { name: 'Yesterday' }).click()
-  await expect(panel.getByRole('button', { name: 'Yesterday' })).toHaveAttribute('aria-pressed', 'true')
-  await expect(value(page, 'Merged')).toHaveText('0')
-  await expect(panel).toContainText('No pull requests were merged in this range.')
-  await expect(value(page, 'Comments')).toHaveText('—')
-  await panel.getByRole('button', { name: 'Today' }).click()
-  await expect(panel.getByRole('button', { name: 'Today' })).toHaveAttribute('aria-pressed', 'true')
-  await panel.getByRole('button', { name: 'Any time' }).click()
-  await expect(panel.getByRole('button', { name: 'Any time' })).toHaveAttribute('aria-pressed', 'true')
-  await expect.poll(() => state.reads.slice(1)).toEqual([
-    { since: '2026-10-08T00:00:00.000Z', until: '2026-10-09T00:00:00.000Z', org: null },
-    { since: '2026-10-09T00:00:00.000Z', until: null, org: null },
-    { since: null, until: null, org: null },
+  await expect(panel.locator('.analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: /^Opened$/ }) }).locator('.analytics-trend')).toContainText('↑ 600%')
+  await expect(panel).toContainText('7-day daily average: 1.7')
+  await page.screenshot({ path: info.outputPath('analytics-day-trend.png') })
+  expect(state.reads).toEqual([
+    { since: '2026-10-09T00:00:00.000Z', until: '2026-10-10T00:00:00.000Z', org: null },
+    { since: '2026-10-02T00:00:00.000Z', until: '2026-10-09T00:00:00.000Z', org: null },
   ])
 
-  // Current keeps its own range.
+  await panel.getByRole('button', { name: 'Previous day' }).click()
+  await expect(panel.locator('.analytics-date')).toHaveText('Yesterday')
+  await expect(panel.getByRole('button', { name: 'Next day' })).toBeEnabled()
+  await expect(value(page, 'Merged')).toHaveText('0')
+  await expect(value(page, 'Median time')).toHaveText('—')
+  await expect(mergeTrend(page)).toHaveCount(0)
+  await expect(panel).toContainText('No pull requests were merged in this range.')
+  await panel.getByRole('button', { name: 'Previous day' }).click()
+  await expect(panel.locator('.analytics-date')).toHaveText('7 Oct 2026')
+  await expect.poll(() => state.reads.slice(2)).toEqual([
+    { since: '2026-10-08T00:00:00.000Z', until: '2026-10-09T00:00:00.000Z', org: null },
+    { since: '2026-10-01T00:00:00.000Z', until: '2026-10-08T00:00:00.000Z', org: null },
+    { since: '2026-10-07T00:00:00.000Z', until: '2026-10-08T00:00:00.000Z', org: null },
+    { since: '2026-09-30T00:00:00.000Z', until: '2026-10-07T00:00:00.000Z', org: null },
+  ])
+  await panel.getByRole('button', { name: 'Next day' }).click()
+  await panel.getByRole('button', { name: 'Next day' }).click()
+  await expect(panel.locator('.analytics-date')).toHaveText('Today')
+  await expect(panel.getByRole('button', { name: 'Next day' })).toBeDisabled()
   await expect(page.locator('#current-time-picker [data-time="week"]')).toHaveClass(/active/)
-
   await page.keyboard.press('Escape')
   await expect(panel).not.toHaveClass(/open/)
   await expect(panel).toHaveAttribute('inert', '')
 })
 
-test('reads the selected account again when the account filter changes', async ({ page }) => {
+test('reads both periods for the selected account and shows slower merges in red', async ({ page }) => {
   const state = await workspace(page)
   await page.goto('/')
   await openAnalytics(page)
   await expect(value(page, 'Merged')).toHaveText('4')
+  state.baselineHours = 9
   await page.locator('#current-filters').getByLabel('Account filter').selectOption('beta')
-  await expect.poll(() => state.reads.at(-1)).toEqual({ since: '2026-10-05T00:00:00.000Z', until: null, org: 'beta' })
+  await expect.poll(() => state.reads.slice(-2)).toEqual([
+    { since: '2026-10-09T00:00:00.000Z', until: '2026-10-10T00:00:00.000Z', org: 'beta' },
+    { since: '2026-10-02T00:00:00.000Z', until: '2026-10-09T00:00:00.000Z', org: 'beta' },
+  ])
+  await expect(mergeTrend(page)).toHaveClass(/bad/)
+  await expect(mergeTrend(page)).toContainText('↑ 200%')
+  await expect(mergeTrend(page).getByRole('img')).toHaveAccessibleName('200% slower versus the preceding 7-day average')
+})
+
+test('names an empty baseline instead of inventing a trend', async ({ page }) => {
+  const state = await workspace(page)
+  state.baselineMerged = 0
+  await page.goto('/')
+  await openAnalytics(page)
+  await expect(value(page, 'Time to merge')).toHaveText('1d 3h')
+  await expect(mergeTrend(page)).toHaveCount(0)
+  await expect(page.locator('#analytics-panel')).toContainText('7-day rolling average: — · 0 PRs · No baseline')
+})
+
+test('uses configured timezone boundaries across DST', async ({ page }) => {
+  const state = await workspace(page, 'Europe/Helsinki')
+  await page.clock.setFixedTime(new Date('2026-10-25T12:00:00Z'))
+  await page.goto('/')
+  await openAnalytics(page)
+  await expect(value(page, 'Merged')).toHaveText('4')
+  expect(state.reads).toEqual([
+    { since: '2026-10-24T21:00:00.000Z', until: '2026-10-25T22:00:00.000Z', org: null },
+    { since: '2026-10-17T21:00:00.000Z', until: '2026-10-24T21:00:00.000Z', org: null },
+  ])
 })
 
 test('says when the numbers could not be read instead of showing old ones', async ({ page }) => {
@@ -132,10 +173,50 @@ test('says when the numbers could not be read instead of showing old ones', asyn
   await openAnalytics(page)
   await expect(value(page, 'Merged')).toHaveText('4')
   state.fail = true
-  await page.locator('#analytics-panel').getByRole('button', { name: 'Today' }).click()
+  await page.locator('#analytics-panel').getByRole('button', { name: 'Previous day' }).click()
   await expect(page.locator('#analytics-panel .analytics-status')).toHaveText('acme: datastore offline')
   await expect(page.locator('#analytics-panel .analytics-tile')).toHaveCount(0)
-  // The burger closes the panel, as it closes Settings and Typography.
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
   await expect(page.locator('#analytics-panel')).not.toHaveClass(/open/)
+})
+
+test('a slow old date cannot overwrite the latest date or its trend', async ({ page }) => {
+  await workspace(page)
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/analytics?**', async route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('since') === '2026-10-08T00:00:00.000Z' && url.searchParams.get('until') === '2026-10-09T00:00:00.000Z') {
+      await held
+      await route.fulfill({ json: report(99) })
+    } else await route.fallback()
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  await expect(value(page, 'Merged')).toHaveText('4')
+  const panel = page.locator('#analytics-panel')
+  await panel.getByRole('button', { name: 'Previous day' }).click()
+  await panel.getByRole('button', { name: 'Previous day' }).click()
+  await expect(panel.locator('.analytics-date')).toHaveText('7 Oct 2026')
+  await expect(value(page, 'Merged')).toHaveText('4')
+  const response = page.waitForResponse(res => new URL(res.url()).searchParams.get('since') === '2026-10-08T00:00:00.000Z')
+  release()
+  await response
+  await expect(panel.locator('.analytics-groups')).not.toHaveAttribute('aria-busy', 'true')
+  await expect(value(page, 'Merged')).toHaveText('4')
+  await expect(mergeTrend(page)).toContainText('↓ 50%')
+})
+
+test('retains the selected calendar date when navigating across midnight', async ({ page }) => {
+  const state = await workspace(page)
+  await page.goto('/')
+  await openAnalytics(page)
+  const panel = page.locator('#analytics-panel')
+  await panel.getByRole('button', { name: 'Previous day' }).click()
+  await panel.getByRole('button', { name: 'Previous day' }).click()
+  await expect(panel.locator('.analytics-date')).toHaveText('7 Oct 2026')
+  await page.clock.setFixedTime(new Date('2026-10-10T00:01:00Z'))
+  await panel.getByRole('button', { name: 'Previous day' }).click()
+  await expect(panel.locator('.analytics-date')).toHaveText('6 Oct 2026')
+  await expect.poll(() => state.reads.at(-2)?.since).toBe('2026-10-06T00:00:00.000Z')
 })

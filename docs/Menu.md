@@ -19,8 +19,8 @@ a workspace terminal. Publishing lists the websites the Editor publishes to
 
 Explanations appear after half a second over the relevant label, heading,
 value or action, and on keyboard focus. Errors, account state, incomplete
-Analytics coverage and pairing instructions remain visible. Analytics ranges
-use two rows so their labels fit, including at larger text sizes.
+Analytics coverage and pairing instructions remain visible. Analytics uses
+a previous-day/date/next-day navigator; future navigation is disabled.
 
 The frame follows the burger across views and viewport sizes. Reduced-motion
 preferences remove its animations. Existing account, pairing and admin links

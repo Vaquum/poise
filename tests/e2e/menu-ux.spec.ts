@@ -132,7 +132,7 @@ for (const theme of ['light', 'dark']) test(`fits every destination at a narrow 
     await page.locator('#menu-popover').getByRole('button', { name: section, exact: true }).click()
     const panel = page.locator('#menu-surface .menu-panel.open')
     await expect(panel.locator('.tp-close')).toHaveCount(0)
-    if (section === 'Analytics') await expect(panel.locator('.analytics-tile')).toHaveCount(8)
+    if (section === 'Analytics') await expect(panel.locator('.analytics-tile')).toHaveCount(9)
     if (section === 'Accounts') await expect(panel.locator('.st-account')).toHaveCount(2)
     await attached(page)
     const sizes = await panel.evaluate((element) => ({ width: element.clientWidth, scroll: element.scrollWidth }))
@@ -141,7 +141,7 @@ for (const theme of ['light', 'dark']) test(`fits every destination at a narrow 
     const overflow = await body.evaluate((element) => element.scrollWidth - element.clientWidth)
     expect(overflow).toBeLessThanOrEqual(1)
     if (section === 'Analytics') {
-      const buttons = await panel.locator('[data-range]').evaluateAll((items) => items.map((item) => item.scrollWidth - item.clientWidth))
+      const buttons = await panel.locator('[data-day]').evaluateAll((items) => items.map((item) => item.scrollWidth - item.clientWidth))
       expect(Math.max(...buttons)).toBeLessThanOrEqual(1)
     }
     await settled(page)
