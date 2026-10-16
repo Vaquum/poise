@@ -46,6 +46,8 @@ export interface PublicationView {
   publishedAt: string
   updatedAt: string
   pullRequest: { number: number, url: string, state: 'open' | 'closed' | 'merged' | 'unknown' }
+  /** Still this document's there, so its slug holds: open, merged, or merged before. */
+  live: boolean
   changed: boolean
   problem?: string
 }

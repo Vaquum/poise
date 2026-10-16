@@ -115,8 +115,10 @@ what is wrong.
 - While the pull request is open, publishing again commits to its branch. If
   it is merged or closed meanwhile, that commit gets a pull request of its own.
 - Once it is merged, an update gets a pull request of its own, `Update: <title>`.
-- A pull request closed unmerged left nothing on the site; the next publish is
-  a first one again, and until then no other site names it.
+- A pull request closed unmerged left nothing new on the site. A version
+  merged before it stays the document's, and the next publish updates it;
+  with none, the next publish is a first one again, and until then no other
+  site names it.
 - Changes made on the site (a field, or the text) are kept, at every later
   publication. The same field, or the text, changed both on the site and in
   the document is refused and named; Replace with mine publishes the

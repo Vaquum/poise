@@ -603,11 +603,52 @@ describe('publishing a document', () => {
     await writeDocument(DOC, `${TEXT}\nAnother thought.\n`)
     // The copy goes first, naming the original's new address; the original then fails.
     let commitsSeen = 0
-    failOn = (method, endpoint) => (endpoint === 'graphql' && ++commitsSeen === 2 ? 500 : null)
+    failOn = (_method, endpoint) => (endpoint === 'graphql' && ++commitsSeen === 2 ? 500 : null)
     const results = (await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }, dated('2027-01-05')])).body.results
     expect(results.map((r: any) => r.ok)).toEqual([true, false])
     const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
     expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
+  })
+
+  it("keeps the merged version this document's after a later update is closed unmerged", async () => {
+    await publish([writing()])
+    merge('mikkokotila/mikkokotila-com', 101)
+    await writeDocument(DOC, `${TEXT}\nA second thought.\n`)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    close('mikkokotila/mikkokotila-com', 102)
+    const view = (await request(`/api/editor/doc/${DOC}/publishing`)).body.publications[0]
+    expect(view).toMatchObject({ live: true, pullRequest: { number: 102, state: 'closed' } })
+    await writeDocument(DOC, `${TEXT}\nA third thought.\n`)
+    const again = await publish([writing()])
+    expect(again.body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 103 } } })
+    expect(repos.get('mikkokotila/mikkokotila-com')!.pulls.get(103)).toMatchObject({ title: 'Update: A better question' })
+    expect(fileOn('mikkokotila/mikkokotila-com', repos.get('mikkokotila/mikkokotila-com')!.pulls.get(103)!.head, POST)).toContain('A third thought.')
+  })
+
+  it('refuses a publication whose record could pass 1 MB if a site failed', async () => {
+    for (const [repo, site] of [['acme/notes', 'Notes'], ['acme/more', 'More notes']]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: NOTES_YAML.replace('site: Notes', `site: ${site}`) })
+    }
+    const note = (repo: string, text: string) => ({ repo, section: 'Notes', slug: 'a-better-question', values: { note: text } })
+    expect((await publish([note('acme/notes', 'x'.repeat(400_000))])).body.results[0].ok).toBe(true)
+    const before = calls.length
+    // Shrinking first, then a large new record: it fits only if the shrinking succeeds.
+    expect((await publish([note('acme/notes', 'short'), note('acme/more', 'y'.repeat(400_000))])).status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
+  it("takes a site's new address even when the file is unchanged", async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const journal = { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }
+    expect((await publish([journal])).body.results[0].ok).toBe(true)
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML.replace('journal.example', 'journal.example.org') })
+    const again = (await publish([journal])).body.results[0]
+    expect(again).toMatchObject({ ok: true, unchanged: true, publication: { url: expect.stringMatching(/^https:\/\/journal\.example\.org\//) } })
+    expect((await editor!.readPublishLedger(DOC)).records[0].url).toMatch(/^https:\/\/journal\.example\.org\//)
   })
 
   it('says nothing changed when the site has this version already', async () => {

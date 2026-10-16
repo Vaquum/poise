@@ -85,10 +85,10 @@ function publicationOf(key: string): PublicationView | undefined {
   return state?.doc.publications.find((p) => keyOf(p.repo, p.section) === key)
 }
 
-/** A publication still on its way or on the site: one closed unmerged holds no slug. */
+/** A publication still on its way or on the site: one only ever closed unmerged holds no slug. */
 function livePublicationOf(key: string): PublicationView | undefined {
   const publication = publicationOf(key)
-  return publication && publication.pullRequest.state !== 'closed' ? publication : undefined
+  return publication?.live ? publication : undefined
 }
 
 function asText(value: unknown): string | boolean {

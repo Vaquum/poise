@@ -732,6 +732,9 @@ export interface PublishRecord {
   values: Record<string, unknown>
   data: Record<string, unknown> // the frontmatter this document gave it
   bodySha: string               // the text this document gave it
+  /** This document's side of the version last merged there: still the
+   *  site's file, and still this document's, whatever came after it. */
+  landed?: { data: Record<string, unknown>, bodySha: string, pullRequest: number }
 }
 
 export interface PublishLedger {
@@ -751,6 +754,14 @@ function isPublishRecord(value: unknown): value is PublishRecord {
     && !!pr && Number.isSafeInteger(pr.number) && typeof pr.url === 'string'
     && !!record.values && typeof record.values === 'object' && !Array.isArray(record.values)
     && !!record.data && typeof record.data === 'object' && !Array.isArray(record.data)
+    && (record.landed === undefined || isLanded(record.landed))
+}
+
+function isLanded(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const landed = value as Record<string, unknown>
+  return !!landed.data && typeof landed.data === 'object' && !Array.isArray(landed.data)
+    && typeof landed.bodySha === 'string' && Number.isSafeInteger(landed.pullRequest)
 }
 
 export async function readPublishLedger(slug: string): Promise<PublishLedger> {

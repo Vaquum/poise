@@ -29,7 +29,7 @@ function publication(site: typeof MIKKO | typeof JOURNAL, number: number, values
   return {
     repo: site.repo, section: site.sections[0].name, site: site.site, slug: 'a-better-question', path: 'a-better-question.md',
     url: site.sections[0].url.replace('{slug}', 'a-better-question'), values, publishedAt: '2026-10-17T08:00:00Z', updatedAt: '2026-10-17T08:00:00Z',
-    pullRequest: { number, url: `https://github.com/${site.repo}/pull/${number}`, state: 'open' }, changed: false,
+    pullRequest: { number, url: `https://github.com/${site.repo}/pull/${number}`, state: 'open' }, live: true, changed: false,
   }
 }
 
@@ -102,7 +102,7 @@ test('Settings → Publishing lists each site with its state, adds, describes an
 
   await rows.nth(1).getByRole('button', { name: 'Describe' }).click()
   const description = rows.nth(1).getByLabel('publish.yaml for acme/journal')
-  await expect(description).toHaveValue(/^version: 1\nsite: journal\n/)
+  await expect(description).toHaveValue(/^version: 1\nsite: "journal"\n/)
   await page.screenshot({ path: info.outputPath('settings-publishing.png') })
   await rows.nth(1).getByRole('button', { name: 'Save' }).click()
   await expect(rows.nth(1).locator('.pb-site-state')).toHaveText('Ready · described here')
@@ -214,7 +214,7 @@ test('asks for a required choice instead of showing one as chosen', async ({ pag
 
 test('lets the slug change where the earlier pull request was closed unmerged', async ({ page }) => {
   await workspace(page)
-  const closed = { ...publication(MIKKO, 101, { type: 'essay' }), pullRequest: { number: 101, url: 'https://github.com/mikkokotila/mikkokotila-com/pull/101', state: 'closed' } }
+  const closed = { ...publication(MIKKO, 101, { type: 'essay' }), pullRequest: { number: 101, url: 'https://github.com/mikkokotila/mikkokotila-com/pull/101', state: 'closed' }, live: false }
   await openEditor(page, [MIKKO], () => ({ results: [] }), [closed])
   const dialog = page.getByRole('dialog', { name: 'Publish' })
   await expect(dialog.locator('.ep-pr')).toHaveText('#101 closed')
