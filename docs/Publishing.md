@@ -96,7 +96,10 @@ The Publish icon in the Editor bar opens the panel for the open document:
   you type one, and stays as it was once the piece is published there;
 - one button: Publish, or Update when every chosen site has the piece.
 
-Publishing saves the document first. For each site, Poise builds the file
+Publishing saves the document first. Every site's values are checked before
+anything is written, and a site whose values are refused, or that then fails,
+is named on no other site: a file already published that named it is
+published again without it. For each site, Poise builds the file
 (YAML frontmatter, then the text), creates a branch `publish/<slug>` from the
 site's branch, commits the file with GitHub's GraphQL `createCommitOnBranch`,
 and opens a pull request. Everything is done as your own GitHub account,
@@ -107,10 +110,11 @@ what is wrong.
 
 ### Publishing again
 
-- While the pull request is open, publishing again commits to its branch.
+- While the pull request is open, publishing again commits to its branch. If
+  it is merged or closed meanwhile, that commit gets a pull request of its own.
 - Once it is merged, an update gets a pull request of its own, `Update: <title>`.
 - A pull request closed unmerged left nothing on the site; the next publish is
-  a first one again.
+  a first one again, and until then no other site names it.
 - Changes made on the site (a field, or the text) are kept, at every later
   publication. The same field, or the text, changed both on the site and in
   the document is refused and named; Replace with mine publishes the
@@ -129,6 +133,11 @@ published. Deleting the document deletes it; the pull requests stay.
 
 - Images are not published yet: the Editor holds none.
 - Only sites in GitHub repositories.
-- Up to ten sites at once.
+- Up to ten sites at once, and a document's record of where it is published
+  stays under 1 MB: a publication that would pass it is refused before
+  anything is written.
+- One publication at a time across the Poise processes sharing an Editor
+  folder. None starts while Poise installs an update, and an update waits
+  for one in progress.
 - A site's patterns are checked with a time limit of 50 ms, since a
   description comes from a repository.

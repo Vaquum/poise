@@ -781,3 +781,21 @@ export async function writePublishLedger(slug: string, ledger: PublishLedger): P
   const path = publishLedgerFileFor(slug)
   await serializeMutation(path, () => writeAtomic(path, body))
 }
+
+const PUBLISH_LOCK_PATH = join(EDITOR_DIR, '.poise-publish-lock.sqlite3')
+const PUBLISH_LOCK_TIMEOUT_MS = 30_000
+
+/**
+ * One publication at a time across every Poise process sharing this Editor
+ * folder: each reads a document's record, publishes, and writes it back, so
+ * two at once would each write over the other's pull requests.
+ */
+export async function withPublishLock<T>(operation: () => Promise<T>, timeoutMs = PUBLISH_LOCK_TIMEOUT_MS): Promise<T> {
+  await editorReady
+  return withProcessLock({
+    path: PUBLISH_LOCK_PATH,
+    timeoutMs,
+    unavailableMessage: 'the publishing lock is unavailable',
+    timeoutMessage: 'Another Poise is publishing from this Editor folder; try again once it has finished.',
+  }, operation)
+}

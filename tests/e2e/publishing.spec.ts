@@ -173,3 +173,21 @@ test('with no sites, the panel points to Settings → Publishing', async ({ page
   await page.getByRole('dialog', { name: 'Publish' }).getByRole('button', { name: 'Add one in Settings → Publishing' }).click()
   await expect(page.locator('#settings-panel .tp-title')).toHaveText('Publishing')
 })
+
+test('keeps what is typed for a site whose section name has a | in it', async ({ page }) => {
+  await workspace(page)
+  const pipes = {
+    repo: 'acme/pipes', state: 'ready', source: 'settings', site: 'Pipes', description: 'version: 1\n',
+    sections: [{ name: 'Notes | Essays', url: 'https://pipes.example/{slug}/', firstLine: 'title', fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'subtitle', kind: 'text', required: false },
+    ] }],
+  }
+  const sent = await openEditor(page, [pipes], (body) => ({ results: body.destinations.map((d: any) => ({ repo: d.repo, section: d.section, ok: false, error: 'Not now.' })) }))
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.getByLabel('Pipes')).toBeChecked()
+  await dialog.getByLabel('subtitle').fill('Kept as typed')
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0]).toMatchObject({ section: 'Notes | Essays', values: { title: 'A better question', subtitle: 'Kept as typed' } })
+})

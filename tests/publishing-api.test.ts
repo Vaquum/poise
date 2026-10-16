@@ -22,6 +22,10 @@ let commits: Map<string, Map<string, string>>
 let commitCount = 0
 let calls: Array<{ args: string[], env: NodeJS.ProcessEnv | undefined, input: any }>
 let ghFailure: string | null
+/** An HTTP status to answer a request with instead, by method and endpoint. */
+let failOn: ((method: string, endpoint: string) => number | null) | null
+/** Runs once, just before the next commit is applied: a merge, or a look at what holds meanwhile. */
+let beforeCommit: (() => Promise<void> | void) | null
 
 function commit(files: Map<string, string>): string {
   const sha = (++commitCount).toString(16).padStart(40, '0')
@@ -47,6 +51,10 @@ function editOnSite(fullName: string, branch: string, path: string, edit: (text:
   const files = new Map(commits.get(repo.branches.get(branch)!)!)
   files.set(path, edit(files.get(path)!))
   repo.branches.set(branch, commit(files))
+}
+
+function close(fullName: string, number: number): void {
+  Object.assign(repos.get(fullName.toLowerCase())!.pulls.get(number)!, { state: 'closed', merged: false })
 }
 
 function merge(fullName: string, number: number): void {
@@ -80,7 +88,14 @@ async function gh(command: string, args: string[], options: RunFileOptions = {})
   calls.push({ args, env: options.env, input })
   if (ghFailure) throw Object.assign(new Error('Command failed (1): gh'), { code: 1, stdout: '', stderr: ghFailure })
   const [endpoint, method] = [args[1], args[args.indexOf('--method') + 1]]
+  const failure = failOn?.(method, endpoint)
+  if (failure) return answer(failure, { message: 'Server Error' })
   if (endpoint === 'graphql') {
+    if (beforeCommit) {
+      const hook = beforeCommit
+      beforeCommit = null
+      await hook()
+    }
     const change = input.variables.input
     const repo = repos.get(change.branch.repositoryNameWithOwner.toLowerCase())!
     const head = repo.branches.get(change.branch.branchName)
@@ -166,6 +181,18 @@ sections:
       title: { kind: text, required: true }
       canonical_url: { kind: canonical }
 `
+// A site with a long text field and no limit of its own.
+const NOTES_YAML = `version: 1
+site: Notes
+sections:
+  - name: Notes
+    path: notes/{slug}.md
+    slug: "^[a-z0-9-]+$"
+    first_line: title
+    fields:
+      title: { kind: text, required: true }
+      note: { kind: text, lines: many }
+`
 const WRITING_YAML = 'topics:\n  - tag: machine-intelligence\n  - tag: ad-fraud\n'
 const POST = 'src/content/writing/a-better-question.md'
 
@@ -174,6 +201,7 @@ let server: Server | undefined
 let base = ''
 let database: typeof import('../server/db') | undefined
 let editor: typeof import('../server/editor') | undefined
+let release: typeof import('../server/release-background') | undefined
 const envKeys = ['POISE_DB', 'POISE_EDITOR_DIR']
 const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
 
@@ -208,6 +236,8 @@ beforeEach(async () => {
   commits = new Map()
   calls = []
   ghFailure = null
+  failOn = null
+  beforeCommit = null
   addRepo('mikkokotila/mikkokotila-com', { 'publish.yaml': MIKKO_YAML, 'content/writing.yaml': WRITING_YAML })
   mocks.runFile.mockReset().mockImplementation(gh)
   vi.resetModules()
@@ -216,6 +246,7 @@ beforeEach(async () => {
   database.setMeta('agentAccount', 'octo-agent')
   database.setMeta('timezone', 'Europe/Helsinki')
   editor = await import('../server/editor')
+  release = await import('../server/release-background')
   const { handlePublishingApi } = await import('../server/publishing-api')
   server = createServer((req, res) => {
     void handlePublishingApi(req, res, req.url!).then((handled) => {
@@ -294,6 +325,14 @@ describe('Settings → Publishing', () => {
 
     expect((await request('/api/publishing/sites/acme/broken', 'DELETE')).body).toEqual({ ok: true })
     expect((await request('/api/publishing/sites')).body.sites.map((s: any) => s.repo)).toEqual(['acme/journal'])
+  })
+
+  it('keeps both sites when two are added at once', async () => {
+    addRepo('acme/one', { 'publish.yaml': MIKKO_YAML })
+    addRepo('acme/two', { 'publish.yaml': MIKKO_YAML })
+    const added = await Promise.all(['acme/one', 'acme/two'].map((repo) => request('/api/publishing/sites', 'POST', { repo })))
+    expect(added.map((a) => a.status)).toEqual([200, 200])
+    expect((await request('/api/publishing/sites')).body.sites.map((s: any) => s.repo).sort()).toEqual(['acme/one', 'acme/two'])
   })
 
   it('asks for your GitHub account before reading any site', async () => {
@@ -429,6 +468,86 @@ describe('publishing a document', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('treats a pull request closed unmerged as no publication, and never takes over a file someone added since', async () => {
+    await publish([writing()])
+    close('mikkokotila/mikkokotila-com', 101)
+    expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.publications[0].pullRequest.state).toBe('closed')
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    const files = new Map(commits.get(repo.branches.get('main')!)!)
+    files.set(POST, 'Someone else\'s piece.\n')
+    repo.branches.set('main', commit(files))
+    const refused = await publish([writing()], true)
+    expect(refused.body.results[0]).toMatchObject({ ok: false, error: `${POST} is already in mikkokotila/mikkokotila-com, and this document did not publish it. Choose another slug.` })
+    expect(fileOn('mikkokotila/mikkokotila-com', 'main', POST)).toBe('Someone else\'s piece.\n')
+  })
+
+  it('names no site whose values are refused, or whose publication is closed unmerged', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const journal = { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }
+    // The original's values are refused: the copy names no original.
+    const results = (await publish([writing({ type: 'poem' }), journal])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([false, true])
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('title: "A better question"')
+    expect(copy).not.toContain('canonical_url')
+
+    // A publication closed unmerged is named nowhere.
+    close('acme/journal', 101)
+    expect((await publish([writing()])).body.results[0].ok).toBe(true)
+    expect(fileOn('mikkokotila/mikkokotila-com', 'publish/a-better-question', POST)).not.toContain('Other Journal')
+  })
+
+  it('publishes again, without it, a file that named a site which then failed', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    failOn = (method, endpoint) => (method === 'POST' && endpoint === 'repos/acme/journal/git/refs' ? 500 : null)
+    const results = (await publish([writing(), { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([true, false])
+    expect(fileOn('mikkokotila/mikkokotila-com', 'publish/a-better-question', POST)).not.toContain('Other Journal')
+    expect(calls.filter((call) => call.args[1] === 'graphql')).toHaveLength(2)
+    expect(repos.get('mikkokotila/mikkokotila-com')!.pulls.size).toBe(1)
+  })
+
+  it('admits no publication while Poise installs an update, and counts one in progress', async () => {
+    release!.pauseReleaseBackground()
+    expect(await publish([writing()])).toEqual({ status: 503, body: { error: 'Poise is installing an update; nothing was published.' } })
+    release!.resumeReleaseBackground()
+    let busy = -1
+    let lock = ''
+    beforeCommit = async () => {
+      busy = release!.releaseBackgroundBusy()
+      // Another Poise sharing this Editor folder waits for the lock.
+      lock = await editor!.withPublishLock(async () => 'free', 50).catch((error: Error) => error.message)
+    }
+    expect((await publish([writing()])).body.results[0].ok).toBe(true)
+    expect(busy).toBe(1)
+    expect(lock).toBe('Another Poise is publishing from this Editor folder; try again once it has finished.')
+    expect(release!.releaseBackgroundBusy()).toBe(0)
+  })
+
+  it('opens a pull request of its own when the open one is merged while committing', async () => {
+    await publish([writing()])
+    await writeDocument(DOC, `${TEXT}\nA late thought.\n`)
+    beforeCommit = () => merge('mikkokotila/mikkokotila-com', 101)
+    const again = await publish([writing()])
+    expect(again.body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102, state: 'open' } } })
+    expect(repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)).toMatchObject({ title: 'Update: A better question', head: 'publish/a-better-question', base: 'main', state: 'open' })
+    expect((await editor!.readPublishLedger(DOC)).records[0].pullRequest.number).toBe(102)
+  })
+
+  it('refuses before anything is written when the record would grow past 1 MB', async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    const before = calls.length
+    const refused = await publish([{ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: 'x'.repeat(600_000) } }])
+    expect(refused).toEqual({ status: 413, body: { error: 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.' } })
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
   })
 
   it('says nothing changed when the site has this version already', async () => {

@@ -4,9 +4,10 @@
 // was published as, and where, is a side-car beside it (server/editor.ts).
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { getMeta, setMeta } from './db'
-import { readDoc, readPublishLedger, writePublishLedger, type PublishRecord } from './editor'
+import { db, getMeta, setMeta } from './db'
+import { MAX_PUBLISH_LEDGER_BYTES, readDoc, readPublishLedger, withPublishLock, writePublishLedger, type PublishRecord } from './editor'
 import { HttpError, readJson } from './http'
+import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
 import {
   PUBLISH_FILE,
   PublishConfigError,
@@ -23,8 +24,10 @@ import {
   slugFromTitle,
   suggestionsFrom,
   today,
+  type DocumentParts,
   type FieldKind,
   type FieldValue,
+  type FilledPost,
   type Place,
   type PostFile,
   type PublishConfig,
@@ -43,6 +46,7 @@ import {
   repository,
   signIn,
   type GitHubSession,
+  type PullRequestInfo,
   type RepositoryInfo,
 } from './publishing-github'
 
@@ -72,6 +76,11 @@ function storedSites(): StoredSite[] {
 
 function saveSites(sites: StoredSite[]): void {
   setMeta(SITES_KEY, JSON.stringify(sites))
+}
+
+/** Read and write the sites in one transaction: two changes at once both keep. */
+function updateSites(change: (sites: StoredSite[]) => StoredSite[]): void {
+  db.transaction(() => saveSites(change(storedSites()))).immediate()
 }
 
 function findSite(repo: string): StoredSite {
@@ -238,14 +247,18 @@ async function addSite(value: unknown): Promise<{ site: SiteView }> {
   const session = await signIn(getMeta('me') || '')
   const info = await repository(session, name)
   const site: StoredSite = { repo: info.fullName }
-  saveSites([...stored, site])
+  // Read again after GitHub's answer: another add may have finished meanwhile.
+  updateSites((sites) => {
+    if (sites.some((s) => [name, info.fullName].some((n) => s.repo.toLowerCase() === n.toLowerCase()))) throw new HttpError(409, `${info.fullName} is already one of your sites.`)
+    return [...sites, site]
+  })
   forgetSites()
   return { site: (await cachedSite(session, site)).view }
 }
 
 function removeSite(repo: string): { ok: true } {
   const site = findSite(repo)
-  saveSites(storedSites().filter((s) => s.repo !== site.repo))
+  updateSites((sites) => sites.filter((s) => s.repo !== site.repo))
   forgetSites()
   return { ok: true }
 }
@@ -257,7 +270,10 @@ async function describeSite(repo: string, value: unknown): Promise<{ site: SiteV
   // Kept only when it reads: the box keeps the text, and the error, until then.
   if (description !== undefined) parsePublishConfig(description)
   const next: StoredSite = { repo: site.repo, ...(description !== undefined ? { description } : {}) }
-  saveSites(storedSites().map((s) => (s.repo === site.repo ? next : s)))
+  updateSites((sites) => {
+    if (!sites.some((s) => s.repo === site.repo)) throw new HttpError(404, `${repo} is not one of your publishing sites.`)
+    return sites.map((s) => (s.repo === site.repo ? next : s))
+  })
   forgetSites()
   const session = await signIn(getMeta('me') || '')
   return { site: (await cachedSite(session, next)).view }
@@ -358,12 +374,27 @@ interface Target {
   destination: Destination
   ready: ReadySite
   section: PublishSection
-  previous?: PublishRecord
   key: string
+  /** Its live publication there: a pull request open or merged. */
+  previous?: PublishRecord
+  /** That pull request's state; new when there is none. */
+  state: 'new' | 'open' | 'merged'
 }
 
 function placeKey(repo: string, section: string): string {
   return `${repo.toLowerCase()}#${section}`
+}
+
+function resultFor(target: Target, fields: Partial<PublishResult>): PublishResult {
+  return { repo: target.destination.repo, section: target.destination.section, ok: false, ...fields }
+}
+
+function viewOf(record: PublishRecord, state: PublicationView['pullRequest']['state']): PublicationView {
+  return {
+    repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
+    values: record.values, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
+    pullRequest: { ...record.pullRequest, state }, changed: false,
+  }
 }
 
 const publishing = new Set<string>()
@@ -371,68 +402,158 @@ const publishing = new Set<string>()
 async function publishDocument(slug: string, body: unknown): Promise<{ results: PublishResult[] }> {
   const destinations = destinationsFrom(body)
   const replace = (body as { replace?: unknown }).replace === true
+  // A drain admits no new publication: a restart between opening a pull
+  // request and recording it would leave the pull request unknown here.
+  if (releaseBackgroundPaused()) throw new HttpError(503, 'Poise is installing an update; nothing was published.')
   if (publishing.has(slug)) throw new HttpError(409, 'This document is being published already.')
   publishing.add(slug)
+  const finished = trackReleaseBackground()
   try {
-    const session = await signIn(getMeta('me') || '')
-    const doc = await readDoc(slug)
-    const parts = documentParts(doc.content)
-    if (!parts.whole) throw new HttpError(400, 'The document is empty.')
-    const ledger = await readPublishLedger(slug)
-    const todayValue = today(timeZone())
+    return await withPublishLock(() => publishLocked(slug, destinations, replace))
+  } finally {
+    finished()
+    publishing.delete(slug)
+  }
+}
 
-    const targets: Target[] = []
-    for (const destination of destinations) {
-      const read = await readSite(session, findSite(destination.repo))
-      if (!read.ready) throw new HttpError(read.view.state === 'unavailable' ? 502 : 409, `${destination.repo}: ${read.view.problem}`)
-      const section = read.ready.config.sections.find((s) => s.name === destination.section)
-      if (!section) throw new HttpError(400, `${read.ready.config.site} has no section ${destination.section}.`)
-      const key = placeKey(read.ready.repo, section.name)
-      const previous = ledger.records.find((r) => placeKey(r.repo, r.section) === key)
-      targets.push({ destination, ready: read.ready, section, previous, key })
-    }
+function fillFor(target: Target, parts: DocumentParts, places: Place[], todayValue: string): FilledPost {
+  const { destination, section, previous } = target
+  const self = places.find((p) => p.key === target.key)!
+  const filled = fillPost(section, destination.slug, destination.values, { title: parts.title, today: todayValue, date: previous?.date, places, self })
+  if (previous && previous.path !== filled.path) {
+    throw new PublishValueError([`This piece is published on ${previous.site} as ${previous.path}; publish it with slug ${previous.slug} and its date unchanged.`])
+  }
+  return filled
+}
 
-    // Every place the piece is published, the original first: where it went
-    // before, in the order it went there, then where it goes now.
-    const places: Place[] = [...ledger.records]
+async function publishLocked(slug: string, destinations: Destination[], replace: boolean): Promise<{ results: PublishResult[] }> {
+  const session = await signIn(getMeta('me') || '')
+  const doc = await readDoc(slug)
+  const parts = documentParts(doc.content)
+  if (!parts.whole) throw new HttpError(400, 'The document is empty.')
+  const ledger = await readPublishLedger(slug)
+  const todayValue = today(timeZone())
+
+  // Which earlier publications are live. A pull request closed unmerged left
+  // nothing on its site: it owns no file there and is named nowhere.
+  const states = new Map<string, PullRequestInfo['state']>()
+  await Promise.all(ledger.records.map(async (record) => {
+    states.set(placeKey(record.repo, record.section), (await pullRequest(session, record.repo, record.pullRequest.number)).state)
+  }))
+  const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed')
+
+  const targets: Target[] = []
+  for (const destination of destinations) {
+    const read = await readSite(session, findSite(destination.repo))
+    if (!read.ready) throw new HttpError(read.view.state === 'unavailable' ? 502 : 409, `${destination.repo}: ${read.view.problem}`)
+    const section = read.ready.config.sections.find((s) => s.name === destination.section)
+    if (!section) throw new HttpError(400, `${read.ready.config.site} has no section ${destination.section}.`)
+    const key = placeKey(read.ready.repo, section.name)
+    const previous = live.find((r) => placeKey(r.repo, r.section) === key)
+    const state = previous ? states.get(key) as 'open' | 'merged' : 'new'
+    targets.push({ destination, ready: read.ready, section, key, previous, state })
+  }
+
+  // Every place the piece is published, the original first: where it is live
+  // already, in the order it went there, then the sites it goes to now.
+  const placesFor = (going: Target[]): Place[] => {
+    const places: Place[] = [...live]
       .sort((a, b) => a.publishedAt.localeCompare(b.publishedAt))
       .map((r) => ({ key: placeKey(r.repo, r.section), site: r.site, url: r.url }))
-    for (const target of targets) {
+    for (const target of going) {
       const { destination, section, ready } = target
-      const place = { key: target.key, site: ready.config.site, url: placeUrl(section, destination.slug, postDate(section, destination.values, target.previous?.date ?? todayValue)) }
+      const place = { key: target.key, site: ready.config.site, url: placeUrl(section, destination.slug, postDate(section, destination.values, todayValue, target.previous?.date)) }
       const at = places.findIndex((p) => p.key === target.key)
       if (at >= 0) places[at] = place
       else places.push(place)
     }
+    return places
+  }
 
-    const results: PublishResult[] = []
-    for (const target of targets) {
-      const { repo, section } = target.destination
-      try {
-        const outcome = await publishTo(session, target, parts, places, todayValue, replace, doc.content)
-        if (outcome.record) {
-          ledger.records = [...ledger.records.filter((r) => placeKey(r.repo, r.section) !== target.key), outcome.record]
-          await writePublishLedger(slug, ledger)
-        }
-        const record = outcome.record ?? target.previous!
-        results.push({
-          repo, section, ok: true, ...(outcome.unchanged ? { unchanged: true } : {}),
-          publication: {
-            repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
-            values: record.values, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
-            pullRequest: { ...record.pullRequest, state: outcome.state }, changed: false,
-          },
-        })
-      } catch (error) {
-        if (error instanceof PublishValueError) results.push({ repo, section, ok: false, error: error.message, problems: error.problems })
-        else if (error instanceof PublishConflictError) results.push({ repo, section, ok: false, error: error.message, conflicts: error.conflicts })
-        else if (error instanceof GitHubError || error instanceof HttpError) results.push({ repo, section, ok: false, error: error.message })
-        else throw error
-      }
+  // The values first, for every site: one refused is named on no other.
+  const results = new Map<string, PublishResult>()
+  let going = targets.filter((target) => {
+    try {
+      fillFor(target, parts, placesFor(targets), todayValue)
+      return true
+    } catch (error) {
+      if (!(error instanceof PublishValueError)) throw error
+      results.set(target.key, resultFor(target, { error: error.message, problems: error.problems }))
+      return false
     }
-    return { results }
-  } finally {
-    publishing.delete(slug)
+  })
+  assertLedgerFits(ledger.records, going.map((target) => provisionalRecord(target, fillFor(target, parts, placesFor(going), todayValue))))
+
+  const record = async (target: Target, outcome: Outcome) => {
+    if (outcome.record) {
+      ledger.records = [...ledger.records.filter((r) => placeKey(r.repo, r.section) !== target.key), outcome.record]
+      await writePublishLedger(slug, ledger)
+    }
+    const kept = outcome.record ?? target.previous!
+    results.set(target.key, resultFor(target, { ok: true, ...(outcome.unchanged ? { unchanged: true } : {}), publication: viewOf(kept, outcome.state) }))
+    return kept
+  }
+
+  const published: Array<{ target: Target, record: PublishRecord, places: Place[] }> = []
+  for (const target of [...going]) {
+    const places = placesFor(going)
+    try {
+      const kept = await record(target, await publishTo(session, target, parts, places, todayValue, replace, doc.content))
+      published.push({ target, record: kept, places })
+    } catch (error) {
+      if (!(error instanceof PublishValueError || error instanceof PublishConflictError || error instanceof GitHubError || error instanceof HttpError)) throw error
+      results.set(target.key, resultFor(target, {
+        error: error.message,
+        ...(error instanceof PublishValueError ? { problems: error.problems } : {}),
+        ...(error instanceof PublishConflictError ? { conflicts: error.conflicts } : {}),
+      }))
+      // A site that failed is named on none of the others.
+      going = going.filter((t) => t !== target)
+    }
+  }
+
+  // A site that failed after others were published is named in their files:
+  // publish those again on their open pull requests, without it.
+  const final = placesFor(going)
+  for (const { target, record: kept, places } of published) {
+    if (!target.section.fields.some((f) => f.kind === 'places') || samePlaces(places, final)) continue
+    try {
+      await record(target, await publishTo(session, { ...target, previous: kept, state: 'open' }, parts, final, todayValue, replace, doc.content))
+    } catch (error) {
+      if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError)) throw error
+      results.set(target.key, resultFor(target, {
+        error: `Published as pull request #${kept.pullRequest.number}, but it still names a site that failed: ${error.message} Publish again to correct it.`,
+      }))
+    }
+  }
+  return { results: targets.map((target) => results.get(target.key)!) }
+}
+
+function samePlaces(a: Place[], b: Place[]): boolean {
+  return a.length === b.length && a.every((place, i) => place.key === b[i].key && place.url === b[i].url && place.site === b[i].site)
+}
+
+/** A record as large as the one a publication will write, before anything is written on GitHub. */
+function provisionalRecord(target: Target, filled: FilledPost): PublishRecord {
+  const at = new Date().toISOString()
+  const digest = '0'.repeat(64)
+  return {
+    repo: target.ready.repo, section: target.section.name, site: target.ready.config.site, headRepo: target.ready.repo,
+    branch: `publish/${target.destination.slug}-9`, base: target.ready.base, path: filled.path, url: filled.url,
+    slug: target.destination.slug, date: filled.date,
+    pullRequest: { number: 999_999, url: `https://github.com/${target.ready.repo}/pull/999999` },
+    publishedAt: at, updatedAt: at, sourceSha: digest, values: target.destination.values, data: filled.frontmatter, bodySha: digest,
+  }
+}
+
+// The record is written after each pull request opens. A record that cannot
+// be written then would leave that pull request unknown, and the next publish
+// would open another; so a record that would not fit is refused first.
+function assertLedgerFits(records: PublishRecord[], provisional: PublishRecord[]): void {
+  const keys = new Set(provisional.map((r) => placeKey(r.repo, r.section)))
+  const next = { records: [...records.filter((r) => !keys.has(placeKey(r.repo, r.section))), ...provisional] }
+  if (Buffer.byteLength(JSON.stringify(next, null, 2), 'utf8') > MAX_PUBLISH_LEDGER_BYTES) {
+    throw new HttpError(413, 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.')
   }
 }
 
@@ -457,19 +578,12 @@ interface Outcome {
  * since is kept, and the same field or text changed on both sides is refused
  * unless `replace` says to use this document's version.
  */
-async function publishTo(session: GitHubSession, target: Target, parts: ReturnType<typeof documentParts>, places: Place[], todayValue: string, replace: boolean, content: string): Promise<Outcome> {
-  const { destination, ready, section, previous } = target
-  const self = places.find((p) => p.key === target.key)!
-  const filled = fillPost(section, destination.slug, destination.values, { title: parts.title, today: todayValue, date: previous?.date, places, self })
-  if (previous && previous.path !== filled.path) {
-    throw new PublishValueError([`This piece is published on ${previous.site} as ${previous.path}; publish it with slug ${previous.slug} and its date unchanged.`])
-  }
+async function publishTo(session: GitHubSession, target: Target, parts: DocumentParts, places: Place[], todayValue: string, replace: boolean, content: string): Promise<Outcome> {
+  const { destination, ready, section, previous, state } = target
+  const filled = fillFor(target, parts, places, todayValue)
   const title = String(filled.frontmatter[section.firstLine ?? 'title'] ?? parts.title)
   const ours: PostFile = { data: filled.frontmatter, body: section.firstLine ? parts.rest : parts.whole }
   const upstream = ready.info
-
-  let state: 'new' | 'open' | 'merged' | 'closed' = 'new'
-  if (previous) state = (await pullRequest(session, upstream.fullName, previous.pullRequest.number)).state
 
   // Where the file is now: on the open pull request's branch, else on the site.
   const readFrom = state === 'open' ? { repo: previous!.headRepo, branch: previous!.branch } : { repo: upstream.fullName, branch: ready.base }
@@ -483,7 +597,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: ReturnTy
   // What is recorded as published is this document's side, never the file
   // reconciled with the site: a change made on the site must still read as
   // the site's at every later publication, not only the next one.
-  const published = { data: ours.data, bodySha: sha256(ours.body) }
+  const published = { data: ours.data, bodySha: sha256(ours.body), date: filled.date }
   let file: PostFile = ours
   if (current && previous) {
     const merged = reconcile({ data: previous.data, bodySha: previous.bodySha }, ours, parsePost(current.text))
@@ -494,9 +608,20 @@ async function publishTo(session: GitHubSession, target: Target, parts: ReturnTy
   const now = new Date().toISOString()
   if (current && current.text === text) {
     // The site has this version already: nothing to commit, nothing to open.
-    const record = previous && { ...previous, sourceSha: sha256(content), values: destination.values, ...published, updatedAt: now }
-    return { record, state: state === 'new' ? 'merged' : state, unchanged: true }
+    return { record: { ...previous!, sourceSha: sha256(content), values: destination.values, ...published, updatedAt: now }, state: state as 'open' | 'merged', unchanged: true }
   }
+
+  const open = (headRepo: string, branch: string, update: boolean) => openPullRequest(session, upstream.fullName, {
+    title: update ? `Update: ${title}` : title,
+    body: [
+      `Published from Poise by @${session.me}.`,
+      '',
+      `- File: \`${filled.path}\``,
+      ...(filled.url ? [`- Address once merged: ${filled.url}`] : []),
+    ].join('\n'),
+    head: headRepo === upstream.fullName ? branch : `${headRepo.split('/')[0]}:${branch}`,
+    base: ready.base,
+  })
 
   let branch: string
   let headRepo: string
@@ -505,34 +630,29 @@ async function publishTo(session: GitHubSession, target: Target, parts: ReturnTy
     branch = previous!.branch
     headRepo = previous!.headRepo
     await commitFile(session, headRepo, branch, head, `Update ${filled.path}`, filled.path, text)
-    pr = previous!.pullRequest
+    // Merged or closed while this was committed: the commit needs a pull
+    // request of its own, or the update would reach no one.
+    const after = await pullRequest(session, upstream.fullName, previous!.pullRequest.number)
+    if (after.state === 'open') pr = previous!.pullRequest
+    else {
+      const opened = await open(headRepo, branch, after.state === 'merged')
+      pr = { number: opened.number, url: opened.url }
+    }
   } else {
-    // The site's own repository when the writer can push to it; otherwise
-    // their fork. A pull request closed unmerged left nothing on the site, so
-    // only a merged one makes this an update.
-    const update = state === 'merged'
+    // The site's own repository when the writer can push to it, otherwise
+    // their fork. Only a merged pull request makes this an update.
     const where = upstream.canPush ? upstream : await fork(session, upstream.fullName)
     headRepo = where.fullName
     branch = await freshBranch(session, headRepo, `publish/${destination.slug}`, head)
-    await commitFile(session, headRepo, branch, head, `${update ? 'Update' : 'Publish'} ${filled.path}`, filled.path, text)
-    const opened = await openPullRequest(session, upstream.fullName, {
-      title: update ? `Update: ${title}` : title,
-      body: [
-        `Published from Poise by @${session.me}.`,
-        '',
-        `- File: \`${filled.path}\``,
-        ...(filled.url ? [`- Address once merged: ${filled.url}`] : []),
-      ].join('\n'),
-      head: headRepo === upstream.fullName ? branch : `${where.owner}:${branch}`,
-      base: ready.base,
-    })
+    await commitFile(session, headRepo, branch, head, `${state === 'merged' ? 'Update' : 'Publish'} ${filled.path}`, filled.path, text)
+    const opened = await open(headRepo, branch, state === 'merged')
     pr = { number: opened.number, url: opened.url }
   }
   return {
     state: 'open',
     record: {
       repo: upstream.fullName, section: section.name, site: ready.config.site, headRepo, branch, base: ready.base,
-      path: filled.path, url: filled.url, slug: destination.slug, date: filled.date, pullRequest: pr,
+      path: filled.path, url: filled.url, slug: destination.slug, pullRequest: pr,
       publishedAt: previous?.publishedAt ?? now, updatedAt: now,
       sourceSha: sha256(content), values: destination.values, ...published,
     },
@@ -574,7 +694,7 @@ export async function handlePublishingApi(req: IncomingMessage, res: ServerRespo
     if (error instanceof GitHubError) return send([404, 409, 422, 503].includes(error.status) ? error.status : 502, { error: error.message })
     if (error instanceof PublishConfigError || error instanceof PublishValueError) return send(400, { error: error.message })
     if ((error as { code?: string }).code === 'ENOENT') return send(404, { error: 'That document does not exist.' })
-    if ((error as { code?: string }).code === 'EDITOR_LOCK_UNAVAILABLE') return send(503, { error: (error as Error).message })
+    if (['EDITOR_LOCK_UNAVAILABLE', 'PROCESS_LOCK_UNAVAILABLE'].includes(String((error as { code?: string }).code))) return send(503, { error: (error as Error).message })
     return send(500, { error: error instanceof Error ? error.message : String(error) })
   }
 }

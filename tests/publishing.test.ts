@@ -7,6 +7,7 @@ import {
   matchesPattern,
   parsePost,
   parsePublishConfig,
+  postDate,
   reconcile,
   renderPost,
   sha256,
@@ -177,6 +178,10 @@ describe('a document as a post', () => {
     })
     const original = fillPost(other, 'a-better-question', titled, context({ places: [elsewhere, self], self: elsewhere }))
     expect(original.frontmatter).not.toHaveProperty('canonical_url')
+    // An empty date takes the field's own default, in the path and in the address another site lists alike.
+    const dated = parsePublishConfig(OTHER.replace('canonical_url: { kind: canonical }', 'day: { kind: date, default: "2026-01-02" }')).sections[0]
+    expect(postDate(dated, { day: '' }, '2026-10-17')).toBe('2026-01-02')
+    expect(fillPost(dated, 'a-better-question', { ...titled, day: '' }, context({ self: elsewhere, places: [elsewhere] })).path).toBe('_posts/2026-01-02-a-better-question.md')
     // Published again another day, a section without a date field keeps its first date.
     const later = fillPost(other, 'a-better-question', titled, context({ today: '2027-01-05', date: '2026-10-17', places: [elsewhere], self: elsewhere }))
     expect(later).toMatchObject({ date: '2026-10-17', path: '_posts/2026-10-17-a-better-question.md' })

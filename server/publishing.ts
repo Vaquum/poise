@@ -438,11 +438,17 @@ function inputValue(field: PublishField, raw: unknown, problems: string[]): Fiel
   }
 }
 
-/** The date a post goes by in paths and addresses: its first date field, else today. */
-export function postDate(section: PublishSection, values: Record<string, unknown>, todayValue: string): string {
+/**
+ * The date a post goes by in paths and addresses: its first date field's, as
+ * fillPost resolves it, or `fallback` for a section without one (today, or the
+ * date a published piece was first filled with). One rule, so a path and the
+ * address another site lists for it can never disagree.
+ */
+export function postDate(section: PublishSection, values: Record<string, unknown>, todayValue: string, fallback = todayValue): string {
   const field = section.fields.find((f) => f.kind === 'date')
-  if (!field) return todayValue
-  const raw = field.value ?? values[field.name] ?? field.default
+  if (!field) return fallback
+  const given = values[field.name]
+  const raw = field.value ?? (empty(given) ? (field.default === 'today' ? todayValue : field.default) : given)
   return typeof raw === 'string' && calendarDate(raw) ? raw : todayValue
 }
 
@@ -459,8 +465,7 @@ export function fillPost(section: PublishSection, slug: string, values: Record<s
   const frontmatter: Record<string, unknown> = {}
   // A path or address with {date} in it must not move when a piece without a
   // date field is published again on another day.
-  let date = context.date ?? context.today
-  let dateTaken = false
+  const date = postDate(section, values, context.today, context.date ?? context.today)
   for (const field of section.fields) {
     let value: unknown
     if (field.kind === 'places') {
@@ -480,10 +485,6 @@ export function fillPost(section: PublishSection, slug: string, values: Record<s
       if (value === undefined && empty(raw)) value = field.default === 'today' && field.kind === 'date' ? context.today : field.default
       // A value given but wrong has said so already.
       if (empty(value) && field.required && problems.length === known) problems.push(`${field.label ?? field.name} is required.`)
-    }
-    if (field.kind === 'date' && typeof value === 'string' && !dateTaken) {
-      date = value
-      dateTaken = true
     }
     if (!empty(value)) frontmatter[field.name] = value
   }

@@ -65,6 +65,10 @@ function escapeHtml(value: string): string {
 
 const keyOf = (repo: string, section: string) => `${repo.toLowerCase()}#${section}`
 
+// A section's name may hold any character, so the parts a control names are kept as JSON, never joined.
+const encode = (...parts: string[]) => escapeHtml(JSON.stringify(parts))
+const decode = (value: string) => JSON.parse(value) as string[]
+
 /** Which of a section's fields the shared title, description and date fill. */
 function sharedField(section: SectionView, which: Shared): string | undefined {
   if (which === 'title') return section.firstLine ?? section.fields.find((f) => f.name === 'title' && f.kind === 'text')?.name
@@ -121,7 +125,7 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
 
 function fieldHtml(key: string, field: FieldView, value: string | boolean): string {
   const name = escapeHtml(field.label ?? field.name)
-  const data = `data-field="${escapeHtml(`${key}|${field.name}`)}"`
+  const data = `data-field="${encode(key, field.name)}"`
   const required = field.required ? ' required' : ''
   const max = field.max && field.kind === 'text' ? ` maxlength="${field.max}"` : ''
   let control: string
@@ -139,7 +143,7 @@ function fieldHtml(key: string, field: FieldView, value: string | boolean): stri
       // The suggestions sit beside the label, not in it: they are not the field's name.
       const words = String(value).split(',').map((w) => w.trim()).filter(Boolean)
       const chips = (field.suggestions ?? []).map((s) =>
-        `<button type="button" class="ep-chip${words.includes(s) ? ' is-on' : ''}" data-chip="${escapeHtml(`${key}|${field.name}|${s}`)}" aria-pressed="${words.includes(s)}">${escapeHtml(s)}</button>`).join('')
+        `<button type="button" class="ep-chip${words.includes(s) ? ' is-on' : ''}" data-chip="${encode(key, field.name, s)}" aria-pressed="${words.includes(s)}">${escapeHtml(s)}</button>`).join('')
       const input = `<input type="text" class="ep-input ep-mono" ${data} value="${escapeHtml(String(value))}" placeholder="separated, by commas" autocomplete="off" spellcheck="false" />`
       return `<div class="ep-list"><label class="ep-field"><span class="ep-label">${name}</span>${input}</label>${chips ? `<span class="ep-chips">${chips}</span>` : ''}</div>`
     }
@@ -176,7 +180,7 @@ function syncValues(body: HTMLElement, s: State): void {
     if (control.dataset.shared) wanted = s.shared[control.dataset.shared as Shared]
     else if (control.dataset.slug) wanted = s.slugs.get(control.dataset.slug) ?? ''
     else {
-      const [key, name] = control.dataset.field!.split('|')
+      const [key, name] = decode(control.dataset.field!)
       wanted = s.values.get(key)?.[name] ?? ''
     }
     if (control instanceof HTMLInputElement && control.type === 'checkbox') {
@@ -299,7 +303,7 @@ function onInput(event: Event): void {
     s.slugs.set(target.dataset.slug, target.value)
     s.slugTyped.add(target.dataset.slug)
   } else if (target.dataset.field) {
-    const [key, name] = target.dataset.field.split('|')
+    const [key, name] = decode(target.dataset.field)
     s.values.get(key)![name] = target.type === 'checkbox' ? target.checked : target.value
     // Typed words light their suggestions.
     if (target.closest('.ep-list')) render()
@@ -320,7 +324,7 @@ function onClick(event: MouseEvent, host: PublishPanelHost): void {
   }
   const chip = target.closest<HTMLElement>('[data-chip]')
   if (chip && s) {
-    const [key, name, word] = chip.dataset.chip!.split('|')
+    const [key, name, word] = decode(chip.dataset.chip!)
     const own = s.values.get(key)!
     const words = String(own[name]).split(',').map((w) => w.trim()).filter(Boolean)
     own[name] = (words.includes(word) ? words.filter((w) => w !== word) : [...words, word]).join(', ')
