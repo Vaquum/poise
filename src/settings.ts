@@ -1106,6 +1106,11 @@ export function initSettings() {
     selectSection(panelEl, 'accounts')
     void connect(preset)
   })
+  // A destination asked for from elsewhere (the Editor's Publish panel).
+  window.addEventListener('poise:open-settings', (event) => {
+    const section = (event as CustomEvent<{ section?: string }>).detail?.section
+    if (section && panelEl?.querySelector(`.st-tab[data-tab="${CSS.escape(section)}"]`)) openSettingsAt(section as SettingsSection)
+  })
   openFromAddress()
 }
 

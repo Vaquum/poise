@@ -1,6 +1,5 @@
 import { retire, reveal } from '../motion'
 import { patchContent } from '../dom-patch'
-import { openSettingsAt } from '../settings'
 import {
   fetchDocumentPublishing,
   fetchSites,
@@ -14,12 +13,14 @@ import {
   type SectionView,
   type SiteView,
 } from '../publishing'
-import './editor-publish.css'
 
 // The Editor's Publish panel (docs/Publishing.md): the sites from Settings →
 // Publishing as choices; title, description and date once; each chosen site's
 // own fields under its name; one button. Publishing opens a pull request on
 // each site (server/publishing-api.ts); the panel then shows each one.
+//
+// Tests import the Editor, and so this module: its styles load with the app
+// (src/main.ts), and it opens Settings by event rather than importing it.
 
 export const ICON_PUBLISH = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 9V2.5M4.25 5.25 7 2.5l2.75 2.75M2.5 9.5v2h9v-2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 
@@ -314,7 +315,7 @@ function onClick(event: MouseEvent, host: PublishPanelHost): void {
   const s = state
   if (target.closest('[data-open-settings]')) {
     closePublishPanel()
-    openSettingsAt('publishing')
+    window.dispatchEvent(new CustomEvent('poise:open-settings', { detail: { section: 'publishing' } }))
     return
   }
   const chip = target.closest<HTMLElement>('[data-chip]')
