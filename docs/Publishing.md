@@ -111,9 +111,12 @@ what is wrong.
 - Once it is merged, an update gets a pull request of its own, `Update: <title>`.
 - A pull request closed unmerged left nothing on the site; the next publish is
   a first one again.
-- Changes made on the site since (a field, or the text) are kept. The same
-  field, or the text, changed both on the site and in the document is
-  refused and named; Replace with mine publishes the document's version.
+- Changes made on the site (a field, or the text) are kept, at every later
+  publication. The same field, or the text, changed both on the site and in
+  the document is refused and named; Replace with mine publishes the
+  document's version.
+- A section without a date field keeps the date of its first publication in
+  its path and address.
 - When the site has this version already, nothing is committed.
 - A file the document did not publish is never written over: choose another
   slug.

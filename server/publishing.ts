@@ -371,6 +371,8 @@ export interface FillContext {
   /** The document's first line, as it reads. */
   title: string
   today: string
+  /** The date a section without a date field goes by, once published: its first publication's. */
+  date?: string
   /** Every place the piece is published, the original first. */
   places: Place[]
   /** This destination. */
@@ -379,6 +381,8 @@ export interface FillContext {
 
 export interface FilledPost {
   slug: string
+  /** The date the path and address were filled with. */
+  date: string
   path: string
   url: string
   frontmatter: Record<string, unknown>
@@ -453,7 +457,9 @@ export function fillPost(section: PublishSection, slug: string, values: Record<s
   else if (!matchesPattern(section.slug, slug)) problems.push(`The slug "${slug}" does not match the site's pattern ${section.slug}.`)
 
   const frontmatter: Record<string, unknown> = {}
-  let date = context.today
+  // A path or address with {date} in it must not move when a piece without a
+  // date field is published again on another day.
+  let date = context.date ?? context.today
   let dateTaken = false
   for (const field of section.fields) {
     let value: unknown
@@ -487,7 +493,7 @@ export function fillPost(section: PublishSection, slug: string, values: Record<s
   const parts = { slug, date, year, month, day }
   const path = fillTemplate(section.path, parts)
   if (!isRepositoryPath(path)) throw new PublishValueError([`The path ${path} is not inside the repository.`])
-  return { slug, path, url: section.url ? fillTemplate(section.url, parts) : '', frontmatter }
+  return { slug, date, path, url: section.url ? fillTemplate(section.url, parts) : '', frontmatter }
 }
 
 /** The address a section gives a slug, before anything is published. */

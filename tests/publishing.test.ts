@@ -177,6 +177,9 @@ describe('a document as a post', () => {
     })
     const original = fillPost(other, 'a-better-question', titled, context({ places: [elsewhere, self], self: elsewhere }))
     expect(original.frontmatter).not.toHaveProperty('canonical_url')
+    // Published again another day, a section without a date field keeps its first date.
+    const later = fillPost(other, 'a-better-question', titled, context({ today: '2027-01-05', date: '2026-10-17', places: [elsewhere], self: elsewhere }))
+    expect(later).toMatchObject({ date: '2026-10-17', path: '_posts/2026-10-17-a-better-question.md' })
   })
 
   it('says everything that is wrong at once', () => {

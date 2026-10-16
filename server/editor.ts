@@ -724,13 +724,14 @@ export interface PublishRecord {
   path: string
   url: string
   slug: string
+  date: string                  // the date its path and address were filled with
   pullRequest: { number: number, url: string }
   publishedAt: string           // first published there
   updatedAt: string
   sourceSha: string             // the document as it was published
   values: Record<string, unknown>
-  data: Record<string, unknown> // the frontmatter as published
-  bodySha: string               // the text as published
+  data: Record<string, unknown> // the frontmatter this document gave it
+  bodySha: string               // the text this document gave it
 }
 
 export interface PublishLedger {
@@ -745,7 +746,7 @@ function isPublishRecord(value: unknown): value is PublishRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const record = value as Record<string, unknown>
   const pr = record.pullRequest as Record<string, unknown> | undefined
-  return ['repo', 'section', 'site', 'headRepo', 'branch', 'base', 'path', 'url', 'slug', 'publishedAt', 'updatedAt', 'sourceSha', 'bodySha']
+  return ['repo', 'section', 'site', 'headRepo', 'branch', 'base', 'path', 'url', 'slug', 'date', 'publishedAt', 'updatedAt', 'sourceSha', 'bodySha']
     .every((key) => typeof record[key] === 'string')
     && !!pr && Number.isSafeInteger(pr.number) && typeof pr.url === 'string'
     && !!record.values && typeof record.values === 'object' && !Array.isArray(record.values)

@@ -393,6 +393,44 @@ describe('publishing a document', () => {
     expect(fileOn('mikkokotila/mikkokotila-com', 'publish/a-better-question', POST)).toContain('said the writer')
   })
 
+  it('keeps a change made on the site at every later publication, not only the next', async () => {
+    await publish([writing()])
+    // In review, a maintainer adds a tag and edits the text.
+    editOnSite('mikkokotila/mikkokotila-com', 'publish/a-better-question', POST, (text) => text
+      .replace('  - "ad-fraud"', '  - "ad-fraud"\n  - "machine-intelligence"').replace('More.', 'More, said the editor.'))
+    for (const description of ['A first description.', 'A second description.']) {
+      expect((await publish([writing({ description })])).body.results[0]).toMatchObject({ ok: true })
+      const file = fileOn('mikkokotila/mikkokotila-com', 'publish/a-better-question', POST)!
+      expect(file).toContain(`description: "${description}"`)
+      expect(file).toContain('  - "machine-intelligence"')
+      expect(file).toContain('More, said the editor.')
+    }
+    // The text changed here as well, after the editor's change: a conflict, never a silent replacement.
+    await writeDocument(DOC, TEXT.replace('More.', 'More, said the writer.'))
+    expect((await publish([writing({ description: 'A second description.' })])).body.results[0]).toMatchObject({ ok: false, conflicts: ['the text'] })
+  })
+
+  it('keeps the date in a path when a section without a date field is published again another day', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2026-10-17T10:00:00Z'))
+      addRepo('acme/journal', {})
+      await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+      await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+      const journal = { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }
+      expect((await publish([journal])).body.results[0].ok).toBe(true)
+      vi.setSystemTime(new Date('2027-01-05T10:00:00Z'))
+      await writeDocument(DOC, `${TEXT}\nA later thought.\n`)
+      expect((await publish([journal])).body.results[0]).toMatchObject({
+        ok: true,
+        publication: { path: '_posts/2026-10-17-a-better-question.md', url: 'https://journal.example/2026/a-better-question/', pullRequest: { number: 101 } },
+      })
+      expect(fileOn('acme/journal', 'publish/a-better-question', '_posts/2026-10-17-a-better-question.md')).toContain('A later thought.')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('says nothing changed when the site has this version already', async () => {
     await publish([writing()])
     const commitsBefore = calls.filter((call) => call.args[1] === 'graphql').length

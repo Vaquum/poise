@@ -399,7 +399,7 @@ async function publishDocument(slug: string, body: unknown): Promise<{ results: 
       .map((r) => ({ key: placeKey(r.repo, r.section), site: r.site, url: r.url }))
     for (const target of targets) {
       const { destination, section, ready } = target
-      const place = { key: target.key, site: ready.config.site, url: placeUrl(section, destination.slug, postDate(section, destination.values, todayValue)) }
+      const place = { key: target.key, site: ready.config.site, url: placeUrl(section, destination.slug, postDate(section, destination.values, target.previous?.date ?? todayValue)) }
       const at = places.findIndex((p) => p.key === target.key)
       if (at >= 0) places[at] = place
       else places.push(place)
@@ -460,7 +460,7 @@ interface Outcome {
 async function publishTo(session: GitHubSession, target: Target, parts: ReturnType<typeof documentParts>, places: Place[], todayValue: string, replace: boolean, content: string): Promise<Outcome> {
   const { destination, ready, section, previous } = target
   const self = places.find((p) => p.key === target.key)!
-  const filled = fillPost(section, destination.slug, destination.values, { title: parts.title, today: todayValue, places, self })
+  const filled = fillPost(section, destination.slug, destination.values, { title: parts.title, today: todayValue, date: previous?.date, places, self })
   if (previous && previous.path !== filled.path) {
     throw new PublishValueError([`This piece is published on ${previous.site} as ${previous.path}; publish it with slug ${previous.slug} and its date unchanged.`])
   }
@@ -480,6 +480,10 @@ async function publishTo(session: GitHubSession, target: Target, parts: ReturnTy
     throw new GitHubError(`${filled.path} is already in ${upstream.fullName}, and this document did not publish it. Choose another slug.`, 409)
   }
 
+  // What is recorded as published is this document's side, never the file
+  // reconciled with the site: a change made on the site must still read as
+  // the site's at every later publication, not only the next one.
+  const published = { data: ours.data, bodySha: sha256(ours.body) }
   let file: PostFile = ours
   if (current && previous) {
     const merged = reconcile({ data: previous.data, bodySha: previous.bodySha }, ours, parsePost(current.text))
@@ -490,7 +494,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: ReturnTy
   const now = new Date().toISOString()
   if (current && current.text === text) {
     // The site has this version already: nothing to commit, nothing to open.
-    const record = previous && { ...previous, sourceSha: sha256(content), values: destination.values, data: file.data, bodySha: sha256(file.body), updatedAt: now }
+    const record = previous && { ...previous, sourceSha: sha256(content), values: destination.values, ...published, updatedAt: now }
     return { record, state: state === 'new' ? 'merged' : state, unchanged: true }
   }
 
@@ -528,9 +532,9 @@ async function publishTo(session: GitHubSession, target: Target, parts: ReturnTy
     state: 'open',
     record: {
       repo: upstream.fullName, section: section.name, site: ready.config.site, headRepo, branch, base: ready.base,
-      path: filled.path, url: filled.url, slug: destination.slug, pullRequest: pr,
+      path: filled.path, url: filled.url, slug: destination.slug, date: filled.date, pullRequest: pr,
       publishedAt: previous?.publishedAt ?? now, updatedAt: now,
-      sourceSha: sha256(content), values: destination.values, data: file.data, bodySha: sha256(file.body),
+      sourceSha: sha256(content), values: destination.values, ...published,
     },
   }
 }
