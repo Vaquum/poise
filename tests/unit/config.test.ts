@@ -106,3 +106,14 @@ describe('configured timezone boundaries', () => {
     expect(config.startOfWeekInZone().toISOString()).toBe('2026-01-11T22:00:00.000Z')
   })
 })
+
+
+it('keeps midnight before the DST transition on both clock-change days', () => {
+  config.setLocalSettings({ org: '', me: '', timezone: 'Europe/Helsinki' })
+  vi.setSystemTime(new Date('2026-03-29T12:00:00Z'))
+  expect(config.midnightInZone().toISOString()).toBe('2026-03-28T22:00:00.000Z')
+  expect(config.midnightInZone(1).toISOString()).toBe('2026-03-29T21:00:00.000Z')
+  vi.setSystemTime(new Date('2026-10-25T12:00:00Z'))
+  expect(config.midnightInZone().toISOString()).toBe('2026-10-24T21:00:00.000Z')
+  expect(config.midnightInZone(1).toISOString()).toBe('2026-10-25T22:00:00.000Z')
+})

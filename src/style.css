@@ -988,9 +988,15 @@ tr:hover .review-btn { opacity: 1; }
 }
 
 /* ── Analytics panel ── */
-#analytics-panel .analytics-range { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-1); border-radius: var(--r-md); margin-bottom: var(--sp-5); }
-/* Four ranges share the panel's width evenly instead of overflowing it. */
-#analytics-panel .analytics-range button { min-width: 0; width: 100%; padding: var(--sp-2) var(--sp-3); white-space: normal; border: var(--b-base); border-radius: var(--r-sm); }
+.analytics-day { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-bottom: var(--sp-5); }
+.analytics-day-step { border: var(--b-base); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); font: inherit; color: var(--text); background: transparent; cursor: pointer; }
+.analytics-day-step:disabled { opacity: 0.3; cursor: default; }
+.analytics-date { font-size: 0.8125rem; font-weight: 600; }
+.analytics-trend { margin: var(--sp-2) 0 0; font-size: 0.8125rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.analytics-trend.good { color: var(--green); }
+.analytics-trend.bad { color: var(--red); }
+.analytics-trend.neutral { color: var(--text-secondary); }
+.analytics-trend-caption { display: block; margin-top: 2px; font-size: 0.6875rem; font-weight: 400; }
 .analytics-status { margin: 0 0 var(--sp-4); }
 .analytics-groups { transition: opacity var(--flow-feedback) ease-out; }
 /* The previous range's numbers stay in place while the next ones load,

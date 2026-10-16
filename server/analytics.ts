@@ -44,6 +44,7 @@ export interface AnalyticsReport {
     }
     /** Mean time from opening to merge, in milliseconds. */
     averageTimeToMergeMs: number | null
+    medianTimeToMergeMs: number | null
   }
   errors: OrganizationReadError[]
 }
@@ -106,6 +107,8 @@ export function computeAnalytics(input: {
   const { window } = input
   const merged = input.prs.filter((pr) => pr.status === 'merged' && inWindow(pr.closed_at, window))
 
+  const mergeTimes = merged.map((pr) => Date.parse(pr.closed_at!) - Date.parse(pr.created_at))
+
   const sizes = merged
     .filter((pr) => Number.isSafeInteger(pr.additions) && Number.isSafeInteger(pr.deletions))
     .map((pr) => pr.additions! + pr.deletions!)
@@ -132,7 +135,8 @@ export function computeAnalytics(input: {
         counted: sizes.length,
       },
       behaviors: { perPr: merged.length ? behaviorTotal / merged.length : null, ...behaviors },
-      averageTimeToMergeMs: mean(merged.map((pr) => Date.parse(pr.closed_at!) - Date.parse(pr.created_at))),
+      averageTimeToMergeMs: mean(mergeTimes),
+      medianTimeToMergeMs: median(mergeTimes),
     },
     errors: input.errors ?? [],
   }

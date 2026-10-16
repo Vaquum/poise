@@ -210,33 +210,28 @@ if (typeof window !== 'undefined') window.addEventListener('poise:refresh-rate-c
   if (tickerStarted) scheduleNextTick()
 })
 
-// Minutes between an IANA zone's wall clock and UTC at a given UTC instant.
-// Positive for zones east of UTC. Anchoring at the desired instant handles DST.
-function tzOffsetMin(tz: string, atUtc: Date): number {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: tz, hourCycle: 'h23',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  }).formatToParts(atUtc)
-  const p = (t: string) => Number(parts.find((x) => x.type === t)!.value)
-  const wallAsUtc = Date.UTC(p('year'), p('month') - 1, p('day'), p('hour'), p('minute'), p('second'))
-  return Math.round((wallAsUtc - atUtc.getTime()) / 60000)
-}
-
-// Midnight (00:00) of "today + dayOffset" in the configured zone, returned as a Date.
-// Day rolls at midnight, weeks start on Monday — this function only handles the day part.
-export function midnightInZone(dayOffset: number = 0): Date {
-  const tz = effectiveTimezone()
-  const ymd = new Intl.DateTimeFormat('en-CA', {
-    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-  }).format(new Date())
-  const [y, m, d] = ymd.split('-').map(Number)
-  // Probe the offset at noon of the target day so DST transitions near midnight
-  // can't accidentally pick the wrong side of the jump.
-  const noonProbe = new Date(Date.UTC(y, m - 1, d + dayOffset, 12, 0, 0))
-  const offsetMin = tzOffsetMin(tz, noonProbe)
-  const wallMidUtc = Date.UTC(y, m - 1, d + dayOffset, 0, 0, 0)
-  return new Date(wallMidUtc - offsetMin * 60000)
+// The first instant of "today + dayOffset" in the configured zone. A date
+// can start at 01:00 when DST skips midnight, or repeat midnight on rollback.
+export function midnightInZone(dayOffset: number = 0, anchor = new Date()): Date {
+  const calendar = new Intl.DateTimeFormat('en-CA', {
+    timeZone: effectiveTimezone(), year: 'numeric', month: '2-digit', day: '2-digit',
+  })
+  const localDate = (instant: number): number => {
+    const parts = calendar.formatToParts(instant)
+    const part = (name: string) => Number(parts.find((item) => item.type === name)!.value)
+    return Date.UTC(part('year'), part('month') - 1, part('day'))
+  }
+  const target = localDate(anchor.getTime()) + dayOffset * 86_400_000
+  // All IANA offsets fit inside this bracket. Searching dates instead of
+  // offsets finds the first valid instant even when midnight does not exist.
+  let before = target - 36 * 3_600_000
+  let after = target + 36 * 3_600_000
+  while (after - before > 1) {
+    const middle = Math.floor((before + after) / 2)
+    if (localDate(middle) < target) before = middle
+    else after = middle
+  }
+  return new Date(after)
 }
 
 // Most recent Monday 00:00 in the configured zone (today if today is Monday).

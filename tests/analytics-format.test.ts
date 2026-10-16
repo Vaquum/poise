@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { analyticsGroups, formatDuration, formatRate, type AnalyticsReport } from '../src/analytics-format'
+import { analyticsGroups as buildGroups, mergeTimeTrend, formatDuration, formatRate, type AnalyticsReport } from '../src/analytics-format'
 
 // What the Analytics panel says (src/analytics-format.ts).
 
@@ -13,11 +13,14 @@ function report(pullRequests: Partial<AnalyticsReport['pullRequests']> = {}): An
       lines: { total: 12_345, median: 180.5, counted: 4 },
       behaviors: { perPr: 1.5, approvals: 1, reviews: 4, changesRequested: 1 },
       averageTimeToMergeMs: (26 * 60 + 5) * 60_000,
+      medianTimeToMergeMs: 5 * 3_600_000,
       ...pullRequests,
     },
     errors: [],
   }
 }
+
+function analyticsGroups(value: AnalyticsReport) { return buildGroups(value, report()) }
 
 function tile(groups: ReturnType<typeof analyticsGroups>, label: string) {
   return groups.flatMap((group) => group.tiles).find((t) => t.label === label)!
@@ -47,7 +50,7 @@ describe('Analytics wording', () => {
     expect(groups.map((group) => group.tiles.map((t) => [t.label, t.value]))).toEqual([
       [['Opened', '1,204'], ['Closed', '1']],
       [['Merged', '4'], ['Lines changed', '12,345'], ['Time to merge', '1d 2h']],
-      [['Comments', '2.3'], ['Median lines', '181'], ['Behaviors', '1.5']],
+      [['Comments', '2.3'], ['Median lines', '181'], ['Behaviors', '1.5'], ['Median time', '5h']],
     ])
     expect(tile(groups, 'Behaviors').note).toBe('1 approval · 4 reviews · 1 change request')
     expect(groups.every((group) => !group.note)).toBe(true)
@@ -73,6 +76,7 @@ describe('Analytics wording', () => {
       lines: { total: null, median: null, counted: 0 },
       behaviors: { perPr: null, approvals: 0, reviews: 0, changesRequested: 0 },
       averageTimeToMergeMs: null,
+      medianTimeToMergeMs: null,
     }))
     expect(tile(groups, 'Lines changed').value).toBe('0')
     expect(tile(groups, 'Comments').value).toBe('—')
@@ -80,4 +84,43 @@ describe('Analytics wording', () => {
     expect(groups[1].note).toBeUndefined()
     expect(groups[2].note).toBe('No pull requests were merged in this range.')
   })
+})
+
+
+describe('merge-time trends', () => {
+  it('makes faster, slower and unchanged comparisons explicit', () => {
+    expect(mergeTimeTrend(50, 100)).toEqual({ direction: 'good', caption: 'Faster vs 7-day average', text: '↓ 50%', description: '50% faster versus the preceding 7-day average' })
+    expect(mergeTimeTrend(150, 100)).toEqual({ direction: 'bad', caption: 'Slower vs 7-day average', text: '↑ 50%', description: '50% slower versus the preceding 7-day average' })
+    expect(mergeTimeTrend(100, 100)?.text).toBe('→ 0%')
+    expect(mergeTimeTrend(100, 100)?.direction).toBe('neutral')
+  })
+  it('does not invent percentages without data or with a zero baseline', () => {
+    expect(mergeTimeTrend(null, 100)).toBeUndefined()
+    expect(mergeTimeTrend(100, null)).toBeUndefined()
+    expect(mergeTimeTrend(3_600_000, 0)?.text).toBe('↑ 1h')
+    expect(mergeTimeTrend(0, 0)?.text).toBe('→ 0%')
+    expect(mergeTimeTrend(100.001, 100)?.text).toBe('↑ <0.1%')
+  })
+})
+
+it('withholds comparative claims when an account is missing from either period', () => {
+  const partial = report()
+  partial.errors = [{ org: 'beta', error: 'offline' }]
+  expect(tile(buildGroups(partial, report()), 'Time to merge').trend).toBeUndefined()
+  expect(tile(buildGroups(report(), partial), 'Time to merge').trend).toBeUndefined()
+})
+
+it('compares headline event counts against seven-day daily averages, including zero days', () => {
+  const day = report({ merged: 4, lines: { total: 700, median: 175, counted: 4 } })
+  day.issues = { opened: 7, closed: 0 }
+  const week = report({ merged: 14, lines: { total: 2450, median: 175, counted: 14 } })
+  week.issues = { opened: 14, closed: 7 }
+  const groups = buildGroups(day, week)
+  expect(tile(groups, 'Opened').trend).toMatchObject({ direction: 'good', text: '↑ 250%' })
+  expect(tile(groups, 'Closed').trend).toMatchObject({ direction: 'bad', text: '↓ 100%' })
+  expect(tile(groups, 'Merged').comparison).toBe('7-day daily average: 2.0')
+  expect(tile(groups, 'Lines changed').trend).toMatchObject({ direction: 'good', text: '↑ 100%' })
+  week.pullRequests.lines.counted = 10
+  expect(tile(buildGroups(day, week), 'Lines changed').trend).toBeUndefined()
+  expect(tile(buildGroups(day, week), 'Lines changed').comparison).toBe('7-day daily average: —')
 })

@@ -35,7 +35,7 @@ export async function workspace(page: Page, view = 'current', fontResponse?: Pro
     } })
     if (path === '/api/analytics') return route.fulfill({ json: {
       window: { since: null, until: null }, issues: { opened: 12, closed: 9 },
-      pullRequests: { merged: 4, commentsPerPr: 3.25, lines: { total: 4210, median: 180, counted: 3 }, behaviors: { perPr: 2, approvals: 4, reviews: 4, changesRequested: 0 }, averageTimeToMergeMs: 27 * 3_600_000 }, errors: [],
+      pullRequests: { merged: 4, commentsPerPr: 3.25, lines: { total: 4210, median: 180, counted: 3 }, behaviors: { perPr: 2, approvals: 4, reviews: 4, changesRequested: 0 }, averageTimeToMergeMs: 27 * 3_600_000, medianTimeToMergeMs: 6 * 3_600_000 }, errors: [],
     } })
     return route.fulfill({ json: {} })
   })
