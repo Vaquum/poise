@@ -277,6 +277,15 @@ describe('publishing again', () => {
     expect(configError(MIKKO.replace('item: { venue: "{site}", url: "{url}" }', 'item: { __proto__: "{site}" }'))).toBe('sections[0].fields.origins.item.__proto__: not a usable key')
   })
 
+  it('asks about every difference when what was published is not known', () => {
+    const merged = reconcile(null,
+      { data: { title: 'T', date: '2026-10-17' }, body: 'Mine.' },
+      { data: { title: 'T', tags: ['a'], date: '2026-10-17' }, body: 'Theirs.' })
+    expect(merged.conflicts).toEqual(['tags', 'the text'])
+    expect(merged.data).toEqual({ title: 'T', date: '2026-10-17' })
+    expect(reconcile(null, { data: { title: 'T' }, body: 'Same.' }, { data: { title: 'T' }, body: 'Same.' }).conflicts).toEqual([])
+  })
+
   it('reports the same field, and the text, changed on both sides', () => {
     const merged = reconcile(base,
       { data: { title: 'T', tags: ['c'], date: '2026-10-17' }, body: 'Mine.' },

@@ -587,17 +587,19 @@ export interface Reconciled extends PostFile {
  * now (theirs), and what this document makes now (ours). A field or the text
  * changed on one side only takes that side; changed on both sides, and
  * differently, it is a conflict, and ours is used only when the caller says so.
+ * With no base, when what was published is not known, every difference is a
+ * conflict: a field one side lacks included.
  */
-export function reconcile(base: PublishedState, ours: PostFile, theirs: PostFile): Reconciled {
+export function reconcile(base: PublishedState | null, ours: PostFile, theirs: PostFile): Reconciled {
   const conflicts: string[] = []
   // Without a prototype, a key named __proto__ the site's file has is kept as a key.
   const data: Record<string, unknown> = Object.create(null)
   const keys = [...Object.keys(ours.data), ...Object.keys(theirs.data).filter((key) => !Object.hasOwn(ours.data, key))]
   for (const key of keys) {
-    const mine = own(ours.data, key), site = own(theirs.data, key), was = own(base.data, key)
+    const mine = own(ours.data, key), site = own(theirs.data, key)
     let value: unknown
-    if (same(mine, site) || same(site, was)) value = mine
-    else if (same(mine, was)) value = site
+    if (same(mine, site) || (base && same(site, own(base.data, key)))) value = mine
+    else if (base && same(mine, own(base.data, key))) value = site
     else {
       conflicts.push(key)
       value = mine
@@ -606,8 +608,8 @@ export function reconcile(base: PublishedState, ours: PostFile, theirs: PostFile
   }
   const mineSha = sha256(ours.body), siteSha = sha256(theirs.body)
   let body = ours.body
-  if (mineSha !== siteSha && siteSha !== base.bodySha) {
-    if (mineSha === base.bodySha) body = theirs.body
+  if (mineSha !== siteSha && siteSha !== base?.bodySha) {
+    if (mineSha === base?.bodySha) body = theirs.body
     else conflicts.push('the text')
   }
   return { data, body, conflicts }

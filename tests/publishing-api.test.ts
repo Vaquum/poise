@@ -762,6 +762,20 @@ describe('publishing a document', () => {
     expect((await publish([journal])).body.results[0]).toMatchObject({ ok: false, conflicts: ['the text'] })
   })
 
+  it('asks about a field an update removed, when its pull request was merged without it', async () => {
+    await publish([writing({ description: 'A first description.' })])
+    // The update only removes the description; the pull request merges just before it, and is unreadable after.
+    beforeCommit = () => merge('mikkokotila/mikkokotila-com', 101)
+    afterCommit = () => {
+      failOn = (method, endpoint) => (method === 'GET' && endpoint === 'repos/mikkokotila/mikkokotila-com/pulls/101' ? 500 : null)
+    }
+    expect((await publish([writing()])).body.results[0].ok).toBe(false)
+    failOn = null
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: false, conflicts: ['description'] })
+    expect((await publish([writing()], true)).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    expect(fileOn('mikkokotila/mikkokotila-com', repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)!.head, POST)).not.toContain('A first description.')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

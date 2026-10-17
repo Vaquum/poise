@@ -735,7 +735,7 @@ export interface PublishRecord {
   bodySha: string               // the text this document gave it
   /** This document's side of the version last merged there: still the
    *  site's file, and still this document's, whatever came after it. */
-  landed?: { data: Record<string, unknown>, bodySha: string, pullRequest: number, url: string }
+  landed?: { data: Record<string, unknown>, bodySha: string, pullRequest: number, url: string, unknown?: true }
   /** An update committed while its pull request could not be read: its
    *  commit, and the address of the version before it, until a later
    *  publication reads the pull request again. */
@@ -775,6 +775,7 @@ function isLanded(value: unknown): boolean {
   const landed = value as Record<string, unknown>
   return !!landed.data && typeof landed.data === 'object' && !Array.isArray(landed.data)
     && typeof landed.bodySha === 'string' && Number.isSafeInteger(landed.pullRequest) && typeof landed.url === 'string'
+    && (landed.unknown === undefined || landed.unknown === true)
 }
 
 export async function readPublishLedger(slug: string): Promise<PublishLedger> {

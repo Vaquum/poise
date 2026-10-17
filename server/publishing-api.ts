@@ -470,12 +470,12 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // A merged version stays on the site, and stays this document's, even when
   // a later pull request is closed unmerged. Worked out here, and written only
   // with a record this publication writes.
-  // What it merged then is not recorded: no field is taken for the site's
-  // own, and every difference from the site is asked about.
+  // Merged without an update committed after it: what it merged is not
+  // known, so every difference from the site is asked about.
   const landedOf = (record: PublishRecord): Landed | undefined => {
     const key = placeKey(record.repo, record.section)
     if (states.get(key) !== 'merged') return record.landed
-    return missed.has(key) ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.unconfirmed!.url } : snapshotOf(record)
+    return missed.has(key) ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.unconfirmed!.url, unknown: true } : snapshotOf(record)
   }
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
 
@@ -760,7 +760,8 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     // On an open pull request, what this document last pushed there; on the
     // site, what of this document was last merged.
     const base = state === 'open' ? previous : landed ?? previous
-    const merged = reconcile({ data: base.data, bodySha: base.bodySha }, ours, parsePost(current.text))
+    // A merged version that is not known is no base: every difference is asked about.
+    const merged = reconcile(state !== 'open' && landed?.unknown ? null : { data: base.data, bodySha: base.bodySha }, ours, parsePost(current.text))
     if (merged.conflicts.length && !replace) throw new PublishConflictError(ready.config.site, merged.conflicts)
     file = merged
   }
