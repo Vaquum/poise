@@ -5,6 +5,31 @@ import { freeze, resume, settled, stableLanding } from './fixtures/motion'
 import { setupWorkspace } from './onboarding-fixture'
 declare global { interface Window { retiredSessionOpacities: number[] } }
 
+test('spatial offsets move their actor without inheriting into its content', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const result = await page.evaluate(() => {
+    const actor = document.createElement('div')
+    actor.dataset.flowEnter = ''
+    actor.dataset.flowLayout = ''
+    const content = document.createElement('span')
+    content.textContent = 'Moving content'
+    actor.appendChild(content)
+    document.body.appendChild(actor)
+    try {
+      const properties = ['--flow-layout-x', '--flow-layout-y', '--flow-enter-x', '--flow-enter-y']
+      properties.forEach((property, index) => actor.style.setProperty(property, `${index + 1}px`))
+      return {
+        translate: getComputedStyle(actor).translate,
+        inherited: properties.map(property => getComputedStyle(content).getPropertyValue(property).trim()),
+        displacement: content.getBoundingClientRect().x - actor.offsetLeft,
+      }
+    } finally { actor.remove() }
+  })
+  expect(result.translate).toBe('4px 6px')
+  expect(result.inherited).toEqual(['0px', '0px', '0px', '0px'])
+  expect(result.displacement).toBeCloseTo(4)
+})
+
 for (const entering of [false, true]) test(`setup retirement preserves its ${entering ? 'entering' : 'settled'} dialog geometry`, async ({ page }) => {
   await setupWorkspace(page)
   await page.goto('/')

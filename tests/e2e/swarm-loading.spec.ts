@@ -67,7 +67,10 @@ test('Swarm completes a large history without blocking the preview controls', as
       const durations: number[] = []
       const observer = new PerformanceObserver(list => durations.push(...list.getEntries().map(entry => entry.duration)))
       observer.observe({ entryTypes: ['longtask'] })
-      return { durations, observer }
+      const counts: number[] = []
+      const mutations = new MutationObserver(() => counts.push(document.querySelectorAll('#swarm-tbody > .agent-row').length))
+      mutations.observe(document.getElementById('swarm-tbody')!, { childList: true })
+      return { durations, observer, counts, mutations }
     })
     older.release()
     await expect(page.locator(rows)).toHaveCount(1300)
@@ -77,6 +80,8 @@ test('Swarm completes a large history without blocking the preview controls', as
     })
     console.log(`Swarm preview to 1300 calls: longest main-thread task ${worstTask}ms`)
     expect(worstTask).toBeLessThan(350)
+    const counts = await tasks.evaluate(({ counts, mutations }) => { mutations.disconnect(); return counts })
+    expect(counts.some(count => count > 50 && count < 1300)).toBe(true)
     expect(await control!.evaluate(element => element.isConnected && document.activeElement === element)).toBe(true)
     await page.locator('#swarm-search').fill('acme run 1300')
     await expect(page.locator(rows)).toHaveCount(1)
