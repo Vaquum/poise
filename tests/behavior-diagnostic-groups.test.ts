@@ -122,4 +122,20 @@ describe('behavior diagnostic groups', () => {
       createdAt: '', callId: 'attempt', diagnostic: { severity: 'warning', code: 'held_result' } })
     expect(behaviorDiagnosticGroups(diagnostics)).toEqual([expect.objectContaining({ severity: 'warning', code: 'held_result' })])
   })
+
+  it('records what each detail is about, so the notification rail can join and count it', () => {
+    const diagnostics = snapshot()
+    diagnostics.agentLogsError = 'agent-interface --logs exited with status 1'
+    diagnostics.failures.push({ behavior: 'review-new-prs', target: 'acme/api#9:secondary:check', kind: 'operation',
+      consecutiveFailures: 2, lastFailureAt: '2026-10-17T10:05:00.000Z', nextRetryAt: '', error: 'GitHub 404: Not Found' })
+    diagnostics.deadLetters.push({ id: 'letter', behavior: 'approve-prs', target: 'acme/web#3', error: 'No verdict.',
+      createdAt: '2026-10-17T10:07:00.000Z', attemptCount: 2, diagnostic: { severity: 'error', code: 'invalid_agent_result' } })
+    const entries = behaviorDiagnosticGroups(diagnostics).map((group) => group.entries.map(({ behavior, target, at }) => ({ behavior, target, at })))
+    expect(entries).toEqual([
+      [{ behavior: null, target: null, at: null }],
+      [{ behavior: 'review-new-prs', target: 'acme/api#9:secondary:check', at: '2026-10-17T10:05:00.000Z' }],
+      [{ behavior: 'approve-prs', target: 'acme/web#3', at: '2026-10-17T10:07:00.000Z' }],
+    ])
+    for (const group of behaviorDiagnosticGroups(diagnostics)) expect(group.entries.map((entry) => entry.detail)).toEqual(group.details)
+  })
 })

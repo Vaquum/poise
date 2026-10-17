@@ -1,7 +1,7 @@
-// The notifications at the top of the page (server/alerts/notices.ts): read
-// every few seconds while this tab is in front, at once when it comes back to
-// the front, and after the person acts on one. Every tab of the workspace shows
-// the same ones: what one tab puts away, the others drop on their next read.
+// The notifications the notification rail lists (server/alerts/notices.ts):
+// read every few seconds while this tab is in front, at once when it comes back
+// to the front, and after the person acts on one. Every tab of the workspace
+// shows the same ones: what one tab puts away, the others drop on their next read.
 
 export const NOTICE_KINDS = ['chat_waiting', 'sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'pr_ready', 'chat_turn_finished'] as const
 export type NoticeKind = typeof NOTICE_KINDS[number]
@@ -24,6 +24,14 @@ export interface Notice {
   due: string
   silenceable: boolean
   target: NoticeTarget | null
+  /** On a failed behavior: its behavior and target, as Behaviors' diagnostics
+   *  name them, which joins the notice to its diagnostic. */
+  subject?: NoticeSubject
+}
+
+export interface NoticeSubject {
+  behavior: string
+  target: string
 }
 
 export interface NoticesState {
@@ -47,6 +55,14 @@ function isTarget(value: unknown): value is NoticeTarget {
   return false
 }
 
+function isSubject(value: unknown): value is NoticeSubject {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const subject = value as Record<string, unknown>
+  return Object.keys(subject).length === 2
+    && typeof subject.behavior === 'string' && subject.behavior.length > 0
+    && typeof subject.target === 'string' && subject.target.length > 0
+}
+
 function isNotice(value: unknown): value is Notice {
   if (!value || typeof value !== 'object') return false
   const notice = value as Record<string, unknown>
@@ -58,6 +74,7 @@ function isNotice(value: unknown): value is Notice {
     && typeof notice.due === 'string' && Number.isFinite(Date.parse(notice.due))
     && typeof notice.silenceable === 'boolean'
     && (notice.target === null || isTarget(notice.target))
+    && (notice.subject === undefined || (notice.kind === 'behavior_held' && isSubject(notice.subject)))
 }
 
 /** The server's answer as state, or null when it is not one. A notice the page
@@ -126,6 +143,7 @@ export class NoticeFeed {
   private readonly putAway = new Map<string, PutAway>()
   private sent = 0
   private shown = 0
+  private heard = false
   private readonly listeners = new Set<Listener>()
   private timer: ReturnType<typeof setInterval> | null = null
   private reading: Promise<void> | null = null
@@ -135,6 +153,11 @@ export class NoticeFeed {
 
   get current(): NoticesState {
     return this.state
+  }
+
+  /** Whether the server has answered yet: until then the state is a placeholder. */
+  get answered(): boolean {
+    return this.heard
   }
 
   subscribe(listener: Listener): () => void {
@@ -223,6 +246,7 @@ export class NoticeFeed {
   private receive(sent: number, next: NoticesState | null): void {
     if (!next || sent <= this.shown) return
     this.shown = sent
+    this.heard = true
     // An answer to a request sent after the server took an action knows of it.
     for (const [id, away] of this.putAway) {
       if (away.settledAt !== null && away.settledAt < sent) this.putAway.delete(id)

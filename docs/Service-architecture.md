@@ -544,8 +544,9 @@ Poise Link while it is unfinished.
 
 ## Behaviors
 
-Behaviors presents an Activity log: red Poise faults, yellow conditions needing
-attention and folded grey automatic recovery, with grouped target/cause details.
+The notification rail lists Behaviors' diagnostics: red Poise faults, amber
+conditions that need the person and folded grey automatic recovery, with grouped
+target/cause details ([Notifications](Notifications.md)).
 The API carries an explicit `runtimeError` for scheduler faults and classifies
 retained incidents from its validated Caller snapshot independently of active
 failure summaries. An unavailable Behaviors API request is one availability

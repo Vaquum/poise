@@ -33,7 +33,7 @@ and `deploy/restore.sh` back it up and restore it.
 - **Editor** — atomic Markdown storage, annotations, and agent-backed chat.
 - **Publishing** — an Editor document published as a pull request to one or more websites kept in GitHub repositories, each described by its own `publish.yaml`. See [Publishing](docs/Publishing.md).
 - **Analytics** — headline numbers for Current's time ranges, from the burger menu: issues opened and closed, pull requests merged, lines changed and time to merge, and per merged pull request the comments, median lines and completed behavior reviews and approvals. See [Analytics](docs/Analytics.md).
-- **Notifications** — what needs you, one thing at a time at the top of the page: a failed behavior, a sign-in or a Chat waiting for you, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. See [Notifications](docs/Notifications.md).
+- **Notifications** — what needs you and what Behaviors is doing, in a rail that docks beside the page on a wide window. It covers a failed behavior, a sign-in or a Chat waiting for you, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. See [Notifications](docs/Notifications.md).
 
 Settings reads only the selected section's expensive data. Accounts shows each
 CLI result independently, with pending checks and failures named alongside it.

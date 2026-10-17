@@ -24,8 +24,8 @@ import { restartOnboarding, startOnboarding } from './onboarding'
 import { watchForUpdates } from './updating'
 import { watchForSignOut } from './signed-out'
 import { NoticeFeed, type NoticeTarget } from './notices'
-import { mountNoticeIsland } from './views/notice-island'
-import './views/notice-island.css'
+import { mountNotificationRail } from './views/notification-rail'
+import './views/notification-rail.css'
 import './views/updating.css'
 import './views/editor-publish.css'
 
@@ -146,8 +146,8 @@ const menu = initMenu({
   onClosePanels: () => { closeTypographyPanel(); closeSettingsPanel(); closeAnalyticsPanel() },
 })
 
-// The notification island at the top of the page, and where each notice in it
-// takes the person.
+// The notification rail beside the page, and where each notice in it takes
+// the person.
 const notices = new NoticeFeed()
 function openNotice(target: NoticeTarget): void {
   if ('view' in target) menu.switchTo(target.view)
@@ -160,7 +160,7 @@ function openNotice(target: NoticeTarget): void {
   else window.open(target.pullRequest, '_blank', 'noopener,noreferrer')
 }
 // A Chat session on screen already shows what its notice would say.
-mountNoticeIsland(notices, { open: openNotice, inView: (target) => 'chat' in target && chatSessionInView() === target.chat })
+const notificationRail = mountNotificationRail(notices, { open: openNotice, inView: (target) => 'chat' in target && chatSessionInView() === target.chat })
 window.addEventListener('poise:notifications-changed', () => { void notices.refresh() })
 
 // On load: pull settings first so views render with the correct org/me/timezone,
@@ -184,6 +184,7 @@ watchForSignOut()
   // wall-clock ticker — see server/behaviors.ts.)
   startRefreshTicker()
   notices.start()
+  notificationRail.start()
   void initServiceSettings({
     runSetup: () => {
       restartOnboarding().catch((error: unknown) => console.error('[setup] setup could not start again:', error))

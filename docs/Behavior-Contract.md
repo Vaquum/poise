@@ -5,12 +5,18 @@ construct reviews, or mutate review threads itself.
 
 ## Diagnostic severity
 
-Behaviors shows a compact Activity log grouped by target and cause. **Poise
-faults** are red and mean the scheduler or Poise's launch/result integration needs repair.
-**Needs attention** is yellow for repository access, sign-in, provider limits
-and uncertain outcomes, including unusable model verdicts and exhausted review
-recovery. **Automatic** is grey and folded for known capacity,
-head changes, upstream 429/5xx and transport interruptions that Poise rechecks.
+Behaviors' diagnostics are listed in the notification rail
+([Notifications](Notifications.md)), grouped by target and cause.
+- **Poise faults** are red and mean the scheduler or Poise's launch/result
+  integration needs repair.
+- **Needs you** is amber for repository access, sign-in, provider limits and
+  uncertain outcomes, including unusable model verdicts and exhausted review
+  recovery.
+- **Handled automatically** is grey and folded. It covers known capacity, head
+  changes, upstream 429/5xx and transport interruptions that Poise rechecks.
+
+A failed behavior's notice and its diagnostic are one entry, in the group the
+diagnostic decides.
 Unknown causes stay yellow until their cause is established; a process exit or
 retry count alone never proves Poise is broken. Each row expands to its full
 diagnostic details, retaining its expansion through refresh.
@@ -29,7 +35,7 @@ A grey no-action PR incident requires one validated Caller row matching its
 call, correlation, actor, repository, PR, behavior and source, with
 `not_started` / `preflight_failed`, a pinned expected head, and no executed head
 or review/posting receipts. Missing, conflicting or quarantined evidence stays
-visible under Needs attention. Classification never authorizes a retry.
+visible under Needs you. Classification never authorizes a retry.
 Distinct attempts are read before visual grouping, so a newer automatic event
 cannot hide an older held reviewer. Persisted launch contract and quarantine
 evidence overrides Caller no-action text; a matching correlation must identify

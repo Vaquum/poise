@@ -1,9 +1,40 @@
 # Notifications
 
-Poise shows what needs you in a pill at the top centre of every view: one
-notice at a time, the most pressing first. When nothing needs you, nothing
-shows. It sits in the band above each view's controls, so it never covers a
-control or what a view shows.
+What needs you, and what Behaviors is doing, is in one place: the notification
+rail. A bell at the end of the control bar, in every view, counts what is open
+and opens the rail. When nothing needs you, the bell shows no count.
+
+## The bell
+
+The count is what needs you, Poise faults and what is ready for you. What Poise
+handles on its own is not counted. The badge is:
+
+- red while Poise has a fault;
+- amber while something needs you;
+- green when everything open is ready for you.
+
+## The rail
+
+The rail opens under the control bar, on the right, at full height.
+
+- **Docked.** On a window at least 1400px wide the rail docks. The page ends
+  where the rail begins, including full-width Archive, Swarm, Current and
+  Chat, so the rail covers nothing. It can stay open while you work, across
+  views and reloads. The dock button in its header turns docking off and on.
+- **Floating.** On a narrower window, or with docking off, it floats over the
+  page. It closes on a click outside it or on Escape.
+
+Everything is listed by who acts:
+
+- **Needs you:** what only you can do.
+- **Poise faults:** Poise itself needs repair.
+- **Ready:** done and waiting for you.
+- **Handled automatically:** Poise is retrying, and there is nothing to do.
+  This group is folded behind its count while anything else is listed.
+
+The filter above the list shows one group at a time. Each entry expands in
+place to its full words, what happened and what can be done. An expanded entry
+stays expanded through refreshes.
 
 ## What shows
 
@@ -14,14 +45,23 @@ Each notice is an unresolved alert, the same alerts
 2. A sign-in is needed: Claude, another agent CLI, or a GitHub account gh does
    not hold signed in.
 3. A behavior failed and is held. The notice leaves once Behaviors no longer
-   shows the incident.
+   has the incident.
 4. A GitHub account's datastore has not synced for 15 minutes.
 5. A pull request of yours is ready to merge (below).
 6. A Chat turn that ran longer than two minutes has finished. This one shows
    for an hour.
 
-Within a kind, the one that most recently came due leads. A more pressing
-notice that arrives takes the place of the one shown.
+Within a kind, the one that most recently came due leads. A Chat session that
+is on screen already says what its notice would, so its notice is not listed.
+
+Behaviors' diagnostics are listed too, with the classification and details
+described in [Behavior integration contract](Behavior-Contract.md#diagnostic-severity).
+
+A failed behavior's notice and its diagnostic are one entry. The notice says
+what can be done; the diagnostic says what happened and how it is classified,
+which also decides its group. Each Behaviors row shows that behavior's counts:
+Poise faults, needs you and automatic. A count opens the rail on that behavior
+with its first entry in that group expanded.
 
 ## Pull requests ready to merge
 
@@ -45,38 +85,71 @@ from the start of the check; a different agent account gets its own check.
 
 ## Acting on a notice
 
-- **Click it** to open what it is about and put it away: Swarm, Settings
-  (Accounts or General), the Chat session, or the pull request on GitHub in a
-  new tab.
-  A failed behavior scrolls to its exact run in Swarm, briefly highlights it,
-  and opens the failure detail, including when Swarm is already on screen.
-  Search and account filters that hide the run are cleared, and a collapsed
-  group opens to reveal it. An incident without a recorded agent call opens
-  Behaviors, where its diagnostic is shown.
-- **×** puts it away: for good, or for a ready pull request until its next
-  reminder.
-- **The crossed-out bell**, on a ready pull request only, silences it: no more
+- **Open** goes to what the notice is about and puts the notice away. That is
+  Swarm, Settings (Accounts or General), the Chat session, or the pull request
+  on GitHub in a new tab.
+  - A failed behavior scrolls to its exact run in Swarm, briefly highlights it,
+    and opens the failure detail, including when Swarm is already on screen.
+    Search and account filters that hide the run are cleared, and a collapsed
+    group opens to reveal it.
+  - A failed behavior without a recorded agent call has nothing to open. Its
+    diagnostic is in the entry itself.
+  - A floating rail closes when it opens something; a docked rail stays open.
+- **Dismiss** puts it away: for good, or for a ready pull request until its
+  next reminder.
+- **Silence reminders**, on a ready pull request only, silences it: no more
   reminders while it stays open.
-- **+N** shows the next notice.
 
-What one tab puts away, the others drop within ten seconds. The pill takes no
-focus and makes no sound; a screen reader reads each new notice. It is hidden
-in the Editor's writer mode.
+Behaviors' conditions cannot be put away. They leave the rail when the
+condition clears.
+
+## Arrivals
+
+A notice that arrives while the rail is closed shows for six seconds as a card
+under the control bar. The card has Open (when the notice has somewhere to go),
+Show, which opens the rail on it, and dismiss. Pointing at the card or focusing
+it keeps it on screen. Then it tucks into the bell. A ready pull request's
+reminder arrives the same way. While the rail is open, a new entry is
+highlighted in place instead.
+
+What stood before the page loaded, or before notifications were turned on, is
+counted by the bell, not shown as a card. Cards take no focus and make no
+sound; a screen reader reads each new notice once.
+
+What one tab puts away, the others drop within ten seconds. The bell, the rail
+and arrival cards are hidden in the Editor's writer mode.
+
+## Reading Behaviors' diagnostics
+
+Reading Behaviors' diagnostics runs `agent-interface --logs` on the server, so
+the page reads them only:
+
+- once, 15 seconds after it loads, unless something below has read them first;
+- when the rail opens, and while it is open, on each refresh tick;
+- whenever Behaviors refreshes on screen.
+
+Until that first read, the bell counts only notices.
 
 ## Turning them off
 
-Settings → General → Notifications. Off hides the pill and stops the check of
-pull requests at once. Poise Link's other alerts go on as before.
+Settings → General → Notifications. Off stops notices and the check of pull
+requests at once. Behaviors' diagnostics stay in the rail, and Poise Link's
+other alerts go on as before.
 
 ## API
 
 - `GET /api/notices` answers `{ enabled, notices }`, the most pressing first.
   - A notice is `{ id, kind, title, body, since, due, silenceable, target }`.
+  - On a failed behavior it also carries `subject: { behavior, target }`: the
+    behavior and target Behaviors' diagnostics know it by.
   - `due` is `since`, or the latest reminder of a ready pull request.
-  - `target` is `{ swarm: <call id> }`, `{ view: "behaviors" }` for an incident
-    without a recorded call, `{ settings: "general" | "accounts" }`,
-    `{ chat: <session id> }`, `{ pullRequest: <GitHub URL> }`, or null when
-    the notice only informs.
+  - `target` is one of:
+    - `{ swarm: <call id> }`;
+    - `{ view: "behaviors" }` for an incident without a recorded call;
+    - `{ settings: "general" | "accounts" }`;
+    - `{ chat: <session id> }`;
+    - `{ pullRequest: <GitHub URL> }`;
+    - null when the notice only informs.
 - `POST /api/notices/:id/dismiss` and `POST /api/notices/:id/silence` answer
   the same shape.
   - Either answers 404 for a notice that has cleared or was never issued.
@@ -86,4 +159,5 @@ pull requests at once. Poise Link's other alerts go on as before.
 
 The page reads `GET /api/notices` every ten seconds while it is in front, and
 at once when it comes back to the front. The code is `server/alerts/notices.ts`
-on the server and `src/views/notice-island.ts` in the page.
+on the server; in the page it is `src/views/notification-rail.ts`, with what it
+lists in `src/notification-items.ts`.

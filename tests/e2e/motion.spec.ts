@@ -113,41 +113,48 @@ test('closed menu retains its words until exit while focus and interaction close
   await expect(page.locator('#menu-surface')).not.toHaveAttribute('inert')
 })
 
-test('a notice arriving between resize and its queued fit remains readable', async ({ page }) => {
-  await workspace(page); await settled(page)
-  const notice: import('../../src/notices').Notice = { id: 'resize-arrival', kind: 'chat_turn_finished', title: 'Arrived during resize', body: 'Browser fixture', since: '2026-10-13T10:00:00Z', due: '2026-10-13T10:00:00Z', silenceable: false, target: null }
-  await page.route('**/api/notices', route => route.fulfill({ json: { enabled: true, notices: [notice] } }))
-  await freeze(page)
-  await page.evaluate(() => { window.dispatchEvent(new Event('resize')); window.dispatchEvent(new Event('focus')) })
-  await expect(page.locator('#notice-island .ni-title')).toHaveText(notice.title)
-  await resume(page); await settled(page)
-  await expect(page.locator('#notice-island .ni-shell')).toHaveCSS('opacity', '1')
-  await expect(page.locator('#notice-island .ni-content')).toHaveCSS('opacity', '1')
-})
-
-test('swapping a notice during entrance keeps its presented position', async ({ page }) => {
+test('a notice arriving during a resize shows a readable card', async ({ page }) => {
   await workspace(page)
-  const notices: import('../../src/notices').Notice[] = ['First notice', 'Second notice'].map((title, index) => ({ id: `motion-${index}`, kind: 'chat_turn_finished', title, body: 'Browser fixture', since: '2026-10-13T10:00:00Z', due: '2026-10-13T10:00:00Z', silenceable: false, target: null }))
+  const notice: import('../../src/notices').Notice = { id: 'resize-arrival', kind: 'chat_turn_finished', title: 'Arrived during resize', body: 'Browser fixture', since: '2026-10-13T10:00:00Z', due: '2026-10-13T10:00:00Z', silenceable: false, target: null }
+  let notices: import('../../src/notices').Notice[] = []
   await page.route('**/api/notices', route => route.fulfill({ json: { enabled: true, notices } }))
   await page.reload()
-  const result = await page.evaluate(() => new Promise<{ before: number, after: number, inert: boolean }>((resolve, reject) => {
-    const start = performance.now()
-    const frame = () => {
-      const actor = document.querySelector<HTMLElement>('.ni-content')
-      const y = actor ? parseFloat(actor.style.getPropertyValue('--flow-enter-y')) : NaN
-      if (actor && y > 1 && y < 7) {
-        const before = actor.getBoundingClientRect().top
-        actor.querySelector<HTMLButtonElement>('[data-action="next"]')!.click()
-        resolve({ before, after: actor.getBoundingClientRect().top, inert: actor.inert })
-      } else if (performance.now() - start < 5000) requestAnimationFrame(frame)
-      else reject(new Error('Notice did not enter.'))
-    }
-    requestAnimationFrame(frame)
-  }))
-  expect(result.after).toBe(result.before)
-  expect(result.inert).toBe(true)
   await settled(page)
-  await expect(page.locator('.ni-title')).toHaveText('Second notice')
+  notices = [notice]
+  await freeze(page)
+  await page.evaluate(() => { window.dispatchEvent(new Event('resize')); window.dispatchEvent(new Event('focus')) })
+  await expect(page.locator('.nr-toast .nr-toast-title')).toHaveText(notice.title)
+  await resume(page); await settled(page)
+  await expect(page.locator('.nr-toast')).toHaveCSS('opacity', '1')
+  await expect(page.locator('.nr-toast')).toBeInViewport()
+})
+
+test('an entry put away retires from where it was shown while the next moves up', async ({ page }) => {
+  await workspace(page)
+  let notices: import('../../src/notices').Notice[] = ['First notice', 'Second notice'].map((title, index) => ({ id: `motion-${index}`, kind: 'chat_turn_finished', title, body: 'Browser fixture', since: '2026-10-13T10:00:00Z', due: '2026-10-13T10:00:00Z', silenceable: false, target: null }))
+  await page.route('**/api/notices', route => route.fulfill({ json: { enabled: true, notices } }))
+  await page.route(/\/api\/notices\/[^/]+\/dismiss$/, route => { notices = notices.slice(1); return route.fulfill({ json: { enabled: true, notices } }) })
+  await page.reload()
+  await page.locator('#notification-bell').click()
+  await page.locator('#notification-rail .nr-card').first().locator('.nr-card-head').click()
+  await settled(page)
+  const result = await page.evaluate(() => {
+    const [first, second] = [...document.querySelectorAll<HTMLElement>('#notification-rail .nr-card')]
+    const before = first.getBoundingClientRect().top, secondBefore = second.getBoundingClientRect().top
+    first.querySelector<HTMLButtonElement>('[data-action="dismiss"]')!.click()
+    const ghost = document.querySelector<HTMLElement>('[data-flow-retiring]')
+    return { before, secondBefore, ghost: ghost ? { top: ghost.getBoundingClientRect().top, words: ghost.textContent, inert: ghost.inert } : null, removed: !first.isConnected, secondNow: second.getBoundingClientRect().top }
+  })
+  expect(result.removed).toBe(true)
+  expect(result.ghost).not.toBeNull()
+  expect(Math.abs(result.ghost!.top - result.before)).toBeLessThan(1)
+  expect(result.ghost!.words).toContain('First notice')
+  expect(result.ghost!.inert).toBe(true)
+  expect(Math.abs(result.secondNow - result.secondBefore)).toBeLessThan(1)
+  await settled(page)
+  await expect(page.locator('[data-flow-retiring]')).toHaveCount(0)
+  const settledTop = await page.locator('#notification-rail .nr-card').first().evaluate(element => element.getBoundingClientRect().top)
+  expect(Math.abs(settledTop - result.before)).toBeLessThan(1)
 })
 
 for (const narrow of [false, true]) test(`session controls retain focus and drafts through updates (${narrow ? 'narrow dark' : 'desktop light'})`, async ({ page }) => {
@@ -323,7 +330,7 @@ test('reduced motion removes feedback waits and settles active panels on prefere
   await settled(page)
   await expect(page.locator('#menu-surface')).toHaveCSS('opacity', '1')
   const delay = await page.evaluate(() => {
-    const content = document.createElement('div'); content.className = 'ni-content ni-arriving'; document.body.append(content)
+    const content = document.createElement('div'); content.className = 'nr-card nr-arrived'; document.body.append(content)
     const value = getComputedStyle(content).transitionDelay; content.remove(); return value
   })
   expect(delay.split(',').every(value => parseFloat(value) === 0)).toBe(true)
