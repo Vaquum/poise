@@ -585,3 +585,17 @@ test('reads a list saved as one text into its words', async ({ page }) => {
   await expect(dialog.getByRole('alert')).toContainText('Not now.')
   expect(sent[0].destinations[0].values.tags).toEqual(['ad-fraud', 'machine-intelligence'])
 })
+
+test('shows, and sends, the default of a date with one when it is cleared', async ({ page }) => {
+  await workspace(page)
+  const sent = await openEditor(page, [MIKKO], notNow)
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  const date = dialog.getByLabel('Date', { exact: true })
+  await date.fill('2026-03-01')
+  await date.fill('')
+  // mikkokotila.com's date defaults to today: cleared, it is today, as the site would write it.
+  await expect(date).toHaveValue('2026-10-17')
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values.date).toBe('2026-10-17')
+})

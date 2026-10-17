@@ -331,6 +331,18 @@ async function stillOurs(session: GitHubSession, ready: ReadySite, record: Publi
   }
 }
 
+/**
+ * A pull request a maintainer retargeted goes, or went, where GitHub says
+ * now: a record whose branch came from it follows it. One moved with its
+ * version to another branch since stays there.
+ */
+function followBase(record: PublishRecord, info: PullRequestInfo): void {
+  const seen = record.pullRequest.base ?? record.base
+  if (!info.base || info.state === 'closed' || info.base === seen) return
+  if (record.base === seen) record.base = info.base
+  record.pullRequest = { ...record.pullRequest, base: info.base }
+}
+
 function timeZone(): string | undefined {
   return getMeta('timezone') || undefined
 }
@@ -344,12 +356,14 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
     const view: PublicationView = {
       repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
       values: record.values, date: record.date, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
-      pullRequest: { ...record.pullRequest, state: 'unknown' }, live: true, ...(record.docTitle !== undefined ? { docTitle: record.docTitle } : {}),
+      pullRequest: { number: record.pullRequest.number, url: record.pullRequest.url, state: 'unknown' }, live: true, ...(record.docTitle !== undefined ? { docTitle: record.docTitle } : {}),
       changed: record.sourceSha !== sha256(doc.content),
     }
     try {
-      const state = (await pullRequest(session!, record.repo, record.pullRequest.number)).state
+      const info = await pullRequest(session!, record.repo, record.pullRequest.number)
+      const state = info.state
       view.pullRequest.state = state
+      followBase(record, info)
       view.live = state !== 'closed' || record.landed !== undefined
       // A site moved to another branch since, where the file is not one this
       // document published: published there afresh, under any slug.
@@ -440,7 +454,7 @@ function viewOf(record: PublishRecord, state: PublicationView['pullRequest']['st
   return {
     repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
     values: record.values, date: record.date, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
-    pullRequest: { ...record.pullRequest, state }, live: true, changed: false,
+    pullRequest: { number: record.pullRequest.number, url: record.pullRequest.url, state }, live: true, changed: false,
     ...(record.docTitle !== undefined ? { docTitle: record.docTitle } : {}),
   }
 }
@@ -496,6 +510,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     try {
       const info = await pullRequest(session, record.repo, record.pullRequest.number)
       if (record.unconfirmed && info.state === 'merged' && !await contains(session, record.headRepo, info.headSha, record.unconfirmed.commit)) missed.add(key)
+      followBase(record, info)
       states.set(key, info.state)
     } catch (error) {
       if (!(error instanceof GitHubError)) throw error
@@ -774,7 +789,10 @@ function provisionalRecord(target: Target, filled: FilledPost, docTitle: string,
     headRepo: longest(previous?.headRepo, ready.info.canPush ? ready.repo : LONGEST_REPOSITORY),
     branch: longest(previous?.branch, `${branchFor(destination.slug)}-9`), base: longest(previous?.base, ready.base),
     path: filled.path, url: filled.url, slug: longest(previous?.slug, destination.slug), date: filled.date,
-    pullRequest: { number, url: longest(previous?.pullRequest.url, `https://github.com/${ready.repo}/pull/${number}`) },
+    pullRequest: {
+      number, url: longest(previous?.pullRequest.url, `https://github.com/${ready.repo}/pull/${number}`),
+      base: longest(previous?.pullRequest.base, previous?.base, ready.base),
+    },
     publishedAt: longest(previous?.publishedAt, at), updatedAt: at,
     sourceSha: digest, values: destination.values, data: filled.frontmatter, bodySha: digest, docTitle,
     ...(landed ? { landed } : {}),
@@ -900,7 +918,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
 
   let branch: string
   let headRepo: string
-  let pr: { number: number, url: string }
+  let pr: PublishRecord['pullRequest']
   let kept = landed
   let outcome: Outcome['state'] = 'open'
   let error: string | undefined
@@ -916,7 +934,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     // request of its own, or the update would reach no one, unless the merge
     // took this commit with it, with or without a maintainer's on top.
     const after = await pullRequest(session, upstream.fullName, previous!.pullRequest.number)
-      .then(async (info) => ({ state: info.state, took: info.state === 'merged' && await contains(session, headRepo, info.headSha, commit) }))
+      .then(async (info) => ({ state: info.state, base: info.base, took: info.state === 'merged' && await contains(session, headRepo, info.headSha, commit) }))
       .catch((failure: unknown) => {
         if (!(failure instanceof GitHubError)) throw failure
         return failure
@@ -928,19 +946,26 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       pr = previous!.pullRequest
       unconfirmed = { commit, url: previous!.url, date: previous!.date }
       error = `Committed to the branch of pull request #${pr.number}, but its state could not be read: ${after.message}. Publish again to make sure the update reaches the site.`
-    } else if (after.state === 'open') pr = previous!.pullRequest
-    else if (after.took) {
-      pr = previous!.pullRequest
+    } else if (after.state === 'open') {
+      base = after.base || base
+      pr = { ...previous!.pullRequest, base }
+    } else if (after.took) {
+      base = after.base || base
+      pr = { ...previous!.pullRequest, base }
       kept = { data: published.data, bodySha: published.bodySha, pullRequest: pr.number, url, date: published.date }
       outcome = 'merged'
     } else {
-      // Merged meanwhile: what it held is on the site now, and this document's.
-      if (after.state === 'merged') kept = snapshotOf(previous!)
+      // Merged meanwhile: what it held is on the site now, and this document's,
+      // on the branch it merged into.
+      if (after.state === 'merged') {
+        kept = snapshotOf(previous!)
+        base = after.base || base
+      }
       // To the branch the pull request it replaces went to, where what it
       // merged is: should the site have moved since, the next publication
       // asks whether the piece is still this document's there.
       const opened = await open(headRepo, branch, kept !== undefined, base)
-      pr = { number: opened.number, url: opened.url }
+      pr = { number: opened.number, url: opened.url, base }
     }
   } else {
     // The site's own repository when the writer can push to it, otherwise
@@ -950,7 +975,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     branch = await freshBranch(session, headRepo, branchFor(destination.slug), head)
     await commitFile(session, headRepo, branch, head, `${state === 'merged' ? 'Update' : 'Publish'} ${filled.path}`, filled.path, text)
     const opened = await open(headRepo, branch, state === 'merged', base)
-    pr = { number: opened.number, url: opened.url }
+    pr = { number: opened.number, url: opened.url, base }
   }
   return {
     state: outcome,

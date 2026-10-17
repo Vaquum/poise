@@ -80,6 +80,7 @@ function answer(status: number, body?: unknown) {
 
 const pullJson = (repo: Repo, pull: Pull) => ({
   number: pull.number, state: pull.state, merged: pull.merged, html_url: `https://github.com/${repo.fullName}/pull/${pull.number}`,
+  base: { ref: pull.base },
   head: { ref: pull.head, sha: pull.mergedSha ?? repos.get(pull.headRepo.toLowerCase())!.branches.get(pull.head) ?? '' },
 })
 
@@ -1006,6 +1007,21 @@ sections:
     close('mikkokotila/mikkokotila-com', 102)
     expect((await publish([writing()], true)).body.results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/did not publish it/) })
     expect(fileOn('mikkokotila/mikkokotila-com', 'published', POST)).toBe('Someone else\'s piece.\n')
+  })
+
+  it('follows a pull request a maintainer retargets, and never writes over a file it did not merge into', async () => {
+    await publish([writing()])
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    // A maintainer retargets #101 to another branch and merges it there; main has someone else's piece at the path.
+    repo.branches.set('staging', repo.branches.get('main')!)
+    repo.pulls.get(101)!.base = 'staging'
+    merge('mikkokotila/mikkokotila-com', 101)
+    editOnSite('mikkokotila/mikkokotila-com', 'main', 'content/writing.yaml', (text) => text)
+    const files = new Map(commits.get(repo.branches.get('main')!)!)
+    files.set(POST, 'Someone else\'s piece.\n')
+    repo.branches.set('main', commit(files, repo.branches.get('main')))
+    expect((await publish([writing()], true)).body.results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/did not publish it/) })
+    expect(fileOn('mikkokotila/mikkokotila-com', 'main', POST)).toBe('Someone else\'s piece.\n')
   })
 
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {

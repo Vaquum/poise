@@ -725,7 +725,7 @@ export interface PublishRecord {
   url: string
   slug: string
   date: string                  // the date its path and address were filled with
-  pullRequest: { number: number, url: string }
+  pullRequest: { number: number, url: string, base?: string } // base: the branch it went to when last read
   publishedAt: string           // first published there
   updatedAt: string
   sourceSha: string             // the document as it was published
@@ -756,7 +756,7 @@ function isPublishRecord(value: unknown): value is PublishRecord {
   const pr = record.pullRequest as Record<string, unknown> | undefined
   return ['repo', 'section', 'site', 'headRepo', 'branch', 'base', 'path', 'url', 'slug', 'date', 'publishedAt', 'updatedAt', 'sourceSha', 'bodySha']
     .every((key) => typeof record[key] === 'string')
-    && !!pr && Number.isSafeInteger(pr.number) && typeof pr.url === 'string'
+    && !!pr && Number.isSafeInteger(pr.number) && typeof pr.url === 'string' && (pr.base === undefined || typeof pr.base === 'string')
     && !!record.values && typeof record.values === 'object' && !Array.isArray(record.values)
     && !!record.data && typeof record.data === 'object' && !Array.isArray(record.data)
     && (record.landed === undefined || isLanded(record.landed))

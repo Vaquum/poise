@@ -206,6 +206,8 @@ export interface PullRequestInfo {
   headRef: string
   /** The commit its branch was at: for a merged one, what it merged. */
   headSha: string
+  /** The branch it goes to now: a maintainer can retarget it. */
+  base: string
 }
 
 function pullRequestFrom(body: any): PullRequestInfo {
@@ -215,6 +217,7 @@ function pullRequestFrom(body: any): PullRequestInfo {
     state: body.merged === true || body.merged_at ? 'merged' : body.state === 'open' ? 'open' : 'closed',
     headRef: String(body.head?.ref ?? ''),
     headSha: String(body.head?.sha ?? ''),
+    base: String(body.base?.ref ?? ''),
   }
 }
 

@@ -199,15 +199,16 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
  * today unless its description fixes another.
  */
 function dateFor(s: State, choice: Choice): string {
-  // Typed, or cleared: a date cleared is one the writer leaves out.
-  if (s.dateTyped) return s.shared.date
   const field = choice.section.fields.find((f) => f.name === sharedField(choice.section, 'date'))
+  // A date cleared is left out, unless it has a default: the site writes that instead, so the panel does.
+  const cleared = field?.default === 'today' ? s.doc.today : typeof field?.default === 'string' ? field.default : ''
+  if (s.dateTyped) return s.shared.date || cleared
   const publication = livePublicationOf(s, choice.key)
   if (field && publication) {
-    // Cleared when it was published: left out still. Otherwise the date it
-    // went by, one the site fixed when it was published too.
+    // Cleared when it was published: left out still, or the default it went by.
+    // Otherwise the date it went by, one the site fixed when it was published too.
     const saved = savedValue(publication.values, field.name)
-    if (saved === '') return ''
+    if (saved === '') return cleared && (publication.date || cleared)
     const own = typeof saved === 'string' && saved ? saved : publication.date
     if (own) return own
   }
@@ -422,7 +423,11 @@ function onInput(event: Event): void {
   if (target.dataset.shared) {
     const which = target.dataset.shared as Shared
     s.shared[which] = target.value
-    if (which === 'date') s.dateTyped = true
+    if (which === 'date') {
+      s.dateTyped = true
+      // Cleared, once the change is made: a date with a default shows it again.
+      if (event.type === 'change' && !target.value) render()
+    }
     if (which === 'title') {
       // A slug follows the title until it is typed, or published.
       for (const choice of s.choices) {
