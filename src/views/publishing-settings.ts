@@ -123,10 +123,15 @@ export function publishingSection(): PublishingSection {
     sites = sites.map((s) => (s.repo.toLowerCase() === site.repo.toLowerCase() ? site : s))
   }
 
+  let adding = false
   const add = async () => {
+    if (adding) return
     const repo = input.value.trim()
     if (!repo) { input.focus(); return }
+    // While it is added, the name holds still: what is cleared after is what was added.
+    adding = true
     addButton.disabled = true
+    input.readOnly = true
     say('Reading the repository…')
     try {
       const site = await addSite(repo)
@@ -140,7 +145,9 @@ export function publishingSection(): PublishingSection {
     } catch (error) {
       say((error as Error).message, 'error')
     } finally {
+      adding = false
       addButton.disabled = false
+      input.readOnly = false
     }
   }
 

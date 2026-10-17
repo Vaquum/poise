@@ -374,3 +374,35 @@ test("gives a site chosen after a publication the piece's date", async ({ page }
   await expect.poll(() => sent.length).toBe(2)
   expect(sent[1].destinations.map((d: any) => [d.repo, d.values.date])).toEqual([[FIXED.repo, '2026-01-01'], [MIKKO.repo, '2026-01-01']])
 })
+
+test('holds the repository name still while it is added', async ({ page }) => {
+  await workspace(page)
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  let sites: unknown[] = []
+  let adds = 0
+  await page.route('**/api/publishing/sites**', async (route) => {
+    if (route.request().method() === 'POST') {
+      adds++
+      await held
+      const added = { ...MIKKO, repo: 'acme/notes', site: 'Notes' }
+      sites = [added]
+      return route.fulfill({ json: { site: added } })
+    }
+    return route.fulfill({ json: { sites } })
+  })
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover').getByRole('button', { name: 'Publishing', exact: true }).click()
+  const panel = page.locator('#settings-panel')
+  const repo = panel.getByLabel('Repository to publish to')
+  await repo.fill('acme/notes')
+  await repo.press('Enter')
+  await expect(repo).toHaveAttribute('readonly', '')
+  // A second Enter adds nothing more.
+  await repo.press('Enter')
+  release()
+  await expect(panel.locator('.pb-site')).toHaveCount(1)
+  await expect(repo).not.toHaveAttribute('readonly', '')
+  await expect(repo).toHaveValue('')
+  expect(adds).toBe(1)
+})
