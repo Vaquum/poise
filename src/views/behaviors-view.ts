@@ -13,7 +13,8 @@ import { layout, watchPanel } from '../motion'
 
 import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
 import { organizationErrors } from '../organizations'
-import { behaviorDiagnosticGroups, type BehaviorDiagnosticGroup } from '../behavior-diagnostics'
+import { notificationCountsFor, onNotificationItems, openNotifications } from './notification-rail'
+import type { ItemGroup } from '../notification-items'
 
 let viewEl: HTMLElement
 let initialized = false
@@ -961,7 +962,6 @@ function renderShell(): string {
       <div class="filter-cluster" id="behaviors-filters"><span class="st-help st-help-info">Behavior settings apply to all ready GitHub accounts.</span></div>
     </header>
     <main>
-      <div id="behavior-diagnostics" class="behavior-diagnostics" hidden></div>
       <table id="behaviors-table">
         <thead>
           <tr>
@@ -985,7 +985,7 @@ function renderRow(meta: typeof BEHAVIORS[number]): HTMLTableRowElement {
   tr.dataset.behavior = meta.key
   const owner = behaviorOwners[meta.key] || null
   tr.innerHTML = `
-    <td class="title-cell"><span class="behavior-name">${escapeHtml(meta.label)}</span></td>
+    <td class="title-cell"><span class="behavior-name">${escapeHtml(meta.label)}</span><span class="behavior-notifications">${notificationChips(meta.key)}</span></td>
     <td class="behavior-owner-cell">${ownerCell(owner)}</td>
     <td class="behavior-setting-cell">${settingCell(meta)}</td>
     <td class="behavior-reviewers-cell">${reviewersCell(meta)}</td>
@@ -1012,39 +1012,27 @@ async function fetchBehaviorOwners() {
   }
 }
 
-function renderDiagnostics() {
-  const el = viewEl.querySelector<HTMLElement>('#behavior-diagnostics')
-  if (!el) return
-  const diagnostics = getBehaviorDiagnostics()
-  if (!diagnostics) {
-    el.hidden = true
-    el.textContent = ''
-    return
+// What the notification rail lists about a behavior: one count per group,
+// each of which opens the rail on that behavior.
+const CHIP_GROUPS: { group: ItemGroup, tone: string, words: (n: number) => string }[] = [
+  { group: 'faults', tone: 'red', words: (n) => `${n} Poise fault${n === 1 ? '' : 's'}` },
+  { group: 'needs', tone: 'amber', words: (n) => `${n} need${n === 1 ? 's' : ''} you` },
+  { group: 'auto', tone: 'slate', words: (n) => `${n} automatic` },
+]
+
+function notificationChips(key: BehaviorKey): string {
+  const counts = notificationCountsFor(key)
+  return CHIP_GROUPS.filter(({ group }) => counts[group] > 0).map(({ group, tone, words }) =>
+    `<button type="button" class="nr-count-chip" data-tone="${tone}" data-notifications-behavior="${escapeHtml(key)}" data-group="${group}" data-opens-notifications title="Show in notifications">${words(counts[group])}</button>`,
+  ).join('')
+}
+
+function refreshNotificationChips() {
+  if (!viewEl) return
+  for (const meta of BEHAVIORS) {
+    const cell = viewEl.querySelector<HTMLElement>(`tr[data-behavior="${meta.key}"] .behavior-notifications`)
+    if (cell) patchContent(cell, notificationChips(meta.key))
   }
-  const groups = behaviorDiagnosticGroups(diagnostics)
-  const errors = groups.filter((group) => group.severity === 'error')
-  const warnings = groups.filter((group) => group.severity === 'warning')
-  const automatic = groups.filter((group) => group.severity === 'info')
-  const open = new Set([...el.querySelectorAll<HTMLDetailsElement>('details[open][data-diagnostic-id]')]
-    .map((detail) => detail.dataset.diagnosticId))
-  const list = (entries: BehaviorDiagnosticGroup[]) => `<ul class="behavior-diagnostic-list">${entries.map((group) => {
-    const id = JSON.stringify([group.code, group.scope, group.message])
-    return `<li class="behavior-diagnostic-row" data-severity="${group.severity}">
-      <span class="behavior-diagnostic-dot" aria-hidden="true"></span>
-      <details data-diagnostic-id="${escapeHtml(id)}"${open.has(id) ? ' open' : ''}>
-        <summary><span class="behavior-diagnostic-copy"><span class="behavior-diagnostic-scope">${escapeHtml(group.scope)}</span>
-          <span class="behavior-diagnostic-message">${escapeHtml(group.message)}</span></span>
-          <span class="behavior-diagnostic-count">${group.details.length} ${group.details.length === 1 ? 'event' : 'events'}</span>
-          <span class="behavior-diagnostic-chevron" aria-hidden="true">›</span></summary>
-        <ul class="behavior-diagnostic-details">${group.details.map((detail) => `<li>${escapeHtml(detail)}</li>`).join('')}</ul>
-      </details></li>`
-  }).join('')}</ul>`
-  const section = (label: string, entries: BehaviorDiagnosticGroup[], css: string) => entries.length
-    ? `<section class="${css}" aria-label="${label}"><div class="behavior-diagnostic-section-label">${label}<span>${entries.length}</span></div>${list(entries)}</section>` : ''
-  el.innerHTML = `<div class="behavior-diagnostic-header"><span>Activity</span><span class="behavior-diagnostic-caption">${errors.length ? 'Poise needs repair' : warnings.length ? 'Needs your attention' : 'Poise is handling this'}</span></div>
-    ${section('Poise faults', errors, 'behavior-errors')}${section('Needs attention', warnings, 'behavior-warnings')}
-    ${automatic.length ? `<details class="behavior-info" data-diagnostic-id="automatic"${open.has('automatic') ? ' open' : ''}><summary class="behavior-diagnostic-section-label">Automatic<span>${automatic.length}</span><span class="behavior-diagnostic-chevron" aria-hidden="true">›</span></summary>${list(automatic)}</details>` : ''}`
-  el.hidden = groups.length === 0
 }
 
 function renderRows() {
@@ -1091,6 +1079,12 @@ function attachHandlers() {
     }
   })
   tbody.addEventListener('click', (e) => {
+    // A behavior's notification count → the notification rail, on that behavior.
+    const counted = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-notifications-behavior]')
+    if (counted) {
+      openNotifications({ behavior: counted.dataset.notificationsBehavior, group: counted.dataset.group as ItemGroup })
+      return
+    }
     // Setting pill → open or close the behavior's Setting dropdown.
     const triggersBtn = (e.target as HTMLElement).closest<HTMLButtonElement>('.behavior-triggers-btn')
     if (triggersBtn) {
@@ -1131,7 +1125,6 @@ function attachHandlers() {
 // reflected on the next tick instead of leaving a dangerous false state.
 async function tickRefresh() {
   await refreshState()
-  renderDiagnostics()
   for (const meta of BEHAVIORS) {
     const tr = viewEl.querySelector<HTMLTableRowElement>(`tr[data-behavior="${meta.key}"]`)
     if (!tr) continue
@@ -1174,10 +1167,10 @@ export async function initBehaviorsView() {
     // Re-render when behavior state changes from elsewhere (e.g. boot
     // re-snapshot, programmatic toggle) so the UI never drifts.
     window.addEventListener('poise:behaviors-changed', () => renderRows())
+    onNotificationItems(refreshNotificationChips)
   }
   // Cached rows and explicitly unknown first-load controls do not wait for
   // the runtime read. Attach cleanup-owned work before the first await.
-  renderDiagnostics()
   renderRows()
   // Subscribe to the wall-clock-aligned ticker so the relative-time
   // strings ("2h", "5m") stay accurate and any newly-fired behavior
@@ -1187,5 +1180,5 @@ export async function initBehaviorsView() {
     tickListening = true
   }
   await fetchBehaviorOwners()
-  if (!viewEl.hidden) { renderDiagnostics(); renderRows() }
+  if (!viewEl.hidden) renderRows()
 }

@@ -1,13 +1,25 @@
 import type { BehaviorDiagnostics } from './behaviors'
 import { classifyBehaviorDiagnostic, diagnosticClassification, failureCause, type DiagnosticClassification } from './behavior-failure-cause'
 
+/** One line of a group's details, with what it is about. */
+export interface DiagnosticEntry {
+  /** The behavior and target the line is about; both null for a condition of
+   *  Poise as a whole (agent log, datastore, identity, runtime). */
+  behavior: string | null
+  target: string | null
+  /** When it last happened, when known. */
+  at: string | null
+  detail: string
+}
+
 export interface BehaviorDiagnosticGroup extends DiagnosticClassification {
   scope: string
   message: string
   details: string[]
+  entries: DiagnosticEntry[]
 }
 
-function targetRef(target: string): string {
+export function targetRef(target: string): string {
   return target.match(/^[^#]+#\d+/)?.[0] ?? target
 }
 
@@ -27,12 +39,14 @@ function diagnosticMessage(code: string, cause: string): string {
 
 export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): BehaviorDiagnosticGroup[] {
   const groups = new Map<string, BehaviorDiagnosticGroup>()
-  const add = (classification: DiagnosticClassification, scope: string, message: string, detail: string) => {
+  const add = (classification: DiagnosticClassification, scope: string, message: string, detail: string,
+    about: Omit<DiagnosticEntry, 'detail'> = { behavior: null, target: null, at: null }) => {
     const key = JSON.stringify([classification.severity, classification.code, scope, message])
+    const entry = { ...about, detail }
     const existing = groups.get(key)
     if (existing) {
-      if (!existing.details.includes(detail)) existing.details.push(detail)
-    } else groups.set(key, { ...classification, scope, message, details: [detail] })
+      if (!existing.details.includes(detail)) { existing.details.push(detail); existing.entries.push(entry) }
+    } else groups.set(key, { ...classification, scope, message, details: [detail], entries: [entry] })
   }
   for (const [scope, error] of [
     ['Agent log', diagnostics.agentLogsError], ['Datastore', diagnostics.datastore.error], ['Identity', diagnostics.identity.error],
@@ -58,7 +72,7 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
       ? `GitHub target is unavailable to ${diagnostics.identity.actor || 'the reviewer'}; check repository access.`
       : diagnosticMessage(classification.code, cause)
     const detail = `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}${failure.target ? ` ${failure.target}` : ''}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s) — ${cause}${failure.nextRetryAt ? `; next check ${failure.nextRetryAt}` : ''}`
-    add(classification, scope, message, detail)
+    add(classification, scope, message, detail, { behavior: failure.behavior, target: failure.target ?? null, at: failure.lastFailureAt || null })
   }
   for (const letter of diagnostics.deadLetters) {
     const ref = targetRef(letter.target)
@@ -70,7 +84,8 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
     const existing = letter.callId ? failureCauses.get(JSON.stringify([letter.behavior, letter.callId, cause])) : undefined
     if (existing && (!letter.diagnostic || (existing.code === classification.code && existing.severity === classification.severity))) continue
     add(classification, ref, diagnosticMessage(classification.code, cause),
-      `${letter.behavior} ${letter.target}: ${cause} (${letter.attemptCount ?? 1} attempts)`)
+      `${letter.behavior} ${letter.target}: ${cause} (${letter.attemptCount ?? 1} attempts)`,
+      { behavior: letter.behavior, target: letter.target, at: letter.createdAt || null })
   }
   if (diagnostics.runtimeError) {
     add(diagnosticClassification('runtime_unhealthy'), 'Behaviors', diagnostics.runtimeError, 'Poise runtime needs repair.')

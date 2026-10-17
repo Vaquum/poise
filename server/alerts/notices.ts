@@ -1,6 +1,6 @@
-// Notices: the notifications the page shows at its top, one at a time, the
-// most pressing first (src/views/notice-island.ts). Each is an unresolved
-// alert the person has not put away.
+// Notices: the notifications the page's notification rail lists, the most
+// pressing first (src/views/notification-rail.ts). Each is an unresolved alert
+// the person has not put away.
 //
 // The person's own pull requests are checked here for being ready to merge. A
 // ready one alerts once when it becomes ready, which Poise Link shows too, and
@@ -51,6 +51,9 @@ export interface Notice {
   silenceable: boolean
   /** Where the notice opens; null when it only informs. */
   target: AlertTarget | null
+  /** A failed behavior's behavior and target, as Behaviors' diagnostics name
+   *  them, so the page can show the notice and its diagnostic as one. */
+  subject?: { behavior: string, target: string }
 }
 
 export interface NoticesState {
@@ -93,6 +96,7 @@ export function noticesState(now = Date.now()): NoticesState {
       due: new Date(due).toISOString(),
       silenceable: SILENCEABLE.has(alert.kind),
       target,
+      ...(held ? { subject: { behavior: held[1], target: held[2] } } : {}),
     }]
   })
   // Within a kind, the one that most recently came due leads.

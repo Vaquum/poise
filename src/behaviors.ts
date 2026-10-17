@@ -406,4 +406,6 @@ export async function refreshState(): Promise<void> {
       },
     }
   }
+  // The notification rail lists these diagnostics, from whichever view read them.
+  window.dispatchEvent(new CustomEvent('poise:behavior-diagnostics'))
 }

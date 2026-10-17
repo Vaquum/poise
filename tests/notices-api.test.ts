@@ -119,6 +119,7 @@ describe('the notices API', () => {
     expect(answer.status).toBe(200)
     expect(answer.body.notices).toEqual([expect.objectContaining({
       id: failed.id, target: { swarm: 'failed-call' }, body: 'Open Swarm in Poise to see what happened.',
+      subject: { behavior: 'approve-prs', target: 'acme/api#9' },
     })])
   })
 
@@ -132,6 +133,8 @@ describe('the notices API', () => {
       ['chat_waiting', { chat: 's1' }, false],
       ['pr_ready', { pullRequest: 'https://github.com/acme/api/pull/1' }, true],
     ])
+    // Only a failed behavior names a behavior and target.
+    expect(answer.body.notices.some((notice: any) => 'subject' in notice)).toBe(false)
   })
 
   it('puts a notice away and answers with what is left', async () => {

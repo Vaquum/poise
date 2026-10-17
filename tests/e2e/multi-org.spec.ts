@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { settled } from './fixtures/motion'
 import type { Organization } from '../../src/config'
 import type { BehaviorDiagnostics } from '../../src/behaviors'
 
@@ -365,13 +366,14 @@ test('reports failures across accounts in global behavior diagnostics', async ({
   }
   await page.goto('/')
   await page.locator('#main-filters').getByLabel('Account filter').selectOption('mikkokotila')
-  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  await expect(page.locator('#behavior-diagnostics')).toContainText('acme: review-new-prs acme/same-repo#7: 1 consecutive review failure(s) — First account error')
-  await expect(page.locator('#behavior-diagnostics')).toContainText('mikkokotila: review-new-issues: 2 consecutive review failure(s) — Personal account error')
+  await page.locator('#notification-bell').click()
+  const rail = page.getByRole('complementary', { name: 'Notifications' })
+  await expect(rail).toContainText('acme: review-new-prs acme/same-repo#7: 1 consecutive review failure(s) — First account error')
+  await expect(rail).toContainText('mikkokotila: review-new-issues: 2 consecutive review failure(s) — Personal account error')
   expect(state.reads.filter((read) => read.path === '/api/behaviors').every((read) => read.org === '')).toBe(true)
 })
 
-test('groups conditions needing attention and folds automatic recovery in the Activity log', async ({ page }) => {
+test('groups conditions needing attention and folds automatic recovery in the notification rail', async ({ page }) => {
   const state = await setup(page)
   state.diagnostics = { status: 'ok', agentLogsError: null,
     datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
@@ -389,22 +391,24 @@ test('groups conditions needing attention and folds automatic recovery in the Ac
     ],
   }
   await page.goto('/')
-  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  const diagnostics = page.locator('#behavior-diagnostics')
-  await expect(diagnostics.locator('.behavior-errors')).toHaveCount(0)
-  await expect(diagnostics.locator('.behavior-warnings > ul > li')).toHaveCount(1)
-  await expect(diagnostics.locator('.behavior-warnings')).toContainText('GitHub target is unavailable to bit-mis')
-  const automatic = diagnostics.locator('.behavior-info')
-  await expect(automatic.locator(':scope > summary')).toContainText('Automatic')
-  await expect(automatic).not.toHaveAttribute('open', '')
-  await automatic.locator(':scope > summary').click()
-  await expect(automatic).toContainText('The model is busy. Poise will try again.')
-  await expect(automatic).toContainText('PR updated. Poise will reconsider the latest revision.')
-  await diagnostics.locator('.behavior-warnings details summary').click()
-  await expect(diagnostics.locator('.behavior-warnings details')).toContainText('acme/private#21:secondary:check')
+  await page.locator('#notification-bell').click()
+  const rail = page.getByRole('complementary', { name: 'Notifications' })
+  await expect(rail.getByRole('region', { name: 'Poise faults' })).toHaveCount(0)
+  const needs = rail.getByRole('region', { name: 'Needs you' })
+  await expect(needs.locator('.nr-card')).toHaveCount(1)
+  await expect(needs).toContainText('GitHub target is unavailable to bit-mis')
+  const automatic = rail.getByRole('region', { name: 'Handled automatically' })
+  const fold = automatic.getByRole('button', { name: 'Handled automatically, 2' })
+  await expect(fold).toHaveAttribute('aria-expanded', 'false')
+  await expect(automatic.locator('.nr-fold-items')).toBeHidden()
+  await fold.click()
+  await expect(automatic.locator('.nr-fold-items')).toContainText('The model is busy. Poise will try again.')
+  await expect(automatic.locator('.nr-fold-items')).toContainText('PR updated. Poise will reconsider the latest revision.')
+  await needs.locator('.nr-card-head').click()
+  await expect(needs.locator('.nr-history')).toContainText('acme/private#21:secondary:check')
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
-  await expect(diagnostics.locator('.behavior-warnings details')).toHaveAttribute('open', '')
-  await expect(automatic).toHaveAttribute('open', '')
+  await expect(needs.locator('.nr-card-head')).toHaveAttribute('aria-expanded', 'true')
+  await expect(fold).toHaveAttribute('aria-expanded', 'true')
 })
 
 test('shows one API availability warning and clears it on a successful refresh', async ({ page }) => {
@@ -414,20 +418,20 @@ test('shows one API availability warning and clears it on a successful refresh',
     ? route.fulfill({ status: 502, body: 'Bad Gateway' }) : route.fallback())
   await page.goto('/')
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  const diagnostics = page.locator('#behavior-diagnostics')
-  await expect(diagnostics.locator('.behavior-info > summary')).toContainText('Automatic')
-  await expect(diagnostics.locator('.behavior-errors')).toHaveCount(0)
-  await diagnostics.locator('.behavior-info > summary').click()
-  await expect(diagnostics).toContainText('Status could not be refreshed (HTTP 502).')
-  await expect(diagnostics).not.toContainText('Datastore:')
-  await expect(diagnostics).not.toContainText('Identity:')
-  await expect(diagnostics).not.toContainText('Agent log:')
+  await page.locator('#notification-bell').click()
+  const rail = page.getByRole('complementary', { name: 'Notifications' })
+  const automatic = rail.getByRole('region', { name: 'Handled automatically' })
+  await expect(automatic).toContainText('Status could not be refreshed (HTTP 502).')
+  await expect(rail.locator('.nr-card')).toHaveCount(1)
+  await expect(rail.getByRole('region', { name: 'Poise faults' })).toHaveCount(0)
+  await expect(page.locator('#notification-bell')).toHaveAccessibleName('Notifications')
   await expect(page.locator('input[data-behavior="review-new-prs"]')).toBeDisabled()
   await expect(page.locator('tr[data-behavior="review-new-prs"] .last-dash[title*="unknown"]')).toHaveText('?')
   unavailable = false
   await page.reload()
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  await expect(diagnostics).toBeHidden()
+  await page.locator('#notification-bell').click()
+  await expect(rail.locator('.nr-empty-title')).toHaveText('Nothing needs you')
   await expect(page.locator('input[data-behavior="review-new-prs"]')).toBeEnabled()
 })
 
@@ -441,18 +445,21 @@ test('keeps the last-known runtime error visible alongside a later API outage', 
     ? route.fulfill({ status: 502, body: 'Bad Gateway' }) : route.fallback())
   await page.goto('/')
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-  const diagnostics = page.locator('#behavior-diagnostics')
-  await expect(diagnostics.locator('.behavior-errors')).toContainText('Behavior runtime is degraded.')
+  await page.locator('#notification-bell').click()
+  const rail = page.getByRole('complementary', { name: 'Notifications' })
+  const faults = rail.getByRole('region', { name: 'Poise faults' })
+  await expect(faults).toContainText('Behavior runtime is degraded.')
   unavailable = true
+  // Behaviors is on screen: its refresh is what the rail lists.
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
-  await expect(diagnostics.locator('.behavior-info > summary')).toContainText('Automatic')
-  await expect(diagnostics.locator('.behavior-errors .behavior-diagnostic-section-label')).toContainText('Poise faults')
-  await expect(diagnostics.locator('.behavior-errors')).toContainText('Behavior runtime is degraded.')
+  await rail.getByRole('button', { name: /^Handled automatically/ }).click()
+  await expect(rail.getByRole('region', { name: 'Handled automatically' })).toContainText('Status could not be refreshed (HTTP 502).')
+  await expect(faults).toContainText('Behavior runtime is degraded.')
   unavailable = false
   state.diagnostics.status = 'ok'
   state.diagnostics.runtimeError = null
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
-  await expect(diagnostics).toBeHidden()
+  await expect(rail.locator('.nr-empty-title')).toHaveText('Nothing needs you')
 })
 
 for (const theme of ['light', 'dark']) {
@@ -472,22 +479,27 @@ for (const theme of ['light', 'dark']) {
     await page.goto('/')
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
     await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
-    const diagnostics = page.locator('#behavior-diagnostics')
-    await expect(diagnostics.locator('[data-severity="error"]')).toHaveCount(1)
-    await expect(diagnostics.locator('[data-severity="warning"]')).toHaveCount(1)
-    await expect(diagnostics.locator('[data-severity="info"]')).toHaveCount(1)
-    await expect(diagnostics.locator('.behavior-info')).not.toHaveAttribute('open', '')
-    await diagnostics.locator('.behavior-info > summary').focus()
+    await page.locator('#notification-bell').click()
+    const rail = page.getByRole('complementary', { name: 'Notifications' })
+    await expect(rail.locator('.nr-card[data-tone="red"]')).toHaveCount(1)
+    await expect(rail.locator('.nr-card[data-tone="amber"]')).toHaveCount(1)
+    const automatic = rail.getByRole('region', { name: 'Handled automatically' })
+    const fold = automatic.getByRole('button', { name: 'Handled automatically, 1' })
+    await expect(fold).toHaveAttribute('aria-expanded', 'false')
+    await fold.focus()
     await page.keyboard.press('Enter')
-    await expect(diagnostics.locator('.behavior-info')).toHaveAttribute('open', '')
-    await diagnostics.locator('.behavior-info .behavior-diagnostic-row summary').click()
-    await expect(diagnostics.locator('.behavior-info .behavior-diagnostic-details')).toBeVisible()
-    await page.screenshot({ path: test.info().outputPath(`behavior-activity-${theme}.png`), fullPage: true })
+    await expect(fold).toHaveAttribute('aria-expanded', 'true')
+    await automatic.locator('.nr-card-head').click()
+    await expect(automatic.locator('.nr-history')).toBeVisible()
+    await expect(automatic.locator('.nr-card')).toHaveAttribute('data-tone', 'slate')
+    await settled(page)
+    await page.screenshot({ path: test.info().outputPath(`behavior-activity-${theme}.png`) })
     await page.setViewportSize({ width: 390, height: 844 })
-    await expect(diagnostics).toBeVisible()
-    const width = await diagnostics.evaluate((element) => ({ client: element.clientWidth, scroll: element.scrollWidth }))
+    await expect(rail).toBeVisible()
+    await settled(page)
+    const width = await rail.locator('.nr-body').evaluate((element) => ({ client: element.clientWidth, scroll: element.scrollWidth }))
     expect(width.scroll).toBeLessThanOrEqual(width.client)
-    await page.screenshot({ path: test.info().outputPath(`behavior-activity-${theme}-narrow.png`), fullPage: true })
+    await page.screenshot({ path: test.info().outputPath(`behavior-activity-${theme}-narrow.png`) })
   })
 }
 
