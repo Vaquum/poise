@@ -118,7 +118,8 @@ describe('bounded runner', () => {
   })
 })
 
-describe('git adapter against real repositories', () => {
+// The real-git tests spawn about thirty git processes each, which can outlast the 10 s default on a loaded machine.
+describe('git adapter against real repositories', { timeout: 30_000 }, () => {
   function sh(cwd, ...args) {
     return execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@x', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@x' } }).trim()
   }
@@ -220,5 +221,9 @@ describe('git adapter against real repositories', () => {
       { status: 'R', oldMode: '100644', newMode: '100644', oldPath: 'old.ts', path: 'new.ts' },
     ])
     expect(parseRawDiff('')).toEqual([])
+  })
+
+  it('gives real git work 30 s instead of the global 10 s', ({ task }) => {
+    expect(task.timeout).toBe(30_000)
   })
 })
