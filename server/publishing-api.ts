@@ -447,9 +447,19 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
 
   // Which earlier publications are live. A pull request closed unmerged left
   // nothing on its site: it owns no file there and is named nowhere.
-  const states = new Map<string, PullRequestInfo['state']>()
+  // A pull request that cannot be read (its repository gone, say) fails only
+  // a publication to that site; elsewhere it is still named where it was.
+  const states = new Map<string, PullRequestInfo['state'] | 'unknown'>()
+  const unread = new Map<string, string>()
   await Promise.all(ledger.records.map(async (record) => {
-    states.set(placeKey(record.repo, record.section), (await pullRequest(session, record.repo, record.pullRequest.number)).state)
+    const key = placeKey(record.repo, record.section)
+    try {
+      states.set(key, (await pullRequest(session, record.repo, record.pullRequest.number)).state)
+    } catch (error) {
+      if (!(error instanceof GitHubError)) throw error
+      states.set(key, 'unknown')
+      unread.set(key, error.message)
+    }
   }))
   // A merged version stays on the site, and stays this document's, even when
   // a later pull request is closed unmerged. Worked out here, and written only
@@ -460,12 +470,17 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
 
   const targets: Target[] = []
+  const results = new Map<string, PublishResult>()
   for (const destination of destinations) {
     const read = await readSite(session, findSite(destination.repo))
     if (!read.ready) throw new HttpError(read.view.state === 'unavailable' ? 502 : 409, `${destination.repo}: ${read.view.problem}`)
     const section = read.ready.config.sections.find((s) => s.name === destination.section)
     if (!section) throw new HttpError(400, `${read.ready.config.site} has no section ${destination.section}.`)
     const key = placeKey(read.ready.repo, section.name)
+    if (unread.has(key)) {
+      results.set(key, { repo: destination.repo, section: destination.section, ok: false, error: `Its earlier pull request could not be read: ${unread.get(key)}` })
+      continue
+    }
     const previous = live.find((r) => placeKey(r.repo, r.section) === key)
     // Only an open pull request is still on its way; anything else that is
     // live is the merged version on the site.
@@ -514,7 +529,6 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   }
 
   // The values first, for every site: one refused is named on no other.
-  const results = new Map<string, PublishResult>()
   let going = targets.filter((target) => {
     try {
       fillFor(target, parts, placesFor(targets), todayValue)
@@ -566,6 +580,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       const again: Target = state === 'open'
         ? { ...target, previous: kept, state: 'open', landed: kept.landed }
         : { ...target, previous: kept, state: 'merged', landed: kept.landed ?? target.landed ?? snapshotOf(kept) }
+      assertLedgerFits(ledger.records, [provisionalRecord(again, fillFor(again, parts, final, todayValue), parts.title)])
       await record(target, await publishTo(session, again, parts, final, todayValue, replace, doc.content))
     } catch (error) {
       if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError || error instanceof PostFileError)) throw error
@@ -574,7 +589,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       }))
     }
   }
-  return { results: targets.map((target) => results.get(target.key)!) }
+  return { results: destinations.map((d) => [...results.values()].find((r) => placeKey(r.repo, r.section) === placeKey(d.repo, d.section))!) }
 }
 
 function largestLanded(target: Target, filled: FilledPost): Landed | undefined {

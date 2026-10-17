@@ -215,6 +215,19 @@ sections:
       title: { kind: text, required: true }
       date: { kind: date, required: true }
 `
+// A site with a long text field that also names where else a piece is published.
+const PLACED_YAML = `version: 1
+site: Placed
+sections:
+  - name: Notes
+    path: placed/{slug}.md
+    slug: "^[a-z0-9-]+$"
+    first_line: title
+    fields:
+      title: { kind: text, required: true }
+      note: { kind: text, lines: many }
+      elsewhere: { kind: places, item: "{site}" }
+`
 const WRITING_YAML = 'topics:\n  - tag: machine-intelligence\n  - tag: ad-fraud\n'
 const POST = 'src/content/writing/a-better-question.md'
 
@@ -878,6 +891,37 @@ describe('publishing a document', () => {
     const before = calls.length
     expect((await publish([{ repo: 'acme/notes', section: 'Notes', slug: 'a-long-title', values: { note: 'n'.repeat(200_000) } }])).status).toBe(413)
     expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
+  it('publishes to healthy sites when an old publication cannot be read', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
+    await request('/api/publishing/sites/acme/journal', 'DELETE')
+    repos.delete('acme/journal')
+    const published = await publish([writing()])
+    expect(published.status).toBe(200)
+    expect(published.body.results[0].ok).toBe(true)
+  })
+
+  it('sizes a correction before committing it', async () => {
+    for (const [repo, yaml] of [['acme/placed', PLACED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    // The first pull request merges just before the correction's commit.
+    afterCommit = () => { beforeCommit = () => merge('acme/placed', 101) }
+    failOn = (method, endpoint) => (method === 'POST' && endpoint === 'repos/acme/journal/git/refs' ? 500 : null)
+    const published = await publish([
+      { repo: 'acme/placed', section: 'Notes', slug: 'a-better-question', values: { note: 'x'.repeat(400_000) } },
+      { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } },
+    ])
+    expect(published.status).toBe(200)
+    expect(published.body.results[0]).toMatchObject({ ok: false, error: expect.stringContaining('1 MB') })
+    expect(published.body.results[1].ok).toBe(false)
+    expect((await editor!.readPublishLedger(DOC)).records.map((r) => r.repo)).toEqual(['acme/placed'])
   })
 
   it('says nothing changed when the site has this version already', async () => {

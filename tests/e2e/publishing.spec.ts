@@ -67,7 +67,9 @@ test('Settings → Publishing lists each site with its state, adds, describes an
   await workspace(page)
   let sites: unknown[] = [MIKKO, MISSING]
   const requests: Array<{ method: string, path: string, body: unknown }> = []
-  await page.route('**/api/publishing/sites**', (route) => {
+  let releaseSave!: () => void
+  const saveHeld = new Promise<void>((resolve) => { releaseSave = resolve })
+  await page.route('**/api/publishing/sites**', async (route) => {
     const request = route.request()
     const path = new URL(request.url()).pathname
     requests.push({ method: request.method(), path, body: request.postDataJSON() })
@@ -76,7 +78,10 @@ test('Settings → Publishing lists each site with its state, adds, describes an
       sites = [...sites, added]
       return route.fulfill({ json: { site: added } })
     }
-    if (request.method() === 'PUT') return route.fulfill({ json: { site: JOURNAL } })
+    if (request.method() === 'PUT') {
+      await saveHeld
+      return route.fulfill({ json: { site: JOURNAL } })
+    }
     if (request.method() === 'DELETE') return route.fulfill({ json: { ok: true } })
     return route.fulfill({ json: { sites } })
   })
@@ -105,6 +110,9 @@ test('Settings → Publishing lists each site with its state, adds, describes an
   await expect(description).toHaveValue(/^version: 1\nsite: "journal"\n/)
   await page.screenshot({ path: info.outputPath('settings-publishing.png') })
   await rows.nth(1).getByRole('button', { name: 'Save' }).click()
+  // While it is saved, the description holds still.
+  await expect(description).toHaveAttribute('readonly', '')
+  releaseSave()
   await expect(rows.nth(1).locator('.pb-site-state')).toHaveText('Ready · described here')
   expect(requests.find((r) => r.method === 'PUT')).toMatchObject({ path: '/api/publishing/sites/acme/journal/description' })
 
@@ -281,4 +289,15 @@ test('holds every field still while a publication is in flight', async ({ page }
   release()
   await expect(dialog.getByRole('link', { name: 'Pull request #101' })).toBeVisible()
   await expect(dialog.getByLabel('Slug', { exact: true })).toHaveValue('a-better-question')
+})
+
+test('gives a field the saved values do not have its own default', async ({ page }) => {
+  await workspace(page)
+  const flagged = {
+    ...MIKKO,
+    sections: [{ ...MIKKO.sections[0], fields: [...WRITING_FIELDS, { name: 'featured', kind: 'boolean', required: false, default: true }] }],
+  }
+  // Published before the featured field was added.
+  await openEditor(page, [flagged], () => ({ results: [] }), [publication(MIKKO, 101, { type: 'essay', title: 'A better question' })])
+  await expect(page.getByRole('dialog', { name: 'Publish' }).getByLabel('Featured', { exact: true })).toBeChecked()
 })

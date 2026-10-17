@@ -136,7 +136,9 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
     const publication = published(choice.key)
     const own: Record<string, string | boolean> = {}
     for (const field of ownFields(choice.section)) {
-      const value = publication ? publication.values[field.name] : field.default === 'today' ? doc.today : field.default
+      // A field the saved values do not have (one added since) takes its default.
+      const saved = publication && Object.prototype.hasOwnProperty.call(publication.values, field.name)
+      const value = saved ? publication!.values[field.name] : field.default === 'today' ? doc.today : field.default
       own[field.name] = field.kind === 'boolean' ? value === true : asText(value) as string
     }
     values.set(choice.key, own)

@@ -40,7 +40,7 @@ function siteHtml(site: SiteView, draft: Draft | undefined, confirming: boolean)
   ].join('')
   const editor = draft ? `
     <div class="pb-describe">
-      <textarea class="pb-description" rows="12" spellcheck="false" autocomplete="off" aria-label="${escapeHtml(`publish.yaml for ${site.repo}`)}"></textarea>
+      <textarea class="pb-description" rows="12" spellcheck="false" autocomplete="off" aria-label="${escapeHtml(`publish.yaml for ${site.repo}`)}"${draft.saving ? ' readonly' : ''}></textarea>
       <div class="pb-describe-row">
         <button type="button" class="st-save" data-save${draft.saving ? ' disabled' : ''}>${draft.saving ? 'Saving…' : 'Save'}</button>
         <button type="button" class="st-clear" data-cancel>Cancel</button>
