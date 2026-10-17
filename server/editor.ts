@@ -472,15 +472,15 @@ export async function deleteDoc(slug: string): Promise<{ ok: true }> {
   const annPath = annotationsFileFor(slug)
   const chatPath = chatSessionFileFor(slug)
   const publishPath = publishLedgerFileFor(slug)
-  await Promise.all(
-    [path, annPath, chatPath, publishPath].map((target) => (
-      serializeMutation(target, async () => {
-        try { await unlink(target) }
-        catch (err: any) { if (err.code !== 'ENOENT') throw err }
-        forgetClientWrites(target)
-      })
-    )),
-  )
+  const remove = (target: string) => serializeMutation(target, async () => {
+    try { await unlink(target) }
+    catch (err: any) { if (err.code !== 'ENOENT') throw err }
+    forgetClientWrites(target)
+  })
+  // The doc first: a publishing record written meanwhile is either removed
+  // with the side-cars or finds the doc gone (writePublishLedger).
+  await remove(path)
+  await Promise.all([annPath, chatPath, publishPath].map(remove))
   return { ok: true }
 }
 
@@ -792,7 +792,12 @@ export async function writePublishLedger(slug: string, ledger: PublishLedger): P
   }
   await editorReady
   const path = publishLedgerFileFor(slug)
-  await serializeMutation(path, () => writeAtomic(path, body))
+  await serializeMutation(path, async () => {
+    // A doc deleted while it was being published takes its record with it:
+    // none is written again for it. Its pull requests stay.
+    await stat(fileFor(slug))
+    await writeAtomic(path, body)
+  })
 }
 
 const PUBLISH_LOCK_PATH = join(EDITOR_DIR, '.poise-publish-lock.sqlite3')

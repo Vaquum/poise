@@ -561,7 +561,9 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       await writePublishLedger(slug, ledger)
     }
     const kept = outcome.record ?? target.previous!
-    results.set(target.key, resultFor(target, { ok: true, ...(outcome.unchanged ? { unchanged: true } : {}), publication: viewOf(kept, outcome.state) }))
+    results.set(target.key, resultFor(target, outcome.error
+      ? { error: outcome.error }
+      : { ok: true, ...(outcome.unchanged ? { unchanged: true } : {}), publication: viewOf(kept, outcome.state) }))
     return kept
   }
 
@@ -699,6 +701,8 @@ interface Outcome {
   record?: PublishRecord
   state: 'open' | 'merged' | 'closed'
   unchanged?: boolean
+  /** Committed and recorded, but not known to have reached its pull request. */
+  error?: string
 }
 
 /**
@@ -767,6 +771,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   let pr: { number: number, url: string }
   let kept = landed
   let outcome: Outcome['state'] = 'open'
+  let error: string | undefined
   if (state === 'open') {
     branch = previous!.branch
     headRepo = previous!.headRepo
@@ -774,8 +779,17 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     // Merged or closed while this was committed: the commit needs a pull
     // request of its own, or the update would reach no one, unless the merge
     // took this commit with it.
-    const after = await pullRequest(session, upstream.fullName, previous!.pullRequest.number)
-    if (after.state === 'open') pr = previous!.pullRequest
+    const after = await pullRequest(session, upstream.fullName, previous!.pullRequest.number).catch((failure: unknown) => {
+      if (!(failure instanceof GitHubError)) throw failure
+      return failure
+    })
+    if (after instanceof GitHubError) {
+      // The commit is on the branch whatever GitHub answers: it is recorded
+      // as this document's side there, and the pull request read again at
+      // the next publication.
+      pr = previous!.pullRequest
+      error = `Committed to the branch of pull request #${pr.number}, but its state could not be read: ${after.message}. Publish again to make sure the update reaches the site.`
+    } else if (after.state === 'open') pr = previous!.pullRequest
     else if (after.state === 'merged' && after.headSha === commit) {
       pr = previous!.pullRequest
       kept = { data: published.data, bodySha: published.bodySha, pullRequest: pr.number, url }
@@ -798,6 +812,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   }
   return {
     state: outcome,
+    ...(error ? { error } : {}),
     record: {
       repo: upstream.fullName, section: section.name, site: ready.config.site, headRepo, branch, base: ready.base,
       path: filled.path, url, slug: destination.slug, pullRequest: pr,

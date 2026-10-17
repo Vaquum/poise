@@ -119,6 +119,8 @@ what is wrong.
 
 - While the pull request is open, publishing again commits to its branch. If
   it is merged or closed meanwhile, that commit gets a pull request of its own.
+  If GitHub cannot say afterwards whether it is still open, the commit is
+  recorded and the site says so: publish again to make sure it reaches the site.
 - Once it is merged, an update gets a pull request of its own, `Update: <title>`.
 - A pull request closed unmerged left nothing new on the site. A version
   merged before it stays the document's, and the next publish updates it;
@@ -137,7 +139,8 @@ what is wrong.
 
 Each document's publications are kept beside it as `<slug>.publish.json` in
 the Editor folder: the site, path, branch and pull request, and what was
-published. Deleting the document deletes it; the pull requests stay.
+published. Deleting the document deletes it, even while it is being
+published; the pull requests stay.
 
 ## Limits
 

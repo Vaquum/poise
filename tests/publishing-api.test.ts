@@ -646,6 +646,29 @@ describe('publishing a document', () => {
     expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
   })
 
+  it('records an update committed before its pull request could be read', async () => {
+    await publish([writing()])
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    afterCommit = () => {
+      failOn = (method, endpoint) => (method === 'GET' && endpoint === 'repos/mikkokotila/mikkokotila-com/pulls/101' ? 500 : null)
+    }
+    expect((await publish([writing()])).body.results[0]).toEqual({
+      repo: 'mikkokotila/mikkokotila-com', section: 'Writing', ok: false,
+      error: 'Committed to the branch of pull request #101, but its state could not be read: Reading pull request #101 in mikkokotila/mikkokotila-com: Server Error. Publish again to make sure the update reaches the site.',
+    })
+    // The record has what was committed: going back to the earlier text publishes it.
+    failOn = null
+    await writeDocument(DOC, TEXT)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 101 } } })
+    expect(fileOn('mikkokotila/mikkokotila-com', 'publish/a-better-question', POST)).not.toContain('A new ending.')
+  })
+
+  it('writes no record for a document deleted while it was published', async () => {
+    beforeCommit = async () => { await editor!.deleteDoc(DOC) }
+    expect(await publish([writing()])).toEqual({ status: 404, body: { error: 'That document does not exist.' } })
+    expect((await editor!.readPublishLedger(DOC)).records).toEqual([])
+  })
+
   it('refuses a publication whose record would pass 1 MB on the way, not only at the end', async () => {
     for (const [repo, site] of [['acme/notes', 'Notes'], ['acme/more', 'More notes']]) {
       addRepo(repo, {})

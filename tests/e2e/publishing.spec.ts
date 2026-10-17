@@ -357,3 +357,20 @@ test('keeps the date each site was published with while none is typed', async ({
   await expect(dialog.getByRole('alert')).toHaveCount(2)
   expect(sent[0].destinations.map((d: any) => d.values.date)).toEqual(['2026-01-01', '2026-10-17'])
 })
+
+test("gives a site chosen after a publication the piece's date", async ({ page }) => {
+  await workspace(page)
+  const sent = await openEditor(page, [FIXED, MIKKO], (body) => ({ results: body.destinations.map((d: any) => ({
+    repo: d.repo, section: d.section, ok: true,
+    publication: d.repo === FIXED.repo ? publication(FIXED, 7, d.values) : publication(MIKKO, 101, d.values),
+  })) }))
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await dialog.getByLabel('Fixed').check()
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('link', { name: 'Pull request #7' })).toBeVisible()
+  // Published with the site's own date, 2026-01-01: that is the piece's date now.
+  await dialog.getByLabel('mikkokotila.com').check()
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect.poll(() => sent.length).toBe(2)
+  expect(sent[1].destinations.map((d: any) => [d.repo, d.values.date])).toEqual([[FIXED.repo, '2026-01-01'], [MIKKO.repo, '2026-01-01']])
+})

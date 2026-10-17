@@ -46,8 +46,6 @@ interface State {
   chosen: Set<string>
   /** Title and description as shown; the date once it is typed, until then each site's own (dateFor). */
   shared: Record<Shared, string>
-  /** The date this piece was published with, on the first site that has one. */
-  pieceDate: string
   /** Each destination's own values, as typed: a list is its words joined by commas. */
   values: Map<string, Record<string, string | boolean>>
   slugs: Map<string, string>
@@ -116,23 +114,27 @@ function titleFor(doc: DocumentPublishing, choices: Choice[]): string {
   return doc.title
 }
 
+/**
+ * A shared value from the first publication whose site has it: a site
+ * without a description says nothing about another's. Read from the
+ * publications as they are, so one made in the panel counts at once.
+ */
+function remembered(doc: DocumentPublishing, choices: Choice[], which: Shared): string {
+  for (const publication of doc.publications) {
+    const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
+    const field = choice && sharedField(choice.section, which)
+    const value = field ? asText(publication.values[field]) : ''
+    if (value) return String(value)
+  }
+  return ''
+}
+
 function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): State {
   const choices: Choice[] = sites.filter((s) => s.state === 'ready').flatMap((site) =>
     site.sections!.map((section) => ({ key: keyOf(site.repo, section.name), site, section })))
   const published = (key: string) => doc.publications.find((p) => keyOf(p.repo, p.section) === key)
   const chosen = new Set(choices.filter((c) => published(c.key)).map((c) => c.key))
   if (!chosen.size && choices.length === 1) chosen.add(choices[0].key)
-  // Each shared value from the first publication whose site has it: a site
-  // without a description says nothing about another's.
-  const remembered = (which: Shared): string => {
-    for (const publication of doc.publications) {
-      const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
-      const field = choice && sharedField(choice.section, which)
-      const value = field ? asText(publication.values[field]) : ''
-      if (value) return String(value)
-    }
-    return ''
-  }
   const values = new Map<string, Record<string, string | boolean>>()
   const slugs = new Map<string, string>()
   for (const choice of choices) {
@@ -150,8 +152,7 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
   }
   return {
     slug, choices, doc, chosen, values, slugs, slugTyped: new Set(), results: new Map(), busy: false,
-    shared: { title: titleFor(doc, choices), description: String(remembered('description') || ''), date: '' },
-    pieceDate: remembered('date'),
+    shared: { title: titleFor(doc, choices), description: remembered(doc, choices, 'description'), date: '' },
   }
 }
 
@@ -165,7 +166,8 @@ function dateFor(s: State, choice: Choice): string {
   const field = choice.section.fields.find((f) => f.name === sharedField(choice.section, 'date'))
   const own = field && livePublicationOf(choice.key)?.values[field.name]
   if (typeof own === 'string' && own) return own
-  if (s.pieceDate) return s.pieceDate
+  const piece = remembered(s.doc, s.choices, 'date')
+  if (piece) return piece
   return typeof field?.default === 'string' && field.default !== 'today' ? field.default : s.doc.today
 }
 
