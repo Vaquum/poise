@@ -826,7 +826,14 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       // A site that failed is named on none of the others; nor, if its pull
       // request turned out closed unmerged with nothing landed, is it there.
       going = going.filter((t) => t !== target)
-      if (target.closed && !target.landed && target.previous) gone.add(target.previous)
+      // Its pull request found closed unmerged: for the rest of this publication
+      // it is, and the version that landed before it, if any, is what is named.
+      if (target.closed && target.previous) {
+        const was = placeKey(target.previous.repo, target.previous.section)
+        states.set(was, 'closed')
+        addresses.delete(was)
+        if (!target.landed) gone.add(target.previous)
+      }
     }
   }
 

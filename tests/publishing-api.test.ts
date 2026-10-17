@@ -1265,6 +1265,29 @@ sections:
     expect(copy).not.toContain('canonical_url')
   })
 
+  it('names the version that landed when an update is found closed unmerged and cannot be opened again', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = (date: string) => ({ repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date } })
+    expect((await publish([dated('2026-10-17')])).body.results[0].ok).toBe(true)
+    merge('acme/dated', 101)
+    expect((await publish([dated('2027-01-05')])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    // The update is closed unmerged just after its next commit, and a new pull request cannot be opened.
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    afterCommit = () => {
+      close('acme/dated', 102)
+      failOn = (method, endpoint) => (method === 'POST' && endpoint === 'repos/acme/dated/pulls' ? 500 : null)
+    }
+    const results = (await publish([dated('2027-01-05'), { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([false, true])
+    // The copy names the original where the version that landed is: 2026, not the rejected 2027.
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
