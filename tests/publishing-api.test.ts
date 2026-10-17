@@ -931,6 +931,26 @@ sections:
     expect(fileOn('mikkokotila/mikkokotila-com', repos.get('mikkokotila/mikkokotila-com')!.pulls.get(103)!.head, POST)).toContain('title: "A better question"\n')
   })
 
+  it('never writes over a file on a branch the site has moved to, unless it is this document\'s', async () => {
+    await publish([writing()])
+    merge('mikkokotila/mikkokotila-com', 101)
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    // The site now publishes to another branch, where someone else's piece has this path.
+    repo.branches.set('published', repo.branches.get('main')!)
+    editOnSite('mikkokotila/mikkokotila-com', 'published', POST, () => 'Someone else\'s piece.\n')
+    editOnSite('mikkokotila/mikkokotila-com', 'main', 'publish.yaml', (text) => text.replace('site: mikkokotila.com', 'site: mikkokotila.com\nbranch: published'))
+    const refused = (await publish([writing()], true)).body.results[0]
+    expect(refused).toMatchObject({ ok: false, error: `${POST} is already in mikkokotila/mikkokotila-com, and this document did not publish it. Choose another slug.` })
+    expect(fileOn('mikkokotila/mikkokotila-com', 'published', POST)).toBe('Someone else\'s piece.\n')
+    // Carried over as it was published, it is this document's, and is updated there.
+    repo.branches.set('published', repo.branches.get('main')!)
+    editOnSite('mikkokotila/mikkokotila-com', 'published', 'publish.yaml', (text) => text)
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    const updated = (await publish([writing()])).body.results[0]
+    expect(updated).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    expect(repo.pulls.get(102)).toMatchObject({ base: 'published' })
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

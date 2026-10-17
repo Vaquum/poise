@@ -16,6 +16,7 @@ import {
   documentParts,
   fileDate,
   fillPost,
+  isVersion,
   parsePost,
   parsePublishConfig,
   placeUrl,
@@ -516,7 +517,25 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     if (!section) { refuse(destination, `${read.ready.config.site} has no section ${destination.section}.`); continue }
     const key = placeKey(read.ready.repo, section.name)
     if (unread.has(key)) { refuse(destination, `Its earlier pull request could not be read: ${unread.get(key)}`); continue }
-    const previous = live.find((r) => placeKey(r.repo, r.section) === key)
+    let previous = live.find((r) => placeKey(r.repo, r.section) === key)
+    // A site that has moved to another branch since: a file there is this
+    // document's only if it is a version it published, carried over;
+    // otherwise the piece is published there afresh, as a first publication.
+    if (previous && states.get(key) !== 'open' && previous.base !== read.ready.base) {
+      const there = await fileAt(session, read.ready.repo, previous.path, read.ready.base).catch((error: unknown) => {
+        if (!(error instanceof GitHubError)) throw error
+        return null
+      })
+      let carried = false
+      try {
+        const file = there && parsePost(there.text)
+        const landed = landedOf(previous)
+        carried = !!file && !landed?.unknown && isVersion(file, landed ?? previous)
+      } catch (error) {
+        if (!(error instanceof PostFileError)) throw error
+      }
+      if (!carried) previous = undefined
+    }
     // Only an open pull request is still on its way; anything else that is
     // live is the merged version on the site.
     const state = !previous ? 'new' : states.get(key) === 'open' ? 'open' : 'merged'
@@ -566,7 +585,8 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     const stored = sites.find((site) => site.repo.toLowerCase() === r.repo.toLowerCase())
     const ready = targets.find((t) => t.key === key)?.ready ?? (stored && (await readSite(session, stored)).ready)
     const section = ready?.config.sections.find((sec) => sec.name === r.section)
-    if (!ready || !section?.url) return
+    // A site that has moved to another branch since: its record says where the piece was.
+    if (!ready || !section?.url || (state !== 'open' && r.base !== ready.base)) return
     let date = sinceOf(r)
     if (section.fields.some((f) => f.kind === 'date')) {
       const from = state === 'open' ? { repo: r.headRepo, branch: r.branch } : { repo: ready.repo, branch: ready.base }

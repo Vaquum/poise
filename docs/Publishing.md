@@ -63,7 +63,8 @@ sections:
 
 The first five also take `label`, `required`, `default`, or `value`: a fixed
 value that is always written and never shown. A `default` or `value` is held
-to the field's own limits, as a typed value is. `suggest` names a file in the
+to the field's own limits, as a typed value is, and a required field's
+`value` is never empty. `suggest` names a file in the
 repository and a path in it, like `content/writing.yaml#topics[].tag`, and the
 Editor offers its words. A `places` field writes one entry per site the piece
 is on, from `item`, a template or keys with templates using `{site}` and
@@ -148,7 +149,9 @@ what is wrong.
   included.
 - When the site has this version already, nothing is committed.
 - A file the document did not publish is never written over: choose another
-  slug. A file on the site whose frontmatter cannot be read is reported for
+  slug. When a site moves to another branch, a file already there is the
+  document's only if it is the version the document published; otherwise the
+  piece is published there afresh. A file on the site whose frontmatter cannot be read is reported for
   that site, and the other sites are still published.
 
 Each document's publications are kept beside it as `<slug>.publish.json` in

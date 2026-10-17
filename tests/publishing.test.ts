@@ -129,6 +129,8 @@ describe('publish.yaml', () => {
     const blank = parsePublishConfig(MIKKO.replace('suggest: "content/writing.yaml#topics[].tag" }', 'value: [" "] }')).sections[0]
     expect(blank.fields.find((f) => f.name === 'tags')!.value).toEqual([])
     expect(fillPost(blank, 'a-better-question', { date: '2026-10-17' }, context()).frontmatter).not.toHaveProperty('tags')
+    expect(configError(MIKKO.replace('suggest: "content/writing.yaml#topics[].tag" }', 'required: true, value: [" "] }')))
+      .toBe("sections[0].fields.tags.value: a required field's value cannot be empty")
   })
 
   it('stops a pattern that backtracks without end', () => {

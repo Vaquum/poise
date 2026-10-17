@@ -250,6 +250,7 @@ function readField(name: string, spec: unknown, at: string): PublishField {
     // Kept as a typed value is: trimmed, and a list's words once each; one
     // that trims to nothing is empty, and left out.
     field[key] = normalized ?? (field.kind === 'list' ? [] : field.kind === 'text' ? '' : field[key])
+    if (key === 'value' && field.required && empty(field[key])) throw new PublishConfigError(`${at}.value: a required field's value cannot be empty`)
   }
   return field
 }
@@ -653,6 +654,11 @@ export function reconcile(base: PublishedState | null, ours: PostFile, theirs: P
     else conflicts.push('the text')
   }
   return { data, body, conflicts }
+}
+
+/** Whether a file on the site is exactly a version this document published: its frontmatter and its text. */
+export function isVersion(file: PostFile, version: PublishedState): boolean {
+  return sha256(file.body) === version.bodySha && same(file.data, version.data)
 }
 
 /* ---------------------------------------------------------------- suggestions */
