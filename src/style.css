@@ -6717,7 +6717,6 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 #table .col-owner { width: 12%; }
 #table .col-state { width: 110px; }
 #table td.updated-cell { text-align: right; }
-#main-actions-scope { margin-bottom: 16px; }
 
 /* Keep each Archive filter group intrinsic and its visible end caps intact. */
 #main-filters .range-picker { flex: 0 0 auto; }

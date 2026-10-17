@@ -350,9 +350,6 @@ function updateFilterContext(): void {
   document.getElementById('filter-status')!.hidden = !history
   document.getElementById('filter-action-status')!.hidden = !action
   document.querySelector('#table .col-owner')!.textContent = action ? history ? 'Owner / Branch' : 'Branch' : 'Owner'
-  const scope = document.getElementById('main-actions-scope')!
-  scope.hidden = !action
-  scope.textContent = `Latest 100 ${actionStatus === 'failed' ? 'failed ' : ''}runs per repository · refreshed every 5 minutes. Search and dates filter these runs.`
 }
 
 interface SourceState {
