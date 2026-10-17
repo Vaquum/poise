@@ -1110,6 +1110,34 @@ sections:
     expect((await request('/api/publishing/sites/acme/diary', 'DELETE')).status).toBe(200)
   })
 
+  it('names a renamed site\'s publications as Settings names it, and keeps the site through two reads', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    const twoSections = JOURNAL_YAML + `  - name: Notes
+    path: _notes/{slug}.md
+    slug: "^[a-z0-9-]+$"
+    fields:
+      title: { kind: text, required: true }
+`
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: twoSections })
+    const to = (repo: string, section: string) => ({ repo, section, slug: 'a-better-question', values: { title: 'A better question' } })
+    expect((await publish([to('acme/journal', 'Posts')])).body.results[0].ok).toBe(true)
+    expect((await request('/api/publishing/sites')).body.sites[1].repo).toBe('acme/journal')
+    // Renamed on GitHub: while Settings still has the site from its cache, the publication goes by the same name.
+    const repo = repos.get('acme/journal')!
+    repo.fullName = 'acme/diary'
+    repos.set('acme/diary', repo)
+    expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.publications[0].repo).toBe('acme/journal')
+    // Published to both sections at once, so the site is read twice from before its rename: it is kept, renamed.
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([to('acme/journal', 'Posts'), to('acme/journal', 'Notes')])).body.results.map((r: any) => r.ok)).toEqual([true, true])
+    ;(await import('../server/publishing-api')).forgetSites()
+    const sites = (await request('/api/publishing/sites')).body.sites
+    expect(sites.map((s: any) => s.repo)).toEqual(['mikkokotila/mikkokotila-com', 'acme/diary'])
+    expect(sites[1].description).toBe(twoSections)
+    expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.publications.map((p: any) => p.repo)).toEqual(['acme/diary', 'acme/diary'])
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

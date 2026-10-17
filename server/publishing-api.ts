@@ -88,11 +88,18 @@ function updateSites(change: (sites: StoredSite[]) => StoredSite[]): void {
   db.transaction(() => saveSites(change(storedSites()))).immediate()
 }
 
-/** A repository renamed on GitHub is kept under its new name: Settings and the panel address it so. */
+/**
+ * A repository renamed on GitHub is kept under its new name: Settings and the
+ * panel address it so. Once renamed, it is left as it is: a second read of the
+ * same site, from before the rename, changes nothing.
+ */
 function renameSite(from: string, to: string): void {
-  updateSites((sites) => sites
-    .filter((s) => s.repo.toLowerCase() !== to.toLowerCase())
-    .map((s) => (s.repo.toLowerCase() === from.toLowerCase() ? { ...s, repo: to } : s)))
+  updateSites((sites) => {
+    if (!sites.some((s) => s.repo.toLowerCase() === from.toLowerCase())) return sites
+    return sites
+      .filter((s) => s.repo.toLowerCase() !== to.toLowerCase())
+      .map((s) => (s.repo.toLowerCase() === from.toLowerCase() ? { ...s, repo: to } : s))
+  })
 }
 
 function findSite(repo: string): StoredSite {
@@ -163,7 +170,7 @@ function shownFields(section: PublishSection, suggestions: Map<string, string[]>
 }
 
 /** A site as it is now: its repository, its description and the words it suggests. */
-async function readSite(session: GitHubSession, stored: StoredSite): Promise<SiteRead> {
+async function readSite(session: GitHubSession, stored: StoredSite, { follow = true } = {}): Promise<SiteRead> {
   const described = stored.description !== undefined ? { description: stored.description } : {}
   let info: RepositoryInfo
   let text: string | null
@@ -175,7 +182,7 @@ async function readSite(session: GitHubSession, stored: StoredSite): Promise<Sit
     return { view: { repo: stored.repo, state: 'unavailable', source: null, problem: error.message, ...described } }
   }
   const repo = info.fullName
-  if (repo.toLowerCase() !== stored.repo.toLowerCase()) renameSite(stored.repo, repo)
+  if (follow && repo.toLowerCase() !== stored.repo.toLowerCase()) renameSite(stored.repo, repo)
   const source = stored.description !== undefined ? 'settings' : 'repository'
   if (text === null) {
     return { view: { repo, state: 'missing', source: null, problem: `${repo} has no ${PUBLISH_FILE}. Add one to the repository, or describe the site here.` } }
@@ -373,7 +380,10 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
   const parts = documentParts(doc.content)
   const { records } = await readPublishLedger(slug)
   const session = records.length ? await signIn(getMeta('me') || '') : null
+  const sites = records.length ? storedSites() : []
+  const siteOf = (names: string[]) => sites.find((s) => names.some((n) => s.repo.toLowerCase() === n.toLowerCase()))
   const publications = await Promise.all(records.map(async (record): Promise<PublicationView> => {
+    const recorded = record.repo
     const view: PublicationView = {
       repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
       values: record.values, date: record.date, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
@@ -385,18 +395,22 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
       const state = info.state
       view.pullRequest.state = state
       followRename(record, info)
-      view.repo = record.repo
       followBase(record, info)
       view.live = state !== 'closed' || record.landed !== undefined
       // A site moved to another branch since, where the file is not one this
-      // document published: published there afresh, under any slug.
-      const stored = view.live && state !== 'open' ? storedSites().find((s) => s.repo.toLowerCase() === record.repo.toLowerCase()) : undefined
-      const ready = stored && (await readSite(session!, stored)).ready
+      // document published: published there afresh, under any slug. Read as
+      // it is now, though its name follows only the read Settings shares.
+      const stored = view.live && state !== 'open' ? siteOf([recorded, record.repo]) : undefined
+      const ready = stored && (await readSite(session!, stored, { follow: false })).ready
       if (ready && !(await stillOurs(session!, ready, record, state === 'merged' ? snapshotOf(record) : record.landed, whereOf(record, state)))) view.live = false
     } catch (error) {
       if (!(error instanceof GitHubError)) throw error
       view.problem = error.message
     }
+    // Named as Settings and the panel name its site, by the same read of it,
+    // shared while it is cached: never one name here and another there.
+    const site = siteOf([recorded, record.repo])
+    view.repo = site ? (await cachedSite(session!, site)).view.repo : record.repo
     return view
   }))
   return { title: parts.title, slug: slugFromTitle(parts.title), today: today(timeZone()), publications }
