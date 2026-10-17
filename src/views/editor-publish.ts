@@ -175,11 +175,12 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
     for (const field of ownFields(choice.section)) {
       // A field the saved values leave empty, or do not have (one added
       // since), takes its default: what the site was given for it. Only a
-      // date field reads today as today; elsewhere it is the word.
+      // date field reads today as today; elsewhere it is the word. A list
+      // given as one text, as the API takes it, is its words by commas.
       const saved = publication ? savedValue(publication.values, field.name) : undefined
       const value = !blank(saved) ? saved : field.default === 'today' && field.kind === 'date' ? doc.today : field.default
       own[field.name] = field.kind === 'boolean' ? value === true
-        : field.kind === 'list' ? (Array.isArray(value) ? value.map(String) : [])
+        : field.kind === 'list' ? (Array.isArray(value) ? value.map(String) : typeof value === 'string' ? words(value) : [])
         : asText(value) as string
     }
     values.set(choice.key, own)

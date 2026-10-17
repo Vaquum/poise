@@ -573,3 +573,15 @@ test('keeps the date a site went by when its fixed date has become editable', as
   await expect(dialog.getByRole('alert')).toHaveCount(2)
   expect(sent[0].destinations.map((d: any) => [d.repo, d.values.date])).toEqual([[stamped.repo, '2026-01-01'], [MIKKO.repo, '2026-10-17']])
 })
+
+test('reads a list saved as one text into its words', async ({ page }) => {
+  await workspace(page)
+  // Published through the API with the tags as one text, separated by commas.
+  const saved = publication(MIKKO, 101, { type: 'essay', title: 'A better question', date: '2026-10-17', tags: 'ad-fraud, machine-intelligence' })
+  const sent = await openEditor(page, [MIKKO], notNow, [saved])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.getByLabel('Tags', { exact: true })).toHaveValue('ad-fraud, machine-intelligence')
+  await dialog.getByRole('button', { name: 'Update', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values.tags).toEqual(['ad-fraud', 'machine-intelligence'])
+})
