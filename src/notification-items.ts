@@ -51,6 +51,7 @@ const NOTICE_LOOK: Record<NoticeKind, { group: ItemGroup, tone: ItemTone, icon: 
   sign_in_needed: { group: 'needs', tone: 'amber', icon: 'key', source: 'Accounts' },
   behavior_held: { group: 'needs', tone: 'amber', icon: 'held', source: 'Behaviors' },
   datastore_sync_failing: { group: 'needs', tone: 'amber', icon: 'sync', source: 'GitHub data' },
+  storage_low: { group: 'needs', tone: 'amber', icon: 'held', source: 'Storage' },
   pr_ready: { group: 'ready', tone: 'green', icon: 'merge', source: 'GitHub' },
   chat_turn_finished: { group: 'ready', tone: 'teal', icon: 'check', source: 'Chat' },
 }

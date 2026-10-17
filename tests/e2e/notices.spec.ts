@@ -18,6 +18,19 @@ const WAITING: Notice = { id: 'aaaaaaaaaaaa-3', kind: 'chat_waiting', title: 'Cl
 const HELD: Notice = { id: 'aaaaaaaaaaaa-2', kind: 'behavior_held', title: 'Review New Pull Requests failed on acme/api#9', body: 'Open Swarm in Poise to see what happened.', since: iso(2), due: iso(2), silenceable: false, target: { swarm: HELD_CALL }, subject: { behavior: 'review-new-prs', target: 'acme/api#9' } }
 const READY: Notice = { id: 'aaaaaaaaaaaa-1', kind: 'pr_ready', title: 'acme/api#7 is ready to merge', body: 'Fix the flaky retry test', since: iso(0), due: iso(30), silenceable: true, target: { pullRequest: 'https://github.com/acme/api/pull/7' } }
 
+test('temporary-space warnings inform without blocking normal navigation or work controls', async ({ page }) => {
+  const warning: Notice = { id: 'aaaaaaaaaaaa-4', kind: 'storage_low', title: 'Temporary space is down to 5 GB', body: '4.9 GB remains for temporary files. Work continues normally.', since: iso(5), due: iso(5), silenceable: false, target: null }
+  const state = await workspace(page, [warning])
+  await page.goto('/')
+  await openRail(page)
+  await expect(card(page, warning.id)).toBeVisible()
+  await expand(page, warning.id)
+  await expect(card(page, warning.id)).toContainText(warning.body)
+  await page.locator('#top-nav').getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator('#view-swarm')).toBeVisible()
+  expect(state.sent).toEqual([])
+})
+
 function failedRun(id = HELD_CALL, fields: Record<string, unknown> = {}) {
   return {
     id, repo: 'acme/api', pr_id: '9', actor: 'octo-agent', model: 'astra', behavior: 'pr_review',

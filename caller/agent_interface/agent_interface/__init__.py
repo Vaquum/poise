@@ -592,7 +592,7 @@ def run_issue_review(
                               "action": "commented", "outcome": "commented"}, indent=2))
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
-        shutil.rmtree(run_dir, ignore_errors=True)
+        issue_review.cleanup(run_dir)
 
 
 def _issue_review_targets(call_ids: list[str]) -> dict[str, str]:

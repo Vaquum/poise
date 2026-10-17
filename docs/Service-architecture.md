@@ -347,10 +347,13 @@ computer.
   `POISE_DRAIN_TIMEOUT`, and stops with one message naming each that is
   missing or invalid; any `POISE_MODE` other than `service` is an error.
 
-**Storage.** Everything lives under `~/.poise` in the home volume:
+**Storage.** State and temporary work live in the home volume:
 - Chat workspaces in `~/.poise/chat` (`POISE_CHAT_ROOT`).
 - Snippets in `~/.poise/snippets/poise.yml`.
 - Caller's data in `~/.poise/agent-interface` (`AGENT_INTERFACE_DATA_DIR`).
+- Issue-review temporary files in each owned run's `tmp` directory under
+  `~/.cache/agent-interface/issue-review` (`AGENT_INTERFACE_WORK_DIR` can move
+  this root), removed with the run ([Issue review](Issue-review.md)).
 - Caller itself runs from the image: its CLIs from `CALLER_BIN_ROOT`,
   `agent-interface` in `AGENT_INTERFACE_ROOT`.
 
@@ -642,6 +645,11 @@ after pairing; Poise Link then pairs again.
 
 **Alerts** are recorded by the workspace and kept for 30 days. Each condition
 alerts once, and again only after it has cleared:
+- in service mode, temporary space falls to 5 GB free and each GB below
+  (binary GB, measured every minute); only downward crossings alert, including
+  an initial low reading. Recovery to 6 GB clears and rearms the warning so
+  fluctuations near a threshold do not repeat it. Measurements and
+  warnings never pause, reject or stop work;
 - a Claude or other provider sign-in is needed, or the person's own GitHub
   account or the agent account is not signed in to gh;
 - a behavior failed and is held;

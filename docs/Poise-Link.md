@@ -304,6 +304,7 @@ alerts once and again only after it has cleared:
 | `chat_waiting` | a Chat agent asks for a permission or an answer | the session has nothing pending |
 | `chat_turn_finished` | a Chat turn that ran longer than two minutes finishes, unless the person stopped it | (one alert per turn) |
 | `pr_ready` | one of the person's own open pull requests becomes ready to merge, by Current's rule, checked every two minutes while notifications are on; not while the person has silenced it | it is merged or closed, or stops being ready |
+| `storage_low` | in service mode, temporary space falls to 5 GB free and each GB below; once per threshold in a low-space episode | space recovers to 6 GB; work continues normally |
 
 An alert's `url` is absolute: `POISE_PUBLIC_ORIGIN` in a workspace, the
 address the request came to otherwise. The browser client has no per-view

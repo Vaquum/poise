@@ -8,7 +8,7 @@ import time
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import agent_interface
 from agent_interface import issue_review, review_budget
@@ -66,7 +66,7 @@ def agent_writes(review: dict | str | None, code: int = 0, stdout: str = ""):
     """A provider that does its work and leaves its review next to the checkout."""
     runs = []
 
-    def supervise(args, *, input, cwd, timeout, env, provider):
+    def supervise(args, *, input, cwd, timeout, env, provider, cleanup_root=None):
         runs.append({"args": args, "input": input, "cwd": cwd, "provider": provider})
         if review is not None:
             (Path(cwd).parent / "review.json").write_text(review if isinstance(review, str) else json.dumps(review))
@@ -110,6 +110,34 @@ class IssueReviewCase(TestCase):
 
 
 class TestIssueReviewRun(IssueReviewCase):
+    def test_provider_temporary_files_are_owned_and_removed_after_success_or_failure(self):
+        for code in (0, 1):
+            with self.subTest(code=code):
+                with agent_interface.db() as conn:
+                    conn.execute("delete from calls")
+                made = []
+                writes = agent_writes({"comments": [{"issue": "#452", "body": "One."}]}, code=code)
+
+                def supervise(args, **kwargs):
+                    env = kwargs["env"]
+                    self.assertEqual(env["TMPDIR"], env["TMP"])
+                    self.assertEqual(env["TMPDIR"], env["TEMP"])
+                    directory = subprocess.check_output(
+                        [sys.executable, "-c", "import tempfile; print(tempfile.mkdtemp())"],
+                        env=env, text=True,
+                    ).strip()
+                    scratch = Path(directory)
+                    self.assertTrue(scratch.resolve().is_relative_to(issue_review.WORK_ROOT.resolve()))
+                    (scratch / "virtualenv-artifact").write_bytes(b"dependency files")
+                    self.assertIn(f"$TMPDIR ({scratch.parent})", kwargs["input"])
+                    made.append(scratch)
+                    return writes(args, **kwargs)
+
+                row, _ = self.run_review(FakeGitHub(), supervise, expect_exit=bool(code))
+                self.assertEqual(row["status"], "failed" if code else "completed")
+                self.assertEqual(len(made), 1)
+                self.assertFalse(made[0].exists())
+
     def test_reviews_with_full_access_and_posts_one_comment_per_issue_as_the_actor(self):
         github = FakeGitHub()
         supervise = agent_writes({"comments": [
@@ -336,6 +364,16 @@ class TestSubIssuesReviewedOnce(IssueReviewCase):
 
 
 class TestFullAccessCommands(TestCase):
+    def test_every_provider_inherits_only_its_own_temporary_directory(self):
+        for identity in ["opus-5-max", "gpt-6-astra-ultra", "grok-4.6-xhigh", "gemini-3.8-flash-high", "muse-spark-1.3-contributor-max"]:
+            with self.subTest(identity=identity), tempfile.TemporaryDirectory() as work:
+                with patch.dict(os.environ, {"TMPDIR": "/shared-temp", "TMP": "/shared-temp", "TEMP": "/shared-temp"}):
+                    _, _, env = issue_review.command(CATALOG.resolve(identity), "review this", Path(work) / "repo", Path(work), 600)
+                    scratch = Path(work) / "tmp"
+                    self.assertTrue(scratch.is_dir())
+                    self.assertEqual({env[key] for key in ("TMPDIR", "TMP", "TEMP")}, {str(scratch.resolve())})
+                    self.assertEqual(os.environ["TMPDIR"], "/shared-temp")
+
     def command(self, identity):
         with tempfile.TemporaryDirectory() as work, patch.dict(os.environ, {"OPENAI_API_KEY": "k", "CODEX_API_KEY": "k"}):
             args, stdin, env = issue_review.command(CATALOG.resolve(identity), "review this", Path(work) / "repo", Path(work), 600)
@@ -426,6 +464,145 @@ class TestInterface(TestCase):
 
 
 class TestProcessesAndErrors(TestCase):
+    def test_owned_scratch_leftovers_stop_without_touching_an_unrelated_process(self):
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as unrelated:
+            root = Path(work)
+            checkout, scratch = root / "repo", root / "tmp"
+            checkout.mkdir()
+            scratch.mkdir()
+            other = subprocess.Popen(["sleep", "60"], cwd=unrelated)
+            try:
+                script = ("import subprocess; "
+                          f"p = subprocess.Popen(['sleep', '60'], cwd={str(scratch)!r}, start_new_session=True); "
+                          "print(p.pid)")
+                with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+                    done = issue_review.supervise([sys.executable, "-c", script], input="", cwd=checkout,
+                                                  timeout=30, env=os.environ.copy(), provider=None, cleanup_root=root)
+                pid = int(done.stdout.strip())
+                self.assertIsNone(other.poll())
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    os.kill(pid, 9)
+                    self.fail("a detached process in owned scratch outlived its review")
+            finally:
+                other.terminate()
+                other.wait(timeout=10)
+
+    def test_stale_cleanup_removes_only_inactive_owned_run_directories(self):
+        with tempfile.TemporaryDirectory() as work, patch.object(issue_review, "WORK_ROOT", Path(work)):
+            stale = Path(work) / ("a" * 32)
+            fresh = Path(work) / ("b" * 32)
+            unknown = Path(work) / "user-files"
+            outside = Path(work) / "outside"
+            for directory in [stale, fresh, unknown, outside]:
+                directory.mkdir()
+                (directory / "artifact").write_text("keep unless owned and abandoned")
+            link = Path(work) / ("c" * 32)
+            link.symlink_to(outside, target_is_directory=True)
+            old = time.time() - issue_review.STALE_RUN_SECONDS - 60
+            for directory in [stale, unknown, outside]:
+                os.utime(directory, (old, old))
+            with patch.object(issue_review, "_cwd_pids", return_value=[]):
+                issue_review.sweep()
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(unknown.exists())
+            self.assertTrue(link.is_symlink())
+            self.assertTrue((outside / "artifact").exists())
+
+    def test_stale_cleanup_preserves_a_live_worker_and_unknown_process_evidence(self):
+        with tempfile.TemporaryDirectory() as work, patch.object(issue_review, "WORK_ROOT", Path(work)):
+            active = Path(work) / ("d" * 32)
+            active.mkdir()
+            old = time.time() - issue_review.STALE_RUN_SECONDS - 60
+            os.utime(active, (old, old))
+            process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=active)
+            try:
+                issue_review.sweep()
+                self.assertTrue(active.exists())
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+            with patch.object(issue_review, "_cwd_pids", return_value=None):
+                issue_review.sweep()
+            self.assertTrue(active.exists())
+
+    def test_failed_cleanup_is_visible_without_failing_the_review(self):
+        with tempfile.TemporaryDirectory() as work:
+            with patch.object(issue_review.shutil, "rmtree", side_effect=OSError("busy")), \
+                    self.assertLogs(issue_review.logger, level="WARNING") as captured:
+                issue_review.cleanup(Path(work))
+            self.assertIn(f"Could not remove issue-review workspace {work}: busy", captured.output[0])
+
+    def test_read_only_artifacts_are_removed_without_changing_symlink_targets(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work) / "owned"
+            readonly = root / "module-cache" / "package"
+            readonly.mkdir(parents=True)
+            (readonly / "module").write_text("dependency")
+            readonly.chmod(0o500)
+            readonly.parent.chmod(0o500)
+            outside = Path(work) / "outside"
+            outside.mkdir()
+            (outside / "keep").write_text("unrelated")
+            outside.chmod(0o500)
+            (root / "link").symlink_to(outside, target_is_directory=True)
+            try:
+                issue_review.cleanup(root)
+                self.assertFalse(root.exists())
+                self.assertEqual((outside / "keep").read_text(), "unrelated")
+                self.assertEqual(outside.stat().st_mode & 0o777, 0o500)
+                root.symlink_to(outside, target_is_directory=True)
+                with self.assertLogs(issue_review.logger, level="WARNING"):
+                    issue_review.cleanup(root)
+                self.assertTrue(root.is_symlink())
+                self.assertTrue((outside / "keep").exists())
+                self.assertEqual(outside.stat().st_mode & 0o777, 0o500)
+            finally:
+                outside.chmod(0o700)
+
+    def test_process_inventory_ignores_foreign_users_and_detects_owned_environment_references(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work) / "owned"
+            root.mkdir()
+            own = Path(work) / "424242"
+            own.mkdir()
+            (own / "cwd").symlink_to(Path(work), target_is_directory=True)
+            (own / "fd").mkdir()
+            (own / "environ").write_bytes(f"TMPDIR={root.resolve()}\0".encode())
+            foreign = Mock()
+            foreign.name = "1"
+            foreign.stat.return_value.st_uid = os.getuid() + 1
+            proc = Mock()
+            proc.is_dir.return_value = True
+            proc.iterdir.side_effect = lambda: iter([foreign, own])
+            real_path = Path
+            with patch.object(issue_review, "Path", side_effect=lambda value: proc if str(value) == "/proc" else real_path(value)):
+                self.assertEqual(issue_review._cwd_pids(root, require_complete=True), [424242])
+                (own / "environ").write_bytes(b"TMPDIR=/elsewhere\0")
+                self.assertEqual(issue_review._cwd_pids(root, require_complete=True), [])
+
+    def test_non_proc_inventory_checks_open_files_and_environment_then_proves_an_idle_run(self):
+        root = Path("/owned/run")
+        proc = Mock()
+        proc.is_dir.return_value = False
+        real_path = Path
+        listing = subprocess.CompletedProcess([], 0, "p424242\nn/elsewhere\n", "")
+        active = subprocess.CompletedProcess([], 0, f"424242 worker TMPDIR={root}\n", "")
+        idle = subprocess.CompletedProcess([], 0, "424242 worker TMPDIR=/elsewhere\n", "")
+        with patch.object(issue_review, "Path", side_effect=lambda value: proc if str(value) == "/proc" else real_path(value)):
+            with patch.object(issue_review.subprocess, "run", side_effect=[listing, active]):
+                self.assertEqual(issue_review._cwd_pids(root, require_complete=True), [424242])
+            with patch.object(issue_review.subprocess, "run", side_effect=[listing, idle]):
+                self.assertEqual(issue_review._cwd_pids(root, require_complete=True), [])
+
     def test_a_provider_error_is_its_message_not_its_output(self):
         stdout = "\n".join([
             json.dumps({"type": "item.completed", "item": {"type": "command_execution", "aggregated_output": "SECRET=abc"}}),
