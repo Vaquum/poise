@@ -150,46 +150,34 @@ async def read_job_log(client: GitHubClient, owner: str, repo: str, job_id: int)
     )
 
 
-async def list_review_threads(client: GitHubClient, owner: str, repo: str, pull_number: int) -> list[dict[str, Any]]:
-    query = """
-    query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-      repository(owner: $owner, name: $repo) {
-        pullRequest(number: $number) {
-          reviewThreads(first: 100, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            nodes {
-              id
-              isOutdated
-              isResolved
-              path
-              line
-              originalLine
-              diffSide
-              comments(first: 100) {
-                nodes {
-                  databaseId
-                  body
-                  author { login }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    """
-    threads = []
-    cursor = None
-    while True:
-        data = await client.graphql(query, {"owner": owner, "repo": repo, "number": pull_number, "cursor": cursor})
-        pull = data["repository"]["pullRequest"]
-        if not pull:
-            raise ValueError(f"pull request not found: #{pull_number}")
-        page = pull["reviewThreads"]
-        threads.extend(_thread_summary(thread) for thread in page["nodes"])
-        if not page["pageInfo"]["hasNextPage"]:
-            return threads
-        cursor = page["pageInfo"]["endCursor"]
+REVIEW_THREAD_FIELDS = """
+id
+isOutdated
+isResolved
+path
+line
+originalLine
+diffSide
+comments(first: 100) {
+  nodes {
+    databaseId
+    body
+    author { login }
+  }
+}
+"""
+REVIEW_REQUEST_FIELDS = "requestedReviewer { ... on User { login } }"
+REVIEW_ACTIVITY_FIELDS = "id databaseId author { login } state submittedAt updatedAt commit { oid }"
+
+
+async def list_review_threads(
+    client: GitHubClient, owner: str, repo: str, pull_number: int,
+    initial_page: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    nodes = await _pull_nodes(
+        client, owner, repo, pull_number, "reviewThreads", REVIEW_THREAD_FIELDS, initial_page,
+    )
+    return [_thread_summary(thread) for thread in nodes]
 
 
 async def get_requested_review_state(
@@ -271,72 +259,53 @@ async def get_pull_check_rollup(
     return _required_pull(data, pull_number)
 
 
+REVIEW_ACTIVITY_QUERY = f"""
+query($owner: String!, $repo: String!, $number: Int!) {{
+  repository(owner: $owner, name: $repo) {{
+    pullRequest(number: $number) {{
+      state
+      isDraft
+      headRefOid
+      updatedAt
+      reviewRequests(first: 100) {{
+        pageInfo {{ hasNextPage endCursor }}
+        nodes {{ {REVIEW_REQUEST_FIELDS} }}
+      }}
+      reviews(first: 100) {{
+        pageInfo {{ hasNextPage endCursor }}
+        nodes {{ {REVIEW_ACTIVITY_FIELDS} }}
+      }}
+      reviewThreads(first: 100) {{
+        pageInfo {{ hasNextPage endCursor }}
+        nodes {{ {REVIEW_THREAD_FIELDS} }}
+      }}
+    }}
+  }}
+}}
+"""
+
+
 async def get_review_activity(
     client: GitHubClient,
     owner: str,
     repo: str,
     pull_number: int,
 ) -> dict[str, Any]:
-    pull = await _pull_with_review_requests(client, owner, repo, pull_number)
+    data = await client.graphql(
+        REVIEW_ACTIVITY_QUERY, {"owner": owner, "repo": repo, "number": pull_number},
+    )
+    first = _required_pull(data, pull_number)
+    pull = {key: first[key] for key in ("state", "isDraft", "headRefOid", "updatedAt")}
+    pull["reviewRequests"] = await _pull_nodes(
+        client, owner, repo, pull_number, "reviewRequests", REVIEW_REQUEST_FIELDS, first["reviewRequests"],
+    )
     pull["reviews"] = await _pull_nodes(
-        client,
-        owner,
-        repo,
-        pull_number,
-        "reviews",
-        "id databaseId author { login } state submittedAt updatedAt commit { oid }",
+        client, owner, repo, pull_number, "reviews", REVIEW_ACTIVITY_FIELDS, first["reviews"],
+    )
+    pull["reviewThreads"] = await list_review_threads(
+        client, owner, repo, pull_number, first["reviewThreads"],
     )
     return pull
-
-
-async def _pull_with_review_requests(
-    client: GitHubClient,
-    owner: str,
-    repo: str,
-    pull_number: int,
-) -> dict[str, Any]:
-    query = """
-    query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-      repository(owner: $owner, name: $repo) {
-        pullRequest(number: $number) {
-          state
-          isDraft
-          headRefOid
-          updatedAt
-          reviewRequests(first: 100, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            nodes {
-              requestedReviewer {
-                ... on User { login }
-              }
-            }
-          }
-        }
-      }
-    }
-    """
-    requests: list[dict[str, Any]] = []
-    cursor = None
-    pull: dict[str, Any] | None = None
-    while True:
-        data = await client.graphql(
-            query,
-            {"owner": owner, "repo": repo, "number": pull_number, "cursor": cursor},
-        )
-        page_pull = _required_pull(data, pull_number)
-        if pull is None:
-            pull = {
-                "state": page_pull["state"],
-                "isDraft": page_pull["isDraft"],
-                "headRefOid": page_pull["headRefOid"],
-                "updatedAt": page_pull["updatedAt"],
-            }
-        page = page_pull["reviewRequests"]
-        requests.extend(page["nodes"])
-        if not page["pageInfo"]["hasNextPage"]:
-            pull["reviewRequests"] = requests
-            return pull
-        cursor = page["pageInfo"]["endCursor"]
 
 
 async def _pull_nodes(
@@ -346,6 +315,7 @@ async def _pull_nodes(
     pull_number: int,
     connection: str,
     fields: str,
+    initial_page: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     query = f"""
     query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {{
@@ -361,16 +331,19 @@ async def _pull_nodes(
     """
     nodes: list[dict[str, Any]] = []
     cursor = None
+    page = initial_page
     while True:
-        data = await client.graphql(
-            query,
-            {"owner": owner, "repo": repo, "number": pull_number, "cursor": cursor},
-        )
-        page = _required_pull(data, pull_number)[connection]
+        if page is None:
+            data = await client.graphql(
+                query,
+                {"owner": owner, "repo": repo, "number": pull_number, "cursor": cursor},
+            )
+            page = _required_pull(data, pull_number)[connection]
         nodes.extend(page["nodes"])
         if not page["pageInfo"]["hasNextPage"]:
             return nodes
         cursor = page["pageInfo"]["endCursor"]
+        page = None
 
 
 def _required_pull(data: dict[str, Any], pull_number: int) -> dict[str, Any]:

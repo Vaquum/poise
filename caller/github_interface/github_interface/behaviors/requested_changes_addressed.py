@@ -24,10 +24,6 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
 
     pull = await get_pull(client, owner, repo, pull_number)
     reviews = await list_reviews(client, owner, repo, pull_number)
-    comments = await list_inline_comments(client, owner, repo, pull_number)
-    commits = await list_commits(client, owner, repo, pull_number)
-    public_comments = await issue_comments(client, owner, repo, pull_number)
-    threads = await list_review_threads(client, owner, repo, pull_number)
 
     actor_reviews = [
         review
@@ -43,6 +39,11 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         if latest_review and latest_review.get("state") == "CHANGES_REQUESTED"
         else None
     )
+    # Only an active change request can have response or resolution evidence.
+    comments = await list_inline_comments(client, owner, repo, pull_number) if request_review else []
+    commits = await list_commits(client, owner, repo, pull_number) if request_review else []
+    public_comments = await issue_comments(client, owner, repo, pull_number) if request_review else []
+    threads = await list_review_threads(client, owner, repo, pull_number) if request_review else []
     request_ids = {request_review["id"]} if request_review else set()
     request_comments = [
         comment

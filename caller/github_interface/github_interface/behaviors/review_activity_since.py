@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from github_interface.atoms.pulls import get_review_activity, list_review_threads
+from github_interface.atoms.pulls import get_review_activity
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository, token_user
@@ -22,7 +22,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     since = _time(str(payload.get("since", "")), "since")
 
     pull = await get_review_activity(client, owner, repo, pull_number)
-    threads = await list_review_threads(client, owner, repo, pull_number)
+    threads = pull["reviewThreads"]
     unresolved = [thread for thread in threads if not thread["is_resolved"]]
     unresolved_live = [thread for thread in unresolved if not thread["is_outdated"]]
     head_sha = str(pull.get("headRefOid") or "")

@@ -22,15 +22,18 @@ def review(database_id: int, state: str, submitted_at: str, login: str = "bit-mi
 class FakeClient:
     def __init__(self, reviews: list[dict[str, Any]]):
         self._reviews = reviews
+        self.calls = []
 
     async def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((query, variables))
+        pull = {}
         if "reviewRequests" in query:
-            pull = {"state": "OPEN", "isDraft": False, "headRefOid": HEAD, "updatedAt": "2026-09-17T10:00:00Z", "reviewRequests": {**PAGE, "nodes": []}}
-        elif "reviewThreads" in query:
-            pull = {"reviewThreads": {**PAGE, "nodes": []}}
-        else:
+            pull.update({"state": "OPEN", "isDraft": False, "headRefOid": HEAD, "updatedAt": "2026-09-17T10:00:00Z", "reviewRequests": {**PAGE, "nodes": []}})
+        if "reviewThreads" in query:
+            pull["reviewThreads"] = {**PAGE, "nodes": []}
+        if "reviews(" in query:
             self.assertReviewFields(query)
-            pull = {"reviews": {**PAGE, "nodes": self._reviews}}
+            pull["reviews"] = {**PAGE, "nodes": self._reviews}
         return {"repository": {"pullRequest": pull}}
 
     @staticmethod
@@ -63,6 +66,7 @@ class TestReviewActivitySince(IsolatedAsyncioTestCase):
         self.assertEqual(facts["reviewer_comments_since"], 1)
         self.assertEqual(facts["reviewer_latest_review_id"], "PRR_91")
         self.assertEqual(facts["reviewer_latest_any_review_id"], "PRR_92")
+        self.assertEqual(len(client.calls), 1)
 
     async def test_nothing_since_is_an_empty_list(self) -> None:
         facts = await review_activity_since.run(FakeClient([review(90, "COMMENTED", "2026-09-17T09:00:00Z")]), payload("2026-09-17T10:00:00Z"))

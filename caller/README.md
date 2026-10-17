@@ -87,6 +87,26 @@ merge primitive. A partial query error is returned on its affected target;
 unscoped errors and missing identity/cost evidence fail the operation visibly.
 The read does not merge or use REST polling. An empty list adds no API requests.
 
+## GitHub polling reads
+
+`--requested-changes-addressed` reads the PR and its complete review list first.
+Without an active change request from the acting reviewer, its response evidence
+is empty and it skips inline comments, commits, public comments and threads.
+Active requests retain those reads, including reaffirmed findings and resolved
+threads. Successful response fields are unchanged.
+
+`--review-activity-since` reads PR metadata, review requests, reviews and review
+threads together on their first page. Each overflowing connection follows its
+own cursor to completion. Thread summaries retain the same fields and comment
+bodies. This changes neither the polling cadence nor checks before writes.
+
+The bounded four-call proof compares identical single-page activity payloads
+fetched separately and together, and requires lower GitHub-reported point cost:
+
+```bash
+caller/.venv/bin/python caller/github_interface/scripts/measure_review_activity.py --token-user LOGIN --repository autonomio/poise --pr 161
+```
+
 ## Grey CI recovery
 
 `github-interface --grey-ci-candidates --requests-json
