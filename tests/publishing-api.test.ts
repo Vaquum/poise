@@ -720,6 +720,48 @@ describe('publishing a document', () => {
     expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
   })
 
+  it('names an update whose pull request went unread at its earlier address, and leaves it unconfirmed', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = (date: string) => ({ repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date } })
+    const journal = { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }
+    expect((await publish([dated('2026-10-17')])).body.results[0].ok).toBe(true)
+    // The original's update moves its address, and its pull request cannot be read after the commit.
+    afterCommit = () => {
+      failOn = (method, endpoint) => (method === 'GET' && endpoint === 'repos/acme/dated/pulls/101' ? 500 : null)
+    }
+    const results = (await publish([dated('2027-01-05'), journal])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([false, true])
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
+    expect((await editor!.readPublishLedger(DOC)).records.find((r) => r.repo === 'acme/dated')!.unconfirmed).toBeDefined()
+  })
+
+  it('keeps an update unconfirmed when a later site fails in the same publication', async () => {
+    for (const [repo, yaml] of [['acme/journal', JOURNAL_YAML], ['acme/notes', NOTES_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const journal = { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }
+    const notes = { repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: 'A note.' } }
+    expect((await publish([journal])).body.results[0].ok).toBe(true)
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    // The original's pull request merges just before its update's commit and cannot be read after it; Notes then fails.
+    beforeCommit = () => merge('acme/journal', 101)
+    afterCommit = () => {
+      failOn = (method, endpoint) => (method === 'GET' && endpoint === 'repos/acme/journal/pulls/101') || (method === 'POST' && endpoint === 'repos/acme/notes/git/refs') ? 500 : null
+    }
+    expect((await publish([journal, notes])).body.results.map((r: any) => r.ok)).toEqual([false, false])
+    expect((await editor!.readPublishLedger(DOC)).records.find((r) => r.repo === 'acme/journal')!.unconfirmed).toBeDefined()
+    // So the next publication asks, rather than taking the unmerged update for the site's.
+    failOn = null
+    expect((await publish([journal])).body.results[0]).toMatchObject({ ok: false, conflicts: ['the text'] })
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

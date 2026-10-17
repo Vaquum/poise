@@ -588,6 +588,13 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       assertLedgerFits(ledger.records, [provisionalRecord(target, fillFor(target, parts, places, todayValue), parts.title)])
       const outcome = await publishTo(session, target, parts, places, todayValue, replace, doc.content)
       const kept = await record(target, outcome)
+      if (outcome.error) {
+        // Committed, but whether it can reach the site is not known: the
+        // others name it where it was, and it is corrected, with its pull
+        // request read again, at the next publication.
+        going = going.filter((t) => t !== target)
+        continue
+      }
       published.push({ target, record: kept, places, state: outcome.state })
     } catch (error) {
       if (!(error instanceof PublishValueError || error instanceof PublishConflictError || error instanceof PostFileError || error instanceof GitHubError || error instanceof HttpError)) throw error

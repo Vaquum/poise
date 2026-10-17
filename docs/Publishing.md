@@ -125,6 +125,7 @@ what is wrong.
   it is merged or closed meanwhile, that commit gets a pull request of its own.
   If GitHub cannot say afterwards whether it is still open, the commit is
   recorded and the site says so: publish again to make sure it reaches the site.
+  Until then, the other sites name it at the address it had.
   Should the pull request turn out to have been merged without that commit,
   every difference from the site is asked about before anything is replaced,
   and other sites name the address the piece still has there.
