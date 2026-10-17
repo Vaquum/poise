@@ -1024,6 +1024,46 @@ sections:
     expect(fileOn('mikkokotila/mikkokotila-com', 'main', POST)).toBe('Someone else\'s piece.\n')
   })
 
+  it('owns a piece where what landed is, after a retargeted update is closed unmerged', async () => {
+    await publish([writing()])
+    merge('mikkokotila/mikkokotila-com', 101)
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    await writeDocument(DOC, `${TEXT}\nA second thought.\n`)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    // A maintainer retargets the update to another branch, where someone else's piece has this path.
+    repo.branches.set('staging', repo.branches.get('main')!)
+    editOnSite('mikkokotila/mikkokotila-com', 'staging', POST, () => 'Someone else\'s piece.\n')
+    repo.pulls.get(102)!.base = 'staging'
+    await writeDocument(DOC, `${TEXT}\nA third thought.\n`)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    // Closed unmerged; the site now publishes to that branch.
+    close('mikkokotila/mikkokotila-com', 102)
+    editOnSite('mikkokotila/mikkokotila-com', 'main', 'publish.yaml', (text) => text.replace('site: mikkokotila.com', 'site: mikkokotila.com\nbranch: staging'))
+    expect((await publish([writing()], true)).body.results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/did not publish it/) })
+    expect(fileOn('mikkokotila/mikkokotila-com', 'staging', POST)).toBe('Someone else\'s piece.\n')
+  })
+
+  it('corrects a piece merged during the first pass only where it is this document\'s', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    await publish([writing()])
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    const move = () => editOnSite('mikkokotila/mikkokotila-com', 'main', 'publish.yaml', (text) => text.replace('site: mikkokotila.com', 'site: mikkokotila.com\nbranch: published'))
+    // The site moves to another branch, where someone else's piece has this path.
+    repo.branches.set('published', repo.branches.get('main')!)
+    editOnSite('mikkokotila/mikkokotila-com', 'published', POST, () => 'Someone else\'s piece.\n')
+    move()
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    // #101 merges into main with the update's commit; the journal then fails, so the original would need correcting.
+    afterCommit = () => { merge('mikkokotila/mikkokotila-com', 101); move() }
+    failOn = (method, endpoint) => (method === 'POST' && endpoint === 'repos/acme/journal/git/refs' ? 500 : null)
+    const results = (await publish([writing(), { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }], true)).body.results
+    expect(results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/publishes to published now, where this piece is not/) })
+    expect(repo.pulls.size).toBe(1)
+    expect(fileOn('mikkokotila/mikkokotila-com', 'published', POST)).toBe('Someone else\'s piece.\n')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

@@ -312,12 +312,20 @@ export interface PublicationView {
 }
 
 /**
- * Whether a piece is still this document's on its site's branch: always on
- * the branch it was published to; on a branch the site has moved to since,
- * only if the file there is a version this document published, carried over.
+ * The branch a piece is on: where its pull request went, or, once that is
+ * closed unmerged, where the version that landed before it is.
  */
-async function stillOurs(session: GitHubSession, ready: ReadySite, record: PublishRecord, landed: Landed | undefined): Promise<boolean> {
-  if (record.base === ready.base) return true
+function whereOf(record: PublishRecord, state: PullRequestInfo['state'] | 'unknown' | undefined): string {
+  return state === 'closed' && record.landed ? record.landed.base ?? record.base : record.base
+}
+
+/**
+ * Whether a piece is still this document's on its site's branch: always on
+ * the branch it is on; on another the site has moved to since, only if the
+ * file there is a version this document published, carried over.
+ */
+async function stillOurs(session: GitHubSession, ready: ReadySite, record: PublishRecord, landed: Landed | undefined, where: string): Promise<boolean> {
+  if (where === ready.base) return true
   const there = await fileAt(session, ready.repo, record.path, ready.base).catch((error: unknown) => {
     if (!(error instanceof GitHubError)) throw error
     return null
@@ -369,7 +377,7 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
       // document published: published there afresh, under any slug.
       const stored = view.live && state !== 'open' ? storedSites().find((s) => s.repo.toLowerCase() === record.repo.toLowerCase()) : undefined
       const ready = stored && (await readSite(session!, stored)).ready
-      if (ready && !(await stillOurs(session!, ready, record, state === 'merged' ? snapshotOf(record) : record.landed))) view.live = false
+      if (ready && !(await stillOurs(session!, ready, record, state === 'merged' ? snapshotOf(record) : record.landed, whereOf(record, state)))) view.live = false
     } catch (error) {
       if (!(error instanceof GitHubError)) throw error
       view.problem = error.message
@@ -527,7 +535,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     const key = placeKey(record.repo, record.section)
     if (states.get(key) !== 'merged') return record.landed
     return missed.has(key)
-      ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.unconfirmed!.url, ...(record.unconfirmed!.date ? { date: record.unconfirmed!.date } : {}), unknown: true }
+      ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.unconfirmed!.url, ...(record.unconfirmed!.date ? { date: record.unconfirmed!.date } : {}), base: record.base, unknown: true }
       : snapshotOf(record)
   }
   // The date the version on its site went by: the record's own, unless what is
@@ -561,7 +569,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     let previous = live.find((r) => placeKey(r.repo, r.section) === key)
     // A site that has moved to another branch since, where the file is not
     // one this document published: the piece is published there afresh.
-    if (previous && states.get(key) !== 'open' && !(await stillOurs(session, read.ready, previous, landedOf(previous)))) previous = undefined
+    if (previous && states.get(key) !== 'open' && !(await stillOurs(session, read.ready, previous, landedOf(previous), whereOf(previous, states.get(key))))) previous = undefined
     // Only an open pull request is still on its way; anything else that is
     // live is the merged version on the site.
     const state = !previous ? 'new' : states.get(key) === 'open' ? 'open' : 'merged'
@@ -719,6 +727,14 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     try {
       // On its open pull request; a version already on the site gets an update of its own.
       const landed = state === 'open' ? kept.landed : kept.landed ?? target.landed ?? snapshotOf(kept)
+      // Merged meanwhile into a branch the site no longer publishes to, where the
+      // file is not this document's: there is nothing of it there to correct.
+      if (state !== 'open' && !(await stillOurs(session, target.ready, kept, landed, kept.base))) {
+        results.set(target.key, resultFor(target, {
+          error: `Published as pull request #${kept.pullRequest.number}, but it still names a site that failed, and ${target.ready.config.site} publishes to ${target.ready.base} now, where this piece is not. Publish again to correct it.`,
+        }))
+        continue
+      }
       const again: Target = state === 'open'
         ? { ...target, previous: kept, state: 'open', landed, since: kept.date }
         : { ...target, previous: kept, state: 'merged', landed, since: landed?.date ?? kept.date }
@@ -738,7 +754,7 @@ function largestLanded(target: Target, filled: FilledPost): Landed | undefined {
   const candidates = [
     target.landed,
     open ? snapshotOf(target.previous!) : undefined,
-    open ? { data: filled.frontmatter, bodySha: '0'.repeat(64), pullRequest: target.previous!.pullRequest.number, url: filled.url, date: filled.date } : undefined,
+    open ? { data: filled.frontmatter, bodySha: '0'.repeat(64), pullRequest: target.previous!.pullRequest.number, url: filled.url, date: filled.date, base: longest(target.previous!.pullRequest.base, target.previous!.base, target.ready.base) } : undefined,
   ].filter((landed): landed is Landed => !!landed)
   return largestOf(candidates)
 }
@@ -751,7 +767,7 @@ export function largestOf(candidates: Landed[]): Landed | undefined {
 
 /** This document's side of a record's version, as it stands on the site once merged. */
 function snapshotOf(record: PublishRecord): Landed {
-  return { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url, date: record.date }
+  return { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url, date: record.date, base: record.base }
 }
 
 function samePlaces(a: Place[], b: Place[]): boolean {
@@ -890,7 +906,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     // On the site itself, this version is what landed there now, whatever
     // landed before it: a later change of this document's is one from it.
     const landedNow: Landed | undefined = state === 'merged'
-      ? { data: published.data, bodySha: published.bodySha, pullRequest: landed?.pullRequest ?? previous!.pullRequest.number, url, date: published.date }
+      ? { data: published.data, bodySha: published.bodySha, pullRequest: landed?.pullRequest ?? previous!.pullRequest.number, url, date: published.date, base: ready.base }
       : landed
     // On the site, on the branch it publishes to now; on an open pull request, the branch that targets.
     const record: PublishRecord = {
@@ -952,14 +968,14 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     } else if (after.took) {
       base = after.base || base
       pr = { ...previous!.pullRequest, base }
-      kept = { data: published.data, bodySha: published.bodySha, pullRequest: pr.number, url, date: published.date }
+      kept = { data: published.data, bodySha: published.bodySha, pullRequest: pr.number, url, date: published.date, base }
       outcome = 'merged'
     } else {
       // Merged meanwhile: what it held is on the site now, and this document's,
       // on the branch it merged into.
       if (after.state === 'merged') {
-        kept = snapshotOf(previous!)
         base = after.base || base
+        kept = { ...snapshotOf(previous!), base }
       }
       // To the branch the pull request it replaces went to, where what it
       // merged is: should the site have moved since, the next publication
