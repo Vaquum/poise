@@ -470,8 +470,8 @@ is reported and nothing runs until it is corrected. A drain skips the run.
   and `/poise`);
 - the production updater, its Settings line and its desktop notification;
 - launchd recovery of legacy datastore sync;
-- Espanso detection: Snippets says snippets reach the desktop through Poise
-  Link;
+- Espanso detection: the desktop copy is synced through Poise Link, with
+  connection status in Settings → Accounts → Poise Link;
 - Claude sign-in through a local browser: `POST /api/claude-auth/login`
   answers 409 and points to Settings → Connected accounts, where the sign-in
   banner's button opens Claude's login in a terminal.

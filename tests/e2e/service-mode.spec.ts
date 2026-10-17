@@ -100,13 +100,13 @@ test('says in Settings that no production updater runs in a workspace', async ({
   await expect(page.locator('.st-production-group')).not.toContainText('launchd', { useInnerText: true })
 })
 
-test('says snippets reach the desktop through Poise Link, not an Espanso on the server', async ({ page }) => {
+test('keeps desktop connection messaging out of the service Snippets toolbar', async ({ page }) => {
   await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'snippets') })
   await serviceModeApi(page, [])
   await page.goto('/')
   const view = page.locator('#view-snippets')
   await expect(view.locator('.snip-row[data-trigger=";sig"]')).toBeVisible()
-  await expect(view.locator('.snip-link-hint')).toBeVisible()
-  await expect(view.locator('.snip-link-hint')).toHaveText('No computer is paired with Poise Link, so snippets reach no desktop.')
+  await expect(view.locator('.snip-link-hint, .snip-link-settings')).toHaveCount(0)
+  await expect(view).not.toContainText('Poise Link')
   await expect(view.locator('.snip-espanso-hint')).toBeHidden()
 })

@@ -144,38 +144,38 @@ test('says a paired computer whose Poise Link is not running is not connected, a
   await expect(card.locator('.pl-device-state')).not.toHaveAttribute('data-help', /Poise Link is not running/)
 })
 
-test('says in Snippets whether a change reaches the desktop now, and opens Poise Link in Settings when it does not', async ({ page }) => {
-  const state = await setup(page, 'service')
-  state.devices = [stopped('laptop')]
-  await page.addInitScript(() => localStorage.setItem('poise-view', 'snippets'))
-  await page.clock.install()
-  await page.goto('/')
-  const view = page.locator('#view-snippets')
-  const hint = view.locator('.snip-link-hint')
-  await expect(view.locator('.snip-row[data-trigger=";combo"]')).toBeVisible()
-  await expect(hint).toHaveText(/^Poise Link is not connected \(last seen Oct 9, 2026, 7:53\sAM\)\. Changes reach your computer once Poise Link runs there\.$/)
-  await expect(hint).toHaveClass(/st-help-warn/)
-  await expect(view.locator('.snip-espanso-hint')).toBeHidden()
+for (const [name, devices] of [
+  ['disconnected', [stopped('laptop')]],
+  ['connected', [device('laptop')]],
+  ['multiple connected computers', [device('laptop'), device('desktop')]],
+  ['revoked', [device('laptop', 'revoked')]],
+  ['unpaired', []],
+] as const) {
+  test(`keeps Poise Link status out of Snippets when ${name}`, async ({ page }) => {
+    const state = await setup(page, 'service')
+    state.devices = [...devices]
+    await page.addInitScript(() => localStorage.setItem('poise-view', 'snippets'))
+    await page.clock.install()
+    await page.goto('/')
+    const view = page.locator('#view-snippets')
+    await expect(view.locator('.snip-row[data-trigger=";combo"]')).toBeVisible()
+    await expect(view.locator('.snip-link-hint, .snip-link-settings')).toHaveCount(0)
+    await expect(view).not.toContainText('Poise Link')
+    await expect(view.locator('.snip-espanso-hint')).toBeHidden()
 
-  // Poise Link starts on that computer while the view is open.
-  state.devices = [device('laptop')]
-  await page.clock.fastForward(10_000)
-  await expect(hint).toHaveText('Poise Link is connected: changes reach your computer in seconds.')
-  await expect(hint).toHaveClass(/st-help-ok/)
-  await expect(view.locator('.snip-link-settings')).toBeHidden()
+    await page.clock.fastForward(20_000)
+    await expect(view).not.toContainText('Poise Link')
+    await expect(view.getByRole('button', { name: 'Add snippet' })).toBeVisible()
 
-  state.devices = [device('laptop'), device('desktop')]
-  await page.clock.fastForward(10_000)
-  await expect(hint).toHaveText('Poise Link is connected on 2 computers: changes reach them in seconds.')
-
-  state.devices = [device('laptop', 'revoked')]
-  await page.clock.fastForward(10_000)
-  await expect(hint).toHaveText('No computer is paired with Poise Link, so snippets reach no desktop.')
-  await view.locator('.snip-link-settings').click()
-  await expect(page.locator('#settings-panel')).toHaveClass(/open/)
-  await expect(page.locator('#settings-panel')).toHaveAttribute('data-section', 'accounts')
-  await expect(page.locator('.pl-device-state')).toHaveText('Revoked')
-})
+    // The existing Settings section still reports each computer's status.
+    await page.getByRole('button', { name: 'Menu', exact: true }).click()
+    await page.locator('[data-settings="accounts"]').click()
+    await expect(page.locator('.pl-device')).toHaveCount(devices.length)
+    const labels = devices.map(entry => entry.state === 'revoked' ? 'Revoked' : entry.connected ? 'Connected' : 'Not connected')
+    if (labels.length) await expect(page.locator('.pl-device-state')).toHaveText(labels)
+    else await expect(page.locator('.pl-devices')).toContainText('No computer is paired yet.')
+  })
+}
 
 test('Escape closes the top-right menu, and Settings opened from it', async ({ page }) => {
   await setup(page, 'service')
