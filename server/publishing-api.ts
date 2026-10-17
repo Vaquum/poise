@@ -327,7 +327,10 @@ async function describeSite(repo: string, value: unknown): Promise<{ site: SiteV
   const description = value.trim() ? value : undefined
   // Kept only when it reads: the box keeps the text, and the error, until then.
   if (description !== undefined) parsePublishConfig(description)
-  const next: StoredSite = { repo: site.repo, ...(description !== undefined ? { description } : {}) }
+  // As stored, its former names too; only the description changes.
+  const next: StoredSite = { ...site }
+  delete next.description
+  if (description !== undefined) next.description = description
   updateSites((sites) => {
     if (!sites.some((s) => s.repo === site.repo)) throw new HttpError(404, `${repo} is not one of your publishing sites.`)
     return sites.map((s) => (s.repo === site.repo ? next : s))
@@ -514,6 +517,11 @@ interface Target {
   since?: string
 }
 
+/** Each destination's own result, as it was asked for: two names of one site are two destinations. */
+function resultKey(destination: Destination): string {
+  return placeKey(destination.repo, destination.section)
+}
+
 function placeKey(repo: string, section: string): string {
   return `${repo.toLowerCase()}#${section}`
 }
@@ -577,6 +585,8 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // An update committed while its pull request could not be read, where
   // the pull request has since been merged without it.
   const missed = new Set<string>()
+  // The name each record had before a rename followed here, to find its stored site by.
+  const recordedAs = new Map<PublishRecord, string>(ledger.records.map((record) => [record, record.repo]))
   await Promise.all(ledger.records.map(async (record) => {
     try {
       const info = await pullRequest(session, record.repo, record.pullRequest.number)
@@ -627,7 +637,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   const targets: Target[] = []
   const results = new Map<string, PublishResult>()
   const refuse = (destination: Destination, error: string) => {
-    results.set(placeKey(destination.repo, destination.section), { repo: destination.repo, section: destination.section, ok: false, error })
+    results.set(resultKey(destination), { repo: destination.repo, section: destination.section, ok: false, error })
   }
   const sites = storedSites()
   for (const destination of destinations) {
@@ -675,7 +685,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     })
     if (current instanceof GitHubError) {
       // That site fails alone, as one that cannot be read above.
-      results.set(target.key, resultFor(target, { error: current.message }))
+      results.set(resultKey(target.destination), resultFor(target, { error: current.message }))
       targets.splice(targets.indexOf(target), 1)
       continue
     }
@@ -701,7 +711,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     const state = states.get(key)
     const reached = state === 'open' || (state === 'merged' && !missed.has(key))
     if (state === 'unknown' || (r.unconfirmed && !reached)) return
-    const stored = sites.find((site) => site.repo.toLowerCase() === r.repo.toLowerCase())
+    const stored = sites.find((site) => named(site, r.repo) || named(site, recordedAs.get(r) ?? r.repo))
     const ready = targets.find((t) => t.key === key)?.ready ?? (stored && (await readSite(session, stored)).ready)
     const section = ready?.config.sections.find((sec) => sec.name === r.section)
     // A site that has moved to another branch since the piece went where it is: its record says where it was.
@@ -756,7 +766,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       return true
     } catch (error) {
       if (!(error instanceof PublishValueError)) throw error
-      results.set(target.key, resultFor(target, { error: error.message, problems: error.problems }))
+      results.set(resultKey(target.destination), resultFor(target, { error: error.message, problems: error.problems }))
       return false
     }
   })
@@ -772,7 +782,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     }
     const kept = outcome.record ?? target.previous!
     // Named as it was asked for, so the panel keeps finding it until it reads the sites again.
-    results.set(target.key, resultFor(target, outcome.error
+    results.set(resultKey(target.destination), resultFor(target, outcome.error
       ? { error: outcome.error }
       : { ok: true, ...(outcome.unchanged ? { unchanged: true } : {}), publication: { ...viewOf(kept, outcome.state), repo: target.destination.repo } }))
     return kept
@@ -796,7 +806,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       published.push({ target, record: kept, places, state: outcome.state })
     } catch (error) {
       if (!(error instanceof PublishValueError || error instanceof PublishConflictError || error instanceof PostFileError || error instanceof GitHubError || error instanceof HttpError)) throw error
-      results.set(target.key, resultFor(target, {
+      results.set(resultKey(target.destination), resultFor(target, {
         error: error.message,
         ...(error instanceof PublishValueError ? { problems: error.problems } : {}),
         ...(error instanceof PublishConflictError ? { conflicts: error.conflicts } : {}),
@@ -817,7 +827,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       // Merged meanwhile into a branch the site no longer publishes to, where the
       // file is not this document's: there is nothing of it there to correct.
       if (state !== 'open' && !(await stillOurs(session, target.ready, kept, landed, kept.base))) {
-        results.set(target.key, resultFor(target, {
+        results.set(resultKey(target.destination), resultFor(target, {
           error: `Published as pull request #${kept.pullRequest.number}, but it still names a site that failed, and ${target.ready.config.site} publishes to ${target.ready.base} now, where this piece is not. Publish again to correct it.`,
         }))
         continue
@@ -828,12 +838,12 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       await record(target, await publishTo(session, again, parts, final, todayValue, replace, doc.content, fits))
     } catch (error) {
       if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError || error instanceof PostFileError)) throw error
-      results.set(target.key, resultFor(target, {
+      results.set(resultKey(target.destination), resultFor(target, {
         error: `Published as pull request #${kept.pullRequest.number}, but it still names a site that failed: ${error.message} Publish again to correct it.`,
       }))
     }
   }
-  return { results: destinations.map((d) => [...results.values()].find((r) => placeKey(r.repo, r.section) === placeKey(d.repo, d.section))!) }
+  return { results: destinations.map((d) => results.get(resultKey(d))!) }
 }
 
 function largestLanded(target: Target, filled: FilledPost): Landed | undefined {
