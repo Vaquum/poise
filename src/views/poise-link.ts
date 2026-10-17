@@ -74,28 +74,6 @@ function devicesHtml(devices: PairedDevice[]): string {
   }).join('')
 }
 
-export interface LinkStanding {
-  text: string
-  tone: 'ok' | 'warn'
-  /** Settings → Poise Link is where to act on it. */
-  act: boolean
-}
-
-/** Whether a change made in Poise reaches a computer now, as the Snippets view says it. */
-export function linkStanding(devices: PairedDevice[]): LinkStanding {
-  const active = devices.filter((device) => device.state === 'active')
-  const connected = active.filter((device) => device.connected).length
-  if (connected === 1) return { text: 'Poise Link is connected: changes reach your computer in seconds.', tone: 'ok', act: false }
-  if (connected > 1) return { text: `Poise Link is connected on ${connected} computers: changes reach them in seconds.`, tone: 'ok', act: false }
-  if (!active.length) return { text: 'No computer is paired with Poise Link, so snippets reach no desktop.', tone: 'warn', act: true }
-  const last = Math.max(...active.map((device) => device.lastUsedAt ?? 0))
-  return {
-    text: `Poise Link is not connected${last ? ` (last seen ${moment(last)})` : ''}. Changes reach your computer once Poise Link runs there.`,
-    tone: 'warn',
-    act: true,
-  }
-}
-
 // Settings and first-run setup can each hold a section at once.
 let sections = 0
 
