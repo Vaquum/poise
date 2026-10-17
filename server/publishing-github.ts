@@ -208,6 +208,8 @@ export interface PullRequestInfo {
   headSha: string
   /** The branch it goes to now: a maintainer can retarget it. */
   base: string
+  /** The repository it goes to, by its name now: one renamed since answers to its old name too. */
+  repo: string
 }
 
 function pullRequestFrom(body: any): PullRequestInfo {
@@ -218,6 +220,7 @@ function pullRequestFrom(body: any): PullRequestInfo {
     headRef: String(body.head?.ref ?? ''),
     headSha: String(body.head?.sha ?? ''),
     base: String(body.base?.ref ?? ''),
+    repo: String(body.base?.repo?.full_name ?? ''),
   }
 }
 

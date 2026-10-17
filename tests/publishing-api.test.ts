@@ -80,7 +80,7 @@ function answer(status: number, body?: unknown) {
 
 const pullJson = (repo: Repo, pull: Pull) => ({
   number: pull.number, state: pull.state, merged: pull.merged, html_url: `https://github.com/${repo.fullName}/pull/${pull.number}`,
-  base: { ref: pull.base },
+  base: { ref: pull.base, repo: { full_name: repo.fullName } },
   head: { ref: pull.head, sha: pull.mergedSha ?? repos.get(pull.headRepo.toLowerCase())!.branches.get(pull.head) ?? '' },
 })
 
@@ -1087,6 +1087,27 @@ sections:
     expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
     const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
     expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
+  })
+
+  it('follows a site\'s repository when it is renamed', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const journal = (repo: string) => ({ repo, section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } })
+    expect((await publish([journal('acme/journal')])).body.results[0].ok).toBe(true)
+    // Renamed on GitHub: the old name still answers, as GitHub redirects it.
+    const repo = repos.get('acme/journal')!
+    repo.fullName = 'acme/diary'
+    repos.set('acme/diary', repo)
+    // A minute on, Settings reads the sites again rather than from its cache.
+    ;(await import('../server/publishing-api')).forgetSites()
+    expect((await request('/api/publishing/sites')).body.sites.map((s: any) => s.repo)).toEqual(['mikkokotila/mikkokotila-com', 'acme/diary'])
+    // Settings and the panel address it by its new name; its publication is still this document's.
+    expect((await request('/api/publishing/sites/acme/diary/description', 'PUT', { description: JOURNAL_YAML })).status).toBe(200)
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([journal('acme/diary')])).body.results[0]).toMatchObject({ ok: true, publication: { repo: 'acme/diary', pullRequest: { number: 101 } } })
+    expect((await editor!.readPublishLedger(DOC)).records.map((r) => r.repo)).toEqual(['acme/diary'])
+    expect((await request('/api/publishing/sites/acme/diary', 'DELETE')).status).toBe(200)
   })
 
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {

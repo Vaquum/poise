@@ -88,6 +88,13 @@ function updateSites(change: (sites: StoredSite[]) => StoredSite[]): void {
   db.transaction(() => saveSites(change(storedSites()))).immediate()
 }
 
+/** A repository renamed on GitHub is kept under its new name: Settings and the panel address it so. */
+function renameSite(from: string, to: string): void {
+  updateSites((sites) => sites
+    .filter((s) => s.repo.toLowerCase() !== to.toLowerCase())
+    .map((s) => (s.repo.toLowerCase() === from.toLowerCase() ? { ...s, repo: to } : s)))
+}
+
 function findSite(repo: string): StoredSite {
   const site = storedSites().find((s) => s.repo.toLowerCase() === repo.toLowerCase())
   if (!site) throw new HttpError(404, `${repo} is not one of your publishing sites.`)
@@ -157,17 +164,18 @@ function shownFields(section: PublishSection, suggestions: Map<string, string[]>
 
 /** A site as it is now: its repository, its description and the words it suggests. */
 async function readSite(session: GitHubSession, stored: StoredSite): Promise<SiteRead> {
-  const repo = stored.repo
   const described = stored.description !== undefined ? { description: stored.description } : {}
   let info: RepositoryInfo
   let text: string | null
   try {
-    info = await repository(session, repo)
-    text = stored.description ?? (await fileAt(session, repo, PUBLISH_FILE, info.defaultBranch))?.text ?? null
+    info = await repository(session, stored.repo)
+    text = stored.description ?? (await fileAt(session, info.fullName, PUBLISH_FILE, info.defaultBranch))?.text ?? null
   } catch (error) {
     if (!(error instanceof GitHubError)) throw error
-    return { view: { repo, state: 'unavailable', source: null, problem: error.message, ...described } }
+    return { view: { repo: stored.repo, state: 'unavailable', source: null, problem: error.message, ...described } }
   }
+  const repo = info.fullName
+  if (repo.toLowerCase() !== stored.repo.toLowerCase()) renameSite(stored.repo, repo)
   const source = stored.description !== undefined ? 'settings' : 'repository'
   if (text === null) {
     return { view: { repo, state: 'missing', source: null, problem: `${repo} has no ${PUBLISH_FILE}. Add one to the repository, or describe the site here.` } }
@@ -344,6 +352,11 @@ async function stillOurs(session: GitHubSession, ready: ReadySite, record: Publi
  * now: a record whose branch came from it follows it. One moved with its
  * version to another branch since stays there.
  */
+/** A site renamed on GitHub since: its record goes by the name its pull request gives now. */
+function followRename(record: PublishRecord, info: PullRequestInfo): void {
+  if (info.repo && info.repo.toLowerCase() !== record.repo.toLowerCase()) record.repo = info.repo
+}
+
 function followBase(record: PublishRecord, info: PullRequestInfo): void {
   const seen = record.pullRequest.base ?? record.base
   if (!info.base || info.state === 'closed' || info.base === seen) return
@@ -371,6 +384,8 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
       const info = await pullRequest(session!, record.repo, record.pullRequest.number)
       const state = info.state
       view.pullRequest.state = state
+      followRename(record, info)
+      view.repo = record.repo
       followBase(record, info)
       view.live = state !== 'closed' || record.landed !== undefined
       // A site moved to another branch since, where the file is not one this
@@ -514,14 +529,16 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // the pull request has since been merged without it.
   const missed = new Set<string>()
   await Promise.all(ledger.records.map(async (record) => {
-    const key = placeKey(record.repo, record.section)
     try {
       const info = await pullRequest(session, record.repo, record.pullRequest.number)
+      followRename(record, info)
+      const key = placeKey(record.repo, record.section)
       if (record.unconfirmed && info.state === 'merged' && !await contains(session, record.headRepo, info.headSha, record.unconfirmed.commit)) missed.add(key)
       followBase(record, info)
       states.set(key, info.state)
     } catch (error) {
       if (!(error instanceof GitHubError)) throw error
+      const key = placeKey(record.repo, record.section)
       states.set(key, 'unknown')
       unread.set(key, error.message)
     }
