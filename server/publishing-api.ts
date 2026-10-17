@@ -540,17 +540,18 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     if (date) dates.set(target.key, date)
   }
 
-  // Where each place not published now is, as its site has it: its address
-  // as the site's description gives it now, dated as its file is, a date a
-  // maintainer changed included. One that cannot be read keeps its record's.
+  // Where each live place is now, as its site has it: its address as the
+  // site's description gives it now, dated as its file is, a date a
+  // maintainer changed included. A site published now and failing is named
+  // there too. One that cannot be read keeps its record's.
   const addresses = new Map<string, string>()
   await Promise.all(live.map(async (r) => {
     const key = placeKey(r.repo, r.section)
     const state = states.get(key)
     const reached = state === 'open' || (state === 'merged' && !missed.has(key))
-    if (targets.some((t) => t.key === key) || state === 'unknown' || (r.unconfirmed && !reached)) return
+    if (state === 'unknown' || (r.unconfirmed && !reached)) return
     const stored = sites.find((site) => site.repo.toLowerCase() === r.repo.toLowerCase())
-    const ready = stored && (await readSite(session, stored)).ready
+    const ready = targets.find((t) => t.key === key)?.ready ?? (stored && (await readSite(session, stored)).ready)
     const section = ready?.config.sections.find((sec) => sec.name === r.section)
     if (!ready || !section?.url) return
     let date = r.date

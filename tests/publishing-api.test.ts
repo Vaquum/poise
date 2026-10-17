@@ -863,6 +863,23 @@ sections:
     expect(copy).toContain('canonical_url: "https://dated.example/2025/a-better-question/"')
   })
 
+  it('names an original where its site has it now, when its own update fails', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = (date: string) => ({ repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date } })
+    expect((await publish([dated('2026-10-17')])).body.results[0].ok).toBe(true)
+    merge('acme/dated', 101)
+    editOnSite('acme/dated', 'main', 'posts/a-better-question.md', (text) => text.replace('date: "2026-10-17"', 'date: "2025-03-01"'))
+    // The original's update is refused; the copy still names it where its site has it.
+    const results = (await publish([dated('not a date'), { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([false, true])
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2025/a-better-question/"')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
@@ -882,43 +899,44 @@ sections:
   })
 
   it('sizes each site again with the places it is published with', async () => {
-    const alpha = (url: string) => `version: 1
-site: Alpha
+    const site = (name: string, url: string, fields = '') => `version: 1
+site: ${name}
 sections:
   - name: Posts
-    path: alpha/{slug}.md
+    path: ${name.toLowerCase()}/{slug}.md
     url: ${url}
     slug: "^[a-z0-9-]+$"
     first_line: title
     fields:
       title: { kind: text, required: true }
-`
-    // Beta lists each address four times, so it grows by more than any slack in Alpha's own estimate.
-    for (const [repo, yaml] of [['acme/alpha', alpha(`https://alpha.example/${'{slug}/'.repeat(38)}`)], ['acme/beta', PLACED_YAML.replace('item: "{site}"', 'item: "{url} {url} {url} {url}"')]]) {
+${fields}`
+    for (const [repo, yaml] of [
+      ['acme/alpha', site('Alpha', 'https://alpha.example/{slug}/')],
+      ['acme/gamma', site('Gamma', `https://gamma.example/${'{slug}/'.repeat(38)}`)],
+      ['acme/beta', site('Beta', 'https://beta.example/{slug}/', '      note: { kind: text, lines: many }\n      canonical_url: { kind: canonical }\n')],
+    ]) {
       addRepo(repo, {})
       await request('/api/publishing/sites', 'POST', { repo })
       await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
     }
-    const toAlpha = { repo: 'acme/alpha', section: 'Posts', slug: 'a-better-question', values: {} }
-    expect((await publish([toAlpha])).body.results[0].ok).toBe(true)
-    // Alpha's address is shorter now; Beta lists it.
-    await request('/api/publishing/sites/acme/alpha/description', 'PUT', { description: alpha('https://alpha.example/{slug}/') })
-    const toBeta = (length: number) => ({ repo: 'acme/beta', section: 'Notes', slug: 'a-better-question', values: { note: 'n'.repeat(length) } })
-    // Alpha fails before Beta, so Beta lists the address Alpha has: its earlier, longer one.
-    const alphaFails = (method: string, endpoint: string) => method === 'GET' && endpoint.startsWith('repos/acme/alpha/git/ref/')
-    // The longest note checked to fit with Alpha's new address, found where Beta fails too and nothing is written.
-    failOn = (method, endpoint) => (alphaFails(method, endpoint) || (method === 'POST' && endpoint === 'repos/acme/beta/git/refs') ? 500 : null)
+    const slug = 'a'.repeat(120)
+    const to = (repo: string, values: Record<string, unknown> = {}) => ({ repo, section: 'Posts', slug, values })
+    const all = (length: number) => [to('acme/alpha'), to('acme/gamma'), to('acme/beta', { note: 'n'.repeat(length) })]
+    // Alpha, the original, fails before writing: Beta's canonical address becomes Gamma's, far longer.
+    const alphaFails = (method: string, endpoint: string) => method === 'POST' && endpoint === 'repos/acme/alpha/git/refs'
+    // The longest note checked to fit with Alpha's address, found where every site fails and nothing is written.
+    failOn = (method, endpoint) => (alphaFails(method, endpoint) || (method === 'POST' && /^repos\/acme\/(gamma|beta)\/git\/refs$/.test(endpoint)) ? 500 : null)
     let [fits, over] = [0, 600_000]
     while (over - fits > 1) {
       const length = Math.floor((fits + over) / 2)
-      if ((await publish([toAlpha, toBeta(length)])).status === 413) over = length
+      if ((await publish(all(length))).status === 413) over = length
       else fits = length
     }
     failOn = (method, endpoint) => (alphaFails(method, endpoint) ? 500 : null)
     const before = calls.length
-    const results = (await publish([toAlpha, toBeta(fits)])).body.results
-    expect(results.map((r: any) => r.ok)).toEqual([false, false])
-    expect(results[1].error).toBe('The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.')
+    const results = (await publish(all(fits))).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([false, true, false])
+    expect(results[2].error).toBe('The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.')
     expect(calls.slice(before).filter((call) => call.args.includes('POST') && call.args[1].startsWith('repos/acme/beta/'))).toEqual([])
   })
 
