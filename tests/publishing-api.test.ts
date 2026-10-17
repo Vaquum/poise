@@ -15,7 +15,7 @@ vi.mock('../server/process', async (original) => ({
 /* ---------------------------------------------------------------- a GitHub in memory, as gh api answers */
 
 interface Pull { number: number, state: 'open' | 'closed', merged: boolean, head: string, headRepo: string, base: string, title: string, body: string, mergedSha?: string }
-interface Repo { fullName: string, owner: string, defaultBranch: string, push: boolean, branches: Map<string, string>, pulls: Map<number, Pull> }
+interface Repo { fullName: string, owner: string, defaultBranch: string, push: boolean, branches: Map<string, string>, pulls: Map<number, Pull>, parent?: string }
 
 let repos: Map<string, Repo>
 let commits: Map<string, Map<string, string>>
@@ -149,9 +149,12 @@ async function gh(command: string, args: string[], options: RunFileOptions = {})
   const pullMatch = /^pulls\/(\d+)$/.exec(rest)
   if (pullMatch && method === 'GET') return answer(200, pullJson(repo, repo.pulls.get(Number(pullMatch[1]))!))
   if (rest === 'forks' && method === 'POST') {
+    // A fork made before comes back, under whatever name it has now.
+    const made = [...repos.values()].find((r) => r.parent === repo.fullName)
+    if (made) return answer(202, { full_name: made.fullName })
     const name = `octocat/${repo.fullName.split('/')[1]}`
     if (!repos.has(name)) {
-      const copy: Repo = { fullName: name, owner: 'octocat', defaultBranch: repo.defaultBranch, push: true, branches: new Map([[repo.defaultBranch, repo.branches.get(repo.defaultBranch)!]]), pulls: new Map() }
+      const copy: Repo = { fullName: name, owner: 'octocat', defaultBranch: repo.defaultBranch, push: true, branches: new Map([[repo.defaultBranch, repo.branches.get(repo.defaultBranch)!]]), pulls: new Map(), parent: repo.fullName }
       repos.set(name, copy)
     }
     return answer(202, { full_name: name })
@@ -600,6 +603,49 @@ describe('publishing a document', () => {
     expect(published.body.results[1].ok).toBe(true)
   })
 
+  it('publishes to the other sites when one cannot be read', async () => {
+    addRepo('acme/dated', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/dated' })
+    await request('/api/publishing/sites/acme/dated/description', 'PUT', { description: DATED_YAML })
+    const dated = { repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date: '2026-10-17' } }
+    expect((await publish([writing(), dated])).body.results.map((r: any) => r.ok)).toEqual([true, true])
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    // Its published file cannot be read for the date it goes by.
+    failOn = (method, endpoint) => (method === 'GET' && endpoint.startsWith('repos/acme/dated/contents/') ? 500 : null)
+    const results = (await publish([writing(), dated])).body.results
+    expect(results[0].ok).toBe(true)
+    expect(fileOn('mikkokotila/mikkokotila-com', 'publish/a-better-question', POST)).toContain('A new ending.')
+    expect(results[1]).toEqual({ repo: 'acme/dated', section: 'Posts', ok: false, error: 'Reading posts/a-better-question.md in acme/dated: Server Error' })
+    // Nor its repository, and a site that is not one of yours: each fails alone.
+    failOn = (method, endpoint) => (method === 'GET' && endpoint === 'repos/acme/dated' ? 500 : null)
+    const more = (await publish([writing(), dated, { ...dated, repo: 'acme/unknown' }])).body.results
+    expect(more.map((r: any) => r.ok)).toEqual([true, false, false])
+    expect(more[1].error).toBe('acme/dated: Reading acme/dated: Server Error')
+    expect(more[2].error).toBe('acme/unknown is not one of your publishing sites.')
+  })
+
+  it("counts a fork's name, however long, when it checks the record's size", async () => {
+    addRepo('ab/notes', {}, false)
+    await request('/api/publishing/sites', 'POST', { repo: 'ab/notes' })
+    await request('/api/publishing/sites/ab/notes/description', 'PUT', { description: NOTES_YAML })
+    // The writer's fork of it, made before and renamed since.
+    const forked = addRepo(`octocat/${'notes-'.padEnd(100, 'x')}`, {})
+    forked.parent = 'ab/notes'
+    forked.branches.set('main', repos.get('ab/notes')!.branches.get('main')!)
+    const note = (slug: string, text: string) => ({ repo: 'ab/notes', section: 'Notes', slug, values: { note: text } })
+    // A record as published through that fork, from another document under a slug as long.
+    await writeDocument('draft-2', TEXT)
+    const probe = await request('/api/editor/doc/draft-2/publish', 'POST', { destinations: [note('a-better-response', 'x')] })
+    expect(probe.body.results[0]).toMatchObject({ ok: true })
+    expect(repos.get('ab/notes')!.pulls.get(101)).toMatchObject({ headRepo: forked.fullName })
+    const size = Buffer.byteLength(JSON.stringify(await editor!.readPublishLedger('draft-2'), null, 2), 'utf8')
+    // Each character counts twice, as a value and in the frontmatter: this note is just past 1 MB.
+    const text = 'x'.repeat(1 + Math.ceil((editor!.MAX_PUBLISH_LEDGER_BYTES + 1 - size) / 2))
+    const before = calls.length
+    expect((await publish([note('a-better-question', text)])).status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
   it('refuses a publication whose record would pass 1 MB on the way, not only at the end', async () => {
     for (const [repo, site] of [['acme/notes', 'Notes'], ['acme/more', 'More notes']]) {
       addRepo(repo, {})
@@ -985,15 +1031,15 @@ describe('publishing a document', () => {
       problems: ['type must be one of essay, note.', 'tags: "Not A Tag" does not match the site\'s pattern ^[a-z0-9]+(?:-[a-z0-9]+)*$.'],
     })
     expect(repos.get('mikkokotila/mikkokotila-com')!.branches.has('publish/a-better-question')).toBe(false)
-    expect((await publish([{ ...writing(), repo: 'acme/unknown' }])).status).toBe(404)
+    expect((await publish([{ ...writing(), repo: 'acme/unknown' }])).body.results[0]).toEqual({ repo: 'acme/unknown', section: 'Writing', ok: false, error: 'acme/unknown is not one of your publishing sites.' })
   })
 
   it('keeps the token out of every error', async () => {
     ghFailure = 'error connecting with tok-octocat: connection refused'
     const result = await publish([writing()])
     expect(JSON.stringify(result.body)).not.toContain('tok-octocat')
-    expect(result.status).toBe(502)
-    expect(result.body.error).toBe('mikkokotila/mikkokotila-com: GitHub could not be reached: error connecting with ***: connection refused')
+    expect(result.status).toBe(200)
+    expect(result.body.results[0]).toMatchObject({ ok: false, error: 'mikkokotila/mikkokotila-com: GitHub could not be reached: error connecting with ***: connection refused' })
   })
 
   it('takes the record with the document when it is deleted', async () => {

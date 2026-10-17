@@ -44,7 +44,10 @@ interface State {
   choices: Choice[]
   doc: DocumentPublishing
   chosen: Set<string>
+  /** Title and description as shown; the date once it is typed, until then each site's own (dateFor). */
   shared: Record<Shared, string>
+  /** The date this piece was published with, on the first site that has one. */
+  pieceDate: string
   /** Each destination's own values, as typed: a list is its words joined by commas. */
   values: Map<string, Record<string, string | boolean>>
   slugs: Map<string, string>
@@ -138,7 +141,8 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
     for (const field of ownFields(choice.section)) {
       // A field the saved values do not have (one added since) takes its default.
       const saved = publication && Object.prototype.hasOwnProperty.call(publication.values, field.name)
-      const value = saved ? publication!.values[field.name] : field.default === 'today' ? doc.today : field.default
+      // Only a date field reads today as today: elsewhere it is the word.
+      const value = saved ? publication!.values[field.name] : field.default === 'today' && field.kind === 'date' ? doc.today : field.default
       own[field.name] = field.kind === 'boolean' ? value === true : asText(value) as string
     }
     values.set(choice.key, own)
@@ -146,8 +150,29 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
   }
   return {
     slug, choices, doc, chosen, values, slugs, slugTyped: new Set(), results: new Map(), busy: false,
-    shared: { title: titleFor(doc, choices), description: String(remembered('description') || ''), date: String(remembered('date') || doc.today) },
+    shared: { title: titleFor(doc, choices), description: String(remembered('description') || ''), date: '' },
+    pieceDate: remembered('date'),
   }
+}
+
+/**
+ * The date a chosen site is published with: the one typed; until then the
+ * date it has, else the piece's date elsewhere, else the site's own default,
+ * today unless its description fixes another.
+ */
+function dateFor(s: State, choice: Choice): string {
+  if (s.shared.date) return s.shared.date
+  const field = choice.section.fields.find((f) => f.name === sharedField(choice.section, 'date'))
+  const own = field && livePublicationOf(choice.key)?.values[field.name]
+  if (typeof own === 'string' && own) return own
+  if (s.pieceDate) return s.pieceDate
+  return typeof field?.default === 'string' && field.default !== 'today' ? field.default : s.doc.today
+}
+
+/** The date the panel shows: the first chosen site's. */
+function shownDate(s: State): string {
+  const choice = s.choices.find((c) => s.chosen.has(c.key) && sharedField(c.section, 'date'))
+  return choice ? dateFor(s, choice) : s.shared.date || s.doc.today
 }
 
 /* ---------------------------------------------------------------- rendering */
@@ -220,7 +245,7 @@ function prChip(publication: PublicationView | undefined): string {
 function syncValues(body: HTMLElement, s: State): void {
   for (const control of body.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('[data-shared], [data-slug], [data-field]')) {
     let wanted: string | boolean
-    if (control.dataset.shared) wanted = s.shared[control.dataset.shared as Shared]
+    if (control.dataset.shared) wanted = control.dataset.shared === 'date' ? shownDate(s) : s.shared[control.dataset.shared as Shared]
     else if (control.dataset.slug) wanted = s.slugs.get(control.dataset.slug) ?? ''
     else {
       const [key, name] = decode(control.dataset.field!)
@@ -258,7 +283,7 @@ function render(): void {
   const shared = [
     uses('title') ? `<label class="ep-field"><span class="ep-label">Title</span><input type="text" class="ep-input ep-title" data-key="shared-title" data-shared="title" aria-label="Title" value="${escapeHtml(s.shared.title)}" autocomplete="off" /></label>` : '',
     uses('description') ? `<label class="ep-field"><span class="ep-label">Description</span><textarea class="ep-input" rows="2" data-key="shared-description" data-shared="description" aria-label="Description">${escapeHtml(s.shared.description)}</textarea></label>` : '',
-    uses('date') ? `<label class="ep-field"><span class="ep-label">Date</span><input type="date" class="ep-input" data-key="shared-date" data-shared="date" aria-label="Date" value="${escapeHtml(s.shared.date)}" /></label>` : '',
+    uses('date') ? `<label class="ep-field"><span class="ep-label">Date</span><input type="date" class="ep-input" data-key="shared-date" data-shared="date" aria-label="Date" value="${escapeHtml(shownDate(s))}" /></label>` : '',
   ].join('')
   const destinations = chosen.map((c) => {
     const publication = livePublicationOf(c.key)
@@ -299,7 +324,8 @@ function destinationFor(choice: Choice): Destination {
   }
   for (const which of ['title', 'description', 'date'] as const) {
     const field = sharedField(choice.section, which)
-    if (field && s.shared[which]) values[field] = s.shared[which]
+    const value = which === 'date' ? dateFor(s, choice) : s.shared[which]
+    if (field && value) values[field] = value
   }
   return { repo: choice.site.repo, section: choice.section.name, slug: (s.slugs.get(choice.key) ?? '').trim(), values }
 }

@@ -91,7 +91,10 @@ The Publish icon in the Editor bar opens the panel for the open document:
 - Title, Description and Date, asked once. Title fills each section's
   `first_line` field, or its text field named `title`; Description its text
   field named `description`; Date its first date field. The title starts as
-  the document's first line;
+  the document's first line. Until you change the date, each site keeps the
+  date it was published with, else takes the piece's date from another site,
+  else its own default: today, unless its description fixes another. The
+  panel shows the first chosen site's;
 - each chosen site's own fields and its slug. The slug follows the title until
   you type one, and stays as it was once the piece is published there (a
   pull request closed unmerged does not count). A required choice with no
@@ -101,7 +104,9 @@ The Publish icon in the Editor bar opens the panel for the open document:
 Publishing saves the document first. Every site's values are checked before
 anything is written, and a site whose values are refused, or that then fails,
 is named on no other site: a file already published that named it is
-published again without it. For each site, Poise builds the file
+published again without it. A site that cannot be read, or is no longer one
+of your sites, fails alone too: the others are still published, and where the
+piece is on it already, it is still named there. For each site, Poise builds the file
 (YAML frontmatter, then the text), creates a branch `publish/<slug>` from the
 site's branch, commits the file with GitHub's GraphQL `createCommitOnBranch`,
 and opens a pull request. Everything is done as your own GitHub account,

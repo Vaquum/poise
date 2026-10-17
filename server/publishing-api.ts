@@ -469,18 +469,23 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     : record.landed
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
 
+  // A site that cannot be published to now fails alone: the others still go,
+  // and where this piece is on it already, it is still named there.
   const targets: Target[] = []
   const results = new Map<string, PublishResult>()
+  const refuse = (destination: Destination, error: string) => {
+    results.set(placeKey(destination.repo, destination.section), { repo: destination.repo, section: destination.section, ok: false, error })
+  }
+  const sites = storedSites()
   for (const destination of destinations) {
-    const read = await readSite(session, findSite(destination.repo))
-    if (!read.ready) throw new HttpError(read.view.state === 'unavailable' ? 502 : 409, `${destination.repo}: ${read.view.problem}`)
+    const stored = sites.find((s) => s.repo.toLowerCase() === destination.repo.toLowerCase())
+    if (!stored) { refuse(destination, `${destination.repo} is not one of your publishing sites.`); continue }
+    const read = await readSite(session, stored)
+    if (!read.ready) { refuse(destination, `${destination.repo}: ${read.view.problem}`); continue }
     const section = read.ready.config.sections.find((s) => s.name === destination.section)
-    if (!section) throw new HttpError(400, `${read.ready.config.site} has no section ${destination.section}.`)
+    if (!section) { refuse(destination, `${read.ready.config.site} has no section ${destination.section}.`); continue }
     const key = placeKey(read.ready.repo, section.name)
-    if (unread.has(key)) {
-      results.set(key, { repo: destination.repo, section: destination.section, ok: false, error: `Its earlier pull request could not be read: ${unread.get(key)}` })
-      continue
-    }
+    if (unread.has(key)) { refuse(destination, `Its earlier pull request could not be read: ${unread.get(key)}`); continue }
     const previous = live.find((r) => placeKey(r.repo, r.section) === key)
     // Only an open pull request is still on its way; anything else that is
     // live is the merged version on the site.
@@ -492,11 +497,20 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // changed and this document did not is the site's, as reconcile keeps it,
   // and so is the address other sites name.
   const dates = new Map<string, string>()
-  for (const target of targets) {
+  for (const target of [...targets]) {
     const field = target.section.fields.find((f) => f.kind === 'date')
     if (!target.previous || !field) continue
     const from = target.state === 'open' ? { repo: target.previous.headRepo, branch: target.previous.branch } : { repo: target.ready.repo, branch: target.ready.base }
-    const current = await fileAt(session, from.repo, target.previous.path, from.branch)
+    const current = await fileAt(session, from.repo, target.previous.path, from.branch).catch((error: unknown) => {
+      if (!(error instanceof GitHubError)) throw error
+      return error
+    })
+    if (current instanceof GitHubError) {
+      // That site fails alone, as one that cannot be read above.
+      results.set(target.key, resultFor(target, { error: current.message }))
+      targets.splice(targets.indexOf(target), 1)
+      continue
+    }
     let theirs: unknown
     try { theirs = current && parsePost(current.text).data[field.name] } catch (error) {
       // publishTo reports a file that cannot be read, for its site.
@@ -617,20 +631,39 @@ function samePlaces(a: Place[], b: Place[]): boolean {
   return a.length === b.length && a.every((place, i) => place.key === b[i].key && place.url === b[i].url && place.site === b[i].site)
 }
 
-/** A record as large as the one a publication will write, before anything is written on GitHub. */
+// The longest name a repository can have on GitHub: a 39-character owner, a 100-character name.
+const LONGEST_REPOSITORY = `${'o'.repeat(39)}/${'n'.repeat(100)}`
+
+/** The longest of the names given, in bytes as written. */
+function longest(...names: Array<string | undefined>): string {
+  const bytes = (name: string) => Buffer.byteLength(JSON.stringify(name), 'utf8')
+  return names.reduce<string>((most, name) => (name !== undefined && bytes(name) > bytes(most) ? name : most), '')
+}
+
+/**
+ * A record as large as any a publication may write, before anything is
+ * written on GitHub. Each name is the longest it can be: a record kept
+ * unchanged keeps the earlier one's, a fork's name is known only once GitHub
+ * makes it, and a pull request's number once it opens.
+ */
 function provisionalRecord(target: Target, filled: FilledPost, docTitle: string): PublishRecord {
+  const { destination, ready, previous } = target
   const at = new Date().toISOString()
   const digest = '0'.repeat(64)
+  const number = Number.MAX_SAFE_INTEGER
+  // Kept by publishTo, so counted here. An open pull request merged while
+  // its commit lands puts its own version, or this new one, in its place: the
+  // largest counts.
+  const landed = largestLanded(target, filled)
   return {
-    repo: target.ready.repo, section: target.section.name, site: target.ready.config.site, headRepo: target.ready.repo,
-    branch: `publish/${target.destination.slug}-9`, base: target.ready.base, path: filled.path, url: filled.url,
-    slug: target.destination.slug, date: filled.date,
-    pullRequest: { number: 999_999, url: `https://github.com/${target.ready.repo}/pull/999999` },
-    publishedAt: at, updatedAt: at, sourceSha: digest, values: target.destination.values, data: filled.frontmatter, bodySha: digest, docTitle,
-    // Kept by publishTo, so counted here. An open pull request merged while
-    // its commit lands puts its own version, or this new one, in its place: the
-    // largest counts.
-    ...(largestLanded(target, filled) ? { landed: largestLanded(target, filled) } : {}),
+    repo: longest(previous?.repo, ready.repo), section: target.section.name, site: ready.config.site,
+    headRepo: longest(previous?.headRepo, ready.info.canPush ? ready.repo : LONGEST_REPOSITORY),
+    branch: longest(previous?.branch, `publish/${destination.slug}-9`), base: longest(previous?.base, ready.base),
+    path: filled.path, url: filled.url, slug: longest(previous?.slug, destination.slug), date: filled.date,
+    pullRequest: { number, url: longest(previous?.pullRequest.url, `https://github.com/${ready.repo}/pull/${number}`) },
+    publishedAt: longest(previous?.publishedAt, at), updatedAt: at,
+    sourceSha: digest, values: destination.values, data: filled.frontmatter, bodySha: digest, docTitle,
+    ...(landed ? { landed } : {}),
   }
 }
 

@@ -25,7 +25,18 @@ const JOURNAL = {
 }
 const MISSING = { repo: 'acme/journal', state: 'missing', source: null, problem: 'acme/journal has no publish.yaml. Add one to the repository, or describe the site here.' }
 
-function publication(site: typeof MIKKO | typeof JOURNAL, number: number, values: Record<string, unknown>) {
+// A site whose date field fixes its own default.
+const FIXED = {
+  repo: 'acme/fixed', state: 'ready', source: 'settings', site: 'Fixed', description: 'version: 1\n',
+  sections: [{ name: 'Posts', url: 'https://fixed.example/{slug}/', firstLine: 'title', fields: [
+    { name: 'title', kind: 'text', required: true },
+    { name: 'date', kind: 'date', required: true, default: '2026-01-01' },
+  ] }],
+}
+
+const notNow = (body: any) => ({ results: body.destinations.map((d: any) => ({ repo: d.repo, section: d.section, ok: false, error: 'Not now.' })) })
+
+function publication(site: { repo: string, site: string, sections: Array<{ name: string, url: string }> }, number: number, values: Record<string, unknown>) {
   return {
     repo: site.repo, section: site.sections[0].name, site: site.site, slug: 'a-better-question', path: 'a-better-question.md',
     url: site.sections[0].url.replace('{slug}', 'a-better-question'), values, publishedAt: '2026-10-17T08:00:00Z', updatedAt: '2026-10-17T08:00:00Z',
@@ -300,4 +311,49 @@ test('gives a field the saved values do not have its own default', async ({ page
   // Published before the featured field was added.
   await openEditor(page, [flagged], () => ({ results: [] }), [publication(MIKKO, 101, { type: 'essay', title: 'A better question' })])
   await expect(page.getByRole('dialog', { name: 'Publish' }).getByLabel('Featured', { exact: true })).toBeChecked()
+})
+
+test('reads a default of today as a date only in a date field', async ({ page }) => {
+  await workspace(page)
+  const when = {
+    repo: 'acme/when', state: 'ready', source: 'settings', site: 'When', description: 'version: 1\n',
+    sections: [{ name: 'Posts', firstLine: 'title', fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'when', kind: 'choice', required: false, default: 'today', choices: ['today', 'later'] },
+    ] }],
+  }
+  const sent = await openEditor(page, [when], notNow)
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.getByLabel('When', { exact: true })).toHaveValue('today')
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values).toMatchObject({ when: 'today' })
+})
+
+test("takes each site's own default date until one is typed", async ({ page }) => {
+  await workspace(page)
+  const sent = await openEditor(page, [FIXED, MIKKO], notNow)
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await dialog.getByLabel('Fixed').check()
+  await expect(dialog.getByLabel('Date', { exact: true })).toHaveValue('2026-01-01')
+  await dialog.getByLabel('mikkokotila.com').check()
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toHaveCount(2)
+  expect(sent[0].destinations.map((d: any) => d.values.date)).toEqual(['2026-01-01', '2026-10-17'])
+  // A date typed is every site's.
+  await dialog.getByLabel('Date', { exact: true }).fill('2026-11-05')
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect.poll(() => sent.length).toBe(2)
+  expect(sent[1].destinations.map((d: any) => d.values.date)).toEqual(['2026-11-05', '2026-11-05'])
+})
+
+test('keeps the date each site was published with while none is typed', async ({ page }) => {
+  await workspace(page)
+  const onFixed = { ...publication(FIXED, 7, { title: 'A better question', date: '2026-01-01' }), publishedAt: '2026-10-01T08:00:00Z' }
+  const onMikko = publication(MIKKO, 101, { type: 'essay', title: 'A better question', date: '2026-10-17' })
+  const sent = await openEditor(page, [FIXED, MIKKO], notNow, [onFixed, onMikko])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await dialog.getByRole('button', { name: 'Update', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toHaveCount(2)
+  expect(sent[0].destinations.map((d: any) => d.values.date)).toEqual(['2026-01-01', '2026-10-17'])
 })
