@@ -699,6 +699,27 @@ describe('publishing a document', () => {
     expect(fileOn('mikkokotila/mikkokotila-com', repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)!.head, POST)).toContain('A new ending.')
   })
 
+  it('names the address an update its pull request was merged without never reached', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = (date: string) => ({ repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date } })
+    expect((await publish([dated('2026-10-17')])).body.results[0].ok).toBe(true)
+    // A new date, so a new address, committed just after the pull request merged, and not readable then.
+    beforeCommit = () => merge('acme/dated', 101)
+    afterCommit = () => {
+      failOn = (method, endpoint) => (method === 'GET' && endpoint === 'repos/acme/dated/pulls/101' ? 500 : null)
+    }
+    expect((await publish([dated('2027-01-05')])).body.results[0].ok).toBe(false)
+    failOn = null
+    // A copy published alone names the original where it is: its earlier address.
+    expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
@@ -729,7 +750,8 @@ sections:
     fields:
       title: { kind: text, required: true }
 `
-    for (const [repo, yaml] of [['acme/alpha', alpha(`https://alpha.example/${'{slug}/'.repeat(38)}`)], ['acme/beta', PLACED_YAML.replace('item: "{site}"', 'item: "{url}"')]]) {
+    // Beta lists each address four times, so it grows by more than any slack in Alpha's own estimate.
+    for (const [repo, yaml] of [['acme/alpha', alpha(`https://alpha.example/${'{slug}/'.repeat(38)}`)], ['acme/beta', PLACED_YAML.replace('item: "{site}"', 'item: "{url} {url} {url} {url}"')]]) {
       addRepo(repo, {})
       await request('/api/publishing/sites', 'POST', { repo })
       await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })

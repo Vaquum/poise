@@ -459,7 +459,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     const key = placeKey(record.repo, record.section)
     try {
       const info = await pullRequest(session, record.repo, record.pullRequest.number)
-      if (record.unconfirmed && info.state === 'merged' && !await contains(session, record.headRepo, info.headSha, record.unconfirmed)) missed.add(key)
+      if (record.unconfirmed && info.state === 'merged' && !await contains(session, record.headRepo, info.headSha, record.unconfirmed.commit)) missed.add(key)
       states.set(key, info.state)
     } catch (error) {
       if (!(error instanceof GitHubError)) throw error
@@ -475,7 +475,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   const landedOf = (record: PublishRecord): Landed | undefined => {
     const key = placeKey(record.repo, record.section)
     if (states.get(key) !== 'merged') return record.landed
-    return missed.has(key) ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.url } : snapshotOf(record)
+    return missed.has(key) ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.unconfirmed!.url } : snapshotOf(record)
   }
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
 
@@ -534,12 +534,14 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // Every place the piece is published, the original first: where it is live
   // already, in the order it went there, then the sites it goes to now.
   const placesFor = (going: Target[]): Place[] => {
-    // A later update closed unmerged changed nothing on the site: name what landed there.
+    // An update whose pull request was closed unmerged, or merged before the
+    // update was committed, changed nothing on the site: name the address there.
     const places: Place[] = [...live]
       .sort((a, b) => a.publishedAt.localeCompare(b.publishedAt))
       .map((r) => {
         const key = placeKey(r.repo, r.section)
-        return { key, site: r.site, url: states.get(key) === 'closed' && r.landed ? r.landed.url : r.url }
+        const url = missed.has(key) ? r.unconfirmed!.url : states.get(key) === 'closed' && r.landed ? r.landed.url : r.url
+        return { key, site: r.site, url }
       })
     for (const target of going) {
       const { destination, section, ready } = target
@@ -679,7 +681,7 @@ function provisionalRecord(target: Target, filled: FilledPost, docTitle: string)
     publishedAt: longest(previous?.publishedAt, at), updatedAt: at,
     sourceSha: digest, values: destination.values, data: filled.frontmatter, bodySha: digest, docTitle,
     ...(landed ? { landed } : {}),
-    ...(target.state === 'open' ? { unconfirmed: '0'.repeat(40) } : {}),
+    ...(target.state === 'open' && previous ? { unconfirmed: { commit: '0'.repeat(40), url: previous.url } } : {}),
   }
 }
 
@@ -785,7 +787,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   let kept = landed
   let outcome: Outcome['state'] = 'open'
   let error: string | undefined
-  let unconfirmed: string | undefined
+  let unconfirmed: PublishRecord['unconfirmed']
   if (state === 'open') {
     branch = previous!.branch
     headRepo = previous!.headRepo
@@ -804,7 +806,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       // as this document's side there, with the commit, for a later
       // publication to settle with the pull request.
       pr = previous!.pullRequest
-      unconfirmed = commit
+      unconfirmed = { commit, url: previous!.url }
       error = `Committed to the branch of pull request #${pr.number}, but its state could not be read: ${after.message}. Publish again to make sure the update reaches the site.`
     } else if (after.state === 'open') pr = previous!.pullRequest
     else if (after.took) {
