@@ -426,6 +426,12 @@ variables, and Caller fails loudly when an account is needed and missing.
 **Connected accounts** (Settings → Accounts) lists `claude`, `codex`, `gh`,
 `grok`, `muse` and `antigravity`. Each shows whether the CLI is installed, its
 version, whether it is signed in and as whom.
+
+`GET /api/github-quota` reads the configured user and automation accounts'
+stored credentials explicitly and returns their API budgets without secrets.
+Its response and forecast model are defined in [Analytics](Analytics.md#github-api-quota).
+The workspace monitors these budgets while notifications are on; this does
+not use the gateway's discarded OAuth token.
 - `GET /api/accounts` returns `{ accounts }`, one entry per CLI in that order.
   `GET /api/accounts?id=<cli>` returns only that CLI, so Settings can show each
   result as soon as it arrives. An unknown `id` answers 400. These reads share
@@ -654,6 +660,10 @@ alerts once, and again only after it has cleared:
   account or the agent account is not signed in to gh;
 - a behavior failed and is held;
 - datastore sync has been failing for 15 minutes;
+- a GitHub API budget is forecast to run out (`github_quota_warning`), or is
+  exhausted (`github_quota_exhausted`), while notifications are on. These use
+  the same alert event envelope; [Notifications](Notifications.md#github-api-quota)
+  defines their reset, recovery and dismissal behavior;
 - a Chat agent is waiting for a permission or an answer;
 - a Chat turn that ran longer than two minutes has finished;
 - a pull request of the person's own has become ready to merge, while

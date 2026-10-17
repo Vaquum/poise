@@ -3,6 +3,8 @@ import { patchContent } from './dom-patch'
 import { analyticsGroups, type AnalyticsReport } from './analytics-format'
 import { analyticsDay } from './analytics-day'
 import { organizationErrors, organizationUrl } from './organizations'
+import { effectiveTimezone } from './config'
+import { GITHUB_QUOTA_REFRESH_MS, quotaRiskTone, type GithubQuotaReport } from './github-quota'
 
 let panelEl: HTMLElement | null = null
 let dayOffset = 0
@@ -11,6 +13,8 @@ let midnightTimer: ReturnType<typeof setTimeout> | undefined
 // Each read is numbered so a slow answer for an earlier range or account
 // never replaces the one for what is selected now.
 let readGeneration = 0
+let quotaGeneration = 0
+let quotaTimer: ReturnType<typeof setInterval> | undefined
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
@@ -31,6 +35,11 @@ function buildPanel(): HTMLElement {
       <div class="analytics-loader loader" role="status" aria-label="Loading analytics" hidden><span></span><span></span><span></span></div>
       <p class="analytics-status st-help" role="status" hidden></p>
       <div class="analytics-groups" aria-live="polite"></div>
+      <section class="github-quota-section" aria-label="GitHub API quota">
+        <h3 class="tp-group-label">GitHub API · Live</h3>
+        <div class="github-quota-accounts" aria-live="polite"></div>
+        <p class="analytics-group-note">Estimated risk of running out before reset, assuming recent usage continues. Collecting samples takes at least 15 seconds. Live quotas do not follow the selected day or organization.</p>
+      </section>
     </div>`
   panel.querySelector('.analytics-day')!.addEventListener('click', (e) => {
     const button = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-day]')
@@ -39,6 +48,50 @@ function buildPanel(): HTMLElement {
     void readAnalytics()
   })
   return panel
+}
+
+async function readQuota(): Promise<void> {
+  const panel = panelEl
+  if (!panel) return
+  const generation = ++quotaGeneration
+  const content = panel.querySelector<HTMLElement>('.github-quota-accounts')!
+  try {
+    const response = await fetch('/api/github-quota')
+    const data: GithubQuotaReport & { error?: string } = await response.json()
+    if (!response.ok || !Array.isArray(data.accounts)) throw new Error(data.error || 'GitHub API quota could not be read.')
+    if (generation !== quotaGeneration) return
+    content.classList.remove('st-help-error')
+    const now = Date.now()
+    const number = (n: number) => n.toLocaleString('en-US')
+    const time = (value: string) => new Intl.DateTimeFormat('en-GB', { timeZone: effectiveTimezone(), hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }).format(new Date(value))
+    patchContent(content, data.accounts.length ? data.accounts.map((account) => `
+      <article class="github-quota-account">
+        <h4>${escapeHtml(account.login)} <span>${escapeHtml(account.roles.join(' + '))}</span></h4>
+        ${account.error ? `<p class="st-help st-help-error">${escapeHtml(account.error)}</p>` : account.buckets.map((bucket) => {
+          const minutes = Math.max(0, (Date.parse(bucket.resetAt) - now) / 60_000)
+          const risk = minutes > 0 ? bucket.riskPercent : null
+          return `<div class="github-quota-bucket">
+            <h5>${escapeHtml(bucket.label)}</h5>
+            <p class="github-quota-usage">${number(bucket.used)} / ${number(bucket.limit)} used <span>· ${number(bucket.remaining)} left</span></p>
+            ${bucket.limit === 0 ? '<p class="analytics-note">Unavailable for this account</p>' : `
+              <progress max="${bucket.limit}" value="${bucket.used}" aria-label="${escapeHtml(bucket.label)} quota used"></progress>
+              <p class="analytics-note">Reset ${escapeHtml(time(bucket.resetAt))} · ${minutes.toFixed(1)} min left</p>
+              <p class="analytics-note">${bucket.perMinute === null ? 'Collecting usage samples…' : `${number(Math.round(bucket.perMinute * 10) / 10)} / min used · ${(bucket.remaining / Math.max(minutes, 1 / 60)).toFixed(1)} / min available`}</p>
+              <p class="github-quota-risk ${quotaRiskTone(risk)}">${risk === null ? minutes === 0 ? 'Awaiting reset refresh' : 'Risk: collecting samples…' : `${risk}% estimated risk${bucket.remaining === 0 ? ' · Exhausted' : ''}`}</p>
+            `}
+          </div>`
+        }).join('')}
+        ${account.checkedAt ? `<p class="analytics-group-note">Checked ${escapeHtml(time(account.checkedAt))}</p>` : ''}
+      </article>`).join('') : '<p class="analytics-note">Set your GitHub user and automation accounts in Settings → General.</p>')
+  } catch (error: unknown) {
+    if (generation !== quotaGeneration) return
+    content.textContent = error instanceof Error ? error.message : String(error)
+    content.classList.add('st-help-error')
+  }
+}
+
+function refreshQuota(): void {
+  if (document.visibilityState === 'visible' && panelEl?.classList.contains('open')) void readQuota()
 }
 
 function showStatus(panel: HTMLElement, message: string, isError = false): void {
@@ -126,6 +179,7 @@ export function initAnalytics(): void {
   markPanelClosed(panelEl)
   document.body.appendChild(panelEl)
   window.addEventListener('poise:organization-filter-changed', onOrganizationChanged)
+  document.addEventListener('visibilitychange', refreshQuota)
 }
 
 function scheduleMidnightRead(): void {
@@ -146,14 +200,20 @@ export function openAnalyticsPanel(): void {
   panelEl.removeAttribute('inert')
   panelEl.removeAttribute('aria-hidden')
   panelEl.classList.add('open')
+  panelEl.querySelector('.github-quota-accounts')!.textContent = 'Reading live quota…'
+  clearInterval(quotaTimer)
+  quotaTimer = setInterval(refreshQuota, GITHUB_QUOTA_REFRESH_MS)
   document.addEventListener('keydown', onAnalyticsKeydown)
   void readAnalytics()
+  void readQuota()
 }
 
 export function closeAnalyticsPanel(): void {
   if (!panelEl) return
   if (panelEl.contains(document.activeElement)) (document.activeElement as HTMLElement | null)?.blur()
   readGeneration++
+  quotaGeneration++
+  clearInterval(quotaTimer)
   clearTimeout(midnightTimer)
   panelEl.classList.remove('open')
   markPanelClosed(panelEl)

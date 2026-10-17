@@ -31,6 +31,20 @@ const letter = (target: string, overrides: Partial<BehaviorDiagnostics['deadLett
 })
 
 describe('the list', () => {
+  it('shows quota predictions as warnings and exhaustion as an error', () => {
+    const items = notificationItems([
+      notice('warning', { kind: 'github_quota_warning', target: null }),
+      notice('error', { kind: 'github_quota_exhausted', target: null }),
+      notice('storage', { kind: 'storage_low', target: null }),
+    ], null, NOW)
+    expect(items).toMatchObject([
+      { id: 'warning', group: 'needs', tone: 'amber', source: 'GitHub API' },
+      { id: 'storage', group: 'needs', tone: 'amber', source: 'Storage' },
+      { id: 'error', group: 'faults', tone: 'red', source: 'GitHub API' },
+    ])
+    expect(headTone(countItems(items))).toBe('red')
+  })
+
   it('groups notices by who acts, in the order the server gave them', () => {
     const items = notificationItems([
       notice('waiting'),

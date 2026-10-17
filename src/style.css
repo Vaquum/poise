@@ -1000,6 +1000,19 @@ tr:hover .review-btn { opacity: 1; }
 .analytics-trend-caption { display: block; margin-top: 2px; font-size: 0.6875rem; font-weight: 400; }
 .analytics-status { margin: 0 0 var(--sp-4); }
 .analytics-group { margin-bottom: var(--sp-5); }
+.github-quota-section { border-top: var(--b-base); padding-top: var(--sp-4); }
+.github-quota-account { margin-bottom: var(--sp-5); }
+.github-quota-account h4 { margin: var(--sp-4) 0 var(--sp-2); font-size: 0.8125rem; }
+.github-quota-account h4 span { color: var(--text-secondary); font-weight: 400; }
+.github-quota-bucket { margin-bottom: var(--sp-4); font-variant-numeric: tabular-nums; }
+.github-quota-bucket h5 { margin: 0 0 var(--sp-2); font-size: 0.75rem; }
+.github-quota-usage { margin: 0 0 var(--sp-2); font-size: 0.8125rem; }
+.github-quota-usage span { color: var(--text-secondary); }
+.github-quota-bucket progress { width: 100%; height: 5px; accent-color: var(--text-secondary); }
+.github-quota-risk { margin: var(--sp-2) 0; font-size: 0.8125rem; font-weight: 600; }
+.github-quota-risk.yellow { color: #a07800; }
+.github-quota-risk.orange { color: #c15c00; }
+.github-quota-risk.red { color: var(--red); }
 .analytics-group .tp-group-label { margin-top: 0; }
 .analytics-tiles {
   display: grid;

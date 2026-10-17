@@ -10,7 +10,7 @@
 import { EventEmitter } from 'node:events'
 import { ALERT_ID_EPOCH_KEY, db, getMeta } from '../db'
 
-export const ALERT_KINDS = ['sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'chat_waiting', 'chat_turn_finished', 'pr_ready', 'storage_low'] as const
+export const ALERT_KINDS = ['sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'chat_waiting', 'chat_turn_finished', 'pr_ready', 'github_quota_warning', 'github_quota_exhausted', 'storage_low'] as const
 export type AlertKind = typeof ALERT_KINDS[number]
 
 /** Where the alert's notice in the page takes the person: a view, a Settings
@@ -140,6 +140,13 @@ export function raiseAlert(input: AlertInput, now = Date.now()): Alert | null {
 export function resolveAlert(dedupeKey: string, now = Date.now()): boolean {
   return db.prepare('UPDATE alerts SET resolved_at = ? WHERE dedupe_key = ? AND resolved_at IS NULL')
     .run(new Date(now).toISOString(), dedupeKey).changes === 1
+}
+
+/** Keep a continuing condition current without issuing another arrival or
+ * undoing the person's dismissal. */
+export function updateAlertDetails(dedupeKey: string, title: string, body: string): void {
+  db.prepare('UPDATE alerts SET title = ?, body = ? WHERE dedupe_key = ? AND resolved_at IS NULL')
+    .run(title, body, dedupeKey)
 }
 
 /** Alerts recorded after `seq` and inside the retention window, oldest first:

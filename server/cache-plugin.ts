@@ -16,6 +16,7 @@ import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
 import { parseWindow, readAnalytics } from './analytics'
+import { checkGithubQuota, readGithubQuota, startGithubQuotaRuntime, stopGithubQuotaRuntime } from './github-quota'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
@@ -142,6 +143,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   startOrganizationsRuntime()
   startBehaviorsRuntime()
   startNoticesRuntime()
+  startGithubQuotaRuntime()
   if (service) startTemporaryStorageRuntime()
   startReviewCheckoutPruning()
   startContentFinalizer()
@@ -216,7 +218,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
 }
 
 /** Connected accounts, read now or from the last few seconds, with their
@@ -436,6 +438,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             const settings = setSettings(body, catalog)
             // Turned on, what needs attention is looked for now, not at the next pass.
             if (body && typeof body === 'object' && 'notifications' in body) void checkNotices()
+            if (body && typeof body === 'object' && ['notifications', 'me', 'agentAccount'].some((key) => key in body)) checkGithubQuota()
             return json(res, 200, { ...settings, organizations: getOrganizations() })
           } catch (err: any) {
             return json(res, httpStatus(err, 400), { error: err.message || String(err) })
@@ -813,6 +816,14 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             return json(res, 200, await listOrganizationsRepos(selectedOrg))
           } catch (err: any) {
             return json(res, 502, { error: 'listOrgRepos failed: ' + (err.message || String(err)) })
+          }
+        }
+
+        if (path === '/api/github-quota' && req.method === 'GET') {
+          try {
+            return json(res, 200, await readGithubQuota())
+          } catch (error: unknown) {
+            return json(res, 502, { error: error instanceof Error ? error.message : String(error) })
           }
         }
 

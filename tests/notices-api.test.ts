@@ -105,6 +105,24 @@ const waiting = { kind: 'chat_waiting', dedupeKey: 'chat-waiting:s1', title: 'Cl
 const ready = { kind: 'pr_ready', dedupeKey: 'pr-ready:acme/api#1', title: 'acme/api#1 is ready to merge', body: 'Change 1', path: '/', target: { pullRequest: 'https://github.com/acme/api/pull/1' } } as const
 
 describe('the notices API', () => {
+  it('serves explicit-account quota and its exhaustion error through the notification API', async () => {
+    database!.setMeta('me', 'octocat')
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({
+      stdout: args[0] === 'auth' ? 'test-stored-credential' : JSON.stringify({ resources: { core: { limit: 5000, used: 5000, remaining: 0, reset } } }),
+    }))
+    const quota = await call('GET', '/api/github-quota')
+    expect(quota.status).toBe(200)
+    expect(quota.body.accounts[0]).toMatchObject({ login: 'octocat', roles: ['user'], error: null, buckets: [{ resource: 'core', remaining: 0, riskPercent: 100 }] })
+    expect(JSON.stringify(quota.body)).not.toContain('test-stored-credential')
+    const state = await call('GET', '/api/notices')
+    expect(state.body.notices[0]).toMatchObject({ kind: 'github_quota_exhausted', title: 'GitHub REST API quota exhausted for octocat', silenceable: false })
+    expect((await call('POST', `/api/notices/${state.body.notices[0].id}/dismiss`)).body.notices).toEqual([])
+    await call('GET', '/api/github-quota')
+    expect((await call('GET', '/api/notices')).body.notices).toEqual([])
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+  })
+
   it('gives an existing failed-behavior notice its exact Swarm call', async () => {
     const failed = store!.raiseAlert({
       kind: 'behavior_held', dedupeKey: 'behavior-held:approve-prs:acme/api#9',

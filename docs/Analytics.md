@@ -82,7 +82,42 @@ comparative arrows are withheld while either period has partial account data.
   which come from the other accounts. If none could be read, the panel shows
   the error and no numbers.
 
-## API
+## GitHub API quota
+
+The bottom section is live, independent of the selected day and organization.
+It shows the configured user and automation GitHub accounts separately; a
+shared login appears once with both roles. REST, GraphQL, search and code
+search have separate budgets, as returned by GitHub. Each shows used versus
+total, remaining capacity, next reset in Settings' timezone, minutes left,
+observed use per minute and the remaining sustainable rate.
+
+Reads use each account's stored `gh` credential explicitly. No credential or
+HTTP stderr reaches the browser. An unavailable account shows an error while
+the other account remains visible. A zero limit means that API is unavailable.
+The reset comes from GitHub, including minute-long search windows; no hourly
+start is inferred. Secondary abuse limits are not exposed by this endpoint.
+
+Risk is an estimate, not a GitHub prediction: a Poisson request-count model
+assumes the observed rate continues until reset. GraphQL uses quota points.
+The rate uses counter differences within the same reset window over up to five
+minutes; at least 15 seconds of evidence is required. Samples persist across
+restarts. A reset, decreased counter, or five-minute observation gap starts
+collection again. No history displays “collecting samples,” never a false 0%.
+Probabilities round to whole percentages (below 0.5% displays 0%). Positive
+risk through one third is yellow, through two thirds orange, and above that
+red. Exhaustion is 100%; expired observations await the next refresh.
+
+Analytics refreshes every 15 seconds while open and visible. The server shares
+concurrent reads and a 15-second cache per login with the background monitor.
+`GET /rate_limit` does not consume GitHub's primary API quota; it can count
+toward secondary limits. See [GitHub's rate-limit documentation](https://docs.github.com/en/rest/rate-limit/rate-limit).
+
+`GET /api/github-quota` returns `{ accounts }`. Each account contains `login`,
+`roles` (`user`, `automation`), `checkedAt`, `error`, and `buckets`. A bucket
+contains `resource`, `label`, `limit`, `used`, `remaining`, `resetAt`,
+`perMinute`, and `riskPercent`; the last two are null without usable evidence.
+
+## Daily analytics API
 
 `GET /api/analytics?since=…&until=…&org=…` answers the panel. `since`
 (inclusive) and `until` (exclusive) are times with a timezone, and either may

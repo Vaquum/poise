@@ -113,6 +113,27 @@ async function expand(page: Page, id: string) {
   await expect(card(page, id).locator('.nr-card-head')).toHaveAttribute('aria-expanded', 'true')
 }
 
+test('shows a quota warning, then a red exhaustion error after the warning is dismissed', async ({ page }) => {
+  const warning: Notice = { id: 'aaaaaaaaaaaa-8', kind: 'github_quota_warning', title: 'GitHub REST API quota may run out for octocat', body: '75% estimated risk. Resets at 13:00 UTC.', since: iso(0), due: iso(0), silenceable: false, target: null }
+  const state = await workspace(page, [warning])
+  await page.goto('/')
+  await openRail(page)
+  await expect(card(page, warning.id)).toHaveAttribute('data-tone', 'amber')
+  await expand(page, warning.id)
+  await card(page, warning.id).getByRole('button', { name: 'Dismiss' }).click()
+  await expect(card(page, warning.id)).toHaveCount(0)
+  const error: Notice = { ...warning, id: 'aaaaaaaaaaaa-9', kind: 'github_quota_exhausted', title: 'GitHub REST API quota exhausted for octocat', body: '5,000 of 5,000 used. Requests are blocked. Resets at 13:00 UTC.' }
+  state.notices = [error]
+  await reread(page)
+  await expect(card(page, error.id)).toHaveAttribute('data-tone', 'red')
+  await expect(bell(page).locator('.nr-badge')).toHaveAttribute('data-tone', 'red')
+  await expand(page, error.id)
+  await expect(card(page, error.id)).toContainText('Requests are blocked.')
+  state.notices = []
+  await reread(page)
+  await expect(card(page, error.id)).toHaveCount(0)
+})
+
 test('counts what needs the person on the bell and lists it by who acts', async ({ page }) => {
   await workspace(page, [WAITING, HELD, READY])
   await page.goto('/')

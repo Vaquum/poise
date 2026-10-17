@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import type { AnalyticsReport } from '../../src/analytics-format'
+import type { GithubQuotaReport } from '../../src/github-quota'
 
 function report(merged: number, hours = 27): AnalyticsReport {
   return {
@@ -53,6 +54,7 @@ async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
     if (url.pathname === '/api/agent-logs') return route.fulfill({ json: { logs: [] } })
     if (url.pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (url.pathname === '/api/notices') return route.fulfill({ json: { enabled: false, notices: [] } })
+    if (url.pathname === '/api/github-quota') return route.fulfill({ json: { accounts: [] } })
     return route.fulfill({ json: {} })
   })
   return state
@@ -71,6 +73,60 @@ function mergeTrend(page: Page) {
 function value(page: Page, label: string) {
   return page.locator('#analytics-panel .analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: new RegExp(`^${label}$`) }) }).locator('.analytics-value')
 }
+
+test('shows live account quota below daily analytics with usage, resets and risk colors', async ({ page }, info) => {
+  await workspace(page)
+  const quota: GithubQuotaReport = { accounts: [{
+    login: 'octocat', roles: ['user', 'automation'], checkedAt: '2026-10-09T12:00:00Z', error: null,
+    buckets: [25, 50, 90, 0, null].map((riskPercent, index) => ({
+      resource: String(index), label: ['REST API', 'GraphQL', 'Search', 'Code search', 'Collecting'][index],
+      limit: 5000, used: 3000, remaining: 2000, resetAt: '2026-10-09T12:30:00Z', perMinute: index === 4 ? null : 75, riskPercent,
+    })),
+  }, { login: 'octo-agent', roles: ['automation'], checkedAt: null, error: 'GitHub authentication is unavailable for octo-agent.', buckets: [] }] }
+  await page.route('**/api/github-quota', (route) => route.fulfill({ json: quota }))
+  await page.goto('/')
+  await openAnalytics(page)
+  const section = page.getByRole('region', { name: 'GitHub API quota' })
+  await expect(section).toContainText('octocat user + automation')
+  await expect(section.locator('.github-quota-account')).toHaveCount(2)
+  await expect(section).toContainText('3,000 / 5,000 used · 2,000 left')
+  await expect(section).toContainText('12:30:00 UTC · 30.0 min left')
+  await expect(section).toContainText('75 / min used · 66.7 / min available')
+  const risk = section.locator('.github-quota-risk')
+  await expect(risk.nth(0)).toHaveClass(/yellow/)
+  await expect(risk.nth(0)).toHaveText('25% estimated risk')
+  await expect(risk.nth(1)).toHaveClass(/orange/)
+  await expect(risk.nth(2)).toHaveClass(/red/)
+  await expect(risk.nth(3)).not.toHaveClass(/yellow|orange|red/)
+  await expect(risk.nth(4)).toHaveText('Risk: collecting samples…')
+  await expect(section).toContainText('GitHub authentication is unavailable for octo-agent.')
+  expect(await section.evaluate((element) => element.previousElementSibling?.className)).toBe('analytics-groups')
+  await page.locator('#analytics-panel').getByRole('button', { name: 'Previous day' }).click()
+  await expect(risk.nth(0)).toHaveText('25% estimated risk')
+  await risk.nth(1).scrollIntoViewIfNeeded()
+  await page.screenshot({ path: info.outputPath('github-quota.png') })
+  quota.accounts[0].buckets[0].remaining = 0
+  quota.accounts[0].buckets[0].used = 5000
+  quota.accounts[0].buckets[0].riskPercent = 100
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await expect(risk.nth(0)).toHaveText('100% estimated risk · Exhausted')
+})
+
+test('shows quota read failure and refreshes it without retaining stale values', async ({ page }) => {
+  await workspace(page)
+  let failed = true
+  await page.route('**/api/github-quota', (route) => failed
+    ? route.fulfill({ status: 502, json: { error: 'Quota service unavailable' } })
+    : route.fulfill({ json: { accounts: [] } }))
+  await page.goto('/')
+  await openAnalytics(page)
+  const section = page.getByRole('region', { name: 'GitHub API quota' })
+  await expect(section).toContainText('Quota service unavailable')
+  failed = false
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await expect(section).toContainText('Set your GitHub user and automation accounts')
+  await expect(section.locator('.github-quota-accounts')).not.toHaveClass(/st-help-error/)
+})
 
 test('opens Today with a seven-day comparison and navigates days without changing Current', async ({ page }, info) => {
   const state = await workspace(page)

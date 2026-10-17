@@ -63,6 +63,25 @@ which also decides its group. Each Behaviors row shows that behavior's counts:
 Poise faults, needs you and automatic. A count opens the rail on that behavior
 with its first entry in that group expanded.
 
+## GitHub API quota
+
+While notifications are enabled, a background monitor reads the configured
+user and automation accounts every 15 seconds, even with Analytics closed.
+Any positive displayed [estimated exhaustion risk](Analytics.md#github-api-quota)
+raises an amber `github_quota_warning`. Zero remaining raises a red
+`github_quota_exhausted` error, including after a dismissed warning. The notice
+names the account, API budget, usage and reset time. Errors appear in the rail's
+faults group and turn the bell red.
+
+Each account/budget/reset condition alerts once. Continuing warnings update
+their numbers without undoing a dismissal or issuing another arrival. A
+warning clears when risk returns to zero, exhaustion replaces it, the window
+resets, or the account is removed. Failed reads and insufficient observations
+retain known alerts until reset; they do not claim recovery. Notifications off stops background quota
+reads and new quota alerts. Opening Analytics can still read quota.
+An exhaustion error clears as soon as GitHub confirms positive remaining
+capacity, even while a new consumption rate is being collected.
+
 ## Pull requests ready to merge
 
 Every two minutes Poise checks your own open pull requests, the ones your
