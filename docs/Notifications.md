@@ -66,7 +66,8 @@ with its first entry in that group expanded.
 ## GitHub API quota
 
 While notifications are enabled, a background monitor reads the configured
-user and automation accounts every 15 seconds, even with Analytics closed.
+user and automation accounts every 15 seconds, even when Analytics is not on
+screen.
 Any positive displayed [estimated exhaustion risk](Analytics.md#github-api-quota)
 raises an amber `github_quota_warning`. Zero remaining raises a red
 `github_quota_exhausted` error, including after a dismissed warning. The notice

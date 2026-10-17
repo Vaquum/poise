@@ -1,16 +1,23 @@
-import { patchContent } from './dom-patch'
-// Daily analytics, independently of Current's filters.
-import { analyticsGroups, type AnalyticsReport } from './analytics-format'
-import { analyticsDay } from './analytics-day'
-import { organizationErrors, organizationUrl } from './organizations'
-import { effectiveTimezone } from './config'
-import { GITHUB_QUOTA_REFRESH_MS, quotaRiskTone, type GithubQuotaReport } from './github-quota'
+import { patchContent } from '../dom-patch'
+// Analytics — a view of its own, opened from the burger menu rather than the
+// top nav: the selected day's productivity topline, then the numbers per
+// merged pull request, then live GitHub API quota. Independent of Current's
+// filters.
+import { analyticsGroups, type AnalyticsReport } from '../analytics-format'
+import { analyticsDay } from '../analytics-day'
+import { mountOrganizationFilter, organizationErrors, organizationUrl } from '../organizations'
+import { effectiveTimezone } from '../config'
+import { GITHUB_QUOTA_REFRESH_MS, quotaRiskTone, type GithubQuotaReport } from '../github-quota'
 
-let panelEl: HTMLElement | null = null
+let viewEl: HTMLElement
+let initialized = false
+// From entering the view until leaving it. Timers, account changes and the
+// tab becoming visible read only while the view is on screen.
+let active = false
 let dayOffset = 0
 let dayAnchor = new Date()
 let midnightTimer: ReturnType<typeof setTimeout> | undefined
-// Each read is numbered so a slow answer for an earlier range or account
+// Each read is numbered so a slow answer for an earlier day or account
 // never replaces the one for what is selected now.
 let readGeneration = 0
 let quotaGeneration = 0
@@ -20,41 +27,32 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
 }
 
-function buildPanel(): HTMLElement {
-  const panel = document.createElement('aside')
-  panel.id = 'analytics-panel'
-  panel.setAttribute('aria-label', 'Analytics')
-  panel.innerHTML = `
-    <div class="tp-header"><span class="tp-title" data-help="Counts your work on the selected day. Per-PR numbers cover pull requests merged that day." tabindex="0">Analytics</span></div>
-    <div class="tp-body">
-      <nav class="analytics-day" aria-label="Analytics day">
-        <button type="button" class="analytics-day-step" data-day="-1" aria-label="Previous day">←</button>
-        <span class="analytics-date" aria-live="polite"></span>
-        <button type="button" class="analytics-day-step" data-day="1" aria-label="Next day">→</button>
-      </nav>
+function renderShell(): string {
+  return `
+    <header class="view-header">
+      <div class="filter-cluster" id="analytics-filters">
+        <div class="range-picker analytics-day" role="group" aria-label="Analytics day">
+          <button type="button" data-day="-1" aria-label="Previous day">←</button>
+          <span class="analytics-date" aria-live="polite"></span>
+          <button type="button" data-day="1" aria-label="Next day">→</button>
+        </div>
+      </div>
+    </header>
+    <main>
       <div class="analytics-loader loader" role="status" aria-label="Loading analytics" hidden><span></span><span></span><span></span></div>
       <p class="analytics-status st-help" role="status" hidden></p>
       <div class="analytics-groups" aria-live="polite"></div>
-      <section class="github-quota-section" aria-label="GitHub API quota">
-        <h3 class="tp-group-label">GitHub API · Live</h3>
+      <section class="github-quota-section" aria-labelledby="analytics-github-quota">
+        <h2 class="tp-group-label" id="analytics-github-quota">GitHub API · Live</h2>
         <div class="github-quota-accounts" aria-live="polite"></div>
         <p class="analytics-group-note">Estimated risk of running out before reset, assuming recent usage continues. Collecting samples takes at least 15 seconds. Live quotas do not follow the selected day or organization.</p>
       </section>
-    </div>`
-  panel.querySelector('.analytics-day')!.addEventListener('click', (e) => {
-    const button = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-day]')
-    if (!button || button.disabled) return
-    dayOffset += Number(button.dataset.day)
-    void readAnalytics()
-  })
-  return panel
+    </main>`
 }
 
 async function readQuota(): Promise<void> {
-  const panel = panelEl
-  if (!panel) return
   const generation = ++quotaGeneration
-  const content = panel.querySelector<HTMLElement>('.github-quota-accounts')!
+  const content = viewEl.querySelector<HTMLElement>('.github-quota-accounts')!
   try {
     const response = await fetch('/api/github-quota')
     const data: GithubQuotaReport & { error?: string } = await response.json()
@@ -65,13 +63,16 @@ async function readQuota(): Promise<void> {
     const number = (n: number) => n.toLocaleString('en-US')
     const time = (value: string) => new Intl.DateTimeFormat('en-GB', { timeZone: effectiveTimezone(), hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }).format(new Date(value))
     patchContent(content, data.accounts.length ? data.accounts.map((account) => `
-      <article class="github-quota-account">
-        <h4>${escapeHtml(account.login)} <span>${escapeHtml(account.roles.join(' + '))}</span></h4>
+      <article class="github-quota-account" data-account="${escapeHtml(account.login)}">
+        <header class="github-quota-identity">
+          <h3>${escapeHtml(account.login)} <span>${escapeHtml(account.roles.join(' + '))}</span></h3>
+          ${account.checkedAt ? `<p class="analytics-note">Checked ${escapeHtml(time(account.checkedAt))}</p>` : ''}
+        </header>
         ${account.error ? `<p class="st-help st-help-error">${escapeHtml(account.error)}</p>` : account.buckets.map((bucket) => {
           const minutes = Math.max(0, (Date.parse(bucket.resetAt) - now) / 60_000)
           const risk = minutes > 0 ? bucket.riskPercent : null
           return `<div class="github-quota-bucket">
-            <h5>${escapeHtml(bucket.label)}</h5>
+            <h4>${escapeHtml(bucket.label)}</h4>
             <p class="github-quota-usage">${number(bucket.used)} / ${number(bucket.limit)} used <span>· ${number(bucket.remaining)} left</span></p>
             ${bucket.limit === 0 ? '<p class="analytics-note">Unavailable for this account</p>' : `
               <progress max="${bucket.limit}" value="${bucket.used}" aria-label="${escapeHtml(bucket.label)} quota used"></progress>
@@ -81,7 +82,6 @@ async function readQuota(): Promise<void> {
             `}
           </div>`
         }).join('')}
-        ${account.checkedAt ? `<p class="analytics-group-note">Checked ${escapeHtml(time(account.checkedAt))}</p>` : ''}
       </article>`).join('') : '<p class="analytics-note">Set your GitHub user and automation accounts in Settings → General.</p>')
   } catch (error: unknown) {
     if (generation !== quotaGeneration) return
@@ -91,20 +91,20 @@ async function readQuota(): Promise<void> {
 }
 
 function refreshQuota(): void {
-  if (document.visibilityState === 'visible' && panelEl?.classList.contains('open')) void readQuota()
+  if (document.visibilityState === 'visible' && active) void readQuota()
 }
 
-function showStatus(panel: HTMLElement, message: string, isError = false): void {
-  const status = panel.querySelector<HTMLElement>('.analytics-status')!
+function showStatus(message: string, isError = false): void {
+  const status = viewEl.querySelector<HTMLElement>('.analytics-status')!
   status.textContent = message
   status.hidden = !message
   status.classList.toggle('st-help-error', isError)
 }
 
-function renderReport(panel: HTMLElement, report: AnalyticsReport, baseline: AnalyticsReport): void {
-  patchContent(panel.querySelector('.analytics-groups')!, analyticsGroups(report, baseline).map((group) => `
-    <section class="analytics-group">
-      <h3 class="tp-group-label">${escapeHtml(group.label)}</h3>
+function renderReport(report: AnalyticsReport, baseline: AnalyticsReport): void {
+  patchContent(viewEl.querySelector('.analytics-groups')!, analyticsGroups(report, baseline).map((group) => `
+    <section class="analytics-group" data-group="${group.id}" aria-labelledby="analytics-${group.id}">
+      <h2 class="tp-group-label" id="analytics-${group.id}" data-help="${escapeHtml(group.help)}" tabindex="0">${escapeHtml(group.label)}</h2>
       <dl class="analytics-tiles">
         ${group.tiles.map((tile) => `
           <div class="analytics-tile">
@@ -119,17 +119,21 @@ function renderReport(panel: HTMLElement, report: AnalyticsReport, baseline: Ana
 }
 
 async function readAnalytics(): Promise<void> {
-  const panel = panelEl
-  if (!panel) return
   const generation = ++readGeneration
-  const groups = panel.querySelector<HTMLElement>('.analytics-groups')!
+  const groups = viewEl.querySelector<HTMLElement>('.analytics-groups')!
+  const quota = viewEl.querySelector<HTMLElement>('.github-quota-section')!
   const day = analyticsDay(dayOffset, dayAnchor)
-  panel.querySelector('.analytics-date')!.textContent = day.label
-  panel.querySelector<HTMLButtonElement>('[data-day="1"]')!.disabled = day.isToday
+  viewEl.querySelector('.analytics-date')!.textContent = day.label
+  viewEl.querySelector<HTMLButtonElement>('[data-day="1"]')!.disabled = day.isToday
+  // The emptied sections keep their space while the next day loads, so
+  // GitHub below does not jump up under the loader and back down after.
+  const quotaTop = quota.offsetTop
+  groups.style.minHeight = ''
   groups.replaceChildren()
-  showStatus(panel, '')
-  panel.querySelector<HTMLElement>('.analytics-loader')!.hidden = false
+  showStatus('')
+  viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = false
   groups.setAttribute('aria-busy', 'true')
+  groups.style.minHeight = `${Math.max(0, quotaTop - quota.offsetTop)}px`
   const read = async (since: string, until: string): Promise<AnalyticsReport> => {
     const query = new URLSearchParams({ since, until })
     const res = await fetch(organizationUrl(`/api/analytics?${query}`))
@@ -143,43 +147,20 @@ async function readAnalytics(): Promise<void> {
       read(day.baselineSince, day.since),
     ])
     if (generation !== readGeneration) return
-    renderReport(panel, data, baseline)
-    showStatus(panel, [organizationErrors(data), organizationErrors(baseline)].filter(Boolean).filter((error, i, all) => all.indexOf(error) === i).join('; '))
+    renderReport(data, baseline)
+    showStatus([organizationErrors(data), organizationErrors(baseline)].filter(Boolean).filter((error, i, all) => all.indexOf(error) === i).join('; '))
   } catch (error) {
     if (generation !== readGeneration) return
-    // Numbers from the last range under the next range's name would be wrong.
+    // Numbers from the last day under the next day's name would be wrong.
     groups.innerHTML = ''
-    showStatus(panel, error instanceof Error ? error.message : String(error), true)
+    showStatus(error instanceof Error ? error.message : String(error), true)
   } finally {
     if (generation === readGeneration) {
-      panel.querySelector<HTMLElement>('.analytics-loader')!.hidden = true
+      viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = true
       groups.removeAttribute('aria-busy')
+      groups.style.minHeight = ''
     }
   }
-}
-
-function markPanelClosed(panel: HTMLElement): void {
-  panel.setAttribute('inert', '')
-  panel.setAttribute('aria-hidden', 'true')
-}
-
-function onAnalyticsKeydown(e: KeyboardEvent): void {
-  if (e.key !== 'Escape' || !panelEl?.classList.contains('open') || e.defaultPrevented) return
-  e.preventDefault()
-  closeAnalyticsPanel()
-}
-
-function onOrganizationChanged(): void {
-  if (panelEl?.classList.contains('open')) void readAnalytics()
-}
-
-export function initAnalytics(): void {
-  panelEl = buildPanel()
-  // Built closed, and closed means out of the tab order and unannounced.
-  markPanelClosed(panelEl)
-  document.body.appendChild(panelEl)
-  window.addEventListener('poise:organization-filter-changed', onOrganizationChanged)
-  document.addEventListener('visibilitychange', refreshQuota)
 }
 
 function scheduleMidnightRead(): void {
@@ -191,37 +172,43 @@ function scheduleMidnightRead(): void {
   }, delay + 10)
 }
 
-export function openAnalyticsPanel(): void {
-  if (!panelEl) return
-  window.dispatchEvent(new CustomEvent('poise:panel-opening', { detail: { id: panelEl.id } }))
-  dayOffset = 0
-  dayAnchor = new Date()
+export function initAnalyticsView(): void {
+  viewEl = document.getElementById('view-analytics')!
+  if (!initialized) {
+    initialized = true
+    viewEl.innerHTML = renderShell()
+    mountOrganizationFilter(viewEl.querySelector<HTMLElement>('#analytics-filters')!)
+    viewEl.querySelector('.analytics-day')!.addEventListener('click', (e) => {
+      const button = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-day]')
+      if (!button || button.disabled) return
+      dayOffset += Number(button.dataset.day)
+      void readAnalytics()
+    })
+    window.addEventListener('poise:organization-filter-changed', () => { if (active) void readAnalytics() })
+    document.addEventListener('visibilitychange', refreshQuota)
+  }
+  // Arriving opens on Today. A settings save re-enters the showing view;
+  // that reads again for the day already chosen.
+  if (!active) {
+    active = true
+    dayOffset = 0
+    dayAnchor = new Date()
+    const quota = viewEl.querySelector<HTMLElement>('.github-quota-accounts')!
+    quota.textContent = 'Reading live quota…'
+    quota.classList.remove('st-help-error')
+    clearInterval(quotaTimer)
+    quotaTimer = setInterval(refreshQuota, GITHUB_QUOTA_REFRESH_MS)
+  }
   scheduleMidnightRead()
-  panelEl.removeAttribute('inert')
-  panelEl.removeAttribute('aria-hidden')
-  panelEl.classList.add('open')
-  panelEl.querySelector('.github-quota-accounts')!.textContent = 'Reading live quota…'
-  clearInterval(quotaTimer)
-  quotaTimer = setInterval(refreshQuota, GITHUB_QUOTA_REFRESH_MS)
-  document.addEventListener('keydown', onAnalyticsKeydown)
   void readAnalytics()
   void readQuota()
 }
 
-export function closeAnalyticsPanel(): void {
-  if (!panelEl) return
-  if (panelEl.contains(document.activeElement)) (document.activeElement as HTMLElement | null)?.blur()
+export function stopAnalyticsRefresh(): void {
+  if (!active) return
+  active = false
   readGeneration++
   quotaGeneration++
   clearInterval(quotaTimer)
   clearTimeout(midnightTimer)
-  panelEl.classList.remove('open')
-  markPanelClosed(panelEl)
-  document.removeEventListener('keydown', onAnalyticsKeydown)
-}
-
-export function toggleAnalyticsPanel(): void {
-  if (!panelEl) return
-  if (panelEl.classList.contains('open')) closeAnalyticsPanel()
-  else openAnalyticsPanel()
 }

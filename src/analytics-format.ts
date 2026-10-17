@@ -1,4 +1,4 @@
-// What the Analytics panel says about a report from /api/analytics
+// What the Analytics view says about a report from /api/analytics
 // (server/analytics.ts). Kept free of the DOM so the wording is testable.
 
 export interface AnalyticsReport {
@@ -25,7 +25,11 @@ export interface AnalyticsTile {
 }
 
 export interface AnalyticsGroup {
+  /** Names the section on the page; the productivity topline comes first. */
+  id: 'productivity' | 'per-merged-pr'
   label: string
+  /** What the section counts, shown over its heading. */
+  help: string
   tiles: AnalyticsTile[]
   note?: string
 }
@@ -100,16 +104,13 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
 
   return [
     {
-      label: 'Issues',
+      id: 'productivity',
+      label: 'Productivity',
+      help: 'Your work on the selected day, against the daily average of the seven days before it.',
       tiles: [
-        dailyCount('Opened', report.issues.opened, baseline.issues.opened),
-        dailyCount('Closed', report.issues.closed, baseline.issues.closed),
-      ],
-    },
-    {
-      label: 'Pull requests',
-      tiles: [
-        dailyCount('Merged', pr.merged, baseline.pullRequests.merged),
+        dailyCount('Issues opened', report.issues.opened, baseline.issues.opened),
+        dailyCount('Issues closed', report.issues.closed, baseline.issues.closed),
+        dailyCount('Pull requests merged', pr.merged, baseline.pullRequests.merged),
         { ...dailyCount('Lines changed', none ? 0 : lines.total, baseline.pullRequests.lines.counted < baseline.pullRequests.merged ? null : baseline.pullRequests.merged === 0 ? 0 : baseline.pullRequests.lines.total), value: linesTotal,
           trend: complete && lines.counted === pr.merged && baseline.pullRequests.lines.counted === baseline.pullRequests.merged
             ? metricTrend(none ? 0 : lines.total, baseline.pullRequests.merged === 0 ? 0 : baseline.pullRequests.lines.total === null ? null : baseline.pullRequests.lines.total / 7) : undefined,
@@ -123,7 +124,9 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
       note: linesNote,
     },
     {
+      id: 'per-merged-pr',
       label: 'Per merged pull request',
+      help: 'Over the pull requests merged on the selected day.',
       tiles: [
         { label: 'Comments', value: formatRate(pr.commentsPerPr) },
         { label: 'Median lines', value: lines.median === null ? UNKNOWN : formatCount(Math.round(lines.median)) },

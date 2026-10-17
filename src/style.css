@@ -944,10 +944,9 @@ tr:hover .review-btn { opacity: 1; }
   border-color: var(--text-tertiary);
 }
 
-/* ── Side panels (Typography, Settings, Analytics, Behavior memory) ── */
+/* ── Side panels (Typography, Settings, Behavior memory) ── */
 #typo-panel,
 #settings-panel,
-#analytics-panel,
 #behavior-memory-panel {
   position: fixed;
   /* Below the control bar rather than under it: the burger doubles as
@@ -972,7 +971,6 @@ tr:hover .review-btn { opacity: 1; }
    grey strip down the right edge of every view, darker with each panel. */
 #typo-panel:not(.open),
 #settings-panel:not(.open),
-#analytics-panel:not(.open),
 #behavior-memory-panel:not(.open) {
   box-shadow: none;
 }
@@ -983,61 +981,101 @@ tr:hover .review-btn { opacity: 1; }
 
 #typo-panel.open,
 #settings-panel.open,
-#analytics-panel.open,
 #behavior-memory-panel.open {
   transform: translateX(0);
 }
 
-/* ── Analytics panel ── */
-.analytics-day { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-bottom: var(--sp-5); }
-.analytics-day-step { border: var(--b-base); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); font: inherit; color: var(--text); background: transparent; cursor: pointer; }
-.analytics-day-step:disabled { opacity: 0.3; cursor: default; }
-.analytics-date { font-size: 0.8125rem; font-weight: 600; }
-.analytics-trend { margin: var(--sp-2) 0 0; font-size: 0.8125rem; font-weight: 600; font-variant-numeric: tabular-nums; }
-.analytics-trend.good { color: var(--green); }
-.analytics-trend.bad { color: var(--red); }
-.analytics-trend.neutral { color: var(--text-secondary); }
-.analytics-trend-caption { display: block; margin-top: 2px; font-size: 0.6875rem; font-weight: 400; }
-.analytics-status { margin: 0 0 var(--sp-4); }
-.analytics-group { margin-bottom: var(--sp-5); }
-.github-quota-section { border-top: var(--b-base); padding-top: var(--sp-4); }
-.github-quota-account { margin-bottom: var(--sp-5); }
-.github-quota-account h4 { margin: var(--sp-4) 0 var(--sp-2); font-size: 0.8125rem; }
-.github-quota-account h4 span { color: var(--text-secondary); font-weight: 400; }
-.github-quota-bucket { margin-bottom: var(--sp-4); font-variant-numeric: tabular-nums; }
-.github-quota-bucket h5 { margin: 0 0 var(--sp-2); font-size: 0.75rem; }
-.github-quota-usage { margin: 0 0 var(--sp-2); font-size: 0.8125rem; }
-.github-quota-usage span { color: var(--text-secondary); }
-.github-quota-bucket progress { width: 100%; height: 5px; accent-color: var(--text-secondary); }
-.github-quota-risk { margin: var(--sp-2) 0; font-size: 0.8125rem; font-weight: 600; }
-.github-quota-risk.yellow { color: #a07800; }
-.github-quota-risk.orange { color: #c15c00; }
-.github-quota-risk.red { color: var(--red); }
-.analytics-group .tp-group-label { margin-top: 0; }
-.analytics-tiles {
+/* ── Analytics view (src/views/analytics-view.ts) ──
+   The window rather than the reading column, as in Behaviors, so the five
+   topline numbers share one row. Every section uses the same columns: the
+   per-PR numbers sit under the topline's, and each quota account is a row
+   of its budgets. */
+#view-analytics main {
+  margin-inline: calc(50% - var(--page-w, calc(100vw - var(--scrollbar-w, 0px))) / 2 + 24px);
+  container: analytics / inline-size;
+}
+/* The date is the pill's middle segment, wide enough for "30 Sep 2026" so
+   the arrows hold still while it changes. */
+.analytics-date {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 7.5em;
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--border);
+  border-right: none;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.analytics-day button:disabled { opacity: 0.4; cursor: default; }
+.analytics-day button:disabled:hover { color: var(--text-secondary); background: var(--surface); }
+.analytics-status { margin: 0 0 var(--sp-5); }
+.analytics-group,
+.github-quota-section { margin-bottom: var(--sp-7); }
+#view-analytics .tp-group-label { margin: 0 0 var(--sp-4); }
+#view-analytics [data-help] { cursor: help; }
+#view-analytics .analytics-label[data-help] {
+  text-decoration: underline dotted var(--border);
+  text-underline-offset: 4px;
+}
+#view-analytics [tabindex="0"]:focus-visible {
+  outline: 2px solid var(--a1);
+  outline-offset: 2px;
+}
+.analytics-tiles,
+.github-quota-account {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--sp-4) var(--sp-3);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-5);
   margin: 0;
 }
-.analytics-tile { min-width: 0; }
-/* A tile left alone on its row takes the row, so its note has room. */
-.analytics-tile:last-child:nth-child(odd) { grid-column: 1 / -1; }
+.analytics-tile,
+.github-quota-identity,
+.github-quota-bucket { min-width: 0; }
+.github-quota-identity,
+.github-quota-account > .st-help-error { grid-column: 1 / -1; }
+@container analytics (max-width: 639px) {
+  /* A tile left alone on its row takes the row, so its note has room. */
+  .analytics-tile:last-child:nth-child(odd) { grid-column: 1 / -1; }
+}
+@container analytics (min-width: 640px) {
+  .analytics-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .github-quota-account { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+/* 880px keeps the topline on one row beside a docked notification rail on a
+   1440px window. */
+@container analytics (min-width: 880px) {
+  .analytics-tiles,
+  .github-quota-account { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .github-quota-identity { grid-column: auto; }
+  .github-quota-account > .st-help-error { grid-column: 2 / -1; }
+}
 .analytics-label {
   font-size: 0.6875rem;
   color: var(--text-tertiary);
-  margin-bottom: 2px;
+  margin-bottom: var(--sp-1);
 }
 .analytics-value {
   overflow-wrap: anywhere;
   margin: 0;
-  font-size: 1.375rem;
+  font-size: 1.5rem;
   font-weight: 600;
   color: var(--text);
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
   line-height: 1.15;
 }
+/* The topline leads the page. */
+.analytics-group[data-group="productivity"] .analytics-value { font-size: 2rem; }
+.analytics-trend { margin: var(--sp-2) 0 0; font-size: 0.8125rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.analytics-trend.good { color: var(--green); }
+.analytics-trend.bad { color: var(--red); }
+.analytics-trend.neutral { color: var(--text-secondary); }
+.analytics-trend-caption { display: block; margin-top: 2px; font-size: 0.6875rem; font-weight: 400; }
 .analytics-note {
   margin: 4px 0 0;
   font-size: 0.6875rem;
@@ -1045,11 +1083,29 @@ tr:hover .review-btn { opacity: 1; }
   line-height: 1.4;
 }
 .analytics-group-note {
-  margin: var(--sp-3) 0 0;
+  margin: var(--sp-4) 0 0;
   font-size: 0.6875rem;
   color: var(--text-tertiary);
   line-height: 1.5;
 }
+.github-quota-account {
+  padding-bottom: var(--sp-5);
+  margin-bottom: var(--sp-5);
+  border-bottom: var(--b-hair);
+}
+.github-quota-account:last-child { padding-bottom: 0; margin-bottom: 0; border-bottom: none; }
+.github-quota-identity h3 { margin: 0; font-size: 0.8125rem; overflow-wrap: anywhere; }
+.github-quota-identity h3 span { color: var(--text-secondary); font-weight: 400; }
+.github-quota-account > .st-help-error { margin: 0; }
+.github-quota-bucket { font-variant-numeric: tabular-nums; }
+.github-quota-bucket h4 { margin: 0 0 var(--sp-2); font-size: 0.75rem; }
+.github-quota-usage { margin: 0 0 var(--sp-2); font-size: 0.8125rem; }
+.github-quota-usage span { color: var(--text-secondary); }
+.github-quota-bucket progress { width: 100%; height: 5px; accent-color: var(--text-secondary); }
+.github-quota-risk { margin: var(--sp-2) 0 0; font-size: 0.8125rem; font-weight: 600; }
+.github-quota-risk.yellow { color: #a07800; }
+.github-quota-risk.orange { color: #c15c00; }
+.github-quota-risk.red { color: var(--red); }
 
 .tp-header {
   display: flex;
@@ -1436,7 +1492,7 @@ tr:hover .review-btn { opacity: 1; }
 #menu-surface .tp-row { gap: var(--sp-3); }
 #menu-surface .tp-val { flex-shrink: 0; }
 #menu-surface [data-help] { cursor: help; }
-#menu-surface .tp-label[data-help], #menu-surface .analytics-label[data-help] {
+#menu-surface .tp-label[data-help] {
   text-decoration: underline dotted var(--border);
   text-underline-offset: 4px;
 }

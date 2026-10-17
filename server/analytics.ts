@@ -1,4 +1,4 @@
-// Analytics — the headline numbers in the burger menu's Analytics panel.
+// Analytics — the headline numbers of the Analytics view (burger menu).
 //
 // It counts what Current shows: the issues and pull requests `me` is
 // involved in plus what the agent account authored (involvementScopes), in

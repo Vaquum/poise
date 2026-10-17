@@ -7,7 +7,7 @@ installIconTooltips()
 import { initTypography, toggleTypographyPanel, closeTypographyPanel } from './typo'
 import { initSettings, openSettingsPanel, openSettingsAt, closeSettingsPanel, isFullyConfigured } from './settings'
 import { initMenu } from './menu'
-import { initAnalytics, toggleAnalyticsPanel, closeAnalyticsPanel } from './analytics'
+import { initAnalyticsView, stopAnalyticsRefresh } from './views/analytics-view'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
 import { initCurrentView, stopCurrentPolling } from './views/current-view'
 import { initSwarmView, stopSwarmRefresh, focusRow as focusSwarmRow, focusCall as focusSwarmCall } from './views/swarm-view'
@@ -36,13 +36,14 @@ const viewChatEl = document.getElementById('view-chat')!
 const viewBehaviorsEl = document.getElementById('view-behaviors')!
 const viewSnippetsEl = document.getElementById('view-snippets')!
 const viewEditorEl = document.getElementById('view-editor')!
+const viewAnalyticsEl = document.getElementById('view-analytics')!
 
 const visitedViews = new WeakSet<HTMLElement>()
 
-type ViewSlug = 'main' | 'current' | 'swarm' | 'chat' | 'behaviors' | 'snippets' | 'editor'
+type ViewSlug = 'main' | 'current' | 'swarm' | 'chat' | 'behaviors' | 'snippets' | 'editor' | 'analytics'
 
 function showView(v: ViewSlug) {
-  const all = [viewMainEl, viewCurrentEl, viewSwarmEl, viewChatEl, viewBehaviorsEl, viewSnippetsEl, viewEditorEl]
+  const all = [viewMainEl, viewCurrentEl, viewSwarmEl, viewChatEl, viewBehaviorsEl, viewSnippetsEl, viewEditorEl, viewAnalyticsEl]
   const target =
       v === 'main'      ? viewMainEl
     : v === 'current'   ? viewCurrentEl
@@ -50,6 +51,7 @@ function showView(v: ViewSlug) {
     : v === 'chat'      ? viewChatEl
     : v === 'behaviors' ? viewBehaviorsEl
     : v === 'snippets'  ? viewSnippetsEl
+    : v === 'analytics' ? viewAnalyticsEl
     :                     viewEditorEl
 
   // Polling stays attached across view changes — every view that has
@@ -84,6 +86,8 @@ function showView(v: ViewSlug) {
   // And Archive, the fourth and last. Every view in this app shipped a
   // leave-cleanup that nothing invoked.
   if (v !== 'main') stopMainRefresh()
+  // Analytics' quota refresh and midnight re-read stop with the view.
+  if (v !== 'analytics') stopAnalyticsRefresh()
   // Chat keeps its socket (a running turn keeps being mirrored) but stops
   // the per-second tick and parks the composer draft.
   if (v !== 'chat') stopChatRefresh()
@@ -101,6 +105,7 @@ function showView(v: ViewSlug) {
   else if (v === 'chat')      void initChatView()
   else if (v === 'behaviors') initBehaviorsView()
   else if (v === 'snippets')  initSnippetsView()
+  else if (v === 'analytics') initAnalyticsView()
   else                        initEditorView()
 
   for (const el of all) {
@@ -133,17 +138,17 @@ document.addEventListener('error', (e) => {
 
 initClaudeAuth()
 
-// Init order: typography → settings → analytics → menu → initial view
+// Init order: typography → settings → menu → initial view
 initTypography()
 initSettings()
-initAnalytics()
 
 const menu = initMenu({
   onSelectView: (v) => showView(v),
   onOpenTypography: () => toggleTypographyPanel(),
   onOpenSettings: (section) => openSettingsAt(section),
-  onOpenAnalytics: () => toggleAnalyticsPanel(),
-  onClosePanels: () => { closeTypographyPanel(); closeSettingsPanel(); closeAnalyticsPanel() },
+  // Leaving first makes even a repeat choice arrive afresh, on Today.
+  onOpenAnalytics: () => { stopAnalyticsRefresh(); menu.switchTo('analytics') },
+  onClosePanels: () => { closeTypographyPanel(); closeSettingsPanel() },
 })
 
 // The notification rail beside the page, and where each notice in it takes

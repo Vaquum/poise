@@ -77,6 +77,27 @@ test('rapid close and reopen never loses the menu, and keyboard navigation reach
   await expect(toggle).toBeFocused()
 })
 
+test('Analytics leaves the menu for a view of its own and returns focus to the burger', async ({ page }) => {
+  await workspace(page)
+  const toggle = page.locator('#menu-toggle')
+  await toggle.press('ArrowDown')
+  await expect(page.getByRole('button', { name: 'Analytics', exact: true })).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(page.locator('#view-analytics')).toBeVisible()
+  await expect(page.locator('#view-current')).toBeHidden()
+  await expect(page.locator('#view-analytics .analytics-tile')).toHaveCount(9)
+  await expect(page.locator('#menu-surface')).toBeHidden()
+  await expect(page.locator('#menu-surface .menu-panel.open')).toHaveCount(0)
+  await expect(toggle).toBeFocused()
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+  expect(await toggle.evaluate((burger) => burger.closest('.view')?.id)).toBe('view-analytics')
+  // Settings still open over Analytics, and closing them leaves it in place.
+  await open(page, 'General')
+  await toggle.click()
+  await expect(page.locator('#settings-panel')).toHaveAttribute('inert', '')
+  await expect(page.locator('#view-analytics')).toBeVisible()
+})
+
 test('separates GitHub sign-ins and keeps command details out of the account rows', async ({ page }) => {
   await workspace(page)
   await open(page, 'Accounts')
@@ -128,11 +149,10 @@ for (const theme of ['light', 'dark']) test(`fits every destination at a narrow 
   await attached(page)
   await settled(page)
   await page.screenshot({ path: info.outputPath(`${theme}-menu.png`) })
-  for (const section of ['Analytics', 'General', 'Models', 'Accounts', 'Publishing', 'Typography']) {
+  for (const section of ['General', 'Models', 'Accounts', 'Publishing', 'Typography']) {
     await page.locator('#menu-popover').getByRole('button', { name: section, exact: true }).click()
     const panel = page.locator('#menu-surface .menu-panel.open')
     await expect(panel.locator('.tp-close')).toHaveCount(0)
-    if (section === 'Analytics') await expect(panel.locator('.analytics-tile')).toHaveCount(9)
     if (section === 'Accounts') await expect(panel.locator('.st-account')).toHaveCount(2)
     await attached(page)
     const sizes = await panel.evaluate((element) => ({ width: element.clientWidth, scroll: element.scrollWidth }))
@@ -140,10 +160,6 @@ for (const theme of ['light', 'dark']) test(`fits every destination at a narrow 
     const body = panel.locator('.tp-body')
     const overflow = await body.evaluate((element) => element.scrollWidth - element.clientWidth)
     expect(overflow).toBeLessThanOrEqual(1)
-    if (section === 'Analytics') {
-      const buttons = await panel.locator('[data-day]').evaluateAll((items) => items.map((item) => item.scrollWidth - item.clientWidth))
-      expect(Math.max(...buttons)).toBeLessThanOrEqual(1)
-    }
     await settled(page)
     await page.screenshot({ path: info.outputPath(`${theme}-${section.toLowerCase()}.png`) })
     await panel.getByRole('button', { name: 'Back to menu' }).click()
@@ -167,7 +183,7 @@ test('uses reduced motion and retains the close control after reset, view change
   await page.getByRole('button', { name: 'Editor', exact: true }).click()
   const writer = page.getByRole('button', { name: 'Toggle writer mode' })
   const toggle = page.locator('#menu-toggle')
-  for (const section of ['Typography', 'General', 'Analytics']) {
+  for (const section of ['Typography', 'General']) {
     await open(page, section)
     await writer.click()
     await expect(writer).toHaveAttribute('aria-pressed', 'true')

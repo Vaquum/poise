@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 import type { AnalyticsReport } from '../../src/analytics-format'
 import type { GithubQuotaReport } from '../../src/github-quota'
 
@@ -62,8 +62,15 @@ async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
 
 async function openAnalytics(page: Page) {
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.getByRole('button', { name: 'Analytics' }).click()
-  await expect(page.locator('#analytics-panel')).toHaveClass(/open/)
+  await page.locator('#menu-popover').getByRole('button', { name: 'Analytics', exact: true }).click()
+  await expect(page.locator('#view-analytics')).toBeVisible()
+  await expect(page.locator('#menu-surface')).toBeHidden()
+}
+
+// Leaving is choosing another view; there is no panel to close.
+async function leaveAnalytics(page: Page) {
+  await page.locator('#top-nav').getByRole('button', { name: 'Current', exact: true }).click()
+  await expect(page.locator('#view-analytics')).toBeHidden()
 }
 
 function mergeTrend(page: Page) {
@@ -71,8 +78,131 @@ function mergeTrend(page: Page) {
 }
 
 function value(page: Page, label: string) {
-  return page.locator('#analytics-panel .analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: new RegExp(`^${label}$`) }) }).locator('.analytics-value')
+  return page.locator('#view-analytics .analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: new RegExp(`^${label}$`) }) }).locator('.analytics-value')
 }
+
+function quotaReport(): GithubQuotaReport {
+  return { accounts: [{
+    login: 'octocat', roles: ['user', 'automation'], checkedAt: '2026-10-09T12:00:00Z', error: null,
+    buckets: ['REST API', 'GraphQL', 'Search', 'Code search'].map((label, index) => ({
+      resource: String(index), label, limit: 5000, used: 3000, remaining: 2000, resetAt: '2026-10-09T12:30:00Z', perMinute: 75, riskPercent: [25, 50, 90, 0][index],
+    })),
+  }, { login: 'octo-agent', roles: ['automation'], checkedAt: null, error: 'GitHub authentication is unavailable for octo-agent.', buckets: [] }] }
+}
+
+async function lefts(region: Locator, items: string): Promise<number[]> {
+  return region.locator(items).evaluateAll((elements) => elements.map((element) => Math.round(element.getBoundingClientRect().left)))
+}
+
+test('opens from the burger as a view of its own: productivity topline, per merged pull request, then GitHub', async ({ page }, info) => {
+  await workspace(page)
+  await page.route('**/api/github-quota', (route) => route.fulfill({ json: quotaReport() }))
+  await page.goto('/')
+  await openAnalytics(page)
+  const view = page.locator('#view-analytics')
+  for (const other of ['#view-current', '#view-main', '#view-behaviors']) await expect(page.locator(other)).toBeHidden()
+  await expect(page.locator('#top-nav .nav-item.active')).toHaveCount(0)
+  await expect(page.locator('#menu-popover [data-action="analytics"]')).toHaveAttribute('aria-current', 'page')
+  await expect(page.locator('#menu-toggle')).toBeFocused()
+  await expect(page.locator('#menu-toggle')).toHaveAttribute('aria-expanded', 'false')
+  await expect(view.locator('main h2')).toHaveText(['Productivity', 'Per merged pull request', 'GitHub API · Live'])
+  const topline = view.getByRole('region', { name: 'Productivity' })
+  const perPr = view.getByRole('region', { name: 'Per merged pull request' })
+  const quota = view.getByRole('region', { name: 'GitHub API · Live' })
+  await expect(topline.locator('.analytics-label')).toHaveText(['Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Time to merge'])
+  await expect(perPr.locator('.analytics-label')).toHaveText(['Comments', 'Median lines', 'Behaviors', 'Median time'])
+  await expect(quota.locator('.github-quota-bucket')).toHaveCount(4)
+  // The window, not the reading column: the five topline numbers share one
+  // row, the per-PR numbers sit under them, and each account is a row.
+  expect(await view.locator('main').evaluate((main) => main.getBoundingClientRect().width)).toBeGreaterThan(1200)
+  const tops = await topline.locator('.analytics-tile').evaluateAll((tiles) => tiles.map((tile) => Math.round(tile.getBoundingClientRect().top)))
+  expect(new Set(tops).size).toBe(1)
+  const columns = await lefts(topline, '.analytics-tile')
+  expect(await lefts(perPr, '.analytics-tile')).toEqual(columns.slice(0, 4))
+  expect(await lefts(quota.locator('.github-quota-account').first(), '.github-quota-identity, .github-quota-bucket')).toEqual(columns)
+  await page.screenshot({ path: info.outputPath('analytics-view.png'), fullPage: true })
+
+  await page.reload()
+  await expect(view).toBeVisible()
+  await expect(view.locator('.analytics-date')).toHaveText('Today')
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
+  await expect(page.locator('#menu-popover [data-action="analytics"]')).toHaveAttribute('aria-current', 'page')
+  await leaveAnalytics(page)
+  await expect(page.locator('#top-nav .nav-item.active')).toHaveText('Current')
+  await expect(page.locator('#menu-popover [data-action="analytics"]')).not.toHaveAttribute('aria-current', 'page')
+})
+
+test('choosing Analytics again from the menu returns to Today', async ({ page }) => {
+  const state = await workspace(page)
+  await page.goto('/')
+  await openAnalytics(page)
+  const view = page.locator('#view-analytics')
+  await view.getByRole('button', { name: 'Previous day' }).click()
+  await expect(view.locator('.analytics-date')).toHaveText('Yesterday')
+  await expect(value(page, 'Pull requests merged')).toHaveText('0')
+  await openAnalytics(page)
+  await expect(view.locator('.analytics-date')).toHaveText('Today')
+  await expect(view.getByRole('button', { name: 'Next day' })).toBeDisabled()
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
+  await expect.poll(() => state.reads.slice(-2)).toEqual([
+    { since: '2026-10-09T00:00:00.000Z', until: '2026-10-10T00:00:00.000Z', org: null },
+    { since: '2026-10-02T00:00:00.000Z', until: '2026-10-09T00:00:00.000Z', org: null },
+  ])
+})
+
+test('keeps the topline on one row beside a docked notification rail', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await workspace(page)
+  await page.addInitScript(() => localStorage.setItem('poise-notification-rail', JSON.stringify({ docked: true, open: true })))
+  await page.route('**/api/github-quota', (route) => route.fulfill({ json: quotaReport() }))
+  await page.goto('/')
+  await expect(page.locator('body')).toHaveClass(/notifications-docked/)
+  await openAnalytics(page)
+  const topline = page.getByRole('region', { name: 'Productivity' })
+  await expect(topline.locator('.analytics-tile')).toHaveCount(5)
+  const main = (await page.locator('#view-analytics main').boundingBox())!
+  const rail = (await page.getByRole('complementary', { name: 'Notifications' }).boundingBox())!
+  expect(main.x + main.width).toBeLessThanOrEqual(rail.x + 1)
+  const tops = await topline.locator('.analytics-tile').evaluateAll((tiles) => tiles.map((tile) => Math.round(tile.getBoundingClientRect().top)))
+  expect(new Set(tops).size).toBe(1)
+})
+
+test('stops reading quota once another view is chosen', async ({ page }) => {
+  await workspace(page)
+  await page.route('**/api/github-quota', (route) => route.fulfill({ json: quotaReport() }))
+  await page.goto('/')
+  await openAnalytics(page)
+  await expect(page.locator('.github-quota-bucket')).toHaveCount(4)
+  // The 15-second timer and a returning tab both refresh through one guard.
+  const refresh = async () => {
+    const read = page.waitForRequest('**/api/github-quota', { timeout: 1_000 }).then(() => true, () => false)
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+    return read
+  }
+  expect(await refresh()).toBe(true)
+  await leaveAnalytics(page)
+  expect(await refresh()).toBe(false)
+})
+
+for (const theme of ['light', 'dark']) test(`fits a narrow window and large text in ${theme} mode`, async ({ page }, info) => {
+  await page.setViewportSize({ width: 420, height: 820 })
+  await workspace(page)
+  await page.route('**/api/github-quota', (route) => route.fulfill({ json: quotaReport() }))
+  await page.goto('/')
+  await page.evaluate((chosen) => {
+    document.documentElement.dataset.theme = chosen
+    document.documentElement.style.fontSize = '20px'
+  }, theme)
+  await openAnalytics(page)
+  const view = page.locator('#view-analytics')
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
+  await expect(view.locator('.github-quota-bucket')).toHaveCount(4)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+  const clipped = await view.locator('.analytics-day > *').evaluateAll((items) => items.map((item) => item.scrollWidth - item.clientWidth))
+  expect(Math.max(...clipped)).toBeLessThanOrEqual(1)
+  expect(new Set(await lefts(view.getByRole('region', { name: 'Productivity' }), '.analytics-tile')).size).toBe(2)
+  await page.screenshot({ path: info.outputPath(`analytics-narrow-${theme}.png`), fullPage: true })
+})
 
 test('shows live account quota below daily analytics with usage, resets and risk colors', async ({ page }, info) => {
   await workspace(page)
@@ -86,7 +216,7 @@ test('shows live account quota below daily analytics with usage, resets and risk
   await page.route('**/api/github-quota', (route) => route.fulfill({ json: quota }))
   await page.goto('/')
   await openAnalytics(page)
-  const section = page.getByRole('region', { name: 'GitHub API quota' })
+  const section = page.getByRole('region', { name: 'GitHub API · Live' })
   await expect(section).toContainText('octocat user + automation')
   await expect(section.locator('.github-quota-account')).toHaveCount(2)
   await expect(section).toContainText('3,000 / 5,000 used · 2,000 left')
@@ -101,7 +231,7 @@ test('shows live account quota below daily analytics with usage, resets and risk
   await expect(risk.nth(4)).toHaveText('Risk: collecting samples…')
   await expect(section).toContainText('GitHub authentication is unavailable for octo-agent.')
   expect(await section.evaluate((element) => element.previousElementSibling?.className)).toBe('analytics-groups')
-  await page.locator('#analytics-panel').getByRole('button', { name: 'Previous day' }).click()
+  await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
   await expect(risk.nth(0)).toHaveText('25% estimated risk')
   await risk.nth(1).scrollIntoViewIfNeeded()
   await page.screenshot({ path: info.outputPath('github-quota.png') })
@@ -120,7 +250,7 @@ test('shows quota read failure and refreshes it without retaining stale values',
     : route.fulfill({ json: { accounts: [] } }))
   await page.goto('/')
   await openAnalytics(page)
-  const section = page.getByRole('region', { name: 'GitHub API quota' })
+  const section = page.getByRole('region', { name: 'GitHub API · Live' })
   await expect(section).toContainText('Quota service unavailable')
   failed = false
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
@@ -132,14 +262,14 @@ test('opens Today with a seven-day comparison and navigates days without changin
   const state = await workspace(page)
   await page.goto('/')
   await expect(page.locator('#current-time-picker [data-time="week"]')).toHaveClass(/active/)
-  await expect(page.locator('#analytics-panel')).toHaveAttribute('inert', '')
+  await expect(page.locator('#view-analytics')).toBeHidden()
   await openAnalytics(page)
-  const panel = page.locator('#analytics-panel')
+  const panel = page.locator('#view-analytics')
   await expect(panel.locator('.analytics-date')).toHaveText('Today')
   await expect(panel.getByRole('button', { name: 'Next day' })).toBeDisabled()
-  await expect(value(page, 'Opened')).toHaveText('12')
-  await expect(value(page, 'Closed')).toHaveText('9')
-  await expect(value(page, 'Merged')).toHaveText('4')
+  await expect(value(page, 'Issues opened')).toHaveText('12')
+  await expect(value(page, 'Issues closed')).toHaveText('9')
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
   await expect(value(page, 'Lines changed')).toHaveText('4,210')
   await expect(value(page, 'Time to merge')).toHaveText('1d 3h')
   await expect(value(page, 'Comments')).toHaveText('3.3')
@@ -152,7 +282,7 @@ test('opens Today with a seven-day comparison and navigates days without changin
   await expect(mergeTrend(page).getByRole('img')).toHaveAccessibleName('50% faster versus the preceding 7-day average')
   await expect(panel).toContainText('7-day rolling average: 2d 6h · 8 PRs')
   await expect(panel).toContainText('From 3 of 4 pull requests')
-  await expect(panel.locator('.analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: /^Opened$/ }) }).locator('.analytics-trend')).toContainText('↑ 600%')
+  await expect(panel.locator('.analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: /^Issues opened$/ }) }).locator('.analytics-trend')).toContainText('↑ 600%')
   await expect(panel).toContainText('7-day daily average: 1.7')
   await page.screenshot({ path: info.outputPath('analytics-day-trend.png') })
   expect(state.reads).toEqual([
@@ -163,7 +293,7 @@ test('opens Today with a seven-day comparison and navigates days without changin
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await expect(panel.locator('.analytics-date')).toHaveText('Yesterday')
   await expect(panel.getByRole('button', { name: 'Next day' })).toBeEnabled()
-  await expect(value(page, 'Merged')).toHaveText('0')
+  await expect(value(page, 'Pull requests merged')).toHaveText('0')
   await expect(value(page, 'Median time')).toHaveText('—')
   await expect(mergeTrend(page)).toHaveCount(0)
   await expect(panel).toContainText('No pull requests were merged in this range.')
@@ -180,18 +310,21 @@ test('opens Today with a seven-day comparison and navigates days without changin
   await expect(panel.locator('.analytics-date')).toHaveText('Today')
   await expect(panel.getByRole('button', { name: 'Next day' })).toBeDisabled()
   await expect(page.locator('#current-time-picker [data-time="week"]')).toHaveClass(/active/)
-  await page.keyboard.press('Escape')
-  await expect(panel).not.toHaveClass(/open/)
-  await expect(panel).toHaveAttribute('inert', '')
+  await panel.getByRole('button', { name: 'Previous day' }).click()
+  await expect(panel.locator('.analytics-date')).toHaveText('Yesterday')
+  await leaveAnalytics(page)
+  await expect(page.locator('#current-time-picker [data-time="week"]')).toHaveClass(/active/)
+  await openAnalytics(page)
+  await expect(panel.locator('.analytics-date')).toHaveText('Today')
 })
 
 test('reads both periods for the selected account and shows slower merges in red', async ({ page }) => {
   const state = await workspace(page)
   await page.goto('/')
   await openAnalytics(page)
-  await expect(value(page, 'Merged')).toHaveText('4')
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
   state.baselineHours = 9
-  await page.locator('#current-filters').getByLabel('Account filter').selectOption('beta')
+  await page.locator('#analytics-filters').getByLabel('Account filter').selectOption('beta')
   await expect.poll(() => state.reads.slice(-2)).toEqual([
     { since: '2026-10-09T00:00:00.000Z', until: '2026-10-10T00:00:00.000Z', org: 'beta' },
     { since: '2026-10-02T00:00:00.000Z', until: '2026-10-09T00:00:00.000Z', org: 'beta' },
@@ -208,7 +341,7 @@ test('names an empty baseline instead of inventing a trend', async ({ page }) =>
   await openAnalytics(page)
   await expect(value(page, 'Time to merge')).toHaveText('1d 3h')
   await expect(mergeTrend(page)).toHaveCount(0)
-  await expect(page.locator('#analytics-panel')).toContainText('7-day rolling average: — · 0 PRs · No baseline')
+  await expect(page.locator('#view-analytics')).toContainText('7-day rolling average: — · 0 PRs · No baseline')
 })
 
 test('uses configured timezone boundaries across DST', async ({ page }) => {
@@ -216,7 +349,7 @@ test('uses configured timezone boundaries across DST', async ({ page }) => {
   await page.clock.setFixedTime(new Date('2026-10-25T12:00:00Z'))
   await page.goto('/')
   await openAnalytics(page)
-  await expect(value(page, 'Merged')).toHaveText('4')
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
   expect(state.reads).toEqual([
     { since: '2026-10-24T21:00:00.000Z', until: '2026-10-25T22:00:00.000Z', org: null },
     { since: '2026-10-17T21:00:00.000Z', until: '2026-10-24T21:00:00.000Z', org: null },
@@ -227,13 +360,11 @@ test('says when the numbers could not be read instead of showing old ones', asyn
   const state = await workspace(page)
   await page.goto('/')
   await openAnalytics(page)
-  await expect(value(page, 'Merged')).toHaveText('4')
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
   state.fail = true
-  await page.locator('#analytics-panel').getByRole('button', { name: 'Previous day' }).click()
-  await expect(page.locator('#analytics-panel .analytics-status')).toHaveText('acme: datastore offline')
-  await expect(page.locator('#analytics-panel .analytics-tile')).toHaveCount(0)
-  await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await expect(page.locator('#analytics-panel')).not.toHaveClass(/open/)
+  await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
+  await expect(page.locator('#view-analytics .analytics-status')).toHaveText('acme: datastore offline')
+  await expect(page.locator('#view-analytics .analytics-tile')).toHaveCount(0)
 })
 
 test('a slow old date cannot overwrite the latest date or its trend', async ({ page }) => {
@@ -249,17 +380,17 @@ test('a slow old date cannot overwrite the latest date or its trend', async ({ p
   })
   await page.goto('/')
   await openAnalytics(page)
-  await expect(value(page, 'Merged')).toHaveText('4')
-  const panel = page.locator('#analytics-panel')
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
+  const panel = page.locator('#view-analytics')
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await expect(panel.locator('.analytics-date')).toHaveText('7 Oct 2026')
-  await expect(value(page, 'Merged')).toHaveText('4')
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
   const response = page.waitForResponse(res => new URL(res.url()).searchParams.get('since') === '2026-10-08T00:00:00.000Z')
   release()
   await response
   await expect(panel.locator('.analytics-groups')).not.toHaveAttribute('aria-busy', 'true')
-  await expect(value(page, 'Merged')).toHaveText('4')
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
   await expect(mergeTrend(page)).toContainText('↓ 50%')
 })
 
@@ -267,7 +398,7 @@ test('retains the selected calendar date when navigating across midnight', async
   const state = await workspace(page)
   await page.goto('/')
   await openAnalytics(page)
-  const panel = page.locator('#analytics-panel')
+  const panel = page.locator('#view-analytics')
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await expect(panel.locator('.analytics-date')).toHaveText('7 Oct 2026')
@@ -288,7 +419,7 @@ test('shows the standard loader with no old values on initial load, day/account 
   })
   await page.goto('/')
   await openAnalytics(page)
-  const panel = page.locator('#analytics-panel')
+  const panel = page.locator('#view-analytics')
   const loader = panel.getByRole('status', { name: 'Loading analytics' })
   const pending = async () => {
     await expect(loader).toBeVisible()
@@ -300,7 +431,7 @@ test('shows the standard loader with no old values on initial load, day/account 
   }
   const loaded = async (merged: string) => {
     release()
-    await expect(value(page, 'Merged')).toHaveText(merged)
+    await expect(value(page, 'Pull requests merged')).toHaveText(merged)
     await expect(loader).toBeHidden()
     await expect(panel.locator('.analytics-groups')).not.toHaveAttribute('aria-busy', 'true')
     held = new Promise<void>(resolve => { release = resolve })
@@ -308,14 +439,18 @@ test('shows the standard loader with no old values on initial load, day/account 
   try {
     await pending()
     await loaded('4')
+    const quotaTop = () => panel.locator('.github-quota-section').evaluate((section) => (section as HTMLElement).offsetTop)
+    const settledTop = await quotaTop()
     await panel.getByRole('button', { name: 'Previous day' }).click()
     await pending()
+    // GitHub holds its place while the day loads instead of jumping up.
+    expect(await quotaTop()).toBe(settledTop)
     await page.screenshot({ path: info.outputPath('analytics-loading.png') })
     await loaded('0')
-    await page.locator('#current-filters').getByLabel('Account filter').selectOption('beta')
+    await page.locator('#analytics-filters').getByLabel('Account filter').selectOption('beta')
     await pending()
     await loaded('0')
-    await page.keyboard.press('Escape')
+    await leaveAnalytics(page)
     await openAnalytics(page)
     await pending()
     await loaded('4')
@@ -327,7 +462,7 @@ test('clears a previous read error while retrying with the loader', async ({ pag
   state.fail = true
   await page.goto('/')
   await openAnalytics(page)
-  const panel = page.locator('#analytics-panel')
+  const panel = page.locator('#view-analytics')
   await expect(panel.locator('.analytics-status')).toHaveText('acme: datastore offline')
   let release!: () => void
   const held = new Promise<void>(resolve => { release = resolve })
@@ -339,5 +474,5 @@ test('clears a previous read error while retrying with the loader', async ({ pag
     await expect(panel.locator('.analytics-status')).toBeHidden()
     await expect(panel.locator('.analytics-tile')).toHaveCount(0)
   } finally { release() }
-  await expect(value(page, 'Merged')).toHaveText('0')
+  await expect(value(page, 'Pull requests merged')).toHaveText('0')
 })

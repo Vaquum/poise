@@ -183,6 +183,14 @@ test('docks beside the page on a wide window, covering nothing in any view', asy
     expect(box.y, `${view}: the rail starts below the control bar`).toBeGreaterThanOrEqual(header.y + header.height - 1)
     await expect(rail(page)).toBeVisible()
   }
+  // Analytics is a view too, reached from the burger rather than the nav.
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover').getByRole('button', { name: 'Analytics', exact: true }).click()
+  const analytics = page.locator('#view-analytics main')
+  await expect(analytics).toBeVisible()
+  const analyticsBounds = (await analytics.boundingBox())!
+  expect(analyticsBounds.x + analyticsBounds.width, 'Analytics reaches under the rail').toBeLessThanOrEqual(box.x + 1)
+  await expect(rail(page)).toBeVisible()
   // Floating, by choice, it covers the page instead of moving it.
   await rail(page).getByRole('button', { name: 'Keep beside the page on a wide window' }).click()
   await expect(page.locator('body')).not.toHaveClass(/notifications-docked/)

@@ -1,6 +1,6 @@
-// The time ranges Current filters by, shared with the Analytics panel so both
-// mean the same thing by "Today" or "This week": the person's timezone, from
-// Settings → General.
+// The time ranges Current and Behaviors filter by, so both mean the same
+// thing by "Today" or "This week": the person's timezone, from Settings →
+// General.
 
 import { midnightInZone, startOfWeekInZone } from './config'
 
@@ -28,7 +28,7 @@ export function timeRangeWindow(range: TimeRange): { since?: string; until?: str
 /** Where Current keeps its filters across reloads. */
 export const CURRENT_FILTER_KEY = 'poise-current-filters'
 
-/** The range Current shows; Analytics opens on it. */
+/** The range Current shows. */
 export function currentViewTimeRange(): TimeRange {
   try {
     const time = JSON.parse(localStorage.getItem(CURRENT_FILTER_KEY) || '{}').time

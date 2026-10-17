@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { analyticsGroups as buildGroups, mergeTimeTrend, formatDuration, formatRate, type AnalyticsReport } from '../src/analytics-format'
 
-// What the Analytics panel says (src/analytics-format.ts).
+// What the Analytics view says (src/analytics-format.ts).
 
 function report(pullRequests: Partial<AnalyticsReport['pullRequests']> = {}): AnalyticsReport {
   return {
@@ -44,14 +44,14 @@ describe('Analytics wording', () => {
     expect(formatRate(1234.5)).toBe('1,234.5')
   })
 
-  it('lays out every number the panel promises', () => {
+  it('leads with the productivity topline, then the numbers per merged pull request', () => {
     const groups = analyticsGroups(report())
-    expect(groups.map((group) => group.label)).toEqual(['Issues', 'Pull requests', 'Per merged pull request'])
+    expect(groups.map((group) => [group.id, group.label])).toEqual([['productivity', 'Productivity'], ['per-merged-pr', 'Per merged pull request']])
     expect(groups.map((group) => group.tiles.map((t) => [t.label, t.value]))).toEqual([
-      [['Opened', '1,204'], ['Closed', '1']],
-      [['Merged', '4'], ['Lines changed', '12,345'], ['Time to merge', '1d 2h']],
+      [['Issues opened', '1,204'], ['Issues closed', '1'], ['Pull requests merged', '4'], ['Lines changed', '12,345'], ['Time to merge', '1d 2h']],
       [['Comments', '2.3'], ['Median lines', '181'], ['Behaviors', '1.5'], ['Median time', '5h']],
     ])
+    expect(groups.every((group) => group.help)).toBe(true)
     expect(tile(groups, 'Behaviors').note).toBe('1 approval · 4 reviews · 1 change request')
     expect(groups.every((group) => !group.note)).toBe(true)
   })
@@ -59,14 +59,14 @@ describe('Analytics wording', () => {
   it('says how many pull requests the line counts come from when some have no size yet', () => {
     const groups = analyticsGroups(report({ merged: 52, lines: { total: 900, median: 20, counted: 40 } }))
     expect(tile(groups, 'Lines changed').value).toBe('900')
-    expect(groups[1].note).toBe('From 40 of 52 pull requests')
+    expect(groups[0].note).toBe('From 40 of 52 pull requests')
   })
 
   it('shows an unknown total, not zero, when no merged pull request has a size yet', () => {
     const groups = analyticsGroups(report({ merged: 1, lines: { total: null, median: null, counted: 0 } }))
     expect(tile(groups, 'Lines changed').value).toBe('—')
     expect(tile(groups, 'Median lines').value).toBe('—')
-    expect(groups[1].note).toBe('From 0 of 1 pull request')
+    expect(groups[0].note).toBe('From 0 of 1 pull request')
   })
 
   it('says nothing was merged instead of showing averages of nothing', () => {
@@ -81,8 +81,8 @@ describe('Analytics wording', () => {
     expect(tile(groups, 'Lines changed').value).toBe('0')
     expect(tile(groups, 'Comments').value).toBe('—')
     expect(tile(groups, 'Behaviors').note).toBeUndefined()
-    expect(groups[1].note).toBeUndefined()
-    expect(groups[2].note).toBe('No pull requests were merged in this range.')
+    expect(groups[0].note).toBeUndefined()
+    expect(groups[1].note).toBe('No pull requests were merged in this range.')
   })
 })
 
@@ -116,9 +116,9 @@ it('compares headline event counts against seven-day daily averages, including z
   const week = report({ merged: 14, lines: { total: 2450, median: 175, counted: 14 } })
   week.issues = { opened: 14, closed: 7 }
   const groups = buildGroups(day, week)
-  expect(tile(groups, 'Opened').trend).toMatchObject({ direction: 'good', text: '↑ 250%' })
-  expect(tile(groups, 'Closed').trend).toMatchObject({ direction: 'bad', text: '↓ 100%' })
-  expect(tile(groups, 'Merged').comparison).toBe('7-day daily average: 2.0')
+  expect(tile(groups, 'Issues opened').trend).toMatchObject({ direction: 'good', text: '↑ 250%' })
+  expect(tile(groups, 'Issues closed').trend).toMatchObject({ direction: 'bad', text: '↓ 100%' })
+  expect(tile(groups, 'Pull requests merged').comparison).toBe('7-day daily average: 2.0')
   expect(tile(groups, 'Lines changed').trend).toMatchObject({ direction: 'good', text: '↑ 100%' })
   week.pullRequests.lines.counted = 10
   expect(tile(buildGroups(day, week), 'Lines changed').trend).toBeUndefined()

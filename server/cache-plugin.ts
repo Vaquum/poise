@@ -839,7 +839,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           }
         }
 
-        // ── /api/analytics — the Analytics panel's headline numbers ──
+        // ── /api/analytics — the Analytics view's headline numbers ──
         // ?since=&until= bound the window (ISO with a timezone, either may be
         // absent); ?org= narrows to one account like every other read.
         if (path === '/api/analytics' && req.method === 'GET') {
