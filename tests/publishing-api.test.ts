@@ -740,6 +740,24 @@ describe('publishing a document', () => {
     expect((await editor!.readPublishLedger(DOC)).records.find((r) => r.repo === 'acme/dated')!.unconfirmed).toBeDefined()
   })
 
+  it('names an update at its earlier address while its pull request stays unreadable', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = (date: string) => ({ repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date } })
+    expect((await publish([dated('2026-10-17')])).body.results[0].ok).toBe(true)
+    afterCommit = () => {
+      failOn = (method, endpoint) => (method === 'GET' && endpoint === 'repos/acme/dated/pulls/101' ? 500 : null)
+    }
+    expect((await publish([dated('2027-01-05')])).body.results[0].ok).toBe(false)
+    // Later, with the pull request still unreadable, a copy published alone names the original where it was.
+    expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
+  })
+
   it('keeps an update unconfirmed when a later site fails in the same publication', async () => {
     for (const [repo, yaml] of [['acme/journal', JOURNAL_YAML], ['acme/notes', NOTES_YAML]]) {
       addRepo(repo, {})

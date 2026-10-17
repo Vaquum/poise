@@ -535,13 +535,16 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // Every place the piece is published, the original first: where it is live
   // already, in the order it went there, then the sites it goes to now.
   const placesFor = (going: Target[]): Place[] => {
-    // An update whose pull request was closed unmerged, or merged before the
-    // update was committed, changed nothing on the site: name the address there.
+    // A pull request closed unmerged changed nothing on the site: name what
+    // landed there. An update not known to have reached its pull request
+    // (merged without it, or still unreadable) is named where it was before.
     const places: Place[] = [...live]
       .sort((a, b) => a.publishedAt.localeCompare(b.publishedAt))
       .map((r) => {
         const key = placeKey(r.repo, r.section)
-        const url = missed.has(key) ? r.unconfirmed!.url : states.get(key) === 'closed' && r.landed ? r.landed.url : r.url
+        const state = states.get(key)
+        const reached = state === 'open' || (state === 'merged' && !missed.has(key))
+        const url = state === 'closed' && r.landed ? r.landed.url : r.unconfirmed && !reached ? r.unconfirmed.url : r.url
         return { key, site: r.site, url }
       })
     for (const target of going) {
