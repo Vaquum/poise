@@ -27,6 +27,7 @@ import { NoticeFeed, type NoticeTarget } from './notices'
 import { mountNotificationRail } from './views/notification-rail'
 import './views/notification-rail.css'
 import './views/updating.css'
+import './views/editor-publish.css'
 
 const viewMainEl = document.getElementById('view-main')!
 const viewCurrentEl = document.getElementById('view-current')!

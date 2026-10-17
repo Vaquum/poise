@@ -34,9 +34,9 @@ test('opens Settings destinations directly on one frame and returns to the menu'
   await workspace(page)
   await page.locator('#menu-toggle').click()
   await expect(page.locator('#menu-popover .menu-group-label')).toHaveText('Settings')
-  await expect(page.locator('#menu-popover .menu-item:not([hidden])')).toHaveText(['Analytics', 'General', 'Models', 'Accounts', 'Typography'])
+  await expect(page.locator('#menu-popover .menu-item:not([hidden])')).toHaveText(['Analytics', 'General', 'Models', 'Accounts', 'Publishing', 'Typography'])
   await attached(page)
-  for (const section of ['General', 'Models', 'Accounts', 'Typography']) {
+  for (const section of ['General', 'Models', 'Accounts', 'Publishing', 'Typography']) {
     await page.locator('#menu-popover').getByRole('button', { name: section, exact: true }).click()
     await expect(page.locator('#menu-surface .menu-panel.open .tp-title')).toHaveText(section)
     await expect(page.locator('#menu-surface .tp-close')).toHaveCount(0)
@@ -128,7 +128,7 @@ for (const theme of ['light', 'dark']) test(`fits every destination at a narrow 
   await attached(page)
   await settled(page)
   await page.screenshot({ path: info.outputPath(`${theme}-menu.png`) })
-  for (const section of ['Analytics', 'General', 'Models', 'Accounts', 'Typography']) {
+  for (const section of ['Analytics', 'General', 'Models', 'Accounts', 'Publishing', 'Typography']) {
     await page.locator('#menu-popover').getByRole('button', { name: section, exact: true }).click()
     const panel = page.locator('#menu-surface .menu-panel.open')
     await expect(panel.locator('.tp-close')).toHaveCount(0)

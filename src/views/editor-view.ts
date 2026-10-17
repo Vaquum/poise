@@ -2,6 +2,7 @@ import { scrollToActor } from '../motion'
 import { retire, reveal, watchPanel } from '../motion'
 import { patchContent } from '../dom-patch'
 import { registerReloadGuard } from '../self-update-watch'
+import { ICON_PUBLISH, closePublishPanel, togglePublishPanel } from './editor-publish'
 // Editor — minimalist markdown writing surface.
 //
 // Single horizontal control bar at the top, sharing the exact alignment
@@ -345,6 +346,7 @@ function renderShell(): string {
         <button type="button" class="editor-bar-btn editor-copy-btn"   title="Copy document" aria-label="Copy document">${ICON_COPY}</button>
         <button type="button" class="editor-bar-btn editor-chat-btn"   title="Chat about this document (pane)" aria-label="Open chat">${ICON_CHAT}</button>
         <button type="button" class="editor-bar-btn editor-chat-session-btn" title="Chat about this document" aria-label="Chat about this document">${ICON_CHAT_SESSION}</button>
+        <button type="button" class="editor-bar-btn editor-publish-btn" title="Publish" aria-label="Publish" aria-haspopup="dialog" aria-expanded="false">${ICON_PUBLISH}</button>
         <button type="button" class="editor-bar-btn editor-delete-btn" title="Delete" aria-label="Delete">${ICON_TRASH}</button>
       </div>
       <div class="editor-bar-right">
@@ -2256,6 +2258,7 @@ async function loadDoc(slug: string) {
   const requestId = ++loadRequestId
   if (!(await flushBeforeLeavingDocument('switch documents')) || requestId !== loadRequestId) return
   closePanel()
+  closePublishPanel()
   try {
     const res = await fetch(`/api/editor/doc/${encodeURIComponent(slug)}`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -2292,6 +2295,7 @@ async function loadDoc(slug: string) {
 
 async function newDoc() {
   if (!(await flushBeforeLeavingDocument('start a new document'))) return
+  closePublishPanel()
   try {
     const res = await fetch('/api/editor/docs', { method: 'POST' })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -2347,6 +2351,7 @@ async function deleteCurrent() {
   if (!d) return
   const ok = window.confirm(`Delete "${d.title}"? This cannot be undone.`)
   if (!ok) return
+  closePublishPanel()
   deletingSlug = d.slug
   await discardEditorSaves()
   loadRequestId += 1
@@ -4033,6 +4038,10 @@ function attachHandlers() {
     .addEventListener('click', () => { void newDoc() })
   viewEl.querySelector<HTMLButtonElement>('.editor-delete-btn')!
     .addEventListener('click', () => { void deleteCurrent() })
+  const publishBtn = viewEl.querySelector<HTMLButtonElement>('.editor-publish-btn')!
+  publishBtn.addEventListener('click', () => {
+    togglePublishPanel(publishBtn, { slug: () => currentSlug, flush: flushEditorSaves })
+  })
   copyBtnEl = viewEl.querySelector<HTMLButtonElement>('.editor-copy-btn')!
   copyBtnEl.addEventListener('click', () => { void copyDoc() })
   viewEl.querySelector<HTMLButtonElement>('.editor-chat-btn')!
@@ -4831,6 +4840,7 @@ export function stopEditorRefresh() {
   clearAnnotationsSaveTimer()
   void flushEditorSaves()
   closeMenu()
+  closePublishPanel()
   // Strip the writer-mode body class on view leave — otherwise the
   // hidden top nav stays hidden once you come back from another view
   // and the user is stuck.

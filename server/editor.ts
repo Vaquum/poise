@@ -466,20 +466,21 @@ export async function writeDoc(
 export async function deleteDoc(slug: string): Promise<{ ok: true }> {
   await editorReady
   const path = fileFor(slug)
-  // Take any side-cars with the doc — annotations and chat-session
-  // bookkeeping. All best-effort: ENOENT on a side-car is normal
-  // (most docs won't have annotations or an opened chat).
+  // Take any side-cars with the doc — annotations, chat-session and
+  // publishing bookkeeping. All best-effort: ENOENT on a side-car is
+  // normal (most docs won't have annotations, a chat or a publication).
   const annPath = annotationsFileFor(slug)
   const chatPath = chatSessionFileFor(slug)
-  await Promise.all(
-    [path, annPath, chatPath].map((target) => (
-      serializeMutation(target, async () => {
-        try { await unlink(target) }
-        catch (err: any) { if (err.code !== 'ENOENT') throw err }
-        forgetClientWrites(target)
-      })
-    )),
-  )
+  const publishPath = publishLedgerFileFor(slug)
+  const remove = (target: string) => serializeMutation(target, async () => {
+    try { await unlink(target) }
+    catch (err: any) { if (err.code !== 'ENOENT') throw err }
+    forgetClientWrites(target)
+  })
+  // The doc first: a publishing record written meanwhile is either removed
+  // with the side-cars or finds the doc gone (writePublishLedger).
+  await remove(path)
+  await Promise.all([annPath, chatPath, publishPath].map(remove))
   return { ok: true }
 }
 
@@ -701,4 +702,135 @@ export async function getOrCreateChatSession(slug: string): Promise<ChatSessionF
 export function slugFromEditorSession(sessionId: string): string | null {
   const m = String(sessionId || '').match(/^editor-(.+)-\d+$/)
   return m && isCanonicalSlug(m[1]) ? m[1] : null
+}
+
+// ── Publishing ────────────────────────────────────────────────────────
+//
+// Where a document has been published (server/publishing-api.ts), one
+// record per site and section, kept as a fourth side-car:
+//   <slug>.publish.json  →  { records: [...] }
+// Publishing again finds the same pull request through it, and what was
+// published is what tells the site's own changes apart from the writer's.
+
+export const MAX_PUBLISH_LEDGER_BYTES = 1 * 1024 * 1024
+
+export interface PublishRecord {
+  repo: string                  // the site's repository
+  repoId?: number               // its GitHub id: the same through a rename, another for a repository taking its old name
+  section: string
+  site: string                  // the site's name when published
+  headRepo: string              // where the branch is: the repository, or the writer's fork
+  branch: string
+  base: string                  // the branch the pull request goes to
+  path: string
+  url: string
+  slug: string
+  date: string                  // the date its path and address were filled with
+  pullRequest: { number: number, url: string, base?: string } // base: the branch it went to when last read
+  publishedAt: string           // first published there
+  updatedAt: string
+  sourceSha: string             // the document as it was published
+  docTitle?: string             // its first line then, to tell a title typed in the panel from one that followed it
+  values: Record<string, unknown>
+  data: Record<string, unknown> // the frontmatter this document gave it
+  bodySha: string               // the text this document gave it
+  /** This document's side of the version last merged there: still the
+   *  site's file, and still this document's, whatever came after it. */
+  landed?: { data: Record<string, unknown>, bodySha: string, pullRequest: number, url: string, date?: string, base?: string, unknown?: true }
+  /** An update committed while its pull request could not be read: its
+   *  commit, and the address of the version before it, until a later
+   *  publication reads the pull request again. */
+  unconfirmed?: { commit: string, url: string, date?: string }
+}
+
+export interface PublishLedger {
+  records: PublishRecord[]
+}
+
+function publishLedgerFileFor(slug: string): string {
+  return join(EDITOR_DIR, canonicalSlug(slug) + '.publish.json')
+}
+
+function isPublishRecord(value: unknown): value is PublishRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  const pr = record.pullRequest as Record<string, unknown> | undefined
+  return ['repo', 'section', 'site', 'headRepo', 'branch', 'base', 'path', 'url', 'slug', 'date', 'publishedAt', 'updatedAt', 'sourceSha', 'bodySha']
+    .every((key) => typeof record[key] === 'string')
+    && !!pr && Number.isSafeInteger(pr.number) && typeof pr.url === 'string' && (pr.base === undefined || typeof pr.base === 'string')
+    && !!record.values && typeof record.values === 'object' && !Array.isArray(record.values)
+    && !!record.data && typeof record.data === 'object' && !Array.isArray(record.data)
+    && (record.landed === undefined || isLanded(record.landed))
+    && (record.docTitle === undefined || typeof record.docTitle === 'string')
+    && (record.unconfirmed === undefined || isUnconfirmed(record.unconfirmed))
+    && (record.repoId === undefined || Number.isSafeInteger(record.repoId))
+}
+
+function isUnconfirmed(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const unconfirmed = value as Record<string, unknown>
+  return typeof unconfirmed.commit === 'string' && typeof unconfirmed.url === 'string'
+    && (unconfirmed.date === undefined || typeof unconfirmed.date === 'string')
+}
+
+function isLanded(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const landed = value as Record<string, unknown>
+  return !!landed.data && typeof landed.data === 'object' && !Array.isArray(landed.data)
+    && typeof landed.bodySha === 'string' && Number.isSafeInteger(landed.pullRequest) && typeof landed.url === 'string'
+    && (landed.date === undefined || typeof landed.date === 'string')
+    && (landed.base === undefined || typeof landed.base === 'string')
+    && (landed.unknown === undefined || landed.unknown === true)
+}
+
+export async function readPublishLedger(slug: string): Promise<PublishLedger> {
+  await editorReady
+  const path = publishLedgerFileFor(slug)
+  let raw: string
+  try {
+    raw = (await readUtf8Limited(path, MAX_PUBLISH_LEDGER_BYTES, 'publishing record')).content
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return { records: [] }
+    throw err
+  }
+  // A record that cannot be read is never taken for "not published": that
+  // would open a second pull request for a piece already on its way.
+  const parsed = JSON.parse(raw) as { records?: unknown }
+  if (!parsed || !Array.isArray(parsed.records) || !parsed.records.every(isPublishRecord)) {
+    throw new Error(`the publishing record beside ${canonicalSlug(slug)} is unreadable`)
+  }
+  return { records: parsed.records }
+}
+
+export async function writePublishLedger(slug: string, ledger: PublishLedger): Promise<void> {
+  const body = JSON.stringify({ records: ledger.records }, null, 2)
+  if (Buffer.byteLength(body, 'utf-8') > MAX_PUBLISH_LEDGER_BYTES) {
+    throw new Error(`publishing record too large (max ${MAX_PUBLISH_LEDGER_BYTES} bytes)`)
+  }
+  await editorReady
+  const path = publishLedgerFileFor(slug)
+  await serializeMutation(path, async () => {
+    // A doc deleted while it was being published takes its record with it:
+    // none is written again for it. Its pull requests stay.
+    await stat(fileFor(slug))
+    await writeAtomic(path, body)
+  })
+}
+
+const PUBLISH_LOCK_PATH = join(EDITOR_DIR, '.poise-publish-lock.sqlite3')
+const PUBLISH_LOCK_TIMEOUT_MS = 30_000
+
+/**
+ * One publication at a time across every Poise process sharing this Editor
+ * folder: each reads a document's record, publishes, and writes it back, so
+ * two at once would each write over the other's pull requests.
+ */
+export async function withPublishLock<T>(operation: () => Promise<T>, timeoutMs = PUBLISH_LOCK_TIMEOUT_MS): Promise<T> {
+  await editorReady
+  return withProcessLock({
+    path: PUBLISH_LOCK_PATH,
+    timeoutMs,
+    unavailableMessage: 'the publishing lock is unavailable',
+    timeoutMessage: 'Another Poise is publishing from this Editor folder; try again once it has finished.',
+  }, operation)
 }

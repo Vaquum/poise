@@ -18,6 +18,7 @@ import { productionSummary, type ProductionUpdate } from './production-status'
 import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, type ConnectedAccount } from '../server/accounts/types'
 import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
+import { publishingSection, type PublishingSection } from './views/publishing-settings'
 import { sendLatest } from './notices'
 import './views/connected-accounts.css'
 import type { TerminalPanel } from './views/terminal-panel'
@@ -56,6 +57,7 @@ interface ModelsResponse {
 interface ModelPreset { name: string, models: Record<string, ModelChoice>, savedAt: string }
 
 let panelEl: HTMLElement | null = null
+let publishing: PublishingSection | null = null
 let orgInput: HTMLInputElement | null = null
 let meInput: HTMLInputElement | null = null
 let agentInput: HTMLInputElement | null = null
@@ -822,7 +824,7 @@ function timezoneOptions(): string[] {
   return ['UTC', 'Europe/Helsinki', 'Europe/London', 'Europe/Berlin', 'America/New_York', 'America/Los_Angeles', 'Asia/Tokyo', 'Asia/Singapore']
 }
 
-export type SettingsSection = 'general' | 'models' | 'accounts' | 'admin'
+export type SettingsSection = 'general' | 'models' | 'accounts' | 'publishing' | 'admin'
 
 function selectSection(panel: HTMLElement, tab: SettingsSection) {
   if (!panel.querySelector(`.st-tab[data-tab="${tab}"]`)) return
@@ -833,9 +835,10 @@ function selectSection(panel: HTMLElement, tab: SettingsSection) {
   for (const section of panel.querySelectorAll<HTMLElement>('.st-tab')) {
     section.hidden = section.dataset.tab !== tab
   }
-  panel.querySelector<HTMLElement>('.st-footer')!.hidden = tab === 'accounts' || tab === 'admin'
+  panel.querySelector<HTMLElement>('.st-footer')!.hidden = tab === 'accounts' || tab === 'publishing' || tab === 'admin'
   if (panel.classList.contains('open')) {
     if (tab === 'accounts') void loadAccounts()
+    if (tab === 'publishing') void publishing?.refresh()
   }
   window.dispatchEvent(new CustomEvent('poise:settings-section-changed', { detail: { section: tab } }))
 }
@@ -989,6 +992,8 @@ function buildPanel(): HTMLElement {
         </div>
       </section>
 
+      <section class="st-tab" data-tab="publishing" hidden></section>
+
       </div>
       <div class="st-row st-footer">
         <button class="st-save" type="button">Save</button>
@@ -1018,6 +1023,8 @@ function buildPanel(): HTMLElement {
   panel.querySelector('.st-preset-save')!.addEventListener('click', () => { void presetAction(savePreset) })
   panel.querySelector('.st-preset-use')!.addEventListener('click', () => { void presetAction(usePreset) })
   panel.querySelector('.st-preset-delete')!.addEventListener('click', () => { void presetAction(deletePreset) })
+  publishing = publishingSection()
+  panel.querySelector('.st-tab[data-tab="publishing"]')!.append(publishing.element)
   accountsEl = panel.querySelector('.st-accounts')
   accountsStatusEl = panel.querySelector('.st-accounts-status')
   terminalSlot = panel.querySelector('.st-terminal-slot')
@@ -1099,6 +1106,11 @@ export function initSettings() {
     selectSection(panelEl, 'accounts')
     void connect(preset)
   })
+  // A destination asked for from elsewhere (the Editor's Publish panel).
+  window.addEventListener('poise:open-settings', (event) => {
+    const section = (event as CustomEvent<{ section?: string }>).detail?.section
+    if (section && panelEl?.querySelector(`.st-tab[data-tab="${CSS.escape(section)}"]`)) openSettingsAt(section as SettingsSection)
+  })
   openFromAddress()
 }
 
@@ -1114,6 +1126,7 @@ export function openSettingsPanel() {
   if (panelEl.dataset.section === 'general') void loadProduction()
   void pollOrganizations()
   if (accountsTabSelected()) void loadAccounts()
+  if (panelEl.dataset.section === 'publishing') void publishing?.refresh()
 }
 
 /** Direct destination from the menu, a notification or a gateway link. */
