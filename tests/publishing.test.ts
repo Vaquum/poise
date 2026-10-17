@@ -227,6 +227,8 @@ describe('a document as a post', () => {
     expect(parsePost(file)).toEqual({ data: { title: 'A "quoted" title', date: '2026-10-17', tags: ['a'] }, body: 'Text.' })
     expect(parsePost('No frontmatter here.\n')).toEqual({ data: {}, body: 'No frontmatter here.' })
     expect(parsePost('---\n---\nBody\n')).toEqual({ data: {}, body: 'Body' })
+    // The frontmatter ends at its first closing line, even an empty one.
+    expect(parsePost('---\n---\n\n---\n---\nAfter.\n')).toEqual({ data: {}, body: '---\n---\nAfter.' })
     expect(parsePost('---\ntitle: a---\nstill frontmatter: yes\n---\nBody')).toEqual({ data: { title: 'a---', 'still frontmatter': 'yes' }, body: 'Body' })
   })
 })
@@ -256,6 +258,14 @@ describe('publishing again', () => {
     expect(merged.data).toMatchObject({ constructor: 'kept', toString: 'kept too' })
     const odd = parsePublishConfig(MIKKO.replace('      tags:', '      constructor: { kind: text }\n      tags:')).sections[0]
     expect(() => fillPost(odd, 'a-better-question', {}, context())).not.toThrow()
+  })
+
+  it('keeps a text that opens like frontmatter as text', () => {
+    const text = '---\n---\nAfter two rules.'
+    expect(renderPost({}, text)).toBe(`---\n---\n\n${text}\n`)
+    expect(parsePost(renderPost({}, text))).toEqual({ data: {}, body: text })
+    expect(parsePost(renderPost({ title: 'T' }, text))).toEqual({ data: { title: 'T' }, body: text })
+    expect(renderPost({}, '---\nNo closing line.')).toBe('---\nNo closing line.\n')
   })
 
   it('names no field or place key __proto__, and keeps a key of that name the site has', () => {

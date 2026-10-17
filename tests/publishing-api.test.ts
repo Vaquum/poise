@@ -757,6 +757,20 @@ sections:
     expect(calls.slice(before).filter((call) => call.args.includes('POST') && call.args[1].startsWith('repos/acme/beta/'))).toEqual([])
   })
 
+  it('publishes a text that opens with two rules, and reads it back whole', async () => {
+    addRepo('acme/bare', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/bare' })
+    await request('/api/publishing/sites/acme/bare/description', 'PUT', { description: 'version: 1\nsite: Bare\nsections:\n  - name: Pages\n    path: pages/{slug}.md\n    slug: "^[a-z0-9-]+$"\n' })
+    await writeDocument(DOC, '---\n---\nAfter two rules.\n')
+    const bare = { repo: 'acme/bare', section: 'Pages', slug: 'two-rules', values: {} }
+    expect((await publish([bare])).body.results[0].ok).toBe(true)
+    expect(fileOn('acme/bare', 'publish/two-rules', 'pages/two-rules.md')).toBe('---\n---\n\n---\n---\nAfter two rules.\n')
+    // Published again unchanged, nothing is committed: the rules are still the text.
+    const committed = calls.filter((call) => call.args[1] === 'graphql').length
+    expect((await publish([bare])).body.results[0]).toMatchObject({ ok: true, unchanged: true })
+    expect(calls.filter((call) => call.args[1] === 'graphql')).toHaveLength(committed)
+  })
+
   it('refuses a publication whose record would pass 1 MB on the way, not only at the end', async () => {
     for (const [repo, site] of [['acme/notes', 'Notes'], ['acme/more', 'More notes']]) {
       addRepo(repo, {})

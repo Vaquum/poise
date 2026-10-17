@@ -68,7 +68,8 @@ is on, from `item`, a template or keys with templates using `{site}` and
 `{url}`; `self` is this site's own entry. An empty value leaves its key out.
 
 Strings in the frontmatter are written quoted, so a date stays text for YAML
-1.1 readers too. A description with an unknown key, a missing part or a
+1.1 readers too. A post with no frontmatter whose text opens like frontmatter
+(two `---` lines, say) gets an empty one ahead of it, so it stays text. A description with an unknown key, a missing part or a
 pattern that is not a regular expression is refused, and the message names
 the key. A description is at most 64 KB.
 

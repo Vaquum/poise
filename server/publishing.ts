@@ -524,10 +524,13 @@ export function placeUrl(section: PublishSection, slug: string, date: string): s
 
 export function renderPost(frontmatter: Record<string, unknown>, body: string): string {
   const text = normalizeBody(body)
-  if (!Object.keys(frontmatter).length) return `${text}\n`
+  // A text that opens as frontmatter would be read as frontmatter: an empty
+  // one ahead of it keeps it text.
+  const fields = Object.keys(frontmatter).length > 0
+  if (!fields && !FRONTMATTER.test(text)) return `${text}\n`
   // Every string is quoted: a date left bare is read as a date, not text, by
   // the YAML 1.1 readers many site generators use.
-  const head = stringifyYaml(frontmatter, { defaultStringType: 'QUOTE_DOUBLE', defaultKeyType: 'PLAIN', lineWidth: 0 })
+  const head = fields ? stringifyYaml(frontmatter, { defaultStringType: 'QUOTE_DOUBLE', defaultKeyType: 'PLAIN', lineWidth: 0 }) : ''
   return `---\n${head}---\n${text ? `\n${text}\n` : ''}`
 }
 
@@ -536,8 +539,9 @@ export interface PostFile {
   body: string
 }
 
-// The fences are whole lines; the frontmatter between them may be empty.
-const FRONTMATTER = /^---[ \t]*\r?\n(?:([\s\S]*?)\r?\n)?---[ \t]*(?:\r?\n|$)/
+// The fences are whole lines; the frontmatter between them may be empty, and
+// ends at the first closing line.
+const FRONTMATTER = /^---[ \t]*\r?\n(?:([\s\S]*?)\r?\n)??---[ \t]*(?:\r?\n|$)/
 
 /** A post's frontmatter and text, as the site has it now. */
 export function parsePost(source: string): PostFile {
