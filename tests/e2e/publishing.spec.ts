@@ -534,7 +534,25 @@ test('leaves out an optional date the writer clears', async ({ page }) => {
   await date.fill('')
   await dialog.getByRole('button', { name: 'Update', exact: true }).click()
   await expect(dialog.getByRole('alert')).toContainText('Not now.')
-  expect(sent[0].destinations[0].values).not.toHaveProperty('date')
+  expect(sent[0].destinations[0].values.date).toBe('')
+})
+
+test('keeps a date cleared when it was published left out', async ({ page }) => {
+  await workspace(page)
+  const loose = {
+    repo: 'acme/loose', state: 'ready', source: 'settings', site: 'Loose', description: 'version: 1\n',
+    sections: [{ name: 'Posts', url: 'https://loose.example/{slug}/', firstLine: 'title', dated: true, fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'date', kind: 'date', required: false },
+    ] }],
+  }
+  // Cleared when it was published: its path still went by a date.
+  const sent = await openEditor(page, [loose], notNow, [{ ...publication(loose, 7, { title: 'A better question', date: '' }), date: '2026-10-17' }])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.getByLabel('Date', { exact: true })).toHaveValue('')
+  await dialog.getByRole('button', { name: 'Update', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values.date).toBe('')
 })
 
 test('keeps the date a site went by when its fixed date has become editable', async ({ page }) => {

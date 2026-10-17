@@ -203,8 +203,10 @@ function dateFor(s: State, choice: Choice): string {
   const field = choice.section.fields.find((f) => f.name === sharedField(choice.section, 'date'))
   const publication = livePublicationOf(s, choice.key)
   if (field && publication) {
-    // The date it went by, one the site fixed when it was published too.
+    // Cleared when it was published: left out still. Otherwise the date it
+    // went by, one the site fixed when it was published too.
     const saved = savedValue(publication.values, field.name)
+    if (saved === '') return ''
     const own = typeof saved === 'string' && saved ? saved : publication.date
     if (own) return own
   }
@@ -370,8 +372,10 @@ function destinationFor(s: State, choice: Choice): Destination {
   for (const field of ownFields(choice.section)) values[field.name] = s.values.get(choice.key)![field.name]
   for (const which of ['title', 'description', 'date'] as const) {
     const field = sharedField(choice.section, which)
-    const value = which === 'date' ? dateFor(s, choice) : s.shared[which]
-    if (field && value) values[field] = value
+    if (!field) continue
+    // A date is always sent: an empty one is one the writer cleared, and stays so.
+    if (which === 'date') values[field] = dateFor(s, choice)
+    else if (s.shared[which]) values[field] = s.shared[which]
   }
   return { repo: choice.site.repo, section: choice.section.name, slug: (s.slugs.get(choice.key) ?? '').trim(), values }
 }
