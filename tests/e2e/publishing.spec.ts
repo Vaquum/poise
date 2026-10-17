@@ -634,6 +634,27 @@ test('leaves a later date field, an expiry, to its site', async ({ page }) => {
   expect(sent[0].destinations.find((d: any) => d.repo === 'acme/expiring').values.expires).toBe('2026-12-31')
 })
 
+test('shows, and sends, the default of a later date field when it is cleared', async ({ page }) => {
+  await workspace(page)
+  const expiring = {
+    repo: 'acme/expiring', state: 'ready', source: 'settings', site: 'Expiring', description: 'version: 1\n',
+    sections: [{ name: 'Posts', url: 'https://expiring.example/{slug}/', firstLine: 'title', dateField: 'published', fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'expires', kind: 'date', required: false, default: '2026-12-31' },
+    ] }],
+  }
+  const sent = await openEditor(page, [expiring], notNow)
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  const expires = dialog.getByLabel('Expires', { exact: true })
+  await expires.fill('2027-02-01')
+  await expires.fill('')
+  // Cleared, it is the site's default, as the site would write it.
+  await expect(expires).toHaveValue('2026-12-31')
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values.expires).toBe('2026-12-31')
+})
+
 test('replaces the row it saved when its repository has been renamed', async ({ page }) => {
   await workspace(page)
   let sites: unknown[] = [MISSING]
@@ -676,4 +697,39 @@ test('keeps a description being written when its site turns out renamed', async 
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:open-settings', { detail: { section: 'publishing' } })))
   await expect(rows.nth(0)).toContainText('acme/diary')
   await expect(rows.nth(0).getByLabel('publish.yaml for acme/diary')).toHaveValue('version: 1\nsite: Typed here\n')
+})
+
+test('keeps a description being written with its site by its id, never with a repository that took its old name', async ({ page }) => {
+  await workspace(page)
+  let reads = 0
+  const saved: Array<{ path: string, body: unknown }> = []
+  await page.route('**/api/publishing/sites**', async (route) => {
+    const request = route.request()
+    if (request.method() === 'PUT') {
+      saved.push({ path: new URL(request.url()).pathname, body: request.postDataJSON() })
+      return route.fulfill({ json: { site: { ...JOURNAL, id: 1, repo: 'acme/diary' } } })
+    }
+    reads++
+    // Read again, the repository has a new name, and another repository has its old one.
+    const sites = reads === 1 ? [{ ...MISSING, id: 1 }] : [
+      { ...MISSING, id: 1, repo: 'acme/diary', formerly: ['acme/journal'], problem: 'acme/diary has no publish.yaml. Add one to the repository, or describe the site here.' },
+      { ...MISSING, id: 2 },
+    ]
+    return route.fulfill({ json: { sites } })
+  })
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover').getByRole('button', { name: 'Publishing', exact: true }).click()
+  const panel = page.locator('#settings-panel')
+  const rows = panel.locator('.pb-site')
+  await rows.nth(0).getByRole('button', { name: 'Describe' }).click()
+  await rows.nth(0).getByLabel('publish.yaml for acme/journal').fill('version: 1\nsite: Typed here\n')
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:open-settings', { detail: { section: 'publishing' } })))
+  await expect(rows).toHaveCount(2)
+  await expect(rows.nth(0).getByLabel('publish.yaml for acme/diary')).toHaveValue('version: 1\nsite: Typed here\n')
+  // The repository that has the old name now holds no draft of it.
+  await expect(rows.nth(1).locator('.pb-description')).toHaveCount(0)
+  await expect(rows.nth(1).getByRole('button', { name: 'Describe' })).toBeVisible()
+  await rows.nth(0).getByRole('button', { name: 'Save' }).click()
+  await expect(rows.nth(0).locator('.pb-site-state')).toHaveText('Ready · described here')
+  expect(saved).toEqual([{ path: '/api/publishing/sites/acme/diary/description', body: { description: 'version: 1\nsite: Typed here\n', id: 1 } }])
 })

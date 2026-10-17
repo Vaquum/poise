@@ -127,8 +127,9 @@ export async function removeSite(repo: string): Promise<void> {
   changed()
 }
 
-export async function describeSite(repo: string, description: string): Promise<SiteView> {
-  const { site } = await call<{ site: SiteView }>(`${sitePath(repo)}/description`, 'PUT', { description })
+/** `id` is the site's repository's id where known: the description goes to that site, whatever its name is now. */
+export async function describeSite(repo: string, description: string, id?: number): Promise<SiteView> {
+  const { site } = await call<{ site: SiteView }>(`${sitePath(repo)}/description`, 'PUT', { description, ...(id ? { id } : {}) })
   changed()
   return site
 }

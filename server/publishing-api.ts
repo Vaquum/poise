@@ -356,9 +356,13 @@ async function removeSite(repo: string): Promise<{ ok: true }> {
   return { ok: true }
 }
 
-async function describeSite(repo: string, value: unknown): Promise<{ site: SiteView }> {
+async function describeSite(repo: string, value: unknown, id?: unknown): Promise<{ site: SiteView }> {
   if (typeof value !== 'string') throw new HttpError(400, 'The description is the text of a publish.yaml.')
-  const site = await findSite(repo)
+  if (id !== undefined && !(typeof id === 'number' && Number.isSafeInteger(id) && id > 0)) throw new HttpError(400, 'A site\'s id is its repository\'s GitHub id.')
+  // The site it was written for, by its repository's id where that is given:
+  // renamed since, another repository may have the name it was written under.
+  const site = id ? storedSites().find((s) => s.id === id) : await findSite(repo)
+  if (!site) throw new HttpError(404, `${repo} is not one of your publishing sites.`)
   const description = value.trim() ? value : undefined
   // Kept only when it reads: the box keeps the text, and the error, until then.
   if (description !== undefined) parsePublishConfig(description)
@@ -802,6 +806,10 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     addresses.set(r, placeUrl(section, r.slug, date))
   }))
 
+  // The address each site published now went to, once it is known: dated as
+  // its file is, a date a maintainer changed meanwhile included.
+  const wentTo = new Map<string, string>()
+
   // Every place the piece is published, the original first: where it is live
   // already, in the order it went there, then the sites it goes to now.
   const placesFor = (going: Target[]): Place[] => {
@@ -820,7 +828,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     for (const target of going) {
       const { destination, section, ready } = target
       const date = dates.get(target.key) ?? postDate(section, destination.values, todayValue, target.since)
-      const place = { key: target.key, site: ready.config.site, url: placeUrl(section, destination.slug, date) }
+      const place = { key: target.key, site: ready.config.site, url: wentTo.get(target.key) ?? placeUrl(section, destination.slug, date) }
       const at = places.findIndex((p) => p.key === target.key)
       if (at >= 0) places[at] = place
       else places.push(place)
@@ -872,6 +880,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
         going = going.filter((t) => t !== target)
         continue
       }
+      wentTo.set(target.key, kept.url)
       published.push({ target, record: kept, places, state: outcome.state })
     } catch (error) {
       if (!(error instanceof PublishValueError || error instanceof PublishConflictError || error instanceof PostFileError || error instanceof GitHubError || error instanceof HttpError)) throw error
@@ -1205,7 +1214,10 @@ export async function handlePublishingApi(req: IncomingMessage, res: ServerRespo
     if (path === SITES && method === 'GET') return send(200, await listSites())
     if (path === SITES && method === 'POST') return send(200, await addSite((await readJson<{ repo?: unknown }>(req)).repo))
     if (site && !site[3] && method === 'DELETE') return send(200, await removeSite(`${site[1]}/${site[2]}`))
-    if (site && site[3] && method === 'PUT') return send(200, await describeSite(`${site[1]}/${site[2]}`, (await readJson<{ description?: unknown }>(req)).description))
+    if (site && site[3] && method === 'PUT') {
+      const body = await readJson<{ description?: unknown, id?: unknown }>(req)
+      return send(200, await describeSite(`${site[1]}/${site[2]}`, body?.description, body?.id))
+    }
     if (document && document[2] === 'publishing' && method === 'GET') return send(200, await documentPublishing(document[1]))
     if (document && document[2] === 'publish' && method === 'POST') return send(200, await publishDocument(document[1], await readJson(req)))
     return send(405, { error: `${method} is not used here.` })

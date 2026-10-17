@@ -22,6 +22,8 @@ interface Draft {
   text: string
   error: string
   saving: boolean
+  /** The site's repository's id, where known: the draft stays with that site through a rename. */
+  id?: number
 }
 
 /** Whether the site is described here rather than by its repository. */
@@ -110,14 +112,16 @@ export function publishingSection(): PublishingSection {
       if (mine !== generation) return
       sites = next
       loaded = true
-      // A site renamed since: a description being written for it under its old name stays with it.
+      // A site renamed since: a description being written for it stays with
+      // it, by its repository's id, never with another repository that has
+      // its old name now. Without an id, by its name or one it had.
       for (const [repo, draft] of [...drafts]) {
-        if (sites.some((s) => s.repo === repo)) continue
-        const site = sites.find((s) => s.formerly?.some((name) => name.toLowerCase() === repo.toLowerCase()))
-        if (site && !drafts.has(site.repo)) {
-          drafts.delete(repo)
-          drafts.set(site.repo, draft)
-        }
+        const site = draft.id
+          ? sites.find((s) => s.id === draft.id)
+          : sites.find((s) => s.repo === repo) ?? sites.find((s) => s.formerly?.some((name) => name.toLowerCase() === repo.toLowerCase()))
+        if (site?.repo === repo || (!draft.id && !site)) continue
+        drafts.delete(repo)
+        if (site && !drafts.has(site.repo)) drafts.set(site.repo, draft)
       }
       if (status.classList.contains('st-help-error')) say('')
     } catch (error) {
@@ -150,7 +154,7 @@ export function publishingSection(): PublishingSection {
       loaded = true
       input.value = ''
       say('')
-      if (site.state === 'missing') drafts.set(site.repo, { text: starterDescription(site.repo), error: '', saving: false })
+      if (site.state === 'missing') drafts.set(site.repo, { text: starterDescription(site.repo), error: '', saving: false, ...(site.id ? { id: site.id } : {}) })
       render()
     } catch (error) {
       say((error as Error).message, 'error')
@@ -168,7 +172,7 @@ export function publishingSection(): PublishingSection {
     draft.error = ''
     render()
     try {
-      const site = await describeSite(repo, draft.text)
+      const site = await describeSite(repo, draft.text, draft.id)
       generation++
       // Only this draft, never one opened since.
       if (drafts.get(repo) === draft) drafts.delete(repo)
@@ -211,7 +215,7 @@ export function publishingSection(): PublishingSection {
     if (!repo) return
     if (target.closest('[data-describe]')) {
       const site = sites.find((s) => s.repo === repo)
-      drafts.set(repo, { text: site?.description ?? starterDescription(repo), error: '', saving: false })
+      drafts.set(repo, { text: site?.description ?? starterDescription(repo), error: '', saving: false, ...(site?.id ? { id: site.id } : {}) })
       render()
       list.querySelector<HTMLTextAreaElement>(`[data-key="${CSS.escape(repo)}"] .pb-description`)?.focus()
     } else if (target.closest('[data-cancel]')) {

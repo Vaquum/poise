@@ -464,6 +464,16 @@ function onInput(event: Event): void {
       render()
     } else {
       own[name] = target.type === 'checkbox' ? target.checked : target.value
+      // A date with a default, cleared once the change is made, is written
+      // with its default, as the shared date is: the control shows it.
+      if (event.type === 'change' && target.type === 'date' && !target.value) {
+        const field = s.choices.find((c) => c.key === key)?.section.fields.find((f) => f.name === name)
+        const fallback = field?.default === 'today' ? s.doc.today : typeof field?.default === 'string' ? field.default : ''
+        if (fallback) {
+          own[name] = fallback
+          render()
+        }
+      }
     }
   } else if (target.dataset.choose) {
     if (target.checked) s.chosen.add(target.dataset.choose)

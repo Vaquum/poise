@@ -1348,6 +1348,48 @@ sections:
     expect((await editor!.readPublishLedger(DOC)).records.map((r) => [r.repo, r.headRepo])).toEqual([['acme/diary', 'acme/diary']])
   })
 
+  it('names the original where it went when the site redates it while it is published', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = { repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date: '2026-10-17' } }
+    expect((await publish([dated])).body.results[0].ok).toBe(true)
+    merge('acme/dated', 101)
+    // A maintainer redates the piece just as it is published again, after its date was read.
+    let redated = false
+    failOn = (method, endpoint) => {
+      if (method === 'GET' && endpoint === 'repos/acme/dated/git/ref/heads/main' && !redated) {
+        redated = true
+        editOnSite('acme/dated', 'main', 'posts/a-better-question.md', (text) => text.replace('date: "2026-10-17"', 'date: "2025-03-01"'))
+      }
+      return null
+    }
+    const results = (await publish([dated, { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([true, true])
+    expect(results[0].publication.url).toBe('https://dated.example/2025/a-better-question/')
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2025/a-better-question/"')
+  })
+
+  it('saves a description for the site it was written for, by its id, once another repository has its old name', async () => {
+    addRepo('acme/journal', {})
+    const first = (await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })).body.site
+    const renamed = repos.get('acme/journal')!
+    renamed.fullName = 'acme/diary'
+    repos.set('acme/diary', renamed)
+    ;(await import('../server/publishing-api')).forgetSites()
+    expect((await request('/api/publishing/sites')).body.sites[1].repo).toBe('acme/diary')
+    addRepo('acme/journal', {})
+    expect((await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })).status).toBe(200)
+    // Written for the journal before its rename and saved under that name, with its id: it goes to the diary.
+    expect((await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML, id: first.id })).body.site).toMatchObject({ repo: 'acme/diary', site: 'Other Journal' })
+    expect((await request('/api/publishing/sites')).body.sites.map((s: any) => [s.repo, s.state])).toEqual([['mikkokotila/mikkokotila-com', 'ready'], ['acme/diary', 'ready'], ['acme/journal', 'missing']])
+    expect((await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML, id: 999999 })).status).toBe(404)
+    expect((await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML, id: 'x' })).status).toBe(400)
+  })
+
   it('links a renamed site\'s pull request where GitHub has it now, once another repository takes the old name', async () => {
     addRepo('acme/journal', {})
     await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
