@@ -652,16 +652,14 @@ test('keeps a description being written when its site turns out renamed', async 
     const sites = reads === 1 ? [MISSING] : [{ ...MISSING, repo: 'acme/diary', formerly: ['acme/journal'], problem: 'acme/diary has no publish.yaml. Add one to the repository, or describe the site here.' }]
     return route.fulfill({ json: { sites } })
   })
-  const open = async () => {
-    await page.getByRole('button', { name: 'Menu', exact: true }).click()
-    await page.locator('#menu-popover').getByRole('button', { name: 'Publishing', exact: true }).click()
-  }
-  await open()
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover').getByRole('button', { name: 'Publishing', exact: true }).click()
   const panel = page.locator('#settings-panel')
   const rows = panel.locator('.pb-site')
   await rows.nth(0).getByRole('button', { name: 'Describe' }).click()
   await rows.nth(0).getByLabel('publish.yaml for acme/journal').fill('version: 1\nsite: Typed here\n')
-  await open()
+  // Opened again, as the Editor's Publish panel opens it: the sites are read again.
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:open-settings', { detail: { section: 'publishing' } })))
   await expect(rows.nth(0)).toContainText('acme/diary')
   await expect(rows.nth(0).getByLabel('publish.yaml for acme/diary')).toHaveValue('version: 1\nsite: Typed here\n')
 })
