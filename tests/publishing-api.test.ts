@@ -1288,6 +1288,26 @@ sections:
     expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
   })
 
+  it('never takes a repository that has since taken a renamed site\'s old name for that site', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const renamed = repos.get('acme/journal')!
+    renamed.fullName = 'acme/diary'
+    repos.set('acme/diary', renamed)
+    ;(await import('../server/publishing-api')).forgetSites()
+    expect((await request('/api/publishing/sites')).body.sites[1].repo).toBe('acme/diary')
+    // A new repository takes the old name, and is added as a site of its own.
+    addRepo('acme/journal', {})
+    expect((await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })).status).toBe(200)
+    expect((await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: NOTES_YAML })).status).toBe(200)
+    const sites = (await request('/api/publishing/sites')).body.sites
+    expect(sites.map((s: any) => [s.repo, s.site])).toEqual([['mikkokotila/mikkokotila-com', 'mikkokotila.com'], ['acme/diary', 'Other Journal'], ['acme/journal', 'Notes']])
+    expect(sites[1].formerly).toBeUndefined()
+    expect((await request('/api/publishing/sites/acme/journal', 'DELETE')).status).toBe(200)
+    expect((await request('/api/publishing/sites')).body.sites.map((s: any) => s.repo)).toEqual(['mikkokotila/mikkokotila-com', 'acme/diary'])
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

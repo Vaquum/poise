@@ -67,9 +67,14 @@ interface StoredSite {
   formerly?: string[]
 }
 
-/** Whether a stored site goes, or went, by a name. */
-function named(site: StoredSite, name: string): boolean {
-  return [site.repo, ...(site.formerly ?? [])].some((n) => n.toLowerCase() === name.toLowerCase())
+/**
+ * The stored site going by any of these names: by its name now first, so a
+ * repository that has since taken a renamed site's old name is never taken
+ * for it; then by a name it had before a rename.
+ */
+function siteByName(sites: StoredSite[], names: string[]): StoredSite | undefined {
+  const is = (n: string) => names.some((name) => name.toLowerCase() === n.toLowerCase())
+  return sites.find((s) => is(s.repo)) ?? sites.find((s) => (s.formerly ?? []).some(is))
 }
 
 /* ---------------------------------------------------------------- the sites */
@@ -116,7 +121,7 @@ function renameSite(from: string, to: string): void {
  * the panel may hold one until they read the sites again.
  */
 async function siteNamed(name: string, sites = storedSites()): Promise<StoredSite | undefined> {
-  const direct = sites.find((s) => named(s, name))
+  const direct = siteByName(sites, [name])
   if (direct) return direct
   const session = await signIn(getMeta('me') || '').catch((error: unknown) => {
     if (error instanceof HttpError) return null
@@ -315,7 +320,11 @@ async function addSite(value: unknown): Promise<{ site: SiteView }> {
   // Read again after GitHub's answer: another add may have finished meanwhile.
   updateSites((sites) => {
     if (sites.some((s) => [name, info.fullName].some((n) => s.repo.toLowerCase() === n.toLowerCase()))) throw new HttpError(409, `${info.fullName} is already one of your sites.`)
-    return [...sites, site]
+    // A renamed site's old name, now another repository's: no longer one of its names.
+    const pruned = sites.map((s) => (s.formerly?.some((n) => n.toLowerCase() === info.fullName.toLowerCase())
+      ? { ...s, formerly: s.formerly.filter((n) => n.toLowerCase() !== info.fullName.toLowerCase()) }
+      : s))
+    return [...pruned, site]
   })
   forgetSites()
   return { site: (await cachedSite(session, site)).view }
@@ -426,7 +435,7 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
   const { records } = await readPublishLedger(slug)
   const session = records.length ? await signIn(getMeta('me') || '') : null
   const sites = records.length ? storedSites() : []
-  const siteOf = (names: string[]) => sites.find((s) => names.some((n) => named(s, n)))
+  const siteOf = (names: string[]) => siteByName(sites, names)
   const publications = await Promise.all(records.map(async (record): Promise<PublicationView> => {
     const recorded = record.repo
     const view: PublicationView = {
@@ -722,7 +731,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     const state = states.get(key)
     const reached = state === 'open' || (state === 'merged' && !missed.has(key))
     if (state === 'unknown' || (r.unconfirmed && !reached)) return
-    const stored = sites.find((site) => named(site, r.repo) || named(site, recordedAs.get(r) ?? r.repo))
+    const stored = siteByName(sites, [r.repo, recordedAs.get(r) ?? r.repo])
     const ready = targets.find((t) => t.key === key)?.ready ?? (stored && (await readSite(session, stored)).ready)
     const section = ready?.config.sections.find((sec) => sec.name === r.section)
     // A site that has moved to another branch since the piece went where it is: its record says where it was.
