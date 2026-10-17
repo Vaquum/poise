@@ -14,7 +14,7 @@ vi.mock('../server/process', async (original) => ({
 
 /* ---------------------------------------------------------------- a GitHub in memory, as gh api answers */
 
-interface Pull { number: number, state: 'open' | 'closed', merged: boolean, head: string, headRepo: string, base: string, title: string, body: string }
+interface Pull { number: number, state: 'open' | 'closed', merged: boolean, head: string, headRepo: string, base: string, title: string, body: string, mergedSha?: string }
 interface Repo { fullName: string, owner: string, defaultBranch: string, push: boolean, branches: Map<string, string>, pulls: Map<number, Pull> }
 
 let repos: Map<string, Repo>
@@ -26,6 +26,8 @@ let ghFailure: string | null
 let failOn: ((method: string, endpoint: string) => number | null) | null
 /** Runs once, just before the next commit is applied: a merge, or a look at what holds meanwhile. */
 let beforeCommit: (() => Promise<void> | void) | null
+/** Runs once, just after the next commit is applied. */
+let afterCommit: (() => void) | null
 
 function commit(files: Map<string, string>): string {
   const sha = (++commitCount).toString(16).padStart(40, '0')
@@ -62,7 +64,7 @@ function merge(fullName: string, number: number): void {
   const pull = repo.pulls.get(number)!
   const from = repos.get(pull.headRepo.toLowerCase())!
   repo.branches.set(pull.base, from.branches.get(pull.head)!)
-  Object.assign(pull, { state: 'closed', merged: true })
+  Object.assign(pull, { state: 'closed', merged: true, mergedSha: from.branches.get(pull.head)! })
 }
 
 const http = (status: number, body?: unknown) => `HTTP/2.0 ${status} X\r\nContent-Type: application/json\r\n\r\n${body === undefined ? '' : JSON.stringify(body)}`
@@ -74,7 +76,8 @@ function answer(status: number, body?: unknown) {
 }
 
 const pullJson = (repo: Repo, pull: Pull) => ({
-  number: pull.number, state: pull.state, merged: pull.merged, html_url: `https://github.com/${repo.fullName}/pull/${pull.number}`, head: { ref: pull.head },
+  number: pull.number, state: pull.state, merged: pull.merged, html_url: `https://github.com/${repo.fullName}/pull/${pull.number}`,
+  head: { ref: pull.head, sha: pull.mergedSha ?? repos.get(pull.headRepo.toLowerCase())!.branches.get(pull.head) ?? '' },
 })
 
 async function gh(command: string, args: string[], options: RunFileOptions = {}) {
@@ -104,6 +107,11 @@ async function gh(command: string, args: string[], options: RunFileOptions = {})
     for (const addition of change.fileChanges.additions) files.set(addition.path, Buffer.from(addition.contents, 'base64').toString('utf8'))
     const oid = commit(files)
     repo.branches.set(change.branch.branchName, oid)
+    if (afterCommit) {
+      const hook = afterCommit
+      afterCommit = null
+      hook()
+    }
     return answer(200, { data: { createCommitOnBranch: { commit: { oid } } } })
   }
   const match = /^repos\/([^/]+\/[^/]+)(?:\/(.*))?$/.exec(endpoint.split('?')[0])!
@@ -252,6 +260,7 @@ beforeEach(async () => {
   ghFailure = null
   failOn = null
   beforeCommit = null
+  afterCommit = null
   addRepo('mikkokotila/mikkokotila-com', { 'publish.yaml': MIKKO_YAML, 'content/writing.yaml': WRITING_YAML })
   mocks.runFile.mockReset().mockImplementation(gh)
   vi.resetModules()
@@ -756,6 +765,52 @@ describe('publishing a document', () => {
     // Its open pull request could merge while the new 400,000 characters are committed.
     expect((await publish([note('y'.repeat(400_000))])).status).toBe(413)
     expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
+  it('names the address a date changed on the site gives, as the file keeps that date', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = { repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date: '2026-10-17' } }
+    expect((await publish([dated])).body.results[0].ok).toBe(true)
+    merge('acme/dated', 101)
+    // A maintainer dates it earlier on the site.
+    editOnSite('acme/dated', 'main', 'posts/a-better-question.md', (text) => text.replace('date: "2026-10-17"', 'date: "2025-03-01"'))
+    const results = (await publish([dated, { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results
+    expect(results[0]).toMatchObject({ ok: true, unchanged: true, publication: { url: 'https://dated.example/2025/a-better-question/' } })
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2025/a-better-question/"')
+  })
+
+  it("counts the larger of what landed and what is open when it checks the record's size", async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    const note = (text: string) => ({ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: text } })
+    expect((await publish([note('short')])).body.results[0].ok).toBe(true)
+    merge('acme/notes', 101)
+    expect((await publish([note('x'.repeat(400_000))])).body.results[0].publication.pullRequest.number).toBe(102)
+    const before = calls.length
+    // Open with 400,000 characters over a short landed note: a merge during the commit would land the long one.
+    expect((await publish([note('y'.repeat(400_000))])).status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
+  it('takes a merge that included this commit as the update landing', async () => {
+    await publish([writing()])
+    await writeDocument(DOC, TEXT.replace('More.', 'More, merged at once.'))
+    afterCommit = () => merge('mikkokotila/mikkokotila-com', 101)
+    const landed = (await publish([writing()])).body.results[0]
+    expect(landed).toMatchObject({ ok: true, publication: { pullRequest: { number: 101, state: 'merged' } } })
+    expect(repos.get('mikkokotila/mikkokotila-com')!.pulls.size).toBe(1)
+    // Back to the first version: a change of this document's, published.
+    await writeDocument(DOC, TEXT)
+    const reverted = (await publish([writing()])).body.results[0]
+    expect(reverted).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    const head = repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)!.head
+    expect(fileOn('mikkokotila/mikkokotila-com', head, POST)).not.toContain('merged at once')
   })
 
   it('says nothing changed when the site has this version already', async () => {

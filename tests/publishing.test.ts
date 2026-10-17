@@ -250,6 +250,14 @@ describe('publishing again', () => {
     expect(merged).toEqual({ data: { title: 'T', date: '2026-10-17' }, body: 'New text.', conflicts: [] })
   })
 
+  it('keeps a field the site added, whatever it is called', () => {
+    const merged = reconcile(base, { data: { title: 'T', tags: ['a'], date: '2026-10-17' }, body: 'Old text.' },
+      { data: { title: 'T', tags: ['a'], date: '2026-10-17', constructor: 'kept', toString: 'kept too' }, body: 'Old text.' })
+    expect(merged.data).toMatchObject({ constructor: 'kept', toString: 'kept too' })
+    const odd = parsePublishConfig(MIKKO.replace('      tags:', '      constructor: { kind: text }\n      tags:')).sections[0]
+    expect(() => fillPost(odd, 'a-better-question', {}, context())).not.toThrow()
+  })
+
   it('reports the same field, and the text, changed on both sides', () => {
     const merged = reconcile(base,
       { data: { title: 'T', tags: ['c'], date: '2026-10-17' }, body: 'Mine.' },

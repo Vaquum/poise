@@ -396,6 +396,11 @@ export interface FilledPost {
   frontmatter: Record<string, unknown>
 }
 
+/** A value given for a field, never one inherited: a field may be called constructor. */
+function own(values: Record<string, unknown>, name: string): unknown {
+  return Object.hasOwn(values, name) ? values[name] : undefined
+}
+
 function empty(value: unknown): boolean {
   return value === undefined || value === null || value === '' || (Array.isArray(value) && value.length === 0)
 }
@@ -455,7 +460,7 @@ function inputValue(field: PublishField, raw: unknown, problems: string[]): Fiel
 export function postDate(section: PublishSection, values: Record<string, unknown>, todayValue: string, fallback = todayValue): string {
   const field = section.fields.find((f) => f.kind === 'date')
   if (!field) return fallback
-  const given = values[field.name]
+  const given = own(values, field.name)
   const raw = field.value ?? (empty(given) ? (field.default === 'today' ? todayValue : field.default) : given)
   return typeof raw === 'string' && calendarDate(raw) ? raw : todayValue
 }
@@ -487,7 +492,8 @@ export function fillPost(section: PublishSection, slug: string, values: Record<s
     } else {
       // The document's first line stands for a title left empty, and is held
       // to the same limits as one typed.
-      const raw = empty(values[field.name]) && field.name === section.firstLine ? context.title : values[field.name]
+      const given = own(values, field.name)
+      const raw = empty(given) && field.name === section.firstLine ? context.title : given
       const known = problems.length
       value = inputValue(field, raw, problems)
       if (value === undefined && empty(raw)) value = field.default === 'today' && field.kind === 'date' ? context.today : field.default
@@ -579,9 +585,9 @@ export interface Reconciled extends PostFile {
 export function reconcile(base: PublishedState, ours: PostFile, theirs: PostFile): Reconciled {
   const conflicts: string[] = []
   const data: Record<string, unknown> = {}
-  const keys = [...Object.keys(ours.data), ...Object.keys(theirs.data).filter((key) => !(key in ours.data))]
+  const keys = [...Object.keys(ours.data), ...Object.keys(theirs.data).filter((key) => !Object.hasOwn(ours.data, key))]
   for (const key of keys) {
-    const mine = ours.data[key], site = theirs.data[key], was = base.data[key]
+    const mine = own(ours.data, key), site = own(theirs.data, key), was = own(base.data, key)
     let value: unknown
     if (same(mine, site) || same(site, was)) value = mine
     else if (same(mine, was)) value = site

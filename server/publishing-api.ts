@@ -470,6 +470,25 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     targets.push({ destination, ready: read.ready, section, key, previous, state, landed: previous && landedOf(previous) })
   }
 
+  // The date each publication going again will go by: a date the site
+  // changed and this document did not is the site's, as reconcile keeps it,
+  // and so is the address other sites name.
+  const dates = new Map<string, string>()
+  for (const target of targets) {
+    const field = target.section.fields.find((f) => f.kind === 'date')
+    if (!target.previous || !field) continue
+    const from = target.state === 'open' ? { repo: target.previous.headRepo, branch: target.previous.branch } : { repo: target.ready.repo, branch: target.ready.base }
+    const current = await fileAt(session, from.repo, target.previous.path, from.branch)
+    let theirs: unknown
+    try { theirs = current && parsePost(current.text).data[field.name] } catch (error) {
+      // publishTo reports a file that cannot be read, for its site.
+      if (!(error instanceof PostFileError)) throw error
+    }
+    const base = target.state === 'open' ? target.previous : target.landed ?? target.previous
+    const ours = postDate(target.section, target.destination.values, todayValue, target.previous.date)
+    if (typeof theirs === 'string' && theirs !== base.data[field.name] && ours === base.data[field.name]) dates.set(target.key, theirs)
+  }
+
   // Every place the piece is published, the original first: where it is live
   // already, in the order it went there, then the sites it goes to now.
   const placesFor = (going: Target[]): Place[] => {
@@ -482,7 +501,8 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       })
     for (const target of going) {
       const { destination, section, ready } = target
-      const place = { key: target.key, site: ready.config.site, url: placeUrl(section, destination.slug, postDate(section, destination.values, todayValue, target.previous?.date)) }
+      const date = dates.get(target.key) ?? postDate(section, destination.values, todayValue, target.previous?.date)
+      const place = { key: target.key, site: ready.config.site, url: placeUrl(section, destination.slug, date) }
       const at = places.findIndex((p) => p.key === target.key)
       if (at >= 0) places[at] = place
       else places.push(place)
@@ -554,6 +574,12 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   return { results: targets.map((target) => results.get(target.key)!) }
 }
 
+function largestLanded(target: Target): Landed | undefined {
+  const pending = target.state === 'open' && target.previous ? snapshotOf(target.previous) : undefined
+  const size = (landed: Landed) => JSON.stringify(landed).length
+  return !target.landed ? pending : !pending ? target.landed : size(pending) > size(target.landed) ? pending : target.landed
+}
+
 /** This document's side of a record's version, as it stands on the site once merged. */
 function snapshotOf(record: PublishRecord): Landed {
   return { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url }
@@ -574,8 +600,8 @@ function provisionalRecord(target: Target, filled: FilledPost): PublishRecord {
     pullRequest: { number: 999_999, url: `https://github.com/${target.ready.repo}/pull/999999` },
     publishedAt: at, updatedAt: at, sourceSha: digest, values: target.destination.values, data: filled.frontmatter, bodySha: digest,
     // Kept by publishTo, so counted here; an open pull request merged while
-    // its commit lands would add its own version.
-    ...(target.landed || (target.state === 'open' && target.previous) ? { landed: target.landed ?? snapshotOf(target.previous!) } : {}),
+    // its commit lands would put its own version in its place: the larger counts.
+    ...(largestLanded(target) ? { landed: largestLanded(target) } : {}),
   }
 }
 
@@ -650,11 +676,13 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     file = merged
   }
   const text = renderPost(file.data, file.body)
+  // The address as the file being published dates it: a date the site kept is the site's.
+  const url = placeUrl(section, destination.slug, postDate(section, file.data, todayValue, previous?.date))
   const now = new Date().toISOString()
   if (current && current.text === text) {
     // The site has this version already: nothing to commit, nothing to open.
     return {
-      record: { ...previous!, site: ready.config.site, url: filled.url, sourceSha: sha256(content), values: destination.values, ...published, ...(landed ? { landed } : {}), updatedAt: now },
+      record: { ...previous!, site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published, ...(landed ? { landed } : {}), updatedAt: now },
       state: state as 'open' | 'merged',
       unchanged: true,
     }
@@ -666,7 +694,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       `Published from Poise by @${session.me}.`,
       '',
       `- File: \`${filled.path}\``,
-      ...(filled.url ? [`- Address once merged: ${filled.url}`] : []),
+      ...(url ? [`- Address once merged: ${url}`] : []),
     ].join('\n'),
     head: headRepo === upstream.fullName ? branch : `${headRepo.split('/')[0]}:${branch}`,
     base: ready.base,
@@ -676,15 +704,21 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   let headRepo: string
   let pr: { number: number, url: string }
   let kept = landed
+  let outcome: Outcome['state'] = 'open'
   if (state === 'open') {
     branch = previous!.branch
     headRepo = previous!.headRepo
-    await commitFile(session, headRepo, branch, head, `Update ${filled.path}`, filled.path, text)
+    const commit = await commitFile(session, headRepo, branch, head, `Update ${filled.path}`, filled.path, text)
     // Merged or closed while this was committed: the commit needs a pull
-    // request of its own, or the update would reach no one.
+    // request of its own, or the update would reach no one, unless the merge
+    // took this commit with it.
     const after = await pullRequest(session, upstream.fullName, previous!.pullRequest.number)
     if (after.state === 'open') pr = previous!.pullRequest
-    else {
+    else if (after.state === 'merged' && after.headSha === commit) {
+      pr = previous!.pullRequest
+      kept = { data: published.data, bodySha: published.bodySha, pullRequest: pr.number, url }
+      outcome = 'merged'
+    } else {
       // Merged meanwhile: what it held is on the site now, and this document's.
       if (after.state === 'merged') kept = snapshotOf(previous!)
       const opened = await open(headRepo, branch, kept !== undefined)
@@ -701,10 +735,10 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     pr = { number: opened.number, url: opened.url }
   }
   return {
-    state: 'open',
+    state: outcome,
     record: {
       repo: upstream.fullName, section: section.name, site: ready.config.site, headRepo, branch, base: ready.base,
-      path: filled.path, url: filled.url, slug: destination.slug, pullRequest: pr,
+      path: filled.path, url, slug: destination.slug, pullRequest: pr,
       publishedAt: previous?.publishedAt ?? now, updatedAt: now,
       sourceSha: sha256(content), values: destination.values, ...published,
       ...(kept ? { landed: kept } : {}),
