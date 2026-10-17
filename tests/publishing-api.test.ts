@@ -915,6 +915,22 @@ sections:
     expect(copy).not.toContain('2027')
   })
 
+  it('takes a maintainer\'s edit it adopts as what landed, after an update closed unmerged', async () => {
+    await publish([writing()])
+    merge('mikkokotila/mikkokotila-com', 101)
+    await writeDocument(DOC, `${TEXT}\nA second thought.\n`)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    close('mikkokotila/mikkokotila-com', 102)
+    // A maintainer retitles it on the site; the writer takes the new title in, with the text as it landed.
+    editOnSite('mikkokotila/mikkokotila-com', 'main', POST, (text) => text.replace('title: "A better question"', 'title: "A better question, retitled"'))
+    await writeDocument(DOC, TEXT)
+    expect((await publish([writing({ title: 'A better question, retitled' })])).body.results[0]).toMatchObject({ ok: true, unchanged: true })
+    // Going back to the first title is then this document's change, published.
+    const reverted = (await publish([writing()])).body.results[0]
+    expect(reverted).toMatchObject({ ok: true, publication: { pullRequest: { number: 103 } } })
+    expect(fileOn('mikkokotila/mikkokotila-com', repos.get('mikkokotila/mikkokotila-com')!.pulls.get(103)!.head, POST)).toContain('title: "A better question"\n')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

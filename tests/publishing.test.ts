@@ -126,6 +126,9 @@ describe('publish.yaml', () => {
     // Kept as checked: trimmed, as a typed value is.
     const padded = parsePublishConfig(MIKKO.replace('suggest: "content/writing.yaml#topics[].tag" }', 'value: [" ad-fraud ", "ad-fraud"] }')).sections[0]
     expect(padded.fields.find((f) => f.name === 'tags')!.value).toEqual(['ad-fraud'])
+    const blank = parsePublishConfig(MIKKO.replace('suggest: "content/writing.yaml#topics[].tag" }', 'value: [" "] }')).sections[0]
+    expect(blank.fields.find((f) => f.name === 'tags')!.value).toEqual([])
+    expect(fillPost(blank, 'a-better-question', { date: '2026-10-17' }, context()).frontmatter).not.toHaveProperty('tags')
   })
 
   it('stops a pattern that backtracks without end', () => {

@@ -838,7 +838,12 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   if (current && current.text === text) {
     // The site has this version already: nothing to commit, nothing to open.
     // A commit left unconfirmed is settled: its pull request was read again.
-    const record: PublishRecord = { ...previous!, site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published, ...(landed ? { landed } : {}), updatedAt: now }
+    // On the site itself, this version is what landed there now, whatever
+    // landed before it: a later change of this document's is one from it.
+    const landedNow: Landed | undefined = state === 'merged'
+      ? { data: published.data, bodySha: published.bodySha, pullRequest: landed?.pullRequest ?? previous!.pullRequest.number, url, date: published.date }
+      : landed
+    const record: PublishRecord = { ...previous!, site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published, ...(landedNow ? { landed: landedNow } : {}), updatedAt: now }
     delete record.unconfirmed
     fits(record)
     return { record, state: state as 'open' | 'merged', unchanged: true }

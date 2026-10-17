@@ -247,8 +247,9 @@ function readField(name: string, spec: unknown, at: string): PublishField {
       problems.push(...error.problems)
     }
     if (problems.length) throw new PublishConfigError(`${at}.${key}: ${problems[0]}`)
-    // Kept as a typed value is: trimmed, and a list's words once each.
-    if (normalized !== undefined) field[key] = normalized
+    // Kept as a typed value is: trimmed, and a list's words once each; one
+    // that trims to nothing is empty, and left out.
+    field[key] = normalized ?? (field.kind === 'list' ? [] : field.kind === 'text' ? '' : field[key])
   }
   return field
 }
