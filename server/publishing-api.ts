@@ -112,8 +112,8 @@ export interface SectionView {
   name: string
   url?: string
   firstLine?: string
-  /** Dated by a date field, one the writer fills or one the site fixes. */
-  dated?: true
+  /** The date field that dates it, the first one: one the writer fills, or one the site fixes. */
+  dateField?: string
   /** The fields a writer fills in: neither fixed nor filled in by Poise. */
   fields: FieldView[]
 }
@@ -202,7 +202,7 @@ async function readSite(session: GitHubSession, stored: StoredSite): Promise<Sit
       repo: info.fullName, state: 'ready', source, site: config.site,
       sections: config.sections.map((s) => ({
         name: s.name, ...(s.url ? { url: s.url } : {}), ...(s.firstLine ? { firstLine: s.firstLine } : {}),
-        ...(s.fields.some((f) => f.kind === 'date') ? { dated: true as const } : {}),
+        ...(s.fields.some((f) => f.kind === 'date') ? { dateField: s.fields.find((f) => f.kind === 'date')!.name } : {}),
         fields: shownFields(s, suggestions),
       })),
       ...(warnings.length ? { warning: [...new Set(warnings)].join(' ') } : {}),
@@ -619,8 +619,8 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     const stored = sites.find((site) => site.repo.toLowerCase() === r.repo.toLowerCase())
     const ready = targets.find((t) => t.key === key)?.ready ?? (stored && (await readSite(session, stored)).ready)
     const section = ready?.config.sections.find((sec) => sec.name === r.section)
-    // A site that has moved to another branch since: its record says where the piece was.
-    if (!ready || !section?.url || (state !== 'open' && r.base !== ready.base)) return
+    // A site that has moved to another branch since the piece went where it is: its record says where it was.
+    if (!ready || !section?.url || (state !== 'open' && whereOf(r, state) !== ready.base)) return
     let date = sinceOf(r)
     if (section.fields.some((f) => f.kind === 'date')) {
       const from = state === 'open' ? { repo: r.headRepo, branch: r.branch } : { repo: ready.repo, branch: ready.base }

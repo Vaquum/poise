@@ -505,7 +505,7 @@ test("takes the piece's date from a site that fixes its own", async ({ page }) =
   await workspace(page)
   const stamped = {
     repo: 'acme/stamped', state: 'ready', source: 'settings', site: 'Stamped', description: 'version: 1\n',
-    sections: [{ name: 'Posts', url: 'https://stamped.example/{slug}/', firstLine: 'title', dated: true, fields: [{ name: 'title', kind: 'text', required: true }] }],
+    sections: [{ name: 'Posts', url: 'https://stamped.example/{slug}/', firstLine: 'title', dateField: 'date', fields: [{ name: 'title', kind: 'text', required: true }] }],
   }
   // Published where the site fixes the date: the writer never filled one.
   const onStamped = { ...publication(stamped, 7, { title: 'A better question' }), date: '2026-01-01' }
@@ -522,7 +522,7 @@ test('leaves out an optional date the writer clears', async ({ page }) => {
   await workspace(page)
   const loose = {
     repo: 'acme/loose', state: 'ready', source: 'settings', site: 'Loose', description: 'version: 1\n',
-    sections: [{ name: 'Posts', url: 'https://loose.example/{slug}/', firstLine: 'title', dated: true, fields: [
+    sections: [{ name: 'Posts', url: 'https://loose.example/{slug}/', firstLine: 'title', dateField: 'date', fields: [
       { name: 'title', kind: 'text', required: true },
       { name: 'date', kind: 'date', required: false },
     ] }],
@@ -541,7 +541,7 @@ test('keeps a date cleared when it was published left out', async ({ page }) => 
   await workspace(page)
   const loose = {
     repo: 'acme/loose', state: 'ready', source: 'settings', site: 'Loose', description: 'version: 1\n',
-    sections: [{ name: 'Posts', url: 'https://loose.example/{slug}/', firstLine: 'title', dated: true, fields: [
+    sections: [{ name: 'Posts', url: 'https://loose.example/{slug}/', firstLine: 'title', dateField: 'date', fields: [
       { name: 'title', kind: 'text', required: true },
       { name: 'date', kind: 'date', required: false },
     ] }],
@@ -559,7 +559,7 @@ test('keeps the date a site went by when its fixed date has become editable', as
   await workspace(page)
   const stamped = {
     repo: 'acme/stamped', state: 'ready', source: 'settings', site: 'Stamped', description: 'version: 1\n',
-    sections: [{ name: 'Posts', url: 'https://stamped.example/{slug}/', firstLine: 'title', dated: true, fields: [
+    sections: [{ name: 'Posts', url: 'https://stamped.example/{slug}/', firstLine: 'title', dateField: 'date', fields: [
       { name: 'title', kind: 'text', required: true },
       { name: 'date', kind: 'date', required: true, default: 'today' },
     ] }],
@@ -598,4 +598,24 @@ test('shows, and sends, the default of a date with one when it is cleared', asyn
   await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
   await expect(dialog.getByRole('alert')).toContainText('Not now.')
   expect(sent[0].destinations[0].values.date).toBe('2026-10-17')
+})
+
+test('leaves a later date field, an expiry, to its site', async ({ page }) => {
+  await workspace(page)
+  // The first date is fixed, so never shown; the expiry is the site's own field.
+  const expiring = {
+    repo: 'acme/expiring', state: 'ready', source: 'settings', site: 'Expiring', description: 'version: 1\n',
+    sections: [{ name: 'Posts', url: 'https://expiring.example/{slug}/', firstLine: 'title', dateField: 'published', fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'expires', kind: 'date', required: false, default: '2026-12-31' },
+    ] }],
+  }
+  const onMikko = { ...publication(MIKKO, 101, { type: 'essay', title: 'A better question', date: '2026-10-17' }), date: '2026-10-17' }
+  const sent = await openEditor(page, [MIKKO, expiring], notNow, [onMikko])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await dialog.getByLabel('Expiring').check()
+  await expect(dialog.getByLabel('Expires', { exact: true })).toHaveValue('2026-12-31')
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toHaveCount(2)
+  expect(sent[0].destinations.find((d: any) => d.repo === 'acme/expiring').values.expires).toBe('2026-12-31')
 })

@@ -85,6 +85,9 @@ function sharedField(section: SectionView, which: Shared): string | undefined {
     const field = section.fields.find((f) => f.name === 'description' && f.kind === 'text')?.name
     return field !== sharedField(section, 'title') ? field : undefined
   }
+  // The date that dates the post, only where the writer fills it: a later date
+  // field (an expiry, say) is the site's own, and a fixed one is never shown.
+  if (section.dateField) return section.fields.some((f) => f.name === section.dateField) ? section.dateField : undefined
   return section.fields.find((f) => f.kind === 'date')?.name
 }
 
@@ -154,7 +157,7 @@ function remembered(doc: DocumentPublishing, choices: Choice[], which: Shared): 
     const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
     if (!choice) continue
     const field = sharedField(choice.section, which)
-    const dated = which === 'date' && (choice.section.dated || field) ? publication.date : undefined
+    const dated = which === 'date' && (choice.section.dateField || field) ? publication.date : undefined
     const value = dated ?? (field ? asText(savedValue(publication.values, field)) : '')
     if (value) return String(value)
   }

@@ -346,7 +346,7 @@ describe('Settings → Publishing', () => {
         name: 'Writing',
         url: 'https://mikkokotila.com/writing/{slug}/',
         firstLine: 'title',
-        dated: true,
+        dateField: 'date',
         fields: [
           { name: 'type', kind: 'choice', required: false, default: 'essay', choices: ['essay', 'note'] },
           { name: 'title', kind: 'text', required: true, max: 220 },
@@ -1062,6 +1062,31 @@ sections:
     expect(results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/publishes to published now, where this piece is not/) })
     expect(repo.pulls.size).toBe(1)
     expect(fileOn('mikkokotila/mikkokotila-com', 'published', POST)).toBe('Someone else\'s piece.\n')
+  })
+
+  it('names an original where what landed is, after a retargeted update is closed unmerged', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = (date: string) => ({ repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date } })
+    expect((await publish([dated('2026-10-17')])).body.results[0].ok).toBe(true)
+    merge('acme/dated', 101)
+    expect((await publish([dated('2027-01-05')])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    // The update is retargeted to a branch where an unrelated post, dated 2025, has this path, then closed unmerged.
+    const repo = repos.get('acme/dated')!
+    repo.branches.set('staging', repo.branches.get('main')!)
+    editOnSite('acme/dated', 'staging', 'posts/a-better-question.md', () => '---\ndate: "2025-03-01"\n---\n\nUnrelated.\n')
+    repo.pulls.get(102)!.base = 'staging'
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([dated('2027-01-05')])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    close('acme/dated', 102)
+    await request('/api/publishing/sites/acme/dated/description', 'PUT', { description: DATED_YAML.replace('site: Dated', 'site: Dated\nbranch: staging') })
+    // A copy published alone names the original where what landed is.
+    expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://dated.example/2026/a-better-question/"')
   })
 
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {

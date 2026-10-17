@@ -21,8 +21,8 @@ export interface SectionView {
   name: string
   url?: string
   firstLine?: string
-  /** Dated by a date field, one the writer fills or one the site fixes. */
-  dated?: boolean
+  /** The date field that dates it, the first one: one the writer fills, or one the site fixes. */
+  dateField?: string
   fields: FieldView[]
 }
 
