@@ -96,8 +96,19 @@ function ownFields(section: SectionView): FieldView[] {
   return section.fields.filter((f) => !shared.has(f.name))
 }
 
+/**
+ * Whether a publication is of a choice's site and section: by its
+ * repository's id where both are known, so a repository that took another's
+ * name never takes its publications; else by name.
+ */
+function isOf(publication: PublicationView, choice: Choice): boolean {
+  if (publication.section !== choice.section.name) return false
+  return publication.repoId && choice.site.id ? publication.repoId === choice.site.id : keyOf(publication.repo, publication.section) === choice.key
+}
+
 function publicationOf(s: State, key: string): PublicationView | undefined {
-  return s.doc.publications.find((p) => keyOf(p.repo, p.section) === key)
+  const choice = s.choices.find((c) => c.key === key)
+  return choice && s.doc.publications.find((p) => isOf(p, choice))
 }
 
 /** A publication still on its way or on the site: one only ever closed unmerged holds no slug. */
@@ -137,7 +148,7 @@ function asText(value: unknown): string | boolean {
 function titleFor(doc: DocumentPublishing, choices: Choice[]): string {
   for (const publication of doc.publications) {
     if (publication.docTitle !== doc.title) continue
-    const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
+    const choice = choices.find((c) => isOf(publication, c))
     const field = choice && sharedField(choice.section, 'title')
     const value = field ? asText(savedValue(publication.values, field)) : ''
     if (value) return String(value)
@@ -154,7 +165,7 @@ function titleFor(doc: DocumentPublishing, choices: Choice[]): string {
  */
 function remembered(doc: DocumentPublishing, choices: Choice[], which: Shared): string {
   for (const publication of doc.publications) {
-    const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
+    const choice = choices.find((c) => isOf(publication, c))
     if (!choice) continue
     const field = sharedField(choice.section, which)
     const dated = which === 'date' && (choice.section.dateField || field) ? publication.date : undefined
@@ -167,13 +178,13 @@ function remembered(doc: DocumentPublishing, choices: Choice[], which: Shared): 
 function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): State {
   const choices: Choice[] = sites.filter((s) => s.state === 'ready').flatMap((site) =>
     site.sections!.map((section) => ({ key: keyOf(site.repo, section.name), site, section })))
-  const published = (key: string) => doc.publications.find((p) => keyOf(p.repo, p.section) === key)
-  const chosen = new Set(choices.filter((c) => published(c.key)).map((c) => c.key))
+  const published = (choice: Choice) => doc.publications.find((p) => isOf(p, choice))
+  const chosen = new Set(choices.filter((c) => published(c)).map((c) => c.key))
   if (!chosen.size && choices.length === 1) chosen.add(choices[0].key)
   const values = new Map<string, Record<string, OwnValue>>()
   const slugs = new Map<string, string>()
   for (const choice of choices) {
-    const publication = published(choice.key)
+    const publication = published(choice)
     const own: Record<string, OwnValue> = {}
     for (const field of ownFields(choice.section)) {
       // A field the saved values leave empty, or do not have (one added
@@ -401,8 +412,10 @@ async function publish(host: PublishPanelHost, replace: boolean): Promise<void> 
     for (const result of results) {
       const key = keyOf(result.repo, result.section)
       s.results.set(key, result)
+      const choice = s.choices.find((c) => c.key === key)
       if (result.ok && result.publication) {
-        s.doc.publications = [...s.doc.publications.filter((p) => keyOf(p.repo, p.section) !== key), result.publication]
+        // In place of the one it updates: another repository's under the same name stays.
+        s.doc.publications = [...s.doc.publications.filter((p) => !(choice ? isOf(p, choice) : keyOf(p.repo, p.section) === key)), result.publication]
         s.slugs.set(key, result.publication.slug)
       }
     }

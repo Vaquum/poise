@@ -143,7 +143,7 @@ export async function repository(session: GitHubSession, repo: string): Promise<
 /** A repository by its id, under the name it has now. */
 export async function repositoryById(session: GitHubSession, id: number): Promise<RepositoryInfo> {
   const answer = await request(session, 'GET', `repositories/${id}`)
-  if (answer.status === 404) throw new GitHubError(`The repository a site was added with no longer exists, or ${session.me} cannot see it`, 404)
+  if (answer.status === 404) throw new GitHubError(`Its repository no longer exists, or ${session.me} cannot see it`, 404)
   if (answer.status !== 200) fail(answer, `Reading repository ${id}`)
   return repositoryFrom(answer.body)
 }

@@ -574,6 +574,20 @@ test('keeps the date a site went by when its fixed date has become editable', as
   expect(sent[0].destinations.map((d: any) => [d.repo, d.values.date])).toEqual([[stamped.repo, '2026-01-01'], [MIKKO.repo, '2026-10-17']])
 })
 
+test("takes the values of the site's own repository's publication, not one before it under the same name", async ({ page }) => {
+  await workspace(page)
+  // Published to a repository since deleted, then to the one made again under its name, which the site has now.
+  const before = { ...publication(MIKKO, 101, { type: 'essay', title: 'A better question', date: '2026-10-01', tags: ['ad-fraud'] }), repoId: 1 }
+  const now = { ...publication(MIKKO, 101, { type: 'note', title: 'A better question', date: '2026-10-17', tags: ['machine-intelligence'] }), repoId: 2 }
+  const sent = await openEditor(page, [{ ...MIKKO, id: 2 }], notNow, [before, now])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.getByLabel('Tags', { exact: true })).toHaveValue('machine-intelligence')
+  await expect(dialog.getByLabel('Type', { exact: true })).toHaveValue('note')
+  await dialog.getByRole('button', { name: 'Update', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values).toMatchObject({ type: 'note', date: '2026-10-17', tags: ['machine-intelligence'] })
+})
+
 test('reads a list saved as one text into its words', async ({ page }) => {
   await workspace(page)
   // Published through the API with the tags as one text, separated by commas.

@@ -349,6 +349,7 @@ describe('Settings → Publishing', () => {
     expect(added.status).toBe(200)
     expect(added.body.site).toEqual({
       repo: 'mikkokotila/mikkokotila-com',
+      id: repos.get('mikkokotila/mikkokotila-com')!.id,
       state: 'ready',
       source: 'repository',
       site: 'mikkokotila.com',
@@ -380,7 +381,7 @@ describe('Settings → Publishing', () => {
     })
     expect((await request('/api/publishing/sites', 'POST', { repo: 'not a repository' })).status).toBe(400)
     const missing = (await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })).body.site
-    expect(missing).toEqual({ repo: 'acme/journal', state: 'missing', source: null, problem: 'acme/journal has no publish.yaml. Add one to the repository, or describe the site here.' })
+    expect(missing).toEqual({ repo: 'acme/journal', id: repos.get('acme/journal')!.id, state: 'missing', source: null, problem: 'acme/journal has no publish.yaml. Add one to the repository, or describe the site here.' })
     const broken = (await request('/api/publishing/sites', 'POST', { repo: 'acme/broken' })).body.site
     expect(broken).toMatchObject({ state: 'invalid', source: 'repository', problem: 'publish.yaml in acme/broken: version: must be 1' })
 
@@ -1345,6 +1346,44 @@ sections:
     expect(diary.pulls.size).toBe(1)
     expect([...commits.get(diary.branches.get('publish/a-better-question')!)!.values()].join('\n')).toContain('A new ending.')
     expect((await editor!.readPublishLedger(DOC)).records.map((r) => [r.repo, r.headRepo])).toEqual([['acme/diary', 'acme/diary']])
+  })
+
+  it('links a renamed site\'s pull request where GitHub has it now, once another repository takes the old name', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const journal = (repo: string) => ({ repo, section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } })
+    expect((await publish([journal('acme/journal')])).body.results[0].publication.pullRequest.url).toBe('https://github.com/acme/journal/pull/101')
+    const diary = repos.get('acme/journal')!
+    diary.fullName = 'acme/diary'
+    repos.set('acme/diary', diary)
+    addRepo('acme/journal', {})
+    expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.publications[0].pullRequest).toEqual({ number: 101, url: 'https://github.com/acme/diary/pull/101', state: 'open' })
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([journal('acme/diary')])).body.results[0].publication.pullRequest).toMatchObject({ number: 101, url: 'https://github.com/acme/diary/pull/101' })
+    expect((await editor!.readPublishLedger(DOC)).records[0].pullRequest.url).toBe('https://github.com/acme/diary/pull/101')
+  })
+
+  it('tells a publication to a repository made again under the same name from the one before it', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const journal = { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }
+    expect((await publish([journal])).body.results[0].ok).toBe(true)
+    const first = repos.get('acme/journal')!.id
+    // The site is removed, its repository deleted and made again under its name, added again and published to.
+    expect((await request('/api/publishing/sites/acme/journal', 'DELETE')).status).toBe(200)
+    repos.delete('acme/journal')
+    const second = addRepo('acme/journal', {}).id
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([journal])).body.results[0]).toMatchObject({ ok: true, publication: { repo: 'acme/journal', repoId: second, pullRequest: { number: 101 } } })
+    // Each publication says which repository it is of, as the site says which it has: the panel goes by that.
+    expect((await request('/api/publishing/sites')).body.sites[1]).toMatchObject({ repo: 'acme/journal', id: second })
+    const publications = (await request(`/api/editor/doc/${DOC}/publishing`)).body.publications
+    expect(publications.map((p: any) => [p.repo, p.repoId, p.pullRequest.state])).toEqual([['acme/journal', first, 'unknown'], ['acme/journal', second, 'open']])
+    expect(publications[0].problem).toBe('Its repository no longer exists, or octocat cannot see it')
   })
 
   it('updates a renamed site\'s open publication on its branch once an empty repository takes the old name', async () => {

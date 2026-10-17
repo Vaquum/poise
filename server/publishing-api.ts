@@ -187,6 +187,8 @@ export interface SectionView {
 
 export interface SiteView {
   repo: string
+  /** Its repository's GitHub id: the panel takes a publication with that id for the site's. */
+  id?: number
   /** Names it had before a rename: Settings moves what it holds under one to the site. */
   formerly?: string[]
   state: SiteState
@@ -236,9 +238,10 @@ async function readSite(session: GitHubSession, stored: StoredSite, { follow = t
     text = stored.description ?? (await fileAt(session, info.fullName, PUBLISH_FILE, info.defaultBranch))?.text ?? null
   } catch (error) {
     if (!(error instanceof GitHubError)) throw error
-    return { view: { repo: stored.repo, state: 'unavailable', source: null, problem: error.message, ...described } }
+    return { view: { repo: stored.repo, ...(stored.id ? { id: stored.id } : {}), state: 'unavailable', source: null, problem: error.message, ...described } }
   }
   const repo = info.fullName
+  const id = info.id ? { id: info.id } : {}
   const renamed = repo.toLowerCase() !== stored.repo.toLowerCase()
   if (follow && renamed) renameSite(stored.repo, repo, info.id)
   else if (follow && !stored.id) rememberId(stored.repo, info.id)
@@ -247,7 +250,7 @@ async function readSite(session: GitHubSession, stored: StoredSite, { follow = t
   const formerly = former.length ? { formerly: former } : {}
   const source = stored.description !== undefined ? 'settings' : 'repository'
   if (text === null) {
-    return { view: { repo, state: 'missing', source: null, problem: `${repo} has no ${PUBLISH_FILE}. Add one to the repository, or describe the site here.`, ...formerly } }
+    return { view: { repo, ...id, state: 'missing', source: null, problem: `${repo} has no ${PUBLISH_FILE}. Add one to the repository, or describe the site here.`, ...formerly } }
   }
   let config: PublishConfig
   try {
@@ -255,7 +258,7 @@ async function readSite(session: GitHubSession, stored: StoredSite, { follow = t
   } catch (error) {
     if (!(error instanceof PublishConfigError)) throw error
     const where = source === 'settings' ? 'The description here' : `${PUBLISH_FILE} in ${repo}`
-    return { view: { repo, state: 'invalid', source, problem: `${where}: ${error.message}`, ...described, ...formerly } }
+    return { view: { repo, ...id, state: 'invalid', source, problem: `${where}: ${error.message}`, ...described, ...formerly } }
   }
   const base = config.branch ?? info.defaultBranch
   const suggestions = new Map<string, string[]>()
@@ -276,7 +279,7 @@ async function readSite(session: GitHubSession, stored: StoredSite, { follow = t
   }
   return {
     view: {
-      repo: info.fullName, state: 'ready', source, site: config.site,
+      repo: info.fullName, ...id, state: 'ready', source, site: config.site,
       sections: config.sections.map((s) => ({
         name: s.name, ...(s.url ? { url: s.url } : {}), ...(s.firstLine ? { firstLine: s.firstLine } : {}),
         ...(s.fields.some((f) => f.kind === 'date') ? { dateField: s.fields.find((f) => f.kind === 'date')!.name } : {}),
@@ -376,6 +379,8 @@ async function describeSite(repo: string, value: unknown): Promise<{ site: SiteV
 
 export interface PublicationView {
   repo: string
+  /** The GitHub id of the repository it went to, where known: two repositories may have had one name. */
+  repoId?: number
   section: string
   site: string
   slug: string
@@ -455,7 +460,9 @@ async function readPullRequest(session: GitHubSession, record: PublishRecord): P
     if (!ours(info)) throw new GitHubError(`Pull request #${number} could not be read in ${own.fullName}.`, 409)
   }
   if (info.repo && info.repo.toLowerCase() !== record.repo.toLowerCase()) moveTo(record, info.repo)
-  // Its branch's repository as GitHub names it now: a fork renamed since too.
+  // Its address and its branch's repository as GitHub gives them now: a
+  // link to the old name would lead to whatever repository has it since.
+  if (info.url && info.url !== record.pullRequest.url) record.pullRequest = { ...record.pullRequest, url: info.url }
   if (info.headRepo) record.headRepo = info.headRepo
   if (!record.repoId && info.repoId) record.repoId = info.repoId
   return info
@@ -487,7 +494,7 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
   const publications = await Promise.all(records.map(async (record): Promise<PublicationView> => {
     const recorded = record.repo
     const view: PublicationView = {
-      repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
+      repo: record.repo, ...(record.repoId ? { repoId: record.repoId } : {}), section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
       values: record.values, date: record.date, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
       pullRequest: { number: record.pullRequest.number, url: record.pullRequest.url, state: 'unknown' }, live: true, ...(record.docTitle !== undefined ? { docTitle: record.docTitle } : {}),
       changed: record.sourceSha !== sha256(doc.content),
@@ -495,7 +502,8 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
     try {
       const info = await readPullRequest(session!, record)
       const state = info.state
-      view.pullRequest.state = state
+      view.pullRequest = { ...view.pullRequest, url: record.pullRequest.url, state }
+      if (record.repoId) view.repoId = record.repoId
       followBase(record, info)
       view.live = state !== 'closed' || record.landed !== undefined
       // A site moved to another branch since, where the file is not one this
@@ -602,7 +610,7 @@ function resultFor(target: Target, fields: Partial<PublishResult>): PublishResul
 
 function viewOf(record: PublishRecord, state: PublicationView['pullRequest']['state']): PublicationView {
   return {
-    repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
+    repo: record.repo, ...(record.repoId ? { repoId: record.repoId } : {}), section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
     values: record.values, date: record.date, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
     pullRequest: { number: record.pullRequest.number, url: record.pullRequest.url, state }, live: true, changed: false,
     ...(record.docTitle !== undefined ? { docTitle: record.docTitle } : {}),

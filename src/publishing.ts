@@ -28,6 +28,8 @@ export interface SectionView {
 
 export interface SiteView {
   repo: string
+  /** Its repository's GitHub id: a publication goes with the site that has it. */
+  id?: number
   /** Names it had before a rename. */
   formerly?: string[]
   state: 'ready' | 'invalid' | 'missing' | 'unavailable'
@@ -41,6 +43,8 @@ export interface SiteView {
 
 export interface PublicationView {
   repo: string
+  /** The GitHub id of the repository it went to, where known. */
+  repoId?: number
   section: string
   site: string
   slug: string

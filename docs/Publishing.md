@@ -90,7 +90,8 @@ must be set, and signed in to `gh`.
 A repository renamed on GitHub is followed: the site is listed under its new
 name, and the pieces published there stay its own, their branches too. Poise
 knows each site and each publication by its repository's GitHub id, so a new
-repository that takes a renamed one's old name is never taken for it.
+repository that takes another's name, renamed or deleted since, is never taken
+for it, nor are its publications.
 
 ## Publishing from the Editor
 
