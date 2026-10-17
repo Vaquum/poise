@@ -478,6 +478,21 @@ export function fileDate(section: PublishSection, data: Record<string, unknown>,
 }
 
 /**
+ * The date a piece published again goes by when the site changed its date
+ * field, or removed it, and this document did not: as the reconciled file
+ * will date it (fileDate). Undefined when this document's date stands.
+ */
+export function siteDate(section: PublishSection, base: Record<string, unknown>, theirs: Record<string, unknown>, values: Record<string, unknown>, todayValue: string, fallback = todayValue): string | undefined {
+  const field = section.fields.find((f) => f.kind === 'date')
+  if (!field) return undefined
+  const was = own(base, field.name), site = own(theirs, field.name), given = own(values, field.name)
+  // The value this document writes for it, as fillPost writes it.
+  const mine = field.value ?? (empty(given) ? (field.default === 'today' ? todayValue : field.default) : given)
+  if (same(site, was) || !same(mine, was)) return undefined
+  return fileDate(section, theirs, todayValue, fallback)
+}
+
+/**
  * The file a document becomes in one section of a site: its slug, path,
  * address and frontmatter, in the order the section lists its fields. What is
  * wrong with the values is thrown together, one sentence each.

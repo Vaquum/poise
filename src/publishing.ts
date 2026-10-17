@@ -21,6 +21,8 @@ export interface SectionView {
   name: string
   url?: string
   firstLine?: string
+  /** Dated by a date field, one the writer fills or one the site fixes. */
+  dated?: boolean
   fields: FieldView[]
 }
 
@@ -43,6 +45,8 @@ export interface PublicationView {
   path: string
   url: string
   values: Record<string, unknown>
+  /** The date its path and address went by. */
+  date?: string
   publishedAt: string
   updatedAt: string
   pullRequest: { number: number, url: string, state: 'open' | 'closed' | 'merged' | 'unknown' }

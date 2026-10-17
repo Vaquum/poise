@@ -23,6 +23,7 @@ import {
   reconcile,
   renderPost,
   sha256,
+  siteDate,
   slugFromTitle,
   suggestionsFrom,
   today,
@@ -110,6 +111,8 @@ export interface SectionView {
   name: string
   url?: string
   firstLine?: string
+  /** Dated by a date field, one the writer fills or one the site fixes. */
+  dated?: true
   /** The fields a writer fills in: neither fixed nor filled in by Poise. */
   fields: FieldView[]
 }
@@ -198,6 +201,7 @@ async function readSite(session: GitHubSession, stored: StoredSite): Promise<Sit
       repo: info.fullName, state: 'ready', source, site: config.site,
       sections: config.sections.map((s) => ({
         name: s.name, ...(s.url ? { url: s.url } : {}), ...(s.firstLine ? { firstLine: s.firstLine } : {}),
+        ...(s.fields.some((f) => f.kind === 'date') ? { dated: true as const } : {}),
         fields: shownFields(s, suggestions),
       })),
       ...(warnings.length ? { warning: [...new Set(warnings)].join(' ') } : {}),
@@ -292,6 +296,8 @@ export interface PublicationView {
   path: string
   url: string
   values: Record<string, unknown>
+  /** The date its path and address went by. */
+  date: string
   publishedAt: string
   updatedAt: string
   pullRequest: { number: number, url: string, state: 'open' | 'closed' | 'merged' | 'unknown' }
@@ -316,7 +322,7 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
   const publications = await Promise.all(records.map(async (record): Promise<PublicationView> => {
     const view: PublicationView = {
       repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
-      values: record.values, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
+      values: record.values, date: record.date, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
       pullRequest: { ...record.pullRequest, state: 'unknown' }, live: true, ...(record.docTitle !== undefined ? { docTitle: record.docTitle } : {}),
       changed: record.sourceSha !== sha256(doc.content),
     }
@@ -404,7 +410,7 @@ function resultFor(target: Target, fields: Partial<PublishResult>): PublishResul
 function viewOf(record: PublishRecord, state: PublicationView['pullRequest']['state']): PublicationView {
   return {
     repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
-    values: record.values, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
+    values: record.values, date: record.date, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
     pullRequest: { ...record.pullRequest, state }, live: true, changed: false,
     ...(record.docTitle !== undefined ? { docTitle: record.docTitle } : {}),
   }
@@ -522,14 +528,16 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       targets.splice(targets.indexOf(target), 1)
       continue
     }
-    let theirs: unknown
-    try { theirs = current && parsePost(current.text).data[field.name] } catch (error) {
+    let theirs: Record<string, unknown> | undefined
+    try { theirs = current ? parsePost(current.text).data : undefined } catch (error) {
       // publishTo reports a file that cannot be read, for its site.
       if (!(error instanceof PostFileError)) throw error
     }
+    // A merged version that is not known says nothing of what the site changed.
+    if (!theirs || (target.state !== 'open' && target.landed?.unknown)) continue
     const base = target.state === 'open' ? target.previous : target.landed ?? target.previous
-    const ours = postDate(target.section, target.destination.values, todayValue, target.previous.date)
-    if (typeof theirs === 'string' && theirs !== base.data[field.name] && ours === base.data[field.name]) dates.set(target.key, theirs)
+    const date = siteDate(target.section, base.data, theirs, target.destination.values, todayValue, target.previous.date)
+    if (date) dates.set(target.key, date)
   }
 
   // Every place the piece is published, the original first: where it is live

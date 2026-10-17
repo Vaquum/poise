@@ -345,6 +345,7 @@ describe('Settings → Publishing', () => {
         name: 'Writing',
         url: 'https://mikkokotila.com/writing/{slug}/',
         firstLine: 'title',
+        dated: true,
         fields: [
           { name: 'type', kind: 'choice', required: false, default: 'essay', choices: ['essay', 'note'] },
           { name: 'title', kind: 'text', required: true, max: 220 },
@@ -826,6 +827,25 @@ sections:
     expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
     const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
     expect(copy).toContain('canonical_url: "https://stamped.example/2027/a-better-question/"')
+  })
+
+  it('names the address the site gives when it removes an optional date', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML.replace('date: { kind: date, required: true }', 'date: { kind: date }')], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const dated = { repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date: '2025-03-01' } }
+    expect((await publish([dated])).body.results[0].ok).toBe(true)
+    // A maintainer removes the date in review: the site dates the post its own way, today.
+    editOnSite('acme/dated', 'publish/a-better-question', 'posts/a-better-question.md', (text) => text.replace('date: "2025-03-01"\n', ''))
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    const { today } = await import('../server/publishing')
+    const address = `https://dated.example/${today('Europe/Helsinki').slice(0, 4)}/a-better-question/`
+    const results = (await publish([dated, { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results
+    expect(results[0]).toMatchObject({ ok: true, publication: { url: address } })
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain(`canonical_url: "${address}"`)
   })
 
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {

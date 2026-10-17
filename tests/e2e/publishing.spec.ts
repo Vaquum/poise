@@ -500,3 +500,20 @@ test('publishes what was asked for when the panel is closed while the document s
   await expect.poll(() => sent.length).toBe(1)
   expect(sent[0].destinations[0]).toMatchObject({ repo: MIKKO.repo, section: 'Writing' })
 })
+
+test("takes the piece's date from a site that fixes its own", async ({ page }) => {
+  await workspace(page)
+  const stamped = {
+    repo: 'acme/stamped', state: 'ready', source: 'settings', site: 'Stamped', description: 'version: 1\n',
+    sections: [{ name: 'Posts', url: 'https://stamped.example/{slug}/', firstLine: 'title', dated: true, fields: [{ name: 'title', kind: 'text', required: true }] }],
+  }
+  // Published where the site fixes the date: the writer never filled one.
+  const onStamped = { ...publication(stamped, 7, { title: 'A better question' }), date: '2026-01-01' }
+  const sent = await openEditor(page, [stamped, MIKKO], notNow, [onStamped])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await dialog.getByLabel('mikkokotila.com').check()
+  await expect(dialog.getByLabel('Date', { exact: true })).toHaveValue('2026-01-01')
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toHaveCount(2)
+  expect(sent[0].destinations.find((d: any) => d.repo === MIKKO.repo).values.date).toBe('2026-01-01')
+})

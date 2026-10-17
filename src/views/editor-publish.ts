@@ -143,13 +143,17 @@ function titleFor(doc: DocumentPublishing, choices: Choice[]): string {
 /**
  * A shared value from the first publication whose site has it: a site
  * without a description says nothing about another's. Read from the
- * publications as they are, so one made in the panel counts at once.
+ * publications as they are, so one made in the panel counts at once. A date
+ * is the one a publication went by, where its section is dated by a field:
+ * one the site fixes too, which the writer never fills.
  */
 function remembered(doc: DocumentPublishing, choices: Choice[], which: Shared): string {
   for (const publication of doc.publications) {
     const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
-    const field = choice && sharedField(choice.section, which)
-    const value = field ? asText(savedValue(publication.values, field)) : ''
+    if (!choice) continue
+    const field = sharedField(choice.section, which)
+    const dated = which === 'date' && (choice.section.dated || field) ? publication.date : undefined
+    const value = dated ?? (field ? asText(savedValue(publication.values, field)) : '')
     if (value) return String(value)
   }
   return ''
