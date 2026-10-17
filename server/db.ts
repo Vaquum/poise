@@ -91,6 +91,32 @@ db.exec(`
     PRIMARY KEY (key, target)
   );
 
+  CREATE TABLE IF NOT EXISTS behavior_runs (
+    id TEXT PRIMARY KEY,
+    behavior TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL DEFAULT 'running'
+  );
+  CREATE INDEX IF NOT EXISTS behavior_runs_started
+    ON behavior_runs(unixepoch(started_at, 'subsec'));
+  CREATE INDEX IF NOT EXISTS behavior_runs_running
+    ON behavior_runs(unixepoch(started_at, 'subsec')) WHERE status = 'running';
+  CREATE TABLE IF NOT EXISTS behavior_runs_revision (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL
+  );
+  INSERT OR IGNORE INTO behavior_runs_revision VALUES (1, 0);
+  CREATE TRIGGER IF NOT EXISTS behavior_runs_insert AFTER INSERT ON behavior_runs BEGIN
+    UPDATE behavior_runs_revision SET revision = revision + 1 WHERE id = 1;
+  END;
+  CREATE TRIGGER IF NOT EXISTS behavior_runs_update AFTER UPDATE ON behavior_runs BEGIN
+    UPDATE behavior_runs_revision SET revision = revision + 1 WHERE id = 1;
+  END;
+  CREATE TRIGGER IF NOT EXISTS behavior_runs_delete AFTER DELETE ON behavior_runs BEGIN
+    UPDATE behavior_runs_revision SET revision = revision + 1 WHERE id = 1;
+  END;
+
   CREATE TABLE IF NOT EXISTS behavior_dead_letters (
     id TEXT PRIMARY KEY,
     behavior TEXT NOT NULL,

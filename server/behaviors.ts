@@ -1,5 +1,6 @@
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
+import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun } from './behavior-metrics'
 import { CLI_UPDATE_TIMEOUT_MS } from '../scripts/provider-cli-updates.mjs'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
 // Server-side behavior runtime. Lives with the Poise HTTP server
@@ -242,8 +243,8 @@ async function withBehaviorProcessLock<T>(
   }, operation)
 }
 
-export type BehaviorKey = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci' | 'review-new-issues'
-export const BEHAVIOR_KEYS: BehaviorKey[] = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci', 'review-new-issues']
+import { BEHAVIOR_KEYS, type BehaviorKey } from '../src/behavior-types'
+export { BEHAVIOR_KEYS, type BehaviorKey } from '../src/behavior-types'
 
 let behaviorAbortController: AbortController | null = null
 const behaviorOperationSignal = new AsyncLocalStorage<AbortSignal>()
@@ -2883,6 +2884,7 @@ async function tickResolveUnblocking(): Promise<void> {
       if (!behaviorRetryDue('resolve-unblocking', checkTarget)) return
       let checked = false
       let operationId: string | null = null
+      let runId: string | null = null
       try {
         // A read cannot resolve anything. Avoid occupying the mutation lock
         // when the PR has no unresolved conversations to act on.
@@ -2898,7 +2900,11 @@ async function tickResolveUnblocking(): Promise<void> {
         // immediately before invocation prevent a disabled behavior, or one
         // whose repository was just skipped, from starting another resolve.
         if (!isEnabled('resolve-unblocking') || !stillEligible('resolve-unblocking', pr)) return
+        runId = startDirectBehaviorRun('resolve-unblocking')
         const result = await resolveNonblockingIfReady(pr.repo, pr.number)
+        if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true)
+        else discardDirectBehaviorRun(runId)
+        runId = null
         checked = true
         if (result.superseded) {
           console.log(`[behaviors] resolve-unblocking superseded on ${pr.repo}#${pr.number} by head ${result.headSha}`)
@@ -2924,6 +2930,7 @@ async function tickResolveUnblocking(): Promise<void> {
         console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, err)
         recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget)
       } finally {
+        if (runId) finishDirectBehaviorRun(runId, false)
         if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
         if (operationId) releasePrOperationOwned(operationId)
       }
@@ -3025,6 +3032,7 @@ async function tickMergePrs(): Promise<void> {
       }
       const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
       if (!operationId) continue
+      let runId: string | null = null
       try {
         const expectedHead = candidate.head!
         const [owner, name] = pr.repo.split('/', 2)
@@ -3032,6 +3040,7 @@ async function tickMergePrs(): Promise<void> {
         await mkdir(cwd, { recursive: true })
         if (!isEnabled('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', pr)
           || configuredReviewer() !== actor) continue
+        runId = startDirectBehaviorRun('merge-prs')
         const { stdout } = await runFile(GH_INTERFACE, [
           '--merge-if-ready', `#${pr.number}`, '--expected-head', expectedHead,
           '--author', author, '--token-user', actor,
@@ -3043,6 +3052,8 @@ async function tickMergePrs(): Promise<void> {
           || (result.outcome === 'merged' && (typeof result.merge_sha !== 'string' || !SHA_PATTERN.test(result.merge_sha)))) {
           throw new Error('github-interface --merge-if-ready returned malformed state')
         }
+        finishDirectBehaviorRun(runId, true)
+        runId = null
         if (result.outcome === 'merged') {
           setMeta(MERGE_LAST_FIRED_KEY, JSON.stringify({ at: new Date().toISOString(), target }))
           console.log(`[behaviors] merge-prs merged ${target}`)
@@ -3053,6 +3064,7 @@ async function tickMergePrs(): Promise<void> {
         recordBehaviorFailure('merge-prs', 'operation', error, target)
         console.error(`[behaviors] merge-prs failed for ${target}:`, error)
       } finally {
+        if (runId) finishDirectBehaviorRun(runId, false)
         releasePrOperationOwned(operationId)
       }
     }
@@ -3150,6 +3162,7 @@ async function tickRerunGreyCi(): Promise<void> {
         const claimId = randomUUID()
         const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
         if (!operationId) continue
+        let metricRunId: string | null = null
         try {
           const [owner, name] = pr.repo.split('/', 2)
           const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
@@ -3164,6 +3177,7 @@ async function tickRerunGreyCi(): Promise<void> {
             return true
           })()
           if (!claimed) continue
+          metricRunId = startDirectBehaviorRun('rerun-grey-ci')
           const { stdout: receipt } = await runFile(GH_INTERFACE, ['--rerun-grey-ci-if-ready', `#${pr.number}`,
             '--run-id', String(runId), '--run-attempt', String(attempt), '--expected-head', row.head_sha,
             '--author', author, '--token-user', actor],
@@ -3173,6 +3187,8 @@ async function tickRerunGreyCi(): Promise<void> {
             || result.head_sha !== row.head_sha || result.run_id !== runId || result.run_attempt !== attempt
             || !['rerun_requested', 'not_ready', 'superseded', 'read_failed'].includes(String(result.outcome))
             || (result.outcome === 'read_failed' && (typeof result.error !== 'string' || !result.error))) throw new Error('malformed grey CI rerun receipt')
+          finishDirectBehaviorRun(metricRunId, result.outcome !== 'read_failed')
+          metricRunId = null
           if (result.outcome === 'rerun_requested') {
             if (!completeSeenOwned(claimKey, claimTarget, claimId)) throw new Error('grey CI intent ownership changed before receipt')
             setMeta('behavior_rerun_grey_ci_last_fired', JSON.stringify({ at: new Date().toISOString(), target,
@@ -3187,7 +3203,10 @@ async function tickRerunGreyCi(): Promise<void> {
           setBehaviorLaunchErrorOwned(claimKey, claimTarget, claimId, behaviorErrorMessage(error))
           recordBehaviorFailure(behavior, 'worker', error, failureTarget, { held: true })
           console.error(`[behaviors] grey CI rerun held for ${target}:`, error)
-        } finally { releasePrOperationOwned(operationId) }
+        } finally {
+          if (metricRunId) finishDirectBehaviorRun(metricRunId, false)
+          releasePrOperationOwned(operationId)
+        }
       }
     }
   }

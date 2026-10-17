@@ -20,6 +20,7 @@ import { checkGithubQuota, readGithubQuota, startGithubQuotaRuntime, stopGithubQ
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
+import { readBehaviorMetrics } from './behavior-metrics'
 import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, getOrCreateChatSession, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
@@ -576,6 +577,17 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // no log surface (github-interface doesn't persist its calls)
         // so its lastTriggered stays null — the dash in the Behaviors
         // view reflects the actual state of the world.
+        if (path === '/api/behavior-metrics' && req.method === 'GET') {
+          const query = new URLSearchParams(url.split('?')[1] || '')
+          const window = parseWindow(query.get('since'), query.get('until'))
+          try {
+            const snapshot = await fetchAgentLogSnapshot()
+            const error = snapshot.quarantined.length ? 'Some worker logs are unreadable; agent metrics are unavailable.' : null
+            return json(res, 200, readBehaviorMetrics(snapshot.entries, window, error))
+          } catch (error) {
+            return json(res, 200, readBehaviorMetrics([], window, error instanceof Error ? error.message : String(error)))
+          }
+        }
         if (path === '/api/behaviors' && req.method === 'GET') {
           const enabled = getEnabledMap()
           const settings = getSettingMap()
@@ -694,7 +706,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         const behaviorMatch = url.match(/^\/api\/behaviors\/([a-z0-9-]+)(?:\?|$)/)
         if (behaviorMatch && req.method === 'POST') {
           const key = behaviorMatch[1] as BehaviorKey
-          if (!(BEHAVIOR_KEYS as string[]).includes(key)) {
+          if (!BEHAVIOR_KEYS.includes(key)) {
             return json(res, 400, { error: 'unknown behavior: ' + key })
           }
           try {

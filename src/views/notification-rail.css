@@ -377,7 +377,7 @@ body.notifications-docked:not(.editor-writer-mode) .self-update-banner { right: 
 }
 
 /* ── Behaviors: each row's counts, which open the rail on it ── */
-.behavior-notifications { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-top: 5px; }
+.behavior-notifications { display: flex; flex-wrap: nowrap; align-items: center; gap: var(--sp-1); }
 .behavior-notifications:empty { display: none; }
 .nr-count-chip {
   display: inline-flex;

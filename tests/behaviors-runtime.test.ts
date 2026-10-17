@@ -110,6 +110,8 @@ interface ReviewActivityFixture {
   resolveSuperseded?: boolean
   resolveUnresolvedCount?: number
   resolveBlockers?: string[]
+  resolveResolvedCount?: number
+  resolveError?: boolean
 }
 
 function arrangeCli(
@@ -249,6 +251,7 @@ function arrangeCli(
       }
     }
     if (command === 'github-interface' && args[0] === '--resolve-nonblocking-conversations-if-ready') {
+      if (reviewActivity.resolveError) throw new Error('resolution failed')
       const cwdParts = String(options?.cwd || '').split('/')
       const repository = `${cwdParts[cwdParts.length - 2]}/${cwdParts[cwdParts.length - 1]}`
       const pullNumber = Number(args[1].replace(/^#/, ''))
@@ -267,22 +270,22 @@ function arrangeCli(
       }
       return {
         stdout: JSON.stringify({
-          ready_except_conversations: false,
+          ready_except_conversations: (reviewActivity.resolveResolvedCount ?? 0) > 0,
           action: 'resolved_nonblocking_conversations_if_ready',
           repository,
           pull_number: pullNumber,
           head_sha: reviewActivity.headSha ?? HEAD_SHA,
-          reviewer_approved_current_head: false,
+          reviewer_approved_current_head: (reviewActivity.resolveResolvedCount ?? 0) > 0,
           changes_requested: false,
-          statuses_green: false,
-          checks_green: false,
-          checks_present: false,
+          statuses_green: (reviewActivity.resolveResolvedCount ?? 0) > 0,
+          checks_green: (reviewActivity.resolveResolvedCount ?? 0) > 0,
+          checks_present: (reviewActivity.resolveResolvedCount ?? 0) > 0,
           blockers: reviewActivity.resolveBlockers
-            ?? ['reviewer_not_approved_current_head'],
-          resolved_count: 0,
+            ?? ((reviewActivity.resolveResolvedCount ?? 0) > 0 ? [] : ['reviewer_not_approved_current_head']),
+          resolved_count: reviewActivity.resolveResolvedCount ?? 0,
           unresolved_count: reviewActivity.resolveUnresolvedCount ?? 0,
           latest_reviews: {},
-          conversations: [],
+          conversations: Array.from({ length: reviewActivity.resolveResolvedCount ?? 0 }, () => ({ id: 'thread' })),
         }),
         stderr: '',
       }
@@ -1388,6 +1391,36 @@ describe('behavior launch claims', () => {
       expect.any(Object),
     )
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('does not retain idle resolution polls as successful runs', async () => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, resolveUnresolvedCount: 1 })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_resolve_unblocking_enabled', '1')
+
+    for (let tick = 0; tick < 3; tick++) await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--resolve-nonblocking-conversations-if-ready')).toHaveLength(3)
+    expect(db.db.prepare('SELECT * FROM behavior_runs').all()).toEqual([])
+    expect(runtime.getResolveUnblockingLastFired()).toBeNull()
+  })
+
+  it.each([
+    { resolveResolvedCount: 1, status: 'completed' },
+    { resolveError: true, status: 'failed' },
+  ])('retains actual resolution results as $status runs', async ({ status, ...result }) => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, ...result })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_resolve_unblocking_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(db.db.prepare('SELECT behavior, status FROM behavior_runs').all())
+      .toEqual([{ behavior: 'resolve-unblocking', status }])
   })
 
   it('preserves the startup ledger and catches a PR opened during downtime', async () => {

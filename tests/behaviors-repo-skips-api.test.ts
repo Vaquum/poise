@@ -143,6 +143,22 @@ afterEach(async () => {
 })
 
 describe('Skip repositories API', () => {
+  it('serves time-filtered metrics and rejects invalid period boundaries', async () => {
+    database!.db.prepare('INSERT INTO behavior_runs(id, behavior, started_at, completed_at, status) VALUES (?, ?, ?, ?, ?)')
+      .run('merge-run', 'merge-prs', '2026-10-17T10:00:00Z', '2026-10-17T10:02:00Z', 'completed')
+    const response = await fetch(`${base}/api/behavior-metrics?since=2026-10-17T00:00:00Z&until=2026-10-18T00:00:00Z`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ error: null, behaviors: {
+      'merge-prs': { totalRuns: 1, durationMinutes: 2, successRate: 100 },
+      'review-new-prs': { totalRuns: 0, durationMinutes: 0, successRate: null },
+    } })
+    const before = await fetch(`${base}/api/behavior-metrics?until=2026-10-17T00:00:00Z`)
+    expect(await before.json()).toMatchObject({ behaviors: { 'merge-prs': { totalRuns: 0 } } })
+    for (const query of ['since=invalid', 'since=2026-10-17T00:00:00', 'since=2026-10-18T00:00:00Z&until=2026-10-17T00:00:00Z']) {
+      expect((await fetch(`${base}/api/behavior-metrics?${query}`)).status).toBe(400)
+    }
+  })
+
   it.each(['[broken', JSON.stringify({ at: 'invalid', target: 7 })])('keeps behavior controls readable when merge history is corrupt: %s', async (value) => {
     const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     database!.setMeta('behavior_merge_prs_last_fired', value)

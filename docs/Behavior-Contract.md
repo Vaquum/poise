@@ -231,3 +231,24 @@ if the workflow is now running or green. Diagnostics belong to each workflow,
 so a different successful rerun cannot clear an unresolved hold. A `read_failed`
 receipt proves no write occurred: its intent is released and the visible read
 failure retries with backoff. Errors after the write begins remain held.
+
+## Run analytics
+
+Behaviors uses the full table width. Its leading, unlabeled toggle controls
+activation; notification counts occupy the Status column after Behavior.
+The shaded numeric columns show total runs, total elapsed minutes, and the
+percentage of finished runs that did not fail. Any time, Today, Yesterday,
+and This week filter all three metrics by run start, using the timezone in
+Settings, independently of Current. These filters do not change settings,
+notifications, or Last triggered. Live runs contribute elapsed time but are
+excluded from success rate; no finished runs shows a dash.
+
+Agent metrics use only automatic runs with the matching behavior and Poise
+source. Missing or quarantined logs show unavailable metrics, never zero.
+Resolution, merge, and grey-CI metrics count direct mutation attempts recorded
+in the local run ledger since tracking was introduced; earlier history is
+unavailable. Eligibility checks and resolution polls that change no conversations
+are excluded. Safe no-write merge/rerun receipts count as successful executions;
+errors count as failures. Unknown durations show a dash. The ledger uses indexed
+time windows and cached database aggregates; unchanged refreshes do not scan its
+history. Narrow windows scroll the table without compressing its controls.

@@ -15,9 +15,60 @@ import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewers, setReviewer
 import { organizationErrors } from '../organizations'
 import { notificationCountsFor, onNotificationItems, openNotifications } from './notification-rail'
 import type { ItemGroup } from '../notification-items'
+import { TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../time-range'
+import type { BehaviorMetricsReport } from '../behavior-metrics'
 
 let viewEl: HTMLElement
 let initialized = false
+let metricsRange: TimeRange = 'all'
+let metricsReport: BehaviorMetricsReport | null = null
+let metricsError = ''
+let metricsGeneration = 0
+
+function metricCells(key: BehaviorKey): string {
+  const metrics = metricsReport?.behaviors[key]
+  const direct = key === 'resolve-unblocking' || key === 'merge-prs' || key === 'rerun-grey-ci'
+  const note = metricsError || (!metrics ? metricsReport?.error || 'Reading run history…' : direct
+    ? 'Direct action attempts recorded since run tracking was introduced; earlier history is unavailable.'
+    : 'Automatic runs started in the selected period. Live runs contribute elapsed time; success rate excludes unfinished runs.')
+  const format = (value: number | null | undefined, decimals = 0) => value == null ? '—'
+    : value.toLocaleString(undefined, { maximumFractionDigits: decimals })
+  return `<td class="behavior-metric behavior-metrics-start" title="${escapeHtml(note)}">${format(metrics?.totalRuns)}</td>
+    <td class="behavior-metric" title="${escapeHtml(note)}">${format(metrics?.durationMinutes, 1)}</td>
+    <td class="behavior-metric" title="${escapeHtml(note)}">${metrics?.successRate == null ? '—' : `${format(metrics.successRate, 1)}%`}</td>`
+}
+
+function refreshMetricCells(): void {
+  for (const meta of BEHAVIORS) {
+    const row = viewEl.querySelector<HTMLTableRowElement>(`tr[data-behavior="${meta.key}"]`)
+    if (!row) continue
+    const template = document.createElement('template')
+    template.innerHTML = `<table><tbody><tr>${metricCells(meta.key)}</tr></tbody></table>`
+    const cells = template.content.querySelectorAll('td')
+    row.querySelectorAll('.behavior-metric').forEach((cell, i) => cell.replaceWith(cells[i]))
+  }
+  const status = viewEl.querySelector<HTMLElement>('#behavior-metrics-error')!
+  status.textContent = metricsError || metricsReport?.error || ''
+  status.hidden = !status.textContent
+}
+
+async function refreshMetrics(): Promise<void> {
+  const generation = ++metricsGeneration
+  const query = new URLSearchParams(timeRangeWindow(metricsRange))
+  try {
+    const response = await fetch(`/api/behavior-metrics?${query}`)
+    const data = await response.json() as BehaviorMetricsReport & { error?: string }
+    if (!response.ok || !data.behaviors) throw new Error(data.error || 'Run metrics could not be read.')
+    if (generation !== metricsGeneration) return
+    metricsReport = data
+    metricsError = ''
+  } catch (error) {
+    if (generation !== metricsGeneration) return
+    metricsReport = null
+    metricsError = error instanceof Error ? error.message : String(error)
+  }
+  if (!viewEl.hidden) refreshMetricCells()
+}
 // Owner per behavior, fetched once from /api/behaviors: the agent account
 // from Settings → GitHub, the GitHub user the automations act as.
 const behaviorOwners: Partial<Record<BehaviorKey, string | null>> = {}
@@ -959,19 +1010,28 @@ function refreshMemoryCell(key: BehaviorKey) {
 function renderShell(): string {
   return `
     <header class="view-header">
-      <div class="filter-cluster" id="behaviors-filters"><span class="st-help st-help-info">Behavior settings apply to all ready GitHub accounts.</span></div>
+      <div class="filter-cluster" id="behaviors-filters">
+        <div class="range-picker" id="behaviors-time-picker" role="group" aria-label="Run metrics period">
+          ${TIME_RANGES.map((range) => `<button type="button" data-time="${range.key}" class="${metricsRange === range.key ? 'active' : ''}" aria-pressed="${metricsRange === range.key}">${range.label}</button>`).join('')}
+        </div>
+      </div>
     </header>
     <main>
+      <p id="behavior-metrics-error" class="st-help st-help-error" role="status" hidden></p>
       <table id="behaviors-table">
         <thead>
           <tr>
+            <th class="col-active" aria-label="Active"></th>
             <th class="col-title">Behavior</th>
+            <th class="col-notifications">Status</th>
             <th class="col-owner-wide">Owner</th>
             <th class="col-setting">Setting</th>
             <th class="col-reviewers">Reviewers</th>
             <th class="col-memory">Memory</th>
             <th class="col-last">Last triggered</th>
-            <th class="col-active">Active</th>
+            <th class="col-runs behavior-metric behavior-metrics-start" title="Runs started in the selected period">Total runs</th>
+            <th class="col-duration behavior-metric" title="Total elapsed run duration in minutes">Duration <span class="behavior-unit">(mins)</span></th>
+            <th class="col-success behavior-metric" title="Completed runs that did not fail; unfinished runs are excluded">Success <span class="behavior-unit">(%)</span></th>
           </tr>
         </thead>
         <tbody id="behaviors-tbody"></tbody>
@@ -985,13 +1045,15 @@ function renderRow(meta: typeof BEHAVIORS[number]): HTMLTableRowElement {
   tr.dataset.behavior = meta.key
   const owner = behaviorOwners[meta.key] || null
   tr.innerHTML = `
-    <td class="title-cell"><span class="behavior-name">${escapeHtml(meta.label)}</span><span class="behavior-notifications">${notificationChips(meta.key)}</span></td>
+    <td class="behavior-active-cell">${toggleCell(meta.key)}</td>
+    <td class="title-cell" title="${escapeHtml(meta.label)}"><span class="behavior-name">${escapeHtml(meta.label)}</span></td>
+    <td class="behavior-status-cell"><span class="behavior-notifications">${notificationChips(meta.key)}</span></td>
     <td class="behavior-owner-cell">${ownerCell(owner)}</td>
     <td class="behavior-setting-cell">${settingCell(meta)}</td>
     <td class="behavior-reviewers-cell">${reviewersCell(meta)}</td>
     <td class="behavior-memory-cell">${memoryCell(meta)}</td>
     <td class="behavior-last-cell">${lastTriggeredCell(meta.key)}</td>
-    <td class="behavior-active-cell">${toggleCell(meta.key)}</td>
+    ${metricCells(meta.key)}
   `
   return tr
 }
@@ -1015,9 +1077,9 @@ async function fetchBehaviorOwners() {
 // What the notification rail lists about a behavior: one count per group,
 // each of which opens the rail on that behavior.
 const CHIP_GROUPS: { group: ItemGroup, tone: string, words: (n: number) => string }[] = [
-  { group: 'faults', tone: 'red', words: (n) => `${n} Poise fault${n === 1 ? '' : 's'}` },
+  { group: 'faults', tone: 'red', words: (n) => `${n} fault${n === 1 ? '' : 's'}` },
   { group: 'needs', tone: 'amber', words: (n) => `${n} need${n === 1 ? 's' : ''} you` },
-  { group: 'auto', tone: 'slate', words: (n) => `${n} automatic` },
+  { group: 'auto', tone: 'slate', words: (n) => `${n} auto` },
 ]
 
 function notificationChips(key: BehaviorKey): string {
@@ -1041,6 +1103,20 @@ function renderRows() {
 }
 
 function attachHandlers() {
+  viewEl.querySelector('#behaviors-time-picker')!.addEventListener('click', (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-time]')
+    if (!button || !isTimeRange(button.dataset.time) || button.dataset.time === metricsRange) return
+    metricsRange = button.dataset.time
+    metricsReport = null
+    metricsError = ''
+    viewEl.querySelectorAll<HTMLButtonElement>('#behaviors-time-picker button').forEach((pill) => {
+      const selected = pill.dataset.time === metricsRange
+      pill.classList.toggle('active', selected)
+      pill.setAttribute('aria-pressed', String(selected))
+    })
+    refreshMetricCells()
+    void refreshMetrics()
+  })
   const tbody = viewEl.querySelector<HTMLTableSectionElement>('#behaviors-tbody')!
   tbody.addEventListener('change', (e) => {
     const target = e.target as HTMLElement
@@ -1124,6 +1200,7 @@ function attachHandlers() {
 // authoritative for controls: another tab or a rejected request must be
 // reflected on the next tick instead of leaving a dangerous false state.
 async function tickRefresh() {
+  void refreshMetrics()
   await refreshState()
   for (const meta of BEHAVIORS) {
     const tr = viewEl.querySelector<HTMLTableRowElement>(`tr[data-behavior="${meta.key}"]`)
@@ -1150,6 +1227,7 @@ async function tickRefresh() {
 }
 
 export function stopBehaviorsRefresh() {
+  metricsGeneration++
   // The view is going away, so the panel cannot stay open over what replaces it.
   closeMemoryPanel(true)
   void closeTriggersPanel(true)
@@ -1172,6 +1250,7 @@ export async function initBehaviorsView() {
   // Cached rows and explicitly unknown first-load controls do not wait for
   // the runtime read. Attach cleanup-owned work before the first await.
   renderRows()
+  void refreshMetrics()
   // Subscribe to the wall-clock-aligned ticker so the relative-time
   // strings ("2h", "5m") stay accurate and any newly-fired behavior
   // shows up without a manual reload.

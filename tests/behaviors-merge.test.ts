@@ -110,11 +110,13 @@ describe('Merge Pull Requests', () => {
     expect(runtime.getMergePrsLastFired()).toEqual({ at: expect.any(String), target: `${REPO}#7` })
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.db.prepare('SELECT behavior, status FROM behavior_runs').all()).toEqual([{ behavior: 'merge-prs', status: 'completed' }])
     const first = runtime.getMergePrsLastFired()
     db.closeDatabase(); vi.resetModules()
     db = await import('../server/db'); runtime = await import('../server/behaviors')
     expect(runtime.getEnabledMap()['merge-prs']).toBe(true)
     expect(runtime.getMergePrsLastFired()).toEqual(first)
+    expect(db.db.prepare('SELECT status FROM behavior_runs').all()).toEqual([{ status: 'completed' }])
   })
   it.each(['not_ready', 'superseded', 'already_merged'])('does not report a merge for %s', async (value) => {
     enable(); outcome = value
@@ -207,6 +209,7 @@ describe('Merge Pull Requests', () => {
   it('records per-target errors and applies retry backoff', async () => {
     enable(); error = new Error('GitHub unavailable')
     await runtime.runEnabledBehaviorsOnce()
+    expect(db.db.prepare('SELECT status FROM behavior_runs').all()).toEqual([{ status: 'failed' }])
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ behavior: 'merge-prs', target: `${REPO}#7`, error: 'GitHub unavailable' })])
     await runtime.runEnabledBehaviorsOnce()
     expect(mergeCalls()).toHaveLength(1)

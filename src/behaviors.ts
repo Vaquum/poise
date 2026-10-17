@@ -7,7 +7,8 @@
 
 import { classifyBehaviorDiagnostic, type DiagnosticClassification } from './behavior-failure-cause'
 
-export type BehaviorKey = 'review-new-prs' | 'approve-prs' | 'resolve-unblocking' | 'merge-prs' | 'rerun-grey-ci' | 'review-new-issues'
+import type { BehaviorKey } from './behavior-types'
+export type { BehaviorKey } from './behavior-types'
 
 export interface BehaviorMeta {
   key: BehaviorKey

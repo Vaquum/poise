@@ -115,6 +115,7 @@ describe('Rerun Grey CI', () => {
       '--expected-head', HEAD, '--author', 'octocat', '--token-user', 'review-bot'])
     expect(runtime.getGreyCiLastFired()).toEqual({ at: expect.any(String), target: `${REPO}#7`, url: `https://github.com/${REPO}/actions/runs/100` })
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.db.prepare('SELECT behavior, status FROM behavior_runs').all()).toEqual([{ behavior: 'rerun-grey-ci', status: 'completed' }])
     db.closeDatabase(); vi.resetModules(); db = await import('../server/db'); runtime = await import('../server/behaviors')
     expect(runtime.getEnabledMap()['rerun-grey-ci']).toBe(true)
     await runtime.runEnabledBehaviorsOnce()

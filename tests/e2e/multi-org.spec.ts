@@ -162,7 +162,7 @@ test('uses one global behavior configuration regardless of the dashboard account
   await page.locator('#main-filters').getByLabel('Account filter').selectOption('beta')
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
   await expect(page.getByLabel('Behavior account')).toHaveCount(0)
-  await expect(page.locator('#behaviors-filters')).toContainText('Behavior settings apply to all ready GitHub accounts.')
+  await expect(page.locator('#behaviors-time-picker button')).toHaveText(['Any time', 'Today', 'Yesterday', 'This week'])
   const toggle = page.locator('input[data-behavior="review-new-prs"]')
   await expect(toggle).toBeChecked()
   await page.locator('tr[data-behavior="review-new-prs"] label.toggle').click()
@@ -330,7 +330,7 @@ test('adds a personal GitHub account alongside an organization with shared behav
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
   await expect(page.getByLabel('Behavior account')).toHaveCount(0)
   await expect(page.locator('input[data-behavior="review-new-prs"]')).toBeChecked()
-  await expect(page.locator('#behaviors-filters')).toContainText('all ready GitHub accounts')
+  await expect(page.locator('#behaviors-filters')).not.toContainText('all ready GitHub accounts')
   expect(state.behaviorWrites).toEqual([])
 })
 

@@ -3184,37 +3184,41 @@ tr:hover .stop-btn { opacity: 1; }
    This block only declares the column widths and the toggle switch.
    ───────────────────────────────────────────────────────────────────────── */
 
-/* The controls take what they need and the name gets the rest — at the
-   default 960px content width that is ~220px, enough for the longest name
-   on one line; every cell stays on one line and ellipsizes rather than
-   wraps (the shared .title-cell rule allows wrapping for Archive's
-   titles, which is exactly what stacked the names three lines high). The
-   Setting column fits "<=p3, skip 236" within that budget. */
-.col-owner-wide { width: 150px; }
-.col-setting    { width: 164px; }
-.col-reviewers  { width: 80px; }
-.col-memory     { width: 90px; }
-.col-last       { width: 125px; }
-.col-active     { width: 80px; }
-
-#behaviors-table .title-cell {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+/* Fixed control budgets preserve spacing; the behavior name takes the rest.
+   Narrow windows scroll the table rather than compressing its controls. */
+#view-behaviors main {
+  margin-inline: calc(50% - var(--page-w, calc(100vw - var(--scrollbar-w, 0px))) / 2 + 24px);
+  overflow-x: auto;
 }
-
-/* Below the narrowest content width the table can hold, it keeps its
-   layout and the view scrolls sideways; the name column never collapses. */
-#view-behaviors main { overflow-x: auto; }
-#behaviors-table { min-width: 860px; }
-
-/* The universal `td:nth-last-child(2) { text-align: right }` rule is
-   meant for Archive's "Updated" column — it shouldn't apply here.
-   Force-left for behaviors' nth-last-child(2) cell (Last triggered)
-   so the link lines up under its header. */
-#behaviors-table tbody td:nth-last-child(2) {
-  text-align: left;
+#behaviors-table { min-width: 1500px; }
+#behaviors-table .col-active { width: 48px; }
+#behaviors-table .col-notifications { width: 226px; }
+#behaviors-table .col-owner-wide { width: 112px; }
+#behaviors-table .col-setting { width: 164px; }
+#behaviors-table .col-reviewers { width: 96px; }
+#behaviors-table .col-memory { width: 94px; }
+#behaviors-table .col-last { width: 112px; }
+#behaviors-table .col-runs { width: 112px; }
+#behaviors-table .col-duration { width: 148px; }
+#behaviors-table .col-success { width: 116px; }
+#behaviors-table :is(th, td) { white-space: nowrap; }
+#behaviors-table .title-cell { overflow: hidden; text-overflow: ellipsis; }
+#behaviors-table .behavior-metric {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  background: color-mix(in srgb, var(--surface) 42%, transparent);
+  padding-inline: 16px;
 }
+#behaviors-table .behavior-metrics-start {
+  border-left: 1px solid var(--border);
+  padding-left: 24px;
+}
+#behaviors-table tbody .behavior-metric { color: var(--text-secondary); }
+#behaviors-table .behavior-unit { color: var(--text-tertiary); font-weight: 400; }
+#behaviors-table .behavior-active-cell { padding-left: 0; text-align: left; }
+#behaviors-table .behavior-owner { max-width: 100%; }
+#behaviors-table .behavior-owner-name { overflow: hidden; text-overflow: ellipsis; }
+#behaviors-table .behavior-status-cell { overflow: visible; }
 
 .behavior-last-link {
   font-variant-numeric: tabular-nums;
@@ -3240,20 +3244,6 @@ tr:hover .stop-btn { opacity: 1; }
 .behavior-owner-name {
   font-size: 0.8125rem;
   color: var(--text-secondary);
-}
-
-/* Toggle cell — right-aligned with breathing room. The universal
-   `td:last-child { padding-right: 0 }` is meant for Archive's narrow
-   icon-only action column; for the toggle we want some inset so the
-   switch doesn't kiss the table edge. The header ACTIVE label gets
-   the same inset so it lines up over the toggle. */
-#behaviors-table .behavior-active-cell {
-  text-align: right;
-  padding-right: var(--sp-3);
-}
-#behaviors-table th.col-active {
-  text-align: right;
-  padding-right: var(--sp-3);
 }
 
 /* DS-aligned toggle — pill body, knob slides on activate, accent fill
