@@ -999,10 +999,6 @@ tr:hover .review-btn { opacity: 1; }
 .analytics-trend.neutral { color: var(--text-secondary); }
 .analytics-trend-caption { display: block; margin-top: 2px; font-size: 0.6875rem; font-weight: 400; }
 .analytics-status { margin: 0 0 var(--sp-4); }
-.analytics-groups { transition: opacity var(--flow-feedback) ease-out; }
-/* The previous range's numbers stay in place while the next ones load,
-   dimmed so they do not read as the answer. */
-.analytics-groups.is-stale { opacity: 0.45; }
 .analytics-group { margin-bottom: var(--sp-5); }
 .analytics-group .tp-group-label { margin-top: 0; }
 .analytics-tiles {
@@ -6638,7 +6634,7 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 #main-filters .range-picker { flex: 0 0 auto; }
 #main-filters .range-picker[hidden] { display: none; }
 #main-filters .range-picker button { white-space: nowrap; flex-shrink: 0; }
-#loader span { animation: pulse 1s ease-in-out infinite; }
+#loader span, .analytics-loader span { animation: pulse 1s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) {
-  #loader span { animation: none; }
+  #loader span, .analytics-loader span { animation: none; }
 }

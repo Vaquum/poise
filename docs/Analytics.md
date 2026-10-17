@@ -13,6 +13,10 @@ Settings → General, including daylight-saving transitions. Analytics does
 not change Current's filters. The selected calendar date stays fixed across
 midnight; labels and forward navigation refresh when the local day changes.
 
+While a day or account loads, previous values are removed immediately and
+the standard three-dot loading indicator appears. The server reads the local
+datastore views directly, without starting a CLI process for each scope.
+
 ## What it counts
 
 It counts what Current shows: the issues and pull requests your GitHub account

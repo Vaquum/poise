@@ -28,6 +28,7 @@ function buildPanel(): HTMLElement {
         <span class="analytics-date" aria-live="polite"></span>
         <button type="button" class="analytics-day-step" data-day="1" aria-label="Next day">→</button>
       </nav>
+      <div class="analytics-loader loader" role="status" aria-label="Loading analytics" hidden><span></span><span></span><span></span></div>
       <p class="analytics-status st-help" role="status" hidden></p>
       <div class="analytics-groups" aria-live="polite"></div>
     </div>`
@@ -72,10 +73,9 @@ async function readAnalytics(): Promise<void> {
   const day = analyticsDay(dayOffset, dayAnchor)
   panel.querySelector('.analytics-date')!.textContent = day.label
   panel.querySelector<HTMLButtonElement>('[data-day="1"]')!.disabled = day.isToday
-  // With numbers on screen, dimming them says enough: a line above them
-  // would push the panel down and back up on every switch.
-  if (!groups.childElementCount) showStatus(panel, 'Reading…')
-  groups.classList.add('is-stale')
+  groups.replaceChildren()
+  showStatus(panel, '')
+  panel.querySelector<HTMLElement>('.analytics-loader')!.hidden = false
   groups.setAttribute('aria-busy', 'true')
   const read = async (since: string, until: string): Promise<AnalyticsReport> => {
     const query = new URLSearchParams({ since, until })
@@ -99,7 +99,7 @@ async function readAnalytics(): Promise<void> {
     showStatus(panel, error instanceof Error ? error.message : String(error), true)
   } finally {
     if (generation === readGeneration) {
-      groups.classList.remove('is-stale')
+      panel.querySelector<HTMLElement>('.analytics-loader')!.hidden = true
       groups.removeAttribute('aria-busy')
     }
   }
