@@ -1247,6 +1247,24 @@ sections:
     expect(copy).toContain('canonical_url: "https://dated.example/2025/a-better-question/"')
   })
 
+  it('names no original whose pull request was found closed unmerged and could not be opened again', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    await publish([writing()])
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    // Pull request #101 is closed unmerged just after the update's commit, and a new one cannot be opened.
+    afterCommit = () => {
+      close('mikkokotila/mikkokotila-com', 101)
+      failOn = (method, endpoint) => (method === 'POST' && endpoint === 'repos/mikkokotila/mikkokotila-com/pulls' ? 500 : null)
+    }
+    const results = (await publish([writing(), { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([false, true])
+    // The copy is the only place the piece is: it names no original.
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).not.toContain('canonical_url')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

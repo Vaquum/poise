@@ -642,3 +642,26 @@ test('replaces the row it saved when its repository has been renamed', async ({ 
   await expect(rows.nth(0)).toContainText('acme/diary')
   await expect(rows.nth(0).locator('.pb-site-state')).toHaveText('Ready · described here')
 })
+
+test('keeps a description being written when its site turns out renamed', async ({ page }) => {
+  await workspace(page)
+  let reads = 0
+  await page.route('**/api/publishing/sites**', async (route) => {
+    reads++
+    // Read again, the repository has a new name; it had the old one before.
+    const sites = reads === 1 ? [MISSING] : [{ ...MISSING, repo: 'acme/diary', formerly: ['acme/journal'], problem: 'acme/diary has no publish.yaml. Add one to the repository, or describe the site here.' }]
+    return route.fulfill({ json: { sites } })
+  })
+  const open = async () => {
+    await page.getByRole('button', { name: 'Menu', exact: true }).click()
+    await page.locator('#menu-popover').getByRole('button', { name: 'Publishing', exact: true }).click()
+  }
+  await open()
+  const panel = page.locator('#settings-panel')
+  const rows = panel.locator('.pb-site')
+  await rows.nth(0).getByRole('button', { name: 'Describe' }).click()
+  await rows.nth(0).getByLabel('publish.yaml for acme/journal').fill('version: 1\nsite: Typed here\n')
+  await open()
+  await expect(rows.nth(0)).toContainText('acme/diary')
+  await expect(rows.nth(0).getByLabel('publish.yaml for acme/diary')).toHaveValue('version: 1\nsite: Typed here\n')
+})

@@ -169,6 +169,8 @@ export interface SectionView {
 
 export interface SiteView {
   repo: string
+  /** Names it had before a rename: Settings moves what it holds under one to the site. */
+  formerly?: string[]
   state: SiteState
   source: 'repository' | 'settings' | null
   site?: string
@@ -217,10 +219,14 @@ async function readSite(session: GitHubSession, stored: StoredSite, { follow = t
     return { view: { repo: stored.repo, state: 'unavailable', source: null, problem: error.message, ...described } }
   }
   const repo = info.fullName
-  if (follow && repo.toLowerCase() !== stored.repo.toLowerCase()) renameSite(stored.repo, repo)
+  const renamed = repo.toLowerCase() !== stored.repo.toLowerCase()
+  if (follow && renamed) renameSite(stored.repo, repo)
+  // The names it had: what Settings holds under one of them is the site's.
+  const former = renamed ? [...(stored.formerly ?? []), stored.repo] : stored.formerly ?? []
+  const formerly = former.length ? { formerly: former } : {}
   const source = stored.description !== undefined ? 'settings' : 'repository'
   if (text === null) {
-    return { view: { repo, state: 'missing', source: null, problem: `${repo} has no ${PUBLISH_FILE}. Add one to the repository, or describe the site here.` } }
+    return { view: { repo, state: 'missing', source: null, problem: `${repo} has no ${PUBLISH_FILE}. Add one to the repository, or describe the site here.`, ...formerly } }
   }
   let config: PublishConfig
   try {
@@ -228,7 +234,7 @@ async function readSite(session: GitHubSession, stored: StoredSite, { follow = t
   } catch (error) {
     if (!(error instanceof PublishConfigError)) throw error
     const where = source === 'settings' ? 'The description here' : `${PUBLISH_FILE} in ${repo}`
-    return { view: { repo, state: 'invalid', source, problem: `${where}: ${error.message}`, ...described } }
+    return { view: { repo, state: 'invalid', source, problem: `${where}: ${error.message}`, ...described, ...formerly } }
   }
   const base = config.branch ?? info.defaultBranch
   const suggestions = new Map<string, string[]>()
@@ -257,6 +263,7 @@ async function readSite(session: GitHubSession, stored: StoredSite, { follow = t
       })),
       ...(warnings.length ? { warning: [...new Set(warnings)].join(' ') } : {}),
       ...described,
+      ...formerly,
     },
     ready: { repo: info.fullName, info, base, config },
   }
@@ -515,6 +522,8 @@ interface Target {
   landed?: Landed
   /** The date the version on the site, or on its open pull request, went by: a dateless post's date. */
   since?: string
+  /** Its pull request was found closed unmerged while this publication went on. */
+  closed?: boolean
 }
 
 /** Each destination's own result, as it was asked for: two names of one site are two destinations. */
@@ -631,6 +640,8 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     return record.date
   }
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
+  // A publication found closed unmerged while this one went on, with nothing landed before it: named nowhere.
+  const gone = new Set<PublishRecord>()
 
   // A site that cannot be published to now fails alone: the others still go,
   // and where this piece is on it already, it is still named there.
@@ -739,7 +750,8 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     // A pull request closed unmerged changed nothing on the site: name what
     // landed there. An update not known to have reached its pull request
     // (merged without it, or still unreadable) is named where it was before.
-    const places: Place[] = [...live]
+    const places: Place[] = live
+      .filter((r) => !gone.has(r))
       .sort((a, b) => a.publishedAt.localeCompare(b.publishedAt))
       .map((r) => {
         const key = placeKey(r.repo, r.section)
@@ -811,8 +823,10 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
         ...(error instanceof PublishValueError ? { problems: error.problems } : {}),
         ...(error instanceof PublishConflictError ? { conflicts: error.conflicts } : {}),
       }))
-      // A site that failed is named on none of the others.
+      // A site that failed is named on none of the others; nor, if its pull
+      // request turned out closed unmerged with nothing landed, is it there.
       going = going.filter((t) => t !== target)
+      if (target.closed && !target.landed && target.previous) gone.add(target.previous)
     }
   }
 
@@ -1069,11 +1083,11 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       outcome = 'merged'
     } else {
       // Merged meanwhile: what it held is on the site now, and this document's,
-      // on the branch it merged into.
+      // on the branch it merged into. Closed unmerged, nothing new is there.
       if (after.state === 'merged') {
         base = after.base || base
         kept = { ...snapshotOf(previous!), base }
-      }
+      } else target.closed = true
       // To the branch the pull request it replaces went to, where what it
       // merged is: should the site have moved since, the next publication
       // asks whether the piece is still this document's there.

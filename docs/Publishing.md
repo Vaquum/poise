@@ -170,5 +170,5 @@ published; the pull requests stay.
 - One publication at a time across the Poise processes sharing an Editor
   folder. None starts while Poise installs an update, and an update waits
   for one in progress.
-- A site's patterns are checked with a time limit of 50 ms, since a
+- A site's patterns are checked with a time limit of 500 ms, since a
   description comes from a repository.

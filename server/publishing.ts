@@ -79,7 +79,8 @@ export class PublishValueError extends Error {
 // pattern that backtracks without end is stopped instead of holding the
 // server. The description comes from a repository, so it is not trusted.
 const patternContext = createContext(Object.create(null))
-const PATTERN_TIMEOUT_MS = 50
+// Ample for any pattern a site means, on a busy machine too; a pattern that backtracks without end stops there.
+const PATTERN_TIMEOUT_MS = 500
 const MAX_PATTERN_LENGTH = 200
 
 function runPattern(pattern: string, value: string | null): boolean {

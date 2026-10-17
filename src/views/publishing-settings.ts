@@ -110,6 +110,15 @@ export function publishingSection(): PublishingSection {
       if (mine !== generation) return
       sites = next
       loaded = true
+      // A site renamed since: a description being written for it under its old name stays with it.
+      for (const [repo, draft] of [...drafts]) {
+        if (sites.some((s) => s.repo === repo)) continue
+        const site = sites.find((s) => s.formerly?.some((name) => name.toLowerCase() === repo.toLowerCase()))
+        if (site && !drafts.has(site.repo)) {
+          drafts.delete(repo)
+          drafts.set(site.repo, draft)
+        }
+      }
       if (status.classList.contains('st-help-error')) say('')
     } catch (error) {
       if (mine !== generation) return

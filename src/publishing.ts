@@ -28,6 +28,8 @@ export interface SectionView {
 
 export interface SiteView {
   repo: string
+  /** Names it had before a rename. */
+  formerly?: string[]
   state: 'ready' | 'invalid' | 'missing' | 'unavailable'
   source: 'repository' | 'settings' | null
   site?: string
