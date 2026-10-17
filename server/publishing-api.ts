@@ -525,7 +525,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       return false
     }
   })
-  assertLedgerFits(ledger.records, going.map((target) => provisionalRecord(target, fillFor(target, parts, placesFor(going), todayValue))))
+  assertLedgerFits(ledger.records, going.map((target) => provisionalRecord(target, fillFor(target, parts, placesFor(going), todayValue), parts.title)))
 
   const record = async (target: Target, outcome: Outcome) => {
     if (outcome.record) {
@@ -587,9 +587,9 @@ function largestLanded(target: Target, filled: FilledPost): Landed | undefined {
   return largestOf(candidates)
 }
 
-/** The landed version that takes most bytes as written. */
+/** The landed version that takes most bytes as written: indented, in a record, in the record list. */
 export function largestOf(candidates: Landed[]): Landed | undefined {
-  const bytes = (landed: Landed) => Buffer.byteLength(JSON.stringify(landed), 'utf8')
+  const bytes = (landed: Landed) => Buffer.byteLength(JSON.stringify({ records: [{ landed }] }, null, 2), 'utf8')
   return candidates.reduce<Landed | undefined>((largest, landed) => (!largest || bytes(landed) > bytes(largest) ? landed : largest), undefined)
 }
 
@@ -603,7 +603,7 @@ function samePlaces(a: Place[], b: Place[]): boolean {
 }
 
 /** A record as large as the one a publication will write, before anything is written on GitHub. */
-function provisionalRecord(target: Target, filled: FilledPost): PublishRecord {
+function provisionalRecord(target: Target, filled: FilledPost, docTitle: string): PublishRecord {
   const at = new Date().toISOString()
   const digest = '0'.repeat(64)
   return {
@@ -611,7 +611,7 @@ function provisionalRecord(target: Target, filled: FilledPost): PublishRecord {
     branch: `publish/${target.destination.slug}-9`, base: target.ready.base, path: filled.path, url: filled.url,
     slug: target.destination.slug, date: filled.date,
     pullRequest: { number: 999_999, url: `https://github.com/${target.ready.repo}/pull/999999` },
-    publishedAt: at, updatedAt: at, sourceSha: digest, values: target.destination.values, data: filled.frontmatter, bodySha: digest,
+    publishedAt: at, updatedAt: at, sourceSha: digest, values: target.destination.values, data: filled.frontmatter, bodySha: digest, docTitle,
     // Kept by publishTo, so counted here. An open pull request merged while
     // its commit lands puts its own version, or this new one, in its place: the
     // largest counts.

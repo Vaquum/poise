@@ -98,13 +98,19 @@ function asText(value: unknown): string | boolean {
 }
 
 /**
- * The title to offer: one typed in the panel and published is kept while the
- * document's first line is what it was then; a first line changed since is
- * the title now.
+ * The title to offer: one published while the document's first line was
+ * what it is now, typed in the panel or not, read from that same
+ * publication; otherwise the first line.
  */
-function titleFor(doc: DocumentPublishing, published: string): string {
-  const unchanged = doc.publications.some((p) => p.docTitle === doc.title)
-  return published && unchanged ? published : doc.title
+function titleFor(doc: DocumentPublishing, choices: Choice[]): string {
+  for (const publication of doc.publications) {
+    if (publication.docTitle !== doc.title) continue
+    const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
+    const field = choice && sharedField(choice.section, 'title')
+    const value = field ? asText(publication.values[field]) : ''
+    if (value) return String(value)
+  }
+  return doc.title
 }
 
 function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): State {
@@ -138,7 +144,7 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
   }
   return {
     slug, choices, doc, chosen, values, slugs, slugTyped: new Set(), results: new Map(), busy: false,
-    shared: { title: titleFor(doc, remembered('title')), description: String(remembered('description') || ''), date: String(remembered('date') || doc.today) },
+    shared: { title: titleFor(doc, choices), description: String(remembered('description') || ''), date: String(remembered('date') || doc.today) },
   }
 }
 
@@ -266,9 +272,12 @@ function render(): void {
   const updating = chosen.length > 0 && chosen.every((c) => livePublicationOf(c.key))
   const conflicted = [...s.results.values()].some((r) => r.conflicts?.length)
   const label = s.busy ? 'Publishing…' : updating ? 'Update' : 'Publish'
+  // While a publication is in flight nothing can be edited: what is sent is what stays.
   patchContent(body, `
+    <fieldset class="ep-form"${s.busy ? ' disabled' : ''}>
     <div class="ep-sites">${sites}</div>
     ${chosen.length ? `<div class="ep-fields">${shared}</div>${destinations}` : ''}
+    </fieldset>
     <div class="ep-actions">
       <button type="button" class="composer-add ep-publish"${!chosen.length || s.busy ? ' disabled' : ''}>${label}</button>
       ${conflicted && !s.busy ? '<button type="button" class="composer-cancel ep-replace">Replace with mine</button>' : ''}
@@ -308,6 +317,7 @@ async function publish(host: PublishPanelHost, replace: boolean): Promise<void> 
       s.results.set(key, result)
       if (result.ok && result.publication) {
         s.doc.publications = [...s.doc.publications.filter((p) => keyOf(p.repo, p.section) !== key), result.publication]
+        s.slugs.set(key, result.publication.slug)
       }
     }
     const done = results.filter((r) => r.ok).length

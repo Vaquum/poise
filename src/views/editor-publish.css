@@ -15,9 +15,17 @@
   color: var(--text);
 }
 
-.ep-body {
+.ep-body,
+.ep-form {
   display: grid;
   gap: var(--sp-3);
+}
+
+.ep-form {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
 }
 
 .ep-sites {

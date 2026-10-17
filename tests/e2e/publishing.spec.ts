@@ -253,3 +253,32 @@ test('follows a first line changed since the title was typed', async ({ page }) 
   await openEditor(page, [MIKKO], () => ({ results: [] }), [earlier])
   await expect(page.getByRole('dialog', { name: 'Publish' }).getByLabel('Title', { exact: true })).toHaveValue('A better question')
 })
+
+test('reads the title and its first line from the same publication', async ({ page }) => {
+  await workspace(page)
+  // mikkokotila.com has an old typed title, from an earlier first line; the journal has the first line as it is now.
+  const old = { ...publication(MIKKO, 101, { type: 'essay', title: 'An old typed title' }), docTitle: 'An earlier first line' }
+  const now = { ...publication(JOURNAL, 7, { title: 'A better question' }), docTitle: 'A better question' }
+  await openEditor(page, [MIKKO, JOURNAL], () => ({ results: [] }), [old, now])
+  await expect(page.getByRole('dialog', { name: 'Publish' }).getByLabel('Title', { exact: true })).toHaveValue('A better question')
+})
+
+test('holds every field still while a publication is in flight', async ({ page }) => {
+  await workspace(page)
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  await openEditor(page, [MIKKO], () => ({ results: [] }))
+  // The publish answer waits until the fields have been looked at.
+  await page.route('**/api/editor/doc/draft-1/publish', async (route) => {
+    await held
+    const body = route.request().postDataJSON()
+    await route.fulfill({ json: { results: body.destinations.map((d: any) => ({ repo: d.repo, section: d.section, ok: true, publication: publication(MIKKO, 101, d.values) })) } })
+  })
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByLabel('Slug', { exact: true })).toBeDisabled()
+  await expect(dialog.getByLabel('Title', { exact: true })).toBeDisabled()
+  release()
+  await expect(dialog.getByRole('link', { name: 'Pull request #101' })).toBeVisible()
+  await expect(dialog.getByLabel('Slug', { exact: true })).toHaveValue('a-better-question')
+})

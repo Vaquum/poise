@@ -857,6 +857,29 @@ describe('publishing a document', () => {
     expect(largestOf([ascii, cjk])).toBe(cjk)
   })
 
+  it('weighs an open list as written, indented, against a long new text', async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    const at = (values: Record<string, unknown>) => ({ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values })
+    const words = Array.from({ length: 20_000 }, (_, i) => String(i).padStart(6, '0'))
+    expect((await publish([at({ words })])).body.results[0].ok).toBe(true)
+    const before = calls.length
+    // Compact, the text outweighs the open list; indented as the record is written, the list does.
+    expect((await publish([at({ note: 'x'.repeat(330_000) })])).status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
+  it("counts the document's first line in the record's size", async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    await writeDocument(DOC, `# ${'T'.repeat(400_000)}\n\nText.\n`)
+    const before = calls.length
+    expect((await publish([{ repo: 'acme/notes', section: 'Notes', slug: 'a-long-title', values: { note: 'n'.repeat(200_000) } }])).status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
   it('says nothing changed when the site has this version already', async () => {
     await publish([writing()])
     const commitsBefore = calls.filter((call) => call.args[1] === 'graphql').length
