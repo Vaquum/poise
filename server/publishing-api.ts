@@ -63,6 +63,13 @@ interface StoredSite {
   repo: string
   /** The site described here, for a repository without publish.yaml. */
   description?: string
+  /** Names its repository had before a rename: records made then still go by them. */
+  formerly?: string[]
+}
+
+/** Whether a stored site goes, or went, by a name. */
+function named(site: StoredSite, name: string): boolean {
+  return [site.repo, ...(site.formerly ?? [])].some((n) => n.toLowerCase() === name.toLowerCase())
 }
 
 /* ---------------------------------------------------------------- the sites */
@@ -74,7 +81,8 @@ function storedSites(): StoredSite[] {
   try { parsed = JSON.parse(raw) } catch { parsed = null }
   const valid = Array.isArray(parsed) && parsed.every((site) => !!site && typeof site === 'object'
     && typeof site.repo === 'string' && REPOSITORY.test(site.repo)
-    && (site.description === undefined || typeof site.description === 'string'))
+    && (site.description === undefined || typeof site.description === 'string')
+    && (site.formerly === undefined || (Array.isArray(site.formerly) && site.formerly.every((n: unknown) => typeof n === 'string'))))
   if (!valid) throw new HttpError(500, 'The publishing sites saved in Settings are unreadable.')
   return parsed as StoredSite[]
 }
@@ -98,7 +106,7 @@ function renameSite(from: string, to: string): void {
     if (!sites.some((s) => s.repo.toLowerCase() === from.toLowerCase())) return sites
     return sites
       .filter((s) => s.repo.toLowerCase() !== to.toLowerCase())
-      .map((s) => (s.repo.toLowerCase() === from.toLowerCase() ? { ...s, repo: to } : s))
+      .map((s) => (s.repo.toLowerCase() === from.toLowerCase() ? { ...s, repo: to, formerly: [...new Set([...(s.formerly ?? []), s.repo])] } : s))
   })
 }
 
@@ -108,7 +116,7 @@ function renameSite(from: string, to: string): void {
  * the panel may hold one until they read the sites again.
  */
 async function siteNamed(name: string, sites = storedSites()): Promise<StoredSite | undefined> {
-  const direct = sites.find((s) => s.repo.toLowerCase() === name.toLowerCase())
+  const direct = sites.find((s) => named(s, name))
   if (direct) return direct
   const session = await signIn(getMeta('me') || '').catch((error: unknown) => {
     if (error instanceof HttpError) return null
@@ -408,7 +416,7 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
   const { records } = await readPublishLedger(slug)
   const session = records.length ? await signIn(getMeta('me') || '') : null
   const sites = records.length ? storedSites() : []
-  const siteOf = (names: string[]) => sites.find((s) => names.some((n) => s.repo.toLowerCase() === n.toLowerCase()))
+  const siteOf = (names: string[]) => sites.find((s) => names.some((n) => named(s, n)))
   const publications = await Promise.all(records.map(async (record): Promise<PublicationView> => {
     const recorded = record.repo
     const view: PublicationView = {
@@ -630,8 +638,10 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     const section = read.ready.config.sections.find((s) => s.name === destination.section)
     if (!section) { refuse(destination, `${read.ready.config.site} has no section ${destination.section}.`); continue }
     const key = placeKey(read.ready.repo, section.name)
+    // Chosen twice under two of its names: once is enough.
+    if (targets.some((t) => t.key === key)) { refuse(destination, `${read.ready.config.site} · ${section.name} is chosen twice.`); continue }
     // A record under a name the repository had before is the same publication.
-    const names = new Set([key, placeKey(destination.repo, section.name), placeKey(stored.repo, section.name)])
+    const names = new Set([key, placeKey(destination.repo, section.name), ...[stored.repo, ...(stored.formerly ?? [])].map((n) => placeKey(n, section.name))])
     const unreadName = [...names].find((name) => unread.has(name))
     if (unreadName) { refuse(destination, `Its earlier pull request could not be read: ${unread.get(unreadName)}`); continue }
     let previous = live.find((r) => names.has(placeKey(r.repo, r.section)))

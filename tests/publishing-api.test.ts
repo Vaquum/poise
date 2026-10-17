@@ -1181,6 +1181,31 @@ sections:
     expect(fileOn('mikkokotila/mikkokotila-com', repo.pulls.get(103)!.head, POST)).toContain('title: "A better question, retitled"')
   })
 
+  it('names a renamed site\'s publication by the site even while GitHub cannot be read, and takes it once', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const journal = (repo: string) => ({ repo, section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } })
+    expect((await publish([journal('acme/journal')])).body.results[0].ok).toBe(true)
+    const repo = repos.get('acme/journal')!
+    repo.fullName = 'acme/diary'
+    repos.set('acme/diary', repo)
+    // Settings learns the rename; the record still has the old name.
+    ;(await import('../server/publishing-api')).forgetSites()
+    expect((await request('/api/publishing/sites')).body.sites[1].repo).toBe('acme/diary')
+    // With GitHub unable to answer for the old name, the publication still goes by the site's name.
+    failOn = (method, endpoint) => (method === 'GET' && endpoint.startsWith('repos/acme/journal') ? 500 : null)
+    expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.publications[0].repo).toBe('acme/diary')
+    failOn = null
+    // Both of its names at once, for the same section: one publication.
+    const before = repo.pulls.size
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    const results = (await publish([journal('acme/diary'), journal('acme/journal')])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([true, false])
+    expect(results[1].error).toBe('Other Journal · Posts is chosen twice.')
+    expect(repo.pulls.size).toBe(before)
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
