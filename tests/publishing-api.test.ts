@@ -951,6 +951,43 @@ sections:
     expect(repo.pulls.get(102)).toMatchObject({ base: 'published' })
   })
 
+  it('keeps an open pull request\'s branch when the site moves, and frees the slug where the file is not this document\'s', async () => {
+    await publish([writing()])
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    // The site moves to another branch, where someone else's piece has this path, while pull request #101 is open on main.
+    repo.branches.set('published', repo.branches.get('main')!)
+    editOnSite('mikkokotila/mikkokotila-com', 'published', POST, () => 'Someone else\'s piece.\n')
+    editOnSite('mikkokotila/mikkokotila-com', 'main', 'publish.yaml', (text) => text.replace('site: mikkokotila.com', 'site: mikkokotila.com\nbranch: published'))
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 101 } } })
+    expect((await editor!.readPublishLedger(DOC)).records[0].base).toBe('main')
+    merge('mikkokotila/mikkokotila-com', 101)
+    // This test GitHub merges by moving main to the pull request's head: the site's move is made there again.
+    editOnSite('mikkokotila/mikkokotila-com', 'main', 'publish.yaml', (text) => text.replace('site: mikkokotila.com', 'site: mikkokotila.com\nbranch: published'))
+    // Merged into main, it is not this document's on the new branch: its slug is free there, and the file is never written over.
+    expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.publications[0]).toMatchObject({ live: false })
+    expect((await publish([writing()], true)).body.results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/did not publish it/) })
+    expect(fileOn('mikkokotila/mikkokotila-com', 'published', POST)).toBe('Someone else\'s piece.\n')
+  })
+
+  it('moves a version carried onto a site\'s new branch there, so later edits there are the site\'s', async () => {
+    await publish([writing()])
+    merge('mikkokotila/mikkokotila-com', 101)
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    editOnSite('mikkokotila/mikkokotila-com', 'main', 'publish.yaml', (text) => text.replace('site: mikkokotila.com', 'site: mikkokotila.com\nbranch: published'))
+    repo.branches.set('published', repo.branches.get('main')!)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, unchanged: true })
+    expect((await editor!.readPublishLedger(DOC)).records[0].base).toBe('published')
+    // A maintainer retitles it there; this document's next change keeps the new title.
+    editOnSite('mikkokotila/mikkokotila-com', 'published', POST, (text) => text.replace('title: "A better question"', 'title: "A better question, retitled"'))
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    const update = fileOn('mikkokotila/mikkokotila-com', repo.pulls.get(102)!.head, POST)!
+    expect(update).toContain('title: "A better question, retitled"')
+    expect(update).toContain('A new ending.')
+    expect(repo.pulls.get(102)).toMatchObject({ base: 'published' })
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

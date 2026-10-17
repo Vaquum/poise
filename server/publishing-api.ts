@@ -311,6 +311,26 @@ export interface PublicationView {
   problem?: string
 }
 
+/**
+ * Whether a piece is still this document's on its site's branch: always on
+ * the branch it was published to; on a branch the site has moved to since,
+ * only if the file there is a version this document published, carried over.
+ */
+async function stillOurs(session: GitHubSession, ready: ReadySite, record: PublishRecord, landed: Landed | undefined): Promise<boolean> {
+  if (record.base === ready.base) return true
+  const there = await fileAt(session, ready.repo, record.path, ready.base).catch((error: unknown) => {
+    if (!(error instanceof GitHubError)) throw error
+    return null
+  })
+  try {
+    const file = there && parsePost(there.text)
+    return !!file && !landed?.unknown && isVersion(file, landed ?? record)
+  } catch (error) {
+    if (!(error instanceof PostFileError)) throw error
+    return false
+  }
+}
+
 function timeZone(): string | undefined {
   return getMeta('timezone') || undefined
 }
@@ -328,8 +348,14 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
       changed: record.sourceSha !== sha256(doc.content),
     }
     try {
-      view.pullRequest.state = (await pullRequest(session!, record.repo, record.pullRequest.number)).state
-      view.live = view.pullRequest.state !== 'closed' || record.landed !== undefined
+      const state = (await pullRequest(session!, record.repo, record.pullRequest.number)).state
+      view.pullRequest.state = state
+      view.live = state !== 'closed' || record.landed !== undefined
+      // A site moved to another branch since, where the file is not one this
+      // document published: published there afresh, under any slug.
+      const stored = view.live && state !== 'open' ? storedSites().find((s) => s.repo.toLowerCase() === record.repo.toLowerCase()) : undefined
+      const ready = stored && (await readSite(session!, stored)).ready
+      if (ready && !(await stillOurs(session!, ready, record, state === 'merged' ? snapshotOf(record) : record.landed))) view.live = false
     } catch (error) {
       if (!(error instanceof GitHubError)) throw error
       view.problem = error.message
@@ -518,24 +544,9 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     const key = placeKey(read.ready.repo, section.name)
     if (unread.has(key)) { refuse(destination, `Its earlier pull request could not be read: ${unread.get(key)}`); continue }
     let previous = live.find((r) => placeKey(r.repo, r.section) === key)
-    // A site that has moved to another branch since: a file there is this
-    // document's only if it is a version it published, carried over;
-    // otherwise the piece is published there afresh, as a first publication.
-    if (previous && states.get(key) !== 'open' && previous.base !== read.ready.base) {
-      const there = await fileAt(session, read.ready.repo, previous.path, read.ready.base).catch((error: unknown) => {
-        if (!(error instanceof GitHubError)) throw error
-        return null
-      })
-      let carried = false
-      try {
-        const file = there && parsePost(there.text)
-        const landed = landedOf(previous)
-        carried = !!file && !landed?.unknown && isVersion(file, landed ?? previous)
-      } catch (error) {
-        if (!(error instanceof PostFileError)) throw error
-      }
-      if (!carried) previous = undefined
-    }
+    // A site that has moved to another branch since, where the file is not
+    // one this document published: the piece is published there afresh.
+    if (previous && states.get(key) !== 'open' && !(await stillOurs(session, read.ready, previous, landedOf(previous)))) previous = undefined
     // Only an open pull request is still on its way; anything else that is
     // live is the merged version on the site.
     const state = !previous ? 'new' : states.get(key) === 'open' ? 'open' : 'merged'
@@ -863,7 +874,11 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     const landedNow: Landed | undefined = state === 'merged'
       ? { data: published.data, bodySha: published.bodySha, pullRequest: landed?.pullRequest ?? previous!.pullRequest.number, url, date: published.date }
       : landed
-    const record: PublishRecord = { ...previous!, site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published, ...(landedNow ? { landed: landedNow } : {}), updatedAt: now }
+    // On the site, on the branch it publishes to now; on an open pull request, the branch that targets.
+    const record: PublishRecord = {
+      ...previous!, site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published,
+      ...(landedNow ? { landed: landedNow } : {}), ...(state === 'merged' ? { base: ready.base } : {}), updatedAt: now,
+    }
     delete record.unconfirmed
     fits(record)
     return { record, state: state as 'open' | 'merged', unchanged: true }
@@ -890,9 +905,12 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   let outcome: Outcome['state'] = 'open'
   let error: string | undefined
   let unconfirmed: PublishRecord['unconfirmed']
+  // The branch the pull request goes to: an open one keeps its own, even if the site has moved since.
+  let base = ready.base
   if (state === 'open') {
     branch = previous!.branch
     headRepo = previous!.headRepo
+    base = previous!.base
     const commit = await commitFile(session, headRepo, branch, head, `Update ${filled.path}`, filled.path, text)
     // Merged or closed while this was committed: the commit needs a pull
     // request of its own, or the update would reach no one, unless the merge
@@ -920,6 +938,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       if (after.state === 'merged') kept = snapshotOf(previous!)
       const opened = await open(headRepo, branch, kept !== undefined)
       pr = { number: opened.number, url: opened.url }
+      base = ready.base
     }
   } else {
     // The site's own repository when the writer can push to it, otherwise
@@ -935,7 +954,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     state: outcome,
     ...(error ? { error } : {}),
     record: {
-      repo: upstream.fullName, section: section.name, site: ready.config.site, headRepo, branch, base: ready.base,
+      repo: upstream.fullName, section: section.name, site: ready.config.site, headRepo, branch, base,
       path: filled.path, url, slug: destination.slug, pullRequest: pr,
       publishedAt: previous?.publishedAt ?? now, updatedAt: now,
       sourceSha: sha256(content), values: destination.values, ...published,
