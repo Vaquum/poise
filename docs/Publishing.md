@@ -111,7 +111,8 @@ is named on no other site: a file already published that named it is
 published again without it. A site that cannot be read, or is no longer one
 of your sites, fails alone too: the others are still published, and where the
 piece is on it already, it is still named there. For each site, Poise builds the file
-(YAML frontmatter, then the text), creates a branch `publish/<slug>` from the
+(YAML frontmatter, then the text), creates a branch `publish/<slug>` (a dot
+in the slug becomes a hyphen there) from the
 site's branch, commits the file with GitHub's GraphQL `createCommitOnBranch`,
 and opens a pull request. Everything is done as your own GitHub account,
 with the token `gh` holds for it, never the automation account. A repository
@@ -155,8 +156,9 @@ published; the pull requests stay.
 - Images are not published yet: the Editor holds none.
 - Only sites in GitHub repositories.
 - Up to ten sites at once, and a document's record of where it is published
-  stays under 1 MB: a publication that would pass it is refused before
-  anything is written.
+  stays under 1 MB. A publication plainly too large is refused before
+  anything is written; a site whose record a commit could take past it is
+  refused once its file is known, before anything is written for it.
 - One publication at a time across the Poise processes sharing an Editor
   folder. None starts while Poise installs an update, and an update waits
   for one in progress.

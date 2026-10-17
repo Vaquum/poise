@@ -569,7 +569,9 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       return false
     }
   })
-  assertLedgerFits(ledger.records, going.map((target) => provisionalRecord(target, fillFor(target, parts, placesFor(going), todayValue), parts.title)))
+  assertLedgerFits(ledger.records, going.map((target) => provisionalRecord(target, fillFor(target, parts, placesFor(going), todayValue), parts.title, { commit: false })))
+  // Each site again once its file is known: exactly, when nothing changes.
+  const fits = (record: PublishRecord) => assertLedgerFits(ledger.records, [record])
 
   const record = async (target: Target, outcome: Outcome) => {
     if (outcome.record) {
@@ -587,10 +589,9 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   for (const target of [...going]) {
     const places = placesFor(going)
     try {
-      // Sized again with the places it goes with now: a site that failed
-      // before it can name another original, or an address published earlier.
-      assertLedgerFits(ledger.records, [provisionalRecord(target, fillFor(target, parts, places, todayValue), parts.title)])
-      const outcome = await publishTo(session, target, parts, places, todayValue, replace, doc.content)
+      // Sized in publishTo with the places it goes with now: a site that
+      // failed before it can name another original, or an earlier address.
+      const outcome = await publishTo(session, target, parts, places, todayValue, replace, doc.content, fits)
       const kept = await record(target, outcome)
       if (outcome.error) {
         // Committed, but whether it can reach the site is not known: the
@@ -622,8 +623,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       const again: Target = state === 'open'
         ? { ...target, previous: kept, state: 'open', landed: kept.landed }
         : { ...target, previous: kept, state: 'merged', landed: kept.landed ?? target.landed ?? snapshotOf(kept) }
-      assertLedgerFits(ledger.records, [provisionalRecord(again, fillFor(again, parts, final, todayValue), parts.title)])
-      await record(target, await publishTo(session, again, parts, final, todayValue, replace, doc.content))
+      await record(target, await publishTo(session, again, parts, final, todayValue, replace, doc.content, fits))
     } catch (error) {
       if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError || error instanceof PostFileError)) throw error
       results.set(target.key, resultFor(target, {
@@ -672,9 +672,11 @@ function longest(...names: Array<string | undefined>): string {
  * A record as large as any a publication may write, before anything is
  * written on GitHub. Each name is the longest it can be: a record kept
  * unchanged keeps the earlier one's, a fork's name is known only once GitHub
- * makes it, and a pull request's number once it opens.
+ * makes it, and a pull request's number once it opens. With `commit`, also
+ * what a commit could add to it: a version a merge during it lands, and its
+ * commit if the pull request cannot be read after it.
  */
-function provisionalRecord(target: Target, filled: FilledPost, docTitle: string): PublishRecord {
+function provisionalRecord(target: Target, filled: FilledPost, docTitle: string, { commit = true } = {}): PublishRecord {
   const { destination, ready, previous } = target
   const at = new Date().toISOString()
   const digest = '0'.repeat(64)
@@ -682,23 +684,25 @@ function provisionalRecord(target: Target, filled: FilledPost, docTitle: string)
   // Kept by publishTo, so counted here. An open pull request merged while
   // its commit lands puts its own version, or this new one, in its place: the
   // largest counts.
-  const landed = largestLanded(target, filled)
+  const landed = commit ? largestLanded(target, filled) : target.landed
   return {
     repo: longest(previous?.repo, ready.repo), section: target.section.name, site: ready.config.site,
     headRepo: longest(previous?.headRepo, ready.info.canPush ? ready.repo : LONGEST_REPOSITORY),
-    branch: longest(previous?.branch, `publish/${destination.slug}-9`), base: longest(previous?.base, ready.base),
+    branch: longest(previous?.branch, `${branchFor(destination.slug)}-9`), base: longest(previous?.base, ready.base),
     path: filled.path, url: filled.url, slug: longest(previous?.slug, destination.slug), date: filled.date,
     pullRequest: { number, url: longest(previous?.pullRequest.url, `https://github.com/${ready.repo}/pull/${number}`) },
     publishedAt: longest(previous?.publishedAt, at), updatedAt: at,
     sourceSha: digest, values: destination.values, data: filled.frontmatter, bodySha: digest, docTitle,
     ...(landed ? { landed } : {}),
-    ...(target.state === 'open' && previous ? { unconfirmed: { commit: '0'.repeat(40), url: previous.url } } : {}),
+    ...(commit && target.state === 'open' && previous ? { unconfirmed: { commit: '0'.repeat(40), url: previous.url } } : {}),
   }
 }
 
 // The record is written after each pull request opens. A record that cannot
 // be written then would leave that pull request unknown, and the next publish
-// would open another; so a record that would not fit is refused first.
+// would open another; so a record that would not fit is refused first: every
+// site before anything is written, at what its record will hold whatever
+// happens, and each again once its file is known (publishTo).
 function assertLedgerFits(records: PublishRecord[], provisional: PublishRecord[]): void {
   // Each record is written as its site is published, and any site can fail
   // and keep its old record: so the record must fit with every site at the
@@ -714,6 +718,11 @@ function assertLedgerFits(records: PublishRecord[], provisional: PublishRecord[]
   if (Buffer.byteLength(JSON.stringify({ records: [...worst.values()] }, null, 2), 'utf8') > MAX_PUBLISH_LEDGER_BYTES) {
     throw new HttpError(413, 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.')
   }
+}
+
+/** The branch a slug is published from. Git refuses a dot in some places (a.lock, a trailing dot), so each becomes a hyphen. */
+function branchFor(slug: string): string {
+  return `publish/${slug.replace(/\./g, '-')}`
 }
 
 async function freshBranch(session: GitHubSession, repo: string, name: string, sha: string): Promise<string> {
@@ -739,7 +748,7 @@ interface Outcome {
  * since is kept, and the same field or text changed on both sides is refused
  * unless `replace` says to use this document's version.
  */
-async function publishTo(session: GitHubSession, target: Target, parts: DocumentParts, places: Place[], todayValue: string, replace: boolean, content: string): Promise<Outcome> {
+async function publishTo(session: GitHubSession, target: Target, parts: DocumentParts, places: Place[], todayValue: string, replace: boolean, content: string, fits: (record: PublishRecord) => void): Promise<Outcome> {
   const { destination, ready, section, previous, state, landed } = target
   const filled = fillFor(target, parts, places, todayValue)
   const title = String(filled.frontmatter[section.firstLine ?? 'title'] ?? parts.title)
@@ -778,8 +787,11 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     // A commit left unconfirmed is settled: its pull request was read again.
     const record: PublishRecord = { ...previous!, site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published, ...(landed ? { landed } : {}), updatedAt: now }
     delete record.unconfirmed
+    fits(record)
     return { record, state: state as 'open' | 'merged', unchanged: true }
   }
+  // Before anything is written: at the most a commit could add to the record.
+  fits(provisionalRecord(target, filled, parts.title))
 
   const open = (headRepo: string, branch: string, update: boolean) => openPullRequest(session, upstream.fullName, {
     title: update ? `Update: ${title}` : title,
@@ -836,7 +848,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     // their fork. Only a merged pull request makes this an update.
     const where = upstream.canPush ? upstream : await fork(session, upstream.fullName)
     headRepo = where.fullName
-    branch = await freshBranch(session, headRepo, `publish/${destination.slug}`, head)
+    branch = await freshBranch(session, headRepo, branchFor(destination.slug), head)
     await commitFile(session, headRepo, branch, head, `${state === 'merged' ? 'Update' : 'Publish'} ${filled.path}`, filled.path, text)
     const opened = await open(headRepo, branch, state === 'merged')
     pr = { number: opened.number, url: opened.url }

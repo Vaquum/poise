@@ -137,6 +137,10 @@ async function gh(command: string, args: string[], options: RunFileOptions = {})
   }
   if (rest === 'git/refs' && method === 'POST') {
     const name = input.ref.replace(/^refs\/heads\//, '')
+    // As Git checks a ref's name: no part starts with a dot or ends with .lock, nothing ends with a dot, no ..
+    if (name.split('/').some((part: string) => part.startsWith('.') || part.endsWith('.lock')) || name.endsWith('.') || name.includes('..')) {
+      return answer(422, { message: 'Reference name is not valid' })
+    }
     if (repo.branches.has(name)) return answer(422, { message: 'Reference already exists' })
     if (!commits.has(input.sha)) return answer(422, { message: 'Object does not exist' })
     repo.branches.set(name, input.sha)
@@ -1065,6 +1069,25 @@ sections:
     expect(results.map((r: any) => r.ok)).toEqual([true, false])
   })
 
+  it('updates an open publication that has this version already, however long', async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    const note = { repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: 'x'.repeat(400_000) } }
+    expect((await publish([note])).body.results[0].ok).toBe(true)
+    // Nothing to commit, so nothing a merge during a commit could add.
+    expect((await publish([note])).body.results[0]).toMatchObject({ ok: true, unchanged: true })
+  })
+
+  it('names a branch Git takes for a slug with a dot', async () => {
+    addRepo('acme/dotted', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/dotted' })
+    await request('/api/publishing/sites/acme/dotted/description', 'PUT', { description: 'version: 1\nsite: Dotted\nsections:\n  - name: Pages\n    path: pages/{slug}.md\n    slug: "^[a-z0-9.-]+$"\n' })
+    expect((await publish([{ repo: 'acme/dotted', section: 'Pages', slug: 'article.lock', values: {} }])).body.results[0].ok).toBe(true)
+    expect(repos.get('acme/dotted')!.pulls.get(101)).toMatchObject({ head: 'publish/article-lock' })
+    expect(fileOn('acme/dotted', 'publish/article-lock', 'pages/article.lock.md')).toContain('The opening paragraph.')
+  })
+
   it("counts what a merge during the commit would add to an open publication's record", async () => {
     addRepo('acme/notes', {})
     await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
@@ -1073,7 +1096,7 @@ sections:
     expect((await publish([note('x'.repeat(400_000))])).body.results[0].ok).toBe(true)
     const before = calls.length
     // Its open pull request could merge while the new 400,000 characters are committed.
-    expect((await publish([note('y'.repeat(400_000))])).status).toBe(413)
+    expect((await publish([note('y'.repeat(400_000))])).body.results[0]).toMatchObject({ ok: false, error: 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.' })
     expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
   })
 
@@ -1104,7 +1127,7 @@ sections:
     expect((await publish([note('x'.repeat(400_000))])).body.results[0].publication.pullRequest.number).toBe(102)
     const before = calls.length
     // Open with 400,000 characters over a short landed note: a merge during the commit would land the long one.
-    expect((await publish([note('y'.repeat(400_000))])).status).toBe(413)
+    expect((await publish([note('y'.repeat(400_000))])).body.results[0]).toMatchObject({ ok: false, error: 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.' })
     expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
   })
 
@@ -1149,7 +1172,7 @@ sections:
     const note = (text: string) => ({ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: text } })
     expect((await publish([note('short')])).body.results[0].ok).toBe(true)
     const before = calls.length
-    expect((await publish([note('x'.repeat(400_000))])).status).toBe(413)
+    expect((await publish([note('x'.repeat(400_000))])).body.results[0]).toMatchObject({ ok: false, error: 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.' })
     expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
   })
 
@@ -1176,7 +1199,7 @@ sections:
     expect((await publish([at({ words })])).body.results[0].ok).toBe(true)
     const before = calls.length
     // Compact, the text outweighs the open list; indented as the record is written, the list does.
-    expect((await publish([at({ note: 'x'.repeat(330_000) })])).status).toBe(413)
+    expect((await publish([at({ note: 'x'.repeat(330_000) })])).body.results[0]).toMatchObject({ ok: false, error: 'The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.' })
     expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
   })
 
