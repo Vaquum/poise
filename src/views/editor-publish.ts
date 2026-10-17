@@ -39,6 +39,9 @@ interface Choice {
 
 type Shared = 'title' | 'description' | 'date'
 
+/** A site's own field as the panel holds it: a list as its words, each kept whole, commas and all. */
+type OwnValue = string | boolean | string[]
+
 interface State {
   slug: string
   choices: Choice[]
@@ -46,8 +49,10 @@ interface State {
   chosen: Set<string>
   /** Title and description as shown; the date once it is typed, until then each site's own (dateFor). */
   shared: Record<Shared, string>
-  /** Each destination's own values, as typed: a list is its words joined by commas. */
-  values: Map<string, Record<string, string | boolean>>
+  /** Each destination's own values. */
+  values: Map<string, Record<string, OwnValue>>
+  /** A list's text while it is typed, by the control's field key: shown as typed, read into words as it goes. */
+  listText: Map<string, string>
   slugs: Map<string, string>
   slugTyped: Set<string>
   results: Map<string, PublishResult>
@@ -101,6 +106,18 @@ function savedValue(values: Record<string, unknown>, name: string): unknown {
   return Object.prototype.hasOwnProperty.call(values, name) ? values[name] : undefined
 }
 
+/** Empty as the site reads it: nothing, an empty text, or no words. */
+function blank(value: unknown): boolean {
+  return value === undefined || value === null || value === '' || (Array.isArray(value) && !value.length)
+}
+
+/** A list's words as typed, separated by commas. */
+function words(text: string): string[] {
+  return text.split(',').map((w) => w.trim()).filter(Boolean)
+}
+
+const fieldKey = (key: string, name: string) => JSON.stringify([key, name])
+
 function asText(value: unknown): string | boolean {
   if (typeof value === 'boolean') return value
   if (Array.isArray(value)) return value.join(', ')
@@ -144,23 +161,26 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
   const published = (key: string) => doc.publications.find((p) => keyOf(p.repo, p.section) === key)
   const chosen = new Set(choices.filter((c) => published(c.key)).map((c) => c.key))
   if (!chosen.size && choices.length === 1) chosen.add(choices[0].key)
-  const values = new Map<string, Record<string, string | boolean>>()
+  const values = new Map<string, Record<string, OwnValue>>()
   const slugs = new Map<string, string>()
   for (const choice of choices) {
     const publication = published(choice.key)
-    const own: Record<string, string | boolean> = {}
+    const own: Record<string, OwnValue> = {}
     for (const field of ownFields(choice.section)) {
-      // A field the saved values do not have (one added since) takes its default.
-      const saved = publication && Object.prototype.hasOwnProperty.call(publication.values, field.name)
-      // Only a date field reads today as today: elsewhere it is the word.
-      const value = saved ? savedValue(publication!.values, field.name) : field.default === 'today' && field.kind === 'date' ? doc.today : field.default
-      own[field.name] = field.kind === 'boolean' ? value === true : asText(value) as string
+      // A field the saved values leave empty, or do not have (one added
+      // since), takes its default: what the site was given for it. Only a
+      // date field reads today as today; elsewhere it is the word.
+      const saved = publication ? savedValue(publication.values, field.name) : undefined
+      const value = !blank(saved) ? saved : field.default === 'today' && field.kind === 'date' ? doc.today : field.default
+      own[field.name] = field.kind === 'boolean' ? value === true
+        : field.kind === 'list' ? (Array.isArray(value) ? value.map(String) : [])
+        : asText(value) as string
     }
     values.set(choice.key, own)
     slugs.set(choice.key, publication?.slug ?? doc.slug)
   }
   return {
-    slug, choices, doc, chosen, values, slugs, slugTyped: new Set(), results: new Map(), busy: false,
+    slug, choices, doc, chosen, values, listText: new Map(), slugs, slugTyped: new Set(), results: new Map(), busy: false,
     shared: { title: titleFor(doc, choices), description: remembered(doc, choices, 'description'), date: '' },
   }
 }
@@ -196,20 +216,24 @@ function labelOf(field: FieldView): string {
   return words.charAt(0).toUpperCase() + words.slice(1)
 }
 
-function fieldHtml(key: string, field: FieldView, value: string | boolean): string {
+function fieldHtml(key: string, field: FieldView, value: OwnValue, typed?: string): string {
   const name = escapeHtml(labelOf(field))
   // The label wraps the control; aria-label keeps its name to the field's
   // name alone, without a select's options or a list's suggestions.
   const data = `data-field="${encode(key, field.name)}" aria-label="${name}"`
   const required = field.required ? ' required' : ''
   const max = field.max && field.kind === 'text' ? ` maxlength="${field.max}"` : ''
+  // Left empty, a field is written with its default: the box says which.
+  const hint = typeof field.default === 'string' && field.default ? ` placeholder="${escapeHtml(field.default)}"` : ''
   let control: string
   switch (field.kind) {
     case 'choice': {
-      // Nothing chosen shows as nothing chosen, never as the first choice the browser would display.
+      // Nothing chosen shows as nothing chosen, never as the first choice the
+      // browser would display. A choice with a default is never left empty:
+      // the site would write its default.
       const none = value === ''
         ? `<option value="" selected${field.required ? ' disabled' : ''}>${field.required ? 'Choose…' : ''}</option>`
-        : field.required ? '' : '<option value=""></option>'
+        : field.required || field.default !== undefined ? '' : '<option value=""></option>'
       control = `<select class="ep-input" ${data}>${none}${field.choices!.map((c) =>
         `<option value="${escapeHtml(c)}"${c === value ? ' selected' : ''}>${escapeHtml(c)}</option>`).join('')}</select>`
       break
@@ -221,16 +245,17 @@ function fieldHtml(key: string, field: FieldView, value: string | boolean): stri
       return `<label class="ep-check"><input type="checkbox" ${data}${value === true ? ' checked' : ''} /> <span>${name}</span></label>`
     case 'list': {
       // The suggestions sit beside the label, not in it: they are not the field's name.
-      const words = String(value).split(',').map((w) => w.trim()).filter(Boolean)
+      const items = value as string[]
       const chips = (field.suggestions ?? []).map((s) =>
-        `<button type="button" class="ep-chip${words.includes(s) ? ' is-on' : ''}" data-chip="${encode(key, field.name, s)}" aria-pressed="${words.includes(s)}">${escapeHtml(s)}</button>`).join('')
-      const input = `<input type="text" class="ep-input ep-mono" ${data} value="${escapeHtml(String(value))}" placeholder="separated, by commas" autocomplete="off" spellcheck="false" />`
+        `<button type="button" class="ep-chip${items.includes(s) ? ' is-on' : ''}" data-chip="${encode(key, field.name, s)}" aria-pressed="${items.includes(s)}">${escapeHtml(s)}</button>`).join('')
+      const listHint = Array.isArray(field.default) && field.default.length ? field.default.join(', ') : 'separated, by commas'
+      const input = `<input type="text" class="ep-input ep-mono" ${data} value="${escapeHtml(typed ?? items.join(', '))}" placeholder="${escapeHtml(listHint)}" autocomplete="off" spellcheck="false" />`
       return `<div class="ep-list"><label class="ep-field"><span class="ep-label">${name}</span>${input}</label>${chips ? `<span class="ep-chips">${chips}</span>` : ''}</div>`
     }
     default:
       control = field.lines === 'many'
-        ? `<textarea class="ep-input" rows="2" ${data}${max}${required}>${escapeHtml(String(value))}</textarea>`
-        : `<input type="text" class="ep-input" ${data} value="${escapeHtml(String(value))}"${max}${required} autocomplete="off" />`
+        ? `<textarea class="ep-input" rows="2" ${data}${max}${required}${hint}>${escapeHtml(String(value))}</textarea>`
+        : `<input type="text" class="ep-input" ${data} value="${escapeHtml(String(value))}"${max}${required}${hint} autocomplete="off" />`
   }
   return `<label class="ep-field"><span class="ep-label">${name}</span>${control}</label>`
 }
@@ -261,7 +286,8 @@ function syncValues(body: HTMLElement, s: State): void {
     else if (control.dataset.slug) wanted = s.slugs.get(control.dataset.slug) ?? ''
     else {
       const [key, name] = decode(control.dataset.field!)
-      wanted = s.values.get(key)?.[name] ?? ''
+      const value = s.values.get(key)?.[name] ?? ''
+      wanted = Array.isArray(value) ? s.listText.get(control.dataset.field!) ?? value.join(', ') : value
     }
     if (control instanceof HTMLInputElement && control.type === 'checkbox') {
       if (control.checked !== (wanted === true)) control.checked = wanted === true
@@ -304,7 +330,7 @@ function render(): void {
       <div class="ep-dest" data-key="${escapeHtml(c.key)}-fields">
         ${chosen.length > 1 || ownFields(c.section).length ? `<div class="ep-dest-name">${escapeHtml(c.site.site ?? c.site.repo)}${sectionsOf(c.site.repo) > 1 ? ` · ${escapeHtml(c.section.name)}` : ''}</div>` : ''}
         <label class="ep-field"><span class="ep-label">Slug</span><input type="text" class="ep-input ep-mono" data-slug="${escapeHtml(c.key)}" aria-label="Slug" value="${escapeHtml(s.slugs.get(c.key) ?? '')}"${publication ? ' readonly title="Published under this slug"' : ''} autocomplete="off" spellcheck="false" /></label>
-        ${ownFields(c.section).map((f) => fieldHtml(c.key, f, own[f.name] ?? '')).join('')}
+        ${ownFields(c.section).map((f) => fieldHtml(c.key, f, own[f.name] ?? '', s.listText.get(fieldKey(c.key, f.name)))).join('')}
         ${resultHtml(s.results.get(c.key))}
       </div>`
   }).join('')
@@ -330,10 +356,7 @@ function render(): void {
 function destinationFor(choice: Choice): Destination {
   const s = state!
   const values: Record<string, unknown> = {}
-  for (const field of ownFields(choice.section)) {
-    const raw = s.values.get(choice.key)![field.name]
-    values[field.name] = field.kind === 'list' ? String(raw).split(',').map((w) => w.trim()).filter(Boolean) : raw
-  }
+  for (const field of ownFields(choice.section)) values[field.name] = s.values.get(choice.key)![field.name]
   for (const which of ['title', 'description', 'date'] as const) {
     const field = sharedField(choice.section, which)
     const value = which === 'date' ? dateFor(s, choice) : s.shared[which]
@@ -389,9 +412,15 @@ function onInput(event: Event): void {
     s.slugTyped.add(target.dataset.slug)
   } else if (target.dataset.field) {
     const [key, name] = decode(target.dataset.field)
-    s.values.get(key)![name] = target.type === 'checkbox' ? target.checked : target.value
-    // Typed words light their suggestions.
-    if (target.closest('.ep-list')) render()
+    const own = s.values.get(key)!
+    if (Array.isArray(own[name])) {
+      // Typed words light their suggestions; the text stays as typed.
+      s.listText.set(target.dataset.field, target.value)
+      own[name] = words(target.value)
+      render()
+    } else {
+      own[name] = target.type === 'checkbox' ? target.checked : target.value
+    }
   } else if (target.dataset.choose) {
     if (target.checked) s.chosen.add(target.dataset.choose)
     else s.chosen.delete(target.dataset.choose)
@@ -411,8 +440,9 @@ function onClick(event: MouseEvent, host: PublishPanelHost): void {
   if (chip && s) {
     const [key, name, word] = decode(chip.dataset.chip!)
     const own = s.values.get(key)!
-    const words = String(own[name]).split(',').map((w) => w.trim()).filter(Boolean)
-    own[name] = (words.includes(word) ? words.filter((w) => w !== word) : [...words, word]).join(', ')
+    const items = own[name] as string[]
+    own[name] = items.includes(word) ? items.filter((w) => w !== word) : [...items, word]
+    s.listText.delete(fieldKey(key, name))
     render()
     return
   }

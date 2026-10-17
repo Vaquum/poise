@@ -442,3 +442,34 @@ test('fills a first line named description from the title alone', async ({ page 
   await expect(dialog.getByRole('alert')).toContainText('Not now.')
   expect(sent[0].destinations[0].values).toEqual({ description: 'A better question, asked' })
 })
+
+test('never leaves a choice with a default empty', async ({ page }) => {
+  await workspace(page)
+  // mikkokotila.com's type is optional, with essay as its default; it was published left empty.
+  const sent = await openEditor(page, [MIKKO], notNow, [publication(MIKKO, 101, { type: '', title: 'A better question' })])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  const type = dialog.getByLabel('Type', { exact: true })
+  await expect(type).toHaveValue('essay')
+  await expect(type.locator('option')).toHaveText(['essay', 'note'])
+  await dialog.getByRole('button', { name: 'Update', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values.type).toBe('essay')
+})
+
+test('keeps each word of a list whole, commas and all', async ({ page }) => {
+  await workspace(page)
+  const listed = {
+    repo: 'acme/listed', state: 'ready', source: 'settings', site: 'Listed', description: 'version: 1\n',
+    sections: [{ name: 'Posts', url: 'https://listed.example/{slug}/', firstLine: 'title', fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'cities', kind: 'list', required: false, default: ['Helsinki, Finland'], suggestions: ['Paris, France'] },
+    ] }],
+  }
+  const sent = await openEditor(page, [listed], notNow)
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.getByLabel('Cities', { exact: true })).toHaveValue('Helsinki, Finland')
+  await dialog.getByRole('button', { name: 'Paris, France' }).click()
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values.cities).toEqual(['Helsinki, Finland', 'Paris, France'])
+})
