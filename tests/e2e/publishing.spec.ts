@@ -425,3 +425,20 @@ test('reads only what a publication holds, never what every object inherits', as
   await expect(dialog.getByRole('alert')).toContainText('Not now.')
   expect(sent[0].destinations[0].values.constructor).toBe('2026-01-01')
 })
+
+test('fills a first line named description from the title alone', async ({ page }) => {
+  await workspace(page)
+  const lede = {
+    repo: 'acme/lede', state: 'ready', source: 'settings', site: 'Lede', description: 'version: 1\n',
+    sections: [{ name: 'Posts', url: 'https://lede.example/{slug}/', firstLine: 'description', fields: [
+      { name: 'description', kind: 'text', required: true },
+    ] }],
+  }
+  const sent = await openEditor(page, [lede], notNow)
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.getByLabel('Description', { exact: true })).toHaveCount(0)
+  await dialog.getByLabel('Title', { exact: true }).fill('A better question, asked')
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values).toEqual({ description: 'A better question, asked' })
+})

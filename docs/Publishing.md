@@ -92,7 +92,8 @@ The Publish icon in the Editor bar opens the panel for the open document:
   state, and is chosen already, as is the only site when there is one;
 - Title, Description and Date, asked once. Title fills each section's
   `first_line` field, or its text field named `title`; Description its text
-  field named `description`; Date its first date field. The title starts as
+  field named `description`, unless that is the first line Title fills; Date
+  its first date field. The title starts as
   the document's first line. Until you change the date, each site keeps the
   date it was published with, else takes the piece's date from another site,
   else its own default: today, unless its description fixes another. The

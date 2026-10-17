@@ -73,7 +73,11 @@ const decode = (value: string) => JSON.parse(value) as string[]
 /** Which of a section's fields the shared title, description and date fill. */
 function sharedField(section: SectionView, which: Shared): string | undefined {
   if (which === 'title') return section.firstLine ?? section.fields.find((f) => f.name === 'title' && f.kind === 'text')?.name
-  if (which === 'description') return section.fields.find((f) => f.name === 'description' && f.kind === 'text')?.name
+  if (which === 'description') {
+    // A description that is the first line is the title's: one field, one control.
+    const field = section.fields.find((f) => f.name === 'description' && f.kind === 'text')?.name
+    return field !== sharedField(section, 'title') ? field : undefined
+  }
   return section.fields.find((f) => f.kind === 'date')?.name
 }
 
