@@ -258,6 +258,15 @@ describe('publishing again', () => {
     expect(() => fillPost(odd, 'a-better-question', {}, context())).not.toThrow()
   })
 
+  it('names no field or place key __proto__, and keeps a key of that name the site has', () => {
+    expect(configError(MIKKO.replace('      tags:', '      __proto__: { kind: text }\n      tags:'))).toBe('sections[0].fields.__proto__: __proto__ cannot name a field')
+    const merged = reconcile(base, { data: { title: 'T', tags: ['a'], date: '2026-10-17' }, body: 'Old text.' },
+      { data: JSON.parse('{"title":"T","tags":["a"],"date":"2026-10-17","__proto__":"kept"}'), body: 'Old text.' })
+    expect(Object.hasOwn(merged.data, '__proto__')).toBe(true)
+    expect(renderPost(merged.data, merged.body)).toContain('__proto__: "kept"')
+    expect(configError(MIKKO.replace('item: { venue: "{site}", url: "{url}" }', 'item: { __proto__: "{site}" }'))).toBe('sections[0].fields.origins.item.__proto__: not a usable key')
+  })
+
   it('reports the same field, and the text, changed on both sides', () => {
     const merged = reconcile(base,
       { data: { title: 'T', tags: ['c'], date: '2026-10-17' }, body: 'Mine.' },

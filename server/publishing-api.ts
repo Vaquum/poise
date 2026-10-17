@@ -39,6 +39,7 @@ import {
   REPOSITORY,
   branchHead,
   commitFile,
+  contains,
   createBranch,
   fileAt,
   fork,
@@ -451,10 +452,15 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // a publication to that site; elsewhere it is still named where it was.
   const states = new Map<string, PullRequestInfo['state'] | 'unknown'>()
   const unread = new Map<string, string>()
+  // An update committed while its pull request could not be read, where
+  // the pull request has since been merged without it.
+  const missed = new Set<string>()
   await Promise.all(ledger.records.map(async (record) => {
     const key = placeKey(record.repo, record.section)
     try {
-      states.set(key, (await pullRequest(session, record.repo, record.pullRequest.number)).state)
+      const info = await pullRequest(session, record.repo, record.pullRequest.number)
+      if (record.unconfirmed && info.state === 'merged' && !await contains(session, record.headRepo, info.headSha, record.unconfirmed)) missed.add(key)
+      states.set(key, info.state)
     } catch (error) {
       if (!(error instanceof GitHubError)) throw error
       states.set(key, 'unknown')
@@ -464,9 +470,13 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // A merged version stays on the site, and stays this document's, even when
   // a later pull request is closed unmerged. Worked out here, and written only
   // with a record this publication writes.
-  const landedOf = (record: PublishRecord): Landed | undefined => states.get(placeKey(record.repo, record.section)) === 'merged'
-    ? snapshotOf(record)
-    : record.landed
+  // What it merged then is not recorded: no field is taken for the site's
+  // own, and every difference from the site is asked about.
+  const landedOf = (record: PublishRecord): Landed | undefined => {
+    const key = placeKey(record.repo, record.section)
+    if (states.get(key) !== 'merged') return record.landed
+    return missed.has(key) ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.url } : snapshotOf(record)
+  }
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
 
   // A site that cannot be published to now fails alone: the others still go,
@@ -571,6 +581,9 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   for (const target of [...going]) {
     const places = placesFor(going)
     try {
+      // Sized again with the places it goes with now: a site that failed
+      // before it can name another original, or an address published earlier.
+      assertLedgerFits(ledger.records, [provisionalRecord(target, fillFor(target, parts, places, todayValue), parts.title)])
       const outcome = await publishTo(session, target, parts, places, todayValue, replace, doc.content)
       const kept = await record(target, outcome)
       published.push({ target, record: kept, places, state: outcome.state })
@@ -666,6 +679,7 @@ function provisionalRecord(target: Target, filled: FilledPost, docTitle: string)
     publishedAt: longest(previous?.publishedAt, at), updatedAt: at,
     sourceSha: digest, values: destination.values, data: filled.frontmatter, bodySha: digest, docTitle,
     ...(landed ? { landed } : {}),
+    ...(target.state === 'open' ? { unconfirmed: '0'.repeat(40) } : {}),
   }
 }
 
@@ -747,11 +761,10 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   const now = new Date().toISOString()
   if (current && current.text === text) {
     // The site has this version already: nothing to commit, nothing to open.
-    return {
-      record: { ...previous!, site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published, ...(landed ? { landed } : {}), updatedAt: now },
-      state: state as 'open' | 'merged',
-      unchanged: true,
-    }
+    // A commit left unconfirmed is settled: its pull request was read again.
+    const record: PublishRecord = { ...previous!, site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published, ...(landed ? { landed } : {}), updatedAt: now }
+    delete record.unconfirmed
+    return { record, state: state as 'open' | 'merged', unchanged: true }
   }
 
   const open = (headRepo: string, branch: string, update: boolean) => openPullRequest(session, upstream.fullName, {
@@ -772,25 +785,29 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   let kept = landed
   let outcome: Outcome['state'] = 'open'
   let error: string | undefined
+  let unconfirmed: string | undefined
   if (state === 'open') {
     branch = previous!.branch
     headRepo = previous!.headRepo
     const commit = await commitFile(session, headRepo, branch, head, `Update ${filled.path}`, filled.path, text)
     // Merged or closed while this was committed: the commit needs a pull
     // request of its own, or the update would reach no one, unless the merge
-    // took this commit with it.
-    const after = await pullRequest(session, upstream.fullName, previous!.pullRequest.number).catch((failure: unknown) => {
-      if (!(failure instanceof GitHubError)) throw failure
-      return failure
-    })
+    // took this commit with it, with or without a maintainer's on top.
+    const after = await pullRequest(session, upstream.fullName, previous!.pullRequest.number)
+      .then(async (info) => ({ state: info.state, took: info.state === 'merged' && await contains(session, headRepo, info.headSha, commit) }))
+      .catch((failure: unknown) => {
+        if (!(failure instanceof GitHubError)) throw failure
+        return failure
+      })
     if (after instanceof GitHubError) {
       // The commit is on the branch whatever GitHub answers: it is recorded
-      // as this document's side there, and the pull request read again at
-      // the next publication.
+      // as this document's side there, with the commit, for a later
+      // publication to settle with the pull request.
       pr = previous!.pullRequest
+      unconfirmed = commit
       error = `Committed to the branch of pull request #${pr.number}, but its state could not be read: ${after.message}. Publish again to make sure the update reaches the site.`
     } else if (after.state === 'open') pr = previous!.pullRequest
-    else if (after.state === 'merged' && after.headSha === commit) {
+    else if (after.took) {
       pr = previous!.pullRequest
       kept = { data: published.data, bodySha: published.bodySha, pullRequest: pr.number, url }
       outcome = 'merged'
@@ -819,6 +836,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       publishedAt: previous?.publishedAt ?? now, updatedAt: now,
       sourceSha: sha256(content), values: destination.values, ...published,
       ...(kept ? { landed: kept } : {}),
+      ...(unconfirmed ? { unconfirmed } : {}),
     },
   }
 }

@@ -183,7 +183,7 @@ function placeTemplate(value: unknown, at: string): PlaceTemplate {
   if (!isMapping(value) || !Object.keys(value).length) throw new PublishConfigError(`${at}: give a template, or keys with templates`)
   const out: Record<string, string> = {}
   for (const [key, template] of Object.entries(value)) {
-    if (!FIELD_NAME.test(key)) throw new PublishConfigError(`${at}.${key}: not a usable key`)
+    if (!FIELD_NAME.test(key) || key === '__proto__') throw new PublishConfigError(`${at}.${key}: not a usable key`)
     checkTemplate(text(template, `${at}.${key}`, 300), PLACE_NAMES, `${at}.${key}`)
     out[key] = template as string
   }
@@ -191,7 +191,9 @@ function placeTemplate(value: unknown, at: string): PlaceTemplate {
 }
 
 function readField(name: string, spec: unknown, at: string): PublishField {
-  if (!FIELD_NAME.test(name)) throw new PublishConfigError(`${at}: a field name is letters, digits, _ and -, starting with a letter`)
+  if (!FIELD_NAME.test(name)) throw new PublishConfigError(`${at}: a field name is letters, digits, _ and -, starting with a letter or _`)
+  // An object would take it for its prototype, and the value would be lost.
+  if (name === '__proto__') throw new PublishConfigError(`${at}: __proto__ cannot name a field`)
   if (!isMapping(spec)) throw new PublishConfigError(`${at}: describe the field with kind and its options`)
   const kind = spec.kind as FieldKind
   if (!FIELD_KINDS.includes(kind)) throw new PublishConfigError(`${at}.kind: one of ${FIELD_KINDS.join(', ')}`)
@@ -584,7 +586,8 @@ export interface Reconciled extends PostFile {
  */
 export function reconcile(base: PublishedState, ours: PostFile, theirs: PostFile): Reconciled {
   const conflicts: string[] = []
-  const data: Record<string, unknown> = {}
+  // Without a prototype, a key named __proto__ the site's file has is kept as a key.
+  const data: Record<string, unknown> = Object.create(null)
   const keys = [...Object.keys(ours.data), ...Object.keys(theirs.data).filter((key) => !Object.hasOwn(ours.data, key))]
   for (const key of keys) {
     const mine = own(ours.data, key), site = own(theirs.data, key), was = own(base.data, key)

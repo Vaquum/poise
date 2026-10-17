@@ -19,6 +19,8 @@ interface Repo { fullName: string, owner: string, defaultBranch: string, push: b
 
 let repos: Map<string, Repo>
 let commits: Map<string, Map<string, string>>
+/** Each commit's parent, for compare. */
+let parents: Map<string, string>
 let commitCount = 0
 let calls: Array<{ args: string[], env: NodeJS.ProcessEnv | undefined, input: any }>
 let ghFailure: string | null
@@ -29,9 +31,10 @@ let beforeCommit: (() => Promise<void> | void) | null
 /** Runs once, just after the next commit is applied. */
 let afterCommit: (() => void) | null
 
-function commit(files: Map<string, string>): string {
+function commit(files: Map<string, string>, parent?: string): string {
   const sha = (++commitCount).toString(16).padStart(40, '0')
   commits.set(sha, files)
+  if (parent) parents.set(sha, parent)
   return sha
 }
 
@@ -52,7 +55,7 @@ function editOnSite(fullName: string, branch: string, path: string, edit: (text:
   const repo = repos.get(fullName.toLowerCase())!
   const files = new Map(commits.get(repo.branches.get(branch)!)!)
   files.set(path, edit(files.get(path)!))
-  repo.branches.set(branch, commit(files))
+  repo.branches.set(branch, commit(files, repo.branches.get(branch)))
 }
 
 function close(fullName: string, number: number): void {
@@ -105,7 +108,7 @@ async function gh(command: string, args: string[], options: RunFileOptions = {})
     if (head !== change.expectedHeadOid) return answer(200, { errors: [{ message: `Expected branch to point to "${change.expectedHeadOid}" but it did not` }] })
     const files = new Map(commits.get(head!)!)
     for (const addition of change.fileChanges.additions) files.set(addition.path, Buffer.from(addition.contents, 'base64').toString('utf8'))
-    const oid = commit(files)
+    const oid = commit(files, head)
     repo.branches.set(change.branch.branchName, oid)
     if (afterCommit) {
       const hook = afterCommit
@@ -145,6 +148,16 @@ async function gh(command: string, args: string[], options: RunFileOptions = {})
     const pull: Pull = { number: 100 + repo.pulls.size + 1, state: 'open', merged: false, head: branch, headRepo: headRepo.fullName, base: input.base, title: input.title, body: input.body }
     repo.pulls.set(pull.number, pull)
     return answer(201, pullJson(repo, pull))
+  }
+  if (rest.startsWith('compare/') && method === 'GET') {
+    const [from, to] = rest.slice('compare/'.length).split('...').map(decodeURIComponent)
+    const history = (sha: string) => {
+      const seen: string[] = []
+      for (let at: string | undefined = sha; at; at = parents.get(at)) seen.push(at)
+      return seen
+    }
+    const status = from === to ? 'identical' : history(to).includes(from) ? 'ahead' : history(from).includes(to) ? 'behind' : 'diverged'
+    return answer(200, { status })
   }
   const pullMatch = /^pulls\/(\d+)$/.exec(rest)
   if (pullMatch && method === 'GET') return answer(200, pullJson(repo, repo.pulls.get(Number(pullMatch[1]))!))
@@ -272,6 +285,7 @@ beforeEach(async () => {
   process.env.POISE_EDITOR_DIR = join(root, 'editor')
   repos = new Map()
   commits = new Map()
+  parents = new Map()
   calls = []
   ghFailure = null
   failOn = null
@@ -667,6 +681,80 @@ describe('publishing a document', () => {
     beforeCommit = async () => { await editor!.deleteDoc(DOC) }
     expect(await publish([writing()])).toEqual({ status: 404, body: { error: 'That document does not exist.' } })
     expect((await editor!.readPublishLedger(DOC)).records).toEqual([])
+  })
+
+  it('asks before publishing over an update its pull request was merged without', async () => {
+    await publish([writing()])
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    // Merged just before the update's commit, and not readable just after it.
+    beforeCommit = () => merge('mikkokotila/mikkokotila-com', 101)
+    afterCommit = () => {
+      failOn = (method, endpoint) => (method === 'GET' && endpoint === 'repos/mikkokotila/mikkokotila-com/pulls/101' ? 500 : null)
+    }
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/^Committed to the branch of pull request #101/) })
+    failOn = null
+    // The update never reached the site: it is neither taken as published there nor given up as the site's change.
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: false, conflicts: ['the text'] })
+    expect((await publish([writing()], true)).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    expect(fileOn('mikkokotila/mikkokotila-com', repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)!.head, POST)).toContain('A new ending.')
+  })
+
+  it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
+    await publish([writing()])
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    // Right after the update's commit, a maintainer adds a description on top of it, and merges.
+    afterCommit = () => {
+      editOnSite('mikkokotila/mikkokotila-com', 'publish/a-better-question', POST, (text) => text.replace('title: "A better question"', 'title: "A better question"\ndescription: "Added in review."'))
+      merge('mikkokotila/mikkokotila-com', 101)
+    }
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 101, state: 'merged' } } })
+    expect(repos.get('mikkokotila/mikkokotila-com')!.pulls.has(102)).toBe(false)
+    // Going back to the earlier text updates that merged version, and keeps the maintainer's description.
+    await writeDocument(DOC, TEXT)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    const update = fileOn('mikkokotila/mikkokotila-com', repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)!.head, POST)!
+    expect(update).not.toContain('A new ending.')
+    expect(update).toContain('description: "Added in review."')
+  })
+
+  it('sizes each site again with the places it is published with', async () => {
+    const alpha = (url: string) => `version: 1
+site: Alpha
+sections:
+  - name: Posts
+    path: alpha/{slug}.md
+    url: ${url}
+    slug: "^[a-z0-9-]+$"
+    first_line: title
+    fields:
+      title: { kind: text, required: true }
+`
+    for (const [repo, yaml] of [['acme/alpha', alpha(`https://alpha.example/${'{slug}/'.repeat(38)}`)], ['acme/beta', PLACED_YAML.replace('item: "{site}"', 'item: "{url}"')]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const toAlpha = { repo: 'acme/alpha', section: 'Posts', slug: 'a-better-question', values: {} }
+    expect((await publish([toAlpha])).body.results[0].ok).toBe(true)
+    // Alpha's address is shorter now; Beta lists it.
+    await request('/api/publishing/sites/acme/alpha/description', 'PUT', { description: alpha('https://alpha.example/{slug}/') })
+    const toBeta = (length: number) => ({ repo: 'acme/beta', section: 'Notes', slug: 'a-better-question', values: { note: 'n'.repeat(length) } })
+    // Alpha fails before Beta, so Beta lists the address Alpha has: its earlier, longer one.
+    const alphaFails = (method: string, endpoint: string) => method === 'GET' && endpoint.startsWith('repos/acme/alpha/git/ref/')
+    // The longest note checked to fit with Alpha's new address, found where Beta fails too and nothing is written.
+    failOn = (method, endpoint) => (alphaFails(method, endpoint) || (method === 'POST' && endpoint === 'repos/acme/beta/git/refs') ? 500 : null)
+    let [fits, over] = [0, 600_000]
+    while (over - fits > 1) {
+      const length = Math.floor((fits + over) / 2)
+      if ((await publish([toAlpha, toBeta(length)])).status === 413) over = length
+      else fits = length
+    }
+    failOn = (method, endpoint) => (alphaFails(method, endpoint) ? 500 : null)
+    const before = calls.length
+    const results = (await publish([toAlpha, toBeta(fits)])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([false, false])
+    expect(results[1].error).toBe('The record of where this document is published would grow past 1 MB. Publish to fewer sites at once, or shorten the longest fields.')
+    expect(calls.slice(before).filter((call) => call.args.includes('POST') && call.args[1].startsWith('repos/acme/beta/'))).toEqual([])
   })
 
   it('refuses a publication whose record would pass 1 MB on the way, not only at the end', async () => {

@@ -230,6 +230,14 @@ export async function pullRequest(session: GitHubSession, repo: string, number: 
   return pullRequestFrom(answer.body)
 }
 
+/** Whether `commit` is in `head`'s history: the same commit, or one before it. */
+export async function contains(session: GitHubSession, repo: string, head: string, commit: string): Promise<boolean> {
+  if (head === commit) return true
+  const answer = await request(session, 'GET', `repos/${repo}/compare/${encodeURIComponent(commit)}...${encodeURIComponent(head)}?per_page=1`)
+  if (answer.status !== 200) fail(answer, `Comparing ${commit.slice(0, 7)} with ${head.slice(0, 7)} in ${repo}`)
+  return answer.body?.status === 'ahead' || answer.body?.status === 'identical'
+}
+
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /**

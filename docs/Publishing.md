@@ -46,7 +46,9 @@ sections:
   - `first_line` (optional) names the text field the document's first line
     fills; the post's text starts after that line. Without it, the whole
     document is the text.
-  - `fields` become the post's frontmatter, in the order listed.
+  - `fields` become the post's frontmatter, in the order listed. A field's
+    name is letters, digits, `_` and `-`, starting with a letter or `_`, and
+    never `__proto__`; so is each key of a `places` entry.
 
 | Kind | What it holds | Options |
 | --- | --- | --- |
@@ -121,6 +123,8 @@ what is wrong.
   it is merged or closed meanwhile, that commit gets a pull request of its own.
   If GitHub cannot say afterwards whether it is still open, the commit is
   recorded and the site says so: publish again to make sure it reaches the site.
+  Should the pull request turn out to have been merged without that commit,
+  every difference from the site is asked about before anything is replaced.
 - Once it is merged, an update gets a pull request of its own, `Update: <title>`.
 - A pull request closed unmerged left nothing new on the site. A version
   merged before it stays the document's, and the next publish updates it;

@@ -736,6 +736,9 @@ export interface PublishRecord {
   /** This document's side of the version last merged there: still the
    *  site's file, and still this document's, whatever came after it. */
   landed?: { data: Record<string, unknown>, bodySha: string, pullRequest: number, url: string }
+  /** An update committed while its pull request could not be read: its
+   *  commit, until a later publication reads the pull request again. */
+  unconfirmed?: string
 }
 
 export interface PublishLedger {
@@ -757,6 +760,7 @@ function isPublishRecord(value: unknown): value is PublishRecord {
     && !!record.data && typeof record.data === 'object' && !Array.isArray(record.data)
     && (record.landed === undefined || isLanded(record.landed))
     && (record.docTitle === undefined || typeof record.docTitle === 'string')
+    && (record.unconfirmed === undefined || typeof record.unconfirmed === 'string')
 }
 
 function isLanded(value: unknown): boolean {
