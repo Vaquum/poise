@@ -735,11 +735,11 @@ export interface PublishRecord {
   bodySha: string               // the text this document gave it
   /** This document's side of the version last merged there: still the
    *  site's file, and still this document's, whatever came after it. */
-  landed?: { data: Record<string, unknown>, bodySha: string, pullRequest: number, url: string, unknown?: true }
+  landed?: { data: Record<string, unknown>, bodySha: string, pullRequest: number, url: string, date?: string, unknown?: true }
   /** An update committed while its pull request could not be read: its
    *  commit, and the address of the version before it, until a later
    *  publication reads the pull request again. */
-  unconfirmed?: { commit: string, url: string }
+  unconfirmed?: { commit: string, url: string, date?: string }
 }
 
 export interface PublishLedger {
@@ -768,6 +768,7 @@ function isUnconfirmed(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const unconfirmed = value as Record<string, unknown>
   return typeof unconfirmed.commit === 'string' && typeof unconfirmed.url === 'string'
+    && (unconfirmed.date === undefined || typeof unconfirmed.date === 'string')
 }
 
 function isLanded(value: unknown): boolean {
@@ -775,6 +776,7 @@ function isLanded(value: unknown): boolean {
   const landed = value as Record<string, unknown>
   return !!landed.data && typeof landed.data === 'object' && !Array.isArray(landed.data)
     && typeof landed.bodySha === 'string' && Number.isSafeInteger(landed.pullRequest) && typeof landed.url === 'string'
+    && (landed.date === undefined || typeof landed.date === 'string')
     && (landed.unknown === undefined || landed.unknown === true)
 }
 

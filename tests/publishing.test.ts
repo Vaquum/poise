@@ -123,6 +123,9 @@ describe('publish.yaml', () => {
     expect(configError(MIKKO.replace('suggest: "content/writing.yaml#topics[].tag" }', 'value: [Not A Tag] }')))
       .toBe('sections[0].fields.tags.value: tags: "Not A Tag" does not match the site\'s pattern ^[a-z0-9]+(?:-[a-z0-9]+)*$.')
     expect(() => parsePublishConfig(MIKKO.replace('max: 420 }', 'max: 420, default: A short one. }'))).not.toThrow()
+    // Kept as checked: trimmed, as a typed value is.
+    const padded = parsePublishConfig(MIKKO.replace('suggest: "content/writing.yaml#topics[].tag" }', 'value: [" ad-fraud ", "ad-fraud"] }')).sections[0]
+    expect(padded.fields.find((f) => f.name === 'tags')!.value).toEqual(['ad-fraud'])
   })
 
   it('stops a pattern that backtracks without end', () => {

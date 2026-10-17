@@ -397,6 +397,8 @@ interface Target {
   state: 'new' | 'open' | 'merged'
   /** This document's side of the version on the site, when one was merged. */
   landed?: Landed
+  /** The date the version on the site, or on its open pull request, went by: a dateless post's date. */
+  since?: string
 }
 
 function placeKey(repo: string, section: string): string {
@@ -438,7 +440,7 @@ async function publishDocument(slug: string, body: unknown): Promise<{ results: 
 function fillFor(target: Target, parts: DocumentParts, places: Place[], todayValue: string): FilledPost {
   const { destination, section, previous } = target
   const self = places.find((p) => p.key === target.key)!
-  const filled = fillPost(section, destination.slug, destination.values, { title: parts.title, today: todayValue, date: previous?.date, places, self })
+  const filled = fillPost(section, destination.slug, destination.values, { title: parts.title, today: todayValue, date: target.since, places, self })
   if (previous && previous.path !== filled.path) {
     throw new PublishValueError([`This piece is published on ${previous.site} as ${previous.path}; publish it with slug ${previous.slug} and its date unchanged.`])
   }
@@ -482,7 +484,18 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   const landedOf = (record: PublishRecord): Landed | undefined => {
     const key = placeKey(record.repo, record.section)
     if (states.get(key) !== 'merged') return record.landed
-    return missed.has(key) ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.unconfirmed!.url, unknown: true } : snapshotOf(record)
+    return missed.has(key)
+      ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.unconfirmed!.url, ...(record.unconfirmed!.date ? { date: record.unconfirmed!.date } : {}), unknown: true }
+      : snapshotOf(record)
+  }
+  // The date the version on its site went by: the record's own, unless what is
+  // there is an earlier version, an update after it closed unmerged or never
+  // reaching its merged pull request.
+  const sinceOf = (record: PublishRecord): string => {
+    const key = placeKey(record.repo, record.section)
+    if (states.get(key) === 'closed' && record.landed) return record.landed.date ?? record.date
+    if (missed.has(key)) return record.unconfirmed!.date ?? record.date
+    return record.date
   }
   const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
 
@@ -507,7 +520,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     // Only an open pull request is still on its way; anything else that is
     // live is the merged version on the site.
     const state = !previous ? 'new' : states.get(key) === 'open' ? 'open' : 'merged'
-    targets.push({ destination, ready: read.ready, section, key, previous, state, landed: previous && landedOf(previous) })
+    targets.push({ destination, ready: read.ready, section, key, previous, state, landed: previous && landedOf(previous), since: previous && sinceOf(previous) })
   }
 
   // The date each publication going again will go by: a date the site
@@ -536,7 +549,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     // A merged version that is not known says nothing of what the site changed.
     if (!theirs || (target.state !== 'open' && target.landed?.unknown)) continue
     const base = target.state === 'open' ? target.previous : target.landed ?? target.previous
-    const date = siteDate(target.section, base.data, theirs, target.destination.values, todayValue, target.previous.date)
+    const date = siteDate(target.section, base.data, theirs, target.destination.values, todayValue, target.since)
     if (date) dates.set(target.key, date)
   }
 
@@ -554,7 +567,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     const ready = targets.find((t) => t.key === key)?.ready ?? (stored && (await readSite(session, stored)).ready)
     const section = ready?.config.sections.find((sec) => sec.name === r.section)
     if (!ready || !section?.url) return
-    let date = r.date
+    let date = sinceOf(r)
     if (section.fields.some((f) => f.kind === 'date')) {
       const from = state === 'open' ? { repo: r.headRepo, branch: r.branch } : { repo: ready.repo, branch: ready.base }
       const file = await fileAt(session, from.repo, r.path, from.branch).catch((error: unknown) => {
@@ -566,7 +579,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
         if (!(error instanceof PostFileError)) throw error
       }
       if (!data) return
-      date = fileDate(section, data, todayValue, r.date)
+      date = fileDate(section, data, todayValue, sinceOf(r))
     }
     addresses.set(key, placeUrl(section, r.slug, date))
   }))
@@ -588,7 +601,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       })
     for (const target of going) {
       const { destination, section, ready } = target
-      const date = dates.get(target.key) ?? postDate(section, destination.values, todayValue, target.previous?.date)
+      const date = dates.get(target.key) ?? postDate(section, destination.values, todayValue, target.since)
       const place = { key: target.key, site: ready.config.site, url: placeUrl(section, destination.slug, date) }
       const at = places.findIndex((p) => p.key === target.key)
       if (at >= 0) places[at] = place
@@ -659,9 +672,10 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     if (!target.section.fields.some((f) => f.kind === 'places' || f.kind === 'canonical') || samePlaces(places, final)) continue
     try {
       // On its open pull request; a version already on the site gets an update of its own.
+      const landed = state === 'open' ? kept.landed : kept.landed ?? target.landed ?? snapshotOf(kept)
       const again: Target = state === 'open'
-        ? { ...target, previous: kept, state: 'open', landed: kept.landed }
-        : { ...target, previous: kept, state: 'merged', landed: kept.landed ?? target.landed ?? snapshotOf(kept) }
+        ? { ...target, previous: kept, state: 'open', landed, since: kept.date }
+        : { ...target, previous: kept, state: 'merged', landed, since: landed?.date ?? kept.date }
       await record(target, await publishTo(session, again, parts, final, todayValue, replace, doc.content, fits))
     } catch (error) {
       if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError || error instanceof PostFileError)) throw error
@@ -678,7 +692,7 @@ function largestLanded(target: Target, filled: FilledPost): Landed | undefined {
   const candidates = [
     target.landed,
     open ? snapshotOf(target.previous!) : undefined,
-    open ? { data: filled.frontmatter, bodySha: '0'.repeat(64), pullRequest: target.previous!.pullRequest.number, url: filled.url } : undefined,
+    open ? { data: filled.frontmatter, bodySha: '0'.repeat(64), pullRequest: target.previous!.pullRequest.number, url: filled.url, date: filled.date } : undefined,
   ].filter((landed): landed is Landed => !!landed)
   return largestOf(candidates)
 }
@@ -691,7 +705,7 @@ export function largestOf(candidates: Landed[]): Landed | undefined {
 
 /** This document's side of a record's version, as it stands on the site once merged. */
 function snapshotOf(record: PublishRecord): Landed {
-  return { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url }
+  return { data: record.data, bodySha: record.bodySha, pullRequest: record.pullRequest.number, url: record.url, date: record.date }
 }
 
 function samePlaces(a: Place[], b: Place[]): boolean {
@@ -733,7 +747,7 @@ function provisionalRecord(target: Target, filled: FilledPost, docTitle: string,
     publishedAt: longest(previous?.publishedAt, at), updatedAt: at,
     sourceSha: digest, values: destination.values, data: filled.frontmatter, bodySha: digest, docTitle,
     ...(landed ? { landed } : {}),
-    ...(commit && target.state === 'open' && previous ? { unconfirmed: { commit: '0'.repeat(40), url: previous.url } } : {}),
+    ...(commit && target.state === 'open' && previous ? { unconfirmed: { commit: '0'.repeat(40), url: previous.url, date: previous.date } } : {}),
   }
 }
 
@@ -819,7 +833,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   }
   const text = renderPost(file.data, file.body)
   // The address as the file being published dates it: a date the site kept is the site's.
-  const url = placeUrl(section, destination.slug, fileDate(section, file.data, todayValue, previous?.date))
+  const url = placeUrl(section, destination.slug, fileDate(section, file.data, todayValue, target.since))
   const now = new Date().toISOString()
   if (current && current.text === text) {
     // The site has this version already: nothing to commit, nothing to open.
@@ -869,12 +883,12 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       // as this document's side there, with the commit, for a later
       // publication to settle with the pull request.
       pr = previous!.pullRequest
-      unconfirmed = { commit, url: previous!.url }
+      unconfirmed = { commit, url: previous!.url, date: previous!.date }
       error = `Committed to the branch of pull request #${pr.number}, but its state could not be read: ${after.message}. Publish again to make sure the update reaches the site.`
     } else if (after.state === 'open') pr = previous!.pullRequest
     else if (after.took) {
       pr = previous!.pullRequest
-      kept = { data: published.data, bodySha: published.bodySha, pullRequest: pr.number, url }
+      kept = { data: published.data, bodySha: published.bodySha, pullRequest: pr.number, url, date: published.date }
       outcome = 'merged'
     } else {
       // Merged meanwhile: what it held is on the site now, and this document's.

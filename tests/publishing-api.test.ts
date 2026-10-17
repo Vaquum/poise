@@ -896,6 +896,25 @@ sections:
     expect(copy).toContain('canonical_url: "https://dated.example/2025/a-better-question/"')
   })
 
+  it('dates a dateless original by the version on its site, after an update closed unmerged', async () => {
+    for (const [repo, yaml] of [['acme/dated', DATED_YAML.replace('date: { kind: date, required: true }', 'date: { kind: date }')], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const { today } = await import('../server/publishing')
+    const dated = (date: string) => ({ repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date } })
+    // Merged without a date, so dated today; then an update dated 2027, closed unmerged.
+    expect((await publish([dated('')])).body.results[0].ok).toBe(true)
+    merge('acme/dated', 101)
+    expect((await publish([dated('2027-01-05')])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    close('acme/dated', 102)
+    expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain(`canonical_url: "https://dated.example/${today('Europe/Helsinki').slice(0, 4)}/a-better-question/"`)
+    expect(copy).not.toContain('2027')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

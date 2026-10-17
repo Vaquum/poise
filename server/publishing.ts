@@ -239,13 +239,16 @@ function readField(name: string, spec: unknown, at: string): PublishField {
     // Held to the field's own limits, as a value typed in is: the panel sends a default as typed.
     if (key === 'default' && field.kind === 'date' && spec[key] === 'today') continue
     const problems: string[] = []
+    let normalized: FieldValue | undefined
     try {
-      inputValue(field, field[key], problems)
+      normalized = inputValue(field, field[key], problems)
     } catch (error) {
       if (!(error instanceof PublishValueError)) throw error
       problems.push(...error.problems)
     }
     if (problems.length) throw new PublishConfigError(`${at}.${key}: ${problems[0]}`)
+    // Kept as a typed value is: trimmed, and a list's words once each.
+    if (normalized !== undefined) field[key] = normalized
   }
   return field
 }
