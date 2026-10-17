@@ -517,3 +517,41 @@ test("takes the piece's date from a site that fixes its own", async ({ page }) =
   await expect(dialog.getByRole('alert')).toHaveCount(2)
   expect(sent[0].destinations.find((d: any) => d.repo === MIKKO.repo).values.date).toBe('2026-01-01')
 })
+
+test('leaves out an optional date the writer clears', async ({ page }) => {
+  await workspace(page)
+  const loose = {
+    repo: 'acme/loose', state: 'ready', source: 'settings', site: 'Loose', description: 'version: 1\n',
+    sections: [{ name: 'Posts', url: 'https://loose.example/{slug}/', firstLine: 'title', dated: true, fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'date', kind: 'date', required: false },
+    ] }],
+  }
+  const sent = await openEditor(page, [loose], notNow, [{ ...publication(loose, 7, { title: 'A better question', date: '2026-05-05' }), date: '2026-05-05' }])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  const date = dialog.getByLabel('Date', { exact: true })
+  await expect(date).toHaveValue('2026-05-05')
+  await date.fill('')
+  await dialog.getByRole('button', { name: 'Update', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values).not.toHaveProperty('date')
+})
+
+test('keeps the date a site went by when its fixed date has become editable', async ({ page }) => {
+  await workspace(page)
+  const stamped = {
+    repo: 'acme/stamped', state: 'ready', source: 'settings', site: 'Stamped', description: 'version: 1\n',
+    sections: [{ name: 'Posts', url: 'https://stamped.example/{slug}/', firstLine: 'title', dated: true, fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'date', kind: 'date', required: true, default: 'today' },
+    ] }],
+  }
+  // mikkokotila.com first, with its own date; Stamped's was fixed then, so its values hold none.
+  const onMikko = { ...publication(MIKKO, 101, { type: 'essay', title: 'A better question', date: '2026-10-17' }), date: '2026-10-17' }
+  const onStamped = { ...publication(stamped, 7, { title: 'A better question' }), date: '2026-01-01' }
+  const sent = await openEditor(page, [stamped, MIKKO], notNow, [onMikko, onStamped])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await dialog.getByRole('button', { name: 'Update', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toHaveCount(2)
+  expect(sent[0].destinations.map((d: any) => [d.repo, d.values.date])).toEqual([[stamped.repo, '2026-01-01'], [MIKKO.repo, '2026-10-17']])
+})

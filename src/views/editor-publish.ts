@@ -47,8 +47,10 @@ interface State {
   choices: Choice[]
   doc: DocumentPublishing
   chosen: Set<string>
-  /** Title and description as shown; the date once it is typed, until then each site's own (dateFor). */
+  /** Title and description as shown; the date as typed, once it is (dateTyped), until then each site's own (dateFor). */
   shared: Record<Shared, string>
+  /** The date was typed, or cleared: from then it is every site's. */
+  dateTyped: boolean
   /** Each destination's own values. */
   values: Map<string, Record<string, OwnValue>>
   /** A list's text while it is typed, by the control's field key: shown as typed, read into words as it goes. */
@@ -186,6 +188,7 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
   return {
     slug, choices, doc, chosen, values, listText: new Map(), slugs, slugTyped: new Set(), results: new Map(), busy: false,
     shared: { title: titleFor(doc, choices), description: remembered(doc, choices, 'description'), date: '' },
+    dateTyped: false,
   }
 }
 
@@ -195,11 +198,16 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
  * today unless its description fixes another.
  */
 function dateFor(s: State, choice: Choice): string {
-  if (s.shared.date) return s.shared.date
+  // Typed, or cleared: a date cleared is one the writer leaves out.
+  if (s.dateTyped) return s.shared.date
   const field = choice.section.fields.find((f) => f.name === sharedField(choice.section, 'date'))
   const publication = livePublicationOf(s, choice.key)
-  const own = field && publication ? savedValue(publication.values, field.name) : undefined
-  if (typeof own === 'string' && own) return own
+  if (field && publication) {
+    // The date it went by, one the site fixed when it was published too.
+    const saved = savedValue(publication.values, field.name)
+    const own = typeof saved === 'string' && saved ? saved : publication.date
+    if (own) return own
+  }
   const piece = remembered(s.doc, s.choices, 'date')
   if (piece) return piece
   return typeof field?.default === 'string' && field.default !== 'today' ? field.default : s.doc.today
@@ -208,7 +216,7 @@ function dateFor(s: State, choice: Choice): string {
 /** The date the panel shows: the first chosen site's. */
 function shownDate(s: State): string {
   const choice = s.choices.find((c) => s.chosen.has(c.key) && sharedField(c.section, 'date'))
-  return choice ? dateFor(s, choice) : s.shared.date || s.doc.today
+  return choice ? dateFor(s, choice) : s.dateTyped ? s.shared.date : s.doc.today
 }
 
 /* ---------------------------------------------------------------- rendering */
@@ -409,6 +417,7 @@ function onInput(event: Event): void {
   if (target.dataset.shared) {
     const which = target.dataset.shared as Shared
     s.shared[which] = target.value
+    if (which === 'date') s.dateTyped = true
     if (which === 'title') {
       // A slug follows the title until it is typed, or published.
       for (const choice of s.choices) {
