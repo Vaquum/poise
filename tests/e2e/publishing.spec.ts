@@ -121,8 +121,9 @@ test('Settings → Publishing lists each site with its state, adds, describes an
   await expect(description).toHaveValue(/^version: 1\nsite: "journal"\n/)
   await page.screenshot({ path: info.outputPath('settings-publishing.png') })
   await rows.nth(1).getByRole('button', { name: 'Save' }).click()
-  // While it is saved, the description holds still.
+  // While it is saved, the description holds still, and cannot be put away.
   await expect(description).toHaveAttribute('readonly', '')
+  await expect(rows.nth(1).getByRole('button', { name: 'Cancel' })).toBeDisabled()
   releaseSave()
   await expect(rows.nth(1).locator('.pb-site-state')).toHaveText('Ready · described here')
   expect(requests.find((r) => r.method === 'PUT')).toMatchObject({ path: '/api/publishing/sites/acme/journal/description' })
@@ -405,4 +406,22 @@ test('holds the repository name still while it is added', async ({ page }) => {
   await expect(repo).not.toHaveAttribute('readonly', '')
   await expect(repo).toHaveValue('')
   expect(adds).toBe(1)
+})
+
+test('reads only what a publication holds, never what every object inherits', async ({ page }) => {
+  await workspace(page)
+  const dated = {
+    repo: 'acme/dated', state: 'ready', source: 'settings', site: 'Dated', description: 'version: 1\n',
+    sections: [{ name: 'Posts', url: 'https://dated.example/{slug}/', firstLine: 'title', fields: [
+      { name: 'title', kind: 'text', required: true },
+      { name: 'constructor', kind: 'date', required: true, default: '2026-01-01' },
+    ] }],
+  }
+  // Published before its date field, named constructor, was added.
+  const sent = await openEditor(page, [dated], notNow, [publication(dated, 7, { title: 'A better question' })])
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await expect(dialog.getByLabel('Date', { exact: true })).toHaveValue('2026-01-01')
+  await dialog.getByRole('button', { name: 'Update', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  expect(sent[0].destinations[0].values.constructor).toBe('2026-01-01')
 })

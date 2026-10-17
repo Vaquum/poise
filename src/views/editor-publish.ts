@@ -92,6 +92,11 @@ function livePublicationOf(key: string): PublicationView | undefined {
   return publication?.live ? publication : undefined
 }
 
+/** What a publication's values hold under a name: their own, never what every object inherits, like constructor. */
+function savedValue(values: Record<string, unknown>, name: string): unknown {
+  return Object.prototype.hasOwnProperty.call(values, name) ? values[name] : undefined
+}
+
 function asText(value: unknown): string | boolean {
   if (typeof value === 'boolean') return value
   if (Array.isArray(value)) return value.join(', ')
@@ -108,7 +113,7 @@ function titleFor(doc: DocumentPublishing, choices: Choice[]): string {
     if (publication.docTitle !== doc.title) continue
     const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
     const field = choice && sharedField(choice.section, 'title')
-    const value = field ? asText(publication.values[field]) : ''
+    const value = field ? asText(savedValue(publication.values, field)) : ''
     if (value) return String(value)
   }
   return doc.title
@@ -123,7 +128,7 @@ function remembered(doc: DocumentPublishing, choices: Choice[], which: Shared): 
   for (const publication of doc.publications) {
     const choice = choices.find((c) => c.key === keyOf(publication.repo, publication.section))
     const field = choice && sharedField(choice.section, which)
-    const value = field ? asText(publication.values[field]) : ''
+    const value = field ? asText(savedValue(publication.values, field)) : ''
     if (value) return String(value)
   }
   return ''
@@ -144,7 +149,7 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
       // A field the saved values do not have (one added since) takes its default.
       const saved = publication && Object.prototype.hasOwnProperty.call(publication.values, field.name)
       // Only a date field reads today as today: elsewhere it is the word.
-      const value = saved ? publication!.values[field.name] : field.default === 'today' && field.kind === 'date' ? doc.today : field.default
+      const value = saved ? savedValue(publication!.values, field.name) : field.default === 'today' && field.kind === 'date' ? doc.today : field.default
       own[field.name] = field.kind === 'boolean' ? value === true : asText(value) as string
     }
     values.set(choice.key, own)
@@ -164,7 +169,8 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
 function dateFor(s: State, choice: Choice): string {
   if (s.shared.date) return s.shared.date
   const field = choice.section.fields.find((f) => f.name === sharedField(choice.section, 'date'))
-  const own = field && livePublicationOf(choice.key)?.values[field.name]
+  const publication = livePublicationOf(choice.key)
+  const own = field && publication ? savedValue(publication.values, field.name) : undefined
   if (typeof own === 'string' && own) return own
   const piece = remembered(s.doc, s.choices, 'date')
   if (piece) return piece

@@ -43,7 +43,7 @@ function siteHtml(site: SiteView, draft: Draft | undefined, confirming: boolean)
       <textarea class="pb-description" rows="12" spellcheck="false" autocomplete="off" aria-label="${escapeHtml(`publish.yaml for ${site.repo}`)}"${draft.saving ? ' readonly' : ''}></textarea>
       <div class="pb-describe-row">
         <button type="button" class="st-save" data-save${draft.saving ? ' disabled' : ''}>${draft.saving ? 'Saving…' : 'Save'}</button>
-        <button type="button" class="st-clear" data-cancel>Cancel</button>
+        <button type="button" class="st-clear" data-cancel${draft.saving ? ' disabled' : ''}>Cancel</button>
       </div>
       ${draft.error ? `<div class="st-help st-help-error" role="alert">${escapeHtml(draft.error)}</div>` : ''}
     </div>` : ''
@@ -160,7 +160,8 @@ export function publishingSection(): PublishingSection {
     try {
       const site = await describeSite(repo, draft.text)
       generation++
-      drafts.delete(repo)
+      // Only this draft, never one opened since.
+      if (drafts.get(repo) === draft) drafts.delete(repo)
       replace(site)
     } catch (error) {
       draft.error = (error as Error).message
