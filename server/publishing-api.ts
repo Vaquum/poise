@@ -102,8 +102,35 @@ function renameSite(from: string, to: string): void {
   })
 }
 
-function findSite(repo: string): StoredSite {
-  const site = storedSites().find((s) => s.repo.toLowerCase() === repo.toLowerCase())
+/**
+ * A stored site by a name it is addressed by. An old name of a repository
+ * renamed since finds it too: GitHub answers to an old name, and Settings or
+ * the panel may hold one until they read the sites again.
+ */
+async function siteNamed(name: string, sites = storedSites()): Promise<StoredSite | undefined> {
+  const direct = sites.find((s) => s.repo.toLowerCase() === name.toLowerCase())
+  if (direct) return direct
+  const session = await signIn(getMeta('me') || '').catch((error: unknown) => {
+    if (error instanceof HttpError) return null
+    throw error
+  })
+  const info = session && await repository(session, name).catch((error: unknown) => {
+    if (error instanceof GitHubError) return null
+    throw error
+  })
+  if (!session || !info) return undefined
+  const byName = sites.find((s) => s.repo.toLowerCase() === info.fullName.toLowerCase())
+  if (byName) return byName
+  // Still kept under a name it had before: each site as it is now, its rename followed.
+  for (const site of sites) {
+    const read = await readSite(session, site)
+    if (read.view.repo.toLowerCase() === info.fullName.toLowerCase()) return { ...site, repo: read.view.repo }
+  }
+  return undefined
+}
+
+async function findSite(repo: string): Promise<StoredSite> {
+  const site = await siteNamed(repo)
   if (!site) throw new HttpError(404, `${repo} is not one of your publishing sites.`)
   return site
 }
@@ -279,8 +306,8 @@ async function addSite(value: unknown): Promise<{ site: SiteView }> {
   return { site: (await cachedSite(session, site)).view }
 }
 
-function removeSite(repo: string): { ok: true } {
-  const site = findSite(repo)
+async function removeSite(repo: string): Promise<{ ok: true }> {
+  const site = await findSite(repo)
   updateSites((sites) => sites.filter((s) => s.repo !== site.repo))
   forgetSites()
   return { ok: true }
@@ -288,7 +315,7 @@ function removeSite(repo: string): { ok: true } {
 
 async function describeSite(repo: string, value: unknown): Promise<{ site: SiteView }> {
   if (typeof value !== 'string') throw new HttpError(400, 'The description is the text of a publish.yaml.')
-  const site = findSite(repo)
+  const site = await findSite(repo)
   const description = value.trim() ? value : undefined
   // Kept only when it reads: the box keeps the text, and the error, until then.
   if (description !== undefined) parsePublishConfig(description)
@@ -552,6 +579,13 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       states.set(key, info.state)
     } catch (error) {
       if (!(error instanceof GitHubError)) throw error
+      // Unreadable, it still goes by its repository's name now, so a site
+      // renamed since finds it: GitHub answers to the old name.
+      const current = await repository(session, record.repo).catch((failure: unknown) => {
+        if (failure instanceof GitHubError) return null
+        throw failure
+      })
+      if (current) record.repo = current.fullName
       const key = placeKey(record.repo, record.section)
       states.set(key, 'unknown')
       unread.set(key, error.message)
@@ -589,22 +623,32 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   }
   const sites = storedSites()
   for (const destination of destinations) {
-    const stored = sites.find((s) => s.repo.toLowerCase() === destination.repo.toLowerCase())
+    const stored = await siteNamed(destination.repo, sites)
     if (!stored) { refuse(destination, `${destination.repo} is not one of your publishing sites.`); continue }
     const read = await readSite(session, stored)
     if (!read.ready) { refuse(destination, `${destination.repo}: ${read.view.problem}`); continue }
     const section = read.ready.config.sections.find((s) => s.name === destination.section)
     if (!section) { refuse(destination, `${read.ready.config.site} has no section ${destination.section}.`); continue }
     const key = placeKey(read.ready.repo, section.name)
-    if (unread.has(key)) { refuse(destination, `Its earlier pull request could not be read: ${unread.get(key)}`); continue }
-    let previous = live.find((r) => placeKey(r.repo, r.section) === key)
-    // A site that has moved to another branch since, where the file is not
-    // one this document published: the piece is published there afresh.
-    if (previous && states.get(key) !== 'open' && !(await stillOurs(session, read.ready, previous, landedOf(previous), whereOf(previous, states.get(key))))) previous = undefined
+    // A record under a name the repository had before is the same publication.
+    const names = new Set([key, placeKey(destination.repo, section.name), placeKey(stored.repo, section.name)])
+    const unreadName = [...names].find((name) => unread.has(name))
+    if (unreadName) { refuse(destination, `Its earlier pull request could not be read: ${unread.get(unreadName)}`); continue }
+    let previous = live.find((r) => names.has(placeKey(r.repo, r.section)))
+    const was = previous ? placeKey(previous.repo, previous.section) : key
+    let landed = previous && landedOf(previous)
+    if (previous && states.get(was) !== 'open') {
+      // A site that has moved to another branch since, where the file is not
+      // one this document published: the piece is published there afresh.
+      // Carried onto that branch as published, what landed is there too.
+      const where = whereOf(previous, states.get(was))
+      if (!(await stillOurs(session, read.ready, previous, landed, where))) previous = undefined
+      else if (where !== read.ready.base && landed) landed = { ...landed, base: read.ready.base }
+    }
     // Only an open pull request is still on its way; anything else that is
     // live is the merged version on the site.
-    const state = !previous ? 'new' : states.get(key) === 'open' ? 'open' : 'merged'
-    targets.push({ destination, ready: read.ready, section, key, previous, state, landed: previous && landedOf(previous), since: previous && sinceOf(previous) })
+    const state = !previous ? 'new' : states.get(was) === 'open' ? 'open' : 'merged'
+    targets.push({ destination, ready: read.ready, section, key, previous, state, landed: previous ? landed : undefined, since: previous && sinceOf(previous) })
   }
 
   // The date each publication going again will go by: a date the site
@@ -712,13 +756,15 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
 
   const record = async (target: Target, outcome: Outcome) => {
     if (outcome.record) {
-      ledger.records = [...ledger.records.filter((r) => placeKey(r.repo, r.section) !== target.key), outcome.record]
+      // In place of its earlier record, under whatever name the repository had then.
+      ledger.records = [...ledger.records.filter((r) => r !== target.previous && placeKey(r.repo, r.section) !== target.key), outcome.record]
       await writePublishLedger(slug, ledger)
     }
     const kept = outcome.record ?? target.previous!
+    // Named as it was asked for, so the panel keeps finding it until it reads the sites again.
     results.set(target.key, resultFor(target, outcome.error
       ? { error: outcome.error }
-      : { ok: true, ...(outcome.unchanged ? { unchanged: true } : {}), publication: viewOf(kept, outcome.state) }))
+      : { ok: true, ...(outcome.unchanged ? { unchanged: true } : {}), publication: { ...viewOf(kept, outcome.state), repo: target.destination.repo } }))
     return kept
   }
 
@@ -1061,7 +1107,7 @@ export async function handlePublishingApi(req: IncomingMessage, res: ServerRespo
   try {
     if (path === SITES && method === 'GET') return send(200, await listSites())
     if (path === SITES && method === 'POST') return send(200, await addSite((await readJson<{ repo?: unknown }>(req)).repo))
-    if (site && !site[3] && method === 'DELETE') return send(200, removeSite(`${site[1]}/${site[2]}`))
+    if (site && !site[3] && method === 'DELETE') return send(200, await removeSite(`${site[1]}/${site[2]}`))
     if (site && site[3] && method === 'PUT') return send(200, await describeSite(`${site[1]}/${site[2]}`, (await readJson<{ description?: unknown }>(req)).description))
     if (document && document[2] === 'publishing' && method === 'GET') return send(200, await documentPublishing(document[1]))
     if (document && document[2] === 'publish' && method === 'POST') return send(200, await publishDocument(document[1], await readJson(req)))

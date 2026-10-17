@@ -619,3 +619,26 @@ test('leaves a later date field, an expiry, to its site', async ({ page }) => {
   await expect(dialog.getByRole('alert')).toHaveCount(2)
   expect(sent[0].destinations.find((d: any) => d.repo === 'acme/expiring').values.expires).toBe('2026-12-31')
 })
+
+test('replaces the row it saved when its repository has been renamed', async ({ page }) => {
+  await workspace(page)
+  let sites: unknown[] = [MISSING]
+  await page.route('**/api/publishing/sites**', async (route) => {
+    if (route.request().method() === 'PUT') {
+      // Renamed on GitHub since: the site comes back under its new name.
+      const renamed = { ...JOURNAL, repo: 'acme/diary' }
+      sites = [renamed]
+      return route.fulfill({ json: { site: renamed } })
+    }
+    return route.fulfill({ json: { sites } })
+  })
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover').getByRole('button', { name: 'Publishing', exact: true }).click()
+  const panel = page.locator('#settings-panel')
+  const rows = panel.locator('.pb-site')
+  await rows.nth(0).getByRole('button', { name: 'Describe' }).click()
+  await rows.nth(0).getByRole('button', { name: 'Save' }).click()
+  await expect(rows).toHaveCount(1)
+  await expect(rows.nth(0)).toContainText('acme/diary')
+  await expect(rows.nth(0).locator('.pb-site-state')).toHaveText('Ready · described here')
+})

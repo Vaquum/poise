@@ -119,8 +119,9 @@ export function publishingSection(): PublishingSection {
     render()
   }
 
-  const replace = (site: SiteView) => {
-    sites = sites.map((s) => (s.repo.toLowerCase() === site.repo.toLowerCase() ? site : s))
+  // The row it was read for: a repository renamed since comes back under its new name.
+  const replace = (repo: string, site: SiteView) => {
+    sites = sites.map((s) => (s.repo === repo ? site : s))
   }
 
   let adding = false
@@ -162,7 +163,7 @@ export function publishingSection(): PublishingSection {
       generation++
       // Only this draft, never one opened since.
       if (drafts.get(repo) === draft) drafts.delete(repo)
-      replace(site)
+      replace(repo, site)
     } catch (error) {
       draft.error = (error as Error).message
     } finally {

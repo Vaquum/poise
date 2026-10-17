@@ -1138,6 +1138,49 @@ sections:
     expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.publications.map((p: any) => p.repo)).toEqual(['acme/diary', 'acme/diary'])
   })
 
+  it('answers to a renamed site by its old name, and never takes its unreadable publication for a new one', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const journal = (repo: string) => ({ repo, section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } })
+    expect((await publish([journal('acme/journal')])).body.results[0].ok).toBe(true)
+    const repo = repos.get('acme/journal')!
+    repo.fullName = 'acme/diary'
+    repos.set('acme/diary', repo)
+    // Its pull request cannot be read: the publication is refused, not opened again.
+    failOn = (method, endpoint) => (method === 'GET' && /^repos\/acme\/(journal|diary)\/pulls\/101$/.test(endpoint) ? 500 : null)
+    expect((await publish([journal('acme/diary')])).body.results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/^Its earlier pull request could not be read/) })
+    expect(repo.pulls.size).toBe(1)
+    failOn = null
+    // Published by the old name the panel still holds, after the site was renamed: the same publication, named as asked.
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([journal('acme/journal')])).body.results[0]).toMatchObject({ ok: true, publication: { repo: 'acme/journal', pullRequest: { number: 101 } } })
+    expect((await publish([journal('acme/journal')])).body.results[0]).toMatchObject({ ok: true, unchanged: true })
+    expect((await editor!.readPublishLedger(DOC)).records.map((r) => r.repo)).toEqual(['acme/diary'])
+    // Settings may hold the old name too.
+    expect((await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })).status).toBe(200)
+    expect((await request('/api/publishing/sites/acme/journal', 'DELETE')).status).toBe(200)
+    expect((await request('/api/publishing/sites')).body.sites.map((s: any) => s.repo)).toEqual(['mikkokotila/mikkokotila-com'])
+  })
+
+  it('keeps a version carried onto a site\'s new branch there, after an update to it is closed unmerged', async () => {
+    await publish([writing()])
+    merge('mikkokotila/mikkokotila-com', 101)
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    editOnSite('mikkokotila/mikkokotila-com', 'main', 'publish.yaml', (text) => text.replace('site: mikkokotila.com', 'site: mikkokotila.com\nbranch: published'))
+    repo.branches.set('published', repo.branches.get('main')!)
+    // An update to the carried version, against the new branch, closed unmerged.
+    await writeDocument(DOC, `${TEXT}\nA second thought.\n`)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    expect((await editor!.readPublishLedger(DOC)).records[0].landed?.base).toBe('published')
+    close('mikkokotila/mikkokotila-com', 102)
+    // A maintainer retitles the carried file; this document's next change still updates it, keeping the title.
+    editOnSite('mikkokotila/mikkokotila-com', 'published', POST, (text) => text.replace('title: "A better question"', 'title: "A better question, retitled"'))
+    await writeDocument(DOC, `${TEXT}\nA third thought.\n`)
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 103 } } })
+    expect(fileOn('mikkokotila/mikkokotila-com', repo.pulls.get(103)!.head, POST)).toContain('title: "A better question, retitled"')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
