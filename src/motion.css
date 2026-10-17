@@ -1,4 +1,9 @@
 /* Spatial motion composes with native transforms, including full-bleed layout. */
+/* Per-actor offsets must not invalidate every descendant on each frame. */
+@property --flow-layout-x { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --flow-layout-y { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --flow-enter-x { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --flow-enter-y { syntax: "<length>"; inherits: false; initial-value: 0px; }
 [data-flow-enter], [data-flow-layout] {
   --flow-layout-x: 0px;
   --flow-layout-y: 0px;
