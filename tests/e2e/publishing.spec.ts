@@ -585,6 +585,8 @@ test("takes the values of the site's own repository's publication, not one befor
   await expect(dialog.getByLabel('Type', { exact: true })).toHaveValue('note')
   await dialog.getByRole('button', { name: 'Update', exact: true }).click()
   await expect(dialog.getByRole('alert')).toContainText('Not now.')
+  // Sent with the site's id: renamed meanwhile, the site is still the one published to.
+  expect(sent[0].destinations[0]).toMatchObject({ repo: 'mikkokotila/mikkokotila-com', id: 2 })
   expect(sent[0].destinations[0].values).toMatchObject({ type: 'note', date: '2026-10-17', tags: ['machine-intelligence'] })
 })
 
@@ -732,4 +734,84 @@ test('keeps a description being written with its site by its id, never with a re
   await rows.nth(0).getByRole('button', { name: 'Save' }).click()
   await expect(rows.nth(0).locator('.pb-site-state')).toHaveText('Ready · described here')
   expect(saved).toEqual([{ path: '/api/publishing/sites/acme/diary/description', body: { description: 'version: 1\nsite: Typed here\n', id: 1 } }])
+})
+
+const missingAt = (repo: string, id: number) => ({ repo, id, state: 'missing', source: null, problem: `${repo} has no publish.yaml. Add one to the repository, or describe the site here.` })
+
+async function openPublishingSettings(page: Page) {
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover').getByRole('button', { name: 'Publishing', exact: true }).click()
+  return page.locator('#settings-panel')
+}
+
+const readAgain = (page: Page) => page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:open-settings', { detail: { section: 'publishing' } })))
+
+test("keeps every description being written when sites are renamed into each other's names", async ({ page }) => {
+  await workspace(page)
+  let reads = 0
+  await page.route('**/api/publishing/sites**', async (route) => {
+    reads++
+    // Read again, acme/a is acme/b now, and acme/b is acme/c.
+    const sites = reads === 1 ? [missingAt('acme/a', 1), missingAt('acme/b', 2)] : [missingAt('acme/b', 1), missingAt('acme/c', 2)]
+    return route.fulfill({ json: { sites } })
+  })
+  const rows = (await openPublishingSettings(page)).locator('.pb-site')
+  await rows.nth(0).getByRole('button', { name: 'Describe' }).click()
+  await rows.nth(0).getByLabel('publish.yaml for acme/a').fill('version: 1\nsite: First\n')
+  await rows.nth(1).getByRole('button', { name: 'Describe' }).click()
+  await rows.nth(1).getByLabel('publish.yaml for acme/b').fill('version: 1\nsite: Second\n')
+  await readAgain(page)
+  await expect(rows.nth(1)).toContainText('acme/c')
+  await expect(rows.nth(0).getByLabel('publish.yaml for acme/b')).toHaveValue('version: 1\nsite: First\n')
+  await expect(rows.nth(1).getByLabel('publish.yaml for acme/c')).toHaveValue('version: 1\nsite: Second\n')
+})
+
+test('a save that finishes after its site is renamed replaces that site\'s row, never one that took its old name', async ({ page }) => {
+  await workspace(page)
+  let reads = 0
+  let releaseSave!: () => void
+  const saveHeld = new Promise<void>((resolve) => { releaseSave = resolve })
+  await page.route('**/api/publishing/sites**', async (route) => {
+    if (route.request().method() === 'PUT') {
+      await saveHeld
+      return route.fulfill({ json: { site: { ...JOURNAL, id: 1, repo: 'acme/diary' } } })
+    }
+    reads++
+    // Read again while the save is on its way: renamed, and another repository has its old name.
+    const sites = reads === 1 ? [missingAt('acme/journal', 1)] : [missingAt('acme/diary', 1), missingAt('acme/journal', 2)]
+    return route.fulfill({ json: { sites } })
+  })
+  const panel = await openPublishingSettings(page)
+  const rows = panel.locator('.pb-site')
+  await rows.nth(0).getByRole('button', { name: 'Describe' }).click()
+  await rows.nth(0).getByLabel('publish.yaml for acme/journal').fill('version: 1\nsite: Other Journal\n')
+  await rows.nth(0).getByRole('button', { name: 'Save' }).click()
+  await readAgain(page)
+  await expect(rows).toHaveCount(2)
+  await expect(rows.nth(0).getByLabel('publish.yaml for acme/diary')).toHaveAttribute('readonly', '')
+  releaseSave()
+  await expect(rows.nth(0).locator('.pb-site-state')).toHaveText('Ready · described here')
+  await expect(rows.nth(0)).toContainText('acme/diary')
+  await expect(rows.nth(1)).toContainText('acme/journal')
+  await expect(rows.nth(1).locator('.pb-site-state')).toHaveText('acme/journal has no publish.yaml. Add one to the repository, or describe the site here.')
+  await expect(panel.locator('.pb-description')).toHaveCount(0)
+})
+
+test('removes a site by its id, so a name held from before its rename reaches no other repository', async ({ page }) => {
+  await workspace(page)
+  const removed: string[] = []
+  await page.route('**/api/publishing/sites**', async (route) => {
+    const request = route.request()
+    if (request.method() === 'DELETE') {
+      const url = new URL(request.url())
+      removed.push(`${url.pathname}${url.search}`)
+      return route.fulfill({ json: { ok: true } })
+    }
+    return route.fulfill({ json: { sites: [missingAt('acme/journal', 1)] } })
+  })
+  const rows = (await openPublishingSettings(page)).locator('.pb-site')
+  await rows.nth(0).getByRole('button', { name: 'Remove' }).click()
+  await rows.nth(0).getByRole('button', { name: 'Confirm remove' }).click()
+  await expect(rows).toHaveCount(0)
+  expect(removed).toEqual(['/api/publishing/sites/acme/journal?id=1'])
 })

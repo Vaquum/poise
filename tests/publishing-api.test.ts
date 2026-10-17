@@ -1390,6 +1390,30 @@ sections:
     expect((await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML, id: 'x' })).status).toBe(400)
   })
 
+  it('publishes to, and removes, the site the panel chose by its id, once another repository has its old name', async () => {
+    addRepo('acme/journal', {})
+    const first = (await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })).body.site
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const diary = repos.get('acme/journal')!
+    diary.fullName = 'acme/diary'
+    repos.set('acme/diary', diary)
+    ;(await import('../server/publishing-api')).forgetSites()
+    expect((await request('/api/publishing/sites')).body.sites[1].repo).toBe('acme/diary')
+    const journal = addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML.replace('Other Journal', 'New Journal') })
+    // A panel still holding the old name publishes with the site's id: to the diary.
+    const result = (await publish([{ repo: 'acme/journal', id: first.id, section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0]
+    expect(result).toMatchObject({ ok: true, repo: 'acme/journal', publication: { repoId: first.id, site: 'Other Journal' } })
+    expect([diary.pulls.size, journal.pulls.size]).toEqual([1, 0])
+    // Removed by its id too: the diary goes, the repository with the old name stays.
+    expect((await request(`/api/publishing/sites/acme/journal?id=${first.id}`, 'DELETE')).status).toBe(200)
+    expect((await request('/api/publishing/sites')).body.sites.map((s: any) => s.repo)).toEqual(['mikkokotila/mikkokotila-com', 'acme/journal'])
+    expect((await request('/api/publishing/sites/acme/journal?id=x', 'DELETE')).status).toBe(400)
+    expect((await request(`/api/publishing/sites/acme/journal?id=${first.id}`, 'DELETE')).status).toBe(404)
+    expect((await publish([{ repo: 'acme/journal', id: 'x', section: 'Posts', slug: 'a-better-question', values: {} }])).status).toBe(400)
+  })
+
   it('links a renamed site\'s pull request where GitHub has it now, once another repository takes the old name', async () => {
     addRepo('acme/journal', {})
     await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })

@@ -393,7 +393,7 @@ function destinationFor(s: State, choice: Choice): Destination {
     if (which === 'date') values[field] = dateFor(s, choice)
     else if (s.shared[which]) values[field] = s.shared[which]
   }
-  return { repo: choice.site.repo, section: choice.section.name, slug: (s.slugs.get(choice.key) ?? '').trim(), values }
+  return { repo: choice.site.repo, ...(choice.site.id ? { id: choice.site.id } : {}), section: choice.section.name, slug: (s.slugs.get(choice.key) ?? '').trim(), values }
 }
 
 async function publish(host: PublishPanelHost, replace: boolean): Promise<void> {

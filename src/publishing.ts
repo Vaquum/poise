@@ -73,6 +73,8 @@ export interface DocumentPublishing {
 
 export interface Destination {
   repo: string
+  /** The site's repository's id, where known: the destination is that site, whatever its name is now. */
+  id?: number
   section: string
   slug: string
   values: Record<string, unknown>
@@ -122,8 +124,9 @@ export async function addSite(repo: string): Promise<SiteView> {
   return site
 }
 
-export async function removeSite(repo: string): Promise<void> {
-  await call(sitePath(repo), 'DELETE')
+/** `id` is the site's repository's id where known: that site is removed, whatever its name is now. */
+export async function removeSite(repo: string, id?: number): Promise<void> {
+  await call(`${sitePath(repo)}${id ? `?id=${id}` : ''}`, 'DELETE')
   changed()
 }
 

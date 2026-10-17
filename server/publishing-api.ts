@@ -161,6 +161,31 @@ async function findSite(repo: string): Promise<StoredSite> {
   return site
 }
 
+/** A site's id as a request gives it: its repository's GitHub id, or none. */
+function idFrom(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined
+  const id = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value
+  if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) throw new HttpError(400, 'A site\'s id is its repository\'s GitHub id.')
+  return id
+}
+
+/**
+ * The site a request is for: by its repository's id where the request gives
+ * it, so a name held from before a rename never reaches another repository
+ * that has it now; else by name.
+ */
+async function siteAsked(repo: string, id: number | undefined): Promise<StoredSite> {
+  if (!id) return findSite(repo)
+  const site = storedSites().find((s) => s.id === id)
+  if (!site) throw new HttpError(404, `${repo} is not one of your publishing sites.`)
+  return site
+}
+
+/** A stored site's own entry: by its repository's id where it has one, else by name. */
+function entryOf(site: StoredSite): (s: StoredSite) => boolean {
+  return (s) => (site.id ? s.id === site.id : s.repo === site.repo)
+}
+
 export type SiteState = 'ready' | 'invalid' | 'missing' | 'unavailable'
 
 export interface FieldView {
@@ -349,20 +374,17 @@ async function addSite(value: unknown): Promise<{ site: SiteView }> {
   return { site: (await cachedSite(session, site)).view }
 }
 
-async function removeSite(repo: string): Promise<{ ok: true }> {
-  const site = await findSite(repo)
-  updateSites((sites) => sites.filter((s) => s.repo !== site.repo))
+async function removeSite(repo: string, id?: number): Promise<{ ok: true }> {
+  const site = await siteAsked(repo, id)
+  updateSites((sites) => sites.filter((s) => !entryOf(site)(s)))
   forgetSites()
   return { ok: true }
 }
 
-async function describeSite(repo: string, value: unknown, id?: unknown): Promise<{ site: SiteView }> {
+async function describeSite(repo: string, value: unknown, id?: number): Promise<{ site: SiteView }> {
   if (typeof value !== 'string') throw new HttpError(400, 'The description is the text of a publish.yaml.')
-  if (id !== undefined && !(typeof id === 'number' && Number.isSafeInteger(id) && id > 0)) throw new HttpError(400, 'A site\'s id is its repository\'s GitHub id.')
-  // The site it was written for, by its repository's id where that is given:
-  // renamed since, another repository may have the name it was written under.
-  const site = id ? storedSites().find((s) => s.id === id) : await findSite(repo)
-  if (!site) throw new HttpError(404, `${repo} is not one of your publishing sites.`)
+  // The site it was written for: renamed since, another repository may have the name it was written under.
+  const site = await siteAsked(repo, id)
   const description = value.trim() ? value : undefined
   // Kept only when it reads: the box keeps the text, and the error, until then.
   if (description !== undefined) parsePublishConfig(description)
@@ -371,8 +393,8 @@ async function describeSite(repo: string, value: unknown, id?: unknown): Promise
   delete next.description
   if (description !== undefined) next.description = description
   updateSites((sites) => {
-    if (!sites.some((s) => s.repo === site.repo)) throw new HttpError(404, `${repo} is not one of your publishing sites.`)
-    return sites.map((s) => (s.repo === site.repo ? next : s))
+    if (!sites.some(entryOf(site))) throw new HttpError(404, `${repo} is not one of your publishing sites.`)
+    return sites.map((s) => (entryOf(site)(s) ? next : s))
   })
   forgetSites()
   const session = await signIn(getMeta('me') || '')
@@ -531,6 +553,8 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
 
 interface Destination {
   repo: string
+  /** The site's repository's id, where the panel knows it: the destination is that site, whatever its name is now. */
+  id?: number
   section: string
   slug: string
   values: Record<string, unknown>
@@ -551,7 +575,8 @@ function destinationsFrom(body: unknown): Destination[] {
     const key = `${entry.repo.toLowerCase()}#${entry.section}`
     if (seen.has(key)) throw new HttpError(400, `${entry.repo} · ${entry.section} is chosen twice.`)
     seen.add(key)
-    return { repo: entry.repo, section: entry.section, slug: entry.slug.trim(), values: entry.values as Record<string, unknown> }
+    const id = idFrom(entry.id)
+    return { repo: entry.repo, ...(id ? { id } : {}), section: entry.section, slug: entry.slug.trim(), values: entry.values as Record<string, unknown> }
   })
 }
 
@@ -713,7 +738,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   }
   const sites = storedSites()
   for (const destination of destinations) {
-    const stored = await siteNamed(destination.repo, sites)
+    const stored = destination.id ? sites.find((s) => s.id === destination.id) : await siteNamed(destination.repo, sites)
     if (!stored) { refuse(destination, `${destination.repo} is not one of your publishing sites.`); continue }
     const read = await readSite(session, stored)
     if (!read.ready) { refuse(destination, `${destination.repo}: ${read.view.problem}`); continue }
@@ -1210,13 +1235,14 @@ export async function handlePublishingApi(req: IncomingMessage, res: ServerRespo
     return true
   }
   const method = req.method || 'GET'
+  const query = new URLSearchParams(url.split('?')[1] ?? '')
   try {
     if (path === SITES && method === 'GET') return send(200, await listSites())
     if (path === SITES && method === 'POST') return send(200, await addSite((await readJson<{ repo?: unknown }>(req)).repo))
-    if (site && !site[3] && method === 'DELETE') return send(200, await removeSite(`${site[1]}/${site[2]}`))
+    if (site && !site[3] && method === 'DELETE') return send(200, await removeSite(`${site[1]}/${site[2]}`, idFrom(query.get('id') ?? undefined)))
     if (site && site[3] && method === 'PUT') {
       const body = await readJson<{ description?: unknown, id?: unknown }>(req)
-      return send(200, await describeSite(`${site[1]}/${site[2]}`, body?.description, body?.id))
+      return send(200, await describeSite(`${site[1]}/${site[2]}`, body?.description, idFrom(body?.id)))
     }
     if (document && document[2] === 'publishing' && method === 'GET') return send(200, await documentPublishing(document[1]))
     if (document && document[2] === 'publish' && method === 'POST') return send(200, await publishDocument(document[1], await readJson(req)))

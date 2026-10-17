@@ -83,7 +83,9 @@ export function publishingSection(): PublishingSection {
   let loaded = false
   let generation = 0
   const drafts = new Map<string, Draft>()
-  let confirming: { repo: string, timer: ReturnType<typeof setTimeout> } | null = null
+  let confirming: { repo: string, id?: number, timer: ReturnType<typeof setTimeout> } | null = null
+  // The site a pending Remove is for: by its repository's id where known, whatever its name is now.
+  const confirmingOf = (site: SiteView) => !!confirming && (confirming.id && site.id ? confirming.id === site.id : confirming.repo === site.repo)
 
   const say = (text: string, kind: 'info' | 'error' = 'info') => {
     status.textContent = text
@@ -96,7 +98,7 @@ export function publishingSection(): PublishingSection {
       return
     }
     patchContent(list, sites.length
-      ? sites.map((site) => siteHtml(site, drafts.get(site.repo), confirming?.repo === site.repo)).join('')
+      ? sites.map((site) => siteHtml(site, drafts.get(site.repo), confirmingOf(site))).join('')
       : '<div class="st-help st-help-info">No sites yet. Add a repository below.</div>')
     // A textarea's typed value is not markup: put each draft back after the patch.
     for (const [repo, draft] of drafts) {
@@ -114,15 +116,20 @@ export function publishingSection(): PublishingSection {
       loaded = true
       // A site renamed since: a description being written for it stays with
       // it, by its repository's id, never with another repository that has
-      // its old name now. Without an id, by its name or one it had.
-      for (const [repo, draft] of [...drafts]) {
+      // its old name now; without an id, by its name or one it had. All move
+      // at once, so sites renamed into each other's names keep every draft.
+      const moved = new Map<string, Draft>()
+      for (const [repo, draft] of drafts) {
         const site = draft.id
           ? sites.find((s) => s.id === draft.id)
           : sites.find((s) => s.repo === repo) ?? sites.find((s) => s.formerly?.some((name) => name.toLowerCase() === repo.toLowerCase()))
-        if (site?.repo === repo || (!draft.id && !site)) continue
-        drafts.delete(repo)
-        if (site && !drafts.has(site.repo)) drafts.set(site.repo, draft)
+        // Its site removed meanwhile: there is nothing to save it to.
+        if (draft.id && !site) continue
+        const key = site?.repo ?? repo
+        if (!moved.has(key)) moved.set(key, draft)
       }
+      drafts.clear()
+      for (const [key, draft] of moved) drafts.set(key, draft)
       if (status.classList.contains('st-help-error')) say('')
     } catch (error) {
       if (mine !== generation) return
@@ -132,9 +139,10 @@ export function publishingSection(): PublishingSection {
     render()
   }
 
-  // The row it was read for: a repository renamed since comes back under its new name.
+  // The row it was read for, by its repository's id, whatever its name is now:
+  // renamed since, it comes back under its new name. Without an id, by name.
   const replace = (repo: string, site: SiteView) => {
-    sites = sites.map((s) => (s.repo === repo ? site : s))
+    sites = sites.map((s) => ((site.id && s.id ? s.id === site.id : s.repo === repo) ? site : s))
   }
 
   let adding = false
@@ -174,8 +182,8 @@ export function publishingSection(): PublishingSection {
     try {
       const site = await describeSite(repo, draft.text, draft.id)
       generation++
-      // Only this draft, never one opened since.
-      if (drafts.get(repo) === draft) drafts.delete(repo)
+      // Only this draft, never one opened since, wherever a refresh has moved it.
+      for (const [key, held] of drafts) if (held === draft) drafts.delete(key)
       replace(repo, site)
     } catch (error) {
       draft.error = (error as Error).message
@@ -185,14 +193,15 @@ export function publishingSection(): PublishingSection {
     }
   }
 
-  const remove = async (repo: string) => {
+  const remove = async (repo: string, id?: number) => {
     if (confirming) clearTimeout(confirming.timer)
     confirming = null
     try {
-      await removeSite(repo)
+      await removeSite(repo, id)
       generation++
-      sites = sites.filter((s) => s.repo !== repo)
-      drafts.delete(repo)
+      // By its id where known: renamed meanwhile, another repository may have this name.
+      sites = sites.filter((s) => !(id && s.id ? s.id === id : s.repo === repo))
+      for (const [key, draft] of drafts) if (id && draft.id ? draft.id === id : key === repo) drafts.delete(key)
       render()
     } catch (error) {
       say((error as Error).message, 'error')
@@ -224,13 +233,14 @@ export function publishingSection(): PublishingSection {
     } else if (target.closest('[data-save]')) {
       void save(repo)
     } else if (target.closest('[data-remove]')) {
-      if (confirming?.repo !== repo) {
+      const site = sites.find((s) => s.repo === repo)
+      if (!site || !confirmingOf(site)) {
         if (confirming) clearTimeout(confirming.timer)
-        confirming = { repo, timer: setTimeout(() => { confirming = null; render() }, CONFIRM_MS) }
+        confirming = { repo, ...(site?.id ? { id: site.id } : {}), timer: setTimeout(() => { confirming = null; render() }, CONFIRM_MS) }
         render()
         return
       }
-      void remove(repo)
+      void remove(repo, site.id)
     }
   })
 
