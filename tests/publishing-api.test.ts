@@ -988,6 +988,26 @@ sections:
     expect(repo.pulls.get(102)).toMatchObject({ base: 'published' })
   })
 
+  it('opens a commit that missed its merge to the branch that merge went to, should the site have moved', async () => {
+    await publish([writing()])
+    const repo = repos.get('mikkokotila/mikkokotila-com')!
+    const move = () => editOnSite('mikkokotila/mikkokotila-com', 'main', 'publish.yaml', (text) => text.replace('site: mikkokotila.com', 'site: mikkokotila.com\nbranch: published'))
+    // The site moves to another branch, where someone else's piece has this path.
+    repo.branches.set('published', repo.branches.get('main')!)
+    editOnSite('mikkokotila/mikkokotila-com', 'published', POST, () => 'Someone else\'s piece.\n')
+    move()
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    // Pull request #101 merges into main just before the update's commit (this test GitHub then moves main to its head: the move is made again).
+    beforeCommit = () => { merge('mikkokotila/mikkokotila-com', 101); move() }
+    expect((await publish([writing()])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 102 } } })
+    expect(repo.pulls.get(102)).toMatchObject({ base: 'main' })
+    expect((await editor!.readPublishLedger(DOC)).records[0].base).toBe('main')
+    // Closed unmerged, it never makes the moved branch's file this document's.
+    close('mikkokotila/mikkokotila-com', 102)
+    expect((await publish([writing()], true)).body.results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/did not publish it/) })
+    expect(fileOn('mikkokotila/mikkokotila-com', 'published', POST)).toBe('Someone else\'s piece.\n')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

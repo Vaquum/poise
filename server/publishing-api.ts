@@ -886,7 +886,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   // Before anything is written: at the most a commit could add to the record.
   fits(provisionalRecord(target, filled, parts.title))
 
-  const open = (headRepo: string, branch: string, update: boolean) => openPullRequest(session, upstream.fullName, {
+  const open = (headRepo: string, branch: string, update: boolean, base: string) => openPullRequest(session, upstream.fullName, {
     title: update ? `Update: ${title}` : title,
     body: [
       `Published from Poise by @${session.me}.`,
@@ -895,7 +895,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       ...(url ? [`- Address once merged: ${url}`] : []),
     ].join('\n'),
     head: headRepo === upstream.fullName ? branch : `${headRepo.split('/')[0]}:${branch}`,
-    base: ready.base,
+    base,
   })
 
   let branch: string
@@ -936,9 +936,11 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     } else {
       // Merged meanwhile: what it held is on the site now, and this document's.
       if (after.state === 'merged') kept = snapshotOf(previous!)
-      const opened = await open(headRepo, branch, kept !== undefined)
+      // To the branch the pull request it replaces went to, where what it
+      // merged is: should the site have moved since, the next publication
+      // asks whether the piece is still this document's there.
+      const opened = await open(headRepo, branch, kept !== undefined, base)
       pr = { number: opened.number, url: opened.url }
-      base = ready.base
     }
   } else {
     // The site's own repository when the writer can push to it, otherwise
@@ -947,7 +949,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     headRepo = where.fullName
     branch = await freshBranch(session, headRepo, branchFor(destination.slug), head)
     await commitFile(session, headRepo, branch, head, `${state === 'merged' ? 'Update' : 'Publish'} ${filled.path}`, filled.path, text)
-    const opened = await open(headRepo, branch, state === 'merged')
+    const opened = await open(headRepo, branch, state === 'merged', base)
     pr = { number: opened.number, url: opened.url }
   }
   return {
