@@ -829,7 +829,7 @@ sections:
     expect(copy).toContain('canonical_url: "https://stamped.example/2027/a-better-question/"')
   })
 
-  it('names the address the site gives when it removes an optional date', async () => {
+  it('names the address the original records when the site removes an optional date', async () => {
     for (const [repo, yaml] of [['acme/dated', DATED_YAML.replace('date: { kind: date, required: true }', 'date: { kind: date }')], ['acme/journal', JOURNAL_YAML]]) {
       addRepo(repo, {})
       await request('/api/publishing/sites', 'POST', { repo })
@@ -837,15 +837,31 @@ sections:
     }
     const dated = { repo: 'acme/dated', section: 'Posts', slug: 'a-better-question', values: { date: '2025-03-01' } }
     expect((await publish([dated])).body.results[0].ok).toBe(true)
-    // A maintainer removes the date in review: the site dates the post its own way, today.
+    // A maintainer removes the date in review: the post still goes by the date it was published with.
     editOnSite('acme/dated', 'publish/a-better-question', 'posts/a-better-question.md', (text) => text.replace('date: "2025-03-01"\n', ''))
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
-    const { today } = await import('../server/publishing')
-    const address = `https://dated.example/${today('Europe/Helsinki').slice(0, 4)}/a-better-question/`
+    const address = 'https://dated.example/2025/a-better-question/'
     const results = (await publish([dated, { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results
     expect(results[0]).toMatchObject({ ok: true, publication: { url: address } })
     const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
     expect(copy).toContain(`canonical_url: "${address}"`)
+  })
+
+  it('keeps the path an optional date left empty went by, on a later day', async () => {
+    addRepo('acme/loose', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/loose' })
+    await request('/api/publishing/sites/acme/loose/description', 'PUT', { description: 'version: 1\nsite: Loose\nsections:\n  - name: Posts\n    path: _posts/{date}-{slug}.md\n    slug: "^[a-z0-9-]+$"\n    first_line: title\n    fields:\n      title: { kind: text, required: true }\n      date: { kind: date }\n' })
+    const { today } = await import('../server/publishing')
+    const loose = { repo: 'acme/loose', section: 'Posts', slug: 'a-better-question', values: { date: '' } }
+    // Published where it is already tomorrow, published again where it is still yesterday.
+    database!.setMeta('timezone', 'Pacific/Kiritimati')
+    const path = `_posts/${today('Pacific/Kiritimati')}-a-better-question.md`
+    expect((await publish([loose])).body.results[0].ok).toBe(true)
+    expect(fileOn('acme/loose', 'publish/a-better-question', path)).toBeDefined()
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    database!.setMeta('timezone', 'Pacific/Pago_Pago')
+    expect((await publish([loose])).body.results[0].ok).toBe(true)
+    expect(fileOn('acme/loose', 'publish/a-better-question', path)).toContain('A new ending.')
   })
 
   it('names an original where its site has it now, when only a copy is published', async () => {

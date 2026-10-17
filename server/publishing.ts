@@ -236,6 +236,16 @@ function readField(name: string, spec: unknown, at: string): PublishField {
   for (const key of ['default', 'value'] as const) {
     if (spec[key] === undefined) continue
     field[key] = fieldConstant(field, spec[key], `${at}.${key}`, key)
+    // Held to the field's own limits, as a value typed in is: the panel sends a default as typed.
+    if (key === 'default' && field.kind === 'date' && spec[key] === 'today') continue
+    const problems: string[] = []
+    try {
+      inputValue(field, field[key], problems)
+    } catch (error) {
+      if (!(error instanceof PublishValueError)) throw error
+      problems.push(...error.problems)
+    }
+    if (problems.length) throw new PublishConfigError(`${at}.${key}: ${problems[0]}`)
   }
   return field
 }
@@ -455,16 +465,17 @@ function inputValue(field: PublishField, raw: unknown, problems: string[]): Fiel
 
 /**
  * The date a post goes by in paths and addresses: its first date field's, as
- * fillPost resolves it, or `fallback` for a section without one (today, or the
- * date a published piece was first filled with). One rule, so a path and the
- * address another site lists for it can never disagree.
+ * fillPost resolves it, or `fallback` for a section without one, or a date
+ * left empty (today, or the date a published piece was first filled with).
+ * One rule, so a path and the address another site lists for it can never
+ * disagree, and a path never moves because a day passed.
  */
 export function postDate(section: PublishSection, values: Record<string, unknown>, todayValue: string, fallback = todayValue): string {
   const field = section.fields.find((f) => f.kind === 'date')
   if (!field) return fallback
   const given = own(values, field.name)
   const raw = field.value ?? (empty(given) ? (field.default === 'today' ? todayValue : field.default) : given)
-  return typeof raw === 'string' && calendarDate(raw) ? raw : todayValue
+  return typeof raw === 'string' && calendarDate(raw) ? raw : fallback
 }
 
 /**

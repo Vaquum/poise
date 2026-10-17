@@ -117,6 +117,14 @@ describe('publish.yaml', () => {
     expect(configError(`${MIKKO}#${'x'.repeat(64 * 1024)}`)).toBe('publish.yaml is larger than 64 KB')
   })
 
+  it("holds a default, or a fixed value, to the field's own limits", () => {
+    expect(configError(MIKKO.replace('description: { kind: text, lines: many, max: 420 }', 'description: { kind: text, lines: many, max: 3, default: long }')))
+      .toBe('sections[0].fields.description.default: description is longer than 3 characters.')
+    expect(configError(MIKKO.replace('suggest: "content/writing.yaml#topics[].tag" }', 'value: [Not A Tag] }')))
+      .toBe('sections[0].fields.tags.value: tags: "Not A Tag" does not match the site\'s pattern ^[a-z0-9]+(?:-[a-z0-9]+)*$.')
+    expect(() => parsePublishConfig(MIKKO.replace('max: 420 }', 'max: 420, default: A short one. }'))).not.toThrow()
+  })
+
   it('stops a pattern that backtracks without end', () => {
     const start = Date.now()
     expect(() => matchesPattern('^(a+)+$', `${'a'.repeat(40)}b`)).toThrow(PublishValueError)

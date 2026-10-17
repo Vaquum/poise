@@ -39,7 +39,8 @@ sections:
   a name of its own:
   - `path` is where the file goes, and must contain `{slug}`. `path` and `url`
     can use `{slug}`, `{date}`, `{year}`, `{month}` and `{day}`; the date is
-    the section's first date field, or today.
+    the section's first date field. Without one, or with it left empty, it
+    is today on a first publication and the same date after that.
   - `url` (optional) is the page's address once published.
   - `slug` is a regular expression the slug must match. The Editor suggests
     a slug from the title: lowercase words joined by hyphens.
@@ -61,7 +62,8 @@ sections:
 | `canonical` | The original's address, written only on the copies; filled in by Poise | |
 
 The first five also take `label`, `required`, `default`, or `value`: a fixed
-value that is always written and never shown. `suggest` names a file in the
+value that is always written and never shown. A `default` or `value` is held
+to the field's own limits, as a typed value is. `suggest` names a file in the
 repository and a path in it, like `content/writing.yaml#topics[].tag`, and the
 Editor offers its words. A `places` field writes one entry per site the piece
 is on, from `item`, a template or keys with templates using `{site}` and
