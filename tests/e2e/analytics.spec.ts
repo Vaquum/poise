@@ -5,9 +5,14 @@ import type { GithubQuotaReport } from '../../src/github-quota'
 function report(merged: number, hours = 27): AnalyticsReport {
   return {
     window: { since: null, until: null },
+    agentAccount: 'octo-agent',
     issues: { opened: 12, closed: 9 },
     pullRequests: {
+      opened: 5,
+      closedUnmerged: 1,
       merged,
+      mergedByAgent: merged ? merged - 1 : 0,
+      firstReview: { count: 3, medianMs: hours > 30 ? 150_000 : 75_000 },
       commentsPerPr: merged ? 3.25 : null,
       lines: { total: merged ? 4210 : null, median: merged ? 180 : null, counted: merged ? merged - 1 : 0 },
       behaviors: { perPr: merged ? 2 : null, approvals: merged, reviews: merged, changesRequested: 0 },
@@ -105,12 +110,20 @@ test('opens from the burger as a view of its own: productivity topline, per merg
   await expect(page.locator('#menu-popover [data-action="analytics"]')).toHaveAttribute('aria-current', 'page')
   await expect(page.locator('#menu-toggle')).toBeFocused()
   await expect(page.locator('#menu-toggle')).toHaveAttribute('aria-expanded', 'false')
-  await expect(view.locator('main h2')).toHaveText(['Productivity', 'Per merged pull request', 'GitHub API · Live'])
+  await expect(view.locator('main h2')).toHaveText(['Productivity', 'Pull request flow', 'Per merged pull request', 'GitHub API · Live'])
   const topline = view.getByRole('region', { name: 'Productivity' })
+  const flow = view.getByRole('region', { name: 'Pull request flow' })
   const perPr = view.getByRole('region', { name: 'Per merged pull request' })
   const quota = view.getByRole('region', { name: 'GitHub API · Live' })
   await expect(topline.locator('.analytics-label')).toHaveText(['Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Time to merge'])
-  await expect(perPr.locator('.analytics-label')).toHaveText(['Comments', 'Median lines', 'Behaviors', 'Median time'])
+  await expect(flow.locator('.analytics-label')).toHaveText(['Pull requests opened', 'Closed without merging', 'Time to first review'])
+  await expect(perPr.locator('.analytics-label')).toHaveText(['Comments', 'Median lines', 'Behaviors', 'Median time', 'Merged by agent'])
+  // Seconds matter: agents review within minutes.
+  await expect(value(page, 'Time to first review')).toHaveText('1m 15s')
+  await expect(flow).toContainText('Faster vs 7-day median')
+  await expect(flow).toContainText('7-day median: 2m 30s · 3 first reviews')
+  await expect(value(page, 'Merged by agent')).toHaveText('75%')
+  await expect(perPr).toContainText('3 of 4 by octo-agent')
   await expect(quota.locator('.github-quota-bucket')).toHaveCount(4)
   // The window, not the reading column: the five topline numbers share one
   // row, the per-PR numbers sit under them, and each account is a row.
@@ -118,7 +131,8 @@ test('opens from the burger as a view of its own: productivity topline, per merg
   const tops = await topline.locator('.analytics-tile').evaluateAll((tiles) => tiles.map((tile) => Math.round(tile.getBoundingClientRect().top)))
   expect(new Set(tops).size).toBe(1)
   const columns = await lefts(topline, '.analytics-tile')
-  expect(await lefts(perPr, '.analytics-tile')).toEqual(columns.slice(0, 4))
+  expect(await lefts(flow, '.analytics-tile')).toEqual(columns.slice(0, 3))
+  expect(await lefts(perPr, '.analytics-tile')).toEqual(columns)
   expect(await lefts(quota.locator('.github-quota-account').first(), '.github-quota-identity, .github-quota-bucket')).toEqual(columns)
   await page.screenshot({ path: info.outputPath('analytics-view.png'), fullPage: true })
 

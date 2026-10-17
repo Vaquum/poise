@@ -7,7 +7,7 @@ import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DatastoreRecord } from '../server/gh'
 
-// The Analytics panel's numbers (server/analytics.ts): the window, each count,
+// The Analytics view's numbers (server/analytics.ts): the window, each count,
 // the per-PR numbers over the pull requests merged in the window, and reading
 // exactly what Current shows from each account's datastore.
 
@@ -180,9 +180,14 @@ describe('the numbers', () => {
     const report = computeAnalytics({ window: WEEK, issues: [], prs: [], behaviors: [] })
     expect(report).toEqual({
       window: WEEK,
+      agentAccount: null,
       issues: { opened: 0, closed: 0 },
       pullRequests: {
+        opened: 0,
+        closedUnmerged: 0,
         merged: 0,
+        mergedByAgent: null,
+        firstReview: { count: 0, medianMs: null },
         commentsPerPr: null,
         lines: { total: null, median: null, counted: 0 },
         behaviors: { perPr: null, approvals: 0, reviews: 0, changesRequested: 0 },
@@ -191,6 +196,45 @@ describe('the numbers', () => {
       },
       errors: [],
     })
+  })
+
+  it('counts pull requests opened and closed without merging inside the window', () => {
+    const report = computeAnalytics({ window: WEEK, issues: [], behaviors: [], prs: [
+      pr(1, '2026-10-05T00:00:00Z', null),                                              // opened on the first instant
+      pr(2, '2026-10-06T00:00:00Z', '2026-10-07T00:00:00Z'),                            // opened, then merged
+      { ...pr(3, '2026-10-01T00:00:00Z', null), status: 'closed', closed_at: '2026-10-08T00:00:00Z' },  // closed unmerged inside
+      { ...pr(4, '2026-10-06T00:00:00Z', null), status: 'closed', closed_at: '2026-10-12T00:00:00Z' },  // closed on the end: outside
+      pr(5, '2026-10-12T00:00:00Z', null),                                              // opened on the end: outside
+    ] })
+    expect(report.pullRequests.opened).toBe(3)
+    expect(report.pullRequests.closedUnmerged).toBe(1)
+    expect(report.pullRequests.merged).toBe(1)
+  })
+
+  it('times first reviews submitted in the window from each opening, to the millisecond', () => {
+    const report = computeAnalytics({ window: WEEK, issues: [], behaviors: [], prs: [
+      pr(1, '2026-10-05T00:00:00Z', null, { first_review_at: '2026-10-05T00:00:42Z' }),
+      pr(2, '2026-10-04T23:00:00Z', null, { first_review_at: '2026-10-05T00:03:00Z' }),      // opened before, reviewed inside
+      pr(3, '2026-10-06T00:00:00Z', null, { first_review_at: '2026-10-06T02:00:00.500Z' }),
+      pr(4, '2026-10-01T00:00:00Z', null, { first_review_at: '2026-10-04T23:59:59.999Z' }),  // reviewed before the window
+      pr(5, '2026-10-06T00:00:00Z', null, { first_review_at: null }),                        // not reviewed yet
+    ] })
+    expect(report.pullRequests.firstReview).toEqual({ count: 3, medianMs: 63 * 60_000 })
+  })
+
+  it('counts merges by the agent account without case, and does not guess without one', () => {
+    const prs = [
+      pr(1, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { merged_by: 'Robot' }),
+      pr(2, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { merged_by: 'octocat' }),
+      pr(3, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { merged_by: null }),
+      pr(4, '2026-09-05T00:00:00Z', '2026-09-06T00:00:00Z', { merged_by: 'robot' }),      // merged before the window
+    ]
+    const report = computeAnalytics({ window: WEEK, issues: [], behaviors: [], prs, agent: 'robot' })
+    expect(report.agentAccount).toBe('robot')
+    expect(report.pullRequests.mergedByAgent).toBe(1)
+    const unset = computeAnalytics({ window: WEEK, issues: [], behaviors: [], prs })
+    expect(unset.agentAccount).toBeNull()
+    expect(unset.pullRequests.mergedByAgent).toBeNull()
   })
 })
 
@@ -210,7 +254,7 @@ describe('reading what Current shows', () => {
       db.prepare(`INSERT INTO items (node_id, repo_id, repo_full_name, number, item_type, state, title, author_login, created_at, updated_at, closed_at, raw_json, expanded_json, synced_at)
         VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)`).run(
         String(row.number), row.repo, row.number, kind, row.status, row.title, row.author, row.created_at, row.updated_at, row.closed_at,
-        JSON.stringify({ pull: { graphql: { additions: row.additions, deletions: row.deletions } } }), row.updated_at,
+        JSON.stringify({ pull: { graphql: { additions: row.additions, deletions: row.deletions }, merged_by: row.merged_by ? { login: row.merged_by } : null } }), row.updated_at,
       )
       const id = db.prepare<[], { item_id: number }>('SELECT max(item_id) AS item_id FROM items').get()!.item_id
       if (involved) {
@@ -222,6 +266,14 @@ describe('reading what Current shows', () => {
         const insert = db.prepare(`INSERT INTO ${table} (node_id, item_id, created_at, updated_at, raw_json) VALUES (?, ?, ?, ?, '{}')`)
         for (let i = 0; i < count; i++) insert.run(`${id}-${i}`, id, row.created_at, row.updated_at)
       }
+      return id
+    } finally { db.close() }
+  }
+  function review(itemId: number, author: string | null, state: string, submitted: string | null) {
+    const db = new Database(mocks.orgs[0].datastorePath)
+    try {
+      db.prepare(`INSERT INTO reviews (node_id, item_id, author_login, state, submitted_at, raw_json) VALUES (?, ?, ?, ?, ?, '{}')`)
+        .run(`review-${itemId}-${author}-${state}-${submitted}`, itemId, author, state, submitted)
     } finally { db.close() }
   }
 
@@ -256,6 +308,29 @@ describe('reading what Current shows', () => {
     expect(report.pullRequests.lines).toEqual({ total: 14, median: 7, counted: 2 })
     expect(report.pullRequests.commentsPerPr).toBe(2)
     expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('reads first reviews by someone else, and who merged, from the stored pull requests', async () => {
+    const reviewed = seed(pr(1, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { merged_by: 'robot' }), 'pr', true)
+    // The author's own review and a review still pending are not a first review.
+    review(reviewed, 'octocat', 'COMMENTED', '2026-10-05T00:00:05Z')
+    review(reviewed, 'robot', 'PENDING', null)
+    review(reviewed, 'robot', 'COMMENTED', '2026-10-05T00:00:42Z')
+    review(reviewed, 'robot', 'APPROVED', '2026-10-05T00:09:00Z')
+    seed(pr(2, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { merged_by: 'octocat' }), 'pr', true)
+    seed({ ...pr(3, '2026-10-05T00:00:00Z', null), status: 'closed', closed_at: '2026-10-07T00:00:00Z' }, 'pr', true)
+    const report = await readAnalytics(WEEK)
+    expect(report.pullRequests.firstReview).toEqual({ count: 1, medianMs: 42_000 })
+    expect(report.pullRequests).toMatchObject({ opened: 3, merged: 2, closedUnmerged: 1, mergedByAgent: 1 })
+    expect(report.agentAccount).toBe('robot')
+  })
+
+  it('counts a first review on a pull request whose author account was deleted', async () => {
+    const orphan = seed({ ...pr(1, '2026-10-05T00:00:00Z', null), author: null as unknown as string }, 'pr', true)
+    review(orphan, 'robot', 'COMMENTED', '2026-10-05T00:00:30Z')
+    const deleted = seed(pr(2, '2026-10-05T00:00:00Z', null), 'pr', true)
+    review(deleted, null, 'APPROVED', '2026-10-05T00:02:00Z')
+    expect((await readAnalytics(WEEK)).pullRequests.firstReview).toEqual({ count: 2, medianMs: 75_000 })
   })
 
   it('reads only the selected account, including all history for unbounded windows', async () => {
@@ -312,7 +387,7 @@ describe('reading what Current shows', () => {
     const oldMs = performance.now() - start
     const expected = computeAnalytics({ window: WEEK,
       issues: [...new Map([...old[0], ...old[1]].map(row => [row.number, row])).values()],
-      prs: old[4].filter(row => [...old[2], ...old[3]].some(scope => scope.number === row.number)), behaviors: [],
+      prs: old[4].filter(row => [...old[2], ...old[3]].some(scope => scope.number === row.number)), behaviors: [], agent: 'robot',
     })
     const directStart = performance.now()
     expect(await readAnalytics(WEEK, 'alpha')).toEqual(expected)

@@ -35,8 +35,8 @@ export async function workspace(page: Page, view = 'current', fontResponse?: Pro
       fixed: [], presets: [], refresh: null,
     } })
     if (path === '/api/analytics') return route.fulfill({ json: {
-      window: { since: null, until: null }, issues: { opened: 12, closed: 9 },
-      pullRequests: { merged: 4, commentsPerPr: 3.25, lines: { total: 4210, median: 180, counted: 3 }, behaviors: { perPr: 2, approvals: 4, reviews: 4, changesRequested: 0 }, averageTimeToMergeMs: 27 * 3_600_000, medianTimeToMergeMs: 6 * 3_600_000 }, errors: [],
+      window: { since: null, until: null }, agentAccount: 'octo-agent', issues: { opened: 12, closed: 9 },
+      pullRequests: { opened: 5, closedUnmerged: 1, merged: 4, mergedByAgent: 3, firstReview: { count: 3, medianMs: 75_000 }, commentsPerPr: 3.25, lines: { total: 4210, median: 180, counted: 3 }, behaviors: { perPr: 2, approvals: 4, reviews: 4, changesRequested: 0 }, averageTimeToMergeMs: 27 * 3_600_000, medianTimeToMergeMs: 6 * 3_600_000 }, errors: [],
     } })
     return route.fulfill({ json: {} })
   })

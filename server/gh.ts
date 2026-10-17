@@ -77,6 +77,10 @@ export interface DatastoreRecord {
   // null for a pull request the datastore stored before it read sizes
   additions?: number | null
   deletions?: number | null
+  // Analytics only: the first review by someone other than the author, and
+  // who merged a merged pull request.
+  first_review_at?: string | null
+  merged_by?: string | null
   owner_login?: string | null
   owner_avatar?: string | null
   // Issue-only

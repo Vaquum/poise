@@ -3,9 +3,14 @@
 
 export interface AnalyticsReport {
   window: { since: string | null, until: string | null }
+  agentAccount: string | null
   issues: { opened: number, closed: number }
   pullRequests: {
+    opened: number
+    closedUnmerged: number
     merged: number
+    mergedByAgent: number | null
+    firstReview: { count: number, medianMs: number | null }
     commentsPerPr: number | null
     lines: { total: number | null, median: number | null, counted: number }
     behaviors: { perPr: number | null, approvals: number, reviews: number, changesRequested: number }
@@ -26,7 +31,7 @@ export interface AnalyticsTile {
 
 export interface AnalyticsGroup {
   /** Names the section on the page; the productivity topline comes first. */
-  id: 'productivity' | 'per-merged-pr'
+  id: 'productivity' | 'flow' | 'per-merged-pr'
   label: string
   /** What the section counts, shown over its heading. */
   help: string
@@ -58,28 +63,44 @@ export function formatDuration(ms: number | null): string {
   return `${minutes}m`
 }
 
+/** Down to the second, two units at most: "45s", "3m 12s", then as formatDuration. */
+export function formatShortDuration(ms: number | null): string {
+  if (ms === null) return UNKNOWN
+  const seconds = Math.floor(ms / 1000)
+  if (seconds < 1) return '<1s'
+  if (seconds < 60) return `${seconds}s`
+  if (seconds < 3600) return seconds % 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds / 60}m`
+  return formatDuration(ms)
+}
+
 function plural(n: number, one: string, many: string): string {
   return `${formatCount(n)} ${n === 1 ? one : many}`
 }
 
-function metricTrend(current: number | null, baseline: number | null, duration = false): AnalyticsTile['trend'] {
+/** A duration trend names faster or slower against the 7-day average or median. */
+function metricTrend(current: number | null, baseline: number | null, duration?: { format: (ms: number) => string, basis: 'average' | 'median' }): AnalyticsTile['trend'] {
   if (current === null || baseline === null) return undefined
+  const basis = duration?.basis ?? 'average'
   const delta = current - baseline
   const direction = delta === 0 ? 'neutral' : (duration ? delta < 0 : delta > 0) ? 'good' : 'bad'
   const percent = baseline === 0 ? 0 : Math.abs(delta / baseline * 100)
   const change = baseline === 0
-    ? duration ? formatDuration(Math.abs(delta)) : formatRate(Math.abs(delta))
+    ? duration ? duration.format(Math.abs(delta)) : formatRate(Math.abs(delta))
     : percent > 0 && percent < 0.1 ? '<0.1%' : `${percent.toLocaleString('en-US', { maximumFractionDigits: 1 })}%`
   const movement = duration ? delta < 0 ? 'faster' : 'slower' : delta < 0 ? 'below' : 'above'
   const description = delta === 0 ? 'Unchanged' : `${change} ${movement}`
-  const caption = delta === 0 ? 'Same as 7-day average' : duration
-    ? `${delta < 0 ? 'Faster' : 'Slower'} vs 7-day average`
+  const caption = delta === 0 ? `Same as 7-day ${basis}` : duration
+    ? `${delta < 0 ? 'Faster' : 'Slower'} vs 7-day ${basis}`
     : `${delta < 0 ? 'Below' : 'Above'} 7-day daily average`
-  return { direction, caption, text: `${delta < 0 ? '↓' : delta > 0 ? '↑' : '→'} ${delta === 0 ? '0%' : change}`, description: `${description} versus the preceding 7-day average` }
+  return { direction, caption, text: `${delta < 0 ? '↓' : delta > 0 ? '↑' : '→'} ${delta === 0 ? '0%' : change}`, description: `${description} versus the preceding 7-day ${basis}` }
 }
 
 export function mergeTimeTrend(current: number | null, baseline: number | null): AnalyticsTile['trend'] {
-  return metricTrend(current, baseline, true)
+  return metricTrend(current, baseline, { format: formatDuration, basis: 'average' })
+}
+
+export function firstReviewTrend(current: number | null, baseline: number | null): AnalyticsTile['trend'] {
+  return metricTrend(current, baseline, { format: formatShortDuration, basis: 'median' })
 }
 
 export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsReport): AnalyticsGroup[] {
@@ -124,6 +145,22 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
       note: linesNote,
     },
     {
+      id: 'flow',
+      label: 'Pull request flow',
+      help: 'Pull requests opened, closed without merging and first reviewed on the selected day, against the seven days before it.',
+      tiles: [
+        dailyCount('Pull requests opened', pr.opened, baseline.pullRequests.opened),
+        dailyCount('Closed without merging', pr.closedUnmerged, baseline.pullRequests.closedUnmerged),
+        {
+          label: 'Time to first review', value: formatShortDuration(pr.firstReview.medianMs),
+          note: 'Median, from opened to the first review by someone other than the author',
+          trend: complete ? firstReviewTrend(pr.firstReview.medianMs, baseline.pullRequests.firstReview.medianMs) : undefined,
+          comparison: `7-day median: ${formatShortDuration(baseline.pullRequests.firstReview.medianMs)} · ${plural(baseline.pullRequests.firstReview.count, 'first review', 'first reviews')}`,
+        },
+      ],
+      note: pr.firstReview.count ? undefined : 'No pull request had its first review in this range.',
+    },
+    {
       id: 'per-merged-pr',
       label: 'Per merged pull request',
       help: 'Over the pull requests merged on the selected day.',
@@ -140,6 +177,12 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
           ].join(' · '),
         },
         { label: 'Median time', value: formatDuration(pr.medianTimeToMergeMs), note: 'Median, from opened to merged' },
+        {
+          label: 'Merged by agent',
+          value: pr.mergedByAgent === null || none ? UNKNOWN : `${Math.round(pr.mergedByAgent / pr.merged * 100)}%`,
+          note: 'Share of these pull requests that the agent account from Settings merged',
+          comparison: report.agentAccount === null ? 'No agent account in Settings' : none ? undefined : `${formatCount(pr.mergedByAgent ?? 0)} of ${formatCount(pr.merged)} by ${report.agentAccount}`,
+        },
       ],
       note: none ? 'No pull requests were merged in this range.' : undefined,
     },

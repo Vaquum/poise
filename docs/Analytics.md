@@ -11,13 +11,17 @@ The page reads top to bottom:
 1. **Productivity**: the day's topline. Issues opened and closed, pull
    requests merged, lines changed and time to merge, each against the seven
    days before.
-2. **Per merged pull request**: comments, median lines, behaviors and median
-   time over the pull requests merged that day.
-3. **GitHub API · Live**: quota for the configured GitHub accounts.
+2. **Pull request flow**: pull requests opened, closed without merging, and
+   the time to their first review, down to the second.
+3. **Per merged pull request**: comments, median lines, behaviors, median
+   time and the share the agent account merged, over the pull requests merged
+   that day.
+4. **GitHub API · Live**: quota for the configured GitHub accounts.
 
 The page takes the window's width. The sections share five columns, so the
-per-PR numbers sit under the topline's, and each quota account is a row: the
-account, then its budgets. A narrower page uses three columns, then two.
+flow and per-PR numbers sit under the topline's, and each quota account is a
+row: the account, then its budgets. A narrower page uses three columns, then
+two.
 
 ## The day
 
@@ -56,6 +60,21 @@ Productivity:
 | Lines changed | Additions plus deletions of the pull requests merged in the range. |
 | Time to merge | The average time from a pull request's opening to its merge, over the pull requests merged in the range. |
 
+Pull request flow:
+
+| Number | What it is |
+| --- | --- |
+| Pull requests opened | Pull requests created in the range. |
+| Closed without merging | Pull requests closed unmerged in the range. |
+| Time to first review | The median time from a pull request's opening to its first review, over the first reviews submitted in the range. Shown down to the second: "45s", "3m 12s", then hours and days. |
+
+A first review is the earliest review on GitHub (approved, changes requested,
+commented or dismissed) submitted by anyone other than the pull request's
+author, read from the datastore's `reviews` table. Reviews still pending are
+not submitted and do not count; neither does the author's own review, which is
+a reply. Poise's agent account counts like any other reviewer. Conversation
+comments are not reviews.
+
 Per merged pull request, over the pull requests merged in the range:
 
 | Number | What it is |
@@ -64,6 +83,11 @@ Per merged pull request, over the pull requests merged in the range:
 | Median lines | The median of additions plus deletions. |
 | Behaviors | The reviews and approvals behaviors completed on them, on average, and how many of each. |
 | Median time | The median time from opening to merge; even samples use the mean of the middle pair. |
+| Merged by agent | The share of them the agent account from Settings merged, and how many of how many. With no agent account set it shows — and says so. |
+
+Who merged comes from each merged pull request's stored GitHub record. Merges
+measure the agent's share because the pull requests themselves are usually
+opened under your own account.
 
 Behaviors are read from Poise's own record of the reviews and approvals it
 launched (`behavior_seen` in cache.db). One counts once its agent reported
@@ -74,9 +98,9 @@ comment on issues, not pull requests, and are not counted either.
 
 ## Seven-day trends
 
-Issues opened, Issues closed, Pull requests merged and Lines changed compare
-the day's totals with the preceding seven complete calendar days' daily
-averages, including zero days.
+Issues opened, Issues closed, Pull requests merged, Lines changed, Pull
+requests opened and Closed without merging compare the day's totals with the
+preceding seven complete calendar days' daily averages, including zero days.
 An upward green arrow means increased activity; a downward red arrow means
 less activity. Partial line-size coverage withholds its comparison arrow; incomplete baseline
 coverage also shows an unknown daily line average.
@@ -93,6 +117,11 @@ text stating faster or slower. An unchanged mean shows a neutral arrow and
 No merges in either period means no directional comparison; an empty
 baseline is explicitly labelled. Account read errors remain visible, and
 comparative arrows are withheld while either period has partial account data.
+
+Time to first review compares the day's median with the median of the
+preceding seven days' first reviews, and names how many there were. The
+arrows read as they do for time to merge: green and downward is faster. A
+zero baseline shows the increase in seconds.
 
 ## When a number is missing
 
@@ -149,7 +178,10 @@ contains `resource`, `label`, `limit`, `used`, `remaining`, `resetAt`,
 (inclusive) and `until` (exclusive) are times with a timezone, and either may
 be left out; `org` narrows to one account. Implemented in
 `server/analytics.ts`. The view reads the selected day and preceding seven-day
-window through this endpoint; `medianTimeToMergeMs` accompanies the mean.
+window through this endpoint; `medianTimeToMergeMs` accompanies the mean. The
+report also names `agentAccount` (null when none is set) and gives, under
+`pullRequests`, `opened`, `closedUnmerged`, `mergedByAgent` (null without an
+agent account) and `firstReview` with its `count` and `medianMs`.
 
 Section and metric explanations appear after half a second on hover or on
 keyboard focus; missing data and coverage notes remain visible. See

@@ -9,6 +9,10 @@
 // Behaviors per PR come from Poise's own ledger of completed launches
 // (behavior_seen): an approval or a review counts once its agent reported the
 // result, which is what actually happened on GitHub.
+//
+// Pull request flow counts openings, unmerged closings and first reviews in
+// the window. A first review is the earliest review someone other than the
+// author submitted; its time runs from the pull request's opening.
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -17,6 +21,7 @@ import { getMeta, listCompletedBehaviorActions, type BehaviorLaunchAction, type 
 import { HttpError } from './http'
 import { involvementScopes, repoBelongsTo, selectOrganizations, type DatastoreRecord, type OrganizationReadError } from './gh'
 import type { Organization } from './organizations'
+import { agentAccount } from './settings'
 
 export interface AnalyticsWindow {
   /** Inclusive start; null is "since the beginning". */
@@ -27,9 +32,18 @@ export interface AnalyticsWindow {
 
 export interface AnalyticsReport {
   window: AnalyticsWindow
+  /** The agent account from Settings; null when none is set. */
+  agentAccount: string | null
   issues: { opened: number, closed: number }
   pullRequests: {
+    opened: number
+    /** Closed without merging. */
+    closedUnmerged: number
     merged: number
+    /** Merged pull requests the agent account merged; null without one. */
+    mergedByAgent: number | null
+    /** First reviews submitted in the window, timed from each opening. */
+    firstReview: { count: number, medianMs: number | null }
     /** Conversation and review comments per merged PR; null without merged PRs. */
     commentsPerPr: number | null
     lines: {
@@ -105,12 +119,19 @@ export function computeAnalytics(input: {
   issues: DatastoreRecord[]
   prs: DatastoreRecord[]
   behaviors: CompletedBehaviorAction[]
+  /** The agent account from Settings, whose merges are counted. */
+  agent?: string
   errors?: OrganizationReadError[]
 }): AnalyticsReport {
   const { window } = input
+  const agent = input.agent?.toLowerCase() || null
   const merged = input.prs.filter((pr) => pr.status === 'merged' && inWindow(pr.closed_at, window))
 
   const mergeTimes = merged.map((pr) => Date.parse(pr.closed_at!) - Date.parse(pr.created_at))
+  const firstReviewTimes = input.prs
+    .filter((pr) => inWindow(pr.first_review_at, window))
+    .map((pr) => Date.parse(pr.first_review_at!) - Date.parse(pr.created_at))
+    .filter((ms) => ms >= 0)
 
   const sizes = merged
     .filter((pr) => Number.isSafeInteger(pr.additions) && Number.isSafeInteger(pr.deletions))
@@ -125,12 +146,17 @@ export function computeAnalytics(input: {
 
   return {
     window,
+    agentAccount: input.agent || null,
     issues: {
       opened: input.issues.filter((issue) => inWindow(issue.created_at, window)).length,
       closed: input.issues.filter((issue) => issue.status === 'closed' && inWindow(issue.closed_at, window)).length,
     },
     pullRequests: {
+      opened: input.prs.filter((pr) => inWindow(pr.created_at, window)).length,
+      closedUnmerged: input.prs.filter((pr) => pr.status === 'closed' && inWindow(pr.closed_at, window)).length,
       merged: merged.length,
+      mergedByAgent: agent ? merged.filter((pr) => pr.merged_by?.toLowerCase() === agent).length : null,
+      firstReview: { count: firstReviewTimes.length, medianMs: median(firstReviewTimes) },
       commentsPerPr: mean(merged.map((pr) => (pr.comments_count ?? 0) + (pr.review_comments_count ?? 0))),
       lines: {
         total: sizes.length ? sizes.reduce((sum, size) => sum + size, 0) : null,
@@ -175,7 +201,13 @@ async function readOrganization(org: Organization, me: string, window: Analytics
           }
           return `SELECT ${user ? 'item_ref' : ref} FROM ${user ? 'user_items' : view}${filters.length ? ` WHERE ${filters.join(' AND ')}` : ''}`
         })
-        const details = kind === 'pr' ? 'comments_count, review_comments_count, additions, deletions' : '0 AS comments_count'
+        // A pending review is not submitted, and an author's own review is a
+        // reply. A review counts unless it is known to be the author's: a
+        // deleted account leaves either login NULL.
+        const details = kind === 'pr' ? `pr_ref, comments_count, review_comments_count, additions, deletions,
+          (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = pr_ref AND r.submitted_at IS NOT NULL
+            AND r.state <> 'PENDING' AND (r.author_login IS NULL OR author IS NULL OR lower(r.author_login) <> lower(author))) AS first_review_at`
+          : '0 AS comments_count'
         const rows = db.prepare<string[], DatastoreRecord>(`
           SELECT repo, number, status, author, updated_at, created_at, closed_at, title, url, ${details}
           FROM ${view} WHERE ${ref} IN (${scopes.join(' UNION ')})
@@ -185,7 +217,13 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         }
         return rows
       }
-      return { issues: read('issue'), prs: read('pr') }
+      const prs = read('pr')
+      // Who merged lives in the stored payload, so only the merges this
+      // report counts are parsed.
+      const merged = prs.filter((pr) => pr.status === 'merged' && inWindow(pr.closed_at, window))
+      const mergedBy = db.prepare<[number], { login: string | null }>(`SELECT json_extract(expanded_json, '$.pull.merged_by.login') AS login FROM items WHERE item_id = ?`)
+      for (const pr of merged) pr.merged_by = mergedBy.get(pr.pr_ref!)?.login ?? null
+      return { issues: read('issue'), prs }
     })()
   } finally {
     db.close()
@@ -214,5 +252,5 @@ export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string):
   if (results.every((result) => result.status === 'rejected')) {
     throw new HttpError(502, errors.map((entry) => `${entry.org}: ${entry.error}`).join('; '))
   }
-  return computeAnalytics({ window, issues, prs, behaviors: listCompletedBehaviorActions(), errors })
+  return computeAnalytics({ window, issues, prs, behaviors: listCompletedBehaviorActions(), agent: agentAccount(), errors })
 }
