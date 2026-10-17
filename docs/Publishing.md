@@ -141,6 +141,9 @@ what is wrong.
   document's version.
 - A section without a date field keeps the date of its first publication in
   its path and address.
+- Other sites name each place where its site has it now: by the address its
+  description gives, dated as its file is, a date a maintainer changed
+  included.
 - When the site has this version already, nothing is committed.
 - A file the document did not publish is never written over: choose another
   slug. A file on the site whose frontmatter cannot be read is reported for

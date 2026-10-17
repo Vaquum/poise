@@ -540,6 +540,36 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     if (date) dates.set(target.key, date)
   }
 
+  // Where each place not published now is, as its site has it: its address
+  // as the site's description gives it now, dated as its file is, a date a
+  // maintainer changed included. One that cannot be read keeps its record's.
+  const addresses = new Map<string, string>()
+  await Promise.all(live.map(async (r) => {
+    const key = placeKey(r.repo, r.section)
+    const state = states.get(key)
+    const reached = state === 'open' || (state === 'merged' && !missed.has(key))
+    if (targets.some((t) => t.key === key) || state === 'unknown' || (r.unconfirmed && !reached)) return
+    const stored = sites.find((site) => site.repo.toLowerCase() === r.repo.toLowerCase())
+    const ready = stored && (await readSite(session, stored)).ready
+    const section = ready?.config.sections.find((sec) => sec.name === r.section)
+    if (!ready || !section?.url) return
+    let date = r.date
+    if (section.fields.some((f) => f.kind === 'date')) {
+      const from = state === 'open' ? { repo: r.headRepo, branch: r.branch } : { repo: ready.repo, branch: ready.base }
+      const file = await fileAt(session, from.repo, r.path, from.branch).catch((error: unknown) => {
+        if (!(error instanceof GitHubError)) throw error
+        return null
+      })
+      let data: Record<string, unknown> | undefined
+      try { data = file ? parsePost(file.text).data : undefined } catch (error) {
+        if (!(error instanceof PostFileError)) throw error
+      }
+      if (!data) return
+      date = fileDate(section, data, todayValue, r.date)
+    }
+    addresses.set(key, placeUrl(section, r.slug, date))
+  }))
+
   // Every place the piece is published, the original first: where it is live
   // already, in the order it went there, then the sites it goes to now.
   const placesFor = (going: Target[]): Place[] => {
@@ -552,7 +582,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
         const key = placeKey(r.repo, r.section)
         const state = states.get(key)
         const reached = state === 'open' || (state === 'merged' && !missed.has(key))
-        const url = state === 'closed' && r.landed ? r.landed.url : r.unconfirmed && !reached ? r.unconfirmed.url : r.url
+        const url = addresses.get(key) ?? (state === 'closed' && r.landed ? r.landed.url : r.unconfirmed && !reached ? r.unconfirmed.url : r.url)
         return { key, site: r.site, url }
       })
     for (const target of going) {
