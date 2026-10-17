@@ -98,7 +98,7 @@ The Publish icon in the Editor bar opens the panel for the open document:
   the document's first line. Until you change the date, each site keeps the
   date it was published with, else takes the piece's date from another site,
   else its own default: today, unless its description fixes another. The
-  panel shows the first chosen site's;
+  panel shows the first chosen site's. A date you clear is left out;
 - each chosen site's own fields and its slug. The slug follows the title until
   you type one, and stays as it was once the piece is published there (a
   pull request closed unmerged does not count). A required choice with no
