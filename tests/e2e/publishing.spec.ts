@@ -473,3 +473,30 @@ test('keeps each word of a list whole, commas and all', async ({ page }) => {
   await expect(dialog.getByRole('alert')).toContainText('Not now.')
   expect(sent[0].destinations[0].values.cities).toEqual(['Helsinki, Finland', 'Paris, France'])
 })
+
+test('publishes what was asked for when the panel is closed while the document saves', async ({ page }) => {
+  await workspace(page)
+  const sent = await openEditor(page, [MIKKO], (body) => ({ results: body.destinations.map((d: any) => ({ repo: d.repo, section: d.section, ok: true, publication: publication(MIKKO, 101, d.values) })) }))
+  let releaseSave!: () => void
+  const saveHeld = new Promise<void>((resolve) => { releaseSave = resolve })
+  let saves = 0
+  await page.route('**/api/editor/doc/draft-1', async (route) => {
+    if (route.request().method() !== 'PUT') return route.fallback()
+    saves++
+    await saveHeld
+    await route.fulfill({ json: { slug: 'draft-1', content: TEXT, updated_at: '2026-10-17T08:00:00Z', version: VERSION } })
+  })
+  // A change not saved yet, made without leaving the panel.
+  await page.locator('#editor-doc').evaluate((doc) => {
+    doc.lastElementChild!.append(' More.')
+    doc.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }))
+  })
+  const dialog = page.getByRole('dialog', { name: 'Publish' })
+  await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
+  await expect.poll(() => saves).toBeGreaterThan(0)
+  await page.keyboard.press('Escape')
+  await expect(dialog).toHaveCount(0)
+  releaseSave()
+  await expect.poll(() => sent.length).toBe(1)
+  expect(sent[0].destinations[0]).toMatchObject({ repo: MIKKO.repo, section: 'Writing' })
+})

@@ -91,13 +91,13 @@ function ownFields(section: SectionView): FieldView[] {
   return section.fields.filter((f) => !shared.has(f.name))
 }
 
-function publicationOf(key: string): PublicationView | undefined {
-  return state?.doc.publications.find((p) => keyOf(p.repo, p.section) === key)
+function publicationOf(s: State, key: string): PublicationView | undefined {
+  return s.doc.publications.find((p) => keyOf(p.repo, p.section) === key)
 }
 
 /** A publication still on its way or on the site: one only ever closed unmerged holds no slug. */
-function livePublicationOf(key: string): PublicationView | undefined {
-  const publication = publicationOf(key)
+function livePublicationOf(s: State, key: string): PublicationView | undefined {
+  const publication = publicationOf(s, key)
   return publication?.live ? publication : undefined
 }
 
@@ -193,7 +193,7 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
 function dateFor(s: State, choice: Choice): string {
   if (s.shared.date) return s.shared.date
   const field = choice.section.fields.find((f) => f.name === sharedField(choice.section, 'date'))
-  const publication = livePublicationOf(choice.key)
+  const publication = livePublicationOf(s, choice.key)
   const own = field && publication ? savedValue(publication.values, field.name) : undefined
   if (typeof own === 'string' && own) return own
   const piece = remembered(s.doc, s.choices, 'date')
@@ -314,7 +314,7 @@ function render(): void {
     <label class="ep-site" data-key="${escapeHtml(c.key)}">
       <input type="checkbox" data-choose="${escapeHtml(c.key)}"${s.chosen.has(c.key) ? ' checked' : ''}${s.busy ? ' disabled' : ''} />
       <span class="ep-site-name">${escapeHtml(c.site.site ?? c.site.repo)}${sectionsOf(c.site.repo) > 1 ? `<span class="ep-site-section"> · ${escapeHtml(c.section.name)}</span>` : ''}</span>
-      ${prChip(publicationOf(c.key))}
+      ${prChip(publicationOf(s, c.key))}
     </label>`).join('')
   const chosen = s.choices.filter((c) => s.chosen.has(c.key))
   const uses = (which: Shared) => chosen.some((c) => sharedField(c.section, which))
@@ -324,7 +324,7 @@ function render(): void {
     uses('date') ? `<label class="ep-field"><span class="ep-label">Date</span><input type="date" class="ep-input" data-key="shared-date" data-shared="date" aria-label="Date" value="${escapeHtml(shownDate(s))}" /></label>` : '',
   ].join('')
   const destinations = chosen.map((c) => {
-    const publication = livePublicationOf(c.key)
+    const publication = livePublicationOf(s, c.key)
     const own = s.values.get(c.key)!
     return `
       <div class="ep-dest" data-key="${escapeHtml(c.key)}-fields">
@@ -334,7 +334,7 @@ function render(): void {
         ${resultHtml(s.results.get(c.key))}
       </div>`
   }).join('')
-  const updating = chosen.length > 0 && chosen.every((c) => livePublicationOf(c.key))
+  const updating = chosen.length > 0 && chosen.every((c) => livePublicationOf(s, c.key))
   const conflicted = [...s.results.values()].some((r) => r.conflicts?.length)
   const label = s.busy ? 'Publishing…' : updating ? 'Update' : 'Publish'
   // While a publication is in flight nothing can be edited: what is sent is what stays.
@@ -353,8 +353,7 @@ function render(): void {
 
 /* ---------------------------------------------------------------- acting */
 
-function destinationFor(choice: Choice): Destination {
-  const s = state!
+function destinationFor(s: State, choice: Choice): Destination {
   const values: Record<string, unknown> = {}
   for (const field of ownFields(choice.section)) values[field.name] = s.values.get(choice.key)![field.name]
   for (const which of ['title', 'description', 'date'] as const) {
@@ -371,10 +370,13 @@ async function publish(host: PublishPanelHost, replace: boolean): Promise<void> 
   s.busy = true
   message = ''
   render()
+  // What is published is this panel's, read from its own state: closing the
+  // panel meanwhile does not stop it, and shows nothing of it.
+  let note = ''
   try {
     if (!await host.flush()) throw new Error('The document could not be saved, so it was not published.')
     const chosen = s.choices.filter((c) => s.chosen.has(c.key))
-    const results = await publishDocument(s.slug, chosen.map(destinationFor), replace)
+    const results = await publishDocument(s.slug, chosen.map((c) => destinationFor(s, c)), replace)
     for (const result of results) {
       const key = keyOf(result.repo, result.section)
       s.results.set(key, result)
@@ -384,12 +386,15 @@ async function publish(host: PublishPanelHost, replace: boolean): Promise<void> 
       }
     }
     const done = results.filter((r) => r.ok).length
-    message = done === results.length ? '' : `${results.length - done} of ${results.length} not published.`
+    note = done === results.length ? '' : `${results.length - done} of ${results.length} not published.`
   } catch (error) {
-    message = (error as Error).message
+    note = (error as Error).message
   } finally {
     s.busy = false
-    render()
+    if (state === s) {
+      message = note
+      render()
+    }
   }
 }
 
@@ -403,7 +408,7 @@ function onInput(event: Event): void {
     if (which === 'title') {
       // A slug follows the title until it is typed, or published.
       for (const choice of s.choices) {
-        if (!s.slugTyped.has(choice.key) && !livePublicationOf(choice.key)) s.slugs.set(choice.key, slugFromTitle(target.value))
+        if (!s.slugTyped.has(choice.key) && !livePublicationOf(s, choice.key)) s.slugs.set(choice.key, slugFromTitle(target.value))
       }
       render()
     }

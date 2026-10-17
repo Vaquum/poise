@@ -14,6 +14,7 @@ import {
   PublishConfigError,
   PublishValueError,
   documentParts,
+  fileDate,
   fillPost,
   parsePost,
   parsePublishConfig,
@@ -767,7 +768,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   }
   const text = renderPost(file.data, file.body)
   // The address as the file being published dates it: a date the site kept is the site's.
-  const url = placeUrl(section, destination.slug, postDate(section, file.data, todayValue, previous?.date))
+  const url = placeUrl(section, destination.slug, fileDate(section, file.data, todayValue, previous?.date))
   const now = new Date().toISOString()
   if (current && current.text === text) {
     // The site has this version already: nothing to commit, nothing to open.

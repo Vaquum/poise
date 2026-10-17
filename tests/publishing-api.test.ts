@@ -776,6 +776,36 @@ describe('publishing a document', () => {
     expect(fileOn('mikkokotila/mikkokotila-com', repos.get('mikkokotila/mikkokotila-com')!.pulls.get(102)!.head, POST)).not.toContain('A first description.')
   })
 
+  it('names the address by the date the site gave a fixed date field', async () => {
+    const stamped = `version: 1
+site: Stamped
+sections:
+  - name: Posts
+    path: stamped/{slug}.md
+    url: https://stamped.example/{year}/{slug}/
+    slug: "^[a-z0-9-]+$"
+    first_line: title
+    fields:
+      title: { kind: text, required: true }
+      date: { kind: date, value: "2026-10-17" }
+`
+    for (const [repo, yaml] of [['acme/stamped', stamped], ['acme/journal', JOURNAL_YAML]]) {
+      addRepo(repo, {})
+      await request('/api/publishing/sites', 'POST', { repo })
+      await request(`/api/publishing/sites/${repo}/description`, 'PUT', { description: yaml })
+    }
+    const toStamped = { repo: 'acme/stamped', section: 'Posts', slug: 'a-better-question', values: {} }
+    expect((await publish([toStamped])).body.results[0].ok).toBe(true)
+    // A maintainer dates it otherwise in review; the site's date is kept.
+    editOnSite('acme/stamped', 'publish/a-better-question', 'stamped/a-better-question.md', (text) => text.replace('date: "2026-10-17"', 'date: "2027-03-01"'))
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([toStamped])).body.results[0]).toMatchObject({ ok: true, publication: { url: 'https://stamped.example/2027/a-better-question/' } })
+    // A copy published alone names it there.
+    expect((await publish([{ repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results[0].ok).toBe(true)
+    const copy = [...commits.get(repos.get('acme/journal')!.branches.get('publish/a-better-question')!)!.values()].join('\n')
+    expect(copy).toContain('canonical_url: "https://stamped.example/2027/a-better-question/"')
+  })
+
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {
     await publish([writing()])
     await writeDocument(DOC, `${TEXT}\nA new ending.\n`)

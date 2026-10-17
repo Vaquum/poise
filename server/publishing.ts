@@ -468,6 +468,16 @@ export function postDate(section: PublishSection, values: Record<string, unknown
 }
 
 /**
+ * The date a file on the site goes by: its first date field as the file has
+ * it, a date the site gave a fixed field included; otherwise as postDate.
+ */
+export function fileDate(section: PublishSection, data: Record<string, unknown>, todayValue: string, fallback = todayValue): string {
+  const field = section.fields.find((f) => f.kind === 'date')
+  const given = field ? own(data, field.name) : undefined
+  return typeof given === 'string' && calendarDate(given) ? given : postDate(section, data, todayValue, fallback)
+}
+
+/**
  * The file a document becomes in one section of a site: its slug, path,
  * address and frontmatter, in the order the section lists its fields. What is
  * wrong with the values is thrown together, one sentence each.
