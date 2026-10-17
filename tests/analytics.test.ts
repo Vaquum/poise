@@ -1,4 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { execFile } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { promisify } from 'node:util'
+import Database from 'better-sqlite3'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DatastoreRecord } from '../server/gh'
 
 // The Analytics panel's numbers (server/analytics.ts): the window, each count,
@@ -189,79 +195,129 @@ describe('the numbers', () => {
 })
 
 describe('reading what Current shows', () => {
-  // Answers per (database, view, scope) the way github-datastore would.
-  function datastore(rows: Record<string, DatastoreRecord[]>) {
-    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
-      const db = args[1]
-      const view = args.slice(3, args.indexOf('--format')).filter((arg, i, all) => arg !== '--updated-since-datetime' && all[i - 1] !== '--updated-since-datetime')
-      const key = `${db} ${view.join(' ')}`
-      if (!(key in rows)) throw new Error(`unexpected read: ${key}`)
-      return { stdout: JSON.stringify(rows[key]), stderr: '' }
-    })
+  let root: string
+  const schema = readFileSync(resolve('caller/github_datastore/github_datastore/db.py'), 'utf8')
+  function create(path: string) {
+    const db = new Database(path)
+    db.exec(schema.match(/SCHEMA = """([\s\S]*?)"""/)![1])
+    db.exec(schema.match(/VIEW_SCHEMA = """([\s\S]*?)"""/)![1])
+    db.prepare(`INSERT INTO repos VALUES (1, 'repo', 'alpha', 'app', 'alpha/app', 0, 0, 1, '{}', '2026-10-09T00:00:00Z')`).run()
+    db.close()
+  }
+  function seed(row: DatastoreRecord, kind: 'pr' | 'issue', involved = false) {
+    const db = new Database(mocks.orgs[0].datastorePath)
+    try {
+      db.prepare(`INSERT INTO items (node_id, repo_id, repo_full_name, number, item_type, state, title, author_login, created_at, updated_at, closed_at, raw_json, expanded_json, synced_at)
+        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)`).run(
+        String(row.number), row.repo, row.number, kind, row.status, row.title, row.author, row.created_at, row.updated_at, row.closed_at,
+        JSON.stringify({ pull: { graphql: { additions: row.additions, deletions: row.deletions } } }), row.updated_at,
+      )
+      const id = db.prepare<[], { item_id: number }>('SELECT max(item_id) AS item_id FROM items').get()!.item_id
+      if (involved) {
+        const insert = db.prepare(`INSERT INTO associations VALUES ('octocat', ?, ?, 'comment', ?, 'body', '', ?)`)
+        insert.run(id, 'author', '1', row.created_at)
+        insert.run(id, 'commenter', '2', row.created_at)
+      }
+      for (const [table, count] of [['comments', row.comments_count], ['review_comments', row.review_comments_count ?? 0]] as const) {
+        const insert = db.prepare(`INSERT INTO ${table} (node_id, item_id, created_at, updated_at, raw_json) VALUES (?, ?, ?, ?, '{}')`)
+        for (let i = 0; i < count; i++) insert.run(`${id}-${i}`, id, row.created_at, row.updated_at)
+      }
+    } finally { db.close() }
   }
 
   beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'analytics-reads-'))
     mocks.meta = { me: 'octocat', agentAccount: 'robot' }
     mocks.behaviors = []
     mocks.runFile.mockReset()
-    mocks.orgs.forEach((org) => { org.status = 'ready'; org.error = null })
-  })
-
-  it('counts what the person is involved in and what the agent opened, with sizes from the PR view', async () => {
-    const mine = pr(1, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { additions: 10, deletions: 2, comments_count: 4 })
-    const agents = pr(2, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { author: 'robot', additions: 1, deletions: 1 })
-    const someoneElses = pr(3, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { author: 'stranger', additions: 500, deletions: 0 })
-    // views.user carries neither comment counts nor sizes.
-    const mineInUserView = { ...mine, comments_count: undefined as unknown as number, additions: undefined, deletions: undefined }
-    datastore({
-      '/alpha.sqlite user --username octocat --item-type issue': [issue(7, '2026-10-06T00:00:00Z')],
-      '/alpha.sqlite issue --author robot': [issue(7, '2026-10-06T00:00:00Z'), issue(8, '2026-10-06T00:00:00Z')],
-      '/alpha.sqlite user --username octocat --item-type pr': [mineInUserView],
-      '/alpha.sqlite pr --author robot': [agents],
-      '/alpha.sqlite pr': [mine, agents, someoneElses],
-      '/beta.sqlite user --username octocat --item-type issue': [],
-      '/beta.sqlite issue --author robot': [],
-      '/beta.sqlite user --username octocat --item-type pr': [],
-      '/beta.sqlite pr --author robot': [],
-      '/beta.sqlite pr': [],
+    mocks.orgs.forEach(org => {
+      org.datastorePath = join(root, `${org.login}.sqlite`)
+      org.status = 'ready'
+      org.error = null
+      create(org.datastorePath)
     })
+  })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  function data() {
+    seed(issue(7, '2026-10-06T00:00:00Z'), 'issue', true)
+    seed(issue(8, '2026-10-06T00:00:00Z', null, 'alpha/app'), 'issue')
+    seed({ ...issue(9, '2026-10-06T00:00:00Z'), author: 'robot' }, 'issue', true)
+    seed(pr(1, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { additions: 10, deletions: 2, comments_count: 4 }), 'pr', true)
+    seed(pr(2, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { author: 'robot', additions: 1, deletions: 1 }), 'pr')
+    seed(pr(3, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { author: 'stranger', additions: 500 }), 'pr')
+  }
+
+  it('deduplicates involvement and agent authorship and reads PR sizes and comments without CLI processes', async () => {
+    data()
     const report = await readAnalytics(WEEK)
     expect(report.issues.opened).toBe(2)
     expect(report.pullRequests.merged).toBe(2)
     expect(report.pullRequests.lines).toEqual({ total: 14, median: 7, counted: 2 })
     expect(report.pullRequests.commentsPerPr).toBe(2)
-    // The datastore narrows to what changed since the window began.
-    for (const call of mocks.runFile.mock.calls) {
-      expect(call[1]).toEqual(expect.arrayContaining(['--updated-since-datetime', WEEK.since, '--format', 'json']))
-    }
+    expect(mocks.runFile).not.toHaveBeenCalled()
   })
 
-  it('reads only the selected account, and every pull request when Any time is picked', async () => {
-    datastore({
-      '/beta.sqlite user --username octocat --item-type issue': [],
-      '/beta.sqlite issue --author robot': [],
-      '/beta.sqlite user --username octocat --item-type pr': [],
-      '/beta.sqlite pr --author robot': [],
-      '/beta.sqlite pr': [],
-    })
-    await readAnalytics({ since: null, until: null }, 'BETA')
-    expect(mocks.runFile.mock.calls.every((call) => call[1][1] === '/beta.sqlite')).toBe(true)
-    expect(mocks.runFile.mock.calls.some((call) => call[1].includes('--updated-since-datetime'))).toBe(false)
+  it('reads only the selected account, including all history for unbounded windows', async () => {
+    data()
+    expect((await readAnalytics({ since: null, until: null }, 'BETA')).pullRequests.merged).toBe(0)
+    expect((await readAnalytics({ since: null, until: null }, 'alpha')).pullRequests.merged).toBe(2)
+    mocks.meta.me = ''
+    expect((await readAnalytics({ since: null, until: null }, 'alpha')).pullRequests.merged).toBe(3)
   })
 
-  it('names an account it could not read, and fails when it could read none', async () => {
-    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
-      if (args[1] === '/beta.sqlite') throw new Error('offline')
-      return { stdout: '[]', stderr: '' }
-    })
+  it('preserves exact millisecond boundaries after the CLI-compatible coarse filter', async () => {
+    seed(issue(1, '2026-10-09T00:00:00.500Z'), 'issue', true)
+    expect((await readAnalytics(parseWindow('2026-10-09T00:00:00.500Z', '2026-10-09T00:00:00.501Z'))).issues.opened).toBe(1)
+    expect((await readAnalytics(parseWindow(null, '2026-10-09T00:00:00.500Z'))).issues.opened).toBe(0)
+  })
+
+  it('sees datastore writes immediately instead of caching previous reports', async () => {
+    expect((await readAnalytics(WEEK)).issues.opened).toBe(0)
+    seed(issue(1, '2026-10-06T00:00:00Z'), 'issue', true)
+    expect((await readAnalytics(WEEK)).issues.opened).toBe(1)
+  })
+
+  it('names unreadable accounts, retains sync errors and fails when none are readable', async () => {
+    rmSync(mocks.orgs[1].datastorePath)
+    mocks.orgs[0].error = 'sync failed'
     const report = await readAnalytics(WEEK)
-    expect(report.errors).toEqual([{ org: 'beta', error: 'offline' }])
-    mocks.runFile.mockRejectedValue(new Error('offline'))
-    await expect(readAnalytics(WEEK)).rejects.toThrow('alpha: offline; beta: offline')
+    expect(report.errors).toEqual([{ org: 'alpha', error: 'sync failed' }, { org: 'beta', error: expect.any(String) }])
+    rmSync(mocks.orgs[0].datastorePath)
+    await expect(readAnalytics(WEEK)).rejects.toThrow('alpha:')
+  })
+
+  it('rejects records belonging to another account', async () => {
+    seed(pr(1, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { repo: 'foreign/app' }), 'pr', true)
+    await expect(readAnalytics(WEEK, 'alpha')).rejects.toThrow('datastore contains records outside alpha')
   })
 
   it('refuses to answer before any account is ready', async () => {
-    mocks.orgs.forEach((org) => { org.status = 'initializing' })
+    mocks.orgs.forEach(org => { org.status = 'initializing' })
     await expect(readAnalytics(WEEK)).rejects.toThrow('No GitHub account is ready')
+  })
+
+  it('matches the previous Python view reads and measures the eliminated startup cost', async () => {
+    data()
+    const run = promisify(execFile)
+    const python = `import sys\nsys.path.insert(0, sys.argv[1])\nfrom github_datastore import views\nprint(getattr(views, sys.argv[3])(db_path=sys.argv[2], updated_since_datetime=sys.argv[4], **__import__('json').loads(sys.argv[5])))`
+    const start = performance.now()
+    const old = await Promise.all([
+      ['user', { username: 'octocat', item_type: 'issue' }], ['issue', { author: 'robot' }],
+      ['user', { username: 'octocat', item_type: 'pr' }], ['pr', { author: 'robot' }], ['pr', {}],
+    ].map(async ([view, filters]) => {
+      const { stdout } = await run('python3', ['-c', python, resolve('caller/github_datastore'), mocks.orgs[0].datastorePath, String(view), WEEK.since, JSON.stringify(filters)])
+      return JSON.parse(stdout) as DatastoreRecord[]
+    }))
+    const oldMs = performance.now() - start
+    const expected = computeAnalytics({ window: WEEK,
+      issues: [...new Map([...old[0], ...old[1]].map(row => [row.number, row])).values()],
+      prs: old[4].filter(row => [...old[2], ...old[3]].some(scope => scope.number === row.number)), behaviors: [],
+    })
+    const directStart = performance.now()
+    expect(await readAnalytics(WEEK, 'alpha')).toEqual(expected)
+    const directMs = performance.now() - directStart
+    console.info(`Analytics equivalent reads: Python ${oldMs.toFixed(1)} ms; direct SQLite ${directMs.toFixed(1)} ms`)
+    expect(directMs).toBeLessThan(oldMs)
   })
 })

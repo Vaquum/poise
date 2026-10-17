@@ -10,9 +10,12 @@
 // (behavior_seen): an approval or a review counts once its agent reported the
 // result, which is what actually happened on GitHub.
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { getMeta, listCompletedBehaviorActions, type BehaviorLaunchAction, type CompletedBehaviorAction } from './db'
 import { HttpError } from './http'
-import { involvementScopes, runCli, selectOrganizations, type DatastoreRecord, type OrganizationReadError } from './gh'
+import { involvementScopes, repoBelongsTo, selectOrganizations, type DatastoreRecord, type OrganizationReadError } from './gh'
 import type { Organization } from './organizations'
 
 export interface AnalyticsWindow {
@@ -142,29 +145,50 @@ export function computeAnalytics(input: {
   }
 }
 
-function dedupe(rows: DatastoreRecord[]): DatastoreRecord[] {
-  const byKey = new Map<string, DatastoreRecord>()
-  for (const row of rows) byKey.set(itemKey(row.repo, row.number), row)
-  return [...byKey.values()]
-}
-
+// Read the same datastore views and involvement scopes as Current without
+// starting Python for every scope. Project only fields used by the report:
+// unused view columns can parse large payloads and count entire discussions.
 async function readOrganization(org: Organization, me: string, window: AnalyticsWindow): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[] }> {
-  // Anything opened, closed or merged since the window began was updated
-  // since then too, so the datastore can narrow the read. It rounds the time
-  // down to the second, which only widens the read; the window itself is
-  // applied exactly in computeAnalytics.
-  const common = [...(window.since ? ['--updated-since-datetime', window.since] : []), '--format', 'json']
-  const read = (scope: string[]) => runCli(org, ['view', ...scope, ...common])
-  const [issueRows, prScopeRows, prDetails] = await Promise.all([
-    Promise.all(involvementScopes('issue', me).map(read)),
-    Promise.all(involvementScopes('pr', me).map(read)),
-    // views.user has no comment counts or sizes; views.pr has both.
-    read(['pr']),
-  ])
-  const inScope = new Set(prScopeRows.flat().map((row) => itemKey(row.repo, row.number)))
-  return {
-    issues: dedupe(issueRows.flat()),
-    prs: dedupe(prDetails.filter((row) => inScope.has(itemKey(row.repo, row.number)))),
+  const path = org.datastorePath ?? join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'github-datastore', 'github_datastore.sqlite')
+  const db = new Database(path, { readonly: true, fileMustExist: true, timeout: 1_000 })
+  try {
+    return db.transaction(() => {
+      const read = (kind: 'issue' | 'pr'): DatastoreRecord[] => {
+        const view = kind === 'pr' ? 'prs' : 'issues'
+        const ref = kind === 'pr' ? 'pr_ref' : 'issue_ref'
+        const params: string[] = []
+        const scopes = involvementScopes(kind, me).map(scope => {
+          const user = scope[0] === 'user'
+          const filters: string[] = []
+          if (user) {
+            filters.push('username = ?', 'item_type = ?')
+            params.push(me, kind)
+          } else if (scope[1] === '--author') {
+            filters.push('author = ?')
+            params.push(scope[2])
+          }
+          // Match the CLI's second-resolution narrowing; computeAnalytics
+          // applies the exact inclusive/exclusive millisecond boundaries.
+          if (window.since) {
+            filters.push('updated_at >= ?')
+            params.push(new Date(window.since).toISOString().slice(0, 19))
+          }
+          return `SELECT ${user ? 'item_ref' : ref} FROM ${user ? 'user_items' : view}${filters.length ? ` WHERE ${filters.join(' AND ')}` : ''}`
+        })
+        const details = kind === 'pr' ? 'comments_count, review_comments_count, additions, deletions' : '0 AS comments_count'
+        const rows = db.prepare<string[], DatastoreRecord>(`
+          SELECT repo, number, status, author, updated_at, created_at, closed_at, title, url, ${details}
+          FROM ${view} WHERE ${ref} IN (${scopes.join(' UNION ')})
+        `).all(...params)
+        if (rows.some(row => !repoBelongsTo(row.repo, org.login))) {
+          throw new Error(`datastore contains records outside ${org.login}`)
+        }
+        return rows
+      }
+      return { issues: read('issue'), prs: read('pr') }
+    })()
+  } finally {
+    db.close()
   }
 }
 

@@ -220,3 +220,68 @@ test('retains the selected calendar date when navigating across midnight', async
   await expect(panel.locator('.analytics-date')).toHaveText('6 Oct 2026')
   await expect.poll(() => state.reads.at(-2)?.since).toBe('2026-10-06T00:00:00.000Z')
 })
+
+
+test('shows the standard loader with no old values on initial load, day/account changes and reopening', async ({ page }, info) => {
+  await workspace(page)
+  let release!: () => void
+  let held = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/analytics?**', async route => {
+    await held
+    await route.fallback()
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  const panel = page.locator('#analytics-panel')
+  const loader = panel.getByRole('status', { name: 'Loading analytics' })
+  const pending = async () => {
+    await expect(loader).toBeVisible()
+    await expect(loader.locator('span')).toHaveCount(3)
+    await expect(panel.locator('.analytics-tile')).toHaveCount(0)
+    await expect(panel.locator('.analytics-status')).toBeHidden()
+    await expect(panel.locator('.analytics-groups')).toHaveAttribute('aria-busy', 'true')
+    await expect(loader.locator('span').first()).toHaveCSS('animation-name', 'pulse')
+  }
+  const loaded = async (merged: string) => {
+    release()
+    await expect(value(page, 'Merged')).toHaveText(merged)
+    await expect(loader).toBeHidden()
+    await expect(panel.locator('.analytics-groups')).not.toHaveAttribute('aria-busy', 'true')
+    held = new Promise<void>(resolve => { release = resolve })
+  }
+  try {
+    await pending()
+    await loaded('4')
+    await panel.getByRole('button', { name: 'Previous day' }).click()
+    await pending()
+    await page.screenshot({ path: info.outputPath('analytics-loading.png') })
+    await loaded('0')
+    await page.locator('#current-filters').getByLabel('Account filter').selectOption('beta')
+    await pending()
+    await loaded('0')
+    await page.keyboard.press('Escape')
+    await openAnalytics(page)
+    await pending()
+    await loaded('4')
+  } finally { release() }
+})
+
+test('clears a previous read error while retrying with the loader', async ({ page }) => {
+  const state = await workspace(page)
+  state.fail = true
+  await page.goto('/')
+  await openAnalytics(page)
+  const panel = page.locator('#analytics-panel')
+  await expect(panel.locator('.analytics-status')).toHaveText('acme: datastore offline')
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/analytics?**', async route => { await held; await route.fallback() })
+  state.fail = false
+  try {
+    await panel.getByRole('button', { name: 'Previous day' }).click()
+    await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeVisible()
+    await expect(panel.locator('.analytics-status')).toBeHidden()
+    await expect(panel.locator('.analytics-tile')).toHaveCount(0)
+  } finally { release() }
+  await expect(value(page, 'Merged')).toHaveText('0')
+})
