@@ -315,14 +315,14 @@ test('gives a field the saved values do not have its own default', async ({ page
 
 test('reads a default of today as a date only in a date field', async ({ page }) => {
   await workspace(page)
-  const when = {
-    repo: 'acme/when', state: 'ready', source: 'settings', site: 'When', description: 'version: 1\n',
+  const timing = {
+    repo: 'acme/timing', state: 'ready', source: 'settings', site: 'Timing', description: 'version: 1\n',
     sections: [{ name: 'Posts', firstLine: 'title', fields: [
       { name: 'title', kind: 'text', required: true },
       { name: 'when', kind: 'choice', required: false, default: 'today', choices: ['today', 'later'] },
     ] }],
   }
-  const sent = await openEditor(page, [when], notNow)
+  const sent = await openEditor(page, [timing], notNow)
   const dialog = page.getByRole('dialog', { name: 'Publish' })
   await expect(dialog.getByLabel('When', { exact: true })).toHaveValue('today')
   await dialog.getByRole('button', { name: 'Publish', exact: true }).click()
