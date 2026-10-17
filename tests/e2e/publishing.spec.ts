@@ -239,3 +239,17 @@ test('keeps each shared value from the publication that has it', async ({ page }
   await expect(dialog.getByLabel('Date', { exact: true })).toHaveValue('2026-10-02')
   await expect(dialog.getByRole('button', { name: 'Update', exact: true })).toBeVisible()
 })
+
+test('keeps a title typed in the panel while the first line is unchanged', async ({ page }) => {
+  await workspace(page)
+  const typed = { ...publication(MIKKO, 101, { type: 'essay', title: 'A title typed in the panel' }), docTitle: 'A better question' }
+  await openEditor(page, [MIKKO], () => ({ results: [] }), [typed])
+  await expect(page.getByRole('dialog', { name: 'Publish' }).getByLabel('Title', { exact: true })).toHaveValue('A title typed in the panel')
+})
+
+test('follows a first line changed since the title was typed', async ({ page }) => {
+  await workspace(page)
+  const earlier = { ...publication(MIKKO, 101, { type: 'essay', title: 'A title typed in the panel' }), docTitle: 'An earlier first line' }
+  await openEditor(page, [MIKKO], () => ({ results: [] }), [earlier])
+  await expect(page.getByRole('dialog', { name: 'Publish' }).getByLabel('Title', { exact: true })).toHaveValue('A better question')
+})

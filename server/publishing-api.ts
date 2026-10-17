@@ -295,6 +295,8 @@ export interface PublicationView {
   pullRequest: { number: number, url: string, state: 'open' | 'closed' | 'merged' | 'unknown' }
   /** Still this document's there: its pull request is open or merged, or an earlier one was merged. */
   live: boolean
+  /** The document's first line when it was published here. */
+  docTitle?: string
   /** The document has changed since it was last published here. */
   changed: boolean
   problem?: string
@@ -313,7 +315,7 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
     const view: PublicationView = {
       repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
       values: record.values, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
-      pullRequest: { ...record.pullRequest, state: 'unknown' }, live: true,
+      pullRequest: { ...record.pullRequest, state: 'unknown' }, live: true, ...(record.docTitle !== undefined ? { docTitle: record.docTitle } : {}),
       changed: record.sourceSha !== sha256(doc.content),
     }
     try {
@@ -402,6 +404,7 @@ function viewOf(record: PublishRecord, state: PublicationView['pullRequest']['st
     repo: record.repo, section: record.section, site: record.site, slug: record.slug, path: record.path, url: record.url,
     values: record.values, publishedAt: record.publishedAt, updatedAt: record.updatedAt,
     pullRequest: { ...record.pullRequest, state }, live: true, changed: false,
+    ...(record.docTitle !== undefined ? { docTitle: record.docTitle } : {}),
   }
 }
 
@@ -562,7 +565,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       // On its open pull request; a version already on the site gets an update of its own.
       const again: Target = state === 'open'
         ? { ...target, previous: kept, state: 'open', landed: kept.landed }
-        : { ...target, previous: kept, state: 'merged', landed: target.landed ?? snapshotOf(kept) }
+        : { ...target, previous: kept, state: 'merged', landed: kept.landed ?? target.landed ?? snapshotOf(kept) }
       await record(target, await publishTo(session, again, parts, final, todayValue, replace, doc.content))
     } catch (error) {
       if (!(error instanceof GitHubError || error instanceof HttpError || error instanceof PublishConflictError || error instanceof PostFileError)) throw error
@@ -574,10 +577,20 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   return { results: targets.map((target) => results.get(target.key)!) }
 }
 
-function largestLanded(target: Target): Landed | undefined {
-  const pending = target.state === 'open' && target.previous ? snapshotOf(target.previous) : undefined
-  const size = (landed: Landed) => JSON.stringify(landed).length
-  return !target.landed ? pending : !pending ? target.landed : size(pending) > size(target.landed) ? pending : target.landed
+function largestLanded(target: Target, filled: FilledPost): Landed | undefined {
+  const open = target.state === 'open' && target.previous
+  const candidates = [
+    target.landed,
+    open ? snapshotOf(target.previous!) : undefined,
+    open ? { data: filled.frontmatter, bodySha: '0'.repeat(64), pullRequest: target.previous!.pullRequest.number, url: filled.url } : undefined,
+  ].filter((landed): landed is Landed => !!landed)
+  return largestOf(candidates)
+}
+
+/** The landed version that takes most bytes as written. */
+export function largestOf(candidates: Landed[]): Landed | undefined {
+  const bytes = (landed: Landed) => Buffer.byteLength(JSON.stringify(landed), 'utf8')
+  return candidates.reduce<Landed | undefined>((largest, landed) => (!largest || bytes(landed) > bytes(largest) ? landed : largest), undefined)
 }
 
 /** This document's side of a record's version, as it stands on the site once merged. */
@@ -599,9 +612,10 @@ function provisionalRecord(target: Target, filled: FilledPost): PublishRecord {
     slug: target.destination.slug, date: filled.date,
     pullRequest: { number: 999_999, url: `https://github.com/${target.ready.repo}/pull/999999` },
     publishedAt: at, updatedAt: at, sourceSha: digest, values: target.destination.values, data: filled.frontmatter, bodySha: digest,
-    // Kept by publishTo, so counted here; an open pull request merged while
-    // its commit lands would put its own version in its place: the larger counts.
-    ...(largestLanded(target) ? { landed: largestLanded(target) } : {}),
+    // Kept by publishTo, so counted here. An open pull request merged while
+    // its commit lands puts its own version, or this new one, in its place: the
+    // largest counts.
+    ...(largestLanded(target, filled) ? { landed: largestLanded(target, filled) } : {}),
   }
 }
 
@@ -665,7 +679,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
   // What is recorded as published is this document's side, never the file
   // reconciled with the site: a change made on the site must still read as
   // the site's at every later publication, not only the next one.
-  const published = { data: ours.data, bodySha: sha256(ours.body), date: filled.date }
+  const published = { data: ours.data, bodySha: sha256(ours.body), date: filled.date, docTitle: parts.title }
   let file: PostFile = ours
   if (current && previous) {
     // On an open pull request, what this document last pushed there; on the

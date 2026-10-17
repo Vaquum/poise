@@ -97,6 +97,16 @@ function asText(value: unknown): string | boolean {
   return value === undefined || value === null ? '' : String(value)
 }
 
+/**
+ * The title to offer: one typed in the panel and published is kept while the
+ * document's first line is what it was then; a first line changed since is
+ * the title now.
+ */
+function titleFor(doc: DocumentPublishing, published: string): string {
+  const unchanged = doc.publications.some((p) => p.docTitle === doc.title)
+  return published && unchanged ? published : doc.title
+}
+
 function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): State {
   const choices: Choice[] = sites.filter((s) => s.state === 'ready').flatMap((site) =>
     site.sections!.map((section) => ({ key: keyOf(site.repo, section.name), site, section })))
@@ -128,7 +138,7 @@ function startState(slug: string, sites: SiteView[], doc: DocumentPublishing): S
   }
   return {
     slug, choices, doc, chosen, values, slugs, slugTyped: new Set(), results: new Map(), busy: false,
-    shared: { title: doc.title, description: String(remembered('description') || ''), date: String(remembered('date') || doc.today) },
+    shared: { title: titleFor(doc, remembered('title')), description: String(remembered('description') || ''), date: String(remembered('date') || doc.today) },
   }
 }
 

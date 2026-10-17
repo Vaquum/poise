@@ -813,6 +813,50 @@ describe('publishing a document', () => {
     expect(fileOn('mikkokotila/mikkokotila-com', head, POST)).not.toContain('merged at once')
   })
 
+  it('corrects from what the first pass landed, so a failed site is not kept', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    await publish([writing()])
+    merge('mikkokotila/mikkokotila-com', 101)
+    await writeDocument(DOC, `${TEXT}\nA second thought.\n`)
+    expect((await publish([writing()])).body.results[0].publication.pullRequest.number).toBe(102)
+    // The update merges with its new commit in it; the journal then fails.
+    await writeDocument(DOC, `${TEXT}\nA third thought.\n`)
+    afterCommit = () => merge('mikkokotila/mikkokotila-com', 102)
+    failOn = (method, endpoint) => (method === 'POST' && endpoint === 'repos/acme/journal/git/refs' ? 500 : null)
+    const results = (await publish([writing(), { repo: 'acme/journal', section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } }])).body.results
+    expect(results.map((r: any) => r.ok)).toEqual([true, false])
+    const correction = repos.get('mikkokotila/mikkokotila-com')!.pulls.get(103)
+    expect(correction).toBeDefined()
+    expect(fileOn('mikkokotila/mikkokotila-com', correction!.head, POST)).not.toContain('Other Journal')
+  })
+
+  it('counts this new version as what a merge during the commit could land', async () => {
+    addRepo('acme/notes', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/notes' })
+    await request('/api/publishing/sites/acme/notes/description', 'PUT', { description: NOTES_YAML })
+    const note = (text: string) => ({ repo: 'acme/notes', section: 'Notes', slug: 'a-better-question', values: { note: text } })
+    expect((await publish([note('short')])).body.results[0].ok).toBe(true)
+    const before = calls.length
+    expect((await publish([note('x'.repeat(400_000))])).status).toBe(413)
+    expect(calls.slice(before).filter((call) => call.args.includes('POST'))).toEqual([])
+  })
+
+  it('remembers the first line each publication was made with', async () => {
+    await publish([writing({ title: 'A title typed in the panel' })])
+    expect((await request(`/api/editor/doc/${DOC}/publishing`)).body.publications[0]).toMatchObject({
+      docTitle: 'A better question', values: { title: 'A title typed in the panel' },
+    })
+  })
+
+  it('weighs landed versions in bytes, as the record is written', async () => {
+    const { largestOf } = await import('../server/publishing-api')
+    const ascii = { data: { note: 'a'.repeat(150) }, bodySha: '', pullRequest: 1, url: '' }
+    const cjk = { data: { note: '漢'.repeat(100) }, bodySha: '', pullRequest: 2, url: '' }
+    expect(largestOf([ascii, cjk])).toBe(cjk)
+  })
+
   it('says nothing changed when the site has this version already', async () => {
     await publish([writing()])
     const commitsBefore = calls.filter((call) => call.args[1] === 'graphql').length

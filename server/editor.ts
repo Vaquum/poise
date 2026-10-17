@@ -729,6 +729,7 @@ export interface PublishRecord {
   publishedAt: string           // first published there
   updatedAt: string
   sourceSha: string             // the document as it was published
+  docTitle?: string             // its first line then, to tell a title typed in the panel from one that followed it
   values: Record<string, unknown>
   data: Record<string, unknown> // the frontmatter this document gave it
   bodySha: string               // the text this document gave it
@@ -755,6 +756,7 @@ function isPublishRecord(value: unknown): value is PublishRecord {
     && !!record.values && typeof record.values === 'object' && !Array.isArray(record.values)
     && !!record.data && typeof record.data === 'object' && !Array.isArray(record.data)
     && (record.landed === undefined || isLanded(record.landed))
+    && (record.docTitle === undefined || typeof record.docTitle === 'string')
 }
 
 function isLanded(value: unknown): boolean {

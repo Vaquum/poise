@@ -48,6 +48,8 @@ export interface PublicationView {
   pullRequest: { number: number, url: string, state: 'open' | 'closed' | 'merged' | 'unknown' }
   /** Still this document's there, so its slug holds: open, merged, or merged before. */
   live: boolean
+  /** The document's first line when it was published there. */
+  docTitle?: string
   changed: boolean
   problem?: string
 }
