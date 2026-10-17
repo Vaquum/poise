@@ -125,6 +125,8 @@ function encodePath(path: string): string {
 }
 
 export interface RepositoryInfo {
+  /** GitHub's id for it: the same through a rename, another for a repository that takes its old name. */
+  id: number
   fullName: string
   owner: string
   defaultBranch: string
@@ -135,8 +137,20 @@ export async function repository(session: GitHubSession, repo: string): Promise<
   const answer = await request(session, 'GET', `repos/${repo}`)
   if (answer.status === 404) throw new GitHubError(`${repo} does not exist, or ${session.me} cannot see it`, 404)
   if (answer.status !== 200) fail(answer, `Reading ${repo}`)
-  const body = answer.body
+  return repositoryFrom(answer.body)
+}
+
+/** A repository by its id, under the name it has now. */
+export async function repositoryById(session: GitHubSession, id: number): Promise<RepositoryInfo> {
+  const answer = await request(session, 'GET', `repositories/${id}`)
+  if (answer.status === 404) throw new GitHubError(`The repository a site was added with no longer exists, or ${session.me} cannot see it`, 404)
+  if (answer.status !== 200) fail(answer, `Reading repository ${id}`)
+  return repositoryFrom(answer.body)
+}
+
+function repositoryFrom(body: any): RepositoryInfo {
   return {
+    id: Number(body.id) || 0,
     fullName: String(body.full_name),
     owner: String(body.owner?.login ?? String(body.full_name).split('/')[0]),
     defaultBranch: String(body.default_branch),
@@ -210,6 +224,10 @@ export interface PullRequestInfo {
   base: string
   /** The repository it goes to, by its name now: one renamed since answers to its old name too. */
   repo: string
+  /** That repository's id. */
+  repoId: number
+  /** The repository its branch is in, by its name now; empty once that is deleted. */
+  headRepo: string
 }
 
 function pullRequestFrom(body: any): PullRequestInfo {
@@ -221,6 +239,8 @@ function pullRequestFrom(body: any): PullRequestInfo {
     headSha: String(body.head?.sha ?? ''),
     base: String(body.base?.ref ?? ''),
     repo: String(body.base?.repo?.full_name ?? ''),
+    repoId: Number(body.base?.repo?.id) || 0,
+    headRepo: String(body.head?.repo?.full_name ?? ''),
   }
 }
 

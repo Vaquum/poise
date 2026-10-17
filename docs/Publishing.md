@@ -87,6 +87,11 @@ reads; until then the box keeps the text and shows the error. Remove asks
 once more. Sites are read as your GitHub account (Settings → General), which
 must be set, and signed in to `gh`.
 
+A repository renamed on GitHub is followed: the site is listed under its new
+name, and the pieces published there stay its own, their branches too. Poise
+knows each site and each publication by its repository's GitHub id, so a new
+repository that takes a renamed one's old name is never taken for it.
+
 ## Publishing from the Editor
 
 The Publish icon in the Editor bar opens the panel for the open document:
@@ -155,8 +160,8 @@ what is wrong.
   that site, and the other sites are still published.
 
 Each document's publications are kept beside it as `<slug>.publish.json` in
-the Editor folder: the site, path, branch and pull request, and what was
-published. Deleting the document deletes it, even while it is being
+the Editor folder: the site and its repository's id, the path, branch and
+pull request, and what was published. Deleting the document deletes it, even while it is being
 published; the pull requests stay.
 
 ## Limits

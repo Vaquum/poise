@@ -716,6 +716,7 @@ export const MAX_PUBLISH_LEDGER_BYTES = 1 * 1024 * 1024
 
 export interface PublishRecord {
   repo: string                  // the site's repository
+  repoId?: number               // its GitHub id: the same through a rename, another for a repository taking its old name
   section: string
   site: string                  // the site's name when published
   headRepo: string              // where the branch is: the repository, or the writer's fork
@@ -762,6 +763,7 @@ function isPublishRecord(value: unknown): value is PublishRecord {
     && (record.landed === undefined || isLanded(record.landed))
     && (record.docTitle === undefined || typeof record.docTitle === 'string')
     && (record.unconfirmed === undefined || isUnconfirmed(record.unconfirmed))
+    && (record.repoId === undefined || Number.isSafeInteger(record.repoId))
 }
 
 function isUnconfirmed(value: unknown): boolean {

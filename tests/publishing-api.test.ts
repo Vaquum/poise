@@ -14,14 +14,17 @@ vi.mock('../server/process', async (original) => ({
 
 /* ---------------------------------------------------------------- a GitHub in memory, as gh api answers */
 
-interface Pull { number: number, state: 'open' | 'closed', merged: boolean, head: string, headRepo: string, base: string, title: string, body: string, mergedSha?: string }
-interface Repo { fullName: string, owner: string, defaultBranch: string, push: boolean, branches: Map<string, string>, pulls: Map<number, Pull>, parent?: string }
+/** A pull request; `from` is the repository its branch is in, whatever it is named since. */
+interface Pull { number: number, state: 'open' | 'closed', merged: boolean, head: string, headRepo: string, from: Repo, base: string, title: string, body: string, mergedSha?: string }
+/** A repository: its id stays through a rename; a new one under an old name has another. */
+interface Repo { id: number, fullName: string, owner: string, defaultBranch: string, push: boolean, branches: Map<string, string>, pulls: Map<number, Pull>, parent?: string }
 
 let repos: Map<string, Repo>
 let commits: Map<string, Map<string, string>>
 /** Each commit's parent, for compare. */
 let parents: Map<string, string>
 let commitCount = 0
+let repoCount = 0
 let calls: Array<{ args: string[], env: NodeJS.ProcessEnv | undefined, input: any }>
 let ghFailure: string | null
 /** An HTTP status to answer a request with instead, by method and endpoint. */
@@ -39,7 +42,7 @@ function commit(files: Map<string, string>, parent?: string): string {
 }
 
 function addRepo(fullName: string, files: Record<string, string>, push = true): Repo {
-  const repo: Repo = { fullName, owner: fullName.split('/')[0], defaultBranch: 'main', push, branches: new Map(), pulls: new Map() }
+  const repo: Repo = { id: ++repoCount, fullName, owner: fullName.split('/')[0], defaultBranch: 'main', push, branches: new Map(), pulls: new Map() }
   repo.branches.set('main', commit(new Map(Object.entries(files))))
   repos.set(fullName.toLowerCase(), repo)
   return repo
@@ -65,9 +68,8 @@ function close(fullName: string, number: number): void {
 function merge(fullName: string, number: number): void {
   const repo = repos.get(fullName.toLowerCase())!
   const pull = repo.pulls.get(number)!
-  const from = repos.get(pull.headRepo.toLowerCase())!
-  repo.branches.set(pull.base, from.branches.get(pull.head)!)
-  Object.assign(pull, { state: 'closed', merged: true, mergedSha: from.branches.get(pull.head)! })
+  repo.branches.set(pull.base, pull.from.branches.get(pull.head)!)
+  Object.assign(pull, { state: 'closed', merged: true, mergedSha: pull.from.branches.get(pull.head)! })
 }
 
 const http = (status: number, body?: unknown) => `HTTP/2.0 ${status} X\r\nContent-Type: application/json\r\n\r\n${body === undefined ? '' : JSON.stringify(body)}`
@@ -80,9 +82,11 @@ function answer(status: number, body?: unknown) {
 
 const pullJson = (repo: Repo, pull: Pull) => ({
   number: pull.number, state: pull.state, merged: pull.merged, html_url: `https://github.com/${repo.fullName}/pull/${pull.number}`,
-  base: { ref: pull.base, repo: { full_name: repo.fullName } },
-  head: { ref: pull.head, sha: pull.mergedSha ?? repos.get(pull.headRepo.toLowerCase())!.branches.get(pull.head) ?? '' },
+  base: { ref: pull.base, repo: { id: repo.id, full_name: repo.fullName } },
+  head: { ref: pull.head, sha: pull.mergedSha ?? pull.from.branches.get(pull.head) ?? '', repo: { id: pull.from.id, full_name: pull.from.fullName } },
 })
+
+const repoJson = (repo: Repo) => ({ id: repo.id, full_name: repo.fullName, owner: { login: repo.owner }, default_branch: repo.defaultBranch, permissions: { push: repo.push } })
 
 async function gh(command: string, args: string[], options: RunFileOptions = {}) {
   expect(command).toBe('gh')
@@ -118,14 +122,17 @@ async function gh(command: string, args: string[], options: RunFileOptions = {})
     }
     return answer(200, { data: { createCommitOnBranch: { commit: { oid } } } })
   }
+  const byId = /^repositories\/(\d+)$/.exec(endpoint)
+  if (byId && method === 'GET') {
+    const found = [...repos.values()].find((r) => r.id === Number(byId[1]))
+    return found ? answer(200, repoJson(found)) : answer(404, { message: 'Not Found' })
+  }
   const match = /^repos\/([^/]+\/[^/]+)(?:\/(.*))?$/.exec(endpoint.split('?')[0])!
   const repo = repos.get(match[1].toLowerCase())
   const rest = match[2] ?? ''
   const ref = new URLSearchParams(endpoint.split('?')[1] ?? '').get('ref')
   if (!repo) return answer(404, { message: 'Not Found' })
-  if (!rest && method === 'GET') {
-    return answer(200, { full_name: repo.fullName, owner: { login: repo.owner }, default_branch: repo.defaultBranch, permissions: { push: repo.push } })
-  }
+  if (!rest && method === 'GET') return answer(200, repoJson(repo))
   if (rest.startsWith('contents/') && method === 'GET') {
     const sha = repo.branches.get(ref!)
     const text = sha ? commits.get(sha)!.get(decodeURIComponent(rest.slice('contents/'.length))) : undefined
@@ -150,7 +157,7 @@ async function gh(command: string, args: string[], options: RunFileOptions = {})
   if (rest === 'pulls' && method === 'POST') {
     const [owner, branch] = input.head.includes(':') ? input.head.split(':') : [repo.owner, input.head]
     const headRepo = [...repos.values()].find((r) => r.owner === owner && r.branches.has(branch))!
-    const pull: Pull = { number: 100 + repo.pulls.size + 1, state: 'open', merged: false, head: branch, headRepo: headRepo.fullName, base: input.base, title: input.title, body: input.body }
+    const pull: Pull = { number: 100 + repo.pulls.size + 1, state: 'open', merged: false, head: branch, headRepo: headRepo.fullName, from: headRepo, base: input.base, title: input.title, body: input.body }
     repo.pulls.set(pull.number, pull)
     return answer(201, pullJson(repo, pull))
   }
@@ -165,14 +172,17 @@ async function gh(command: string, args: string[], options: RunFileOptions = {})
     return answer(200, { status })
   }
   const pullMatch = /^pulls\/(\d+)$/.exec(rest)
-  if (pullMatch && method === 'GET') return answer(200, pullJson(repo, repo.pulls.get(Number(pullMatch[1]))!))
+  if (pullMatch && method === 'GET') {
+    const pull = repo.pulls.get(Number(pullMatch[1]))
+    return pull ? answer(200, pullJson(repo, pull)) : answer(404, { message: 'Not Found' })
+  }
   if (rest === 'forks' && method === 'POST') {
     // A fork made before comes back, under whatever name it has now.
     const made = [...repos.values()].find((r) => r.parent === repo.fullName)
     if (made) return answer(202, { full_name: made.fullName })
     const name = `octocat/${repo.fullName.split('/')[1]}`
     if (!repos.has(name)) {
-      const copy: Repo = { fullName: name, owner: 'octocat', defaultBranch: repo.defaultBranch, push: true, branches: new Map([[repo.defaultBranch, repo.branches.get(repo.defaultBranch)!]]), pulls: new Map(), parent: repo.fullName }
+      const copy: Repo = { id: ++repoCount, fullName: name, owner: 'octocat', defaultBranch: repo.defaultBranch, push: true, branches: new Map([[repo.defaultBranch, repo.branches.get(repo.defaultBranch)!]]), pulls: new Map(), parent: repo.fullName }
       repos.set(name, copy)
     }
     return answer(202, { full_name: name })
@@ -1303,9 +1313,58 @@ sections:
     expect((await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: NOTES_YAML })).status).toBe(200)
     const sites = (await request('/api/publishing/sites')).body.sites
     expect(sites.map((s: any) => [s.repo, s.site])).toEqual([['mikkokotila/mikkokotila-com', 'mikkokotila.com'], ['acme/diary', 'Other Journal'], ['acme/journal', 'Notes']])
-    expect(sites[1].formerly).toBeUndefined()
+    // The renamed site keeps the old name among its names, for a record written
+    // without its repository's id; the name reaches the repository that has it now.
+    expect(sites[1].formerly).toEqual(['acme/journal'])
     expect((await request('/api/publishing/sites/acme/journal', 'DELETE')).status).toBe(200)
     expect((await request('/api/publishing/sites')).body.sites.map((s: any) => s.repo)).toEqual(['mikkokotila/mikkokotila-com', 'acme/diary'])
+  })
+
+  it('keeps a renamed site\'s open publication its own once a repository added as a site takes the old name', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const journal = (repo: string) => ({ repo, section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } })
+    expect((await publish([journal('acme/journal')])).body.results[0].ok).toBe(true)
+    const diary = repos.get('acme/journal')!
+    diary.fullName = 'acme/diary'
+    repos.set('acme/diary', diary)
+    ;(await import('../server/publishing-api')).forgetSites()
+    expect((await request('/api/publishing/sites')).body.sites[1].repo).toBe('acme/diary')
+    // A new repository takes the old name, the record's still, and is added as a site.
+    addRepo('acme/journal', {})
+    expect((await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })).status).toBe(200)
+    // While the site's pull request cannot be read, publishing there is refused, not opened again.
+    failOn = (method, endpoint) => (method === 'GET' && endpoint === 'repos/acme/diary/pulls/101' ? 500 : null)
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([journal('acme/diary')])).body.results[0]).toMatchObject({ ok: false, error: expect.stringMatching(/^Its earlier pull request could not be read/) })
+    expect(diary.pulls.size).toBe(1)
+    // Once it can be read, the update goes to the same pull request.
+    failOn = null
+    expect((await publish([journal('acme/diary')])).body.results[0]).toMatchObject({ ok: true, publication: { repo: 'acme/diary', pullRequest: { number: 101 } } })
+    expect(diary.pulls.size).toBe(1)
+    expect([...commits.get(diary.branches.get('publish/a-better-question')!)!.values()].join('\n')).toContain('A new ending.')
+    expect((await editor!.readPublishLedger(DOC)).records.map((r) => [r.repo, r.headRepo])).toEqual([['acme/diary', 'acme/diary']])
+  })
+
+  it('updates a renamed site\'s open publication on its branch once an empty repository takes the old name', async () => {
+    addRepo('acme/journal', {})
+    await request('/api/publishing/sites', 'POST', { repo: 'acme/journal' })
+    await request('/api/publishing/sites/acme/journal/description', 'PUT', { description: JOURNAL_YAML })
+    const journal = (repo: string) => ({ repo, section: 'Posts', slug: 'a-better-question', values: { title: 'A better question' } })
+    expect((await publish([journal('acme/journal')])).body.results[0].ok).toBe(true)
+    // Renamed, and updated under its new name: the record follows the rename.
+    const diary = repos.get('acme/journal')!
+    diary.fullName = 'acme/diary'
+    repos.set('acme/diary', diary)
+    await writeDocument(DOC, `${TEXT}\nA new ending.\n`)
+    expect((await publish([journal('acme/diary')])).body.results[0]).toMatchObject({ ok: true, publication: { pullRequest: { number: 101 } } })
+    // An empty repository takes the old name: the next update still goes to the pull request's branch.
+    addRepo('acme/journal', {})
+    await writeDocument(DOC, `${TEXT}\nA newer ending.\n`)
+    expect((await publish([journal('acme/diary')])).body.results[0]).toMatchObject({ ok: true, publication: { repo: 'acme/diary', pullRequest: { number: 101 } } })
+    expect([...commits.get(diary.branches.get('publish/a-better-question')!)!.values()].join('\n')).toContain('A newer ending.')
+    expect((await editor!.readPublishLedger(DOC)).records.map((r) => [r.repo, r.headRepo])).toEqual([['acme/diary', 'acme/diary']])
   })
 
   it("takes an update as merged when a maintainer's commit on top of it was merged", async () => {

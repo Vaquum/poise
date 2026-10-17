@@ -49,6 +49,7 @@ import {
   openPullRequest,
   pullRequest,
   repository,
+  repositoryById,
   signIn,
   type GitHubSession,
   type PullRequestInfo,
@@ -61,6 +62,8 @@ const MAX_DESTINATIONS = 10
 
 interface StoredSite {
   repo: string
+  /** Its repository's GitHub id: the same through a rename, another for a repository taking its old name. */
+  id?: number
   /** The site described here, for a repository without publish.yaml. */
   description?: string
   /** Names its repository had before a rename: records made then still go by them. */
@@ -77,6 +80,12 @@ function siteByName(sites: StoredSite[], names: string[]): StoredSite | undefine
   return sites.find((s) => is(s.repo)) ?? sites.find((s) => (s.formerly ?? []).some(is))
 }
 
+/** The stored site a record is of: by its repository's id; a record or a site without one, by name. */
+function siteFor(sites: StoredSite[], record: PublishRecord, names: string[]): StoredSite | undefined {
+  if (!record.repoId) return siteByName(sites, names)
+  return sites.find((s) => s.id === record.repoId) ?? siteByName(sites.filter((s) => !s.id), names)
+}
+
 /* ---------------------------------------------------------------- the sites */
 
 function storedSites(): StoredSite[] {
@@ -87,6 +96,7 @@ function storedSites(): StoredSite[] {
   const valid = Array.isArray(parsed) && parsed.every((site) => !!site && typeof site === 'object'
     && typeof site.repo === 'string' && REPOSITORY.test(site.repo)
     && (site.description === undefined || typeof site.description === 'string')
+    && (site.id === undefined || Number.isSafeInteger(site.id))
     && (site.formerly === undefined || (Array.isArray(site.formerly) && site.formerly.every((n: unknown) => typeof n === 'string'))))
   if (!valid) throw new HttpError(500, 'The publishing sites saved in Settings are unreadable.')
   return parsed as StoredSite[]
@@ -106,13 +116,22 @@ function updateSites(change: (sites: StoredSite[]) => StoredSite[]): void {
  * panel address it so. Once renamed, it is left as it is: a second read of the
  * same site, from before the rename, changes nothing.
  */
-function renameSite(from: string, to: string): void {
+function renameSite(from: string, to: string, id: number): void {
   updateSites((sites) => {
-    if (!sites.some((s) => s.repo.toLowerCase() === from.toLowerCase())) return sites
+    // By its id where both are known: another repository kept under one of these names is another site.
+    const self = (s: StoredSite) => s.repo.toLowerCase() === from.toLowerCase() && (!s.id || !id || s.id === id)
+    const other = (s: StoredSite) => !!s.id && !!id && s.id !== id
+    if (!sites.some(self)) return sites
     return sites
-      .filter((s) => s.repo.toLowerCase() !== to.toLowerCase())
-      .map((s) => (s.repo.toLowerCase() === from.toLowerCase() ? { ...s, repo: to, formerly: [...new Set([...(s.formerly ?? []), s.repo])] } : s))
+      .filter((s) => self(s) || other(s) || s.repo.toLowerCase() !== to.toLowerCase())
+      .map((s) => (self(s) ? { ...s, repo: to, ...(id ? { id } : {}), formerly: [...new Set([...(s.formerly ?? []), s.repo])] } : s))
   })
+}
+
+/** A stored site's repository id, learnt when it was read without one. */
+function rememberId(repo: string, id: number): void {
+  if (!id) return
+  updateSites((sites) => sites.map((s) => (s.repo.toLowerCase() === repo.toLowerCase() && !s.id ? { ...s, id } : s)))
 }
 
 /**
@@ -132,14 +151,8 @@ async function siteNamed(name: string, sites = storedSites()): Promise<StoredSit
     throw error
   })
   if (!session || !info) return undefined
-  const byName = sites.find((s) => s.repo.toLowerCase() === info.fullName.toLowerCase())
-  if (byName) return byName
-  // Still kept under a name it had before: each site as it is now, its rename followed.
-  for (const site of sites) {
-    const read = await readSite(session, site)
-    if (read.view.repo.toLowerCase() === info.fullName.toLowerCase()) return { ...site, repo: read.view.repo }
-  }
-  return undefined
+  // The repository the name leads to now, by its id: never one that only took a site's old name.
+  return sites.find((s) => s.id === info.id) ?? sites.find((s) => !s.id && s.repo.toLowerCase() === info.fullName.toLowerCase())
 }
 
 async function findSite(repo: string): Promise<StoredSite> {
@@ -218,6 +231,8 @@ async function readSite(session: GitHubSession, stored: StoredSite, { follow = t
   let text: string | null
   try {
     info = await repository(session, stored.repo)
+    // Its name taken by another repository since: the site's own, by its id, under the name it has now.
+    if (stored.id && info.id !== stored.id) info = await repositoryById(session, stored.id)
     text = stored.description ?? (await fileAt(session, info.fullName, PUBLISH_FILE, info.defaultBranch))?.text ?? null
   } catch (error) {
     if (!(error instanceof GitHubError)) throw error
@@ -225,7 +240,8 @@ async function readSite(session: GitHubSession, stored: StoredSite, { follow = t
   }
   const repo = info.fullName
   const renamed = repo.toLowerCase() !== stored.repo.toLowerCase()
-  if (follow && renamed) renameSite(stored.repo, repo)
+  if (follow && renamed) renameSite(stored.repo, repo, info.id)
+  else if (follow && !stored.id) rememberId(stored.repo, info.id)
   // The names it had: what Settings holds under one of them is the site's.
   const former = renamed ? [...(stored.formerly ?? []), stored.repo] : stored.formerly ?? []
   const formerly = former.length ? { formerly: former } : {}
@@ -316,15 +332,15 @@ async function addSite(value: unknown): Promise<{ site: SiteView }> {
   if (stored.some((s) => s.repo.toLowerCase() === name.toLowerCase())) throw new HttpError(409, `${name} is already one of your sites.`)
   const session = await signIn(getMeta('me') || '')
   const info = await repository(session, name)
-  const site: StoredSite = { repo: info.fullName }
+  const site: StoredSite = { repo: info.fullName, ...(info.id ? { id: info.id } : {}) }
   // Read again after GitHub's answer: another add may have finished meanwhile.
+  // The same repository kept under a name it had before a rename is the same site.
   updateSites((sites) => {
-    if (sites.some((s) => [name, info.fullName].some((n) => s.repo.toLowerCase() === n.toLowerCase()))) throw new HttpError(409, `${info.fullName} is already one of your sites.`)
-    // A renamed site's old name, now another repository's: no longer one of its names.
-    const pruned = sites.map((s) => (s.formerly?.some((n) => n.toLowerCase() === info.fullName.toLowerCase())
-      ? { ...s, formerly: s.formerly.filter((n) => n.toLowerCase() !== info.fullName.toLowerCase()) }
-      : s))
-    return [...pruned, site]
+    if (sites.some((s) => (!!info.id && s.id === info.id) || [name, info.fullName].some((n) => s.repo.toLowerCase() === n.toLowerCase()))) throw new HttpError(409, `${info.fullName} is already one of your sites.`)
+    // A renamed site keeps its old names, one of them now this repository's:
+    // a name finds the site that has it now first, and a record goes by its
+    // repository's id, so only a record written without one goes by them.
+    return [...sites, site]
   })
   forgetSites()
   return { site: (await cachedSite(session, site)).view }
@@ -408,16 +424,48 @@ async function stillOurs(session: GitHubSession, ready: ReadySite, record: Publi
   }
 }
 
+/** A record moved with its repository's rename: its branch's repository too, where that is the same one. */
+function moveTo(record: PublishRecord, name: string): void {
+  if (record.headRepo.toLowerCase() === record.repo.toLowerCase()) record.headRepo = name
+  record.repo = name
+}
+
+/**
+ * A record's pull request, from its repository as it is now. One renamed
+ * since is found by its id, even once another repository has taken its old
+ * name, and that one's pull requests are never taken for it. The record goes
+ * by the names GitHub gives now, its branch's repository's too, and one
+ * written without its repository's id learns it here.
+ */
+async function readPullRequest(session: GitHubSession, record: PublishRecord): Promise<PullRequestInfo> {
+  const number = record.pullRequest.number
+  const ours = (info: PullRequestInfo) => !record.repoId || !info.repoId || info.repoId === record.repoId
+  const byName = await pullRequest(session, record.repo, number).catch((error: unknown) => {
+    if (!(error instanceof GitHubError) || !record.repoId) throw error
+    return error
+  })
+  let info: PullRequestInfo
+  if (!(byName instanceof GitHubError) && ours(byName)) info = byName
+  else {
+    // Not found by its name, or another repository's under it: its own, by its id.
+    const own = await repositoryById(session, record.repoId!)
+    if (byName instanceof GitHubError && own.fullName.toLowerCase() === record.repo.toLowerCase()) throw byName
+    moveTo(record, own.fullName)
+    info = await pullRequest(session, own.fullName, number)
+    if (!ours(info)) throw new GitHubError(`Pull request #${number} could not be read in ${own.fullName}.`, 409)
+  }
+  if (info.repo && info.repo.toLowerCase() !== record.repo.toLowerCase()) moveTo(record, info.repo)
+  // Its branch's repository as GitHub names it now: a fork renamed since too.
+  if (info.headRepo) record.headRepo = info.headRepo
+  if (!record.repoId && info.repoId) record.repoId = info.repoId
+  return info
+}
+
 /**
  * A pull request a maintainer retargeted goes, or went, where GitHub says
  * now: a record whose branch came from it follows it. One moved with its
  * version to another branch since stays there.
  */
-/** A site renamed on GitHub since: its record goes by the name its pull request gives now. */
-function followRename(record: PublishRecord, info: PullRequestInfo): void {
-  if (info.repo && info.repo.toLowerCase() !== record.repo.toLowerCase()) record.repo = info.repo
-}
-
 function followBase(record: PublishRecord, info: PullRequestInfo): void {
   const seen = record.pullRequest.base ?? record.base
   if (!info.base || info.state === 'closed' || info.base === seen) return
@@ -435,7 +483,7 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
   const { records } = await readPublishLedger(slug)
   const session = records.length ? await signIn(getMeta('me') || '') : null
   const sites = records.length ? storedSites() : []
-  const siteOf = (names: string[]) => siteByName(sites, names)
+  const siteOf = (record: PublishRecord, recorded: string) => siteFor(sites, record, [recorded, record.repo])
   const publications = await Promise.all(records.map(async (record): Promise<PublicationView> => {
     const recorded = record.repo
     const view: PublicationView = {
@@ -445,16 +493,15 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
       changed: record.sourceSha !== sha256(doc.content),
     }
     try {
-      const info = await pullRequest(session!, record.repo, record.pullRequest.number)
+      const info = await readPullRequest(session!, record)
       const state = info.state
       view.pullRequest.state = state
-      followRename(record, info)
       followBase(record, info)
       view.live = state !== 'closed' || record.landed !== undefined
       // A site moved to another branch since, where the file is not one this
       // document published: published there afresh, under any slug. Read as
       // it is now, though its name follows only the read Settings shares.
-      const stored = view.live && state !== 'open' ? siteOf([recorded, record.repo]) : undefined
+      const stored = view.live && state !== 'open' ? siteOf(record, recorded) : undefined
       const ready = stored && (await readSite(session!, stored, { follow: false })).ready
       if (ready && !(await stillOurs(session!, ready, record, state === 'merged' ? snapshotOf(record) : record.landed, whereOf(record, state)))) view.live = false
     } catch (error) {
@@ -463,7 +510,7 @@ async function documentPublishing(slug: string): Promise<{ title: string, slug: 
     }
     // Named as Settings and the panel name its site, by the same read of it,
     // shared while it is cached: never one name here and another there.
-    const site = siteOf([recorded, record.repo])
+    const site = siteOf(record, recorded)
     view.repo = site ? (await cachedSite(session!, site)).view.repo : record.repo
     return view
   }))
@@ -540,8 +587,13 @@ function resultKey(destination: Destination): string {
   return placeKey(destination.repo, destination.section)
 }
 
-function placeKey(repo: string, section: string): string {
-  return `${repo.toLowerCase()}#${section}`
+/** A place: its repository, by its id where that is known, else by its name, and its section. */
+function placeKey(repo: number | string, section: string): string {
+  return `${typeof repo === 'number' ? repo : repo.toLowerCase()}#${section}`
+}
+
+function placeOf(record: PublishRecord): string {
+  return placeKey(record.repoId || record.repo, record.section)
 }
 
 function resultFor(target: Target, fields: Partial<PublishResult>): PublishResult {
@@ -598,33 +650,23 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // nothing on its site: it owns no file there and is named nowhere.
   // A pull request that cannot be read (its repository gone, say) fails only
   // a publication to that site; elsewhere it is still named where it was.
-  const states = new Map<string, PullRequestInfo['state'] | 'unknown'>()
-  const unread = new Map<string, string>()
+  const states = new Map<PublishRecord, PullRequestInfo['state'] | 'unknown'>()
+  const unread = new Map<PublishRecord, string>()
   // An update committed while its pull request could not be read, where
   // the pull request has since been merged without it.
-  const missed = new Set<string>()
+  const missed = new Set<PublishRecord>()
   // The name each record had before a rename followed here, to find its stored site by.
   const recordedAs = new Map<PublishRecord, string>(ledger.records.map((record) => [record, record.repo]))
   await Promise.all(ledger.records.map(async (record) => {
     try {
-      const info = await pullRequest(session, record.repo, record.pullRequest.number)
-      followRename(record, info)
-      const key = placeKey(record.repo, record.section)
-      if (record.unconfirmed && info.state === 'merged' && !await contains(session, record.headRepo, info.headSha, record.unconfirmed.commit)) missed.add(key)
+      const info = await readPullRequest(session, record)
+      if (record.unconfirmed && info.state === 'merged' && !await contains(session, record.headRepo, info.headSha, record.unconfirmed.commit)) missed.add(record)
       followBase(record, info)
-      states.set(key, info.state)
+      states.set(record, info.state)
     } catch (error) {
       if (!(error instanceof GitHubError)) throw error
-      // Unreadable, it still goes by its repository's name now, so a site
-      // renamed since finds it: GitHub answers to the old name.
-      const current = await repository(session, record.repo).catch((failure: unknown) => {
-        if (failure instanceof GitHubError) return null
-        throw failure
-      })
-      if (current) record.repo = current.fullName
-      const key = placeKey(record.repo, record.section)
-      states.set(key, 'unknown')
-      unread.set(key, error.message)
+      states.set(record, 'unknown')
+      unread.set(record, error.message)
     }
   }))
   // A merged version stays on the site, and stays this document's, even when
@@ -633,9 +675,8 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // Merged without an update committed after it: what it merged is not
   // known, so every difference from the site is asked about.
   const landedOf = (record: PublishRecord): Landed | undefined => {
-    const key = placeKey(record.repo, record.section)
-    if (states.get(key) !== 'merged') return record.landed
-    return missed.has(key)
+    if (states.get(record) !== 'merged') return record.landed
+    return missed.has(record)
       ? { data: {}, bodySha: '', pullRequest: record.pullRequest.number, url: record.unconfirmed!.url, ...(record.unconfirmed!.date ? { date: record.unconfirmed!.date } : {}), base: record.base, unknown: true }
       : snapshotOf(record)
   }
@@ -643,12 +684,11 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // there is an earlier version, an update after it closed unmerged or never
   // reaching its merged pull request.
   const sinceOf = (record: PublishRecord): string => {
-    const key = placeKey(record.repo, record.section)
-    if (states.get(key) === 'closed' && record.landed) return record.landed.date ?? record.date
-    if (missed.has(key)) return record.unconfirmed!.date ?? record.date
+    if (states.get(record) === 'closed' && record.landed) return record.landed.date ?? record.date
+    if (missed.has(record)) return record.unconfirmed!.date ?? record.date
     return record.date
   }
-  const live = ledger.records.filter((record) => states.get(placeKey(record.repo, record.section)) !== 'closed' || record.landed)
+  const live = ledger.records.filter((record) => states.get(record) !== 'closed' || record.landed)
   // A publication found closed unmerged while this one went on, with nothing landed before it: named nowhere.
   const gone = new Set<PublishRecord>()
 
@@ -667,27 +707,29 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
     if (!read.ready) { refuse(destination, `${destination.repo}: ${read.view.problem}`); continue }
     const section = read.ready.config.sections.find((s) => s.name === destination.section)
     if (!section) { refuse(destination, `${read.ready.config.site} has no section ${destination.section}.`); continue }
-    const key = placeKey(read.ready.repo, section.name)
+    const { id } = read.ready.info
+    const key = placeKey(id || read.ready.repo, section.name)
     // Chosen twice under two of its names: once is enough.
     if (targets.some((t) => t.key === key)) { refuse(destination, `${read.ready.config.site} · ${section.name} is chosen twice.`); continue }
-    // A record under a name the repository had before is the same publication.
-    const names = new Set([key, placeKey(destination.repo, section.name), ...[stored.repo, ...(stored.formerly ?? [])].map((n) => placeKey(n, section.name))])
-    const unreadName = [...names].find((name) => unread.has(name))
-    if (unreadName) { refuse(destination, `Its earlier pull request could not be read: ${unread.get(unreadName)}`); continue }
-    let previous = live.find((r) => names.has(placeKey(r.repo, r.section)))
-    const was = previous ? placeKey(previous.repo, previous.section) : key
+    // Its records go by its repository's id; one written without it, by a
+    // name: the repository's now, or one it had before a rename.
+    const names = new Set([read.ready.repo, destination.repo, stored.repo, ...(stored.formerly ?? [])].map((n) => n.toLowerCase()))
+    const belongs = (r: PublishRecord) => r.section === section.name && (r.repoId && id ? r.repoId === id : names.has(r.repo.toLowerCase()))
+    const unreadOne = [...unread.keys()].find(belongs)
+    if (unreadOne) { refuse(destination, `Its earlier pull request could not be read: ${unread.get(unreadOne)}`); continue }
+    let previous = live.find(belongs)
     let landed = previous && landedOf(previous)
-    if (previous && states.get(was) !== 'open') {
+    if (previous && states.get(previous) !== 'open') {
       // A site that has moved to another branch since, where the file is not
       // one this document published: the piece is published there afresh.
       // Carried onto that branch as published, what landed is there too.
-      const where = whereOf(previous, states.get(was))
+      const where = whereOf(previous, states.get(previous))
       if (!(await stillOurs(session, read.ready, previous, landed, where))) previous = undefined
       else if (where !== read.ready.base && landed) landed = { ...landed, base: read.ready.base }
     }
     // Only an open pull request is still on its way; anything else that is
     // live is the merged version on the site.
-    const state = !previous ? 'new' : states.get(was) === 'open' ? 'open' : 'merged'
+    const state = !previous ? 'new' : states.get(previous) === 'open' ? 'open' : 'merged'
     targets.push({ destination, ready: read.ready, section, key, previous, state, landed: previous ? landed : undefined, since: previous && sinceOf(previous) })
   }
 
@@ -725,14 +767,13 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   // site's description gives it now, dated as its file is, a date a
   // maintainer changed included. A site published now and failing is named
   // there too. One that cannot be read keeps its record's.
-  const addresses = new Map<string, string>()
+  const addresses = new Map<PublishRecord, string>()
   await Promise.all(live.map(async (r) => {
-    const key = placeKey(r.repo, r.section)
-    const state = states.get(key)
-    const reached = state === 'open' || (state === 'merged' && !missed.has(key))
+    const state = states.get(r)
+    const reached = state === 'open' || (state === 'merged' && !missed.has(r))
     if (state === 'unknown' || (r.unconfirmed && !reached)) return
-    const stored = siteByName(sites, [r.repo, recordedAs.get(r) ?? r.repo])
-    const ready = targets.find((t) => t.key === key)?.ready ?? (stored && (await readSite(session, stored)).ready)
+    const stored = siteFor(sites, r, [r.repo, recordedAs.get(r) ?? r.repo])
+    const ready = targets.find((t) => t.key === placeOf(r))?.ready ?? (stored && (await readSite(session, stored)).ready)
     const section = ready?.config.sections.find((sec) => sec.name === r.section)
     // A site that has moved to another branch since the piece went where it is: its record says where it was.
     if (!ready || !section?.url || (state !== 'open' && whereOf(r, state) !== ready.base)) return
@@ -750,7 +791,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       if (!data) return
       date = fileDate(section, data, todayValue, sinceOf(r))
     }
-    addresses.set(key, placeUrl(section, r.slug, date))
+    addresses.set(r, placeUrl(section, r.slug, date))
   }))
 
   // Every place the piece is published, the original first: where it is live
@@ -763,11 +804,10 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       .filter((r) => !gone.has(r))
       .sort((a, b) => a.publishedAt.localeCompare(b.publishedAt))
       .map((r) => {
-        const key = placeKey(r.repo, r.section)
-        const state = states.get(key)
-        const reached = state === 'open' || (state === 'merged' && !missed.has(key))
-        const url = addresses.get(key) ?? (state === 'closed' && r.landed ? r.landed.url : r.unconfirmed && !reached ? r.unconfirmed.url : r.url)
-        return { key, site: r.site, url }
+        const state = states.get(r)
+        const reached = state === 'open' || (state === 'merged' && !missed.has(r))
+        const url = addresses.get(r) ?? (state === 'closed' && r.landed ? r.landed.url : r.unconfirmed && !reached ? r.unconfirmed.url : r.url)
+        return { key: placeOf(r), site: r.site, url }
       })
     for (const target of going) {
       const { destination, section, ready } = target
@@ -798,7 +838,7 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
   const record = async (target: Target, outcome: Outcome) => {
     if (outcome.record) {
       // In place of its earlier record, under whatever name the repository had then.
-      ledger.records = [...ledger.records.filter((r) => r !== target.previous && placeKey(r.repo, r.section) !== target.key), outcome.record]
+      ledger.records = [...ledger.records.filter((r) => r !== target.previous && placeOf(r) !== target.key), outcome.record]
       await writePublishLedger(slug, ledger)
     }
     const kept = outcome.record ?? target.previous!
@@ -838,9 +878,8 @@ async function publishLocked(slug: string, destinations: Destination[], replace:
       // Its pull request found closed unmerged: for the rest of this publication
       // it is, and the version that landed before it, if any, is what is named.
       if (target.closed && target.previous) {
-        const was = placeKey(target.previous.repo, target.previous.section)
-        states.set(was, 'closed')
-        addresses.delete(was)
+        states.set(target.previous, 'closed')
+        addresses.delete(target.previous)
         if (!target.landed) gone.add(target.previous)
       }
     }
@@ -928,7 +967,7 @@ function provisionalRecord(target: Target, filled: FilledPost, docTitle: string,
   // largest counts.
   const landed = commit ? largestLanded(target, filled) : target.landed
   return {
-    repo: longest(previous?.repo, ready.repo), section: target.section.name, site: ready.config.site,
+    repo: longest(previous?.repo, ready.repo), ...(ready.info.id ? { repoId: ready.info.id } : {}), section: target.section.name, site: ready.config.site,
     headRepo: longest(previous?.headRepo, ready.info.canPush ? ready.repo : LONGEST_REPOSITORY),
     branch: longest(previous?.branch, `${branchFor(destination.slug)}-9`), base: longest(previous?.base, ready.base),
     path: filled.path, url: filled.url, slug: longest(previous?.slug, destination.slug), date: filled.date,
@@ -954,9 +993,9 @@ function assertLedgerFits(records: PublishRecord[], provisional: PublishRecord[]
   // larger of its old and new versions, which covers every step and outcome.
   // Measured as written, indented within the record list: a long list grows more there than a long string.
   const size = (record: PublishRecord) => Buffer.byteLength(JSON.stringify({ records: [record] }, null, 2), 'utf8')
-  const worst = new Map(records.map((record) => [placeKey(record.repo, record.section), record]))
+  const worst = new Map(records.map((record) => [placeOf(record), record]))
   for (const record of provisional) {
-    const key = placeKey(record.repo, record.section)
+    const key = placeOf(record)
     const old = worst.get(key)
     if (!old || size(record) > size(old)) worst.set(key, record)
   }
@@ -1037,7 +1076,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
       : landed
     // On the site, on the branch it publishes to now; on an open pull request, the branch that targets.
     const record: PublishRecord = {
-      ...previous!, site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published,
+      ...previous!, ...(upstream.id ? { repoId: upstream.id } : {}), site: ready.config.site, url, sourceSha: sha256(content), values: destination.values, ...published,
       ...(landedNow ? { landed: landedNow } : {}), ...(state === 'merged' ? { base: ready.base } : {}), updatedAt: now,
     }
     delete record.unconfirmed
@@ -1124,7 +1163,7 @@ async function publishTo(session: GitHubSession, target: Target, parts: Document
     state: outcome,
     ...(error ? { error } : {}),
     record: {
-      repo: upstream.fullName, section: section.name, site: ready.config.site, headRepo, branch, base,
+      repo: upstream.fullName, ...(upstream.id ? { repoId: upstream.id } : {}), section: section.name, site: ready.config.site, headRepo, branch, base,
       path: filled.path, url, slug: destination.slug, pullRequest: pr,
       publishedAt: previous?.publishedAt ?? now, updatedAt: now,
       sourceSha: sha256(content), values: destination.values, ...published,
