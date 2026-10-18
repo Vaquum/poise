@@ -417,6 +417,58 @@ describe('reading what Current shows', () => {
     expect((await readAnalytics(WEEK)).issues.opened).toBe(1)
   })
 
+  it('does not parse discussion payloads for open PRs or merges outside the window', async () => {
+    const open = seed(pr(1, '2026-10-05T00:00:00Z', null), 'pr', true)
+    const old = seed(pr(2, '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z', { updated_at: '2026-10-06T00:00:00Z' }), 'pr', true)
+    seed(pr(3, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { additions: 10, deletions: 2, comments_count: 3, merged_by: 'robot' }), 'pr', true)
+    const db = new Database(mocks.orgs[0].datastorePath)
+    try {
+      // These records have readable events but deliberately unreadable
+      // discussion payloads. None of their payload fields enter this report.
+      db.prepare("UPDATE items SET expanded_json = 'unreadable discussion' WHERE item_id IN (?, ?)").run(open, old)
+    } finally { db.close() }
+    const report = await readAnalytics(WEEK, 'alpha')
+    expect(report.pullRequests).toMatchObject({ opened: 2, merged: 1, mergedByAgent: 1, commentsPerPr: 3, lines: { total: 12, counted: 1 } })
+  })
+
+  it('serves other work before a large history finishes, without changing its measurements', async () => {
+    const rows = Array.from({ length: 192 }, (_, i) => pr(i + 1, '2026-10-05T00:00:00Z', i % 2 ? '2026-10-06T00:00:00Z' : null, { additions: i, deletions: 1 }))
+    rows.forEach(row => seed(row, 'pr', true))
+    let completed = false
+    const pending = readAnalyticsHistory(['2026-10-05T00:00:00Z', '2026-10-12T00:00:00Z'], 'alpha').then(report => { completed = true; return report })
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(completed).toBe(false)
+    // A separate account/day read can complete while the history is pending.
+    expect((await readAnalytics(WEEK, 'beta')).pullRequests.merged).toBe(0)
+    expect(completed).toBe(false)
+    const history = await pending
+    const expected = computeAnalytics({ window: WEEK, issues: [], prs: rows, behaviors: [], agent: 'robot' })
+    expect(history.periods[0].pullRequests).toEqual(expected.pullRequests)
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('measures equivalent reads with large discussions outside the merged set', async () => {
+    for (let i = 1; i <= 192; i++) seed(pr(i, '2026-10-05T00:00:00Z', i === 1 ? '2026-10-06T00:00:00Z' : null, { additions: 10, deletions: 2 }), 'pr', true)
+    const db = new Database(mocks.orgs[0].datastorePath)
+    try {
+      db.prepare("UPDATE items SET expanded_json = json_set(expanded_json, '$.discussion', ?)").run('x'.repeat(1024 * 1024))
+      const oldStart = performance.now()
+      const rows = db.prepare<[], DatastoreRecord>(`SELECT repo, number, status, author, updated_at, created_at, closed_at, title, url,
+        pr_ref, comments_count, review_comments_count, additions, deletions,
+        (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = pr_ref AND r.submitted_at IS NOT NULL
+          AND r.state <> 'PENDING' AND (r.author_login IS NULL OR author IS NULL OR lower(r.author_login) <> lower(author))) AS first_review_at
+        FROM prs`).all()
+      for (const row of rows.filter(row => row.status === 'merged')) row.merged_by = null
+      const expected = computeAnalytics({ window: WEEK, issues: [], prs: rows, behaviors: [], agent: 'robot' })
+      const oldMs = performance.now() - oldStart
+      const start = performance.now()
+      expect(await readAnalytics(WEEK, 'alpha')).toEqual(expected)
+      const readMs = performance.now() - start
+      console.info(`Analytics 192 MiB discussions: eager ${oldMs.toFixed(1)} ms; windowed ${readMs.toFixed(1)} ms`)
+      expect(readMs).toBeLessThan(oldMs)
+    } finally { db.close() }
+  })
+
   it('names unreadable accounts, retains sync errors and fails when none are readable', async () => {
     rmSync(mocks.orgs[1].datastorePath)
     mocks.orgs[0].error = 'sync failed'

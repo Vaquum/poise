@@ -16,6 +16,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { setImmediate } from 'node:timers/promises'
 import Database from 'better-sqlite3'
 import { getMeta, listCompletedBehaviorActions, type BehaviorLaunchAction, type CompletedBehaviorAction } from './db'
 import { HttpError } from './http'
@@ -237,54 +238,71 @@ async function readOrganization(org: Organization, me: string, window: Analytics
   const path = org.datastorePath ?? join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'github-datastore', 'github_datastore.sqlite')
   const db = new Database(path, { readonly: true, fileMustExist: true, timeout: 1_000 })
   try {
-    return db.transaction(() => {
-      const read = (kind: 'issue' | 'pr'): DatastoreRecord[] => {
-        const view = kind === 'pr' ? 'prs' : 'issues'
-        const ref = kind === 'pr' ? 'pr_ref' : 'issue_ref'
-        const params: string[] = []
-        const scopes = involvementScopes(kind, me).map(scope => {
-          const user = scope[0] === 'user'
-          const filters: string[] = []
-          if (user) {
-            filters.push('username = ?', 'item_type = ?')
-            params.push(me, kind)
-          } else if (scope[1] === '--author') {
-            filters.push('author = ?')
-            params.push(scope[2])
-          }
-          // Match the CLI's second-resolution narrowing; computeAnalytics
-          // applies the exact inclusive/exclusive millisecond boundaries.
-          if (window.since) {
-            filters.push('updated_at >= ?')
-            params.push(new Date(window.since).toISOString().slice(0, 19))
-          }
-          return `SELECT ${user ? 'item_ref' : ref} FROM ${user ? 'user_items' : view}${filters.length ? ` WHERE ${filters.join(' AND ')}` : ''}`
-        })
-        // A pending review is not submitted, and an author's own review is a
-        // reply. A review counts unless it is known to be the author's: a
-        // deleted account leaves either login NULL.
-        const details = kind === 'pr' ? `pr_ref, comments_count, review_comments_count, additions, deletions,
-          (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = pr_ref AND r.submitted_at IS NOT NULL
-            AND r.state <> 'PENDING' AND (r.author_login IS NULL OR author IS NULL OR lower(r.author_login) <> lower(author))) AS first_review_at`
-          : '0 AS comments_count'
-        const rows = db.prepare<string[], DatastoreRecord>(`
-          SELECT repo, number, status, author, updated_at, created_at, closed_at, title, url, ${details}
-          FROM ${view} WHERE ${ref} IN (${scopes.join(' UNION ')})
-        `).all(...params)
-        if (rows.some(row => !repoBelongsTo(row.repo, org.login))) {
-          throw new Error(`datastore contains records outside ${org.login}`)
+    // Keep one snapshot while yielding between bounded slices of work. A
+    // synchronous .all() across a year prevents even quota/health reads.
+    const scopeByKind = { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) }
+    db.exec('BEGIN')
+    const mergedDetails = db.prepare<[number], Pick<DatastoreRecord, 'comments_count' | 'review_comments_count' | 'additions' | 'deletions' | 'merged_by'>>(`
+      SELECT comments_count, review_comments_count, additions, deletions,
+        json_extract(i.expanded_json, '$.pull.merged_by.login') AS merged_by
+      FROM prs JOIN items i ON i.item_id = pr_ref WHERE pr_ref = ?
+    `)
+    const read = async (kind: 'issue' | 'pr'): Promise<DatastoreRecord[]> => {
+      const view = kind === 'pr' ? 'prs' : 'issues'
+      const ref = kind === 'pr' ? 'pr_ref' : 'issue_ref'
+      const params: string[] = []
+      const scopes = scopeByKind[kind].map(scope => {
+        const user = scope[0] === 'user'
+        const filters: string[] = []
+        if (user) {
+          filters.push('a.username = ?', 'i.item_type = ?')
+          params.push(me, kind)
+        } else if (scope[1] === '--author') {
+          filters.push('author = ?')
+          params.push(scope[2])
         }
-        return rows
+        // Match the CLI's second-resolution narrowing; computeAnalytics
+        // applies the exact inclusive/exclusive millisecond boundaries.
+        if (window.since) {
+          filters.push('updated_at >= ?')
+          params.push(new Date(window.since).toISOString().slice(0, 19))
+        }
+        // Only membership is needed. user_items groups all involvement
+        // evidence into explanations before it can return these same IDs.
+        return `SELECT ${user ? 'a.item_id' : ref} FROM ${user ? 'associations a JOIN items i ON i.item_id = a.item_id' : view}${filters.length ? ` WHERE ${filters.join(' AND ')}` : ''}`
+      })
+      // A pending review is not submitted, and an author's own review is a
+      // reply. A review counts unless it is known to be the author's: a
+      // deleted account leaves either login NULL.
+      // Discussion counts and size JSON are only used for PRs merged in
+      // this window; openings and first reviews need none of that payload.
+      const details = kind === 'pr' ? `pr_ref, 0 AS comments_count,
+        (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = pr_ref AND r.submitted_at IS NOT NULL
+          AND r.state <> 'PENDING' AND (r.author_login IS NULL OR author IS NULL OR lower(r.author_login) <> lower(author))) AS first_review_at`
+        : '0 AS comments_count'
+      const query = db.prepare<string[], DatastoreRecord>(`
+        SELECT repo, number, status, author, updated_at, created_at, closed_at, title, url, ${details}
+        FROM ${view} WHERE ${ref} IN (${scopes.join(' UNION ')})
+      `)
+      const rows: DatastoreRecord[] = []
+      let sliceStart = performance.now()
+      for (const row of query.iterate(...params)) {
+        if (!repoBelongsTo(row.repo, org.login)) throw new Error(`datastore contains records outside ${org.login}`)
+        if (kind === 'pr' && row.status === 'merged' && inWindow(row.closed_at, window)) {
+          Object.assign(row, mergedDetails.get(row.pr_ref!))
+        }
+        rows.push(row)
+        if (rows.length % 64 === 0 || performance.now() - sliceStart >= 8) {
+          await setImmediate()
+          sliceStart = performance.now()
+        }
       }
-      const prs = read('pr')
-      // Who merged lives in the stored payload, so only the merges this
-      // report counts are parsed.
-      const merged = prs.filter((pr) => pr.status === 'merged' && inWindow(pr.closed_at, window))
-      const mergedBy = db.prepare<[number], { login: string | null }>(`SELECT json_extract(expanded_json, '$.pull.merged_by.login') AS login FROM items WHERE item_id = ?`)
-      for (const pr of merged) pr.merged_by = mergedBy.get(pr.pr_ref!)?.login ?? null
-      return { issues: read('issue'), prs }
-    })()
+      return rows
+    }
+    const prs = await read('pr')
+    return { issues: await read('issue'), prs }
   } finally {
+    if (db.inTransaction) db.exec('ROLLBACK')
     db.close()
   }
 }
@@ -318,13 +336,15 @@ export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string, 
   if (dailyBounds && (dailyBounds.length !== 8 || dailyBounds[0] !== window.since || dailyBounds.at(-1) !== window.until)) {
     throw new HttpError(400, 'daily bounds must cover the requested seven-day window')
   }
+  const agent = agentAccount()
   const { issues, prs, errors } = await readScoped(window, orgLogin)
-  const input = { window, issues, prs, behaviors: listCompletedBehaviorActions(), agent: agentAccount(), errors }
+  const input = { window, issues, prs, behaviors: listCompletedBehaviorActions(), agent, errors }
   return { ...computeAnalytics(input), ...(dailyBounds ? { daily: computeHistory({ ...input, bounds: dailyBounds }).periods } : {}) }
 }
 
 /** One local datastore read across every period, then each period counted alike. */
 export async function readAnalyticsHistory(bounds: string[], orgLogin?: string): Promise<AnalyticsHistory> {
+  const agent = agentAccount()
   const { issues, prs, errors } = await readScoped({ since: bounds[0], until: bounds.at(-1)! }, orgLogin)
-  return computeHistory({ bounds, issues, prs, errors, behaviors: listCompletedBehaviorActions(), agent: agentAccount() })
+  return computeHistory({ bounds, issues, prs, errors, behaviors: listCompletedBehaviorActions(), agent })
 }
