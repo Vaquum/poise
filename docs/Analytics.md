@@ -8,20 +8,18 @@ stays on Analytics, and choosing a view in the top nav leaves it.
 
 The page reads top to bottom:
 
-1. **Productivity**: the day's topline. Issues opened and closed, pull
-   requests merged, lines changed and time to merge, each against the seven
-   days before, and under each its past year by 7-day period.
-2. **Pull request flow**: pull requests opened, closed without merging, and
-   the time to their first review, down to the second.
-3. **Per merged pull request**: comments, median lines, behaviors, median
-   time and the share the agent account merged, over the pull requests merged
-   that day.
-4. **GitHub API · Live**: quota for the configured GitHub accounts.
+1. **Productivity**: eight cards for issues opened and closed, pull requests
+   merged, lines changed, time to merge, pull requests opened and closed
+   without merging, and time to first review. Four columns by two rows.
+2. **Per merged pull request**: five compact cards for comments, median lines,
+   behaviors, median time and the share merged by the agent account.
+3. **GitHub API · Live**: avatar-led user and automation account panels side
+   by side, each holding REST and GraphQL budgets.
 
-The page takes the window's width. The sections share five columns, so the
-flow and per-PR numbers sit under the topline's, and each quota account is a
-row: the account, then its budgets. A narrower page uses three columns, then
-two.
+Every metric card has its value, seven-day comparison, weekly history line
+and a ten-bin histogram. Productivity uses larger cards and taller plots than
+per-PR metrics. Borders, colors, spacing and tooltip motion follow the shared
+design system. Narrow layouts reduce columns without horizontal overflow.
 
 ## The day
 
@@ -45,8 +43,9 @@ not refreshed until it is chosen again.
 
 It counts what Current shows: the issues and pull requests your GitHub account
 is involved in, plus what the agent account opened. Without a GitHub account
-in Settings it counts everything in the datastore. The account filter in the
-control bar, shown with two or more accounts, narrows it to one account. It is
+in Settings it counts everything in the datastore. The organization filter in the
+control bar, shown with two or more organizations, narrows it to one. Its
+shared default label is “All orgs”; every selected label is vertically centered. It is
 the same choice Current, Swarm and Archive use, and Analytics reads again when
 it changes.
 
@@ -123,21 +122,30 @@ preceding seven days' first reviews, and names how many there were. The
 arrows read as they do for time to merge: green and downward is faster. A
 zero baseline shows the increase in seconds.
 
+Per-PR comparisons use the preceding seven days' merged population: averages
+for comments and behaviors, medians for lines and time, and the agent's merge
+share. Missing values or partial account/size coverage withhold trend claims.
+
 ## The past year
 
-Under each Productivity figure a chart shows the year before the selected
+Under every metric a chart shows the year before the selected
 day, one point per 7-day period: 52 periods, the last of them the seven days
 before the selected day, which is the figure's own 7-day baseline. Issues
 opened and closed, pull requests merged and lines changed are daily averages
 over each period; time to merge is the mean of the pull requests merged in
-it. Periods are calendar weeks in the timezone from Settings, so a week that
+it. Flow counts use daily averages; first review and per-PR values use the
+same aggregation as their cards. Periods are calendar weeks in the timezone from Settings, so a week that
 crosses a daylight-saving change is 167 or 169 hours long.
 
 The line is grey with a light wash and the latest period is marked in blue.
-Each chart's highest value is named above it. Pointing at a chart, or
+Each chart's highest value is named above it. Hovering for half a second, or
 focusing it and using the arrow keys, Home and End, shows a period's value,
 what it is made of (such as "8 merged" or "Mean of 8 PRs") and its dates.
-"The past year as a table" lists every period, newest first.
+The readout explains the chart and its period boundaries. Below each line,
+ten equal-width bins show the distribution of known weekly values. Empty
+periods stay unknown for metrics that require observations; zero event
+counts remain zero. Hover or focus explains the distribution. There is no
+history table.
 
 A period without merges has no time to merge, and one whose merged pull
 requests are not all sized has no lines total; the line breaks there instead
@@ -162,9 +170,9 @@ charts say "Past year unavailable" and the day's numbers stay.
 ## GitHub API quota
 
 The last section is live, independent of the selected day and organization.
-It shows the configured user and automation GitHub accounts separately, one
-row each; a shared login appears once with both roles. REST, GraphQL, search
-and code search have separate budgets, as returned by GitHub. Each shows used
+It shows the configured user and automation GitHub accounts separately,
+side by side with avatars; a shared login appears once with both roles.
+Only REST and GraphQL budgets appear. Each shows used
 versus total, remaining capacity, next reset in Settings' timezone, minutes
 left, observed use per minute and the remaining sustainable rate.
 
@@ -190,10 +198,21 @@ and the browser tab is visible. The server shares concurrent reads and a
 `GET /rate_limit` does not consume GitHub's primary API quota; it can count
 toward secondary limits. See [GitHub's rate-limit documentation](https://docs.github.com/en/rest/rate-limit/rate-limit).
 
+Each budget shows 24 stacked hourly columns (including this hour) for used
+and remaining quota, normalized to its limit. The latest observation in each
+hour is retained for seven days across restarts. A ten-bin histogram compares
+the distributions of used and remaining percentages across those observations;
+it names the observed hours out of 168. Missing hours are empty, never carried
+forward or invented. History starts collecting when this version first runs.
+Both charts use the existing quota response and unchanged 15-second polling;
+no extra GitHub requests are made. Avatars use the same cached GitHub image
+URLs as other views, without a profile API request.
+
 `GET /api/github-quota` returns `{ accounts }`. Each account contains `login`,
 `roles` (`user`, `automation`), `checkedAt`, `error`, and `buckets`. A bucket
 contains `resource`, `label`, `limit`, `used`, `remaining`, `resetAt`,
-`perMinute`, and `riskPercent`; the last two are null without usable evidence.
+`perMinute`, and `riskPercent`, plus `history` on REST and GraphQL buckets (hourly
+`at`, `used`, `remaining`, `limit` observations); rate and risk are null without usable evidence.
 
 ## Daily analytics API
 
@@ -211,9 +230,13 @@ lists the period edges, comma-separated times with a timezone, increasing,
 2 to 80 of them; each period runs from one edge (inclusive) to the next
 (exclusive). The answer is `{ periods, errors }`: each period has `since`,
 `until`, `issues` (`opened`, `closed`) and `pullRequests` (`merged`, `lines`
-with `total` and `counted`, `averageTimeToMergeMs`), counted exactly as the
-day is. The server reads every period in one pass over sizes and times only.
+with `total`, `median` and `counted`, and every flow and per-PR field from
+the daily report), counted exactly as the day is. The server reads local
+datastores once across all periods and uses the existing behavior ledger;
+this adds no upstream requests.
 
-Section and metric explanations appear after half a second on hover or on
-keyboard focus; missing data and coverage notes remain visible. See
+Measurement explanations appear after half a second on hover or keyboard
+focus. Headings stay plain and have no tooltips or dotted underlines. Risk
+assumptions and sample requirements live on the risk measurement itself;
+missing data and coverage notes remain visible. See
 [Menu and Settings](Menu.md).

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { analyticsDay, analyticsHistoryBounds } from '../src/analytics-day'
-import { historyChart, historySeries, periodLabel, type AnalyticsPeriod } from '../src/analytics-history'
+import { historyChart, histogram, historySeries, periodLabel, type AnalyticsPeriod } from '../src/analytics-history'
 import { setLocalSettings } from '../src/config'
 
 // The past year under the Analytics topline (src/analytics-history.ts).
@@ -10,7 +10,7 @@ afterEach(() => { vi.useRealTimers() })
 function period(i: number, overrides: Partial<AnalyticsPeriod['pullRequests']> = {}, issues = { opened: 14, closed: 7 }): AnalyticsPeriod {
   const since = new Date(Date.UTC(2026, 0, 5 + 7 * i)).toISOString()
   const until = new Date(Date.UTC(2026, 0, 12 + 7 * i)).toISOString()
-  return { since, until, issues, pullRequests: { merged: 7, lines: { total: 700, counted: 7 }, averageTimeToMergeMs: 3_600_000, ...overrides } }
+  return { since, until, issues, pullRequests: { opened: 14, closedUnmerged: 7, merged: 7, mergedByAgent: 3, firstReview: { count: 7, medianMs: 60_000 }, commentsPerPr: 2, lines: { total: 700, median: 100, counted: 7 }, behaviors: { perPr: 1, approvals: 7, reviews: 0, changesRequested: 0 }, averageTimeToMergeMs: 3_600_000, medianTimeToMergeMs: 3_600_000, ...overrides } }
 }
 
 describe('the periods', () => {
@@ -45,7 +45,9 @@ describe('the periods', () => {
 
 describe('the series', () => {
   it('gives the five topline figures as daily averages, and time to merge as each period\'s mean', () => {
-    const series = historySeries({ periods: [period(0), period(1, { merged: 0, lines: { total: null, counted: 0 }, averageTimeToMergeMs: null })], errors: [] })
+    const all = historySeries({ periods: [period(0), period(1, { merged: 0, lines: { total: null, median: null, counted: 0 }, averageTimeToMergeMs: null })], errors: [] })
+    expect(all).toHaveLength(13)
+    const series = all.slice(0, 5)
     expect(series.map((s) => s.label)).toEqual(['Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Time to merge'])
     expect(series.map((s) => s.values)).toEqual([[2, 2], [1, 1], [1, 0], [100, 0], [3_600_000, null]])
     expect(series.map((s) => s.format(s.values[0]))).toEqual(['2.0/day', '1.0/day', '1.0/day', '100/day', '1h'])
@@ -55,9 +57,9 @@ describe('the series', () => {
   })
 
   it('leaves lines unknown where a period has merged pull requests without a size', () => {
-    const series = historySeries({ periods: [period(0, { lines: { total: 500, counted: 5 } })], errors: [] })
+    const series = historySeries({ periods: [period(0, { lines: { total: 500, median: 100, counted: 5 } })], errors: [] })
     expect(series[3].values).toEqual([null])
-    expect(series[3].detail(period(0, { lines: { total: 500, counted: 5 } }))).toBe('Sizes known for 5 of 7')
+    expect(series[3].detail(period(0, { lines: { total: 500, median: 100, counted: 5 } }))).toBe('Sizes known for 5 of 7')
   })
 })
 
@@ -77,5 +79,22 @@ describe('the chart', () => {
   it('draws a flat year on the baseline and an empty one not at all', () => {
     expect(historyChart([0, 0, 0]).points.every((p) => p?.y === 96)).toBe(true)
     expect(historyChart([null, null])).toEqual({ line: '', area: '', points: [null, null], isolated: [], max: null })
+  })
+})
+
+describe('ten-bin distributions', () => {
+  it('includes both boundaries, excludes unknowns, and preserves every observation', () => {
+    const bins = histogram([0, 1, 2, 9, 10, null])
+    expect(bins).toHaveLength(10)
+    expect(bins[0]).toEqual({ from: 0, until: 1, count: 1 })
+    expect(bins[9]).toEqual({ from: 9, until: 10, count: 2 })
+    expect(bins.reduce((sum, bin) => sum + bin.count, 0)).toBe(5)
+    expect(histogram([null]).every((bin) => bin.count === 0)).toBe(true)
+    expect(histogram([4, 4]).map((bin) => bin.count)).toEqual([2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  })
+
+  it('provides all flow and per-PR series from the same periods', () => {
+    const series = historySeries({ periods: [period(0)], errors: [] })
+    expect(series.slice(5).map((item) => item.values[0])).toEqual([2, 1, 60_000, 2, 100, 1, 3_600_000, 3 / 7 * 100])
   })
 })

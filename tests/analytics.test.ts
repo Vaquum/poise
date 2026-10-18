@@ -101,7 +101,7 @@ describe('the periods of a history', () => {
       ],
     })
     expect(history.errors).toEqual([])
-    expect(history.periods).toEqual([
+    expect(history.periods).toMatchObject([
       { since: '2026-09-28T00:00:00Z', until: '2026-10-05T00:00:00Z', issues: { opened: 1, closed: 0 },
         pullRequests: { merged: 1, lines: { total: 10, counted: 1 }, averageTimeToMergeMs: 6 * HOUR } },
       { since: '2026-10-05T00:00:00Z', until: '2026-10-12T00:00:00Z', issues: { opened: 1, closed: 1 },
@@ -372,14 +372,14 @@ describe('reading what Current shows', () => {
     seed(pr(4, '2026-09-28T00:00:00Z', '2026-09-29T00:00:00Z', { additions: 3, deletions: 3 }), 'pr', true)
     const bounds = ['2026-09-28T00:00:00.000Z', '2026-10-05T00:00:00.000Z', '2026-10-12T00:00:00.000Z']
     const history = await readAnalyticsHistory(bounds, 'alpha')
-    expect(history.periods.map((p) => [p.issues.opened, p.pullRequests.merged, p.pullRequests.lines])).toEqual([
+    expect(history.periods.map((p) => [p.issues.opened, p.pullRequests.merged, { total: p.pullRequests.lines.total, counted: p.pullRequests.lines.counted }])).toEqual([
       [0, 1, { total: 6, counted: 1 }],
       [2, 2, { total: 14, counted: 2 }],
     ])
     // The second period is the week the day report reads, and agrees with it.
     const week = await readAnalytics({ since: bounds[1], until: bounds[2] }, 'alpha')
     expect(history.periods[1].issues).toEqual(week.issues)
-    expect(history.periods[1].pullRequests).toEqual({ merged: week.pullRequests.merged, lines: { total: week.pullRequests.lines.total, counted: week.pullRequests.lines.counted }, averageTimeToMergeMs: week.pullRequests.averageTimeToMergeMs })
+    expect(history.periods[1].pullRequests).toEqual(week.pullRequests)
     expect((await readAnalyticsHistory(bounds, 'beta')).periods.every((p) => p.pullRequests.merged === 0)).toBe(true)
     expect(mocks.runFile).not.toHaveBeenCalled()
   })

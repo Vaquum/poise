@@ -66,16 +66,12 @@ export interface AnalyticsReport {
   errors: OrganizationReadError[]
 }
 
-/** The headline numbers of one period of a history. */
+/** The same metrics as the selected day, aggregated over one history period. */
 export interface AnalyticsPeriod {
   since: string
   until: string
-  issues: { opened: number, closed: number }
-  pullRequests: {
-    merged: number
-    lines: { total: number | null, counted: number }
-    averageTimeToMergeMs: number | null
-  }
+  issues: AnalyticsReport['issues']
+  pullRequests: AnalyticsReport['pullRequests']
 }
 
 export interface AnalyticsHistory {
@@ -212,13 +208,14 @@ export function computeHistory(input: {
   issues: DatastoreRecord[]
   prs: DatastoreRecord[]
   errors?: OrganizationReadError[]
+  behaviors?: CompletedBehaviorAction[]
+  agent?: string
 }): AnalyticsHistory {
   return {
     periods: input.bounds.slice(1).map((until, i) => {
       const since = input.bounds[i]
-      const report = computeAnalytics({ window: { since, until }, issues: input.issues, prs: input.prs, behaviors: [] })
-      const { merged, lines, averageTimeToMergeMs } = report.pullRequests
-      return { since, until, issues: report.issues, pullRequests: { merged, lines: { total: lines.total, counted: lines.counted }, averageTimeToMergeMs } }
+      const report = computeAnalytics({ window: { since, until }, issues: input.issues, prs: input.prs, behaviors: input.behaviors ?? [], agent: input.agent })
+      return { since, until, issues: report.issues, pullRequests: report.pullRequests }
     }),
     errors: input.errors ?? [],
   }
@@ -227,8 +224,7 @@ export function computeHistory(input: {
 // Read the same datastore views and involvement scopes as Current without
 // starting Python for every scope. Project only fields used by the report:
 // unused view columns can parse large payloads and count entire discussions.
-// A lean read, for a history, takes sizes and times only.
-async function readOrganization(org: Organization, me: string, window: AnalyticsWindow, lean = false): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[] }> {
+async function readOrganization(org: Organization, me: string, window: AnalyticsWindow): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[] }> {
   const path = org.datastorePath ?? join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'github-datastore', 'github_datastore.sqlite')
   const db = new Database(path, { readonly: true, fileMustExist: true, timeout: 1_000 })
   try {
@@ -258,7 +254,7 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         // A pending review is not submitted, and an author's own review is a
         // reply. A review counts unless it is known to be the author's: a
         // deleted account leaves either login NULL.
-        const details = kind === 'pr' && lean ? 'additions, deletions' : kind === 'pr' ? `pr_ref, comments_count, review_comments_count, additions, deletions,
+        const details = kind === 'pr' ? `pr_ref, comments_count, review_comments_count, additions, deletions,
           (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = pr_ref AND r.submitted_at IS NOT NULL
             AND r.state <> 'PENDING' AND (r.author_login IS NULL OR author IS NULL OR lower(r.author_login) <> lower(author))) AS first_review_at`
           : '0 AS comments_count'
@@ -272,7 +268,6 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         return rows
       }
       const prs = read('pr')
-      if (lean) return { issues: read('issue'), prs }
       // Who merged lives in the stored payload, so only the merges this
       // report counts are parsed.
       const merged = prs.filter((pr) => pr.status === 'merged' && inWindow(pr.closed_at, window))
@@ -285,11 +280,11 @@ async function readOrganization(org: Organization, me: string, window: Analytics
   }
 }
 
-async function readScoped(window: AnalyticsWindow, orgLogin: string | undefined, lean: boolean): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[], errors: OrganizationReadError[] }> {
+async function readScoped(window: AnalyticsWindow, orgLogin: string | undefined): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[], errors: OrganizationReadError[] }> {
   const orgs = selectOrganizations(orgLogin)
   if (!orgs.length) throw new HttpError(409, 'No GitHub account is ready yet')
   const me = getMeta('me') || ''
-  const results = await Promise.allSettled(orgs.map((org) => readOrganization(org, me, window, lean)))
+  const results = await Promise.allSettled(orgs.map((org) => readOrganization(org, me, window)))
   const issues: DatastoreRecord[] = []
   const prs: DatastoreRecord[] = []
   const errors: OrganizationReadError[] = []
@@ -311,12 +306,12 @@ async function readScoped(window: AnalyticsWindow, orgLogin: string | undefined,
 }
 
 export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string): Promise<AnalyticsReport> {
-  const { issues, prs, errors } = await readScoped(window, orgLogin, false)
+  const { issues, prs, errors } = await readScoped(window, orgLogin)
   return computeAnalytics({ window, issues, prs, behaviors: listCompletedBehaviorActions(), agent: agentAccount(), errors })
 }
 
-/** One lean read across every period, then each period counted alike. */
+/** One local datastore read across every period, then each period counted alike. */
 export async function readAnalyticsHistory(bounds: string[], orgLogin?: string): Promise<AnalyticsHistory> {
-  const { issues, prs, errors } = await readScoped({ since: bounds[0], until: bounds.at(-1)! }, orgLogin, true)
-  return computeHistory({ bounds, issues, prs, errors })
+  const { issues, prs, errors } = await readScoped({ since: bounds[0], until: bounds.at(-1)! }, orgLogin)
+  return computeHistory({ bounds, issues, prs, errors, behaviors: listCompletedBehaviorActions(), agent: agentAccount() })
 }

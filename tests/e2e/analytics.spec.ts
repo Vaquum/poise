@@ -30,7 +30,7 @@ function history(bounds: string[]): AnalyticsHistory {
     const quiet = i % 13 === 0
     const merged = quiet ? 0 : 7 + i % 5
     return { since: bounds[i], until, issues: { opened: i % 9, closed: (i * 3) % 7 },
-      pullRequests: { merged, lines: { total: quiet ? null : 700 + 50 * (i % 6), counted: merged }, averageTimeToMergeMs: quiet ? null : (10 + i % 7) * 3_600_000 } }
+      pullRequests: { ...report(merged).pullRequests, lines: { total: quiet ? null : 700 + 50 * (i % 6), median: quiet ? null : 100 + i, counted: merged }, averageTimeToMergeMs: quiet ? null : (10 + i % 7) * 3_600_000 } }
   }) }
 }
 
@@ -109,7 +109,8 @@ function quotaReport(): GithubQuotaReport {
   return { accounts: [{
     login: 'octocat', roles: ['user', 'automation'], checkedAt: '2026-10-09T12:00:00Z', error: null,
     buckets: ['REST API', 'GraphQL', 'Search', 'Code search'].map((label, index) => ({
-      resource: String(index), label, limit: 5000, used: 3000, remaining: 2000, resetAt: '2026-10-09T12:30:00Z', perMinute: 75, riskPercent: [25, 50, 90, 0][index],
+      history: Array.from({ length: 24 }, (_, hour) => ({ at: Date.parse('2026-10-09T12:00:00Z') - (23 - hour) * 3_600_000, used: hour * 100, remaining: 5000 - hour * 100, limit: 5000 })),
+      resource: ['core', 'graphql', 'search', 'code_search'][index], label, limit: 5000, used: 3000, remaining: 2000, resetAt: '2026-10-09T12:30:00Z', perMinute: 75, riskPercent: [25, 50, 90, 0][index],
     })),
   }, { login: 'octo-agent', roles: ['automation'], checkedAt: null, error: 'GitHub authentication is unavailable for octo-agent.', buckets: [] }] }
 }
@@ -129,30 +130,33 @@ test('opens from the burger as a view of its own: productivity topline, per merg
   await expect(page.locator('#menu-popover [data-action="analytics"]')).toHaveAttribute('aria-current', 'page')
   await expect(page.locator('#menu-toggle')).toBeFocused()
   await expect(page.locator('#menu-toggle')).toHaveAttribute('aria-expanded', 'false')
-  await expect(view.locator('main h2')).toHaveText(['Productivity', 'Pull request flow', 'Per merged pull request', 'GitHub API · Live'])
+  await expect(view.locator('main h2')).toHaveText(['Productivity', 'Per merged pull request', 'GitHub API · Live'])
   const topline = view.getByRole('region', { name: 'Productivity' })
-  const flow = view.getByRole('region', { name: 'Pull request flow' })
+  const flow = topline
   const perPr = view.getByRole('region', { name: 'Per merged pull request' })
   const quota = view.getByRole('region', { name: 'GitHub API · Live' })
-  await expect(topline.locator('.analytics-label')).toHaveText(['Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Time to merge'])
-  await expect(flow.locator('.analytics-label')).toHaveText(['Pull requests opened', 'Closed without merging', 'Time to first review'])
+  await expect(topline.locator('.analytics-label')).toHaveText(['Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Time to merge', 'Pull requests opened', 'Closed without merging', 'Time to first review'])
   await expect(perPr.locator('.analytics-label')).toHaveText(['Comments', 'Median lines', 'Behaviors', 'Median time', 'Merged by agent'])
   // Seconds matter: agents review within minutes.
   await expect(value(page, 'Time to first review')).toHaveText('1m 15s')
-  await expect(flow).toContainText('Faster vs 7-day median')
+  await expect(flow.locator('[data-help="Faster vs 7-day median"]')).toBeVisible()
   await expect(flow).toContainText('7-day median: 2m 30s · 3 first reviews')
   await expect(value(page, 'Merged by agent')).toHaveText('75%')
-  await expect(perPr).toContainText('3 of 4 by octo-agent')
-  await expect(quota.locator('.github-quota-bucket')).toHaveCount(4)
+  await expect(perPr.locator('.analytics-value').last()).toHaveAttribute('data-help', /3 of 4 by octo-agent/)
+  await expect(quota.locator('.github-quota-bucket')).toHaveCount(2)
   // The window, not the reading column: the five topline numbers share one
   // row, the per-PR numbers sit under them, and each account is a row.
   expect(await view.locator('main').evaluate((main) => main.getBoundingClientRect().width)).toBeGreaterThan(1200)
   const tops = await topline.locator('.analytics-tile').evaluateAll((tiles) => tiles.map((tile) => Math.round(tile.getBoundingClientRect().top)))
-  expect(new Set(tops).size).toBe(1)
-  const columns = await lefts(topline, '.analytics-tile')
-  expect(await lefts(flow, '.analytics-tile')).toEqual(columns.slice(0, 3))
-  expect(await lefts(perPr, '.analytics-tile')).toEqual(columns)
-  expect(await lefts(quota.locator('.github-quota-account').first(), '.github-quota-identity, .github-quota-bucket')).toEqual(columns)
+  expect(new Set(tops).size).toBe(2)
+  expect(new Set(await lefts(topline, '.analytics-tile')).size).toBe(4)
+  expect(new Set(await lefts(perPr, '.analytics-tile')).size).toBe(5)
+  const accounts = await quota.locator('.github-quota-account').evaluateAll((items) => items.map((item) => item.getBoundingClientRect().top))
+  expect(new Set(accounts).size).toBe(1)
+  await expect(quota.locator('.github-quota-avatar')).toHaveCount(2)
+  await expect(quota.locator('.github-quota-bucket h4')).toHaveText(['REST API', 'GraphQL'])
+  await expect(view.locator('.analytics-histogram svg rect')).toHaveCount(130)
+  await expect(perPr.locator('.analytics-note')).toHaveCount(5)
   await page.screenshot({ path: info.outputPath('analytics-view.png'), fullPage: true })
 
   await page.reload()
@@ -192,12 +196,12 @@ test('keeps the topline on one row beside a docked notification rail', async ({ 
   await expect(page.locator('body')).toHaveClass(/notifications-docked/)
   await openAnalytics(page)
   const topline = page.getByRole('region', { name: 'Productivity' })
-  await expect(topline.locator('.analytics-tile')).toHaveCount(5)
+  await expect(topline.locator('.analytics-tile')).toHaveCount(8)
   const main = (await page.locator('#view-analytics main').boundingBox())!
   const rail = (await page.getByRole('complementary', { name: 'Notifications' }).boundingBox())!
   expect(main.x + main.width).toBeLessThanOrEqual(rail.x + 1)
   const tops = await topline.locator('.analytics-tile').evaluateAll((tiles) => tiles.map((tile) => Math.round(tile.getBoundingClientRect().top)))
-  expect(new Set(tops).size).toBe(1)
+  expect(new Set(tops).size).toBe(2)
 })
 
 test('draws each headline figure\'s past year by 7-day period, ending at the selected day', async ({ page }, info) => {
@@ -206,25 +210,29 @@ test('draws each headline figure\'s past year by 7-day period, ending at the sel
   await openAnalytics(page)
   const topline = page.getByRole('region', { name: 'Productivity' })
   const plots = topline.locator('.analytics-history-plot')
-  await expect(plots).toHaveCount(5)
-  await expect(topline.locator('.analytics-history-latest')).toHaveCount(5)
+  await expect(plots).toHaveCount(8)
+  await expect(topline.locator('.analytics-history-latest')).toHaveCount(8)
   // The charts share one floor even where a figure above has no trend line.
-  await expect(topline.locator('.analytics-tile').filter({ hasText: 'Lines changed' }).locator('.analytics-trend')).toHaveCount(0)
-  expect(new Set(await plots.evaluateAll((items) => items.map((item) => Math.round(item.getBoundingClientRect().bottom)))).size).toBe(1)
+  await expect(topline.locator('.analytics-tile').filter({ hasText: 'Lines changed' }).locator('.analytics-trend [role=img]')).toHaveCount(0)
+  expect(new Set(await plots.evaluateAll((items) => items.map((item) => Math.round(item.getBoundingClientRect().bottom)))).size).toBe(2)
   for (const plot of await plots.all()) await expect(plot.locator('.analytics-history-line')).toHaveAttribute('d', /^M[\d.]+ [\d.]+ L/)
   // Weeks without a merge leave time to merge unknown, not zero.
   await expect(topline.locator('.analytics-history[data-series="Time to merge"] .analytics-history-line')).toHaveAttribute('d', / M/)
-  await expect(topline.locator('.analytics-history[data-series="Pull requests merged"] .analytics-history-max')).toHaveText('Max 1.6/day')
+  await expect(topline.locator('.analytics-history[data-series="Pull requests merged"] .analytics-history-max')).toHaveText('52 weeksMax 1.6/day')
   expect(state.historyReads).toHaveLength(1)
   const [{ bounds, org }] = state.historyReads
   expect(bounds).toHaveLength(53)
   expect([bounds[0], bounds.at(-2), bounds.at(-1), org]).toEqual(['2025-10-10T00:00:00.000Z', '2026-10-02T00:00:00.000Z', '2026-10-09T00:00:00.000Z', null])
-  await expect(topline).toContainText('The last period is the 7 days before the selected day.')
+  await expect(topline).not.toContainText('Under each figure')
+  await expect(topline.locator('table, details')).toHaveCount(0)
 
   const merged = topline.locator('.analytics-history[data-series="Pull requests merged"]')
   const box = (await merged.locator('.analytics-history-plot').boundingBox())!
   await page.mouse.move(box.x + box.width - 1, box.y + box.height / 2)
   const tip = merged.locator('.analytics-history-tip')
+  await expect(tip).toHaveCount(0)
+  await expect(tip).toBeVisible()
+  await expect(tip.locator('small')).toContainText('Last period: the 7 days before the selected day.')
   await expect(tip.locator('strong')).toHaveText('1.1/day')
   await expect(tip.locator('span')).toHaveText('8 merged · 2 Oct – 8 Oct 2026')
   await page.screenshot({ path: info.outputPath('analytics-history.png') })
@@ -238,15 +246,11 @@ test('draws each headline figure\'s past year by 7-day period, ending at the sel
   await expect(tip.locator('span')).toHaveText(/^7 merged · 25 Sept? – 1 Oct 2026$/)
   await page.keyboard.press('Home')
   await expect(tip.locator('span')).toHaveText('0 merged · 10 Oct – 16 Oct 2025')
-
-  await topline.getByText('The past year as a table').click()
-  const rows = topline.locator('.analytics-history-table tbody tr')
-  await expect(rows).toHaveCount(52)
-  await expect(rows.first().locator('td')).toHaveText(['2 Oct – 8 Oct 2026', '0.9/day', '0.9/day', '1.1/day', '121/day', '12h'])
-  await expect(topline.locator('.analytics-history-table thead th')).toHaveText(['Period', 'Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Time to merge'])
+  await page.keyboard.press('Escape')
+  await expect(tip).toHaveCount(0)
 
   await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
-  await page.locator('#analytics-filters').getByLabel('Account filter').selectOption('beta')
+  await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('beta')
   await expect.poll(() => state.historyReads.at(-1)?.org).toBe('beta')
   expect(state.historyReads.at(-1)!.bounds.at(-1)).toBe('2026-10-08T00:00:00.000Z')
 })
@@ -279,7 +283,7 @@ test('stops reading quota once another view is chosen', async ({ page }) => {
   await page.route('**/api/github-quota', (route) => route.fulfill({ json: quotaReport() }))
   await page.goto('/')
   await openAnalytics(page)
-  await expect(page.locator('.github-quota-bucket')).toHaveCount(4)
+  await expect(page.locator('.github-quota-bucket')).toHaveCount(2)
   // The 15-second timer and a returning tab both refresh through one guard.
   const refresh = async () => {
     const read = page.waitForRequest('**/api/github-quota', { timeout: 1_000 }).then(() => true, () => false)
@@ -303,27 +307,30 @@ for (const theme of ['light', 'dark']) test(`fits a narrow window and large text
   await openAnalytics(page)
   const view = page.locator('#view-analytics')
   await expect(value(page, 'Pull requests merged')).toHaveText('4')
-  await expect(view.locator('.github-quota-bucket')).toHaveCount(4)
+  await expect(view.locator('.github-quota-bucket')).toHaveCount(2)
   expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
   const clipped = await view.locator('.analytics-day > *').evaluateAll((items) => items.map((item) => item.scrollWidth - item.clientWidth))
   expect(Math.max(...clipped)).toBeLessThanOrEqual(1)
   expect(new Set(await lefts(view.getByRole('region', { name: 'Productivity' }), '.analytics-tile')).size).toBe(2)
-  await expect(view.locator('.analytics-history-line')).toHaveCount(5)
+  await expect(view.locator('.analytics-history-line')).toHaveCount(13)
+  const overflows = await view.locator('.analytics-tile').evaluateAll((tiles) => tiles.map((tile) => {
+    const histogram = tile.querySelector('.analytics-histogram')!
+    return histogram.getBoundingClientRect().bottom - tile.getBoundingClientRect().bottom
+  }))
+  expect(Math.max(...overflows)).toBeLessThanOrEqual(-8)
   await page.screenshot({ path: info.outputPath(`analytics-narrow-${theme}.png`), fullPage: true })
   // A readout wider than a right-column chart stays on the page.
   const closed = view.locator('.analytics-history[data-series="Issues closed"] .analytics-history-plot')
   const plot = (await closed.boundingBox())!
   await page.mouse.move(plot.x + plot.width - 1, plot.y + plot.height / 2)
+  await expect(closed.locator('.analytics-history-tip')).toBeVisible()
   const tip = (await closed.locator('.analytics-history-tip').boundingBox())!
   const main = (await view.locator('main').boundingBox())!
   expect(tip.width).toBeGreaterThan(plot.width)
   expect(tip.x).toBeGreaterThanOrEqual(main.x - 1)
   expect(tip.x + tip.width).toBeLessThanOrEqual(main.x + main.width + 1)
   await page.mouse.move(0, 0)
-  // The year's table scrolls in its own box instead of widening the page.
-  await view.getByText('The past year as a table').click()
-  await expect(view.locator('.analytics-history-table tbody tr')).toHaveCount(52)
-  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+  await expect(view.locator('.analytics-history-table')).toHaveCount(0)
 })
 
 test('shows live account quota below daily analytics with usage, resets and risk colors', async ({ page }, info) => {
@@ -331,7 +338,7 @@ test('shows live account quota below daily analytics with usage, resets and risk
   const quota: GithubQuotaReport = { accounts: [{
     login: 'octocat', roles: ['user', 'automation'], checkedAt: '2026-10-09T12:00:00Z', error: null,
     buckets: [25, 50, 90, 0, null].map((riskPercent, index) => ({
-      resource: String(index), label: ['REST API', 'GraphQL', 'Search', 'Code search', 'Collecting'][index],
+      resource: ['core', 'graphql', 'search', 'code_search', 'other'][index], label: ['REST API', 'GraphQL', 'Search', 'Code search', 'Collecting'][index],
       limit: 5000, used: 3000, remaining: 2000, resetAt: '2026-10-09T12:30:00Z', perMinute: index === 4 ? null : 75, riskPercent,
     })),
   }, { login: 'octo-agent', roles: ['automation'], checkedAt: null, error: 'GitHub authentication is unavailable for octo-agent.', buckets: [] }] }
@@ -339,7 +346,7 @@ test('shows live account quota below daily analytics with usage, resets and risk
   await page.goto('/')
   await openAnalytics(page)
   const section = page.getByRole('region', { name: 'GitHub API · Live' })
-  await expect(section).toContainText('octocat user + automation')
+  await expect(section).toContainText('octocatuser + automation')
   await expect(section.locator('.github-quota-account')).toHaveCount(2)
   await expect(section).toContainText('3,000 / 5,000 used · 2,000 left')
   await expect(section).toContainText('12:30:00 UTC · 30.0 min left')
@@ -348,20 +355,21 @@ test('shows live account quota below daily analytics with usage, resets and risk
   await expect(risk.nth(0)).toHaveClass(/yellow/)
   await expect(risk.nth(0)).toHaveText('25% estimated risk')
   await expect(risk.nth(1)).toHaveClass(/orange/)
-  await expect(risk.nth(2)).toHaveClass(/red/)
-  await expect(risk.nth(3)).not.toHaveClass(/yellow|orange|red/)
-  await expect(risk.nth(4)).toHaveText('Risk: collecting samples…')
   await expect(section).toContainText('GitHub authentication is unavailable for octo-agent.')
   expect(await section.evaluate((element) => element.previousElementSibling?.className)).toBe('analytics-groups')
   await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
   await expect(risk.nth(0)).toHaveText('25% estimated risk')
   await risk.nth(1).scrollIntoViewIfNeeded()
   await page.screenshot({ path: info.outputPath('github-quota.png') })
+  const avatar = section.locator('.github-quota-avatar img').first()
+  await expect(avatar).toHaveClass(/broken/)
   quota.accounts[0].buckets[0].remaining = 0
   quota.accounts[0].buckets[0].used = 5000
   quota.accounts[0].buckets[0].riskPercent = 100
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
   await expect(risk.nth(0)).toHaveText('100% estimated risk · Exhausted')
+  await expect(avatar).toHaveClass(/broken/)
+  await expect(avatar).toBeHidden()
 })
 
 test('shows quota read failure and refreshes it without retaining stale values', async ({ page }) => {
@@ -395,7 +403,7 @@ test('opens Today with a seven-day comparison and navigates days without changin
   await expect(value(page, 'Lines changed')).toHaveText('4,210')
   await expect(value(page, 'Time to merge')).toHaveText('1d 3h')
   await expect(value(page, 'Comments')).toHaveText('3.3')
-  await expect(value(page, 'Median lines')).toHaveText('180')
+  await expect(value(page, 'Median lines')).toHaveText('—')
   await expect(value(page, 'Behaviors')).toHaveText('2.0')
   await expect(value(page, 'Median time')).toHaveText('6h')
   await expect(panel.locator('.analytics-group').last().locator('.analytics-label').nth(3)).toHaveText('Median time')
@@ -417,7 +425,7 @@ test('opens Today with a seven-day comparison and navigates days without changin
   await expect(panel.getByRole('button', { name: 'Next day' })).toBeEnabled()
   await expect(value(page, 'Pull requests merged')).toHaveText('0')
   await expect(value(page, 'Median time')).toHaveText('—')
-  await expect(mergeTrend(page)).toHaveCount(0)
+  await expect(mergeTrend(page).getByRole('img')).toHaveCount(0)
   await expect(panel).toContainText('No pull requests were merged in this range.')
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await expect(panel.locator('.analytics-date')).toHaveText('7 Oct 2026')
@@ -446,7 +454,7 @@ test('reads both periods for the selected account and shows slower merges in red
   await openAnalytics(page)
   await expect(value(page, 'Pull requests merged')).toHaveText('4')
   state.baselineHours = 9
-  await page.locator('#analytics-filters').getByLabel('Account filter').selectOption('beta')
+  await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('beta')
   await expect.poll(() => state.reads.slice(-2)).toEqual([
     { since: '2026-10-09T00:00:00.000Z', until: '2026-10-10T00:00:00.000Z', org: 'beta' },
     { since: '2026-10-02T00:00:00.000Z', until: '2026-10-09T00:00:00.000Z', org: 'beta' },
@@ -462,7 +470,7 @@ test('names an empty baseline instead of inventing a trend', async ({ page }) =>
   await page.goto('/')
   await openAnalytics(page)
   await expect(value(page, 'Time to merge')).toHaveText('1d 3h')
-  await expect(mergeTrend(page)).toHaveCount(0)
+  await expect(mergeTrend(page).getByRole('img')).toHaveCount(0)
   await expect(page.locator('#view-analytics')).toContainText('7-day rolling average: — · 0 PRs · No baseline')
 })
 
@@ -569,7 +577,7 @@ test('shows the standard loader with no old values on initial load, day/account 
     expect(await quotaTop()).toBe(settledTop)
     await page.screenshot({ path: info.outputPath('analytics-loading.png') })
     await loaded('0')
-    await page.locator('#analytics-filters').getByLabel('Account filter').selectOption('beta')
+    await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('beta')
     await pending()
     await loaded('0')
     await leaveAnalytics(page)
@@ -597,4 +605,104 @@ test('clears a previous read error while retrying with the loader', async ({ pag
     await expect(panel.locator('.analytics-tile')).toHaveCount(0)
   } finally { release() }
   await expect(value(page, 'Pull requests merged')).toHaveText('0')
+})
+
+test('shows quota charts from the existing read and centers every organization selection', async ({ page }) => {
+  const state = await workspace(page)
+  let reads = 0
+  await page.route('**/api/github-quota', (route) => { reads++; return route.fulfill({ json: quotaReport() }) })
+  await page.goto('/')
+  await openAnalytics(page)
+  const view = page.locator('#view-analytics')
+  await expect(view.locator('.quota-hour')).toHaveCount(48)
+  await expect(view.locator('.quota-hour-empty')).toHaveCount(0)
+  await expect(view.locator('.quota-distribution rect')).toHaveCount(40)
+  await expect(view.locator('.github-quota-avatar img').first()).toHaveAttribute('src', 'https://github.com/octocat.png?size=80')
+  await expect(view.locator('.github-quota-avatar').first()).toHaveCSS('border-radius', '999px')
+  await expect(view.locator('.analytics-history-latest').first()).toHaveCSS('border-radius', '999px')
+  expect(reads).toBe(1)
+  expect(state.reads).toHaveLength(2)
+  expect(state.historyReads).toHaveLength(1)
+  const filter = view.getByLabel('Organization filter')
+  await expect(filter.locator('option')).toHaveText(['All orgs', 'acme', 'beta'])
+  for (const selection of ['', 'acme', 'beta']) {
+    await filter.selectOption(selection)
+    const geometry = await filter.evaluate((select) => {
+      const style = getComputedStyle(select)
+      return { height: select.getBoundingClientRect().height, line: parseFloat(style.lineHeight), top: parseFloat(style.paddingTop), bottom: parseFloat(style.paddingBottom), border: parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth) }
+    })
+    expect(geometry.top).toBe(geometry.bottom)
+    expect(geometry.line + geometry.border).toBe(geometry.height)
+  }
+})
+
+test('attaches delayed help to measurements, with plain headings and no quota explainer', async ({ page }) => {
+  await workspace(page)
+  await page.route('**/api/github-quota', (route) => route.fulfill({ json: quotaReport() }))
+  await page.goto('/')
+  await openAnalytics(page)
+  const view = page.locator('#view-analytics')
+  await expect(view.locator('h2[data-help], dt[data-help]')).toHaveCount(0)
+  await expect(view).not.toContainText('Estimated risk of running out before reset, assuming recent usage continues.')
+  await expect(view.locator('.analytics-value[data-help]')).toHaveCount(13)
+  const figure = value(page, 'Behaviors')
+  await figure.scrollIntoViewIfNeeded()
+  await page.mouse.move(0, 0)
+  await figure.hover()
+  const tooltip = page.getByRole('tooltip')
+  await expect(tooltip).toBeHidden()
+  await expect(tooltip).toBeVisible()
+  await expect(tooltip).toContainText('Mean completed review and approval behaviors')
+  await expect(figure).toHaveCSS('text-decoration-line', 'none')
+  await page.mouse.move(0, 0)
+  await expect(tooltip).toBeHidden()
+})
+
+test('caps seven-day quota charts at 168 hours and visibly explains an unset agent', async ({ page }) => {
+  await workspace(page)
+  const quota = quotaReport()
+  const now = Date.parse('2026-10-09T12:00:00Z')
+  quota.accounts[0].buckets[0].history = Array.from({ length: 169 }, (_, i) => ({ at: now - i * 3_600_000, used: 100, remaining: 4900, limit: 5000 }))
+  await page.route('**/api/github-quota', route => route.fulfill({ json: quota }))
+  await page.route('**/api/analytics?**', route => route.fulfill({ json: { ...report(4), agentAccount: null, pullRequests: { ...report(4).pullRequests, mergedByAgent: null } } }))
+  await page.goto('/')
+  await openAnalytics(page)
+  await expect(page.locator('.quota-charts').first()).toContainText('168/168 hours')
+  const agent = page.locator('.analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: /^Merged by agent$/ }) })
+  await expect(agent.locator('.analytics-value')).toHaveText('—')
+  await expect(agent.locator('.analytics-note')).toHaveText('No agent account in Settings')
+})
+
+test('reopens a chart readout after keyboard focus leaves while the pointer stays inside', async ({ page }) => {
+  await workspace(page)
+  await page.goto('/')
+  await openAnalytics(page)
+  const plot = page.locator('.analytics-history[data-series="Issues opened"] .analytics-history-plot')
+  const tip = plot.locator('.analytics-history-tip')
+  await plot.hover()
+  await expect(tip).toBeVisible()
+  await plot.focus()
+  await page.keyboard.press('Tab')
+  await expect(tip).toHaveCount(0)
+  const box = (await plot.boundingBox())!
+  await page.mouse.move(box.x + box.width * .6, box.y + box.height / 2)
+  await expect(tip).toBeVisible()
+})
+
+test('keyboard selection takes precedence over a pending pointer readout', async ({ page }) => {
+  await page.clock.install({ time: new Date('2026-10-09T12:00:00Z') })
+  await workspace(page)
+  await page.goto('/')
+  await openAnalytics(page)
+  const plot = page.locator('.analytics-history[data-series="Issues opened"] .analytics-history-plot')
+  await expect(plot.locator('.analytics-history-line')).toBeVisible()
+  await page.clock.pauseAt(new Date('2026-10-09T12:01:00Z'))
+  await page.mouse.move(0, 0)
+  await plot.focus()
+  const box = (await plot.boundingBox())!
+  await page.mouse.move(box.x + 1, box.y + box.height / 2)
+  await page.keyboard.press('End')
+  await expect(plot.locator('.analytics-history-tip span')).toHaveText('6 opened · 2 Oct – 8 Oct 2026')
+  await page.clock.runFor(600)
+  await expect(plot.locator('.analytics-history-tip span')).toHaveText('6 opened · 2 Oct – 8 Oct 2026')
 })

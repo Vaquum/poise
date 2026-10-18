@@ -185,7 +185,7 @@ test('Archive ignores a count from the previous account filter', async ({ page }
   try {
     await page.goto('/')
     await expect(page.locator('#tbody')).toContainText('Available GitHub issue', { timeout: 2000 })
-    await page.locator('#main-filters').getByLabel('Account filter').selectOption('beta')
+    await page.locator('#main-filters').getByLabel('Organization filter').selectOption('beta')
     await expect(page.locator('#count')).toHaveText('1 / 42')
     const oldResponse = page.waitForResponse((response) => response.url().endsWith('/api/gh')
       && response.request().postDataJSON().count_only && !response.request().postDataJSON().org)

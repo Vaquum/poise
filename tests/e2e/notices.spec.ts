@@ -296,7 +296,7 @@ test('focuses an older grouped failure while already in Swarm, clears filters, a
   await expect(page.locator('#swarm-empty')).toHaveText('No runs match this filter.')
   const accountLoaded = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/agent-logs'
     && new URL(response.url()).searchParams.get('org') === 'beta')
-  await page.locator('#swarm-filters').getByRole('combobox', { name: 'Account filter' }).selectOption('beta')
+  await page.locator('#swarm-filters').getByRole('combobox', { name: 'Organization filter' }).selectOption('beta')
   await accountLoaded
   // Docked, the rail stays beside Swarm while the run is found.
   await openRail(page)
@@ -307,7 +307,7 @@ test('focuses an older grouped failure while already in Swarm, clears filters, a
   await expect(focused).toHaveClass(/agent-row-focus/)
   await expect(focused.getByRole('button', { name: 'Toggle detail' })).toBeFocused()
   await expect(page.locator('#swarm-search')).toHaveValue('')
-  await expect(page.locator('#swarm-filters').getByRole('combobox', { name: 'Account filter' })).toHaveValue('')
+  await expect(page.locator('#swarm-filters').getByRole('combobox', { name: 'Organization filter' })).toHaveValue('')
   await expect(page.locator(`.agent-row[data-id="${newest}"]`)).not.toHaveClass(/agent-row-focus/)
   await expect(page.locator(`.agent-expand-row[data-expand-for="${HELD_CALL}"]`)).toContainText('The provider rejected this review.')
   await expect(focused).toBeInViewport()
@@ -366,7 +366,7 @@ test('keeps the last opened notice in control when two navigations share a pendi
   await expect(page.locator(`.agent-row[data-id="${HELD_CALL}"]`)).toBeVisible()
   const accountLoaded = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/agent-logs'
     && new URL(response.url()).searchParams.get('org') === 'beta')
-  const account = page.locator('#swarm-filters').getByRole('combobox', { name: 'Account filter' })
+  const account = page.locator('#swarm-filters').getByRole('combobox', { name: 'Organization filter' })
   await account.selectOption('beta')
   await accountLoaded
   await expect(page.locator(`.agent-row[data-id="${insideCall}"]`)).toBeVisible()

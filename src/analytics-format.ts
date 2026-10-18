@@ -31,7 +31,7 @@ export interface AnalyticsTile {
 
 export interface AnalyticsGroup {
   /** Names the section on the page; the productivity topline comes first. */
-  id: 'productivity' | 'flow' | 'per-merged-pr'
+  id: 'productivity' | 'per-merged-pr'
   label: string
   /** What the section counts, shown over its heading. */
   help: string
@@ -78,9 +78,8 @@ function plural(n: number, one: string, many: string): string {
 }
 
 /** A duration trend names faster or slower against the 7-day average or median. */
-function metricTrend(current: number | null, baseline: number | null, duration?: { format: (ms: number) => string, basis: 'average' | 'median' }): AnalyticsTile['trend'] {
+function metricTrend(current: number | null, baseline: number | null, duration?: { format: (ms: number) => string, basis: 'average' | 'median' }, basis = duration?.basis ?? 'average', daily = true): AnalyticsTile['trend'] {
   if (current === null || baseline === null) return undefined
-  const basis = duration?.basis ?? 'average'
   const delta = current - baseline
   const direction = delta === 0 ? 'neutral' : (duration ? delta < 0 : delta > 0) ? 'good' : 'bad'
   const percent = baseline === 0 ? 0 : Math.abs(delta / baseline * 100)
@@ -91,7 +90,7 @@ function metricTrend(current: number | null, baseline: number | null, duration?:
   const description = delta === 0 ? 'Unchanged' : `${change} ${movement}`
   const caption = delta === 0 ? `Same as 7-day ${basis}` : duration
     ? `${delta < 0 ? 'Faster' : 'Slower'} vs 7-day ${basis}`
-    : `${delta < 0 ? 'Below' : 'Above'} 7-day daily average`
+    : `${delta < 0 ? 'Below' : 'Above'} 7-day ${daily ? 'daily ' : ''}${basis}`
   return { direction, caption, text: `${delta < 0 ? '↓' : delta > 0 ? '↑' : '→'} ${delta === 0 ? '0%' : change}`, description: `${description} versus the preceding 7-day ${basis}` }
 }
 
@@ -123,6 +122,12 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
     linesNote = `From ${formatCount(lines.counted)} of ${plural(pr.merged, 'pull request', 'pull requests')}`
   }
 
+  const perPr = (label: string, current: number | null, previous: number | null, format: (n: number | null) => string, median = false, duration = false): AnalyticsTile => ({
+    label, value: format(current),
+    trend: complete ? metricTrend(current, previous, duration ? { format: formatDuration, basis: 'median' } : undefined, median ? 'median' : 'average', false) : undefined,
+    comparison: `7-day ${median ? 'median' : 'average'}: ${format(previous)} · ${plural(baseline.pullRequests.merged, 'PR', 'PRs')}`,
+  })
+
   return [
     {
       id: 'productivity',
@@ -141,14 +146,6 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
           trend: !complete ? undefined : mergeTimeTrend(pr.averageTimeToMergeMs, baseline.pullRequests.averageTimeToMergeMs),
           comparison: `7-day rolling average: ${formatDuration(baseline.pullRequests.averageTimeToMergeMs)} · ${plural(baseline.pullRequests.merged, 'PR', 'PRs')}${baseline.pullRequests.merged ? '' : ' · No baseline'}`,
         },
-      ],
-      note: linesNote,
-    },
-    {
-      id: 'flow',
-      label: 'Pull request flow',
-      help: 'Pull requests opened, closed without merging and first reviewed on the selected day, against the seven days before it.',
-      tiles: [
         dailyCount('Pull requests opened', pr.opened, baseline.pullRequests.opened),
         dailyCount('Closed without merging', pr.closedUnmerged, baseline.pullRequests.closedUnmerged),
         {
@@ -158,30 +155,29 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
           comparison: `7-day median: ${formatShortDuration(baseline.pullRequests.firstReview.medianMs)} · ${plural(baseline.pullRequests.firstReview.count, 'first review', 'first reviews')}`,
         },
       ],
-      note: pr.firstReview.count ? undefined : 'No pull request had its first review in this range.',
+      note: [linesNote, pr.firstReview.count ? '' : 'No pull request had its first review in this range.'].filter(Boolean).join(' '),
     },
     {
       id: 'per-merged-pr',
       label: 'Per merged pull request',
       help: 'Over the pull requests merged on the selected day.',
       tiles: [
-        { label: 'Comments', value: formatRate(pr.commentsPerPr) },
-        { label: 'Median lines', value: lines.median === null ? UNKNOWN : formatCount(Math.round(lines.median)) },
+        perPr('Comments', pr.commentsPerPr, baseline.pullRequests.commentsPerPr, formatRate),
+        perPr('Median lines', lines.counted < pr.merged ? null : lines.median, baseline.pullRequests.lines.counted < baseline.pullRequests.merged ? null : baseline.pullRequests.lines.median, (n) => n === null ? UNKNOWN : formatCount(Math.round(n)), true),
         {
-          label: 'Behaviors',
-          value: formatRate(behaviors.perPr),
+          ...perPr('Behaviors', behaviors.perPr, baseline.pullRequests.behaviors.perPr, formatRate),
           note: none ? undefined : [
             plural(behaviors.approvals, 'approval', 'approvals'),
             plural(behaviors.reviews, 'review', 'reviews'),
             plural(behaviors.changesRequested, 'change request', 'change requests'),
           ].join(' · '),
         },
-        { label: 'Median time', value: formatDuration(pr.medianTimeToMergeMs), note: 'Median, from opened to merged' },
+        { ...perPr('Median time', pr.medianTimeToMergeMs, baseline.pullRequests.medianTimeToMergeMs, formatDuration, true, true), note: 'Median, from opened to merged' },
         {
-          label: 'Merged by agent',
+          ...perPr('Merged by agent', pr.mergedByAgent === null || none ? null : pr.mergedByAgent / pr.merged * 100, baseline.pullRequests.mergedByAgent === null || !baseline.pullRequests.merged ? null : baseline.pullRequests.mergedByAgent / baseline.pullRequests.merged * 100, (n) => n === null ? UNKNOWN : `${formatRate(n)}%`),
           value: pr.mergedByAgent === null || none ? UNKNOWN : `${Math.round(pr.mergedByAgent / pr.merged * 100)}%`,
-          note: 'Share of these pull requests that the agent account from Settings merged',
-          comparison: report.agentAccount === null ? 'No agent account in Settings' : none ? undefined : `${formatCount(pr.mergedByAgent ?? 0)} of ${formatCount(pr.merged)} by ${report.agentAccount}`,
+          ...(report.agentAccount === null ? { comparison: 'No agent account in Settings' } : {}),
+          note: report.agentAccount === null || none ? undefined : `${formatCount(pr.mergedByAgent ?? 0)} of ${formatCount(pr.merged)} by ${report.agentAccount}`,
         },
       ],
       note: none ? 'No pull requests were merged in this range.' : undefined,

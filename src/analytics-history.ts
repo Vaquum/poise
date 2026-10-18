@@ -2,17 +2,13 @@
 // /api/analytics/history (server/analytics.ts). Kept free of the DOM so the
 // numbers and the chart geometry are testable.
 
-import { formatCount, formatDuration, formatRate } from './analytics-format'
+import { formatCount, formatDuration, formatRate, formatShortDuration, type AnalyticsReport } from './analytics-format'
 
 export interface AnalyticsPeriod {
   since: string
   until: string
-  issues: { opened: number, closed: number }
-  pullRequests: {
-    merged: number
-    lines: { total: number | null, counted: number }
-    averageTimeToMergeMs: number | null
-  }
+  issues: AnalyticsReport['issues']
+  pullRequests: AnalyticsReport['pullRequests']
 }
 
 export interface AnalyticsHistory {
@@ -25,7 +21,7 @@ export interface HistorySeries {
   label: string
   /** One value per period, oldest first; null where it is unknown. */
   values: Array<number | null>
-  /** A value as the chart, its tooltip and the table say it. */
+  /** A value as the chart, its tooltip say it. */
   format: (value: number | null) => string
   /** What the value is made of in one period. */
   detail: (period: AnalyticsPeriod) => string
@@ -37,7 +33,7 @@ function perDay(value: number | null): string {
   return value === null ? '—' : `${formatRate(value)}/day`
 }
 
-/** The five topline figures over the periods: counts as daily averages, time to merge as each period's mean. */
+/** All metric figures over the periods: counts as daily averages, time to merge as each period's mean. */
 export function historySeries(history: AnalyticsHistory): HistorySeries[] {
   const { periods } = history
   return [
@@ -59,6 +55,16 @@ export function historySeries(history: AnalyticsHistory): HistorySeries[] {
       format: formatDuration,
       detail: ({ pullRequests: pr }) => pr.merged ? `Mean of ${formatCount(pr.merged)} ${pr.merged === 1 ? 'PR' : 'PRs'}` : 'No merges',
     },
+    { label: 'Pull requests opened', values: periods.map((p) => p.pullRequests.opened / PERIOD_DAYS), format: perDay, detail: (p) => `${formatCount(p.pullRequests.opened)} opened` },
+    { label: 'Closed without merging', values: periods.map((p) => p.pullRequests.closedUnmerged / PERIOD_DAYS), format: perDay, detail: (p) => `${formatCount(p.pullRequests.closedUnmerged)} closed unmerged` },
+    { label: 'Time to first review', values: periods.map((p) => p.pullRequests.firstReview.medianMs), format: formatShortDuration, detail: (p) => `Median of ${formatCount(p.pullRequests.firstReview.count)} first reviews` },
+    ...[
+      { label: 'Comments', value: (pr: AnalyticsPeriod['pullRequests']) => pr.commentsPerPr, format: formatRate },
+      { label: 'Median lines', value: (pr: AnalyticsPeriod['pullRequests']) => pr.lines.counted < pr.merged ? null : pr.lines.median, format: (n: number | null) => n === null ? '—' : formatCount(Math.round(n)) },
+      { label: 'Behaviors', value: (pr: AnalyticsPeriod['pullRequests']) => pr.behaviors.perPr, format: formatRate },
+      { label: 'Median time', value: (pr: AnalyticsPeriod['pullRequests']) => pr.medianTimeToMergeMs, format: formatDuration },
+      { label: 'Merged by agent', value: (pr: AnalyticsPeriod['pullRequests']) => pr.merged && pr.mergedByAgent !== null ? pr.mergedByAgent / pr.merged * 100 : null, format: (n: number | null) => n === null ? '—' : `${formatRate(n)}%` },
+    ].map(({ label, value, format }) => ({ label, values: periods.map((p) => value(p.pullRequests)), format, detail: (p: AnalyticsPeriod) => `Over ${formatCount(p.pullRequests.merged)} merged PRs` })),
   ]
 }
 
@@ -115,4 +121,17 @@ export function historyChart(values: Array<number | null>): HistoryChart {
     isolated: runs.filter((run) => run.length === 1).map((run) => run[0]),
     max,
   }
+}
+
+export interface HistogramBin { from: number, until: number, count: number }
+
+/** Equal-width bins; unknown observations never enter the distribution. */
+export function histogram(values: Array<number | null>, min?: number, max?: number): HistogramBin[] {
+  const known = values.filter((n): n is number => n !== null && Number.isFinite(n))
+  const low = min ?? (known.length ? Math.min(...known) : 0)
+  const high = max ?? (known.length ? Math.max(...known) : 0)
+  const width = (high - low || Math.max(1, Math.abs(low) * 0.1)) / 10
+  const bins = Array.from({ length: 10 }, (_, i) => ({ from: low + width * i, until: low + width * (i + 1), count: 0 }))
+  for (const n of known) bins[Math.max(0, Math.min(9, Math.floor((n - low) / width)))].count++
+  return bins
 }

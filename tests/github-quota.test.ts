@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { quotaRiskTone } from '../src/github-quota'
+import { quotaHours, quotaRiskTone } from '../src/github-quota'
 import type { GithubQuotaAccount } from '../src/github-quota'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
@@ -213,4 +213,41 @@ describe('quota notifications', () => {
     await vi.advanceTimersByTimeAsync(180_000)
     expect(mocks.runFile).toHaveBeenCalledTimes(count)
   })
+})
+
+describe('quota chart observations', () => {
+  it('persists one latest snapshot per hour across resets and restarts without extra upstream reads', async () => {
+    quota.quotaBuckets(payload(100), 'octocat', T0)
+    quota.quotaBuckets(payload(300), 'octocat', T0 + 60_000)
+    let bucket = quota.quotaBuckets(payload(40, reset + 3600), 'octocat', T0 + 3_600_000)[0]
+    expect(bucket.history?.map((sample) => sample.used)).toEqual([300, 40])
+    vi.resetModules()
+    quota = await import('../server/github-quota')
+    database = await import('../server/db')
+    bucket = quota.quotaBuckets(payload(50, reset + 7200), 'octocat', T0 + 7_200_000)[0]
+    expect(bucket.history?.map((sample) => sample.used)).toEqual([300, 40, 50])
+    expect(mocks.runFile).not.toHaveBeenCalled()
+    bucket = quota.quotaBuckets(payload(20, reset + 8 * 86_400), 'octocat', T0 + 8 * 86_400_000)[0]
+    expect(bucket.history).toHaveLength(1)
+    expect(bucket.history?.[0].used).toBe(20)
+  })
+
+  it('gives exactly 24 slots and leaves unobserved hours unknown', () => {
+    const samples = [{ at: T0, used: 100, remaining: 4900, limit: 5000 }]
+    const hours = quotaHours(samples, T0 + 3_600_000)
+    expect(hours).toHaveLength(24)
+    expect(hours.filter(Boolean)).toEqual(samples)
+    expect(hours[22]).toEqual(samples[0])
+    expect(hours[23]).toBeNull()
+  })
+})
+
+it('retains exactly 168 hourly slots including this hour after a full week', () => {
+  const now = T0 + 30 * 60_000
+  const history = Array.from({ length: 169 }, (_, i) => ({ at: now - (168 - i) * 3_600_000, used: i, remaining: 5000 - i, limit: 5000 }))
+  database.setMeta('github-quota:hours:octocat:core', JSON.stringify(history))
+  const bucket = quota.quotaBuckets(payload(200), 'octocat', now)[0]
+  expect(bucket.history).toHaveLength(168)
+  expect(bucket.history?.[0].at).toBe(now - 167 * 3_600_000)
+  expect(bucket.history?.at(-1)?.used).toBe(200)
 })

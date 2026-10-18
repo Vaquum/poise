@@ -171,7 +171,7 @@ test('switching accounts supersedes an older pending full-history read', async (
   try {
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
     await expect(page.locator(rows)).toHaveCount(50)
-    await page.locator('#view-swarm').getByLabel('Account filter').selectOption('beta')
+    await page.locator('#view-swarm').getByLabel('Organization filter').selectOption('beta')
     await expect(page.locator(rows)).toHaveCount(1)
     await expect(page.locator(rows)).toContainText('beta')
     older.release()

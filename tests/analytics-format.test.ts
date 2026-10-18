@@ -52,14 +52,13 @@ describe('Analytics wording', () => {
   it('leads with the productivity topline, then pull request flow, then the numbers per merged pull request', () => {
     const groups = analyticsGroups(report())
     expect(groups.map((group) => [group.id, group.label])).toEqual([
-      ['productivity', 'Productivity'], ['flow', 'Pull request flow'], ['per-merged-pr', 'Per merged pull request'],
+      ['productivity', 'Productivity'], ['per-merged-pr', 'Per merged pull request'],
     ])
     expect(groups.map((group) => group.tiles.map((t) => [t.label, t.value]))).toEqual([
-      [['Issues opened', '1,204'], ['Issues closed', '1'], ['Pull requests merged', '4'], ['Lines changed', '12,345'], ['Time to merge', '1d 2h']],
-      [['Pull requests opened', '6'], ['Closed without merging', '1'], ['Time to first review', '1m 35s']],
+      [['Issues opened', '1,204'], ['Issues closed', '1'], ['Pull requests merged', '4'], ['Lines changed', '12,345'], ['Time to merge', '1d 2h'], ['Pull requests opened', '6'], ['Closed without merging', '1'], ['Time to first review', '1m 35s']],
       [['Comments', '2.3'], ['Median lines', '181'], ['Behaviors', '1.5'], ['Median time', '5h'], ['Merged by agent', '75%']],
     ])
-    expect(tile(groups, 'Merged by agent').comparison).toBe('3 of 4 by robot')
+    expect(tile(groups, 'Merged by agent').note).toBe('3 of 4 by robot')
     expect(groups.every((group) => group.help)).toBe(true)
     expect(tile(groups, 'Behaviors').note).toBe('1 approval · 4 reviews · 1 change request')
     expect(groups.every((group) => !group.note)).toBe(true)
@@ -92,9 +91,9 @@ describe('Analytics wording', () => {
     expect(tile(groups, 'Comments').value).toBe('—')
     expect(tile(groups, 'Behaviors').note).toBeUndefined()
     expect(tile(groups, 'Merged by agent').value).toBe('—')
-    expect(tile(groups, 'Merged by agent').comparison).toBeUndefined()
-    expect(groups[0].note).toBeUndefined()
-    expect(groups[2].note).toBe('No pull requests were merged in this range.')
+    expect(tile(groups, 'Merged by agent').trend).toBeUndefined()
+    expect(groups[0].note).toBe('')
+    expect(groups[1].note).toBe('No pull requests were merged in this range.')
   })
 })
 
@@ -169,8 +168,16 @@ describe('pull request flow', () => {
   it('says when nothing had its first review, and when no agent account is set', () => {
     const quiet = analyticsGroups(report({ firstReview: { count: 0, medianMs: null } }))
     expect(tile(quiet, 'Time to first review').value).toBe('—')
-    expect(quiet[1].note).toBe('No pull request had its first review in this range.')
+    expect(quiet[0].note).toBe('No pull request had its first review in this range.')
     const unset = analyticsGroups({ ...report({ mergedByAgent: null }), agentAccount: null })
     expect(tile(unset, 'Merged by agent')).toMatchObject({ value: '—', comparison: 'No agent account in Settings' })
   })
+})
+
+it('compares every per-PR metric with the same seven-day population', () => {
+  const day = report({ commentsPerPr: 6, medianTimeToMergeMs: 3_600_000 })
+  const groups = buildGroups(day, report({ commentsPerPr: 3, medianTimeToMergeMs: 7_200_000 }))
+  expect(groups[1].tiles.every((item) => item.trend && item.comparison?.includes('4 PRs'))).toBe(true)
+  expect(tile(groups, 'Comments').trend?.text).toBe('↑ 100%')
+  expect(tile(groups, 'Median time')).toMatchObject({ trend: { direction: 'good', text: '↓ 50%' }, comparison: '7-day median: 2h · 4 PRs' })
 })

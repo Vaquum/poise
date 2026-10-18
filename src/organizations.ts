@@ -25,22 +25,27 @@ export function setSelectedOrganization(org: string): void {
 
 export function mountOrganizationFilter(container: HTMLElement): void {
   if (container.querySelector('.organization-filter')) return
+  const wrapper = document.createElement('span')
+  wrapper.className = 'organization-filter-wrap'
+  wrapper.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>'
   const select = document.createElement('select')
   select.className = 'organization-filter'
-  select.setAttribute('aria-label', 'Account filter')
+  select.setAttribute('aria-label', 'Organization filter')
   const refresh = () => {
     const organizations = getOrganizations().filter((org) => org.status === 'ready')
     const selected = getSelectedOrganization()
-    select.replaceChildren(new Option('All accounts', ''), ...organizations.map((org) => new Option(org.login, org.login)))
+    select.replaceChildren(new Option('All orgs', ''), ...organizations.map((org) => new Option(org.login, org.login)))
     select.value = selected
     select.hidden = organizations.length < 2
+    wrapper.hidden = select.hidden
   }
   refresh()
   select.addEventListener('change', () => setSelectedOrganization(select.value))
   window.addEventListener('poise:organization-filter-changed', refresh)
   window.addEventListener('poise:organizations-changed', refresh)
   window.addEventListener('poise:synced', refresh)
-  container.prepend(select)
+  wrapper.prepend(select)
+  container.prepend(wrapper)
 }
 
 export function organizationErrors(data: { errors?: Array<{ org: string, error: string }> }): string {

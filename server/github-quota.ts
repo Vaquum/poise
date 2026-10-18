@@ -3,7 +3,7 @@ import { openAlerts, raiseAlert, resolveAlert, updateAlertDetails } from './aler
 import { getMeta, setMeta } from './db'
 import { runFile } from './process'
 import { getNotificationSettings, getSettings } from './settings'
-import { GITHUB_QUOTA_REFRESH_MS, type GithubQuotaAccount, type GithubQuotaBucket, type GithubQuotaReport } from '../src/github-quota'
+import { GITHUB_QUOTA_REFRESH_MS, type GithubQuotaAccount, type GithubQuotaBucket, type GithubQuotaReport, type GithubQuotaObservation } from '../src/github-quota'
 
 export const QUOTA_INTERVAL_MS = GITHUB_QUOTA_REFRESH_MS
 const HISTORY_MS = 5 * 60_000
@@ -37,7 +37,7 @@ function object(value: unknown): Record<string, unknown> {
 export function quotaBuckets(value: unknown, login: string, now: number): GithubQuotaBucket[] {
   const resources = object(object(value).resources)
   if (!resources.core) throw new Error('GitHub quota response is missing REST API limits')
-  const histories: Array<[string, Sample[]]> = []
+  const histories: Array<[string, string]> = []
   const buckets = Object.entries(RESOURCES).flatMap(([resource, label]): GithubQuotaBucket[] => {
     if (resources[resource] === undefined) return []
     const row = object(resources[resource])
@@ -51,12 +51,21 @@ export function quotaBuckets(value: unknown, login: string, now: number): Github
     const samples = history.at(-1) && history.at(-1)!.used > used ? [] : history.filter((sample) => sample.reset === reset && sample.at >= now - HISTORY_MS && sample.at < now)
     const first = samples[0]
     const perMinute = first && now - first.at >= QUOTA_INTERVAL_MS ? (used - first.used) * 60_000 / (now - first.at) : null
-    histories.push([key, [...samples, { at: now, used, reset }].slice(-21)])
+    histories.push([key, JSON.stringify([...samples, { at: now, used, reset }].slice(-21))])
+    let observations: GithubQuotaObservation[] | undefined
+    if (resource === 'core' || resource === 'graphql') {
+      const observationKey = `${PREFIX}hours:${login}:${resource}`
+      const persisted = getMeta(observationKey)
+      const hour = Math.floor(now / 3_600_000)
+      const previous: GithubQuotaObservation[] = persisted ? JSON.parse(persisted) : []
+      observations = [...previous.filter((sample) => Math.floor(sample.at / 3_600_000) >= hour - 167 && Math.floor(sample.at / 3_600_000) < hour), { at: now, used, remaining, limit }]
+      histories.push([observationKey, JSON.stringify(observations)])
+    }
     const minutesLeft = Math.max(0, (reset * 1000 - now) / 60_000)
-    return [{ resource, label, limit, used, remaining, resetAt: new Date(reset * 1000).toISOString(), perMinute,
+    return [{ resource, label, limit, used, remaining, resetAt: new Date(reset * 1000).toISOString(), perMinute, ...(observations ? { history: observations } : {}),
       riskPercent: limit === 0 || minutesLeft === 0 ? null : remaining === 0 ? 100 : perMinute === null ? null : exhaustionRisk(remaining, perMinute * minutesLeft) }]
   })
-  for (const [key, samples] of histories) setMeta(key, JSON.stringify(samples))
+  for (const [key, value] of histories) setMeta(key, value)
   return buckets
 }
 

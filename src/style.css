@@ -985,209 +985,106 @@ tr:hover .review-btn { opacity: 1; }
   transform: translateX(0);
 }
 
-/* ── Analytics view (src/views/analytics-view.ts) ──
-   The window rather than the reading column, as in Behaviors, so the five
-   topline numbers share one row. Every section uses the same columns: the
-   per-PR numbers sit under the topline's, and each quota account is a row
-   of its budgets. */
+/* Analytics: shared card rhythm, with larger productivity and compact per-PR plots. */
 #view-analytics main {
   margin-inline: calc(50% - var(--page-w, calc(100vw - var(--scrollbar-w, 0px))) / 2 + 24px);
   container: analytics / inline-size;
 }
-/* The date is the pill's middle segment, wide enough for "30 Sep 2026" so
-   the arrows hold still while it changes. */
-.analytics-date {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 7.5em;
-  padding: var(--sp-1) var(--sp-3);
-  border: 1px solid var(--border);
-  border-right: none;
-  background: var(--surface);
-  color: var(--text);
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-}
-.analytics-day button:disabled { opacity: 0.4; cursor: default; }
+.analytics-date { display: flex; align-items: center; justify-content: center; min-width: 7.5em; padding: var(--sp-1) var(--sp-3); border: var(--b-base); border-right: none; background: var(--surface); color: var(--text); font-size: .75rem; font-weight: 600; white-space: nowrap; }
+.analytics-day button:disabled { opacity: .4; cursor: default; }
 .analytics-day button:disabled:hover { color: var(--text-secondary); background: var(--surface); }
 .analytics-status { margin: 0 0 var(--sp-5); }
-.analytics-group,
-.github-quota-section { margin-bottom: var(--sp-7); }
+.analytics-group, .github-quota-section { margin-bottom: var(--sp-7); }
 #view-analytics .tp-group-label { margin: 0 0 var(--sp-4); }
 #view-analytics [data-help] { cursor: help; }
-#view-analytics .analytics-label[data-help] {
-  text-decoration: underline dotted var(--border);
-  text-underline-offset: 4px;
-}
-#view-analytics [tabindex="0"]:focus-visible {
-  outline: 2px solid var(--a1);
-  outline-offset: 2px;
-}
-.analytics-tiles,
-.github-quota-account {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--sp-5);
-  margin: 0;
-}
-.analytics-tile,
-.github-quota-identity,
-.github-quota-bucket { min-width: 0; }
-.github-quota-identity,
-.github-quota-account > .st-help-error { grid-column: 1 / -1; }
-@container analytics (max-width: 639px) {
-  /* A tile left alone on its row takes the row, so its note has room. */
-  .analytics-tile:last-child:nth-child(odd) { grid-column: 1 / -1; }
-}
-@container analytics (min-width: 640px) {
-  .analytics-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .github-quota-account { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-}
-/* 880px keeps the topline on one row beside a docked notification rail on a
-   1440px window. */
-@container analytics (min-width: 880px) {
-  .analytics-tiles,
-  .github-quota-account { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-  .github-quota-identity { grid-column: auto; }
-  .github-quota-account > .st-help-error { grid-column: 2 / -1; }
-}
-.analytics-label {
-  font-size: 0.6875rem;
-  color: var(--text-tertiary);
-  margin-bottom: var(--sp-1);
-}
-.analytics-value {
-  overflow-wrap: anywhere;
-  margin: 0;
-  font-size: 1.5rem;
-  font-weight: 600;
-  color: var(--text);
-  letter-spacing: -0.02em;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.15;
-}
-/* The topline leads the page. */
-.analytics-group[data-group="productivity"] .analytics-value { font-size: 2rem; }
-.analytics-trend { margin: var(--sp-2) 0 0; font-size: 0.8125rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+#view-analytics [tabindex="0"]:focus-visible { outline: 2px solid var(--a1); outline-offset: 2px; }
+.analytics-tiles, .github-quota-accounts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-3); margin: 0; }
+.analytics-tile, .github-quota-account { min-width: 0; padding: var(--sp-3); border: var(--b-base); border-radius: var(--r-sm); background: var(--surface); }
+.analytics-tile { display: flex; flex-direction: column; }
+.analytics-label { min-height: 1.5em; margin-bottom: var(--sp-2); font-size: .6875rem; line-height: 1.5; color: var(--text-secondary); }
+.analytics-value { overflow-wrap: anywhere; margin: 0; font-size: 1.5rem; font-weight: 600; color: var(--text); letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.15; }
+[data-group="productivity"] .analytics-value { font-size: 2rem; }
+.analytics-trend { min-height: 1.5em; margin: var(--sp-2) 0 0; font-size: .8125rem; line-height: 1.5; font-weight: 600; font-variant-numeric: tabular-nums; }
 .analytics-trend.good { color: var(--green); }
 .analytics-trend.bad { color: var(--red); }
 .analytics-trend.neutral { color: var(--text-secondary); }
-.analytics-trend-caption { display: block; margin-top: 2px; font-size: 0.6875rem; font-weight: 400; }
-.analytics-note {
-  margin: 4px 0 0;
-  font-size: 0.6875rem;
-  color: var(--text-tertiary);
-  line-height: 1.4;
-}
-.analytics-group-note {
-  margin: var(--sp-4) 0 0;
-  font-size: 0.6875rem;
-  color: var(--text-tertiary);
-  line-height: 1.5;
-}
-/* The past year under each headline figure: one point per 7-day period.
-   A grey line with a light wash carries the year; the latest period is the
-   one blue mark. The SVG stretches to the tile, so marks that must stay
-   round are positioned over it in percent. */
-/* A tile is a column, so its chart sits on the row's common floor whether
-   or not the figure above it has a trend line. */
-.analytics-tile:has(> .analytics-history) { display: flex; flex-direction: column; }
-.analytics-history { --history-line: var(--n5); position: relative; margin: auto 0 0; padding-top: var(--sp-3); }
+.analytics-note { margin: var(--sp-1) 0 0; font-size: .6875rem; color: var(--text-tertiary); line-height: 1.5; overflow-wrap: anywhere; }
+.analytics-tile > .analytics-note { min-height: 3em; }
+.analytics-group-note { margin: var(--sp-3) 0 0; font-size: .6875rem; color: var(--text-tertiary); line-height: 1.5; }
+.analytics-history { --history-line: var(--n5); position: relative; min-height: 184px; box-sizing: border-box; margin: auto 0 0; padding-top: var(--sp-4); }
 [data-theme="dark"] .analytics-history { --history-line: var(--n4); }
-.analytics-history-max {
-  display: block;
-  min-height: 1.4em;
-  font-size: 0.625rem;
-  line-height: 1.4;
-  color: var(--text-tertiary);
-  text-align: right;
-}
-.analytics-history-plot {
-  position: relative;
-  height: 48px;
-  margin: 0 4px;
-}
+.analytics-history-max { display: flex; justify-content: space-between; min-height: 1.5em; margin-bottom: var(--sp-2); font-size: .625rem; line-height: 1.5; color: var(--text-tertiary); }
+.analytics-history-plot { position: relative; height: 64px; margin-inline: var(--sp-1); }
 .analytics-history-plot[tabindex] { cursor: crosshair; touch-action: pan-y; }
-.analytics-history-plot:focus-visible { outline: 2px solid var(--a1); outline-offset: 4px; }
 .analytics-history-plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
 .analytics-history-base { stroke: var(--hairline); stroke-width: 1; }
-.analytics-history-area { fill: var(--history-line); opacity: 0.1; }
-.analytics-history-line { fill: none; stroke: var(--history-line); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-.analytics-history-dot,
-.analytics-history-latest,
-.analytics-history-point {
-  position: absolute;
-  width: 8px;
-  height: 8px;
-  margin: -4px 0 0 -4px;
-  border-radius: 50%;
-  box-shadow: 0 0 0 2px var(--bg);
-  pointer-events: none;
-}
+.analytics-history-area { fill: var(--history-line); opacity: .08; }
+.analytics-history-line { fill: none; stroke: var(--history-line); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.analytics-history-dot, .analytics-history-latest, .analytics-history-point { position: absolute; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: var(--r-pill); box-shadow: 0 0 0 2px var(--surface); pointer-events: none; }
 .analytics-history-dot { background: var(--history-line); }
 .analytics-history-latest { background: var(--a1); }
 .analytics-history-point { background: var(--text); }
 .analytics-history-point[hidden] { display: none; }
-.analytics-history-cursor {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 1px;
-  margin-left: -0.5px;
-  background: var(--border);
-  pointer-events: none;
-}
-.analytics-history-tip {
-  position: absolute;
-  bottom: calc(100% + var(--sp-1));
-  z-index: 2;
-  padding: var(--sp-1) var(--sp-2);
-  border: var(--b-base);
-  border-radius: var(--r-sm);
-  background: var(--surface);
-  box-shadow: var(--e-2);
-  font-size: 0.6875rem;
-  line-height: 1.4;
-  white-space: nowrap;
-  pointer-events: none;
-}
-.analytics-history-tip strong { display: block; font-size: 0.8125rem; color: var(--text); }
+.analytics-history-cursor { position: absolute; inset-block: 0; width: 1px; margin-left: -.5px; background: var(--border); pointer-events: none; }
+.analytics-history-tip { position: absolute; bottom: calc(100% + var(--sp-2)); z-index: 2; padding: var(--sp-2) var(--sp-3); border: var(--b-base); border-radius: var(--r-sm); background: var(--surface); box-shadow: var(--e-2); font-size: .6875rem; line-height: 1.5; white-space: nowrap; pointer-events: none; }
+.analytics-history-tip strong { display: block; font-size: .8125rem; color: var(--text); }
 .analytics-history-tip span { color: var(--text-secondary); }
-.analytics-history-empty {
-  display: flex;
-  align-items: center;
-  min-height: calc(48px + 0.875rem);
-  margin: 0;
-  font-size: 0.6875rem;
-  color: var(--text-tertiary);
-}
-/* Six columns scroll inside their own box on a narrow page. */
-.analytics-history-table { margin-top: var(--sp-3); font-size: 0.75rem; overflow-x: auto; }
-.analytics-history-table summary { cursor: pointer; color: var(--text-secondary); width: fit-content; }
-.analytics-history-table table { margin-top: var(--sp-3); font-variant-numeric: tabular-nums; }
-.analytics-history-table td:not(:first-child),
-.analytics-history-table th:not(:first-child) { text-align: right; }
-.github-quota-account {
-  padding-bottom: var(--sp-5);
-  margin-bottom: var(--sp-5);
-  border-bottom: var(--b-hair);
-}
-.github-quota-account:last-child { padding-bottom: 0; margin-bottom: 0; border-bottom: none; }
-.github-quota-identity h3 { margin: 0; font-size: 0.8125rem; overflow-wrap: anywhere; }
-.github-quota-identity h3 span { color: var(--text-secondary); font-weight: 400; }
-.github-quota-account > .st-help-error { margin: 0; }
-.github-quota-bucket { font-variant-numeric: tabular-nums; }
-.github-quota-bucket h4 { margin: 0 0 var(--sp-2); font-size: 0.75rem; }
-.github-quota-usage { margin: 0 0 var(--sp-2); font-size: 0.8125rem; }
+.analytics-history-tip small { display: block; max-width: 280px; margin-top: var(--sp-2); white-space: normal; color: var(--text-tertiary); font-size: .6875rem; }
+.analytics-history-empty { display: flex; align-items: center; height: 158px; margin: 0; font-size: .6875rem; color: var(--text-tertiary); }
+.analytics-histogram { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: var(--b-hair); }
+.analytics-histogram svg, .quota-distribution svg { display: block; width: 100%; height: 40px; overflow: visible; }
+.analytics-histogram rect { fill: var(--history-line); opacity: .45; }
+.analytics-histogram rect:hover { fill: var(--a1); opacity: 1; }
+.analytics-chart-axis, .analytics-chart-heading { display: flex; justify-content: space-between; gap: var(--sp-1); color: var(--text-tertiary); font-size: .625rem; line-height: 1.5; font-variant-numeric: tabular-nums; }
+.analytics-chart-axis { margin-top: var(--sp-1); }
+.analytics-chart-axis > span { min-width: 0; overflow-wrap: anywhere; }
+.analytics-chart-axis > span:last-child { text-align: right; }
+[data-group="per-merged-pr"] .analytics-history { min-height: 148px; }
+[data-group="per-merged-pr"] .analytics-history-plot { height: 40px; }
+[data-group="per-merged-pr"] .analytics-histogram svg { height: 28px; }
+[data-group="per-merged-pr"] .analytics-history-empty { height: 122px; }
+.github-quota-accounts { grid-template-columns: minmax(0, 1fr); }
+.github-quota-account { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-4); align-content: start; }
+.github-quota-identity { display: flex; align-items: center; gap: var(--sp-3); grid-column: 1 / -1; padding-bottom: var(--sp-3); border-bottom: var(--b-hair); }
+.github-quota-avatar { position: relative; display: flex; align-items: center; justify-content: center; flex: none; width: 40px; height: 40px; border-radius: var(--r-pill); background: var(--n2); color: var(--text-secondary); overflow: hidden; }
+.github-quota-avatar svg { width: 24px; height: 24px; }
+.github-quota-avatar img { position: absolute; inset: 0; width: 40px; height: 40px; }
+.github-quota-identity h3 { margin: 0; font-size: .8125rem; overflow-wrap: anywhere; }
+.github-quota-identity .analytics-note { margin: 0; }
+.github-quota-account > .st-help-error { grid-column: 1 / -1; margin: 0; }
+.github-quota-bucket { min-width: 0; font-variant-numeric: tabular-nums; }
+.github-quota-bucket h4 { margin: 0 0 var(--sp-2); font-size: .75rem; }
+.github-quota-usage { margin: 0 0 var(--sp-2); font-size: .8125rem; }
 .github-quota-usage span { color: var(--text-secondary); }
-.github-quota-bucket progress { width: 100%; height: 5px; accent-color: var(--text-secondary); }
-.github-quota-risk { margin: var(--sp-2) 0 0; font-size: 0.8125rem; font-weight: 600; }
-.github-quota-risk.yellow { color: #a07800; }
-.github-quota-risk.orange { color: #c15c00; }
+.github-quota-bucket progress { width: 100%; height: 4px; accent-color: var(--a1); }
+.github-quota-risk { margin: var(--sp-2) 0 0; font-size: .75rem; font-weight: 600; }
+.github-quota-risk.yellow { color: var(--a4); }
+.github-quota-risk.orange { color: var(--a6); }
 .github-quota-risk.red { color: var(--red); }
+.quota-charts { margin-top: var(--sp-4); padding-top: var(--sp-3); border-top: var(--b-hair); }
+.analytics-chart-heading { flex-wrap: wrap; margin-bottom: var(--sp-2); }
+.quota-legend { display: inline-flex; align-items: center; gap: var(--sp-1); }
+.quota-legend i { display: inline-block; width: 6px; height: 6px; }
+.quota-used { background: var(--a1); fill: var(--a1); }
+.quota-left { background: var(--n2); fill: var(--n2); }
+[data-theme="dark"] .quota-left { background: var(--n3); fill: var(--n3); }
+.quota-hours { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); align-items: end; gap: 2px; height: 64px; }
+.quota-hour { display: flex; flex-direction: column; height: 100%; }
+.quota-hour i { display: block; width: 100%; }
+.quota-hour-empty { border-bottom: 1px dotted var(--text-tertiary); }
+.quota-charts > .analytics-chart-heading:not(:first-child) { margin-top: var(--sp-4); }
+@container analytics (max-width: 639px) {
+  [data-group="per-merged-pr"] .analytics-tile:last-child { grid-column: 1 / -1; }
+  .analytics-histogram .analytics-chart-axis > span:nth-child(2) { display: none; }
+}
+@container analytics (min-width: 640px) {
+  .analytics-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@container analytics (min-width: 880px) {
+  .analytics-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  [data-group="per-merged-pr"] .analytics-tiles { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .github-quota-accounts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 .tp-header {
   display: flex;
@@ -6744,14 +6641,19 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
   min-width: 150px;
   max-width: 240px;
   height: 30px;
-  padding: var(--sp-1) var(--sp-2);
+  padding: 0 var(--sp-7) 0 var(--sp-2);
+  appearance: none;
   border: var(--b-base);
   border-radius: var(--r-sm);
   background: var(--bg);
   color: var(--text);
   font: inherit;
+  line-height: 28px;
+  vertical-align: middle;
 }
-.organization-filter[hidden] { display: none; }
+.organization-filter[hidden], .organization-filter-wrap[hidden] { display: none; }
+.organization-filter-wrap { position: relative; display: inline-flex; align-items: center; }
+.organization-filter-wrap svg { position: absolute; right: var(--sp-2); width: 12px; height: 12px; color: var(--text-secondary); pointer-events: none; }
 .st-org-add-row { display: flex; align-items: center; gap: var(--sp-2); }
 .st-org-add-row .st-input { min-width: 0; flex: 1; }
 .st-organizations { display: grid; gap: var(--sp-2); margin-bottom: var(--sp-3); }
