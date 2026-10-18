@@ -1,11 +1,13 @@
 import io
 import json
 import signal
+import subprocess
 import sys
 import tempfile
 from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
+from time import monotonic, sleep
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -74,15 +76,43 @@ class TestProcessDiagnostic(TestCase):
     def test_signal_timeout_missing_binary_and_empty_stderr_are_distinct(self):
         self.fake('import os, signal\nos.kill(os.getpid(), signal.SIGTERM)\n')
         self.assertEqual(self.failure('checkout').diagnostic['signal'], signal.SIGTERM)
-        self.fake('import sys, time\nsys.stderr.write("waiting for peer\\n"); sys.stderr.flush()\ntime.sleep(10)\n')
-        error = self.failure('fetch', timeout=0.1)
-        self.assertIsInstance(error, TimeoutError)
-        self.assertEqual(error.diagnostic['outcome'], 'timed_out')
-        self.assertIn('waiting for peer', str(error))
+        ready = self.root / 'stderr-ready'
+        self.fake('import sys, time\nfrom pathlib import Path\nsys.stderr.write("waiting for peer\\n"); sys.stderr.flush()\n'
+                  f'Path({str(ready)!r}).touch()\ntime.sleep(10)\n')
+        child = subprocess.Popen(['git', 'fetch'], cwd=self.root, env=self.env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            deadline = monotonic() + 3
+            while not ready.exists() and child.poll() is None and monotonic() < deadline:
+                sleep(.01)
+            self.assertTrue(ready.exists(), 'Git fixture did not reach its stderr write')
+            # Test the deadline of an I/O-ready process, independently of interpreter startup.
+            with patch.object(rd.subprocess, 'Popen', return_value=child) as spawn:
+                error = self.failure('fetch', timeout=0.1)
+            spawn.assert_called_once()
+            self.assertIsInstance(error, TimeoutError)
+            self.assertEqual(error.diagnostic['outcome'], 'timed_out')
+            self.assertEqual(error.diagnostic['timeout_seconds'], 0.1)
+            self.assertEqual(child.returncode, -signal.SIGKILL)
+            self.assertIn('waiting for peer', str(error))
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=3)
+            child.stdout.close()
+            child.stderr.close()
         (self.root / 'git').unlink()
         self.assertEqual(self.failure('init').diagnostic['outcome'], 'missing_executable')
         self.fake('raise SystemExit(128)\n')
         self.assertIn('cause unknown', str(self.failure('fetch')))
+
+    def test_silent_process_deadline_keeps_missing_stderr_explicit(self):
+        self.fake('import time\ntime.sleep(10)\n')
+        error = self.failure('fetch', timeout=0.01)
+        self.assertIsInstance(error, TimeoutError)
+        self.assertEqual(error.diagnostic['outcome'], 'timed_out')
+        self.assertEqual(error.diagnostic['stderr'], '')
+        self.assertIn('no stderr was provided; cause unknown', str(error))
 
     def test_malformed_optional_basic_credential_never_masks_the_git_cause(self):
         self.env['EXTRA_AUTHORIZATION'] = 'authorization: basic abc'
