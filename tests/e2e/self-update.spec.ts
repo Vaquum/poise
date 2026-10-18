@@ -545,7 +545,9 @@ test.describe('on a release build', () => {
     await page.waitForFunction(() => sessionStorage.getItem('poise-self-update-reloaded-release') === 'r2', null, { timeout: 25_000 })
     await sock.subscribed('s1')
     await expect(input(page)).toHaveValue('carry me over')
-    expect(loads).toBe(2)
+    // The reloaded document exists, and the socket can resubscribe, before
+    // its load event fires: wait for the count instead of reading it.
+    await expect.poll(() => loads).toBe(2)
     expect(await page.evaluate(() => localStorage.getItem('poise-chat-draft-snapshot'))).toBeNull()
     // Same bundle, same disagreement: the banner says so and the tab stays put.
     await expect(banner).toContainText('did not pick up the new Poise build')
@@ -586,7 +588,7 @@ test.describe('on a release build', () => {
     await expect(page.locator('#settings-panel')).toHaveClass(/open/)
     await page.waitForFunction(() => performance.getEntriesByType('navigation').some((e) => (e as PerformanceNavigationTiming).type === 'reload'), null, { timeout: 15_000 })
     await sock.subscribed('s1')
-    expect(loads).toBe(2)
+    await expect.poll(() => loads).toBe(2)
     await expect(input(page)).toHaveValue('explicit draft')
   })
 
@@ -637,7 +639,7 @@ test.describe('on a release build', () => {
     releaseSave!()
     await expect(page.locator('#editor-meta')).toContainText('saved')
     await page.waitForFunction(() => performance.getEntriesByType('navigation').some((e) => (e as PerformanceNavigationTiming).type === 'reload'), null, { timeout: 15_000 })
-    expect(loads).toBe(2)
+    await expect.poll(() => loads).toBe(2)
   })
 
   test('an explicit Refresh goes past a pending question but not past a half-typed answer', async ({ page }) => {
@@ -668,7 +670,7 @@ test.describe('on a release build', () => {
     await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
     await page.waitForFunction(() => performance.getEntriesByType('navigation').some((e) => (e as PerformanceNavigationTiming).type === 'reload'), null, { timeout: 15_000 })
     await sock.subscribed('s1')
-    expect(loads).toBe(2)
+    await expect.poll(() => loads).toBe(2)
     await expect(page.locator('.chat-question.pending')).toBeVisible()
   })
 })
