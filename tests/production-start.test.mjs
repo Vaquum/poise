@@ -154,7 +154,7 @@ describe('ensureFreshBundle', () => {
   it('keeps the stale stamp after a failed rebuild so the next start retries', async () => {
     await ensureFreshBundle({ root, log: silent, build: async () => writeBundle(root, 'good\n') })
     const stampAfterGoodBuild = await computeBuildStamp(root)
-    await writeFile(join(root, 'src', 'main.ts'), 'export const a = 4\n')
+    await writeFile(join(root, 'src', 'main.ts'), 'export const a = 44\n')
     await ensureFreshBundle({
       root,
       log: silent,
