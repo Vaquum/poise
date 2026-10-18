@@ -132,3 +132,28 @@ if the workflow is now running or green. Diagnostics belong to each workflow,
 so a different successful rerun cannot clear an unresolved hold. A `read_failed`
 receipt proves no write occurred: its intent is released and the visible read
 failure retries with backoff. Errors after the write begins remain held.
+
+## Review preparation diagnostics
+
+Review Git failures retain a version 1 `diagnostic` object in the durable call
+and `agent-interface --logs`. `github-interface` emits the same redacted JSON
+as `caller_diagnostic: …` on stderr; agent-interface preserves it across packet
+acquisition, checkout and inspection. Poise's agent-log API exposes its bounded
+cause as `diagnostic` (identity/process fields under `context`), and validated
+behavior incidents carry `processDiagnostic` alongside their classification.
+
+The evidence records the actual Git subcommand after global options, exit or
+signal, deadline, elapsed time, configured/resolved executable, working path,
+repository/revision and call/correlation identity. Unobserved values are null.
+A timeout is distinct from a killed process; user cancellation and head moves
+keep their existing stopped/superseded lifecycle and retry ownership.
+
+Stderr is drained concurrently, retaining at most 16 KiB plus a truncation
+marker. Partial lines at capture boundaries are omitted to avoid leaking
+credential fragments. Credentials, encoded Git authentication, URL passwords,
+authorization headers and cookies are redacted before CLI output or durable
+storage. Neither stdout, prompts, argv nor the environment enter the diagnostic.
+An empty stderr says the cause is unknown. Explicit ENOSPC/quota evidence also
+records filesystem bytes/inodes measured immediately after the process failure,
+with its own measurement time; unavailable readings are null with the measurement
+error. This is evidence at capture time, never a claim about earlier disk use.

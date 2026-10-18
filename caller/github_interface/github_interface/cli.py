@@ -145,7 +145,8 @@ def main() -> None:
     try:
         result = asyncio.run(behavior(payload))
     except (RuntimeError, ValueError) as error:
-        print(f"error: {error}", file=sys.stderr)
+        diagnostic = getattr(error, "diagnostic", None)
+        print("caller_diagnostic: " + json.dumps(diagnostic) if diagnostic else f"error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
     print(json.dumps(result, separators=(",", ":")) if argv[0] == "--pr-review" else json.dumps(result, indent=2))
 

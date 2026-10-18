@@ -1,4 +1,5 @@
 import { prepareModelClis } from './provider-clis'
+import { parseProcessDiagnostic, type ProcessDiagnostic } from './process-diagnostic'
 // Bridge to the local `agent-interface` CLI for Swarm's data source.
 //
 // Two operations:
@@ -55,6 +56,7 @@ export interface LogEntry {
   error: string
   review_policy?: string | null
   recovery_model?: string | null
+  diagnostic?: ProcessDiagnostic | null
   error_code?: string | null
   // The GitHub review this run submitted (Caller's receipt); tells a
   // reviewer's review apart from a sibling's on the same pull request.
@@ -368,6 +370,7 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     response: optionalString('response'),
     error,
     error_code: optionalString('error_code'),
+    diagnostic: parseProcessDiagnostic(row.diagnostic),
     review_policy: optionalString('review_policy'),
     recovery_model: optionalString('recovery_model'),
     review_id: Number.isSafeInteger(row.review_id) && Number(row.review_id) > 0 ? Number(row.review_id) : null,

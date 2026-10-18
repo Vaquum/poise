@@ -11,11 +11,13 @@ import re
 import signal
 import subprocess
 import tempfile
+from time import monotonic
 import threading
 from pathlib import PurePosixPath
 from typing import Any
 
 from github_interface.client import GitHubClient
+from .process_diagnostic import GitProcessError, StderrCapture, failure
 
 MAX_DIFF_BYTES = 1_350_000
 MAX_PACKET_BYTES = 1_450_000  # Leave room for the governed agent policy.
@@ -30,12 +32,16 @@ class ReviewPacketTooLarge(RuntimeError):
 
 
 def _git(cwd: str, env: dict[str, str], *args: str, limit: int = MAX_DIFF_BYTES, timeout: float = 120) -> bytes:
-    # The credential stays out of argv and errors. Every command is read-only
-    # against GitHub, and all local writes are inside the temporary directory.
-    with tempfile.TemporaryFile() as errors, subprocess.Popen(
-        ["git", *args], cwd=cwd, env=env, stdout=subprocess.PIPE,
-        stderr=errors, start_new_session=True,
-    ) as process:
+    started = monotonic()
+    capture = StderrCapture()
+    try:
+        process = subprocess.Popen(
+            ["git", *args], cwd=cwd, env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True,
+        )
+    except OSError as error:
+        raise failure(cwd, env, args, started, capture, error=error, timeout=timeout) from error
+    with process:
         def stop() -> None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -45,11 +51,13 @@ def _git(cwd: str, env: dict[str, str], *args: str, limit: int = MAX_DIFF_BYTES,
                 process.kill()
 
         timed_out = threading.Event()
-
         def expire() -> None:
-            timed_out.set()
+            if process.poll() is None:
+                timed_out.set()
             stop()
 
+        reader = threading.Thread(target=capture.drain, args=(process.stderr,), daemon=True)
+        reader.start()
         timer = threading.Timer(timeout, expire)
         timer.start()
         try:
@@ -57,15 +65,22 @@ def _git(cwd: str, env: dict[str, str], *args: str, limit: int = MAX_DIFF_BYTES,
             if len(stdout) > limit:
                 stop()
                 raise ReviewPacketTooLarge(f"{PACKET_LIMIT_CODE}: retained review diff exceeds {limit} bytes")
-            if process.wait():
-                if timed_out.is_set():
-                    raise TimeoutError(f"review git {args[0]} timed out after {timeout:g}s")
-                raise RuntimeError(f"review diff git {args[0]} failed (exit {process.returncode})")
+            process.wait()
+            timer.cancel()
+            reader.join(timeout=1)
+            if reader.is_alive():
+                stop()  # A completed leader may leave inherited stderr open.
+                reader.join(timeout=1)
+            if process.returncode:
+                raise failure(cwd, env, args, started, capture, process=process,
+                              timed_out=timed_out.is_set(), timeout=timeout)
             return stdout
         finally:
             timer.cancel()
-            if process.poll() is None:
+            if process.poll() is None or reader.is_alive():
                 stop()
+            process.wait()
+            reader.join(timeout=1)
 
 
 def _env(token: str) -> dict[str, str]:
@@ -172,7 +187,13 @@ async def review_diff(
     env = _env(client.token)
     with tempfile.TemporaryDirectory(prefix="caller-review-") as directory:
         async def git(*args: str, limit: int = MAX_DIFF_BYTES) -> bytes:
-            return await asyncio.to_thread(_git, directory, env, *args, limit=limit)
+            try:
+                return await asyncio.to_thread(_git, directory, env, *args, limit=limit)
+            except GitProcessError as error:
+                error.diagnostic.update(phase="packet_acquisition", repository=f"{owner}/{repo}",
+                                        pr=pull.get("number"), expected_head=head, observed_head=None,
+                                        base_sha=base, merge_base_sha=merge_base)
+                raise
 
         await git("init", "--bare", "--quiet", "--template=")
         await git("remote", "add", "origin", f"https://github.com/{owner}/{repo}.git")

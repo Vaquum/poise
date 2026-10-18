@@ -11,9 +11,10 @@ _current = ContextVar("review_budget", default=None)
 
 
 class ReviewLimitError(RuntimeError):
-    def __init__(self, message, code="model_output_limit"):
+    def __init__(self, message, code="model_output_limit", diagnostic=None):
         super().__init__(message)
         self.code = code
+        self.diagnostic = diagnostic
 
 
 def timeout(cap, *, reserve=0):

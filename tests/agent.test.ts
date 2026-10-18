@@ -91,6 +91,17 @@ describe('agent log compatibility', () => {
     expect(rows.some((r) => r.id === 'b'.repeat(32))).toBe(true)
   })
 
+  it('passes the exact durable process cause into Poise with its call identity', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow({ diagnostic: {
+      version: 1, source: 'caller', severity: 'error', operation: 'fetch', phase: 'checkout', outcome: 'exit',
+      stderr: 'fatal: remote ref missing\nremote: exact cause', stderr_truncated: false,
+      call_id: 'a'.repeat(32), correlation_id: 'run', exit_code: 128, filesystem: null,
+    } })]), stderr: '' })
+    const rows = await fetchAgentLogs()
+    expect(rows[0]?.diagnostic).toMatchObject({ operation: 'fetch', stderr: 'fatal: remote ref missing\nremote: exact cause',
+      context: { call_id: 'a'.repeat(32), correlation_id: 'run', exit_code: 128 } })
+  })
+
   it('keeps a historical unqualified repository row readable', async () => {
     mocks.runFile.mockResolvedValue({
       stdout: JSON.stringify([logRow({ repo: 'legacy-repo' })]),

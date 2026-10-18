@@ -77,6 +77,23 @@ class TestRepositoryLifecycle(TestCase):
             with rr.prepare("/repo", PR, "bot", HEAD, PACKET):
                 self.fail("wrong checkout yielded")
 
+    def test_initial_inspection_process_error_keeps_its_own_phase_path_and_deadline(self):
+        for error in (FileNotFoundError('inspection executable absent'), subprocess.TimeoutExpired('github-interface', 30)):
+            checkout = {}
+            def command(argv, **kwargs):
+                if '--checkout-review' in argv:
+                    checkout['root'] = argv[argv.index('--path') + 1]
+                    return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps({
+                        'action': 'checkout_review', 'repository': 'o/r', 'path': checkout['root'],
+                        'head_sha': HEAD, 'merge_base_sha': 'b' * 40}))
+                raise error
+            with self.subTest(error=type(error).__name__), patch.object(rr.subprocess, 'run', side_effect=command), self.assertRaises(atoms.AgentPreflightError) as failure:
+                with rr.prepare('/repo', PR, 'bot', HEAD, PACKET) as repository:
+                    repository.prompt()
+            self.assertEqual(failure.exception.diagnostic['phase'], 'inspection')
+            self.assertEqual(failure.exception.diagnostic['cwd'], checkout['root'])
+            self.assertEqual(failure.exception.diagnostic['timeout_seconds'], 30)
+
     def test_all_provider_prompts_receive_identical_guidance_and_scoped_access(self):
         repo = SimpleNamespace(root=Path("/tmp/review"), prompt=lambda: "trusted merge-base AGENTS.md guidance")
         for identity in ("opus-5-high", "gpt-6-astra-ultra", "grok-4.6-high", "gemini-3.8-flash-high", "muse-spark-1.3-contributor-max"):

@@ -32,7 +32,7 @@ export function behaviorIncidentDiagnostics(incidents: BehaviorDeadLetter[], sna
       && ['failed', 'error', 'cancelled', 'canceled', 'timed_out', 'timeout'].includes(call.status.toLowerCase())
       && !call.head_sha && call.review_id == null && call.receipts == null && !call.review_comments
     const error = behaviorErrorMessage(fault ? launch?.launchError || incident.error : exact ? call.error || incident.error : incident.error)
-    return { ...incident, error, diagnostic: fault ? diagnosticClassification('invalid_agent_result') : classifyBehaviorDiagnostic(error, {
+    return { ...incident, error, processDiagnostic: exact ? call.diagnostic ?? null : null, diagnostic: fault ? diagnosticClassification('invalid_agent_result') : classifyBehaviorDiagnostic(error, {
       held: !noAction, errorCode: exact ? call.error_code : null,
     }) }
   })

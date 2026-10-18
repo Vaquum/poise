@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 from time import monotonic
 
 from .review_diff import OPAQUE_SUFFIXES, _env, _git
+from .process_diagnostic import GitProcessError
 
 MAX_FILES = 20_000
 MAX_CHECKOUT_BYTES = 256 * 1024 * 1024
@@ -60,7 +61,12 @@ def checkout(owner: str, repo: str, head: str, merge_base: str, token: str,
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise RuntimeError("review checkout timed out")
-        return _git(str(path), env, *args, limit=limit, timeout=remaining if checkout else min(60, remaining))
+        try:
+            return _git(str(path), env, *args, limit=limit, timeout=remaining if checkout else min(60, remaining))
+        except GitProcessError as error:
+            error.diagnostic.update(phase="checkout", repository=f"{owner}/{repo}", expected_head=head,
+                                    observed_head=None, merge_base_sha=merge_base)
+            raise
 
     try:
         git("init", "--quiet", "--template=")
