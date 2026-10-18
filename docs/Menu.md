@@ -1,11 +1,11 @@
 # Menu and Settings
 
 The burger at the top right opens a surface attached to the button. Choose
-Analytics, or a destination under Settings: General, Models, Accounts,
-Publishing or Typography. Service administrators also see Admin. Analytics
-is a view of its own rather than a panel: choosing it closes the menu and
+Analytics, Logging, or a destination under Settings: General, Models, Accounts,
+Publishing or Typography. Service administrators also see Admin. Analytics and Logging
+are views of their own: choosing it closes the menu and
 replaces the page, and the menu marks it as the current page while it shows
-(see [Analytics](Analytics.md)). There is no second tab strip inside
+(see [Analytics](Analytics.md) and [Logging](Logging.md)). There is no second tab strip inside
 Settings. Back returns to the menu on the same surface. The burger becomes
 the single close button while the menu or a panel is open; clicking it or
 pressing Escape closes the surface. Escape inside an account terminal belongs

@@ -12,6 +12,7 @@ import type { DiskWatch } from './disk.js'
 import type { Orchestrator, UpstreamResolver } from './orchestrator.js'
 import { FONT_ORIGIN } from './pages.js'
 import type { Session, Store, User } from './store.js'
+import { LoggingQueryPool } from './diagnostics/query-pool.js'
 
 export const APEX_COOKIE = 'poise_gw'
 export const WORKSPACE_COOKIE = 'poise_ws'
@@ -43,6 +44,9 @@ export interface Principal {
 
 /** What every route needs: dependencies, the public origins and the session rules. */
 export class Context {
+  private loggingReader: LoggingQueryPool | null = null
+  get loggingQueries(): LoggingQueryPool { return this.loggingReader ??= new LoggingQueryPool() }
+  async closeLoggingReads(): Promise<void> { await this.loggingReader?.close() }
   readonly scheme: 'http' | 'https'
   readonly apexOrigin: string
   readonly pageHeaders: Record<string, string>

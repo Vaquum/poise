@@ -1,6 +1,6 @@
 import type { Page } from '@playwright/test'
 
-export async function workspace(page: Page, view = 'current', fontResponse?: Promise<void>, options: { preserveOnReload?: boolean } = {}): Promise<void> {
+export async function workspace(page: Page, view = 'current', fontResponse?: Promise<void>, options: { preserveOnReload?: boolean; realLogging?: boolean; path?: string; timezone?: string } = {}): Promise<void> {
   await page.addInitScript(({ view, preserveOnReload }) => {
     if (preserveOnReload && sessionStorage.getItem('poise-workspace-initialized')) return
     localStorage.clear()
@@ -14,8 +14,9 @@ export async function workspace(page: Page, view = 'current', fontResponse?: Pro
   })
   await page.route('**/api/**', (route) => {
     const path = new URL(route.request().url()).pathname
+    if (options.realLogging && path.startsWith('/api/logging')) return route.continue()
     const organizations = [{ login: 'acme', managed: true, status: 'ready', stage: 'ready', error: null, activatedAt: '2026-10-01T08:00:00Z' }]
-    if (path === '/api/settings') return route.fulfill({ json: { org: 'acme', me: 'octocat', agentAccount: 'octo-agent', timezone: 'UTC', organizations, models: {} } })
+    if (path === '/api/settings') return route.fulfill({ json: { org: 'acme', me: 'octocat', agentAccount: 'octo-agent', timezone: options.timezone ?? 'UTC', organizations, models: {} } })
     if (path === '/api/organizations') return route.fulfill({ json: { organizations } })
     if (path === '/api/workspace') return route.fulfill({ json: { mode: 'local' } })
     if (path === '/api/current') return route.fulfill({ json: { cards: [] } })
@@ -41,6 +42,6 @@ export async function workspace(page: Page, view = 'current', fontResponse?: Pro
     } })
     return route.fulfill({ json: {} })
   })
-  await page.goto('/', { waitUntil: fontResponse ? 'domcontentloaded' : 'load' })
+  await page.goto(options.path ?? '/', { waitUntil: fontResponse ? 'domcontentloaded' : 'load' })
 }
 

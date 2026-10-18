@@ -13,3 +13,8 @@ await build({
   entryPoints: ['server/runtime-diagnostic.ts'], bundle: true, platform: 'node',
   format: 'esm', packages: 'external', outfile: 'dist/runtime-diagnostic.js', logLevel: 'info',
 })
+
+await build({
+  entryPoints: ['gateway/src/diagnostics/query-worker.ts'], bundle: true, platform: 'node',
+  format: 'esm', packages: 'external', outfile: 'dist/query-worker.js', logLevel: 'info',
+})

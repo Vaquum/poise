@@ -149,6 +149,14 @@ the workspace.
     `/_poise/api/admin/users/disable` and `…/enable` take `{ handle }`.
   - Each answers with the updated overview.
 - Failures answer `{ error, message }` with their HTTP status.
+- `GET /_poise/api/logging`, `/logging/events/ID`, `/logging/health` and
+  `/logging/export` read retained central diagnostics through a bounded worker.
+  They require the owner's browser session and exact Origin when one is sent.
+  Explicit `scope=instance` requires current admin access; another workspace's
+  private application/Caller records remain excluded. No assertion scope or
+  workspace fan-out is added. [Logging](Logging.md) defines filters, budgets,
+  scoped cursors and 404/410/503 evidence states. Local `/api/logging` uses the
+  local store and existing loopback checks; service workspaces return 404 there.
 - For local and CI end-to-end runs only, `POISE_INSECURE_HTTP=1` serves plain
   http: the cookies drop `Secure`, and every address the gateway builds,
   including `POISE_PUBLIC_ORIGIN` and `X-Forwarded-Proto`, uses `http`. The

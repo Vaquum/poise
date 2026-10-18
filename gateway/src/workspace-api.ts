@@ -7,6 +7,7 @@ import { header, HttpError, readBody, sendJson } from './http.js'
 import { decideCode, listDevices, revokeDevice } from './link.js'
 import { LINK_INSTALLER_URL, LINK_RELEASES_URL } from './pages.js'
 import type { User } from './store.js'
+import { gatewayLogging } from './logging-api.js'
 
 /**
  * The gateway's JSON API on every workspace host, for the owner's own browser: Poise's Settings pairs
@@ -181,6 +182,16 @@ const ROUTES: Record<string, Route> = {
 }
 
 export async function workspaceApi(ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL, owner: User): Promise<void> {
+  if (url.pathname === '/_poise/api/logging' || url.pathname.startsWith('/_poise/api/logging/')) {
+    try {
+      const principal = browserPrincipal(ctx, req, owner)
+      requireOwnPage(ctx, req, owner, false)
+      return await gatewayLogging(ctx, req, res, url, principal)
+    } catch (error) {
+      if (!(error instanceof HttpError)) throw error
+      return sendJson(res, error.status, { error: error.status === 401 ? 'unauthorized' : 'forbidden', message: error.message })
+    }
+  }
   const route = Object.hasOwn(ROUTES, url.pathname.slice(WORKSPACE_API_PREFIX.length))
     ? ROUTES[url.pathname.slice(WORKSPACE_API_PREFIX.length)]
     : undefined

@@ -1,4 +1,5 @@
 import { startLogging, stopLogging } from './logging'
+import { localLogging, stopLoggingApi } from './logging-api'
 import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
 import type { ServerResponse } from 'node:http'
@@ -222,6 +223,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   dailyModelRefresh = null
   linkApi = null
   await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
+  await stopLoggingApi()
   await stopLogging()
 }
 
@@ -269,6 +271,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           authority = enforceApiRequest(req, { allowedHosts: opts.allowedHosts, service })
         } catch (err) {
           return json(res, httpStatus(err, 403), { error: (err as Error).message })
+        }
+        if (path === '/api/logging' || path.startsWith('/api/logging/')) {
+          if (service) return json(res, 404, { error: 'logging_not_available_here', message: 'Use the gateway Logging API for environment history.' })
+          return localLogging(req, res)
         }
         if (req.method === 'OPTIONS') {
           return json(res, 405, { error: 'cross-origin preflight is not supported' })

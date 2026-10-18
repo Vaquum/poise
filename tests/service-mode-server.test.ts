@@ -268,6 +268,22 @@ describe('Poise in service mode', () => {
     expect((await send('GET', '/api/settings')).status).toBe(200)
   })
 
+  it('never serves Logging environment history through the service workspace query path', async () => {
+    const now = Math.floor(Date.now() / 1000)
+    const invalid = ['malformed', signAssertion(gatewayKeys().privateKey),
+      ...[{ iat: 1, exp: 61 }, { iss: 'foreign' }, { aud: 'workspace:other' }, { sub: 'other' },
+        { iat: now + 120, exp: now + 180 }, { exp: now + 3600 }, { scope: 'unknown' }].map((claims) => signAssertion(gateway.privateKey, claims))]
+    for (const path of ['/api/logging', '/api/logging/health', '/api/logging/export', '/api/logging/events/evt_' + '0'.repeat(16) + '_' + '0'.repeat(64), '/api/logging?incidentId=inc_' + '0'.repeat(16) + '_' + '0'.repeat(64)]) {
+      expect((await send('GET', path)).status).toBe(404)
+      expect((await send('GET', path, fromGateway())).status).toBe(404)
+      expect((await send('GET', path, { peer: GATEWAY_PEER })).status).toBe(401)
+      for (const identity of invalid) expect((await send('GET', path, { ...fromGateway(), identity })).status).toBe(401)
+      for (const scope of ['link', 'admin']) expect((await send('GET', path, fromGateway(scope))).status).toBe(403)
+      expect((await send('GET', path, { ...fromGateway(), origin: 'https://foreign.test' })).status).toBe(403)
+      expect((await send('GET', path, { ...fromGateway(), host: 'foreign.test' })).status).toBe(403)
+    }
+  })
+
   it('answers the container health check and the gateway\'s admin scope only', async () => {
     const health = await send('GET', '/api/service/health')
     expect(health.status).toBe(200)

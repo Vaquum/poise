@@ -150,10 +150,11 @@ export function createGateway(deps: GatewayDeps): Gateway {
   return {
     context: ctx,
     server,
-    close: () => new Promise<void>((resolve, reject) => {
+    close: async () => {
       ctx.agent.destroy()
-      server.close((error) => (error ? reject(error) : resolve()))
+      const stopped = new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
       server.closeAllConnections()
-    }),
+      await Promise.all([stopped, ctx.closeLoggingReads()])
+    },
   }
 }

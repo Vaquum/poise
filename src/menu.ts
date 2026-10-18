@@ -4,7 +4,7 @@ import type { SettingsSection } from './settings'
 import { cancelMotion, motionValue, reveal, spring } from './motion'
 
 // Analytics is a view too, reached from the burger menu rather than the nav.
-type ViewName = 'current' | 'swarm' | 'chat' | 'main' | 'behaviors' | 'snippets' | 'editor' | 'analytics'
+type ViewName = 'current' | 'swarm' | 'chat' | 'main' | 'behaviors' | 'snippets' | 'editor' | 'analytics' | 'logging'
 
 const VIEW_KEY = 'poise-view'
 
@@ -41,7 +41,7 @@ function loadView(): ViewName {
       localStorage.setItem(VIEW_KEY, 'current')
       return 'current'
     }
-    if (v === 'current' || v === 'swarm' || v === 'chat' || v === 'main' || v === 'behaviors' || v === 'snippets' || v === 'editor' || v === 'analytics') return v
+    if (v === 'current' || v === 'swarm' || v === 'chat' || v === 'main' || v === 'behaviors' || v === 'snippets' || v === 'editor' || v === 'analytics' || v === 'logging') return v
   } catch { /* ignore */ }
   return 'current'
 }
@@ -100,6 +100,9 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     <div class="menu-divider menu-release-divider" hidden></div>
     <button type="button" class="menu-item" data-action="analytics">
       <span class="menu-icon">${ICON_ANALYTICS}</span><span class="menu-text">Analytics</span>
+    </button>
+    <button type="button" class="menu-item" data-action="logging">
+      <span class="menu-icon">${ICON_MODELS}</span><span class="menu-text">Logging</span>
     </button>
     <div class="menu-divider"></div>
     <div class="menu-group-label">Settings</div>
@@ -263,12 +266,16 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
   }, { passive: true })
 
   const analyticsItem = menu.querySelector<HTMLButtonElement>('[data-action="analytics"]')!
+  const loggingItem = menu.querySelector<HTMLButtonElement>('[data-action="logging"]')!
   function setActiveItem(): void {
     nav.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === current))
     // No nav item lights up on Analytics, so its menu entry says where you are.
     analyticsItem.classList.toggle('active', current === 'analytics')
     if (current === 'analytics') analyticsItem.setAttribute('aria-current', 'page')
     else analyticsItem.removeAttribute('aria-current')
+    loggingItem.classList.toggle('active', current === 'logging')
+    if (current === 'logging') loggingItem.setAttribute('aria-current', 'page')
+    else loggingItem.removeAttribute('aria-current')
   }
   setActiveItem()
 
@@ -333,6 +340,10 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
       // Closing the menu returns focus to the burger, which first has to move
       // into the new view's header: inside the view just hidden it cannot
       // take focus.
+      mountGlobalControls()
+    }
+    else if (button.dataset.action === 'logging') {
+      current = 'logging'; saveView(current); setActiveItem(); callbacks.onSelectView(current)
       mountGlobalControls()
     }
     syncSurface()

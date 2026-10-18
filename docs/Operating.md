@@ -1,5 +1,17 @@
 # Operating Poise
 
+Open Menu → Logging to investigate retained diagnostics; Export NDJSON downloads
+a fresh bounded snapshot of the applied filters. Diagnostic HTTP reads are for
+the owner's same-origin workspace page. Typing or
+bookmarking an export endpoint is refused by the existing browser guards; an
+operator without that page uses the operator command documented in Logging.
+The page's authenticated `/_poise/api/logging/export` request returns bounded
+NDJSON with `truncated` and `resumeCursor` in its metadata line. Continuing an
+export requires the same filters and that opaque cursor. `scope=instance` is
+an explicit administrator choice. Local installations use `/api/logging/export`
+under the local loopback rules; no browser session token is needed there.
+See [Logging](Logging.md) for access, retention, filters and query budgets.
+
 This guide runs Poise as a service on one Linux server, for yourself and a
 few colleagues. Each person signs in with GitHub at one address and gets
 their own workspace: their own Poise, agent CLIs, GitHub accounts and data,

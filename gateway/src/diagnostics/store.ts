@@ -3,38 +3,16 @@ import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import { scopePrefix, SEVERITIES, type LogEvent, type Severity } from './contract.js'
+import { scopePrefix, SEVERITIES, type LogEvent } from './contract.js'
 
-export interface LogAccess { workspace: string | null; operator: boolean }
-export interface LogFilter {
-  severities?: Severity[]
-  from?: string
-  to?: string
-  source?: string
-  component?: string
-  workspace?: string
-  account?: string
-  repository?: string
-  callId?: string
-  correlationId?: string
-  incidentId?: string
-  search?: string
-  cursor?: string
-  after?: string
-  limit?: number
+import type { LogAccess, LogFilter, Coverage, LogPolicy, LoggingPage } from './query-contract.js'
+export type { LogAccess, LogFilter, Coverage, LogPolicy } from './query-contract.js'
+export function projectCoverage(value: Coverage, access: LogAccess): Coverage {
+  return access.operator || value.workspace === access.workspace ? value : {
+    ...value, id: 'shared_' + createHash('sha256').update(value.id).digest('hex').slice(0, 16), error: value.error ? 'Source unavailable; an operator can inspect the cause.' : null,
+    gaps: value.gaps.map((gap) => ({ ...gap, reason: 'Shared source collection gap' })),
+  }
 }
-export interface Coverage {
-  id: string
-  source: string
-  workspace: string | null
-  status: 'connected' | 'unavailable' | 'partial' | 'not-configured'
-  observedAt: string | null
-  ingestedAt: string | null
-  availableFrom: string | null
-  error: string | null
-  gaps: Array<{ from: string; to: string | null; reason: string }>
-}
-export interface LogPolicy { retentionMs: number; maxBytes: number; maxEvents: number }
 export const DEFAULT_LOG_POLICY: LogPolicy = { retentionMs: 30 * 86_400_000, maxBytes: 64 * 1024 * 1024, maxEvents: 50_000 }
 export const MAX_COVERAGE_SOURCES = 256
 export const MAX_COVERAGE_RECORD_BYTES = 64 * 1024
@@ -191,16 +169,10 @@ export class DiagnosticStore {
 
   readCoverage(access: LogAccess): Coverage[] {
     const rows = this.db.prepare('SELECT payload FROM log_coverage WHERE workspace=? OR workspace IS NULL').all(access.workspace) as Array<{ payload: string }>
-    return rows.map(({ payload }) => {
-      const value = JSON.parse(payload) as Coverage
-      return access.operator || value.workspace === access.workspace ? value : {
-        ...value, id: 'shared_' + createHash('sha256').update(value.id).digest('hex').slice(0, 16), error: value.error ? 'Source unavailable; an operator can inspect the cause.' : null,
-        gaps: value.gaps.map((gap) => ({ ...gap, reason: 'Shared source collection gap' })),
-      }
-    })
+    return rows.map(({ payload }) => projectCoverage(JSON.parse(payload) as Coverage, access))
   }
 
-  query(access: LogAccess, filter: LogFilter = {}) {
+  query(access: LogAccess, filter: LogFilter = {}): LoggingPage {
     const levels = filter.severities ?? [...SEVERITIES]
     if (!Array.isArray(levels) || !levels.every((level) => SEVERITIES.includes(level))) throw new Error('Select only Critical, Error and Warning')
     const limit = filter.limit ?? 50
@@ -244,9 +216,16 @@ export class DiagnosticStore {
     const pageValues = cursor ? [...values, cursor.time, cursor.time, cursor.id, limit + 1] : [...values, limit + 1]
     const rows = this.db.prepare(`SELECT id,sort_time,payload FROM log_events WHERE ${pageWhere} ORDER BY sort_time DESC,id DESC LIMIT ?`).all(...pageValues) as EventRow[]
     const page = rows.slice(0, limit)
+    const occurrenceCounts = new Map<string, number>()
+    const countIncident = this.db.prepare('SELECT COUNT(*) AS count FROM log_events WHERE incident_id=? AND ingested_at>=?')
+    const retentionAfter = new Date(this.now() - this.policy.retentionMs).toISOString()
     const events = page.map((row) => {
       const event = JSON.parse(row.payload) as LogEvent
-      const occurrences = (this.db.prepare('SELECT COUNT(*) AS count FROM log_events WHERE incident_id=? AND ingested_at>=?').get(event.incidentId, new Date(this.now() - this.policy.retentionMs).toISOString()) as { count: number }).count
+      let occurrences = occurrenceCounts.get(event.incidentId)
+      if (occurrences === undefined) {
+        occurrences = (countIncident.get(event.incidentId, retentionAfter) as { count: number }).count
+        occurrenceCounts.set(event.incidentId, occurrences)
+      }
       return { ...event, occurrences }
     })
     const last = page.at(-1)

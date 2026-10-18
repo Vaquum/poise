@@ -2844,7 +2844,8 @@ tr:hover .review-btn { opacity: 1; }
    margins pull <main> out to the same 24px inset the control bar and the
    kanban use; below the column width they resolve to zero. */
 #view-main main,
-#view-swarm main {
+#view-swarm main,
+#view-logging main {
   margin-inline: calc(50% - var(--page-w, 100vw) / 2 + 24px);
 }
 
@@ -3059,7 +3060,7 @@ button.agent-target:hover {
 
 /* A thousand rows scroll a long way; the headers have to stay. */
 #table thead th,
-#swarm-table thead th {
+:is(#swarm-table, #logging-table) thead th {
   position: sticky;
   top: 0;
   z-index: 2;
@@ -3166,7 +3167,7 @@ tr:hover .stop-btn { opacity: 1; }
 
 /* Expanded response row — soft surface so the body reads as a
    continuation of the row above rather than a separate item. */
-#view-swarm tr.agent-expand-row > td {
+:is(#view-swarm, #view-logging) tr.agent-expand-row > td {
   padding: var(--sp-4) var(--sp-5) var(--sp-5) var(--sp-5);
   background: var(--surface);
   border-bottom: var(--b-hair);
@@ -3174,7 +3175,7 @@ tr:hover .stop-btn { opacity: 1; }
 }
 /* The table is window-wide; a response is prose. Keep it at the reading
    width the person set rather than one line across the whole screen. */
-#view-swarm tr.agent-expand-row > td > * {
+:is(#view-swarm, #view-logging) tr.agent-expand-row > td > * {
   max-width: var(--typo-width, 960px);
 }
 
@@ -3188,6 +3189,34 @@ tr:hover .stop-btn { opacity: 1; }
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+#logging-filters { flex-wrap: wrap; }
+#logging-filters .logging-compact[hidden], #logging-new[hidden] { display: none; }
+#logging-filters .logging-compact { display: inline-flex; align-items: center; gap: var(--sp-2); color: var(--text-secondary); font-size: 0.75rem; }
+#logging-filters .st-select { width: auto; margin: 0; }
+.logging-custom:not([hidden]), .logging-exact-fields { display: flex; flex-wrap: wrap; align-items: end; gap: var(--sp-3); margin-block: var(--sp-3); }
+.logging-custom label, .logging-exact-fields label { flex: 1 1 190px; min-width: 0; color: var(--text-secondary); font-size: 0.75rem; }
+.logging-custom .st-input, .logging-exact-fields .st-input { width: 100%; }
+.logging-more { margin-block: var(--sp-3); font-size: 0.8125rem; color: var(--text-secondary); }
+.logging-more summary, .logging-coverage summary { cursor: pointer; }
+.logging-table-wrap { overflow-x: auto; }
+#logging-table { min-width: 1000px; }
+#logging-table th:nth-child(1) { width: 180px; }
+#logging-table th:nth-child(7) { text-align: right; }
+#logging-table .logging-target { max-width: 20ch; overflow: hidden; text-overflow: ellipsis; }
+#logging-table .logging-summary { max-width: 40ch; overflow: hidden; text-overflow: ellipsis; }
+#logging-table .started-cell .agent-status-note { display: block; }
+.logging-pagination { display: flex; align-items: center; gap: var(--sp-3); margin-block: var(--sp-4); }
+.logging-new { margin-block: var(--sp-3); }
+.logging-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-3); margin-block: var(--sp-4); font-size: 0.8125rem; }
+.logging-facts dt { color: var(--text-tertiary); }
+.logging-facts dd { margin: 3px 0 0; overflow-wrap: anywhere; color: var(--text); }
+.logging-evidence { margin-block: var(--sp-4); }
+.logging-linked { margin-block: var(--sp-4); padding: var(--sp-4) var(--sp-5); background: var(--surface); border: var(--b-hair); }
+.logging-linked > * { max-width: var(--typo-width, 960px); }
+.logging-related-list { padding-left: var(--sp-4); overflow-wrap: anywhere; }
+.logging-related-list button { padding: 4px 0; border: 0; background: transparent; color: var(--text-secondary); font: inherit; text-align: left; cursor: pointer; }
+.logging-coverage { margin-block: var(--sp-3); font-size: 0.8125rem; color: var(--text-secondary); }
 
 /* The failure text of a run that failed. Every failed row has one and it was
    rendered nowhere, so diagnosing a failure meant leaving Poise for the CLI. */

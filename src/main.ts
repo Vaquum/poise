@@ -8,6 +8,8 @@ import { initTypography, toggleTypographyPanel, closeTypographyPanel } from './t
 import { initSettings, openSettingsPanel, openSettingsAt, closeSettingsPanel, isFullyConfigured } from './settings'
 import { initMenu } from './menu'
 import { initAnalyticsView, stopAnalyticsRefresh } from './views/analytics-view'
+import { initLoggingView, refreshLoggingView, stopLoggingRefresh } from './views/logging-view'
+import { loggingCallId, loggingHref, type LoggingLink } from './logging'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
 import { initCurrentView, stopCurrentPolling } from './views/current-view'
 import { initSwarmView, stopSwarmRefresh, focusRow as focusSwarmRow, focusCall as focusSwarmCall } from './views/swarm-view'
@@ -38,13 +40,21 @@ const viewBehaviorsEl = document.getElementById('view-behaviors')!
 const viewSnippetsEl = document.getElementById('view-snippets')!
 const viewEditorEl = document.getElementById('view-editor')!
 const viewAnalyticsEl = document.getElementById('view-analytics')!
+const viewLoggingEl = document.getElementById('view-logging')!
 
 const visitedViews = new WeakSet<HTMLElement>()
 
-type ViewSlug = 'main' | 'current' | 'swarm' | 'chat' | 'behaviors' | 'snippets' | 'editor' | 'analytics'
+type ViewSlug = 'main' | 'current' | 'swarm' | 'chat' | 'behaviors' | 'snippets' | 'editor' | 'analytics' | 'logging'
 
 function showView(v: ViewSlug) {
-  const all = [viewMainEl, viewCurrentEl, viewSwarmEl, viewChatEl, viewBehaviorsEl, viewSnippetsEl, viewEditorEl, viewAnalyticsEl]
+  const all = [viewMainEl, viewCurrentEl, viewSwarmEl, viewChatEl, viewBehaviorsEl, viewSnippetsEl, viewEditorEl, viewAnalyticsEl, viewLoggingEl]
+  if (v !== 'logging') {
+    const url = new URL(location.href)
+    if (url.searchParams.get('view') === 'logging') {
+      for (const key of ['view', 'event', 'incident', 'from', 'to']) url.searchParams.delete(key)
+      history.replaceState(null, '', url)
+    }
+  }
   const target =
       v === 'main'      ? viewMainEl
     : v === 'current'   ? viewCurrentEl
@@ -53,6 +63,7 @@ function showView(v: ViewSlug) {
     : v === 'behaviors' ? viewBehaviorsEl
     : v === 'snippets'  ? viewSnippetsEl
     : v === 'analytics' ? viewAnalyticsEl
+    : v === 'logging'   ? viewLoggingEl
     :                     viewEditorEl
 
   // Polling stays attached across view changes — every view that has
@@ -87,6 +98,7 @@ function showView(v: ViewSlug) {
   if (v !== 'main') stopMainRefresh()
   // Analytics' quota refresh and midnight re-read stop with the view.
   if (v !== 'analytics') stopAnalyticsRefresh()
+  if (v !== 'logging') stopLoggingRefresh()
   // Chat keeps its socket (a running turn keeps being mirrored) but stops
   // the per-second tick and parks the composer draft.
   if (v !== 'chat') stopChatRefresh()
@@ -105,6 +117,7 @@ function showView(v: ViewSlug) {
   else if (v === 'behaviors') initBehaviorsView()
   else if (v === 'snippets')  initSnippetsView()
   else if (v === 'analytics') initAnalyticsView()
+  else if (v === 'logging')   initLoggingView()
   else                        initEditorView()
 
   for (const el of all) {
@@ -181,7 +194,8 @@ watchForSignOut()
 
 ;(async () => {
   await loadSettings()
-  showView(menu.currentView())
+  if (new URLSearchParams(location.search).get('view') === 'logging') menu.switchTo('logging')
+  else showView(menu.currentView())
   // Single shared refresh clock — every view listens for poise:refresh-tick
   // and refreshes on it. Wall-clock-aligned so switching views never causes
   // an off-cycle re-fetch. (Behaviors run server-side on their own
@@ -218,7 +232,11 @@ watchForSignOut()
 // cycle and does not depend on org/me, so leave it alone; refresh the rest.
 window.addEventListener('poise:synced', () => {
   const v = menu.currentView()
+  // Startup reads the durable target after Settings resolves; this earlier
+  // Settings notification must not mount a different view and discard it.
+  if (v !== 'logging' && new URLSearchParams(location.search).get('view') === 'logging') return
   if (v === 'main') refreshMainView()
+  else if (v === 'logging') refreshLoggingView()
   else if (v === 'editor') { /* nothing here is scoped by org/me */ }
   else showView(v)
 })
@@ -281,6 +299,26 @@ window.addEventListener('poise:goto-swarm-row', (ev) => {
   window.requestAnimationFrame(() => {
     void focusSwarmRow(detail.repo, detail.pr_id)
   })
+})
+
+window.addEventListener('poise:goto-swarm-call', (event) => {
+  const detail = (event as CustomEvent<{ id?: unknown }>).detail
+  if (typeof detail?.id !== 'string' || !loggingCallId(detail.id)) return
+  menu.switchTo('swarm')
+  void focusSwarmCall(detail.id)
+})
+window.addEventListener('poise:logging-settings', (event) => {
+  const section = (event as CustomEvent<{ section?: unknown }>).detail?.section
+  if (section === 'general' || section === 'models' || section === 'accounts' || section === 'publishing' || section === 'admin') openSettingsAt(section)
+})
+window.addEventListener('poise:open-logging', (event) => {
+  const href = loggingHref((event as CustomEvent<LoggingLink>).detail ?? {})
+  if (!href) return
+  history.pushState(null, '', href)
+  menu.switchTo('logging')
+})
+window.addEventListener('popstate', () => {
+  if (new URLSearchParams(location.search).get('view') === 'logging' || menu.currentView() === 'logging') menu.switchTo('logging')
 })
 
 // Chat /content → editor article. The chat pane dispatches

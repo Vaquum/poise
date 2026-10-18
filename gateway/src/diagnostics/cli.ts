@@ -7,6 +7,7 @@ import { DiagnosticStore, type Coverage } from './store.js'
 import { environmentSecrets, normalize, redact } from './contract.js'
 import { nativeDiagnostic } from './sources.js'
 import { MAX_COVERAGE_JOURNAL_BYTES } from './runtime.js'
+import { validateLoggingFilter } from './query-parser.js'
 
 interface JournalHealth { version: number; stopped: boolean; sinkError: string | null; coverageError?: string | null; reportError?: string | null; writtenAt: string; sources: Coverage[]; dropped?: number; rejected?: number }
 
@@ -46,10 +47,7 @@ export async function runOperator(args: string[], write: (line: string) => void 
       write(JSON.stringify(db.lookup(access, options[0])))
     } else if (command === 'query' || command === 'export') {
       if (options.length > 1) throw new Error('query/export accept one JSON filter object')
-      const filter = options[0] ? JSON.parse(options[0]) as Parameters<DiagnosticStore['query']>[1] : {}
-      if (!filter || typeof filter !== 'object' || Array.isArray(filter)) throw new Error('Filter must be an object')
-      const allowed = ['severities', 'from', 'to', 'source', 'component', 'workspace', 'account', 'repository', 'callId', 'correlationId', 'incidentId', 'search', 'cursor', 'after', 'limit']
-      if (Object.keys(filter).some((key) => !allowed.includes(key))) throw new Error('Unknown Logging filter')
+      const filter = validateLoggingFilter(options[0] ? JSON.parse(options[0]) : {}, access)
       const page = db.query(access, filter)
       if (command === 'query') write(JSON.stringify(page))
       else { write(JSON.stringify({ type: 'metadata', ...page, events: undefined })); for (const event of page.events) write(JSON.stringify({ type: 'event', event })) }

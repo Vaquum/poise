@@ -33,7 +33,65 @@ fields recursively. Strings and nested context are bounded; truncation is
 explicit. The source adapters select Caller metadata without reading prompt or
 response fields, and preserve its exact process evidence when available.
 
+## Native Logging view
+
+Menu → Logging opens a server-paged table of retained events, with all three
+severities and Any time selected initially. Filters cover the full permitted
+store; the count is matching events, while each row's occurrence count describes
+its retained incident. Source time is displayed in Settings' timezone; missing
+source time is explicitly labeled as ingestion time. Today, Yesterday and This
+week use civil boundaries in that timezone. Custom intervals require UTC offsets.
+
+Expand a row with its evidence button (Enter or Space). Cause, stderr, stack,
+resource units/measurement time and truncation are shown as recorded. Related
+incident/correlation reads use the applied time, severity and access scope,
+twenty events per page. Recorded Caller runs open Swarm; valid repository/PR
+pairs open GitHub. Unrecorded targets have no link.
+
+Filters and the selected view survive reload. A mounted refresh preserves focus,
+scroll position and ID-keyed expansion. Only the visible first page checks for
+new ingestions every fifteen seconds; late older events count too. Apply the
+new-diagnostics button to replace the snapshot. Other pages retain their snapshot;
+hiding the document or leaving Logging cancels reads and stops polling. Failed
+refreshes visibly retain a stale snapshot with its last-success time.
+
+Durable `/?view=logging&event=ID` or `incident=ID` links accept optional zoned
+`from`/`to` bounds. They replace saved filters visibly, expand/focus the target,
+and offer Restore saved filters. Missing bounds use recorded time ± one hour;
+provided bounds widen visibly when needed. Invalid, unavailable, expired and
+query-service failure states are distinct and show available retention bounds.
+Export NDJSON reads a fresh matching snapshot, independent of the current page.
+
 ## Retention and queries
+
+Browser reads use `GET /_poise/api/logging` on the owner's workspace host, with
+its existing `poise_ws` session. Device tokens and identity assertions cannot
+replace that session. An Origin, when supplied, must match exactly. The gateway
+reads central history itself, without starting or querying a workspace.
+`scope=instance` is an explicit administrator choice checked on every request;
+it never grants another owner's private application or Caller evidence.
+
+`/logging/events/ID`, `/logging/health` and `/logging/export` share that boundary.
+Local development uses `/api/logging` and the same suffixes under its loopback,
+Host and Origin rules. Service workspaces refuse this alternative query path.
+The HTTP and operator JSON adapters share filter validation. HTTP `severity`
+may repeat; a single empty value selects none. Times require valid zoned ISO
+timestamps, and unknown or duplicate scalar parameters fail explicitly.
+
+One worker handles reads away from agent/request execution, with at most sixteen
+queued jobs and two outstanding responses per owner across scopes. Admission is
+held until the response finishes or closes. A two-second budget includes queue,
+execution and response backpressure. Saturation returns 429 with Retry-After;
+timeouts and unavailable/unsupported stores return explicit 503 errors.
+Unknown and inaccessible event IDs both return 404; only authorized retained
+expiry evidence returns 410. Health projects independent collection state and
+never exposes other owners' private counts or causes.
+
+Export is NDJSON, with metadata first, at most 1,000 events and 8 MiB including
+metadata. `resumeCursor` and `truncated` describe bounded partial exports; resume
+with the same filters and that opaque cursor. No CSV or logged URL is executed.
+An explicit HTTP `limit` also caps the exported row count (1–100); omitting it
+uses the export's 1,000-event cap rather than the list's 50-event page size.
 
 Defaults are **up to 30 days**, **64 MiB of accounted event storage**, and **50,000 events**;
 the earliest bound reached expires evidence. Age and eviction use ingestion time,

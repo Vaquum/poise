@@ -27,6 +27,7 @@ const stderrFailure = (error: Error & { code?: unknown }) => {
 
 export function loggingRuntime(): DiagnosticRuntime | null { return active }
 export function loggingWorkspace(): string { return workspace }
+export function loggingPath(): string | null { return active ? path : null }
 
 export function diagnostic(input: Omit<DiagnosticInput, 'source' | 'workspace'> & { source?: string }, secrets: readonly string[] = []): string | null {
   if (!active) return null
