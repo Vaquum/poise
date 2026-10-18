@@ -123,19 +123,27 @@ class TestProgress(TestCase):
     def test_receives_events_before_worker_exit_and_preserves_stdout_bytes(self):
         event = {"type": "item.completed", "item": {"type": "reasoning", "text": "private reasoning"}}
         encoded = json.dumps(event) + "\n"
+        observed = Path(self.work.name) / "provider-observed"
+        worker = ("import sys,time\nfrom pathlib import Path\n"
+                  f"sys.stdout.write({encoded!r}); sys.stdout.flush()\n"
+                  f"while not Path({str(observed)!r}).exists(): time.sleep(.01)\n")
         with patch.object(progress, "HEARTBEAT_SECONDS", .02), progress.Progress(self.database, "run"), \
                 ReviewWatch("/tmp", PR, "bit-mis", HEAD) as watch:
             def inspect_head(_timeout):
                 saved = self.saved()
+                if saved["last_provider_event_at"] is None:
+                    return None
                 self.assertEqual(saved["phase"], "reasoning")
                 self.assertTrue(saved["last_provider_event_at"])
+                observed.touch()
                 return None
             with patch('agent_interface.review_watch.PROGRESS_SECONDS', .01), \
                     patch('agent_interface.review_watch.POLL_SECONDS', .15), \
                     patch.object(watch, "changed_head", side_effect=inspect_head) as check:
-                done = watch.run([sys.executable, "-c", f"import sys,time; sys.stdout.write({encoded!r}); sys.stdout.flush(); time.sleep(.35)"],
+                done = watch.run([sys.executable, "-c", worker],
                                  input="packet", cwd="/tmp", timeout=3, env=os.environ.copy(), provider="codex")
             self.assertGreater(check.call_count, 0)
+            self.assertTrue(observed.exists())
             self.assertEqual(done.stdout, encoded)
 
     def test_progress_read_failure_does_not_abort_model_execution(self):
