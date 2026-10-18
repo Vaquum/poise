@@ -166,6 +166,43 @@ the Editor folder: the site and its repository's id, the path, branch and
 pull request, and what was published. Deleting the document deletes it, even while it is being
 published; the pull requests stay.
 
+### Reviewing in the Editor
+
+Published documents show Review comments above the writing surface. Inline
+threads also underline their passage with a distinct dashed mark; opening either
+shows the reviewer, site, PR, replies and resolved/outdated state. Reviewer
+text is read-only. General PR comments, review summaries, metadata feedback,
+removed passages and ambiguous locations remain accessible in the review list.
+Editing a passage never resolves its thread automatically.
+
+Review locations come from the exact commit originally reviewed, accounting
+for generated frontmatter. Only an exact, unambiguous passage or a match
+disambiguated by surrounding lines is highlighted in the current draft.
+Multi-line passages are supported. Removed-side comments stay in the list.
+
+Reply on GitHub and Resolve thread act as your publishing account. General
+feedback replies are posted to the PR discussion. Ask agent privately opens
+a separate document chat with the review as its draft; nothing is sent to
+GitHub by asking the agent. Update continues to commit to an open PR, or to
+open a new update PR after merge.
+
+Reviews are stored separately from editable annotations in a persistent
+server cache, scoped to the GitHub account and publication repository id/PR.
+Opening the document shows cached feedback immediately and asks for a refresh
+when stale. A visible document with an open PR refreshes every five minutes;
+hidden documents and merged/closed PRs do not poll. Refresh reviews requests
+an immediate read with a shared ten-second cooldown. Publication and review
+actions also refresh. Concurrent readers share one request per PR.
+
+A normal refresh reads PR state, threads, replies, discussion comments and
+review summaries together with one bounded GraphQL query. Additional pages
+are fetched when needed; immutable reviewed files are fetched on first use
+and cached. GitHub's reported query cost is requested with its remaining
+budget; fewer than 100 remaining points pauses review requests until reset.
+Rate limits and failures retain cached feedback, show the problem and back
+off rather than repeatedly retrying. Review actions are never automatically
+retried. A PR's cached review history is limited to 2 MB.
+
 ## Limits
 
 - Images are not published yet: the Editor holds none.

@@ -25,6 +25,7 @@ export async function workspace(page: Page, view = 'current', fontResponse?: Pro
     if (path === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (path === '/api/notices') return route.fulfill({ json: { enabled: false, notices: [] } })
     if (path === '/api/publishing/sites') return route.fulfill({ json: { sites: [] } })
+    if (/^\/api\/editor\/doc\/[^/]+\/reviews(?:\/sync)?$/.test(path)) return route.fulfill({ json: { reviews: [], checkedAt: null, active: false, stale: false, problems: [] } })
     if (path === '/api/accounts') return route.fulfill({ json: { accounts: [
       { id: 'codex', installed: true, version: '1.2.3', signedIn: true, identity: 'person@example.test', detail: null, login: { label: 'codex login --device-auth' } },
       { id: 'gh', installed: true, version: '2.92.0', signedIn: true, identity: 'octocat', detail: null, login: { label: 'gh auth login --web' }, accounts: [{ login: 'octocat', active: true, signedIn: true, detail: null }] },

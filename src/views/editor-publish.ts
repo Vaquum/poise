@@ -29,6 +29,7 @@ export interface PublishPanelHost {
   slug(): string | null
   /** Saves what has been typed, so what is published is what is on the page. */
   flush(): Promise<boolean>
+  published?(): void
 }
 
 interface Choice {
@@ -420,6 +421,7 @@ async function publish(host: PublishPanelHost, replace: boolean): Promise<void> 
       }
     }
     const done = results.filter((r) => r.ok).length
+    if (done) host.published?.()
     note = done === results.length ? '' : `${results.length - done} of ${results.length} not published.`
   } catch (error) {
     note = (error as Error).message

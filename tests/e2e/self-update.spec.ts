@@ -79,6 +79,7 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     const body = method === 'POST' || method === 'PATCH' ? (req.postDataJSON?.() ?? null) : null
     state.calls.push({ method, path, query: Object.fromEntries(url.searchParams), body })
     if (path === '/api/health') { await route.fulfill({ json: state.health }); return }
+    if (/^\/api\/editor\/doc\/[^/]+\/reviews(?:\/sync)?$/.test(path)) { await route.fulfill({ json: { reviews: [], checkedAt: null, active: false, stale: false, problems: [] } }); return }
     if (state.editor && path.startsWith('/api/editor/')) { await state.editor(path, method, route); return }
     if (path === '/api/settings') { await route.fulfill({ json: { org: 'acme', me: 'octocat', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 } } }); return }
     if (path === '/api/models') { await route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } }); return }

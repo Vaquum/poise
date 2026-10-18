@@ -21,7 +21,7 @@ export const REPOSITORY = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,
 
 /** A GitHub answer that was not a success: its HTTP status and GitHub's message. */
 export class GitHubError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly retryAt?: number) {
     super(message)
     this.name = 'GitHubError'
   }
@@ -55,6 +55,7 @@ function redact(text: string, session: GitHubSession): string {
 interface Answer {
   status: number
   body: any
+  headers: Record<string, string>
 }
 
 function answerFrom(stdout: string): Answer | null {
@@ -67,7 +68,12 @@ function answerFrom(stdout: string): Answer | null {
   if (text) {
     try { body = JSON.parse(text) } catch { body = text }
   }
-  return { status: Number(status), body }
+  const headers: Record<string, string> = {}
+  for (const line of head.split(/\r?\n/).slice(1)) {
+    const colon = line.indexOf(':')
+    if (colon > 0) headers[line.slice(0, colon).toLowerCase()] = line.slice(colon + 1).trim()
+  }
+  return { status: Number(status), body, headers }
 }
 
 function messageOf(body: any, fallback: string): string {
@@ -117,7 +123,23 @@ async function request(session: GitHubSession, method: string, endpoint: string,
 }
 
 function fail(answer: Answer, what: string): never {
-  throw new GitHubError(`${what}: ${messageOf(answer.body, `GitHub answered ${answer.status}`)}`, answer.status)
+  const retry = Number(answer.headers['retry-after'])
+  const reset = answer.headers['x-ratelimit-remaining'] === '0' ? Number(answer.headers['x-ratelimit-reset']) * 1000 : 0
+  const limited = answer.status === 429 || answer.headers['x-ratelimit-remaining'] === '0'
+    || /rate limit/i.test(messageOf(answer.body, ''))
+  const retryAt = limited || retry > 0 ? Math.max(Date.now() + (retry > 0 ? retry * 1000 : 60_000), reset || 0) : undefined
+  throw new GitHubError(`${what}: ${messageOf(answer.body, `GitHub answered ${answer.status}`)}`, answer.status, retryAt)
+}
+
+/** Typed GraphQL reads and explicit review actions, under the publishing account. */
+export async function queryGitHub<T>(session: GitHubSession, query: string, variables: Record<string, unknown>): Promise<T> {
+  const answer = await request(session, 'POST', 'graphql', { query, variables })
+  if (answer.status === 200 && Array.isArray(answer.body?.errors)
+    && answer.body.errors.some((error: unknown) => error && typeof error === 'object' && 'type' in error && error.type === 'NOT_FOUND')) {
+    fail({ ...answer, status: 404 }, 'Reading or updating GitHub reviews')
+  }
+  if (answer.status !== 200 || answer.body?.errors?.length || !answer.body?.data) fail(answer, 'Reading or updating GitHub reviews')
+  return answer.body.data as T
 }
 
 function encodePath(path: string): string {

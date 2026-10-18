@@ -8,6 +8,7 @@ import { db, getMeta, setMeta } from './db'
 import { MAX_PUBLISH_LEDGER_BYTES, readDoc, readPublishLedger, withPublishLock, writePublishLedger, type PublishRecord } from './editor'
 import { HttpError, readJson } from './http'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
+import { handleArticleReviewsApi } from './publishing-reviews'
 import {
   PUBLISH_FILE,
   PostFileError,
@@ -1223,6 +1224,7 @@ const DOCUMENT = /^\/api\/editor\/doc\/([A-Za-z0-9._-]+)\/(publishing|publish)$/
 
 /** Settings → Publishing (/api/publishing/sites…) and the Editor's panel (/api/editor/doc/:slug/publishing and …/publish). */
 export async function handlePublishingApi(req: IncomingMessage, res: ServerResponse, url: string): Promise<boolean> {
+  if (await handleArticleReviewsApi(req, res, url)) return true
   const path = url.split('?')[0]
   const site = SITE.exec(path)
   const document = DOCUMENT.exec(path)

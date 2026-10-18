@@ -28,6 +28,7 @@ import { mountNotificationRail } from './views/notification-rail'
 import './views/notification-rail.css'
 import './views/updating.css'
 import './views/editor-publish.css'
+import './views/editor-reviews.css'
 
 const viewMainEl = document.getElementById('view-main')!
 const viewCurrentEl = document.getElementById('view-current')!
@@ -64,10 +65,8 @@ function showView(v: ViewSlug) {
   // guards its tick-listener with a boolean so re-entering doesn't
   // attach duplicates.
   //
-  // Editor leave-cleanup is the one exception: stopEditorRefresh isn't
-  // a polling-stop (the editor has no tick listener) — it flushes the
-  // pending autosave, closes the doc-picker menu, and strips the
-  // writer-mode body class so the chrome reappears in other views.
+  // Editor leave-cleanup pauses publication reviews, flushes pending
+  // autosaves, closes the doc picker, and restores the writer-mode chrome.
   // All of those are essential on leaving the editor; keep the call.
   if (v !== 'editor')    stopEditorRefresh()
   // Behaviors needs the same leave-cleanup. stopBehaviorsRefresh existed and

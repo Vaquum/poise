@@ -3,6 +3,8 @@ import { retire, reveal, watchPanel } from '../motion'
 import { patchContent } from '../dom-patch'
 import { registerReloadGuard } from '../self-update-watch'
 import { ICON_PUBLISH, closePublishPanel, togglePublishPanel } from './editor-publish'
+import { EditorReviews } from './editor-reviews'
+import type { ArticleReview } from '../publishing-review'
 // Editor — minimalist markdown writing surface.
 //
 // Single horizontal control bar at the top, sharing the exact alignment
@@ -109,6 +111,8 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null
 // the panel for it. The panel is a single floating element shared
 // across annotations — only one is visible at a time.
 let annotations: Annotation[] = []
+let articleReviews: EditorReviews | undefined
+const reviewSessions = new Map<string, string>()
 let annotationsReadySlug: string | null = null
 const documentVersions = new Map<string, string>()
 const annotationsVersions = new Map<string, string>()
@@ -2273,6 +2277,7 @@ async function loadDoc(slug: string) {
     // cannot be stranded when currentSlug changes below.
     if (!(await flushBeforeLeavingDocument('switch documents')) || requestId !== loadRequestId) return
     currentSlug = nextSlug
+    articleReviews?.clear()
     documentVersions.set(currentSlug, data.version)
     loadIntoEditor(data.content)
     // History is per-document: undo must never walk back into the
@@ -2288,6 +2293,7 @@ async function loadDoc(slug: string) {
     await fetchAnnotations(currentSlug)
     if (requestId !== loadRequestId) return
     renderAnnotationOverlay()
+    void articleReviews?.load(currentSlug)
   } catch (err) {
     console.error('[editor] loadDoc failed:', err)
   }
@@ -2373,6 +2379,7 @@ async function deleteCurrent() {
   documentVersions.delete(d.slug)
   annotationsVersions.delete(d.slug)
   currentSlug = null
+  articleReviews?.clear()
   annotations = []
   annotationsReadySlug = null
   if (docEl) {
@@ -2405,13 +2412,17 @@ async function deleteCurrent() {
 // itself is the modular `src/views/chat-pane.ts` already used by the
 // card-chats; we just bring it up with a doc-scoped session id and
 // the doc's current title as the header label.
-async function openChatForCurrentDoc(): Promise<void> {
+async function openChatForCurrentDoc(draft?: string, reviewSession?: string): Promise<void> {
   if (!currentSlug) return
   const slug = currentSlug
   try {
-    const res = await fetch(`/api/editor/doc/${encodeURIComponent(slug)}/chat-session`)
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const data = await res.json() as { session_id: string }
+    let data: { session_id: string }
+    if (reviewSession) data = { session_id: reviewSession }
+    else {
+      const res = await fetch(`/api/editor/doc/${encodeURIComponent(slug)}/chat-session`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      data = await res.json() as { session_id: string }
+    }
     if (!data.session_id) throw new Error('no session_id in response')
     const d = currentDoc()
     const label = d?.title || slug
@@ -2425,6 +2436,7 @@ async function openChatForCurrentDoc(): Promise<void> {
       detail: {
         session: data.session_id,
         label,
+        draft,
         parseEdits: true,
         onEditHover: (edit: EditCardData) => {
           if (currentSlug !== slug) return
@@ -2953,6 +2965,7 @@ function reAnchorAnnotation(a: Annotation): AnnotationRange | null {
 // pinned even as the page scrolls. Re-rendered after every reclassify
 // (text edits) and on window resize.
 function renderAnnotationOverlay(): void {
+  articleReviews?.renderMarks()
   if (!docEl || !overlayEl) return
   overlayEl.innerHTML = ''
   if (!annotations.length) return
@@ -4040,7 +4053,7 @@ function attachHandlers() {
     .addEventListener('click', () => { void deleteCurrent() })
   const publishBtn = viewEl.querySelector<HTMLButtonElement>('.editor-publish-btn')!
   publishBtn.addEventListener('click', () => {
-    togglePublishPanel(publishBtn, { slug: () => currentSlug, flush: flushEditorSaves })
+    togglePublishPanel(publishBtn, { slug: () => currentSlug, flush: flushEditorSaves, published: () => { void articleReviews?.synchronize(true) } })
   })
   copyBtnEl = viewEl.querySelector<HTMLButtonElement>('.editor-copy-btn')!
   copyBtnEl.addEventListener('click', () => { void copyDoc() })
@@ -4806,11 +4819,24 @@ export async function initEditorView() {
     triggerTitleEl = viewEl.querySelector<HTMLElement>('.editor-doc-trigger-title')
     menuEl         = viewEl.querySelector<HTMLElement>('#editor-doc-menu')
     metaEl         = viewEl.querySelector<HTMLElement>('#editor-meta')
+    articleReviews = new EditorReviews({
+      view: viewEl, document: docEl!, text: serializeDoc,
+      range: (start, end) => domRangeForCharRange(docTextSnapshot(), start, end),
+      beforeOpen: closePanel,
+      ask: (review: ArticleReview) => {
+        if (!currentSlug) return
+        const key = `${currentSlug}:${review.id}`
+        const session = reviewSessions.get(key) ?? editorChatSessionId(currentSlug)
+        reviewSessions.set(key, session)
+        void openChatForCurrentDoc(`Help me address this review from @${review.messages[0]?.author} on ${review.site} (${review.prUrl}).\n\n${review.messages.map((message) => `@${message.author}: ${message.body}`).join('\n\n')}\n\n${review.anchor?.quote ?? ''}`, session)
+      },
+    })
     attachHandlers()
   }
   // The editor owns unsaved text, selection and undo history. A return only
   // refreshes its picker; reopening the same file would replace that state.
   if (currentSlug) {
+    articleReviews?.resume()
     void fetchDocs()
     requestAnimationFrame(() => { if (!viewEl.hidden) renderAnnotationOverlay() })
     return
@@ -4836,6 +4862,7 @@ async function openInitialDocument(): Promise<void> {
 }
 
 export function stopEditorRefresh() {
+  articleReviews?.stop()
   clearSaveTimer()
   clearAnnotationsSaveTimer()
   void flushEditorSaves()

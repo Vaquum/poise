@@ -53,6 +53,7 @@ async function openEditor(page: Page, sites: unknown[], answer: (body: any) => u
     if (path === '/api/editor/docs') return route.fulfill({ json: { docs: [{ slug: 'draft-1', title: 'A better question', updated_at: '2026-10-17T08:00:00Z', size: TEXT.length }] } })
     if (path === '/api/editor/doc/draft-1') return route.fulfill({ json: { slug: 'draft-1', content: TEXT, updated_at: '2026-10-17T08:00:00Z', version: VERSION } })
     if (path === '/api/editor/doc/draft-1/annotations') return route.fulfill({ json: { annotations: [], version: VERSION } })
+    if (path.endsWith('/reviews') || path.endsWith('/reviews/sync')) return route.fulfill({ json: { reviews: [], checkedAt: null, active: false, stale: false, problems: [] } })
     if (path === '/api/editor/doc/draft-1/publishing') return route.fulfill({ json: { title: 'A better question', slug: 'a-better-question', today: '2026-10-17', publications } })
     if (path === '/api/editor/doc/draft-1/publish') {
       const body = request.postDataJSON()
