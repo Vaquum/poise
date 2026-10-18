@@ -46,6 +46,7 @@ export interface AnalyticsReport {
     firstReview: { count: number, medianMs: number | null }
     /** Conversation and review comments per merged PR; null without merged PRs. */
     commentsPerPr: number | null
+    medianCommentsPerPr?: number | null
     lines: {
       /** Additions plus deletions over the merged PRs whose size is known. */
       total: number | null
@@ -55,6 +56,7 @@ export interface AnalyticsReport {
     }
     behaviors: {
       perPr: number | null
+      medianPerPr?: number | null
       approvals: number
       reviews: number
       changesRequested: number
@@ -63,7 +65,8 @@ export interface AnalyticsReport {
     averageTimeToMergeMs: number | null
     medianTimeToMergeMs: number | null
   }
-  errors: OrganizationReadError[]
+  daily?: AnalyticsPeriod[]
+  errors: Array<OrganizationReadError & { stale?: boolean }>
 }
 
 /** The same metrics as the selected day, aggregated over one history period. */
@@ -170,8 +173,13 @@ export function computeAnalytics(input: {
 
   const mergedKeys = new Set(merged.map((pr) => itemKey(pr.repo, pr.number)))
   const behaviors = { approvals: 0, reviews: 0, changesRequested: 0 }
+  const behaviorsByPr = new Map([...mergedKeys].map((key) => [key, 0]))
   for (const action of input.behaviors) {
-    if (mergedKeys.has(itemKey(action.repo, action.pr))) behaviors[BEHAVIOR_FIELD[action.action]] += 1
+    const key = itemKey(action.repo, action.pr)
+    if (mergedKeys.has(key)) {
+      behaviors[BEHAVIOR_FIELD[action.action]] += 1
+      behaviorsByPr.set(key, behaviorsByPr.get(key)! + 1)
+    }
   }
   const behaviorTotal = behaviors.approvals + behaviors.reviews + behaviors.changesRequested
 
@@ -189,12 +197,13 @@ export function computeAnalytics(input: {
       mergedByAgent: agent ? merged.filter((pr) => pr.merged_by?.toLowerCase() === agent).length : null,
       firstReview: { count: firstReviewTimes.length, medianMs: median(firstReviewTimes) },
       commentsPerPr: mean(merged.map((pr) => (pr.comments_count ?? 0) + (pr.review_comments_count ?? 0))),
+      medianCommentsPerPr: median(merged.map((pr) => (pr.comments_count ?? 0) + (pr.review_comments_count ?? 0))),
       lines: {
         total: sizes.length ? sizes.reduce((sum, size) => sum + size, 0) : null,
         median: median(sizes),
         counted: sizes.length,
       },
-      behaviors: { perPr: merged.length ? behaviorTotal / merged.length : null, ...behaviors },
+      behaviors: { perPr: merged.length ? behaviorTotal / merged.length : null, medianPerPr: median([...behaviorsByPr.values()]), ...behaviors },
       averageTimeToMergeMs: mean(mergeTimes),
       medianTimeToMergeMs: median(mergeTimes),
     },
@@ -280,20 +289,20 @@ async function readOrganization(org: Organization, me: string, window: Analytics
   }
 }
 
-async function readScoped(window: AnalyticsWindow, orgLogin: string | undefined): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[], errors: OrganizationReadError[] }> {
+async function readScoped(window: AnalyticsWindow, orgLogin: string | undefined): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[], errors: Array<OrganizationReadError & { stale?: boolean }> }> {
   const orgs = selectOrganizations(orgLogin)
   if (!orgs.length) throw new HttpError(409, 'No GitHub account is ready yet')
   const me = getMeta('me') || ''
   const results = await Promise.allSettled(orgs.map((org) => readOrganization(org, me, window)))
   const issues: DatastoreRecord[] = []
   const prs: DatastoreRecord[] = []
-  const errors: OrganizationReadError[] = []
+  const errors: Array<OrganizationReadError & { stale?: boolean }> = []
   results.forEach((result, i) => {
     if (result.status === 'fulfilled') {
       issues.push(...result.value.issues)
       prs.push(...result.value.prs)
       // A readable cache can still be stale after synchronization failed.
-      if (orgs[i].error) errors.push({ org: orgs[i].login, error: orgs[i].error! })
+      if (orgs[i].error) errors.push({ org: orgs[i].login, error: orgs[i].error!, stale: true })
     } else {
       errors.push({ org: orgs[i].login, error: result.reason instanceof Error ? result.reason.message : String(result.reason) })
     }
@@ -305,9 +314,13 @@ async function readScoped(window: AnalyticsWindow, orgLogin: string | undefined)
   return { issues, prs, errors }
 }
 
-export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string): Promise<AnalyticsReport> {
+export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string, dailyBounds?: string[]): Promise<AnalyticsReport> {
+  if (dailyBounds && (dailyBounds.length !== 8 || dailyBounds[0] !== window.since || dailyBounds.at(-1) !== window.until)) {
+    throw new HttpError(400, 'daily bounds must cover the requested seven-day window')
+  }
   const { issues, prs, errors } = await readScoped(window, orgLogin)
-  return computeAnalytics({ window, issues, prs, behaviors: listCompletedBehaviorActions(), agent: agentAccount(), errors })
+  const input = { window, issues, prs, behaviors: listCompletedBehaviorActions(), agent: agentAccount(), errors }
+  return { ...computeAnalytics(input), ...(dailyBounds ? { daily: computeHistory({ ...input, bounds: dailyBounds }).periods } : {}) }
 }
 
 /** One local datastore read across every period, then each period counted alike. */

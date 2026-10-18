@@ -13,7 +13,7 @@ export interface AnalyticsPeriod {
 
 export interface AnalyticsHistory {
   periods: AnalyticsPeriod[]
-  errors: Array<{ org: string, error: string }>
+  errors: Array<{ org: string, error: string, stale?: boolean }>
 }
 
 export interface HistorySeries {
@@ -33,7 +33,7 @@ function perDay(value: number | null): string {
   return value === null ? '—' : `${formatRate(value)}/day`
 }
 
-/** All metric figures over the periods: counts as daily averages, time to merge as each period's mean. */
+/** All metric figures over the periods: counts as daily averages, time to merge as each period's median. */
 export function historySeries(history: AnalyticsHistory): HistorySeries[] {
   const { periods } = history
   return [
@@ -51,17 +51,17 @@ export function historySeries(history: AnalyticsHistory): HistorySeries[] {
     },
     {
       label: 'Time to merge',
-      values: periods.map((p) => p.pullRequests.averageTimeToMergeMs),
+      values: periods.map((p) => p.pullRequests.medianTimeToMergeMs),
       format: formatDuration,
-      detail: ({ pullRequests: pr }) => pr.merged ? `Mean of ${formatCount(pr.merged)} ${pr.merged === 1 ? 'PR' : 'PRs'}` : 'No merges',
+      detail: ({ pullRequests: pr }) => pr.merged ? `Median of ${formatCount(pr.merged)} ${pr.merged === 1 ? 'PR' : 'PRs'}` : 'No merges',
     },
     { label: 'Pull requests opened', values: periods.map((p) => p.pullRequests.opened / PERIOD_DAYS), format: perDay, detail: (p) => `${formatCount(p.pullRequests.opened)} opened` },
     { label: 'Closed without merging', values: periods.map((p) => p.pullRequests.closedUnmerged / PERIOD_DAYS), format: perDay, detail: (p) => `${formatCount(p.pullRequests.closedUnmerged)} closed unmerged` },
     { label: 'Time to first review', values: periods.map((p) => p.pullRequests.firstReview.medianMs), format: formatShortDuration, detail: (p) => `Median of ${formatCount(p.pullRequests.firstReview.count)} first reviews` },
     ...[
-      { label: 'Comments', value: (pr: AnalyticsPeriod['pullRequests']) => pr.commentsPerPr, format: formatRate },
+      { label: 'Comments', value: (pr: AnalyticsPeriod['pullRequests']) => pr.medianCommentsPerPr ?? null, format: formatRate },
       { label: 'Median lines', value: (pr: AnalyticsPeriod['pullRequests']) => pr.lines.counted < pr.merged ? null : pr.lines.median, format: (n: number | null) => n === null ? '—' : formatCount(Math.round(n)) },
-      { label: 'Behaviors', value: (pr: AnalyticsPeriod['pullRequests']) => pr.behaviors.perPr, format: formatRate },
+      { label: 'Behaviors', value: (pr: AnalyticsPeriod['pullRequests']) => pr.behaviors.medianPerPr ?? null, format: formatRate },
       { label: 'Median time', value: (pr: AnalyticsPeriod['pullRequests']) => pr.medianTimeToMergeMs, format: formatDuration },
       { label: 'Merged by agent', value: (pr: AnalyticsPeriod['pullRequests']) => pr.merged && pr.mergedByAgent !== null ? pr.mergedByAgent / pr.merged * 100 : null, format: (n: number | null) => n === null ? '—' : `${formatRate(n)}%` },
     ].map(({ label, value, format }) => ({ label, values: periods.map((p) => value(p.pullRequests)), format, detail: (p: AnalyticsPeriod) => `Over ${formatCount(p.pullRequests.merged)} merged PRs` })),

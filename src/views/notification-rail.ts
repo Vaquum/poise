@@ -277,7 +277,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   }
 
   function recompute(): void {
-    const visible = enabled ? notices.filter((notice) => !notice.target || !actions.inView?.(notice.target)) : []
+    const visible = notices.filter((notice) => (enabled || notice.kind === 'read_failed') && (!notice.target || !actions.inView?.(notice.target)))
     items = notificationItems(visible, getBehaviorDiagnostics(), Date.now())
     for (const id of [...expanded]) if (!items.some((item) => item.id === id)) expanded.delete(id)
     renderBell()

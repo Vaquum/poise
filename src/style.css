@@ -993,7 +993,6 @@ tr:hover .review-btn { opacity: 1; }
 .analytics-date { display: flex; align-items: center; justify-content: center; min-width: 7.5em; padding: var(--sp-1) var(--sp-3); border: var(--b-base); border-right: none; background: var(--surface); color: var(--text); font-size: .75rem; font-weight: 600; white-space: nowrap; }
 .analytics-day button:disabled { opacity: .4; cursor: default; }
 .analytics-day button:disabled:hover { color: var(--text-secondary); background: var(--surface); }
-.analytics-status { margin: 0 0 var(--sp-5); }
 .analytics-group, .github-quota-section { margin-bottom: var(--sp-7); }
 #view-analytics .tp-group-label { margin: 0 0 var(--sp-4); }
 #view-analytics [data-help] { cursor: help; }
@@ -1004,16 +1003,23 @@ tr:hover .review-btn { opacity: 1; }
 .analytics-label { min-height: 1.5em; margin-bottom: var(--sp-2); font-size: .6875rem; line-height: 1.5; color: var(--text-secondary); }
 .analytics-value { overflow-wrap: anywhere; margin: 0; font-size: 1.5rem; font-weight: 600; color: var(--text); letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.15; }
 [data-group="productivity"] .analytics-value { font-size: 2rem; }
-.analytics-trend { min-height: 1.5em; margin: var(--sp-2) 0 0; font-size: .8125rem; line-height: 1.5; font-weight: 600; font-variant-numeric: tabular-nums; }
-.analytics-trend.good { color: var(--green); }
-.analytics-trend.bad { color: var(--red); }
-.analytics-trend.neutral { color: var(--text-secondary); }
+.analytics-summary { margin: 0; }
+.analytics-summary.good { color: var(--green); }
+.analytics-summary.bad { color: var(--red); }
+.analytics-summary.neutral { color: var(--text-secondary); }
+.analytics-value-row { display: flex; align-items: baseline; gap: var(--sp-2); }
+.analytics-summary .analytics-value { color: inherit; }
+.analytics-summary.neutral .analytics-value { color: var(--text); }
+.analytics-arrow { font-size: 1.5rem; line-height: 1; font-weight: 600; }
+[data-group="per-merged-pr"] .analytics-arrow { font-size: 1.125rem; }
+.analytics-trend { min-height: 4.5em; margin-top: var(--sp-2); font-size: .6875rem; line-height: 1.5; font-variant-numeric: tabular-nums; }
+.analytics-delta { font-size: .8125rem; font-weight: 600; }
 .analytics-note { margin: var(--sp-1) 0 0; font-size: .6875rem; color: var(--text-tertiary); line-height: 1.5; overflow-wrap: anywhere; }
-.analytics-tile > .analytics-note { min-height: 3em; }
-.analytics-group-note { margin: var(--sp-3) 0 0; font-size: .6875rem; color: var(--text-tertiary); line-height: 1.5; }
+.analytics-trend .analytics-note { display: block; margin-top: 0; color: inherit; }
+.github-quota-unavailable { padding: var(--sp-4) 0; color: var(--text-tertiary); }
 .analytics-history { --history-line: var(--n5); position: relative; min-height: 184px; box-sizing: border-box; margin: auto 0 0; padding-top: var(--sp-4); }
 [data-theme="dark"] .analytics-history { --history-line: var(--n4); }
-.analytics-history-max { display: flex; justify-content: space-between; min-height: 1.5em; margin-bottom: var(--sp-2); font-size: .625rem; line-height: 1.5; color: var(--text-tertiary); }
+.analytics-history-max { display: flex; justify-content: flex-end; min-height: 1.5em; margin-bottom: var(--sp-2); font-size: .625rem; line-height: 1.5; color: var(--text-tertiary); }
 .analytics-history-plot { position: relative; height: 64px; margin-inline: var(--sp-1); }
 .analytics-history-plot[tabindex] { cursor: crosshair; touch-action: pan-y; }
 .analytics-history-plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
@@ -1074,8 +1080,9 @@ tr:hover .review-btn { opacity: 1; }
 .quota-hour-empty { border-bottom: 1px dotted var(--text-tertiary); }
 .quota-charts > .analytics-chart-heading:not(:first-child) { margin-top: var(--sp-4); }
 @container analytics (max-width: 639px) {
+  [data-group="productivity"] .analytics-value { font-size: 1.5rem; }
+  .analytics-arrow { font-size: 1.125rem; }
   [data-group="per-merged-pr"] .analytics-tile:last-child { grid-column: 1 / -1; }
-  .analytics-histogram .analytics-chart-axis > span:nth-child(2) { display: none; }
 }
 @container analytics (min-width: 640px) {
   .analytics-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }

@@ -16,7 +16,8 @@ The page reads top to bottom:
 3. **GitHub API · Live**: avatar-led user and automation account panels side
    by side, each holding REST and GraphQL budgets.
 
-Every metric card has its value, seven-day comparison, weekly history line
+Every metric card groups its colored value and adjacent trend arrow above a
+matching delta and seven-day baseline. A gap separates this summary from the weekly history line
 and a ten-bin histogram. Productivity uses larger cards and taller plots than
 per-PR metrics. Borders, colors, spacing and tooltip motion follow the shared
 design system. Narrow layouts reduce columns without horizontal overflow.
@@ -57,7 +58,7 @@ Productivity:
 | Issues closed | Issues closed in the range. |
 | Pull requests merged | Pull requests merged in the range. |
 | Lines changed | Additions plus deletions of the pull requests merged in the range. |
-| Time to merge | The average time from a pull request's opening to its merge, over the pull requests merged in the range. |
+| Time to merge | The median time from a pull request's opening to its merge, over the pull requests merged in the range. |
 
 Pull request flow:
 
@@ -78,9 +79,9 @@ Per merged pull request, over the pull requests merged in the range:
 
 | Number | What it is |
 | --- | --- |
-| Comments | Conversation comments and review comments, on average. |
+| Comments | Median conversation comments plus review comments per merged pull request. |
 | Median lines | The median of additions plus deletions. |
-| Behaviors | The reviews and approvals behaviors completed on them, on average, and how many of each. |
+| Behaviors | Median completed review and approval behaviors per merged pull request, with totals by kind in the measurement tooltip. |
 | Median time | The median time from opening to merge; even samples use the mean of the middle pair. |
 | Merged by agent | The share of them the agent account from Settings merged, and how many of how many. With no agent account set it shows — and says so. |
 
@@ -99,46 +100,42 @@ comment on issues, not pull requests, and are not counted either.
 
 Issues opened, Issues closed, Pull requests merged, Lines changed, Pull
 requests opened and Closed without merging compare the day's totals with the
-preceding seven complete calendar days' daily averages, including zero days.
-An upward green arrow means increased activity; a downward red arrow means
-less activity. Partial line-size coverage withholds its comparison arrow; incomplete baseline
-coverage also shows an unknown daily line average.
+median of the preceding seven complete calendar days' totals, including zero
+days. The existing baseline response includes those seven daily totals; no
+extra request or upstream read is needed. Calendar boundaries follow Settings'
+timezone, including daylight-saving changes. Missing daily data or partial
+line-size coverage withholds the comparison.
 
-Time to merge shows the selected day's mean alongside the preceding seven
-complete calendar days' rolling mean and merged PR count. Both means are
-weighted by pull request, not by day. The selected day is excluded from the
-baseline. Today is partial; its values update when Analytics reads again.
+Time to merge and Time to first review compare the selected day's median
+with the median of the preceding seven days' observations and name the sample
+count. The selected day is excluded. Today is partial. A green downward arrow
+means faster; a red upward arrow means slower. Activity increases are green,
+decreases red. The colored arrow sits beside the value, with the matching
+percentage delta and baseline underneath. An unchanged value shows a neutral
+arrow and 0%; a zero baseline uses an absolute change rather than division
+by zero. Without observations, no directional claim is made.
 
-A green downward arrow means faster merges; a red upward arrow means slower
-merges. The figure is the percentage change against the baseline, with plain
-text stating faster or slower. An unchanged mean shows a neutral arrow and
-0%. A zero baseline uses the duration increase instead of dividing by zero.
-No merges in either period means no directional comparison; an empty
-baseline is explicitly labelled. Account read errors remain visible, and
-comparative arrows are withheld while either period has partial account data.
-
-Time to first review compares the day's median with the median of the
-preceding seven days' first reviews, and names how many there were. The
-arrows read as they do for time to merge: green and downward is faster. A
-zero baseline shows the increase in seconds.
-
-Per-PR comparisons use the preceding seven days' merged population: averages
-for comments and behaviors, medians for lines and time, and the agent's merge
-share. Missing values or partial account/size coverage withhold trend claims.
+Per-PR comments and behaviors show selected-day medians and compare with
+the median across the preceding seven days' merged pull requests. Lines and
+time compare population medians. Agent merges compare shares, explicitly
+labelled “7-day share” because a binary merger's median would lose the share.
+An unreadable account withholds comparisons. A readable cache with a sync
+warning retains comparisons over its stored records; the warning is notified.
 
 ## The past year
 
 Under every metric a chart shows the year before the selected
 day, one point per 7-day period: 52 periods, the last of them the seven days
-before the selected day, which is the figure's own 7-day baseline. Issues
+before the selected day, which covers the same dates as its 7-day baseline. Issues
 opened and closed, pull requests merged and lines changed are daily averages
-over each period; time to merge is the mean of the pull requests merged in
+over each period; time to merge is the median of the pull requests merged in
 it. Flow counts use daily averages; first review and per-PR values use the
-same aggregation as their cards. Periods are calendar weeks in the timezone from Settings, so a week that
+same aggregation as their selected-day cards. Count history uses weekly daily averages even though the comparison uses daily medians. Periods are calendar weeks in the timezone from Settings, so a week that
 crosses a daylight-saving change is 167 or 169 hours long.
 
 The line is grey with a light wash and the latest period is marked in blue.
-Each chart's highest value is named above it. Hovering for half a second, or
+Each chart's highest value is named above it; the redundant “52 weeks” and
+“Distribution” labels are omitted. Hovering for half a second, or
 focusing it and using the arrow keys, Home and End, shows a period's value,
 what it is made of (such as "8 merged" or "Mean of 8 PRs") and its dates.
 The readout explains the chart and its period boundaries. Below each line,
@@ -152,20 +149,23 @@ requests are not all sized has no lines total; the line breaks there instead
 of falling to zero, and a known value with unknown neighbours shows as a dot.
 The year is read once per day and account, separately from the day's numbers,
 and each chart keeps its place until it arrives. If it cannot be read, the
-charts say "Past year unavailable" and the day's numbers stay.
+charts keep an empty reserved space, the day's numbers stay, and the failure
+appears in Notifications.
 
-## When a number is missing
+## Missing data and failures
 
-- No pull request merged in the range: the per-PR numbers show — and the
-  page says nothing was merged.
-- github-datastore keeps a pull request's size since it started asking GitHub
-  for it. A pull request stored before then has no size until the datastore's
-  next full reconcile, which Poise runs daily. Until then the page says how
-  many merged pull requests the line counts come from, such as "From 40 of 52
-  pull requests".
-- An account whose datastore could not be read is named above the numbers,
-  which come from the other accounts. If none could be read, the page shows
-  the error and no numbers.
+A missing metric shows —; its measurement tooltip explains its meaning and
+any partial size coverage. No merges produce zero changed lines and unknown
+per-PR metrics. An unconfigured agent is explained with its missing value.
+No status paragraphs or account errors are rendered inside Analytics.
+
+Account, day, baseline, history and quota read failures go to the shared
+notification rail. Repeated account failures across the three Analytics reads
+appear once. They remain accessible after navigating away, can be dismissed,
+and clear once all reporting reads recover. A recurrence after recovery is a
+new notification. These browser read failures are local to the tab and remain accessible in the rail when Notifications are off
+(the switch suppresses their popups); recording, dismissing and clearing them makes
+no API request. Existing server sync alerts continue independently.
 
 ## GitHub API quota
 
@@ -177,8 +177,8 @@ versus total, remaining capacity, next reset in Settings' timezone, minutes
 left, observed use per minute and the remaining sustainable rate.
 
 Reads use each account's stored `gh` credential explicitly. No credential or
-HTTP stderr reaches the browser. An unavailable account shows an error while
-the other account remains visible. A zero limit means that API is unavailable.
+HTTP stderr reaches the browser. An unavailable account retains its identity and an unknown quota marker while
+the other account remains visible; its error appears only in Notifications. A zero limit means that API is unavailable.
 The reset comes from GitHub, including minute-long search windows; no hourly
 start is inferred. Secondary abuse limits are not exposed by this endpoint.
 
@@ -220,7 +220,11 @@ contains `resource`, `label`, `limit`, `used`, `remaining`, `resetAt`,
 (inclusive) and `until` (exclusive) are times with a timezone, and either may
 be left out; `org` narrows to one account. Implemented in
 `server/analytics.ts`. The view reads the selected day and preceding seven-day
-window through this endpoint; `medianTimeToMergeMs` accompanies the mean. The
+window through this endpoint; `medianTimeToMergeMs` accompanies the mean.
+The baseline request adds `dailyBounds` (eight increasing zoned edges covering
+its window); the response includes seven `daily` reports from the same local
+read. Comments and behaviors include `medianCommentsPerPr` and `medianPerPr`
+alongside their means. Errors from readable but stale caches carry `stale: true`. The
 report also names `agentAccount` (null when none is set) and gives, under
 `pullRequests`, `opened`, `closedUnmerged`, `mergedByAgent` (null without an
 agent account) and `firstReview` with its `count` and `medianMs`.
@@ -238,5 +242,5 @@ this adds no upstream requests.
 Measurement explanations appear after half a second on hover or keyboard
 focus. Headings stay plain and have no tooltips or dotted underlines. Risk
 assumptions and sample requirements live on the risk measurement itself;
-missing data and coverage notes remain visible. See
+coverage notes live on the measurement tooltip; read failures live in Notifications. See
 [Menu and Settings](Menu.md).

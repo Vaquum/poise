@@ -19,3 +19,8 @@ export function analyticsDay(offset: number, anchor = new Date()): { label: stri
 export function analyticsHistoryBounds(offset: number, anchor = new Date(), periods = 52): string[] {
   return Array.from({ length: periods + 1 }, (_, i) => midnightInZone(offset - 7 * (periods - i), anchor).toISOString())
 }
+
+/** Seven complete calendar days, including DST days, without another request. */
+export function analyticsDailyBounds(offset: number, anchor = new Date()): string[] {
+  return Array.from({ length: 8 }, (_, i) => midnightInZone(offset - 7 + i, anchor).toISOString())
+}

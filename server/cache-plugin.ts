@@ -857,7 +857,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (path === '/api/analytics' && req.method === 'GET') {
           try {
             const query = new URLSearchParams(url.split('?')[1] || '')
-            return json(res, 200, await readAnalytics(parseWindow(query.get('since'), query.get('until')), selectedOrg))
+            return json(res, 200, await readAnalytics(parseWindow(query.get('since'), query.get('until')), selectedOrg, query.has('dailyBounds') ? parseBounds(query.get('dailyBounds')) : undefined))
           } catch (err: any) {
             return json(res, httpStatus(err, 502), { error: err.message || String(err) })
           }

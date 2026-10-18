@@ -5,10 +5,11 @@ import { patchContent } from '../dom-patch'
 // pull request, each with a weekly line and distribution, then
 // live GitHub API quota. Independent of Current's filters.
 import { analyticsGroups, type AnalyticsGroup, type AnalyticsReport } from '../analytics-format'
-import { analyticsDay, analyticsHistoryBounds } from '../analytics-day'
+import { analyticsDay, analyticsDailyBounds, analyticsHistoryBounds } from '../analytics-day'
 import { HISTORY_BASELINE, historyChart, histogram, historySeries, periodLabel, type AnalyticsHistory, type HistorySeries } from '../analytics-history'
-import { mountOrganizationFilter, organizationErrors, organizationUrl } from '../organizations'
+import { mountOrganizationFilter, organizationUrl } from '../organizations'
 import { effectiveTimezone } from '../config'
+import { noticeFeed, type ReadFailure } from '../notices'
 import { GITHUB_QUOTA_REFRESH_MS, quotaRiskTone, quotaHours, type GithubQuotaReport, type GithubQuotaBucket } from '../github-quota'
 
 let viewEl: HTMLElement
@@ -52,7 +53,6 @@ function renderShell(): string {
     </header>
     <main>
       <div class="analytics-loader loader" role="status" aria-label="Loading analytics" hidden><span></span><span></span><span></span></div>
-      <p class="analytics-status st-help" role="status" hidden></p>
       <div class="analytics-groups" aria-live="polite"></div>
       <section class="github-quota-section" aria-labelledby="analytics-github-quota">
         <h2 class="tp-group-label" id="analytics-github-quota">GitHub API · Live</h2>
@@ -68,7 +68,7 @@ function histogramMarkup(series: HistorySeries): string {
   const help = `${series.label}: distribution of ${count} known weekly values over the past year in 10 equal-width bins. Unknown periods are excluded.`
   return `<div class="analytics-histogram" tabindex="0" role="img" aria-label="${escapeHtml(help)}" data-help="${escapeHtml(help)}">
     <svg viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">${bins.map((bin, i) => `<rect x="${i * 10 + 1}" y="${39 - bin.count / max * 36}" width="8" height="${bin.count / max * 36}" data-help="${escapeHtml(`${series.format(bin.from)} – ${series.format(bin.until)}: ${bin.count} periods`)}"/>`).join('')}</svg>
-    <span class="analytics-chart-axis"><span>${escapeHtml(series.format(bins[0].from))}</span><span>${count ? 'Distribution' : 'No observations'}</span><span>${escapeHtml(series.format(bins[9].until))}</span></span>
+    <span class="analytics-chart-axis"><span>${escapeHtml(series.format(bins[0].from))}</span><span>${count ? '' : '—'}</span><span>${escapeHtml(series.format(bins[9].until))}</span></span>
   </div>`
 }
 
@@ -89,7 +89,7 @@ function quotaCharts(bucket: GithubQuotaBucket, now: number): string {
       return `<span class="quota-hour${sample ? '' : ' quota-hour-empty'}" data-help="${escapeHtml(text)}">${sample ? `<i class="quota-left" style="height:${sample.remaining / sample.limit * 100}%"></i><i class="quota-used" style="height:${sample.used / sample.limit * 100}%"></i>` : ''}</span>`
     }).join('')}</div>
     <span class="analytics-chart-axis"><span>24h ago</span><span>Now</span></span>
-    <div class="analytics-chart-heading"><span>Past 7 days · Distribution</span><span>${observations.length}/168 hours</span></div>
+    <div class="analytics-chart-heading"><span>Past 7 days</span><span>${observations.length}/168 hours</span></div>
     <div class="quota-distribution" role="img" tabindex="0" aria-label="${escapeHtml(distribution)}" data-help="${escapeHtml(distribution)}"><svg viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">${used.map((bin, i) => `<g data-help="${bin.from}–${bin.until}% quota: ${bin.count} used observations · ${left[i].count} remaining observations"><rect class="quota-used" x="${i * 10 + 1}" y="${39 - bin.count / peak * 36}" width="3.5" height="${bin.count / peak * 36}"/><rect class="quota-left" x="${i * 10 + 5}" y="${39 - left[i].count / peak * 36}" width="3.5" height="${left[i].count / peak * 36}"/></g>`).join('')}</svg></div>
     <span class="analytics-chart-axis"><span>0%</span><span>${observations.length ? 'Quota utilization' : 'Collecting history…'}</span><span>100%</span></span>
   </div>`
@@ -103,7 +103,9 @@ async function readQuota(): Promise<void> {
     const data: GithubQuotaReport & { error?: string } = await response.json()
     if (!response.ok || !Array.isArray(data.accounts)) throw new Error(data.error || 'GitHub API quota could not be read.')
     if (generation !== quotaGeneration) return
-    content.classList.remove('st-help-error')
+    const quotaFailures: ReadFailure[] = data.accounts.flatMap((account) => account.error ? [{ key: `quota:${account.login.toLowerCase()}`, title: `GitHub quota for ${account.login} is unavailable`, body: account.error }] : [])
+    if (!data.accounts.length) quotaFailures.push({ key: 'quota:configuration', title: 'GitHub quota needs configured accounts', body: 'Set your GitHub user and automation accounts in Settings → General.', target: { settings: 'general' } })
+    noticeFeed.reportReadErrors('analytics-quota', quotaFailures)
     const now = Date.now()
     const avatar = (login: string) => `https://github.com/${encodeURIComponent(login)}.png?size=80`
     const failedAvatars = new Set(Array.from(content.querySelectorAll<HTMLImageElement>('.github-quota-avatar img.broken'), (img) => img.getAttribute('src')))
@@ -116,7 +118,7 @@ async function readQuota(): Promise<void> {
           <div><h3>${escapeHtml(account.login)}</h3><p class="analytics-note">${escapeHtml(account.roles.join(' + '))}</p>
           ${account.checkedAt ? `<p class="analytics-note">Checked ${escapeHtml(time(account.checkedAt))}</p>` : ''}</div>
         </header>
-        ${account.error ? `<p class="st-help st-help-error">${escapeHtml(account.error)}</p>` : account.buckets.filter((bucket) => bucket.resource === 'core' || bucket.resource === 'graphql').map((bucket) => {
+        ${account.error ? '<div class="github-quota-unavailable" aria-label="Quota unavailable">—</div>' : account.buckets.filter((bucket) => bucket.resource === 'core' || bucket.resource === 'graphql').map((bucket) => {
           const minutes = Math.max(0, (Date.parse(bucket.resetAt) - now) / 60_000)
           const risk = minutes > 0 ? bucket.riskPercent : null
           return `<div class="github-quota-bucket">
@@ -131,11 +133,11 @@ async function readQuota(): Promise<void> {
             ${quotaCharts(bucket, now)}
           </div>`
         }).join('')}
-      </article>`).join('') : '<p class="analytics-note">Set your GitHub user and automation accounts in Settings → General.</p>')
+      </article>`).join('') : '')
   } catch (error: unknown) {
     if (generation !== quotaGeneration) return
-    content.textContent = error instanceof Error ? error.message : String(error)
-    content.classList.add('st-help-error')
+    content.replaceChildren()
+    noticeFeed.reportReadErrors('analytics-quota', [readFailure('GitHub quota is unavailable', error)])
   }
 }
 
@@ -143,15 +145,17 @@ function refreshQuota(): void {
   if (document.visibilityState === 'visible' && active) void readQuota()
 }
 
-function showStatus(message: string, isError = false): void {
-  const status = viewEl.querySelector<HTMLElement>('.analytics-status')!
-  status.textContent = message
-  status.hidden = !message
-  status.classList.toggle('st-help-error', isError)
+function readFailure(title: string, error: unknown): ReadFailure {
+  const body = error instanceof Error ? error.message : String(error)
+  return { key: `read:${body}`, title, body }
+}
+
+function accountFailures(data: { errors: Array<{ org: string, error: string, stale?: boolean }> }): ReadFailure[] {
+  return data.errors.map(({ org, error, stale }) => ({ key: `account:${org.toLowerCase()}`, title: `GitHub data for ${org} ${stale ? 'is not updating' : 'is unavailable'}`, body: error }))
 }
 
 function historyMarkup(label: string, all: HistorySeries[] | null): string {
-  if (history.error) return `<dd class="analytics-history"><p class="analytics-history-empty" data-help="${escapeHtml(history.error)}" tabindex="0">Past year unavailable</p></dd>`
+  if (history.error) return '<dd class="analytics-history" aria-label="History unavailable"></dd>'
   if (!all) return '<dd class="analytics-history" aria-busy="true"><span class="analytics-history-max"></span><div class="analytics-history-plot"></div><div class="analytics-histogram"></div></dd>'
   const series = all.find((s) => s.label === label)
   if (!series) return ''
@@ -160,7 +164,7 @@ function historyMarkup(label: string, all: HistorySeries[] | null): string {
   const at = (point: { x: number, y: number }) => `left: ${point.x}%; top: ${point.y}%`
   const summary = `${series.label}, the past year by 7-day period: latest ${series.format(series.values[series.values.length - 1] ?? null)}, highest ${series.format(chart.max)}. Arrow keys move between periods.`
   return `<dd class="analytics-history" data-series="${escapeHtml(series.label)}">
-    <span class="analytics-history-max"><span>52 weeks</span><span>${chart.max === null ? '' : `Max ${escapeHtml(series.format(chart.max))}`}</span></span>
+    <span class="analytics-history-max"><span>${chart.max === null ? '' : `Max ${escapeHtml(series.format(chart.max))}`}</span></span>
     <div class="analytics-history-plot" tabindex="0" role="img" aria-label="${escapeHtml(summary)}">
       <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true" focusable="false">
         <line class="analytics-history-base" x1="0" y1="${HISTORY_BASELINE}" x2="100" y2="${HISTORY_BASELINE}" vector-effect="non-scaling-stroke"/>
@@ -178,14 +182,14 @@ const measurementHelp: Record<string, string> = {
   'Issues opened': 'Issues created on the selected day within the selected organization scope.',
   'Issues closed': 'Issues closed on the selected day within the selected organization scope.',
   'Pull requests merged': 'Pull requests merged on the selected day.',
-  'Lines changed': 'Additions plus deletions across pull requests merged on the selected day. Partial size coverage is reported below the cards.',
-  'Time to merge': 'Mean elapsed time from opening to merge across pull requests merged on the selected day.',
+  'Lines changed': 'Additions plus deletions across pull requests merged on the selected day. The tooltip names any partial size coverage.',
+  'Time to merge': 'Median elapsed time from opening to merge across pull requests merged on the selected day.',
   'Pull requests opened': 'Pull requests created on the selected day.',
   'Closed without merging': 'Pull requests closed on the selected day without being merged.',
   'Time to first review': 'Median elapsed time from opening to the first submitted review by someone other than the author, for first reviews on the selected day.',
-  'Comments': 'Mean conversation and review comments per pull request merged on the selected day.',
+  'Comments': 'Median conversation and review comments per pull request merged on the selected day.',
   'Median lines': 'Median additions plus deletions per pull request merged on the selected day. Withheld when any size is unknown.',
-  'Behaviors': 'Mean completed review and approval behaviors per pull request merged on the selected day.',
+  'Behaviors': 'Median completed review and approval behaviors per pull request merged on the selected day.',
   'Median time': 'Median elapsed time from opening to merge across pull requests merged on the selected day.',
   'Merged by agent': 'Share of pull requests merged on the selected day whose merger was the configured agent account.',
 }
@@ -199,14 +203,13 @@ function groupMarkup(group: AnalyticsGroup): string {
         ${group.tiles.map((tile) => `
           <div class="analytics-tile">
             <dt class="analytics-label">${escapeHtml(tile.label)}</dt>
-            <dd class="analytics-value" data-help="${escapeHtml([measurementHelp[tile.label], tile.note].filter(Boolean).join(' '))}" tabindex="0">${escapeHtml(tile.value)}</dd>
-            <dd class="analytics-trend ${tile.trend?.direction ?? 'neutral'}">${tile.trend ? `<span role="img" aria-label="${escapeHtml(tile.trend.description)}" data-help="${escapeHtml(tile.trend.caption)}">${escapeHtml(tile.trend.text)}</span>` : ''}</dd>
-            <dd class="analytics-note">${tile.comparison ? escapeHtml(tile.comparison) : ''}</dd>
+            <dd class="analytics-summary ${tile.trend?.direction ?? 'neutral'}">
+              <div class="analytics-value-row"><span class="analytics-value" data-help="${escapeHtml([measurementHelp[tile.label], tile.note].filter(Boolean).join(' '))}" tabindex="0">${escapeHtml(tile.value)}</span>${tile.trend ? `<span class="analytics-arrow" role="img" aria-label="${escapeHtml(tile.trend.description)}" data-help="${escapeHtml(tile.trend.caption)}" tabindex="0">${escapeHtml(tile.trend.text.slice(0, 1))}</span>` : ''}</div>
+              <div class="analytics-trend">${tile.trend ? `<span class="analytics-delta" data-help="${escapeHtml(tile.trend.description)}" tabindex="0">${escapeHtml(tile.trend.text.slice(2))}</span>` : ''}<span class="analytics-note">${tile.comparison ? escapeHtml(tile.comparison) : ''}</span></div>
+            </dd>
             ${historyMarkup(tile.label, series)}
           </div>`).join('')}
       </dl>
-      ${group.note ? `<p class="analytics-group-note">${escapeHtml(group.note)}</p>` : ''}
-      ${group.id === 'productivity' && history.data?.errors.length ? `<p class="analytics-group-note st-help-error">${escapeHtml(organizationErrors(history.data))}</p>` : ''}
     </section>`
 }
 
@@ -250,7 +253,7 @@ function showCursor(label: string, index: number): void {
   const detail = document.createElement('span')
   detail.textContent = `${series.detail(data.periods[i])} · ${periodLabel(data.periods[i], effectiveTimezone())}`
   const explanation = document.createElement('small')
-  explanation.textContent = `${series.label} · Past year, one value per 7-day period. ${['Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Pull requests opened', 'Closed without merging'].includes(label) ? 'Daily averages.' : label === 'Time to merge' ? 'Period means.' : 'Period values.'} Last period: the 7 days before the selected day.`
+  explanation.textContent = `${series.label} · Past year, one value per 7-day period. ${['Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Pull requests opened', 'Closed without merging'].includes(label) ? 'Daily averages.' : label === 'Time to merge' ? 'Period medians.' : 'Period values.'} Last period: the 7 days before the selected day.`
   const firstShow = !tip.childElementCount
   tip.replaceChildren(value, detail, explanation)
   if (firstShow) reveal(tip, { distance: 4 })
@@ -335,9 +338,11 @@ async function readHistory(bounds: string[]): Promise<void> {
     if (!res.ok || !Array.isArray(data?.periods)) throw new Error(data?.error || `The past year could not be read (HTTP ${res.status})`)
     if (generation !== historyGeneration) return
     history = { data: data as AnalyticsHistory, error: '' }
+    noticeFeed.reportReadErrors('analytics-history', accountFailures(data))
   } catch (error) {
     if (generation !== historyGeneration) return
     history = { data: null, error: error instanceof Error ? error.message : String(error) }
+    noticeFeed.reportReadErrors('analytics-history', [readFailure('Analytics history is unavailable', error)])
   }
   render()
 }
@@ -356,12 +361,11 @@ async function readAnalytics(): Promise<void> {
   const quotaTop = quota.offsetTop
   groups.style.minHeight = ''
   groups.replaceChildren()
-  showStatus('')
   viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = false
   groups.setAttribute('aria-busy', 'true')
   groups.style.minHeight = `${Math.max(0, quotaTop - quota.offsetTop)}px`
-  const read = async (since: string, until: string): Promise<AnalyticsReport> => {
-    const query = new URLSearchParams({ since, until })
+  const read = async (since: string, until: string, dailyBounds?: string[]): Promise<AnalyticsReport> => {
+    const query = new URLSearchParams({ since, until, ...(dailyBounds ? { dailyBounds: dailyBounds.join(',') } : {}) })
     const res = await fetch(organizationUrl(`/api/analytics?${query}`))
     const data = await res.json().catch(() => null)
     if (!res.ok || !data) throw new Error(data?.error || `Analytics could not be read (HTTP ${res.status})`)
@@ -370,17 +374,17 @@ async function readAnalytics(): Promise<void> {
   try {
     const [data, baseline] = await Promise.all([
       read(day.since, day.until),
-      read(day.baselineSince, day.since),
+      read(day.baselineSince, day.since, analyticsDailyBounds(dayOffset, dayAnchor)),
     ])
     if (generation !== readGeneration) return
     shown = { report: data, baseline }
     render()
-    showStatus([organizationErrors(data), organizationErrors(baseline)].filter(Boolean).filter((error, i, all) => all.indexOf(error) === i).join('; '))
+    noticeFeed.reportReadErrors('analytics-day', [...accountFailures(data), ...accountFailures(baseline)])
   } catch (error) {
     if (generation !== readGeneration) return
     // Numbers from the last day under the next day's name would be wrong.
     groups.innerHTML = ''
-    showStatus(error instanceof Error ? error.message : String(error), true)
+    noticeFeed.reportReadErrors('analytics-day', [readFailure('Analytics is unavailable', error)])
   } finally {
     if (generation === readGeneration) {
       viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = true

@@ -47,6 +47,7 @@ export interface NotificationItem {
 export type ItemCounts = Record<ItemGroup, number> & { open: number }
 
 const NOTICE_LOOK: Record<NoticeKind, { group: ItemGroup, tone: ItemTone, icon: ItemIcon, source: string }> = {
+  read_failed: { group: 'faults', tone: 'red', icon: 'fault', source: 'Data' },
   chat_waiting: { group: 'needs', tone: 'blue', icon: 'chat', source: 'Chat' },
   sign_in_needed: { group: 'needs', tone: 'amber', icon: 'key', source: 'Accounts' },
   behavior_held: { group: 'needs', tone: 'amber', icon: 'held', source: 'Behaviors' },

@@ -23,7 +23,7 @@ import { initServiceSettings, openServicePlace, takeServicePlace } from './servi
 import { restartOnboarding, startOnboarding } from './onboarding'
 import { watchForUpdates } from './updating'
 import { watchForSignOut } from './signed-out'
-import { NoticeFeed, type NoticeTarget } from './notices'
+import { noticeFeed, type NoticeTarget } from './notices'
 import { mountNotificationRail } from './views/notification-rail'
 import './views/notification-rail.css'
 import './views/updating.css'
@@ -152,7 +152,7 @@ const menu = initMenu({
 
 // The notification rail beside the page, and where each notice in it takes
 // the person.
-const notices = new NoticeFeed()
+const notices = noticeFeed
 function openNotice(target: NoticeTarget): void {
   if ('view' in target) menu.switchTo(target.view)
   else if ('swarm' in target) {

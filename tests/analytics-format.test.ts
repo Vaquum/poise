@@ -15,12 +15,14 @@ function report(pullRequests: Partial<AnalyticsReport['pullRequests']> = {}): An
       mergedByAgent: 3,
       firstReview: { count: 5, medianMs: 95_000 },
       commentsPerPr: 2.25,
+      medianCommentsPerPr: pullRequests.commentsPerPr ?? 2.25,
       lines: { total: 12_345, median: 180.5, counted: 4 },
-      behaviors: { perPr: 1.5, approvals: 1, reviews: 4, changesRequested: 1 },
+      behaviors: { medianPerPr: 1.5, perPr: 1.5, approvals: 1, reviews: 4, changesRequested: 1 },
       averageTimeToMergeMs: (26 * 60 + 5) * 60_000,
       medianTimeToMergeMs: 5 * 3_600_000,
       ...pullRequests,
     },
+    daily: Array.from({ length: 7 }, () => ({ issues: { opened: 172, closed: 1 }, pullRequests: { opened: 3, closedUnmerged: 0, merged: 2, mergedByAgent: 1, firstReview: { count: 1, medianMs: 1 }, commentsPerPr: 1, lines: { total: 350, median: 175, counted: 2 }, behaviors: { perPr: 1, approvals: 1, reviews: 1, changesRequested: 0 }, averageTimeToMergeMs: 1, medianTimeToMergeMs: 1 } })),
     errors: [],
   }
 }
@@ -55,7 +57,7 @@ describe('Analytics wording', () => {
       ['productivity', 'Productivity'], ['per-merged-pr', 'Per merged pull request'],
     ])
     expect(groups.map((group) => group.tiles.map((t) => [t.label, t.value]))).toEqual([
-      [['Issues opened', '1,204'], ['Issues closed', '1'], ['Pull requests merged', '4'], ['Lines changed', '12,345'], ['Time to merge', '1d 2h'], ['Pull requests opened', '6'], ['Closed without merging', '1'], ['Time to first review', '1m 35s']],
+      [['Issues opened', '1,204'], ['Issues closed', '1'], ['Pull requests merged', '4'], ['Lines changed', '12,345'], ['Time to merge', '5h'], ['Pull requests opened', '6'], ['Closed without merging', '1'], ['Time to first review', '1m 35s']],
       [['Comments', '2.3'], ['Median lines', '181'], ['Behaviors', '1.5'], ['Median time', '5h'], ['Merged by agent', '75%']],
     ])
     expect(tile(groups, 'Merged by agent').note).toBe('3 of 4 by robot')
@@ -82,6 +84,7 @@ describe('Analytics wording', () => {
       merged: 0,
       mergedByAgent: 0,
       commentsPerPr: null,
+      medianCommentsPerPr: null,
       lines: { total: null, median: null, counted: 0 },
       behaviors: { perPr: null, approvals: 0, reviews: 0, changesRequested: 0 },
       averageTimeToMergeMs: null,
@@ -100,8 +103,8 @@ describe('Analytics wording', () => {
 
 describe('merge-time trends', () => {
   it('makes faster, slower and unchanged comparisons explicit', () => {
-    expect(mergeTimeTrend(50, 100)).toEqual({ direction: 'good', caption: 'Faster vs 7-day average', text: '↓ 50%', description: '50% faster versus the preceding 7-day average' })
-    expect(mergeTimeTrend(150, 100)).toEqual({ direction: 'bad', caption: 'Slower vs 7-day average', text: '↑ 50%', description: '50% slower versus the preceding 7-day average' })
+    expect(mergeTimeTrend(50, 100)).toEqual({ direction: 'good', caption: 'Faster vs 7-day median', text: '↓ 50%', description: '50% faster versus the preceding 7-day median' })
+    expect(mergeTimeTrend(150, 100)).toEqual({ direction: 'bad', caption: 'Slower vs 7-day median', text: '↑ 50%', description: '50% slower versus the preceding 7-day median' })
     expect(mergeTimeTrend(100, 100)?.text).toBe('→ 0%')
     expect(mergeTimeTrend(100, 100)?.direction).toBe('neutral')
   })
@@ -121,19 +124,21 @@ it('withholds comparative claims when an account is missing from either period',
   expect(tile(buildGroups(report(), partial), 'Time to merge').trend).toBeUndefined()
 })
 
-it('compares headline event counts against seven-day daily averages, including zero days', () => {
+it('compares headline event counts against seven-day daily medians, including zero days', () => {
   const day = report({ merged: 4, lines: { total: 700, median: 175, counted: 4 } })
   day.issues = { opened: 7, closed: 0 }
   const week = report({ merged: 14, lines: { total: 2450, median: 175, counted: 14 } })
   week.issues = { opened: 14, closed: 7 }
+  week.daily!.forEach((day) => { day.issues = { opened: 2, closed: 1 } })
   const groups = buildGroups(day, week)
   expect(tile(groups, 'Issues opened').trend).toMatchObject({ direction: 'good', text: '↑ 250%' })
   expect(tile(groups, 'Issues closed').trend).toMatchObject({ direction: 'bad', text: '↓ 100%' })
-  expect(tile(groups, 'Pull requests merged').comparison).toBe('7-day daily average: 2.0')
+  expect(tile(groups, 'Pull requests merged').comparison).toBe('7-day median: 2.0 / day')
   expect(tile(groups, 'Lines changed').trend).toMatchObject({ direction: 'good', text: '↑ 100%' })
   week.pullRequests.lines.counted = 10
+  week.daily![0].pullRequests.lines.counted = 1
   expect(tile(buildGroups(day, week), 'Lines changed').trend).toBeUndefined()
-  expect(tile(buildGroups(day, week), 'Lines changed').comparison).toBe('7-day daily average: —')
+  expect(tile(buildGroups(day, week), 'Lines changed').comparison).toBe('7-day median: — / day')
 })
 
 
@@ -159,9 +164,9 @@ describe('pull request flow', () => {
     expect(tile(groups, 'Time to first review').comparison).toBe('7-day median: 3m 10s · 20 first reviews')
   })
 
-  it('counts openings and unmerged closings against the 7-day daily average', () => {
+  it('counts openings and unmerged closings against the 7-day daily median', () => {
     const groups = buildGroups(report(), report({ opened: 21, closedUnmerged: 0 }))
-    expect(tile(groups, 'Pull requests opened')).toMatchObject({ trend: { direction: 'good', text: '↑ 100%' }, comparison: '7-day daily average: 3.0' })
+    expect(tile(groups, 'Pull requests opened')).toMatchObject({ trend: { direction: 'good', text: '↑ 100%' }, comparison: '7-day median: 3.0 / day' })
     expect(tile(groups, 'Closed without merging').trend).toMatchObject({ text: '↑ 1.0' })
   })
 
@@ -180,4 +185,28 @@ it('compares every per-PR metric with the same seven-day population', () => {
   expect(groups[1].tiles.every((item) => item.trend && item.comparison?.includes('4 PRs'))).toBe(true)
   expect(tile(groups, 'Comments').trend?.text).toBe('↑ 100%')
   expect(tile(groups, 'Median time')).toMatchObject({ trend: { direction: 'good', text: '↓ 50%' }, comparison: '7-day median: 2h · 4 PRs' })
+})
+
+it('keeps trends for a readable cache with a sync failure, but not missing scope', () => {
+  const stale = report()
+  stale.errors = [{ org: 'alpha', error: 'enumeration changed', stale: true }]
+  expect(tile(buildGroups(stale, report()), 'Time to merge').trend).toBeDefined()
+  stale.errors.push({ org: 'beta', error: 'unreadable' })
+  expect(tile(buildGroups(stale, report()), 'Time to merge').trend).toBeUndefined()
+})
+
+it('uses the middle daily total, includes zero days, and never substitutes a weekly mean', () => {
+  const week = report()
+  week.daily!.forEach((day, i) => { day.issues.opened = [0, 0, 0, 2, 4, 10, 700][i] })
+  const day = report()
+  day.issues.opened = 4
+  expect(tile(buildGroups(day, week), 'Issues opened')).toMatchObject({ trend: { text: '↑ 100%' }, comparison: '7-day median: 2.0 / day' })
+  delete week.daily
+  expect(tile(buildGroups(day, week), 'Issues opened').trend).toBeUndefined()
+})
+
+it('compares medians consistently even when unchanged populations are strongly skewed', () => {
+  const skewed = report({ commentsPerPr: 34, medianCommentsPerPr: 1, behaviors: { perPr: 34, medianPerPr: 1, approvals: 100, reviews: 1, changesRequested: 1 } })
+  const groups = buildGroups(skewed, skewed)
+  for (const label of ['Comments', 'Behaviors']) expect(tile(groups, label)).toMatchObject({ value: '1.0', trend: { direction: 'neutral', text: '→ 0%' } })
 })

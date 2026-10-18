@@ -4,7 +4,9 @@
 // shows the same ones: what one tab puts away, the others drop on their next read.
 
 export const NOTICE_KINDS = ['chat_waiting', 'sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'pr_ready', 'chat_turn_finished', 'github_quota_warning', 'github_quota_exhausted', 'storage_low'] as const
-export type NoticeKind = typeof NOTICE_KINDS[number]
+export type NoticeKind = typeof NOTICE_KINDS[number] | 'read_failed'
+
+export interface ReadFailure { key: string, title: string, body: string, target?: NoticeTarget }
 
 export type NoticeTarget =
   | { view: 'behaviors' }
@@ -141,6 +143,10 @@ export class NoticeFeed {
   private state: NoticesState = { enabled: false, notices: [] }
   private server: NoticesState = { enabled: false, notices: [] }
   private readonly putAway = new Map<string, PutAway>()
+  private readonly readFailures = new Map<string, ReadFailure[]>()
+  private readonly local = new Map<string, Notice>()
+  private readonly dismissedLocal = new Set<string>()
+  private localSequence = 0
   private sent = 0
   private shown = 0
   private heard = false
@@ -181,6 +187,25 @@ export class NoticeFeed {
     window.removeEventListener('focus', this.onVisible)
   }
 
+  /** Browser read failures belong to the shared rail, not the view. Sources
+   *  share a key so day, baseline and history report an account only once.
+   *  These tab-local failures never post another request. */
+  reportReadErrors(source: string, failures: ReadFailure[]): void {
+    this.readFailures.set(source, failures)
+    const pending = new Map([...this.readFailures.values()].flat().map((failure) => [failure.key, failure]))
+    for (const [key, notice] of this.local) {
+      if (!pending.has(key)) { this.local.delete(key); this.dismissedLocal.delete(notice.id) }
+    }
+    for (const [key, failure] of pending) {
+      const previous = this.local.get(key)
+      const at = new Date().toISOString()
+      this.local.set(key, { id: previous?.id ?? `read:${++this.localSequence}`, kind: 'read_failed',
+        title: failure.title, body: failure.body, since: previous?.since ?? at, due: previous?.due ?? at,
+        silenceable: false, target: failure.target ?? null })
+    }
+    this.publish()
+  }
+
   /** Reads what the server shows now, joining a read already on its way; an
    *  answer that is not one changes nothing. */
   read(): Promise<void> {
@@ -212,6 +237,11 @@ export class NoticeFeed {
 
   /** Puts a notice away here at once, then on the server, whose answer wins. */
   dismiss(id: string): Promise<void> {
+    if ([...this.local.values()].some((notice) => notice.id === id)) {
+      this.dismissedLocal.add(id)
+      this.publish()
+      return Promise.resolve()
+    }
     return this.act(id, 'dismiss')
   }
 
@@ -260,8 +290,11 @@ export class NoticeFeed {
       const away = this.putAway.get(notice.id)
       return !!away && (away.due === null || away.due === notice.due)
     }
-    const next = { ...this.server, notices: this.server.notices.filter((notice) => !hidden(notice)) }
+    const next = { ...this.server, notices: [...this.server.notices.filter((notice) => !hidden(notice)), ...[...this.local.values()].filter((notice) => !this.dismissedLocal.has(notice.id))] }
     this.state = next
     for (const listener of this.listeners) listener(next)
   }
 }
+
+/** The page shares one feed across views and the notification rail. */
+export const noticeFeed = new NoticeFeed()

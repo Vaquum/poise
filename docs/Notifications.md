@@ -38,8 +38,13 @@ stays expanded through refreshes.
 
 ## What shows
 
-Each notice is an unresolved alert, the same alerts
-[Poise Link](Poise-Link.md) shows on the desktop. They come in this order:
+Server notices are unresolved alerts, the same alerts
+[Poise Link](Poise-Link.md) shows on the desktop. Analytics also reports browser
+read failures here as tab-local Poise faults. These failures are shared across
+views, deduplicated across requests, dismissible without a request, and cleared
+on recovery. They remain accessible when Notifications are off; the switch
+suppresses their popups. See
+[Analytics](Analytics.md#missing-data-and-failures). They come in this order:
 
 1. A Chat agent is waiting for a permission or an answer.
 2. A sign-in is needed: Claude, another agent CLI, or a GitHub account gh does

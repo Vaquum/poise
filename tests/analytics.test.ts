@@ -144,6 +144,7 @@ describe('the numbers', () => {
     })
     expect(report.pullRequests.merged).toBe(3)
     expect(report.pullRequests.commentsPerPr).toBe(2)
+    expect(report.pullRequests.medianCommentsPerPr).toBe(1)
     expect(report.pullRequests.lines).toEqual({ total: 610, median: 100, counted: 3 })
     expect(report.pullRequests.medianTimeToMergeMs).toBe(4 * HOUR)
     // 2h, 5 days and 4h, averaged.
@@ -207,7 +208,7 @@ describe('the numbers', () => {
         { repo: 'alpha/other', pr: 2, action: 'approved', completedAt: '2026-10-05T01:00:00Z' },
       ],
     })
-    expect(report.pullRequests.behaviors).toEqual({ perPr: 2, approvals: 1, reviews: 2, changesRequested: 1 })
+    expect(report.pullRequests.behaviors).toEqual({ perPr: 2, medianPerPr: 2, approvals: 1, reviews: 2, changesRequested: 1 })
   })
 
   it('reports an empty range as zero counts and no averages', () => {
@@ -223,8 +224,9 @@ describe('the numbers', () => {
         mergedByAgent: null,
         firstReview: { count: 0, medianMs: null },
         commentsPerPr: null,
+        medianCommentsPerPr: null,
         lines: { total: null, median: null, counted: 0 },
-        behaviors: { perPr: null, approvals: 0, reviews: 0, changesRequested: 0 },
+        behaviors: { perPr: null, medianPerPr: null, approvals: 0, reviews: 0, changesRequested: 0 },
         averageTimeToMergeMs: null,
         medianTimeToMergeMs: null,
       },
@@ -367,6 +369,17 @@ describe('reading what Current shows', () => {
     expect((await readAnalytics(WEEK)).pullRequests.firstReview).toEqual({ count: 2, medianMs: 75_000 })
   })
 
+  it('returns seven daily totals, including empty days, from the same datastore read', async () => {
+    data()
+    const bounds = Array.from({ length: 8 }, (_, i) => new Date(Date.UTC(2026, 9, 5 + i)).toISOString())
+    const report = await readAnalytics(parseWindow(bounds[0], bounds[7]), 'alpha', bounds)
+    expect(report.daily?.map((day) => day.issues.opened)).toEqual([0, 2, 0, 0, 0, 0, 0])
+    expect(report.daily?.map((day) => day.pullRequests.merged)).toEqual([0, 2, 0, 0, 0, 0, 0])
+    expect(mocks.runFile).not.toHaveBeenCalled()
+    await expect(readAnalytics(WEEK, 'alpha', bounds.slice(1))).rejects.toThrow('daily bounds')
+    await expect(readAnalytics(parseWindow(null, bounds[7]), 'alpha', bounds)).rejects.toThrow('daily bounds')
+  })
+
   it('reads a history in one pass over every period, for the selected account', async () => {
     data()
     seed(pr(4, '2026-09-28T00:00:00Z', '2026-09-29T00:00:00Z', { additions: 3, deletions: 3 }), 'pr', true)
@@ -408,7 +421,7 @@ describe('reading what Current shows', () => {
     rmSync(mocks.orgs[1].datastorePath)
     mocks.orgs[0].error = 'sync failed'
     const report = await readAnalytics(WEEK)
-    expect(report.errors).toEqual([{ org: 'alpha', error: 'sync failed' }, { org: 'beta', error: expect.any(String) }])
+    expect(report.errors).toEqual([{ org: 'alpha', error: 'sync failed', stale: true }, { org: 'beta', error: expect.any(String) }])
     rmSync(mocks.orgs[0].datastorePath)
     await expect(readAnalytics(WEEK)).rejects.toThrow('alpha:')
   })
