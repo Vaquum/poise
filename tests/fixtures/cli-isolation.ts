@@ -17,7 +17,7 @@ import { delimiter, join } from 'node:path'
 
 /** Where the agent CLIs keep their logins and settings. */
 export const CLI_HOME_VARIABLES = [
-  'HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GH_CONFIG_DIR', 'GROK_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
+  'HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GH_CONFIG_DIR', 'GROK_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'AGENT_INTERFACE_DATA_DIR',
 ] as const
 
 /** The agent CLIs' executables, as Poise runs them by name. */

@@ -32,9 +32,10 @@ async function pointer(name, value) {
   await writeFile(join(home, '.poise', 'releases', name), `${value}\n`)
 }
 
-function supervise() {
+function supervise(diagnostic) {
   return supervisor({
     home,
+    diagnostic,
     image: IMAGE,
     base: 'B',
     env: { HOME: home, PATH: `${home}/.local/bin:/opt/caller/venv/bin:/usr/bin:/bin` },
@@ -164,4 +165,38 @@ describe('the workspace supervisor', () => {
     ;(await nth(0)).child.exit(3)
     expect(await running).toBe(3)
   })
+})
+
+it('records native supervisor failure facts and omits planned switches and shutdown', async () => {
+  const records = []; const instance = supervise((input) => records.push(input)); const running = instance.run()
+  const first = await nth(0)
+  first.child.exit(UPDATE_EXIT_CODE)
+  const second = await nth(1)
+  expect(records).toHaveLength(0)
+  clock += 2500
+  second.child.exit(9)
+  expect(await running).toBe(9)
+  expect(records).toEqual([expect.objectContaining({ level: 'error', operation: 'workspace.exit', release: 'r1', exitCode: 9,
+    context: expect.objectContaining({ elapsedMs: 2500, executable: process.execPath, cwd: '/opt/poise' }) })])
+  const stopping = supervise((input) => records.push(input)); const stopped = stopping.run()
+  const third = await nth(2); stopping.stop('SIGTERM'); third.child.exit(0)
+  await stopped; expect(records).toHaveLength(1)
+})
+
+it('retains actual spawn errors without letting a diagnostic reporter change supervision', async () => {
+  const records = []; const instance = supervise((input) => { records.push(input); throw new Error('fixture reporter offline') })
+  const running = instance.run(); const child = (await nth(0)).child
+  child.emit('error', Object.assign(new Error('precise launch cause'), { code: 'EACCES', errno: -13 }))
+  expect(await running).toBe(1)
+  expect(records[0]).toMatchObject({ level: 'error', operation: 'workspace.spawn', errno: -13, message: 'precise launch cause', context: { processErrorCode: 'EACCES' } })
+})
+
+it('records a release fallback without changing the selected release or failed marker', async () => {
+  await install('r2', 'B'); await pointer('current', 'r2')
+  const records = []; const instance = supervise((input) => records.push(input)); const running = instance.run()
+  const child = (await nth(0)).child; clock += 2000; child.exit(1)
+  expect((await nth(1)).release).toBe(IMAGE)
+  expect(records.find((input) => input.operation === 'workspace.release_fallback')).toMatchObject({ level: 'warning', release: 'r2', exitCode: 1,
+    context: { elapsedMs: 2000, startupWindowMs: FAILED_START_MS, fallbackRelease: 'r1' } })
+  instance.stop('SIGTERM'); started[1].child.exit(0); await running
 })

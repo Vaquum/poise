@@ -1,3 +1,4 @@
+import { diagnostic, diagnosticFailure } from './logging'
 import { GH_STORED_ACCOUNTS_ENV } from './accounts/clis'
 import { openAlerts, raiseAlert, resolveAlert, updateAlertDetails } from './alerts/store'
 import { getMeta, setMeta } from './db'
@@ -97,7 +98,8 @@ async function readAccount(login: string): Promise<Snapshot> {
         env: GH_STORED_ACCOUNTS_ENV, timeoutMs: 10_000, maxOutputBytes: 64 * 1024,
       })).stdout.trim()
       if (!token) throw new Error('Empty credential')
-    } catch {
+    } catch (error) {
+      diagnosticFailure('github_quota.authentication', error, { account: login, phase: 'credential_lookup' }, { stderr: false, level: 'warning' })
       return { checkedAt: Date.now(), buckets: [], error: `GitHub authentication is unavailable for ${login}. Connect this account in Settings → Accounts.` }
     }
     try {
@@ -105,8 +107,16 @@ async function readAccount(login: string): Promise<Snapshot> {
         env: { ...GH_STORED_ACCOUNTS_ENV, GH_HOST: 'github.com', GH_TOKEN: token }, timeoutMs: 10_000, maxOutputBytes: 256 * 1024,
       })
       const now = Date.now()
-      return { checkedAt: now, buckets: quotaBuckets(JSON.parse(result.stdout), key, now), error: null }
-    } catch {
+      const buckets = quotaBuckets(JSON.parse(result.stdout), key, now)
+      for (const bucket of buckets) {
+        const was = cached?.snapshot.buckets.find((prior) => prior.resource === bucket.resource && prior.resetAt === bucket.resetAt)
+        if (bucket.remaining === 0 && was?.remaining !== 0) diagnostic({ level: 'error', operation: 'github_quota.exhausted',
+          account: login, target: bucket.resource, condition: bucket.resetAt, message: 'GitHub API budget is exhausted',
+          context: { resource: bucket.resource, used: bucket.used, remaining: bucket.remaining, limit: bucket.limit, resetAt: bucket.resetAt, measuredAt: new Date(now).toISOString() } })
+      }
+      return { checkedAt: now, buckets, error: null }
+    } catch (error) {
+      diagnosticFailure('github_quota.read', error, { account: login, phase: 'rate_limit' }, { secrets: [token], level: 'warning' })
       // Neither the credential command nor HTTP stderr may expose a token.
       return { checkedAt: Date.now(), buckets: [], error: `GitHub API quota could not be read for ${login}. It will be checked again shortly.` }
     }

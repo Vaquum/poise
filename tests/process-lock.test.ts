@@ -2,7 +2,8 @@ import Database from 'better-sqlite3'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
+import * as logging from '../server/logging'
 import { withProcessLock } from '../server/process-lock'
 
 it('releases an empty reservation without falsely failing an already committed file write', async () => {
@@ -25,4 +26,19 @@ it('releases an empty reservation without falsely failing an already committed f
     observer?.close()
     await rm(root, { recursive: true, force: true })
   }
+})
+
+it('retains measured lock acquisition wait, contention code and unverifiable owner explicitly', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'poise-lock-evidence-'))
+  const path = join(root, 'lock.sqlite3')
+  const holder = new Database(path)
+  holder.exec('BEGIN IMMEDIATE')
+  const captured = vi.spyOn(logging, 'diagnosticFailure').mockReturnValue('fixture')
+  try {
+    await expect(withProcessLock({ path, timeoutMs: 1000 }, async () => 'unreachable')).rejects.toThrow('timed out waiting for process lock')
+    expect(captured).toHaveBeenCalledWith('process_lock.acquire', expect.objectContaining({ code: 'SQLITE_BUSY' }),
+      expect.objectContaining({ lockPath: path, phase: 'acquisition', waitLimitMs: 1000, holderPid: null, holderIdentityVerified: false }), { level: 'warning' })
+    const context = captured.mock.calls[0][2]!
+    expect(context.elapsedMs).toBeGreaterThanOrEqual(1000)
+  } finally { captured.mockRestore(); holder.exec('ROLLBACK'); holder.close(); await rm(root, { recursive: true, force: true }) }
 })

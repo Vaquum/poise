@@ -99,6 +99,22 @@ def init_db():
                where correlation_id is not null"""
         )
 
+        conn.executescript("""
+            create table if not exists diagnostic_calls (
+                seq integer primary key autoincrement, call_id text not null unique
+            );
+            create index if not exists calls_diagnostic_pending on calls(ended_at,id)
+                where status != 'running' and (coalesce(error,'') != '' or error_code is not null or diagnostic is not null);
+            create trigger if not exists calls_diagnostic_insert after insert on calls
+            when new.status != 'running' and (coalesce(new.error,'') != '' or new.error_code is not null or new.diagnostic is not null)
+            begin insert or ignore into diagnostic_calls(call_id) values(new.id); end;
+            create trigger if not exists calls_diagnostic_update after update of status,error,error_code,diagnostic on calls
+            when new.status != 'running' and (coalesce(new.error,'') != '' or new.error_code is not null or new.diagnostic is not null)
+            begin insert or ignore into diagnostic_calls(call_id) values(new.id); end;
+        """)
+        conn.execute("create table if not exists diagnostic_stream (id integer primary key check(id=1), generation text not null)")
+        conn.execute("insert or ignore into diagnostic_stream values(1,?)", (uuid4().hex,))
+
 
 init_db()
 
@@ -470,6 +486,59 @@ def logs():
         }
         for r in rows
     ]
+
+
+def diagnostics(after: int = 0, limit: int = 3) -> dict:
+    """Bounded metadata-only read; completion sequence includes late-finishing calls.
+
+    The owner consumes this internal stream and applies the canonical Logging
+    redactor before persistence. It never opens response/reasoning artifacts.
+    """
+    if type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 10:
+        raise ValueError("diagnostics requires a nonnegative cursor and limit 1..10")
+    fields = ("id", "model", "status", "pr_id", "repo", "actor", "behavior", "outcome", "head_sha",
+              "expected_head", "source", "correlation_id", "action", "error_code")
+    with db() as conn:
+        stream_id = conn.execute("select generation from diagnostic_stream where id=1").fetchone()[0]
+        if not isinstance(stream_id, str) or not re.fullmatch(r"[a-f0-9]{32}", stream_id):
+            raise RuntimeError("Caller diagnostic stream identity is invalid")
+        conn.execute("""insert or ignore into diagnostic_calls(call_id)
+            select c.id from calls c left join diagnostic_calls d on d.call_id=c.id
+            where d.call_id is null and c.status != 'running'
+              and (coalesce(c.error,'') != '' or c.error_code is not null or c.diagnostic is not null)
+            order by c.ended_at,c.id limit 100""")
+        backfill = conn.execute("""select exists(select 1 from calls c left join diagnostic_calls d on d.call_id=c.id
+            where d.call_id is null and c.status != 'running'
+              and (coalesce(c.error,'') != '' or c.error_code is not null or c.diagnostic is not null))""").fetchone()[0]
+        columns = ",".join(f"substr(c.{field},1,512) as {field}" for field in fields)
+        rows = conn.execute(f"""select d.seq,{columns},c.started_at,c.ended_at,
+            substr(c.error,1,8192) as error,substr(c.diagnostic,1,65536) as diagnostic
+            from diagnostic_calls d join calls c on c.id=d.call_id
+            where d.seq>? order by d.seq limit ?""", (after, limit + 1)).fetchall()
+    events = []
+    for row in rows[:limit]:
+        entry = {field: row[field] for field in fields}
+        entry.update(seq=row["seq"], error=row["error"], started_at_precise=utc_stamp(row["started_at"]),
+                     completed_at=utc_stamp(row["ended_at"]) if row["ended_at"] else None)
+        try:
+            raw = row["diagnostic"]
+            evidence = json.loads(raw) if raw is not None else None
+            if raw is not None and (not isinstance(evidence, dict) or isinstance(evidence.get("version"), bool) or evidence.get("version") != 1):
+                raise ValueError("diagnostic must be a supported version 1 object")
+            # Python's decoder accepts NaN/Infinity and overflowing exponents.
+            # The stream must remain finite JSON for its JavaScript consumer.
+            json.dumps(evidence, allow_nan=False)
+            entry["diagnostic"] = evidence
+        except (ValueError, TypeError, RecursionError):
+            entry["diagnostic"] = None
+            entry["evidence_unavailable"] = "Stored process diagnostic is malformed, unsupported, non-finite or exceeds bounded decoding limits"
+        if len(json.dumps(entry, allow_nan=False).encode()) > 64 * 1024:
+            entry["diagnostic"] = None
+            entry["error"] = (row["error"] or "")[:2048]
+            entry["evidence_unavailable"] = "Stored process diagnostic exceeds the bounded metadata envelope"
+        events.append(entry)
+    return {"version": 1, "streamId": stream_id, "events": events, "cursor": events[-1]["seq"] if events else after,
+            "hasMore": len(rows) > limit, "backfillPending": bool(backfill)}
 
 
 def _receipts(raw: str | None) -> list | None:
@@ -1299,6 +1368,7 @@ behaviors:
   --models
   --refresh-models
   --logs
+  --diagnostics [after-sequence] [limit-1..10]
   --stop CALL_ID
   --read-response HASH
   --read-reasoning HASH
@@ -1378,6 +1448,11 @@ def main():
                 raise ValueError("unknown call id")
         path = DB.parent / "reasoning" / f"{call_id}.txt"
         print(path.read_text(encoding="utf-8") if path.exists() else "")
+        return
+    if len(sys.argv) in (2, 3, 4) and sys.argv[1] == "--diagnostics":
+        after = int(sys.argv[2]) if len(sys.argv) >= 3 else 0
+        limit = int(sys.argv[3]) if len(sys.argv) == 4 else 3
+        print(json.dumps(diagnostics(after, limit), allow_nan=False))
         return
     if sys.argv[1:] == ["--logs"]:
         print(json.dumps(logs(), indent=2))

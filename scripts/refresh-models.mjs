@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { environmentSecrets, redact } from '../gateway/src/diagnostics/redaction.mjs'
 // Shared by the daily job and Settings: update real CLIs before discovery.
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -37,8 +38,9 @@ const report = await withModelRefreshLock(reportPath, async () => {
     for (const provider of Object.keys(cliUpdates)) if (!result.families[provider]) result.families[provider] = { status: 'unavailable', error: 'Caller did not report discovery results' }
   } catch (error) {
     // A failed run must replace an old green check, not leave “nothing new”.
-    result = { checked_at: new Date().toISOString(), families: {}, error: error instanceof Error ? error.message : String(error) }
+    result = { checked_at: new Date().toISOString(), families: {}, error: redact(error instanceof Error ? error.message : String(error), environmentSecrets()), ...(error && typeof error === 'object' && error.diagnostic ? { diagnostic: error.diagnostic } : {}) }
   }
+  for (const family of Object.values(result.families)) if (typeof family.error === 'string') family.error = redact(family.error, environmentSecrets())
   result.cli_updates = cliUpdates
   result.completed_at = new Date().toISOString()
   const staged = `${reportPath}.${randomUUID()}.tmp`

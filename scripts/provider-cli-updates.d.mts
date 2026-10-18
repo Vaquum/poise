@@ -1,9 +1,12 @@
 export type Provider = 'claude' | 'codex' | 'grok' | 'antigravity' | 'muse'
 export interface CliUpdate {
   provider: Provider
+  configuredExecutable?: string
   status: 'current' | 'updated' | 'unavailable'
   checkedAt: string
   path?: string
+  resolvedPath?: string
+  diagnostic?: { version: 1; operation: string; configuredExecutable: string; cwd: string; exitCode: number | null; signal: string | null; errno: string | number | null; timeoutMs: number; elapsedMs: number; stderr: string; truncated: boolean }
   launchPath?: string
   launchVersion?: string
   before?: string

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+import { environmentSecrets, redact } from './diagnostics/redaction.mjs'
 import http from 'node:http'
 
 export class DockerError extends Error {
@@ -28,6 +30,21 @@ export interface ContainerDetails {
   NetworkSettings: { Networks: Record<string, unknown> }
   /** Volumes and bind mounts, each with its path on the Docker host (Source) and in the container. */
   Mounts?: Array<{ Type: string; Source: string; Destination: string }>
+}
+
+export const TASK_STDERR_LINE_LIMIT = 1000
+
+export interface TaskFailureEvidence {
+  id: string
+  name: string
+  container: string | null
+  labels: Record<string, string>
+  exitCode: number | null
+  phase: 'installer_start' | 'installer_wait' | 'installer_exit'
+  error: string | null
+  stderr: Buffer | null
+  stderrError: string | null
+  limits: { memoryBytes: number; nanoCpus: number; pids: number }
 }
 
 export type ContainerMount =
@@ -91,7 +108,9 @@ const DISK_USAGE_TIMEOUT_MS = 10 * 60_000
  * refuses anything below 1.44, and every field used here is the same in both.
  */
 export class DockerClient {
-  constructor(private readonly socketPath: string) {}
+  private reportingError: string | null = null
+  get taskCaptureError(): string | null { return this.reportingError }
+  constructor(private readonly socketPath: string, private readonly taskFailure?: (evidence: TaskFailureEvidence) => void, private readonly taskTimeoutMs = TASK_TIMEOUT_MS) {}
 
   async imageId(name: string): Promise<string | null> {
     const response = await this.call('GET', `/images/${encodeURI(name)}/json`, undefined, [404])
@@ -113,6 +132,39 @@ export class DockerClient {
   async listManagedContainers(): Promise<ContainerSummary[]> {
     const filters = encodeURIComponent(JSON.stringify({ label: ['poise.managed=true'] }))
     return (await this.call('GET', `/containers/json?all=true&filters=${filters}`)).body as ContainerSummary[]
+  }
+
+  /** Bounded diagnostics only; payload parsing is owned by the collector. */
+  async diagnosticRead(path: string, maxBytes = 2 * 1024 * 1024, timeoutMs = 5000): Promise<Buffer> {
+    if (!path.startsWith('/containers/') && !path.startsWith('/events?')) throw new Error('Unsupported Docker diagnostic operation')
+    return new Promise((resolve, reject) => {
+      const req = http.get({ socketPath: this.socketPath, path, headers: { host: 'docker' } }, (res) => {
+        let size = 0
+        const chunks: Buffer[] = []
+        res.on('data', (chunk: Buffer) => {
+          size += chunk.length
+          if (size > maxBytes) { req.destroy(new Error(`Docker diagnostic response exceeds ${maxBytes} bytes; collection gap`)); return }
+          chunks.push(chunk)
+        })
+        res.on('error', reject)
+        res.on('end', () => res.statusCode === 200 ? resolve(Buffer.concat(chunks))
+          : reject(new Error(`Docker diagnostic source answered HTTP ${res.statusCode}`)))
+      })
+      const deadline = setTimeout(() => req.destroy(new Error(`Docker diagnostic read exceeded its absolute deadline after ${timeoutMs} ms`)), timeoutMs)
+      req.once('close', () => clearTimeout(deadline))
+      req.setTimeout(timeoutMs, () => req.destroy(new Error(`Docker diagnostic read timed out after ${timeoutMs} ms`)))
+      req.on('error', reject)
+    })
+  }
+
+  async diagnosticContainers(): Promise<ContainerSummary[]> {
+    const result = new Map<string, ContainerSummary>()
+    for (const label of ['poise.managed=true', 'com.docker.compose.project=poise', 'poise.task=install-release']) {
+      const filters = encodeURIComponent(JSON.stringify({ label: [label] }))
+      const body = await this.diagnosticRead(`/containers/json?all=true&filters=${filters}`, 512 * 1024)
+      for (const value of JSON.parse(body.toString()) as ContainerSummary[]) result.set(value.Id, value)
+    }
+    return [...result.values()]
   }
 
   /** Each volume's size in bytes, as Docker measures it; -1 for one it did not. Docker walks every volume. */
@@ -168,13 +220,39 @@ export class DockerClient {
   /** Runs a task container to its end and removes it; resolves with its exit code. */
   async runTask(name: string, spec: TaskSpec): Promise<number> {
     await this.call('DELETE', `/containers/${encodeURIComponent(name)}?force=true`, undefined, [404])
-    await this.call('POST', `/containers/create?name=${encodeURIComponent(name)}`, spec)
+    const created = await this.call('POST', `/containers/create?name=${encodeURIComponent(name)}`, spec)
+    const native = created.body && typeof created.body === 'object' ? created.body as { Id?: unknown } : null
+    const container = typeof native?.Id === 'string' ? native.Id : null
+    let phase: TaskFailureEvidence['phase'] = 'installer_start'
     try {
       await this.call('POST', `/containers/${encodeURIComponent(name)}/start`)
-      const result = await this.call('POST', `/containers/${encodeURIComponent(name)}/wait`, undefined, [], TASK_TIMEOUT_MS)
-      return Number((result.body as { StatusCode?: unknown }).StatusCode ?? -1)
+      phase = 'installer_wait'
+      const result = await this.call('POST', `/containers/${encodeURIComponent(name)}/wait`, undefined, [], this.taskTimeoutMs)
+      const code = result.body && typeof result.body === 'object' ? (result.body as { StatusCode?: unknown }).StatusCode : null
+      if (typeof code !== 'number' || !Number.isSafeInteger(code) || code < 0) throw new Error('Docker task wait returned no valid exit status')
+      phase = 'installer_exit'
+      if (code !== 0) await this.captureTaskFailure(name, spec, container, code, phase, null)
+      return code
+    } catch (error) {
+      await this.captureTaskFailure(name, spec, container, null, phase, error instanceof Error ? error.message : String(error))
+      throw error
     } finally {
       await this.call('DELETE', `/containers/${encodeURIComponent(name)}?force=true`, undefined, [404])
+    }
+  }
+
+  private async captureTaskFailure(name: string, spec: TaskSpec, container: string | null, exitCode: number | null, phase: TaskFailureEvidence['phase'], error: string | null): Promise<void> {
+    if (!this.taskFailure) return
+    let stderr: Buffer | null = null; let stderrError: string | null = null
+    try { stderr = await this.diagnosticRead(`/containers/${encodeURIComponent(container ?? name)}/logs?stdout=0&stderr=1&timestamps=1&tail=all`, 64 * 1024, 250) }
+    catch (failure) { stderrError = failure instanceof Error ? failure.message : String(failure) }
+    try {
+      this.taskFailure({ id: container ?? randomUUID(), name, container, labels: spec.Labels, exitCode, phase, error, stderr, stderrError,
+        limits: { memoryBytes: spec.HostConfig.Memory, nanoCpus: spec.HostConfig.NanoCpus, pids: spec.HostConfig.PidsLimit } })
+      this.reportingError = null
+    } catch (failure) {
+      // The collector exposes this through its independent health journal.
+      this.reportingError = redact(failure instanceof Error ? failure.message : String(failure), environmentSecrets()).slice(0, 2048)
     }
   }
 

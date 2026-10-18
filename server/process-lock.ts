@@ -1,4 +1,6 @@
+import { diagnosticFailure } from './logging'
 import Database from 'better-sqlite3'
+import { performance } from 'node:perf_hooks'
 import { chmod, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
@@ -36,7 +38,9 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function lockError(options: ProcessLockOptions, message: string, cause: unknown): Error {
+function lockError(options: ProcessLockOptions, message: string, cause: unknown, elapsedMs: number): Error {
+  if ((options.timeoutMs ?? DEFAULT_TIMEOUT_MS) >= 1000 || !isSqliteContention(cause)) diagnosticFailure('process_lock.acquire', cause,
+    { lockPath: options.path, phase: 'acquisition', elapsedMs: Math.round(elapsedMs), waitLimitMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS, holderPid: null, holderIdentityVerified: false }, { level: 'warning' })
   return options.errorFactory?.(message, cause) ?? new ProcessLockError(message, { cause })
 }
 
@@ -46,6 +50,7 @@ function lockError(options: ProcessLockOptions, message: string, cause: unknown)
 // fail closed: the callback is never invoked without ownership.
 async function acquireProcessLock(options: ProcessLockOptions): Promise<LockDatabase> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const began = performance.now()
   const deadline = Date.now() + timeoutMs
   await mkdir(dirname(options.path), { recursive: true })
 
@@ -63,6 +68,7 @@ async function acquireProcessLock(options: ProcessLockOptions): Promise<LockData
           options,
           options.unavailableMessage ?? 'process lock is unavailable',
           error,
+          performance.now() - began,
         )
       }
       if (Date.now() >= deadline) {
@@ -70,6 +76,7 @@ async function acquireProcessLock(options: ProcessLockOptions): Promise<LockData
           options,
           options.timeoutMessage ?? 'timed out waiting for process lock',
           error,
+          performance.now() - began,
         )
       }
       await delay(RETRY_MIN_MS + Math.random() * RETRY_JITTER_MS)

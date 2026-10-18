@@ -208,6 +208,9 @@ def run_agent(
             f"{prompt_bytes} bytes exceeds {MAX_GOVERNED_PROMPT_BYTES} after data exclusions; "
             "reduce the remaining review input",
             "review_packet_too_large",
+            {"version": 1, "source": "caller", "severity": "error", "operation": "provider.input_admission",
+             "phase": "before_provider_launch", "stderr": "", "context": {"actual_input_bytes": prompt_bytes,
+             "input_limit_bytes": MAX_GOVERNED_PROMPT_BYTES, "provider_started": False}},
         )
     spec = CATALOG.review_model(behavior, model)
     if spec.provider != "claude":

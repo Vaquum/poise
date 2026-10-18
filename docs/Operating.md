@@ -759,3 +759,11 @@ in `/etc/docker/daemon.json` and restart Docker:
 - **Secrets on disk**: the OAuth App's client secret in `deploy/.env`, the
   gateway's signing key in `poise-gateway-data`, and each person's CLI
   credentials in their home volume. Backups hold the last two.
+
+### Diagnostic history
+
+[Logging](Logging.md#collection-and-operation) defines independent local and
+central stores, retention limits, source coverage, the operator CLI and external
+proxy delivery. `poise-gateway-data` backups include the central SQLite history;
+workspace replacement/removal does not remove that history. Missing host
+journals or incompatible workspace versions are visible collection gaps.

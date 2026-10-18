@@ -101,6 +101,7 @@ COPY --from=poise /src/package.json /opt/poise/package.json
 COPY --from=poise /src/node_modules /opt/poise/node_modules
 COPY --from=poise /src/dist /opt/poise/dist
 COPY scripts /opt/poise/scripts
+COPY gateway/src/diagnostics/redaction.mjs /opt/poise/gateway/src/diagnostics/redaction.mjs
 COPY caller /opt/poise/caller
 COPY deploy/runtime/entrypoint.sh deploy/runtime/install-clis.sh /opt/poise/deploy/runtime/
 # The base every release of this image runs on: the supervisor, which runs

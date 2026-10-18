@@ -1,3 +1,4 @@
+import { diagnosticFailure } from './logging'
 import Database from 'better-sqlite3'
 import { chmodSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -246,6 +247,7 @@ async function githubEnvironment(me: string | undefined, signal: AbortSignal): P
     })).stdout.trim()
   } catch (error) {
     if (signal.aborted) throw error
+    diagnosticFailure('datastore.authentication', error, { account: me, phase: 'credential_lookup' }, { stderr: false, level: 'warning' })
     // Credential subprocess output must never enter the durable status row.
     throw new Error(`GitHub authentication is unavailable for ${me}. Run gh auth login for that account and retry.`)
   }
@@ -424,6 +426,14 @@ function launch(login: string): void {
     } catch (error) {
       if (controller.signal.aborted || error instanceof ProcessLockError) return
       const failed = rowFor(login)!
+      const failures = error instanceof GitHubRateLimitError ? failed.sync_failures : failed.activated_at ? failed.sync_failures + 1 : 0
+      const retryAt = error instanceof GitHubRateLimitError ? error.resetAt : failures ? Date.now() + Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(failures - 1, 6), MAX_SYNC_RETRY_MS) : 0
+      diagnosticFailure(failed.activated_at ? 'datastore.sync' : 'datastore.activate', error, {
+        account: login, databasePath: failed.datastore_path, phase: failed.stage,
+        lastSuccessfulSyncAt: failed.last_sync_at ? new Date(failed.last_sync_at).toISOString() : null,
+        ageMs: failed.last_sync_at ? Date.now() - failed.last_sync_at : null, freshnessLimitMs: SYNC_INTERVAL_MS,
+        retryCount: failures, nextRetryAt: retryAt || null,
+      }, { secrets: env?.GH_TOKEN ? [env.GH_TOKEN] : [], level: error instanceof GitHubRateLimitError ? 'warning' : 'error' })
       if (error instanceof GitHubRateLimitError) {
         db.prepare(`
           UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'initializing' ELSE 'ready' END,
@@ -431,8 +441,6 @@ function launch(login: string): void {
         `).run(error.message, login)
         return
       }
-      const failures = failed.activated_at ? failed.sync_failures + 1 : 0
-      const retryAt = failures ? Date.now() + Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(failures - 1, 6), MAX_SYNC_RETRY_MS) : 0
       const failingSince = failures ? failed.sync_failing_since || Date.now() : 0
       db.prepare(`
         UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'error' ELSE 'ready' END,

@@ -64,6 +64,7 @@ beforeEach(async () => {
   // Nothing here may reach a CLI: no GitHub account is set, so the check of
   // pull requests has nothing to read.
   mocks.runFile.mockReset().mockImplementation(async (command: string, args: string[]) => {
+    if (command === 'agent-interface' && args[0] === '--diagnostics') return { stdout: JSON.stringify({ version: 1, streamId: 'f'.repeat(32), events: [], cursor: Number(args[1]), hasMore: false, backfillPending: false }) }
     throw new Error(`Unexpected test command: ${command} ${args.join(' ')}`)
   })
   mocks.spawnDetached.mockReset().mockResolvedValue(undefined)
@@ -120,7 +121,7 @@ describe('the notices API', () => {
     expect((await call('POST', `/api/notices/${state.body.notices[0].id}/dismiss`)).body.notices).toEqual([])
     await call('GET', '/api/github-quota')
     expect((await call('GET', '/api/notices')).body.notices).toEqual([])
-    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    expect(mocks.runFile.mock.calls.filter(([command]) => command === 'gh')).toHaveLength(2)
   })
 
   it('gives an existing failed-behavior notice its exact Swarm call', async () => {

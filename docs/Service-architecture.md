@@ -716,3 +716,32 @@ whose `POISE_DRAIN_TIMEOUT` differs from its own, keeping its volume.
 and update themselves there, as Poise already does before each launch. The
 image carries everything else: Node 22, Python 3.13, Caller, `gh`, `git`,
 build tools and `tini`.
+
+## Diagnostic collection boundary
+
+Poise retains version 1 private diagnostic records in a dedicated home-volume
+SQLite store; the gateway retains the central copy in its own data volume.
+Neither store depends on alert lifecycle. Workspaces never mount the central
+store, Docker socket or host journal. Host journal directories and machine ID
+are read-only gateway mounts, used only for kernel and Docker-daemon warnings.
+The operator CLI and redaction/retention/coverage contracts are in
+[Logging](Logging.md).
+
+`GET /api/service/diagnostics?cursor=OPAQUE` is a maintenance-only delivery
+route: loopback or the existing gateway `admin` assertion, never browser/link
+scope. It returns `{ version:1, events, cursor, hasMore, coverage }`, at most
+three redacted private events and 256 KiB. This separate bound does not change
+the 64 KiB health/drain bound. The gateway validates the workspace identity,
+full scoped event/incident identifiers and severity, re-redacts the envelope,
+and commits its checkpoint only after durable central ingestion. Delivery
+cursors survive ordinary process/container replacement and cannot widen scope.
+No new JWT scope, owner bypass, shared filesystem or public ingest route is
+introduced. A failed source or sink remains explicitly unavailable/partial.
+An obsolete source cursor returns 409 `diagnostic_cursor_invalid`; only this explicit rejection permits resetting that source checkpoint and bounded replay, with a recorded collection gap. Other failures preserve the checkpoint.
+
+The workspace distribution includes the bounded bootstrap diagnostic command and
+its canonical redaction module for standalone maintenance scripts. Installer
+output capture preserves command status/deadlines and excludes arguments and
+stdout from diagnostic records. The gateway captures release-task failure
+metadata before removing its short-lived container; retained central evidence
+is independent of that container and its home-volume lifecycle.

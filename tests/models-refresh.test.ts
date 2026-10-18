@@ -1,12 +1,13 @@
 import { beforeEach, expect, it, vi } from 'vitest'
-const mocks = vi.hoisted(() => ({ run: vi.fn(), invalidate: vi.fn() }))
+const mocks = vi.hoisted(() => ({ run: vi.fn(), invalidate: vi.fn(), diagnostic: vi.fn() }))
 vi.mock('../server/process', () => ({
   CLAUDE_SUBSCRIPTION_CLI: '/poise/scripts/claude-subscription.mjs',
   claudeSubscriptionEnvironment: () => ({}), scrubbedChildEnvironment: () => ({}), runFile: mocks.run,
 }))
+vi.mock('../server/logging', () => ({ diagnostic: mocks.diagnostic }))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/caller', catalogReportPath: () => '/poise/report.json', invalidateCatalog: mocks.invalidate }))
 import { refreshModelCatalog } from '../server/models-refresh'
-beforeEach(() => { mocks.run.mockReset(); mocks.invalidate.mockClear() })
+beforeEach(() => { mocks.diagnostic.mockReset(); mocks.run.mockReset(); mocks.invalidate.mockClear() })
 it('coalesces manual checks and invalidates the catalogue only after settlement', async () => {
   let finish!: (result: { stdout: string }) => void
   mocks.run.mockImplementation(() => new Promise(resolve => { finish = resolve }))
@@ -43,4 +44,13 @@ it('starts no check while a drain pauses background work, but keeps one already 
   } finally {
     background.resumeReleaseBackground()
   }
+})
+
+it('retains updater failure evidence even when discovery succeeds with the existing launcher', async () => {
+  const report = { families: { claude: { status: 'ok' } }, cli_updates: { claude: { status: 'unavailable', error: 'update rejected', configuredExecutable: 'claude',
+    resolvedPath: '/fixture/claude', diagnostic: { stderr: 'precise updater cause', exitCode: 9, timeoutMs: 120000, elapsedMs: 51, cwd: '/fixture' } } } }
+  mocks.run.mockResolvedValueOnce({ stdout: JSON.stringify(report) })
+  await expect(refreshModelCatalog()).resolves.toEqual(report)
+  expect(mocks.diagnostic).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ operation: 'provider.cli_update', component: 'claude', level: 'warning',
+    stderr: 'precise updater cause', exitCode: 9, context: expect.objectContaining({ configuredExecutable: 'claude', resolvedExecutable: '/fixture/claude', elapsedMs: 51 }) }))
 })

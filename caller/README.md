@@ -157,3 +157,16 @@ An empty stderr says the cause is unknown. Explicit ENOSPC/quota evidence also
 records filesystem bytes/inodes measured immediately after the process failure,
 with its own measurement time; unavailable readings are null with the measurement
 error. This is evidence at capture time, never a claim about earlier disk use.
+
+### Bounded diagnostic reads
+
+`agent-interface --diagnostics [after-sequence] [limit]` returns version 1
+metadata-only events, a persistent database `streamId`, a completion cursor, `hasMore` and `backfillPending`. The owner binds its checkpoint to that identity; database replacement restarts bounded replay with a visible collection gap. Legacy unbound checkpoints replay from zero.
+The default page is three events; the maximum is ten. Late-finishing calls
+receive a new completion sequence, so advancing past a running call cannot
+skip its later failure. Legacy terminal calls are indexed in bounded batches.
+Prompt, response, reasoning and command arguments are never returned or opened.
+The owner applies Poise's canonical redactor before retaining or publishing the
+records. Malformed/oversized stored evidence is reported explicitly within the
+64 KiB per-row envelope; it cannot stall later completions. This read does not
+change review, retry, outcome or interruption policy.

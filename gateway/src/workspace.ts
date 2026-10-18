@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { heldBindings, isSafePath } from './auth.js'
@@ -224,22 +225,28 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
       }
     })
   }
-  proxyRequest(req, res, ctx.deps.upstream(owner.handle), headers, ctx.agent, (error) => {
+  const target = ctx.deps.upstream(owner.handle)
+  const requestStarted = performance.now()
+  const requestId = randomUUID()
+  const route = url.pathname.startsWith('/api/') ? url.pathname.split('/').slice(0, 3).join('/') : '/'
+  const evidence = () => ({ requestId, method: req.method, route, upstream: `${target.host}:${target.port}`,
+    container: target.host, durationMs: Math.round(performance.now() - requestStarted), disconnect: 'upstream error reported while client remains answerable' })
+  proxyRequest(req, res, target, headers, ctx.agent, (error) => {
     // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
     try {
       if (error instanceof RequestTooLargeError) {
-        log.warn('proxy.body_too_large', { handle: owner.handle, limit: error.limit })
+        log.warn('proxy.body_too_large', { handle: owner.handle, limit: error.limit, ...evidence() })
         // The rest of the body is never read: close the connection once the refusal is sent.
         sendJson(res, 413, { error: 'payload_too_large', message: `A request body may be at most ${error.limit} bytes.` }, { connection: 'close' })
         return
       }
       if (isUnreachable(error)) {
         orchestrator.markNotReady(owner.handle)
-        log.warn('workspace.unreachable', { handle: owner.handle, error: error.message })
+        log.warn('workspace.unreachable', { handle: owner.handle, error: error.message, errno: error.code ?? null, ...evidence() })
         starting(ctx, req, res, owner, null)
         return
       }
-      log.error('proxy.failed', { handle: owner.handle, error: error.message })
+      log.error('proxy.failed', { handle: owner.handle, error: error.message, errno: error.code ?? null, ...evidence() })
       if (isNavigation(req)) {
         sendHtml(res, 502, messagePage('Your workspace did not answer', 'The connection to your workspace failed. Reload to try again.'), ctx.pageHeaders)
       } else {
@@ -289,17 +296,22 @@ export async function workspaceUpgrade(ctx: Context, req: IncomingMessage, socke
     proto: ctx.scheme,
     dropAuthorization: auth.scope === 'link',
   })
-  proxyUpgrade(req, socket, head, ctx.deps.upstream(owner.handle), headers, (error) => {
+  const target = ctx.deps.upstream(owner.handle)
+  const requestStarted = performance.now()
+  const requestId = randomUUID()
+  const evidence = () => ({ requestId, method: 'GET', route: path.startsWith('/api/') ? path.split('/').slice(0, 3).join('/') : '/',
+    upstream: `${target.host}:${target.port}`, container: target.host, durationMs: Math.round(performance.now() - requestStarted), disconnect: 'upstream upgrade failure' })
+  proxyUpgrade(req, socket, head, target, headers, (error) => {
     // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
     try {
       if (isUnreachable(error)) {
         orchestrator.markNotReady(owner.handle)
         orchestrator.startInBackground(owner.handle, owner.login)
-        log.warn('workspace.unreachable', { handle: owner.handle, error: error.message })
+        log.warn('workspace.unreachable', { handle: owner.handle, error: error.message, errno: error.code ?? null, ...evidence() })
         rejectUpgrade(socket, 503, STARTING, { 'retry-after': '2' })
         return
       }
-      log.error('proxy.upgrade.failed', { handle: owner.handle, error: error.message })
+      log.error('proxy.upgrade.failed', { handle: owner.handle, error: error.message, errno: error.code ?? null, ...evidence() })
       rejectUpgrade(socket, 502, { error: 'bad_gateway', message: 'The connection to the workspace failed.' })
     } catch (failure) {
       log.error('proxy.failure.unanswered', { handle: owner.handle, error: errorMessage(failure) })

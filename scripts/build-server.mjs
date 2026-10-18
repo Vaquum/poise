@@ -7,3 +7,9 @@ await build({
   define: { __POISE_BUILD_SHA__: JSON.stringify(buildSourceSha()) },
   logLevel: 'info',
 })
+
+
+await build({
+  entryPoints: ['server/runtime-diagnostic.ts'], bundle: true, platform: 'node',
+  format: 'esm', packages: 'external', outfile: 'dist/runtime-diagnostic.js', logLevel: 'info',
+})

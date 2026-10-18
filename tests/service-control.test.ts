@@ -345,3 +345,30 @@ describe('switching to another release', () => {
     }
   })
 })
+
+describe('private diagnostic maintenance delivery', () => {
+  it('refuses browser/link assertions before reading any diagnostic evidence', () => {
+    const { service } = serviceOf()
+    for (const scope of ['browser', 'link'] as const) {
+      expect(() => call('GET', '/api/service/diagnostics', { kind: 'gateway', scope }, service)).toThrow(expect.objectContaining({ statusCode: 403 }))
+    }
+    expect(call('POST', '/api/service/diagnostics', { kind: 'gateway', scope: 'admin' }, service)).toMatchObject({ status: 405, allow: 'GET' })
+  })
+})
+
+
+it('distinguishes an invalid diagnostic cursor from an unavailable source', async () => {
+  const logging = await import('../server/logging')
+  const { DiagnosticCursorError } = await import('../gateway/src/diagnostics/store')
+  const spy = vi.spyOn(logging, 'diagnosticPage').mockImplementation(() => { throw new DiagnosticCursorError('old source key') })
+  const { service } = serviceOf()
+  const req = Object.assign(Readable.from([]), { method: 'GET', url: '/api/service/diagnostics?cursor=old', headers: {} }) as unknown as IncomingMessage
+  const res = response()
+  try {
+    control.handleServiceApi(req, res as unknown as ServerResponse, '/api/service/diagnostics', { kind: 'gateway', scope: 'admin' }, service)
+    expect(res.statusCode).toBe(409)
+    expect(JSON.parse(res.body)).toMatchObject({ error: 'diagnostic_cursor_invalid' })
+    spy.mockImplementation(() => { throw new Error('source sink unavailable') })
+    expect(() => control.handleServiceApi(req, res as unknown as ServerResponse, '/api/service/diagnostics', { kind: 'gateway', scope: 'admin' }, service)).toThrow('source sink unavailable')
+  } finally { spy.mockRestore() }
+})

@@ -8,9 +8,11 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
-RUN npm run build && npm prune --omit=dev
+RUN npm run build && npm prune --omit=dev \
+  && node --input-type=module -e "await import('./dist/diagnostics/cli.js')"
 
 FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends systemd && rm -rf /var/lib/apt/lists/*
 # deploy/lib.sh removes the gateway images an upgrade leaves without a tag by this label.
 LABEL poise.image=gateway
 ENV NODE_ENV=production

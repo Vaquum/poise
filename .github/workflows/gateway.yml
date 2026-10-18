@@ -51,7 +51,6 @@ jobs:
         working-directory: .
         run: docker build gateway/
 
-      - name: Run a workspace on the real Docker Engine
-        env:
-          POISE_GATEWAY_DOCKER_TESTS: '1'
-        run: npx vitest run tests/docker.integration.test.ts
+      - name: Prove workspace networking and durable diagnostic sources on the real Engine
+        working-directory: .
+        run: npm run check:gateway-docker

@@ -1,3 +1,4 @@
+import { startLogging, stopLogging } from './logging'
 import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
 import type { ServerResponse } from 'node:http'
@@ -135,6 +136,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   seedAgentAccount(opts.reviewAgentUsername)
   const service = serviceOf(opts)
   if (service) applyServiceEnvironment()
+  startLogging()
   const auth = opts.claudeAuth ?? claudeAuth
   if (!activeClaudeAuthRuntimes.has(auth)) activeClaudeAuthRuntimes.set(auth, auth.onStatus(claudeAuthStatusChanged))
   auth.start()
@@ -220,6 +222,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   dailyModelRefresh = null
   linkApi = null
   await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
+  await stopLogging()
 }
 
 /** Connected accounts, read now or from the last few seconds, with their

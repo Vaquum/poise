@@ -6,8 +6,9 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RunFileOptions } from '../server/process'
 
-const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), diagnosticFailure: vi.fn() }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
+vi.mock('../server/logging', () => ({ diagnosticFailure: mocks.diagnosticFailure, diagnostic: vi.fn() }))
 
 let tempRoot = ''
 let database: typeof import('../server/db') | undefined
@@ -56,6 +57,7 @@ beforeEach(async () => {
   process.env.POISE_DB = join(tempRoot, 'cache.db')
   delete process.env.POISE_DATASTORE_DB
   vi.resetModules()
+  mocks.diagnosticFailure.mockReset()
   mocks.runFile.mockReset().mockImplementation(cli)
   await load()
   database!.setMeta('me', 'octocat')
@@ -359,6 +361,7 @@ describe('managed organization synchronization', () => {
     const state = database!.db.prepare("SELECT next_sync_at, sync_failures FROM organizations WHERE login = 'acme'").get() as { next_sync_at: number, sync_failures: number }
     expect(state.next_sync_at - Date.now()).toBeGreaterThan(50_000)
     expect(state.sync_failures).toBe(1)
+    expect(mocks.diagnosticFailure).toHaveBeenCalledWith('datastore.sync', expect.any(Error), expect.objectContaining({ retryCount: 1, nextRetryAt: state.next_sync_at }), expect.any(Object))
     await organizations!.stopOrganizationsRuntime()
     database!.closeDatabase()
     vi.resetModules()

@@ -34,6 +34,7 @@ const APEX_ROUTES: Record<string, Record<string, Handler>> = {
 }
 
 export interface Gateway {
+  readonly context: Context
   server: http.Server
   close(): Promise<void>
 }
@@ -147,6 +148,7 @@ export function createGateway(deps: GatewayDeps): Gateway {
   // Outlive Caddy's two-minute upstream keep-alive, so the gateway never closes a connection Caddy is about to reuse.
   server.keepAliveTimeout = 130_000
   return {
+    context: ctx,
     server,
     close: () => new Promise<void>((resolve, reject) => {
       ctx.agent.destroy()

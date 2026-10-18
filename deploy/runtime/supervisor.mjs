@@ -41,11 +41,17 @@ export function supervisor({
     cwd: release.poise, env: childEnv, stdio: 'inherit',
   }),
   now = Date.now,
+  diagnostic = null,
   log = (line) => console.log(`poise-runtime: ${line}`),
 } = {}) {
   const releases = join(home, '.poise', 'releases')
   let stopping = false
   let child = null
+  const record = (input) => {
+    if (!diagnostic) return
+    try { diagnostic({ source: 'poise', component: 'workspace-supervisor', ...input }) }
+    catch (error) { log(`diagnostic reporting unavailable: ${error instanceof Error ? error.name : 'capture failure'}`) }
+  }
 
   const installed = (name) => ({ name, poise: join(releases, name, 'poise'), venv: join(releases, name, 'venv') })
 
@@ -79,6 +85,8 @@ export function supervisor({
         replace(join(releases, 'current'), next)
         return installed(next)
       }
+      record({ level: 'warning', operation: 'workspace.release_unavailable', phase: 'release_selection', target: next,
+        message: 'Requested workspace release is not installed for this base', context: { requestedRelease: next, base, fallbackRelease: image.name } })
       log(`release ${next} is not installed for this base; staying on the current one`)
     }
     const current = read(join(releases, 'current'))
@@ -100,13 +108,22 @@ export function supervisor({
   }
 
   const runOnce = (release) => new Promise((resolve) => {
-    child = start(release, childEnv(release))
+    const began = now()
+    const spawnFailure = (error) => record({ level: 'error', operation: 'workspace.spawn', phase: 'application_spawn', release: release.name,
+      message: error.message, stack: error.stack, errno: error.errno ?? error.code ?? null,
+      context: { executable: process.execPath, cwd: release.poise, elapsedMs: now() - began, processErrorCode: error.code ?? null } })
+    try { child = start(release, childEnv(release)) }
+    catch (error) { spawnFailure(error); throw error }
     child.once('error', (error) => {
+      spawnFailure(error)
       log(`Poise could not start: ${error.message}`)
       child = null
       resolve(1)
     })
     child.once('exit', (code, signal) => {
+      if (!stopping && code !== UPDATE_EXIT_CODE && (code !== 0 || signal)) record({ level: 'error', operation: 'workspace.exit', phase: 'application_exit',
+        release: release.name, message: `Workspace application exited (code ${code}, signal ${signal})`, exitCode: code, signal,
+        context: { executable: process.execPath, cwd: release.poise, elapsedMs: now() - began, stderrEvidence: 'Application diagnostics use the inherited stream and separate durable store' } })
       child = null
       resolve(code ?? 128 + (constants.signals[signal] ?? 0))
     })
@@ -130,6 +147,9 @@ export function supervisor({
         if (release !== image && now() - startedAt < FAILED_START_MS) {
           writeFileSync(join(releases, release.name, 'failed'), `exited with ${code} within a minute of starting\n`)
           rmSync(join(releases, 'current'), { force: true })
+          record({ level: 'warning', operation: 'workspace.release_fallback', phase: 'failed_release_start', release: release.name,
+            message: 'Workspace release exited within the startup window; returning to the image release', exitCode: code,
+            context: { elapsedMs: now() - startedAt, startupWindowMs: FAILED_START_MS, fallbackRelease: image.name } })
           log(`release ${release.name} exited with ${code} soon after starting; going back to this image's release`)
           continue
         }
@@ -140,7 +160,10 @@ export function supervisor({
 }
 
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
-  const instance = supervisor()
+  let diagnostic = null
+  try { ({ recordRuntimeDiagnostic: diagnostic } = await import('/opt/poise/dist/runtime-diagnostic.js')) }
+  catch { process.stderr.write('poise-runtime: diagnostic helper unavailable.\n') }
+  const instance = supervisor({ diagnostic })
   for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => instance.stop(signal))
   process.exitCode = await instance.run()
 }

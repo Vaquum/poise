@@ -1,3 +1,4 @@
+import { environmentSecrets } from '../gateway/src/diagnostics/redaction.mjs'
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { basename, delimiter, join } from 'node:path'
@@ -352,6 +353,19 @@ async function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals)
   try { child.kill(signal) } catch { /* taskkill already reaped it */ }
 }
 
+export interface ProcessFailureEvidence {
+  command: string
+  executable: string
+  operation: string
+  cwd: string | null
+  elapsedMs: number
+  timeoutMs: number
+  stderrAllowed: boolean
+  secrets: string[]
+}
+let processFailureObserver: ((error: Error, evidence: ProcessFailureEvidence) => void) | null = null
+export function setProcessFailureObserver(observer: typeof processFailureObserver): void { processFailureObserver = observer }
+
 // Run a short-lived CLI with production-safe bounds. spawn keeps argv separate
 // from the shell. POSIX children lead an isolated process group so timeout,
 // abort, and output-limit termination includes their complete descendant tree.
@@ -378,6 +392,19 @@ export function runFile(
   }
 
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
+    const observe = (error: Error) => {
+      if (!processFailureObserver || options.signal?.aborted || args[0] === '--diagnostics') return
+      try {
+        processFailureObserver(error, { command, executable: resolveCommand(command),
+          operation: command + (['auth', 'api', 'sync', 'health', 'build-user', '--refresh-models', '--pr-review'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),
+          cwd: options.cwd ?? null, elapsedMs: Date.now() - startedAt, timeoutMs: timeout,
+          stderrAllowed: !(command === 'gh' && args[0] === 'auth' && args[1] === 'token'),
+          secrets: environmentSecrets(options.env ?? {}) })
+      } catch (failure) {
+        process.stderr.write(JSON.stringify({ level: 'error', event: 'logging.process_observer.failed', message: failure instanceof Error ? failure.message : 'observer failure' }) + '\n')
+      }
+    }
     const child = spawn(resolveCommand(command), [...args], {
       cwd: options.cwd,
       env: childEnvironment(command, options.env, args),
@@ -438,6 +465,7 @@ export function runFile(
       const stderr = Buffer.concat(stderrChunks, stderrBytes).toString('utf8')
       if (terminalError) {
         Object.assign(terminalError, { stdout, stderr })
+        observe(terminalError)
         reject(terminalError)
         return
       }
@@ -452,6 +480,7 @@ export function runFile(
             stderr,
           },
         )
+        observe(error)
         reject(error)
         return
       }

@@ -1,3 +1,5 @@
+import { DiagnosticCursorError } from '../../gateway/src/diagnostics/store'
+import { diagnosticPage } from '../logging'
 // The service endpoints the container health check and the gateway call
 // (docs/Service-architecture.md, "Service endpoints"). A drain is the drain a
 // release uses: the Chat runtime refuses new work and stops dispatching its
@@ -266,6 +268,20 @@ function json(res: ServerResponse, status: number, body: unknown): void {
  *  the gateway's admin scope. The owner's browser may only resume, to lift a
  *  drain the gateway left behind. */
 export function handleServiceApi(req: IncomingMessage, res: ServerResponse, path: string, authority: RequestAuthority, control: ServiceControl): void | Promise<void> {
+  if (path === '/api/service/diagnostics') {
+    if (authority.kind === 'gateway' && authority.scope !== 'admin') throw new HttpError(403, 'only the gateway collects workspace diagnostics')
+    if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return json(res, 405, { error: 'use GET for diagnostics' }) }
+    const params = new URL(req.url ?? path, 'http://workspace').searchParams
+    if ([...params.keys()].some((key) => key !== 'cursor')) throw new HttpError(400, 'unknown diagnostic delivery parameter')
+    let page: ReturnType<typeof diagnosticPage>
+    try { page = diagnosticPage(params.get('cursor')) }
+    catch (error) {
+      if (error instanceof DiagnosticCursorError) return json(res, 409, { error: 'diagnostic_cursor_invalid', message: 'The source no longer accepts this delivery cursor; restart bounded backfill.' })
+      throw error
+    }
+    if (Buffer.byteLength(JSON.stringify(page)) > 256 * 1024) throw new HttpError(503, 'diagnostic delivery exceeds 256 KiB')
+    return json(res, 200, page)
+  }
   if (path === '/api/service/switch') {
     if (authority.kind === 'gateway' && authority.scope !== 'admin') {
       throw new HttpError(403, 'only the gateway switches releases')

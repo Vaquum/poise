@@ -29,7 +29,7 @@ const projectRoot = fileURLToPath(new URL('..', import.meta.url))
 
 // Everything `npm run build` reads. Nothing outside this set can change the
 // output, so keeping the list tight is what makes an unchanged restart cheap.
-const SOURCE_DIRECTORIES = ['src', 'server']
+const SOURCE_DIRECTORIES = ['src', 'server', 'gateway/src/diagnostics']
 const SOURCE_FILES = [
   'index.html',
   'package.json',
@@ -39,6 +39,7 @@ const SOURCE_FILES = [
   'tsconfig.server.json',
   'scripts/build-server.mjs',
   'scripts/build-identity.mjs',
+  'scripts/provider-cli-updates.mjs',
 ]
 
 async function collectDirectory(root, dir, into) {

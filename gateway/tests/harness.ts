@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect } from 'vitest'
+import type { Context } from '../src/context.js'
 import type { AssertionClaims } from '../src/assertion.js'
 import { loadConfig, type Config } from '../src/config.js'
 import { DiskWatch } from '../src/disk.js'
@@ -47,6 +48,7 @@ export interface RequestOptions {
 }
 
 export interface Harness {
+  context: Context
   config: Config
   store: Store
   keys: GatewayKeys
@@ -230,6 +232,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   }
 
   return {
+    context: gateway.context,
     config,
     store,
     keys,

@@ -20,6 +20,8 @@ import type { ClaudeAuthRuntime } from './cache-plugin'
 // misconfigured service mode stops here, naming every variable at fault.
 await loadSecureDotenv()
 readServiceConfig()
+const { startLogging } = await import('./logging')
+startLogging({ captureFatal: true })
 const { attachChatSockets, createPoiseMiddleware, stopPoiseRuntime } = await import('./cache-plugin')
 const { closeDatabase } = await import('./db')
 

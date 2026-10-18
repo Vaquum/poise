@@ -338,8 +338,39 @@ check_data() {
   pass "alice's file and database are intact, owned by the workspace user"
 }
 
+diagnostic_owner_count() {
+  docker exec poise-gateway node --input-type=module --eval "const {DiagnosticStore}=await import('/app/dist/diagnostics/store.js'); const db=new DiagnosticStore('/data/logging.db',undefined,Date.now,true); console.log(db.query({workspace:'alice',operator:false},{search:'poise-e2e-diagnostic-fixture'}).total); db.close()"
+}
+
+check_diagnostic_history() {
+  local count
+  count=$(diagnostic_owner_count)
+  [ "$count" -ge 1 ] || fail "the owner's retained diagnostic disappeared"
+  docker exec poise-gateway node dist/diagnostics/cli.js query '{"search":"poise-e2e-diagnostic-fixture"}' \
+    | jq --exit-status '.total == 0' >/dev/null || fail "operator access widened into another owner's private diagnostic"
+  docker exec poise-gateway node dist/diagnostics/cli.js query '{"search":"poise-e2e-ingress-fixture"}' \
+    | jq --exit-status '.total == 1 and .events[0].severity == "error"' >/dev/null || fail "Poise-owned ingress evidence is unavailable"
+}
+
+seed_diagnostic_history() {
+  local status=0 count=0
+  in_workspace node /opt/poise/dist/runtime-diagnostic.js /missing/poise-e2e-diagnostic-fixture || status=$?
+  [ "$status" = 127 ] || fail "the fake failed installer changed its outcome to $status"
+  printf '%s' '{"level":"error","msg":"poise-e2e-ingress-fixture","request":{"host":"poise.test"},"request_id":"poise-ci-ingress-proof"}' \
+    | docker exec --interactive poise-gateway node dist/diagnostics/cli.js ingress \
+    | jq --exit-status '.accepted and (.eventId | startswith("evt_"))' >/dev/null || fail "Poise-owned external ingress integration refused its fixture"
+  for _ in $(seq 1 30); do
+    count=$(diagnostic_owner_count)
+    if [ "$count" -ge 1 ]; then break; fi
+    sleep 2
+  done
+  check_diagnostic_history
+  pass "owned producer -> durable authenticated collection -> scoped query works without another application"
+}
+
 backup_and_restore() {
   local marker backup key
+  seed_diagnostic_history
   marker="e2e $(date +%s)"
   in_workspace sh -c "mkdir -p /home/poise/e2e && printf '%s' '$marker' >/home/poise/e2e/marker"
   docker exec --detach poise-ws-alice python3 -c "$live_writer"
@@ -370,6 +401,8 @@ backup_and_restore() {
   "$deploy/install.sh"
   [ "$(docker exec poise-gateway sha256sum /data/identity-ed25519.pem)" = "$key" ] || fail "the gateway's signing key was not restored"
   pass "the gateway's signing key is restored"
+  check_diagnostic_history
+  pass "private and ingress diagnostic history survived complete source removal and restore"
 
   # alice's browser session lives in the restored gateway database.
   expect 503 "alice's visit after the restore starts her workspace" "$alice" "http://alice.$domain/" "${navigate[@]}"

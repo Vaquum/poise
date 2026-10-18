@@ -1,3 +1,4 @@
+import { diagnostic } from './logging'
 import { statfs } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { db, getMeta, setMeta } from './db'
@@ -9,7 +10,7 @@ const BUCKET_KEY = 'temporary_storage_warning_bucket'
 const alertKey = (bucket: number) => `temporary-storage:${bucket}`
 
 /** Warn on downward crossings only; storage never gates or stops work. */
-export function temporaryStorageMeasured(free: number): void {
+export function temporaryStorageMeasured(free: number, resources: Record<string, unknown> = {}): void {
   if (!Number.isFinite(free) || free < 0) throw new Error('temporary storage free bytes must be nonnegative')
   const bucket = Math.max(1, Math.min(6, Math.ceil(free / TEMPORARY_STORAGE_GB)))
   db.transaction(() => {
@@ -21,6 +22,8 @@ export function temporaryStorageMeasured(free: number): void {
     if (bucket === previous) return
     for (let level = 1; level <= 5; level++) resolveAlert(alertKey(level))
     if (bucket < previous && bucket <= 5) {
+      diagnostic({ level: 'warning', operation: 'storage.pressure', message: `Temporary filesystem crossed the ${bucket} GiB warning threshold`,
+        target: tmpdir(), condition: 'temporary_storage_low', resources: { ...resources, freeBytes: free, measuredAt: new Date().toISOString() } })
       raiseAlert({
         kind: 'storage_low',
         dedupeKey: alertKey(bucket),
@@ -36,7 +39,8 @@ export function temporaryStorageMeasured(free: number): void {
 export async function checkTemporaryStorage(read = () => statfs(tmpdir())): Promise<void> {
   try {
     const stats = await read()
-    temporaryStorageMeasured(stats.bavail * stats.bsize)
+    temporaryStorageMeasured(stats.bavail * stats.bsize, { filesystem: tmpdir(), totalBytes: stats.blocks * stats.bsize,
+      freeInodes: stats.ffree, totalInodes: stats.files })
   } catch (error) {
     console.error('[storage] could not measure temporary space:', error)
   }

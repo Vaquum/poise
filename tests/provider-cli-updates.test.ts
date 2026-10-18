@@ -176,3 +176,15 @@ it('keeps admitted Codex launchers usable when npm removes a native dependency m
   expect((await launch(repaired.launchPath!)).stdout.trim()).toBe('1.1.0')
   expect((await launch(failed.launchPath!)).stdout.trim()).toBe('1.0.0')
 })
+
+it('retains bounded redacted updater causes without stdout or arguments', async () => {
+  const secret = 'opaque-updater-credential'
+  const command = "process.stdout.write('private-output');process.stderr.write('fatal: exact updater cause\\n'+process.env.OPENAI_API_KEY+'\\n');process.exit(7)"
+  try {
+    await runUpdateCommand(process.execPath, ['-e', command, 'private-argument'], { env: { ...env, OPENAI_API_KEY: secret }, cwd: root })
+    throw new Error('Expected the fake updater to fail')
+  } catch (error) {
+    expect(error).toMatchObject({ diagnostic: { configuredExecutable: process.execPath, exitCode: 7, stderr: expect.stringContaining('exact updater cause'), timeoutMs: 120_000 } })
+    for (const value of [secret, 'private-output', 'private-argument']) expect(JSON.stringify(error)).not.toContain(value)
+  }
+})

@@ -80,6 +80,15 @@ describe('production build stamp', () => {
     expect(await computeBuildStamp(root)).not.toBe(before)
   })
 
+  it('rebuilds when shared diagnostic sources change', async () => {
+    const shared = join(root, 'gateway', 'src', 'diagnostics')
+    await mkdir(shared, { recursive: true })
+    await writeFile(join(shared, 'contract.ts'), 'export const version = 1\n')
+    const before = await computeBuildStamp(root)
+    await writeFile(join(shared, 'contract.ts'), 'export const version = 222\n')
+    expect(await computeBuildStamp(root)).not.toBe(before)
+  })
+
   it('changes when a source file is added', async () => {
     const before = await computeBuildStamp(root)
     await writeFile(join(root, 'src', 'extra.ts'), 'export const c = 3\n')

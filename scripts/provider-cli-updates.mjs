@@ -1,3 +1,5 @@
+import { StringDecoder } from 'node:string_decoder'
+import { environmentSecrets, redact } from '../gateway/src/diagnostics/redaction.mjs'
 // Refresh the actual standalone provider launchers, never an IDE's bundled CLI.
 import { spawn } from 'node:child_process'
 import { access, cp, mkdir, readFile, rename, rm, writeFile, realpath } from 'node:fs/promises'
@@ -39,28 +41,41 @@ async function executable(command, env) {
 export function runUpdateCommand(command, args, { env, cwd, timeoutMs = CLI_UPDATE_TIMEOUT_MS }) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('timeoutMs must be a positive integer')
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
     const child = spawn(command, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true })
     children.add(child)
     let stdout = '', stderr = '', failure
+    const stderrDecoder = new StringDecoder('utf8')
     const terminate = reason => {
       if (failure) return
       failure = new Error(reason)
       try { if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL') } catch { /* already exited */ }
       child.stdout?.destroy(); child.stderr?.destroy()
     }
+    const evidence = (error, code = null, signal = null) => {
+      const safe = Buffer.from(redact(stderr, environmentSecrets(env)))
+      let begin = Math.max(0, safe.length - 16 * 1024)
+      while (begin < safe.length && (safe[begin] & 0xc0) === 0x80) begin++
+      return Object.assign(error, { diagnostic: {
+        version: 1, operation: args.includes('--refresh-models') ? 'models.discovery' : args[0] === '--version' ? 'provider.version' : 'provider.cli_update',
+        configuredExecutable: command, cwd, exitCode: code, signal, errno: error.errno ?? error.code ?? null,
+        timeoutMs, elapsedMs: Date.now() - startedAt, stderr: safe.subarray(begin).toString(), truncated: safe.length > 16 * 1024 || !!failure,
+      } })
+    }
     const timer = setTimeout(() => terminate(`${command} update timed out`), timeoutMs)
     const collect = (name, chunk) => {
       if (failure) return
-      if (name === 'stdout') stdout += chunk; else stderr += chunk
+      if (name === 'stdout') stdout += chunk; else stderr += stderrDecoder.write(chunk)
       if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > 512 * 1024) terminate(`${command} update exceeded its output limit`)
     }
     child.stdout?.on('data', chunk => collect('stdout', chunk))
     child.stderr?.on('data', chunk => collect('stderr', chunk))
-    child.once('error', error => { clearTimeout(timer); children.delete(child); reject(error) })
-    child.once('close', code => {
+    child.once('error', error => { clearTimeout(timer); children.delete(child); reject(evidence(error)) })
+    child.once('close', (code, signal) => {
+      stderr += stderrDecoder.end()
       clearTimeout(timer); children.delete(child)
-      if (failure) reject(failure)
-      else if (code !== 0) reject(new Error(`${command} update exited ${code}; check the provider installation and network access`))
+      if (failure) reject(evidence(failure, code, signal))
+      else if (code !== 0) reject(evidence(new Error(`${command} update exited ${code}; check the provider installation and network access`), code, signal))
       else resolve({ stdout, stderr })
     })
   })
@@ -132,7 +147,7 @@ async function update(provider, options, requestedAt) {
   const root = options.root || join(source.HOME || source.USERPROFILE || homedir(), '.poise', 'provider-clis')
   let path, before, after, lock
   const run = options.run || runUpdateCommand
-  const result = { provider, status: 'unavailable', checkedAt: new Date().toISOString() }
+  const result = { provider, configuredExecutable: COMMANDS[provider], status: 'unavailable', checkedAt: new Date().toISOString() }
   try {
     await mkdir(root, { recursive: true, mode: 0o700 })
     path = await executable(COMMANDS[provider], { ...env, PATH: source.PATH })
@@ -141,6 +156,7 @@ async function update(provider, options, requestedAt) {
     lock = await acquireLock(receipt + '.lock.sqlite3', remaining())
     const prior = await readReceipt(receipt)
     const resolved = await realpath(path)
+    result.resolvedPath = resolved
     const version = async () => {
       const shown = versionOf((await run(path, ['--version'], { env: { ...env, MUSE_NO_AUTO_UPDATE: '1' }, cwd: root, timeoutMs: remaining(10_000) })).stdout)
       if (provider === 'muse') {
@@ -196,7 +212,8 @@ async function update(provider, options, requestedAt) {
     await saveReceipt(receipt, result)
   } catch (error) {
     result.status = 'unavailable'
-    result.error = error instanceof Error ? error.message : String(error)
+    result.error = redact(error instanceof Error ? error.message : String(error), environmentSecrets(source))
+    if (error && typeof error === 'object' && error.diagnostic) result.diagnostic = error.diagnostic
     result.checkedAt = new Date().toISOString()
   } finally {
     if (lock) { try { if (lock.inTransaction) lock.exec('ROLLBACK') } finally { lock.close() } }

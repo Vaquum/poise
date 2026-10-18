@@ -1,3 +1,4 @@
+import { diagnostic } from './logging'
 import { trackReleaseBackground } from './release-background'
 import { ensureProviderCli, type Provider, type CliUpdate } from '../scripts/provider-cli-updates.mjs'
 import type { Catalog } from './models'
@@ -6,7 +7,14 @@ import type { Catalog } from './models'
 export async function prepareProviderCli(provider: Provider, signal?: AbortSignal): Promise<CliUpdate> {
   signal?.throwIfAborted()
   const finished = trackReleaseBackground()
-  const task = ensureProviderCli(provider).finally(finished)
+  const task = ensureProviderCli(provider).then((result) => {
+    if (result.status === 'unavailable') diagnostic({ level: 'warning', component: provider, operation: 'provider.cli_update', phase: 'launcher_verification',
+      message: result.error ?? 'Provider CLI update evidence is unavailable', stderr: result.diagnostic?.stderr ?? null, truncated: result.diagnostic?.truncated,
+      exitCode: result.diagnostic?.exitCode ?? null, signal: result.diagnostic?.signal ?? null, errno: result.diagnostic?.errno ?? null,
+      timeoutMs: result.diagnostic?.timeoutMs ?? null, context: { configuredExecutable: result.diagnostic?.configuredExecutable ?? result.configuredExecutable ?? result.path ?? null,
+        resolvedExecutable: result.resolvedPath ?? null, launchExecutable: result.launchPath ?? null, elapsedMs: result.diagnostic?.elapsedMs ?? null } })
+    return result
+  }).finally(finished)
   if (!signal) return task
   return new Promise((resolve, reject) => {
     const aborted = () => reject(signal.reason || new Error('CLI startup cancelled'))
