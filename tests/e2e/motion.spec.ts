@@ -43,28 +43,39 @@ for (const entering of [false, true]) test(`setup retirement preserves its ${ent
       return { x: box.x, y: box.y, width: box.width, height: box.height, transform: getComputedStyle(element).transform }
     }
     if (entering) {
-      // Replay and pause the actual CSS entrance: a busy browser can finish
-      // the first entrance before Playwright delivers this evaluation.
+      // Replay and pause both CSS entrances: wall-clock timing can leave the
+      // backdrop transparent even when the dialog transform is in progress.
+      root.style.transition = 'none'
       dialog.style.transition = 'none'
       root.classList.remove('ob-visible')
       void dialog.offsetWidth
+      root.style.removeProperty('transition')
       dialog.style.removeProperty('transition')
       root.classList.add('ob-visible')
       const entrance = dialog.getAnimations().find(animation => animation instanceof CSSTransition && animation.transitionProperty === 'transform')
       if (!entrance) throw new Error('Setup did not present an unfinished entrance.')
       entrance.pause()
       entrance.currentTime = Number(entrance.effect!.getTiming().duration) * .1
+      const backdrop = root.getAnimations().find(animation => animation instanceof CSSTransition && animation.transitionProperty === 'opacity')
+      if (!backdrop) throw new Error('Setup did not present an unfinished backdrop entrance.')
+      backdrop.pause()
+      backdrop.currentTime = Number(backdrop.effect!.getTiming().duration) * .1
+      const opacity = Number(getComputedStyle(root).opacity)
+      if (!(opacity > 0 && opacity < 1)) throw new Error('Setup backdrop was not captured visibly in progress.')
       const matrix = new DOMMatrix(getComputedStyle(dialog).transform)
       if (!(matrix.m42 > .5 && matrix.m42 < 9)) throw new Error('Setup entrance was not captured in progress.')
     }
     const before = geometry(dialog)
+    const opacity = Number(getComputedStyle(root).opacity)
     root.querySelector<HTMLButtonElement>('.ob-later')!.click()
     const ghost = document.querySelector<HTMLElement>('.ob-backdrop[data-flow-retiring]')!
     const visual = ghost.querySelector<HTMLElement>('.ob-dialog')!
-    return { before, after: geometry(visual), detached: !root.isConnected, inert: ghost.inert, hidden: ghost.getAttribute('aria-hidden'), appUsable: !document.getElementById('app')!.inert, transition: getComputedStyle(visual).transitionDuration }
+    return { before, after: geometry(visual), opacity, retiredOpacity: Number(getComputedStyle(ghost).opacity), detached: !root.isConnected, inert: ghost.inert, hidden: ghost.getAttribute('aria-hidden'), appUsable: !document.getElementById('app')!.inert, transition: getComputedStyle(visual).transitionDuration }
   }, entering)
   expect(result).toMatchObject({ detached: true, inert: true, hidden: 'true', appUsable: true, transition: '0s' })
   expect(result.after.transform).toBe(result.before.transform)
+  expect(result.opacity).toBeGreaterThan(0)
+  expect(result.retiredOpacity).toBeCloseTo(result.opacity, 5)
   for (const axis of ['x', 'y', 'width', 'height'] as const) expect(Math.abs(result.after[axis] - result.before[axis])).toBeLessThan(.5)
   await settled(page)
   await expect(page.locator('.ob-backdrop')).toHaveCount(0)
