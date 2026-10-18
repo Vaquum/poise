@@ -51,13 +51,13 @@ describe('Analytics wording', () => {
     expect(formatRate(1234.5)).toBe('1,234.5')
   })
 
-  it('leads with the productivity topline, then pull request flow, then the numbers per merged pull request', () => {
+  it('orders productivity by pull request flow, review and merge times, then issues', () => {
     const groups = analyticsGroups(report())
     expect(groups.map((group) => [group.id, group.label])).toEqual([
       ['productivity', 'Productivity'], ['per-merged-pr', 'Per merged pull request'],
     ])
     expect(groups.map((group) => group.tiles.map((t) => [t.label, t.value]))).toEqual([
-      [['Issues opened', '1,204'], ['Issues closed', '1'], ['Pull requests merged', '4'], ['Lines changed', '12,345'], ['Time to merge', '5h'], ['Pull requests opened', '6'], ['Closed without merging', '1'], ['Time to first review', '1m 35s']],
+      [['Pull requests opened', '6'], ['Pull requests merged', '4'], ['Closed without merging', '1'], ['Lines changed', '12,345'], ['Time to first review', '1m 35s'], ['Time to merge', '5h'], ['Issues opened', '1,204'], ['Issues closed', '1']],
       [['Comments', '2.3'], ['Median lines', '181'], ['Behaviors', '1.5'], ['Median time', '5h'], ['Merged by agent', '75%']],
     ])
     expect(tile(groups, 'Merged by agent').note).toBe('3 of 4 by robot')

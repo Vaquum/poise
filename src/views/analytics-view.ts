@@ -1,7 +1,7 @@
 import { reveal } from '../motion'
 import { patchContent } from '../dom-patch'
 // Analytics — a view of its own, opened from the burger menu rather than the
-// top nav: productivity and pull request flow, then the numbers per merged
+// top nav: productivity, then the numbers per merged
 // pull request, each with a weekly line and distribution, then
 // live GitHub API quota. Independent of Current's filters.
 import { analyticsGroups, type AnalyticsGroup, type AnalyticsReport } from '../analytics-format'

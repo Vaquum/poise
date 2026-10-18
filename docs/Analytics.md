@@ -8,9 +8,11 @@ stays on Analytics, and choosing a view in the top nav leaves it.
 
 The page reads top to bottom:
 
-1. **Productivity**: eight cards for issues opened and closed, pull requests
-   merged, lines changed, time to merge, pull requests opened and closed
-   without merging, and time to first review. Four columns by two rows.
+1. **Productivity**: four columns by two rows in a wide window (an analytics
+   container at least 880px wide). The first row shows pull
+   requests opened, merged, closed without merging, and lines changed.
+   The second shows time to first review, time to merge, issues opened,
+   and issues closed.
 2. **Per merged pull request**: five compact cards for comments, median lines,
    behaviors, median time and the share merged by the agent account.
 3. **GitHub API · Live**: avatar-led user and automation account panels side
@@ -20,7 +22,8 @@ Every metric card groups its colored value and adjacent trend arrow above a
 matching delta and seven-day baseline. A gap separates this summary from the weekly history line
 and a ten-bin histogram. Productivity uses larger cards and taller plots than
 per-PR metrics. Borders, colors, spacing and tooltip motion follow the shared
-design system. Narrow layouts reduce columns without horizontal overflow.
+design system. Narrow layouts reduce columns without horizontal overflow,
+keeping the same card sequence and keyboard focus order.
 
 ## The day
 
@@ -62,19 +65,14 @@ Productivity:
 
 | Number | What it is |
 | --- | --- |
+| Pull requests opened | Pull requests created in the range. |
+| Pull requests merged | Pull requests merged in the range. |
+| Closed without merging | Pull requests closed unmerged in the range. |
+| Lines changed | Additions plus deletions of the pull requests merged in the range. |
+| Time to first review | The median time from a pull request's opening to its first review, over the first reviews submitted in the range. Shown down to the second: "45s", "3m 12s", then hours and days. |
+| Time to merge | The median time from a pull request's opening to its merge, over the pull requests merged in the range. |
 | Issues opened | Issues created in the range. |
 | Issues closed | Issues closed in the range. |
-| Pull requests merged | Pull requests merged in the range. |
-| Lines changed | Additions plus deletions of the pull requests merged in the range. |
-| Time to merge | The median time from a pull request's opening to its merge, over the pull requests merged in the range. |
-
-Pull request flow:
-
-| Number | What it is |
-| --- | --- |
-| Pull requests opened | Pull requests created in the range. |
-| Closed without merging | Pull requests closed unmerged in the range. |
-| Time to first review | The median time from a pull request's opening to its first review, over the first reviews submitted in the range. Shown down to the second: "45s", "3m 12s", then hours and days. |
 
 A first review is the earliest review on GitHub (approved, changes requested,
 commented or dismissed) submitted by anyone other than the pull request's
@@ -106,8 +104,8 @@ comment on issues, not pull requests, and are not counted either.
 
 ## Seven-day trends
 
-Issues opened, Issues closed, Pull requests merged, Lines changed, Pull
-requests opened and Closed without merging compare the day's totals with the
+Pull requests opened, Pull requests merged, Closed without merging, Lines
+changed, Issues opened and Issues closed compare the day's totals with the
 median of the preceding seven complete calendar days' totals, including zero
 days. The existing baseline response includes those seven daily totals; no
 extra request or upstream read is needed. Calendar boundaries follow Settings'
