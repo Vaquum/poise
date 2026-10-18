@@ -25,6 +25,7 @@ from . import progress, review_budget, review_receipt
 
 
 MAX_INSPECTION_ROUNDS = 12
+CODEX_MAX_INPUT_CHARS = 1_048_576
 GROK_DISABLED_TOOLS = (
     "run_terminal_cmd,run_terminal_command,read_file,write_file,write,search_replace,list_dir,grep,"
     "kill_command_or_subagent,todo_write,get_command_or_subagent_output,spawn_subagent,Agent,"
@@ -247,38 +248,75 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
     # Each review owns one fresh native conversation. Resume that exact ID
     # with only newly supplied inspection evidence, retaining the provider's
     # prior analysis instead of recomputing the whole packet each round.
-    command = [*args, "resume", state["thread_id"], "-"] if resume else [*args, "-"]
-    done = watch.run(command, input=prompt[state["prefix_length"]:] if resume else prompt,
-                     cwd=str(root), timeout=timeout, env=env, provider="codex")
-    if done.returncode:
-        raise ValueError((done.stderr or done.stdout).strip() or f"codex exited {done.returncode}")
-    # A tool-using response is outside this adapter's contract. Never
-    # submit its verdict, even if the provider returned exit code zero.
-    # Item-level errors can be startup notices about disabled tools;
-    # turn failures and actual tool executions still reject the verdict.
-    thread_id = None
-    for event in events(done.stdout):
-        if event.get("type") in {"error", "turn.failed"}:
-            raise ValueError("Codex review did not complete successfully")
-        item = event.get("item") or {}
-        if not isinstance(item, dict):
-            raise InvalidVerdict("invalid Codex review item")
-        kind = item.get("type", "")
-        if not isinstance(kind, str) or (kind and kind not in {"agent_message", "reasoning", "todo_list", "error"}):
-            raise InvalidVerdict(f"unexpected Codex review item: {kind}")
-        if event.get("type") == "thread.started":
-            try:
-                observed = str(UUID(event["thread_id"]))
-            except (KeyError, ValueError, TypeError, AttributeError) as error:
-                raise InvalidVerdict("invalid Codex review conversation ID") from error
-            if (thread_id and observed != thread_id) or (resume and observed != state["thread_id"]):
-                raise InvalidVerdict("Codex resumed a different review conversation")
-            thread_id = observed
+    message = prompt[state["prefix_length"]:] if resume else prompt
+    fragments = [message]
+    if len(message) > CODEX_MAX_INPUT_CHARS:
+        # Keep the input intact in one native conversation. Intermediate
+        # turns only acknowledge receipt; only the last can return a verdict.
+        width = CODEX_MAX_INPUT_CHARS - 1024
+        fragments = [message[start:start + width] for start in range(0, len(message), width)]
+    thread_id = state["thread_id"] if resume else None
+    deadline = monotonic() + timeout
+    for index, fragment in enumerate(fragments, 1):
+        final = index == len(fragments)
+        schema_path = root / "verdict.schema.json"
+        part = fragment
+        if len(fragments) > 1:
+            part = (f"Caller review input fragment {index}/{len(fragments)}. These are consecutive "
+                    "fragments of one immutable review prompt. Retain every fragment verbatim as review input. "
+                    + ("All fragments are now supplied. Review them together and return the requested verdict or inspection step."
+                       if final else f'Do not review or return a verdict yet. Reply only with {{"received":{index}}}.')
+                    + "\nBEGIN REVIEW INPUT FRAGMENT\n" + fragment + "\nEND REVIEW INPUT FRAGMENT")
+            if not final:
+                schema_path = root / "receipt.schema.json"
+                schema_path.write_text(json.dumps({"type": "object", "additionalProperties": False,
+                    "required": ["received"], "properties": {"received": {"type": "integer", "enum": [index]}}}))
+        if len(part) > CODEX_MAX_INPUT_CHARS:
+            raise InvalidVerdict("Codex review fragment exceeds its input limit")
+        command_args = args.copy()
+        command_args[command_args.index("--output-schema") + 1] = str(schema_path)
+        command = [*command_args, "resume", thread_id, "-"] if thread_id else [*command_args, "-"]
+        output.unlink(missing_ok=True)
+        remaining = timeout if len(fragments) == 1 else deadline - monotonic()
+        if remaining <= 0:
+            raise review_budget.ReviewLimitError("Review reached its total time limit", "review_budget_exhausted")
+        done = watch.run(command, input=part, cwd=str(root), timeout=remaining, env=env, provider="codex")
+        if done.returncode:
+            raise ValueError((done.stderr or done.stdout).strip() or f"codex exited {done.returncode}")
+        # Startup item errors can be notices about disabled tools. Failed
+        # turns and actual native tool executions still reject the verdict.
+        observed_thread = None
+        for event in events(done.stdout):
+            if event.get("type") in {"error", "turn.failed"}:
+                raise ValueError("Codex review did not complete successfully")
+            item = event.get("item") or {}
+            if not isinstance(item, dict):
+                raise InvalidVerdict("invalid Codex review item")
+            kind = item.get("type", "")
+            if not isinstance(kind, str) or (kind and kind not in {"agent_message", "reasoning", "todo_list", "error"}):
+                raise InvalidVerdict(f"unexpected Codex review item: {kind}")
+            if event.get("type") == "thread.started":
+                try:
+                    observed = str(UUID(event["thread_id"]))
+                except (KeyError, ValueError, TypeError, AttributeError) as error:
+                    raise InvalidVerdict("invalid Codex review conversation ID") from error
+                if (observed_thread and observed != observed_thread) or (thread_id and observed != thread_id):
+                    raise InvalidVerdict("Codex resumed a different review conversation")
+                observed_thread = observed
+        thread_id = observed_thread or thread_id
+        if len(fragments) > 1 and not thread_id:
+            raise InvalidVerdict("Codex staged review has no conversation ID")
+        result = output.read_text()
+        if not final:
+            receipt = json.loads(result)
+            if (not isinstance(receipt, dict) or set(receipt) != {"received"}
+                    or type(receipt["received"]) is not int or receipt["received"] != index):
+                raise InvalidVerdict("Codex did not acknowledge the review input fragment")
     if thread_id:
         prefix = prompt.rsplit("\n\nInspection rounds remaining:", 1)[0]
         state_path.write_text(json.dumps({"thread_id": thread_id, "prefix_length": len(prefix),
                                          "prefix_digest": sha256(prefix.encode()).hexdigest()}))
-    return output.read_text()
+    return result
 
 
 # ── Grok Build ────────────────────────────────────────────────────────

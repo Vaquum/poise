@@ -268,6 +268,7 @@ const migrateSchema = db.transaction(() => {
   // where it opens, and when the person dismissed or silenced it.
   ensureColumn('alerts', 'target', 'target TEXT')
   ensureColumn('alerts', 'dismissed_at', 'dismissed_at TEXT')
+  ensureColumn('alerts', 'cause', 'cause TEXT')
   ensureColumn('alerts', 'silenced_at', 'silenced_at TEXT')
   const behaviorLaunchTrackingMigrated = db.prepare(
     'SELECT 1 FROM meta WHERE key = ?',

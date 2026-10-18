@@ -134,6 +134,25 @@ test('shows a quota warning, then a red exhaustion error after the warning is di
   await expect(card(page, error.id)).toHaveCount(0)
 })
 
+test('shows a new failure cause for the same held PR after the earlier notice was dismissed', async ({ page }) => {
+  const disk: Notice = { ...HELD, body: 'No space left on device. Open Behaviors in Poise for details.' }
+  const state = await workspace(page, [disk])
+  await page.goto('/')
+  await openRail(page)
+  await expand(page, disk.id)
+  await expect(card(page, disk.id)).toContainText('No space left on device')
+  await card(page, disk.id).getByRole('button', { name: 'Dismiss' }).click()
+  await expect(card(page, disk.id)).toHaveCount(0)
+  const overflow: Notice = { ...disk, id: 'aaaaaaaaaaaa-10', since: iso(5), due: iso(5),
+    body: 'Input exceeds the maximum length of 1048576 characters. Open Behaviors in Poise for details.' }
+  state.notices = [overflow]
+  await reread(page)
+  await expect(card(page, overflow.id)).toBeVisible()
+  await expand(page, overflow.id)
+  await expect(card(page, overflow.id)).toContainText('Input exceeds the maximum length')
+  expect(state.sent).toEqual([`dismiss ${disk.id}`])
+})
+
 test('counts what needs the person on the bell and lists it by who acts', async ({ page }) => {
   await workspace(page, [WAITING, HELD, READY])
   await page.goto('/')

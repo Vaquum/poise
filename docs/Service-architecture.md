@@ -658,7 +658,9 @@ alerts once, and again only after it has cleared:
   warnings never pause, reject or stop work;
 - a Claude or other provider sign-in is needed, or the person's own GitHub
   account or the agent account is not signed in to gh;
-- a behavior failed and is held;
+- a behavior failed and is held, with a fresh alert when its cause materially
+  changes even if the previous alert was dismissed. Repeats of the same cause
+  remain deduplicated ([Notifications](Notifications.md));
 - datastore sync has been failing for 15 minutes;
 - a GitHub API budget is forecast to run out (`github_quota_warning`), or is
   exhausted (`github_quota_exhausted`), while notifications are on. These use

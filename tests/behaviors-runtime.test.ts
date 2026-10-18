@@ -2230,7 +2230,7 @@ describe('behavior launch claims', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
   })
 
-  it('alerts once when a behavior gives up on a pull request, however often it fails there', async () => {
+  it('alerts once per held cause and renews a dismissed alert when the cause changes', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
     const launched = await launchReviewBeforeCrash()
@@ -2261,6 +2261,21 @@ describe('behavior launch claims', () => {
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorDeadLetters()).toHaveLength(2)
     expect(alerts()).toHaveLength(1)
+    launched.database.db.prepare('UPDATE alerts SET dismissed_at = ? WHERE resolved_at IS NULL').run(new Date().toISOString())
+    vi.setSystemTime(Date.now() + launched.behaviors.BEHAVIOR_RETRY_MAX_MS)
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    const changed = launched.database.listBehaviorLaunchClaims('review-new-prs').find((claim) => claim.target === launched.target)!
+    agentLogs.push(agentLog({
+      id: '9'.repeat(32), status: 'failed', error: 'Input exceeds the maximum length of 1048576 characters',
+      error_code: 'review_packet_too_large', action: 'not_started', outcome: 'preflight_failed',
+      actor: changed.launchActor, source: changed.launchSource, expected_head: changed.launchExpectedHead,
+      correlation_id: changed.launchCorrelationId,
+    }))
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(alerts()).toHaveLength(2)
+    const fresh = launched.database.db.prepare('SELECT body, dismissed_at FROM alerts WHERE resolved_at IS NULL').get()
+    expect(fresh).toEqual({ body: 'Input exceeds the maximum length of 1048576 characters Open Behaviors in Poise for details.', dismissed_at: null })
   })
 
   it('requires an unambiguous failed call before recovering a no-action failure', async () => {

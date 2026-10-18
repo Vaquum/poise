@@ -45,7 +45,10 @@ Each notice is an unresolved alert, the same alerts
 2. A sign-in is needed: Claude, another agent CLI, or a GitHub account gh does
    not hold signed in.
 3. A behavior failed and is held. The notice leaves once Behaviors no longer
-   has the incident.
+   has the incident. A materially different failure cause replaces the notice
+   with a fresh, specific alert, including after dismissal. Repeated failures
+   with the same cause retain their dismissal; changing counts and attempt IDs
+   do not count as a new cause. This persists across restarts.
 4. A GitHub account's datastore has not synced for 15 minutes.
 5. A pull request of yours is ready to merge (below).
 6. A Chat turn that ran longer than two minutes has finished. This one shows

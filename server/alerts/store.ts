@@ -47,6 +47,8 @@ export interface AlertInput {
   body: string
   /** The page in this workspace the alert opens, as a path. */
   path: string
+  /** Internal normalized cause fingerprint, independent of display bounds. */
+  cause?: string
   /** Where its notice in the page opens; none, and the notice only informs. */
   target?: AlertTarget
 }
@@ -126,10 +128,10 @@ export function raiseAlert(input: AlertInput, now = Date.now()): Alert | null {
   pruneAlerts(now)
   const createdAt = new Date(now).toISOString()
   const info = db.prepare(`
-    INSERT INTO alerts(kind, title, body, url, created_at, dedupe_key, target)
-    VALUES(?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO alerts(kind, title, body, url, created_at, dedupe_key, target, cause)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING
-  `).run(input.kind, input.title, input.body, input.path, createdAt, input.dedupeKey, input.target ? JSON.stringify(input.target) : null)
+  `).run(input.kind, input.title, input.body, input.path, createdAt, input.dedupeKey, input.target ? JSON.stringify(input.target) : null, input.cause ?? null)
   if (info.changes !== 1) return null
   announce()
   const seq = Number(info.lastInsertRowid)
@@ -170,6 +172,7 @@ export function latestAlertSeq(): number {
 
 /** An unresolved alert as its notice in the page needs it. */
 export interface OpenAlert {
+  cause?: string
   id: string
   seq: number
   kind: AlertKind
@@ -183,6 +186,7 @@ export interface OpenAlert {
 }
 
 interface OpenAlertRow {
+  cause: string | null
   id: number
   kind: AlertKind
   title: string
@@ -209,7 +213,7 @@ function storedTarget(raw: string | null): AlertTarget | null {
 export function openAlerts(options: { kind?: AlertKind, now?: number } = {}): OpenAlert[] {
   const cutoff = new Date((options.now ?? Date.now()) - ALERT_RETENTION_MS).toISOString()
   const rows = db.prepare(`
-    SELECT id, kind, title, body, created_at, dedupe_key, target, dismissed_at, silenced_at FROM alerts
+    SELECT id, kind, title, body, cause, created_at, dedupe_key, target, dismissed_at, silenced_at FROM alerts
     WHERE resolved_at IS NULL AND created_at >= ? AND (? IS NULL OR kind = ?)
     ORDER BY id DESC
   `).all(cutoff, options.kind ?? null, options.kind ?? null) as OpenAlertRow[]
@@ -220,6 +224,7 @@ export function openAlerts(options: { kind?: AlertKind, now?: number } = {}): Op
     kind: row.kind,
     title: row.title,
     body: row.body,
+    ...(row.cause ? { cause: row.cause } : {}),
     createdAt: row.created_at,
     dedupeKey: row.dedupe_key,
     target: storedTarget(row.target),

@@ -132,6 +132,13 @@ with provisional `comments` and a `requests` array; Caller reads the requested
 source and supplies the result in their next turn. Terminal verdicts require
 `requests: []`. At most 12 inspection rounds fit within the existing total review
 deadline and 1.5 MB prompt limit; exhausting inspection never submits a review.
+Codex messages at or below its 1,048,576-character input limit keep their existing
+single-turn path. Only overflowing messages are sent as consecutive bounded
+fragments through the same native review conversation. Intermediate turns must
+acknowledge the exact fragment number; only the last can return a verdict or
+inspection request. The full input is retained, the existing total deadline and
+1.5 MB limit still apply, and partial staging, mismatched conversation IDs,
+failed turns or native tool use submit nothing.
 Each provider process runs in a separate temporary directory with native tools
 disabled, receiving the same explicit guidance and scoped inspection access: Codex
 (Astra, Sol; CLI 0.154.0 or newer, signed in to ChatGPT — API credentials are not

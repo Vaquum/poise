@@ -39,7 +39,7 @@ export function behaviorIncidentDiagnostics(incidents: BehaviorDeadLetter[], sna
 }
 
 // Keep bounded, redacted CLI evidence in health instead of an opaque exit code.
-export function behaviorErrorMessage(error: unknown): string {
+export function behaviorErrorMessage(error: unknown, maxLength = 300): string {
   const message = error instanceof Error ? error.message : String(error)
   const stderr = (error as { stderr?: unknown } | null)?.stderr
   const detail = typeof stderr === 'string' ? stderr.trim().split('\n').at(-1)?.trim() : ''
@@ -55,5 +55,5 @@ export function behaviorErrorMessage(error: unknown): string {
     .replace(/(https?:\/\/)[^\s/]+@/g, '$1[redacted]@')
     .replace(/\b(Bearer|token)\s+[^\s,;"']+/gi, '$1 [redacted]')
     .replace(/[\x00-\x1f\x7f]/g, ' ')
-    .slice(0, 300)
+    .slice(0, maxLength)
 }

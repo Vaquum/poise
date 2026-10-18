@@ -191,14 +191,13 @@ function listBehaviorIncidents(limit = 50) {
 }
 
 // A dead letter is an incident in the Behaviors view, grouped by pull request
-// or issue. Recording the first one for a target alerts the person; more for
-// the same target stay that one alert until the incident has cleared.
+// or issue. A new cause alerts even while an earlier incident still stands.
 function recordBehaviorDeadLetter(claim: BehaviorLaunchClaim, error: string, callId?: string | null): string {
   const target = claim.launchRepo && claim.launchPr ? `${claim.launchRepo}#${claim.launchPr}` : claim.target
   const alreadyHeld = databaseListBehaviorIncidents(500)
     .some((incident) => incident.behavior === claim.key && incident.target === target)
   const id = databaseRecordBehaviorDeadLetter(claim, error, callId)
-  behaviorHeld(claim.key, target, alreadyHeld)
+  behaviorHeld(claim.key, target, alreadyHeld, behaviorErrorMessage(error, Infinity))
   return id
 }
 

@@ -88,6 +88,10 @@ is held on unchanged input and model instead of repeatedly launching the same
 worker. A clean review becomes approval-eligible on the next scheduler scan.
 Provider account blocks (`review_provider_blocked`) use the same hold, preventing
 an exhausted balance or local account latch from launching identical workers.
+Codex input overflow is staged within the existing total review budget, with
+every fragment acknowledged in one native conversation before a single final
+verdict can be submitted. Ordinary messages are unchanged. The bounds and
+failure rules are in [Caller PR review models](../caller/agent_interface/README.md#pr-review-models).
 After account recovery, a successful explicit replay on the same head, model,
 and reviewer reconciles the held no-action attempt. Its GitHub review receipt
 must be present in live evidence before it becomes durable approval evidence.
