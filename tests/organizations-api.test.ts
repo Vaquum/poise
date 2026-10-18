@@ -44,6 +44,8 @@ let database: typeof import('../server/db') | undefined
 let cache: typeof import('../server/cache-plugin') | undefined
 let pendingIndex: Promise<void> | undefined
 let releaseIndex: (() => void) | undefined
+let pendingHealth: Promise<void> | undefined
+let releaseHealth: (() => void) | undefined
 let failIndex = false
 let behaviorLogs: unknown[] = []
 const envKeys = ['POISE_DB', 'POISE_EDITOR_DIR', 'POISE_CHAT_ATTACHMENTS_DIR', 'POISE_LOCK_DIR', 'AGENT_INTERFACE_ROOT', 'POISE_ESPANSO_MATCH_DIR', 'POISE_DATASTORE_DB']
@@ -75,6 +77,10 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
     if (failIndex) throw new Error('organization access denied')
     writeIndex(args[1]!, args[3]!)
   }
+  if (args[2] === 'health' && pendingHealth) await Promise.race([
+    pendingHealth,
+    new Promise<void>((_resolve, reject) => options.signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true })),
+  ])
   return {
     stdout: args[2] === 'health'
       ? JSON.stringify({ action: 'health', healthy: true, status: 'healthy', database: args[1] })
@@ -139,6 +145,8 @@ beforeEach(async () => {
   delete process.env.POISE_DATASTORE_DB
   pendingIndex = undefined
   releaseIndex = undefined
+  pendingHealth = undefined
+  releaseHealth = undefined
   failIndex = false
   behaviorLogs = []
   mocks.runFile.mockReset().mockImplementation(cli)
@@ -199,6 +207,7 @@ describe('organizations API', () => {
 
   it('returns accepted before indexing ends, then publishes ready status without touching legacy', async () => {
     pendingIndex = new Promise<void>((resolve) => { releaseIndex = resolve })
+    pendingHealth = new Promise<void>((resolve) => { releaseHealth = resolve })
     database!.recordSeen('review-new-prs', 'Legacy/repo#1')
     const added = await request('/api/organizations', { org: ' Acme ', datastorePath: '/ignored.sqlite' })
     expect(added.status).toBe(202)
@@ -213,6 +222,11 @@ describe('organizations API', () => {
     expect(progress.body.organizations[1]!.status).toBe('initializing')
     releaseIndex!()
     pendingIndex = undefined
+    await vi.waitFor(() => expect(mocks.runFile.mock.calls.some(([command, args]) => command === 'github-datastore' && args[2] === 'health')).toBe(true), { timeout: 5000 })
+    const checking = await request('/api/organizations')
+    expect(checking.body.organizations[1]).toMatchObject({ status: 'initializing', stage: 'checking' })
+    releaseHealth!()
+    pendingHealth = undefined
     await orgStatus('acme', 'ready')
     expect(mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-datastore' && args[2] === 'init-org')).toHaveLength(1)
     expect(database!.getMeta('org')).toBe('Legacy')
