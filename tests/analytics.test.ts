@@ -31,7 +31,7 @@ vi.mock('../server/organizations', () => ({
   readyOrganizations: () => mocks.orgs.filter((org) => org.status === 'ready'),
   organizationArgs: (org: { datastorePath: string }, args: string[]) => ['--db', org.datastorePath, ...args],
 }))
-const { computeAnalytics, parseWindow, readAnalytics } = await import('../server/analytics')
+const { computeAnalytics, computeHistory, parseBounds, parseWindow, readAnalytics, readAnalyticsHistory } = await import('../server/analytics')
 
 const HOUR = 60 * 60 * 1000
 const WEEK = { since: '2026-10-05T00:00:00Z', until: '2026-10-12T00:00:00Z' }
@@ -73,6 +73,40 @@ describe('the window', () => {
     expect(() => parseWindow('yesterday', null)).toThrow('timezone')
     expect(() => parseWindow(null, ['2026-10-09T00:00:00Z'])).toThrow('timezone')
     expect(() => parseWindow('2026-10-09T00:00:00Z', '2026-10-09T00:00:00Z')).toThrow('before until')
+  })
+})
+
+describe('the periods of a history', () => {
+  it('takes increasing zoned edges, exact to the millisecond', () => {
+    expect(parseBounds('2026-10-01T00:00:00+03:00,2026-10-08T00:00:00.500Z')).toEqual(['2026-09-30T21:00:00.000Z', '2026-10-08T00:00:00.500Z'])
+    expect(parseBounds(Array.from({ length: 80 }, (_, i) => new Date(Date.UTC(2026, 0, 1 + i)).toISOString()).join(','))).toHaveLength(80)
+  })
+
+  it('refuses missing, unzoned, empty, repeated, decreasing and too many edges', () => {
+    for (const bad of [null, '', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00,2026-10-08T00:00:00Z', '2026-10-01T00:00:00Z,,2026-10-08T00:00:00Z',
+      '2026-10-08T00:00:00Z,2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z,2026-10-01T00:00:00Z',
+      Array.from({ length: 81 }, (_, i) => new Date(Date.UTC(2026, 0, 1 + i)).toISOString()).join(',')]) {
+      expect(() => parseBounds(bad), String(bad)).toThrow()
+    }
+  })
+
+  it('counts each period as a day is counted, every edge inclusive at the start', () => {
+    const history = computeHistory({
+      bounds: ['2026-09-28T00:00:00Z', '2026-10-05T00:00:00Z', '2026-10-12T00:00:00Z'],
+      issues: [issue(1, '2026-09-28T00:00:00Z'), issue(2, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z'), issue(3, '2026-10-12T00:00:00Z')],
+      prs: [
+        pr(1, '2026-09-28T00:00:00Z', '2026-09-28T06:00:00Z', { additions: 10, deletions: 0 }),
+        pr(2, '2026-09-29T00:00:00Z', '2026-10-05T00:00:00Z', { additions: null, deletions: null }),
+        pr(3, '2026-10-05T00:00:00Z', '2026-10-05T02:00:00Z', { additions: 1, deletions: 1 }),
+      ],
+    })
+    expect(history.errors).toEqual([])
+    expect(history.periods).toEqual([
+      { since: '2026-09-28T00:00:00Z', until: '2026-10-05T00:00:00Z', issues: { opened: 1, closed: 0 },
+        pullRequests: { merged: 1, lines: { total: 10, counted: 1 }, averageTimeToMergeMs: 6 * HOUR } },
+      { since: '2026-10-05T00:00:00Z', until: '2026-10-12T00:00:00Z', issues: { opened: 1, closed: 1 },
+        pullRequests: { merged: 2, lines: { total: 2, counted: 1 }, averageTimeToMergeMs: (6 * 24 * HOUR + 2 * HOUR) / 2 } },
+    ])
   })
 })
 
@@ -331,6 +365,23 @@ describe('reading what Current shows', () => {
     const deleted = seed(pr(2, '2026-10-05T00:00:00Z', null), 'pr', true)
     review(deleted, null, 'APPROVED', '2026-10-05T00:02:00Z')
     expect((await readAnalytics(WEEK)).pullRequests.firstReview).toEqual({ count: 2, medianMs: 75_000 })
+  })
+
+  it('reads a history in one pass over every period, for the selected account', async () => {
+    data()
+    seed(pr(4, '2026-09-28T00:00:00Z', '2026-09-29T00:00:00Z', { additions: 3, deletions: 3 }), 'pr', true)
+    const bounds = ['2026-09-28T00:00:00.000Z', '2026-10-05T00:00:00.000Z', '2026-10-12T00:00:00.000Z']
+    const history = await readAnalyticsHistory(bounds, 'alpha')
+    expect(history.periods.map((p) => [p.issues.opened, p.pullRequests.merged, p.pullRequests.lines])).toEqual([
+      [0, 1, { total: 6, counted: 1 }],
+      [2, 2, { total: 14, counted: 2 }],
+    ])
+    // The second period is the week the day report reads, and agrees with it.
+    const week = await readAnalytics({ since: bounds[1], until: bounds[2] }, 'alpha')
+    expect(history.periods[1].issues).toEqual(week.issues)
+    expect(history.periods[1].pullRequests).toEqual({ merged: week.pullRequests.merged, lines: { total: week.pullRequests.lines.total, counted: week.pullRequests.lines.counted }, averageTimeToMergeMs: week.pullRequests.averageTimeToMergeMs })
+    expect((await readAnalyticsHistory(bounds, 'beta')).periods.every((p) => p.pullRequests.merged === 0)).toBe(true)
+    expect(mocks.runFile).not.toHaveBeenCalled()
   })
 
   it('reads only the selected account, including all history for unbounded windows', async () => {

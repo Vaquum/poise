@@ -1088,6 +1088,88 @@ tr:hover .review-btn { opacity: 1; }
   color: var(--text-tertiary);
   line-height: 1.5;
 }
+/* The past year under each headline figure: one point per 7-day period.
+   A grey line with a light wash carries the year; the latest period is the
+   one blue mark. The SVG stretches to the tile, so marks that must stay
+   round are positioned over it in percent. */
+/* A tile is a column, so its chart sits on the row's common floor whether
+   or not the figure above it has a trend line. */
+.analytics-tile:has(> .analytics-history) { display: flex; flex-direction: column; }
+.analytics-history { --history-line: var(--n5); position: relative; margin: auto 0 0; padding-top: var(--sp-3); }
+[data-theme="dark"] .analytics-history { --history-line: var(--n4); }
+.analytics-history-max {
+  display: block;
+  min-height: 1.4em;
+  font-size: 0.625rem;
+  line-height: 1.4;
+  color: var(--text-tertiary);
+  text-align: right;
+}
+.analytics-history-plot {
+  position: relative;
+  height: 48px;
+  margin: 0 4px;
+}
+.analytics-history-plot[tabindex] { cursor: crosshair; touch-action: pan-y; }
+.analytics-history-plot:focus-visible { outline: 2px solid var(--a1); outline-offset: 4px; }
+.analytics-history-plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.analytics-history-base { stroke: var(--hairline); stroke-width: 1; }
+.analytics-history-area { fill: var(--history-line); opacity: 0.1; }
+.analytics-history-line { fill: none; stroke: var(--history-line); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.analytics-history-dot,
+.analytics-history-latest,
+.analytics-history-point {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--bg);
+  pointer-events: none;
+}
+.analytics-history-dot { background: var(--history-line); }
+.analytics-history-latest { background: var(--a1); }
+.analytics-history-point { background: var(--text); }
+.analytics-history-point[hidden] { display: none; }
+.analytics-history-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  margin-left: -0.5px;
+  background: var(--border);
+  pointer-events: none;
+}
+.analytics-history-tip {
+  position: absolute;
+  bottom: calc(100% + var(--sp-1));
+  z-index: 2;
+  padding: var(--sp-1) var(--sp-2);
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  box-shadow: var(--e-2);
+  font-size: 0.6875rem;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.analytics-history-tip strong { display: block; font-size: 0.8125rem; color: var(--text); }
+.analytics-history-tip span { color: var(--text-secondary); }
+.analytics-history-empty {
+  display: flex;
+  align-items: center;
+  min-height: calc(48px + 0.875rem);
+  margin: 0;
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+}
+/* Six columns scroll inside their own box on a narrow page. */
+.analytics-history-table { margin-top: var(--sp-3); font-size: 0.75rem; overflow-x: auto; }
+.analytics-history-table summary { cursor: pointer; color: var(--text-secondary); width: fit-content; }
+.analytics-history-table table { margin-top: var(--sp-3); font-variant-numeric: tabular-nums; }
+.analytics-history-table td:not(:first-child),
+.analytics-history-table th:not(:first-child) { text-align: right; }
 .github-quota-account {
   padding-bottom: var(--sp-5);
   margin-bottom: var(--sp-5);

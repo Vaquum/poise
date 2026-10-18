@@ -14,3 +14,8 @@ export function analyticsDay(offset: number, anchor = new Date()): { label: stri
     baselineSince: midnightInZone(offset - 7, anchor).toISOString(),
   }
 }
+
+/** The edges of the 7-day periods in the year before the selected day, oldest first. The last edge is the selected day's midnight, so the latest period is its 7-day baseline. */
+export function analyticsHistoryBounds(offset: number, anchor = new Date(), periods = 52): string[] {
+  return Array.from({ length: periods + 1 }, (_, i) => midnightInZone(offset - 7 * (periods - i), anchor).toISOString())
+}

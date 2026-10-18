@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
 import type { AnalyticsReport } from '../../src/analytics-format'
+import type { AnalyticsHistory } from '../../src/analytics-history'
 import type { GithubQuotaReport } from '../../src/github-quota'
 
 function report(merged: number, hours = 27): AnalyticsReport {
@@ -23,7 +24,19 @@ function report(merged: number, hours = 27): AnalyticsReport {
   }
 }
 
+// A year of deterministic 7-day periods between the requested edges.
+function history(bounds: string[]): AnalyticsHistory {
+  return { errors: [], periods: bounds.slice(1).map((until, i) => {
+    const quiet = i % 13 === 0
+    const merged = quiet ? 0 : 7 + i % 5
+    return { since: bounds[i], until, issues: { opened: i % 9, closed: (i * 3) % 7 },
+      pullRequests: { merged, lines: { total: quiet ? null : 700 + 50 * (i % 6), counted: merged }, averageTimeToMergeMs: quiet ? null : (10 + i % 7) * 3_600_000 } }
+  }) }
+}
+
 interface Workspace {
+  historyReads: Array<{ bounds: string[], org: string | null }>
+  historyFails: boolean
   reads: Array<{ since: string | null, until: string | null, org: string | null }>
   fail: boolean
   baselineHours: number
@@ -31,7 +44,7 @@ interface Workspace {
 }
 
 async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
-  const state: Workspace = { reads: [], fail: false, baselineHours: 54, baselineMerged: 8 }
+  const state: Workspace = { historyReads: [], historyFails: false, reads: [], fail: false, baselineHours: 54, baselineMerged: 8 }
   await page.clock.setFixedTime(new Date('2026-10-09T12:00:00Z'))
   await page.addInitScript(() => {
     if (sessionStorage.getItem('seeded')) return
@@ -44,6 +57,12 @@ async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
   const organizations = ['acme', 'beta'].map((login) => ({ login, managed: true, status: 'ready', stage: 'ready', error: null, activatedAt: '2026-10-01T08:00:00Z' }))
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
+    if (url.pathname === '/api/analytics/history') {
+      const bounds = url.searchParams.get('bounds')!.split(',')
+      state.historyReads.push({ bounds, org: url.searchParams.get('org') })
+      if (state.historyFails) return route.fulfill({ status: 502, json: { error: 'acme: datastore offline' } })
+      return route.fulfill({ json: history(bounds) })
+    }
     if (url.pathname === '/api/analytics') {
       const read = { since: url.searchParams.get('since'), until: url.searchParams.get('until'), org: url.searchParams.get('org') }
       state.reads.push(read)
@@ -181,6 +200,80 @@ test('keeps the topline on one row beside a docked notification rail', async ({ 
   expect(new Set(tops).size).toBe(1)
 })
 
+test('draws each headline figure\'s past year by 7-day period, ending at the selected day', async ({ page }, info) => {
+  const state = await workspace(page)
+  await page.goto('/')
+  await openAnalytics(page)
+  const topline = page.getByRole('region', { name: 'Productivity' })
+  const plots = topline.locator('.analytics-history-plot')
+  await expect(plots).toHaveCount(5)
+  await expect(topline.locator('.analytics-history-latest')).toHaveCount(5)
+  // The charts share one floor even where a figure above has no trend line.
+  await expect(topline.locator('.analytics-tile').filter({ hasText: 'Lines changed' }).locator('.analytics-trend')).toHaveCount(0)
+  expect(new Set(await plots.evaluateAll((items) => items.map((item) => Math.round(item.getBoundingClientRect().bottom)))).size).toBe(1)
+  for (const plot of await plots.all()) await expect(plot.locator('.analytics-history-line')).toHaveAttribute('d', /^M[\d.]+ [\d.]+ L/)
+  // Weeks without a merge leave time to merge unknown, not zero.
+  await expect(topline.locator('.analytics-history[data-series="Time to merge"] .analytics-history-line')).toHaveAttribute('d', / M/)
+  await expect(topline.locator('.analytics-history[data-series="Pull requests merged"] .analytics-history-max')).toHaveText('Max 1.6/day')
+  expect(state.historyReads).toHaveLength(1)
+  const [{ bounds, org }] = state.historyReads
+  expect(bounds).toHaveLength(53)
+  expect([bounds[0], bounds.at(-2), bounds.at(-1), org]).toEqual(['2025-10-10T00:00:00.000Z', '2026-10-02T00:00:00.000Z', '2026-10-09T00:00:00.000Z', null])
+  await expect(topline).toContainText('The last period is the 7 days before the selected day.')
+
+  const merged = topline.locator('.analytics-history[data-series="Pull requests merged"]')
+  const box = (await merged.locator('.analytics-history-plot').boundingBox())!
+  await page.mouse.move(box.x + box.width - 1, box.y + box.height / 2)
+  const tip = merged.locator('.analytics-history-tip')
+  await expect(tip.locator('strong')).toHaveText('1.1/day')
+  await expect(tip.locator('span')).toHaveText('8 merged · 2 Oct – 8 Oct 2026')
+  await page.screenshot({ path: info.outputPath('analytics-history.png') })
+  await page.mouse.move(box.x + box.width / 2, box.y - 60)
+  await expect(tip).toHaveCount(0)
+
+  await merged.locator('.analytics-history-plot').focus()
+  await expect(tip.locator('span')).toHaveText('8 merged · 2 Oct – 8 Oct 2026')
+  await page.keyboard.press('ArrowLeft')
+  await expect(tip.locator('strong')).toHaveText('1.0/day')
+  await expect(tip.locator('span')).toHaveText(/^7 merged · 25 Sept? – 1 Oct 2026$/)
+  await page.keyboard.press('Home')
+  await expect(tip.locator('span')).toHaveText('0 merged · 10 Oct – 16 Oct 2025')
+
+  await topline.getByText('The past year as a table').click()
+  const rows = topline.locator('.analytics-history-table tbody tr')
+  await expect(rows).toHaveCount(52)
+  await expect(rows.first().locator('td')).toHaveText(['2 Oct – 8 Oct 2026', '0.9/day', '0.9/day', '1.1/day', '121/day', '12h'])
+  await expect(topline.locator('.analytics-history-table thead th')).toHaveText(['Period', 'Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Time to merge'])
+
+  await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
+  await page.locator('#analytics-filters').getByLabel('Account filter').selectOption('beta')
+  await expect.poll(() => state.historyReads.at(-1)?.org).toBe('beta')
+  expect(state.historyReads.at(-1)!.bounds.at(-1)).toBe('2026-10-08T00:00:00.000Z')
+})
+
+test('holds each chart\'s place while the past year loads, and says when it cannot be read', async ({ page }) => {
+  const state = await workspace(page)
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/api/analytics/history?**', async (route) => { await held; await route.fallback() })
+  await page.goto('/')
+  await openAnalytics(page)
+  const tile = page.getByRole('region', { name: 'Productivity' }).locator('.analytics-tile').first()
+  await expect(value(page, 'Issues opened')).toHaveText('12')
+  await expect(tile.locator('.analytics-history')).toHaveAttribute('aria-busy', 'true')
+  const pending = (await tile.boundingBox())!.height
+  release()
+  await expect(tile.locator('.analytics-history-line')).toHaveCount(1)
+  expect((await tile.boundingBox())!.height).toBe(pending)
+
+  state.historyFails = true
+  await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
+  await expect(tile.locator('.analytics-history-empty')).toHaveText('Past year unavailable')
+  await expect(tile.locator('.analytics-history-empty')).toHaveAttribute('data-help', 'acme: datastore offline')
+  await expect(value(page, 'Issues opened')).toHaveText('12')
+  expect((await tile.boundingBox())!.height).toBe(pending)
+})
+
 test('stops reading quota once another view is chosen', async ({ page }) => {
   await workspace(page)
   await page.route('**/api/github-quota', (route) => route.fulfill({ json: quotaReport() }))
@@ -215,7 +308,22 @@ for (const theme of ['light', 'dark']) test(`fits a narrow window and large text
   const clipped = await view.locator('.analytics-day > *').evaluateAll((items) => items.map((item) => item.scrollWidth - item.clientWidth))
   expect(Math.max(...clipped)).toBeLessThanOrEqual(1)
   expect(new Set(await lefts(view.getByRole('region', { name: 'Productivity' }), '.analytics-tile')).size).toBe(2)
+  await expect(view.locator('.analytics-history-line')).toHaveCount(5)
   await page.screenshot({ path: info.outputPath(`analytics-narrow-${theme}.png`), fullPage: true })
+  // A readout wider than a right-column chart stays on the page.
+  const closed = view.locator('.analytics-history[data-series="Issues closed"] .analytics-history-plot')
+  const plot = (await closed.boundingBox())!
+  await page.mouse.move(plot.x + plot.width - 1, plot.y + plot.height / 2)
+  const tip = (await closed.locator('.analytics-history-tip').boundingBox())!
+  const main = (await view.locator('main').boundingBox())!
+  expect(tip.width).toBeGreaterThan(plot.width)
+  expect(tip.x).toBeGreaterThanOrEqual(main.x - 1)
+  expect(tip.x + tip.width).toBeLessThanOrEqual(main.x + main.width + 1)
+  await page.mouse.move(0, 0)
+  // The year's table scrolls in its own box instead of widening the page.
+  await view.getByText('The past year as a table').click()
+  await expect(view.locator('.analytics-history-table tbody tr')).toHaveCount(52)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
 })
 
 test('shows live account quota below daily analytics with usage, resets and risk colors', async ({ page }, info) => {

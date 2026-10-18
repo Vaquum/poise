@@ -10,7 +10,7 @@ The page reads top to bottom:
 
 1. **Productivity**: the day's topline. Issues opened and closed, pull
    requests merged, lines changed and time to merge, each against the seven
-   days before.
+   days before, and under each its past year by 7-day period.
 2. **Pull request flow**: pull requests opened, closed without merging, and
    the time to their first review, down to the second.
 3. **Per merged pull request**: comments, median lines, behaviors, median
@@ -123,6 +123,29 @@ preceding seven days' first reviews, and names how many there were. The
 arrows read as they do for time to merge: green and downward is faster. A
 zero baseline shows the increase in seconds.
 
+## The past year
+
+Under each Productivity figure a chart shows the year before the selected
+day, one point per 7-day period: 52 periods, the last of them the seven days
+before the selected day, which is the figure's own 7-day baseline. Issues
+opened and closed, pull requests merged and lines changed are daily averages
+over each period; time to merge is the mean of the pull requests merged in
+it. Periods are calendar weeks in the timezone from Settings, so a week that
+crosses a daylight-saving change is 167 or 169 hours long.
+
+The line is grey with a light wash and the latest period is marked in blue.
+Each chart's highest value is named above it. Pointing at a chart, or
+focusing it and using the arrow keys, Home and End, shows a period's value,
+what it is made of (such as "8 merged" or "Mean of 8 PRs") and its dates.
+"The past year as a table" lists every period, newest first.
+
+A period without merges has no time to merge, and one whose merged pull
+requests are not all sized has no lines total; the line breaks there instead
+of falling to zero, and a known value with unknown neighbours shows as a dot.
+The year is read once per day and account, separately from the day's numbers,
+and each chart keeps its place until it arrives. If it cannot be read, the
+charts say "Past year unavailable" and the day's numbers stay.
+
 ## When a number is missing
 
 - No pull request merged in the range: the per-PR numbers show — and the
@@ -182,6 +205,14 @@ window through this endpoint; `medianTimeToMergeMs` accompanies the mean. The
 report also names `agentAccount` (null when none is set) and gives, under
 `pullRequests`, `opened`, `closedUnmerged`, `mergedByAgent` (null without an
 agent account) and `firstReview` with its `count` and `medianMs`.
+
+`GET /api/analytics/history?bounds=…&org=…` answers the past year. `bounds`
+lists the period edges, comma-separated times with a timezone, increasing,
+2 to 80 of them; each period runs from one edge (inclusive) to the next
+(exclusive). The answer is `{ periods, errors }`: each period has `since`,
+`until`, `issues` (`opened`, `closed`) and `pullRequests` (`merged`, `lines`
+with `total` and `counted`, `averageTimeToMergeMs`), counted exactly as the
+day is. The server reads every period in one pass over sizes and times only.
 
 Section and metric explanations appear after half a second on hover or on
 keyboard focus; missing data and coverage notes remain visible. See

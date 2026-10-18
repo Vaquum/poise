@@ -66,6 +66,23 @@ export interface AnalyticsReport {
   errors: OrganizationReadError[]
 }
 
+/** The headline numbers of one period of a history. */
+export interface AnalyticsPeriod {
+  since: string
+  until: string
+  issues: { opened: number, closed: number }
+  pullRequests: {
+    merged: number
+    lines: { total: number | null, counted: number }
+    averageTimeToMergeMs: number | null
+  }
+}
+
+export interface AnalyticsHistory {
+  periods: AnalyticsPeriod[]
+  errors: OrganizationReadError[]
+}
+
 const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
 
 function windowBound(value: unknown, name: string): string | null {
@@ -83,6 +100,24 @@ export function parseWindow(since: unknown, until: unknown): AnalyticsWindow {
     throw new HttpError(400, 'since must be before until')
   }
   return window
+}
+
+/** A year and a half of weekly periods at most, plus the closing edge. */
+const MAX_BOUNDS = 80
+
+/** The edges of consecutive periods: comma-separated zoned times, increasing. */
+export function parseBounds(value: unknown): string[] {
+  const parts = typeof value === 'string' && value ? value.split(',') : []
+  if (parts.length < 2 || parts.length > MAX_BOUNDS) throw new HttpError(400, `bounds must list 2 to ${MAX_BOUNDS} period edges`)
+  const bounds = parts.map((part) => {
+    const bound = windowBound(part, 'every bound')
+    if (!bound) throw new HttpError(400, 'every bound must be a date and time with a timezone')
+    return bound
+  })
+  if (bounds.some((bound, i) => i > 0 && Date.parse(bounds[i - 1]) >= Date.parse(bound))) {
+    throw new HttpError(400, 'bounds must increase')
+  }
+  return bounds
 }
 
 function inWindow(at: string | null | undefined, window: AnalyticsWindow): boolean {
@@ -171,10 +206,29 @@ export function computeAnalytics(input: {
   }
 }
 
+/** The headline numbers of each consecutive period between the bounds, counted as a day is. */
+export function computeHistory(input: {
+  bounds: string[]
+  issues: DatastoreRecord[]
+  prs: DatastoreRecord[]
+  errors?: OrganizationReadError[]
+}): AnalyticsHistory {
+  return {
+    periods: input.bounds.slice(1).map((until, i) => {
+      const since = input.bounds[i]
+      const report = computeAnalytics({ window: { since, until }, issues: input.issues, prs: input.prs, behaviors: [] })
+      const { merged, lines, averageTimeToMergeMs } = report.pullRequests
+      return { since, until, issues: report.issues, pullRequests: { merged, lines: { total: lines.total, counted: lines.counted }, averageTimeToMergeMs } }
+    }),
+    errors: input.errors ?? [],
+  }
+}
+
 // Read the same datastore views and involvement scopes as Current without
 // starting Python for every scope. Project only fields used by the report:
 // unused view columns can parse large payloads and count entire discussions.
-async function readOrganization(org: Organization, me: string, window: AnalyticsWindow): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[] }> {
+// A lean read, for a history, takes sizes and times only.
+async function readOrganization(org: Organization, me: string, window: AnalyticsWindow, lean = false): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[] }> {
   const path = org.datastorePath ?? join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'github-datastore', 'github_datastore.sqlite')
   const db = new Database(path, { readonly: true, fileMustExist: true, timeout: 1_000 })
   try {
@@ -204,7 +258,7 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         // A pending review is not submitted, and an author's own review is a
         // reply. A review counts unless it is known to be the author's: a
         // deleted account leaves either login NULL.
-        const details = kind === 'pr' ? `pr_ref, comments_count, review_comments_count, additions, deletions,
+        const details = kind === 'pr' && lean ? 'additions, deletions' : kind === 'pr' ? `pr_ref, comments_count, review_comments_count, additions, deletions,
           (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = pr_ref AND r.submitted_at IS NOT NULL
             AND r.state <> 'PENDING' AND (r.author_login IS NULL OR author IS NULL OR lower(r.author_login) <> lower(author))) AS first_review_at`
           : '0 AS comments_count'
@@ -218,6 +272,7 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         return rows
       }
       const prs = read('pr')
+      if (lean) return { issues: read('issue'), prs }
       // Who merged lives in the stored payload, so only the merges this
       // report counts are parsed.
       const merged = prs.filter((pr) => pr.status === 'merged' && inWindow(pr.closed_at, window))
@@ -230,11 +285,11 @@ async function readOrganization(org: Organization, me: string, window: Analytics
   }
 }
 
-export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string): Promise<AnalyticsReport> {
+async function readScoped(window: AnalyticsWindow, orgLogin: string | undefined, lean: boolean): Promise<{ issues: DatastoreRecord[], prs: DatastoreRecord[], errors: OrganizationReadError[] }> {
   const orgs = selectOrganizations(orgLogin)
   if (!orgs.length) throw new HttpError(409, 'No GitHub account is ready yet')
   const me = getMeta('me') || ''
-  const results = await Promise.allSettled(orgs.map((org) => readOrganization(org, me, window)))
+  const results = await Promise.allSettled(orgs.map((org) => readOrganization(org, me, window, lean)))
   const issues: DatastoreRecord[] = []
   const prs: DatastoreRecord[] = []
   const errors: OrganizationReadError[] = []
@@ -252,5 +307,16 @@ export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string):
   if (results.every((result) => result.status === 'rejected')) {
     throw new HttpError(502, errors.map((entry) => `${entry.org}: ${entry.error}`).join('; '))
   }
+  return { issues, prs, errors }
+}
+
+export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string): Promise<AnalyticsReport> {
+  const { issues, prs, errors } = await readScoped(window, orgLogin, false)
   return computeAnalytics({ window, issues, prs, behaviors: listCompletedBehaviorActions(), agent: agentAccount(), errors })
+}
+
+/** One lean read across every period, then each period counted alike. */
+export async function readAnalyticsHistory(bounds: string[], orgLogin?: string): Promise<AnalyticsHistory> {
+  const { issues, prs, errors } = await readScoped({ since: bounds[0], until: bounds.at(-1)! }, orgLogin, true)
+  return computeHistory({ bounds, issues, prs, errors })
 }
