@@ -1,3 +1,4 @@
+import { conditionCorrelation } from './logging-context'
 import { diagnostic } from './logging'
 import { statfs } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -22,7 +23,8 @@ export function temporaryStorageMeasured(free: number, resources: Record<string,
     if (bucket === previous) return
     for (let level = 1; level <= 5; level++) resolveAlert(alertKey(level))
     if (bucket < previous && bucket <= 5) {
-      diagnostic({ level: 'warning', operation: 'storage.pressure', message: `Temporary filesystem crossed the ${bucket} GiB warning threshold`,
+      const now = Date.now()
+      diagnostic({ time: new Date(now).toISOString(), correlationId: conditionCorrelation('storage', alertKey(bucket), new Date(now).toISOString()), level: 'warning', operation: 'storage.pressure', message: `Temporary filesystem crossed the ${bucket} GiB warning threshold`,
         target: tmpdir(), condition: 'temporary_storage_low', resources: { ...resources, freeBytes: free, measuredAt: new Date().toISOString() } })
       raiseAlert({
         kind: 'storage_low',
@@ -30,7 +32,7 @@ export function temporaryStorageMeasured(free: number, resources: Record<string,
         title: `Temporary space is down to ${bucket} GB`,
         body: `${(free / TEMPORARY_STORAGE_GB).toFixed(1)} GB remains for temporary files. Work continues normally.`,
         path: '/',
-      })
+      }, now)
     }
     setMeta(BUCKET_KEY, String(bucket))
   })()

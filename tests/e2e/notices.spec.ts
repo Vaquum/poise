@@ -1,3 +1,8 @@
+import { build } from 'esbuild'
+import { execFileSync } from 'node:child_process'
+import { resolve } from 'node:path'
+import { mkdirSync } from 'node:fs'
+import { isolatedEnvironment } from '../fixtures/cli-isolation'
 import { expect, test, type Page } from '@playwright/test'
 import type { BehaviorDiagnostics } from '../../src/behaviors'
 import type { Notice } from '../../src/notices'
@@ -56,7 +61,7 @@ interface Workspace {
   sent: string[]
 }
 
-async function workspace(page: Page, notices: Notice[], options: { enabled?: boolean, accounts?: string[], diagnostics?: BehaviorDiagnostics } = {}): Promise<Workspace> {
+async function workspace(page: Page, notices: Notice[], options: { enabled?: boolean, accounts?: string[], diagnostics?: BehaviorDiagnostics, realEvidence?: boolean } = {}): Promise<Workspace> {
   const accounts = options.accounts ?? ['acme']
   const state: Workspace = { enabled: options.enabled ?? true, notices: [...notices], diagnostics: options.diagnostics ?? null, sent: [] }
   await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'current') })
@@ -68,6 +73,7 @@ async function workspace(page: Page, notices: Notice[], options: { enabled?: boo
   await page.route('**/api/**', async (route) => {
     const request = route.request()
     const { pathname } = new URL(request.url())
+    if (options.realEvidence && (pathname === '/api/notices' || pathname.startsWith('/api/notices/') || pathname.startsWith('/api/logging') || pathname === '/api/behaviors')) return route.continue()
     if (pathname === '/api/notices') return route.fulfill({ json: answer() })
     const action = /^\/api\/notices\/([^/]+)\/(dismiss|silence)$/.exec(pathname)
     if (action && request.method() === 'POST') {
@@ -483,9 +489,10 @@ test('never tucks away an arrival card the person is using', async ({ page }) =>
   await page.goto('/')
   await expect(bell(page)).toHaveAccessibleName('Notifications')
   const arrival = (n: number): Notice => ({ ...WAITING, id: `arrival-${n}`, title: `Arrival ${n}`, since: iso(10 + n), due: iso(10 + n) })
-  state.notices = [arrival(1)]
+  state.notices = [{ ...arrival(1), evidence: retainedEvidence() }]
   await reread(page)
   const first = page.locator('.nr-toast').filter({ hasText: 'Arrival 1' })
+  await expect(first.locator('[data-action="logging"]')).toHaveCount(0)
   await first.getByRole('button', { name: 'Show' }).focus()
   state.notices = [1, 2, 3, 4].map(arrival)
   await reread(page)
@@ -575,4 +582,134 @@ test('turns notices off and on from Settings, keeping Behaviors’ activity in t
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
   await expect(rail(page).locator('.nr-empty-title')).toHaveText('Nothing needs you')
   await expect(bell(page)).toHaveAccessibleName('Notifications')
+})
+
+
+const retainedEvidence = (character = 'a') => ({ eventId: `evt_${'a'.repeat(16)}_${character.repeat(64)}`, incidentId: `inc_${'a'.repeat(16)}_${character.repeat(64)}`, from: iso(0), to: iso(60) })
+for (const width of [1000, 1600]) test(`secondary Logging action preserves the notice and ${width === 1000 ? 'closes a floating' : 'keeps a docked'} rail`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 })
+  const evidence = retainedEvidence()
+  const state = await workspace(page, [{ ...HELD, evidence }])
+  await page.route('**/api/logging/events/**', (route) => route.fulfill({ status: 410, json: { error: 'logging_event_expired', message: 'Expired evidence' } }))
+  await page.goto('/')
+  await openRail(page); await expand(page, HELD.id)
+  await page.evaluate(() => document.body.classList.add('editor-writer-mode'))
+  await expect(rail(page)).toBeHidden()
+  await page.evaluate(() => document.body.classList.remove('editor-writer-mode'))
+  await expect(rail(page)).toBeVisible()
+  state.notices = [{ ...HELD, evidenceStatus: 'pending' }]
+  await reread(page)
+  await expect(card(page, HELD.id).getByRole('button', { name: 'View in Logging', exact: true })).toBeVisible()
+  await card(page, HELD.id).getByRole('button', { name: 'View in Logging', exact: true }).click()
+  await expect(page.locator('#view-logging')).toBeVisible()
+  await expect(page.locator('#logging-link')).toContainText('evidence has expired')
+  expect(new URL(page.url()).searchParams.get('event')).toBe(evidence.eventId)
+  expect(state.sent).toEqual([])
+  expect(state.notices).toHaveLength(1)
+  if (width === 1000) await expect(rail(page)).toBeHidden()
+  else await expect(rail(page)).toBeVisible()
+})
+
+test('diagnostic-only attempts retain separate secondary actions with Notifications off', async ({ page }) => {
+  const evidence = retainedEvidence(), second = retainedEvidence('b')
+  const state = await workspace(page, [], { enabled: false, diagnostics: diagnostics({ deadLetters: [
+    { id: 'a', behavior: 'review-new-prs', target: 'acme/api#9', error: 'Precise failure', createdAt: iso(0), callId: 'a'.repeat(32), evidence },
+    { id: 'b', behavior: 'review-new-prs', target: 'acme/api#9', error: 'Precise failure', createdAt: iso(0), callId: 'b'.repeat(32), evidence: second },
+  ] }) })
+  await page.route('**/api/logging/events/**', (route) => route.fulfill({ status: 404, json: { error: 'logging_event_unavailable', message: 'Unavailable evidence' } }))
+  await page.goto('/'); await openRail(page)
+  const entry = rail(page).locator('.nr-card').first()
+  await entry.locator('.nr-card-head').click()
+  await expect(entry.getByRole('button', { name: 'View in Logging', exact: true })).toBeVisible()
+  await entry.getByRole('button', { name: 'View retained attempt 2 in Logging', exact: true }).click()
+  await expect(page.locator('#logging-link')).toContainText('evidence is unavailable')
+  expect(new URL(page.url()).searchParams.get('event')).toBe(second.eventId)
+  expect(state.sent).toEqual([])
+})
+
+test('malformed optional evidence preserves the primary action and query failure remains explicit', async ({ page }) => {
+  const state = await workspace(page, [{ ...HELD, evidence: { ...retainedEvidence(), eventId: 'javascript:alert(1)' } }])
+  await page.goto('/'); await openRail(page); await expand(page, HELD.id)
+  await expect(card(page, HELD.id).getByRole('button', { name: 'View in Logging' })).toHaveCount(0)
+  await expect(card(page, HELD.id).getByRole('button', { name: 'Open the run in Swarm' })).toBeVisible()
+  state.notices = [{ ...HELD, evidence: retainedEvidence(), evidenceMore: true }]
+  await reread(page)
+  await expect(card(page, HELD.id).getByRole('button', { name: 'View in Logging' })).toBeVisible()
+  await expect(card(page, HELD.id)).toContainText('Additional retained history')
+  await page.route('**/api/logging/events/**', (route) => route.fulfill({ status: 503, json: { error: 'logging_unavailable', message: 'Query service failed' } }))
+  await card(page, HELD.id).getByRole('button', { name: 'View in Logging' }).click()
+  await expect(page.locator('#logging-link')).toContainText('query service is unavailable')
+  expect(state.sent).toEqual([])
+})
+
+test('real producers resolve exact notice, distinct-attempt and pre-launch evidence through APIs into Logging', async ({ page }) => {
+  const root = resolve('test-results/e2e/notice-source')
+  mkdirSync(root, { recursive: true })
+  const script = resolve(root, 'source.mjs')
+  await build({ entryPoints: [resolve('tests/e2e/fixtures/notification-producer.ts')], bundle: true, platform: 'node', format: 'esm', packages: 'external', outfile: script, logLevel: 'silent' })
+  const environment = { ...process.env, ...isolatedEnvironment(root, process.env.PATH ?? ''), POISE_DB: resolve('test-results/e2e/cache.db'),
+    POISE_WORKSPACE_HANDLE: 'local', POISE_NOTICE_FIXTURE_ROOT: root, CALLER_BIN_ROOT: resolve('test-results/e2e/caller/bin'), AGENT_INTERFACE_ROOT: resolve('test-results/e2e/caller/agent_interface') }
+  const produce = (mode: string) => execFileSync(process.execPath, [script, mode], { env: environment, stdio: 'pipe' })
+  try {
+    produce('cross')
+    const response = await page.request.get('/api/notices')
+    const notice = (await response.json()).notices.find((row: Notice) => row.kind === 'storage_low') as Notice
+    expect(notice?.evidence?.eventId).toMatch(/^evt_/)
+    await workspace(page, [], { realEvidence: true })
+    await page.goto('/'); await openRail(page); await expand(page, notice.id)
+    await card(page, notice.id).getByRole('button', { name: 'View in Logging', exact: true }).click()
+    await expect(page.locator('#view-logging')).toContainText('Temporary filesystem crossed the 5 GiB warning threshold')
+    expect(new URL(page.url()).searchParams.get('event')).toBe(notice.evidence!.eventId)
+    expect((await (await page.request.get('/api/notices')).json()).notices.some((row: Notice) => row.id === notice.id)).toBe(true)
+    const event = await (await page.request.get('/api/logging/events/' + notice.evidence!.eventId)).json()
+    expect(event.event).toMatchObject({ id: notice.evidence!.eventId, source: 'poise', operation: 'storage.pressure', workspace: 'local' })
+    produce('recover')
+    expect((await (await page.request.get('/api/notices')).json()).notices.some((row: Notice) => row.id === notice.id)).toBe(false)
+    expect((await page.request.get('/api/logging/events/' + notice.evidence!.eventId)).status()).toBe(200)
+
+    produce('held-one')
+    const first = (await (await page.request.get('/api/notices')).json()).notices.find((row: Notice) => row.kind === 'behavior_held') as Notice
+    expect(first.evidence?.eventId).toMatch(/^evt_/)
+    await page.goto('/'); await openRail(page); await expand(page, first.id)
+    await card(page, first.id).getByRole('button', { name: 'View in Logging', exact: true }).click()
+    await expect(page.locator('#view-logging')).toContainText('precise retained cause')
+    expect(new URL(page.url()).searchParams.get('event')).toBe(first.evidence!.eventId)
+    await page.request.post(`/api/notices/${first.id}/dismiss`)
+    produce('held-two')
+    expect((await (await page.request.get('/api/notices')).json()).notices.filter((row: Notice) => row.kind === 'behavior_held')).toEqual([])
+    const actual = (await (await page.request.get('/api/behaviors')).json()).diagnostics as BehaviorDiagnostics
+    const attempts = actual.deadLetters.filter((row) => row.target === 'acme/notification-evidence#901')
+    expect(new Set(attempts.map((row) => row.evidence?.eventId)).size).toBe(2)
+    await page.goto('/'); await openRail(page)
+    const diagnostic = rail(page).locator('.nr-card').filter({ hasText: 'precise retained cause' }).first()
+    await diagnostic.locator('.nr-card-head').click()
+    await diagnostic.getByRole('button', { name: 'View in Logging', exact: true }).click()
+    await expect(page.locator('#view-logging')).toContainText('precise retained cause')
+    expect(attempts.some((row) => row.evidence?.eventId === new URL(page.url()).searchParams.get('event'))).toBe(true)
+    const two = await (await page.request.get('/api/logging?source=caller&repository=acme%2Fnotification-evidence')).json()
+    expect(two.total).toBe(2)
+    produce('held-change')
+    const changed = (await (await page.request.get('/api/notices')).json()).notices.find((row: Notice) => row.kind === 'behavior_held') as Notice
+    expect(changed.evidence?.eventId).toMatch(/^evt_/)
+    expect(changed.id).not.toBe(first.id)
+    expect(changed.evidence?.eventId).not.toBe(first.evidence!.eventId)
+    await page.goto('/'); await openRail(page); await expand(page, changed.id)
+    await expect(card(page, changed.id).locator('[data-action="logging"]')).toHaveCount(3)
+    await page.screenshot({ path: test.info().outputPath('retained-evidence-rail.png') })
+    await card(page, changed.id).getByRole('button', { name: 'View in Logging', exact: true }).click()
+    await expect(page.locator('#view-logging')).toContainText('changed retained cause')
+    expect(new URL(page.url()).searchParams.get('event')).toBe(changed.evidence!.eventId)
+    produce('recover')
+    produce('prelaunch')
+    const preparation = (await (await page.request.get('/api/behaviors')).json()).diagnostics as BehaviorDiagnostics
+    const failed = preparation.failures.find((row) => row.target === 'acme/notification-evidence#901:check')!
+    expect(failed?.evidence?.eventId).toMatch(/^evt_/)
+    expect(failed.callId).toBeUndefined()
+    await page.goto('/'); await openRail(page)
+    const preparationCard = rail(page).locator('.nr-card').filter({ hasText: 'prelaunch preparation unavailable' }).first()
+    await preparationCard.locator('.nr-card-head').click()
+    await preparationCard.getByRole('button', { name: 'View in Logging', exact: true }).click()
+    await expect(page.locator('#view-logging')).toContainText('prelaunch preparation unavailable')
+    expect(preparation.failures.flatMap((row) => row.evidenceReferences ?? []).some((ref) => ref.eventId === new URL(page.url()).searchParams.get('event'))).toBe(true)
+  } finally { produce('recover') }
 })

@@ -1,3 +1,4 @@
+import { joinEvidence } from './query-evidence.js'
 import { parentPort } from 'node:worker_threads'
 import { readFileSync, statSync } from 'node:fs'
 import { DiagnosticCursorError, DiagnosticStore, projectCoverage, type Coverage } from './store.js'
@@ -83,6 +84,7 @@ export function executeLoggingRead(request: LoggingRead): LoggingReply {
   if (request.operation === 'health') return health(request)
   const db = new DiagnosticStore(request.path, request.policy, () => request.now, true)
   try {
+    if (request.operation === 'evidence') return json(200, joinEvidence(db, request.access, request.selectors ?? []))
     if (request.operation === 'event') {
       const found = db.lookup(request.access, request.eventId!)
       const bounds = db.bounds(request.access)

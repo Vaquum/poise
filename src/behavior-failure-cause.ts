@@ -2,42 +2,31 @@
 // or GitHub's JSON error reads by its message, not by whichever line of it
 // holds a brace: a Grok balance error showed as "Internal error: {" or "}".
 
-const JSON_MESSAGE = /\{[\s\S]*?"message"\s*:\s*("(?:[^"\\]|\\.)*")/
-
-function record(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown> : null
-}
-
-// Startup item errors are not terminal turn failures. Read the complete event
-// stream before bounding it, and prefer the last authoritative failed turn.
-export function terminalProviderMessage(error: string): string | null {
-  let terminal: string | null = null
-  let providerError: string | null = null
-  for (const line of error.split('\n')) {
-    const start = line.indexOf('{')
-    if (start < 0) continue
-    let event: Record<string, unknown> | null
-    try { event = record(JSON.parse(line.slice(start))) } catch { continue }
-    if (!event) continue
-    const message = event.type === 'turn.failed' ? record(event.error)?.message : event.message
-    if (typeof message !== 'string' || !message.trim()) continue
-    if (event.type === 'turn.failed') terminal = message.trim()
-    else if (event.type === 'error') providerError = message.trim()
-  }
-  return terminal ?? providerError
-}
+import { terminalProviderMessage } from '../gateway/src/diagnostics/material-cause'
+export { failureCause, terminalProviderMessage } from '../gateway/src/diagnostics/material-cause'
 
 export type DiagnosticSeverity = 'error' | 'warning' | 'info'
 export interface DiagnosticClassification { severity: DiagnosticSeverity; code: string }
 export interface DiagnosticOptions { errorCode?: string | null; held?: boolean }
 
-// Colour expresses who can correct the condition, not a process exit code.
+/** Audited finite taxonomy. Dynamic codes use the explicit unknown row, retaining their original code. */
+export const DIAGNOSTIC_PLACEMENT = {
+  invalid_agent_result: { rail: 'error', logging: 'error' }, runtime_unhealthy: { rail: 'error', logging: 'error' },
+  head_changed: { rail: 'info', logging: 'excluded' }, provider_capacity: { rail: 'info', logging: 'warning' },
+  rate_limit: { rail: 'info', logging: 'warning' }, upstream_unavailable: { rail: 'info', logging: 'warning' }, network_interruption: { rail: 'info', logging: 'warning' },
+  held_result: { rail: 'warning', logging: 'source' }, unknown: { rail: 'warning', logging: 'source' },
+  review_provider_blocked: { rail: 'warning', logging: 'warning' }, authentication: { rail: 'warning', logging: 'warning' }, github_access: { rail: 'warning', logging: 'warning' },
+  review_packet_too_large: { rail: 'warning', logging: 'error' }, model_output_limit: { rail: 'warning', logging: 'error' },
+  review_contract_violation: { rail: 'warning', logging: 'error' }, review_recovery_failed: { rail: 'warning', logging: 'error' }, review_budget_exhausted: { rail: 'warning', logging: 'error' },
+  runtime_status_unknown: { rail: 'warning', logging: 'warning' },
+} as const satisfies Record<string, { rail: DiagnosticSeverity; logging: 'excluded' | 'source' | 'warning' | 'error' }>
+export type KnownDiagnosticCode = keyof typeof DIAGNOSTIC_PLACEMENT
+export const DIAGNOSTIC_SCOPES = ['Agent log', 'Datastore', 'Identity', 'Behaviors runtime', 'Behaviors API dynamic code'] as const
+// Colour expresses who can correct the condition, independently of technical severity.
 export function diagnosticClassification(code: string): DiagnosticClassification {
-  const severity: DiagnosticSeverity = ['invalid_agent_result', 'runtime_unhealthy'].includes(code)
-    ? 'error' : ['head_changed', 'provider_capacity', 'rate_limit', 'upstream_unavailable', 'network_interruption'].includes(code)
-      ? 'info' : 'warning'
-  return { severity, code }
+  const placement = Object.prototype.hasOwnProperty.call(DIAGNOSTIC_PLACEMENT, code)
+    ? DIAGNOSTIC_PLACEMENT[code as KnownDiagnosticCode] : DIAGNOSTIC_PLACEMENT.unknown
+  return { severity: placement.rail, code }
 }
 
 // Warning rules are an allowlist of observable transient outcomes. Neither a
@@ -72,26 +61,4 @@ export function classifyBehaviorDiagnostic(error: string, options: DiagnosticOpt
     return diagnosticClassification('authentication')
   }
   return diagnosticClassification('unknown')
-}
-
-export function failureCause(error: string): string {
-  const terminal = terminalProviderMessage(error)
-  if (terminal) return terminal.slice(0, 300)
-  const json = JSON_MESSAGE.exec(error)
-  if (json) {
-    let message = ''
-    try {
-      message = String(JSON.parse(json[1])).trim()
-    } catch {
-      // Not a JSON string after all: the lines below say what they can.
-    }
-    if (message) {
-      const before = error.slice(0, json.index).split('\n').pop()?.trim().replace(/^error:\s*/i, '') ?? ''
-      return `${before ? `${before} ` : ''}${message}`.slice(0, 300)
-    }
-  }
-  const lines = error.trim().split('\n').filter((line) => line.trim())
-  const cause = [...lines].reverse().find((line) => /(?:Error|Timeout|review_packet_too_large):?/.test(line))
-    ?? lines[lines.length - 1] ?? error
-  return cause.trim().slice(0, 300)
 }

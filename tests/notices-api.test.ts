@@ -106,6 +106,24 @@ const waiting = { kind: 'chat_waiting', dedupeKey: 'chat-waiting:s1', title: 'Cl
 const ready = { kind: 'pr_ready', dedupeKey: 'pr-ready:acme/api#1', title: 'acme/api#1 is ready to merge', body: 'Change 1', path: '/', target: { pullRequest: 'https://github.com/acme/api/pull/1' } } as const
 
 describe('the notices API', () => {
+  it('retains source evidence when Off is selected during an actual quota API read', async () => {
+    database!.setMeta('me', 'octocat')
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[0] === 'auth') return { stdout: 'test-stored-credential' }
+      database!.setMeta('notification_settings', JSON.stringify({ enabled: false }))
+      return { stdout: JSON.stringify({ resources: { core: { limit: 5000, used: 5000, remaining: 0, reset } } }) }
+    })
+    expect((await call('GET', '/api/github-quota')).body.accounts[0].buckets[0].remaining).toBe(0)
+    expect((await call('GET', '/api/notices')).body).toEqual({ enabled: false, notices: [] })
+    const logging = await import('../server/logging')
+    logging.loggingRuntime()!.flush()
+    const retained = await call('GET', '/api/logging?source=poise&account=octocat')
+    expect(retained.status).toBe(200)
+    expect(retained.body.events.some((event: { operation: string }) => event.operation === 'github_quota.exhausted')).toBe(true)
+    expect(JSON.stringify(retained.body)).not.toContain('test-stored-credential')
+  })
+
   it('serves explicit-account quota and its exhaustion error through the notification API', async () => {
     database!.setMeta('me', 'octocat')
     const reset = Math.floor(Date.now() / 1000) + 3600

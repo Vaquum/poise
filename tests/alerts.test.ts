@@ -60,13 +60,15 @@ describe('the alerts store', () => {
       expect(store.alertSeq(id), JSON.stringify(id)).toBeNull()
     }
     // Pruned rows leave their ids behind: AUTOINCREMENT never reuses them.
+    store.resolveAlert('chat-waiting:s1')
     expect(store.pruneAlerts(Date.now() + 31 * DAY)).toBe(1)
     expect(store.raiseAlert(input())!.seq).toBe(alert.seq + 1)
   })
 
-  it('keeps alerts for 30 days', () => {
+  it('keeps resolved history and desktop replay for 30 days', () => {
     const now = Date.now()
     store.raiseAlert(input({ dedupeKey: 'old' }), now - 31 * DAY)
+    store.resolveAlert('old', now - 31 * DAY + 1000)
     const recent = store.raiseAlert(input({ dedupeKey: 'recent' }), now - 29 * DAY)!
     // Reading never returns what retention has dropped, even before pruning.
     expect(store.alertsAfter(0, 10, { now }).map((alert) => alert.id)).toEqual([recent.id])
@@ -74,6 +76,26 @@ describe('the alerts store', () => {
     const fresh = store.raiseAlert(input({ dedupeKey: 'fresh' }), now)!
     expect(rows().map((row) => row.key)).toEqual(['recent', 'fresh'])
     expect(store.alertsAfter(recent.seq, 10, { now }).map((alert) => alert.id)).toEqual([fresh.id])
+  })
+
+  it('retains unresolved conditions and dismissal identity until authoritative resolution', () => {
+    const now = Date.now()
+    const original = store.raiseAlert(input({ kind: 'storage_low', dedupeKey: 'pressure' }), now - 31 * DAY)!
+    store.dismissAlert(original.seq, now - DAY)
+    expect(store.pruneAlerts(now)).toBe(0)
+    expect(store.openAlerts({ now })).toMatchObject([{ id: original.id, dismissedAt: new Date(now - DAY).toISOString() }])
+    expect(store.raiseAlert(input({ kind: 'storage_low', dedupeKey: 'pressure' }), now)).toBeNull()
+    expect(store.alertsAfter(0, 10, { now })).toEqual([])
+    store.resolveAlert('pressure', now)
+    expect(store.pruneAlerts(now)).toBe(1)
+    expect(store.raiseAlert(input({ kind: 'storage_low', dedupeKey: 'pressure' }), now)!.seq).toBeGreaterThan(original.seq)
+  })
+
+  it('still expires finished-turn product history on its existing retention schedule', () => {
+    const now = Date.now()
+    store.raiseAlert(input({ kind: 'chat_turn_finished' }), now - 31 * DAY)
+    expect(store.openAlerts({ now })).toEqual([])
+    expect(store.pruneAlerts(now)).toBe(1)
   })
 
   it('reads alerts after a seq, oldest first, or the newest few', () => {

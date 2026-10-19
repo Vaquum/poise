@@ -1,3 +1,6 @@
+import { normalize } from '../gateway/src/diagnostics/contract'
+import type { EvidenceSelector } from '../gateway/src/diagnostics/query-evidence'
+import { loggingWorkspace } from './logging'
 import { diagnostic, diagnosticFailure } from './logging'
 import { GH_STORED_ACCOUNTS_ENV } from './accounts/clis'
 import { openAlerts, raiseAlert, resolveAlert, updateAlertDetails } from './alerts/store'
@@ -129,17 +132,72 @@ async function readAccount(login: string): Promise<Snapshot> {
   } finally { pending.delete(key) }
 }
 
-export function syncQuotaAlerts(accounts: GithubQuotaAccount[], now = Date.now()): void {
-  if (!getNotificationSettings().enabled) return
+export const QUOTA_WARNING_RISK_PERCENT = 50
+export const QUOTA_WARNING_SUSTAIN_MS = 30_000
+interface RiskWindow { resetAt: string; since: number | null; lastAt: number; warned: boolean; exhaustedSince?: number | null }
+const riskKey = (login: string, resource: string) => `${PREFIX}risk:${login.toLowerCase()}:${resource}`
+const conditionKey = (login: string, bucket: GithubQuotaBucket) => `${PREFIX}${login.toLowerCase()}:${bucket.resource}:${Date.parse(bucket.resetAt)}`
+
+/** Observe actual snapshots even with popups off; cached reads cannot extend a risk interval. */
+export function observeQuotaConditions(accounts: GithubQuotaAccount[], now = Date.now()): ReadonlySet<string> {
+  const sustained = new Set<string>()
+  for (const account of accounts) {
+    if (account.error || !account.checkedAt) continue
+    const at = Date.parse(account.checkedAt)
+    if (!Number.isFinite(at) || at > now) throw new Error('Invalid GitHub quota observation time')
+    for (const bucket of account.buckets) {
+      const key = riskKey(account.login, bucket.resource)
+      const raw = getMeta(key)
+      let previous: RiskWindow | null = null
+      if (raw) {
+        const value = object(JSON.parse(raw))
+        if (typeof value.resetAt !== 'string' || !Number.isFinite(Date.parse(value.resetAt))
+          || (value.since !== null && (typeof value.since !== 'number' || !Number.isFinite(value.since)))
+          || (value.exhaustedSince !== undefined && value.exhaustedSince !== null && (typeof value.exhaustedSince !== 'number' || !Number.isFinite(value.exhaustedSince)))
+          || typeof value.lastAt !== 'number' || !Number.isFinite(value.lastAt) || typeof value.warned !== 'boolean') throw new Error('Invalid retained GitHub quota risk interval')
+        previous = value as unknown as RiskWindow
+      }
+      const eligible = bucket.limit > 0 && bucket.remaining > 0 && Date.parse(bucket.resetAt) > now && bucket.riskPercent !== null && bucket.riskPercent >= QUOTA_WARNING_RISK_PERCENT
+      const state: RiskWindow = previous?.resetAt === bucket.resetAt && previous.lastAt <= at
+        ? { ...previous } : { resetAt: bucket.resetAt, since: null, lastAt: at, warned: false }
+      state.exhaustedSince = bucket.remaining === 0 && Date.parse(bucket.resetAt) > now ? state.exhaustedSince ?? at : null
+      // Positive capacity is authoritative even before a forecast can be computed.
+      if (bucket.riskPercent === null) { setMeta(key, JSON.stringify(state)); continue }
+      if (!eligible) { state.since = null; state.warned = false }
+      else if (state.since === null) state.since = at
+      state.lastAt = Math.max(state.lastAt, at)
+      if (eligible && state.since !== null && state.lastAt - state.since >= QUOTA_WARNING_SUSTAIN_MS) {
+        sustained.add(conditionKey(account.login, bucket))
+        if (!state.warned) state.warned = diagnostic({ id: `quota-warning:${account.login.toLowerCase()}:${bucket.resource}:${bucket.resetAt}:${state.since}`,
+          level: 'warning', operation: 'github_quota.warning', account: account.login, target: bucket.resource, condition: bucket.resetAt,
+          message: 'GitHub API budget has sustained exhaustion risk', context: { resource: bucket.resource, riskPercent: bucket.riskPercent,
+            used: bucket.used, remaining: bucket.remaining, limit: bucket.limit, perMinute: bucket.perMinute, resetAt: bucket.resetAt,
+            measuredAt: account.checkedAt, riskSince: new Date(state.since).toISOString(), sustainMs: state.lastAt - state.since } }) !== null
+      }
+      setMeta(key, JSON.stringify(state))
+    }
+  }
+  return sustained
+}
+
+export function syncQuotaAlerts(accounts: GithubQuotaAccount[], now = Date.now(), observed?: ReadonlySet<string>): void {
+  const enabled = getNotificationSettings().enabled
+  const sustained = observed ?? observeQuotaConditions(accounts, now)
   const standing = new Set<string>()
+  const existing = new Set(openAlerts({ now }).map((alert) => alert.dedupeKey))
   for (const account of accounts) {
     for (const bucket of account.buckets) {
-      if (bucket.limit === 0 || Date.parse(bucket.resetAt) <= now || !bucket.riskPercent) continue
+      if (bucket.limit === 0 || Date.parse(bucket.resetAt) <= now) continue
       const exhausted = bucket.remaining === 0
       const key = `${PREFIX}${account.login.toLowerCase()}:${bucket.resource}:${Date.parse(bucket.resetAt)}:${exhausted ? 'error' : 'warning'}`
+      // An upgrade has no observation history. An unchanged existing condition
+      // keeps its identity and dismissal until an actual recovery.
+      if (!exhausted && (bucket.riskPercent === null || bucket.riskPercent < QUOTA_WARNING_RISK_PERCENT
+        || (!sustained.has(conditionKey(account.login, bucket)) && !existing.has(key)))) continue
       standing.add(key)
       const title = exhausted ? `GitHub ${bucket.label} quota exhausted for ${account.login}` : `GitHub ${bucket.label} quota may run out for ${account.login}`
       const body = `${account.roles.join(' + ')} account · ${bucket.used.toLocaleString('en-US')} of ${bucket.limit.toLocaleString('en-US')} used. ${exhausted ? 'Requests are blocked.' : `${bucket.riskPercent}% estimated risk before reset at the observed usage rate.`} Resets ${bucket.resetAt}.`
+      if (!enabled) continue
       raiseAlert({
         kind: exhausted ? 'github_quota_exhausted' : 'github_quota_warning', dedupeKey: key,
         title, body,
@@ -167,14 +225,16 @@ export async function readGithubQuota(): Promise<GithubQuotaReport> {
     return { ...account, ...snapshot, checkedAt: new Date(snapshot.checkedAt).toISOString() }
   }))
   if (JSON.stringify(configured) !== JSON.stringify(configuredAccounts())) throw new Error('GitHub accounts changed while reading quota; retry.')
-  syncQuotaAlerts(accounts)
+  const now = Date.now()
+  const observed = observeQuotaConditions(accounts, now)
+  syncQuotaAlerts(accounts, now, observed)
   return { accounts }
 }
 
 let timer: ReturnType<typeof setInterval> | undefined
 let pass: Promise<void> | undefined
 export function checkGithubQuota(): void {
-  if (pass || !getNotificationSettings().enabled) return
+  if (pass) return
   pass = readGithubQuota().then(() => undefined).catch((error: unknown) => {
     console.error('[github-quota] monitor failed:', error)
   }).finally(() => { pass = undefined })
@@ -190,4 +250,20 @@ export async function stopGithubQuotaRuntime(): Promise<void> {
   clearInterval(timer)
   timer = undefined
   await pass
+}
+
+/** The observed condition begins independently of when Notifications is enabled. */
+export function quotaEvidenceSelector(account: string, resource: string, resetAt: string, exhausted: boolean): EvidenceSelector | null {
+  const raw = getMeta(riskKey(account, resource))
+  if (!raw) return null
+  const state = object(JSON.parse(raw))
+  if (state.resetAt !== resetAt) return null
+  const since = exhausted ? state.exhaustedSince : state.since
+  if (typeof since !== 'number' || !Number.isFinite(since) || since < 0) return null
+  const operation = exhausted ? 'github_quota.exhausted' : 'github_quota.warning'
+  const canonical = normalize({ id: `quota-warning:${account.toLowerCase()}:${resource}:${resetAt}:${since}`, level: 'warning', source: 'poise',
+    operation, account, target: resource, condition: resetAt, message: '', workspace: loggingWorkspace() })!
+  return { source: 'poise', operation, account, target: resource, ...(exhausted
+    ? { incidentId: canonical.incidentId, from: new Date(since).toISOString() }
+    : { eventId: canonical.id }) }
 }

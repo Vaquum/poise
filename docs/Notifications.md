@@ -73,21 +73,28 @@ with its first entry in that group expanded.
 
 ## GitHub API quota
 
-While notifications are enabled, a background monitor reads the configured
-user and automation accounts every 15 seconds, even when Analytics is not on
-screen.
-Any positive displayed [estimated exhaustion risk](Analytics.md#github-api-quota)
-raises an amber `github_quota_warning`. Zero remaining raises a red
+A background monitor reads the configured user and automation accounts every
+15 seconds, including when Analytics is closed and Notifications are off.
+While notifications are enabled, a displayed [estimated exhaustion risk](Analytics.md#github-api-quota)
+of at least 50% sustained across distinct observations at least 30 seconds apart
+in the same reset window raises an amber `github_quota_warning`. Zero remaining raises a red
 `github_quota_exhausted` error, including after a dismissed warning. The notice
 names the account, API budget, usage and reset time. Errors appear in the rail's
 faults group and turn the bell red.
 
 Each account/budget/reset condition alerts once. Continuing warnings update
 their numbers without undoing a dismissal or issuing another arrival. A
-warning clears when risk returns to zero, exhaustion replaces it, the window
+warning clears when known risk falls below 50%, exhaustion replaces it, the window
 resets, or the account is removed. Failed reads and insufficient observations
-retain known alerts until reset; they do not claim recovery. Notifications off stops background quota
-reads and new quota alerts. Opening Analytics can still read quota.
+retain known alerts until reset; they do not claim recovery. Notifications off
+suppresses new quota alerts while diagnostic observation and confirmed condition
+resolution continue. Re-enabling preserves a continuing condition; recovery while
+off rearms its next sustained condition. A read uses
+one credential command and one rate-limit command per distinct configured account
+per read. The background cadence alone is eight commands per account per minute.
+Concurrent Analytics reads share the cache and pending request, but a budget
+reset invalidates that cache early; foreground polling can add reads around
+those resets. There is no fixed per-minute command ceiling.
 An exhaustion error clears as soon as GitHub confirms positive remaining
 capacity, even while a new consumption rate is being collected.
 
@@ -110,6 +117,11 @@ from the start of the check; a different agent account gets its own check.
   it. Once ready again, it is noticed again, unless you silenced it.
 - A pull request GitHub could not be asked about, or whose account could not
   be read just then, keeps what it had.
+
+Unresolved current conditions retain their identity and dismissal until
+authoritative resolution, including beyond thirty days. Resolved history and
+native alert replay keep their thirty-day window. Finished-turn notices still
+expire after one hour; ready-PR reminders follow their existing lifecycle.
 
 ## Acting on a notice
 
@@ -189,3 +201,13 @@ The page reads `GET /api/notices` every ten seconds while it is in front, and
 at once when it comes back to the front. The code is `server/alerts/notices.ts`
 on the server; in the page it is `src/views/notification-rail.ts`, with what it
 lists in `src/notification-items.ts`.
+
+## Retained evidence
+
+Expanded rail entries, including diagnostic-only conditions, show **View in
+Logging** when exact retained evidence is available. Distinct attempts keep their
+own references; additional retained history is labelled. Pending collection and
+unavailable diagnostics remain explicit. A missing record never borrows another
+review's failure. [Logging](Logging.md#notification-evidence) defines identity and
+expiry behavior. This secondary action never dismisses or silences; the primary
+Open action keeps its existing dismissal behavior. Arrival cards are unchanged.

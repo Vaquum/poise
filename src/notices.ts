@@ -1,3 +1,4 @@
+import { evidenceAttachment, evidenceReferences, keepKnownEvidence, type EvidenceAttachment } from '../gateway/src/diagnostics/evidence-contract'
 // The notifications the notification rail lists (server/alerts/notices.ts):
 // read every few seconds while this tab is in front, at once when it comes back
 // to the front, and after the person acts on one. Every tab of the workspace
@@ -15,7 +16,7 @@ export type NoticeTarget =
   | { chat: string }
   | { pullRequest: string }
 
-export interface Notice {
+export interface Notice extends EvidenceAttachment {
   id: string
   kind: NoticeKind
   title: string
@@ -85,7 +86,10 @@ export function noticesFrom(value: unknown): NoticesState | null {
   if (!value || typeof value !== 'object') return null
   const body = value as Record<string, unknown>
   if (typeof body.enabled !== 'boolean' || !Array.isArray(body.notices)) return null
-  return { enabled: body.enabled, notices: body.enabled ? body.notices.filter(isNotice) : [] }
+  return { enabled: body.enabled, notices: body.enabled ? body.notices.filter(isNotice).map((notice) => {
+    const { evidence: _evidence, evidenceReferences: _refs, evidenceMore: _more, evidenceStatus: _status, ...primary } = notice
+    return { ...primary, ...evidenceAttachment(notice) }
+  }) : [] }
 }
 
 /** "4 min", "1 h 5 min": how long a condition has stood, for a reminder. */
@@ -273,6 +277,8 @@ export class NoticeFeed {
   }
 
   /** The server's answer to request `sent`, unless a later one is shown already. */
+  private readonly knownEvidence = new Map<string, EvidenceAttachment>()
+
   private receive(sent: number, next: NoticesState | null): void {
     if (!next || sent <= this.shown) return
     this.shown = sent
@@ -281,7 +287,19 @@ export class NoticeFeed {
     for (const [id, away] of this.putAway) {
       if (away.settledAt !== null && away.settledAt < sent) this.putAway.delete(id)
     }
-    this.server = next
+    if (next.enabled) {
+      const active = new Set(next.notices.map((notice) => notice.id))
+      for (const id of this.knownEvidence.keys()) if (!active.has(id)) this.knownEvidence.delete(id)
+    }
+    this.server = { ...next, notices: next.notices.map((notice) => {
+      const retained = keepKnownEvidence(notice, this.knownEvidence.get(notice.id))
+      if (evidenceReferences(retained).length) {
+        this.knownEvidence.delete(notice.id)
+        this.knownEvidence.set(notice.id, retained)
+        while (this.knownEvidence.size > 200) this.knownEvidence.delete(this.knownEvidence.keys().next().value!)
+      }
+      return { ...notice, ...retained }
+    }) }
     this.publish()
   }
 

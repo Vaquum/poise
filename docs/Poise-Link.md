@@ -293,7 +293,8 @@ commit the running bundle was built from (`null` for a development build).
 - When Poise stops, it ends every stream and answers every waiting long poll
   with 503, so a restart never waits on a device.
 
-**Alerts** are kept in the workspace database for 30 days. Each condition
+**Alerts** retain unresolved conditions until authoritative resolution. Resolved
+history and native replay keep their 30-day window. Each condition
 alerts once and again only after it has cleared:
 
 | Kind | Recorded when | Cleared when |
@@ -304,7 +305,7 @@ alerts once and again only after it has cleared:
 | `chat_waiting` | a Chat agent asks for a permission or an answer | the session has nothing pending |
 | `chat_turn_finished` | a Chat turn that ran longer than two minutes finishes, unless the person stopped it | (one alert per turn) |
 | `pr_ready` | one of the person's own open pull requests becomes ready to merge, by Current's rule, checked every two minutes while notifications are on; not while the person has silenced it | it is merged or closed, or stops being ready |
-| `github_quota_warning` | a configured user or automation account has positive estimated risk of exhausting an API budget before reset, while notifications are on | risk returns to zero, an exhaustion error replaces it, the window resets, or the account is removed; missing observations retain the warning |
+| `github_quota_warning` | a configured user or automation account has at least 50% estimated risk sustained across observations at least 30 seconds apart in the same budget window, while notifications are on | known risk falls below 50%, an exhaustion error replaces it, the window resets, or the account is removed; missing observations retain the warning |
 | `github_quota_exhausted` | a configured account has zero remaining API quota, while notifications are on | quota recovers, the window resets, or the account is removed; failed reads retain it until reset |
 | `storage_low` | in service mode, temporary space falls to 5 GB free and each GB below; once per threshold in a low-space episode | space recovers to 6 GB; work continues normally |
 
@@ -372,3 +373,8 @@ when they start, so start at login stays as it was.
 - Automatic updates; run the install command again to update.
 - On Windows, an alert opens its page when clicked while the notification is on
   screen, but not later from the notification center.
+
+Browser-only **View in Logging** references do not change Link's alert envelope,
+primary front-page URL, pairing or device authorization. Optional evidence is
+resolved only for the browser notice/Behaviors reads; the native alert stream
+remains `{ id, kind, title, body, url, created_at }`.

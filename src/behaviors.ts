@@ -1,3 +1,5 @@
+import { retainDiagnosticEvidence } from './behavior-diagnostics'
+import type { EvidenceAttachment } from '../gateway/src/diagnostics/evidence-contract'
 // Thin client for the Behaviors view.
 //
 // All polling, snapshotting, and triggering live SERVER-SIDE in
@@ -67,7 +69,7 @@ export interface BehaviorDiagnostics {
     actor: string | null
     error: string | null
   }
-  failures: Array<{
+  failures: Array<EvidenceAttachment & {
     org?: string
     behavior: BehaviorKey
     target?: string
@@ -78,15 +80,17 @@ export interface BehaviorDiagnostics {
     error?: string
     diagnostic?: DiagnosticClassification
     callId?: string
+    correlationId?: string
     recovered?: boolean
   }>
-  deadLetters: Array<{
+  deadLetters: Array<EvidenceAttachment & {
     id: string
     behavior: string
     target: string
     error: string
     createdAt: string
     attemptCount?: number
+    correlationId?: string | null
     callId?: string | null
     diagnostic?: DiagnosticClassification
   }>
@@ -352,7 +356,7 @@ export async function refreshState(): Promise<void> {
   }]))
   try {
     const res = await fetch('/api/behaviors').catch((cause: unknown) => {
-      requestFailure = classifyBehaviorDiagnostic(cause instanceof TypeError ? 'ECONNRESET' : String(cause))
+      requestFailure = classifyBehaviorDiagnostic(cause instanceof Error ? cause.message : String(cause))
       throw cause
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -381,7 +385,7 @@ export async function refreshState(): Promise<void> {
     for (const k of keys) {
       ownerByKey[k] = typeof data[k]?.owner === 'string' ? data[k].owner : null
     }
-    diagnostics = data.diagnostics ?? null
+    diagnostics = data.diagnostics ? retainDiagnosticEvidence(data.diagnostics, diagnostics) : null
     stateLoadOk = true
   } catch (error) {
     if (mine !== refreshSequence) return

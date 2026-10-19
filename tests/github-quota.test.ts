@@ -140,6 +140,33 @@ describe('identity-scoped reads', () => {
     expect(JSON.stringify(result)).not.toMatch(/token-|ghp_secret/)
   })
 
+  it('suppresses issuance when Off is selected during an in-flight quota read and after restart', async () => {
+    database.setMeta('me', 'octocat')
+    let release: (() => void) | undefined
+    const held = new Promise<void>((resolve) => { release = resolve })
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[0] === 'auth') return { stdout: 'test-stored-credential' }
+      await held
+      return { stdout: JSON.stringify(payload(5000)) }
+    })
+    const pending = quota.readGithubQuota()
+    await Promise.resolve()
+    database.setMeta('notification_settings', JSON.stringify({ enabled: false }))
+    release!()
+    expect((await pending).accounts[0].buckets[0].remaining).toBe(0)
+    expect(alerts.openAlerts()).toEqual([])
+    await quota.stopGithubQuotaRuntime()
+    database.closeDatabase()
+    vi.resetModules()
+    database = await import('../server/db')
+    alerts = await import('../server/alerts/store')
+    quota = await import('../server/github-quota')
+    quota.startGithubQuotaRuntime()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(mocks.runFile).toHaveBeenCalledTimes(4)
+    expect(alerts.openAlerts()).toEqual([])
+  })
+
   it('does not publish results for identities changed during a read', async () => {
     database.setMeta('me', 'octocat')
     mocks.runFile.mockImplementation(async () => {
@@ -157,48 +184,101 @@ describe('quota notifications', () => {
     buckets: error ? [] : [{ resource: 'core', label: 'REST API', limit: 5000, used, remaining: 5000 - used, resetAt: new Date(reset * 1000).toISOString(), perMinute: 100, riskPercent }],
   })
 
+  const sample = (accounts: GithubQuotaAccount[], now: number) => quota.syncQuotaAlerts(accounts.map((entry) => ({ ...entry, checkedAt: new Date(now).toISOString() })), now)
+  const sustained = (value: GithubQuotaAccount) => { sample([value], T0); sample([value], T0 + 30_000) }
+
+  it('preserves an upgraded warning and its dismissal without risk history until recovery', () => {
+    const dedupeKey = `github-quota:octocat:core:${reset * 1000}:warning`
+    alerts.raiseAlert({ kind: 'github_quota_warning', dedupeKey, title: 'Existing warning', body: 'Known condition', path: '/' }, T0 - 60_000)
+    const before = alerts.openAlerts({ now: T0 })[0]
+    alerts.dismissAlert(alerts.alertSeq(before.id)!, T0 - 30_000)
+    sample([account(100, 50)], T0)
+    sample([account(200, 50)], T0 + 15_000)
+    expect(alerts.openAlerts({ now: T0 + 15_000 })).toMatchObject([{ id: before.id, dismissedAt: new Date(T0 - 30_000).toISOString() }])
+    sample([account(300, 49)], T0 + 20_000)
+    expect(alerts.openAlerts({ now: T0 + 20_000 })).toEqual([])
+    sample([account(400, 80)], T0 + 30_000)
+    expect(alerts.openAlerts({ now: T0 + 30_000 })).toEqual([])
+    sample([account(500, 80)], T0 + 60_000)
+    expect(alerts.openAlerts({ now: T0 + 60_000 })[0].id).not.toBe(before.id)
+  })
+
+  it('resolves a known recovery while off, then requires a new sustained condition', () => {
+    sustained(account(100, 50))
+    const old = alerts.openAlerts()[0]
+    alerts.dismissAlert(old.seq)
+    database.setMeta('notification_settings', JSON.stringify({ enabled: false }))
+    sample([account(200, 0)], T0 + 45_000)
+    expect(alerts.openAlerts()).toEqual([])
+    sample([account(300, 90)], T0 + 60_000)
+    database.setMeta('notification_settings', JSON.stringify({ enabled: true }))
+    sample([account(400, 90)], T0 + 75_000)
+    expect(alerts.openAlerts()).toEqual([])
+    sample([account(500, 90)], T0 + 90_000)
+    expect(alerts.openAlerts()).toMatchObject([{ dismissedAt: null }])
+    expect(alerts.openAlerts()[0].id).not.toBe(old.id)
+  })
+
+  it('requires 50 percent risk across distinct observations at least 30 seconds apart', () => {
+    sample([account(100, 49)], T0)
+    sample([account(200, 80)], T0 + 15_000)
+    sample([account(300, 80)], T0 + 30_000)
+    expect(alerts.openAlerts()).toEqual([])
+    sample([account(400, 49)], T0 + 40_000)
+    sample([account(500, 50)], T0 + 45_000)
+    quota.syncQuotaAlerts([{ ...account(500, 50), checkedAt: new Date(T0 + 45_000).toISOString() }], T0 + 75_000)
+    expect(alerts.openAlerts()).toEqual([])
+    sample([account(600, 50)], T0 + 75_000)
+    expect(alerts.openAlerts()).toMatchObject([{ kind: 'github_quota_warning' }])
+  })
+
   it('deduplicates, updates risk, escalates after dismissal, and clears on reset or removal', () => {
-    quota.syncQuotaAlerts([account(100, 25)], T0)
+    sustained(account(100, 50))
     const warning = alerts.openAlerts()[0]
     alerts.dismissAlert(warning.seq)
-    quota.syncQuotaAlerts([account(200, 90)], T0 + 60_000)
+    sample([account(200, 90)], T0 + 60_000)
     expect(alerts.latestAlertSeq()).toBe(warning.seq)
     expect(alerts.openAlerts()[0].body).toContain('90%')
     expect(alerts.openAlerts()[0].dismissedAt).not.toBeNull()
-    quota.syncQuotaAlerts([account(5000, 100)], T0 + 120_000)
+    sample([account(5000, 100)], T0 + 120_000)
     expect(alerts.openAlerts()).toHaveLength(1)
     expect(alerts.openAlerts()[0]).toMatchObject({ kind: 'github_quota_exhausted', dismissedAt: null })
-    quota.syncQuotaAlerts([account(0, null, 'Network unavailable')], reset * 1000)
+    sample([account(0, null, 'Network unavailable')], reset * 1000)
     expect(alerts.openAlerts()).toHaveLength(0)
-    quota.syncQuotaAlerts([account(5000, 100)], T0)
-    quota.syncQuotaAlerts([], T0 + 60_000)
+    sample([account(5000, 100)], T0)
+    sample([], T0 + 60_000)
     expect(alerts.openAlerts()).toHaveLength(0)
   })
 
   it('keeps known risk on failed reads, clears recovery, and respects Notifications off', async () => {
-    quota.syncQuotaAlerts([account(100, 25)], T0)
-    quota.syncQuotaAlerts([account(0, null, 'Network unavailable')], T0 + 60_000)
+    sustained(account(100, 50))
+    sample([account(0, null, 'Network unavailable')], T0 + 60_000)
     expect(alerts.openAlerts()).toHaveLength(1)
-    quota.syncQuotaAlerts([account(100, null)], T0 + 90_000)
+    sample([account(100, null)], T0 + 90_000)
     expect(alerts.openAlerts()).toHaveLength(1)
-    quota.syncQuotaAlerts([account(100, 0)], T0 + 120_000)
+    sample([account(100, 0)], T0 + 120_000)
     expect(alerts.openAlerts()).toHaveLength(0)
     database.setMeta('notification_settings', JSON.stringify({ enabled: false }))
     database.setMeta('me', 'octocat')
-    quota.syncQuotaAlerts([account(5000, 100)], T0)
+    sample([account(5000, 100)], T0)
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify(payload(5000)) })
     quota.startGithubQuotaRuntime()
-    await vi.advanceTimersByTimeAsync(180_000)
-    expect(mocks.runFile).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(mocks.runFile).toHaveBeenCalledTimes(4)
+    await vi.advanceTimersByTimeAsync(150_000)
+    expect(mocks.runFile).toHaveBeenCalled()
     expect(alerts.openAlerts()).toHaveLength(0)
   })
 
   it('clears exhaustion on confirmed remaining quota even while the rate is unknown', () => {
     const exhausted = quota.quotaBuckets(payload(5000), 'octocat', T0)[0]
-    quota.syncQuotaAlerts([{ ...account(5000, 100), buckets: [exhausted] }], T0)
+    sample([{ ...account(5000, 100), buckets: [exhausted] }], T0)
     expect(alerts.openAlerts()[0].kind).toBe('github_quota_exhausted')
     const recovered = quota.quotaBuckets(payload(100), 'octocat', T0 + 15_000)[0]
     expect(recovered).toMatchObject({ remaining: 4900, perMinute: null, riskPercent: null })
-    quota.syncQuotaAlerts([{ ...account(100, null), buckets: [recovered] }], T0 + 15_000)
+    sample([{ ...account(100, null), buckets: [recovered] }], T0 + 15_000)
     expect(alerts.openAlerts()).toHaveLength(0)
   })
 

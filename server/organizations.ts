@@ -7,6 +7,7 @@ import { db, getMeta } from './db'
 import { ProcessLockError, withProcessLock } from './process-lock'
 import { runFile } from './process'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
+import { conditionCorrelation } from './logging-context'
 import { datastoreSyncFailed, datastoreSyncRecovered } from './alerts/producers'
 
 export interface Organization {
@@ -428,7 +429,9 @@ function launch(login: string): void {
       const failed = rowFor(login)!
       const failures = error instanceof GitHubRateLimitError ? failed.sync_failures : failed.activated_at ? failed.sync_failures + 1 : 0
       const retryAt = error instanceof GitHubRateLimitError ? error.resetAt : failures ? Date.now() + Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(failures - 1, 6), MAX_SYNC_RETRY_MS) : 0
+      const failingSince = failures ? failed.sync_failing_since || Date.now() : 0
       diagnosticFailure(failed.activated_at ? 'datastore.sync' : 'datastore.activate', error, {
+        correlationId: conditionCorrelation('datastore-sync', login.toLowerCase(), String(failingSince)),
         account: login, databasePath: failed.datastore_path, phase: failed.stage,
         lastSuccessfulSyncAt: failed.last_sync_at ? new Date(failed.last_sync_at).toISOString() : null,
         ageMs: failed.last_sync_at ? Date.now() - failed.last_sync_at : null, freshnessLimitMs: SYNC_INTERVAL_MS,
@@ -441,7 +444,6 @@ function launch(login: string): void {
         `).run(error.message, login)
         return
       }
-      const failingSince = failures ? failed.sync_failing_since || Date.now() : 0
       db.prepare(`
         UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'error' ELSE 'ready' END,
           stage = CASE WHEN activated_at IS NULL THEN stage ELSE 'sync-error' END, error = ?,

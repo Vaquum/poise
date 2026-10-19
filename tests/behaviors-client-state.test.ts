@@ -52,6 +52,12 @@ describe('Behaviors availability diagnostics', () => {
     expect(behaviorDiagnosticGroups(behaviors.getBehaviorDiagnostics()!).map((group) => group.code)).toEqual(['upstream_unavailable'])
     expect(behaviors.isBehaviorStateLoaded()).toBe(false)
   })
+  it('preserves a generic fetch exception without fabricating a reset cause', async () => {
+    vi.stubGlobal('fetch', async () => { throw new TypeError('Failed to fetch') })
+    await behaviors.refreshState()
+    expect(behaviors.getBehaviorDiagnostics()?.apiError).toEqual({ severity: 'warning', code: 'unknown', message: 'Failed to fetch' })
+    expect(JSON.stringify(behaviors.getBehaviorDiagnostics())).not.toContain('ECONNRESET')
+  })
   it('keeps a known degraded runtime visible through a 502 until a healthy read', async () => {
     const snapshot = { status: 'degraded', runtimeError: 'Behavior runtime is degraded.', agentLogsError: null,
       datastore: { status: 'healthy', error: null }, identity: { status: 'valid', actor: 'reviewer', error: null },

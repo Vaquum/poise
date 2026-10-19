@@ -5,7 +5,8 @@
 //
 // An alert is raised under a dedupe key and stays the only one for that key
 // until it is resolved, so a condition that persists alerts once, and alerts
-// again only after it has cleared. Alerts are kept for 30 days.
+// again only after it has cleared. Resolved history is kept for 30 days;
+// unresolved conditions retain their identity until authoritative resolution.
 
 import { EventEmitter } from 'node:events'
 import { ALERT_ID_EPOCH_KEY, db, getMeta } from '../db'
@@ -118,7 +119,7 @@ function assertInput(input: AlertInput): void {
 }
 
 export function pruneAlerts(now = Date.now()): number {
-  return db.prepare('DELETE FROM alerts WHERE created_at < ?').run(new Date(now - ALERT_RETENTION_MS).toISOString()).changes
+  return db.prepare("DELETE FROM alerts WHERE created_at < ? AND (resolved_at IS NOT NULL OR kind = 'chat_turn_finished')").run(new Date(now - ALERT_RETENTION_MS).toISOString()).changes
 }
 
 /** Records an alert unless one for the same key is still unresolved.
@@ -208,13 +209,14 @@ function storedTarget(raw: string | null): AlertTarget | null {
   }
 }
 
-/** The unresolved alerts inside the retention window, newest first; with
+/** Current unresolved conditions, newest first; finished-turn history keeps
+ *  its existing retention window. With
  *  `kind`, only those of that kind. */
 export function openAlerts(options: { kind?: AlertKind, now?: number } = {}): OpenAlert[] {
   const cutoff = new Date((options.now ?? Date.now()) - ALERT_RETENTION_MS).toISOString()
   const rows = db.prepare(`
     SELECT id, kind, title, body, cause, created_at, dedupe_key, target, dismissed_at, silenced_at FROM alerts
-    WHERE resolved_at IS NULL AND created_at >= ? AND (? IS NULL OR kind = ?)
+    WHERE resolved_at IS NULL AND (kind != 'chat_turn_finished' OR created_at >= ?) AND (? IS NULL OR kind = ?)
     ORDER BY id DESC
   `).all(cutoff, options.kind ?? null, options.kind ?? null) as OpenAlertRow[]
   const prefix = epoch()

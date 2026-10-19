@@ -44,7 +44,8 @@ cached automatic failure summary.
 
 If the browser cannot read `/api/behaviors`, it reports one request diagnostic
 and retains its last known snapshot. It does not infer agent-log, datastore or
-identity failures from that request. Controls remain unavailable until a
+identity failures from that request. A generic browser fetch exception retains
+its actual message and unknown cause; it never fabricates an ECONNRESET. Controls remain unavailable until a
 successful read restores current state.
 An initial unread runtime has `status: 'unknown'`. A previously observed
 degraded runtime remains visible alongside the request diagnostic until a
@@ -256,3 +257,13 @@ are excluded. Safe no-write merge/rerun receipts count as successful executions;
 errors count as failures. Unknown durations show a dash. The ledger uses indexed
 time windows and cached database aggregates; unchanged refreshes do not scan its
 history. Narrow windows scroll the table without compressing its controls.
+
+### Notification evidence identity
+
+The browser retains validated `callId`/`correlationId` and optional retained
+Logging references in each diagnostic detail before deduplicating presentation.
+Preparation exceptions inherit only their current launch's identity through the
+existing capture path. Read-time joins require exact source, owner, target and
+material cause; absent preparation or Caller evidence is never replaced by a
+sibling PR attempt. These references change neither retry ownership nor attempt
+accounting. [Logging](Logging.md#notification-evidence) defines the read boundary.

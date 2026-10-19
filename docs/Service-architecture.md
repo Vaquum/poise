@@ -438,7 +438,8 @@ version, whether it is signed in and as whom.
 `GET /api/github-quota` reads the configured user and automation accounts'
 stored credentials explicitly and returns their API budgets without secrets.
 Its response and forecast model are defined in [Analytics](Analytics.md#github-api-quota).
-The workspace monitors these budgets while notifications are on; this does
+The workspace observes these budgets every 15 seconds even with notifications
+off; only quota alert issuance is disabled. This does
 not use the gateway's discarded OAuth token.
 - `GET /api/accounts` returns `{ accounts }`, one entry per CLI in that order.
   `GET /api/accounts?id=<cli>` returns only that CLI, so Settings can show each
@@ -657,7 +658,8 @@ after pairing; Poise Link then pairs again.
   A device token on a path outside `/api/link/*` gets 401 with
   `invalid_token`.
 
-**Alerts** are recorded by the workspace and kept for 30 days. Each condition
+**Alerts** retain unresolved workspace conditions until authoritative resolution;
+resolved history and native replay retain their 30-day window. Each condition
 alerts once, and again only after it has cleared:
 - in service mode, temporary space falls to 5 GB free and each GB below
   (binary GB, measured every minute); only downward crossings alert, including
@@ -753,3 +755,10 @@ output capture preserves command status/deadlines and excludes arguments and
 stdout from diagnostic records. The gateway captures release-task failure
 metadata before removing its short-lived container; retained central evidence
 is independent of that container and its home-volume lifecycle.
+
+The browser notice and Behaviors APIs may include optional `evidence` and bounded
+`evidenceReferences` from the retained owner-scoped index. Association shares the
+Logging read worker and its admission/deadline limits; it creates no diagnostic
+occurrences and cannot delay raising an alert. Pending/unavailable associations
+preserve the primary condition and action. No new route, ingest endpoint, target
+variant or scope is introduced. See [Logging](Logging.md#notification-evidence).

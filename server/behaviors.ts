@@ -1,3 +1,4 @@
+import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-context'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
 import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun } from './behavior-metrics'
@@ -342,6 +343,7 @@ interface PersistedBehaviorFailure {
   error?: string
   diagnostic?: DiagnosticClassification
   callId?: string
+  correlationId?: string
 }
 
 function failureKey(key: BehaviorKey, target?: string): string {
@@ -370,6 +372,7 @@ function readBehaviorFailure(key: BehaviorKey, target?: string): PersistedBehavi
       ...(typeof value.error === 'string' && value.error ? { error: value.error.slice(0, 300) } : {}),
       ...(value.diagnostic && ['error', 'warning', 'info'].includes(value.diagnostic.severity)
         && typeof value.diagnostic.code === 'string' ? { diagnostic: diagnosticClassification(value.diagnostic.code) } : {}),
+      ...(typeof value.correlationId === 'string' && /^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(value.correlationId) ? { correlationId: value.correlationId } : {}),
       ...(typeof value.callId === 'string' && /^[a-f0-9]{32}$/.test(value.callId) ? { callId: value.callId } : {}),
     }
   } catch {
@@ -398,6 +401,7 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
     ...(error ? { error } : {}),
     diagnostic,
     ...(options.callId ? { callId: options.callId } : {}),
+    ...(diagnosticIdentity(cause)?.correlationId ? { correlationId: diagnosticIdentity(cause)!.correlationId } : {}),
   } satisfies PersistedBehaviorFailure))
 }
 
@@ -1670,6 +1674,7 @@ async function fireReview(
   claimId: string,
   slot: ReviewerSlot = 'primary',
 ): Promise<boolean> {
+  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
   if (!isEnabled('review-new-prs')) return false
   const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url: ' + pr.url)
@@ -1745,6 +1750,7 @@ async function fireReview(
   })
   markClaimLaunched(claimId)
   return true
+  })
 }
 
 const INITIAL_REVIEW_BASELINE_KEY = 'behavior_review_new_prs_initial_baseline'
@@ -2507,6 +2513,7 @@ async function fireApprove(
   claimId: string,
   expectedHead: string,
 ): Promise<boolean> {
+  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
   if (!isEnabled('approve-prs')) return false
   const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url: ' + pr.url)
@@ -2572,6 +2579,7 @@ async function fireApprove(
   })
   markClaimLaunched(claimId)
   return true
+  })
 }
 
 async function tickApprovePrs(): Promise<void> {
@@ -3683,6 +3691,7 @@ async function fireIssueReview(
   slot: ReviewerSlot,
   covers: readonly string[],
 ): Promise<boolean> {
+  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-issues', repository: issue.repo, target: `${issue.repo}#${issue.number}`, account: agentAccount() || null }, async () => {
   if (!isEnabled(ISSUES_KEY)) return false
   const resolved = await waitForBehavior(issueSlotModel(slot))
   if (!resolved) return false
@@ -3733,6 +3742,7 @@ async function fireIssueReview(
   })
   markClaimLaunched(claimId)
   return true
+  })
 }
 
 // A failed reviewer runs again only when it provably posted nothing, the
@@ -4426,6 +4436,7 @@ export interface BehaviorsRuntimeHealth {
     error?: string
     diagnostic?: DiagnosticClassification
     callId?: string
+    correlationId?: string
     recovered?: boolean
   }>
   datastore: DatastoreFreshness
@@ -4486,6 +4497,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
         ...(failure.error ? { error: failure.error } : {}),
         ...(failure.diagnostic ? { diagnostic: failure.diagnostic } : {}),
         ...(failure.callId ? { callId: failure.callId } : {}),
+        ...(failure.correlationId ? { correlationId: failure.correlationId } : {}),
         ...(recovered ? { recovered: true } : {}),
       }] : []
     })

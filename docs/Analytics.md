@@ -171,7 +171,8 @@ appear once. They remain accessible after navigating away, can be dismissed,
 and clear once all reporting reads recover. A recurrence after recovery is a
 new notification. These browser read failures are local to the tab and remain accessible in the rail when Notifications are off
 (the switch suppresses their popups); recording, dismissing and clearing them makes
-no API request. Existing server sync alerts continue independently.
+no API request. A generic fetch failure does not establish a server fault or
+connection-reset cause. Existing server sync alerts continue independently.
 
 ## GitHub API quota
 

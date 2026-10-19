@@ -1,3 +1,4 @@
+import { diagnosticIdentity } from './logging-context'
 import { diagnosticConfig } from '../gateway/src/diagnostics/config'
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -33,7 +34,7 @@ export function diagnostic(input: Omit<DiagnosticInput, 'source' | 'workspace'> 
   if (!active) return null
   let accepted: string | null = null
   try {
-    const event = normalize({ ...input, time: input.time === undefined ? new Date().toISOString() : input.time,
+    const event = normalize({ ...diagnosticIdentity(), ...input, time: input.time === undefined ? new Date().toISOString() : input.time,
       source: input.source ?? 'poise', workspace, visibility: 'workspace',
       instance: input.instance === undefined ? process.env.POISE_WORKSPACE_HANDLE ?? process.env.POISE_INSTANCE_LABEL ?? 'local' : input.instance,
       container: input.container === undefined ? process.env.POISE_MODE === 'service' ? process.env.HOSTNAME ?? null : null : input.container,
@@ -60,9 +61,10 @@ export function diagnosticFailure(operation: string, error: unknown, context: Re
   const seen = new Set<Error>([value])
   let underlying: unknown = value.cause
   while (underlying instanceof Error && !seen.has(underlying) && cause.length < 8) { seen.add(underlying); cause.push(underlying.message); underlying = underlying.cause }
+  context = { ...diagnosticIdentity(error), ...context }
   const identity = (key: string) => typeof context[key] === 'string' ? context[key] as string : null
   return diagnostic({ level: options.level ?? 'error', operation, cause, truncated: underlying instanceof Error, account: identity('account'), repository: identity('repository'),
-    callId: identity('callId'), correlationId: identity('correlationId'), requestId: identity('requestId'), phase: identity('phase'),
+    callId: identity('callId'), correlationId: identity('correlationId'), requestId: identity('requestId'), behavior: identity('behavior'), target: identity('target'), phase: identity('phase'),
     timeoutMs: typeof context.timeoutMs === 'number' ? context.timeoutMs : null, message: value.message, stack: value.stack,
     stderr: options.stderr === false ? null : typeof fields?.stderr === 'string' ? fields.stderr : null,
     exitCode: typeof fields?.code === 'number' ? fields.code : null,

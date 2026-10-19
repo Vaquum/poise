@@ -1,3 +1,5 @@
+import { evidenceReferences } from '../../gateway/src/diagnostics/evidence-contract'
+import { loggingHref } from '../logging'
 import { cancelMotion, disclosure, layout, retire, scrollToActor, spring, watchPanel } from '../motion'
 import { patchContent } from '../dom-patch'
 import { BEHAVIORS, getBehaviorDiagnostics, refreshState } from '../behaviors'
@@ -123,17 +125,23 @@ export function itemHtml(item: NotificationItem, opened: boolean, now: number): 
     : ''
   const notice = item.notice
   const label = notice?.target ? openLabel(notice.target) : null
-  const actions = notice
+  const primaryActions = notice
     ? (label ? `<button type="button" class="nr-btn nr-btn-primary" data-action="open">${label}</button>` : '')
       + (notice.silenceable ? '<button type="button" class="nr-btn" data-action="silence">Silence reminders</button>' : '')
       + '<button type="button" class="nr-btn" data-action="dismiss">Dismiss</button>'
     : ''
+  const refs = evidenceReferences(item)
+  const diagnosticActions = refs.map((ref, index) => `<button type="button" class="nr-btn" data-key="evidence-${ref.eventId}" data-action="logging" data-evidence="${index}">${index === 0 ? 'View in Logging' : `View retained attempt ${index + 1} in Logging`}</button>`).join('')
+  const evidenceState = item.evidenceStatus === 'unavailable' ? 'Retained diagnostics are unavailable.'
+    : item.evidenceStatus === 'pending' ? 'No matching retained evidence is available yet.' : ''
+  const evidenceNote = `${evidenceState}${item.evidenceMore ? ' Additional retained history is available in Logging.' : ''}`
+  const actions = primaryActions + diagnosticActions
   return `<article class="nr-card${opened ? ' is-open' : ''}${item.group === 'auto' ? ' is-auto' : ''}" data-id="${escapeHtml(item.id)}" data-tone="${item.tone}">`
     + `<button type="button" class="nr-card-head" data-action="expand" aria-expanded="${opened}" aria-controls="${id}">`
     + `<span class="nr-chip">${icon(item.icon)}</span>`
     + `<span class="nr-card-text"><span class="nr-card-title">${escapeHtml(item.title)}</span>${item.body ? `<span class="nr-card-body">${escapeHtml(item.body)}</span>` : ''}<span class="nr-card-meta">${meta}</span></span>`
     + `<span class="nr-card-side">${when}<span class="nr-chev">${ICON_DOWN}</span></span></button>`
-    + `<div class="nr-details" id="${id}"${opened ? '' : ' hidden'}>${history}${actions ? `<div class="nr-actions">${actions}</div>` : ''}</div>`
+    + `<div class="nr-details" id="${id}"${opened ? '' : ' hidden'}>${history}${evidenceNote ? `<p class="nr-evidence-note">${escapeHtml(evidenceNote)}</p>` : ''}${actions ? `<div class="nr-actions">${actions}</div>` : ''}</div>`
     + '</article>'
 }
 
@@ -454,6 +462,14 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     }
     const card = button.closest<HTMLElement>('.nr-card')
     if (!card) return
+    if (action === 'logging') {
+      const item = items.find((entry) => entry.id === card.dataset.id)
+      const ref = item && evidenceReferences(item)[Number(button.dataset.evidence)]
+      if (!ref || !loggingHref({ event: ref.eventId, from: ref.from, to: ref.to })) return
+      if (opened && !dockedNow()) setOpen(false)
+      window.dispatchEvent(new CustomEvent('poise:open-logging', { detail: { event: ref.eventId, from: ref.from, to: ref.to } }))
+      return
+    }
     if (action === 'expand') expand(card, !expanded.has(card.dataset.id!))
     else act(action, card.dataset.id!, null)
   })

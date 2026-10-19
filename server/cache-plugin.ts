@@ -1,3 +1,4 @@
+import { noticeEvidence, behaviorEvidence } from './notification-evidence'
 import { startLogging, stopLogging } from './logging'
 import { localLogging, stopLoggingApi } from './logging-api'
 import { handleJevApi, stopJev } from './jev/api'
@@ -458,7 +459,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // ── Notices ──
         // The notifications at the top of the page (server/alerts/notices.ts).
         if (path === '/api/notices' && req.method === 'GET') {
-          return json(res, 200, noticesState())
+          return json(res, 200, await noticeEvidence(noticesState()))
         }
         const noticeAction = path.match(/^\/api\/notices\/([^/]+)\/(dismiss|silence)$/)
         if (noticeAction && req.method === 'POST') {
@@ -466,7 +467,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             const id = decodeURIComponent(noticeAction[1])
             if (noticeAction[2] === 'dismiss') dismissNotice(id)
             else silenceNotice(id)
-            return json(res, 200, noticesState())
+            return json(res, 200, await noticeEvidence(noticesState()))
           } catch (error) {
             return json(res, httpStatus(error, 400), { error: (error as Error).message })
           }
@@ -628,6 +629,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             } : null
           }
           const runtime = getBehaviorsRuntimeHealth()
+          const evidence = await behaviorEvidence({ failures: runtime.failures, deadLetters: getBehaviorDiagnosticIncidents(snapshot) })
           // Every behavior acts as the agent account.
           const owner = agentAccount() || null
           return json(res, 200, {
@@ -704,8 +706,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               agentLogsError,
               datastore: runtime.datastore,
               identity: runtime.identity,
-              failures: runtime.failures,
-              deadLetters: getBehaviorDiagnosticIncidents(snapshot),
+              failures: evidence.failures,
+              deadLetters: evidence.deadLetters,
             },
           })
         }

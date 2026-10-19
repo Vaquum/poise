@@ -293,13 +293,13 @@ describe('the check for pull requests ready to merge', () => {
     expect(open()).toEqual([])
   })
 
-  it('remembers a silence beyond the 30 days alerts are kept, while the pull request stays open', async () => {
+  it('retains an unresolved ready-PR silence beyond the history retention window', async () => {
     const DAY = 24 * 60
     await check(all([pr(1, 'green')]), at(0))
     notices.silenceNotice(shown(at(1))[0].id, at(1))
-    expect(store.pruneAlerts(at(31 * DAY))).toBe(1)
+    expect(store.pruneAlerts(at(31 * DAY))).toBe(0)
     await check(all([pr(1, 'green')]), at(31 * DAY))
-    expect(store.openAlerts({ kind: 'pr_ready', now: at(31 * DAY) })).toEqual([])
+    expect(store.openAlerts({ kind: 'pr_ready', now: at(31 * DAY) })).toHaveLength(1)
     expect(shown(at(31 * DAY + 20))).toEqual([])
   })
 

@@ -10,6 +10,7 @@
 // Settings → General → Notifications turns this off: the page shows nothing
 // and nothing here checks GitHub. Poise Link's other alerts go on as before.
 
+import type { EvidenceAttachment } from '../../gateway/src/diagnostics/evidence-contract'
 import { GITHUB_AUTOMATION_SIGN_IN_TITLE } from '../accounts/types'
 import { getBehaviorIncident, listBehaviorIncidents } from '../db'
 import { readOwnPullRequests, type OwnPullRequest } from '../gh'
@@ -38,7 +39,7 @@ const INCIDENT_READ_LIMIT = 500
 const ORDER: readonly AlertKind[] = ['chat_waiting', 'sign_in_needed', 'github_quota_exhausted', 'storage_low', 'github_quota_warning', 'behavior_held', 'datastore_sync_failing', 'pr_ready', 'chat_turn_finished']
 const SILENCEABLE: ReadonlySet<AlertKind> = new Set(['pr_ready'])
 
-export interface Notice {
+export interface Notice extends EvidenceAttachment {
   id: string
   kind: AlertKind
   title: string

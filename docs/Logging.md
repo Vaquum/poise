@@ -141,6 +141,11 @@ query validation, coverage-journal and reporting failures remain distinct from s
 outages. Shutdown drains queued batches within two seconds, then records any loss.
 Coverage preserves prior drops and open outage intervals across restart.
 
+Quota observation continues every fifteen seconds with Notifications off.
+A warning requires at least 50% forecast risk sustained across distinct
+observations thirty seconds apart in one reset window; exhaustion remains
+immediate. These technical records do not depend on popup issuance or dismissal.
+
 ## Collection and operation
 
 The application starts a dedicated `logging.db` beside `POISE_DB` (otherwise
@@ -364,3 +369,26 @@ budget, retaining the first 1,000 decoded stderr lines. Later omitted lines or
 unavailable capture mark evidence incomplete explicitly. Docker's shared tail
 window is avoided because filtered stdout can consume its records. Short lines
 can reach the line limit even when retained text fits within its byte limit.
+
+### Notification evidence
+
+Expanded browser notifications and Behaviors diagnostics offer **View in Logging**
+when the retained index contains an exact qualifying source record. The optional
+`evidence` reference contains `eventId`, `incidentId` and zoned `from`/`to` bounds;
+`evidenceReferences` preserves up to twenty distinct retained attempts before
+presentation deduplication. Additional retained history is labelled. A pending
+association or unavailable query service remains explicit and does not delay or
+suppress the primary condition.
+
+Association uses the existing bounded read worker and owner-scoped index, with
+no ingestion or association database. Caller call IDs identify source events;
+correlation IDs identify preparation attempts or producer conditions. A Behaviors
+workflow incident, alert dedupe key and material-cause hash retain their separate
+lifecycle roles. Source, workspace, target and material cause must match; a newer
+record about the same PR cannot substitute for missing evidence.
+
+Opening evidence preserves dismissal/silence state, closes a floating rail and
+leaves a docked rail open. Arrival cards keep their primary controls. Known links
+keep the ordinary 410 expiry, indistinguishable unknown/foreign 404 and honest
+503 unavailable behavior described above. Recovery, Notifications off and
+container replacement do not delete retained source evidence.

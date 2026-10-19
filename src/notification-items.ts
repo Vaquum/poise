@@ -1,3 +1,4 @@
+import { evidenceReferences, type EvidenceAttachment } from '../gateway/src/diagnostics/evidence-contract'
 // What the notification rail lists (src/views/notification-rail.ts): the
 // notices (src/notices.ts) and Behaviors' diagnostics (src/behavior-diagnostics.ts)
 // as one list, grouped by who acts. A failed behavior's notice and its
@@ -21,7 +22,7 @@ export const GROUPS: readonly { key: ItemGroup, label: string, short: string, no
   { key: 'auto', label: 'Handled automatically', short: 'Automatic', note: 'Poise is retrying. Nothing to do.' },
 ]
 
-export interface NotificationItem {
+export interface NotificationItem extends EvidenceAttachment {
   /** A notice's id, or `diagnostic:` and its group's identity: stable across reads. */
   id: string
   group: ItemGroup
@@ -46,7 +47,7 @@ export interface NotificationItem {
 
 export type ItemCounts = Record<ItemGroup, number> & { open: number }
 
-const NOTICE_LOOK: Record<NoticeKind, { group: ItemGroup, tone: ItemTone, icon: ItemIcon, source: string }> = {
+export const NOTICE_LOOK: Record<NoticeKind, { group: ItemGroup, tone: ItemTone, icon: ItemIcon, source: string }> = {
   read_failed: { group: 'faults', tone: 'red', icon: 'fault', source: 'Data' },
   chat_waiting: { group: 'needs', tone: 'blue', icon: 'chat', source: 'Chat' },
   sign_in_needed: { group: 'needs', tone: 'amber', icon: 'key', source: 'Accounts' },
@@ -138,6 +139,14 @@ export function notificationItems(notices: readonly Notice[], diagnostics: Behav
       source: 'Behaviors', scope: group.scope, when: latest(group.entries), meta: '',
       details: group.entries, behaviors, notice: null,
     })
+  }
+  for (const item of items) {
+    const attachments = [...(item.notice ? [item.notice] : []), ...item.details]
+    const refs = [...new Map(attachments.flatMap(evidenceReferences).map((ref) => [ref.eventId, ref])).values()]
+    if (refs.length) Object.assign(item, { evidence: refs[0], evidenceReferences: refs.slice(0, 20), evidenceStatus: 'retained' })
+    if (attachments.some((entry) => entry.evidenceStatus === 'unavailable')) item.evidenceStatus = 'unavailable'
+    else if (!refs.length && attachments.some((entry) => entry.evidenceStatus === 'pending')) item.evidenceStatus = 'pending'
+    if (refs.length > 20 || attachments.some((entry) => entry.evidenceMore)) item.evidenceMore = true
   }
   return items
     .map((item, index) => ({ item, index }))
