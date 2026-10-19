@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { environmentSecrets, normalize, type DiagnosticInput } from '../gateway/src/diagnostics/contract'
 import { DiagnosticRuntime } from '../gateway/src/diagnostics/runtime'
+import { diagnosticDeliveryPage } from '../gateway/src/diagnostics/workspace-delivery'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import { runFile, setProcessFailureObserver } from './process'
 
@@ -189,10 +190,5 @@ export async function stopLogging(): Promise<void> {
 /** Authenticated maintenance export; the HTTP owner supplies authorization. */
 export function diagnosticPage(cursor: string | null) {
   if (!active) throw new Error('Diagnostic collection has not started')
-  const page = active.query((store) => store.delivery({ workspace, operator: false }, cursor))
-  const health = active.health()
-  return { ...page, coverage: { status: health.status, error: health.error, dropped: health.dropped, rejected: health.rejected,
-    lastSuccessfulWriteAt: health.lastSuccessfulWriteAt, sources: health.sources.slice(0, 16).map((source) => ({
-      source: source.source, status: source.status, observedAt: source.observedAt, availableFrom: source.availableFrom,
-    })) } }
+  return diagnosticDeliveryPage(active, workspace, cursor)
 }

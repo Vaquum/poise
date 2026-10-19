@@ -3191,22 +3191,63 @@ tr:hover .stop-btn { opacity: 1; }
   word-break: break-word;
 }
 
-#logging-filters { flex-wrap: wrap; }
-#logging-filters .logging-compact[hidden], #logging-new[hidden] { display: none; }
-#logging-filters .logging-compact { display: inline-flex; align-items: center; gap: var(--sp-2); color: var(--text-secondary); font-size: 0.75rem; }
-#logging-filters .st-select { width: auto; margin: 0; }
-.logging-custom:not([hidden]), .logging-exact-fields { display: flex; flex-wrap: wrap; align-items: end; gap: var(--sp-3); margin-block: var(--sp-3); }
-.logging-custom label, .logging-exact-fields label { flex: 1 1 190px; min-width: 0; color: var(--text-secondary); font-size: 0.75rem; }
-.logging-custom .st-input, .logging-exact-fields .st-input { width: 100%; }
-.logging-more { margin-block: var(--sp-3); font-size: 0.8125rem; color: var(--text-secondary); }
-.logging-more summary, .logging-coverage summary { cursor: pointer; }
-.logging-table-wrap { overflow-x: auto; }
-#logging-table { min-width: 1000px; }
-#logging-table th:nth-child(1) { width: 180px; }
-#logging-table th:nth-child(7) { text-align: right; }
-#logging-table .logging-target { max-width: 20ch; overflow: hidden; text-overflow: ellipsis; }
-#logging-table .logging-summary { max-width: 40ch; overflow: hidden; text-overflow: ellipsis; }
+#logging-filters { gap: var(--sp-3); }
+.logging-screen-reader { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+#logging-scope-label[hidden], #logging-new[hidden], .logging-custom[hidden] { display: none; }
+.logging-table-wrap { overflow: auto; max-height: calc(100dvh - 180px); overscroll-behavior: contain; }
+#logging-table { min-width: 1050px; }
+#logging-table th, #logging-table td { text-align: left; }
+#logging-table .logging-column-time { width: 180px; }
+#logging-table .logging-column-severity { width: 90px; }
+#logging-table .logging-column-source { width: 90px; }
+#logging-table .logging-column-component { width: 135px; }
+#logging-table .logging-column-repository { width: 140px; }
+#logging-table .logging-column-target { width: 145px; }
+#logging-table .logging-column-occurrences { width: 64px; }
+#logging-table th:last-child { width: 32px; }
+#logging-table .logging-column-occurrences, #logging-table .logging-number { text-align: right; font-variant-numeric: tabular-nums; }
+#logging-table .logging-cell { max-width: 22ch; overflow: hidden; text-overflow: ellipsis; }
+#logging-table .logging-cell-message { min-width: 28ch; max-width: 50ch; }
+#logging-table :is(.logging-cell-callId, .logging-cell-correlationId, .logging-cell-incidentId) { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: .75rem; max-width: 18ch; }
 #logging-table .started-cell .agent-status-note { display: block; }
+.logging-column-button { display: inline-flex; align-items: center; justify-content: space-between; gap: var(--sp-2); width: 100%; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; text-align: left; cursor: pointer; }
+.logging-column-button svg { flex: none; opacity: .35; }
+.logging-column-button:hover svg, .logging-column-button.active svg { opacity: 1; }
+.logging-column-button.active { color: var(--a1); }
+.logging-column-button:focus-visible, .logging-toolbar-button:focus-visible { outline: 2px solid var(--a1); outline-offset: 4px; border-radius: var(--r-sm); }
+.logging-toolbar-button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-tertiary); cursor: pointer; }
+.logging-toolbar-button:hover, .logging-toolbar-button:popover-open { background: var(--hover); color: var(--text); }
+.logging-toolbar-button.has-issue { color: var(--amber); }
+.logging-popover { position: fixed; inset: auto; margin: 0; padding: var(--sp-4); box-sizing: border-box; overflow: auto; border: var(--b-hair); border-radius: var(--r-sm); background: var(--bg); color: var(--text); box-shadow: var(--e-1); font-family: inherit; font-size: .8125rem; }
+.logging-popover::backdrop { background: transparent; }
+.logging-popover-title { margin-bottom: var(--sp-3); color: var(--text-secondary); font-size: .75rem; font-weight: 600; }
+.logging-popover .st-input, .logging-popover .st-select { width: 100%; margin: 0; box-sizing: border-box; }
+.logging-filter-options { display: flex; flex-wrap: wrap; gap: var(--sp-1); }
+.logging-filter-options button { flex: 1 1 auto; }
+.logging-clear-filter { margin-top: var(--sp-3); border: 0; padding: 0; background: transparent; color: var(--text-tertiary); font: inherit; font-size: .75rem; cursor: pointer; }
+.logging-clear-filter:hover { color: var(--text); }
+.logging-custom { display: grid; gap: var(--sp-3); margin-top: var(--sp-4); }
+.logging-custom label, #logging-scope-label { display: grid; gap: var(--sp-2); color: var(--text-secondary); font-size: .75rem; }
+#logging-scope-label:not([hidden]) { margin-bottom: var(--sp-3); }
+.logging-column-option { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0; cursor: pointer; }
+.logging-column-option input { accent-color: var(--a1); }
+.logging-column-option:has(input:disabled) { color: var(--text-tertiary); cursor: default; }
+.logging-data-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-3); margin: 0 0 var(--sp-4); }
+.logging-data-facts dt { color: var(--text-tertiary); font-size: .6875rem; }
+.logging-data-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.logging-coverage-table { width: 100%; font-size: .75rem; }
+.logging-coverage-table th, .logging-coverage-table td { padding: var(--sp-2); vertical-align: top; text-align: left; white-space: normal; }
+.logging-coverage-table small { display: block; color: var(--text-tertiary); font-size: .6875rem; overflow-wrap: anywhere; }
+.logging-coverage-table details { min-width: 6ch; }
+.logging-coverage-table summary { cursor: pointer; }
+.logging-coverage-table ul { padding-left: var(--sp-3); max-width: 240px; overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  #logging-filters { gap: var(--sp-2); }
+  #logging-filters .search-input { width: 125px; min-width: 60px; }
+  #logging-filters .range-picker button { padding-inline: var(--sp-2); }
+  #view-logging tr.agent-expand-row > td { overflow: visible; }
+  #view-logging tr.agent-expand-row > td > * { position: sticky; left: var(--sp-4); width: calc(100vw - 72px); max-width: calc(100vw - 72px); }
+}
 .logging-pagination { display: flex; align-items: center; gap: var(--sp-3); margin-block: var(--sp-4); }
 .logging-new { margin-block: var(--sp-3); }
 .logging-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-3); margin-block: var(--sp-4); font-size: 0.8125rem; }
@@ -3217,7 +3258,6 @@ tr:hover .stop-btn { opacity: 1; }
 .logging-linked > * { max-width: var(--typo-width, 960px); }
 .logging-related-list { padding-left: var(--sp-4); overflow-wrap: anywhere; }
 .logging-related-list button { padding: 4px 0; border: 0; background: transparent; color: var(--text-secondary); font: inherit; text-align: left; cursor: pointer; }
-.logging-coverage { margin-block: var(--sp-3); font-size: 0.8125rem; color: var(--text-secondary); }
 
 /* The failure text of a run that failed. Every failed row has one and it was
    rendered nowhere, so diagnosing a failure meant leaving Poise for the CLI. */

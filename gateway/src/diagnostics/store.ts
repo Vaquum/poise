@@ -33,6 +33,7 @@ export class DiagnosticConflictError extends Error {
 
 export class DiagnosticStore {
   private readonly db: Database.Database
+  private readonly indexes = new Set<string>()
   constructor(readonly path: string, readonly policy: LogPolicy = DEFAULT_LOG_POLICY, readonly now = Date.now, readonly readOnly = false) {
     if (!Object.values(policy).every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error('Logging retention and storage limits must be positive integers')
     if (!readOnly && path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
@@ -41,6 +42,7 @@ export class DiagnosticStore {
       this.db.pragma('busy_timeout = 25')
       if (readOnly) {
         this.checkVersion()
+        this.indexInventory()
         return
       }
       if (path !== ':memory:') chmodSync(path, 0o600)
@@ -60,12 +62,13 @@ export class DiagnosticStore {
           account TEXT, repository TEXT, call_id TEXT, correlation_id TEXT, search TEXT NOT NULL,
           bytes INTEGER NOT NULL, payload TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS log_scope_time ON log_events(workspace, sort_time DESC, id DESC);
         CREATE INDEX IF NOT EXISTS log_time ON log_events(sort_time DESC, id DESC);
         CREATE INDEX IF NOT EXISTS log_ingestion_seq ON log_events(ingested_at,seq);
         CREATE INDEX IF NOT EXISTS log_incident ON log_events(incident_id);
         CREATE INDEX IF NOT EXISTS log_incident_retained ON log_events(incident_id,ingested_at);
         CREATE INDEX IF NOT EXISTS log_call ON log_events(call_id);
+        CREATE INDEX IF NOT EXISTS log_scope_count ON log_events(workspace,visibility,severity,ingested_at);
+        CREATE INDEX IF NOT EXISTS log_scope_search ON log_events(workspace,visibility,severity,ingested_at,search);
         CREATE TABLE IF NOT EXISTS log_coverage (id TEXT PRIMARY KEY, workspace TEXT, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS log_expired (id TEXT PRIMARY KEY, workspace TEXT, visibility TEXT NOT NULL CHECK (visibility IN ('workspace','operator','infrastructure')), expired_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS log_expired_order ON log_expired(expired_at DESC,id DESC);
@@ -80,8 +83,15 @@ export class DiagnosticStore {
         CREATE TABLE IF NOT EXISTS log_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         INSERT OR IGNORE INTO log_meta VALUES ('version','1');
       `)
+      // Select page identities and filters without reading their large payloads.
+      // Older stores had only the first three (later six) metadata columns.
+      const scopeColumns = this.db.pragma('index_info(log_scope_time)') as Array<{ name: string }>
+      if (scopeColumns.map((column) => column.name).join(',') !== 'workspace,sort_time,id,visibility,ingested_at,severity,source,component,account,repository,call_id,correlation_id,incident_id,search') this.db.transaction(() => {
+        this.db.exec('DROP INDEX IF EXISTS log_scope_time; CREATE INDEX log_scope_time ON log_events(workspace,sort_time DESC,id DESC,visibility,ingested_at,severity,source,component,account,repository,call_id,correlation_id,incident_id,search)')
+      }).immediate()
       this.db.prepare("INSERT OR IGNORE INTO log_meta VALUES ('cursor_key',?)").run(randomBytes(32).toString('hex'))
       this.checkVersion()
+      this.indexInventory()
     } catch (error) {
       this.db.close()
       throw error
@@ -91,6 +101,10 @@ export class DiagnosticStore {
   private checkVersion(): void {
     const version = this.db.prepare("SELECT value FROM log_meta WHERE key='version'").get() as { value: string } | undefined
     if (version?.value !== '1') throw new Error(`Unsupported Logging store version ${version?.value ?? 'missing'}`)
+  }
+
+  private indexInventory(): void {
+    for (const index of this.db.pragma('index_list(log_events)') as Array<{ name: string }>) this.indexes.add(index.name)
   }
 
   append(events: readonly LogEvent[]): number {
@@ -159,7 +173,7 @@ export class DiagnosticStore {
 
   coverage(value: Coverage): void {
     if (!value.id || value.id.length > 256 || (value.workspace !== null && value.workspace.length > 512)) throw new Error('Logging coverage identity exceeds its bound')
-    const payload = JSON.stringify({ ...value, gaps: value.gaps.slice(-32).map((gap) => ({ ...gap, reason: gap.reason.slice(0, 128) })) })
+    const payload = JSON.stringify({ ...value, ...(value.gaps.length > 32 ? { historyIncomplete: true } : {}), gaps: value.gaps.slice(-32).map((gap) => ({ ...gap, reason: gap.reason.slice(0, 128) })) })
     if (Buffer.byteLength(payload) > MAX_COVERAGE_RECORD_BYTES) throw new Error('Logging coverage exceeds its bound')
     this.db.transaction(() => {
       const count = (this.db.prepare('SELECT COUNT(*) AS count FROM log_coverage').get() as { count: number }).count
@@ -174,6 +188,10 @@ export class DiagnosticStore {
   }
 
   query(access: LogAccess, filter: LogFilter = {}): LoggingPage {
+    return this.db.transaction(() => this.querySnapshot(access, filter))()
+  }
+
+  private querySnapshot(access: LogAccess, filter: LogFilter): LoggingPage {
     const levels = filter.severities ?? [...SEVERITIES]
     if (!Array.isArray(levels) || !levels.every((level) => SEVERITIES.includes(level))) throw new Error('Select only Critical, Error and Warning')
     const limit = filter.limit ?? 50
@@ -212,11 +230,21 @@ export class DiagnosticStore {
     const high = cursor?.high ?? (this.db.prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='log_events'),0) AS high").get() as { high: number }).high
     clauses.push('seq<=?'); values.push(high)
     const where = clauses.join(' AND ')
-    const total = (this.db.prepare(`SELECT COUNT(*) AS count FROM log_events WHERE ${where}`).get(...values) as { count: number }).count
+    const broad = !filter.from && !filter.to && Object.keys(columns).every((key) => key === 'workspace' || filter[key as keyof typeof columns] === undefined)
+    const countIndex = filter.callId ? 'log_call' : broad ? filter.search ? 'log_scope_search' : 'log_scope_count' : 'log_scope_time'
+    const countHint = this.indexes.has(countIndex) ? ` INDEXED BY ${countIndex}` : ''
+    const total = (this.db.prepare(`SELECT COUNT(*) AS count FROM log_events${countHint} WHERE ${where}`).get(...values) as { count: number }).count
     const pageWhere = cursor ? where + ' AND (sort_time < ? OR (sort_time = ? AND id < ?))' : where
     const pageValues = cursor ? [...values, cursor.time, cursor.time, cursor.id, limit + 1] : [...values, limit + 1]
-    const rows = this.db.prepare(`SELECT id,sort_time,payload FROM log_events WHERE ${pageWhere} ORDER BY sort_time DESC,id DESC LIMIT ?`).all(...pageValues) as EventRow[]
-    const page = rows.slice(0, limit)
+    const pageIndex = filter.callId ? 'log_call' : 'log_scope_time'
+    const pageHint = this.indexes.has(pageIndex) ? ` INDEXED BY ${pageIndex}` : ''
+    const positions = total ? this.db.prepare(`SELECT id,sort_time FROM log_events${pageHint} WHERE ${pageWhere} ORDER BY sort_time DESC,id DESC LIMIT ?`).all(...pageValues) as Array<Pick<EventRow, 'id' | 'sort_time'>> : []
+    const loadPayload = this.db.prepare('SELECT payload FROM log_events WHERE id=?')
+    const page = positions.slice(0, limit).map((position) => {
+      const row = loadPayload.get(position.id) as { payload: string } | undefined
+      if (!row) throw new Error('Retained diagnostic payload is absent from its read snapshot')
+      return { ...position, payload: row.payload }
+    })
     const occurrenceCounts = new Map<string, number>()
     const countIncident = this.db.prepare('SELECT COUNT(*) AS count FROM log_events WHERE incident_id=? AND ingested_at>=?')
     const retentionAfter = new Date(this.now() - this.policy.retentionMs).toISOString()
@@ -230,7 +258,7 @@ export class DiagnosticStore {
       return { ...event, occurrences }
     })
     const last = page.at(-1)
-    return { version: 1, events, total, countKind: 'events', nextCursor: rows.length > limit && last
+    return { version: 1, events, total, countKind: 'events', nextCursor: positions.length > limit && last
       ? this.sealToken({ kind: 'page', high, time: last.sort_time, id: last.id, filter: fingerprint }) : null,
     watermark: this.sealToken({ kind: 'watermark', high, filter: filterHash }),
     coverage: this.readCoverage(access), bounds: this.bounds(access), policy: this.policy }

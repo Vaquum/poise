@@ -746,8 +746,25 @@ full scoped event/incident identifiers and severity, re-redacts the envelope,
 and commits its checkpoint only after durable central ingestion. Delivery
 cursors survive ordinary process/container replacement and cannot widen scope.
 No new JWT scope, owner bypass, shared filesystem or public ingest route is
-introduced. A failed source or sink remains explicitly unavailable/partial.
+introduced. A failed source or sink remains explicitly unavailable/partial. Coverage retains its historical `status` and independently reports optional `currentStatus`; runtime and browser-health responses distinguish recovered observation from retained gaps, pending backfill and stale/unread state. Ordinary workspace stdout is outside the structured collection contract and cannot create a false outage. Malformed claimed diagnostic envelopes remain observable failures.
 An obsolete source cursor returns 409 `diagnostic_cursor_invalid`; only this explicit rejection permits resetting that source checkpoint and bounded replay, with a recorded collection gap. Other failures preserve the checkpoint.
+The optional `lossActive` observation distinguishes current overflow/rejection
+from cumulative loss. Its first transition is immediately journaled; a successful
+drain/persistence boundary without new loss establishes recovery. Independent
+health readers retain cumulative loss and do not infer recovery from legacy
+counters that lack this observation.
+Maintenance coverage adds bounded owner-scoped historical summaries: optional
+`historyIncomplete`, dropped/rejected lower bounds and up to two latest gaps for
+each of at most 16 sources. The production producer and collector share this
+projection's regression proof; invalid coverage cannot advance a delivery cursor.
+Source details omitted by the projection remain explicitly incomplete after
+current observation recovers. No status enum changes. An explicit `optional`
+flag describes intentionally unsupported local collectors; missing required
+production sources are not exempted from health.
+Workspace native diagnostic/fatal/fallback reports use stderr. Ordinary stdout
+is outside that log-read window; Caddy retains its native streams and release
+tasks retain their separate failure collector. Workspace stream health is
+aggregated once per collection pass across all relevant containers.
 
 The workspace distribution includes the bounded bootstrap diagnostic command and
 its canonical redaction module for standalone maintenance scripts. Installer

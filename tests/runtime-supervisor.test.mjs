@@ -61,6 +61,7 @@ beforeEach(async () => {
   started = []
 })
 afterEach(async () => {
+  vi.restoreAllMocks()
   await rm(home, { recursive: true, force: true })
 })
 
@@ -184,11 +185,15 @@ it('records native supervisor failure facts and omits planned switches and shutd
 })
 
 it('retains actual spawn errors without letting a diagnostic reporter change supervision', async () => {
+  const fallback = vi.spyOn(console, 'error').mockImplementation(() => undefined)
   const records = []; const instance = supervise((input) => { records.push(input); throw new Error('fixture reporter offline') })
   const running = instance.run(); const child = (await nth(0)).child
   child.emit('error', Object.assign(new Error('precise launch cause'), { code: 'EACCES', errno: -13 }))
   expect(await running).toBe(1)
   expect(records[0]).toMatchObject({ level: 'error', operation: 'workspace.spawn', errno: -13, message: 'precise launch cause', context: { processErrorCode: 'EACCES' } })
+  expect(fallback).toHaveBeenCalledWith('poise-runtime: diagnostic reporting unavailable: Error')
+  expect(fallback.mock.calls.flat().join(' ')).not.toContain('fixture reporter offline')
+  fallback.mockRestore()
 })
 
 it('records a release fallback without changing the selected release or failed marker', async () => {

@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import Database from 'better-sqlite3'
 import { environmentSecrets, normalize, redact, severity, type DiagnosticInput, type LogEvent } from '../src/diagnostics/contract.js'
 import { DiagnosticRuntime } from '../src/diagnostics/runtime.js'
 import { runOperator } from '../src/diagnostics/cli.js'
@@ -16,6 +17,54 @@ const directories: string[] = []
 afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of directories.splice(0)) rmSync(dir, { force: true, recursive: true }) })
 function directory() { const path = mkdtempSync(join(tmpdir(), 'poise-diagnostics-')); directories.push(path); return path }
 function store(policy = DEFAULT_LOG_POLICY) { const value = new DiagnosticStore(':memory:', policy, () => NOW); stores.push(value); return value }
+
+it('upgrades legacy count metadata without losing retained events or existing snapshot cursors', () => {
+  const path = join(directory(), 'logging.db')
+  const original = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => NOW)
+  original.append(Array.from({ length: 12 }, (_, index) => event('legacy-index-' + index)))
+  const first = original.query(alice, { limit: 5 })
+  original.close()
+  const legacy = new Database(path)
+  try { legacy.exec('DROP INDEX log_scope_count; DROP INDEX log_scope_search; DROP INDEX log_scope_time; CREATE INDEX log_scope_time ON log_events(workspace,sort_time DESC,id DESC)') }
+  finally { legacy.close() }
+  const upgraded = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => NOW)
+  try {
+    const next = upgraded.query(alice, { limit: 5, cursor: first.nextCursor! })
+    expect(next.total).toBe(12)
+    expect(next.events).toHaveLength(5)
+    expect(next.events.some((row) => first.events.some((prior) => row.id === prior.id))).toBe(false)
+    const reader = new Database(path, { readonly: true })
+    try {
+      const plan = reader.prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM log_events WHERE workspace=? AND visibility IN ('workspace','infrastructure') AND severity IN ('critical','error','warning') AND ingested_at>=? AND seq<=?")
+        .all('alice', new Date(NOW - DEFAULT_LOG_POLICY.retentionMs).toISOString(), 12) as Array<{ detail: string }>
+      expect(plan.some((step) => step.detail.includes('COVERING INDEX'))).toBe(true)
+    } finally { reader.close() }
+  } finally { upgraded.close() }
+})
+
+it('keeps selected payloads and counts in one read snapshot during concurrent eviction', () => {
+  const path = join(directory(), 'snapshot.db'), policy = { ...DEFAULT_LOG_POLICY, maxEvents: 2 }
+  const writer = new DiagnosticStore(path, policy, () => NOW)
+  const selected = event('snapshot-selected', { time: new Date(NOW + 1000).toISOString() })
+  writer.append([selected, event('snapshot-other')])
+  const reader = new DiagnosticStore(path, policy, () => NOW, true)
+  const prepare = Database.prototype.prepare
+  let evicted = false
+  const interleave = vi.spyOn(Database.prototype, 'prepare').mockImplementation(function(this: Database.Database, sql: string) {
+    if (!evicted && sql === 'SELECT payload FROM log_events WHERE id=?') {
+      evicted = true
+      writer.append([event('snapshot-replacement', { time: new Date(NOW + 2000).toISOString() })])
+    }
+    return prepare.call(this, sql)
+  })
+  try {
+    const page = reader.query(alice, { limit: 1 })
+    expect(evicted).toBe(true)
+    expect(page.total).toBe(2)
+    expect(page.events.map((row) => row.id)).toEqual([selected.id])
+    expect(writer.lookup(alice, selected.id).status).toBe('expired')
+  } finally { interleave.mockRestore(); reader.close(); writer.close() }
+})
 function event(id: string, update: Partial<DiagnosticInput> = {}): LogEvent {
   const value = normalize({ id, time: new Date(NOW).toISOString(), level: 'error', source: 'poise', operation: 'test.operation',
     workspace: 'alice', message: 'precise failure', ...update }, NOW)
@@ -670,4 +719,28 @@ it.each([...Array.from({ length: 32 }, (_, code) => String.fromCharCode(code)).f
 it('matches normalized configured credentials without creating empty secret patterns', () => {
   expect(redact('opaque\x00credential', ['opaque\x00credential'])).toBe('[redacted]')
   expect(redact('actual cause', ['\x00', '\x1b[31m'])).toBe('actual cause')
+})
+
+it('separates current source observation from immutable historical gaps and rechecks after restart', async () => {
+  const path = join(directory(), 'current-observation.db')
+  const options = { path, now: () => NOW, report: () => undefined }
+  const runtime = new DiagnosticRuntime(options)
+  runtime.observe('caller', 'caller', 'alice', 'source offline')
+  runtime.flush()
+  expect(runtime.health().sources[0]).toMatchObject({ status: 'unavailable', currentStatus: 'unavailable' })
+  runtime.observe('caller', 'caller', 'alice')
+  runtime.flush()
+  expect(runtime.health()).toMatchObject({ status: 'partial', currentStatus: 'connected' })
+  expect(runtime.health().sources[0]).toMatchObject({ status: 'partial', currentStatus: 'connected', error: null })
+  expect(runtime.health().sources[0].gaps).toHaveLength(1)
+  expect(runtime.health().sources[0].gaps[0].to).not.toBeNull()
+  runtime.partial('caller', 'caller', 'alice', 'retained backfill pending')
+  expect(runtime.health()).toMatchObject({ status: 'partial', currentStatus: 'partial' })
+  await runtime.stop()
+  const restarted = new DiagnosticRuntime(options)
+  expect(restarted.health().sources[0].currentStatus).toBe('initializing')
+  restarted.observe('caller', 'caller', 'alice'); restarted.flush()
+  expect(restarted.health()).toMatchObject({ status: 'partial', currentStatus: 'connected' })
+  expect(restarted.health().sources[0].gaps).toHaveLength(1)
+  await restarted.stop()
 })

@@ -27,12 +27,14 @@ describe.skipIf(!enabled)('durable diagnostics from real Docker sources', () => 
       for (let attempt = 0; attempt < 2; attempt++) {
         const event = normalize({ id: 'attempt-' + attempt, source: 'poise', operation: 'review.fetch', level: 'error', workspace: 'logproof',
           message: 'Git fetch failed', stderr: 'fatal: exact cause\nstack one\nstack two' })!
-        const code = `process.stderr.write(${JSON.stringify(JSON.stringify({ poiseDiagnostic: event }) + '\n')});setInterval(()=>{},1000)`
+        const code = `process.stdout.write('ordinary non-diagnostic stdout\\n'.repeat(2000));process.stderr.write(${JSON.stringify(JSON.stringify({ poiseDiagnostic: event }) + '\n')});setInterval(()=>{},1000)`
         const container = docker('run', '--detach', '--name', name, '--label', 'poise.managed=true', '--label', 'poise.workspace=logproof', 'node:22-bookworm-slim', 'node', '-e', code)
         for (let poll = 0; poll < 100; poll++) {
-          const bytes = await client.diagnosticRead(`/containers/${container}/logs?stdout=1&stderr=1&timestamps=1`)
+          const bytes = await client.diagnosticRead(`/containers/${container}/logs?stdout=0&stderr=1&timestamps=1`)
           const lines = dockerLines(bytes)
           if (lines.length) {
+            expect(lines).toHaveLength(1)
+            expect(lines[0]).not.toContain('ordinary non-diagnostic stdout')
             const envelope = JSON.parse(lines[0].slice(lines[0].indexOf(' ') + 1)) as { poiseDiagnostic: unknown }
             store.append([workspaceEnvelope(envelope.poiseDiagnostic, 'logproof', Date.now(), [])]); break
           }

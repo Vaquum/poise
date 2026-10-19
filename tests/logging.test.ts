@@ -255,3 +255,19 @@ it.each([{ hasMore: true, backfillPending: false }, { hasMore: false, backfillPe
   expect(loggingRuntime()!.query((db) => db.readCoverage({ workspace: 'alice', operator: false })).find((source) => source.id === 'caller')).toMatchObject({ status: 'connected', error: null, gaps: [] })
   expect(loggingRuntime()!.query((db) => db.query({ workspace: 'alice', operator: false }, { source: 'caller' })).total).toBe(1)
 })
+
+it('delivers current recovered observation independently of historical coverage through the actual producer', async () => {
+  vi.stubEnv('POISE_MODE', 'service')
+  vi.spyOn(processes, 'runFile').mockResolvedValue({ stdout: JSON.stringify({ version: 1, streamId: 'd'.repeat(32), cursor: 0, hasMore: false, backfillPending: false, events: [] }), stderr: '' })
+  start()
+  await vi.waitFor(() => expect(loggingRuntime()!.health().sources.find((source) => source.source === 'caller')?.currentStatus).toBe('connected'))
+  const runtime = loggingRuntime()!
+  runtime.observe('application', 'poise', 'alice', 'previous transport failure'); runtime.flush()
+  runtime.observe('application', 'poise', 'alice'); runtime.flush()
+  const page = diagnosticPage(null)
+  expect(page.coverage).toMatchObject({ status: 'partial', currentStatus: 'connected' })
+  expect(page.coverage.sources.find((source) => source.source === 'poise')).toMatchObject({ status: 'partial', currentStatus: 'connected' })
+  expect(runtime.health().sources.find((source) => source.source === 'poise')?.gaps).toHaveLength(1)
+  runtime.partial('caller', 'caller', 'alice', 'Backfill pending')
+  expect(diagnosticPage(null).coverage.currentStatus).toBe('partial')
+})

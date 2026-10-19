@@ -6,8 +6,46 @@ import http from 'node:http'
 import { normalize, type DiagnosticInput, type LogEvent } from './contract.js'
 import { DiagnosticRuntime } from './runtime.js'
 import { nativeDiagnostic, supervisorDiagnostic, workspaceEnvelope } from './sources.js'
+import type { Coverage } from './query-contract.js'
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
+const time = (value: unknown): value is string => typeof value === 'string' && value.length <= 50 && Number.isFinite(Date.parse(value))
+function workspaceCoverage(value: unknown) {
+  if (!object(value) || !['connected', 'partial', 'unavailable', 'initializing'].includes(String(value.status))
+    || (value.currentStatus !== undefined && !['connected', 'partial', 'unavailable', 'initializing'].includes(String(value.currentStatus)))
+    || (value.error !== undefined && value.error !== null && (typeof value.error !== 'string' || value.error.length > 2048))
+    || (value.historyIncomplete !== undefined && typeof value.historyIncomplete !== 'boolean')
+    || (value.lossActive !== undefined && typeof value.lossActive !== 'boolean')) throw new Error('Workspace diagnostic coverage is incompatible')
+  for (const key of ['dropped', 'rejected']) if (value[key] !== undefined && (!Number.isSafeInteger(value[key]) || Number(value[key]) < 0)) throw new Error('Workspace diagnostic loss counter is incompatible')
+  const history: { incomplete: boolean; gaps: Coverage['gaps']; dropped: number; rejected: number; lossActive?: boolean; availableFrom: string | null } = {
+    incomplete: value.historyIncomplete === undefined ? value.status === 'partial' : value.historyIncomplete === true,
+    gaps: [], dropped: Number(value.dropped ?? 0), rejected: Number(value.rejected ?? 0), lossActive: value.lossActive as boolean | undefined, availableFrom: null,
+  }
+  if (history.dropped || history.rejected) history.incomplete = true
+  if (value.sources !== undefined) {
+    if (!Array.isArray(value.sources) || value.sources.length > 16) throw new Error('Workspace diagnostic coverage exceeds 16 sources')
+    for (const source of value.sources) {
+      if (!object(source) || typeof source.source !== 'string' || source.source.length > 128
+        || !['connected', 'partial', 'unavailable', 'not-configured'].includes(String(source.status))
+        || (source.optional !== undefined && typeof source.optional !== 'boolean')
+        || (source.historyIncomplete !== undefined && typeof source.historyIncomplete !== 'boolean')
+        || (source.availableFrom !== undefined && source.availableFrom !== null && !time(source.availableFrom))) throw new Error('Workspace source coverage is incompatible')
+      if (source.gaps !== undefined && (!Array.isArray(source.gaps) || source.gaps.length > 2)) throw new Error('Workspace source gap projection exceeds its bound')
+      if (!source.optional) {
+        history.incomplete ||= source.historyIncomplete === true || source.historyIncomplete === undefined && source.status === 'partial'
+        if (time(source.availableFrom) && (!history.availableFrom || source.availableFrom < history.availableFrom)) history.availableFrom = source.availableFrom
+      }
+      for (const gap of Array.isArray(source.gaps) ? source.gaps : []) {
+        if (!object(gap) || !time(gap.from) || (gap.to !== null && (!time(gap.to) || Date.parse(gap.to) < Date.parse(gap.from))) || typeof gap.reason !== 'string' || gap.reason.length > 128) throw new Error('Workspace diagnostic gap is incompatible')
+        if (!source.optional) history.gaps.push({ from: new Date(gap.from).toISOString(), to: gap.to === null ? null : new Date(gap.to as string).toISOString(), reason: source.source + ': ' + gap.reason })
+      }
+    }
+  }
+  return { currentStatus: value.lossActive === true ? 'partial' : value.lossActive === undefined && (history.dropped || history.rejected) ? 'initializing'
+    : value.currentStatus === undefined ? value.status === 'partial' ? 'initializing' : String(value.status) : String(value.currentStatus),
+    unavailable: !!value.error, history }
+}
 const handle = (value: string | undefined) => value && /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/.test(value) ? value : null
 export const diagnosticOwner = (labels: Record<string, string>) =>
   labels['poise.managed'] === 'true' || labels['poise.task'] === 'install-release' ? handle(labels['poise.workspace']) : null
@@ -136,10 +174,16 @@ export class EnvironmentCollectors {
       const containers = await this.docker.diagnosticContainers()
       if (containers.length > 128) throw new Error('Docker collection exceeds 128 source containers; remaining coverage is unavailable')
       this.runtime.query((db) => db.reconcileDockerCheckpoints(containers.map((container) => container.Id)))
+      const streams = new Map<string, { source: string; workspace: string | null; errors: string[] }>()
       for (const container of containers) {
         if (this.stopping) return
-        await this.logs(container, until)
+        const observation = await this.logs(container, until)
+        if (!observation) continue
+        const group = streams.get(observation.id) ?? { source: observation.source, workspace: observation.workspace, errors: [] }
+        if (observation.error) group.errors.push(observation.error)
+        streams.set(observation.id, group)
       }
+      for (const [id, group] of streams) this.runtime.observe(id, group.source, group.workspace, group.errors.length ? [...new Set(group.errors)].sort().join('; ') : null)
       await this.events(until)
       this.runtime.observe('docker', 'docker', null)
     } catch (error) { this.runtime.observe('docker', 'docker', null, String(error)) }
@@ -149,19 +193,19 @@ export class EnvironmentCollectors {
     }
   }
 
-  private async logs(container: ContainerSummary, until: number): Promise<void> {
-    if (!diagnosticManaged(container.Labels) || container.Labels['com.docker.compose.service'] === 'gateway') return
+  private async logs(container: ContainerSummary, until: number): Promise<{ id: string; source: string; workspace: string | null; error: string | null } | null> {
+    if (!diagnosticManaged(container.Labels) || container.Labels['com.docker.compose.service'] === 'gateway' || container.Labels['poise.task'] === 'install-release') return null
     const workspace = diagnosticOwner(container.Labels)
     const key = 'docker-log:' + container.Id
     const coverage = workspace ? 'workspace-stream:' + workspace : 'ingress'
+    const observation = { id: coverage, source: workspace ? 'poise' : 'ingress', workspace, error: null as string | null }
     try {
       const previous = this.runtime.query((db) => db.checkpoint(key))
       const since = previous ? Number(previous) : until - 60
-      const bytes = await this.docker.diagnosticRead(`/containers/${encodeURIComponent(container.Id)}/logs?stdout=1&stderr=1&timestamps=1&since=${since}&until=${until}&tail=1000`)
+      const bytes = await this.docker.diagnosticRead(`/containers/${encodeURIComponent(container.Id)}/logs?stdout=${workspace ? 0 : 1}&stderr=1&timestamps=1&since=${since}&until=${until}`)
       const events: LogEvent[] = []
-      let excluded = 0
+      let invalid = 0
       const lines = dockerLines(bytes)
-      if (lines.length >= 1000) throw new Error('Docker log tail bound reached; earlier records may be missing')
       for (const line of lines) {
         const content = line.slice(line.indexOf(' ') + 1)
         const startup = workspace ? supervisorDiagnostic(content, container.Id + ':' + hash(line), workspace) : null
@@ -171,12 +215,19 @@ export class EnvironmentCollectors {
           continue
         }
         let row: unknown
-        try { row = JSON.parse(content) } catch { excluded++; continue }
-        const envelope = row && typeof row === 'object' && 'poiseDiagnostic' in row ? row.poiseDiagnostic : null
-        if (workspace && envelope) {
-          try { events.push(workspaceEnvelope(envelope, workspace, Date.now(), [])) }
+        try { row = JSON.parse(content) } catch {
+          if (!workspace || /"poiseDiagnostic"\s*:/.test(content)) {
+            invalid++
+            const warning = normalize({ id: 'malformed-envelope:' + hash(line), source: 'collection', operation: 'workspace.envelope_rejected', level: 'warning', workspace,
+              message: 'Malformed structured diagnostic record; original output excluded' })
+            if (warning) events.push(warning)
+          }
+          continue
+        }
+        if (workspace && row && typeof row === 'object' && 'poiseDiagnostic' in row) {
+          try { events.push(workspaceEnvelope(row.poiseDiagnostic, workspace, Date.now(), [])) }
           catch (error) {
-            excluded++
+            invalid++
             const warning = normalize({ id: 'invalid-envelope:' + hash(line), source: 'collection', operation: 'workspace.envelope_rejected', level: 'warning', workspace, message: error instanceof Error ? error.message : String(error) })
             if (warning) events.push(warning)
           }
@@ -187,16 +238,16 @@ export class EnvironmentCollectors {
           input.context = { container: container.Id, originalSource: 'caddy' }
           const event = normalize(input)
           if (event) events.push(event)
-        } else excluded++
+        }
       }
       const rejected = this.runtime.deliver(events, key, String(until), { id: coverage, source: workspace ? 'poise' : 'ingress', workspace })
-      this.runtime.observe(coverage, workspace ? 'poise' : 'ingress', workspace, excluded || rejected ? 'Unstructured source output excluded to protect user content; structured diagnostic coverage only' : null)
+      return { ...observation, error: invalid || rejected ? 'Structured diagnostic records were malformed or rejected; retained coverage is incomplete' : null }
     } catch (error) {
       if (/bound|exceeds|tail/i.test(String(error))) {
         try { this.runtime.query((db) => db.commitDelivery([], key, String(until))) }
-        catch (failure) { this.runtime.observe(coverage, workspace ? 'poise' : 'ingress', workspace, String(failure)); return }
+        catch (failure) { return { ...observation, error: String(failure) } }
       }
-      this.runtime.observe(coverage, workspace ? 'poise' : 'ingress', workspace, String(error))
+      return { ...observation, error: String(error) }
     }
   }
 
@@ -248,7 +299,7 @@ export class EnvironmentCollectors {
       const target = this.context.deps.upstream(handle)
       const { config, keys, now } = this.context.deps
       const path = '/api/service/diagnostics' + (cursor ? '?cursor=' + encodeURIComponent(cursor) : '')
-      const page = await new Promise<{ version: number; events: unknown[]; cursor: string; coverage: { status: string; error?: string | null } }>((resolve, reject) => {
+      const page = await new Promise<{ version: number; events: unknown[]; cursor: string; hasMore?: boolean; coverage: unknown }>((resolve, reject) => {
         const req = http.get({ host: target.host, port: target.port, path, agent: false, headers: {
           host: `${handle}.${config.domain}`, 'x-poise-identity': signAssertion(keys.privateKey, { handle, login, scope: 'admin' }, now()),
         } }, (res) => {
@@ -269,7 +320,8 @@ export class EnvironmentCollectors {
         req.once('close', () => clearTimeout(deadline))
         req.setTimeout(this.workspaceTimeoutMs, () => req.destroy(new Error('Workspace diagnostic source timed out'))); req.on('error', reject)
       })
-      if (page.version !== 1 || !Array.isArray(page.events) || page.events.length > 3 || typeof page.cursor !== 'string' || !page.coverage || typeof page.coverage.status !== 'string') throw new Error('Workspace diagnostic delivery is incompatible')
+      if (page.version !== 1 || !Array.isArray(page.events) || page.events.length > 3 || typeof page.cursor !== 'string') throw new Error('Workspace diagnostic delivery is incompatible')
+      const coverage = workspaceCoverage(page.coverage)
       const events: LogEvent[] = []
       let rejected = 0
       for (const row of page.events) {
@@ -282,9 +334,13 @@ export class EnvironmentCollectors {
         }
       }
       rejected += this.runtime.deliver(events, key, page.cursor, { id: key, source: 'poise', workspace: handle })
-      if (page.coverage.status === 'unavailable' || page.coverage.status === 'initializing' || page.coverage.error) this.runtime.observe(key, 'poise', handle, 'Workspace diagnostic sink is currently unavailable')
-      else if (rejected || page.coverage.status === 'partial' || ('hasMore' in page && page.hasMore)) this.runtime.partial(key, 'poise', handle, 'Workspace is reachable; historical gaps or pending backfill limit completeness')
+      const currentStatus = coverage.currentStatus
+      if (currentStatus === 'unavailable' || coverage.unavailable) this.runtime.observe(key, 'poise', handle, 'Workspace diagnostic sink is currently unavailable')
+      else if (page.hasMore) this.runtime.partial(key, 'poise', handle, 'Retained diagnostic backfill is still pending')
+      else if (!rejected && currentStatus === 'initializing') this.runtime.partial(key, 'poise', handle, 'Workspace current observation is unestablished', 'initializing')
+      else if (rejected || currentStatus !== 'connected') this.runtime.partial(key, 'poise', handle, 'Workspace diagnostic collection is degraded or has not established current observation')
       else this.runtime.observe(key, 'poise', handle)
+      this.runtime.mergeHistory(key, coverage.history)
     } catch (error) {
       if (error instanceof WorkspaceCursorError) {
         this.runtime.observe(key, 'poise', handle, error.message)

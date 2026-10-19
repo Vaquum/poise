@@ -16,7 +16,7 @@ export interface LoggingAccess { endpoint: string; isAdmin: boolean; owner: stri
 export interface LoggingHealth {
   version: 1
   status: string
-  collection: { status: string; checkedAt: string; sources: Coverage[]; lossObserved: boolean }
+  collection: { status: string; currentStatus?: string; checkedAt: string; sources: Coverage[]; lossObserved: boolean; lossActive?: boolean }
   query: { status: string }
   bounds?: LoggingPage['bounds']
   policy: LogPolicy
@@ -58,6 +58,9 @@ function bounds(value: unknown): value is LoggingPage['bounds'] {
 function coverage(value: unknown): boolean {
   return object(value) && typeof value.id === 'string' && typeof value.source === 'string' && (value.workspace === null || typeof value.workspace === 'string')
     && ['connected', 'unavailable', 'partial', 'not-configured'].includes(String(value.status)) && (value.error === null || typeof value.error === 'string')
+    && (value.currentStatus === undefined || ['connected', 'unavailable', 'partial', 'not-configured', 'initializing'].includes(String(value.currentStatus)))
+    && ['optional', 'historyIncomplete', 'lossActive'].every((key) => value[key] === undefined || typeof value[key] === 'boolean')
+    && ['dropped', 'rejected'].every((key) => value[key] === undefined || Number.isSafeInteger(value[key]) && Number(value[key]) >= 0)
     && ['observedAt', 'ingestedAt', 'availableFrom'].every((key) => value[key] === null || time(value[key]))
     && Array.isArray(value.gaps) && value.gaps.length <= 32 && value.gaps.every((gap) => object(gap) && time(gap.from) && (gap.to === null || time(gap.to)) && typeof gap.reason === 'string')
 }
@@ -142,6 +145,8 @@ export async function loggingHealth(access: LoggingAccess, scope: LoggingQuery['
   const body = await read(access, '/health', { scope }, signal, true)
   if (!object(body) || body.version !== 1 || !['connected', 'partial', 'unavailable', 'stopped', 'stale'].includes(String(body.status))
     || !object(body.collection) || !object(body.query) || !time(body.collection.checkedAt) || typeof body.collection.lossObserved !== 'boolean'
+    || (body.collection.currentStatus !== undefined && !['connected', 'partial', 'unavailable', 'initializing', 'stopped', 'stale'].includes(String(body.collection.currentStatus)))
+    || (body.collection.lossActive !== undefined && typeof body.collection.lossActive !== 'boolean')
     || !['connected', 'partial', 'unavailable', 'stopped', 'stale'].includes(String(body.collection.status)) || !['connected', 'unavailable'].includes(String(body.query.status))
     || !Array.isArray(body.collection.sources) || body.collection.sources.length > 256 || !body.collection.sources.every(coverage)
     || (body.bounds !== undefined && !bounds(body.bounds)) || !policy(body.policy)) return protocol()

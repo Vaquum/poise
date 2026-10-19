@@ -136,3 +136,37 @@ it('keeps scoped source-time bounds and ingestion expiry equivalent across reade
     } finally { read.close() }
   } finally { writer.close(); rmSync(directory, { recursive: true, force: true }) }
 })
+
+it('projects current collection state independently of historical gaps and loss without widening access', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'logging-current-health-'))
+  const path = join(directory, 'logging.db'); const now = Date.now()
+  const db = new DiagnosticStore(path)
+  const source = { id: 'own-source', source: 'caller', workspace: 'alice', status: 'partial', currentStatus: 'connected',
+    observedAt: new Date(now).toISOString(), ingestedAt: null, availableFrom: new Date(now - 1000).toISOString(), error: null as string | null,
+    gaps: [{ from: new Date(now - 2000).toISOString(), to: new Date(now - 1000).toISOString(), reason: 'recovered outage' }] }
+  const journal = { version: 1, writtenAt: new Date(now).toISOString(), stopped: false, sinkError: null as string | null, dropped: 2, rejected: 0, lossActive: false,
+    sources: [source, { ...source, id: 'foreign-source', workspace: 'bob', currentStatus: 'unavailable', error: 'foreign-private-cause' }] }
+  const request: LoggingRead = { path, now, policy: DEFAULT_LOG_POLICY, access: { workspace: 'alice', operator: false }, operation: 'health', filter: {} }
+  const read = () => { writeFileSync(path + '.coverage.json', JSON.stringify(journal)); return JSON.parse(executeLoggingRead(request).body) }
+  try {
+    expect(read()).toMatchObject({ collection: { status: 'partial', currentStatus: 'connected', lossObserved: true, sources: [{ id: 'own-source', currentStatus: 'connected' }] } })
+    expect(JSON.stringify(read())).not.toContain('foreign-private-cause')
+    expect(read().collection.sources).toHaveLength(1)
+    source.currentStatus = 'partial'; source.error = 'backfill pending'
+    expect(read().collection.currentStatus).toBe('partial')
+    journal.sinkError = 'sink failed'
+    expect(read()).toMatchObject({ collection: { currentStatus: 'unavailable' }, query: { status: 'connected' } })
+    journal.sinkError = null; source.error = null
+    const legacy = { ...source }; delete (legacy as Partial<typeof source>).currentStatus
+    writeFileSync(path + '.coverage.json', JSON.stringify({ ...journal, sources: [legacy] }))
+    expect(JSON.parse(executeLoggingRead(request).body).collection.currentStatus).toBe('initializing')
+    source.currentStatus = 'connected'; request.now += 60_001
+    expect(read().collection.currentStatus).toBe('stale')
+    request.now = now
+    db.coverage({ id: 'external-ingress', source: 'ingress', workspace: null, status: 'not-configured', currentStatus: 'not-configured',
+      observedAt: null, ingestedAt: null, availableFrom: null, error: 'Operator delivery has not been configured', gaps: [] })
+    expect(read()).toMatchObject({ collection: { status: 'partial', currentStatus: 'partial', sources: expect.arrayContaining([
+      expect.objectContaining({ source: 'ingress', currentStatus: 'not-configured' }),
+    ]) } })
+  } finally { db.close(); rmSync(directory, { recursive: true, force: true }) }
+})

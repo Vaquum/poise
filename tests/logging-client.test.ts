@@ -104,3 +104,23 @@ it('shares a fixed wall-clock 15-second cadence and stops every unsubscribed rea
   expect(first).toHaveBeenCalledTimes(1); expect(second).toHaveBeenCalledTimes(2)
   stopSecond(); expect(vi.getTimerCount()).toBe(0)
 })
+
+it('validates current observation independently of historical completeness', async () => {
+  respond({ ...health, collection: { ...health.collection, status: 'partial', currentStatus: 'connected' } })
+  expect((await loggingHealth(access, 'workspace', signal())).collection.currentStatus).toBe('connected')
+  vi.restoreAllMocks()
+  respond({ ...health, collection: { ...health.collection, currentStatus: 'invented' } })
+  await expect(loggingHealth(access, 'workspace', signal())).rejects.toMatchObject({ code: 'logging_incompatible' })
+})
+
+it.each([{ optional: 'yes' }, { historyIncomplete: 'yes' }, { lossActive: 'yes' }, { dropped: -1 }, { rejected: 1.5 }])('rejects malformed additive coverage fields %j', async (change) => {
+  const source = { id: 'application', source: 'poise', workspace: 'local', status: 'partial', currentStatus: 'connected',
+    observedAt: null, ingestedAt: null, availableFrom: null, error: null, gaps: [], ...change }
+  respond({ ...health, collection: { ...health.collection, sources: [source] } })
+  await expect(loggingHealth(access, 'workspace', signal())).rejects.toMatchObject({ code: 'logging_incompatible' })
+})
+
+it('rejects malformed active-loss observation without treating it as historical recovery', async () => {
+  respond({ ...health, collection: { ...health.collection, lossActive: 'false' } })
+  await expect(loggingHealth(access, 'workspace', signal())).rejects.toMatchObject({ code: 'logging_incompatible' })
+})

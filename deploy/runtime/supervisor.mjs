@@ -50,7 +50,7 @@ export function supervisor({
   const record = (input) => {
     if (!diagnostic) return
     try { diagnostic({ source: 'poise', component: 'workspace-supervisor', ...input }) }
-    catch (error) { log(`diagnostic reporting unavailable: ${error instanceof Error ? error.name : 'capture failure'}`) }
+    catch (error) { console.error(`poise-runtime: diagnostic reporting unavailable: ${error instanceof Error ? error.name : 'capture failure'}`) }
   }
 
   const installed = (name) => ({ name, poise: join(releases, name, 'poise'), venv: join(releases, name, 'venv') })

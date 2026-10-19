@@ -211,3 +211,5 @@ unavailable diagnostics remain explicit. A missing record never borrows another
 review's failure. [Logging](Logging.md#notification-evidence) defines identity and
 expiry behavior. This secondary action never dismisses or silences; the primary
 Open action keeps its existing dismissal behavior. Arrival cards are unchanged.
+
+Logging table counts, retention bounds, snapshot times and closed coverage gaps are inspection metadata, not notification producers. They appear only in Logging’s structured Data and collection control. Current source faults retain qualifying diagnostic events; historical incompleteness alone must not create a persistent current-failure signal.
