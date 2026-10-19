@@ -117,14 +117,6 @@ export function send(port: number, options: RequestOptions): Promise<Reply> {
   })
 }
 
-async function closedPort(): Promise<number> {
-  const server = http.createServer()
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
-  const { port } = server.address() as AddressInfo
-  await new Promise<void>((resolve) => server.close(() => resolve()))
-  return port
-}
-
 export async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gw-'))
   const dataDir = join(dir, 'data')
@@ -154,7 +146,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     spec: { HostConfig: { Mounts: [{ Type: 'volume', Source: GATEWAY_DATA_SOURCE, Target: dataDir }] } },
   })
   const workspace = await startWorkspaceStub()
-  const unreachablePort = await closedPort()
+
 
   const config = loadConfig({
     POISE_DOMAIN: DOMAIN,
@@ -180,7 +172,9 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   const keys = loadOrCreateKeys(dataDir, log)
   const upstream = (handle: string): Upstream => {
     const joined = !options.requireNetwork || docker.containers.get('poise-gateway')?.networks.has(`poise-net-${handle}`) === true
-    return { host: '127.0.0.1', port: workspace.reachable && joined ? workspace.port : unreachablePort }
+    // The stub owns this port for its entire lifetime. A reserved DNS name
+    // represents unreachability without releasing an address another fixture can claim.
+    return { host: workspace.reachable && joined ? '127.0.0.1' : 'unavailable.poise.invalid', port: workspace.port }
   }
   const dockerClient = new DockerClient(config.dockerSocket)
   const workspaceResolvConf = await prepareWorkspaceDns(config, dockerClient)
