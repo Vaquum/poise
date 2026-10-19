@@ -105,28 +105,65 @@ comment on issues, not pull requests, and are not counted either.
 ## Seven-day trends
 
 Pull requests opened, Pull requests merged, Closed without merging, Lines
-changed, Issues opened and Issues closed compare the day's totals with the
-median of the preceding seven complete calendar days' totals, including zero
-days. The existing baseline response includes those seven daily totals; no
-extra request or upstream read is needed. Calendar boundaries follow Settings'
-timezone, including daylight-saving changes. Missing daily data or partial
-line-size coverage withholds the comparison.
+changed, Issues opened and Issues closed use the median of the preceding seven
+complete calendar days' totals, including zero days. For Today, the comparison
+is `typical = median × clamp((readTime − since) / (until − since), 0, 1)`.
+`readTime` is captured when the totals read starts; `since` and `until` are
+that read's calendar edges in Settings' timezone. Elapsed time and day length
+use actual milliseconds, including 23- and 25-hour daylight-saving days.
+For example, 10 elapsed hours of a 25-hour day with a 27/day median gives 10.8.
+
+Today's cards retain the actual total and full-day seven-day median and show
+“Typical by now.” Above 110% of that typical value, the total and upward arrow
+are green and the percentage says “ahead of pace.” Below 90%, they are red with
+a downward arrow and “behind pace.” From 90% through 110%, inclusive, the total
+and neutral arrow are white and say “On pace.” Classification and percentages
+use the unrounded typical value; Typical displays one decimal, and percentages
+at most one. An outside-band percentage that would round to 10% displays
+“>10%.” Every positive typical value qualifies, without a minimum count,
+elapsed-time floor or percentage cap. For example, 15 merges against a 27/day
+median after 10 hours of a 24-hour day uses 11.25 to show “Typical by now: 11.3”
+and “33.3% ahead of pace.”
+
+A zero typical value, missing daily data or partial current or baseline
+line-size coverage withholds the affected tile's arrow, percentage and
+directional color. Any read error in either report, including a stale-cache
+warning, withholds these for every Today cumulative tile. Known totals, Typical
+and median remain visible: zero Typical shows 0.0, an unknown baseline shows —,
+and partial current lines retain their count and coverage note beside the known
+baseline context.
+
+Pacing uses the existing baseline response's seven daily totals. Its comparison
+stays with the totals snapshot when history arrives, quota refreshes or the
+clock advances. Each paced value's keyboard-accessible tooltip gives the
+snapshot date, time and Settings timezone; the visible label stays “Typical by
+now.” Opening Analytics, choosing a day or organization, saving Settings and
+crossing midnight use the existing analytics reads to refresh the snapshot.
+Pacing adds no analytics or GitHub reads.
+
+Completed days retain the full-day comparison: activity increases are green,
+decreases red, and an unchanged value has a neutral arrow and 0%. A zero
+baseline uses an absolute change rather than division by zero. The weekly
+history lines and histograms remain unchanged.
 
 Time to merge and Time to first review compare the selected day's median
 with the median of the preceding seven days' observations and name the sample
 count. The selected day is excluded. Today is partial. A green downward arrow
-means faster; a red upward arrow means slower. Activity increases are green,
-decreases red. The colored arrow sits beside the value, with the matching
-percentage delta and baseline underneath. An unchanged value shows a neutral
-arrow and 0%; a zero baseline uses an absolute change rather than division
-by zero. Without observations, no directional claim is made.
+means faster; a red upward arrow means slower. The colored arrow sits beside
+the value, with the matching percentage delta and baseline underneath. An
+unchanged value shows a neutral arrow and 0%; a zero baseline uses an absolute
+change rather than division by zero. Without observations, no directional
+claim is made. Durations and per-PR metrics keep these existing comparisons
+without elapsed-day adjustment or the pacing tolerance.
 
 Per-PR comments and behaviors show selected-day medians and compare with
 the median across the preceding seven days' merged pull requests. Lines and
 time compare population medians. Agent merges compare shares, explicitly
 labelled “7-day share” because a binary merger's median would lose the share.
 An unreadable account withholds comparisons. A readable cache with a sync
-warning retains comparisons over its stored records; the warning is notified.
+warning retains the existing completed-day, duration and per-PR comparisons
+over its stored records; Today's cumulative pace is withheld. The warning is
+notified.
 
 ## The past year
 

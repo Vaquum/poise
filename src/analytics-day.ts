@@ -1,5 +1,11 @@
 import { effectiveTimezone, midnightInZone } from './config'
 
+/** Fraction elapsed between the actual calendar edges, including 23/25-hour days. */
+export function analyticsDayProgress(since: string, until: string, now = Date.now()): number {
+  const start = Date.parse(since)
+  return Math.max(0, Math.min(1, (now - start) / (Date.parse(until) - start)))
+}
+
 /** Calendar days in Settings' timezone, including the seven completed days before selection. */
 export function analyticsDay(offset: number, anchor = new Date()): { label: string, isToday: boolean, since: string, until: string, baselineSince: string } {
   const start = midnightInZone(offset, anchor)

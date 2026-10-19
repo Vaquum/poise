@@ -5,7 +5,7 @@ import { patchContent } from '../dom-patch'
 // pull request, each with a weekly line and distribution, then
 // live GitHub API quota. Independent of Current's filters.
 import { analyticsGroups, type AnalyticsGroup, type AnalyticsReport } from '../analytics-format'
-import { analyticsDay, analyticsDailyBounds, analyticsHistoryBounds } from '../analytics-day'
+import { analyticsDay, analyticsDayProgress, analyticsDailyBounds, analyticsHistoryBounds } from '../analytics-day'
 import { HISTORY_BASELINE, historyChart, histogram, historySeries, periodLabel, type AnalyticsHistory, type HistorySeries } from '../analytics-history'
 import { mountOrganizationFilter, organizationUrl } from '../organizations'
 import { effectiveTimezone } from '../config'
@@ -28,7 +28,7 @@ let historyGeneration = 0
 let quotaTimer: ReturnType<typeof setInterval> | undefined
 // The day on screen and the past year it is drawn with. The year arrives on
 // its own: until then each headline tile holds its chart's place.
-let shown: { report: AnalyticsReport, baseline: AnalyticsReport } | null = null
+let shown: { report: AnalyticsReport, baseline: AnalyticsReport, progress: number | undefined, snapshotTime: string | undefined } | null = null
 let history: { data: AnalyticsHistory | null, error: string } = { data: null, error: '' }
 // The period a chart's cursor rests on, by tile, while hovered or focused.
 const cursors = new Map<string, number>()
@@ -203,7 +203,7 @@ function groupMarkup(group: AnalyticsGroup): string {
         ${group.tiles.map((tile) => `
           <div class="analytics-tile">
             <dt class="analytics-label">${escapeHtml(tile.label)}</dt>
-            <dd class="analytics-summary ${tile.trend?.direction ?? 'neutral'}">
+            <dd class="analytics-summary ${tile.trend?.direction ?? 'neutral'}${tile.trend?.onPace ? ' on-pace' : ''}">
               <div class="analytics-value-row"><span class="analytics-value" data-help="${escapeHtml([measurementHelp[tile.label], tile.note].filter(Boolean).join(' '))}" tabindex="0">${escapeHtml(tile.value)}</span>${tile.trend ? `<span class="analytics-arrow" role="img" aria-label="${escapeHtml(tile.trend.description)}" data-help="${escapeHtml(tile.trend.caption)}" tabindex="0">${escapeHtml(tile.trend.text.slice(0, 1))}</span>` : ''}</div>
               <div class="analytics-trend">${tile.trend ? `<span class="analytics-delta" data-help="${escapeHtml(tile.trend.description)}" tabindex="0">${escapeHtml(tile.trend.text.slice(2))}</span>` : ''}<span class="analytics-note">${tile.comparison ? escapeHtml(tile.comparison) : ''}</span></div>
             </dd>
@@ -215,7 +215,7 @@ function groupMarkup(group: AnalyticsGroup): string {
 
 function render(): void {
   if (!shown) return
-  patchContent(viewEl.querySelector('.analytics-groups')!, analyticsGroups(shown.report, shown.baseline).map(groupMarkup).join(''))
+  patchContent(viewEl.querySelector('.analytics-groups')!, analyticsGroups(shown.report, shown.baseline, shown.progress, shown.snapshotTime).map(groupMarkup).join(''))
   for (const [label, index] of cursors) showCursor(label, index)
 }
 
@@ -352,6 +352,12 @@ async function readAnalytics(): Promise<void> {
   const groups = viewEl.querySelector<HTMLElement>('.analytics-groups')!
   const quota = viewEl.querySelector<HTMLElement>('.github-quota-section')!
   const day = analyticsDay(dayOffset, dayAnchor)
+  // Totals and typical-by-now must describe the same read, even on later renders.
+  const capturedAt = Date.now()
+  const progress = day.isToday ? analyticsDayProgress(day.since, day.until, capturedAt) : undefined
+  const snapshotTime = day.isToday ? new Intl.DateTimeFormat('en-GB', {
+    timeZone: effectiveTimezone(), day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+  }).format(capturedAt) : undefined
   shown = null
   void readHistory(analyticsHistoryBounds(dayOffset, dayAnchor))
   viewEl.querySelector('.analytics-date')!.textContent = day.label
@@ -377,7 +383,7 @@ async function readAnalytics(): Promise<void> {
       read(day.baselineSince, day.since, analyticsDailyBounds(dayOffset, dayAnchor)),
     ])
     if (generation !== readGeneration) return
-    shown = { report: data, baseline }
+    shown = { report: data, baseline, progress, snapshotTime }
     render()
     noticeFeed.reportReadErrors('analytics-day', [...accountFailures(data), ...accountFailures(baseline)])
   } catch (error) {

@@ -27,7 +27,7 @@ export interface AnalyticsTile {
   value: string
   /** A line under the value that says what it is made of. */
   note?: string
-  trend?: { direction: 'good' | 'bad' | 'neutral', text: string, description: string, caption: string }
+  trend?: { direction: 'good' | 'bad' | 'neutral', text: string, description: string, caption: string, onPace?: boolean }
   comparison?: string
 }
 
@@ -104,23 +104,48 @@ export function firstReviewTrend(current: number | null, baseline: number | null
   return metricTrend(current, baseline, { format: formatShortDuration, basis: 'median' })
 }
 
-export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsReport): AnalyticsGroup[] {
+function paceTrend(current: number | null, typical: number | null): AnalyticsTile['trend'] {
+  if (current === null || typical === null || typical === 0) return undefined
+  // Elapsed-day fractions can round an exact boundary just outside the band.
+  const ratio = current / typical
+  if (ratio >= 0.9 - Number.EPSILON && ratio <= 1.1 + Number.EPSILON) {
+    return { direction: 'neutral', text: '→ On pace', description: 'Within 10% of typical by now', caption: 'On pace · within 10% of typical by now', onPace: true }
+  }
+  const ahead = current > typical
+  const percent = Math.abs((current - typical) / typical * 100)
+  const rounded = percent.toLocaleString('en-US', { maximumFractionDigits: 1 })
+  const change = rounded === '10' ? '>10%' : `${rounded}%`
+  const description = `${change} ${ahead ? 'ahead of' : 'behind'} pace`
+  return {
+    direction: ahead ? 'good' : 'bad', text: `${ahead ? '↑' : '↓'} ${description}`,
+    description: `${description} versus the preceding 7-day daily median, adjusted for elapsed day`,
+    caption: `${ahead ? 'Ahead of' : 'Behind'} pace · typical by now`,
+  }
+}
+
+export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsReport, dayProgress?: number, snapshotTime?: string): AnalyticsGroup[] {
   const pr = report.pullRequests
   const { lines, behaviors } = pr
   const none = pr.merged === 0
   const complete = ![...report.errors, ...baseline.errors].some((error) => !error.stale)
+  const countsComplete = dayProgress === undefined ? complete : report.errors.length === 0 && baseline.errors.length === 0
+  const paceNote = dayProgress !== undefined && snapshotTime ? `Pace as of ${snapshotTime}, when totals were read.` : undefined
   const dailyMedian = (value: (day: NonNullable<AnalyticsReport['daily']>[number]) => number | null): number | null => {
     if (baseline.daily?.length !== 7) return null
     const values = baseline.daily.map(value)
     if (values.some((n) => n === null)) return null
     return values.filter((n): n is number => n !== null).sort((a, b) => a - b)[3]
   }
-  const dailyCount = (label: string, current: number | null, previous: number | null): AnalyticsTile => ({
-    label,
-    value: current === null ? UNKNOWN : formatCount(current),
-    trend: complete ? metricTrend(current, previous) : undefined,
-    comparison: `7-day median: ${formatRate(previous)} / day`,
-  })
+  const dailyCount = (label: string, current: number | null, previous: number | null): AnalyticsTile => {
+    const typical = previous === null || dayProgress === undefined ? null : previous * dayProgress
+    return {
+      label,
+      value: current === null ? UNKNOWN : formatCount(current),
+      note: paceNote,
+      trend: !countsComplete ? undefined : dayProgress === undefined ? metricTrend(current, previous) : paceTrend(current, typical),
+      comparison: `${dayProgress === undefined ? '' : `Typical by now: ${formatRate(typical)} · `}7-day median: ${formatRate(previous)} / day`,
+    }
+  }
 
   // Zero merged pull requests changed zero lines; merged ones nobody has
   // sized yet changed an unknown number.
@@ -146,7 +171,7 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
         dailyCount('Pull requests merged', pr.merged, dailyMedian((day) => day.pullRequests.merged)),
         dailyCount('Closed without merging', pr.closedUnmerged, dailyMedian((day) => day.pullRequests.closedUnmerged)),
         { ...dailyCount('Lines changed', none ? 0 : lines.total, dailyMedian(({ pullRequests: day }) => day.merged === 0 ? 0 : day.lines.counted < day.merged ? null : day.lines.total)), value: linesTotal,
-          ...(lines.counted < pr.merged ? { trend: undefined } : {}), note: linesNote,
+          ...(lines.counted < pr.merged ? { trend: undefined } : {}), note: [paceNote, linesNote].filter(Boolean).join(' ') || undefined,
         },
         {
           label: 'Time to first review', value: formatShortDuration(pr.firstReview.medianMs),

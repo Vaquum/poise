@@ -1007,6 +1007,7 @@ tr:hover .review-btn { opacity: 1; }
 .analytics-summary.good { color: var(--green); }
 .analytics-summary.bad { color: var(--red); }
 .analytics-summary.neutral { color: var(--text-secondary); }
+.analytics-summary.on-pace { color: var(--text); }
 .analytics-value-row { display: flex; align-items: baseline; gap: var(--sp-2); }
 .analytics-summary .analytics-value { color: inherit; }
 .analytics-summary.neutral .analytics-value { color: var(--text); }
