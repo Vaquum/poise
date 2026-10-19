@@ -1,6 +1,8 @@
 import { noticeEvidence, behaviorEvidence } from './notification-evidence'
 import { startLogging, stopLogging } from './logging'
 import { localLogging, stopLoggingApi } from './logging-api'
+import { startBehaviorLedger, stopBehaviorLedger } from './behavior-ledger'
+import { handleBehaviorLedger } from './behavior-ledger-http'
 import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
 import type { ServerResponse } from 'node:http'
@@ -139,6 +141,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   const service = serviceOf(opts)
   if (service) applyServiceEnvironment()
   startLogging()
+  void startBehaviorLedger()
   const auth = opts.claudeAuth ?? claudeAuth
   if (!activeClaudeAuthRuntimes.has(auth)) activeClaudeAuthRuntimes.set(auth, auth.onStatus(claudeAuthStatusChanged))
   auth.start()
@@ -224,6 +227,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   dailyModelRefresh = null
   linkApi = null
   await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
+  await stopBehaviorLedger()
   await stopLoggingApi()
   await stopLogging()
 }
@@ -272,6 +276,9 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           authority = enforceApiRequest(req, { allowedHosts: opts.allowedHosts, service })
         } catch (err) {
           return json(res, httpStatus(err, 403), { error: (err as Error).message })
+        }
+        if (path === '/api/behavior-ledger' || path.startsWith('/api/behavior-ledger/')) {
+          return handleBehaviorLedger(req, res, url)
         }
         if (path === '/api/logging' || path.startsWith('/api/logging/')) {
           if (service) return json(res, 404, { error: 'logging_not_available_here', message: 'Use the gateway Logging API for environment history.' })

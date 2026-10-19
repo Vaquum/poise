@@ -1,0 +1,83 @@
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { readBehaviorLedger } from './behavior-ledger'
+import { LEDGER_RESPONSE_BYTES, type LedgerRead, type LedgerReply } from './behavior-ledger-contract'
+
+const PREFIX = '/api/behavior-ledger'
+const ID = /^[a-f0-9]{64}$/
+const MAX_CURSOR_LENGTH = 2048
+
+class InvalidRead extends Error {
+  constructor(readonly status: number, readonly code: string) { super(code) }
+}
+
+function identifier(value: string): string {
+  if (!ID.test(value)) throw new InvalidRead(400, 'invalid_id')
+  return value
+}
+
+function cursor(value: string): string {
+  if (!value || value.length > MAX_CURSOR_LENGTH) throw new InvalidRead(400, 'invalid_cursor')
+  return value
+}
+
+/** Strictly bounded selectors; no evidence resolution or execution operations. */
+export function parseBehaviorLedgerRead(target: string): LedgerRead {
+  const url = new URL(target, 'http://ledger.invalid')
+  if (target.split('?')[0] !== url.pathname) throw new InvalidRead(404, 'not_found')
+  const path = url.pathname
+  const operation = path === PREFIX ? 'list'
+    : path === `${PREFIX}/changes` ? 'changes'
+      : path === `${PREFIX}/health` ? 'health' : 'get'
+  if (operation === 'get' && (!path.startsWith(`${PREFIX}/`) || path.slice(PREFIX.length + 1).includes('/'))) {
+    throw new InvalidRead(404, 'not_found')
+  }
+  const permitted = operation === 'list' ? ['limit', 'cursor', 'parent']
+    : operation === 'changes' ? ['limit', 'cursor'] : []
+  for (const key of url.searchParams.keys()) {
+    if (!permitted.includes(key) || url.searchParams.getAll(key).length !== 1) throw new InvalidRead(400, 'invalid_query')
+  }
+  const rawLimit = url.searchParams.get('limit')
+  if (rawLimit !== null && (!/^[1-9]\d{0,2}$/.test(rawLimit) || Number(rawLimit) > 100)) {
+    throw new InvalidRead(400, 'invalid_query')
+  }
+  const limit = rawLimit === null ? undefined : Number(rawLimit)
+  const rawCursor = url.searchParams.get('cursor')
+  const continuation = rawCursor === null ? undefined : cursor(rawCursor)
+  if (operation === 'health') return { operation }
+  if (operation === 'get') return { operation, id: identifier(path.slice(PREFIX.length + 1)) }
+  if (operation === 'changes') {
+    if (!continuation) throw new InvalidRead(400, 'invalid_cursor')
+    return { operation, cursor: continuation, ...(limit === undefined ? {} : { limit }) }
+  }
+  const parent = url.searchParams.get('parent')
+  return { operation, ...(limit === undefined ? {} : { limit }), ...(continuation === undefined ? {} : { cursor: continuation }),
+    ...(parent === null ? {} : { parent: identifier(parent) }) }
+}
+
+function send(res: ServerResponse, status: number, body: LedgerReply): void {
+  let text = JSON.stringify(body)
+  if (Buffer.byteLength(text) > LEDGER_RESPONSE_BYTES) {
+    status = 503
+    text = JSON.stringify({ version: 1, health: body.health, error: 'response_too_large' })
+  }
+  res.statusCode = status
+  res.setHeader('Content-Type', 'application/json')
+  if (status === 429) res.setHeader('Retry-After', '1')
+  if (status === 405) res.setHeader('Allow', 'GET')
+  res.end(text)
+}
+
+/** Called only after the current workspace/local request guards succeed. */
+export async function handleBehaviorLedger(req: IncomingMessage, res: ServerResponse, target: string): Promise<void> {
+  let request: LedgerRead
+  try {
+    if (req.method !== 'GET') throw new InvalidRead(405, 'method_not_allowed')
+    request = parseBehaviorLedgerRead(target)
+  } catch (error) {
+    if (!(error instanceof InvalidRead)) throw error
+    const { body } = await readBehaviorLedger({ operation: 'health' })
+    return send(res, error.status, { version: 1, health: body.health, error: error.code })
+  }
+  const { status, body } = await readBehaviorLedger(request)
+  send(res, status, body)
+}

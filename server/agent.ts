@@ -1,4 +1,5 @@
 import { prepareModelClis } from './provider-clis'
+import { captureBehaviorAdmission, captureBehaviorOutcome, observeAgentSnapshot } from './behavior-ledger'
 import { parseProcessDiagnostic, type ProcessDiagnostic } from './process-diagnostic'
 // Bridge to the local `agent-interface` CLI for Swarm's data source.
 //
@@ -242,7 +243,9 @@ export async function fetchAgentLogSnapshot(
     try { entries.push(validateLogEntry(value, index)) }
     catch (error) { quarantined.push(quarantineLogEntry(value, index, error)) }
   })
-  return { entries: entries.reverse(), quarantined }
+  const snapshot = { entries: entries.reverse(), quarantined }
+  observeAgentSnapshot(snapshot)
+  return snapshot
 }
 
 function validateLogEntry(value: unknown, index: number): LogEntry {
@@ -445,7 +448,10 @@ export async function triggerPrReview(
 
   if (claude) await claudeAuth.requireReady()
   if ((await reviewChoice('pr_review')).model !== model) throw new Error('Review model changed; retry the request')
-  await spawnDetached(CLI, [
+  captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
+    behavior: 'review-new-prs', source, owner, actor, repository: repoFullName,
+    number: Number(num), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+  try { await spawnDetached(CLI, [
     '--pr-review',
     `#${num}`,
     '--model',
@@ -466,7 +472,10 @@ export async function triggerPrReview(
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
-  })
+  }) } catch (error) {
+    captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
+    throw error
+  }
   return { ok: true, source, correlationId }
 }
 
@@ -519,7 +528,10 @@ export async function replayAgentJob(input: {
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
   if ((await reviewChoice(place)).model !== model) throw new Error('Review model changed; retry the request')
-  await spawnDetached(CLI, [
+  captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
+    behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
+    repository: repo, number: Number(prId), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+  try { await spawnDetached(CLI, [
     flag,
     `#${prId}`,
     '--model',
@@ -540,7 +552,10 @@ export async function replayAgentJob(input: {
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
-  })
+  }) } catch (error) {
+    captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
+    throw error
+  }
   return { ok: true, source, correlationId }
 }
 
@@ -557,7 +572,10 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
   if ((await reviewChoice('issue_review')).model !== model) throw new Error('Review model changed; retry the request')
-  await spawnDetached(CLI, [
+  captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
+    behavior: 'review-new-issues', source, owner: repo.split('/')[0], actor,
+    repository: repo, number: Number(issue), head: null, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+  try { await spawnDetached(CLI, [
     '--issue-review',
     `${repo}#${issue}`,
     '--model',
@@ -574,6 +592,9 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
-  })
+  }) } catch (error) {
+    captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
+    throw error
+  }
   return { ok: true, source, correlationId }
 }

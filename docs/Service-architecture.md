@@ -762,3 +762,13 @@ Logging read worker and its admission/deadline limits; it creates no diagnostic
 occurrences and cannot delay raising an alert. Pending/unavailable associations
 preserve the primary condition and action. No new route, ingest endpoint, target
 variant or scope is introduced. See [Logging](Logging.md#notification-evidence).
+
+## Workspace behavior observation
+
+The [Behavior ledger](Behavior-ledger.md) adds guarded, read-only
+`/api/behavior-ledger` routes and a loopback CLI within each workspace. A separate
+bounded worker/store captures existing behavior events and Caller snapshots;
+no new Caller reads, gateway scope, public machine credential or proxy delivery
+is introduced. It shares the current workspace owner/operator boundary and
+cannot influence execution. Concrete pilot deployment remains outside this
+package contract.

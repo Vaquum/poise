@@ -18,3 +18,13 @@ await build({
   entryPoints: ['gateway/src/diagnostics/query-worker.ts'], bundle: true, platform: 'node',
   format: 'esm', packages: 'external', outfile: 'dist/query-worker.js', logLevel: 'info',
 })
+
+await build({
+  entryPoints: ['server/behavior-ledger-cli.ts'], bundle: true, platform: 'node',
+  format: 'esm', packages: 'external', outfile: 'dist/behavior-ledger.js', logLevel: 'info',
+})
+
+await build({
+  entryPoints: ['server/behavior-ledger-worker.ts'], bundle: true, platform: 'node',
+  format: 'esm', packages: 'external', outfile: 'dist/behavior-ledger-worker.js', logLevel: 'info',
+})

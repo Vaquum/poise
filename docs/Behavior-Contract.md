@@ -267,3 +267,12 @@ existing capture path. Read-time joins require exact source, owner, target and
 material cause; absent preparation or Caller evidence is never replaced by a
 sibling PR attempt. These references change neither retry ownership nor attempt
 accounting. [Logging](Logging.md#notification-evidence) defines the read boundary.
+
+## Read-only firing ledger
+
+The [Behavior ledger](Behavior-ledger.md) exposes compact per-firing metadata,
+child attempts, native evidence references and a resumable change feed. It
+observes the existing six Behaviors through nonblocking hooks and existing
+Caller snapshots. Its separate worker/store cannot change behavior decisions,
+claims, retries, metrics or launch arguments. Missing or stale evidence stays
+explicitly unknown; capture loss is visible in independent health metadata.

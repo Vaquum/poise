@@ -5,7 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RunFileOptions } from '../server/process'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
 
-const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn() }))
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn(),
+  captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn() }))
+vi.mock('../server/behavior-ledger', () => ({
+  captureBehaviorAdmission: mocks.captureAdmission, captureBehaviorOutcome: mocks.captureOutcome,
+  observeAgentSnapshot: mocks.observeSnapshot, behaviorLedgerHeartbeat: vi.fn(),
+}))
+
 vi.mock('../server/process', async (original) => ({
   ...await original<typeof import('../server/process')>(),
   runFile: mocks.runFile, spawnDetached: mocks.spawnDetached,
@@ -61,6 +67,7 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
 }
 
 beforeEach(async () => {
+  mocks.captureAdmission.mockClear(); mocks.captureOutcome.mockClear(); mocks.observeSnapshot.mockClear()
   root = await mkdtemp(join(tmpdir(), 'poise-merge-'))
   process.env.POISE_DB = join(root, 'cache.db')
   pulls = [pull()]
@@ -111,6 +118,12 @@ describe('Merge Pull Requests', () => {
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
     expect(db.db.prepare('SELECT behavior, status FROM behavior_runs').all()).toEqual([{ behavior: 'merge-prs', status: 'completed' }])
+    expect(mocks.captureAdmission).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      behavior: 'merge-prs', repository: REPO, number: 7, head: HEAD,
+    }))
+    expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      nativeId: mocks.captureAdmission.mock.calls[0][0].nativeId, state: 'completed', outcome: 'merged',
+    }))
     const first = runtime.getMergePrsLastFired()
     db.closeDatabase(); vi.resetModules()
     db = await import('../server/db'); runtime = await import('../server/behaviors')
@@ -124,6 +137,9 @@ describe('Merge Pull Requests', () => {
     expect(mergeCalls()).toHaveLength(1)
     expect(runtime.getMergePrsLastFired()).toBeNull()
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+    expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      state: value === 'superseded' ? 'superseded' : 'completed', outcome: value,
+    }))
   })
   it('filters drafts, foreign authors and skipped repositories before reading or locking them', async () => {
     enable()

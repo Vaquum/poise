@@ -5,11 +5,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CATALOG_STDOUT, PRE_ISSUE_REVIEW_CATALOG } from './model-catalog-fixture'
 
 const mocks = vi.hoisted(() => ({
+  captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
   runFile: vi.fn(),
   spawnDetached: vi.fn(),
   authStatus: 'authenticated',
   requireAuth: vi.fn(),
   observeAuthFailure: vi.fn(),
+}))
+
+vi.mock('../server/behavior-ledger', () => ({
+  captureBehaviorAdmission: mocks.captureAdmission, captureBehaviorOutcome: mocks.captureOutcome,
+  observeAgentSnapshot: mocks.observeSnapshot, behaviorLedgerHeartbeat: vi.fn(),
 }))
 
 vi.mock('../server/process', () => ({
@@ -179,6 +185,7 @@ function skipBackoff(): void {
 }
 
 beforeEach(async () => {
+  mocks.captureAdmission.mockClear(); mocks.captureOutcome.mockClear(); mocks.observeSnapshot.mockClear()
   tempRoot = await mkdtemp(join(tmpdir(), 'poise-issue-review-test-'))
   mocks.runFile.mockReset()
   mocks.spawnDetached.mockReset()
@@ -206,6 +213,22 @@ afterEach(async () => {
 })
 
 describe('Review New Issues', () => {
+  it('keeps configured applicable siblings in admission provenance during temporary sign-out', async () => {
+    const { behaviors } = await start({ reviewers: 2 })
+    issues = [issue(452)]
+    mocks.authStatus = 'reauth_required'
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(1)
+    const admitted = mocks.captureAdmission.mock.calls[0][0]
+    expect(admitted).toMatchObject({ slot: 'secondary', plannedSlots: ['primary', 'secondary'] })
+    mocks.authStatus = 'authenticated'
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(2)
+    expect(mocks.captureAdmission.mock.calls[1][0]).toMatchObject({
+      admissionKey: admitted.admissionKey, slot: 'primary', plannedSlots: ['primary', 'secondary'],
+    })
+  })
+
   it('shares issue preferences while each account reads and launches only its own selected repositories', async () => {
     const betaRepo = 'beta/Origo'
     const since = ago(60 * MINUTE)
@@ -261,6 +284,11 @@ describe('Review New Issues', () => {
     expect(flag(secondary, '--model')).toBe('gpt-6-astra-ultra')
     expect(mocks.spawnDetached.mock.calls[0][0]).toBe('agent-interface')
     expect(primary).not.toContain('--expected-head')
+    const admissions = mocks.captureAdmission.mock.calls.map(([admission]) => admission)
+    expect(admissions).toHaveLength(2)
+    expect(new Set(admissions.map(({ admissionKey }) => admissionKey)).size).toBe(1)
+    expect(admissions.map(({ slot }) => slot)).toEqual(['primary', 'secondary'])
+    expect(admissions.every(({ head, plannedSlots }) => head === null && plannedSlots.join(',') === 'primary,secondary')).toBe(true)
 
     const claims = database.listBehaviorLaunchClaims(KEY)
     expect(claims.map((claim) => claim.target).sort()).toEqual([`${REPO}#452`, `${REPO}#452:secondary`])

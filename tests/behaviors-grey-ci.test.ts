@@ -5,7 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RunFileOptions } from '../server/process'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
 
-const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn() }))
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn(),
+  captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn() }))
+vi.mock('../server/behavior-ledger', () => ({
+  captureBehaviorAdmission: mocks.captureAdmission, captureBehaviorOutcome: mocks.captureOutcome,
+  observeAgentSnapshot: mocks.observeSnapshot, behaviorLedgerHeartbeat: vi.fn(),
+}))
+
 vi.mock('../server/process', async (original) => ({
   ...await original<typeof import('../server/process')>(),
   runFile: mocks.runFile, spawnDetached: mocks.spawnDetached,
@@ -67,6 +73,7 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
 }
 
 beforeEach(async () => {
+  mocks.captureAdmission.mockClear(); mocks.captureOutcome.mockClear(); mocks.observeSnapshot.mockClear()
   root = await mkdtemp(join(tmpdir(), 'poise-merge-'))
   process.env.POISE_DB = join(root, 'cache.db')
   pulls = [pull()]
@@ -116,6 +123,13 @@ describe('Rerun Grey CI', () => {
     expect(runtime.getGreyCiLastFired()).toEqual({ at: expect.any(String), target: `${REPO}#7`, url: `https://github.com/${REPO}/actions/runs/100` })
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
     expect(db.db.prepare('SELECT behavior, status FROM behavior_runs').all()).toEqual([{ behavior: 'rerun-grey-ci', status: 'completed' }])
+    expect(mocks.captureAdmission).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      behavior: 'rerun-grey-ci', repository: REPO, number: 7, head: HEAD,
+      workflow: { id: 70, runId: 100, attempt: 2, event: 'pull_request_review' },
+    }))
+    expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      nativeId: mocks.captureAdmission.mock.calls[0][0].nativeId, state: 'completed', outcome: 'rerun_requested',
+    }))
     db.closeDatabase(); vi.resetModules(); db = await import('../server/db'); runtime = await import('../server/behaviors')
     expect(runtime.getEnabledMap()['rerun-grey-ci']).toBe(true)
     await runtime.runEnabledBehaviorsOnce()

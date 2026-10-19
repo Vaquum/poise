@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
+  captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
   runFile: vi.fn(),
   models: {} as Record<string, { default: string, fallback: string }>,
   agentAccount: 'bit-mis',
@@ -14,6 +15,11 @@ vi.mock('../server/settings', () => ({
     if (!mocks.agentAccount) throw new Error('No agent account is set. Set it in Settings → GitHub: it is the GitHub user your reviews and comments are posted as.')
     return mocks.agentAccount
   },
+}))
+
+vi.mock('../server/behavior-ledger', () => ({
+  captureBehaviorAdmission: mocks.captureAdmission, captureBehaviorOutcome: mocks.captureOutcome,
+  observeAgentSnapshot: mocks.observeSnapshot, behaviorLedgerHeartbeat: vi.fn(),
 }))
 
 vi.mock('../server/process', () => ({
@@ -62,8 +68,21 @@ function logRow(overrides: Record<string, unknown> = {}): Record<string, unknown
   }
 }
 
+beforeEach(() => {
+  mocks.captureAdmission.mockClear(); mocks.captureOutcome.mockClear(); mocks.observeSnapshot.mockClear()
+})
+
 describe('agent log compatibility', () => {
   beforeEach(() => mocks.runFile.mockReset())
+
+  it('projects an existing validated snapshot without another Caller read', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    const snapshot = await fetchAgentLogSnapshot()
+    expect(mocks.observeSnapshot).toHaveBeenCalledExactlyOnceWith(snapshot)
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs'])
+    expect(mocks.captureAdmission).not.toHaveBeenCalled()
+  })
 
   // Fields agent-interface added over time — expected_head, source,
   // correlation_id, action — are simply absent from rows written before them.
@@ -358,6 +377,26 @@ describe('manual review model selection', () => {
       expect(args).toEqual(expect.arrayContaining(['--model', 'opus-5-xhigh', '--recovery-model', 'gpt-6-astra-ultra', '--actor', 'bit-mis', '--expected-head', 'a'.repeat(40)]))
     }
     expect(claudeAuth.requireReady).toHaveBeenCalledTimes(4)
+    const admissions = mocks.captureAdmission.mock.calls.map(([admission]) => admission)
+    expect(admissions).toMatchObject([
+      { behavior: 'review-new-prs', source: 'poise:manual-review', repository: 'o/r', number: 12 },
+      { behavior: 'approve-prs', source: 'poise:replay', repository: 'o/r', number: 12 },
+    ])
+    expect(new Set(admissions.map(({ admissionKey }) => admissionKey)).size).toBe(2)
+    for (const admission of admissions) expect(admission.admissionKey).toBe(admission.nativeId)
+  })
+
+  it('records a rejected spawn and preserves its exact error', async () => {
+    const { triggerPrReview } = await import('../server/agent')
+    const { spawnDetached } = await import('../server/process')
+    const failure = new Error('spawn rejected')
+    vi.mocked(spawnDetached).mockRejectedValueOnce(failure)
+    await expect(triggerPrReview('https://github.com/o/r/pull/12')).rejects.toBe(failure)
+    expect(mocks.captureAdmission).toHaveBeenCalledOnce()
+    expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith({
+      nativeId: mocks.captureAdmission.mock.calls[0][0].nativeId,
+      state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed',
+    })
   })
 
   it('launches the chosen default and fallback, and skips the Claude gate for Codex', async () => {

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
+import type { LedgerAdmission, LedgerResult } from '../server/behavior-ledger-contract'
 
 // Reading Caller's local model catalog is not external work: no GitHub call,
 // no launch. The pause assertions below ignore it.
@@ -11,12 +12,18 @@ function externalCalls(): unknown[][] {
 }
 
 const mocks = vi.hoisted(() => ({
+  captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
   runFile: vi.fn(),
   spawnDetached: vi.fn(),
   authStatus: 'authenticated',
   requireAuth: vi.fn(),
   observeAuthFailure: vi.fn(),
   lockContention: false,
+}))
+
+vi.mock('../server/behavior-ledger', () => ({
+  captureBehaviorAdmission: mocks.captureAdmission, captureBehaviorOutcome: mocks.captureOutcome,
+  observeAgentSnapshot: mocks.observeSnapshot, behaviorLedgerHeartbeat: vi.fn(),
 }))
 
 vi.mock('../server/process', () => ({
@@ -460,6 +467,7 @@ async function launchApprovalBeforeCrash() {
 }
 
 beforeEach(async () => {
+  mocks.captureAdmission.mockReset(); mocks.captureOutcome.mockReset(); mocks.observeSnapshot.mockReset()
   tempRoot = await mkdtemp(join(tmpdir(), 'poise-behavior-test-'))
   mocks.runFile.mockReset()
   mocks.spawnDetached.mockReset()
@@ -761,6 +769,10 @@ describe('behavior launch claims', () => {
     ]))
     expect(db.hasSeen('approve-prs',
       `${pr.repo}#17@req=2026-07-10T10:00:00Z/r=2/head=${HEAD_SHA}`)).toBe(true)
+    expect(mocks.captureAdmission).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      behavior: 'approve-prs', nativeId: expect.any(String), plannedSlots: ['primary'],
+      admissionKey: JSON.stringify(['Vaquum', 'approve-prs', `${pr.repo}#17@req=2026-07-10T10:00:00Z/r=2/head=${HEAD_SHA}`]),
+    }))
     expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--approve-pr')).toBe(false)
   })
 
@@ -1405,6 +1417,61 @@ describe('behavior launch claims', () => {
     expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--resolve-nonblocking-conversations-if-ready')).toHaveLength(3)
     expect(db.db.prepare('SELECT * FROM behavior_runs').all()).toEqual([])
     expect(runtime.getResolveUnblockingLastFired()).toBeNull()
+    expect(mocks.captureAdmission).toHaveBeenCalledTimes(3)
+    expect(new Set(mocks.captureAdmission.mock.calls.map(([admission]) => admission.nativeId)).size).toBe(3)
+    expect(mocks.captureOutcome.mock.calls.map(([result]) => result)).toEqual(Array.from({ length: 3 }, () => expect.objectContaining({
+      state: 'completed', outcome: 'waiting', activity: 'settled',
+    })))
+  })
+
+  it.each(['absent', 'healthy', 'failed'] as const)('preserves resolution execution with %s real ledger capture', async (mode) => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, resolveUnresolvedCount: 1 })
+    const { database: db, behaviors: runtime } = await loadModules()
+    const { BehaviorLedgerObserver } = await vi.importActual<typeof import('../server/behavior-ledger')>('../server/behavior-ledger')
+    const observer = mode === 'absent' ? null : new BehaviorLedgerObserver({ path: mode === 'failed'
+      ? join(tempRoot, 'cache.db', 'behavior-ledger.db') : join(tempRoot, 'behavior-ledger.db') })
+    try {
+      if (observer) {
+        await observer.start()
+        mocks.captureAdmission.mockImplementation((input: Omit<LedgerAdmission, 'type'>) => observer.capture({ ...input, type: 'admit' }))
+        mocks.captureOutcome.mockImplementation((input: Omit<LedgerResult, 'type'>) => observer.capture({ ...input, type: 'result' }))
+      }
+      db.setMeta('me', 'poise-user')
+      db.setMeta('behavior_resolve_unblocking_enabled', '1')
+      await runtime.runEnabledBehaviorsOnce()
+
+      expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--resolve-nonblocking-conversations-if-ready')
+        .map(([command, args]) => [command, args])).toEqual([['github-interface', [
+        '--resolve-nonblocking-conversations-if-ready', '#17', '--username', 'review-bot',
+        '--expected-head', HEAD_SHA, '--token-user', 'review-bot',
+      ]]])
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+      expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs')).toEqual([])
+      expect(db.db.prepare('SELECT * FROM behavior_runs').all()).toEqual([])
+      expect(db.db.prepare('SELECT key, target FROM behavior_seen').all()).toEqual([])
+      expect(db.db.prepare("SELECT key FROM meta WHERE key LIKE 'behavior_%_failure%' AND value <> ''").all()).toEqual([])
+      const { readBehaviorMetrics } = await import('../server/behavior-metrics')
+      expect(readBehaviorMetrics([], { since: null, until: null }, null).behaviors['resolve-unblocking'])
+        .toEqual({ totalRuns: 0, durationMinutes: 0, successRate: null })
+
+      if (observer) {
+        const reply = await observer.read({ operation: 'list' })
+        if (mode === 'healthy') {
+          expect(reply.status).toBe(200)
+          expect(reply.body.records).toEqual(expect.arrayContaining([
+            expect.objectContaining({ kind: 'firing', behavior: 'resolve-unblocking', state: 'completed', outcome: 'waiting' }),
+            expect.objectContaining({ kind: 'attempt', head: HEAD_SHA, state: 'completed', activity: 'settled' }),
+          ]))
+        } else {
+          expect(reply.status).toBe(503)
+          expect(reply.body.health.status).toBe('unavailable')
+          expect(reply.body.health.dropped).toBeGreaterThan(0)
+          expect(reply.body.records).toBeUndefined()
+        }
+      }
+    } finally {
+      await observer?.stop()
+    }
   })
 
   it.each([
@@ -2432,6 +2499,11 @@ describe('behavior launch claims', () => {
     const launches = mocks.spawnDetached.mock.calls.map((call) => call[1] as string[])
     expect(launches.map((args) => args[args.indexOf('--model') + 1]).sort()).toEqual(['gpt-6-astra-ultra', 'grok-4.6-xhigh', 'opus-5-xhigh'])
     expect(new Set(launches.map((args) => args[args.indexOf('--correlation-id') + 1])).size).toBe(3)
+    const admissions = mocks.captureAdmission.mock.calls.map(([admission]) => admission)
+    expect(admissions).toHaveLength(3)
+    expect(new Set(admissions.map(({ admissionKey }) => admissionKey)).size).toBe(1)
+    expect(new Set(admissions.map(({ nativeId }) => nativeId)).size).toBe(3)
+    expect(admissions.every(({ plannedSlots }) => plannedSlots.join(',') === 'primary,secondary,tertiary')).toBe(true)
     for (const args of launches) {
       expect(args).toEqual(expect.arrayContaining(['--pr-review', `#${pr.number}`, '--expected-head', HEAD_SHA, '--source', 'poise:review-new-prs']))
     }
@@ -3274,6 +3346,9 @@ describe('behavior launch claims', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
     expect(db.listBehaviorDeadLetters()).toEqual([])
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: launched.correlationId, state: 'superseded', stateSource: 'native',
+    }))
   })
 
   it('waits through bounded registration grace before retrying a missing call', async () => {
@@ -3400,6 +3475,35 @@ describe('behavior launch claims', () => {
 
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     expect(mocks.spawnDetached.mock.calls[0][1]).toContain(`#${pr.number}`)
+  })
+
+  it.each(['review-new-prs', 'approve-prs'] as const)('settles admitted %s work when operation ownership is lost before spawn', async (behavior) => {
+    arrangeCli(behavior === 'approve-prs')
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta(`behavior_${behavior.replace(/-/g, '_')}_enabled`, '1')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+    const base = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
+      const result = await base(command, args, options)
+      if (command === 'github-interface' && args[0] === '--head-sha') {
+        db.db.prepare("DELETE FROM behavior_seen WHERE key = 'pr-operation'").run()
+      }
+      return result
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.listBehaviorLaunchClaims(behavior)).toEqual([])
+    expect(mocks.captureAdmission).toHaveBeenCalledOnce()
+    expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      nativeId: mocks.captureAdmission.mock.calls[0][0].nativeId,
+      state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'preflight_failed',
+    }))
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
+      error: expect.stringContaining('operation ownership was lost'),
+    }))
   })
 
   // The enabled flag is re-read immediately before the head-SHA lookup, but

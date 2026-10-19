@@ -1,4 +1,5 @@
 import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-context'
+import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
 import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun } from './behavior-metrics'
@@ -755,21 +756,32 @@ function markLaunchIntent(
   claimId: string,
   expectedHead: string,
   actor: string,
+  slot: ReviewerSlot = 'primary',
+  plannedSlots: ReviewerSlot[] = ['primary'],
 ): boolean {
-  const source = `poise:${behavior}`
-  return markBehaviorLaunchIntentOwned({
+  const source = `poise:${behavior}` as const
+  const startedAt = new Date().toISOString()
+  const admitted = markBehaviorLaunchIntentOwned({
     key: behavior,
     target,
     claimId,
     launchBehavior: upstreamBehavior(behavior),
     repo: pr.repo,
     pr: pr.number,
-    requestedAt: new Date().toISOString(),
+    requestedAt: startedAt,
     expectedHead,
     actor,
     source,
     correlationId: claimId,
   })
+  if (admitted) captureBehaviorAdmission({
+    admissionKey: behavior === 'review-new-prs'
+      ? scopedMetaKey(`${META_PREFIX}review_new_prs_panel:${pr.repo}#${pr.number}`)
+      : JSON.stringify([currentOrganization()?.login ?? null, behavior, target]),
+    nativeId: claimId, behavior, source, owner: currentOrganization()?.login ?? null,
+    actor, repository: pr.repo, number: pr.number, head: expectedHead, slot, plannedSlots, startedAt,
+  })
+  return admitted
 }
 
 function retainClaimSafely(claim: BehaviorLaunchClaim, error: string): void {
@@ -790,9 +802,12 @@ function completeClaimSafely(claim: BehaviorLaunchClaim, error: string | null = 
   return completed
 }
 
-function deadLetterClaim(claim: BehaviorLaunchClaim, error: string): boolean {
+function deadLetterClaim(claim: BehaviorLaunchClaim, error: string, observe = true): boolean {
   recordBehaviorDeadLetter(claim, error)
-  return completeClaimSafely(claim, error)
+  const completed = completeClaimSafely(claim, error)
+  if (completed && observe) captureBehaviorOutcome({ nativeId: claim.launchCorrelationId,
+    state: 'held', activity: 'unknown', stateSource: 'native', callId: claim.launchCallId ?? undefined })
+  return completed
 }
 
 function recordQuarantineIncident(claim: BehaviorLaunchClaim, error: string, callId: string | null): void {
@@ -826,14 +841,17 @@ function quarantineClaim(
   callId: string | null = claim.launchCallId,
   mayRun = true,
 ): void {
-  db.transaction(() => {
-    if (!quarantineBehaviorLaunchOwned(claim.key, claim.target, claim.claimId, kind, error, mayRun)) return
+  const changed = db.transaction(() => {
+    if (!quarantineBehaviorLaunchOwned(claim.key, claim.target, claim.claimId, kind, error, mayRun)) return false
     if (kind === 'invalid_result' && !claim.launchCallId && callId) {
       linkBehaviorLaunchCallOwned(claim.key, claim.target, claim.claimId, callId)
     }
     recordQuarantineIncident(claim, error, callId)
     clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
+    return true
   })()
+  if (changed) captureBehaviorOutcome({ nativeId: claim.launchCorrelationId,
+    state: kind === 'invalid_result' ? 'held' : 'unknown', activity: 'unknown', stateSource: 'native', callId: callId ?? undefined })
   retainClaimSafely({ ...claim, launchQuarantine: kind }, error)
 }
 
@@ -927,7 +945,7 @@ function quarantineFailedClaim(
   error: string,
   mayRun = false,
 ): void {
-  db.transaction(() => {
+  const changed = db.transaction(() => {
     const changed = db.prepare(`
       UPDATE behavior_seen
       SET launch_quarantine_may_run = CASE WHEN launch_quarantine IS NULL THEN ? ELSE MAX(launch_quarantine_may_run, ?) END,
@@ -940,7 +958,11 @@ function quarantineFailedClaim(
       recordQuarantineIncident(claim, error, claim.launchCallId)
       clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
     }
+    return changed.changes !== 0
   })()
+  if (changed) captureBehaviorOutcome({ nativeId: claim.launchCorrelationId,
+    state: kind === 'invalid_result' ? 'held' : 'unknown', activity: 'unknown', stateSource: 'native',
+    callId: claim.launchCallId ?? undefined })
 }
 
 function quarantineFailedLog(snapshot: AgentLogSnapshot, claim: BehaviorLaunchClaim, observed?: LogEntry): boolean {
@@ -1040,6 +1062,9 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
     WHERE key = ? AND target = ? AND claim_id = '' AND launch_quarantine = 'unreadable'
       AND launch_call_id = ? AND launch_correlation_id = ? AND launch_requested_at = ?
   `).run(claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
+  captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+    state: 'completed', activity: 'settled', stateSource: 'native', outcome: call.outcome,
+    head: call.head_sha, completedAt: call.completed_at })
   return true
 }
 
@@ -1287,6 +1312,9 @@ async function reconcileBehaviorLaunchClaims(
       || call.error === SUPERSEDED_AGENT_ERROR
     if (superseded) {
       if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'superseded', activity: status === 'superseded' ? 'settled' : 'unknown', stateSource: 'native',
+          outcome: 'superseded', head: call.head_sha, completedAt: call.completed_at })
         clearBehaviorFailure(behavior, claim.target)
       }
       console.log(
@@ -1307,11 +1335,15 @@ async function reconcileBehaviorLaunchClaims(
       if (call.error_code === 'review_packet_too_large') {
         // This input cannot improve through retry. Retain the launch proof and
         // block this PR/head only; other targets continue normally.
+        let held = false
         db.transaction(() => {
-          if (deadLetterClaim(claim, message)) {
+          held = deadLetterClaim(claim, message, false)
+          if (held) {
             setMeta(packetBlockKey(behavior, claim.launchRepo, claim.launchPr), claim.launchExpectedHead)
           }
         })()
+        if (held) captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'held', activity: 'unknown', stateSource: 'native' })
       } else {
         recordBehaviorDeadLetter(claim, message, call.id)
         if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
@@ -1355,6 +1387,9 @@ async function reconcileBehaviorLaunchClaims(
         headSha,
       })
       if (completed) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'completed', activity: 'settled', stateSource: 'native',
+          outcome: outcome as 'clean' | 'changes_requested' | 'approved', head: headSha, completedAt })
         if (claim.launchQuarantine === 'unreadable') retireQuarantineIncident(claim)
         activeClaims.delete(claim.claimId)
         clearBehaviorFailure(behavior, claim.target)
@@ -1673,6 +1708,7 @@ async function fireReview(
   claimTarget: string,
   claimId: string,
   slot: ReviewerSlot = 'primary',
+  plannedSlots: ReviewerSlot[] = ['primary'],
 ): Promise<boolean> {
   return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
   if (!isEnabled('review-new-prs')) return false
@@ -1739,15 +1775,22 @@ async function fireReview(
     claimId,
     expectedHead,
     actor,
+    slot,
+    plannedSlots,
   )) return false
   if (!renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
+    captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
+      outcome: 'preflight_failed', completedAt: new Date().toISOString() })
     throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
   }
-  await spawnDetached(AGENT_INTERFACE, args, {
+  try { await spawnDetached(AGENT_INTERFACE, args, {
     cwd: agentInterfaceCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: settleClaimAfterExit('review-new-prs', claimTarget, claimId),
-  })
+  }) } catch (error) {
+    captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
+    throw error
+  }
   markClaimLaunched(claimId)
   return true
   })
@@ -1950,8 +1993,8 @@ async function tickReviewNewPrs(): Promise<void> {
         const target = reviewSlotTarget(key, slot)
         if (slot === 'primary') return primaryFresh
         return (admittedSlots.has(slot) && !hasSeen('review-new-prs', target)) || !!getFailedBehaviorLaunch('review-new-prs', target)
-      }).map((slot) => [pr, key, slot] as const)
-    }).map(async ([pr, key, slot]) => {
+      }).map((slot) => [pr, key, slot, [...admittedSlots]] as const)
+    }).map(async ([pr, key, slot, plannedSlots]) => {
       if (!isEnabled('review-new-prs') || behaviorAborted()) return
       const target = reviewSlotTarget(key, slot)
       const checkTarget = `${target}:check`
@@ -2013,7 +2056,7 @@ async function tickReviewNewPrs(): Promise<void> {
             }
           }
 
-          const accepted = await fireReview(pr, target, claimId, slot)
+          const accepted = await fireReview(pr, target, claimId, slot, [...plannedSlots])
           if (!accepted) {
             releaseOwnedClaim('review-new-prs', target, claimId)
             return
@@ -2369,6 +2412,10 @@ async function releaseFailedBehaviorIfNoAction(
           startedAt: agentCallStartedAt(replay), completedAt: replay.completed_at!,
           action: replay.action as 'reviewed_clean' | 'requested_changes' | 'approved',
           outcome: replay.outcome as 'clean' | 'changes_requested' | 'approved' })) {
+        captureBehaviorOutcome({ nativeId: failed.launchCorrelationId, callId: call.id,
+          state: 'completed', activity: 'settled', stateSource: 'native', outcome: 'adopted',
+          head: replay.head_sha, completedAt: replay.completed_at,
+          refs: [{ kind: 'caller', identity: replay.id, availability: 'available' }] })
         retireBehaviorDeadLettersForTarget(behavior, target)
         clearBehaviorFailure(behavior, target)
         return false
@@ -2570,13 +2617,18 @@ async function fireApprove(
     actor,
   )) return false
   if (!renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
+    captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
+      outcome: 'preflight_failed', completedAt: new Date().toISOString() })
     throw new Error(`approval PR operation ownership was lost for ${pr.repo}#${pr.number}`)
   }
-  await spawnDetached(AGENT_INTERFACE, args, {
+  try { await spawnDetached(AGENT_INTERFACE, args, {
     cwd: agentInterfaceCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: settleClaimAfterExit('approve-prs', claimTarget, claimId),
-  })
+  }) } catch (error) {
+    captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
+    throw error
+  }
   markClaimLaunched(claimId)
   return true
   })
@@ -2802,6 +2854,11 @@ async function resolveNonblockingIfReady(repo: string, number: number): Promise<
   await mkdir(cwd, { recursive: true })
   const reviewer = configuredReviewer()
   const expectedHead = await currentHeadSha(repo, number, reviewer)
+  const nativeId = randomUUID()
+  captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
+    source: 'poise:resolve-unblocking', owner: currentOrganization()?.login ?? null,
+    actor: reviewer, repository: repo, number, head: expectedHead, startedAt: new Date().toISOString() })
+  try {
   const { stdout } = await runFile(
     GH_INTERFACE,
     [
@@ -2831,6 +2888,8 @@ async function resolveNonblockingIfReady(repo: string, number: number): Promise<
       || currentHeadSha === expectedHead) {
       throw new Error('github-interface resolution returned malformed supersession')
     }
+    captureBehaviorOutcome({ nativeId, state: 'superseded', activity: 'settled', stateSource: 'native',
+      outcome: 'superseded', head: currentHeadSha, completedAt: new Date().toISOString() })
     return {
       ready_except_conversations: false,
       headSha: currentHeadSha,
@@ -2868,6 +2927,9 @@ async function resolveNonblockingIfReady(repo: string, number: number): Promise<
         || unresolvedCount !== 0))) {
     throw new Error('github-interface resolution returned malformed or unsafe state')
   }
+  captureBehaviorOutcome({ nativeId, state: 'completed', activity: 'settled', stateSource: 'native',
+    outcome: resolvedCount > 0 ? 'resolved' : unresolvedCount > 0 ? 'waiting' : 'no_op', head: headSha,
+    completedAt: new Date().toISOString() })
   return {
     ready_except_conversations: data.ready_except_conversations,
     headSha,
@@ -2875,6 +2937,10 @@ async function resolveNonblockingIfReady(repo: string, number: number): Promise<
     unresolved_count: unresolvedCount,
     blockers: data.blockers.map(String),
     superseded: false,
+  }
+  } catch (error) {
+    captureBehaviorOutcome({ nativeId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+    throw error
   }
 }
 
@@ -3048,6 +3114,9 @@ async function tickMergePrs(): Promise<void> {
         if (!isEnabled('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', pr)
           || configuredReviewer() !== actor) continue
         runId = startDirectBehaviorRun('merge-prs')
+        captureBehaviorAdmission({ admissionKey: runId, nativeId: runId, behavior: 'merge-prs',
+          source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
+          actor, repository: pr.repo, number: pr.number, head: expectedHead, startedAt: new Date().toISOString() })
         const { stdout } = await runFile(GH_INTERFACE, [
           '--merge-if-ready', `#${pr.number}`, '--expected-head', expectedHead,
           '--author', author, '--token-user', actor,
@@ -3059,6 +3128,9 @@ async function tickMergePrs(): Promise<void> {
           || (result.outcome === 'merged' && (typeof result.merge_sha !== 'string' || !SHA_PATTERN.test(result.merge_sha)))) {
           throw new Error('github-interface --merge-if-ready returned malformed state')
         }
+        captureBehaviorOutcome({ nativeId: runId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
+          activity: 'settled', stateSource: 'native', outcome: result.outcome as 'merged' | 'already_merged' | 'not_ready' | 'superseded',
+          head: expectedHead, completedAt: new Date().toISOString() })
         finishDirectBehaviorRun(runId, true)
         runId = null
         if (result.outcome === 'merged') {
@@ -3067,6 +3139,7 @@ async function tickMergePrs(): Promise<void> {
         }
         clearBehaviorFailure('merge-prs', target)
       } catch (error) {
+        if (runId) captureBehaviorOutcome({ nativeId: runId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
         if (behaviorAborted()) return
         recordBehaviorFailure('merge-prs', 'operation', error, target)
         console.error(`[behaviors] merge-prs failed for ${target}:`, error)
@@ -3185,6 +3258,10 @@ async function tickRerunGreyCi(): Promise<void> {
           })()
           if (!claimed) continue
           metricRunId = startDirectBehaviorRun('rerun-grey-ci')
+          captureBehaviorAdmission({ admissionKey: metricRunId, nativeId: metricRunId, behavior,
+            source: 'poise:rerun-grey-ci', owner: currentOrganization()?.login ?? null,
+            actor, repository: pr.repo, number: pr.number, head: row.head_sha,
+            workflow: { id: workflowId, runId, attempt, event: run.event }, startedAt: new Date().toISOString() })
           const { stdout: receipt } = await runFile(GH_INTERFACE, ['--rerun-grey-ci-if-ready', `#${pr.number}`,
             '--run-id', String(runId), '--run-attempt', String(attempt), '--expected-head', row.head_sha,
             '--author', author, '--token-user', actor],
@@ -3194,6 +3271,10 @@ async function tickRerunGreyCi(): Promise<void> {
             || result.head_sha !== row.head_sha || result.run_id !== runId || result.run_attempt !== attempt
             || !['rerun_requested', 'not_ready', 'superseded', 'read_failed'].includes(String(result.outcome))
             || (result.outcome === 'read_failed' && (typeof result.error !== 'string' || !result.error))) throw new Error('malformed grey CI rerun receipt')
+          captureBehaviorOutcome({ nativeId: metricRunId,
+            state: result.outcome === 'superseded' ? 'superseded' : result.outcome === 'read_failed' ? 'failed' : 'completed',
+            activity: 'settled', stateSource: 'native', outcome: result.outcome as 'rerun_requested' | 'not_ready' | 'superseded' | 'read_failed',
+            completedAt: new Date().toISOString(), refs: [{ kind: 'intent', identity: claimId, availability: 'available' }] })
           finishDirectBehaviorRun(metricRunId, result.outcome !== 'read_failed')
           metricRunId = null
           if (result.outcome === 'rerun_requested') {
@@ -3207,7 +3288,9 @@ async function tickRerunGreyCi(): Promise<void> {
         } catch (error) {
           // A missing receipt may follow an accepted write. Retain the durable
           // claim across restarts; never automatically replay that ambiguity.
-          setBehaviorLaunchErrorOwned(claimKey, claimTarget, claimId, behaviorErrorMessage(error))
+          const held = setBehaviorLaunchErrorOwned(claimKey, claimTarget, claimId, behaviorErrorMessage(error))
+          if (held && metricRunId) captureBehaviorOutcome({ nativeId: metricRunId, state: 'held', activity: 'unknown', stateSource: 'native',
+            refs: [{ kind: 'intent', identity: claimId, availability: 'available' }] })
           recordBehaviorFailure(behavior, 'worker', error, failureTarget, { held: true })
           console.error(`[behaviors] grey CI rerun held for ${target}:`, error)
         } finally {
@@ -3547,6 +3630,8 @@ interface IssueCandidate {
   slot: ReviewerSlot
   target: string
   order: number
+  admissionKey: string
+  plannedSlots: ReviewerSlot[]
 }
 
 interface EligibleIssue {
@@ -3690,6 +3775,8 @@ async function fireIssueReview(
   claimId: string,
   slot: ReviewerSlot,
   covers: readonly string[],
+  admissionKey: string,
+  plannedSlots: ReviewerSlot[],
 ): Promise<boolean> {
   return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-issues', repository: issue.repo, target: `${issue.repo}#${issue.number}`, account: agentAccount() || null }, async () => {
   if (!isEnabled(ISSUES_KEY)) return false
@@ -3707,6 +3794,7 @@ async function fireIssueReview(
   if ((await waitForBehavior(issueSlotModel(slot)))?.model !== model) return false
   if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return false
   if (issueReviewRefusal(issueReviewPolicy(), issue.repo, issue.number, issue)) return false
+  const startedAt = new Date().toISOString()
   if (!markBehaviorLaunchIntentOwned({
     key: ISSUES_KEY,
     target,
@@ -3714,14 +3802,17 @@ async function fireIssueReview(
     launchBehavior: 'issue_review',
     repo: issue.repo,
     pr: issue.number,
-    requestedAt: new Date().toISOString(),
+    requestedAt: startedAt,
     expectedHead: '',
     actor,
     source: ISSUE_REVIEW_SOURCE,
     correlationId: claimId,
     covers,
   })) return false
-  await spawnDetached(AGENT_INTERFACE, [
+  captureBehaviorAdmission({ admissionKey, nativeId: claimId, behavior: ISSUES_KEY,
+    source: ISSUE_REVIEW_SOURCE, owner: currentOrganization()?.login ?? null, actor,
+    repository: issue.repo, number: issue.number, head: null, slot, plannedSlots, startedAt })
+  try { await spawnDetached(AGENT_INTERFACE, [
     '--issue-review',
     `${issue.repo}#${issue.number}`,
     '--model',
@@ -3739,7 +3830,10 @@ async function fireIssueReview(
     cwd: agentInterfaceCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: settleClaimAfterExit(ISSUES_KEY, target, claimId),
-  })
+  }) } catch (error) {
+    captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
+    throw error
+  }
   markClaimLaunched(claimId)
   return true
   })
@@ -3797,6 +3891,8 @@ async function launchIssueReview(
   target: string,
   logs: () => Promise<AgentLogSnapshot>,
   covers: readonly string[],
+  admissionKey: string,
+  plannedSlots: ReviewerSlot[],
 ): Promise<boolean> {
   if (!behaviorRetryDue(ISSUES_KEY, target)) return false
   if (countBehaviorDeadLetters(ISSUES_KEY, target) >= ISSUE_REVIEW_ATTEMPTS && !hasSeen(ISSUES_KEY, target)) return false
@@ -3808,7 +3904,7 @@ async function launchIssueReview(
   }
   trackClaim(ISSUES_KEY, target, claimId)
   try {
-    if (!await fireIssueReview(issue, target, claimId, slot, covers)) {
+    if (!await fireIssueReview(issue, target, claimId, slot, covers, admissionKey, plannedSlots)) {
       releaseOwnedClaim(ISSUES_KEY, target, claimId)
       return false
     }
@@ -3825,7 +3921,8 @@ async function tickReviewNewIssues(): Promise<void> {
   const repositories = getIssueRepositories().filter((entry) => organizationOwns(entry.repo))
   if (repositories.length === 0) return
   const policy = issueReviewPolicy()
-  const slots = availableReviewSlots(await reviewPanel(getReviewers(ISSUES_KEY), 'issue_review'))
+  const panel = await reviewPanel(getReviewers(ISSUES_KEY), 'issue_review')
+  const slots = availableReviewSlots(panel)
   if (slots.length === 0) return
   const slotSince = getIssueSlotSince()
   await requireFreshDatastore()
@@ -3857,6 +3954,9 @@ async function tickReviewNewIssues(): Promise<void> {
       const created = Date.parse(issue.createdAt)
       if (issueReviewRefusal(policy, issue.repo, issue.number, issue) || created < Date.parse(since)) continue
       const targets: string[] = []
+      const plannedSlots = panel.reviewers.map(({ slot }) => slot).filter((slot) =>
+        slot === 'primary' || !slotSince[slot] || created >= Date.parse(slotSince[slot]!))
+      const admissionKey = JSON.stringify([ISSUES_KEY, currentOrganization()?.login ?? null, repo, since, issue.number])
       slots.forEach((slot, index) => {
         const joined = slot === 'primary' ? undefined : slotSince[slot]
         if (joined && created < Date.parse(joined)) return
@@ -3866,7 +3966,7 @@ async function tickReviewNewIssues(): Promise<void> {
         if (hasSeen(ISSUES_KEY, target)
           && !getFailedBehaviorLaunch(ISSUES_KEY, target)
           && !hasExpiredPreLaunchClaim(ISSUES_KEY, target)) return
-        candidates.push({ issue, slot, target, order: created * REVIEWER_SLOTS.length + index })
+        candidates.push({ issue, slot, target, order: created * REVIEWER_SLOTS.length + index, admissionKey, plannedSlots })
       })
       if (targets.length > 0) eligible.push({ issue, targets })
     }
@@ -3898,7 +3998,7 @@ async function tickReviewNewIssues(): Promise<void> {
     }
     if (settled) console.log(`[behaviors] review-new-issues: ${settled} was reviewed as a sub-issue of ${by}`)
   }
-  for (const { issue, slot, target } of candidates) {
+  for (const { issue, slot, target, admissionKey, plannedSlots } of candidates) {
     if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return
     const covers = plan.launch.get(issueRef(`${issue.repo}#${issue.number}`))
     if (!covers) continue
@@ -3906,7 +4006,7 @@ async function tickReviewNewIssues(): Promise<void> {
     const checkTarget = `${target}:check`
     if (!behaviorRetryDue(ISSUES_KEY, checkTarget)) continue
     try {
-      if (await launchIssueReview(issue, slot, target, readLogs, covers)) {
+      if (await launchIssueReview(issue, slot, target, readLogs, covers, admissionKey, plannedSlots)) {
         clearBehaviorFailure(ISSUES_KEY, checkTarget)
       }
     } catch (error) {
@@ -4109,6 +4209,9 @@ async function reconcileIssueReviewClaims(): Promise<void> {
         claimId: claim.claimId,
         completedAt: String(call.completed_at),
       })) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'completed', activity: 'settled', stateSource: 'native', outcome: 'commented',
+          completedAt: call.completed_at })
         if (claim.launchQuarantine === 'unreadable') retireQuarantineIncident(claim)
         clearBehaviorFailure(ISSUES_KEY, claim.target)
       }
@@ -4398,6 +4501,7 @@ function scheduleNextTick(generation: number) {
     tickTimer = null
     if (!tickerStarted || generation !== runtimeGeneration) return
     lastTickAtMs = Date.now()
+    behaviorLedgerHeartbeat()
     // Rearm before external work. One slow scan can no longer silence the
     // scheduler; the next tick skips only behaviors that are still busy.
     scheduleNextTick(generation)

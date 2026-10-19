@@ -596,10 +596,10 @@ describe('bootstrap runner (real processes)', () => {
     const installer = fileURLToPath(new URL('../scripts/install-self-update.mjs', import.meta.url))
     const script = [
       `import { createBootstrapRunner } from ${JSON.stringify(installer)}`,
-      `import { writeFileSync } from 'node:fs'`,
+      `import { writeFileSync, renameSync } from 'node:fs'`,
       `const { run } = createBootstrapRunner({ registryPath: ${JSON.stringify(registryPath)} })`,
       `const registry = (await import(${JSON.stringify(installer)})).createBootstrapRegistry(${JSON.stringify(registryPath)})`,
-      `const poll = setInterval(async () => { const w = Object.values((await registry.read()).workers); if (w.length) { writeFileSync(${JSON.stringify(marker)}, String(w[0].pgid)); clearInterval(poll) } }, 20)`,
+      `const poll = setInterval(async () => { const w = Object.values((await registry.read()).workers); if (w.length) { writeFileSync(${JSON.stringify(marker + '.tmp')}, String(w[0].pgid)); renameSync(${JSON.stringify(marker + '.tmp')}, ${JSON.stringify(marker)}); clearInterval(poll) } }, 20)`,
       `await run('sh', ['-c', 'sleep 60 & sleep 60'], { env: ${JSON.stringify(env())}, write: true, staging: '/s', timeoutMs: 120000 })`,
     ].join('\n')
     const scriptPath = join(home, 'parent.mjs')
