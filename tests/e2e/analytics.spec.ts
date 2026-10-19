@@ -44,10 +44,12 @@ interface Workspace {
   baselineHours: number
   baselineMerged: number
   pacing: { merged: number, median: number } | null
+  closedUnmerged: { current: number, median: number } | null
+  medianLines: { current: number, baseline: number } | null
 }
 
 async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
-  const state: Workspace = { historyReads: [], historyFails: false, reads: [], fail: false, stale: false, baselineHours: 54, baselineMerged: 8, pacing: null }
+  const state: Workspace = { historyReads: [], historyFails: false, reads: [], fail: false, stale: false, baselineHours: 54, baselineMerged: 8, pacing: null, closedUnmerged: null, medianLines: null }
   await page.clock.setFixedTime(new Date('2026-10-09T12:00:00Z'))
   await page.addInitScript(() => {
     if (sessionStorage.getItem('seeded')) return
@@ -77,9 +79,12 @@ async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
       if (baseline) result.daily = Array.from({ length: 7 }, () => {
         const pullRequests = report(state.pacing?.median ?? 1).pullRequests
         if (state.pacing) pullRequests.lines = { total: pullRequests.merged * 1000, median: 180, counted: pullRequests.merged }
+        if (state.closedUnmerged) pullRequests.closedUnmerged = state.closedUnmerged.median
         return { issues: { opened: 2, closed: 1 }, pullRequests }
       })
       if (state.pacing) result.pullRequests.lines = { total: result.pullRequests.merged * 1000, median: 180, counted: result.pullRequests.merged }
+      if (state.closedUnmerged) result.pullRequests.closedUnmerged = baseline ? state.closedUnmerged.median * 7 : state.closedUnmerged.current
+      if (state.medianLines) result.pullRequests.lines = { ...result.pullRequests.lines, median: baseline ? state.medianLines.baseline : state.medianLines.current, counted: result.pullRequests.merged }
       return route.fulfill({ json: result })
     }
     if (url.pathname === '/api/settings') return route.fulfill({ json: { org: 'acme', me: 'octocat', timezone, organizations, models: {} } })
@@ -605,6 +610,92 @@ test('keeps stale totals and their pacing context without judging Today, while r
   await expect(merged.locator('.analytics-delta')).toHaveText('44.4%')
   await expect(merged).toContainText('7-day median: 27.0 / day')
   await expect(merged).not.toContainText('Typical by now')
+  expect(state.reads).toHaveLength(4)
+  expect(state.historyReads).toHaveLength(2)
+})
+
+test('treats fewer unmerged closures as better while preserving numeric arrows, the pace band and zero baselines', async ({ page }) => {
+  const state = await workspace(page)
+  const cases = [
+    { current: 5, median: 20, direction: 'good', arrow: '↓', delta: '50% below typical' },
+    { current: 15, median: 20, direction: 'bad', arrow: '↑', delta: '50% above typical' },
+    { current: 9, median: 20, direction: 'neutral', arrow: '→', delta: 'On pace' },
+    { current: 11, median: 20, direction: 'neutral', arrow: '→', delta: 'On pace' },
+    { current: 0, median: 20, direction: 'good', arrow: '↓', delta: '100% below typical' },
+    { current: 0, median: 0, direction: 'neutral', arrow: '→', delta: 'On pace' },
+    { current: 3, median: 0, direction: 'bad', arrow: '↑', delta: '3.0 above typical' },
+  ]
+  state.closedUnmerged = cases[0]
+  await page.goto('/')
+  await openAnalytics(page)
+  const summary = countTrend(page, 'Closed without merging')
+  const graph = page.locator('.analytics-history[data-series="Closed without merging"] .analytics-history-line')
+  let graphBefore: string | null = null
+  for (const [index, sample] of cases.entries()) {
+    if (index) {
+      state.closedUnmerged = sample
+      await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption(index % 2 ? 'beta' : 'acme')
+    }
+    await expect(summary.locator('.analytics-value')).toHaveText(String(sample.current))
+    await expect(summary).toHaveClass(new RegExp(sample.direction))
+    await expect(summary.locator('.analytics-arrow')).toHaveText(sample.arrow)
+    await expect(summary.locator('.analytics-delta')).toHaveText(sample.delta)
+    await expect(summary).toContainText(`Typical by now: ${(sample.median / 2).toFixed(1)} · 7-day median: ${sample.median.toFixed(1)} / day`)
+    if (sample.direction === 'neutral') {
+      const colors = await summary.evaluate(element => ['.analytics-value', '.analytics-arrow', '.analytics-delta'].map(selector => getComputedStyle(element.querySelector(selector)!).color))
+      expect(new Set(colors).size).toBe(1)
+    }
+    await expect(graph).toHaveAttribute('d', /^M/)
+    const path = await graph.getAttribute('d')
+    if (index === 0) graphBefore = path
+    else expect(path).toBe(graphBefore)
+    expect(state.reads).toHaveLength((index + 1) * 2)
+    expect(state.historyReads).toHaveLength(index + 1)
+  }
+
+  state.closedUnmerged = { current: 5, median: 20 }
+  await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
+  await expect(summary).toHaveClass(/good/)
+  await expect(summary.locator('.analytics-arrow')).toHaveText('↓')
+  await expect(summary.locator('.analytics-delta')).toHaveText('75%')
+  await expect(summary.locator('.analytics-arrow')).toHaveAccessibleName('75% below versus the preceding 7-day median')
+  await expect(summary).not.toContainText('Typical by now')
+
+  state.closedUnmerged.current = 25
+  await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('beta')
+  await expect(summary).toHaveClass(/bad/)
+  await expect(summary.locator('.analytics-arrow')).toHaveText('↑')
+  await expect(summary.locator('.analytics-delta')).toHaveText('25%')
+  await expect(summary.locator('.analytics-arrow')).toHaveAccessibleName('25% above versus the preceding 7-day median')
+  expect(state.reads).toHaveLength(18)
+  expect(state.historyReads).toHaveLength(9)
+})
+
+test('treats smaller median PR size as better with numeric comparisons and unchanged history', async ({ page }) => {
+  const state = await workspace(page)
+  state.medianLines = { current: 90, baseline: 100 }
+  await page.goto('/')
+  await openAnalytics(page)
+  const summary = countTrend(page, 'Median lines')
+  const graph = page.locator('.analytics-history[data-series="Median lines"] .analytics-history-line')
+  await expect(summary.locator('.analytics-value')).toHaveText('90')
+  await expect(summary).toHaveClass(/good/)
+  await expect(summary.locator('.analytics-arrow')).toHaveText('↓')
+  await expect(summary.locator('.analytics-delta')).toHaveText('10%')
+  await expect(summary.locator('.analytics-arrow')).toHaveAccessibleName('10% below versus the preceding 7-day median')
+  await expect(summary).toContainText('7-day median: 100 · 8 PRs')
+  await expect(graph).toHaveAttribute('d', /^M/)
+  const graphBefore = await graph.getAttribute('d')
+
+  state.medianLines.current = 110
+  await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('beta')
+  await expect(summary.locator('.analytics-value')).toHaveText('110')
+  await expect(summary).toHaveClass(/bad/)
+  await expect(summary.locator('.analytics-arrow')).toHaveText('↑')
+  await expect(summary.locator('.analytics-delta')).toHaveText('10%')
+  await expect(summary.locator('.analytics-arrow')).toHaveAccessibleName('10% above versus the preceding 7-day median')
+  await expect(summary).not.toContainText(/faster|slower/i)
+  await expect(graph).toHaveAttribute('d', graphBefore!)
   expect(state.reads).toHaveLength(4)
   expect(state.historyReads).toHaveLength(2)
 })

@@ -268,6 +268,86 @@ describe('elapsed-day pacing', () => {
   })
 })
 
+describe('lower-is-better analytics', () => {
+  function closedTile(current: number, median: number, progress?: number) {
+    const week = report()
+    week.daily!.forEach((day) => { day.pullRequests.closedUnmerged = median })
+    return tile(buildGroups(report({ closedUnmerged: current }), week, progress), 'Closed without merging')
+  }
+
+  it.each([
+    [0, 'good', '↓ 100% below typical'],
+    [44, 'good', '↓ 12% below typical'],
+    [45, 'neutral', '→ On pace'],
+    [50, 'neutral', '→ On pace'],
+    [55, 'neutral', '→ On pace'],
+    [56, 'bad', '↑ 12% above typical'],
+  ] as const)('treats %s unmerged closings against typical 50 with inclusive tolerance', (current, direction, text) => {
+    const closed = closedTile(current, 100, 0.5)
+    expect(closed).toMatchObject({ value: String(current), trend: { direction, text }, comparison: 'Typical by now: 50.0 · 7-day median: 100.0 / day' })
+    expect(closed.trend?.description).not.toMatch(/ahead|behind|faster|slower/)
+    expect(closed.trend?.caption).not.toMatch(/ahead|behind|faster|slower/i)
+  })
+
+  it.each([
+    [4, 'good', '↓ 50%', 'below'],
+    [8, 'neutral', '→ 0%', 'Unchanged'],
+    [12, 'bad', '↑ 50%', 'above'],
+  ] as const)('treats %s completed-day unmerged closings against median 8', (current, direction, text, movement) => {
+    const closed = closedTile(current, 8)
+    expect(closed).toMatchObject({ trend: { direction, text }, comparison: '7-day median: 8.0 / day' })
+    expect(closed.trend?.description).toContain(movement)
+    expect(closed.trend?.description).not.toMatch(/faster|slower/)
+  })
+
+  it('keeps zero unmerged closings on pace against zero typical and reports positive counts as absolute increases', () => {
+    expect(closedTile(0, 0, 0.5).trend).toMatchObject({ direction: 'neutral', text: '→ On pace' })
+    const positive = closedTile(3, 0, 0.5)
+    expect(positive).toMatchObject({ value: '3', trend: { direction: 'bad', text: '↑ 3.0 above typical' }, comparison: 'Typical by now: 0.0 · 7-day median: 0.0 / day' })
+    expect(positive.trend?.description).not.toContain('%')
+    expect(closedTile(3, 0).trend).toMatchObject({ direction: 'bad', text: '↑ 3.0' })
+    expect(closedTile(0, 0).trend).toMatchObject({ direction: 'neutral', text: '→ 0%' })
+  })
+
+  it.each([
+    [50, 'good', '↓ 50%', 'below'],
+    [95, 'good', '↓ 5%', 'below'],
+    [100, 'neutral', '→ 0%', 'Unchanged'],
+    [150, 'bad', '↑ 50%', 'above'],
+  ] as const)('favors median lines %s against 100 with numeric wording and no daily tolerance', (current, direction, text, movement) => {
+    const day = report({ lines: { total: current * 4, median: current, counted: 4 } })
+    const week = report({ lines: { total: 400, median: 100, counted: 4 } })
+    const median = tile(buildGroups(day, week, 0.5), 'Median lines')
+    expect(median).toMatchObject({ value: String(current), trend: { direction, text }, comparison: '7-day median: 100 · 4 PRs' })
+    expect(median.trend?.description).toContain(movement)
+    expect(median.trend?.description).not.toMatch(/faster|slower/)
+    expect(median.trend?.caption).not.toMatch(/faster|slower/i)
+    expect(tile(buildGroups(day, week), 'Median lines')).toEqual(median)
+  })
+
+  it('retains increasing-activity and faster-duration polarity for the other metrics', () => {
+    const day = report({
+      opened: 8, merged: 4, mergedByAgent: 4, commentsPerPr: 4.5,
+      firstReview: { count: 5, medianMs: 47_500 },
+      lines: { total: 700, median: 50, counted: 4 },
+      behaviors: { perPr: 3, medianPerPr: 3, approvals: 1, reviews: 4, changesRequested: 1 },
+      medianTimeToMergeMs: 2.5 * 3_600_000,
+    })
+    day.issues = { opened: 344, closed: 2 }
+    for (const progress of [undefined, 0.5]) {
+      const groups = buildGroups(day, report(), progress)
+      for (const label of ['Pull requests opened', 'Pull requests merged', 'Lines changed', 'Issues opened', 'Issues closed', 'Comments', 'Behaviors', 'Merged by agent']) {
+        expect(tile(groups, label).trend?.direction).toBe('good')
+        expect(tile(groups, label).trend?.text).toMatch(/^↑/)
+      }
+      for (const label of ['Time to first review', 'Time to merge', 'Median time']) {
+        expect(tile(groups, label).trend).toMatchObject({ direction: 'good', text: '↓ 50%' })
+        expect(tile(groups, label).trend?.description).toContain('faster')
+      }
+    }
+  })
+})
+
 
 describe('pull request flow', () => {
   it('times first reviews down to the second', () => {
