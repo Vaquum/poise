@@ -64,6 +64,7 @@ export class DiagnosticStore {
         CREATE INDEX IF NOT EXISTS log_time ON log_events(sort_time DESC, id DESC);
         CREATE INDEX IF NOT EXISTS log_ingestion_seq ON log_events(ingested_at,seq);
         CREATE INDEX IF NOT EXISTS log_incident ON log_events(incident_id);
+        CREATE INDEX IF NOT EXISTS log_incident_retained ON log_events(incident_id,ingested_at);
         CREATE INDEX IF NOT EXISTS log_call ON log_events(call_id);
         CREATE TABLE IF NOT EXISTS log_coverage (id TEXT PRIMARY KEY, workspace TEXT, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS log_expired (id TEXT PRIMARY KEY, workspace TEXT, visibility TEXT NOT NULL CHECK (visibility IN ('workspace','operator','infrastructure')), expired_at TEXT NOT NULL);
@@ -307,8 +308,12 @@ export class DiagnosticStore {
     const predicate = access.operator ? "WHERE (visibility IN ('operator','infrastructure') OR (workspace=? AND visibility='workspace')) AND ingested_at>=?"
       : "WHERE workspace=? AND visibility IN ('workspace','infrastructure') AND ingested_at>=?"
     const parameters = [access.workspace, new Date(this.now() - this.policy.retentionMs).toISOString()]
-    const row = this.db.prepare(`SELECT MIN(sort_time) AS from_time,MAX(sort_time) AS to_time FROM log_events ${predicate}`).get(...parameters) as { from_time: string | null; to_time: string | null }
-    return { from: row.from_time, to: row.to_time, retentionAfter: new Date(this.now() - this.policy.retentionMs).toISOString() }
+    return this.db.transaction(() => {
+      // Separate indexed extrema avoid visiting every retained payload for each page.
+      const first = this.db.prepare(`SELECT sort_time FROM log_events ${predicate} ORDER BY sort_time ASC LIMIT 1`).get(...parameters) as { sort_time: string } | undefined
+      const last = this.db.prepare(`SELECT sort_time FROM log_events ${predicate} ORDER BY sort_time DESC LIMIT 1`).get(...parameters) as { sort_time: string } | undefined
+      return { from: first?.sort_time ?? null, to: last?.sort_time ?? null, retentionAfter: new Date(this.now() - this.policy.retentionMs).toISOString() }
+    })()
   }
 
   lookup(access: LogAccess, id: string): { status: 'found'; event: LogEvent } | { status: 'expired' | 'unavailable' } {

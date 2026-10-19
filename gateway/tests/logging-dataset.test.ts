@@ -107,3 +107,32 @@ it('exports an honest byte-bounded prefix and resumes exactly at the first omitt
     expect(health).not.toContain('private-bob'); expect(health).not.toContain('operator-private'); expect(health).not.toContain('bob-private')
   } finally { db.close(); rmSync(dir, { recursive: true, force: true }) }
 })
+
+
+it('keeps scoped source-time bounds and ingestion expiry equivalent across readers', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'logging-bounds-'))
+  const path = join(directory, 'logging.db'); let now = Date.now()
+  const policy = { ...DEFAULT_LOG_POLICY, retentionMs: 10_000 }
+  const writer = new DiagnosticStore(path, policy, () => now)
+  const at = (offset: number) => new Date(now + offset).toISOString()
+  const inputs = [
+    { id: 'own-old-source', workspace: 'alice', visibility: 'workspace' as const, time: at(-86_400_000) },
+    { id: 'own-shared', workspace: 'alice', visibility: 'infrastructure' as const, time: at(3_600_000) },
+    { id: 'foreign-private', workspace: 'bob', visibility: 'workspace' as const, time: at(-4 * 86_400_000) },
+    { id: 'foreign-shared', workspace: 'bob', visibility: 'infrastructure' as const, time: at(2 * 3_600_000) },
+    { id: 'operator', workspace: null, visibility: 'operator' as const, time: at(-3 * 86_400_000) },
+  ]
+  const reader = () => new DiagnosticStore(path, policy, () => now, true)
+  try {
+    writer.append(inputs.map((input) => normalize({ ...input, source: 'poise', level: 'error', operation: 'bounds', message: 'retained bounds evidence' }, now)!))
+    const read = reader()
+    try {
+      expect(read.bounds({ workspace: 'alice', operator: false })).toMatchObject({ from: at(-86_400_000), to: at(3_600_000) })
+      expect(read.bounds({ workspace: 'alice', operator: true })).toMatchObject({ from: at(-3 * 86_400_000), to: at(2 * 3_600_000) })
+      now += policy.retentionMs + 1
+      // The writer has not pruned: a read still enforces ingestion retention.
+      expect(read.bounds({ workspace: 'alice', operator: false })).toMatchObject({ from: null, to: null })
+      expect(read.bounds({ workspace: 'alice', operator: true })).toMatchObject({ from: null, to: null })
+    } finally { read.close() }
+  } finally { writer.close(); rmSync(directory, { recursive: true, force: true }) }
+})
