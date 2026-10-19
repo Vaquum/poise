@@ -60,6 +60,7 @@ export class DiagnosticRuntime {
   private readonly runId = randomUUID()
   private sourceSequence = 0
   private readonly sources = new Map<string, Coverage>()
+  private readonly externalSources = new Set<string>()
   private readonly now: () => number
   private readonly secrets: readonly string[]
   private readonly report: (line: string) => void
@@ -224,7 +225,11 @@ export class DiagnosticRuntime {
   }
 
   health() {
-    const required = [...this.sources.values()].filter((source) => !source.optional)
+    let external: Coverage[] = []
+    try { external = this.store?.readCoverage({ workspace: null, operator: true }).filter((source) => this.externalSources.has(source.id)) ?? [] }
+    catch (error) { this.coverageError = this.message(error) }
+    const sources = [...this.sources.values()].filter((source) => !this.externalSources.has(source.id)).concat(external)
+    const required = sources.filter((source) => !source.optional)
     const partial = this.dropped > 0 || this.rejected > 0 || this.journalError || this.coverageError || this.reportError
       || required.some((source) => source.status !== 'connected')
     const observations = required.map(currentCoverageStatus)
@@ -237,7 +242,31 @@ export class DiagnosticRuntime {
         ? true : required.some((source) => source.lossActive === undefined && ((source.dropped ?? 0) > 0 || (source.rejected ?? 0) > 0)) ? undefined : false,
       lastRejected: this.lastRejected, checkedAt: this.iso(), lastSuccessfulWriteAt: this.lastSuccess,
       queued: this.queue.length, queuedBytes: this.queuedBytes, dropped: this.dropped, droppedSince: this.droppedSince,
-      sources: [...this.sources.values()], policy: this.policy }
+      sources, policy: this.policy }
+  }
+
+  /** Hand an operator integration to the single store authority before collectors start. */
+  ownCoverage(id: string, configured: boolean): void {
+    const store = this.connection()
+    const legacy = this.sources.get(id)
+    const retained = store.readCoverage({ workspace: null, operator: true }).find((source) => source.id === id)
+    const source = retained ?? legacy
+    if (source) {
+      const gaps = new Map([...source.gaps, ...(legacy?.gaps ?? [])].map((gap) => [gap.from + ':' + gap.reason, gap]))
+      const ordered = [...gaps.values()].sort((a, b) => a.from.localeCompare(b.from))
+      if (source.status !== 'not-configured' && !ordered.some((gap) => gap.to === null)) ordered.push({
+        from: source.observedAt ?? this.iso(), to: null, reason: 'External proxy observation unavailable during gateway restart',
+      })
+      const next = { ...source, status: source.status === 'not-configured' ? 'not-configured' as const : 'partial' as const,
+        gaps: ordered.slice(-32), historyIncomplete: source.historyIncomplete || ordered.length > 32,
+        currentStatus: source.status === 'not-configured' ? 'not-configured' as const : 'initializing' as const }
+      delete next.observationExpiresAt
+      store.coverage(next)
+    } else if (configured) store.coverage({ id, source: 'ingress', workspace: null, status: 'not-configured', currentStatus: 'not-configured',
+      observedAt: null, ingestedAt: null, availableFrom: null, error: 'External proxy diagnostic delivery has not been configured', gaps: [] })
+    this.sources.delete(id)
+    this.externalSources.add(id)
+    this.saveJournal(true)
   }
 
   private connection(): DiagnosticStore {
@@ -333,7 +362,7 @@ export class DiagnosticRuntime {
         if (events.length && (id !== null ? source.id === id : events.some((event) => event.source === source.source && event.workspace === source.workspace))) source.ingestedAt = this.iso()
       }
       // Record every committed source before a fallible coverage write can stop persistence.
-      for (const source of this.sources.values()) store.coverage(source)
+      for (const source of this.sources.values()) if (!this.externalSources.has(source.id)) store.coverage(source)
       this.coverageError = null
     } catch (error) {
       const message = this.message(error)
@@ -361,7 +390,7 @@ export class DiagnosticRuntime {
     try {
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
       const journal: Journal = { version: 1, writtenAt: this.iso(), stopped: this.stopped, dropped: this.dropped, rejected: this.rejected, lossActive: this.lossActive, droppedSince: this.droppedSince,
-        sinkError: this.sinkError, coverageError: this.coverageError, reportError: this.reportError, sinkSince: this.sinkSince, sources: [...this.sources.values()] }
+        sinkError: this.sinkError, coverageError: this.coverageError, reportError: this.reportError, sinkSince: this.sinkSince, sources: [...this.sources.values()].filter((source) => !this.externalSources.has(source.id)) }
       const payload = JSON.stringify(journal)
       if (Buffer.byteLength(payload) > MAX_COVERAGE_JOURNAL_BYTES) throw new Error('Coverage journal exceeds 8 MiB')
       writeFileSync(path + '.tmp', payload, { mode: 0o600 }); renameSync(path + '.tmp', path)

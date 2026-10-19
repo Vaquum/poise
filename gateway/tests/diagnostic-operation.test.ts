@@ -3,13 +3,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { runOperator } from '../src/diagnostics/cli.js'
+import { startIngressSocket } from '../src/diagnostics/ingress-ipc.js'
 import { HostJournal } from '../src/diagnostics/host.js'
 import { normalize } from '../src/diagnostics/contract.js'
 import { DiagnosticStore } from '../src/diagnostics/store.js'
 import { DiagnosticRuntime } from '../src/diagnostics/runtime.js'
 
 const directories: string[] = []
-afterEach(() => { vi.unstubAllEnvs(); for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }) })
+afterEach(async () => {
+  for (const stop of writers.splice(0)) await stop()
+  vi.unstubAllEnvs(); for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }) })
 function directory() { const value = mkdtempSync(join(tmpdir(), 'poise-diagnostic-operation-')); directories.push(value); return value }
 function journalFixture(path: string, program: string) {
   const executable = join(path, 'journal-fixture'), ready = join(path, 'journal-ready'), release = join(path, 'journal-release')
@@ -21,6 +24,14 @@ function journalFixture(path: string, program: string) {
     rmSync(ready); writeFileSync(release, 'release')
   }, reset() { rmSync(release) } }
 }
+
+const writers: Array<() => Promise<void>> = []
+async function operatorWriter(path: string): Promise<void> {
+  const runtime = new DiagnosticRuntime({ path: join(path, 'logging.db'), report: () => undefined })
+  const listener = await startIngressSocket(runtime, join(path, 'logging.ingress.sock'), 'poise.test', true)
+  writers.push(async () => { await listener.close(); runtime.stop() })
+}
+
 
 describe('independent operator health', () => {
   it('does not create a missing store when an operator asks to query', async () => {
@@ -88,6 +99,7 @@ it('reports fresh source failures and recorded loss as partial operator coverage
 
 it('preserves ingress Unicode split between stdin chunks', async () => {
   const path = directory(); vi.stubEnv('POISE_GATEWAY_DATA', path); vi.stubEnv('POISE_DOMAIN', 'poise.test')
+  await operatorWriter(path)
   const bytes = Buffer.from(JSON.stringify({ request: { host: 'poise.test' }, level: 'error', msg: 'native 障 cause' }))
   const split = bytes.indexOf(Buffer.from('障')) + 1
   async function* chunks() { yield bytes.subarray(0, split); yield bytes.subarray(split) }
@@ -128,6 +140,7 @@ it('gives host operator commands no workspace identity, including a real owner n
 
 it('retains distinct ingress occurrences for one request while deduplicating exact replay', async () => {
   const path = directory(); vi.stubEnv('POISE_GATEWAY_DATA', path); vi.stubEnv('POISE_DOMAIN', 'poise.test')
+  await operatorWriter(path)
   const records = [
     { request: { host: 'poise.test' }, request_id: 'same-request', ts: 1792317600, level: 'warn', msg: 'proxy retry' },
     { request: { host: 'poise.test' }, request_id: 'same-request', ts: 1792317600, level: 'error', msg: 'proxy failed' },
@@ -146,6 +159,7 @@ it('retains distinct ingress occurrences for one request while deduplicating exa
 
 it('preserves retained ingress coverage when later routine records are excluded', async () => {
   const path = directory(); vi.stubEnv('POISE_GATEWAY_DATA', path); vi.stubEnv('POISE_DOMAIN', 'poise.test')
+  await operatorWriter(path)
   const send = async (level: string) => {
     async function* input() { yield JSON.stringify({ request: { host: 'poise.test' }, level, msg: level + ' native cause' }) }
     await runOperator(['ingress'], () => undefined, input())

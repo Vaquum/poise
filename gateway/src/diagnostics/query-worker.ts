@@ -29,7 +29,7 @@ function health(request: LoggingRead): LoggingReply {
       dropped: number; rejected: number; lossActive?: boolean; coverageError?: string | null; reportError?: string | null;
     }
     if (journal.version !== 1 || !Array.isArray(journal.sources) || journal.sources.length > 256 || !Number.isFinite(Date.parse(journal.writtenAt))) throw new Error('Unsupported coverage journal')
-    const sources = journal.sources.filter((source) => source.workspace === null || source.workspace === request.access.workspace)
+    const sources = journal.sources.filter((source) => (source.workspace === null || source.workspace === request.access.workspace) && source.id !== 'external-ingress')
       .map((source) => projectCoverage(source, request.access))
     const lossObserved = journal.dropped > 0 || journal.rejected > 0 || !!journal.coverageError || !!journal.reportError
       || sources.some((source) => (source.dropped ?? 0) > 0 || (source.rejected ?? 0) > 0)
@@ -54,7 +54,7 @@ function health(request: LoggingRead): LoggingReply {
     // Operator integrations write their coverage directly; a fresh runtime journal
     // must not hide an unconfigured or disconnected external source.
     const sources = new Map(db.readCoverage(request.access).map((source) => [source.id, source]))
-    for (const source of collection.sources) sources.set(source.id, source)
+    for (const source of collection.sources) if (source.id !== 'external-ingress' || !sources.has(source.id)) sources.set(source.id, source)
     if (sources.size > 256) throw new Error('Combined collection coverage exceeds its source bound')
     collection.sources = [...sources.values()]
     const required = collection.sources.filter((source) => !source.optional)

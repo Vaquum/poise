@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { scopePrefix, SEVERITIES, type LogEvent } from './contract.js'
 
 import type { LogAccess, LogFilter, Coverage, LogPolicy, LoggingPage } from './query-contract.js'
+import { observedCoverage } from './query-contract.js'
 export type { LogAccess, LogFilter, Coverage, LogPolicy } from './query-contract.js'
 export function projectCoverage(value: Coverage, access: LogAccess): Coverage {
   return access.operator || value.workspace === access.workspace ? value : {
@@ -184,7 +185,7 @@ export class DiagnosticStore {
 
   readCoverage(access: LogAccess): Coverage[] {
     const rows = this.db.prepare('SELECT payload FROM log_coverage WHERE workspace=? OR workspace IS NULL').all(access.workspace) as Array<{ payload: string }>
-    return rows.map(({ payload }) => projectCoverage(JSON.parse(payload) as Coverage, access))
+    return rows.map(({ payload }) => projectCoverage(observedCoverage(JSON.parse(payload) as Coverage, this.now()), access))
   }
 
   query(access: LogAccess, filter: LogFilter = {}): LoggingPage {
@@ -303,6 +304,15 @@ export class DiagnosticStore {
       this.db.prepare('INSERT INTO log_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('checkpoint:' + key, cursor)
       return inserted
     })()
+  }
+
+  commitCollection(events: readonly LogEvent[], key: string, expected: string | null, cursor: string | null, coverage: Coverage): void {
+    this.db.transaction(() => {
+      if (this.checkpoint(key) !== expected) throw new Error('Diagnostic source checkpoint changed during delivery')
+      for (let i = 0; i < events.length; i += 100) this.append(events.slice(i, i + 100))
+      this.coverage(coverage)
+      if (cursor !== null) this.db.prepare('INSERT INTO log_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('checkpoint:' + key, cursor)
+    }).immediate()
   }
 
   private key(): Buffer {

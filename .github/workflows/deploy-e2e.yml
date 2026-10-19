@@ -44,6 +44,9 @@ jobs:
       - name: Lint the operator scripts
         run: shellcheck -x deploy/*.sh deploy/ci/*.sh
 
+      - name: Build the canonical ingress projection
+        run: npm ci --prefix gateway && node deploy/ingress/build.mjs
+
       - name: Test the volume archive
         run: python3 -m unittest discover --start-directory deploy/ci --pattern 'test_*.py' --verbose
 

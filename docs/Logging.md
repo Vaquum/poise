@@ -203,6 +203,19 @@ only after persistence. The operator owns delivery/retry and must not forward
 unrelated business-service logs. No public or workspace ingestion endpoint is
 added. Unconfigured external ingress coverage remains unknown, not healthy.
 
+External Caddy installations can instead run the bounded continuous
+[operator reader](../deploy/ingress/README.md). A dedicated forced-command SSH
+key reaches only `ingress-stream`. Its version-1 handshake returns the configured
+domain and durable source checkpoint; a single bounded JSON batch carries the
+expected checkpoint, container, UTC source window and projected records. Events,
+coverage and the next checkpoint commit atomically before acknowledgement.
+The source's optional `observationExpiresAt` lease makes current health unavailable
+after 90 seconds without reporting. Initial history replays retained native records
+within 30 days (an empty source starts with five minutes); rotation, replacement and irreducible read bounds remain explicit
+historical uncertainty/gaps. The reader excludes unrelated hosts and request
+payloads before transport; canonical gateway normalization/redaction remains
+authoritative. Manual one-record delivery cannot renew this continuous lease.
+
 Production starts capture after secure environment validation and before the
 application database modules load. An uncaught process failure retains a
 Critical event and then exits with the existing failure status. Structured

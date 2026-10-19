@@ -47,7 +47,8 @@
     "self-update:disable": "node scripts/install-self-update.mjs disable",
     "self-update:uninstall": "node scripts/install-self-update.mjs uninstall",
     "self-update:control": "node scripts/self-update/cli.mjs",
-    "check:deployment": "shellcheck -x deploy/*.sh deploy/ci/*.sh deploy/runtime/*.sh deploy/runtime/test/*.sh && python3 -m unittest discover --start-directory deploy/ci --pattern test_*.py",
+    "check:ingress": "node deploy/ingress/test.mjs",
+    "check:deployment": "shellcheck -x deploy/*.sh deploy/ci/*.sh deploy/runtime/*.sh deploy/runtime/test/*.sh && node deploy/ingress/build.mjs && python3 -m unittest discover --start-directory deploy/ci --pattern test_*.py",
     "check:gateway-image": "docker build -t poise-gateway:diagnostics-check gateway/",
     "check:runtime-image": "docker build -f deploy/runtime/Dockerfile -t poise-runtime:diagnostics-check . && deploy/runtime/test/smoke.sh contract poise-runtime:diagnostics-check && deploy/runtime/test/smoke.sh offline poise-runtime:diagnostics-check",
     "check:gateway-docker": "docker build -f gateway/Dockerfile.test -t poise-gateway:docker-check gateway/ && docker run --rm --network host -e VITEST_MAX_WORKERS -v /var/run/docker.sock:/var/run/docker.sock poise-gateway:docker-check"
