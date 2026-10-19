@@ -92,6 +92,7 @@
      adds emphasis. Derived from A3/A5/A1 at low alpha. */
   --tint-a1: rgba(58, 114, 176, 0.06);
   --tint-a3: rgba(74, 142, 94, 0.07);
+  --tint-a4: rgba(168, 121, 43, 0.07);
   --tint-a5: rgba(184, 80, 72, 0.06);
 
   /* Motion — three canonical durations, all eased the same way. Quick is
@@ -163,6 +164,7 @@
   /* Tint backgrounds — DS dark-mode rule: ~25% alpha for badges. */
   --tint-a1: rgba(58, 114, 176, 0.20);
   --tint-a3: rgba(74, 142, 94, 0.20);
+  --tint-a4: rgba(168, 121, 43, 0.20);
   --tint-a5: rgba(184, 80, 72, 0.20);
 
   /* Elevation — light-mode shadows used rgba(22,26,32,…) which
@@ -5980,6 +5982,7 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 .chat-tool-status { flex: 0 0 auto; display: inline-flex; }
 .chat-tool-status.ok { color: var(--a3); }
 .chat-tool-status.bad { color: var(--a5); }
+.chat-tool[data-status="cancelled"] .chat-tool-status { color: var(--a4); }
 .chat-tool-status.run { color: var(--text-tertiary); }
 .chat-tool-body {
   border-top: var(--b-hair);

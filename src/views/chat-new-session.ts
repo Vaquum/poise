@@ -11,7 +11,7 @@ export function renderNewSessionDialog(
   const initial = familyForIdentity(families, info.defaults.model) ?? families.find(f => f.agent.available) ?? families[0]
   const options = info.agents.map(agent => `<optgroup label="${escapeHtml(agent.label)}">${families.filter(f => f.agent === agent).map(f => `<option value="${escapeHtml(f.key)}" data-provider="${escapeHtml(agent.id)}">${escapeHtml(f.label)}</option>`).join('')}</optgroup>`).join('')
   const fallback = info.defaults.fallbackReason ? `<fieldset class="chat-dialog-field chat-dialog-fallback">
-    <legend>Model provider</legend><div class="st-help st-help-error">${escapeHtml(info.defaults.fallbackReason)}</div>
+    <legend>Model provider</legend><div class="st-help st-help-warn">${escapeHtml(info.defaults.fallbackReason)}</div>
     <label class="chat-radio"><input type="radio" name="fallback" value="default" checked> Use the default, <code>${escapeHtml(info.defaults.model)}</code></label>
     <label class="chat-radio"><input type="radio" name="fallback" value="fallback"> Use the fallback, <code>${escapeHtml(info.defaults.fallback)}</code></label></fieldset>` : ''
   container.innerHTML = `<form class="chat-dialog-body">

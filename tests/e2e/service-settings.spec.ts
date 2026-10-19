@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import type { AdminOverview, GatewayAccount, PairedDevice } from '../../src/gateway-client'
+import { adminPage, type AdminView } from '../../gateway/src/pages'
 
 // Settings in a workspace behind the gateway: Poise Link under Accounts and,
 // for the gateway's admins, an Admin tab. Poise's own API and the gateway's
@@ -210,6 +211,12 @@ test('gives the gateway\'s admins an Admin tab that manages people and workspace
   await expect(page.locator('.ad-user[data-user="octocat"]')).toContainText('2.4 GB on disk')
   await expect(page.locator('.ad-disk')).toContainText('Server disk: 20 GB free of 290 GB')
   await expect(page.locator('.ad-disk')).toContainText('Less than a tenth is free.')
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    await expect(page.locator('.ad-disk .st-help')).toHaveCSS('color', 'rgb(168, 121, 43)')
+    await expect(alice.getByText('61 GB on disk, over its 50 GB budget', { exact: true })).toHaveCSS('color', 'rgb(168, 121, 43)')
+    await expect(alice.getByText('the last start timed out', { exact: true })).toHaveCSS('color', 'rgb(184, 80, 72)')
+  }
   // An admin cannot disable themselves.
   await expect(page.locator('.ad-user[data-user="octocat"] [data-change="users/disable"]')).toHaveCount(0)
   await expect(page.locator('.ad-allowed-row')).toContainText('added by octocat')
@@ -226,6 +233,25 @@ test('gives the gateway\'s admins an Admin tab that manages people and workspace
   await expect(page.locator('.st-tabs')).toHaveCount(0)
   await page.getByRole('button', { name: 'Back to menu' }).click()
   await expect(page.locator('#menu-popover [data-settings="admin"]')).toBeVisible()
+})
+
+test('gateway Admin disk warnings are amber and start failures stay red in both themes', async ({ page }) => {
+  const view: AdminView = {
+    csrf: 'fixture', admins: ['octocat'], allowed: [], allowedOrgs: [], access: new Map(), dockerError: null,
+    users: [{ handle: 'alice', login: 'Alice', githubId: 1, accessOrg: null, createdAt: 0, lastLoginAt: 0, disabledAt: null, disabledBy: null }],
+    workspaces: new Map([['alice', { state: 'exited', image: 'outdated' }]]),
+    records: new Map([['alice', { handle: 'alice', login: 'Alice', createdAt: 0, lastStartedAt: null, lastError: 'the last start timed out', lastErrorAt: 0 }]]),
+    disk: { measuredAt: 0, free: 20 * 1024 ** 3, total: 290 * 1024 ** 3, low: true, workspaces: new Map([['alice', 61 * 1024 ** 3]]) },
+    diskBudget: 50 * 1024 ** 3,
+  }
+  await page.route('https://rsms.me/**', route => route.abort())
+  await page.setContent(adminPage(view))
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme })
+    await expect(page.getByText(/Server disk:.*Less than a tenth is free/)).toHaveCSS('color', 'rgb(168, 121, 43)')
+    await expect(page.getByText('61 GB on disk, over its 50 GB budget', { exact: true })).toHaveCSS('color', 'rgb(168, 121, 43)')
+    await expect(page.getByText('the last start timed out', { exact: true })).toHaveCSS('color', 'rgb(184, 80, 72)')
+  }
 })
 
 test('saves the model choices under a name and switches back to them in one step', async ({ page }) => {

@@ -45,14 +45,14 @@ function diskHtml(view: AdminOverview): string {
   if (!disk || disk.free === null || disk.total === null) return ''
   const text = `Server disk: ${size(disk.free)} free of ${size(disk.total)}, measured ${moment(disk.measuredAt)}.`
   return disk.low
-    ? `<div class="st-help st-help-error">${escapeHtml(text)} Less than a tenth is free.</div>`
+    ? `<div class="st-help st-help-warn">${escapeHtml(text)} Less than a tenth is free.</div>`
     : `<div class="st-help st-help-info">${escapeHtml(text)}</div>`
 }
 
 function userDiskHtml(user: AdminUser, budget: number): string {
   if (!user.disk) return ''
   return user.disk.overBudget
-    ? `<div class="st-help st-help-error">${escapeHtml(`${size(user.disk.bytes)} on disk, over its ${size(budget)} budget`)}</div>`
+    ? `<div class="st-help st-help-warn">${escapeHtml(`${size(user.disk.bytes)} on disk, over its ${size(budget)} budget`)}</div>`
     : `<div class="st-help st-help-info">${escapeHtml(`${size(user.disk.bytes)} on disk`)}</div>`
 }
 

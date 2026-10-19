@@ -66,7 +66,7 @@ function ghAccounts(account: ConnectedAccount, identities: GitHubIdentities): st
     identities.me && !usable(identities.me) ? `Your GitHub account ${identities.me} is not signed in.` : '',
     identities.agentAccount && !usable(identities.agentAccount) ? `Your GitHub automation account ${identities.agentAccount} is not signed in.` : '',
   ].filter(Boolean)
-  return list + missing.map((text) => `<div class="st-help st-help-error st-gh-missing">${escapeHtml(text)}</div>`).join('')
+  return list + missing.map((text) => `<div class="st-help st-help-warn st-gh-missing">${escapeHtml(text)}</div>`).join('')
 }
 
 /** The rows. `busy` while a terminal runs: one login at a time. */

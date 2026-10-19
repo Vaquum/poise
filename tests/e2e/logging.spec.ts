@@ -221,6 +221,50 @@ test('discards a delayed older filter response and stops polling in a hidden doc
   } finally { release() }
 })
 
+test('a paused Logging refresh stays neutral while failed reads and exports remain red', async ({ page }) => {
+  await ready(page)
+  let release!: () => void
+  const released = new Promise<void>(resolve => { release = resolve })
+  let held!: () => void
+  const holding = new Promise<void>(resolve => { held = resolve })
+  let fail = false
+  await page.route('**/api/logging?**', async route => {
+    if (new URL(route.request().url()).searchParams.has('after')) return route.continue()
+    if (fail) return route.fulfill({ status: 503, json: { error: 'logging_unavailable', message: 'Fixture read unavailable' } })
+    const response = await route.fetch()
+    const body = await response.json()
+    held(); await released; await route.fulfill({ json: body })
+  })
+  try {
+    await action(page, 'refresh').click(); await holding
+    await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')) })
+    release()
+    const polled = page.waitForResponse(response => new URL(response.url()).pathname === '/api/logging' && new URL(response.url()).searchParams.has('after'))
+    await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: false }); document.dispatchEvent(new Event('visibilitychange')) })
+    await polled
+    const note = page.locator('#logging-message')
+    await expect(note).toHaveText('The pending read was paused when this tab became hidden.')
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+      await expect(note).toHaveCSS('color', 'rgb(142, 149, 158)')
+    }
+    fail = true
+    await action(page, 'refresh').click()
+    await expect(note).toContainText('Fixture read unavailable')
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+      await expect(note).toHaveCSS('color', 'rgb(184, 80, 72)')
+    }
+    await page.route('**/api/logging/export**', route => route.fulfill({ status: 503, json: { error: 'logging_unavailable', message: 'Fixture export unavailable' } }))
+    await action(page, 'export').click()
+    await expect(note).toContainText('Export failed; no complete download was produced.')
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+      await expect(note).toHaveCSS('color', 'rgb(184, 80, 72)')
+    }
+  } finally { release() }
+})
+
 test('cold links reveal an event outside the first page, widen bounds, persist view and restore saved filters', async ({ page }) => {
   const target = fixtures[0]
   const path = '/?' + new URLSearchParams({ view: 'logging', event: target.id, from: new Date(Date.now() + 3_600_000).toISOString() })
@@ -309,6 +353,10 @@ test('failed refreshes are stale and lookup failures never become an ordinary em
     await page.route('**/api/logging/events/**', (route) => route.fulfill({ status: code, json: { error: 'logging_unavailable', message: 'Fixture evidence state', bounds: { from: null, to: null, retentionAfter: '2026-09-19T00:00:00Z' } } }))
     await page.goto('/?view=logging&event=' + fixtures[0].id)
     await expect(page.locator('#logging-link')).toContainText(text)
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+      await expect(page.locator('#logging-link .st-help')).toHaveCSS('color', code === 503 ? 'rgb(184, 80, 72)' : 'rgb(168, 121, 43)')
+    }
     await expect(page.locator('#logging-empty')).toBeHidden()
     await page.getByRole('button', { name: 'Diagnostic data details' }).click()
     await expect(page.locator('#logging-health')).toContainText('Retention boundary')
@@ -317,6 +365,10 @@ test('failed refreshes are stale and lookup failures never become an ordinary em
     await action(page, 'refresh').click()
     await retried
     await expect(page.locator('#logging-link')).toContainText(text)
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+      await expect(page.locator('#logging-link .st-help')).toHaveCSS('color', code === 503 ? 'rgb(184, 80, 72)' : 'rgb(168, 121, 43)')
+    }
     await expect(page.locator('#logging-empty')).toBeHidden()
     await page.unroute('**/api/logging/events/**')
   }
@@ -477,4 +529,35 @@ test('shows recovered history only on inspection and identifies actual current c
   await page.getByRole('button', { name: 'Diagnostic data details' }).click()
   await expect(page.locator('#logging-data')).toContainText('Fixture transport disconnected')
   await expect(page.locator('#logging-data')).toContainText('Unavailable')
+})
+
+
+test('auxiliary Logging failures warn while primary evidence remains usable', async ({ page }) => {
+  await ready(page)
+  const saved = await rows(page).count()
+  await page.route('**/api/logging?**', route => {
+    const params = new URL(route.request().url()).searchParams
+    return params.has('incidentId') ? route.fulfill({ status: 503, json: { error: 'logging_unavailable', message: 'Fixture related read unavailable' } }) : route.continue()
+  })
+  const button = rows(page).filter({ hasText: 'fetch failed' }).first().getByRole('button', { name: 'Toggle diagnostic evidence' })
+  await button.click()
+  const detail = page.locator('#logging-tbody > .agent-expand-row').first()
+  await detail.getByRole('button', { name: 'Show incident', exact: true }).click()
+  const related = detail.getByRole('status')
+  await expect(related).toContainText('Fixture related read unavailable')
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    await expect.soft(related).toHaveCSS('color', 'rgb(168, 121, 43)')
+  }
+  await page.route('**/api/logging/health?**', route => route.fulfill({ status: 503, json: { error: 'logging_unavailable', message: 'Fixture health unavailable' } }))
+  const health = page.waitForResponse(response => new URL(response.url()).pathname === '/api/logging/health')
+  await action(page, 'refresh').click(); await health
+  await expect(rows(page)).toHaveCount(saved)
+  await expect(page.locator('#logging-loader')).toBeHidden()
+  await page.getByRole('button', { name: 'Diagnostic data details' }).click()
+  const note = page.locator('#logging-health .st-help').filter({ hasText: 'Fixture health unavailable' })
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    await expect.soft(note).toHaveCSS('color', 'rgb(168, 121, 43)')
+  }
 })

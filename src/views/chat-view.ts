@@ -1722,7 +1722,7 @@ function headerHtml(): string {
       ${memoriesButton()}
     </div>
     ${s.safeModePending ? '<div id="chat-safe-mode-status" class="st-help chat-safe-mode-status" role="status">Permission change queued for the next turn; current native permissions are unchanged.</div>' : ''}
-    ${s.cliWarning ? `<div class="st-help st-help-error chat-cli-warning" role="status">${escapeHtml(s.cliWarning)}</div>` : ''}
+    ${s.cliWarning ? `<div class="st-help st-help-warn chat-cli-warning" role="status">${escapeHtml(s.cliWarning)}</div>` : ''}
     ${s.orphanNotice ? `<div class="st-help st-help-error">${escapeHtml(s.orphanNotice)}</div>` : ''}
   `
 }

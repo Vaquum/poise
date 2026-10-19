@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { STATUS, fakeCalls, script, writeFakeClis } from '../fixtures/accounts/fake-clis'
 import { cliHomes } from '../fixtures/cli-isolation'
+import { workspace } from './fixtures/workspace'
 
 // Settings → Connected accounts against fake CLIs: the real accounts route
 // and the real terminal, with nothing but the fakes on the server's PATH.
@@ -134,5 +135,40 @@ test('connects a CLI from Settings in a terminal and shows its new sign-in', asy
     expect(calls.filter((call) => call.args.includes('login') && call.args.join(' ') !== 'login status')).toHaveLength(1)
   } finally {
     await stop(fixture.child)
+  }
+})
+
+
+test('account sign-in notices are amber while account read failures stay red', async ({ page }) => {
+  await workspace(page)
+  await page.route('**/api/accounts**', async route => {
+    const id = new URL(route.request().url()).searchParams.get('id') ?? 'gh'
+    await route.fulfill({ json: { accounts: [{ id, installed: true, version: '2.92.0', signedIn: false, identity: null, detail: null,
+      login: { label: 'Connect account' }, ...(id === 'gh' ? { accounts: [
+        { login: 'octocat', active: true, signedIn: false, detail: 'Sign-in needed' },
+        { login: 'octo-agent', active: false, signedIn: false, detail: 'Sign-in needed' },
+      ] } : {}) }] } })
+  })
+  await page.locator('#menu-toggle').click()
+  await page.locator('#menu-popover [data-settings="accounts"]').click()
+  const row = page.locator('.st-account[data-account="gh"]')
+  await expect(row.locator('.st-gh-missing')).toHaveCount(2)
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    for (const note of await row.locator('.st-gh-missing, .st-gh-problem').all()) {
+      await expect.soft(note).toHaveCSS('color', 'rgb(168, 121, 43)')
+    }
+    for (const state of await row.locator('.st-account-state-off').all()) {
+      await expect.poll(() => state.evaluate(el => getComputedStyle(el, '::before').backgroundColor)).toBe('rgb(168, 121, 43)')
+    }
+  }
+  await page.route('**/api/accounts**', route => route.fulfill({ status: 503, json: { error: 'Fixture accounts unavailable' } }))
+  await page.keyboard.press('Escape')
+  await page.locator('#menu-toggle').click()
+  await page.locator('#menu-popover [data-settings="accounts"]').click()
+  await expect(page.locator('.st-account-checks-status')).toContainText('Could not check gh')
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    await expect.soft(page.locator('.st-account-checks-status')).toHaveCSS('color', 'rgb(184, 80, 72)')
   }
 })

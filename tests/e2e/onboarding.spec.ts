@@ -242,3 +242,53 @@ test('never opens setup in a workspace that is already set up, and offers to run
   await expect(page.locator('.ob-title')).toHaveText('Choose how Poise looks')
   await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)
 })
+
+
+test('setup cooldowns are neutral while genuine activation and sync failures stay red', async ({ page }) => {
+  const retryAt = new Date(Date.now() + 3_600_000).toISOString()
+  const state = await setupWorkspace(page, { step: 'organizations', me: 'octocat', organizations: [
+    { ...organization('waiting-new', 'initializing', 'GitHub cooldown; resuming automatically.'), stage: 'rate-limited', retryAt },
+    { ...organization('waiting-ready', 'ready', 'GitHub cooldown; resuming automatically.'), stage: 'rate-limited', retryAt },
+    organization('activation-failed', 'error', 'Activation failed: access denied.'),
+    organization('sync-failed', 'ready', 'Sync failed: repository read denied.'),
+  ] })
+  // Setup retries failed activation once after sign-in; this backend failure persists.
+  await page.route('**/api/organizations/activation-failed/retry', route => route.fulfill({ status: 202, json: { organizations: state.organizations } }))
+  await page.goto('/')
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    for (const login of ['waiting-new', 'waiting-ready']) {
+      const row = page.locator(`.ob-org[data-org="${login}"]`)
+      await expect.soft(row.locator('.ob-org-state')).toHaveText('Waiting for GitHub')
+      await expect.soft(row.locator('.ob-org-state')).toHaveCSS('color', theme === 'light' ? 'rgb(92, 99, 109)' : 'rgb(197, 203, 209)')
+      await expect.soft(row.locator('.st-help')).toHaveCSS('color', 'rgb(142, 149, 158)')
+      await expect.soft(row.getByRole('button', { name: 'Retry' })).toHaveCount(0)
+    }
+    for (const login of ['activation-failed', 'sync-failed']) {
+      const row = page.locator(`.ob-org[data-org="${login}"]`)
+      await expect.soft(row.locator('.ob-org-state')).toHaveCSS('color', 'rgb(184, 80, 72)')
+      await expect.soft(row.locator('.st-help-error')).toHaveCSS('color', 'rgb(184, 80, 72)')
+      await expect(row.getByRole('button', { name: 'Retry' })).toBeEnabled()
+    }
+  }
+})
+
+test('optional setup probes warn while an unavailable model catalog blocks progress', async ({ page }) => {
+  for (const [step, path, text, blocked] of [
+    ['ai', '**/api/accounts**', 'Could not ask the CLIs:', false],
+    ['link', '**/_poise/api/account', 'The gateway did not answer:', false],
+    ['models', '**/api/models', 'The model catalog is unavailable:', true],
+  ] as const) {
+    await setupWorkspace(page, { step, me: 'octocat' })
+    await page.route(path, route => route.fulfill({ status: 503, json: { error: 'Fixture read unavailable' } }))
+    await page.goto('/')
+    const note = page.locator('.ob-dialog .st-help').filter({ hasText: text })
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+      await expect.soft(note).toHaveCSS('color', blocked ? 'rgb(184, 80, 72)' : 'rgb(168, 121, 43)')
+      if (blocked) await expect(next(page)).toBeDisabled()
+      else await expect(next(page)).toBeEnabled()
+    }
+    await page.unroute(path)
+  }
+})

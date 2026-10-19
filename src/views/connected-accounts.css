@@ -77,7 +77,7 @@
 }
 
 .st-account-state-on::before { background: var(--a3); box-shadow: 0 0 0 3px var(--tint-a3); }
-.st-account-state-off::before { background: var(--a5); box-shadow: 0 0 0 3px var(--tint-a5); }
+.st-account-state-off::before { background: var(--a4); box-shadow: 0 0 0 3px var(--tint-a4); }
 
 .st-account-detail,
 .st-account-login {
@@ -110,7 +110,7 @@
   background: var(--a3);
 }
 
-.st-gh-account.st-account-state-off::before { background: var(--a5); }
+.st-gh-account.st-account-state-off::before { background: var(--a4); }
 
 .st-gh-login {
   font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
@@ -122,7 +122,7 @@
 .st-gh-problem {
   flex-basis: 100%;
   padding-left: 11px;
-  color: var(--red);
+  color: var(--amber);
 }
 
 .st-account-actions {

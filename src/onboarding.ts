@@ -436,13 +436,14 @@ function organizationsStep(ctx: StepContext): StepView {
   const render = () => {
     const organizations = getOrganizations()
     const html = organizations.map((org) => {
-      const state = org.status === 'ready' ? (org.error ? 'Sync failed' : 'Ready') : org.status === 'error' ? 'Activation failed' : 'Activating…'
-      const tone = org.status === 'ready' && !org.error ? 'ready' : org.status === 'error' || org.error ? 'error' : 'initializing'
+      const waiting = org.status !== 'error' && org.stage === 'rate-limited' && !!org.retryAt && Date.parse(org.retryAt) > Date.now()
+      const state = waiting ? 'Waiting for GitHub' : org.status === 'ready' ? (org.error ? 'Sync failed' : 'Ready') : org.status === 'error' ? 'Activation failed' : 'Activating…'
+      const tone = waiting ? 'waiting' : org.status === 'ready' && !org.error ? 'ready' : org.status === 'error' || org.error ? 'error' : 'initializing'
       return `
         <div class="ob-org" data-org="${escapeHtml(org.login)}">
           <div class="ob-org-head"><span class="ob-org-name">${escapeHtml(org.login)}</span><span class="ob-org-state ob-org-state-${tone}">${state}</span></div>
-          ${org.status === 'initializing' ? `<div class="st-help st-help-info">${escapeHtml(ORGANIZATION_STAGES[org.stage] ?? 'Preparing account…')}</div>` : ''}
-          ${org.status === 'error' || org.error ? `<div class="st-help st-help-error">${escapeHtml(org.error ?? 'Activation failed.')}</div><button type="button" class="st-clear ob-org-retry" data-retry="${escapeHtml(org.login)}">Retry</button>` : ''}
+          ${waiting ? `<div class="st-help st-help-info">${escapeHtml(org.error ?? 'Waiting for GitHub; activation will resume automatically.')}</div>` : org.status === 'initializing' ? `<div class="st-help st-help-info">${escapeHtml(ORGANIZATION_STAGES[org.stage] ?? 'Preparing account…')}</div>` : ''}
+          ${!waiting && (org.status === 'error' || org.error) ? `<div class="st-help st-help-error">${escapeHtml(org.error ?? 'Activation failed.')}</div><button type="button" class="st-clear ob-org-retry" data-retry="${escapeHtml(org.login)}">Retry</button>` : ''}
         </div>`
     }).join('') || '<div class="st-help st-help-info ob-empty">No organizations yet.</div>'
     if (html === rendered) return
@@ -628,7 +629,7 @@ function aiStep(ctx: StepContext): StepView {
       await ctx.refreshInfo()
       if (!disposed) render()
     } catch (error) {
-      if (!disposed) list.innerHTML = `<div class="st-help st-help-error">${escapeHtml(`Could not ask the CLIs: ${(error as Error).message}`)}</div>`
+      if (!disposed) list.innerHTML = `<div class="st-help st-help-warn">${escapeHtml(`Could not ask the CLIs: ${(error as Error).message}`)}</div>`
     }
     ctx.update()
   }
@@ -813,7 +814,7 @@ function linkStep(ctx: StepContext): StepView {
     })
     view.replaceChildren(section.element)
   }).catch((error: unknown) => {
-    if (!disposed) view.innerHTML = `<div class="st-help st-help-error">${escapeHtml(`The gateway did not answer: ${(error as Error).message}. You can pair later in Settings → Accounts.`)}</div>`
+    if (!disposed) view.innerHTML = `<div class="st-help st-help-warn">${escapeHtml(`The gateway did not answer: ${(error as Error).message}. You can pair later in Settings → Accounts.`)}</div>`
   })
   return {
     element: view,

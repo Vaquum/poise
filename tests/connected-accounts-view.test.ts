@@ -23,7 +23,7 @@ function notes(html: string, login: string): string | null {
 }
 
 function missing(html: string): string[] {
-  return [...html.matchAll(/<div class="st-help st-help-error st-gh-missing">([^<]*)<\/div>/g)].map((match) => match[1])
+  return [...html.matchAll(/<div class="[^"]*\bst-gh-missing\b[^"]*">([^<]*)<\/div>/g)].map((match) => match[1])
 }
 
 describe('the gh row', () => {

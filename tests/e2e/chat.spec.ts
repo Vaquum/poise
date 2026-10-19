@@ -171,6 +171,33 @@ test('Enter sends, Shift+Enter breaks the line, Enter steers while running, and 
   await expect(page.locator('.chat-v-composer .chat-send')).toHaveAttribute('aria-label', 'Send')
 })
 
+for (const stopReason of ['cancelled', 'interrupted'] as const) test(`cancelled tool after ${stopReason} is amber while failed tools stay red`, async ({ page }) => {
+  const history = [
+    env('s1', 1, { type: 'turn.started', turnId: 't1', prompt: { text: 'go', attachments: [], mentions: [] } }),
+    env('s1', 2, { type: 'tool.started', turnId: 't1', id: 'pending', kind: 'execute', title: 'Pending command' }),
+    env('s1', 3, { type: 'tool.started', turnId: 't1', id: 'failed', kind: 'execute', title: 'Failed command' }),
+    env('s1', 4, { type: 'tool.finished', turnId: 't1', id: 'failed', status: 'failed' }),
+  ]
+  const state = makeState([session({ status: 'running', lastSeq: 4 })], { s1: history })
+  await installRoutes(page, state); const sock = await installSocket(page, state)
+  await page.goto('/'); await sock.subscribed('s1'); sock.seq = 4
+  const pending = page.locator('.chat-tool').filter({ hasText: 'Pending command' })
+  const failed = page.locator('.chat-tool').filter({ hasText: 'Failed command' })
+  await expect(pending).toHaveAttribute('data-status', 'running')
+  if (stopReason === 'cancelled') {
+    await input(page).press('ControlOrMeta+.')
+    await expect.poll(() => sock.framesOf('cancel').length).toBe(1)
+  }
+  sock.push('s1', { type: 'turn.finished', turnId: 't1', stopReason })
+  sock.push('s1', { type: 'status.changed', status: stopReason === 'cancelled' ? 'idle' : 'interrupted' })
+  await expect(pending).toHaveAttribute('data-status', 'cancelled')
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    await expect(pending.locator('.chat-tool-status')).toHaveCSS('color', 'rgb(168, 121, 43)')
+    await expect(failed.locator('.chat-tool-status')).toHaveCSS('color', 'rgb(184, 80, 72)')
+  }
+})
+
 test('streams text, sticks to the bottom only when there, and never runs agent HTML', async ({ page, browserName }) => {
   const state = makeState([session({ status: 'running' })], { s1: [env('s1', 1, { type: 'turn.started', turnId: 't1', prompt: { text: 'go', attachments: [], mentions: [] } })] })
   await installRoutes(page, state)
@@ -429,6 +456,19 @@ test('offers an explicit fallback choice when the default provider is not signed
   await dialog.getByRole('button', { name: 'Create' }).click()
   await expect(page.getByRole('dialog', { name: 'New session' }).getByRole('alert')).toContainText('uncommitted changes')
   await expect(page.locator('.chat-session-item')).toHaveCount(0)
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    await expect.soft(dialog.locator('.chat-dialog-fallback .st-help')).toHaveCSS('color', 'rgb(168, 121, 43)')
+    await expect.soft(dialog.getByRole('alert')).toHaveCSS('color', 'rgb(184, 80, 72)')
+    await expect(dialog.getByRole('button', { name: 'Create' })).toBeEnabled()
+  }
+  await dialog.getByLabel('Model').selectOption('grok-4.6-xhigh')
+  await expect(dialog.getByRole('status')).toContainText('not signed in')
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    await expect.soft(dialog.getByRole('status')).toHaveCSS('color', 'rgb(184, 80, 72)')
+    await expect(dialog.getByRole('button', { name: 'Create' })).toBeDisabled()
+  }
 })
 
 test('hands a Current card and an Editor document off to a prefilled New session dialog', async ({ page }) => {
@@ -2800,10 +2840,10 @@ for (const theme of ['light', 'dark']) test(`CLI refresh: ${theme} status colors
   const state = makeState([]); await installRoutes(page, state); await installSocket(page, state)
   let release!: () => void
   let gate = new Promise<void>(resolve => { release = resolve })
-  let failure = true
+  let failuresRemaining = 2
   await page.route('**/api/models/refresh', async route => {
     await gate
-    await route.fulfill(failure ? { status: 502, json: { error: 'Provider update unavailable' } } : { json: { families: { claude: { status: 'ok' } } } })
+    await route.fulfill(failuresRemaining ? { status: 502, json: { error: 'Provider update unavailable' } } : { json: { families: { claude: { status: 'ok' } } } })
   })
   try {
     await page.goto('/'); await openModelSettings(page)
@@ -2811,7 +2851,7 @@ for (const theme of ['light', 'dark']) test(`CLI refresh: ${theme} status colors
     const status = page.locator('.st-catalog-status')
     const help = page.locator('.st-status')
     const check = page.getByRole('button', { name: 'Check now', exact: true })
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       await check.click()
       await expect(status).toContainText('Updating provider CLIs')
       await expect(status).toHaveCSS('color', 'rgb(142, 149, 158)')
@@ -2819,11 +2859,11 @@ for (const theme of ['light', 'dark']) test(`CLI refresh: ${theme} status colors
       await expect(help).toBeEmpty()
       release()
       await expect(page.locator('.st-refresh-models')).toBeEnabled()
-      if (failure) {
+      if (failuresRemaining) {
         await expect(status).toContainText('Provider update unavailable')
         await expect(status).toHaveCSS('color', 'rgb(184, 80, 72)')
         await expect(help).toHaveCSS('color', 'rgb(184, 80, 72)')
-        failure = false
+        failuresRemaining--
         gate = new Promise<void>(resolve => { release = resolve })
       } else {
         await expect(status).toContainText('models')
@@ -2900,13 +2940,25 @@ test('CLI refresh: a completed Settings check updates the fresh console without 
 
 test('CLI refresh: an unavailable latest version stays visible independently of activity and reasoning', async ({ page }) => {
   const warning = 'Latest claude CLI could not be verified: download unavailable. Trying the installed CLI (2.1.274).'
-  const state = makeState([session({ cliVersion: '2.1.274', cliWarning: warning })])
+  const orphan = 'An orphaned process must be stopped by hand before this chat can continue.'
+  const state = makeState([session({ cliVersion: '2.1.274', cliWarning: warning, orphanNotice: orphan })])
   await installRoutes(page, state); const sock = await installSocket(page, state)
   await page.goto('/'); await sock.subscribed('s1')
   await expect(page.locator('.chat-cli-warning')).toHaveText(warning)
+  await expect(page.locator('.chat-cli-warning')).toHaveCSS('color', 'rgb(168, 121, 43)')
   await page.getByRole('button', { name: 'Hide activity', exact: true }).click()
   await expect(page.locator('.chat-cli-warning')).toBeVisible()
+  const subscriptionsBeforeReload = sock.framesOf('subscribe').length
   await page.reload(); await expect(page.locator('.chat-cli-warning')).toHaveText(warning)
+  await expect(page.locator('.chat-cli-warning')).toHaveCSS('color', 'rgb(168, 121, 43)')
+  await expect.poll(() => sock.framesOf('subscribe').length).toBeGreaterThan(subscriptionsBeforeReload)
+  sock.push('s1', { type: 'error', message: 'Actual provider failure', recoverable: true })
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    await expect(page.locator('.chat-cli-warning')).toHaveCSS('color', 'rgb(168, 121, 43)')
+    await expect(page.getByText(orphan, { exact: true })).toHaveCSS('color', 'rgb(184, 80, 72)')
+    await expect(page.locator('.chat-msg-error .chat-msg-body').filter({ hasText: 'Actual provider failure' })).toHaveCSS('color', 'rgb(184, 80, 72)')
+  }
 })
 
 test('CLI refresh: a fast catalogue cannot accept text into the wrong conversation during reload', async ({ page }) => {

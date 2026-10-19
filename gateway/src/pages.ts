@@ -42,7 +42,7 @@ const STYLE = `
     color-scheme: light;
     --bg: #F7F8F9; --surface: #EEF0F2; --hover: #DEE2E6; --hairline: #DEE2E6; --border: #C5CBD1;
     --text: #2F353D; --text-secondary: #5C636D; --text-tertiary: #8E959E;
-    --n0: #F7F8F9; --n5: #5C636D; --n6: #2F353D; --a1: #3A72B0; --a5: #B85048;
+    --n0: #F7F8F9; --n5: #5C636D; --n6: #2F353D; --a1: #3A72B0; --a4: #A8792B; --a5: #B85048;
     --e-3: 0 12px 24px rgba(22, 26, 32, .14), 0 4px 8px rgba(22, 26, 32, .06);
     ${MOTION_CSS}
     --ease: var(--flow-spring);
@@ -80,6 +80,7 @@ const STYLE = `
   strong { font-weight: 600; color: var(--text); }
   .muted { font-size: 0.75rem; color: var(--text-tertiary); }
   .error { color: var(--a5); }
+  .warning { color: var(--a4); }
   .footer { text-align: center; font-size: 0.6875rem; color: var(--text-tertiary); }
   a { color: var(--text-secondary); text-decoration: underline; text-underline-offset: 2px; }
   a:hover { color: var(--text); }
@@ -255,7 +256,7 @@ function diskLine(view: AdminView): Html | string {
   const { disk } = view
   if (!disk || disk.free === null || disk.total === null) return ''
   const text = `Server disk: ${size(disk.free)} free of ${size(disk.total)}, measured ${when(disk.measuredAt)}.`
-  return disk.low ? html`<p class="error">${text} Less than a tenth is free.</p>` : html`<p class="muted">${text}</p>`
+  return disk.low ? html`<p class="warning">${text} Less than a tenth is free.</p>` : html`<p class="muted">${text}</p>`
 }
 
 function workspaceDisk(view: AdminView, handle: string): Html | string {
@@ -263,7 +264,7 @@ function workspaceDisk(view: AdminView, handle: string): Html | string {
   if (bytes === undefined) return ''
   const over = view.diskBudget > 0 && bytes > view.diskBudget
   return over
-    ? html`<br><span class="error">${size(bytes)} on disk, over its ${size(view.diskBudget)} budget</span>`
+    ? html`<br><span class="warning">${size(bytes)} on disk, over its ${size(view.diskBudget)} budget</span>`
     : html`<br><span class="muted">${size(bytes)} on disk</span>`
 }
 

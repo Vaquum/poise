@@ -672,7 +672,8 @@ disk its data lives on when it starts and every hour. Settings → Admin and
 the admin page show both. The gateway logs `disk.workspace.over_budget` when
 a workspace grows past `POISE_WORKSPACE_DISK_BUDGET` (50 GB by default), and
 `disk.low` when less than a tenth of the disk is free. Each is logged once,
-until it clears.
+until it clears. Both Admin views show these capacity warnings in amber;
+failed operations, such as a workspace that could not start, remain red.
 
 What grows in a home volume is each person's own: their provider CLIs, Chat
 history, the GitHub indexes Poise reads, and the repositories agents check

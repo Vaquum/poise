@@ -39,6 +39,12 @@ Progress and informational messages use neutral text. Recoverable warnings,
 including model substitutions, interrupted chats and bounded diagnostic
 evidence, use amber. Red messages indicate failed operations or unavailable
 capabilities. A retry clears the previous error tone while it is running.
+Automatic GitHub cooldowns and hidden-tab pauses are neutral waits. Optional
+setup probes, sign-in prompts, available model/CLI fallbacks, cancelled tools
+and Admin capacity notices are amber. In Logging, auxiliary related/health
+read failures and missing/expired linked evidence are amber; primary read,
+export and rejected/failed linked-target requests are red. Blocking model
+catalog, orphan cleanup, Docker Engine and workspace-start failures stay red.
 
 ### Dark-mode principle
 
