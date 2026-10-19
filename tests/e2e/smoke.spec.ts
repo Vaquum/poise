@@ -104,6 +104,20 @@ test.beforeEach(async ({ page }) => {
   await installApiRoutes(page)
 })
 
+test('model status colors distinguish substitutions from unavailable capabilities', async ({ page }) => {
+  const data = modelsResponse({})
+  await page.route('**/api/models', route => route.fulfill({ json: {
+    ...data, places: data.places.map(place => place.key === 'pr_review'
+      ? { ...place, providers: [], notes: ['Update Caller: PR review is unavailable.'] }
+      : place.key === 'chat' ? { ...place, notes: ['Old model is no longer in the catalog; using the current model.'] } : place),
+  } }))
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('[data-settings="models"]').click()
+  await expect(page.locator('.st-place[data-place="chat"] .st-help')).toHaveCSS('color', 'rgb(168, 121, 43)')
+  await expect(page.locator('.st-place[data-place="pr_review"] .st-help')).toHaveCSS('color', 'rgb(184, 80, 72)')
+})
+
 test('boots the configured dashboard with deterministic API data', async ({ page }) => {
   await page.goto('/')
 

@@ -177,7 +177,7 @@ function detail(event: LoggingEvent): string {
   const relatedMarkup = r ? `<p class="st-help" role="status">${escape(r.loading ? 'Loading related diagnostics…' : r.error || `${r.total.toLocaleString()} matching retained events · related snapshot`)}</p>
     <ul class="logging-related-list">${r.events.map((entry) => `<li><button type="button" data-action="related-event" data-event="${entry.id}">${escape(date(entry.eventTime ?? entry.ingestedAt))} · ${escape(entry.message)}</button></li>`).join('')}</ul>
     <div class="range-picker" role="group" aria-label="Related pages"><button type="button" data-action="related-previous" data-row="${event.id}" data-focus="related-previous-${event.id}" ${r.page === 0 || r.loading ? 'disabled' : ''}>Previous</button><button type="button" data-action="related-next" data-row="${event.id}" data-focus="related-next-${event.id}" ${!r.cursor || r.loading ? 'disabled' : ''}>Next 20</button></div>` : ''
-  return `${event.truncated ? '<p class="st-help st-help-error">Evidence is truncated; omitted details are not retained.</p>' : ''}
+  return `${event.truncated ? '<p class="st-help st-help-warn">Evidence is truncated; omitted details are not retained.</p>' : ''}
     <div class="range-picker logging-evidence-links" role="group" aria-label="Diagnostic destinations">${links || '<span class="st-help">No recorded navigation target.</span>'}</div>
     <dl class="logging-facts">${field('Component', event.component)}${field('Operation', event.operation)}${field('Phase', event.phase)}${field('Target', event.target)}
     ${field('Source severity', event.sourceLevel)}${field('Workspace', event.workspace)}${field('Instance', event.instance)}${field('Container', event.container)}${field('Release', event.release)}

@@ -35,6 +35,11 @@ under `:root` (search for `Design System v1`).
 | A7    | Violet | #7560A8 | categorical, special state |
 | A8    | Slate  | #6E7886 | neutral category, unknown, "other" |
 
+Progress and informational messages use neutral text. Recoverable warnings,
+including model substitutions, interrupted chats and bounded diagnostic
+evidence, use amber. Red messages indicate failed operations or unavailable
+capabilities. A retry clears the previous error tone while it is running.
+
 ### Dark-mode principle
 
 Neutrals invert (N7 → N0 stack). Accents hold; raise surface tints

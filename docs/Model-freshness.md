@@ -48,7 +48,9 @@ visible Chat warning, and a later turn retries. A failed model check preserves
 existing choices and reports the affected CLI/provider instead of claiming
 “nothing new.” Missing providers are not installed implicitly.
 
-The Settings view shows elapsed time while checking, then versions and the
+The Settings view shows elapsed time in neutral text while checking, clearing
+any previous failure message and error color. A failed check is red; a successful
+check restores the neutral catalog status. It then shows versions and the
 completed result. Refreshing the catalogue updates an untouched fresh console
 to the latest discovered Opus with High effort. Explicit model selections and
 existing conversations are not silently moved to another model.

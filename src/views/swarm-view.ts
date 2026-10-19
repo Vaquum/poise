@@ -1292,6 +1292,9 @@ function renderStaleBanner(): void {
   if (!viewEl) return
   const el = viewEl.querySelector<HTMLElement>('#swarm-stale')
   if (!el) return
+  const failed = !!lastLoadError || quarantined.length > 0
+  el.classList.toggle('st-help-error', failed)
+  el.classList.toggle('st-help-info', !failed)
   if (!lastLoadError && loadingHistory) {
     el.textContent = `Loading older runs… Showing ${entries.length} of ${incompleteTotal} runs.`
       + (quarantined.length ? ` ${quarantined.length} unreadable worker log row(s) isolated.` : '')

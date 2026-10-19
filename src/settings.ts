@@ -495,7 +495,8 @@ function renderPlaces(data: ModelsResponse) {
   patchContent(modelsEl, data.places.map((place) => {
     const current: ModelChoice = kept.get(place.key)
       || { default: place.default, fallback: place.fallback, secondary: place.secondary, tertiary: place.tertiary }
-    const notes = place.notes.map((n) => `<div class="st-help st-help-error">${escapeHtml(n)}</div>`).join('')
+    const providers = place.providers !== undefined ? place.providers : place.review ? data.catalog.review_providers : null
+    const notes = place.notes.map((n) => `<div class="st-help st-help-${providers?.length === 0 ? 'error' : 'warn'}">${escapeHtml(n)}</div>`).join('')
     const reviewers = place.reviewers
       ? REVIEWER_SLOTS.map((slot) => `
         <label class="st-sublabel">${slot === 'secondary' ? 'Secondary reviewer' : 'Tertiary reviewer'}</label>
@@ -683,6 +684,11 @@ async function refreshModels(): Promise<void> {
   modelsGeneration++
   refreshBtn.disabled = true
   refreshBtn.textContent = 'Checking…'
+  setHelp('')
+  if (catalogStatusEl) {
+    catalogStatusEl.classList.remove('st-help-error')
+    delete catalogStatusEl.dataset.help
+  }
   const started = Date.now()
   const controller = new AbortController()
   const progress = () => {
@@ -711,7 +717,10 @@ async function refreshModels(): Promise<void> {
     refreshBtn.textContent = 'Check now'
   }
   if (lastModels) renderCatalogStatus(lastModels)
-  if (summary.level === 'error' && catalogStatusEl) catalogStatusEl.textContent = summary.text
+  if (summary.level === 'error' && catalogStatusEl) {
+    catalogStatusEl.textContent = summary.text
+    catalogStatusEl.classList.add('st-help-error')
+  }
   setHelp(summary.text, summary.level)
 }
 

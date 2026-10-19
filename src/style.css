@@ -5782,8 +5782,8 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 .chat-h-status[data-status="running"],
 .chat-h-status[data-status="stopping"] { color: var(--a2); }
 .chat-h-status[data-status="waiting"],
-.chat-h-status[data-status="queued"] { color: var(--a4); }
-.chat-h-status[data-status="interrupted"],
+.chat-h-status[data-status="queued"],
+.chat-h-status[data-status="interrupted"] { color: var(--a4); }
 .chat-h-status[data-status="error"] { color: var(--a5); }
 .chat-h-btn {
   display: inline-flex;

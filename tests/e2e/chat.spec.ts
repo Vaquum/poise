@@ -330,6 +330,7 @@ test('renders an unanswered permission from history after a reload, and an inter
   await page.locator('.chat-session-item[data-id="s2"]').click()
   await expect(page.locator('.chat-turn-footer')).toHaveText('Interrupted')
   await expect(page.locator('.chat-h-status')).toHaveText('interrupted')
+  await expect(page.locator('.chat-h-status')).toHaveCSS('color', 'rgb(168, 121, 43)')
   await expect(input(page)).toBeEnabled() // /reset can recover without the old native log.
   await expect(page.locator('.chat-send')).toBeDisabled()
   await input(page).fill('Do not submit until resumed'); await input(page).press('Enter')
@@ -2795,6 +2796,44 @@ async function openModelSettings(page: Page): Promise<void> {
   await expect(page.locator('.st-catalog-status')).toContainText('models')
 }
 
+for (const theme of ['light', 'dark']) test(`CLI refresh: ${theme} status colors recover from failure through progress and success`, async ({ page }) => {
+  const state = makeState([]); await installRoutes(page, state); await installSocket(page, state)
+  let release!: () => void
+  let gate = new Promise<void>(resolve => { release = resolve })
+  let failure = true
+  await page.route('**/api/models/refresh', async route => {
+    await gate
+    await route.fulfill(failure ? { status: 502, json: { error: 'Provider update unavailable' } } : { json: { families: { claude: { status: 'ok' } } } })
+  })
+  try {
+    await page.goto('/'); await openModelSettings(page)
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    const status = page.locator('.st-catalog-status')
+    const help = page.locator('.st-status')
+    const check = page.getByRole('button', { name: 'Check now', exact: true })
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await check.click()
+      await expect(status).toContainText('Updating provider CLIs')
+      await expect(status).toHaveCSS('color', 'rgb(142, 149, 158)')
+      await expect(status).not.toHaveAttribute('data-help', /unavailable/)
+      await expect(help).toBeEmpty()
+      release()
+      await expect(page.locator('.st-refresh-models')).toBeEnabled()
+      if (failure) {
+        await expect(status).toContainText('Provider update unavailable')
+        await expect(status).toHaveCSS('color', 'rgb(184, 80, 72)')
+        await expect(help).toHaveCSS('color', 'rgb(184, 80, 72)')
+        failure = false
+        gate = new Promise<void>(resolve => { release = resolve })
+      } else {
+        await expect(status).toContainText('models')
+        await expect(status).toHaveCSS('color', 'rgb(142, 149, 158)')
+        await expect(help).toContainText('Catalog checked')
+      }
+    }
+  } finally { release() }
+})
+
 test('CLI refresh: slow checks show elapsed progress and a CLI failure is not nothing new', async ({ page }) => {
   const state = makeState([]); await installRoutes(page, state); await installSocket(page, state)
   let release!: () => void
@@ -2810,6 +2849,7 @@ test('CLI refresh: slow checks show elapsed progress and a CLI failure is not no
   release()
   await expect(page.locator('.st-refresh-models')).toBeEnabled()
   await expect(page.locator('.st-catalog-status')).toContainText('Model check incomplete')
+  await expect(page.locator('.st-catalog-status')).toHaveCSS('color', 'rgb(184, 80, 72)')
   await expect(page.locator('.st-status')).toContainText('download timed out')
   await expect(page.locator('.st-status')).not.toContainText('nothing new')
 })

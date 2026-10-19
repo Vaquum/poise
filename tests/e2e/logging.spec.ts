@@ -72,7 +72,7 @@ test.beforeAll(() => {
       behavior: component, repo: 'acme/repo', pr_id: '42', actor: 'octocat', outcome: 'failed', error: 'fetch failed\nAuthorization: Bearer fixture-secret',
       diagnostic: { version: 1, severity: 'error', operation: 'git.fetch', phase: 'checkout', stderr: 'fatal: retained stderr\nAuthorization: Bearer fixture-secret',
         context: { exit_code: 128, timeout_seconds: 15, elapsed_ms: 23, provider_started: false } } }, 'local')!
-    fixtures.push(normalize({ ...input, condition: 'fixture-fetch', cause: ['underlying retained cause', 'x'.repeat(512)], resources: { usedBytes: 42, measuredAt: new Date(now - 1000).toISOString(), measurement: 'statfs' } }, now, ['fixture-secret'])!)
+    fixtures.push(normalize({ ...input, truncated: true, condition: 'fixture-fetch', cause: ['underlying retained cause', 'x'.repeat(512)], resources: { usedBytes: 42, measuredAt: new Date(now - 1000).toISOString(), measurement: 'statfs' } }, now, ['fixture-secret'])!)
   }
   for (const level of ['critical', 'warning']) fixtures.push(normalize({ id: 'fixture-' + level, component, source: 'poise', level, operation: 'fixture', workspace: 'local', message: level + ' representative evidence' }, now)!)
   const foreign = normalize({ id: 'fixture-bob', component, source: 'caller', level: 'error', operation: 'fetch', workspace: 'bob', message: 'never reveal bob-private-evidence' }, now)!
@@ -95,6 +95,7 @@ test('real retained Caller evidence supports bounded native filters, expansion, 
   await button.focus(); await page.keyboard.press('Enter')
   await expect(button).toHaveAttribute('aria-expanded', 'true')
   const detail = page.locator('#logging-tbody > .agent-expand-row').first()
+  await expect(detail.getByText('Evidence is truncated; omitted details are not retained.')).toHaveCSS('color', 'rgb(168, 121, 43)')
   await expect(detail).toContainText(fixtures[0].stderr!)
   await expect(detail).toContainText('underlying retained cause')
   await expect(detail).toContainText('Resource measurement time')
