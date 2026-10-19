@@ -36,11 +36,14 @@ function history(bounds: string[]): AnalyticsHistory {
 }
 
 interface Workspace {
+  quotaReads: number
   historyReads: Array<{ bounds: string[], org: string | null }>
   historyFails: boolean
   reads: Array<{ since: string | null, until: string | null, org: string | null }>
   fail: boolean
   stale: boolean
+  partial: 'day' | 'baseline' | null
+  additionalMissingOrg: string | null
   baselineHours: number
   baselineMerged: number
   pacing: { merged: number, median: number } | null
@@ -49,7 +52,7 @@ interface Workspace {
 }
 
 async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
-  const state: Workspace = { historyReads: [], historyFails: false, reads: [], fail: false, stale: false, baselineHours: 54, baselineMerged: 8, pacing: null, closedUnmerged: null, medianLines: null }
+  const state: Workspace = { quotaReads: 0, historyReads: [], historyFails: false, reads: [], fail: false, stale: false, partial: null, additionalMissingOrg: null, baselineHours: 54, baselineMerged: 8, pacing: null, closedUnmerged: null, medianLines: null }
   await page.clock.setFixedTime(new Date('2026-10-09T12:00:00Z'))
   await page.addInitScript(() => {
     if (sessionStorage.getItem('seeded')) return
@@ -76,6 +79,8 @@ async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
       const result = baseline ? report(state.baselineMerged, state.baselineHours) : report(state.pacing?.merged ?? (read.since === '2026-10-08T00:00:00.000Z' ? 0 : 4))
       result.window = { since: read.since, until: read.until }
       if (state.stale) result.errors = [{ org: 'acme', error: 'Synchronization failed', stale: true }]
+      if (state.partial === (baseline ? 'baseline' : 'day')) result.errors.push({ org: 'beta', error: 'Account scope unavailable' })
+      if (baseline && state.additionalMissingOrg) result.errors.push({ org: state.additionalMissingOrg, error: 'Additional account scope unavailable' })
       if (baseline) result.daily = Array.from({ length: 7 }, () => {
         const pullRequests = report(state.pacing?.median ?? 1).pullRequests
         if (state.pacing) pullRequests.lines = { total: pullRequests.merged * 1000, median: 180, counted: pullRequests.merged }
@@ -95,7 +100,10 @@ async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
     if (url.pathname === '/api/agent-logs') return route.fulfill({ json: { logs: [] } })
     if (url.pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (url.pathname === '/api/notices') return route.fulfill({ json: { enabled: false, notices: [] } })
-    if (url.pathname === '/api/github-quota') return route.fulfill({ json: { accounts: [] } })
+    if (url.pathname === '/api/github-quota') {
+      state.quotaReads++
+      return route.fulfill({ json: { accounts: [] } })
+    }
     return route.fulfill({ json: {} })
   })
   return state
@@ -124,6 +132,30 @@ function value(page: Page, label: string) {
 
 function countTrend(page: Page, label = 'Pull requests merged') {
   return page.locator('#view-analytics .analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: new RegExp(`^${label}$`) }) }).locator('.analytics-summary')
+}
+
+async function installRefreshClock(page: Page) {
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.clock.install({ time: new Date('2026-10-09T10:00:00Z') })
+}
+
+async function pauseRefreshClock(page: Page) {
+  await expect(page.getByRole('button', { name: 'Menu', exact: true })).toBeVisible()
+  const now = await page.evaluate(() => Date.now())
+  await page.clock.pauseAt(new Date(now + 1000))
+  await page.clock.setFixedTime(new Date('2026-10-09T10:00:00Z'))
+}
+
+async function refreshAnalytics(page: Page) {
+  await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+}
+
+async function changeVisibility(page: Page, state: DocumentVisibilityState) {
+  await page.evaluate(visibility => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: visibility })
+    Object.defineProperty(document, 'hidden', { configurable: true, value: visibility === 'hidden' })
+    document.dispatchEvent(new Event('visibilitychange'))
+  }, state)
 }
 
 function quotaReport(): GithubQuotaReport {
@@ -515,17 +547,19 @@ test('compares cumulative cards with elapsed-day pace while retaining actual val
   expect(state.historyReads).toHaveLength(2)
 })
 
-test('keeps pace tied to its data snapshot through elapsed time, history and quota updates, then renews it on reopening', async ({ page }) => {
+test('refreshes one quiet local pair on ticks and visibility return while keeping counts and pace in one snapshot', async ({ page }) => {
   const state = await workspace(page)
   state.pacing = { merged: 15, median: 27 }
   state.baselineMerged = 189
   let releaseHistory!: () => void
   const historyHeld = new Promise<void>((resolve) => { releaseHistory = resolve })
   await page.route('**/api/analytics/history?**', async (route) => { await historyHeld; await route.fallback() })
-  await page.clock.install({ time: new Date('2026-10-09T10:00:00Z') })
+  await installRefreshClock(page)
   await page.goto('/')
+  await pauseRefreshClock(page)
   await openAnalytics(page)
   const merged = countTrend(page)
+  const panel = page.locator('#view-analytics')
   const expectInitialSnapshot = async () => {
     await expect(merged.locator('.analytics-value')).toHaveText('15')
     await expect(merged).toHaveClass(/good/)
@@ -536,29 +570,38 @@ test('keeps pace tied to its data snapshot through elapsed time, history and quo
   }
   await expectInitialSnapshot()
 
-  await page.clock.fastForward(3 * 3_600_000)
+  await page.clock.setFixedTime(new Date('2026-10-09T13:00:00Z'))
   await expectInitialSnapshot()
   expect(state.reads).toHaveLength(2)
   expect(state.historyReads).toHaveLength(0)
-  releaseHistory()
-  await expect(page.locator('.analytics-history[data-series="Pull requests merged"] .analytics-history-line')).toHaveAttribute('d', /^M/)
+  const graph = page.locator('.analytics-history[data-series="Pull requests merged"] .analytics-history-line')
   await expectInitialSnapshot()
-  const quotaRefresh = page.waitForResponse(response => new URL(response.url()).pathname === '/api/github-quota')
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-  await quotaRefresh
-  await expectInitialSnapshot()
-  expect(state.reads).toHaveLength(2)
-  expect(state.historyReads).toHaveLength(1)
 
-  await leaveAnalytics(page)
-  const hiddenSummary = await merged.textContent()
-  await page.clock.fastForward(3_600_000)
-  await expect(merged).toHaveText(hiddenSummary!)
-  expect(state.reads).toHaveLength(2)
-  expect(state.historyReads).toHaveLength(1)
-
+  let releaseRefresh!: () => void
+  const refreshHeld = new Promise<void>((resolve) => { releaseRefresh = resolve })
+  let refreshRequests = 0
+  await page.route('**/api/analytics?**', async (route) => {
+    refreshRequests++
+    await refreshHeld
+    await route.fallback()
+  })
+  await page.clock.setFixedTime(new Date('2026-10-09T14:00:00Z'))
   state.pacing.merged = 16
-  await openAnalytics(page)
+  await refreshAnalytics(page)
+  await expect.poll(() => refreshRequests).toBe(2)
+  await expectInitialSnapshot()
+  await expect(panel.locator('.analytics-tile')).toHaveCount(13)
+  await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeHidden()
+  await expect(panel.locator('.analytics-groups')).not.toHaveAttribute('aria-busy', 'true')
+  await refreshAnalytics(page)
+  await refreshAnalytics(page)
+  expect(refreshRequests).toBe(2)
+  expect(state.historyReads).toHaveLength(0)
+  expect(state.quotaReads).toBe(1)
+  await changeVisibility(page, 'visible')
+  await expect.poll(() => state.quotaReads).toBe(2)
+  expect(refreshRequests).toBe(2)
+  releaseRefresh()
   await expect(merged.locator('.analytics-value')).toHaveText('16')
   await expect(merged).toHaveClass(/neutral/)
   await expect(merged.locator('.analytics-arrow')).toHaveText('→')
@@ -568,13 +611,23 @@ test('keeps pace tied to its data snapshot through elapsed time, history and quo
   const colors = await merged.evaluate(element => ['.analytics-value', '.analytics-arrow', '.analytics-delta'].map(selector => getComputedStyle(element.querySelector(selector)!).color))
   expect(new Set(colors).size).toBe(1)
   expect(state.reads).toHaveLength(4)
-  expect(state.historyReads).toHaveLength(2)
+  expect(state.historyReads).toHaveLength(0)
+  releaseHistory()
+  await expect(graph).toHaveAttribute('d', /^M/)
+  const graphBefore = await graph.getAttribute('d')
+  await expect(merged.locator('.analytics-value')).toHaveText('16')
+  await expect(merged.locator('.analytics-delta')).toHaveText('On pace')
+  await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 14:00 UTC/)
+  expect(state.historyReads).toHaveLength(1)
 
-  await leaveAnalytics(page)
-  await page.clock.fastForward(4 * 3_600_000)
+  await changeVisibility(page, 'hidden')
   await page.clock.setFixedTime(new Date('2026-10-09T18:00:00Z'))
   state.pacing.merged = 17
-  await openAnalytics(page)
+  await refreshAnalytics(page)
+  expect(state.reads).toHaveLength(4)
+  expect(state.quotaReads).toBe(2)
+  await expect(merged.locator('.analytics-value')).toHaveText('16')
+  await changeVisibility(page, 'visible')
   await expect(merged.locator('.analytics-value')).toHaveText('17')
   await expect(merged).toHaveClass(/bad/)
   await expect(merged.locator('.analytics-arrow')).toHaveText('↓')
@@ -583,8 +636,245 @@ test('keeps pace tied to its data snapshot through elapsed time, history and quo
   await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 18:00 UTC, when totals were read\./)
   await expect(mergeTrend(page).locator('.analytics-delta')).toHaveText('50%')
   expect(state.reads).toHaveLength(6)
-  expect(state.historyReads).toHaveLength(3)
+  expect(state.historyReads).toHaveLength(1)
+  await expect.poll(() => state.quotaReads).toBe(3)
+  await expect(graph).toHaveAttribute('d', graphBefore!)
+
+  await leaveAnalytics(page)
+  const hiddenSummary = await merged.textContent()
+  await refreshAnalytics(page)
+  await changeVisibility(page, 'visible')
+  await expect(merged).toHaveText(hiddenSummary!)
+  expect(state.reads).toHaveLength(6)
+  expect(state.historyReads).toHaveLength(1)
+  expect(state.quotaReads).toBe(3)
 })
+
+test('keeps the last complete snapshot on a quiet failure, cancels the other half and recovers on the next tick', async ({ page }) => {
+  const state = await workspace(page)
+  state.pacing = { merged: 15, median: 27 }
+  state.baselineMerged = 189
+  await installRefreshClock(page)
+  await page.goto('/')
+  await pauseRefreshClock(page)
+  await openAnalytics(page)
+  const panel = page.locator('#view-analytics')
+  const merged = countTrend(page)
+  await expect(merged.locator('.analytics-delta')).toHaveText('33.3% ahead of pace')
+
+  let releaseBaseline!: () => void
+  const baselineHeld = new Promise<void>((resolve) => { releaseBaseline = resolve })
+  let baselineFinished!: () => void
+  const finished = new Promise<void>((resolve) => { baselineFinished = resolve })
+  let holdBaseline = true
+  await page.route('**/api/analytics?**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    if (!holdBaseline || !query.has('dailyBounds')) return route.fallback()
+    state.reads.push({ since: query.get('since'), until: query.get('until'), org: query.get('org') })
+    await baselineHeld
+    try { await route.fulfill({ json: report(189, 54) }) } finally { baselineFinished() }
+  })
+  await page.clock.setFixedTime(new Date('2026-10-09T14:00:00Z'))
+  state.pacing.merged = 16
+  state.fail = true
+  const canceledBaseline = page.waitForEvent('requestfailed', {
+    predicate: request => new URL(request.url()).pathname === '/api/analytics' && new URL(request.url()).searchParams.has('dailyBounds'),
+  })
+  await refreshAnalytics(page)
+  await canceledBaseline
+  await expect(merged.locator('.analytics-value')).toHaveText('15')
+  await expect(merged.locator('.analytics-delta')).toHaveText('33.3% ahead of pace')
+  await expect(merged).toContainText('Typical by now: 11.3 · 7-day median: 27.0 / day')
+  await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 10:00 UTC/)
+  await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeHidden()
+  await expect(panel.locator('.analytics-tile')).toHaveCount(13)
+  await page.locator('.nr-bell').click()
+  const failure = page.locator('.nr-rail .nr-card').filter({ hasText: 'acme: datastore offline' })
+  await expect(failure).toHaveCount(1)
+  expect(state.reads).toHaveLength(4)
+  expect(state.historyReads).toHaveLength(1)
+  expect(state.quotaReads).toBe(1)
+  releaseBaseline()
+  await finished
+
+  holdBaseline = false
+  state.fail = false
+  await refreshAnalytics(page)
+  await expect(merged.locator('.analytics-value')).toHaveText('16')
+  await expect(merged.locator('.analytics-delta')).toHaveText('On pace')
+  await expect(merged).toContainText('Typical by now: 15.8 · 7-day median: 27.0 / day')
+  await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 14:00 UTC/)
+  await expect(failure).toHaveCount(0)
+  expect(state.reads).toHaveLength(6)
+  expect(state.historyReads).toHaveLength(1)
+  expect(state.quotaReads).toBe(1)
+
+  await page.clock.setFixedTime(new Date('2026-10-09T15:00:00Z'))
+  state.pacing.merged = 20
+  state.partial = 'baseline'
+  await refreshAnalytics(page)
+  const partialFailure = page.locator('.nr-rail .nr-card').filter({ hasText: 'Account scope unavailable' })
+  await expect(partialFailure).toHaveCount(1)
+  await expect(partialFailure).toContainText('GitHub data for beta is unavailable')
+  await expect(merged.locator('.analytics-value')).toHaveText('16')
+  await expect(merged.locator('.analytics-delta')).toHaveText('On pace')
+  await expect(merged).toContainText('Typical by now: 15.8 · 7-day median: 27.0 / day')
+  await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 14:00 UTC/)
+  await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeHidden()
+  expect(state.reads).toHaveLength(8)
+  expect(state.historyReads).toHaveLength(1)
+
+  await page.clock.setFixedTime(new Date('2026-10-09T16:00:00Z'))
+  state.partial = null
+  state.stale = true
+  await refreshAnalytics(page)
+  await expect(merged.locator('.analytics-value')).toHaveText('20')
+  await expect(merged.locator('.analytics-arrow')).toHaveCount(0)
+  await expect(merged.locator('.analytics-delta')).toHaveCount(0)
+  await expect(merged).toContainText('Typical by now: 18.0 · 7-day median: 27.0 / day')
+  await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 16:00 UTC/)
+  await expect(partialFailure).toHaveCount(0)
+  expect(state.reads).toHaveLength(10)
+  expect(state.historyReads).toHaveLength(1)
+  expect(state.quotaReads).toBe(1)
+})
+
+for (const partial of ['day', 'baseline'] as const) {
+  test(`refreshes an initially partial ${partial} snapshot until another account becomes unavailable`, async ({ page }) => {
+    const state = await workspace(page)
+    state.pacing = { merged: 15, median: 27 }
+    state.partial = partial
+    await installRefreshClock(page)
+    await page.goto('/')
+    await pauseRefreshClock(page)
+    await openAnalytics(page)
+    const merged = countTrend(page)
+    await expect(merged.locator('.analytics-value')).toHaveText('15')
+    await expect(merged.locator('.analytics-arrow')).toHaveCount(0)
+    await expect(merged.locator('.analytics-delta')).toHaveCount(0)
+
+    await page.clock.setFixedTime(new Date('2026-10-09T14:00:00Z'))
+    state.pacing.merged = 16
+    await refreshAnalytics(page)
+    await expect(merged.locator('.analytics-value')).toHaveText('16')
+    await expect(merged).toContainText('Typical by now: 15.8 · 7-day median: 27.0 / day')
+    await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 14:00 UTC/)
+    await expect(merged.locator('.analytics-arrow')).toHaveCount(0)
+    await expect(merged.locator('.analytics-delta')).toHaveCount(0)
+    await page.locator('.nr-bell').click()
+    const notices = page.locator('.nr-rail .nr-card')
+    await expect(notices.filter({ hasText: 'Account scope unavailable' })).toHaveCount(1)
+    await expect(notices.filter({ hasText: 'Account scope unavailable' })).toContainText('GitHub data for beta is unavailable')
+    expect(state.reads).toHaveLength(4)
+    expect(state.historyReads).toHaveLength(1)
+
+    await page.clock.setFixedTime(new Date('2026-10-09T15:00:00Z'))
+    state.pacing.merged = 20
+    state.additionalMissingOrg = 'acme'
+    await refreshAnalytics(page)
+    await expect(notices.filter({ hasText: 'Additional account scope unavailable' })).toHaveCount(1)
+    await expect(merged.locator('.analytics-value')).toHaveText('16')
+    await expect(merged).toContainText('Typical by now: 15.8 · 7-day median: 27.0 / day')
+    await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 14:00 UTC/)
+    await expect(merged.locator('.analytics-arrow')).toHaveCount(0)
+    expect(state.reads).toHaveLength(6)
+    expect(state.historyReads).toHaveLength(1)
+    expect(state.quotaReads).toBe(1)
+  })
+}
+
+test('coalesces ticks during a foreground read and discards a superseded background day', async ({ page }) => {
+  const state = await workspace(page)
+  state.pacing = { merged: 15, median: 27 }
+  await installRefreshClock(page)
+  let initialRelease!: () => void
+  const initialHeld = new Promise<void>((resolve) => { initialRelease = resolve })
+  let requests = 0
+  let holdInitial = true
+  let releaseOldDay!: () => void
+  const oldDayHeld = new Promise<void>((resolve) => { releaseOldDay = resolve })
+  let oldDayFinished!: () => void
+  const finished = new Promise<void>((resolve) => { oldDayFinished = resolve })
+  let holdOldDay = false
+  await page.route('**/api/analytics?**', async (route) => {
+    requests++
+    const query = new URL(route.request().url()).searchParams
+    if (holdInitial) await initialHeld
+    if (holdOldDay && !query.has('dailyBounds') && query.get('since') === '2026-10-09T00:00:00.000Z') {
+      await oldDayHeld
+      try { await route.fulfill({ json: report(99) }) } finally { oldDayFinished() }
+      return
+    }
+    await route.fallback()
+  })
+  await page.goto('/')
+  await pauseRefreshClock(page)
+  await openAnalytics(page)
+  await expect.poll(() => requests).toBe(2)
+  await refreshAnalytics(page)
+  await changeVisibility(page, 'visible')
+  await expect.poll(() => state.quotaReads).toBe(2)
+  expect(requests).toBe(2)
+  holdInitial = false
+  initialRelease()
+  await expect(value(page, 'Pull requests merged')).toHaveText('15')
+
+  holdOldDay = true
+  await page.clock.setFixedTime(new Date('2026-10-09T14:00:00Z'))
+  await refreshAnalytics(page)
+  await expect.poll(() => requests).toBe(4)
+  state.pacing.merged = 20
+  const canceledOldDay = page.waitForEvent('requestfailed', {
+    predicate: request => {
+      const url = new URL(request.url())
+      return url.pathname === '/api/analytics' && !url.searchParams.has('dailyBounds') && url.searchParams.get('since') === '2026-10-09T00:00:00.000Z'
+    },
+  })
+  await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
+  await canceledOldDay
+  await expect(page.locator('.analytics-date')).toHaveText('Yesterday')
+  await expect(value(page, 'Pull requests merged')).toHaveText('20')
+  await expect(countTrend(page)).not.toContainText('Typical by now')
+  releaseOldDay()
+  await finished
+  await expect(value(page, 'Pull requests merged')).toHaveText('20')
+  expect(requests).toBe(6)
+  expect(state.historyReads).toHaveLength(2)
+
+  state.pacing.merged = 21
+  await refreshAnalytics(page)
+  await expect(value(page, 'Pull requests merged')).toHaveText('21')
+  await expect(countTrend(page).locator('.analytics-delta')).toHaveText('22.2%')
+  await expect(countTrend(page)).not.toContainText('Typical by now')
+  expect(requests).toBe(8)
+  expect(state.historyReads).toHaveLength(2)
+  expect(state.quotaReads).toBe(2)
+})
+
+for (const rate of ['1m', '5m'] as const) {
+  test(`uses the shared ${rate} cadence for quiet local refreshes`, async ({ page }) => {
+    const state = await workspace(page)
+    state.pacing = { merged: 15, median: 27 }
+    await installRefreshClock(page)
+    await page.goto('/')
+    await pauseRefreshClock(page)
+    await page.evaluate(refreshRate => {
+      localStorage.setItem('poise-refresh-rate', refreshRate)
+      window.dispatchEvent(new Event('poise:refresh-rate-changed'))
+    }, rate)
+    await openAnalytics(page)
+    await expect(value(page, 'Pull requests merged')).toHaveText('15')
+    state.pacing.merged = 16
+    const interval = rate === '1m' ? 60_000 : 300_000
+    await page.clock.fastForward(interval - 1)
+    expect(state.reads).toHaveLength(2)
+    await expect(value(page, 'Pull requests merged')).toHaveText('15')
+    await page.clock.fastForward(1)
+    await expect(value(page, 'Pull requests merged')).toHaveText('16')
+    expect(state.reads).toHaveLength(4)
+    expect(state.historyReads).toHaveLength(1)
+  })
+}
 
 test('keeps stale totals and their pacing context without judging Today, while retaining completed-day comparisons', async ({ page }) => {
   const state = await workspace(page)
@@ -763,11 +1053,16 @@ test('a slow old date cannot overwrite the latest date or its trend', async ({ p
   await workspace(page)
   let release!: () => void
   const held = new Promise<void>(resolve => { release = resolve })
+  let started!: () => void
+  const oldReadStarted = new Promise<void>(resolve => { started = resolve })
+  let finished!: () => void
+  const oldReadFinished = new Promise<void>(resolve => { finished = resolve })
   await page.route('**/api/analytics?**', async route => {
     const url = new URL(route.request().url())
     if (url.searchParams.get('since') === '2026-10-08T00:00:00.000Z' && url.searchParams.get('until') === '2026-10-09T00:00:00.000Z') {
+      started()
       await held
-      await route.fulfill({ json: report(99) })
+      try { await route.fulfill({ json: report(99) }) } finally { finished() }
     } else await route.fallback()
   })
   await page.goto('/')
@@ -775,12 +1070,19 @@ test('a slow old date cannot overwrite the latest date or its trend', async ({ p
   await expect(value(page, 'Pull requests merged')).toHaveText('4')
   const panel = page.locator('#view-analytics')
   await panel.getByRole('button', { name: 'Previous day' }).click()
+  await oldReadStarted
+  const canceled = page.waitForEvent('requestfailed', {
+    predicate: request => {
+      const query = new URL(request.url()).searchParams
+      return query.get('since') === '2026-10-08T00:00:00.000Z' && query.get('until') === '2026-10-09T00:00:00.000Z'
+    },
+  })
   await panel.getByRole('button', { name: 'Previous day' }).click()
+  await canceled
   await expect(panel.locator('.analytics-date')).toHaveText('7 Oct 2026')
   await expect(value(page, 'Pull requests merged')).toHaveText('4')
-  const response = page.waitForResponse(res => new URL(res.url()).searchParams.get('since') === '2026-10-08T00:00:00.000Z')
   release()
-  await response
+  await oldReadFinished
   await expect(panel.locator('.analytics-groups')).not.toHaveAttribute('aria-busy', 'true')
   await expect(value(page, 'Pull requests merged')).toHaveText('4')
   await expect(mergeTrend(page)).toContainText('50%')
@@ -803,7 +1105,7 @@ test('retains the selected calendar date and completes its pace comparison acros
   await expect(merged).toContainText('7-day median: 27.0 / day')
   await expect(merged).not.toContainText('Typical by now')
   expect(state.reads).toHaveLength(4)
-  expect(state.historyReads).toHaveLength(2)
+  expect(state.historyReads).toHaveLength(1)
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await expect(panel.locator('.analytics-date')).toHaveText('7 Oct 2026')
@@ -812,9 +1114,43 @@ test('retains the selected calendar date and completes its pace comparison acros
   await expect(panel.locator('.analytics-date')).toHaveText('6 Oct 2026')
   await expect.poll(() => state.reads.at(-2)?.since).toBe('2026-10-06T00:00:00.000Z')
   expect(state.reads).toHaveLength(10)
-  expect(state.historyReads).toHaveLength(5)
+  expect(state.historyReads).toHaveLength(4)
 })
 
+
+for (const failure of ['HTTP', 'account'] as const) {
+  test(`completes the selected day's calendar presentation when the midnight ${failure} refresh fails`, async ({ page }) => {
+    const state = await workspace(page)
+    state.pacing = { merged: 15, median: 27 }
+    await page.clock.install({ time: new Date('2026-10-09T23:59:30Z') })
+    await page.goto('/')
+    await openAnalytics(page)
+    const panel = page.locator('#view-analytics')
+    const merged = countTrend(page)
+    await expect(panel.locator('.analytics-date')).toHaveText('Today')
+    await expect(panel.getByRole('button', { name: 'Next day' })).toBeDisabled()
+    await expect(merged).toContainText('Typical by now: 27.0 · 7-day median: 27.0 / day')
+    await expect(panel.locator('.analytics-history-line')).toHaveCount(13)
+    state.pacing.merged = 20
+    if (failure === 'HTTP') state.fail = true
+    else state.partial = 'baseline'
+
+    await page.clock.fastForward(60_000)
+    await expect(panel.locator('.analytics-date')).toHaveText('Yesterday')
+    await expect(panel.getByRole('button', { name: 'Next day' })).toBeEnabled()
+    await expect(merged.locator('.analytics-value')).toHaveText('15')
+    await expect(merged.locator('.analytics-delta')).toHaveText('44.4%')
+    await expect(merged).toContainText('7-day median: 27.0 / day')
+    await expect(merged).not.toContainText('Typical by now')
+    await expect(merged.locator('.analytics-value')).not.toHaveAttribute('data-help', /Pace as of/)
+    await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeHidden()
+    await expect(panel.locator('.analytics-tile')).toHaveCount(13)
+    await page.locator('.nr-bell').click()
+    await expect(page.locator('.nr-rail .nr-card').filter({ hasText: failure === 'HTTP' ? 'acme: datastore offline' : 'Account scope unavailable' })).toHaveCount(1)
+    expect(state.reads).toHaveLength(4)
+    expect(state.historyReads).toHaveLength(1)
+  })
+}
 
 test('shows the standard loader with no old values on initial load, day/account changes and reopening', async ({ page }, info) => {
   await workspace(page)

@@ -23,6 +23,8 @@ let midnightTimer: ReturnType<typeof setTimeout> | undefined
 // Each read is numbered so a slow answer for an earlier day or account
 // never replaces the one for what is selected now.
 let readGeneration = 0
+let analyticsRead: AbortController | null = null
+let lastReadAt = 0
 let quotaGeneration = 0
 let historyGeneration = 0
 let quotaTimer: ReturnType<typeof setInterval> | undefined
@@ -145,6 +147,13 @@ function refreshQuota(): void {
   if (document.visibilityState === 'visible' && active) void readQuota()
 }
 
+function refreshAnalytics(): void {
+  if (document.visibilityState === 'visible' && active) {
+    render()
+    void readAnalytics(true)
+  }
+}
+
 function readFailure(title: string, error: unknown): ReadFailure {
   const body = error instanceof Error ? error.message : String(error)
   return { key: `read:${body}`, title, body }
@@ -152,6 +161,11 @@ function readFailure(title: string, error: unknown): ReadFailure {
 
 function accountFailures(data: { errors: Array<{ org: string, error: string, stale?: boolean }> }): ReadFailure[] {
   return data.errors.map(({ org, error, stale }) => ({ key: `account:${org.toLowerCase()}`, title: `GitHub data for ${org} ${stale ? 'is not updating' : 'is unavailable'}`, body: error }))
+}
+
+function hasNewAccountFailure(report: AnalyticsReport, previous: AnalyticsReport): boolean {
+  const missing = new Set(previous.errors.filter((error) => !error.stale).map((error) => error.org.toLowerCase()))
+  return report.errors.some((error) => !error.stale && !missing.has(error.org.toLowerCase()))
 }
 
 function historyMarkup(label: string, all: HistorySeries[] | null): string {
@@ -214,8 +228,11 @@ function groupMarkup(group: AnalyticsGroup): string {
 }
 
 function render(): void {
+  const day = analyticsDay(dayOffset, dayAnchor)
+  viewEl.querySelector('.analytics-date')!.textContent = day.label
+  viewEl.querySelector<HTMLButtonElement>('[data-day="1"]')!.disabled = day.isToday
   if (!shown) return
-  patchContent(viewEl.querySelector('.analytics-groups')!, analyticsGroups(shown.report, shown.baseline, shown.progress, shown.snapshotTime).map(groupMarkup).join(''))
+  patchContent(viewEl.querySelector('.analytics-groups')!, analyticsGroups(shown.report, shown.baseline, day.isToday ? shown.progress : undefined, day.isToday ? shown.snapshotTime : undefined).map(groupMarkup).join(''))
   for (const [label, index] of cursors) showCursor(label, index)
 }
 
@@ -347,32 +364,38 @@ async function readHistory(bounds: string[]): Promise<void> {
   render()
 }
 
-async function readAnalytics(): Promise<void> {
+async function readAnalytics(background = false): Promise<void> {
+  if (background && analyticsRead) return
   const generation = ++readGeneration
+  analyticsRead?.abort()
+  const controller = new AbortController()
+  analyticsRead = controller
   const groups = viewEl.querySelector<HTMLElement>('.analytics-groups')!
   const quota = viewEl.querySelector<HTMLElement>('.github-quota-section')!
   const day = analyticsDay(dayOffset, dayAnchor)
   // Totals and typical-by-now must describe the same read, even on later renders.
   const capturedAt = Date.now()
+  lastReadAt = capturedAt
   const progress = day.isToday ? analyticsDayProgress(day.since, day.until, capturedAt) : undefined
   const snapshotTime = day.isToday ? new Intl.DateTimeFormat('en-GB', {
     timeZone: effectiveTimezone(), day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
   }).format(capturedAt) : undefined
-  shown = null
-  void readHistory(analyticsHistoryBounds(dayOffset, dayAnchor))
-  viewEl.querySelector('.analytics-date')!.textContent = day.label
-  viewEl.querySelector<HTMLButtonElement>('[data-day="1"]')!.disabled = day.isToday
-  // The emptied sections keep their space while the next day loads, so
-  // GitHub below does not jump up under the loader and back down after.
-  const quotaTop = quota.offsetTop
-  groups.style.minHeight = ''
-  groups.replaceChildren()
-  viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = false
-  groups.setAttribute('aria-busy', 'true')
-  groups.style.minHeight = `${Math.max(0, quotaTop - quota.offsetTop)}px`
+  if (!background) {
+    shown = null
+    render()
+    void readHistory(analyticsHistoryBounds(dayOffset, dayAnchor))
+    // The emptied sections keep their space while the next day loads, so
+    // GitHub below does not jump up under the loader and back down after.
+    const quotaTop = quota.offsetTop
+    groups.style.minHeight = ''
+    groups.replaceChildren()
+    viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = false
+    groups.setAttribute('aria-busy', 'true')
+    groups.style.minHeight = `${Math.max(0, quotaTop - quota.offsetTop)}px`
+  }
   const read = async (since: string, until: string, dailyBounds?: string[]): Promise<AnalyticsReport> => {
     const query = new URLSearchParams({ since, until, ...(dailyBounds ? { dailyBounds: dailyBounds.join(',') } : {}) })
-    const res = await fetch(organizationUrl(`/api/analytics?${query}`))
+    const res = await fetch(organizationUrl(`/api/analytics?${query}`), { signal: controller.signal })
     const data = await res.json().catch(() => null)
     if (!res.ok || !data) throw new Error(data?.error || `Analytics could not be read (HTTP ${res.status})`)
     return data as AnalyticsReport
@@ -383,16 +406,23 @@ async function readAnalytics(): Promise<void> {
       read(day.baselineSince, day.since, analyticsDailyBounds(dayOffset, dayAnchor)),
     ])
     if (generation !== readGeneration) return
+    const failures = [...accountFailures(data), ...accountFailures(baseline)]
+    if (background && shown && (hasNewAccountFailure(data, shown.report) || hasNewAccountFailure(baseline, shown.baseline))) {
+      noticeFeed.reportReadErrors('analytics-day', failures)
+      return
+    }
     shown = { report: data, baseline, progress, snapshotTime }
     render()
-    noticeFeed.reportReadErrors('analytics-day', [...accountFailures(data), ...accountFailures(baseline)])
+    noticeFeed.reportReadErrors('analytics-day', failures)
   } catch (error) {
     if (generation !== readGeneration) return
-    // Numbers from the last day under the next day's name would be wrong.
-    groups.innerHTML = ''
-    noticeFeed.reportReadErrors('analytics-day', [readFailure('Analytics is unavailable', error)])
+    // A failed refresh keeps the last totals and their matching pace timestamp.
+    if (!background) groups.innerHTML = ''
+    noticeFeed.reportReadErrors('analytics-day', [readFailure(background ? 'Analytics could not refresh' : 'Analytics is unavailable', error)])
   } finally {
-    if (generation === readGeneration) {
+    controller.abort()
+    if (analyticsRead === controller) analyticsRead = null
+    if (generation === readGeneration && !background) {
       viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = true
       groups.removeAttribute('aria-busy')
       groups.style.minHeight = ''
@@ -402,9 +432,11 @@ async function readAnalytics(): Promise<void> {
 
 function scheduleMidnightRead(): void {
   clearTimeout(midnightTimer)
-  const delay = Date.parse(analyticsDay(0).until) - Date.now()
+  const boundary = Date.parse(analyticsDay(0).until)
+  const delay = boundary - Date.now()
   midnightTimer = setTimeout(() => {
-    void readAnalytics()
+    // The shared refresh tick can already have read this midnight's snapshot.
+    if (lastReadAt < boundary) refreshAnalytics()
     scheduleMidnightRead()
   }, delay + 10)
 }
@@ -446,7 +478,9 @@ export function initAnalyticsView(): void {
       if (label) hideCursor(label)
     })
     groups.addEventListener('keydown', onPlotKey)
+    window.addEventListener('poise:refresh-tick', refreshAnalytics)
     document.addEventListener('visibilitychange', refreshQuota)
+    document.addEventListener('visibilitychange', refreshAnalytics)
   }
   // Arriving opens on Today. A settings save re-enters the showing view;
   // that reads again for the day already chosen.
@@ -469,6 +503,8 @@ export function stopAnalyticsRefresh(): void {
   if (!active) return
   active = false
   readGeneration++
+  analyticsRead?.abort()
+  analyticsRead = null
   quotaGeneration++
   historyGeneration++
   cancelHover()

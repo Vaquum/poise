@@ -37,9 +37,10 @@ Analytics does not change Current's filters. The selected calendar date stays
 fixed across midnight; labels and forward navigation refresh when the local
 day changes.
 
-While a day or account loads, previous values are removed immediately and
-the standard three-dot loading indicator appears. The server reads the local
-datastore views directly, without starting a CLI process for each scope.
+When opening Analytics, changing its day or account, or saving Settings,
+previous values are removed immediately and the standard three-dot loading
+indicator appears. The server reads the local datastore views directly,
+without starting a CLI process for each scope.
 Each account read keeps one database snapshot and yields to other server
 work after 64 records or once eight milliseconds of processing have elapsed. Discussion
 counts and stored JSON for sizes and merger identity are read only for pull
@@ -50,6 +51,24 @@ Involvement membership comes directly from the indexed associations, without
 aggregating the evidence descriptions that the full user view supplies.
 Leaving Analytics stops its reads: a late answer is discarded, and quota is
 not refreshed until it is chosen again.
+
+While Analytics and its browser tab are visible, the shared refresh clock
+quietly rereads the selected day's numbers and seven-day baseline from local
+SQLite. It uses the refresh interval from Settings: one minute by default, or
+five minutes. Returning to the visible tab refreshes once; overlapping refreshes
+share the pending read. The selected calendar date stays chosen, and the year
+history is not reread. Quota keeps its separate refresh schedule.
+
+The current values, charts and chart cursor stay in place during refreshes.
+A successful read replaces totals and their pace timestamp together. A failed
+request, or an account becoming unreadable in either report, preserves the
+previous snapshot and reports the failure in Notifications. A snapshot that
+already lacks an account can still refresh its other accounts while the same
+account remains unreadable. Readable stale caches update with the existing
+warning and pace suppression.
+These local reads make no GitHub requests and consume no GitHub API quota.
+They show the datastore's latest stored records; freshness still depends on
+the existing GitHub sync, whose schedule and requests are unchanged.
 
 ## What it counts
 
@@ -143,12 +162,15 @@ and partial current lines retain their count and coverage note beside the known
 baseline context.
 
 Pacing uses the existing baseline response's seven daily totals. Its comparison
-stays with the totals snapshot when history arrives, quota refreshes or the
-clock advances. Each paced value's keyboard-accessible tooltip gives the
-snapshot date, time and Settings timezone; the visible label stays “Typical by
-now.” Opening Analytics, choosing a day or organization, saving Settings and
-crossing midnight use the existing analytics reads to refresh the snapshot.
-Pacing adds no analytics or GitHub reads.
+stays with the totals snapshot between successful local reads, including when
+history arrives or quota refreshes. Each paced value's keyboard-accessible
+tooltip gives the snapshot date, time and Settings timezone; the visible label
+stays “Typical by now.” Opening Analytics, choosing a day or organization,
+saving Settings and the visible refresh clock renew the snapshot. At midnight
+or on returning to the tab, calendar labels, forward navigation and the
+completed-day comparison update even if the local read fails; the retained
+totals keep their selected date. History is not reloaded. Pacing reuses these
+local reads and makes no GitHub requests.
 
 Completed days retain the full-day comparison: activity increases are green
 and decreases red, with Closed without merging using the inverse colors.
