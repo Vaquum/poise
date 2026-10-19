@@ -328,6 +328,15 @@ computer.
 - Binding to a non-loopback address is allowed only in service mode.
 - Loopback requests keep today's rules; they come from inside the owner's own
   container.
+- Native chats discover Poise through a private connection file and
+  `POST /api/chat/control`. This endpoint additionally requires a per-chat,
+  process-scoped credential, a loopback peer and no browser Origin/fetch
+  headers; even a valid gateway browser/admin assertion cannot call it.
+  The native command can also use the normal loopback Poise APIs under their
+  existing policy. Manager/worker relationships, inbox admission, supervision
+  and explicit issue/PR ownership persist in the workspace's SQLite store.
+  Dispatch pauses while draining; running monitor reads join the existing
+  background-work barrier. See [Chat orchestration](Chat-orchestration.md).
 - Non-loopback requests need a valid assertion with the right scope: API
   routes, static assets and the page itself alike. The assertion header is
   removed before any check, so Poise never echoes, logs or forwards it.

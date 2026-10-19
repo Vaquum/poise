@@ -272,6 +272,68 @@ test('answers a permission with the keyboard and a question with its options', a
   await expect(q).toHaveClass(/resolved/)
 })
 
+test('discovers native workers live and after reconnect without losing the manager draft', async ({ page }) => {
+  const parent = session({ title: 'Manager' })
+  const state = makeState([parent])
+  await installRoutes(page, state)
+  const sock = await installSocket(page, state)
+  await page.goto('/')
+  await sock.subscribed('s1')
+  await input(page).fill('Unsent manager instruction')
+  let releaseList: (() => void) | undefined
+  await page.route('**/api/chat/sessions', async route => {
+    await new Promise<void>(done => { releaseList = done })
+    await route.fulfill({ json: { sessions: [parent], instance: 'poise-dev:test' } })
+  }, { times: 1 })
+  const disconnected = sock.ws
+  sock.ws!.close()
+  await expect.poll(() => sock.ws !== disconnected && !!releaseList).toBe(true)
+  for (let i = 0; i < 3; i++) {
+    const worker = session({ id: `worker-${i}`, title: `Worker ${i}`, status: 'idle', lastSeq: 1 })
+    state.sessions.push(worker); state.history[worker.id] = []
+    sock.ws!.send(JSON.stringify({ kind: 'session.created', session: worker }))
+  }
+  await expect(page.locator('.chat-session-item')).toHaveCount(4)
+  const busyWorker = state.sessions.find(s => s.id === 'worker-0')!
+  busyWorker.status = 'running'
+  sock.ws!.send(JSON.stringify({ kind: 'session.updated', session: busyWorker }))
+  await expect(page.locator('.chat-session-item[data-id="worker-0"] .chat-session-running')).toBeVisible()
+  const staleResponse = page.waitForResponse(response => response.url().endsWith('/api/chat/sessions'))
+  releaseList!()
+  await (await staleResponse).finished()
+  await page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))))
+  await expect(page.locator('.chat-session-item')).toHaveCount(4)
+  await expect(page.locator('.chat-session-item[data-id="worker-0"] .chat-session-running')).toBeVisible()
+  const reconnected = sock.ws
+  sock.ws!.close()
+  const missed = session({ id: 'missed-worker', title: 'Created while disconnected' })
+  state.sessions.push(missed); state.history[missed.id] = []
+  await expect.poll(() => sock.ws !== reconnected).toBe(true)
+  await expect(page.locator('.chat-session-item[data-id="missed-worker"]')).toBeVisible()
+  await expect(page.locator('.chat-session-item[data-id="s1"]')).toHaveClass(/active/)
+  await expect(input(page)).toHaveValue('Unsent manager instruction')
+  expect(sock.framesOf('prompt')).toHaveLength(0)
+  expect(sock.framesOf('subscribe').every(frame => frame.command.type === 'subscribe' && frame.command.sessionId === 's1')).toBe(true)
+})
+
+test('attributes a worker question answer to its manager and preserves it on reload', async ({ page }) => {
+  const state = makeState([session({ status: 'running' })], { s1: [env('s1', 1, { type: 'turn.started', turnId: 't1', prompt: { text: 'Work on staging', attachments: [], mentions: [] } })] })
+  await installRoutes(page, state)
+  const sock = await installSocket(page)
+  await page.goto('/')
+  await sock.subscribed('s1')
+  sock.seq = 1
+  state.history.s1.push(sock.push('s1', { type: 'question.asked', id: 'q-manager', turnId: 't1', questions: [{ id: 'target', question: 'Which deployment target?', options: [], multiSelect: false, freeText: true }] }))
+  const question = page.locator('.chat-question[data-request="q-manager"]')
+  await expect(question).toContainText('Which deployment target?')
+  state.history.s1.push(sock.push('s1', { type: 'question.answered', id: 'q-manager', answers: { target: 'staging' }, by: 'chat', fromSession: 'manager-session' }))
+  await expect(question).toContainText('Answered by manager')
+  await expect(question).toHaveClass(/resolved/)
+  expect(sock.framesOf('question.answer')).toHaveLength(0)
+  await page.reload()
+  await expect(page.locator('.chat-question[data-request="q-manager"]')).toContainText('Answered by manager')
+})
+
 test('shows tool cards with diffs, reverts one by its diffId, and folds consecutive reads', async ({ page }) => {
   const state = makeState([session({ status: 'running' })], { s1: [env('s1', 1, { type: 'turn.started', turnId: 't1', prompt: { text: 'go', attachments: [], mentions: [] } })] })
   await installRoutes(page, state)

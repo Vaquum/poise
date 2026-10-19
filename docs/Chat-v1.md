@@ -6,6 +6,10 @@ and interaction; Claude Code, Codex, Grok Build and Muse do the agent work
 through their native session interfaces. The implementation follows issue #68,
 with the new-session policy below superseding its repository-picker design.
 
+Chats can create and supervise workers, exchange durable internal messages,
+claim issue/PR work and inspect Poise through the native control command.
+See [Chat orchestration](Chat-orchestration.md).
+
 ## Scope and migration
 
 Chat is a full view alongside Current, Swarm and Editor. Its sidebar stores

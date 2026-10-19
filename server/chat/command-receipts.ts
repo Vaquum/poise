@@ -3,7 +3,7 @@
 // an explicitly unknown outcome, NEVER permission to execute it again.
 import { createHash } from 'node:crypto'
 import { db } from '../db'
-import type { ChatCommand, ServerFrame } from './protocol'
+import type { ServerFrame } from './protocol'
 
 type Ack = Extract<ServerFrame, { kind: 'ack' }>
 interface Receipt { fingerprint: string, ack: string | null }
@@ -51,7 +51,7 @@ const reserve = db.transaction((instance: string, id: string, fingerprint: strin
 export function executeCommandOnce(
   instance: string,
   id: string,
-  command: ChatCommand,
+  command: unknown,
   execute: () => Promise<Ack>,
 ): Promise<Ack> {
   let fingerprint: string

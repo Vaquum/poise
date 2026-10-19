@@ -306,7 +306,7 @@ export type ChatEvent =
   | { type: 'permission.requested', id: string, turnId: string, toolId?: string, title: string, description?: string, input?: unknown, options: PermissionOption[] }
   | { type: 'permission.resolved', id: string, optionId: string, by: 'user' | 'session' | 'auto_merge' | 'unrestricted' | 'cancelled' }
   | { type: 'question.asked', id: string, turnId: string, toolId?: string, questions: Question[] }
-  | { type: 'question.answered', id: string, answers: Record<string, string | string[]>, by: 'user' | 'cancelled' }
+  | { type: 'question.answered', id: string, answers: Record<string, string | string[]>, by: 'user' | 'chat' | 'cancelled', fromSession?: string }
   | { type: 'commands.updated', commands: CommandOption[] }
   | { type: 'mode.updated', mode: string, modes: ModeOption[] }
   | { type: 'model.updated', model: string, modelId: string, effort: string, efforts?: string[] }
@@ -395,6 +395,7 @@ export interface ClientFrame {
 
 /** Server → client frames. */
 export type ServerFrame =
+  | { kind: 'session.created' | 'session.updated', session: SessionRecord }
   | { kind: 'switches.updated', catalogue: ChatSwitches }
   | { kind: 'ack', id: string, ok: true, result?: unknown }
   | { kind: 'ack', id: string, ok: false, error: string, code?: string }

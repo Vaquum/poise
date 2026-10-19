@@ -38,6 +38,7 @@ import { ProcessLockError } from './process-lock'
 import { retryFailedPrReviews } from './behaviors'
 import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders, type RequestAuthority } from './http'
 import { ChatRuntime } from './chat/runtime'
+import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
 import { ChatSocketServer, handleChatApi } from './chat/transport'
 import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
@@ -89,6 +90,7 @@ export interface CachePluginOptions {
 // (`poise-<label>:<db path>`), so the same database file never hosts two
 // servers' sessions and two different databases never mix.
 let chatRuntime: ChatRuntime | null = null
+let chatControl: ChatControl | null = null
 let chatSockets: ChatSocketServer | null = null
 let terminalSockets: TerminalSocketServer | null = null
 // Service mode only: Connected accounts read on a schedule, for their alerts.
@@ -119,6 +121,7 @@ export function getSelfUpdateService(): SelfUpdateService {
 export function attachChatSockets(server: Server): void {
   if (!chatSockets || !terminalSockets) throw new Error('the chat runtime is not started')
   chatSockets.attach(server)
+  chatControl?.attach(server)
   terminalSockets.attach(server)
 }
 
@@ -171,7 +174,12 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       idleTimeoutMinutes: () => getChatSettings().idleTimeoutMinutes,
       branchPrefix: () => getChatSettings().branchPrefix,
       selfUpdate: bridge,
+      controlContext: id => {
+        if (!chatControl) throw new Error('the native chat control is not started')
+        return chatControl.context(id)
+      },
     })
+    chatControl = new ChatControl(chatRuntime)
     chatRuntime.on('log', (line: string) => console.log(line))
     chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
     terminalSockets = new TerminalSocketServer({ allowedHosts: opts.allowedHosts, service }, { command: opts.terminalCommand })
@@ -195,7 +203,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     } else {
       selfUpdate = new SelfUpdateService(chatRuntime, bridge)
     }
-    void chatRuntime.recover().catch((error: unknown) => {
+    void chatRuntime.recover().then(() => chatControl?.start()).catch((error: unknown) => {
       console.error('[chat] startup reconciliation failed:', error)
     })
   }
@@ -209,6 +217,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   })
   activeClaudeAuthRuntimes.clear()
   const chatStop = chatRuntime?.stop() ?? Promise.resolve()
+  const controlStop = chatControl?.stop(chatStop) ?? Promise.resolve()
   const socketStop = chatSockets?.close() ?? Promise.resolve()
   const terminalStop = terminalSockets?.close() ?? Promise.resolve()
   stopAccountsCheck?.()
@@ -220,13 +229,14 @@ export async function stopPoiseRuntime(): Promise<void> {
   linkApi?.close()
   setCallerAccounts(null)
   chatRuntime = null
+  chatControl = null
   chatSockets = null
   terminalSockets = null
   selfUpdate = null
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), controlStop, chatStop, socketStop, terminalStop, ...authStops])
   await stopBehaviorLedger()
   await stopLoggingApi()
   await stopLogging()
@@ -286,6 +296,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
         if (req.method === 'OPTIONS') {
           return json(res, 405, { error: 'cross-origin preflight is not supported' })
+        }
+        if (path === CHAT_CONTROL_PATH) {
+          if (!chatControl) return json(res, 503, { error: 'native chat control is not started' })
+          return chatControl.handle(req, res)
         }
 
         // ── Service mode: the gateway's endpoints, the self-update routes

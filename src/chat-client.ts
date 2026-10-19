@@ -83,6 +83,8 @@ interface Pending {
 }
 
 export interface ChatClientEvents {
+  /** A session created elsewhere; discovering it never subscribes or starts it. */
+  session: (record: SessionRecord) => void
   switches: (catalogue: ChatSwitches) => void
   /** A transcript event for a subscribed session, in seq order, never repeated. */
   event: (envelope: ChatEnvelope) => void
@@ -143,6 +145,7 @@ export class ChatClient {
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null
   private bufferedEvents = new Map<string, Map<number, ChatEnvelope>>()
   private listeners: { [K in keyof ChatClientEvents]: Set<ChatClientEvents[K]> } = {
+    session: new Set(),
     switches: new Set(),
     event: new Set(),
     connection: new Set(),
@@ -285,6 +288,12 @@ export class ChatClient {
       case 'switches.updated': {
         const catalogue = parseChatSwitches(frame.catalogue)
         if (catalogue) for (const fn of this.listeners.switches) fn(catalogue)
+        return
+      }
+      case 'session.created':
+      case 'session.updated': {
+        if (!this.handshakeReady || !frame.session || typeof frame.session.id !== 'string' || frame.session.instance !== this.serverInstance) return
+        for (const fn of this.listeners.session) fn(frame.session)
         return
       }
       case 'ack': {

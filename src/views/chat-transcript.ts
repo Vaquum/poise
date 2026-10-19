@@ -78,7 +78,7 @@ export interface QuestionItem extends Keyed {
   kind: 'question'
   id: string
   questions: Question[]
-  answered?: { answers: Record<string, string | string[]>, by: 'user' | 'cancelled' }
+  answered?: { answers: Record<string, string | string[]>, by: 'user' | 'chat' | 'cancelled' }
 }
 export interface SteerItem extends Keyed { kind: 'steer', text: string, attachments?: PromptInput['attachments'], mentions?: PromptInput['mentions'] }
 export interface ErrorItem extends Keyed { kind: 'error', message: string }
@@ -725,7 +725,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       return `<div class="chat-q" data-qid="${escapeHtml(q.id)}" data-multi="${q.multiSelect ? '1' : '0'}">${q.header ? `<div class="chat-card-title">${escapeHtml(q.header)}</div>` : ''}<div class="chat-q-text-body">${escapeHtml(q.question)}</div><div class="chat-q-options">${opts}</div>${free}</div>`
     }).join('')
     const actions = item.answered
-      ? `<div class="chat-card-actions"><span class="chat-edit-card-badge chat-edit-card-badge-applied">${item.answered.by === 'cancelled' ? 'Cancelled' : 'Answered'}</span></div>`
+      ? `<div class="chat-card-actions"><span class="chat-edit-card-badge chat-edit-card-badge-applied">${item.answered.by === 'cancelled' ? 'Cancelled' : item.answered.by === 'chat' ? 'Answered by manager' : 'Answered'}</span></div>`
       : `<div class="chat-card-actions"><button type="button" class="chat-card-btn chat-q-submit" data-question="${escapeHtml(item.id)}">Submit</button></div>`
     return `<div class="chat-card chat-question${item.answered ? ' resolved' : ' pending'}${focused ? ' focused' : ''}" data-request="${escapeHtml(item.id)}">${qs}${actions}</div>`
   }

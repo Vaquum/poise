@@ -103,3 +103,12 @@ export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'p
     }
   }
 }
+
+/** Validate every managed parent before using the private workspace initializer. */
+export async function ensureWorkerWorkspace(root: string, id: string, instance: string): Promise<string> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Invalid worker workspace ID')
+  await privateDirectory(root)
+  const workers = join(root, 'workers')
+  await privateDirectory(workers)
+  return ensureLocalWorkspace(join(workers, id), instance)
+}
