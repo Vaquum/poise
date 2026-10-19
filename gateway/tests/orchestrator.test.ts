@@ -372,11 +372,13 @@ describe('image upgrades', () => {
     const bobId = h.docker.containers.get('poise-ws-bob')?.id
     h.workspace.health.activeChatTurns = 1
     h.workspace.health.runningCallerCalls = 2
-    setTimeout(() => {
-      h.workspace.health.activeChatTurns = 0
-      h.workspace.health.runningCallerCalls = 0
-    }, 60)
-    await h.orchestrator.upgradePass()
+    const upgrade = h.orchestrator.upgradePass()
+    await waitFor(() => h.workspace.serviceRequests.some((request) => request.url === '/api/service/health'), 'a busy workspace health poll')
+    expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
+    expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
+    h.workspace.health.activeChatTurns = 0
+    h.workspace.health.runningCallerCalls = 0
+    await upgrade
 
     const drain = h.workspace.serviceRequests[0]
     expect(drain.method).toBe('POST')
