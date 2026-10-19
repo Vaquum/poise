@@ -18,6 +18,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { setImmediate } from 'node:timers/promises'
 import Database from 'better-sqlite3'
+import { WORK_TYPES, workType, type ReviewSummary, type WorkReviewAnalytics } from '../src/analytics-work-review'
 import { getMeta, listCompletedBehaviorActions, type BehaviorLaunchAction, type CompletedBehaviorAction } from './db'
 import { HttpError } from './http'
 import { involvementScopes, repoBelongsTo, selectOrganizations, type DatastoreRecord, type OrganizationReadError } from './gh'
@@ -41,6 +42,7 @@ export interface AnalyticsReport {
     /** Closed without merging. */
     closedUnmerged: number
     merged: number
+    workReview: WorkReviewAnalytics
     /** Merged pull requests the agent account merged; null without one. */
     mergedByAgent: number | null
     /** First reviews submitted in the window, timed from each opening. */
@@ -183,6 +185,15 @@ export function computeAnalytics(input: {
     }
   }
   const behaviorTotal = behaviors.approvals + behaviors.reviews + behaviors.changesRequested
+  const reviewed = merged.flatMap((pr) => pr.review_summary ? [pr.review_summary] : [])
+  const knownRounds = reviewed.filter((review) => review.missingCommits === 0)
+  const distribution = new Map<number, number>()
+  for (const review of knownRounds) distribution.set(review.rounds, (distribution.get(review.rounds) ?? 0) + 1)
+  const types = new Map(WORK_TYPES.map((type) => [type, 0]))
+  for (const pr of merged) {
+    const type = workType(pr.title)
+    types.set(type, types.get(type)! + 1)
+  }
 
   return {
     window,
@@ -195,6 +206,22 @@ export function computeAnalytics(input: {
       opened: input.prs.filter((pr) => inWindow(pr.created_at, window)).length,
       closedUnmerged: input.prs.filter((pr) => pr.status === 'closed' && inWindow(pr.closed_at, window)).length,
       merged: merged.length,
+      workReview: {
+        reviewed: reviewed.length === merged.length ? reviewed.filter((review) => review.rounds > 0 || review.missingCommits > 0).length : null,
+        types: [...types].filter(([, count]) => count > 0).map(([type, count]) => ({ type, count })).sort((a, b) => b.count - a.count),
+        rounds: {
+          median: knownRounds.length === merged.length ? median(knownRounds.map((review) => review.rounds)) : null,
+          counted: knownRounds.length,
+          missingReviews: reviewed.reduce((sum, review) => sum + review.missingCommits, 0),
+          distribution: [...distribution].sort(([a], [b]) => a - b).map(([rounds, prs]) => ({ rounds, prs })),
+        },
+        changesRequested: {
+          prs: reviewed.length === merged.length ? reviewed.filter((review) => review.changeRequests > 0).length : null,
+          reviews: reviewed.length === merged.length ? reviewed.reduce((sum, review) => sum + review.changeRequests, 0) : null,
+          dismissed: reviewed.length === merged.length ? reviewed.reduce((sum, review) => sum + review.dismissed, 0) : null,
+          counted: reviewed.length,
+        },
+      },
       mergedByAgent: agent ? merged.filter((pr) => pr.merged_by?.toLowerCase() === agent).length : null,
       firstReview: { count: firstReviewTimes.length, medianMs: median(firstReviewTimes) },
       commentsPerPr: mean(merged.map((pr) => (pr.comments_count ?? 0) + (pr.review_comments_count ?? 0))),
@@ -247,6 +274,16 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         json_extract(i.expanded_json, '$.pull.merged_by.login') AS merged_by
       FROM prs JOIN items i ON i.item_id = pr_ref WHERE pr_ref = ?
     `)
+    const mergedReviews = db.prepare<[number], ReviewSummary>(`
+      SELECT count(DISTINCT nullif(trim(r.commit_id), '')) AS rounds,
+        count(CASE WHEN nullif(trim(r.commit_id), '') IS NULL THEN 1 END) AS missingCommits,
+        count(CASE WHEN r.state = 'CHANGES_REQUESTED' THEN 1 END) AS changeRequests,
+        count(CASE WHEN r.state = 'DISMISSED' THEN 1 END) AS dismissed
+      FROM reviews r JOIN items i ON i.item_id = r.item_id
+      WHERE r.item_id = ? AND r.submitted_at IS NOT NULL AND r.state IN ('APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED')
+        AND julianday(r.submitted_at) <= julianday(i.closed_at)
+        AND (r.author_login IS NULL OR i.author_login IS NULL OR lower(r.author_login) <> lower(i.author_login))
+    `)
     const read = async (kind: 'issue' | 'pr'): Promise<DatastoreRecord[]> => {
       const view = kind === 'pr' ? 'prs' : 'issues'
       const ref = kind === 'pr' ? 'pr_ref' : 'issue_ref'
@@ -290,6 +327,7 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         if (!repoBelongsTo(row.repo, org.login)) throw new Error(`datastore contains records outside ${org.login}`)
         if (kind === 'pr' && row.status === 'merged' && inWindow(row.closed_at, window)) {
           Object.assign(row, mergedDetails.get(row.pr_ref!))
+          row.review_summary = mergedReviews.get(row.pr_ref!)!
         }
         rows.push(row)
         if (rows.length % 64 === 0 || performance.now() - sliceStart >= 8) {

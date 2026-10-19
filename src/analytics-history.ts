@@ -3,6 +3,7 @@
 // numbers and the chart geometry are testable.
 
 import { formatCount, formatDuration, formatRate, formatShortDuration, type AnalyticsReport } from './analytics-format'
+import { changeCoverage, changeRequestShare, roundCoverage } from './analytics-work-review'
 
 export interface AnalyticsPeriod {
   since: string
@@ -60,11 +61,15 @@ export function historySeries(history: AnalyticsHistory): HistorySeries[] {
     { label: 'Time to first review', values: periods.map((p) => p.pullRequests.firstReview.medianMs), format: formatShortDuration, detail: (p) => `Median of ${formatCount(p.pullRequests.firstReview.count)} first reviews` },
     ...[
       { label: 'Comments', value: (pr: AnalyticsPeriod['pullRequests']) => pr.medianCommentsPerPr ?? null, format: formatRate },
+      { label: 'Review rounds', value: (pr: AnalyticsPeriod['pullRequests']) => pr.workReview?.rounds.median ?? null, format: formatRate },
+      { label: 'Change-request share', value: changeRequestShare, format: (n: number | null) => n === null ? '—' : `${formatRate(n)}%` },
       { label: 'Median lines', value: (pr: AnalyticsPeriod['pullRequests']) => pr.lines.counted < pr.merged ? null : pr.lines.median, format: (n: number | null) => n === null ? '—' : formatCount(Math.round(n)) },
       { label: 'Behaviors', value: (pr: AnalyticsPeriod['pullRequests']) => pr.behaviors.medianPerPr ?? null, format: formatRate },
       { label: 'Median time', value: (pr: AnalyticsPeriod['pullRequests']) => pr.medianTimeToMergeMs, format: formatDuration },
       { label: 'Merged by agent', value: (pr: AnalyticsPeriod['pullRequests']) => pr.merged && pr.mergedByAgent !== null ? pr.mergedByAgent / pr.merged * 100 : null, format: (n: number | null) => n === null ? '—' : `${formatRate(n)}%` },
-    ].map(({ label, value, format }) => ({ label, values: periods.map((p) => value(p.pullRequests)), format, detail: (p: AnalyticsPeriod) => `Over ${formatCount(p.pullRequests.merged)} merged PRs` })),
+    ].map(({ label, value, format }) => ({ label, values: periods.map((p) => value(p.pullRequests)), format,
+      detail: (p: AnalyticsPeriod) => label === 'Review rounds' ? roundCoverage(p.pullRequests, 'Period') : label === 'Change-request share' ? changeCoverage(p.pullRequests, 'Period') : `Over ${formatCount(p.pullRequests.merged)} merged PRs`,
+    })),
   ]
 }
 

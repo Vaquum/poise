@@ -48,9 +48,24 @@ describe('the periods', () => {
 })
 
 describe('the series', () => {
+  it('uses each weekly merged cohort for rounds and change-request shares, preserving unknowns', () => {
+    const workReview = { reviewed: 7, types: [], rounds: { median: 3, counted: 7, missingReviews: 0, distribution: [] }, changesRequested: { prs: 5, reviews: 10, dismissed: 1, counted: 7 } }
+    const all = historySeries({ periods: [period(0, { workReview }), period(1), period(2, { merged: 0, workReview })], errors: [] })
+    const rounds = all.find((s) => s.label === 'Review rounds')!
+    const changes = all.find((s) => s.label === 'Change-request share')!
+    expect(rounds.values.slice(0, 2)).toEqual([3, null])
+    expect(changes.values).toEqual([5 / 7 * 100, null, null])
+    expect(changes.format(changes.values[0])).toBe('71.4%')
+    expect(changes.format(null)).toBe('—')
+    const partial = period(3, { workReview: { ...workReview, rounds: { ...workReview.rounds, median: null, counted: 6, missingReviews: 2 } } })
+    expect(rounds.detail(partial)).toContain('exact round counts for 6 of 7 merged PRs; 2 reviews lack commit identities')
+    expect(rounds.detail(period(1))).toContain('review aggregates unavailable')
+    expect(rounds.detail(period(1, { merged: 0 }))).toBe('Period: no merged PRs.')
+    expect(changes.detail(partial)).toContain('Stored summaries available for 7 of 7')
+  })
   it('gives the five topline figures as daily averages, and time to merge as each period\'s median', () => {
     const all = historySeries({ periods: [period(0), period(1, { merged: 0, lines: { total: null, median: null, counted: 0 }, averageTimeToMergeMs: null, medianTimeToMergeMs: null })], errors: [] })
-    expect(all).toHaveLength(13)
+    expect(all).toHaveLength(15)
     const series = all.slice(0, 5)
     expect(series.map((s) => s.label)).toEqual(['Issues opened', 'Issues closed', 'Pull requests merged', 'Lines changed', 'Time to merge'])
     expect(series.map((s) => s.values)).toEqual([[2, 2], [1, 1], [1, 0], [100, 0], [3_600_000, null]])
@@ -99,6 +114,6 @@ describe('ten-bin distributions', () => {
 
   it('provides all flow and per-PR series from the same periods', () => {
     const series = historySeries({ periods: [period(0)], errors: [] })
-    expect(series.slice(5).map((item) => item.values[0])).toEqual([2, 1, 60_000, 2, 100, 1, 3_600_000, 3 / 7 * 100])
+    expect(series.slice(5).map((item) => item.values[0])).toEqual([2, 1, 60_000, 2, null, null, 100, 1, 3_600_000, 3 / 7 * 100])
   })
 })

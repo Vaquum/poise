@@ -1,10 +1,10 @@
 import { reveal } from '../motion'
 import { patchContent } from '../dom-patch'
 // Analytics — a view of its own, opened from the burger menu rather than the
-// top nav: productivity, then the numbers per merged
+// top nav: productivity, work and review, then the numbers per merged
 // pull request, each with a weekly line and distribution, then
 // live GitHub API quota. Independent of Current's filters.
-import { analyticsGroups, type AnalyticsGroup, type AnalyticsReport } from '../analytics-format'
+import { analyticsGroups, formatCount, formatRate, type AnalyticsGroup, type AnalyticsReport, type AnalyticsTile } from '../analytics-format'
 import { analyticsDay, analyticsDayProgress, analyticsDailyBounds, analyticsHistoryBounds } from '../analytics-day'
 import { HISTORY_BASELINE, historyChart, histogram, historySeries, periodLabel, type AnalyticsHistory, type HistorySeries } from '../analytics-history'
 import { mountOrganizationFilter, organizationUrl } from '../organizations'
@@ -63,13 +63,18 @@ function renderShell(): string {
     </main>`
 }
 
-function histogramMarkup(series: HistorySeries): string {
-  const bins = histogram(series.values)
+function histogramMarkup(series: Pick<HistorySeries, 'label' | 'values' | 'format'>, tile: AnalyticsTile): string {
+  const rounds = tile.label === 'Review rounds'
+  const distribution = tile.distribution
+  const values = rounds ? (distribution?.distribution ?? []).flatMap((entry) => Array<number>(entry.prs).fill(entry.rounds)) : series.values
+  const bins = histogram(values, rounds || tile.label === 'Change-request share' ? 0 : undefined, tile.label === 'Change-request share' ? 100 : undefined)
   const max = Math.max(1, ...bins.map((bin) => bin.count))
   const count = bins.reduce((sum, bin) => sum + bin.count, 0)
-  const help = `${series.label}: distribution of ${count} known weekly values over the past year in 10 equal-width bins. Unknown periods are excluded.`
+  const help = rounds
+    ? `Review rounds: distribution of exact round counts for ${distribution?.counted ?? 0} of ${tile.population ?? 0} merged PRs on the selected day. Unknown counts are excluded.`
+    : `${series.label}: distribution of ${count} known weekly values over the past year in 10 equal-width bins. Unknown periods are excluded.`
   return `<div class="analytics-histogram" tabindex="0" role="img" aria-label="${escapeHtml(help)}" data-help="${escapeHtml(help)}">
-    <svg viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">${bins.map((bin, i) => `<rect x="${i * 10 + 1}" y="${39 - bin.count / max * 36}" width="8" height="${bin.count / max * 36}" data-help="${escapeHtml(`${series.format(bin.from)} – ${series.format(bin.until)}: ${bin.count} periods`)}"/>`).join('')}</svg>
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">${bins.map((bin, i) => `<rect x="${i * 10 + 1}" y="${39 - bin.count / max * 36}" width="8" height="${bin.count / max * 36}" data-help="${escapeHtml(`${series.format(bin.from)} – ${series.format(bin.until)}: ${bin.count} ${rounds ? 'PRs' : 'periods'}`)}"/>`).join('')}</svg>
     <span class="analytics-chart-axis"><span>${escapeHtml(series.format(bins[0].from))}</span><span>${count ? '' : '—'}</span><span>${escapeHtml(series.format(bins[9].until))}</span></span>
   </div>`
 }
@@ -168,7 +173,11 @@ function hasNewAccountFailure(report: AnalyticsReport, previous: AnalyticsReport
   return report.errors.some((error) => !error.stale && !missing.has(error.org.toLowerCase()))
 }
 
-function historyMarkup(label: string, all: HistorySeries[] | null): string {
+function historyMarkup(tile: AnalyticsTile, all: HistorySeries[] | null): string {
+  const { label } = tile
+  if (label === 'Review rounds' && (history.error || !all)) {
+    return `<dd class="analytics-history"><span class="analytics-history-max"></span><div class="analytics-history-plot" ${history.error ? 'aria-label="Year history unavailable"' : 'aria-busy="true"'}></div>${histogramMarkup({ label, values: [], format: formatRate }, tile)}</dd>`
+  }
   if (history.error) return '<dd class="analytics-history" aria-label="History unavailable"></dd>'
   if (!all) return '<dd class="analytics-history" aria-busy="true"><span class="analytics-history-max"></span><div class="analytics-history-plot"></div><div class="analytics-histogram"></div></dd>'
   const series = all.find((s) => s.label === label)
@@ -188,7 +197,7 @@ function historyMarkup(label: string, all: HistorySeries[] | null): string {
       ${chart.isolated.map((point) => `<span class="analytics-history-dot" style="${at(point)}"></span>`).join('')}
       ${latest ? `<span class="analytics-history-latest" style="${at(latest)}"></span>` : ''}
     </div>
-    ${histogramMarkup(series)}
+    ${histogramMarkup(series, tile)}
   </dd>`
 }
 
@@ -203,9 +212,21 @@ const measurementHelp: Record<string, string> = {
   'Time to first review': 'Median elapsed time from opening to the first submitted review by someone other than the author, for first reviews on the selected day.',
   'Comments': 'Median conversation and review comments per pull request merged on the selected day.',
   'Median lines': 'Median additions plus deletions per pull request merged on the selected day. Withheld when any size is unknown.',
-  'Behaviors': 'Median completed review and approval behaviors per pull request merged on the selected day.',
+  'Behaviors': 'Median completed review and approval behaviors per pull request merged on the selected day, from Poise’s own launch ledger.',
   'Median time': 'Median elapsed time from opening to merge across pull requests merged on the selected day.',
   'Merged by agent': 'Share of pull requests merged on the selected day whose merger was the configured agent account.',
+  'Work type': 'Share of merged PRs by Conventional Commit title prefix. Titles without a recognized prefix are unclassified. The headline shows the largest category; categories have no good or bad polarity.',
+  'Review rounds': 'Median distinct commit revisions with a submitted APPROVED, CHANGES_REQUESTED, COMMENTED or DISMISSED review by someone other than the author, at or before merge. Bots and the configured agent count; deleted accounts count unless known to be the author. Multiple reviews of one commit count once; PRs without reviews count zero. Includes the initial reviewed revision and comment-only reviews; this does not prove rework or causation.',
+  'Change-request share': 'Share of merged PRs with at least one observed submitted CHANGES_REQUESTED review by someone other than the author, at or before merge, from the local GitHub datastore. Each PR counts once. Comparison is a relative percentage change, like the other cards.',
+}
+
+function workTypeMarkup(tile: AnalyticsTile): string {
+  const entries = tile.workTypes ?? []
+  return `<dd class="analytics-work-types">${entries.map((entry) => {
+    const share = tile.population ? entry.count / tile.population * 100 : 0
+    const help = `${entry.type}: ${formatCount(entry.count)} of ${formatCount(tile.population ?? 0)} merged PRs · ${formatRate(share)}%`
+    return `<div class="analytics-work-type" data-help="${escapeHtml(help)}" tabindex="0"><span>${entry.type}</span><span class="analytics-work-track"><i style="width:${share}%"></i></span><span>${formatRate(share)}%</span></div>`
+  }).join('')}</dd>`
 }
 
 function groupMarkup(group: AnalyticsGroup): string {
@@ -215,13 +236,13 @@ function groupMarkup(group: AnalyticsGroup): string {
       <h2 class="tp-group-label" id="analytics-${group.id}">${escapeHtml(group.label)}</h2>
       <dl class="analytics-tiles">
         ${group.tiles.map((tile) => `
-          <div class="analytics-tile">
+          <div class="analytics-tile${tile.workTypes ? ' analytics-work-tile' : ''}">
             <dt class="analytics-label">${escapeHtml(tile.label)}</dt>
             <dd class="analytics-summary ${tile.trend?.direction ?? 'neutral'}${tile.trend?.onPace ? ' on-pace' : ''}">
-              <div class="analytics-value-row"><span class="analytics-value" data-help="${escapeHtml([measurementHelp[tile.label], tile.note].filter(Boolean).join(' '))}" tabindex="0">${escapeHtml(tile.value)}</span>${tile.trend ? `<span class="analytics-arrow" role="img" aria-label="${escapeHtml(tile.trend.description)}" data-help="${escapeHtml(tile.trend.caption)}" tabindex="0">${escapeHtml(tile.trend.text.slice(0, 1))}</span>` : ''}</div>
-              <div class="analytics-trend">${tile.trend ? `<span class="analytics-delta" data-help="${escapeHtml(tile.trend.description)}" tabindex="0">${escapeHtml(tile.trend.text.slice(2))}</span>` : ''}<span class="analytics-note">${tile.comparison ? escapeHtml(tile.comparison) : ''}</span></div>
+              <div class="analytics-value-row"><span class="analytics-value" data-help="${escapeHtml([measurementHelp[tile.label], tile.note].filter(Boolean).join(' '))}" tabindex="0">${escapeHtml(tile.value)}</span>${tile.valueLabel ? `<span class="analytics-work-label">${escapeHtml(tile.valueLabel)}</span>` : ''}${tile.trend ? `<span class="analytics-arrow" role="img" aria-label="${escapeHtml(tile.trend.description)}" data-help="${escapeHtml(tile.trend.caption)}" tabindex="0">${escapeHtml(tile.trend.text.slice(0, 1))}</span>` : ''}</div>
+              ${tile.workTypes ? '' : `<div class="analytics-trend">${tile.trend ? `<span class="analytics-delta" data-help="${escapeHtml(tile.trend.description)}" tabindex="0">${escapeHtml(tile.trend.text.slice(2))}</span>` : ''}<span class="analytics-note">${tile.comparison ? escapeHtml(tile.comparison) : ''}</span></div>`}
             </dd>
-            ${historyMarkup(tile.label, series)}
+            ${tile.workTypes ? workTypeMarkup(tile) : historyMarkup(tile, series)}
           </div>`).join('')}
       </dl>
     </section>`

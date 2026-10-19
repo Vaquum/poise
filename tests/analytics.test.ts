@@ -48,7 +48,8 @@ function pr(number: number, created: string, merged: string | null, extra: Parti
   return {
     repo: 'alpha/app', number, status: merged ? 'merged' : 'open', author: 'octocat', title: `pr ${number}`,
     url: `https://github.com/alpha/app/pull/${number}`, created_at: created, updated_at: merged ?? created,
-    closed_at: merged, comments_count: 0, review_comments_count: 0, additions: 0, deletions: 0, ...extra,
+    closed_at: merged, comments_count: 0, review_comments_count: 0, additions: 0, deletions: 0,
+    review_summary: { rounds: 0, missingCommits: 0, changeRequests: 0, dismissed: 0 }, ...extra,
   }
 }
 
@@ -77,6 +78,36 @@ describe('the window', () => {
 })
 
 describe('the periods of a history', () => {
+  it('uses per-PR rounds and affected-PR incidence with zero and unknown reviews', () => {
+    const prs = [
+      pr(1, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z', { review_summary: { rounds: 1, missingCommits: 0, changeRequests: 2, dismissed: 0 } }),
+      pr(2, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z', { review_summary: { rounds: 2, missingCommits: 0, changeRequests: 0, dismissed: 0 } }),
+      pr(3, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z'),
+    ]
+    const compute = () => computeAnalytics({ window: WEEK, prs, issues: [], behaviors: [] }).pullRequests.workReview
+    expect(compute()).toMatchObject({ reviewed: 2, rounds: { median: 1, counted: 3 }, changesRequested: { prs: 1, reviews: 2 } })
+    prs.push(pr(4, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z', { review_summary: { rounds: 0, missingCommits: 1, changeRequests: 1, dismissed: 0 } }))
+    expect(compute()).toMatchObject({ reviewed: 3, rounds: { median: null, counted: 3, missingReviews: 1 }, changesRequested: { prs: 2, reviews: 3 } })
+  })
+
+  it('breaks work-type ties by taxonomy order rather than input order', () => {
+    const result = computeAnalytics({ window: WEEK, issues: [], behaviors: [], prs: [
+      pr(1, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z', { title: 'FIX: correct it' }),
+      pr(2, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z', { title: 'feat(ui)!: add it' }),
+    ] })
+    expect(result.pullRequests.workReview.types).toEqual([{ type: 'feat', count: 1 }, { type: 'fix', count: 1 }])
+  })
+  it('pools seven-day PR observations instead of averaging daily medians or shares', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => pr(i + 1, '2026-10-01T00:00:00Z', i < 5 ? '2026-10-04T12:00:00Z' : '2026-10-05T12:00:00Z', {
+      review_summary: { rounds: i < 5 ? 10 : 1, missingCommits: 0, changeRequests: i < 5 ? 2 : 0, dismissed: 0 },
+    }))
+    prs.push(pr(7, '2026-10-01T00:00:00Z', '2026-10-08T12:00:00Z', { review_summary: { rounds: 99, missingCommits: 0, changeRequests: 1, dismissed: 0 } }))
+    const result = computeHistory({ bounds: ['2026-10-01T00:00:00Z', '2026-10-08T00:00:00Z', '2026-10-09T00:00:00Z'], issues: [], prs })
+    expect(result.periods[0].pullRequests.merged).toBe(6)
+    expect(result.periods[0].pullRequests.workReview.rounds.median).toBe(10)
+    expect(result.periods[0].pullRequests.workReview.changesRequested.prs).toBe(5)
+    expect(result.periods[1].pullRequests.workReview.rounds.median).toBe(99)
+  })
   it('takes increasing zoned edges, exact to the millisecond', () => {
     expect(parseBounds('2026-10-01T00:00:00+03:00,2026-10-08T00:00:00.500Z')).toEqual(['2026-09-30T21:00:00.000Z', '2026-10-08T00:00:00.500Z'])
     expect(parseBounds(Array.from({ length: 80 }, (_, i) => new Date(Date.UTC(2026, 0, 1 + i)).toISOString()).join(','))).toHaveLength(80)
@@ -221,6 +252,7 @@ describe('the numbers', () => {
         opened: 0,
         closedUnmerged: 0,
         merged: 0,
+        workReview: { reviewed: 0, types: [], rounds: { median: null, counted: 0, missingReviews: 0, distribution: [] }, changesRequested: { prs: 0, reviews: 0, dismissed: 0, counted: 0 } },
         mergedByAgent: null,
         firstReview: { count: 0, medianMs: null },
         commentsPerPr: null,
@@ -232,6 +264,12 @@ describe('the numbers', () => {
       },
       errors: [],
     })
+  })
+
+  it('does not treat unavailable review aggregates as zero reviews', () => {
+    const report = computeAnalytics({ window: WEEK, issues: [], behaviors: [], prs: [pr(1, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { review_summary: undefined })] })
+    expect(report.pullRequests.workReview.rounds).toEqual({ median: null, counted: 0, missingReviews: 0, distribution: [] })
+    expect(report.pullRequests.workReview.changesRequested).toEqual({ prs: null, reviews: null, dismissed: null, counted: 0 })
   })
 
   it('counts pull requests opened and closed without merging inside the window', () => {
@@ -305,11 +343,11 @@ describe('reading what Current shows', () => {
       return id
     } finally { db.close() }
   }
-  function review(itemId: number, author: string | null, state: string, submitted: string | null) {
+  function review(itemId: number, author: string | null, state: string, submitted: string | null, commit: string | null = 'revision-1') {
     const db = new Database(mocks.orgs[0].datastorePath)
     try {
-      db.prepare(`INSERT INTO reviews (node_id, item_id, author_login, state, submitted_at, raw_json) VALUES (?, ?, ?, ?, ?, '{}')`)
-        .run(`review-${itemId}-${author}-${state}-${submitted}`, itemId, author, state, submitted)
+      db.prepare(`INSERT INTO reviews (node_id, item_id, author_login, state, submitted_at, commit_id, raw_json) VALUES (?, ?, ?, ?, ?, ?, '{}')`)
+        .run(`review-${itemId}-${author}-${state}-${submitted}-${commit}`, itemId, author, state, submitted, commit)
     } finally { db.close() }
   }
 
@@ -335,6 +373,58 @@ describe('reading what Current shows', () => {
     seed(pr(2, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { author: 'robot', additions: 1, deletions: 1 }), 'pr')
     seed(pr(3, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { author: 'stranger', additions: 500 }), 'pr')
   }
+
+  it('counts reviewed revisions and affected PRs through merge, without extra CLI calls', async () => {
+    const first = seed(pr(1, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00.500Z', { title: 'feat(ui)!: add analytics' }), 'pr', true)
+    seed(pr(2, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z', { title: 'fix: correct result', author: 'robot' }), 'pr')
+    seed(pr(3, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z', { title: 'feat: outside involvement' }), 'pr')
+    seed(pr(4, '2026-10-04T00:00:00Z', '2026-10-12T00:00:00Z'), 'pr', true)
+    review(first, 'reviewer', 'CHANGES_REQUESTED', '2026-10-05T01:00:00Z', 'a')
+    review(first, 'other', 'CHANGES_REQUESTED', '2026-10-05T02:00:00Z', 'a')
+    review(first, null, 'DISMISSED', '2026-10-05T03:00:00Z', 'b')
+    review(first, 'reviewer', 'APPROVED', '2026-10-06T03:00:00.500+03:00', 'c')
+    review(first, 'OCTOCAT', 'CHANGES_REQUESTED', '2026-10-05T04:00:00Z', 'author')
+    review(first, 'reviewer', 'PENDING', '2026-10-05T05:00:00Z', 'pending')
+    review(first, 'reviewer', 'APPROVED', null, 'draft')
+    review(first, 'reviewer', 'CHANGES_REQUESTED', '2026-10-06T00:00:00.501Z', 'after')
+    const report = await readAnalytics(WEEK, 'alpha')
+    expect(report.pullRequests.workReview).toEqual({
+      reviewed: 1, types: [{ type: 'feat', count: 1 }, { type: 'fix', count: 1 }],
+      rounds: { median: 1.5, counted: 2, missingReviews: 0, distribution: [{ rounds: 0, prs: 1 }, { rounds: 3, prs: 1 }] },
+      changesRequested: { prs: 1, reviews: 2, dismissed: 1, counted: 2 },
+    })
+    const history = await readAnalyticsHistory([WEEK.since, WEEK.until], 'alpha')
+    expect(history.periods[0].pullRequests.workReview).toEqual(report.pullRequests.workReview)
+    expect((await readAnalytics(WEEK, 'beta')).pullRequests.workReview.rounds.counted).toBe(0)
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('withholds the round median for missing commit identities without losing known review states', async () => {
+    const id = seed(pr(1, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z'), 'pr', true)
+    seed(pr(2, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z'), 'pr', true)
+    review(id, 'reviewer', 'CHANGES_REQUESTED', '2026-10-05T01:00:00Z', null)
+    review(id, 'other', 'DISMISSED', '2026-10-05T02:00:00Z', '')
+    const work = (await readAnalytics(WEEK, 'alpha')).pullRequests.workReview
+    expect(work.rounds).toEqual({ median: null, counted: 1, missingReviews: 2, distribution: [{ rounds: 0, prs: 1 }] })
+    expect(work.changesRequested).toEqual({ prs: 1, reviews: 1, dismissed: 1, counted: 2 })
+  })
+
+  it('counts comment-only, bot and deleted-account reviews without author replies', async () => {
+    const ids = Array.from({ length: 4 }, (_, i) => seed(pr(i + 1, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z'), 'pr', true))
+    review(ids[0], 'reviewer', 'COMMENTED', '2026-10-04T01:00:00Z', 'reply-revision')
+    review(ids[0], 'review-bot[bot]', 'COMMENTED', '2026-10-04T02:00:00Z', 'bot-revision')
+    review(ids[0], 'robot', 'APPROVED', '2026-10-04T03:00:00Z', 'agent-revision')
+    review(ids[1], null, 'APPROVED', '2026-10-04T01:00:00Z', 'deleted-reviewer')
+    const db = new Database(mocks.orgs[0].datastorePath)
+    db.prepare('UPDATE items SET author_login = NULL WHERE item_id = ?').run(ids[2])
+    db.close()
+    review(ids[2], 'octocat', 'APPROVED', '2026-10-04T01:00:00Z', 'deleted-author')
+    review(ids[3], 'OCTOCAT', 'COMMENTED', '2026-10-04T01:00:00Z', 'author-reply')
+    const work = (await readAnalytics(WEEK, 'alpha')).pullRequests.workReview
+    expect(work.reviewed).toBe(3)
+    expect(work.rounds).toEqual({ median: 1, counted: 4, missingReviews: 0, distribution: [{ rounds: 0, prs: 1 }, { rounds: 1, prs: 2 }, { rounds: 3, prs: 1 }] })
+    expect(work.changesRequested.prs).toBe(0)
+  })
 
   it('deduplicates involvement and agent authorship and reads PR sizes and comments without CLI processes', async () => {
     data()
@@ -458,7 +548,10 @@ describe('reading what Current shows', () => {
         (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = pr_ref AND r.submitted_at IS NOT NULL
           AND r.state <> 'PENDING' AND (r.author_login IS NULL OR author IS NULL OR lower(r.author_login) <> lower(author))) AS first_review_at
         FROM prs`).all()
-      for (const row of rows.filter(row => row.status === 'merged')) row.merged_by = null
+      for (const row of rows.filter(row => row.status === 'merged')) {
+        row.merged_by = null
+        row.review_summary = { rounds: 0, missingCommits: 0, changeRequests: 0, dismissed: 0 }
+      }
       const expected = computeAnalytics({ window: WEEK, issues: [], prs: rows, behaviors: [], agent: 'robot' })
       const oldMs = performance.now() - oldStart
       const start = performance.now()
@@ -498,7 +591,7 @@ describe('reading what Current shows', () => {
       ['user', { username: 'octocat', item_type: 'pr' }], ['pr', { author: 'robot' }], ['pr', {}],
     ].map(async ([view, filters]) => {
       const { stdout } = await run('python3', ['-c', python, resolve('caller/github_datastore'), mocks.orgs[0].datastorePath, String(view), WEEK.since, JSON.stringify(filters)])
-      return JSON.parse(stdout) as DatastoreRecord[]
+      return (JSON.parse(stdout) as DatastoreRecord[]).map(row => ({ ...row, review_summary: { rounds: 0, missingCommits: 0, changeRequests: 0, dismissed: 0 } }))
     }))
     const oldMs = performance.now() - start
     const expected = computeAnalytics({ window: WEEK,

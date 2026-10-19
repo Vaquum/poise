@@ -19,6 +19,7 @@
 import { mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { ReviewSummary } from '../src/analytics-work-review'
 import { getMeta } from './db'
 import { HttpError } from './http'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
@@ -81,6 +82,7 @@ export interface DatastoreRecord {
   // who merged a merged pull request.
   first_review_at?: string | null
   merged_by?: string | null
+  review_summary?: ReviewSummary
   owner_login?: string | null
   owner_avatar?: string | null
   // Issue-only

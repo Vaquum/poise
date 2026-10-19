@@ -12,6 +12,12 @@ function report(merged: number, hours = 27): AnalyticsReport {
       opened: 5,
       closedUnmerged: 1,
       merged,
+      workReview: {
+        reviewed: merged,
+        types: merged ? [{ type: 'feat', count: Math.ceil(merged / 2) }, { type: 'fix', count: Math.floor(merged / 2) }] : [],
+        rounds: { median: merged ? 3 : null, counted: merged, missingReviews: 0, distribution: merged ? [{ rounds: 3, prs: merged }] : [] },
+        changesRequested: { prs: merged ? merged === 4 ? 3 : Math.floor(merged / 2) : 0, reviews: merged, dismissed: 0, counted: merged },
+      },
       mergedByAgent: merged ? merged - 1 : 0,
       firstReview: { count: 3, medianMs: hours > 30 ? 150_000 : 75_000 },
       commentsPerPr: merged ? 3.25 : null,
@@ -183,7 +189,7 @@ test('opens from the burger as a view of its own: productivity topline, per merg
   await expect(page.locator('#menu-popover [data-action="analytics"]')).toHaveAttribute('aria-current', 'page')
   await expect(page.locator('#menu-toggle')).toBeFocused()
   await expect(page.locator('#menu-toggle')).toHaveAttribute('aria-expanded', 'false')
-  await expect(view.locator('main h2')).toHaveText(['Productivity', 'Per merged pull request', 'GitHub API · Live'])
+  await expect(view.locator('main h2')).toHaveText(['Productivity', 'Work & review', 'Per merged pull request', 'GitHub API · Live'])
   const topline = view.getByRole('region', { name: 'Productivity' })
   const flow = topline
   const perPr = view.getByRole('region', { name: 'Per merged pull request' })
@@ -208,11 +214,35 @@ test('opens from the burger as a view of its own: productivity topline, per merg
   expect(new Set(placed.map(tile => tile.left)).size).toBe(4)
   expect(placed.sort((a, b) => a.top - b.top || a.left - b.left).map(tile => tile.label)).toEqual(cardOrder)
   expect(new Set(await lefts(perPr, '.analytics-tile')).size).toBe(5)
+  const work = view.getByRole('region', { name: 'Work & review' })
+  await expect(work.locator('.analytics-label')).toHaveText(['Work type', 'Review rounds', 'Change-request share'])
+  const row = await work.locator('.analytics-tile').evaluateAll((tiles) => tiles.map((tile) => {
+    const { x, y, width, height } = tile.getBoundingClientRect()
+    return { x, y, width, height }
+  }))
+  expect(new Set(row.map((box) => box.y)).size).toBe(1)
+  expect(row[0].width).toBeCloseTo(row[1].width * 2 + 12, 0)
+  expect(row[1].width).toBeCloseTo(row[2].width, 0)
+  expect(row[0].y).toBeGreaterThan((await topline.boundingBox())!.y)
+  expect(row[0].y + row[0].height).toBeLessThan((await perPr.boundingBox())!.y)
+  await expect(value(page, 'Work type')).toHaveText('50.0%')
+  await expect(work.locator('.analytics-work-type')).toHaveCount(2)
+  await expect(value(page, 'Review rounds')).toHaveText('3.0')
+  await expect(countTrend(page, 'Review rounds')).toContainText('0%')
+  await expect(countTrend(page, 'Review rounds')).toContainText('7-day median: 3.0 · 8 PRs')
+  await expect(countTrend(page, 'Review rounds')).toHaveClass(/neutral/)
+  await expect(value(page, 'Review rounds')).toHaveAttribute('data-help', /Multiple reviews of one commit count once/)
+  await expect(countTrend(page, 'Change-request share')).toHaveClass(/bad/)
+  await expect(value(page, 'Change-request share')).toHaveText('75.0%')
+  await expect(countTrend(page, 'Change-request share')).toContainText('50%')
+  await expect(countTrend(page, 'Change-request share')).toContainText('7-day share: 50.0% · 8 PRs')
+  await expect(work.locator('.analytics-histogram').first()).toHaveAttribute('data-help', /4 of 4 merged PRs on the selected day/)
+  await expect(work.locator('button, select')).toHaveCount(0)
   const accounts = await quota.locator('.github-quota-account').evaluateAll((items) => items.map((item) => item.getBoundingClientRect().top))
   expect(new Set(accounts).size).toBe(1)
   await expect(quota.locator('.github-quota-avatar')).toHaveCount(2)
   await expect(quota.locator('.github-quota-bucket h4')).toHaveText(['REST API', 'GraphQL'])
-  await expect(view.locator('.analytics-histogram svg rect')).toHaveCount(130)
+  await expect(view.locator('.analytics-histogram svg rect')).toHaveCount(150)
   await expect(perPr.locator('.analytics-note')).toHaveCount(5)
   await page.screenshot({ path: info.outputPath('analytics-view.png'), fullPage: true })
 
@@ -234,6 +264,9 @@ test('choosing Analytics again from the menu returns to Today', async ({ page })
   await view.getByRole('button', { name: 'Previous day' }).click()
   await expect(view.locator('.analytics-date')).toHaveText('Yesterday')
   await expect(value(page, 'Pull requests merged')).toHaveText('0')
+  await expect(value(page, 'Work type')).toHaveText('—')
+  await expect(value(page, 'Review rounds')).toHaveText('—')
+  await expect(value(page, 'Change-request share')).toHaveText('—')
   await openAnalytics(page)
   await expect(view.locator('.analytics-date')).toHaveText('Today')
   await expect(view.getByRole('button', { name: 'Next day' })).toBeDisabled()
@@ -242,6 +275,138 @@ test('choosing Analytics again from the menu returns to Today', async ({ page })
     { since: '2026-10-09T00:00:00.000Z', until: '2026-10-10T00:00:00.000Z', org: null },
     { since: '2026-10-02T00:00:00.000Z', until: '2026-10-09T00:00:00.000Z', org: null },
   ])
+})
+
+test('keeps missing review identities in tooltips while showing known change-request incidence', async ({ page }) => {
+  await workspace(page)
+  await page.route('**/api/analytics?**', async (route) => {
+    const data = report(4)
+    data.pullRequests.workReview!.rounds = { median: null, counted: 3, missingReviews: 2, distribution: [{ rounds: 3, prs: 3 }] }
+    await route.fulfill({ json: data })
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  const figure = value(page, 'Review rounds')
+  await expect(figure).toHaveText('—')
+  await expect(figure).toHaveAttribute('data-help', /exact round counts for 3 of 4 merged PRs; 2 reviews lack commit identities/)
+  await expect(value(page, 'Change-request share')).toHaveText('75.0%')
+  await expect(page.locator('.analytics-history[data-series="Review rounds"] .analytics-history-line')).toHaveCount(1)
+  await figure.scrollIntoViewIfNeeded()
+  await expect(figure).toBeInViewport()
+  await figure.focus()
+  await expect(page.getByRole('tooltip')).toContainText('3 of 4 merged PRs')
+  await expect(page.getByRole('region', { name: 'Work & review' })).not.toContainText('lack commit identities')
+})
+
+test('explains missing baseline and historical round coverage independently of a complete day', async ({ page }) => {
+  await page.setViewportSize({ width: 420, height: 820 })
+  await workspace(page)
+  await page.route('**/api/analytics?**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    const baseline = Date.parse(query.get('until')!) - Date.parse(query.get('since')!) > 2 * 86_400_000
+    const data = report(4)
+    if (baseline) data.pullRequests.workReview!.rounds = { median: null, counted: 3, missingReviews: 2, distribution: [{ rounds: 3, prs: 3 }] }
+    await route.fulfill({ json: data })
+  })
+  await page.route('**/api/analytics/history?**', async (route) => {
+    const data = history(new URL(route.request().url()).searchParams.get('bounds')!.split(','))
+    data.periods.at(-1)!.pullRequests = report(4).pullRequests
+    data.periods.at(-1)!.pullRequests.workReview!.rounds = { median: null, counted: 3, missingReviews: 2, distribution: [{ rounds: 3, prs: 3 }] }
+    await route.fulfill({ json: data })
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  const figure = value(page, 'Review rounds')
+  await expect(figure).toHaveText('3.0')
+  await expect(figure).toHaveAttribute('data-help', /Selected day: exact round counts for 4 of 4.*7-day baseline: exact round counts for 3 of 4 merged PRs; 2 reviews lack commit identities/)
+  await expect(countTrend(page, 'Review rounds')).toContainText('7-day median: — · 4 PRs')
+  const plot = page.locator('.analytics-history[data-series="Review rounds"] .analytics-history-plot')
+  await plot.focus()
+  await page.keyboard.press('End')
+  await expect(page.locator('.analytics-history[data-series="Review rounds"] .analytics-history-tip')).toContainText('exact round counts for 3 of 4 merged PRs; 2 reviews lack commit identities')
+  const tip = (await page.locator('.analytics-history[data-series="Review rounds"] .analytics-history-tip').boundingBox())!
+  expect(tip.x).toBeGreaterThanOrEqual(8)
+  expect(tip.x + tip.width).toBeLessThanOrEqual(412)
+})
+
+test('keeps known daily round counts visible while year history is delayed or unavailable', async ({ page }) => {
+  await workspace(page)
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/api/analytics/history?**', async (route) => {
+    await held
+    await route.fulfill({ status: 502, json: { error: 'History unavailable' } })
+  })
+  await page.route('**/api/analytics?**', async (route) => {
+    const data = report(4)
+    data.pullRequests.workReview!.rounds = { median: null, counted: 3, missingReviews: 2, distribution: [{ rounds: 0, prs: 1 }, { rounds: 3, prs: 2 }] }
+    await route.fulfill({ json: data })
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  const rounds = page.getByRole('region', { name: 'Work & review' }).locator('.analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: /^Review rounds$/ }) })
+  await expect(value(page, 'Review rounds')).toHaveText('—')
+  await expect(rounds.locator('.analytics-history-plot')).toHaveAttribute('aria-busy', 'true')
+  await expect(rounds.locator('.analytics-histogram rect')).toHaveCount(10)
+  await expect(rounds.locator('.analytics-histogram')).toHaveAttribute('data-help', /3 of 4 merged PRs/)
+  const before = await rounds.locator('.analytics-histogram').innerHTML()
+  release()
+  await expect(rounds.locator('.analytics-history-plot')).toHaveAttribute('aria-label', 'Year history unavailable')
+  await expect(rounds.locator('.analytics-histogram')).toHaveJSProperty('innerHTML', before)
+})
+
+test('updates work and review cards and charts by day and organization, discarding late history', async ({ page }) => {
+  await workspace(page)
+  const dataFor = (org: string | null, since: string) => {
+    const beta = org === 'beta'
+    const yesterday = since === '2026-10-08T00:00:00.000Z'
+    const data = report(4)
+    const rounds = beta ? yesterday ? 7 : 6 : yesterday ? 3 : 2
+    data.pullRequests.workReview!.types = [{ type: beta ? yesterday ? 'perf' : 'fix' : yesterday ? 'docs' : 'feat', count: 4 }]
+    data.pullRequests.workReview!.rounds = { median: rounds, counted: 4, missingReviews: 0, distribution: [{ rounds, prs: 4 }] }
+    data.pullRequests.workReview!.changesRequested.prs = beta ? yesterday ? 4 : 3 : yesterday ? 2 : 1
+    return data
+  }
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  let lateHistory = false
+  let finished = false
+  await page.route('**/api/analytics?**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    await route.fulfill({ json: dataFor(query.get('org'), query.get('since')!) })
+  })
+  await page.route('**/api/analytics/history?**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    const bounds = query.get('bounds')!.split(',')
+    const delayed = query.get('org') === 'beta' && bounds.at(-1) === '2026-10-08T00:00:00.000Z'
+    if (delayed) { lateHistory = true; await held }
+    const data = history(bounds)
+    for (const period of data.periods) period.pullRequests = dataFor(query.get('org'), bounds.at(-1)!).pullRequests
+    try { await route.fulfill({ json: data }) } finally { if (delayed) finished = true }
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  const work = page.getByRole('region', { name: 'Work & review' })
+  const assertCards = async (type: string, rounds: number, share: string, chart = true) => {
+    await expect(work.locator('.analytics-work-label')).toHaveText(type)
+    await expect(value(page, 'Review rounds')).toHaveText(`${rounds}.0`)
+    await expect(value(page, 'Change-request share')).toHaveText(share)
+    await expect(work.locator('.analytics-work-type')).toHaveAttribute('data-help', new RegExp(`${type}: 4 of 4`))
+    if (chart) await expect(work.locator('.analytics-history[data-series="Review rounds"] .analytics-history-max')).toHaveText(`Max ${rounds}.0`)
+  }
+  await assertCards('feat', 2, '25.0%')
+  await page.getByRole('button', { name: 'Previous day' }).click()
+  await assertCards('docs', 3, '50.0%')
+  await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('beta')
+  await assertCards('perf', 7, '100.0%', false)
+  await expect.poll(() => lateHistory).toBe(true)
+  await page.getByRole('button', { name: 'Next day' }).click()
+  await assertCards('fix', 6, '75.0%')
+  release()
+  await expect.poll(() => finished).toBe(true)
+  await assertCards('fix', 6, '75.0%')
+  await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('')
+  await assertCards('feat', 2, '25.0%')
 })
 
 test('keeps Productivity in two rows beside a docked notification rail', async ({ page }) => {
@@ -369,8 +534,8 @@ for (const theme of ['light', 'dark']) test(`fits a narrow window and large text
   const clipped = await view.locator('.analytics-day > *').evaluateAll((items) => items.map((item) => item.scrollWidth - item.clientWidth))
   expect(Math.max(...clipped)).toBeLessThanOrEqual(1)
   expect(new Set(await lefts(view.getByRole('region', { name: 'Productivity' }), '.analytics-tile')).size).toBe(2)
-  await expect(view.locator('.analytics-history-line')).toHaveCount(13)
-  const overflows = await view.locator('.analytics-tile').evaluateAll((tiles) => tiles.map((tile) => {
+  await expect(view.locator('.analytics-history-line')).toHaveCount(15)
+  const overflows = await view.locator('.analytics-tile:not(.analytics-work-tile)').evaluateAll((tiles) => tiles.map((tile) => {
     const histogram = tile.querySelector('.analytics-histogram')!
     return histogram.getBoundingClientRect().bottom - tile.getBoundingClientRect().bottom
   }))
@@ -590,7 +755,7 @@ test('refreshes one quiet local pair on ticks and visibility return while keepin
   await refreshAnalytics(page)
   await expect.poll(() => refreshRequests).toBe(2)
   await expectInitialSnapshot()
-  await expect(panel.locator('.analytics-tile')).toHaveCount(13)
+  await expect(panel.locator('.analytics-tile')).toHaveCount(16)
   await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeHidden()
   await expect(panel.locator('.analytics-groups')).not.toHaveAttribute('aria-busy', 'true')
   await refreshAnalytics(page)
@@ -687,7 +852,7 @@ test('keeps the last complete snapshot on a quiet failure, cancels the other hal
   await expect(merged).toContainText('Typical by now: 11.3 · 7-day median: 27.0 / day')
   await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 10:00 UTC/)
   await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeHidden()
-  await expect(panel.locator('.analytics-tile')).toHaveCount(13)
+  await expect(panel.locator('.analytics-tile')).toHaveCount(16)
   await page.locator('.nr-bell').click()
   const failure = page.locator('.nr-rail .nr-card').filter({ hasText: 'acme: datastore offline' })
   await expect(failure).toHaveCount(1)
@@ -1130,7 +1295,7 @@ for (const failure of ['HTTP', 'account'] as const) {
     await expect(panel.locator('.analytics-date')).toHaveText('Today')
     await expect(panel.getByRole('button', { name: 'Next day' })).toBeDisabled()
     await expect(merged).toContainText('Typical by now: 27.0 · 7-day median: 27.0 / day')
-    await expect(panel.locator('.analytics-history-line')).toHaveCount(13)
+    await expect(panel.locator('.analytics-history-line')).toHaveCount(15)
     state.pacing.merged = 20
     if (failure === 'HTTP') state.fail = true
     else state.partial = 'baseline'
@@ -1144,7 +1309,7 @@ for (const failure of ['HTTP', 'account'] as const) {
     await expect(merged).not.toContainText('Typical by now')
     await expect(merged.locator('.analytics-value')).not.toHaveAttribute('data-help', /Pace as of/)
     await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeHidden()
-    await expect(panel.locator('.analytics-tile')).toHaveCount(13)
+    await expect(panel.locator('.analytics-tile')).toHaveCount(16)
     await page.locator('.nr-bell').click()
     await expect(page.locator('.nr-rail .nr-card').filter({ hasText: failure === 'HTTP' ? 'acme: datastore offline' : 'Account scope unavailable' })).toHaveCount(1)
     expect(state.reads).toHaveLength(4)
@@ -1258,7 +1423,7 @@ test('attaches delayed help to measurements, with plain headings and no quota ex
   const view = page.locator('#view-analytics')
   await expect(view.locator('h2[data-help], dt[data-help]')).toHaveCount(0)
   await expect(view).not.toContainText('Estimated risk of running out before reset, assuming recent usage continues.')
-  await expect(view.locator('.analytics-value[data-help]')).toHaveCount(13)
+  await expect(view.locator('.analytics-value[data-help]')).toHaveCount(16)
   const figure = value(page, 'Behaviors')
   await figure.scrollIntoViewIfNeeded()
   await page.mouse.move(0, 0)

@@ -1002,7 +1002,15 @@ tr:hover .review-btn { opacity: 1; }
 .analytics-tile { display: flex; flex-direction: column; }
 .analytics-label { min-height: 1.5em; margin-bottom: var(--sp-2); font-size: .6875rem; line-height: 1.5; color: var(--text-secondary); }
 .analytics-value { overflow-wrap: anywhere; margin: 0; font-size: 1.5rem; font-weight: 600; color: var(--text); letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.15; }
-[data-group="productivity"] .analytics-value { font-size: 2rem; }
+[data-group="productivity"] .analytics-value, [data-group="work-review"] .analytics-value { font-size: 2rem; }
+.analytics-work-tile { grid-column: span 2; }
+.analytics-work-label { color: var(--text-secondary); font-size: .8125rem; }
+.analytics-work-types { display: grid; gap: var(--sp-2); margin: var(--sp-4) 0 0; }
+.analytics-work-type { display: grid; grid-template-columns: 6em minmax(0, 1fr) 4.5em; align-items: center; gap: var(--sp-3); font-size: .6875rem; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.analytics-work-type > span:last-child { text-align: right; }
+.analytics-work-track { height: 6px; background: var(--hairline); }
+.analytics-work-track i { display: block; height: 100%; background: var(--n5); }
+[data-theme="dark"] .analytics-work-track i { background: var(--n4); }
 .analytics-summary { margin: 0; }
 .analytics-summary.good { color: var(--green); }
 .analytics-summary.bad { color: var(--red); }
@@ -1036,6 +1044,7 @@ tr:hover .review-btn { opacity: 1; }
 .analytics-history-tip { position: absolute; bottom: calc(100% + var(--sp-2)); z-index: 2; padding: var(--sp-2) var(--sp-3); border: var(--b-base); border-radius: var(--r-sm); background: var(--surface); box-shadow: var(--e-2); font-size: .6875rem; line-height: 1.5; white-space: nowrap; pointer-events: none; }
 .analytics-history-tip strong { display: block; font-size: .8125rem; color: var(--text); }
 .analytics-history-tip span { color: var(--text-secondary); }
+[data-group="work-review"] .analytics-history-tip span { display: block; max-width: min(280px, calc(100vw - 48px)); white-space: normal; }
 .analytics-history-tip small { display: block; max-width: 280px; margin-top: var(--sp-2); white-space: normal; color: var(--text-tertiary); font-size: .6875rem; }
 .analytics-history-empty { display: flex; align-items: center; height: 158px; margin: 0; font-size: .6875rem; color: var(--text-tertiary); }
 .analytics-histogram { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: var(--b-hair); }
@@ -1087,9 +1096,11 @@ tr:hover .review-btn { opacity: 1; }
 }
 @container analytics (min-width: 640px) {
   .analytics-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  [data-group="work-review"] .analytics-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @container analytics (min-width: 880px) {
   .analytics-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  [data-group="work-review"] .analytics-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   [data-group="per-merged-pr"] .analytics-tiles { grid-template-columns: repeat(5, minmax(0, 1fr)); }
   .github-quota-accounts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

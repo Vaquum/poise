@@ -87,7 +87,7 @@ test('Analytics leaves the menu for a view of its own and returns focus to the b
   await page.keyboard.press('Enter')
   await expect(page.locator('#view-analytics')).toBeVisible()
   await expect(page.locator('#view-current')).toBeHidden()
-  await expect(page.locator('#view-analytics .analytics-tile')).toHaveCount(13)
+  await expect(page.locator('#view-analytics .analytics-tile')).toHaveCount(16)
   await expect(page.locator('#menu-surface')).toBeHidden()
   await expect(page.locator('#menu-surface .menu-panel.open')).toHaveCount(0)
   await expect(toggle).toBeFocused()
