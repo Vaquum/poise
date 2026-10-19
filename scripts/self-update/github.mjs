@@ -1,12 +1,12 @@
 // The GitHub gate. A thin REST client bound to one repository, plus the pure
 // rules that decide whether a pull request has earned a merge: the repository
 // identity matches, its independently required CI checks pass, the
-// trusted CI workflow ran the required Node matrix on this exact head, and the
+// trusted CI workflow passed its aggregate gate on this exact head, and the
 // merge commit that comes back is the one we asked for.
 import { BASE_BRANCH, REPOSITORY, isSha } from './paths.mjs'
 
 export const CI_WORKFLOW_PATH = '.github/workflows/ci.yml'
-export const REQUIRED_CONTEXTS = ['Verify (Node 20)', 'Verify (Node 22)', 'Verify (Node 24)']
+export const REQUIRED_CONTEXTS = ['Verify (Node 22)']
 export const GITHUB_ACTIONS_APP = 'github-actions'
 export const DEFAULT_API_URL = 'https://api.github.com'
 const MAX_BODY_BYTES = 4 * 1024 * 1024

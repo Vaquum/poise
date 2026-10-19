@@ -13,48 +13,116 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Verify (Node ${{ matrix.node-version }})
+  static:
+    name: Lint, types & audit (Node 22)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck client, server and tests
+        run: npm run typecheck
+
+  build:
+    name: Production build (Node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: production-build
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  unit:
+    name: Unit & integration (${{ matrix.shard }}/2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        # Pull requests run the workspace image's Node line only; main runs every supported line.
-        node-version: ${{ github.event_name == 'pull_request' && fromJSON('["22"]') || fromJSON('["20", "22", "24"]') }}
-
+        shard: [1, 2]
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version-file: .node-version
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Audit dependencies
-        run: npm audit --audit-level=high
-
-      - name: Run static, unit, and build gates
-        run: npm run check
-
-      - name: Install Chromium
-        if: matrix.node-version == '22'
-        run: npx playwright install --with-deps chromium
-
-      - name: Run browser smoke and visual tests
-        if: matrix.node-version == '22'
-        run: npm run test:e2e
-
-      - name: Upload browser report
-        if: ${{ matrix.node-version == '22' && !cancelled() }}
-        uses: actions/upload-artifact@v4
+      - run: npm ci
+      - name: Run unit and integration shard with timings
+        run: npm test -- --shard=${{ matrix.shard }}/2 --reporter=default --reporter=json --outputFile=test-results/vitest.json
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
-          name: playwright-report
-          path: playwright-report/
-          if-no-files-found: ignore
+          name: unit-timings-${{ matrix.shard }}
+          path: test-results/vitest.json
+          if-no-files-found: error
           retention-days: 7
+
+  browser:
+    name: Browser Chromium (${{ matrix.shard }}/4)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-build
+          path: dist/
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      # Each shard owns its server, databases and real-API fixtures.
+      # One worker preserves the fixture contracts within a shard.
+      - name: Run browser shard against the production build
+        run: npm run test:e2e -- --shard=${{ matrix.shard }}/4 --workers=1
+        env:
+          POISE_E2E_PREBUILT: '1'
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: browser-report-${{ matrix.shard }}
+          path: |
+            playwright-report/
+            test-results/playwright.json
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    # Preserve the protected context and self-update contract.
+    name: Verify (Node 22)
+    if: ${{ always() }}
+    needs: [static, build, unit, browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Require every gate to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          node -e 'const results = JSON.parse(process.env.RESULTS); if (!Object.keys(results).length) throw new Error("No gate results"); for (const [gate, result] of Object.entries(results)) { console.log(gate + ": " + result.result); if (result.result !== "success") process.exitCode = 1 }'

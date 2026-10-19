@@ -102,9 +102,9 @@ describe('deferred message execution', () => {
     expect(w.runtime.get(w.s.id)?.queue?.ready).toBe(false)
     expect(w.runtime.events(w.s.id, 0).events.some(e => e.event.type === 'turn.started')).toBe(false)
     w.runtime.prompt(w.s.id, input('Do this first'))
-    // Six real git/SQLite lifecycles are six readiness steps, not one
-    // eight-second performance budget for the entire batch under suite load.
-    for (let completed = 1; completed <= 6; completed++) await until(() => w.turns().length >= completed)
+    // Real git startup can exceed eight seconds under suite load. Each turn
+    // has a readiness bound; the whole case retains its 25-second ceiling.
+    for (let completed = 1; completed <= 6; completed++) await until(() => w.turns().length >= completed, 20_000)
     await until(() => w.runtime.get(w.s.id)?.status === 'idle')
     expect(w.c.calls.map(call => call.input.text)).toEqual(['Do this first', 'Queue 1', 'Queue 2', 'Queue 3', 'Queue 4', 'Queue 5'])
     expect(w.c.maximum).toBe(1); expect(w.runtime.get(w.s.id)?.queue?.items).toEqual([])
@@ -156,11 +156,13 @@ describe('deferred message execution', () => {
     const file = await w.runtime.saveAttachment(w.s.id, 'notes.txt', Buffer.from('Important attached text'))
     await w.runtime.enqueue(w.s.id, randomUUID(), { text: 'Use the attachment', attachments: [file], mentions: [{ path: 'README.md' }] }, 'opus-5-max')
     w.runtime.prompt(w.s.id, input('First'))
-    await until(() => w.turns().length === 2)
+    // Give each git/SQLite lifecycle its own readiness bound, including handoff.
+    for (let completed = 1; completed <= 2; completed++) await until(() => w.turns().length >= completed)
+    expect(w.turns()).toHaveLength(2)
     expect(w.c.calls[1].input.attachments[0].text).toBe('Important attached text')
     expect(w.c.calls[1].input.mentions).toEqual([{ path: 'README.md' }])
     await expect(w.runtime.enqueue(w.s.id, randomUUID(), { text: 'Forged', attachments: [{ ...file, size: 100 }], mentions: [] })).rejects.toMatchObject({ code: 'invalid' })
-  })
+  }, 20_000)
 
   it.each(['cancelled', 'error'] as const)('does not drain after a %s turn; later successful work continues the untouched tail', async reason => {
     const w = await world({ auto: false })

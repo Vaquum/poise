@@ -580,8 +580,10 @@ describe('bootstrap runner (real processes)', () => {
   it('kills the whole group, backgrounded descendants included, on timeout and releases the settled record', async () => {
     const registryPath = join(home, BOOTSTRAP_WORKERS_NAME)
     const { run } = createBootstrapRunner({ registryPath })
-    const failure = await run('sh', ['-c', 'sleep 30 & echo $!; sleep 30'], { env: env(), write: true, staging: '/s', timeoutMs: 400 }).catch((error) => error)
-    expect(failure.message).toMatch(/timed out after 400 ms/)
+    // The gate must cold-start and spawn its descendants before the timeout.
+    const timeoutMs = 2_000
+    const failure = await run('sh', ['-c', 'sleep 30 & echo $!; sleep 30'], { env: env(), write: true, staging: '/s', timeoutMs }).catch((error) => error)
+    expect(failure.message).toContain(`timed out after ${timeoutMs} ms`)
     expect(failure.result).toMatchObject({ timedOut: true, settled: true })
     const orphan = Number(failure.result.stdout.trim())
     expect(orphan).toBeGreaterThan(1)
@@ -723,6 +725,11 @@ describe('preflight refusals', () => {
     w.state.githubRepo = { full_name: 'mikkokotila/Other', default_branch: 'main', permissions: { push: true } }
     await expect(w.installer.enable({ tokenFile: w.tokenFile })).rejects.toThrow(`instead of ${REPOSITORY}`)
     expect(w.state.tokenSeen.every((where) => where === 'github')).toBe(true)
+  })
+
+  it.each(['v20.19.0', 'v22.12.0', 'v24.0.0'])('refuses a production service running excluded Node %s', async (nodeVersion) => {
+    const w = await world({ state: { nodeVersion } })
+    await expect(w.installer.enable({ tokenFile: w.tokenFile })).rejects.toThrow('Node 22 (minimum 22.13) is required')
   })
 
   it('refuses an unsupported Node runtime, a service without the checkout\'s Caller, or a non-macOS host', async () => {

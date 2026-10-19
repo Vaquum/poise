@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { parse } from 'yaml'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -26,21 +29,22 @@ function checkRuns(overrides = {}) {
 }
 
 describe('CI gate', () => {
-  it('passes only when the trusted workflow and every required Node check succeeded on the exact head', () => {
+  it('passes with the Node 22 aggregate and trusted workflow on the exact head', () => {
+    expect(REQUIRED_CONTEXTS).toEqual(['Verify (Node 22)'])
     expect(evaluateCi({ headSha: HEAD, checkRuns: checkRuns(), workflowRuns: [workflowRun()] })).toMatchObject({ status: 'success' })
   })
 
   it('is pending until the workflow starts, completes and every check reports', () => {
     expect(evaluateCi({ headSha: HEAD, checkRuns: [], workflowRuns: [] }).status).toBe('pending')
     expect(evaluateCi({ headSha: HEAD, checkRuns: checkRuns(), workflowRuns: [workflowRun({ status: 'in_progress', conclusion: null })] }).status).toBe('pending')
-    expect(evaluateCi({ headSha: HEAD, checkRuns: checkRuns().slice(0, 2), workflowRuns: [workflowRun()] })).toMatchObject({ status: 'pending', reason: /Node 24/ })
+    expect(evaluateCi({ headSha: HEAD, checkRuns: [], workflowRuns: [workflowRun()] })).toMatchObject({ status: 'pending', reason: /Node 22/ })
     expect(evaluateCi({ headSha: HEAD, checkRuns: checkRuns({ status: 'queued', conclusion: null }), workflowRuns: [workflowRun()] }).status).toBe('pending')
   })
 
   it('fails on a failed run or check', () => {
     expect(evaluateCi({ headSha: HEAD, checkRuns: checkRuns(), workflowRuns: [workflowRun({ conclusion: 'failure' })] })).toMatchObject({ status: 'failure' })
     const runs = checkRuns()
-    runs[1].conclusion = 'failure'
+    runs[0].conclusion = 'failure'
     expect(evaluateCi({ headSha: HEAD, checkRuns: runs, workflowRuns: [workflowRun()] })).toMatchObject({ status: 'failure', reason: /Node 22/ })
   })
 
@@ -154,5 +158,32 @@ describe('GitHub client', () => {
 
   it('requires a token loader', () => {
     expect(() => createGitHubClient({ fetch: async () => response(200, {}) })).toThrow(/loadToken/)
+  })
+})
+
+
+describe('required workflow aggregate', () => {
+  const { jobs } = parse(readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
+  const program = jobs.verify.steps[0].run.match(/^node -e '([\s\S]+)'\s*$/)[1]
+  const results = Object.fromEntries(jobs.verify.needs.map((name) => [name, { result: 'success' }]))
+  const run = (results) => spawnSync(process.execPath, ['-e', program], {
+    env: { ...process.env, RESULTS: JSON.stringify(results) }, encoding: 'utf8',
+  })
+
+  it('binds self-update to every CI prerequisite, including jobs skipped after failure', () => {
+    expect(REQUIRED_CONTEXTS).toEqual([jobs.verify.name])
+    expect(jobs.verify.if).toBe('${{ always() }}')
+    expect(jobs.verify.needs.toSorted()).toEqual(Object.keys(jobs).filter((name) => name !== 'verify').toSorted())
+    expect(run(results).status).toBe(0)
+  })
+
+  it.each(['failure', 'skipped', 'cancelled', undefined])('rejects a prerequisite with result %s', (result) => {
+    for (const name of jobs.verify.needs) {
+      expect(run({ ...results, [name]: { result } }).status).not.toBe(0)
+    }
+  })
+
+  it('rejects missing gate evidence', () => {
+    expect(run({}).status).not.toBe(0)
   })
 })

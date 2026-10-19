@@ -93,7 +93,7 @@ working tree are re-verified, the exact head is pushed (never forced), and a
 PR is opened with the request and session.
 
 Merging: the controller verifies the repository identity, current PR head and
-base, and successful `.github/workflows/ci.yml` checks for Node 20/22/24 on
+base, and the successful `.github/workflows/ci.yml` aggregate `Verify (Node 22)` on
 that exact head. It does not require administrators to configure branch
 protection; any GitHub restrictions already in force remain effective and
 are never bypassed. The expected merge parents are journaled before the

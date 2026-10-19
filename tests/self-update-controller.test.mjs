@@ -280,7 +280,7 @@ describe('check, publish and pull request', () => {
 })
 
 describe('CI gate and merge', () => {
-  it('waits for CI, fails on a red matrix, and fails when main drifts under the branch', async () => {
+  it('waits for CI, fails on a red aggregate, and fails when main drifts under the branch', async () => {
     const pending = await harness({ model: { ci: { [HEAD]: 'pending' } } })
     await runToAwaitingCi(pending)
     await pending.controller.tick()

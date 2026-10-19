@@ -198,7 +198,7 @@ function createFakeGitHub({ bare, hub, sh, rollbackPhase }) {
         check_runs: REQUIRED_CONTEXTS.map((name, index) => ({
           name, head_sha: sha, app: { slug: GITHUB_ACTIONS_APP }, check_suite: { id: 4242 },
           status: status === 'pending' ? 'in_progress' : 'completed',
-          conclusion: status === 'pending' ? null : status === 'failure' && index === 1 ? 'failure' : 'success',
+          conclusion: status === 'pending' ? null : status === 'failure' && index === 0 ? 'failure' : 'success',
         })),
       }]
     }

@@ -18,6 +18,7 @@ import { installStopGate, stopGateManifest } from './stop-gate-runtime.mjs'
 import { servicePath } from './production-path.mjs'
 import { legacyDatastoreServices, resolveLegacyDatastore } from './legacy-datastore.mjs'
 import { prepareInstalledBundle } from './start-production.mjs'
+import { selectNodeRuntime } from './self-update/node-runtime.mjs'
 
 import { selfUpdateEnabled } from './self-update-bridge.mjs'
 
@@ -82,28 +83,11 @@ async function commandOutput(command, args) {
   return (await run(command, args, { capture: true })).stdout.trim()
 }
 
-async function supportedNode() {
-  const candidates = [
-    process.env.POISE_NODE,
-    '/opt/homebrew/opt/node@22/bin/node',
-    '/usr/local/opt/node@22/bin/node',
-    '/opt/homebrew/opt/node@20/bin/node',
-    '/usr/local/opt/node@20/bin/node',
-    '/opt/homebrew/opt/node@24/bin/node',
-    '/usr/local/opt/node@24/bin/node',
-    process.execPath,
-  ].filter(Boolean)
-  for (const candidate of [...new Set(candidates)]) {
-    if (!await executable(candidate)) continue
-    const match = (await commandOutput(candidate, ['--version'])).match(/^v(\d+)\.(\d+)\./)
-    if (!match) continue
-    const major = Number(match[1])
-    const minor = Number(match[2])
-    if ((major === 20 && minor >= 19)
-      || (major === 22 && minor >= 13)
-      || major === 24) return candidate
-  }
-  throw new Error('Install supported Node.js 20.19+, 22.13+, or 24.x, or set POISE_NODE')
+function supportedNode() {
+  return selectNodeRuntime({
+    isExecutable: executable,
+    readVersion: (candidate) => commandOutput(candidate, ['--version']),
+  })
 }
 
 function xml(value) {

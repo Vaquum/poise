@@ -22,7 +22,7 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI
-    ? [['github'], ['html', { open: 'never' }]]
+    ? [['github'], ['html', { open: 'never' }], ['json', { outputFile: 'test-results/playwright.json' }]]
     : 'list',
   expect: {
     toHaveScreenshot: {
@@ -49,7 +49,7 @@ export default defineConfig({
     ] : []),
   ],
   webServer: {
-    command: 'npm run preview',
+    command: process.env.POISE_E2E_PREBUILT === '1' ? 'npm start' : 'npm run preview',
     env: {
       ...isolation,
       JEV_API_KEY: '', // Live account is never used by the automated preview.

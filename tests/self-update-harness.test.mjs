@@ -171,7 +171,7 @@ export function fakeGitHub(model, git) {
       return REQUIRED_CONTEXTS.map((name, index) => ({
         name, head_sha: sha, app: { slug: 'github-actions' }, check_suite: { id: 7 },
         status: status === 'pending' ? 'in_progress' : 'completed',
-        conclusion: status === 'pending' ? null : status === 'failure' && index === 1 ? 'failure' : 'success',
+        conclusion: status === 'pending' ? null : status === 'failure' && index === 0 ? 'failure' : 'success',
       }))
     },
     async listWorkflowRuns(sha) {

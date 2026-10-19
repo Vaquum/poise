@@ -47,7 +47,7 @@ even when an earlier read has not finished.
 ## Requirements
 
 - macOS, Linux, or WSL. Native Windows is not supported.
-- Node.js 20.19, 22.13, or 24.x and npm. Use an active LTS line in production.
+- Node.js 22.13 or newer within Node 22, and npm. `.node-version` selects this runtime line.
 - `gh`, authenticated with `gh auth login`.
 - Claude Code, authenticated to a Claude Pro or Max subscription with
   `claude auth login --claudeai`. Poise does not require an Anthropic API key.
@@ -351,6 +351,10 @@ npm ci
 npm run install:production
 ```
 
+Installers use Node 22 (minimum 22.13). `POISE_NODE`, when set, must name that
+runtime; otherwise installation uses Homebrew's stable Node 22 path, then the
+invoking Node 22. Self-update bootstrap rejects services configured with another Node line.
+
 A new installation can start without an initialized datastore; add the first
 GitHub account in Settings. Existing databases and their sync services are retained.
 An explicitly configured `POISE_DATASTORE_DB` must point to an existing file.
@@ -512,9 +516,11 @@ npm run verify     # both suites
 caller/.venv/bin/python -m pytest caller/agent_interface/tests caller/github_interface/tests caller/github_datastore/tests
 ```
 
-CI runs the static, unit, build, and audit gates on Node 20, 22, and 24. Node 22
-also runs the browser suite and uploads its report. The Caller workflow runs
-Caller's tests on Python 3.13.
+CI uses Node 22 for every Poise gate: lint/types/audit, production build, two
+unit/integration shards and four Chromium shards. Browser shards reuse the
+production build. `Verify (Node 22)` requires every job to pass. Per-shard timing
+reports support profiling; see [Testing](docs/Testing.md). The Caller workflow
+runs Caller's tests on Python 3.13.
 
 ## Architecture
 

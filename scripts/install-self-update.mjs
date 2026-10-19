@@ -67,6 +67,7 @@ import { adoptInitialRelease, ensureBridgeKey, initializeRoot, installController
 import { createControlClient } from './self-update/client.mjs'
 import { PRODUCTION_SERVICE_LABEL, normalizeConfig, readConfig, writeConfig } from './self-update/config.mjs'
 import { scrubEnvironment } from './self-update/environment.mjs'
+import { supportedNodeVersion } from './self-update/node-runtime.mjs'
 import { BASE_BRANCH, DEFAULT_PRODUCTION_PORT, DEFAULT_RECOVERY_PORT, REPOSITORY, REPOSITORY_URL, isSha, layout, selfUpdateRoot } from './self-update/paths.mjs'
 import { BUNDLE_PATH, MANIFEST_NAME, newReleaseId, readManifest, releaseIsComplete, toRelease } from './self-update/releases.mjs'
 import { createRunner, reapWorkersDetailed } from './self-update/safe-runner.mjs'
@@ -105,7 +106,6 @@ export const DEFAULT_TIMING = {
 const TOKEN_PATTERN = /^[A-Za-z0-9_]{20,255}$/
 const ESCAPED_REPOSITORY = REPOSITORY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const REMOTE_PATTERN = new RegExp(String.raw`^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)${ESCAPED_REPOSITORY}(?:\.git)?/?$`)
-const NODE_VERSION_PATTERN = /^v(\d+)\.(\d+)\./
 
 export class BootstrapError extends Error {
   constructor(message, { code = 'bootstrap', cause } = {}) {
@@ -440,14 +440,6 @@ async function executable(path) {
   }
 }
 
-function supportedNodeVersion(version) {
-  const match = String(version).trim().match(NODE_VERSION_PATTERN)
-  if (!match) return false
-  const major = Number(match[1])
-  const minor = Number(match[2])
-  return (major === 20 && minor >= 19) || (major === 22 && minor >= 13) || major === 24
-}
-
 function requireSha(value, label) {
   const sha = String(value || '').trim().toLowerCase()
   if (!isSha(sha)) throw new BootstrapError(`${label} did not resolve to a commit SHA`, { code: 'source' })
@@ -711,7 +703,7 @@ export function createInstaller({
     if (typeof node !== 'string' || !node.startsWith('/')) throw new BootstrapError('the production plist has no absolute Node runtime', { code: 'runtime' })
     if (!await executable(node)) throw new BootstrapError(`Node runtime ${node} is not executable`, { code: 'runtime' })
     const version = (await runCommand(node, ['--version'], { env: gitEnv(), timeoutMs: 15_000, purpose: 'node --version' })).stdout.trim()
-    if (!supportedNodeVersion(version)) throw new BootstrapError(`Node runtime ${node} is ${version}; 20.19+, 22.13+ or 24.x is required`, { code: 'runtime' })
+    if (!supportedNodeVersion(version)) throw new BootstrapError(`Node runtime ${node} is ${version}; Node 22 (minimum 22.13) is required`, { code: 'runtime' })
     return { node, nodeBin: dirname(node), version }
   }
 
