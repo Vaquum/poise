@@ -62,7 +62,7 @@ test('outcomes, issue history and persistent filters remain selectable', async (
   await expect(page.locator('#tbody .agent-status.bad')).toHaveText('Failure')
 })
 
-test('partial history and a failed refresh remain visible, and recovered failures disappear', async ({ page }) => {
+test('snapshot limits stay out of Archive while failed refreshes and recovery remain visible', async ({ page }) => {
   await workspace(page, 'swarm')
   let failed = false
   let recovered = false
@@ -71,11 +71,13 @@ test('partial history and a failed refresh remain visible, and recovered failure
     const body = route.request().postDataJSON() as Record<string, unknown>
     return route.fulfill({ json: {
       ...(body.count_only ? { count: recovered ? 0 : 1 } : { records: recovered ? [] : [failedRun], count: recovered ? 0 : 1 }),
-      warnings: ['acme/site: showing the latest 100 of 130 failed runs. Open GitHub for older runs.'],
+      warnings: recovered ? [] : ['acme/site: showing the latest 100 of 130 failed runs. Open GitHub for older runs.'],
     } })
   })
   await page.getByRole('button', { name: 'Archive', exact: true }).click()
-  await expect(page.locator('#main-load-error')).toContainText('latest 100 of 130')
+  await expect(page.locator('#tbody')).toContainText('Deploy')
+  await expect(page.locator('#view-main')).not.toContainText('showing the latest')
+  await expect(page.locator('#main-load-error')).toBeHidden()
   failed = true
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
   await expect(page.locator('#main-load-error')).toContainText('Not updating')
@@ -84,6 +86,25 @@ test('partial history and a failed refresh remain visible, and recovered failure
   recovered = true
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
   await expect(page.locator('#tbody tr')).toHaveCount(0)
+  await expect(page.locator('#main-load-error')).toBeHidden()
+})
+
+for (const width of [390, 1280]) test(`fourteen repository snapshot limits produce no Archive notices at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 })
+  await workspace(page, 'swarm')
+  const warnings = Array.from({ length: 14 }, (_, i) => `acme/repository-${i}: showing the latest 100 of ${130 + i} failed runs. Open GitHub for older runs.`)
+  await page.route('**/api/gh', route => {
+    const action = route.request().postDataJSON().operation === 'actions'
+    return route.fulfill({ json: { records: action ? [failedRun] : [], count: action ? 1 : 0,
+      warnings: action ? warnings : [], errors: action ? [{ org: 'beta', error: 'Repository unavailable' }] : [] } })
+  })
+  await page.getByRole('button', { name: 'Archive', exact: true }).click()
+  await expect(page.locator('#tbody')).toContainText('Deploy')
+  await expect(page.locator('#main-load-error')).toContainText('Repository unavailable')
+  await expect(page.locator('#view-main')).not.toContainText('showing the latest')
+  await expect(page.locator('#view-main')).not.toContainText('Open GitHub for older runs')
+  await expect(page.locator('#main-history-notice')).toHaveCount(0)
+  await page.screenshot({ path: `test-results/archive-notices-${width}.png` })
 })
 
 
