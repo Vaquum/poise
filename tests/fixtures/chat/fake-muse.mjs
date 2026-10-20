@@ -36,7 +36,7 @@ function scripted() {
     updatedAt: '2026-09-18T13:17:02.687057Z', workspaceRoot: '/tmp/fixture', providerId: 'meta', modelId, turnCount: 0, forkedFrom: null,
     approvalMode: { mode: approvalMode, source: 'startup', lastCommandId: null }, ...extra,
   })
-  const models = ['muse-spark-1.3', 'muse-spark-1.3-contributor'].map((id) => ({
+  const models = ['muse-spark-1.3', 'muse-spark-1.3-contributor', 'muse-spark-1.2-contributor'].map((id) => ({
     modelId: id, displayLabel: id, providerId: 'meta', profileId: 'tbh', releaseDate: '2026-09-02', description: null,
     contextLimit: 1007997, outputLimit: 128000, cost: null, isActive: false, isDefault: id.endsWith('contributor'),
   }))
@@ -57,7 +57,7 @@ function scripted() {
           return { providerId: 'meta', profileId: 'tbh', source: 'providerCatalog', models }
         case 'session/start':
           sessionId = uuid('session')
-          modelId = params.modelId ?? modelId
+          modelId = process.argv.includes('--ordinary-start-model') ? 'muse-spark-1.3' : params.modelId ?? modelId
           approvalMode = params.approvalMode ?? 'onRequest'
           peer.notify('session/started', { session: sessionObject(sessionId) })
           return { session: sessionObject(sessionId), viewCursor: viewCursor() }
@@ -91,6 +91,7 @@ function scripted() {
           approvalMode = params.mode
           return { commandId: params.commandId, status: 'accepted', applyOutcome: 'completed', effectiveMode: { mode: approvalMode, source: 'approvalReconfigure', lastCommandId: params.commandId } }
         case 'session/setModel':
+          if (process.argv.includes('--reject-model-change')) return { commandId: params.commandId, status: 'rejected' }
           modelId = params.model.modelId
           view('session/modelChanged', { modelId, providerId: 'meta', source: 'user' })
           return { commandId: params.commandId, status: 'accepted' }
@@ -102,6 +103,7 @@ function scripted() {
           if (turn) throw { code: -32000, message: 'turn already active' }
           turn = { id: params.commandId, interrupted: false, steered: [], decided: [], answered: [], input: params.input, effort: params.reasoningEffort ?? null }
           peer.respond(id, { commandId: params.commandId, status: 'accepted', turnId: turn.id, startedNewTurn: true, disposition: 'started' })
+          if (process.argv.includes('--ordinary-model-change')) view('session/modelChanged', { modelId: 'muse-spark-1.3', providerId: 'meta', source: 'user' })
           runTurn().catch((error) => { process.stderr.write(`fake-muse turn failed: ${error?.stack ?? error}\n`) })
           return HANDLED
         }

@@ -4,7 +4,7 @@ from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from agent_interface.model_catalog import (
     CATALOG,
@@ -74,6 +74,13 @@ class TestModelCatalog(TestCase):
             "muse-spark-1.3-contributor": ["max", "xhigh"],
         })
 
+    def test_muse_ordinary_selectors_cannot_enter_catalog_or_model(self) -> None:
+        for selector in ("muse-spark-1.3", "muse-spark-1.3-contributor-paid", "contributor"):
+            with self.subTest(selector=selector):
+                self._reject(self._catalog().replace('selector = "muse-spark-1.3-contributor"', f'selector = "{selector}"'), "contributor")
+                with self.assertRaisesRegex(ModelCatalogError, "contributor"):
+                    Model("muse-test-max", "muse", selector, "max")
+
     def test_malformed_catalog_fails_loudly(self) -> None:
         self._reject("not = [valid", "cannot parse TOML")
 
@@ -139,6 +146,10 @@ class TestModelCatalog(TestCase):
                 rendered = " ".join(argv)
                 self.assertIn(" ".join(fragment), rendered)
                 self.assertNotIn("cursor", rendered)
+                if command == "muse":
+                    self.assertEqual(argv[argv.index("--contributor-mode") + 1], "on")
+                else:
+                    self.assertNotIn("--contributor-mode", argv)
 
     def test_antigravity_records_the_conversation_it_was_given_back(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -292,3 +303,46 @@ class TestCatalogRefresh(TestCase):
             with patch.object(catalog_refresh, "run", return_value=agy):
                 found = catalog_refresh.antigravity()
         self.assertEqual([(m.identity, m.selector) for m in found], [("gemini-3.8-flash-high", "gemini-3.8-flash"), ("gemini-3.8-flash-medium", "gemini-3.8-flash")])
+
+
+class TestMuseContributorDiscovery(TestCase):
+    def test_discovery_host_explicitly_enables_contributor_mode(self) -> None:
+        proc = MagicMock()
+        listed = [{"modelId": "muse-spark-1.3-contributor"}]
+        proc.stdout = [json.dumps({"id": 1, "result": {}}), json.dumps({"id": 2, "result": {"models": listed}})]
+        with patch.object(catalog_refresh.subprocess, "Popen", return_value=proc) as spawn:
+            self.assertEqual(catalog_refresh.muse_models(), listed)
+        args = spawn.call_args.args[0]
+        self.assertEqual(args[args.index("--contributor-mode") + 1], "on")
+        proc.terminate.assert_called_once()
+
+    def test_ordinary_default_is_never_probed(self) -> None:
+        listed = [{"modelId": "muse-spark-1.3", "isDefault": True},
+                  {"modelId": "muse-spark-1.3-contributor", "isDefault": False}]
+        with patch.object(catalog_refresh, "muse_models", return_value=listed), \
+             patch.object(catalog_refresh, "muse_effort_available", return_value=True) as probe:
+            found = catalog_refresh.muse()
+        self.assertEqual({m.selector for m in found}, {"muse-spark-1.3-contributor"})
+        self.assertTrue(probe.called)
+        self.assertTrue(all(call.args[0] == "muse-spark-1.3-contributor" for call in probe.call_args_list))
+
+    def test_missing_contributor_fails_without_inference(self) -> None:
+        for listed in ([], [{"modelId": "muse-spark-1.3", "isDefault": True}]):
+            with self.subTest(listed=listed), \
+                 patch.object(catalog_refresh, "muse_models", return_value=listed), \
+                 patch.object(catalog_refresh, "muse_effort_available") as probe:
+                with self.assertRaisesRegex(RuntimeError, "no contributor"):
+                    catalog_refresh.muse()
+                probe.assert_not_called()
+
+    def test_probe_rejects_ordinary_model_before_execution(self) -> None:
+        with patch.object(catalog_refresh, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "contributor"):
+                catalog_refresh.muse_effort_available("muse-spark-1.3", "max")
+        run.assert_not_called()
+
+    def test_probe_explicitly_enables_contributor_mode(self) -> None:
+        with patch.object(catalog_refresh, "run", return_value=SimpleNamespace(returncode=0, stderr="")) as run:
+            self.assertTrue(catalog_refresh.muse_effort_available("muse-spark-1.3-contributor", "max"))
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--contributor-mode") + 1], "on")

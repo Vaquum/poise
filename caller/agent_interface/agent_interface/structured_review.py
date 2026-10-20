@@ -421,7 +421,7 @@ def ask_muse(root: Path, model: Model, system: str, text: str, schema: dict, wat
     prompt = root / "prompt.txt"
     prompt.write_text(f"{system}\n\n{text}{instructions(schema)}")
     args = [
-        os.getenv("MUSE_CLI", "muse"), "exec",
+        os.getenv("MUSE_CLI", "muse"), "exec", "--contributor-mode", "on",
         "--prompt-file", str(prompt),
         "--model", model.selector, "--reasoning-effort", model.effort,
         "--disable-shell", "--disable-write", "--disable-web-tools",

@@ -33,6 +33,12 @@ export interface Catalog {
   policy: string
 }
 
+export function assertMuseContributor(selector: unknown): asserts selector is string {
+  if (typeof selector !== 'string' || selector !== selector.trim() || !/^muse-[a-z0-9.-]+-contributor$/.test(selector)) {
+    throw new Error('Muse requires an explicit contributor model selector; ordinary Muse models are prohibited')
+  }
+}
+
 export const REVIEW_POLICY = 'bounded-v1'
 const CATALOG_TTL_MS = 60_000
 const CATALOG_PROBE_TIMEOUT_MS = 30_000
@@ -66,6 +72,9 @@ function parseCatalog(stdout: string): Catalog {
     if (typeof row?.identity !== 'string' || typeof row.provider !== 'string') {
       throw new Error('Update Caller: the model catalog is unavailable')
     }
+  }
+  for (const row of data.models) {
+    if (row.provider === 'muse') assertMuseContributor(row.selector)
   }
   return data as Catalog
 }

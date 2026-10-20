@@ -28,6 +28,13 @@ describe('the catalog Poise reads from Caller', () => {
     await expect(models.loadCatalog()).rejects.toThrow('Update Caller')
   })
 
+  it.each(['muse-spark-1.3', 'muse-spark-1.3-contributor-paid', 'muse-spark-1.3-contributor\n', '', undefined])('rejects unsafe Muse catalog selector %s', async (selector) => {
+    const unsafe = JSON.parse(CATALOG_STDOUT)
+    unsafe.models.find((row: { provider: string }) => row.provider === 'muse').selector = selector
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify(unsafe), stderr: '' })
+    await expect(models.loadCatalog()).rejects.toThrow(/contributor/)
+  })
+
   it('knows the provider behind every identity, and the retired Claude ones by prefix', () => {
     expect(models.isClaudeModel(catalog, 'opus-5-max')).toBe(true)
     expect(models.isClaudeModel(catalog, 'fable-5.1-xhigh')).toBe(true)

@@ -21,6 +21,15 @@ Settings → Models → **Check now** and the existing scheduled model check run
 4. Atomically record the CLI results and per-provider discovery results, then
    invalidate Poise's model cache.
 
+Muse discovery considers only explicit `muse-…-contributor` selectors. An ordinary
+Muse default is never probed or admitted. No contributor model means discovery
+fails for Muse and retains its existing contributor choices. Caller rejects
+ordinary Muse selectors in persisted catalogs; Poise rejects them on catalog
+import and native Chat startup, model changes and subsequent turns.
+
+Every Muse process also receives `--contributor-mode on`; a CLI that cannot
+enforce contributor mode fails instead of falling back to ordinary billing.
+
 Claude uses `claude install latest`. npm-installed Codex checks the latest registry version first and, when needed,
 updates `@openai/codex@latest` in its existing global prefix, including optional
 native packages; other Codex installations use `codex update`. Grok and Antigravity

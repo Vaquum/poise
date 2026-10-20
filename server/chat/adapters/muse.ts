@@ -91,6 +91,7 @@ import type { ChatEvent, ContentBlock, PermissionOption, PermissionOptionKind, P
 import { StdioRpc } from '../rpc'
 import { AdapterError } from './types'
 import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, TurnResult } from './types'
+import { assertMuseContributor } from '../../models'
 import pkg from '../../../package.json'
 
 const AGENT = 'muse' as const
@@ -795,6 +796,12 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
 
     on('session/modelChanged', (params) => {
       modelId = params.modelId
+      try { assertMuseContributor(modelId) } catch (error) {
+        child?.kill('SIGKILL')
+        if (active) finish(active, { stopReason: 'error', error: String(error), terminate: true })
+        host.log(String(error))
+        return
+      }
       emit({ type: 'model.updated', model: modelId, modelId, effort, efforts: [...EFFORTS] })
     })
     on('session/reasoningEffortChanged', (params) => {
@@ -987,8 +994,8 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
 
   // ── Process lifecycle ───────────────────────────────────────────────
 
-  async function launch(): Promise<void> {
-    const process = await host.spawn('muse', ['serve', '--disable-sandbox', '--trust-workspace'])
+  async function launch(selector: string): Promise<void> {
+    const process = await host.spawn('muse', ['serve', '--model', selector, '--contributor-mode', 'on', '--disable-sandbox', '--trust-workspace'])
     child = process
     const link = new StdioRpc(process, { label: LABEL, onStderr: (text) => { if (text.trim()) host.log(`${LABEL} stderr: ${text.trimEnd()}`) } })
     rpc = link
@@ -1017,10 +1024,20 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
   }
 
   async function validateModel(wanted: string): Promise<string> {
+    assertMuseContributor(wanted)
     const catalog = await call('model/list', {}, { timeoutMs: 30_000 })
     const match = catalog.models.find((model) => model.modelId === wanted)
     if (match) return match.modelId
     throw new AdapterError(AGENT, `${LABEL} does not offer model "${wanted}" (available: ${catalog.models.map((model) => model.modelId).join(', ') || 'none'})`, 'start_failed')
+  }
+
+  async function applyModel(id: string, wanted: string): Promise<void> {
+    assertMuseContributor(wanted)
+    const commandId = uuidv7()
+    const receipt = await call('session/setModel', { commandId, sessionId: id, model: { modelId: wanted } }, { timeoutMs: 30_000 })
+    if (receipt.status !== 'accepted' || receipt.commandId !== commandId) {
+      throw new AdapterError(AGENT, 'Muse did not confirm the contributor model selection', 'start_failed')
+    }
   }
 
   function chooseEffort(wanted: string): ReasoningEffort {
@@ -1105,9 +1122,12 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     onExit(listener) { exitListeners.push(listener) },
 
     async start(options: AdapterStartOptions): Promise<AdapterStartResult> {
+      try { assertMuseContributor(options.modelId) } catch (error) {
+        throw new AdapterError(AGENT, String(error), 'start_failed')
+      }
       if (child) throw new AdapterError(AGENT, `${LABEL} adapter already started`, 'protocol')
       try {
-        await launch()
+        await launch(options.modelId)
       } catch (error) {
         throw new AdapterError(AGENT, `${LABEL} could not be launched: ${error instanceof Error ? error.message : String(error)}`, 'start_failed')
       }
@@ -1127,7 +1147,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
           id = response.session.sessionId
           sessionId = id
           if (response.session.modelId !== modelId) {
-            await call('session/setModel', { commandId: uuidv7(), sessionId: id, model: { modelId } }, { timeoutMs: 30_000 })
+            await applyModel(id, modelId)
           }
         } else if (options.forkFrom) {
           const response = await call('session/fork', { commandId: uuidv7(), sessionId: options.forkFrom, excludeItems: true }, { timeoutMs: 60_000 })
@@ -1137,7 +1157,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
           // is idempotent, so a fork is attached explicitly.
           await call('view/subscribe', { sessionId: id }, { timeoutMs: 30_000 })
           if (response.session.modelId !== modelId) {
-            await call('session/setModel', { commandId: uuidv7(), sessionId: id, model: { modelId } }, { timeoutMs: 30_000 })
+            await applyModel(id, modelId)
           }
         } else {
           const response = await call('session/start', {
@@ -1146,6 +1166,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
             approvalMode: options.safeMode === true ? 'onRequest' : 'allowAll',
             modelId,
           }, { timeoutMs: 60_000 })
+          assertMuseContributor(response.session.modelId)
           id = response.session.sessionId
           sessionId = id
         }
@@ -1159,6 +1180,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     },
 
     async prompt(turnId, input, signal): Promise<TurnResult> {
+      assertMuseContributor(modelId)
       const id = session()
       if (active) throw new AdapterError(AGENT, `${LABEL} is already running a turn`, 'protocol')
       if (signal.aborted) return { stopReason: 'cancelled' }
@@ -1207,6 +1229,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     },
 
     async compact(_id, _memories, signal) {
+      assertMuseContributor(modelId)
       if (!child || active || compaction) throw new AdapterError(AGENT, 'Muse is not ready to compact.', 'protocol')
       const current = { commandId: uuidv7(), wait: compactionWaiter(child, signal, options.compactTimeoutMs) }
       compaction = current
@@ -1218,6 +1241,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     },
 
     async steer(text) {
+      assertMuseContributor(modelId)
       const turn = active
       if (!turn || turn.done || turn.interruptRequested || !turn.nativeId) throw new AdapterError(AGENT, `${LABEL} has no running turn to steer`, 'protocol')
       const commandId = uuidv7()
@@ -1248,7 +1272,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       const chosen = chooseEffort(nextEffort)
       const validated = await validateModel(nextModelId)
       if (validated !== modelId) {
-        await call('session/setModel', { commandId: uuidv7(), sessionId: id, model: { modelId: validated } }, { timeoutMs: 30_000 })
+        await applyModel(id, validated)
         modelId = validated
       }
       if (chosen !== effort) {

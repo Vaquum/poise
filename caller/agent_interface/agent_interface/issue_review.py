@@ -240,7 +240,7 @@ def command(model: Model, text: str, checkout: Path, work: Path, seconds: float)
         ], json.dumps(message) + "\n", env
     if model.provider == "muse":
         return [
-            os.getenv("MUSE_CLI", "muse"), "exec", "--prompt-file", str(prompt_file),
+            os.getenv("MUSE_CLI", "muse"), "exec", "--contributor-mode", "on", "--prompt-file", str(prompt_file),
             "--model", model.selector, "--reasoning-effort", model.effort,
             "--yolo", "--workspace", str(checkout), "--json", "--no-session-log",
         ], "", env

@@ -254,6 +254,7 @@ def run(
             args = [
                 os.getenv("MUSE_CLI", "muse"),
                 "exec",
+                "--contributor-mode", "on",
                 "--model",
                 spec.selector,
                 "--reasoning-effort",

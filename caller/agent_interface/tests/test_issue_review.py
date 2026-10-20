@@ -408,6 +408,7 @@ class TestFullAccessCommands(TestCase):
         self.assertEqual(json.loads(stdin)["message"]["content"], "review this")
 
         args, _, _, _ = self.command("muse-spark-1.3-contributor-max")
+        self.assertEqual(args[args.index("--contributor-mode") + 1], "on")
         self.assertIn("--yolo", args)
         for restriction in ("--disable-shell", "--disable-write", "--disable-web-tools"):
             self.assertNotIn(restriction, args)

@@ -26,6 +26,7 @@ from .model_catalog import (
     RUNTIME_CATALOG_PATH,
     SCHEMA_VERSION,
     Model,
+    MUSE_CONTRIBUTOR_RE,
     ModelCatalog,
     catalog_path,
     load_catalog,
@@ -153,7 +154,7 @@ def antigravity() -> list[Model]:
 # ── Muse ──────────────────────────────────────────────────────────────
 def muse_models() -> list[dict]:
     proc = subprocess.Popen(
-        [os.getenv("MUSE_CLI", "muse"), "serve", "--no-session-log"],
+        [os.getenv("MUSE_CLI", "muse"), "serve", "--contributor-mode", "on", "--no-session-log"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
     )
     replies: dict[int, dict] = {}
@@ -196,8 +197,10 @@ def wait(replies: dict[int, dict], request_id: int, timeout_s: int = 60) -> dict
 
 
 def muse_effort_available(selector: str, effort: str) -> bool:
+    if not MUSE_CONTRIBUTOR_RE.fullmatch(selector):
+        raise RuntimeError("Muse requires an explicit contributor model selector")
     done = run(
-        [os.getenv("MUSE_CLI", "muse"), "exec", "--model", selector, "--reasoning-effort", effort,
+        [os.getenv("MUSE_CLI", "muse"), "exec", "--contributor-mode", "on", "--model", selector, "--reasoning-effort", effort,
          "--disable-shell", "--disable-write", PROBE_PROMPT],
         cwd=str(Path.home()),
     )
@@ -207,9 +210,9 @@ def muse_effort_available(selector: str, effort: str) -> bool:
 
 
 def muse() -> list[Model]:
-    models = muse_models()
+    models = [m for m in muse_models() if MUSE_CONTRIBUTOR_RE.fullmatch(m.get("modelId", ""))]
     if not models:
-        raise RuntimeError("muse lists no models")
+        raise RuntimeError("muse lists no contributor models; ordinary Muse models are prohibited")
     latest = next((m for m in models if m.get("isDefault")), models[0])["modelId"]
     accepted: list[str] = []
     for effort in reversed(PROVIDER_EFFORTS["muse"]):

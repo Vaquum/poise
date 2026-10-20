@@ -39,7 +39,7 @@ describe('Muse adapter', () => {
   it('launches muse serve, announces dialog support and advertises its capabilities', async () => {
     const { host, adapter } = setup(['--require-dialogs'])
     const result = await adapter.start(MODEL)
-    expect(host.spawns).toEqual([{ command: 'muse', args: ['serve', '--disable-sandbox', '--trust-workspace'] }])
+    expect(host.spawns).toEqual([{ command: 'muse', args: ['serve', '--model', MODEL.modelId, '--contributor-mode', 'on', '--disable-sandbox', '--trust-workspace'] }])
     expect(adapter.capabilities).toEqual({ steer: true, fork: true, thought: true, plan: false, commands: false, modes: false, permissions: true, questions: true, resume: true, images: false })
     expect(() => assertRequiredCapabilities('muse', adapter.capabilities)).not.toThrow()
     expect(result.nativeSessionId).toMatch(/^session-/)
@@ -53,8 +53,42 @@ describe('Muse adapter', () => {
 
   it('rejects a model Muse does not list, naming the agent', async () => {
     const { adapter } = setup()
-    await expect(adapter.start({ modelId: 'muse-nope', effort: 'low' })).rejects.toMatchObject({ name: 'AdapterError', agent: 'muse', code: 'start_failed' })
-    await expect(createMuseAdapter(createFakeHost(FAKE)).start({ modelId: 'muse-nope', effort: 'low' })).rejects.toThrow(/Muse does not offer model "muse-nope"/)
+    await expect(adapter.start({ modelId: 'muse-nope-contributor', effort: 'low' })).rejects.toMatchObject({ name: 'AdapterError', agent: 'muse', code: 'start_failed' })
+    await expect(createMuseAdapter(createFakeHost(FAKE)).start({ modelId: 'muse-nope-contributor', effort: 'low' })).rejects.toThrow(/Muse does not offer model "muse-nope-contributor"/)
+  })
+
+  it.each(['muse-spark-1.3', 'muse-spark-1.3-contributor-paid', 'contributor'])('rejects ordinary selector %s before spawning', async (modelId) => {
+    const { host, adapter } = setup()
+    await expect(adapter.start({ modelId, effort: 'low' })).rejects.toThrow(/contributor/)
+    expect(host.spawns).toEqual([])
+  })
+
+  it('rejects a switch to the ordinary model even when Muse lists it', async () => {
+    const { adapter } = setup()
+    await adapter.start(MODEL)
+    await expect(adapter.setModel('muse-spark-1.3', 'low')).rejects.toThrow(/contributor/)
+    const turn = await adapter.prompt('turn-1', prompt('echo-input still contributor'), new AbortController().signal)
+    expect(turn.stopReason).toBe('end_turn')
+  })
+
+  it('refuses to resume an ordinary session when contributor selection is rejected', async () => {
+    const { adapter } = setup(['--reject-model-change'])
+    await expect(adapter.start({ ...MODEL, resume: 'ordinary-session' })).rejects.toThrow(/did not confirm the contributor/)
+  })
+
+  it('rejects an ordinary model returned by session startup', async () => {
+    const { adapter } = setup(['--ordinary-start-model'])
+    await expect(adapter.start(MODEL)).rejects.toThrow(/contributor/)
+  })
+
+  it('kills the host if the provider switches an active turn to ordinary Muse', async () => {
+    const { host, adapter } = setup(['--ordinary-model-change'])
+    await adapter.start(MODEL)
+    const turn = await adapter.prompt('turn-1', prompt('slow'), new AbortController().signal)
+    expect(turn).toMatchObject({ stopReason: 'error', error: expect.stringMatching(/contributor/) })
+    await until(() => host.children[0].signalCode !== null)
+    expect(host.children[0].signalCode).toBe('SIGKILL')
+    await expect(adapter.prompt('turn-2', prompt('hello'), new AbortController().signal)).rejects.toThrow(/contributor/)
   })
 
   it('translates a full scripted turn into transcript events', async () => {
@@ -335,9 +369,9 @@ describe('Muse adapter', () => {
   it('switches model and effort on the session and refuses modes', async () => {
     const { host, adapter } = setup()
     await adapter.start(MODEL)
-    await expect(adapter.setModel('muse-spark-1.3', 'high')).resolves.toEqual({ modelId: 'muse-spark-1.3', effort: 'high', efforts: EFFORTS })
-    expect(host.ofType('model.updated').at(-1)).toMatchObject({ modelId: 'muse-spark-1.3', effort: 'high' })
-    await expect(adapter.setModel('muse-none', 'high')).rejects.toThrow(/Muse does not offer model "muse-none"/)
+    await expect(adapter.setModel('muse-spark-1.2-contributor', 'high')).resolves.toEqual({ modelId: 'muse-spark-1.2-contributor', effort: 'high', efforts: EFFORTS })
+    expect(host.ofType('model.updated').at(-1)).toMatchObject({ modelId: 'muse-spark-1.2-contributor', effort: 'high' })
+    await expect(adapter.setModel('muse-none-contributor', 'high')).rejects.toThrow(/Muse does not offer model "muse-none-contributor"/)
     await expect(adapter.setMode('plan')).rejects.toMatchObject({ code: 'unsupported' })
   })
 

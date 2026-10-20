@@ -36,6 +36,7 @@ TOOL_BEHAVIORS = ("fix_failing_ci", "issue_simplify", "author_content", "debate_
 MODEL_BEHAVIORS = REVIEW_BEHAVIORS + TOOL_BEHAVIORS
 BEHAVIOR_KEYS = frozenset((*MODEL_BEHAVIORS, "debate_participants"))
 IDENTITY_RE = re.compile(r"[a-z0-9][a-z0-9.-]{0,127}")
+MUSE_CONTRIBUTOR_RE = re.compile(r"muse-[a-z0-9.-]+-contributor")
 VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
@@ -49,6 +50,10 @@ class Model:
     provider: str
     selector: str
     effort: str
+
+    def __post_init__(self) -> None:
+        if self.provider == "muse" and not MUSE_CONTRIBUTOR_RE.fullmatch(self.selector):
+            raise ModelCatalogError("Muse requires an explicit contributor model selector")
 
     @property
     def supports_allowed_tools(self) -> bool:
@@ -119,6 +124,8 @@ def _model(path: Path, identity: object, body: object) -> Model:
         if not isinstance(value, str) or not VALUE_RE.fullmatch(value):
             raise _error(path, f"models.{identity}.{key} must be a non-empty safe string")
         values[key] = value
+    if values["provider"] == "muse" and not MUSE_CONTRIBUTOR_RE.fullmatch(values["selector"]):
+        raise _error(path, f"models.{identity}: Muse requires an explicit contributor model selector")
     efforts = PROVIDER_EFFORTS.get(values["provider"])
     if efforts is None:
         raise _error(path, f"models.{identity} has unknown provider {values['provider']!r}")

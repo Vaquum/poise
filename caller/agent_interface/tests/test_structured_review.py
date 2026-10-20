@@ -332,6 +332,7 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(Path(args[0]).name, "muse")
         self.assertEqual(args[1], "exec")
         self.assertEqual(args[args.index("--model") + 1], "muse-spark-1.3-contributor")
+        self.assertEqual(args[args.index("--contributor-mode") + 1], "on")
         self.assertEqual(args[args.index("--reasoning-effort") + 1], "max")
         for flag in ("--disable-shell", "--disable-write", "--disable-web-tools", "--no-session-log", "--json"):
             self.assertIn(flag, args)
