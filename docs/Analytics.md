@@ -70,7 +70,10 @@ font changes and viewport resize restore the committed order and release capture
 Only a successful drop saves. Reordering announces pickup, position and placement
 or cancellation through one status region; ordinary data reads do not announce
 the entire board. Chart arrow keys remain scoped to the plot; reorder keys are
-scoped to the header. Focus stays on the semantic control after placement.
+scoped to the header. Guided scrolling keeps a keyboard-held or dropped header
+visible below the fixed application bar. Tab or focus leaving a keyboard-held
+header cancels the move; ordinary chart/value focus never leaves it held.
+Focus stays on the semantic control after placement or Escape cancellation.
 
 `poise-analytics-card-order` stores a JSON array of unique card IDs in localStorage.
 This first format is browser/origin-local, shared by logins using that browser,
@@ -95,6 +98,8 @@ the existing `data-id` reconciliation keys and shared 180/20/1 spring, without
 changing `dom-patch.ts`, `motion.ts` or the gateway motion model.
 Active history readouts raise their card above neighbors and replay their cursor
 after every combined patch, including quota polls and patches deferred by a move.
+Returning to Analytics reserves known account slots but clears previous usage,
+reset, risk and checked-time readings until the fresh quota response arrives.
 
 ## The day
 

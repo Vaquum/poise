@@ -1,5 +1,5 @@
 import { patchContent } from './dom-patch'
-import { cancelMotion, finishMotion, spring } from './motion'
+import { cancelMotion, finishMotion, scroll, spring } from './motion'
 
 const STORAGE_KEY = 'poise-analytics-card-order'
 const GAP = 12
@@ -13,6 +13,11 @@ interface Move {
 export function reconcileCardOrder(saved: string[], available: string[]): string[] {
   const known = new Set(available)
   return [...new Set([...saved.filter(id => known.has(id)), ...available])]
+}
+
+function retainMissingCards(previous: string[], current: string[]): string[] {
+  const visible = new Set(current), remaining = [...current]
+  return [...previous.map(id => visible.has(id) ? remaining.shift()! : id), ...remaining]
 }
 
 /** Row packing keeps semantic order, including when different card sizes meet. */
@@ -72,6 +77,7 @@ export function analyticsLayout(board: HTMLElement, status: HTMLElement, onPatch
     if (!Array.isArray(raw) || !raw.every(id => typeof id === 'string')) throw new Error('Expected a list of card IDs.')
     saved = [...new Set(raw)]
   } catch (error) { status.classList.remove('analytics-sr'); status.textContent = `Saved analytics layout could not be read: ${String(error)}` }
+  let remembered = [...saved]
   let cards = new Map<string, Card>(), order: string[] = [], width = 0
   let move: Move | null = null, pending: string | null = null, resizeFrame = 0, scrollFrame = 0
   const placeholder = document.createElement('div')
@@ -84,6 +90,22 @@ export function analyticsLayout(board: HTMLElement, status: HTMLElement, onPatch
   const announce = (message: string) => { status.textContent = message }
   const draw = (card: Card) => { card.element.style.transform = `translate3d(${card.x}px, ${card.y}px, 0)` }
   const positions = (ids: string[]) => cardPositions(ids.map(id => cards.get(id)!), width)
+
+  function keepHeaderVisible(card: Card): void {
+    const handle = card.element.querySelector('button')
+    if (!handle || !boxes.has(card.id)) return
+    const owner = document.documentElement
+    const top = (parseFloat(getComputedStyle(owner).getPropertyValue('--app-bar-h')) || 100) + 12
+    const destination = () => {
+      const box = boxes.get(card.id)
+      if (!box) return owner.scrollTop
+      const y = owner.scrollTop + board.getBoundingClientRect().top + box.y + handle.offsetTop
+      return y - top - Math.max(0, (innerHeight - top - 12 - handle.offsetHeight) / 2)
+    }
+    const box = boxes.get(card.id)!
+    const y = board.getBoundingClientRect().top + box.y + handle.offsetTop
+    if (y < top || y + handle.offsetHeight > innerHeight - 12) scroll(owner, destination, handle)
+  }
 
   function arrange(immediate = false): void {
     boxes = positions(order)
@@ -136,6 +158,7 @@ export function analyticsLayout(board: HTMLElement, status: HTMLElement, onPatch
     template.innerHTML = markup
     const nodes = new Map([...template.content.children].map(element => [element.getAttribute('data-id')!, element]))
     order = reconcileCardOrder(saved, [...nodes.keys()])
+    remembered = retainMissingCards(remembered, order)
     for (const id of order) template.content.append(nodes.get(id)!)
     patchContent(board, template.innerHTML)
     const next = new Map<string, Card>()
@@ -148,11 +171,12 @@ export function analyticsLayout(board: HTMLElement, status: HTMLElement, onPatch
     onPatch?.()
   }
 
-  function finish(cancel = false): void {
+  function finish(cancel = false, immediate = false): void {
     if (!move) return
     const previous = move, active = previous.active
     if (cancel) order = [...previous.original]
     move = null; cancelAnimationFrame(scrollFrame)
+    if (cancel && previous.pointer === null) cancelMotion(document.documentElement, 'scroll')
     placeholder.hidden = true
     const handle = previous.card.element.querySelector('button')
     handle?.setAttribute('aria-pressed', 'false')
@@ -160,20 +184,21 @@ export function analyticsLayout(board: HTMLElement, status: HTMLElement, onPatch
     const focused = document.activeElement
     for (const id of order) board.append(cards.get(id)!.element)
     if (focused instanceof HTMLElement && focused.isConnected) focused.focus({ preventScroll: true })
-    arrange()
+    arrange(immediate)
     if (active) {
       let failure: string | null = null
       if (!cancel) {
         // Missing account IDs remain saved, so temporary credential failures do not reset their place.
-        const visible = new Set(order)
-        const remaining = [...order]
-        saved = [...saved.map(id => visible.has(id) ? remaining.shift()! : id), ...remaining]
+        saved = retainMissingCards(remembered, order)
+        remembered = [...saved]
         try { localStorage.setItem(STORAGE_KEY, JSON.stringify(saved)) }
         catch (error) { status.classList.remove('analytics-sr'); failure = `Analytics layout could not be saved: ${String(error)}` }
       }
       announce(failure ?? (cancel ? 'Card move cancelled.' : `${previous.card.element.dataset.label} placed, position ${order.indexOf(previous.card.id) + 1} of ${order.length}.`))
     }
-    if (pending !== null) { const markup = pending; pending = null; patch(markup, true) }
+    if (pending !== null) { const markup = pending; pending = null; patch(markup, !immediate) }
+    const current = cards.get(previous.card.id)
+    if (previous.pointer === null && current && document.hasFocus() && document.activeElement === current.element.querySelector('button')) keepHeaderVisible(current)
   }
 
   function begin(): void {
@@ -185,12 +210,16 @@ export function analyticsLayout(board: HTMLElement, status: HTMLElement, onPatch
     placeholder.hidden = false
     announce(`Picked up ${move.card.element.dataset.label}. Arrow keys move, Space drops, Escape cancels.`)
     arrange()
+    if (move.pointer === null) keepHeaderVisible(move.card)
   }
 
   function moveTo(index: number): void {
-    if (!move || index === order.indexOf(move.card.id)) return
-    order.splice(order.indexOf(move.card.id), 1); order.splice(index, 0, move.card.id)
-    arrange()
+    if (!move) return
+    if (index !== order.indexOf(move.card.id)) {
+      order.splice(order.indexOf(move.card.id), 1); order.splice(index, 0, move.card.id)
+      arrange()
+    }
+    if (move.pointer === null) keepHeaderVisible(move.card)
   }
 
   function track(): void {
@@ -252,6 +281,9 @@ export function analyticsLayout(board: HTMLElement, status: HTMLElement, onPatch
       moveTo(Math.max(0, Math.min(order.length - 1, next)))
       announce(`${move.card.element.dataset.label}, position ${order.indexOf(move.card.id) + 1} of ${order.length}.`)
     }
+  })
+  board.addEventListener('focusout', event => {
+    if (move?.pointer === null && event.target === move.card.element.querySelector('button')) finish(true, true)
   })
   window.addEventListener('scroll', track, { passive: true })
   window.addEventListener('blur', () => finish(true))

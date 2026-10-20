@@ -217,19 +217,35 @@ test('fits all work types and retains interleaved account positions through fail
   await expect(board.locator('.github-quota-account')).toHaveCount(0)
   await expect(plot).toBeFocused()
   expect(await retained!.evaluate(element => element.closest<HTMLElement>('[data-id]')!.dataset.id)).toBe('metric:productivity:Lines changed')
+  const moved = board.getByRole('button', { name: 'Move Lines changed', exact: true })
+  await moved.focus()
+  await moved.press('Space')
+  await moved.press('ArrowRight')
+  await moved.press('Space')
+  const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('poise-analytics-card-order')!)) as string[]
+  expect(stored.filter(id => id.startsWith('quota:'))).toHaveLength(2)
   quotaFails = false
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
   await expect(board.locator('.github-quota-account')).toHaveCount(2)
+  await expect.poll(order).toEqual(stored.filter(id => id !== 'obsolete'))
+  await moved.focus()
+  await moved.press('Space')
+  await moved.press('ArrowLeft')
+  await moved.press('Space')
   await expect.poll(async () => (await order()).slice(0, 4)).toEqual(prefix)
-  const before = await board.locator('[data-group="quota"]').evaluateAll(cards => cards.map(card => ({ id: card.getAttribute('data-id'), y: card.getBoundingClientRect().y })))
+  await expect(board.locator('[data-motion-running]')).toHaveCount(0)
+  const before = await board.locator('[data-group="quota"]').evaluateAll(cards => cards.map(card => ({ id: card.getAttribute('data-id'), y: card.getBoundingClientRect().y - card.parentElement!.getBoundingClientRect().y })))
   hold = true
   try {
     await page.getByRole('button', { name: 'Previous day', exact: true }).click()
     await expect(board).toHaveAttribute('aria-busy', 'true')
     await expect(board.locator('.analytics-value')).toHaveCount(0)
-    await expect.poll(() => board.locator('[data-group="quota"]').evaluateAll((cards, previous) => cards.every((card, index) => card.getAttribute('data-id') === previous[index].id && Math.abs(card.getBoundingClientRect().y - previous[index].y) < 1), before)).toBe(true)
+    await expect.poll(() => board.locator('[data-group="quota"]').evaluateAll((cards, previous) => cards.every((card, index) => card.getAttribute('data-id') === previous[index].id && Math.abs(card.getBoundingClientRect().y - card.parentElement!.getBoundingClientRect().y - previous[index].y) < 1), before)).toBe(true)
   } finally { hold = false; release() }
   await expect(board.locator('.analytics-value')).toHaveCount(16)
+  await expect.poll(async () => (await order()).slice(0, 4)).toEqual(prefix)
+  await page.reload()
+  await expect(board.locator('.analytics-panel')).toHaveCount(18)
   await expect.poll(async () => (await order()).slice(0, 4)).toEqual(prefix)
   await page.evaluate(() => localStorage.setItem('poise-analytics-card-order', '{bad json'))
   await page.reload()
@@ -283,6 +299,116 @@ test('vertical header keys move wide cards between visual rows', async ({ page }
   await handle.press('Space')
   await expect.poll(top).toBeLessThan(below - 1)
   await expect(handle).toBeFocused()
+})
+
+test('keyboard traversal keeps the moved header visible and Tab rolls back without blocking live reads', async ({ page }) => {
+  const state = await workspace(page)
+  await page.goto('/')
+  await openAnalytics(page)
+  const board = page.locator('.analytics-board')
+  const handle = page.getByRole('button', { name: 'Move Pull requests opened', exact: true })
+  for (const reduced of [false, true]) {
+    await page.emulateMedia({ reducedMotion: reduced ? 'reduce' : 'no-preference' })
+    await handle.focus()
+    await handle.press('Space')
+    await handle.press('Home')
+    await handle.press('Space')
+    await handle.press('Space')
+    await handle.press('End')
+    await handle.press('End')
+    await handle.press('ArrowRight')
+    await handle.press('End')
+    await expect.poll(() => handle.evaluate(button => {
+      const box = button.getBoundingClientRect()
+      const bar = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-bar-h')) || 0
+      return box.top >= bar && box.bottom <= innerHeight
+    })).toBe(true)
+    await handle.press('Space')
+    await expect(handle).toBeFocused()
+    await expect.poll(() => handle.evaluate(button => {
+      const box = button.getBoundingClientRect()
+      const bar = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-bar-h')) || 0
+      return box.top >= bar && box.bottom <= innerHeight
+    })).toBe(true)
+    const saved = await page.evaluate(() => localStorage.getItem('poise-analytics-card-order'))
+    await handle.press('Space')
+    await handle.press('Home')
+    await handle.press('Tab')
+    await expect(handle).toHaveAttribute('aria-pressed', 'false')
+    await expect(board.locator('.analytics-card-held')).toHaveCount(0)
+    await expect(page.locator('.analytics-drop-slot')).toBeHidden()
+    expect(await page.evaluate(() => localStorage.getItem('poise-analytics-card-order'))).toBe(saved)
+    state.baselineHours = reduced ? 90 : 81
+    await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+    await expect(mergeTrend(page)).toContainText(`7-day median: ${reduced ? 20 : 18}h`)
+  }
+})
+
+test('keeps the canonical unsaved order when quota arrives before daily reports', async ({ page }) => {
+  await workspace(page)
+  let release!: () => void
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/github-quota', route => route.fulfill({ json: quotaReport() }))
+  await page.route('**/api/analytics?**', async route => {
+    await waiting
+    await route.fulfill({ json: report(12) })
+  })
+  await page.goto('/')
+  try {
+    await openAnalytics(page)
+    await expect(page.locator('.analytics-panel[data-group="quota"]')).toHaveCount(2)
+    await expect(page.locator('.analytics-panel[data-group="productivity"]')).toHaveCount(0)
+  } finally { release() }
+  const cards = page.locator('.analytics-board > [data-id]')
+  await expect(cards).toHaveCount(18)
+  await expect(cards.first()).toHaveAttribute('data-group', 'productivity')
+  await expect(cards.nth(15)).toHaveAttribute('data-group', 'per-merged-pr')
+  await expect(cards.nth(16)).toHaveAttribute('data-group', 'quota')
+  expect(await page.evaluate(() => localStorage.getItem('poise-analytics-card-order'))).toBeNull()
+})
+
+test('reopening reserves the saved quota slot with loading content until fresh usage arrives', async ({ page }) => {
+  await workspace(page)
+  let hold = false, release!: () => void, reads = 0
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  const quota = quotaReport()
+  await page.route('**/api/github-quota', async route => {
+    reads++
+    if (hold) await waiting
+    await route.fulfill({ json: quota })
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  const board = page.locator('.analytics-board')
+  await expect(board.locator('.github-quota-usage')).toHaveCount(2)
+  await page.addStyleTag({ content: '.github-quota-usage { min-height: 40rem; }' })
+  await page.evaluate(() => window.dispatchEvent(new Event('resize')))
+  await expect.poll(() => board.locator('[data-group="quota"]').first().evaluate(card => card.getBoundingClientRect().height)).toBeGreaterThan(700)
+  const handle = board.getByRole('button', { name: 'Move GitHub API · Live · octocat', exact: true })
+  await handle.focus()
+  await handle.press('Space')
+  await handle.press('Home')
+  await handle.press('Space')
+  await expect(board.locator('.analytics-card-held')).toHaveCount(0)
+  await expect(board.locator('[data-motion-running]')).toHaveCount(0)
+  const heights = await board.locator('[data-group="quota"]').evaluateAll(cards => cards.map(card => card.getBoundingClientRect().height))
+  const order = await board.locator(':scope > [data-id]').evaluateAll(cards => cards.map(card => card.getAttribute('data-id')))
+  await leaveAnalytics(page)
+  hold = true
+  try {
+    await openAnalytics(page)
+    await expect(board.locator('.github-quota-loading')).toHaveCount(2)
+    await expect(board.locator('.github-quota-usage, .github-quota-risk, .github-quota-checked')).toHaveCount(0)
+    await expect(board.locator('.github-quota-identity h3')).toHaveText(['octocat', 'octo-agent'])
+    await expect.poll(() => board.locator('[data-group="quota"]').evaluateAll(cards => cards.map(card => card.getBoundingClientRect().height))).toEqual(heights)
+    await expect.poll(() => board.locator(':scope > [data-id]').evaluateAll(cards => cards.map(card => card.getAttribute('data-id')))).toEqual(order)
+    await expect(value(page, 'Pull requests merged')).toHaveText('4')
+    quota.accounts[0].buckets[0].used = 1234
+    quota.accounts[0].buckets[0].remaining = 3766
+  } finally { hold = false; release() }
+  await expect(board.locator('.github-quota-usage').first()).toContainText('1,234 / 5,000 used')
+  await expect(board.locator('.github-quota-loading')).toHaveCount(0)
+  expect(reads).toBe(2)
 })
 
 test('paints history readouts above neighboring cards and retains their period through quota polling', async ({ page }) => {
