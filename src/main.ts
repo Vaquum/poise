@@ -200,7 +200,7 @@ watchForSignOut()
   const logging = query.get('view') === 'logging'
   const googleReturning = query.has('google_state') || (query.has('state') && (query.has('code') || query.has('error')))
   // Personal views open independently; a Google return must restore its draft first.
-  const openedEarly = !logging && !googleReturning && (initialView === 'editor' || initialView === 'snippets')
+  const openedEarly = !logging && !googleReturning && (initialView === 'editor' || initialView === 'snippets' || initialView === 'chat')
   if (openedEarly) showView(initialView)
   const [googleReturned] = await Promise.all([finishGoogleConnection(), loadSettings()])
   if (googleReturned === 'publish') menu.switchTo('editor')

@@ -39,7 +39,7 @@ Settings reads only the selected section's expensive data. Accounts shows each
 CLI result independently, with pending checks and failures named alongside it.
 External font stylesheets load after first paint; system fonts keep the app
 usable while typography is unavailable or still loading.
-Editor and Snippets start independently of GitHub settings. Editor opens the
+Editor, Snippets and Chat start independently of GitHub settings. Editor opens the
 remembered document while discovering the library; its open selector updates as
 soon as discovery finishes and distinguishes loading, failure and an empty library.
 Opening a Chat-created document starts fresh discovery without delaying its body;
