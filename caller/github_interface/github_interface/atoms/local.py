@@ -80,7 +80,7 @@ def checkout_repo(
             _run(["git", "-c", header, "clone", "--bare", "--quiet", remote, str(mirror)], token, basic)
         _run(["git", "-C", str(mirror), "-c", header, "fetch", "--quiet", "--prune", remote,
               "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], token, basic)
-        _run(["git", "clone", "--quiet", "--branch", branch, str(mirror), str(path)], token)
+        _run(["git", "clone", "--quiet", "--no-checkout", "--branch", branch, str(mirror), str(path)], token)
 
     with open(mirror.parent / f"{repo}.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -92,6 +92,9 @@ def checkout_repo(
             shutil.rmtree(mirror, ignore_errors=True)
             shutil.rmtree(path, ignore_errors=True)
             refresh()
+    # The snapshot owns its objects. Slow filters and working-tree writes must
+    # not hold up other checkouts or make their caller's deadline expire.
+    _run(["git", "-C", str(path), "reset", "--hard", "--quiet", "HEAD"], token)
     _run(["git", "-C", str(path), "remote", "set-url", "origin", remote], token)
     return {"branch": branch, "head_sha": _run(["git", "-C", str(path), "rev-parse", "HEAD"], token)}
 

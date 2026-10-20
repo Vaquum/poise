@@ -39,6 +39,15 @@ which must be `GITHUB_INTERFACE_AGENT_USER`, and `github-datastore` reads
 GitHub only as the account whose token `GH_TOKEN` holds. Poise sets all of
 these from Settings → GitHub.
 
+## Repository checkouts
+
+Repository checkouts reuse a bare mirror under a per-repository lock. The lock
+covers refreshing the mirror and taking an independent full-history snapshot;
+working-tree files are materialized after it is released. A slow checkout or
+filter therefore does not hold other snapshots behind it. Each checkout keeps
+its own objects and remains usable after the mirror is refreshed or removed.
+Credentials are passed per command and never stored in either repository.
+
 ## Automatic merge primitive
 
 `github-interface --merge-if-ready '#7' --expected-head SHA --author USER

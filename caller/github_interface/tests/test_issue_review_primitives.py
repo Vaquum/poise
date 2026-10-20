@@ -1,12 +1,16 @@
+import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from typing import Any
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
 from github_interface import cli
+from github_interface.atoms import local
 from github_interface.atoms.local import checkout_repo
 from github_interface.behaviors import issue_comments, sub_issues
 
@@ -140,6 +144,66 @@ class TestCheckoutRepo(TestCase):
         result = checkout_repo("o", "r", "main", "secret", self.root / "c", root=self.root / "mirrors", remote=str(self.source))
         self.assertEqual(result["head_sha"], git("rev-parse", "HEAD", cwd=self.source))
         self.assertEqual(git("rev-parse", "--is-bare-repository", cwd=mirror), "true")
+
+    def test_slow_worktree_does_not_hold_another_checkout_behind_the_mirror(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        (self.source / "README.md").write_text("two\n")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-am", "two", cwd=self.source)
+        first, second = self.root / "first", self.root / "second"
+        materializing, release, second_done = Event(), Event(), Event()
+        original_run = local._run
+
+        def run(command: list[str], token: str, *secrets: str) -> str:
+            full_clone = command[:2] == ["git", "clone"] and "--no-checkout" not in command
+            if str(first) in command and (full_clone or "--hard" in command):
+                materializing.set()
+                if not release.wait(10):
+                    raise RuntimeError("fixture did not release working-tree materialization")
+            return original_run(command, token, *secrets)
+
+        def clone(path: Path) -> dict[str, str]:
+            return checkout_repo("o", "r", "main", "secret", path, root=self.root / "mirrors", remote=str(self.source))
+
+        with patch.object(local, "_run", side_effect=run), ThreadPoolExecutor(max_workers=2) as pool:
+            first_result = pool.submit(clone, first)
+            try:
+                self.assertTrue(materializing.wait(5), "first checkout never reached materialization")
+                second_result = pool.submit(clone, second)
+                second_result.add_done_callback(lambda _: second_done.set())
+                progressed = second_done.wait(5)
+                if progressed:
+                    second_result.result()
+                    # A published snapshot cannot depend on the mirror, even
+                    # before its delayed working tree has been written.
+                    shutil.rmtree(self.root / "mirrors")
+            finally:
+                release.set()
+            first_result.result(timeout=10)
+            second_result.result(timeout=10)
+        self.assertTrue(progressed, "another checkout was blocked by working-tree materialization")
+        for path in (first, second):
+            self.assertEqual((path / "README.md").read_text(), "two\n")
+            self.assertEqual(git("rev-list", "--count", "HEAD", cwd=path), "2")
+            self.assertEqual(git("status", "--porcelain", cwd=path), "")
+            self.assertEqual(git("remote", "get-url", "origin", cwd=path), str(self.source))
+            self.assertFalse((path / ".git" / "objects" / "info" / "alternates").exists())
+            self.assertNotIn("Authorization", (path / ".git" / "config").read_text())
+
+    def test_worktree_failure_does_not_rebuild_the_shared_mirror(self) -> None:
+        self.addCleanup(shutil.rmtree, self.root)
+        original_run = local._run
+
+        def run(command: list[str], token: str, *secrets: str) -> str:
+            full_clone = command[:2] == ["git", "clone"] and "--no-checkout" not in command
+            if str(self.root / "failed") in command and (full_clone or "--hard" in command):
+                raise RuntimeError("working-tree filter failed")
+            return original_run(command, token, *secrets)
+
+        with patch.object(local, "_run", side_effect=run) as calls:
+            with self.assertRaisesRegex(RuntimeError, "working-tree filter failed"):
+                checkout_repo("o", "r", "main", "secret", self.root / "failed", root=self.root / "mirrors", remote=str(self.source))
+        self.assertEqual(sum("fetch" in call.args[0] for call in calls.call_args_list), 1)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.root / "mirrors" / "o" / "r.git"), git("rev-parse", "HEAD", cwd=self.source))
 
     def test_refuses_an_existing_or_relative_path(self) -> None:
         (self.root / "taken").mkdir()
