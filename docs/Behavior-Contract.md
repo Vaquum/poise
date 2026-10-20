@@ -74,6 +74,12 @@ Each behavior follows one transaction shape:
    an expected action/outcome pair on the expected head.
 6. Dead-letter uncertain terminal work. Never retry an ambiguous side effect.
 
+Managed accounts interleave ordinary refreshes with resumable daily
+reconciliation chunks (20-second work budget, plus in-flight GraphQL work).
+Partial maintenance is not a completed daily reconciliation and does not
+advance freshness. Scheduling resumes only after an ordinary sync passes the
+unchanged 120-second datastore health gate.
+
 `review-new-issues` accepts `commented`: Caller posted every comment the
 reviewer wrote, on the issue and its sub-issues, and recorded each one as it
 was posted. An issue has no head, so no head is pinned or reported. A failure

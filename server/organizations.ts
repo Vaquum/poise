@@ -72,6 +72,7 @@ const RUNTIME_TICK_MS = 5_000
 const SYNC_INTERVAL_MS = 60_000
 // Match Caller's daily full reconciliation; incremental freshness stays per minute.
 const RECONCILE_INTERVAL_MS = 24 * 60 * 60_000
+const RECONCILE_BUDGET_SECONDS = 20
 const MAX_SYNC_RETRY_MS = 60 * 60_000
 const CLI_TIMEOUT_MS = 30 * 60_000
 let timer: ReturnType<typeof setInterval> | undefined
@@ -294,11 +295,15 @@ function databaseState(path: string): { login: string | null, complete: boolean 
   } finally { connection.close() }
 }
 
-function assertOrganization(path: string, login: string): void {
+function assertOrganization(path: string, login: string): boolean {
   const state = databaseState(path)
   if (state.login?.toLowerCase() !== login.toLowerCase() || !state.complete) {
     throw new Error('Datastore does not contain a completed index for this account.')
   }
+  const connection = new Database(path, { readonly: true, fileMustExist: true })
+  try {
+    return !!connection.prepare("SELECT 1 FROM sync_state WHERE key = 'full_build_retry_required' AND value = '1' LIMIT 1").get()
+  } finally { connection.close() }
 }
 
 async function checkHealth(path: string, me: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<void> {
@@ -372,19 +377,38 @@ async function activate(row: OrganizationRow, me: string, signal: AbortSignal, e
   datastoreSyncRecovered(row.login)
 }
 
+async function reconcileChunk(path: string, me: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<boolean> {
+  const result: unknown = JSON.parse(await caller(path, ['sync', '--reconcile', '--reconcile-max-seconds', String(RECONCILE_BUDGET_SECONDS)], me, env, signal))
+  if (!result || typeof result !== 'object' || !('reconcile_complete' in result) || typeof result.reconcile_complete !== 'boolean') {
+    throw new Error('Datastore reconciliation did not report completion status.')
+  }
+  return result.reconcile_complete
+}
+
 async function synchronize(row: OrganizationRow, me: string, signal: AbortSignal, env: NodeJS.ProcessEnv): Promise<void> {
   const path = row.datastore_path!
-  assertOrganization(path, row.login)
+  const recoveringFullBuild = assertOrganization(path, row.login)
   if (row.indexed_user !== me) {
     stage(row.login, 'building-user')
     await caller(path, ['build-user', me], me, env, signal)
   }
+  let reconcileComplete = false
+  // Older releases invalidated every repository before a full reconciliation.
+  // Repair those markers in resumable chunks before requesting a delta sync.
+  if (recoveringFullBuild) {
+    stage(row.login, 'reconciling')
+    reconcileComplete = await reconcileChunk(path, me, env, signal)
+    if (!reconcileComplete) {
+      db.prepare('UPDATE organizations SET next_sync_at = 0 WHERE login = ?').run(row.login)
+      return
+    }
+  }
   stage(row.login, 'syncing')
   await caller(path, ['sync'], me, env, signal)
   const reconcile = Date.now() - row.last_reconcile_at >= RECONCILE_INTERVAL_MS
-  if (reconcile) {
+  if (reconcile && !reconcileComplete) {
     stage(row.login, 'reconciling')
-    await caller(path, ['sync', '--reconcile'], me, env, signal)
+    reconcileComplete = await reconcileChunk(path, me, env, signal)
     // Reconciliation does not advance Caller's last_sync_at freshness marker.
     await caller(path, ['sync'], me, env, signal)
   }
@@ -392,7 +416,7 @@ async function synchronize(row: OrganizationRow, me: string, signal: AbortSignal
   db.prepare(`
     UPDATE organizations SET stage = 'ready', error = NULL, last_sync_at = ?,
       last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0, sync_failing_since = 0 WHERE login = ?
-  `).run(Date.now(), reconcile ? Date.now() : row.last_reconcile_at, me, row.login)
+  `).run(Date.now(), reconcileComplete ? Date.now() : row.last_reconcile_at, me, row.login)
   datastoreSyncRecovered(row.login)
 }
 

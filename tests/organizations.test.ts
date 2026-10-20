@@ -33,6 +33,7 @@ async function cli(command: string, args: string[], _options?: RunFileOptions) {
   if (operation === 'health') return {
     stdout: JSON.stringify({ action: 'health', status: 'healthy', healthy: true, database: path }), stderr: '',
   }
+  if (args.includes('--reconcile')) return { stdout: JSON.stringify({ reconcile_complete: true }), stderr: '' }
   return { stdout: '', stderr: '' }
 }
 
@@ -281,6 +282,89 @@ describe('organization activation', () => {
 })
 
 describe('managed organization synchronization', () => {
+  it('repairs legacy full-build retry markers in bounded chunks before requesting a delta sync', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    const path = organizations!.getOrganizations()[0]!.datastorePath!
+    const index = new Database(path)
+    index.prepare('INSERT INTO sync_state VALUES (?, ?, ?)').run('repo:10', 'full_build_retry_required', '1')
+    index.close()
+    mocks.runFile.mockClear()
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = 0, sync_failures = 8').run()
+    let complete = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args.includes('--reconcile')) {
+        if (complete) {
+          const fixture = new Database(path)
+          fixture.prepare("DELETE FROM sync_state WHERE key = 'full_build_retry_required'").run()
+          fixture.close()
+        }
+        return { stdout: JSON.stringify({ reconcile_complete: complete }), stderr: '' }
+      }
+      return cli(command, args, options)
+    })
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(operations('sync')).toHaveLength(1))
+    await vi.waitFor(() => expect(database!.db.prepare('SELECT next_sync_at FROM organizations').get()).toEqual({ next_sync_at: 0 }))
+    expect(operations('sync')[0]![1].slice(2)).toEqual(['sync', '--reconcile', '--reconcile-max-seconds', '20'])
+    expect(operations('health')).toHaveLength(0)
+    expect(database!.db.prepare('SELECT last_sync_at, last_reconcile_at, sync_failures FROM organizations').get()).toEqual({ last_sync_at: 0, last_reconcile_at: 0, sync_failures: 8 })
+    complete = true
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(operations('health')).toHaveLength(1))
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]).toMatchObject({ stage: 'ready', error: null }))
+    expect(operations('sync').map((call) => call[1].slice(2))).toEqual([
+      ['sync', '--reconcile', '--reconcile-max-seconds', '20'],
+      ['sync', '--reconcile', '--reconcile-max-seconds', '20'], ['sync'],
+    ])
+    expect(database!.db.prepare('SELECT sync_failures FROM organizations').get()).toEqual({ sync_failures: 0 })
+  })
+
+  it('refreshes between bounded reconciliation chunks and records daily completion only at the end', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    mocks.runFile.mockClear()
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = 0').run()
+    let complete = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args.includes('--reconcile')) {
+        return { stdout: JSON.stringify({ reconcile_complete: complete }), stderr: '' }
+      }
+      return cli(command, args, options)
+    })
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(operations('health')).toHaveLength(1))
+    await vi.waitFor(() => expect(database!.db.prepare('SELECT last_sync_at FROM organizations').get()).toEqual({ last_sync_at: expect.any(Number) }))
+    expect(database!.db.prepare('SELECT last_reconcile_at, sync_failures FROM organizations').get()).toEqual({ last_reconcile_at: 0, sync_failures: 0 })
+    expect(operations('sync').map((call) => call[1].slice(2))).toEqual([
+      ['sync'], ['sync', '--reconcile', '--reconcile-max-seconds', '20'], ['sync'],
+    ])
+    expect(organizations!.getOrganizations()[0]).toMatchObject({ stage: 'ready', error: null })
+    complete = true
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(operations('health')).toHaveLength(2))
+    await vi.waitFor(() => expect((database!.db.prepare('SELECT last_reconcile_at FROM organizations').get() as { last_reconcile_at: number }).last_reconcile_at).toBeGreaterThan(0))
+    expect(operations('sync').map((call) => call[1].slice(2))).toEqual([
+      ['sync'], ['sync', '--reconcile', '--reconcile-max-seconds', '20'], ['sync'],
+      ['sync'], ['sync', '--reconcile', '--reconcile-max-seconds', '20'], ['sync'],
+    ])
+  })
+
+  it('rejects malformed reconciliation completion instead of claiming the daily scan succeeded', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = 0').run()
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args.includes('--reconcile')) return { stdout: '{}', stderr: '' }
+      return cli(command, args, options)
+    })
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]).toMatchObject({
+      stage: 'sync-error', error: 'Datastore reconciliation did not report completion status.',
+    }))
+    expect(database!.db.prepare('SELECT last_reconcile_at FROM organizations').get()).toEqual({ last_reconcile_at: 0 })
+  })
+
   it('pauses new work during a release drain and tracks activation already in progress', async () => {
     const background = await import('../server/release-background')
     background.pauseReleaseBackground()

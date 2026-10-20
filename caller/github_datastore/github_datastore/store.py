@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,13 +28,14 @@ from .db import (
     utc_now,
 )
 from .extract import extract_associations
-from .github_api import ITEM_GRAPH_BATCH_SIZE, GitHubClient, GitHubOrgReader, parse_graphql_datetime
+from .github_api import ITEM_GRAPH_BATCH_SIZE, GitHubClient, GitHubOrgReader, GitHubRateLimitError, parse_graphql_datetime
 
 
 FULL_BUILD_COMPLETE_KEY = "full_build_complete"
 FULL_BUILD_MARKERS_INITIALIZED_KEY = "full_build_markers_v1_initialized"
 FULL_BUILD_RETRY_KEY = "full_build_retry_required"
 INITIALIZATION_KEY = "initialization_v1"
+RECONCILE_PROGRESS_KEY = "reconcile_progress_v1"
 
 
 def init_org(
@@ -333,11 +335,17 @@ def sync_once(
     exclude_repos: list[str] | None = None,
     reconcile: bool = False,
     reconcile_sleep: float = 0.0,
-) -> None:
+    reconcile_max_seconds: float | None = None,
+) -> bool:
     if workers <= 0:
         raise ValueError("workers must be positive")
     if reconcile_sleep < 0:
         raise ValueError("reconcile sleep cannot be negative")
+    if reconcile_max_seconds is not None and (
+        not reconcile or not math.isfinite(reconcile_max_seconds) or reconcile_max_seconds <= 0
+    ):
+        raise ValueError("reconcile-max-seconds requires reconcile and a positive finite duration")
+    deadline = time.monotonic() + reconcile_max_seconds if reconcile_max_seconds is not None else None
     validate_repo_filter(include_repos, exclude_repos)
     conn = connect(db_path)
     reader = GitHubOrgReader(GitHubClient())
@@ -378,11 +386,30 @@ def sync_once(
                     clear_full_build_marker(conn, repo_id)
                 upsert_repo(conn, repo)
             prune_repos(conn, [int(repo["id"]) for repo in repos])
-            if reconcile:
-                for repo in repos:
-                    repo_id = int(repo["id"])
-                    clear_full_build_marker(conn, repo_id)
-                    mark_full_build_retry(conn, repo_id)
+
+        if reconcile:
+            raw_progress = get_state(conn, "org", RECONCILE_PROGRESS_KEY)
+            progress = json.loads(raw_progress) if raw_progress is not None else {
+                "started_at": run_started, "repos": {}, "remaining": [],
+            }
+            if (
+                not isinstance(progress, dict)
+                or set(progress) != {"started_at", "repos", "remaining"}
+                or not isinstance(progress["started_at"], str)
+                or not isinstance(progress["repos"], dict)
+                or not isinstance(progress["remaining"], list)
+                or any(not isinstance(key, str) or not isinstance(value, str) for key, value in progress["repos"].items())
+                or any(not isinstance(value, str) or value not in progress["repos"] for value in progress["remaining"])
+            ):
+                raise RuntimeError("invalid reconciliation progress")
+            current = {str(repo["id"]): json.dumps([repo["full_name"], bool(repo.get("has_issues"))]) for repo in repos}
+            remaining = set(progress["remaining"]) & current.keys()
+            remaining.update(key for key, name in current.items() if progress["repos"].get(key) != name)
+            progress["repos"] = current
+            progress["remaining"] = sorted(remaining)
+            with conn:
+                set_state(conn, "org", RECONCILE_PROGRESS_KEY, json.dumps(progress, sort_keys=True))
+            repos = [repo for repo in repos if str(repo["id"]) in remaining]
 
         incremental_repos = [
             repo for repo in repos
@@ -403,8 +430,9 @@ def sync_once(
             )
             full_enumeration = reconcile or retry_full_build or requires_initial_full
             if full_enumeration:
-                with conn:
-                    clear_full_build_marker(conn, repo_id)
+                if not reconcile:
+                    with conn:
+                        clear_full_build_marker(conn, repo_id)
                 all_issues = list_repo_items(reader, repo)
                 issues = (
                     all_issues
@@ -417,22 +445,60 @@ def sync_once(
                     prune_items_for_repo(
                         conn, repo_id, [int(issue["id"]) for issue in all_issues]
                     )
+                # Each expansion and its source version survive a killed CLI.
+                # A new enumeration still discovers transfers, removals and edits.
+                checkpoint_scope = f"full-refresh:{repo_id}"
+                versions = {
+                    int(issue["id"]): json.dumps([
+                        repo["full_name"], issue["number"], issue["item_kind"], issue["updated_at"],
+                    ]) for issue in issues
+                }
+                stored_versions = {
+                    int(row["item_id"]): json.dumps([
+                        row["repo_full_name"], row["number"], row["item_type"], row["updated_at"],
+                    ]) for row in conn.execute(
+                        "SELECT item_id, repo_full_name, number, item_type, updated_at FROM items WHERE repo_id = ?",
+                        (repo_id,),
+                    )
+                }
+                issues = [issue for issue in issues if stored_versions.get(int(issue["id"])) != versions[int(issue["id"])] or
+                          get_state(conn, checkpoint_scope, str(issue["id"])) != versions[int(issue["id"])]]
             else:
                 issues = changed[repo["full_name"]]
-            for expanded in iter_expanded(reader, repo, issues, workers):
-                store_expanded(conn, expanded, users)
-                if reconcile_sleep:
-                    time.sleep(reconcile_sleep)
+            outstanding = len(issues)
+            expansions = iter_expanded(reader, repo, issues, workers)
+            try:
+                for expanded in expansions:
+                    item_id = store_expanded(conn, expanded, users)
+                    if full_enumeration:
+                        with conn:
+                            set_state(conn, checkpoint_scope, str(item_id), versions[item_id])
+                    outstanding -= 1
+                    if reconcile_sleep:
+                        time.sleep(reconcile_sleep)
+                    if deadline is not None and outstanding and time.monotonic() >= deadline:
+                        return False
+            finally:
+                # Closing explicitly propagates errors from workers still in flight.
+                expansions.close()
             if full_enumeration:
                 with conn:
                     mark_full_build_completed(conn, repo_id)
+                    conn.execute("DELETE FROM sync_state WHERE scope = ?", (checkpoint_scope,))
+                    if reconcile:
+                        progress["remaining"].remove(str(repo_id))
+                        set_state(conn, "org", RECONCILE_PROGRESS_KEY, json.dumps(progress, sort_keys=True))
+            if reconcile and deadline is not None and progress["remaining"] and time.monotonic() >= deadline:
+                return False
 
         with conn:
             if reconcile:
-                set_state(conn, "org", "last_reconcile_at", run_started)
+                set_state(conn, "org", "last_reconcile_at", progress["started_at"])
+                conn.execute("DELETE FROM sync_state WHERE scope = 'org' AND key = ?", (RECONCILE_PROGRESS_KEY,))
             else:
                 set_state(conn, "org", "last_sync_at", run_started)
             assert_no_duplicate_items(conn)
+        return True
     finally:
         conn.close()
 
@@ -552,6 +618,7 @@ def sync_loop(
     exclude_repos: list[str] | None = None,
     reconcile: bool = False,
     reconcile_sleep: float = 0.0,
+    reconcile_max_seconds: float | None = None,
 ) -> None:
     if interval_seconds <= 0:
         raise ValueError("interval must be positive")
@@ -563,6 +630,7 @@ def sync_loop(
             exclude_repos=exclude_repos,
             reconcile=reconcile,
             reconcile_sleep=reconcile_sleep,
+            reconcile_max_seconds=reconcile_max_seconds,
         )
         time.sleep(interval_seconds)
 
@@ -603,6 +671,14 @@ def iter_expanded(
                 # cancel queued pagination and wait for already-running calls.
                 for future in futures:
                     future.cancel()
+                pool.shutdown(wait=True, cancel_futures=True)
+                errors = [error for future in futures if not future.cancelled()
+                          and (error := future.exception()) is not None]
+                for error in errors:
+                    if isinstance(error, GitHubRateLimitError):
+                        raise error
+                if errors:
+                    raise errors[0]
 
 
 def validate_repo_filter(

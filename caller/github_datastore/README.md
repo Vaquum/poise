@@ -48,6 +48,16 @@ stored(user,item) == direct evidence exists in expanded_issue_pr_graph(item)
 REST and Search APIs are not used.
 
 `sync` refreshes changed items. `sync --reconcile` performs full repo/item reconciliation.
+Reconciliation resumes durable repository/item checkpoints after interruption.
+`sync --reconcile --reconcile-max-seconds 20` yields after the work budget
+(checked after item expansions and repositories) and emits
+`{"reconcile_complete": false}` until the full cycle finishes. In-flight
+GraphQL work can overrun the budget. A partial chunk leaves both sync and
+reconciliation success watermarks unchanged; ordinary delta syncs can run
+between chunks. The last complete snapshot remains available under the normal
+freshness gate. Re-enumeration discovers additions/removals and re-expands changed
+items; a new completed cycle discards its checkpoints. Legacy full-build retry
+markers also resume item expansion after a timeout.
 `--include-repos` and `--exclude-repos` are mutually exclusive.
 
 `init-org --resume` retains valid completed item expansions from an interrupted

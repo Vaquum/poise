@@ -303,7 +303,7 @@ class StoreTest(unittest.TestCase):
 
     def test_failed_new_repo_full_build_is_retried_until_complete(self) -> None:
         previous_watermark = "2026-08-29T12:00:00Z"
-        stub = {"id": 100, "number": 1, "item_kind": "issue"}
+        stub = {"id": 100, "number": 1, "item_kind": "issue", "updated_at": "2026-01-02T00:00:00Z"}
 
         class FullReader(BatchReader):
             def __init__(self, fail: bool) -> None:
@@ -426,7 +426,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(first.full_calls, ["Vaquum/Test"])
         self.assertEqual(second.full_calls, ["Vaquum/Test"])
 
-    def test_failed_reconcile_clears_marker_and_forces_full_retry(self) -> None:
+    def test_failed_reconcile_preserves_snapshot_and_resumes_explicitly(self) -> None:
         previous_watermark = "2026-08-29T12:00:00Z"
         stub = {
             "id": 100,
@@ -469,13 +469,13 @@ class StoreTest(unittest.TestCase):
                     sync_once(db_path, workers=1, reconcile=True)
 
             conn = connect(db_path)
-            self.assertIsNone(get_state(conn, "repo:10", "full_build_complete"))
-            self.assertEqual(get_state(conn, "repo:10", "full_build_retry_required"), "1")
+            self.assertEqual(get_state(conn, "repo:10", "full_build_complete"), "1")
+            self.assertIsNone(get_state(conn, "repo:10", "full_build_retry_required"))
             conn.close()
 
             second = ReconcileReader(fail=False)
             with patch("github_datastore.store.GitHubOrgReader", return_value=second):
-                sync_once(db_path, workers=1)
+                sync_once(db_path, workers=1, reconcile=True)
 
         self.assertEqual(first.full_calls, ["Vaquum/Test"])
         self.assertEqual(second.full_calls, ["Vaquum/Test"])
@@ -520,7 +520,7 @@ class StoreTest(unittest.TestCase):
 
         self.assertEqual(reader.full_calls, ["Vaquum/Test"])
 
-    def test_reconcile_marks_later_repos_for_full_retry_before_work(self) -> None:
+    def test_reconcile_preserves_later_snapshots_and_retains_pending_work(self) -> None:
         previous_watermark = "2026-08-29T12:00:00Z"
         second_repo = dict(
             repo_row(),
@@ -562,13 +562,13 @@ class StoreTest(unittest.TestCase):
                     sync_once(db_path, workers=1, reconcile=True)
 
             conn = connect(db_path)
-            self.assertEqual(get_state(conn, "repo:10", "full_build_retry_required"), "1")
-            self.assertEqual(get_state(conn, "repo:20", "full_build_retry_required"), "1")
+            self.assertIsNone(get_state(conn, "repo:10", "full_build_retry_required"))
+            self.assertIsNone(get_state(conn, "repo:20", "full_build_retry_required"))
             conn.close()
 
             second = MultiRepoReader(fail_first=False)
             with patch("github_datastore.store.GitHubOrgReader", return_value=second):
-                sync_once(db_path, workers=1)
+                sync_once(db_path, workers=1, reconcile=True)
 
         self.assertEqual(first.full_calls, ["Vaquum/Test"])
         self.assertEqual(second.full_calls, ["Vaquum/Test", "Vaquum/Second"])

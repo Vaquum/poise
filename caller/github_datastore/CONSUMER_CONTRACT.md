@@ -199,3 +199,10 @@ source: GitHub GraphQL only
 ```
 
 If health fails, consumers must treat datastore output as stale.
+
+Poise runs daily reconciliation in resumable 20-second work chunks between
+ordinary syncs. A chunk may finish its in-flight GraphQL work beyond the budget.
+Partial reconciliation does not advance either success watermark or invalidate
+the last complete snapshot. `sync --reconcile --reconcile-max-seconds 20` returns
+JSON with a boolean `reconcile_complete`; only `true` completes the daily cycle.
+Every scheduler admission still requires the normal fresh-data health gate.

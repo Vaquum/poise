@@ -71,6 +71,8 @@ def main(argv: list[str] | None = None) -> None:
     sync_parser.add_argument("--exclude-repos")
     sync_parser.add_argument("--reconcile", action="store_true")
     sync_parser.add_argument("--reconcile-sleep", type=float, default=0.0)
+    sync_parser.add_argument("--reconcile-max-seconds", type=float,
+                             help="Yield reconciliation after this work budget; print JSON completion status")
 
     health_parser = sub.add_parser("health")
     health_parser.add_argument("--max-age-seconds", type=int, default=120)
@@ -120,17 +122,22 @@ def main(argv: list[str] | None = None) -> None:
                 exclude_repos=parse_repo_list(args.exclude_repos),
                 reconcile=args.reconcile,
                 reconcile_sleep=args.reconcile_sleep,
+                reconcile_max_seconds=args.reconcile_max_seconds,
             )
         else:
-            sync_once(
+            complete = sync_once(
                 db_path,
                 workers=args.workers,
                 include_repos=parse_repo_list(args.include_repos),
                 exclude_repos=parse_repo_list(args.exclude_repos),
                 reconcile=args.reconcile,
                 reconcile_sleep=args.reconcile_sleep,
+                reconcile_max_seconds=args.reconcile_max_seconds,
             )
-            print(f"synced {db_path}")
+            if args.reconcile_max_seconds is not None:
+                print(json.dumps({"reconcile_complete": complete}))
+            else:
+                print(f"synced {db_path}")
     elif args.command == "view":
         rendered = run_view(db_path, args)
         sys.stdout.write(rendered)
