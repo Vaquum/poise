@@ -484,9 +484,11 @@ class GitHubOrgReader:
             raise GitHubApiError(f"incomplete repository enumeration for {org}: expected {expected_count}, got {len(repos)}")
         return repos
 
-    def list_repo_issues(self, full_name: str, since: str | None = None) -> list[dict[str, Any]]:
+    def list_repo_issues(
+        self, full_name: str, since: str | None = None, *, include_issues: bool = True,
+    ) -> list[dict[str, Any]]:
         owner, name = split_full_name(full_name)
-        issues = self._list_issue_nodes(owner, name, since, changed_only=False)
+        issues = self._list_issue_nodes(owner, name, since, changed_only=False) if include_issues else []
         pulls = self._list_pull_nodes(owner, name)
         return self._merge_item_nodes(full_name, issues, pulls)
 
@@ -508,20 +510,30 @@ class GitHubOrgReader:
         full_names: list[str],
         since: str | None,
         stored_pr_updated_at: dict[str, dict[int, str]],
+        *,
+        include_issues: bool = True,
     ) -> dict[str, list[dict[str, Any]]]:
         if len({name.casefold() for name in full_names}) != len(full_names):
             raise ValueError("duplicate repositories in changed-item batch")
         if since is None:
-            return {name: self.list_repo_issues(name) for name in full_names}
+            return {name: self.list_repo_issues(name) if include_issues else
+                    self.list_repo_issues(name, include_issues=False) for name in full_names}
         parse_graphql_datetime(since, "repository batch watermark")
         result: dict[str, list[dict[str, Any]]] = {}
         # Only minimal stubs are batched. Their complete expanded graphs still
         # supply all direct-association evidence through the existing reader.
         for start in range(0, len(full_names), 20):
             names = full_names[start:start + 20]
-            declarations = ["$since: DateTime!"]
+            declarations = ["$since: DateTime!"] if include_issues else []
             fields: list[str] = []
-            variables: dict[str, Any] = {"since": since}
+            variables: dict[str, Any] = {"since": since} if include_issues else {}
+            issue_selection = f"""
+                    issues(first: 100, states: [OPEN, CLOSED], filterBy: {{since: $since}}, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
+                      totalCount
+                      pageInfo {{ hasNextPage endCursor }}
+                      nodes {{ {ISSUE_STUB_FIELDS} }}
+                    }}
+            """ if include_issues else ""
             for index, full_name in enumerate(names):
                 owner, name = split_full_name(full_name)
                 declarations.extend([f"$owner{index}: String!", f"$name{index}: String!"])
@@ -529,11 +541,7 @@ class GitHubOrgReader:
                 fields.append(f"""
                   repo_{index}: repository(owner: $owner{index}, name: $name{index}) {{
                     nameWithOwner
-                    issues(first: 100, states: [OPEN, CLOSED], filterBy: {{since: $since}}, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
-                      totalCount
-                      pageInfo {{ hasNextPage endCursor }}
-                      nodes {{ {ISSUE_STUB_FIELDS} }}
-                    }}
+                    {issue_selection}
                     pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], orderBy: {{field: CREATED_AT, direction: ASC}}) {{
                       totalCount
                       pageInfo {{ hasNextPage endCursor }}
@@ -551,7 +559,7 @@ class GitHubOrgReader:
                 if str(repo.get("nameWithOwner", "")).casefold() != full_name.casefold():
                     raise GitHubApiError(f"repository batch result does not match: {full_name}")
                 repositories[full_name] = repo
-            completed = self._complete_changed_repository_batch(names, since, repositories)
+            completed = self._complete_changed_repository_batch(names, since, repositories, include_issues=include_issues)
             for full_name, (issues, pulls) in completed.items():
                 pulls = self._changed_pull_nodes(full_name, pulls, stored_pr_updated_at.get(full_name, {}))
                 result[full_name] = self._merge_item_nodes(full_name, issues, pulls)
@@ -562,15 +570,18 @@ class GitHubOrgReader:
         full_names: list[str],
         since: str,
         repositories: dict[str, dict[str, Any]],
+        *,
+        include_issues: bool = True,
     ) -> dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
         nodes = {}
         totals = {}
         cursors = {}
         seen_cursors = {}
         since_at = parse_graphql_datetime(since, "repository batch watermark")
+        connections = ("issues", "pullRequests") if include_issues else ("pullRequests",)
         for full_name in full_names:
             owner, name = split_full_name(full_name)
-            for key in ("issues", "pullRequests"):
+            for key in connections:
                 identity = (full_name, key)
                 conn = repositories[full_name][key]
                 nodes[identity] = list(conn["nodes"])
@@ -636,11 +647,12 @@ class GitHubOrgReader:
 
         completed = {}
         for full_name in full_names:
-            for key, label in (("issues", "issue"), ("pullRequests", "pull request")):
+            for key in connections:
+                label = "issue" if key == "issues" else "pull request"
                 identity = (full_name, key)
                 if len(nodes[identity]) != totals[identity]:
                     raise GitHubApiError(f"{label} enumeration count mismatch for {full_name}: expected {totals[identity]}, received {len(nodes[identity])}")
-            completed[full_name] = (nodes[(full_name, "issues")], nodes[(full_name, "pullRequests")])
+            completed[full_name] = (nodes[(full_name, "issues")] if include_issues else [], nodes[(full_name, "pullRequests")])
         return completed
 
     def _list_changed_issue_and_pull_nodes(

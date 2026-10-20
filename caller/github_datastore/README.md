@@ -8,6 +8,12 @@ projected from GraphQL nodes.
 `init-org` accepts an organization or personal username; its name remains unchanged for compatibility.
 Each database indexes only repositories owned by that account and visible to the authenticated user, including accessible private repositories. Collaborator repositories owned by other accounts are excluded.
 
+Disabling a repository's Issues feature omits only Issue collection. Pull
+requests remain indexed during initial loading, incremental sync and
+reconciliation. An Issues-setting transition triggers full enumeration;
+normal sync also recovers PRs omitted by earlier versions without resetting
+downstream behavior state.
+
 ## Commands
 
 ```bash

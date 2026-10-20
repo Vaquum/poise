@@ -461,6 +461,54 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
     def batch_page(full_name: str, key: str, nodes: list[dict], has_next: bool, cursor: str | None, total: int | None) -> dict:
         return {"nameWithOwner": full_name, **repository_page(key, nodes, has_next, cursor, total)["repository"]}
 
+    def test_full_enumeration_with_issues_disabled_reads_every_pr_page(self) -> None:
+        pulls = [pull_stub(1, WATERMARK), pull_stub(2, WATERMARK)]
+        client = ScriptedClient([
+            repository_page("pullRequests", pulls[:1], True, "next-pr", 2),
+            repository_page("pullRequests", pulls[1:], False, None, 2),
+        ])
+        rows = GitHubOrgReader(client).list_repo_issues("owner/repo", include_issues=False)
+        self.assertEqual([(row["item_kind"], row["number"]) for row in rows], [("pr", 1), ("pr", 2)])
+        self.assertEqual(client.calls[1][1]["cursor"], "next-pr")
+        self.assertTrue(all("issues(" not in query for query, _ in client.calls))
+        client.assert_exhausted()
+
+    def test_pr_only_batch_preserves_cursors_counts_and_local_delta_comparison(self) -> None:
+        names = ["owner/first", "owner/second"]
+        client = ScriptedClient([
+            {"repo_0": self.batch_page(names[0], "pullRequests", [pull_stub(1, WATERMARK)], True, "first-next", 2),
+             "repo_1": self.batch_page(names[1], "pullRequests", [pull_stub(3, WATERMARK)], True, "second-next", 2)},
+            {"page_0": self.batch_page(names[0], "pullRequests", [pull_stub(2, WATERMARK)], False, None, 2),
+             "page_1": self.batch_page(names[1], "pullRequests", [pull_stub(4, WATERMARK)], False, None, 2)},
+        ])
+        rows = GitHubOrgReader(client).list_repos_changed_items(
+            names, WATERMARK, {names[0]: {101: WATERMARK}}, include_issues=False,
+        )
+        self.assertEqual({name: [row["number"] for row in items] for name, items in rows.items()},
+                         {names[0]: [2], names[1]: [3, 4]})
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1][1]["cursor0"], "first-next")
+        self.assertEqual(client.calls[1][1]["cursor1"], "second-next")
+        for query, variables in client.calls:
+            self.assertNotIn("issues(", query)
+            self.assertNotIn("$since", query)
+            self.assertNotIn("since", variables)
+        client.assert_exhausted()
+
+    def test_pr_only_batch_still_rejects_missing_pages_and_cyclic_cursors(self) -> None:
+        first = self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], False, None, 2)
+        with self.assertRaisesRegex(GitHubApiError, "enumeration count mismatch"):
+            GitHubOrgReader(ScriptedClient([{"repo_0": first}])).list_repos_changed_items(
+                ["owner/repo"], WATERMARK, {}, include_issues=False,
+            )
+        first = self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], True, "first", 4)
+        second = self.batch_page("owner/repo", "pullRequests", [pull_stub(2, WATERMARK)], True, "second", 4)
+        third = self.batch_page("owner/repo", "pullRequests", [pull_stub(3, WATERMARK)], True, "first", 4)
+        with self.assertRaisesRegex(GitHubApiError, "cyclic page cursor"):
+            GitHubOrgReader(ScriptedClient([{"repo_0": first}, {"page_0": second}, {"page_0": third}])).list_repos_changed_items(
+                ["owner/repo"], WATERMARK, {}, include_issues=False,
+            )
+
     def test_batch_matches_individual_complete_changed_items(self) -> None:
         first = incremental_response([issue_stub(1, WATERMARK)], [pull_stub(1, WATERMARK), pull_stub(2, WATERMARK)])
         second = incremental_response([], [pull_stub(3, WATERMARK)])

@@ -28,7 +28,8 @@ def expansion(repo: dict, item_id: int, number: int, updated: str = "2026-01-02T
 
 def stub(expanded: dict) -> dict:
     issue = expanded["issue"]
-    return {"id": issue["id"], "number": issue["number"], "updated_at": issue["updated_at"], "item_kind": "issue"}
+    return {"id": issue["id"], "number": issue["number"], "updated_at": issue["updated_at"],
+            "item_kind": "pr" if expanded["is_pr"] else "issue"}
 
 
 class InitializationReader(BatchReader):
@@ -45,11 +46,17 @@ class InitializationReader(BatchReader):
     def list_org_repos(self, org: str) -> list[dict]:
         return self.repos
 
-    def list_repo_issues(self, name: str) -> list[dict]:
+    def list_repo_issues(self, name: str, *, include_issues: bool = True) -> list[dict]:
+        self.check_issue_collection([name], include_issues)
         self.listed.append(name)
-        return [stub(item) for item in self.items.get(name, [])]
+        return [stub(item) for item in self.items.get(name, []) if include_issues or item["is_pr"]]
 
-    def list_repos_changed_items(self, names: list[str], since: str, stored: dict) -> dict:
+    def check_issue_collection(self, names: list[str], include_issues: bool) -> None:
+        if any(bool(repo["has_issues"]) != include_issues for repo in self.repos if repo["full_name"] in names):
+            raise AssertionError("Issues collection does not match repository configuration")
+
+    def list_repos_changed_items(self, names: list[str], since: str, stored: dict, *, include_issues: bool = True) -> dict:
+        self.check_issue_collection(names, include_issues)
         self.polls.append((names, since))
         if self.fail_catchup:
             raise RuntimeError("rate limit during catch-up")
@@ -57,7 +64,8 @@ class InitializationReader(BatchReader):
             by_id = {item["issue"]["id"]: item for item in self.items.get(name, [])}
             by_id.update({item["issue"]["id"]: item for item in items})
             self.items[name] = list(by_id.values())
-        return {name: [stub(item) for item in self.catchup_items.get(name, [])] for name in names}
+        return {name: [stub(item) for item in self.catchup_items.get(name, []) if include_issues or item["is_pr"]]
+                for name in names}
 
     def expand_issue_or_pr(self, repo: dict, item: dict) -> dict:
         self.expanded.append(item["id"])

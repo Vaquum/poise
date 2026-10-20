@@ -99,11 +99,7 @@ def init_org(
         # current identity and timestamp still match. This also removes deletions.
         for repo in repos:
             repo_id = int(repo["id"])
-            if not repo.get("has_issues"):
-                with conn:
-                    prune_items_for_repo(conn, repo_id, [])
-                continue
-            all_issues = reader.list_repo_issues(repo["full_name"])
+            all_issues = list_repo_items(reader, repo)
             issues = items_requiring_full_refresh(conn, repo_id, repo["full_name"], all_issues)
             with conn:
                 prune_items_for_repo(conn, repo_id, [int(issue["id"]) for issue in all_issues])
@@ -115,9 +111,8 @@ def init_org(
         # A long or interrupted build can outlive its first enumerations. Catch
         # up from the original start before publishing completion or freshness.
         catchup_started = utc_now()
-        active_repos = [repo for repo in repos if repo.get("has_issues")]
-        changed = changed_items_for_repos(reader, conn, active_repos, state["started_at"])
-        for repo in active_repos:
+        changed = changed_items_for_repos(reader, conn, repos, state["started_at"])
+        for repo in repos:
             issues = items_requiring_full_refresh(
                 conn, int(repo["id"]), repo["full_name"], changed[repo["full_name"]]
             )
@@ -282,22 +277,34 @@ def verify_legacy_initialization_filter(
         raise RuntimeError("legacy initialization repo filter identities do not match stored ids")
 
 
+def list_repo_items(reader: GitHubOrgReader, repo: dict[str, Any]) -> list[dict[str, Any]]:
+    if repo.get("has_issues"):
+        return reader.list_repo_issues(repo["full_name"])
+    return reader.list_repo_issues(repo["full_name"], include_issues=False)
+
+
 def changed_items_for_repos(
     reader: GitHubOrgReader,
     conn: sqlite3.Connection,
     repos: list[dict[str, Any]],
     since: str | None,
 ) -> dict[str, list[dict[str, Any]]]:
-    if not repos:
-        return {}
-    names = [repo["full_name"] for repo in repos]
-    changed = reader.list_repos_changed_items(
-        names,
-        since,
-        {repo["full_name"]: stored_pr_updated_at_by_id(conn, int(repo["id"])) for repo in repos},
-    )
-    if set(changed) != set(names):
-        raise RuntimeError("changed-item batch does not cover the requested repositories")
+    changed = {}
+    # Keep each batch's connection set uniform; disabled Issues never exclude PRs.
+    for include_issues in (True, False):
+        batch = [repo for repo in repos if bool(repo.get("has_issues")) == include_issues]
+        if not batch:
+            continue
+        names = [repo["full_name"] for repo in batch]
+        options = {} if include_issues else {"include_issues": False}
+        result = reader.list_repos_changed_items(
+            names, since,
+            {repo["full_name"]: stored_pr_updated_at_by_id(conn, int(repo["id"])) for repo in batch},
+            **options,
+        )
+        if set(result) != set(names):
+            raise RuntimeError("changed-item batch does not cover the requested repositories")
+        changed.update(result)
     return changed
 
 
@@ -364,27 +371,22 @@ def sync_once(
                 repo_id = int(repo["id"])
                 prior_repo = known_repos.get(repo_id)
                 if (
-                    repo.get("has_issues")
-                    and (
-                        prior_repo is None
-                        or not prior_repo[0]
-                        or prior_repo[1] != repo["full_name"]
-                    )
+                    prior_repo is None
+                    or prior_repo[0] != bool(repo.get("has_issues"))
+                    or prior_repo[1] != repo["full_name"]
                 ):
                     clear_full_build_marker(conn, repo_id)
                 upsert_repo(conn, repo)
             prune_repos(conn, [int(repo["id"]) for repo in repos])
             if reconcile:
                 for repo in repos:
-                    if repo.get("has_issues"):
-                        repo_id = int(repo["id"])
-                        clear_full_build_marker(conn, repo_id)
-                        mark_full_build_retry(conn, repo_id)
+                    repo_id = int(repo["id"])
+                    clear_full_build_marker(conn, repo_id)
+                    mark_full_build_retry(conn, repo_id)
 
         incremental_repos = [
             repo for repo in repos
-            if repo.get("has_issues")
-            and not reconcile
+            if not reconcile
             and full_build_completed(conn, int(repo["id"]))
             and not full_build_retry_required(conn, int(repo["id"]))
         ]
@@ -393,16 +395,9 @@ def sync_once(
         for repo in repos:
             repo_id = int(repo["id"])
             prior_repo = known_repos.get(repo_id)
-            if not repo.get("has_issues"):
-                with conn:
-                    prune_items_for_repo(conn, repo_id, [])
-                    clear_full_build_marker(conn, repo_id)
-                    clear_full_build_retry(conn, repo_id)
-                continue
             retry_full_build = full_build_retry_required(conn, repo_id)
             requires_initial_full = (
                 prior_repo is None
-                or not prior_repo[0]
                 or prior_repo[1] != repo["full_name"]
                 or not full_build_completed(conn, repo_id)
             )
@@ -410,7 +405,7 @@ def sync_once(
             if full_enumeration:
                 with conn:
                     clear_full_build_marker(conn, repo_id)
-                all_issues = reader.list_repo_issues(repo["full_name"])
+                all_issues = list_repo_items(reader, repo)
                 issues = (
                     all_issues
                     if reconcile or retry_full_build
