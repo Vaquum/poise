@@ -31,7 +31,7 @@ vi.mock('../server/organizations', () => ({
   readyOrganizations: () => mocks.orgs.filter((org) => org.status === 'ready'),
   organizationArgs: (org: { datastorePath: string }, args: string[]) => ['--db', org.datastorePath, ...args],
 }))
-const { computeAnalytics, computeHistory, parseBounds, parseWindow, readAnalytics, readAnalyticsHistory } = await import('../server/analytics')
+const { computeAnalytics, computeHistory, parseBounds, parseWindow, prepareMergedDetails, readAnalytics, readAnalyticsHistory } = await import('../server/analytics')
 
 const HOUR = 60 * 60 * 1000
 const WEEK = { since: '2026-10-05T00:00:00Z', until: '2026-10-12T00:00:00Z' }
@@ -576,15 +576,49 @@ describe('reading what Current shows', () => {
           json_extract(i.expanded_json, '$.pull.merged_by.login') AS merged_by
         FROM prs JOIN items i ON i.item_id = pr_ref WHERE pr_ref = ?
       `)
-      const start = performance.now()
-      rows.forEach((row, i) => expect(eager.get(i + 1)).toEqual({ comments_count: 3, review_comments_count: 2, additions: row.additions, deletions: 2, merged_by: 'robot' }))
-      const eagerMs = performance.now() - start
-      const readStart = performance.now()
-      const report = await readAnalytics(WEEK, 'alpha')
-      const readMs = performance.now() - readStart
-      expect(report).toEqual(computeAnalytics({ window: WEEK, issues: [], prs: rows, behaviors: [], agent: 'robot' }))
-      console.info(`Analytics 64 MiB merged discussions: repeated parse ${eagerMs.toFixed(1)} ms; single parse ${readMs.toFixed(1)} ms`)
-      expect(readMs).toBeLessThan(eagerMs)
+      const single = prepareMergedDetails(db)
+      const expectedDetails = rows.map(row => ({ comments_count: 3, review_comments_count: 2, additions: row.additions, deletions: 2, merged_by: 'robot' }))
+      const readDetails = (query: typeof eager) => rows.map((_, i) => query.get(i + 1))
+      // Same prepared queries, connection and row set; assertions and full
+      // report aggregation are outside both clocks. Warm both before pairing.
+      expect(readDetails(eager)).toEqual(expectedDetails)
+      expect(readDetails(single)).toEqual(expectedDetails)
+      const samples = { eager: [] as number[], single: [] as number[] }
+      const measure = (name: keyof typeof samples, query: typeof eager) => {
+        const start = performance.now()
+        readDetails(query)
+        samples[name].push(performance.now() - start)
+      }
+      for (let pair = 0; pair < 8; pair++) {
+        if (pair % 2 === 0) { measure('eager', eager); measure('single', single) }
+        else { measure('single', single); measure('eager', eager) }
+      }
+      const median = (values: number[]) => {
+        const sorted = [...values].sort((a, b) => a - b)
+        return (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+      }
+      const eagerMs = median(samples.eager), singleMs = median(samples.single)
+      process.stdout.write(`${JSON.stringify({ analyticsPerformance: { payloadMiB: 64, pairedSamples: 8, legacyMedianMs: eagerMs, singleMedianMs: singleMs, samples } })}\n`)
+      expect(await readAnalytics(WEEK, 'alpha')).toEqual(computeAnalytics({ window: WEEK, issues: [], prs: rows, behaviors: [], agent: 'robot' }))
+
+      // Count actual large-input extraction calls through SQLite's function
+      // boundary. A separate native connection preserves JSON semantics.
+      const native = new Database(':memory:')
+      let largeExtractions = 0
+      try {
+        db.function('json_extract', { varargs: true, deterministic: true }, (...args: Array<string | number | bigint | Buffer | null>) => {
+          if (typeof args[0] === 'string' && args[0].length >= 1024 * 1024) largeExtractions++
+          return native.prepare<unknown[], { value: string | number | null }>(`SELECT json_extract(${args.map(() => '?').join(',')}) AS value`).get(...args)!.value
+        })
+        expect(readDetails(single)).toEqual(expectedDetails)
+        expect(largeExtractions).toBe(rows.length)
+        const singleExtractions = largeExtractions
+        largeExtractions = 0
+        expect(readDetails(eager)).toEqual(expectedDetails)
+        expect(largeExtractions).toBeGreaterThan(rows.length)
+        process.stdout.write(`${JSON.stringify({ analyticsExtractionWork: { rows: rows.length, single: singleExtractions, legacy: largeExtractions } })}\n`)
+      } finally { native.close() }
+      expect(singleMs).toBeLessThan(eagerMs)
     } finally { db.close() }
   })
 

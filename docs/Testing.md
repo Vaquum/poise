@@ -47,6 +47,17 @@ npm run test:e2e -- --shard=1/4 --workers=1
 this only after downloading the production build from the same workflow run.
 Run `npm run build` first when using it locally.
 
+## Analytics performance proof
+
+The merged-detail benchmark prepares the production query and its legacy
+reference on one connection, warms both, then measures eight counterbalanced
+pairs over identical rows. Assertions and report aggregation stay outside both
+clocks. The optimized median must remain strictly faster. Full-report equality
+is checked separately. A native SQLite delegation counts large-input extraction
+calls: the production query must use one per merged row, while the legacy
+reference uses more. Restoring the legacy query therefore fails a deterministic
+work bound as well as retaining the measured speed comparison.
+
 ## Baseline
 
 [Green run 39310158948](https://github.com/autonomio/poise/actions/runs/39310158948)

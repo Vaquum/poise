@@ -258,6 +258,23 @@ export function computeHistory(input: {
   }
 }
 
+/** Shared query boundary for merged-detail reads and their performance contract. */
+export function prepareMergedDetails(db: Database.Database) {
+  return db.prepare<[number], Pick<DatastoreRecord, 'comments_count' | 'review_comments_count' | 'additions' | 'deletions' | 'merged_by'>>(`
+    WITH payload AS MATERIALIZED (
+      SELECT item_id, json_extract(expanded_json,
+        '$.pull.graphql.additions', '$.pull.graphql.deletions', '$.pull.merged_by.login') AS details
+      FROM items WHERE item_id = ?
+    )
+    SELECT (SELECT count(*) FROM comments c WHERE c.item_id = payload.item_id) AS comments_count,
+      (SELECT count(*) FROM review_comments c WHERE c.item_id = payload.item_id) AS review_comments_count,
+      CAST(json_extract(details, '$[0]') AS INTEGER) AS additions,
+      CAST(json_extract(details, '$[1]') AS INTEGER) AS deletions,
+      json_extract(details, '$[2]') AS merged_by
+    FROM payload
+  `)
+}
+
 // Read the same datastore views and involvement scopes as Current without
 // starting Python for every scope. Project only fields used by the report:
 // unused view columns can parse large payloads and count entire discussions.
@@ -269,19 +286,7 @@ async function readOrganization(org: Organization, me: string, window: Analytics
     // synchronous .all() across a year prevents even quota/health reads.
     const scopeByKind = { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) }
     db.exec('BEGIN')
-    const mergedDetails = db.prepare<[number], Pick<DatastoreRecord, 'comments_count' | 'review_comments_count' | 'additions' | 'deletions' | 'merged_by'>>(`
-      WITH payload AS MATERIALIZED (
-        SELECT item_id, json_extract(expanded_json,
-          '$.pull.graphql.additions', '$.pull.graphql.deletions', '$.pull.merged_by.login') AS details
-        FROM items WHERE item_id = ?
-      )
-      SELECT (SELECT count(*) FROM comments c WHERE c.item_id = payload.item_id) AS comments_count,
-        (SELECT count(*) FROM review_comments c WHERE c.item_id = payload.item_id) AS review_comments_count,
-        CAST(json_extract(details, '$[0]') AS INTEGER) AS additions,
-        CAST(json_extract(details, '$[1]') AS INTEGER) AS deletions,
-        json_extract(details, '$[2]') AS merged_by
-      FROM payload
-    `)
+    const mergedDetails = prepareMergedDetails(db)
     const mergedReviews = db.prepare<[number], ReviewSummary>(`
       SELECT count(DISTINCT nullif(trim(r.commit_id), '')) AS rounds,
         count(CASE WHEN nullif(trim(r.commit_id), '') IS NULL THEN 1 END) AS missingCommits,
