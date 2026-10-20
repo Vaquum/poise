@@ -89,7 +89,8 @@ export class BehaviorLedgerObserver {
     })
     this.worker = worker
     await new Promise<void>((resolveReady, rejectReady) => {
-      const timer = setTimeout(() => { rejectReady(new Error('ledger_start_timeout')); this.fail() }, 2_000)
+      // The startup wait bounds its caller; elapsed time does not prove worker failure.
+      const timer = setTimeout(resolveReady, 2_000)
       worker.on('message', (message: LedgerWorkerReply | { ready: true; health: LedgerHealth; pending: LedgerPending[] }) => {
         if (this.worker !== worker) return
         try {

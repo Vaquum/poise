@@ -77,4 +77,33 @@ describe('bounded behavior ledger transport', () => {
     expect((await observer.read({ operation: 'get', id: 'a'.repeat(64) })).status).toBe(503)
     expect((await observer.read({ operation: 'health' })).body.health.status).toBe('unavailable')
   })
+
+  it('accepts late readiness after the startup budget without losing queued capture', async () => {
+    const observer = await fixture(`
+      import { existsSync, watch } from 'node:fs';
+      const release=new URL('./release',import.meta.url);
+      let ready=false;
+      const watcher=watch(new URL('.',import.meta.url),()=>check());
+      function check() {
+        if(ready||!existsSync(release)) return;
+        ready=true; watcher.close();
+        port.postMessage({ready:true,health,pending:[]});
+      }
+      port.on('message',request=>{
+        if(request.observation?.type==='admit') health.instances++;
+        port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});
+      });
+      check();`, { readTimeoutMs: 30 })
+    observer.capture(admission)
+    expect(await observer.read({ operation: 'health' })).toMatchObject({
+      status: 200, body: { health: { status: 'unavailable', pending: 1, dropped: 0 } },
+    })
+    expect((await observer.read({ operation: 'list' })).status).toBe(503)
+    await writeFile(join(directories.at(-1)!, 'release'), '')
+    await vi.waitFor(async () => {
+      expect(await observer.read({ operation: 'health' })).toMatchObject({
+        status: 200, body: { health: { status: 'ok', pending: 0, dropped: 0, instances: 1 } },
+      })
+    }, { timeout: 1500, interval: 25 })
+  })
 })
