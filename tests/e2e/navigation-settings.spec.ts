@@ -573,7 +573,7 @@ test('native touch scrolls content, drags through the gutter and taps close with
   } finally { await client.detach() }
 })
 
-test('native touch and stationary edge scrolling stay inside a short settings body', async ({ page, browserName }) => {
+test('native touch scrolls a short settings body without moving the page', async ({ page, browserName }) => {
   test.skip(browserName !== 'chromium', 'Chromium provides native CDP touch input.')
   await page.setViewportSize({ width: 420, height: 500 })
   await workspace(page)
@@ -588,10 +588,25 @@ test('native touch and stationary edge scrolling stay inside a short settings bo
     for (let step = 1; step <= 6; step++) await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: point(swipeX, viewport.y + viewport.height - 20 - step * (viewport.height - 40) / 6) })
     await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
     await expect.poll(() => settingsBody(page).evaluate(element => element.scrollTop)).toBeGreaterThan(30)
-    await settingsBody(page).evaluate(element => { element.scrollTop = 0 })
+    expect(await page.evaluate(() => scrollY)).toBe(0)
+  } finally { await client.detach() }
+})
+
+test('native touch and stationary edge scrolling stay inside a short settings body', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'Chromium provides native CDP touch input.')
+  await page.setViewportSize({ width: 420, height: 500 })
+  await workspace(page)
+  await navigation(page)
+  const client = await page.context().newCDPSession(page)
+  const point = (x: number, y: number) => [{ x, y, id: 1 }]
+  try {
+    await client.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 })
+    const viewport = (await settingsBody(page).boundingBox())!
+    // A fresh page keeps native swipe momentum out of the drag's scroll proof.
     const first = (await shortcut(page, 'Current', 'top bar').boundingBox())!
     await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: point(first.x + 20, first.y + 15) })
     await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: point(first.x + 28, first.y + 15) })
+    await expect(page.locator('.st-navigation-ghost')).toBeVisible()
     await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: point(first.x + 28, viewport.y + viewport.height - 4) })
     await expect.poll(() => settingsBody(page).evaluate(element => element.scrollTop)).toBeGreaterThan(80)
     await client.send('Input.dispatchTouchEvent', { type: 'touchCancel', touchPoints: [] })
