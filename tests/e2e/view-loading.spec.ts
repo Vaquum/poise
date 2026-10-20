@@ -13,12 +13,13 @@ const issue = {
   updated_at: '2026-10-13T08:00:00Z', created_at: '2026-10-13T08:00:00Z', merged_at: null,
 }
 
-async function setup(page: Page, view = 'current') {
+async function setup(page: Page, view = 'current', lastDoc = '') {
   const state = { currentReads: 0 }
-  await page.addInitScript((initialView) => {
+  await page.addInitScript(({ initialView, lastDoc }) => {
     localStorage.clear(); localStorage.setItem('poise-filters-v2', JSON.stringify({ types: ['issue'], status: 'all', time: 'all' }))
     localStorage.setItem('poise-view', initialView)
-  }, view)
+    if (lastDoc) localStorage.setItem('poise-editor-last', lastDoc)
+  }, { initialView: view, lastDoc })
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com|github\.com)\//, (route) => route.abort())
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname
@@ -322,4 +323,204 @@ test('empty repository discovery preserves live-feed choices in an open issue co
     await expect(picker).toHaveValue(selected)
     await expect(page.getByPlaceholder('Issue title', { exact: true })).toHaveValue('Draft issue')
   } finally { repos.release() }
+})
+
+
+const summary = (slug: string) => ({ slug, title: `Note ${slug}`, updated_at: '2026-10-20T08:00:00Z', size: 30 })
+async function editorDocuments(page: Page) {
+  const version = 'e'.repeat(64)
+  await page.route(/\/api\/editor\/doc\/[^/]+$/, route => {
+    const slug = new URL(route.request().url()).pathname.split('/').at(-1)!
+    return route.fulfill({ json: { slug, content: `# Note ${slug}\n\nAvailable writing`, version } })
+  })
+  await page.route('**/annotations', route => route.fulfill({ json: { annotations: [], version } }))
+}
+
+test('Editor opens its remembered document before settings and library discovery finish', async ({ page }) => {
+  await setup(page, 'editor', 'remembered')
+  await editorDocuments(page)
+  const settings = deferred(), library = deferred()
+  await page.route('**/api/settings', async route => { await settings.promise; await route.fallback() })
+  await page.route('**/api/editor/docs', async route => {
+    await library.promise
+    await route.fulfill({ json: { docs: [summary('remembered'), summary('other')] } })
+  })
+  const start = Date.now()
+  try {
+    await page.goto('/')
+    const doc = page.locator('#editor-doc')
+    await expect(doc).toContainText('Available writing', { timeout: 2000 })
+    console.log(`Editor remembered document: ${Date.now() - start}ms; settings and library still held`)
+    await doc.press('ControlOrMeta+End'); await doc.pressSequentially(' draft')
+    await page.locator('.editor-doc-trigger').click()
+    await expect(page.locator('#editor-doc-menu')).toContainText('Loading documents…')
+    library.release()
+    await expect(page.locator('.editor-doc-item')).toHaveCount(2)
+    await expect(doc).toContainText('draft')
+    settings.release()
+    await expect(doc).toContainText('draft')
+  } finally { settings.release(); library.release() }
+})
+
+test('Editor populates an already-open selector on first discovery and reports a retryable failure', async ({ page }) => {
+  await setup(page, 'editor')
+  await editorDocuments(page)
+  const library = deferred()
+  let fail = true, writes = 0
+  await page.route('**/api/editor/docs', async route => {
+    if (route.request().method() !== 'GET') writes++
+    await library.promise
+    if (fail) return route.fulfill({ status: 502, json: { error: 'Library unavailable' } })
+    await route.fulfill({ json: { docs: [summary('first')] } })
+  })
+  try {
+    await page.goto('/')
+    await page.locator('.editor-doc-trigger').click()
+    await expect(page.locator('#editor-doc-menu')).toContainText('Loading documents…')
+    library.release()
+    await expect(page.locator('#editor-doc-menu')).toContainText('Could not load documents')
+    expect(writes).toBe(0)
+    await expect(await feedback(page)).toContainText('Editor documents unavailable')
+    await page.keyboard.press('Escape')
+    fail = false
+    await page.locator('.editor-doc-trigger').click()
+    await expect(page.locator('.editor-doc-item')).toHaveCount(1)
+    const recovered = await feedback(page)
+    await expect(recovered.locator('.nr-card').filter({ hasText: 'Editor documents unavailable' })).toHaveCount(0)
+    await expect(recovered.locator('.nr-card').filter({ hasText: 'Could not load documents' })).toHaveCount(0)
+    await page.keyboard.press('Escape')
+    await page.locator('.editor-doc-trigger').click()
+    await page.locator('.editor-doc-item').click()
+    await expect(page.locator('#editor-doc')).toContainText('Available writing')
+  } finally { library.release() }
+})
+
+test('Editor keeps a focused picker item and draft when background discovery adds a document', async ({ page }) => {
+  await setup(page, 'editor', 'first')
+  await editorDocuments(page)
+  const refresh = deferred()
+  let reads = 0
+  await page.route('**/api/editor/docs', async route => {
+    const later = ++reads > 1
+    if (later) await refresh.promise
+    await route.fulfill({ json: { docs: later ? [summary('first'), summary('second')] : [summary('first')] } })
+  })
+  try {
+    await page.goto('/')
+    await expect(page.locator('#editor-doc')).toContainText('Available writing')
+    await page.getByRole('button', { name: 'Archive', exact: true }).click()
+    await page.getByRole('button', { name: 'Editor', exact: true }).click()
+    await expect.poll(() => reads).toBe(2)
+    await page.locator('.editor-doc-trigger').click()
+    const first = page.locator('.editor-doc-item[data-slug="first"]')
+    const actor = await first.elementHandle()
+    await first.focus()
+    refresh.release()
+    await expect(page.locator('.editor-doc-item')).toHaveCount(2)
+    expect(await actor!.evaluate(node => node.isConnected && document.activeElement === node)).toBe(true)
+  } finally { refresh.release() }
+})
+
+test('Snippets paints its library while GitHub settings are pending', async ({ page }) => {
+  await setup(page, 'snippets')
+  const settings = deferred()
+  await page.route('**/api/settings', async route => { await settings.promise; await route.fallback() })
+  await page.route('**/api/snippets', route => route.fulfill({ json: { snippets: [{ trigger: ':fast', replace: 'Available snippet' }], version: 'v1' } }))
+  try {
+    await page.goto('/')
+    await expect(page.locator('#snippets-tbody')).toContainText('Available snippet', { timeout: 2000 })
+  } finally { settings.release() }
+})
+
+
+test('returning to Editor retries the remembered file while its original library read is pending', async ({ page }) => {
+  await setup(page, 'editor', 'remembered')
+  await editorDocuments(page)
+  const first = deferred(), library = deferred()
+  let reads = 0
+  await page.route('**/api/editor/docs', async route => {
+    await library.promise
+    await route.fulfill({ json: { docs: [summary('other'), summary('remembered')] } })
+  })
+  await page.route('**/api/editor/doc/remembered', async route => {
+    if (++reads === 1) await first.promise
+    await route.fallback()
+  })
+  try {
+    await page.goto('/')
+    await expect.poll(() => reads).toBe(1)
+    await page.getByRole('button', { name: 'Archive', exact: true }).click()
+    const received = page.waitForResponse(response => new URL(response.url()).pathname === '/api/editor/doc/remembered')
+    first.release()
+    await (await received).finished()
+    await page.getByRole('button', { name: 'Editor', exact: true }).click()
+    await expect(page.locator('#editor-doc')).toContainText('Note remembered', { timeout: 2000 })
+    expect(reads).toBe(2)
+  } finally { first.release(); library.release() }
+})
+
+
+test('creating a document supersedes a pre-creation library response without waiting for it', async ({ page }) => {
+  await setup(page, 'editor', 'remembered')
+  await editorDocuments(page)
+  const old = deferred()
+  let reads = 0
+  await page.route('**/api/editor/docs', async route => {
+    if (route.request().method() === 'POST') return route.fulfill({ json: { slug: 'created' } })
+    if (++reads === 1) {
+      await old.promise
+      return route.fulfill({ json: { docs: [summary('remembered')] } })
+    }
+    await route.fulfill({ json: { docs: [summary('created'), summary('remembered')] } })
+  })
+  try {
+    await page.goto('/')
+    await expect(page.locator('#editor-doc')).toContainText('Note remembered')
+    await page.getByRole('button', { name: 'New', exact: true }).click()
+    await expect(page.locator('#editor-doc')).toContainText('Note created')
+    await page.locator('.editor-doc-trigger').click()
+    await expect(page.locator('.editor-doc-item[data-slug="created"]')).toHaveCount(1)
+    const received = page.waitForResponse(response => new URL(response.url()).pathname === '/api/editor/docs' && response.request().method() === 'GET')
+    old.release()
+    await (await received).finished()
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    await expect(page.locator('.editor-doc-item[data-slug="created"]')).toHaveCount(1)
+    await page.locator('.editor-doc-trigger').click()
+    const dialogOpened = page.waitForEvent('dialog')
+    const clicking = page.getByRole('button', { name: 'Delete', exact: true }).click()
+    const dialog = await dialogOpened
+    expect(dialog.message()).toContain('Note created')
+    await dialog.dismiss(); await clicking
+  } finally { old.release() }
+})
+
+test('Editor binds reviews and Google publications before annotations and resumes both on return', async ({ page }) => {
+  await setup(page, 'editor', 'remembered')
+  await editorDocuments(page)
+  const annotations = deferred()
+  let reviewReads = 0, googleReads = 0
+  await page.route('**/api/editor/docs', route => route.fulfill({ json: { docs: [summary('remembered')] } }))
+  await page.route('**/annotations', async route => { await annotations.promise; await route.fallback() })
+  await page.route('**/reviews**', route => {
+    reviewReads++
+    return route.fulfill({ json: { reviews: [], checkedAt: null, active: false, stale: false, problems: [] } })
+  })
+  await page.route('**/google/sync', route => {
+    googleReads++
+    return route.fulfill({ json: { publications: [], version: 'e'.repeat(64) } })
+  })
+  try {
+    await page.goto('/')
+    await expect(page.locator('#editor-doc')).toContainText('Available writing')
+    await expect.poll(() => reviewReads).toBeGreaterThan(0)
+    await expect.poll(() => googleReads).toBeGreaterThan(0)
+    await page.getByRole('button', { name: 'Archive', exact: true }).click()
+    const received = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/annotations'))
+    annotations.release()
+    await (await received).finished()
+    const previousReviews = reviewReads, previousGoogle = googleReads
+    await page.getByRole('button', { name: 'Editor', exact: true }).click()
+    await expect.poll(() => reviewReads).toBeGreaterThan(previousReviews)
+    await expect.poll(() => googleReads).toBeGreaterThan(previousGoogle)
+  } finally { annotations.release() }
 })

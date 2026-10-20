@@ -195,10 +195,14 @@ watchForUpdates()
 watchForSignOut()
 
 ;(async () => {
-  const googleReturned = await finishGoogleConnection()
-  await loadSettings()
-  if (new URLSearchParams(location.search).get('view') === 'logging') menu.switchTo('logging')
-  else showView(menu.currentView())
+  const initialView = menu.currentView()
+  const logging = new URLSearchParams(location.search).get('view') === 'logging'
+  // Personal documents and snippets do not depend on GitHub settings.
+  const openedEarly = !logging && (initialView === 'editor' || initialView === 'snippets')
+  if (openedEarly) showView(initialView)
+  const [googleReturned] = await Promise.all([finishGoogleConnection(), loadSettings()])
+  if (logging) menu.switchTo('logging')
+  else if (!openedEarly || menu.currentView() !== initialView) showView(menu.currentView())
   prepareAnalyticsView()
   // Single shared refresh clock — every view listens for poise:refresh-tick
   // and refreshes on it. Wall-clock-aligned so switching views never causes

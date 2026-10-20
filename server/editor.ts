@@ -11,6 +11,7 @@
 // etc.). No lock-in.
 
 import { mkdir, open, unlink, readdir, rename, stat } from 'node:fs/promises'
+import { StringDecoder } from 'node:string_decoder'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
@@ -154,12 +155,27 @@ const editorReady = cleanStaleTmpFiles()
 // blow out memory on read. 5 MB is well past any prose document.
 export const MAX_DOC_BYTES = 5 * 1024 * 1024
 
-async function readUtf8Prefix(path: string, maxBytes: number): Promise<string> {
+async function readTitle(path: string, maxBytes: number): Promise<string> {
   const handle = await open(path, 'r')
   try {
-    const buffer = Buffer.alloc(maxBytes)
-    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0)
-    return buffer.subarray(0, bytesRead).toString('utf-8')
+    const buffer = Buffer.alloc(Math.min(4096, maxBytes))
+    const decoder = new StringDecoder('utf8')
+    const parts: string[] = []
+    let offset = 0
+    let nonempty = false
+    while (offset < maxBytes) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, maxBytes - offset), offset)
+      if (!bytesRead) break
+      offset += bytesRead
+      const text = decoder.write(buffer.subarray(0, bytesRead))
+      for (const part of text.split(/(?<=\n)/)) {
+        parts.push(part)
+        nonempty ||= part.trim().length > 0
+        if (nonempty && part.endsWith('\n')) return deriveTitle(parts.join(''))
+      }
+    }
+    parts.push(decoder.end())
+    return deriveTitle(parts.join(''))
   } finally {
     await handle.close()
   }
@@ -263,33 +279,39 @@ export interface DocSummary {
   size: number         // bytes
 }
 
+// Metadata is rechecked on every listing, including edits made outside Poise.
+const summaryCache = new Map<string, { fingerprint: string, summary: DocSummary }>()
+
 export async function listDocs(): Promise<DocSummary[]> {
   await editorReady
   let names: string[] = []
   try { names = await readdir(EDITOR_DIR) } catch { return [] }
+  const slugs = names.filter(f => f.endsWith('.md')).map(f => f.slice(0, -3)).filter(isCanonicalSlug)
+  const order = new Map(slugs.map((slug, index) => [slug, index]))
+  const present = new Set(slugs)
+  for (const slug of summaryCache.keys()) if (!present.has(slug)) summaryCache.delete(slug)
   const out: DocSummary[] = []
-  for (const f of names) {
-    if (!f.endsWith('.md')) continue
-    const slug = f.slice(0, -3)
-    if (!isCanonicalSlug(slug)) continue
-    const fullPath = join(EDITOR_DIR, f)
-    try {
-      const st = await stat(fullPath)
-      if (!st.isFile()) continue
-      // Skim the file just enough to derive a title — don't slurp
-      // multi-MB files into the listing payload.
-      // Preserve title derivation for every supported document while still
-      // bounding externally oversized files at the normal document limit.
-      const content = await readUtf8Prefix(fullPath, Math.min(st.size, MAX_DOC_BYTES))
-      out.push({
-        slug,
-        title: deriveTitle(content),
-        updated_at: st.mtime.toISOString(),
-        size: st.size,
-      })
-    } catch { /* skip unreadable files silently */ }
-  }
-  out.sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+  let next = 0
+  // Bound open files and disk work even for libraries with thousands of notes.
+  await Promise.all(Array.from({ length: Math.min(8, slugs.length) }, async () => {
+    while (next < slugs.length) {
+      const slug = slugs[next++]
+      const fullPath = join(EDITOR_DIR, slug + '.md')
+      try {
+        const st = await stat(fullPath, { bigint: true })
+        if (!st.isFile()) continue
+        const fingerprint = `${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`
+        let cached = summaryCache.get(slug)
+        if (cached?.fingerprint !== fingerprint) {
+          const title = await readTitle(fullPath, Math.min(Number(st.size), MAX_DOC_BYTES))
+          cached = { fingerprint, summary: { slug, title, updated_at: new Date(Math.round(Number(st.mtimeNs) / 1_000_000)).toISOString(), size: Number(st.size) } }
+          summaryCache.set(slug, cached)
+        }
+        out.push({ ...cached.summary })
+      } catch { /* skip unreadable files silently */ }
+    }
+  }))
+  out.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || order.get(a.slug)! - order.get(b.slug)!)
   return out
 }
 

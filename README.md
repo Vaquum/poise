@@ -39,6 +39,11 @@ Settings reads only the selected section's expensive data. Accounts shows each
 CLI result independently, with pending checks and failures named alongside it.
 External font stylesheets load after first paint; system fonts keep the app
 usable while typography is unavailable or still loading.
+Editor and Snippets start independently of GitHub settings. Editor opens the
+remembered document while discovering the library; its open selector updates as
+soon as discovery finishes and distinguishes loading, failure and an empty library.
+Discovery reads through the first nonempty title line, uses at most eight concurrent
+file reads and reuses summaries while filesystem metadata is unchanged.
 Returning to Editor keeps the open document, draft, selection and undo history;
 its document picker refreshes in the background. Undo and redo history also survive
 app updates and refreshes in the same browser tab, separately for each document
