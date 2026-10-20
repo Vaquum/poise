@@ -1,10 +1,10 @@
 # Analytics
 
-**Analytics** in the burger menu opens a view of its own, like Current or
-Behaviors, but reached from the menu rather than the top nav. The menu
-closes and focus returns to the burger. No top-nav item is highlighted on
-Analytics; the menu marks Analytics as the current page instead. A reload
-stays on Analytics, and choosing a view in the top nav leaves it.
+**Analytics** opens a view of its own, like Current or Behaviors. By default,
+its shortcut is in the burger menu; choosing it closes the menu and returns
+focus to the burger. Settings → Navigation can place it in the top bar too.
+The shortcut on either surface marks Analytics as the current page. A reload
+stays on Analytics, and choosing another view leaves it.
 
 The page reads top to bottom:
 

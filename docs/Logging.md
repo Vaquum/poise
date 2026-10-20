@@ -35,12 +35,15 @@ response fields, and preserve its exact process evidence when available.
 
 ## Native Logging view
 
-Menu → Logging opens a server-paged table of retained events, with all three
+By default, Menu → Logging opens a server-paged table of retained events, with all three
 severities and Any time selected initially. Filters cover the full permitted
 store; the count is matching events, while each row's occurrence count describes
 its retained incident. Source time is displayed in Settings' timezone; missing
 source time is explicitly labeled as ingestion time. Today, Yesterday and This
 week use civil boundaries in that timezone. Custom intervals require UTC offsets.
+
+Settings → Navigation can place Logging in the top bar, reorder its shortcut,
+or hide it on either surface. Hiding shortcuts preserves diagnostic deep links.
 
 Column headers own the severity, time, source and exact identity filters. Columns selects optional workspace/account/repository/call/correlation/incident fields; an active filter keeps its field visible until cleared. Search and the event count remain in the native toolbar. Filters stay usable after a failed query.
 

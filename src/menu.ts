@@ -2,9 +2,7 @@ import { effectiveTimezone } from './config'
 import { releaseLine } from './release'
 import type { SettingsSection } from './settings'
 import { cancelMotion, motionValue, reveal, spring } from './motion'
-
-// Analytics is a view too, reached from the burger menu rather than the nav.
-type ViewName = 'current' | 'swarm' | 'chat' | 'main' | 'behaviors' | 'snippets' | 'editor' | 'analytics' | 'logging'
+import { getNavigation, NAVIGATION_CHANGED, NAVIGATION_KEY, navigationViews, type ViewName } from './navigation'
 
 const VIEW_KEY = 'poise-view'
 
@@ -16,16 +14,6 @@ const ICON_PUBLISHING = '<svg width="14" height="14" viewBox="0 0 14 14" fill="n
 const ICON_SETTINGS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M7 1v1.8M7 11.2V13M1 7h1.8M11.2 7H13M2.76 2.76l1.27 1.27M9.97 9.97l1.27 1.27M2.76 11.24l1.27-1.27M9.97 4.03l1.27-1.27" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
 const ICON_BURGER = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 5h10M3 8h10M3 11h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
 const ICON_CLOSE = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
-
-const VIEW_ITEMS: { key: ViewName; label: string }[] = [
-  { key: 'current',   label: 'Current'   },
-  { key: 'swarm',     label: 'Swarm'     },
-  { key: 'chat',      label: 'Chat'      },
-  { key: 'main',      label: 'Archive'   },
-  { key: 'behaviors', label: 'Behaviors' },
-  { key: 'snippets',  label: 'Snippets'  },
-  { key: 'editor',    label: 'Editor'    },
-]
 
 function loadView(): ViewName {
   try {
@@ -70,7 +58,7 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
   let activeSection: string | undefined
   const nav = document.createElement('nav')
   nav.id = 'top-nav'
-  nav.innerHTML = VIEW_ITEMS.map((v) => `<button class="nav-item" data-view="${v.key}">${v.label}</button>`).join('')
+  nav.setAttribute('aria-label', 'Top navigation')
 
   const toggle = document.createElement('button')
   toggle.id = 'menu-toggle'
@@ -98,16 +86,14 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
       <a class="menu-release-commit" target="_blank" rel="noopener noreferrer"></a><span class="menu-release-when"></span>
     </div>
     <div class="menu-divider menu-release-divider" hidden></div>
-    <button type="button" class="menu-item" data-action="analytics">
-      <span class="menu-icon">${ICON_ANALYTICS}</span><span class="menu-text">Analytics</span>
-    </button>
-    <button type="button" class="menu-item" data-action="logging">
-      <span class="menu-icon">${ICON_MODELS}</span><span class="menu-text">Logging</span>
-    </button>
-    <div class="menu-divider"></div>
+    <div class="menu-views"></div>
+    <div class="menu-divider menu-views-divider"></div>
     <div class="menu-group-label">Settings</div>
     <button type="button" class="menu-item" data-action="settings" data-settings="general">
       <span class="menu-icon">${ICON_SETTINGS}</span><span class="menu-text">General</span>
+    </button>
+    <button type="button" class="menu-item" data-action="settings" data-settings="navigation">
+      <span class="menu-icon">${ICON_BURGER}</span><span class="menu-text">Navigation</span>
     </button>
     <button type="button" class="menu-item" data-action="settings" data-settings="models">
       <span class="menu-icon">${ICON_MODELS}</span><span class="menu-text">Models</span>
@@ -265,19 +251,34 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     queuePosition()
   }, { passive: true })
 
-  const analyticsItem = menu.querySelector<HTMLButtonElement>('[data-action="analytics"]')!
-  const loggingItem = menu.querySelector<HTMLButtonElement>('[data-action="logging"]')!
   function setActiveItem(): void {
-    nav.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === current))
-    // No nav item lights up on Analytics, so its menu entry says where you are.
-    analyticsItem.classList.toggle('active', current === 'analytics')
-    if (current === 'analytics') analyticsItem.setAttribute('aria-current', 'page')
-    else analyticsItem.removeAttribute('aria-current')
-    loggingItem.classList.toggle('active', current === 'logging')
-    if (current === 'logging') loggingItem.setAttribute('aria-current', 'page')
-    else loggingItem.removeAttribute('aria-current')
+    for (const button of [...nav.querySelectorAll<HTMLButtonElement>('[data-view]'), ...menu.querySelectorAll<HTMLButtonElement>('[data-view]')]) {
+      const active = button.dataset.view === current
+      button.classList.toggle('active', active)
+      if (active) button.setAttribute('aria-current', 'page')
+      else button.removeAttribute('aria-current')
+    }
   }
-  setActiveItem()
+  function renderNavigation(): void {
+    const active = document.activeElement
+    const focused = active instanceof HTMLButtonElement && (nav.contains(active) || menu.querySelector('.menu-views')!.contains(active)) ? active : null
+    const focusSurface = focused && nav.contains(focused) ? nav : menu
+    const focusView = focused?.dataset.view
+    const preferences = getNavigation()
+    nav.innerHTML = navigationViews(preferences, 'topBar').map(({ key, label }) => `<button type="button" class="nav-item" data-view="${key}">${label}</button>`).join('')
+    nav.hidden = !nav.childElementCount
+    const menuItems = navigationViews(preferences, 'menu')
+    menu.querySelector('.menu-views')!.innerHTML = menuItems.map(({ key, label }) => `<button type="button" class="menu-item" data-action="${key}" data-view="${key}">
+      <span class="menu-icon">${key === 'analytics' ? ICON_ANALYTICS : ICON_MODELS}</span><span class="menu-text">${label}</span>
+    </button>`).join('')
+    menu.querySelector<HTMLElement>('.menu-views-divider')!.hidden = menuItems.length === 0
+    setActiveItem()
+    if (focusView) (focusSurface.querySelector<HTMLButtonElement>(`[data-view="${focusView}"]`) ?? toggle).focus({ preventScroll: true })
+    queuePosition()
+  }
+  renderNavigation()
+  window.addEventListener(NAVIGATION_CHANGED, renderNavigation)
+  window.addEventListener('storage', (event) => { if (event.key === NAVIGATION_KEY || event.key === null) renderNavigation() })
 
   const releaseEl = menu.querySelector<HTMLElement>('.menu-release')!
   const releaseDivider = menu.querySelector<HTMLElement>('.menu-release-divider')!
@@ -319,13 +320,19 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     else closeMenu()
     syncSurface()
   })
+  function selectView(next: ViewName): void {
+    if (next === 'analytics') callbacks.onOpenAnalytics()
+    else if (next !== current) {
+      current = next
+      saveView(current)
+      setActiveItem()
+      callbacks.onSelectView(current)
+    }
+    mountGlobalControls()
+  }
   nav.addEventListener('click', (event) => {
     const next = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-view]')?.dataset.view as ViewName | undefined
-    if (!next || next === current) return
-    current = next
-    saveView(current)
-    setActiveItem()
-    callbacks.onSelectView(current)
+    if (next) selectView(next)
   })
   menu.addEventListener('click', (event) => {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-action]')
@@ -335,17 +342,7 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     callbacks.onClosePanels()
     if (button.dataset.action === 'settings') callbacks.onOpenSettings(button.dataset.settings as SettingsSection)
     else if (button.dataset.action === 'typography') callbacks.onOpenTypography()
-    else if (button.dataset.action === 'analytics') {
-      callbacks.onOpenAnalytics()
-      // Closing the menu returns focus to the burger, which first has to move
-      // into the new view's header: inside the view just hidden it cannot
-      // take focus.
-      mountGlobalControls()
-    }
-    else if (button.dataset.action === 'logging') {
-      current = 'logging'; saveView(current); setActiveItem(); callbacks.onSelectView(current)
-      mountGlobalControls()
-    }
+    else if (button.dataset.view) selectView(button.dataset.view as ViewName)
     syncSurface()
     openPanel()?.querySelector<HTMLElement>('.tp-title')?.focus({ preventScroll: true })
   })
@@ -367,7 +364,7 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     if (event.key !== 'ArrowDown' || openPanel()) return
     event.preventDefault()
     openMenu()
-    menu.querySelector<HTMLButtonElement>('.menu-item')?.focus()
+    menu.querySelector<HTMLButtonElement>('.menu-item:not([hidden])')?.focus()
   })
   document.addEventListener('click', (event) => {
     if (!menu.hidden && !surface.contains(event.target as Node) && !toggle.contains(event.target as Node)) closeMenu()

@@ -1,3 +1,4 @@
+import { navigationSection } from './navigation-settings'
 import { scrollToActor } from './motion'
 import { patchContent, patchInformation } from './dom-patch'
 import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } from './model-refresh'
@@ -833,7 +834,7 @@ function timezoneOptions(): string[] {
   return ['UTC', 'Europe/Helsinki', 'Europe/London', 'Europe/Berlin', 'America/New_York', 'America/Los_Angeles', 'Asia/Tokyo', 'Asia/Singapore']
 }
 
-export type SettingsSection = 'general' | 'models' | 'accounts' | 'publishing' | 'admin'
+export type SettingsSection = 'general' | 'models' | 'accounts' | 'publishing' | 'navigation' | 'admin'
 
 function selectSection(panel: HTMLElement, tab: SettingsSection) {
   if (!panel.querySelector(`.st-tab[data-tab="${tab}"]`)) return
@@ -844,7 +845,7 @@ function selectSection(panel: HTMLElement, tab: SettingsSection) {
   for (const section of panel.querySelectorAll<HTMLElement>('.st-tab')) {
     section.hidden = section.dataset.tab !== tab
   }
-  panel.querySelector<HTMLElement>('.st-footer')!.hidden = tab === 'accounts' || tab === 'publishing' || tab === 'admin'
+  panel.querySelector<HTMLElement>('.st-footer')!.hidden = tab === 'accounts' || tab === 'publishing' || tab === 'navigation' || tab === 'admin'
   if (panel.classList.contains('open')) {
     if (tab === 'accounts') void loadAccounts()
     if (tab === 'publishing') void publishing?.refresh()
@@ -1032,6 +1033,7 @@ function buildPanel(): HTMLElement {
   panel.querySelector('.st-preset-save')!.addEventListener('click', () => { void presetAction(savePreset) })
   panel.querySelector('.st-preset-use')!.addEventListener('click', () => { void presetAction(usePreset) })
   panel.querySelector('.st-preset-delete')!.addEventListener('click', () => { void presetAction(deletePreset) })
+  panel.querySelector('.tp-body')!.append(navigationSection())
   publishing = publishingSection()
   panel.querySelector('.st-tab[data-tab="publishing"]')!.append(publishing.element)
   accountsEl = panel.querySelector('.st-accounts')
