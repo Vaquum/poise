@@ -22,15 +22,17 @@ const report = await withModelRefreshLock(reportPath, async () => {
   } catch { /* no completed overlapping check */ }
   const cliUpdates = await ensureProviderClis()
   let result
+  let callerExecutable
   try {
     const callerBin = callerBinRoot()
+    callerExecutable = join(callerBin, 'agent-interface')
     const env = {
       ...process.env,
       CLAUDE_CLI: join(projectRoot, 'scripts', 'claude-subscription.mjs'),
       PATH: [callerBin, ...(process.env.PATH || '').split(delimiter).filter(Boolean)].join(delimiter),
     }
     for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN']) delete env[key]
-    const { stdout } = await runUpdateCommand(join(callerBin, 'agent-interface'), ['--refresh-models'], {
+    const { stdout } = await runUpdateCommand(callerExecutable, ['--refresh-models'], {
       cwd: agentInterfaceRoot(), env, timeoutMs: 10 * 60_000,
     })
     result = JSON.parse(stdout)
@@ -41,6 +43,7 @@ const report = await withModelRefreshLock(reportPath, async () => {
     result = { checked_at: new Date().toISOString(), families: {}, error: redact(error instanceof Error ? error.message : String(error), environmentSecrets()), ...(error && typeof error === 'object' && error.diagnostic ? { diagnostic: error.diagnostic } : {}) }
   }
   for (const family of Object.values(result.families)) if (typeof family.error === 'string') family.error = redact(family.error, environmentSecrets())
+  result.caller_executable = callerExecutable
   result.cli_updates = cliUpdates
   result.completed_at = new Date().toISOString()
   const staged = `${reportPath}.${randomUUID()}.tmp`

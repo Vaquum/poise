@@ -21,6 +21,15 @@ Settings → Models → **Check now** and the existing scheduled model check run
 4. Atomically record the CLI results and per-provider discovery results, then
    invalidate Poise's model cache.
 
+Discovery uses the parent server's resolved `CALLER_BIN_ROOT` (default
+`caller/.venv/bin`), passed explicitly to the refresh child. This is the same
+Caller installation `/api/health` checks, including a workspace release's
+separate `venv/bin` directory. A missing configured executable fails without
+trying another installation or PATH. The receipt records `caller_executable`
+on success and failure, with bounded failure diagnostics when spawning fails.
+Direct script runs, including the personal-install launchd job, resolve the
+same setting themselves.
+
 Muse discovery considers only explicit `muse-…-contributor` selectors. An ordinary
 Muse default is never probed or admitted. No contributor model means discovery
 fails for Muse and retains its existing contributor choices. Caller rejects

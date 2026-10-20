@@ -505,7 +505,7 @@ is reported and nothing runs until it is corrected. A drain skips the run.
 | `POISE_CHAT_ATTACHMENTS_DIR` | Durable chat attachments | `~/.poise/chat-attachments` |
 | `POISE_ESPANSO_MATCH_DIR` | Espanso match directory override | macOS Espanso default; `~/.poise/snippets` in service mode |
 | `AGENT_INTERFACE_ROOT` | `agent-interface` working directory | `caller/agent_interface` |
-| `CALLER_BIN_ROOT` | Directory Poise runs Caller's CLIs from | `caller/.venv/bin` |
+| `CALLER_BIN_ROOT` | Directory Poise runs Caller's CLIs from; explicitly passed to model-refresh children | `caller/.venv/bin` |
 | `AGENT_INTERFACE_DATA_DIR` | Durable agent-interface calls and responses | `caller/agent_interface/data`; `~/.poise/agent-interface` in service mode |
 | `POISE_PYTHON` | Python 3.13 that builds Caller's virtualenv | Homebrew `python@3.13`, then `python3.13` on `PATH` |
 | `POISE_CHAT_ROOT` | Chat workspace storage | `.poise-chat/` in the installation; `~/.poise/chat` in service mode |

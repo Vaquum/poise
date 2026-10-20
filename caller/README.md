@@ -18,6 +18,8 @@ describe its contract.
 Poise runs the three CLIs from `caller/.venv/bin` and runs `agent-interface`
 with `caller/agent_interface` as its working directory. `CALLER_BIN_ROOT` and
 `AGENT_INTERFACE_ROOT` (absolute paths) name another installation instead.
+The model-refresh child receives the server's resolved `CALLER_BIN_ROOT`
+explicitly; a missing executable fails without selecting another Caller.
 `/api/health` reports Caller as `callerRelease`: `ready` when the three CLIs
 are runnable, with each package's version from its `pyproject.toml`. The
 production server does not start without it, and `npm run install:production`

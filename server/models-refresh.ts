@@ -2,6 +2,7 @@ import { diagnostic } from './logging'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
 // The scheduled job and manual check share CLI updates, discovery and receipts.
 import { dirname, join } from 'node:path'
+import { callerBinRoot } from '../scripts/caller.mjs'
 import { HttpError } from './http'
 import { agentInterfaceCwd, catalogReportPath, invalidateCatalog } from './models'
 import { CLAUDE_SUBSCRIPTION_CLI, claudeSubscriptionEnvironment, runFile, scrubbedChildEnvironment } from './process'
@@ -17,7 +18,7 @@ export function refreshModelCatalog(): Promise<Record<string, unknown>> {
     let stdout: string
     try { ({ stdout } = await runFile(process.execPath, [join(dirname(CLAUDE_SUBSCRIPTION_CLI), 'refresh-models.mjs'), '--json'], {
       cwd: agentInterfaceCwd(),
-      env: { ...scrubbedChildEnvironment('agent-interface', claudeSubscriptionEnvironment()), POISE_MODEL_CATALOG_REPORT: catalogReportPath() },
+      env: { ...scrubbedChildEnvironment('agent-interface', claudeSubscriptionEnvironment()), CALLER_BIN_ROOT: callerBinRoot(), POISE_MODEL_CATALOG_REPORT: catalogReportPath() },
       timeoutMs: 15 * 60_000, killSignal: 'SIGTERM',
     })) } catch (error) {
       // The script emits a durable structured failure even on a nonzero exit.
