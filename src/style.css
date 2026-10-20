@@ -1052,7 +1052,7 @@ tr:hover .review-btn { opacity: 1; }
 .analytics-history-tip small { display: block; max-width: 280px; margin-top: var(--sp-2); white-space: normal; color: var(--text-tertiary); font-size: .6875rem; }
 .analytics-history-empty { display: flex; align-items: center; height: 158px; margin: 0; font-size: .6875rem; color: var(--text-tertiary); }
 .analytics-histogram { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: var(--b-hair); }
-.analytics-histogram svg, .quota-distribution svg { display: block; width: 100%; height: 40px; overflow: visible; }
+.analytics-histogram svg { display: block; width: 100%; height: 40px; overflow: visible; }
 .analytics-histogram rect { fill: var(--history-line); opacity: .45; }
 .analytics-histogram rect:hover { fill: var(--a1); opacity: 1; }
 .analytics-chart-axis, .analytics-chart-heading { display: flex; justify-content: space-between; gap: var(--sp-1); color: var(--text-tertiary); font-size: .625rem; line-height: 1.5; font-variant-numeric: tabular-nums; }
@@ -1093,20 +1093,39 @@ tr:hover .review-btn { opacity: 1; }
 .quota-hour i { display: block; width: 100%; }
 .quota-hour-empty { border-bottom: 1px dotted var(--text-tertiary); }
 .quota-charts > .analytics-chart-heading:not(:first-child) { margin-top: var(--sp-4); }
+/* All panels share one order and two content-safe height families. */
+#view-analytics main { position: relative; min-height: var(--sp-6); }
+.analytics-board { position: relative; min-width: 0; }
+.analytics-loader { position: absolute; top: 0; inset-inline: 0; z-index: 3; pointer-events: none; }
+.analytics-panel { position: absolute; top: 0; left: 0; box-sizing: border-box; min-width: 0; border: var(--b-base); border-radius: var(--r-sm); background: var(--surface); }
+.analytics-panel[data-size="tall"] { min-height: 22rem; }
+.analytics-panel[data-size="short"] { min-height: 17rem; }
+.analytics-panel > .analytics-tile { height: 100%; box-sizing: border-box; border: none; margin: 0; }
+.analytics-panel .analytics-label { margin: 0 0 var(--sp-2); }
+.analytics-drag-handle { display: flex; align-items: center; gap: var(--sp-2); width: calc(100% + 24px); min-height: 40px; padding: var(--sp-2) var(--sp-3); margin: -12px -12px 0; border: none; border-bottom: var(--b-hair); border-radius: var(--r-sm) var(--r-sm) 0 0; background: transparent; color: var(--text-secondary); font: inherit; font-size: .6875rem; text-align: left; cursor: grab; touch-action: none; user-select: none; transition: background var(--flow-feedback) ease-out; }
+.analytics-drag-handle:hover { background: var(--hover); }
+.analytics-drag-handle > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.analytics-drag-handle:focus-visible { outline: var(--b-focus); outline-offset: 2px; }
+.analytics-drag-grip { flex: none; width: 8px; height: 14px; background: radial-gradient(circle, currentColor 1px, transparent 1.2px) 0 0 / 4px 4px; opacity: .65; }
+.analytics-panel:focus-within, .analytics-panel:has(.analytics-history-tip) { z-index: 2; }
+.analytics-panel.analytics-card-held { z-index: 5; border-color: var(--a1); box-shadow: var(--e-1); }
+.analytics-card-held .analytics-drag-handle { cursor: grabbing; }
+.analytics-drop-slot { position: absolute; box-sizing: border-box; border: 1px dashed var(--a1); border-radius: var(--r-sm); background: var(--tint-a1); pointer-events: none; }
+.analytics-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.github-quota-card-header { grid-column: 1 / -1; }
+.github-quota-card-header > .analytics-drag-handle { margin-bottom: var(--sp-3); }
+.github-quota-identity { padding-bottom: 0; border-bottom: none; }
+[data-group="work-review"] .analytics-value { font-size: 1.5rem; }
+[data-group="work-review"] .analytics-history { min-height: 110px; }
+[data-group="work-review"] .analytics-history-plot { height: 40px; }
+.analytics-work-types { grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr)); gap: var(--sp-1) var(--sp-3); margin-top: var(--sp-3); }
+.analytics-work-type { grid-template-columns: 8em minmax(0, 1fr) 4em; gap: var(--sp-1); }
+@media (pointer: coarse) { .analytics-drag-handle { min-height: 44px; } }
+@media (prefers-reduced-motion: reduce) { .analytics-drag-handle { transition: none; } }
 @container analytics (max-width: 639px) {
+  .analytics-work-types { grid-template-columns: minmax(0, 1fr); }
   [data-group="productivity"] .analytics-value { font-size: 1.5rem; }
   .analytics-arrow { font-size: 1.125rem; }
-  [data-group="per-merged-pr"] .analytics-tile:last-child { grid-column: 1 / -1; }
-}
-@container analytics (min-width: 640px) {
-  .analytics-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  [data-group="work-review"] .analytics-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@container analytics (min-width: 880px) {
-  .analytics-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  [data-group="work-review"] .analytics-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  [data-group="per-merged-pr"] .analytics-tiles { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-  .github-quota-accounts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 .tp-header {

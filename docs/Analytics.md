@@ -6,26 +6,95 @@ focus to the burger. Settings → Navigation can place it in the top bar too.
 The shortcut on either surface marks Analytics as the current page. A reload
 stays on Analytics, and choosing another view leaves it.
 
-The page reads top to bottom:
+Analytics is one board of cards, with no section headings. The default order
+is eight productivity cards (two rows of four in a wide window), Work type,
+Review rounds and Change-request share, five per-PR cards, then live GitHub API
+account cards. Productivity and API cards share the taller height; Work & review
+and per-PR cards share the shorter height. Each family expands together when
+text or typography needs more space. Narrow windows reduce columns.
 
-1. **Productivity**: four columns by two rows in a wide window (an analytics
-   container at least 880px wide). The first row shows pull
-   requests opened, merged, closed without merging, and lines changed.
-   The second shows time to first review, time to merge, issues opened,
-   and issues closed.
-2. **Work & review**: the third row. Work type spans half the row; Review rounds
-   and Change-request share each span a quarter at 880px and wider.
-3. **Per merged pull request**: five compact cards for comments, median lines,
-   behaviors, median time and the share merged by the agent account.
-4. **GitHub API · Live**: avatar-led user and automation account panels side
-   by side, each holding REST and GraphQL budgets.
+Drag a card's top bar to move it anywhere on the board. The held card follows
+the pointer directly; other cards make room with the shared Tactile spring.
+The outlined slot shows the destination. Release to place; Escape, pointer
+cancellation, leaving Analytics or resizing cancels the move. Dragging near the
+viewport edge scrolls the page. Keyboard users focus a header, press Space or
+Enter, move with arrow keys (Home/End reach the ends), then press Space or Enter
+to place. Escape restores the previous order. Focus and document order follow
+the placed cards. Reduced motion places cards immediately.
 
-Except for the neutral Work type breakdown, every metric card groups its colored value and adjacent trend arrow above a
-matching delta and seven-day baseline. A gap separates this summary from the weekly history line
-and a ten-bin histogram. Productivity uses larger cards and taller plots than
-per-PR metrics. Borders, colors, spacing and tooltip motion follow the shared
-design system. Narrow layouts reduce columns without horizontal overflow,
-keeping the same card sequence and keyboard focus order.
+The browser remembers the order across day and organization changes, refreshes,
+navigation and reloads. New cards append to the saved order; unavailable account
+identities retain their saved position. A live read that completes during a move
+is applied after the move, retaining the held card and its controls.
+
+Every metric retains its value, comparison and weekly history. Productivity and
+per-PR cards retain their histograms. Work & review and GitHub API distributions
+are omitted; API cards retain their 24-hour usage chart. Borders, colors, spacing,
+tooltips and motion follow the shared design system.
+
+## Card layout
+
+The board is one named Analytics panels region. Each card has a semantic name;
+per-PR names retain “per merged pull request”, and quota headers retain “Live”.
+Quota cards describe their independence from the day and organization filter.
+There are sixteen metric cards and one card per reported account, holding that
+account's REST and GraphQL budgets together. A shared user/automation login is
+one account; an unavailable account keeps its identity and an unknown value.
+
+Cards pack in document order over twenty width units, with a 12px gap and no
+dense backfill. Mixed rows advance by their tallest card; shorter cards retain
+their own height. The minimum heights are 22rem and 17rem. At every content,
+font or width change each family grows to its largest member's measured content
+height, with the taller family retaining at least 5rem clearance above the shorter
+family. Work type uses two columns when each has at least 14rem of space,
+reducing to one below a 640px board width or when larger type needs it;
+all twelve types remain visible and focusable. There is no
+internal card scrolling or content clipping.
+
+| Board width | Productivity / review | Work type / API account | Per-PR |
+| --- | --- | --- | --- |
+| Below 450px | 20 units | 20 units | 20 units |
+| 450–879px | 10 units | 20 units | 10 units |
+| 880px or wider | 5 units | 10 units | 4 units |
+
+The whole header is a Pointer Events handle, with a grip, a 40px minimum target
+(44px for coarse pointers), `touch-action: none`, pointer capture and a 5px
+movement threshold. Only the primary pointer and primary button initiate a move.
+Plots and the page keep their ordinary interactions outside the header. Insertion
+uses stable boundaries between the other cards, with a 24px switching margin to
+avoid oscillation. Distinct orders remain reachable when a wide card wraps into
+the same destination box. Drop outside the board places at the nearest valid slot. Edge
+scrolling is bounded by the board; the held card cannot extend the page.
+Escape, pointer cancellation/capture loss, window blur, hidden tab, departure,
+font changes and viewport resize restore the committed order and release capture.
+Only a successful drop saves. Reordering announces pickup, position and placement
+or cancellation through one status region; ordinary data reads do not announce
+the entire board. Chart arrow keys remain scoped to the plot; reorder keys are
+scoped to the header. Focus stays on the semantic control after placement.
+
+`poise-analytics-card-order` stores a JSON array of unique card IDs in localStorage.
+This first format is browser/origin-local, shared by logins using that browser,
+and contains layout metadata only. Metric IDs are `metric:<group>:<label>`;
+account IDs are `quota:<lowercase login>`. Renamed metrics and new accounts append
+as new identities; duplicate/obsolete IDs are ignored, and currently missing IDs
+remain remembered when saving another move. No existing format needs migration.
+Malformed data and denied/exhausted storage show an accessible visible error;
+Analytics remains usable in memory. A successful later move writes a valid array.
+
+Foreground reads replace metric bodies with keyed empty slots while retaining
+their measured family heights, including quota cards interleaved among them.
+The loader overlays the board without shifting it. Errors remove
+those placeholders. Background reads retain the semantic card/control nodes;
+the latest combined metric/quota patch waits during a move and applies on drop
+or cancellation, including after a failed preference save. The order survives
+history arrivals, account/day/settings changes, navigation and reload; returning
+to Analytics still resets its day to Today. Existing endpoints, polling and
+chart reads remain unchanged. `src/analytics-layout.ts` is the new controller
+for geometry, DOM reconciliation, persistence and gesture handling. It reuses
+the existing `data-id` reconciliation keys and shared 180/20/1 spring, without
+changing `dom-patch.ts`, `motion.ts` or the gateway motion model.
+Active history readouts raise their card above neighbors and replay their cursor
+after every combined patch, including quota polls and patches deferred by a move.
 
 ## The day
 
@@ -217,9 +286,8 @@ Each chart's highest value is named above it; the redundant “52 weeks” and
 “Distribution” labels are omitted. Hovering for half a second, or
 focusing it and using the arrow keys, Home and End, shows a period's value,
 what it is made of (such as "8 merged" or "Mean of 8 PRs") and its dates.
-The readout explains the chart and its period boundaries. Below each line,
-ten equal-width bins show the distribution of known weekly values (Review
-rounds instead shows the selected day's per-PR counts). Empty
+The readout explains the chart and its period boundaries. Below productivity and per-PR lines,
+ten equal-width bins show the distribution of known weekly values. Empty
 periods stay unknown for metrics that require observations; zero event
 counts remain zero. Hover or focus explains the distribution. There is no
 history table.
@@ -230,8 +298,7 @@ of falling to zero, and a known value with unknown neighbours shows as a dot.
 The year is read once per day and account, separately from the day's numbers,
 and each chart keeps its place until it arrives. If it cannot be read, the
 charts keep an empty reserved space, the day's numbers stay, and the failure
-appears in Notifications. Review rounds retains its independent selected-day
-histogram in that reserved area.
+appears in Notifications.
 
 ## Work and review
 
@@ -258,18 +325,15 @@ author and post-merge reviews are excluded. The initial reviewed revision counts
 If any eligible review lacks a commit identity, the median is withheld.
 Coverage appears separately for the day and baseline in its tooltip, and for
 each historical period in its readout. Empty cohorts say no merges; older
-payloads without aggregates say unavailable. The histogram shows the selected
-day's known per-PR counts, including known counts when the median is withheld;
-the line shows weekly medians across the preceding year. The daily histogram
-remains available while the independent year read is delayed or fails.
+payloads without aggregates say unavailable. The line shows weekly medians
+across the preceding year; the compact card has no histogram.
 
 Change-request share counts each merged PR once if it has at least one observed
 submitted non-author CHANGES_REQUESTED review at or before merge. Its denominator
 includes every merged PR, including those without reviews. The local datastore
 does not collect dismissal events or their previous states, although GitHub
 exposes them. Dismissed change requests can therefore be undercounted; the
-tooltip reports the dismissed-review count. Its line and histogram use weekly
-shares; histogram bounds stay at 0–100%.
+tooltip reports the dismissed-review count. Its line uses weekly shares.
 
 Both friction cards show the pooled preceding seven-day cohort's median or share
 and PR count beneath the delta. Changes use relative percentages, not percentage
@@ -304,7 +368,7 @@ connection-reset cause. Existing server sync alerts continue independently.
 
 ## GitHub API quota
 
-The last section is live, independent of the selected day and organization.
+The GitHub API cards are live, independent of the selected day and organization.
 It shows the configured user and automation GitHub accounts separately,
 side by side with avatars; a shared login appears once with both roles.
 Only REST and GraphQL budgets appear. Each shows used
@@ -335,11 +399,9 @@ toward secondary limits. See [GitHub's rate-limit documentation](https://docs.gi
 
 Each budget shows 24 stacked hourly columns (including this hour) for used
 and remaining quota, normalized to its limit. The latest observation in each
-hour is retained for seven days across restarts. A ten-bin histogram compares
-the distributions of used and remaining percentages across those observations;
-it names the observed hours out of 168. Missing hours are empty, never carried
-forward or invented. History starts collecting when this version first runs.
-Both charts use the existing quota response and unchanged 15-second polling;
+hour is retained for seven days across restarts. Missing hours are empty, never
+carried forward or invented. The utilization distribution is not displayed.
+The hourly charts use the existing quota response and unchanged 15-second polling;
 no extra GitHub requests are made. Avatars use the same cached GitHub image
 URLs as other views, without a profile API request.
 
