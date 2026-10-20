@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { EventEmitter } from 'node:events'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { EventEmitter, once } from 'node:events'
 import { spawn, spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
@@ -16,6 +16,29 @@ beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'poise-worker-safet
 afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
 const env = () => ({ PATH: '/usr/bin:/bin', HOME: root, TMPDIR: root })
+const realSetTimeout = globalThis.setTimeout
+
+function descendantPid(stdout) {
+  const text = stdout.trim()
+  const pid = Number(text)
+  if (!/^[1-9]\d*$/.test(text) || !Number.isSafeInteger(pid) || pid <= 1) {
+    throw new Error(`Expected exactly one descendant PID greater than 1; got ${JSON.stringify(stdout)}`)
+  }
+  return pid
+}
+
+function liveDescendantPid(stdout, pgid) {
+  const pid = descendantPid(stdout)
+  const result = spawnSync('ps', ['-p', String(pid), '-o', 'pgid='], { encoding: 'utf8', timeout: 1_000 })
+  if (result.error || result.status !== 0) throw new Error(`Cannot observe descendant PID ${pid}`)
+  if (Number(result.stdout.trim()) !== pgid) throw new Error(`PID ${pid} is outside worker group ${pgid}`)
+  if (pidDead(pid)) throw new Error(`Descendant PID ${pid} is already dead`)
+  return pid
+}
+
+async function requireDescendantDead(pid) {
+  if (!await waitFor(() => pidDead(pid), 2_000)) throw new Error(`Descendant PID ${pid} is still present`)
+}
 
 function pidDead(pid) {
   try { process.kill(pid, 0); return false } catch (error) { return error.code === 'ESRCH' }
@@ -25,7 +48,7 @@ async function waitFor(check, ms = 5_000) {
   const deadline = Date.now() + ms
   while (!check()) {
     if (Date.now() >= deadline) return false
-    await new Promise((resolve) => setTimeout(resolve, 25))
+    await new Promise((resolve) => realSetTimeout(resolve, 25))
   }
   return true
 }
@@ -124,23 +147,102 @@ describe('a registered, gated subprocess', () => {
     expect(await waitFor(() => pidDead(orphan), 2_000)).toBe(true)
   })
 
-  it('kills the whole group on timeout and reports it as a failure', async () => {
+  it('enforces the wall-clock timeout even before the command starts', async () => {
+    const marker = join(root, 'ran')
     const workers = registry()
-    const runner = createRunner({ workers })
+    let gate
+    const runner = createRunner({ workers, spawn: (command, args, options) => {
+      // Hold startup on a separate pipe: GO cannot start the command before
+      // the real 400 ms deadline, regardless of machine scheduling.
+      gate = spawn('sh', ['-c', 'read -r startup <&4; exec "$@"', 'held-gate', command, ...args], {
+        ...options, stdio: [...options.stdio, 'pipe'],
+      })
+      gate.stdio[4].resume()
+      return gate
+    } })
     const started = Date.now()
-    const failure = await runner.run('sh', ['-c', 'sleep 30 & echo $!; wait'], { env: env(), timeoutMs: 400 })
+    try {
+      const failure = await runner.run('sh', ['-c', `touch ${marker}; sleep 30 & echo $!; wait`], { env: env(), timeoutMs: 400 })
+        .catch((error) => error)
+      expect(failure).toBeInstanceOf(SubprocessError)
+      expect(failure.message).toMatch(/timed out after 400 ms/)
+      expect(failure.result).toMatchObject({ timedOut: true, timeoutMs: 400, settled: true, stdout: '' })
+      expect(existsSync(marker)).toBe(false)
+      expect(pgidAlive(failure.result.pgid)).toBe(false)
+      expect(workers.calls).toEqual([['register', failure.result.pid], ['release', failure.result.pid]])
+      expect(Date.now() - started).toBeGreaterThanOrEqual(400)
+      expect(Date.now() - started).toBeLessThan(8_000)
+    } finally {
+      gate?.stdio[4].destroy()
+      if (gate?.pid && pgidAlive(gate.pid)) process.kill(-gate.pid, 'SIGKILL')
+    }
+  })
+
+  it('kills a started descendant on timeout and reports it as a failure', async () => {
+    const workers = registry()
+    let gate
+    let output = ''
+    let fireDeadline
+    const runner = createRunner({ workers, spawn: (...args) => {
+      gate = spawn(...args)
+      gate.stdout.on('data', (chunk) => { output += chunk.toString() })
+      return gate
+    } })
+    // The preceding test proves real wall-clock enforcement. Defer only its
+    // 400 ms callback here until the real descendant is observed; all startup,
+    // cleanup and PID-death waits retain their real deadlines.
+    const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback, ms, ...args) => {
+      if (ms !== 400) return realSetTimeout(callback, ms, ...args)
+      if (fireDeadline) throw new Error('Unexpected second execution deadline')
+      fireDeadline = () => callback(...args)
+      return realSetTimeout(() => { /* driven after descendant readiness */ }, ms)
+    })
+    const started = Date.now()
+    const run = runner.run('sh', ['-c', 'sleep 30 & echo $!; wait'], { env: env(), timeoutMs: 400 })
       .catch((error) => error)
-    expect(failure).toBeInstanceOf(SubprocessError)
-    expect(failure.message).toMatch(/timed out after 400 ms/)
-    expect(failure.result.timedOut).toBe(true)
-    expect(failure.result.settled).toBe(true)
-    expect(Date.now() - started).toBeLessThan(8_000)
-    const orphan = Number(failure.result.stdout.trim())
-    expect(pgidAlive(failure.result.pgid)).toBe(false)
-    // The orphan is dead; launchd may still owe it a wait().
-    expect(await waitFor(() => pidDead(orphan), 2_000)).toBe(true)
-    // A settled group is released even when the run failed.
-    expect(workers.calls).toEqual([['register', failure.result.pid], ['release', failure.result.pid]])
+    try {
+      expect(await waitFor(() => output.includes('\n'), 2_000)).toBe(true)
+      const orphan = liveDescendantPid(output, gate.pid)
+      expect(fireDeadline).toBeTypeOf('function')
+      fireDeadline()
+      const failure = await run
+      expect(failure).toBeInstanceOf(SubprocessError)
+      expect(failure.message).toMatch(/timed out after 400 ms/)
+      expect(failure.result).toMatchObject({ timedOut: true, timeoutMs: 400, settled: true })
+      expect(descendantPid(failure.result.stdout)).toBe(orphan)
+      expect(pgidAlive(failure.result.pgid)).toBe(false)
+      await requireDescendantDead(orphan)
+      expect(workers.calls).toEqual([['register', failure.result.pid], ['release', failure.result.pid]])
+      expect(Date.now() - started).toBeLessThan(8_000)
+    } finally {
+      timer.mockRestore()
+      if (gate?.pid && pgidAlive(gate.pid)) process.kill(-gate.pid, 'SIGKILL')
+      await run
+    }
+  })
+
+  it('rejects missing, invalid and multiple descendant PID output', () => {
+    for (const stdout of ['', ' \n', '0', '1', '-5', 'NaN', '12x', '12\n13\n', '9007199254740993']) {
+      expect(() => descendantPid(stdout)).toThrow(/exactly one descendant PID greater than 1/)
+    }
+    expect(descendantPid('123\n')).toBe(123)
+  })
+
+  it('rejects a surviving process and a PID from another group as teardown proof', async () => {
+    const survivor = spawn('sleep', ['30'], { env: env(), detached: true, stdio: 'ignore' })
+    const exited = once(survivor, 'exit')
+    try {
+      await once(survivor, 'spawn')
+      expect(survivor.pid).toBeGreaterThan(1)
+      expect(pidDead(survivor.pid)).toBe(false)
+      expect(liveDescendantPid(String(survivor.pid), survivor.pid)).toBe(survivor.pid)
+      expect(() => liveDescendantPid(String(survivor.pid), survivor.pid + 1)).toThrow(/outside worker group/)
+      await expect(requireDescendantDead(survivor.pid)).rejects.toThrow(/still present/)
+      expect(pidDead(survivor.pid)).toBe(false)
+    } finally {
+      survivor.kill('SIGKILL')
+      await exited
+    }
   })
 
   it('treats a non-zero exit as failure unless the caller allows it', async () => {
