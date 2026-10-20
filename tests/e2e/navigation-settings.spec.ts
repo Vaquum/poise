@@ -544,6 +544,7 @@ test('native touch scrolls content, drags through the gutter and taps close with
     await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: point(target.x + 20, target.y + 3) })
     await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
     await expect(page.locator('#top-nav .nav-item').first()).toHaveText('Logging')
+    await settled(page)
     const removeButton = page.getByRole('button', { name: 'Remove Logging from top bar', exact: true })
     const close = (await removeButton.boundingBox())!
     await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: point(close.x + close.width / 2, close.y + close.height / 2) })
