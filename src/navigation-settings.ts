@@ -53,6 +53,9 @@ export function navigationSection(): HTMLElement {
     status.classList.remove('st-help-error')
     status.textContent = message
   }
+  function preventNativeDragScroll(event: TouchEvent): void {
+    if (pickup?.mode === 'pointer') event.preventDefault()
+  }
   function renderLists(preferences = getNavigation(), animate = false): void {
     const before = new Map<string, DOMRect>()
     for (const row of section.querySelectorAll<HTMLElement>('.st-navigation-row')) {
@@ -68,6 +71,10 @@ export function navigationSection(): HTMLElement {
         <button type="button" class="st-navigation-handle" data-pickup="${key}" data-source="${surface}" data-navigation-focus="${surface}-${key}" aria-label="Arrange ${label} in ${surfaceName(surface)}" aria-describedby="st-navigation-instructions">${GRIP}<span>${label}</span></button>
         <button type="button" class="st-navigation-remove" data-remove="${key}" data-surface="${surface}" data-navigation-focus="remove-${surface}-${key}" aria-label="Remove ${label} from ${surfaceName(surface)}">${CLOSE}</button>
       </li>`).join('') + (target && pickup!.index >= items.length ? gap : '') + (!items.length && !target ? '<li class="st-navigation-empty">Drop a view here</li>' : '')
+    }
+    // Native touch stays targeted at the original handle after preview replaces it.
+    for (const handle of section.querySelectorAll<HTMLElement>('[data-pickup]')) {
+      handle.addEventListener('touchmove', preventNativeDragScroll, { passive: false })
     }
     if (animate) for (const row of section.querySelectorAll<HTMLElement>('.st-navigation-row')) {
       const previous = before.get(row.dataset.row!)

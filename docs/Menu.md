@@ -28,7 +28,9 @@ arrange, Home/End reach the ends, Left chooses Top bar, Right chooses Menu,
 and Space/Enter drops. Escape cancels and returns focus to the origin; Escape
 while idle closes Settings. Tab cancels and continues traversal. Position and
 completion are announced. Short panels scroll within Settings, including during
-a held drag; narrow panels stack the two areas. External preference changes,
+a held drag. Native touch movement is consumed during a held drag so the next
+tap can activate normally; panning outside a drag remains available. Narrow
+panels stack the two areas. External preference changes,
 panel dismissal, resize and focus/typography changes discard an active move.
 
 Changes apply immediately and stay in this browser, including across reloads
