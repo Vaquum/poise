@@ -40,7 +40,11 @@ CLI result independently, with pending checks and failures named alongside it.
 External font stylesheets load after first paint; system fonts keep the app
 usable while typography is unavailable or still loading.
 Returning to Editor keeps the open document, draft, selection and undo history;
-its document picker refreshes in the background. Other views keep their cached
+its document picker refreshes in the background. Undo and redo history also survive
+app updates and refreshes in the same browser tab, separately for each document
+(up to 300 steps per stack). History restores only when the saved text still
+matches; external edits start a new timeline. An update waits if browser storage
+cannot preserve history. Other views keep their cached
 content usable while a refresh runs, and leaving stops their visible-only work
 even when an earlier read has not finished.
 

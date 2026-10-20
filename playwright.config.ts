@@ -3,7 +3,10 @@ import { mkdirSync, mkdtempSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { isolatedEnvironment } from './tests/fixtures/cli-isolation'
 
-const port = 5566
+const port = Number(process.env.POISE_E2E_PORT ?? 5566)
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  throw new Error('POISE_E2E_PORT must be an integer from 1 to 65535')
+}
 const baseURL = `http://127.0.0.1:${port}`
 const e2eRoot = resolve('test-results/e2e')
 

@@ -1,7 +1,8 @@
 import { scrollToActor } from '../motion'
 import { retire, reveal, watchPanel } from '../motion'
 import { patchContent } from '../dom-patch'
-import { registerReloadGuard } from '../self-update-watch'
+import { registerReloadGuard, registerReloadSnapshot } from '../self-update-watch'
+import { editorHistoryKey, HISTORY_LIMIT, readEditorHistory, writeEditorHistory, type EditorHistoryEntry } from '../editor-history'
 import { ICON_PUBLISH, closePublishPanel, togglePublishPanel } from './editor-publish'
 import { EditorReviews } from './editor-reviews'
 import type { ArticleReview } from '../publishing-review'
@@ -1136,13 +1137,6 @@ function serializeDoc(): string {
 // caret position, and own Cmd+Z / Cmd+Shift+Z outright. Documents here
 // are capped at 5 MiB and typically a few KB, so full snapshots are far
 // cheaper than tracking deltas correctly.
-interface EditorHistoryEntry {
-  text: string       // full markdown, exactly as serializeDoc yields it
-  line: number       // caret line index
-  offset: number     // caret offset within that line's source text
-}
-
-const HISTORY_LIMIT = 300
 // Plain typing coalesces into one undo step until this much idle time
 // passes; structural edits close the step immediately.
 const HISTORY_COALESCE_MS = 450
@@ -1155,6 +1149,22 @@ let historyBatchTimer: number | null = null
 // Set while we rebuild the document from a snapshot, so the resulting
 // DOM churn doesn't record history of its own.
 let historySuppress = false
+
+function persistEditorHistory(): boolean {
+  if (!currentSlug || !docEl || currentSlug === deletingSlug) return true
+  try {
+    writeEditorHistory(sessionStorage, currentSlug, {
+      version: 1, current: captureHistoryEntry(), undo: historyUndo, redo: historyRedo,
+    })
+    return true
+  } catch (error) {
+    console.error('[editor] history could not be preserved:', error)
+    setMeta('Undo history could not be preserved — browser storage unavailable')
+    return false
+  }
+}
+
+registerReloadSnapshot(persistEditorHistory)
 
 function captureHistoryEntry(): EditorHistoryEntry {
   const pos = caretSourcePosition()
@@ -2276,6 +2286,7 @@ async function loadDoc(slug: string) {
     // in flight. Drain once more so keystrokes made during that request
     // cannot be stranded when currentSlug changes below.
     if (!(await flushBeforeLeavingDocument('switch documents')) || requestId !== loadRequestId) return
+    if (!persistEditorHistory()) return
     currentSlug = nextSlug
     articleReviews?.clear()
     documentVersions.set(currentSlug, data.version)
@@ -2283,11 +2294,26 @@ async function loadDoc(slug: string) {
     // History is per-document: undo must never walk back into the
     // previous document's text and save it over this one.
     resetEditorHistory()
+    let restored: EditorHistoryEntry | null = null
+    try {
+      const history = readEditorHistory(sessionStorage, currentSlug, data.content)
+      if (history) {
+        historyUndo = history.undo
+        historyRedo = history.redo
+        restored = history.current
+      }
+    } catch (error) {
+      console.error('[editor] history could not be restored:', error)
+    }
     try { localStorage.setItem(LAST_OPEN_KEY, currentSlug) } catch { /* ignore */ }
     setTriggerTitle()
     setMetaForCurrent()
     docEl.focus()
     placeCaretAtEnd()
+    if (restored) {
+      const line = docEl.children[Math.min(restored.line, docEl.children.length - 1)] as HTMLElement | undefined
+      if (line) setCursorOffsetInLine(line, Math.min(restored.offset, (line.textContent || '').length))
+    }
     // Annotations live alongside the doc — load and render in parallel
     // with the markdown so the underlines appear when the doc does.
     await fetchAnnotations(currentSlug)
@@ -2376,6 +2402,9 @@ async function deleteCurrent() {
   // The deleted document must stop being an editable current target before
   // the replacement's async fetches begin. Otherwise keystrokes during that
   // gap can enqueue the old slug and recreate the file we just removed.
+  try { sessionStorage.removeItem(editorHistoryKey(d.slug)) } catch (error) {
+    console.error('[editor] deleted history could not be removed:', error)
+  }
   documentVersions.delete(d.slug)
   annotationsVersions.delete(d.slug)
   currentSlug = null
@@ -4726,6 +4755,7 @@ function onEditorPageHide(event: PageTransitionEvent): void {
   // persist on every transition. Per-client revisions make a beacon safe even
   // when an older fetch is still in flight.
   void event
+  persistEditorHistory()
   sendPendingEditorBeacons()
 }
 

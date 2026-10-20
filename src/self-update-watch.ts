@@ -27,6 +27,14 @@ export function registerDraftProvider(provider: DraftProvider): () => void {
   return () => { if (draftProvider === provider) draftProvider = null }
 }
 
+const reloadSnapshots = new Set<() => boolean>()
+
+/** Views with reload-sensitive state persist it before the page can leave. */
+export function registerReloadSnapshot(snapshot: () => boolean): () => void {
+  reloadSnapshots.add(snapshot)
+  return () => { reloadSnapshots.delete(snapshot) }
+}
+
 let lastActivity = 0
 
 // ── Draft snapshot ───────────────────────────────────────────────────────
@@ -142,7 +150,7 @@ export function installSelfUpdateWatch(opts: { browserSha?: string | null, fetch
   /** Save drafts, record the release, go. Returns the banner to show instead when it cannot. */
   function reload(explicit: boolean, pending: { sha: string, releaseId: string }): ReloadPlan | null {
     if (reloading) return null
-    if (!snapshotDrafts()) {
+    if (![...reloadSnapshots].every((snapshot) => snapshot()) || !snapshotDrafts()) {
       return { action: 'banner', pending, blockers: ['snapshot'], requested: explicit, exhausted: controller.exhausted(pending) }
     }
     if (!controller.markReloading(pending, explicit)) {

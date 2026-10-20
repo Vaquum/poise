@@ -643,6 +643,82 @@ test.describe('on a release build', () => {
     await expect.poll(() => loads).toBe(2)
   })
 
+  for (const refresh of ['automatic', 'explicit', 'storage-full'] as const) test(`Editor undo and redo survive ${refresh} update reloads`, async ({ page }) => {
+    const state = makeState([session()])
+    state.health = NEW_BUILD
+    const version = 'e'.repeat(64)
+    let content = 'original'
+    state.editor = async (path, method, route) => {
+      if (path === '/api/editor/docs') { await route.fulfill({ json: { docs: [{ slug: 'notes', title: 'Notes', updated_at: NOW, size: content.length }, { slug: 'other', title: 'Other', updated_at: NOW, size: 5 }] } }); return }
+      if (path === '/api/editor/doc/notes/annotations') { await route.fulfill({ json: { annotations: [], version } }); return }
+      if (path === '/api/editor/doc/notes' && method === 'GET') { await route.fulfill({ json: { slug: 'notes', content, version } }); return }
+      if (path === '/api/editor/doc/other' && method === 'GET') { await route.fulfill({ json: { slug: 'other', content: 'other', version } }); return }
+      if (path === '/api/editor/doc/notes' && method === 'PUT') {
+        content = route.request().postDataJSON().content
+        await route.fulfill({ json: { version, title: 'Notes', updated_at: NOW, size: content.length } }); return
+      }
+      await route.fulfill({ json: {} })
+    }
+    await installRoutes(page, state)
+    await installSocket(page)
+    let loads = 0
+    page.on('load', () => { loads++ })
+    await page.goto(release.baseURL)
+    await page.locator('.nav-item[data-view="editor"]').click()
+    const doc = page.locator('#editor-doc')
+    await expect(doc).toHaveText('original')
+    await doc.press('ControlOrMeta+End')
+    await page.keyboard.type(' first')
+    await expect(page.locator('#editor-meta')).toContainText('saved')
+    await page.keyboard.type(' second')
+    await expect(page.locator('#editor-meta')).toContainText('saved')
+    await doc.press('ControlOrMeta+z')
+    await expect(doc).toHaveText('original first')
+    await expect(page.locator('#editor-meta')).toContainText('saved')
+    if (refresh === 'storage-full') {
+      await page.evaluate(() => {
+        const original = Storage.prototype.setItem
+        Storage.prototype.setItem = function (key, value) {
+          if (key.startsWith('poise-editor-history:')) throw new Error('storage full')
+          original.call(this, key, value)
+        }
+        Object.assign(window, { restoreHistoryStorage: () => { Storage.prototype.setItem = original } })
+      })
+    }
+    if (refresh === 'storage-full') {
+      await page.locator('.editor-doc-trigger').click()
+      await page.locator('.editor-doc-item[data-slug="other"]').click()
+      await expect(page.locator('#editor-meta')).toContainText('Undo history could not be preserved')
+      await expect(doc).toHaveText('original first')
+    }
+    // The update must preserve the hidden Editor too.
+    await page.locator('.nav-item[data-view="chat"]').click()
+    const banner = page.locator('.self-update-banner')
+    await expect(banner).toBeVisible()
+    if (refresh !== 'automatic') await banner.locator('.self-update-refresh').click()
+    if (refresh === 'storage-full') {
+      await expect(banner).toContainText('saving drafts locally')
+      await page.waitForTimeout(2_500)
+      expect(loads).toBe(1)
+      await page.evaluate(() => { (window as unknown as { restoreHistoryStorage(): void }).restoreHistoryStorage() })
+    }
+    await expect.poll(() => loads, { timeout: 25_000 }).toBe(2)
+    await page.locator('.nav-item[data-view="editor"]').click()
+    await expect(doc).toHaveText('original first')
+    await doc.press('ControlOrMeta+Shift+z')
+    await expect(doc).toHaveText('original first second')
+    await doc.press('ControlOrMeta+z')
+    await expect(doc).toHaveText('original first')
+    await doc.press('ControlOrMeta+z')
+    await expect(doc).toHaveText('original')
+    await expect(page.locator('#editor-meta')).toContainText('saved')
+    // Redo survives an ordinary refresh as well as an update.
+    await page.reload()
+    await expect(doc).toHaveText('original')
+    await doc.press('ControlOrMeta+Shift+z')
+    await expect(doc).toHaveText('original first')
+  })
+
   test('an explicit Refresh goes past a pending question but not past a half-typed answer', async ({ page }) => {
     const state = makeState([session({ status: 'waiting', pendingRequests: ['q1'] })])
     state.history.s1 = [
