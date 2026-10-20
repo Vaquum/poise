@@ -34,6 +34,13 @@ Both assertion cleanup and test teardown release the hold and destroy the
 request before stopping the runtime, including after the unchanged 20-second
 test deadline leaves an event pending.
 
+The Analytics midnight browser regression observes each selected day's exact
+year-history bounds and organization scope, then waits for the history charts
+to render before navigating again or checking read counts. Selected-day request
+admission precedes its response and the deliberately deferred history read; it
+is not a completion signal. The original pace, calendar, request-count and
+midnight deduplication assertions remain intact.
+
 ## Profile a run
 
 CI uploads `unit-timings-1` and `unit-timings-2` (Vitest JSON with per-test

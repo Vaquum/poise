@@ -1724,8 +1724,17 @@ test('retains the selected calendar date and completes its pace comparison acros
   await openAnalytics(page)
   const panel = page.locator('#view-analytics')
   const merged = countTrend(page)
+  const expectHistory = async (selectedDay: string) => {
+    const selected = Date.parse(`${selectedDay}T00:00:00.000Z`)
+    await expect.poll(() => state.historyReads.at(-1)).toEqual({
+      bounds: Array.from({ length: 53 }, (_, i) => new Date(selected - (52 - i) * 7 * 86_400_000).toISOString()),
+      org: null,
+    })
+    await expect(panel.locator('.analytics-history-line')).toHaveCount(15)
+  }
   await expect(panel.locator('.analytics-date')).toHaveText('Today')
   await expect(merged).toContainText('Typical by now: 27.0 · 7-day median: 27.0 / day')
+  await expectHistory('2026-10-09')
   await page.clock.fastForward(60_000)
   await expect(panel.locator('.analytics-date')).toHaveText('Yesterday')
   await expect(merged.locator('.analytics-value')).toHaveText('15')
@@ -1735,12 +1744,16 @@ test('retains the selected calendar date and completes its pace comparison acros
   expect(state.reads).toHaveLength(4)
   expect(state.historyReads).toHaveLength(1)
   await panel.getByRole('button', { name: 'Previous day' }).click()
+  await expect(panel.locator('.analytics-date')).toHaveText('8 Oct 2026')
+  await expectHistory('2026-10-08')
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await expect(panel.locator('.analytics-date')).toHaveText('7 Oct 2026')
+  await expectHistory('2026-10-07')
   await page.clock.setFixedTime(new Date('2026-10-10T00:01:00Z'))
   await panel.getByRole('button', { name: 'Previous day' }).click()
   await expect(panel.locator('.analytics-date')).toHaveText('6 Oct 2026')
   await expect.poll(() => state.reads.at(-2)?.since).toBe('2026-10-06T00:00:00.000Z')
+  await expectHistory('2026-10-06')
   expect(state.reads).toHaveLength(10)
   expect(state.historyReads).toHaveLength(4)
 })
