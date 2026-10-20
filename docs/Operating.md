@@ -141,6 +141,7 @@ describes every setting with an example. These are required:
 | `POISE_DOMAIN` | The apex, for example `poise.example.com` |
 | `POISE_GITHUB_CLIENT_ID` | The OAuth App's client ID |
 | `POISE_GITHUB_CLIENT_SECRET` | The OAuth App's client secret |
+| `POISE_GOOGLE_CLIENT_ID`, `POISE_GOOGLE_CLIENT_SECRET` | Optional Google client pair, configured once; [Google connections](Google-connections.md#operator-configuration) |
 | `POISE_ADMINS` | GitHub logins that administer this Poise, separated by commas |
 | `POISE_ACME_EMAIL` | The address Let's Encrypt writes to about certificates; not needed behind your own proxy |
 

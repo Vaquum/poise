@@ -4,8 +4,8 @@ import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-const mocks = vi.hoisted(() => ({ accounts: vi.fn(), settings: vi.fn(), configure: vi.fn(), connection: vi.fn(), read: vi.fn(), create: vi.fn(), update: vi.fn(), id: vi.fn() }))
-vi.mock('../server/google/accounts', async original => ({ ...(await original<typeof import('../server/google/accounts')>()), googleAccounts: mocks.accounts, googleAccountSettings: mocks.settings, configureGoogle: mocks.configure, googleConnectionVersion: mocks.connection }))
+const mocks = vi.hoisted(() => ({ accounts: vi.fn(), settings: vi.fn(), disconnect: vi.fn(), connection: vi.fn(), read: vi.fn(), create: vi.fn(), update: vi.fn(), id: vi.fn() }))
+vi.mock('../server/google/accounts', async original => ({ ...(await original<typeof import('../server/google/accounts')>()), googleAccounts: mocks.accounts, googleAccountSettings: mocks.settings, disconnectGoogle: mocks.disconnect, googleConnectionVersion: mocks.connection }))
 vi.mock('../server/google/drive', () => ({ readGoogleFile: mocks.read, createGoogleFile: mocks.create, updateGoogleFile: mocks.update, googleFileId: mocks.id }))
 vi.mock('node:fs/promises', async original => { const actual = await original<typeof import('node:fs/promises')>(); return { ...actual, open: vi.fn(actual.open) } })
 let root: string, server: Server, base: string
@@ -26,7 +26,7 @@ beforeEach(async () => {
   const { HttpError } = await import('../server/http')
   await editor.writeDoc(slug, body); raw = null; etag = '"revision-one"'
   mocks.accounts.mockReturnValue([{ id: 'one', email: 'one@example.com', connected: true }, { id: 'two', email: 'two@example.com', connected: true }])
-  mocks.configure.mockReset(); mocks.settings.mockReturnValue({ configured: true, accounts: mocks.accounts() })
+  mocks.disconnect.mockReset(); mocks.settings.mockReturnValue({ configured: true, accounts: mocks.accounts() })
   mocks.id.mockResolvedValue(fileId); mocks.connection.mockReturnValue('connection-one')
   mocks.read.mockReset().mockImplementation(async () => { if (raw === null) throw new HttpError(404, 'missing'); return { raw, etag, file: { id: fileId, name: 'A draft.md', mimeType: 'text/markdown' } } })
   mocks.create.mockReset().mockImplementation(async (_account, _id, _title, text: string) => { raw = text })
@@ -195,19 +195,19 @@ it('refuses import before touching a replacement draft when its reviewed binding
   expect(await editor.readGoogleLedger(slug)).toEqual([])
   await expect(readdir(join(root, 'editor', '.google-history', slug))).rejects.toMatchObject({ code: 'ENOENT' })
 })
-it('serializes OAuth configuration changes behind admitted publication work', async () => {
+it('serializes Google disconnection behind admitted publication work', async () => {
   await publish(); await editor.writeDoc(slug, body + '\nNew local text.')
   let release!: () => void, started!: () => void
   const held = new Promise<void>(resolve => { release = resolve }), pending = new Promise<void>(resolve => { started = resolve })
   mocks.update.mockImplementationOnce(async () => { started(); await held })
   const publication = publish(); await pending
-  const configuring = fetch(`${base}/api/google/config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ clientId: 'proof.apps.googleusercontent.com', clientSecret: 'private-test-client', origin: base }) })
+  const disconnecting = fetch(`${base}/api/google/disconnect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId: 'one' }) })
   await new Promise(resolve => setTimeout(resolve, 100))
-  expect(mocks.configure).not.toHaveBeenCalled()
+  expect(mocks.disconnect).not.toHaveBeenCalled()
   release()
   expect((await publication).status).toBe(200)
-  expect((await configuring).status).toBe(200)
-  expect(mocks.configure).toHaveBeenCalledTimes(1)
+  expect((await disconnecting).status).toBe(200)
+  expect(mocks.disconnect).toHaveBeenCalledTimes(1)
 })
 it('rejects a reviewed publication on a replacement draft before reserving a new destination', async () => {
   await publish(); raw = body + '\nGoogle edit.'
@@ -217,4 +217,21 @@ it('rejects a reviewed publication on a replacement draft before reserving a new
   expect(await editor.readGoogleLedger(slug)).toEqual([])
   expect(mocks.id).toHaveBeenCalledTimes(1)
   expect(mocks.create).toHaveBeenCalledTimes(1)
+})
+it('retains the original destination and baseline when another Google app cannot authorize its file', async () => {
+  await publish()
+  const before = await editor.readGoogleLedgerState(slug), creates = mocks.create.mock.calls.length, updates = mocks.update.mock.calls.length
+  const { HttpError } = await import('../server/http')
+  for (const status of [422, 404]) {
+    mocks.read.mockRejectedValueOnce(new HttpError(status, 'This linked file is unavailable to the deployment Google app. Reconnecting cannot grant file access.'))
+    expect((await publish()).status).toBe(status)
+    expect(await editor.readGoogleLedgerState(slug)).toEqual(before)
+  }
+  expect(mocks.create).toHaveBeenCalledTimes(creates)
+  expect(mocks.update).toHaveBeenCalledTimes(updates)
+})
+it('refuses browser configuration without applying private setup', async () => {
+  const response = await fetch(`${base}/api/google/config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ clientId: 'proof.apps.googleusercontent.com', clientSecret: 'private-test-secret', origin: base }) })
+  expect(response.status).toBe(404)
+  expect(await response.text()).not.toContain('private-test-secret')
 })

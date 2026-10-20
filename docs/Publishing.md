@@ -225,26 +225,12 @@ private Markdown file in My Drive. Google Docs edits the `.md` file without
 conversion. One document can have one Google file per connected account, up to
 ten accounts. Google publishing is independent of website publishing.
 
-Settings → Accounts → Google OAuth setup accepts a Google **web application**
-OAuth client ID and secret. Enable Google Drive API in that client's Google Cloud
-project, configure its consent screen, and register the exact redirect URI shown
-in Settings (the Poise origin plus `/`). Add your accounts as test users while
-the consent screen is in Testing. Google can expire testing grants; reconnect
-when Google rejects a grant. Poise requests `openid`, `email` and `drive.file`,
-which covers files Poise creates. Existing arbitrary Drive files and folder
-selection are not supported. All users of a service deployment configure their
-own client in their isolated workspace. Changing client IDs requires disconnecting
-connected accounts first. Disconnect forgets the local grant and leaves remote
-files and other applications' grants intact.
-
-Credentials remain in the workspace's private SQLite database (mode 0600), never
-in browser responses or agent process environments. The OAuth code exchange
-uses a one-time, ten-minute state, PKCE and a private binding kept in the
-connecting browser tab. The binding is posted only to Poise; it is never sent
-in the Google redirect URL. This also works through the service gateway, which
-intentionally strips workspace cookies.
-Google redirects to Poise's normal page; it then exchanges the code through a
-same-origin API request and removes OAuth parameters from the address bar.
+Connect Google in Accounts, or Add Google account directly from the Editor's
+Publish panel. Choose an account in Google's browser page and approve access.
+The operator configures one integration; no user client/secret setup is required.
+Connecting saves pending text and annotations, returns to that draft and selects
+the verified account without publishing. See [Google connections](Google-connections.md)
+for local/service configuration, status, recovery and migration limits.
 
 The Editor's Google Docs section displays native Markdown comments with their
 author, quoted passage, replies and resolution state. Open Google to reply or
@@ -281,13 +267,12 @@ remote file limit and the Editor's 5 MB text limit.
 
 ### Credentials, recovery and proof boundary
 
-Google client secrets, access tokens and refresh tokens are stored unencrypted
-in the workspace's private SQLite file. The operating-system user, unsandboxed
-agents running as that user, and the service operator can read them. Workspace
-backups contain them too and require the protections described in
-[Security → The host](../SECURITY.md#the-host). Browser API responses and upstream
-error messages never include these credentials. OAuth client configuration is
-per workspace; it does not require sharing a secret through the gateway.
+Service grants are encrypted in the gateway's private vault, isolated by immutable
+owner and Google subject. The app secret and refresh grants never reach workspaces
+or the browser; only admitted workspace operations receive short-lived access
+tokens. Local direct credentials retain the local OS-user trust boundary.
+[Google connections](Google-connections.md#service-trust-and-persistence) defines
+storage, backup/key rotation, bounded delegation and reconnect behavior.
 
 Disconnect waits for admitted Google publish/import work to settle, then forgets
 the grant. It supersedes older unfinished OAuth flows. Client configuration

@@ -97,9 +97,10 @@ workspace cannot offer.
 
 ## Google accounts
 
-Google connections appear separately below the CLI accounts. Configure a Google
-web OAuth client once per workspace, then Connect Google account for each email.
-Each publication is bound to the selected account's stable Google identity,
-even after reconnecting. Disconnect removes that account's local credentials
-without removing its documents. Setup, scopes and Editor behavior are described
-in [Publishing → Google Docs](Publishing.md#google-docs).
+Google connections use the same account rows and compact status text below the
+CLI accounts. Connect Google opens ordinary browser account selection and consent;
+Add Google account connects another email. Reconnect verifies the same stable
+Google identity. Disconnect forgets that owner's grant and retains its documents.
+The operator configures the integration once; users enter no client IDs or secrets.
+[Google connections](Google-connections.md) describes the flow, saved-draft return,
+status, configuration and old-file authorization limits.

@@ -196,12 +196,15 @@ watchForSignOut()
 
 ;(async () => {
   const initialView = menu.currentView()
-  const logging = new URLSearchParams(location.search).get('view') === 'logging'
-  // Personal documents and snippets do not depend on GitHub settings.
-  const openedEarly = !logging && (initialView === 'editor' || initialView === 'snippets')
+  const query = new URLSearchParams(location.search)
+  const logging = query.get('view') === 'logging'
+  const googleReturning = query.has('google_state') || (query.has('state') && (query.has('code') || query.has('error')))
+  // Personal views open independently; a Google return must restore its draft first.
+  const openedEarly = !logging && !googleReturning && (initialView === 'editor' || initialView === 'snippets')
   if (openedEarly) showView(initialView)
   const [googleReturned] = await Promise.all([finishGoogleConnection(), loadSettings()])
-  if (logging) menu.switchTo('logging')
+  if (googleReturned === 'publish') menu.switchTo('editor')
+  else if (logging) menu.switchTo('logging')
   else if (!openedEarly || menu.currentView() !== initialView) showView(menu.currentView())
   prepareAnalyticsView()
   // Single shared refresh clock — every view listens for poise:refresh-tick
@@ -221,7 +224,8 @@ watchForSignOut()
   const place = takeServicePlace()
   // A workspace that still has to be set up opens first-run setup instead, at
   // pairing when Poise Link sent the person here.
-  if (googleReturned) { openSettingsAt('accounts'); return }
+  if (googleReturned === 'accounts') { openSettingsAt('accounts'); return }
+  if (googleReturned === 'publish') return
   if (await startOnboarding(place)) return
   if (place) {
     void openServicePlace(place)

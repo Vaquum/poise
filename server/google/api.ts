@@ -2,7 +2,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createHash } from 'node:crypto'
 import { HttpError, httpStatus, readJson } from '../http'
 import { EditorConflictError, importGoogleDocument, readDoc, readGoogleDocumentState, readGoogleLedger, readGoogleLedgerState, withPublishLock, writeGoogleLedger } from '../editor'
-import { beginGoogleLogin, completeGoogleLogin, configureGoogle, disconnectGoogle, googleAccounts, googleAccountSettings, googleConnectionVersion } from './accounts'
+import { beginGoogleLogin, completeGoogleLogin, disconnectGoogle, googleAccounts, googleAccountSettings, googleConnectionVersion } from './accounts'
+import { readServiceConfig, type ServiceConfig } from '../service/config'
+import { withGoogleRequest } from './service'
 import { createGoogleFile, googleFileId, readGoogleFile, updateGoogleFile } from './drive'
 import { readGoogleMarkdown, updateGoogleMarkdown } from './markdown'
 import { releaseBackgroundPaused, trackReleaseBackground } from '../release-background'
@@ -44,7 +46,7 @@ async function publish(slug: string, input: Record<string, unknown>) {
     const records = ledger.records
     let ledgerVersion = ledger.version
     let record = records.find(r => r.accountId === id)
-    if (input.reviewedRemoteSha !== undefined && (!record || input.fileId !== record.fileId || input.connectionVersion !== googleConnectionVersion(id))) throw new HttpError(409, 'The Google connection or document binding changed after review.')
+    if (input.reviewedRemoteSha !== undefined && (!record || input.fileId !== record.fileId || input.connectionVersion !== await googleConnectionVersion(id))) throw new HttpError(409, 'The Google connection or document binding changed after review.')
     if (!record) {
       if (records.length >= 10) throw new HttpError(422, 'A document can have at most ten Google destinations.')
       // Reserve and persist the remote ID before a network write. An uncertain create cannot duplicate it.
@@ -80,19 +82,19 @@ async function publish(slug: string, input: Record<string, unknown>) {
 }
 async function review(slug: string, input: Record<string, unknown>): Promise<GoogleChangeReview> {
   const record = binding(await readGoogleLedger(slug), text(input.accountId, 'Google account'))
-  const connectionVersion = googleConnectionVersion(record.accountId)
+  const connectionVersion = await googleConnectionVersion(record.accountId)
   const [doc, remote] = await Promise.all([readDoc(slug), readGoogleFile(record.accountId, record.fileId)])
   const parsed = readGoogleMarkdown(remote.raw)
-  if (connectionVersion !== googleConnectionVersion(record.accountId)) throw new HttpError(409, 'The Google connection changed during review.')
+  if (connectionVersion !== await googleConnectionVersion(record.accountId)) throw new HttpError(409, 'The Google connection changed during review.')
   return { fileId: record.fileId, connectionVersion, localText: doc.content, remoteText: parsed.text, localVersion: doc.version, remoteSha: sha(remote.raw), comments: parsed.comments }
 }
 async function importChanges(slug: string, input: Record<string, unknown>) {
   const id = text(input.accountId, 'Google account'), version = text(input.localVersion, 'Document version'), remoteSha = text(input.remoteSha, 'Google version')
   return withPublishLock(async () => {
     const ledger = await readGoogleLedgerState(slug), records = ledger.records, record = binding(records, id)
-    if (input.fileId !== record.fileId || input.connectionVersion !== googleConnectionVersion(id)) throw new HttpError(409, 'The Google connection or document binding changed after review.')
+    if (input.fileId !== record.fileId || input.connectionVersion !== await googleConnectionVersion(id)) throw new HttpError(409, 'The Google connection or document binding changed after review.')
     const remote = await readGoogleFile(id, record.fileId)
-    if (input.connectionVersion !== googleConnectionVersion(id)) throw new HttpError(409, 'The Google connection changed during import.')
+    if (input.connectionVersion !== await googleConnectionVersion(id)) throw new HttpError(409, 'The Google connection changed during import.')
     if (sha(remote.raw) !== remoteSha) throw new HttpError(409, 'Google changed after the review opened. Review the latest version.')
     const parsed = readGoogleMarkdown(remote.raw)
     await importGoogleDocument(slug, parsed.text, version, ledger.version)
@@ -102,23 +104,27 @@ async function importChanges(slug: string, input: Record<string, unknown>) {
     return { ok: true, content: imported.content, version: imported.version }
   })
 }
-export async function handleGoogleApi(req: IncomingMessage, res: ServerResponse, url: string): Promise<boolean> {
+export async function handleGoogleApi(req: IncomingMessage, res: ServerResponse, url: string, service: ServiceConfig | null = readServiceConfig()): Promise<boolean> {
   const path = url.split('?')[0], match = /^\/api\/editor\/doc\/([A-Za-z0-9._-]+)\/google(?:\/(sync|publish|review|import))?$/.exec(path)
   if (!path.startsWith('/api/google/') && !match) return false
   const send = (status: number, body: unknown) => { res.statusCode = status; res.setHeader('Content-Type', 'application/json'); res.setHeader('Cache-Control', 'no-store'); res.end(JSON.stringify(body)); return true }
   let done: (() => void) | undefined
   try {
+    if (path === '/api/google/config') return send(404, { error: 'Google is configured by the Poise operator.' })
+    const accountAction = /^\/api\/google\/(accounts|connect|callback|disconnect)$/.exec(path)?.[1]
+    if (!accountAction && !match) return send(404, { error: 'Unknown Google action.' })
+    const purpose = accountAction === 'accounts' || accountAction === 'connect' || accountAction === 'callback' || accountAction === 'disconnect' ? accountAction : match?.[2] === 'publish' || match?.[2] === 'review' || match?.[2] === 'import' ? match[2] : 'sync'
+    return await withGoogleRequest(req, service, purpose, async () => {
     if (req.method === 'GET' && path === '/api/google/accounts') return send(200, googleAccountSettings())
     if (req.method === 'GET' && match && !match[2]) return send(200, await documentView(match[1], false))
     if (req.method !== 'POST') return send(405, { error: 'Use POST for Google actions.' })
     if (releaseBackgroundPaused()) throw new HttpError(503, 'Poise is installing an update; try again afterwards.')
     done = trackReleaseBackground()
-    const body = await readJson<Record<string, unknown>>(req)
+    const body = await readJson<Record<string, unknown>>(req, 16 * 1024)
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'A Google action object is required.')
-    if (path === '/api/google/config') return send(200, await withPublishLock(async () => { configureGoogle(body); return googleAccountSettings() }))
-    if (path === '/api/google/connect') return send(200, beginGoogleLogin(req, body))
-    if (path === '/api/google/callback') return send(200, await withPublishLock(async () => { await completeGoogleLogin(req, body); return googleAccountSettings() }))
-    if (path === '/api/google/disconnect') { return send(200, await withPublishLock(async () => { disconnectGoogle(text(body.accountId, 'Google account')); return googleAccountSettings() })) }
+    if (path === '/api/google/connect') return send(200, await beginGoogleLogin(req, body))
+    if (path === '/api/google/callback') return send(200, await withPublishLock(async () => { const connection = await completeGoogleLogin(req, body); return { ...googleAccountSettings(), connection } }))
+    if (path === '/api/google/disconnect') { return send(200, await withPublishLock(async () => { await disconnectGoogle(text(body.accountId, 'Google account')); return googleAccountSettings() })) }
     if (match) {
       if (match[2] === 'sync') return send(200, await documentView(match[1], true))
       if (match[2] === 'publish') return send(200, await publish(match[1], body))
@@ -126,6 +132,7 @@ export async function handleGoogleApi(req: IncomingMessage, res: ServerResponse,
       if (match[2] === 'import') return send(200, await importChanges(match[1], body))
     }
     return send(404, { error: 'Unknown Google action.' })
+    })
   } catch (error) {
     return send((error as NodeJS.ErrnoException).code === 'ENOENT' ? 404 : error instanceof EditorConflictError ? 409 : httpStatus(error, 500), { error: (error as Error).message })
   } finally { done?.() }

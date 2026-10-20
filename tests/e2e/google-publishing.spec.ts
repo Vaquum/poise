@@ -4,7 +4,7 @@ const VERSION = 'a'.repeat(64), REMOTE = 'b'.repeat(64), TEXT = '# Draft\n\nThe 
 const accounts = { configured: true, clientId: 'poise.apps.googleusercontent.com', origin: 'http://127.0.0.1:5566', accounts: [{ id: 'one', email: 'one@example.test', connected: true }, { id: 'two', email: 'two@example.test', connected: true }] }
 const publication = { accountId: 'one', fileId: 'file-one', title: 'Draft', url: 'https://docs.google.com/document/d/file-one/edit', sourceSha: VERSION, remoteSha: REMOTE, email: 'one@example.test', connected: true, remoteChanged: true, localChanged: true, comments: [{ id: 'c1', author: 'Reviewer', body: 'Please clarify.', quote: 'The local paragraph.', resolved: false, replies: [{ author: 'Second reviewer', body: 'Please also check the example.' }], start: 9, end: 29 }] }
 async function setup(page: Page, options: { initialSyncFailure?: boolean, remoteText?: string, emptyFirstLoad?: boolean } = {}) {
-  await workspace(page)
+  await workspace(page, 'current', undefined, { preserveOnReload: true })
   let content = TEXT
   const remoteText = options.remoteText ?? '# Draft\n\nThe Google paragraph.\n'
   let docListReads = 0
@@ -17,7 +17,7 @@ async function setup(page: Page, options: { initialSyncFailure?: boolean, remote
       if (options.emptyFirstLoad && method === 'POST') return route.fulfill({ status: 503, json: { error: 'Fixture draft creation unavailable.' } })
       return route.fulfill({ json: { docs: options.emptyFirstLoad && docListReads++ === 0 ? [] : [{ slug: 'google-draft', title: 'Draft', updated_at: '2026-10-20T08:00:00Z', size: content.length }] } })
     }
-    if (path === '/api/editor/doc/google-draft') return route.fulfill({ json: { slug: 'google-draft', content, version: VERSION } })
+    if (path === '/api/editor/doc/google-draft') { if (method === 'PUT') content = (route.request().postDataJSON() as { content: string }).content; return route.fulfill({ json: { slug: 'google-draft', content, version: VERSION } }) }
     if (path.endsWith('/chat-session')) return route.fulfill({ json: { session_id: 'editor-google-draft-1792487000000' } })
     if (path.endsWith('/annotations')) return route.fulfill({ json: { annotations: [], version: VERSION } })
     if (path.endsWith('/reviews') || path.endsWith('/reviews/sync')) return route.fulfill({ json: { reviews: [], checkedAt: null, active: false, stale: false, problems: [] } })
@@ -97,11 +97,11 @@ test('lists multiple Google connections and disconnects only the chosen account'
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
   await page.locator('#menu-popover').getByRole('button', { name: 'Accounts', exact: true }).click()
   const google = page.locator('.st-google-accounts')
-  await expect(google).toContainText('one@example.test · Connected')
-  await expect(google).toContainText('two@example.test · Connected')
+  await expect(google.locator('[data-google-account="one"]')).toContainText('Connected')
+  await expect(google.locator('[data-google-account="two"]')).toContainText('Connected')
   await google.getByRole('button', { name: 'Disconnect', exact: true }).first().click()
-  await expect(google).toContainText('one@example.test · Disconnected')
-  await expect(google).toContainText('two@example.test · Connected')
+  await expect(google.locator('[data-google-account="one"]')).toContainText('Disconnected')
+  await expect(google.locator('[data-google-account="two"]')).toContainText('Connected')
   expect(disconnected).toEqual({ accountId: 'one' })
 })
 test('retains the Poise draft when Google changes after review', async ({ page }) => {
@@ -156,7 +156,7 @@ test('OAuth return opens Accounts and displays the result without depending on w
   await page.evaluate(secret => sessionStorage.setItem('poise-google-login-secret', secret), browserSecret)
   await page.route('**/api/google/accounts', route => route.fulfill({ json: accounts }))
   let exchanged: unknown
-  await page.route('**/api/google/callback', route => { exchanged = route.request().postDataJSON(); return route.fulfill({ json: accounts }) })
+  await page.route('**/api/google/callback', route => { exchanged = route.request().postDataJSON(); return route.fulfill({ json: { ...accounts, connection: { outcome: 'connected', accountId: 'one' } } }) })
   await page.goto('/?code=proof-code&state=proof-state')
   await expect(page.locator('#settings-panel')).toBeVisible()
   await expect(page.locator('.st-google-accounts')).toBeVisible()
@@ -260,4 +260,234 @@ test('a failed first Google read stays visible and offers recovery', async ({ pa
   await google.getByRole('button', { name: 'Refresh Google', exact: true }).click()
   await expect(google).toContainText('Please clarify.')
   await expect(google.getByRole('alert')).toHaveCount(0)
+})
+
+const FLOW_STATE = 's'.repeat(43)
+async function retainedFlow(page: Page, place: 'accounts' | 'publish' = 'accounts', expectedAccountId?: string) {
+  await page.evaluate(({ state, place, expectedAccountId }) => sessionStorage.setItem('poise-google-flow', JSON.stringify({ secret: 'a'.repeat(64), state, createdAt: Date.now(), returnTo: place === 'publish' ? { place, slug: 'google-draft' } : { place }, ...(expectedAccountId ? { expectedAccountId } : {}) })), { state: FLOW_STATE, place, expectedAccountId })
+}
+for (const theme of ['light', 'dark']) test(`Google accounts reuse compact agent typography at narrow width in ${theme}`, async ({ page }, info) => {
+  await workspace(page)
+  await page.route('**/api/google/accounts', route => route.fulfill({ json: { ...accounts, accounts: [accounts.accounts[0], { ...accounts.accounts[1], connected: false, state: 'expired' }] } }))
+  await page.setViewportSize({ width: 420, height: 820 })
+  await page.evaluate(theme => { document.documentElement.dataset.theme = theme; document.documentElement.style.fontSize = '20px'; document.body.style.fontFamily = 'Georgia, serif' }, theme)
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover').getByRole('button', { name: 'Accounts', exact: true }).click()
+  const google = page.locator('.st-google-accounts')
+  await expect(google.locator('[data-google-account="two"] .st-account-state')).toHaveText('Needs sign-in')
+  await expect(google.getByRole('button', { name: 'Reconnect', exact: true })).toBeVisible()
+  await expect(google.locator('input, details, summary, code, .google-config')).toHaveCount(0)
+  await expect(google).not.toContainText(/Client ID|Client secret|redirect URI|Cloud/)
+  const sizes = await page.evaluate(() => {
+    const css = (selector: string) => { const s = getComputedStyle(document.querySelector(selector)!); return [s.fontSize, s.fontFamily, s.fontWeight, s.lineHeight] }
+    const panel = document.querySelector('#settings-panel .tp-body')!
+    return { name: css('.st-google-accounts .st-account-name'), agentName: css('.st-accounts .st-account-name'), status: css('.st-google-accounts .st-account-state'), agentStatus: css('.st-accounts .st-account-state'), overflow: panel.scrollWidth - panel.clientWidth }
+  })
+  expect(sizes.name).toEqual(sizes.agentName); expect(sizes.status).toEqual(sizes.agentStatus); expect(sizes.overflow).toBeLessThanOrEqual(1)
+  await page.screenshot({ path: info.outputPath(`google-accounts-${theme}.png`) })
+  await page.evaluate(() => { document.documentElement.style.removeProperty('font-size'); document.body.style.removeProperty('font-family') })
+  await google.screenshot({ path: info.outputPath(`google-accounts-default-${theme}.png`) })
+})
+test('central completion restores the exact draft and verified subject without publishing', async ({ page }) => {
+  const actions = await setup(page)
+  await retainedFlow(page, 'publish')
+  await page.evaluate(() => localStorage.setItem('poise-editor-last', 'a-different-draft'))
+  let completed: unknown
+  await page.route('**/api/google/callback', route => { completed = route.request().postDataJSON(); return route.fulfill({ json: { ...accounts, accounts: [...accounts.accounts].reverse(), connection: { outcome: 'connected', accountId: 'two' } } }) })
+  await page.goto('/?google_state=' + FLOW_STATE)
+  const panel = page.getByRole('dialog', { name: 'Publish', exact: true })
+  await expect(panel).toBeVisible()
+  await expect(page.locator('#editor-doc')).toContainText('The local paragraph.')
+  await expect(panel.getByLabel('Google publishing account')).toHaveValue('two')
+  await expect(panel.getByRole('status')).toHaveText('Google account connected.')
+  await expect(page.locator('#settings-panel')).not.toBeVisible()
+  expect(completed).toEqual({ state: FLOW_STATE, browserSecret: 'a'.repeat(64) })
+  expect(actions.some(a => a.path.endsWith('/publish') || a.path.endsWith('/google/import'))).toBe(false)
+  expect(new URL(page.url()).searchParams.has('google_state')).toBe(false)
+})
+test('cancelled Publish connection returns quietly to the saved draft without publishing', async ({ page }) => {
+  const actions = await setup(page); await retainedFlow(page, 'publish')
+  await page.route('**/api/google/callback', route => route.fulfill({ json: { ...accounts, connection: { outcome: 'cancelled' } } }))
+  await page.goto('/?google_state=' + FLOW_STATE)
+  await expect(page.getByRole('dialog', { name: 'Publish', exact: true }).getByRole('status')).toHaveText('Google sign-in cancelled.')
+  await expect(page.locator('#editor-doc')).toContainText('The local paragraph.')
+  expect(actions.some(a => a.path.endsWith('/publish'))).toBe(false)
+})
+for (const status of [409, 503]) test(`a failed${status} save refuses Google navigation and keeps the draft`, async ({ page }) => {
+  const actions = await setup(page)
+  let connections = 0
+  await page.route('**/api/google/connect', route => { connections++; return route.fulfill({ json: { url: 'https://accounts.google.com/o/oauth2/v2/auth?state=' + FLOW_STATE } }) })
+  await page.route('**/api/editor/doc/google-draft', route => route.request().method() === 'PUT' ? route.fulfill({ status, json: { error: 'The draft save was refused.' } }) : route.fallback())
+  await page.locator('#editor-doc').fill('An unsaved draft that must survive Google connection.')
+  await page.getByRole('button', { name: 'Publish', exact: true }).click()
+  const panel = page.getByRole('dialog', { name: 'Publish', exact: true })
+  await panel.getByRole('button', { name: 'Add Google account', exact: true }).click()
+  await expect(panel.getByRole('status')).toContainText('draft could not be saved')
+  await expect(page.locator('#editor-doc')).toContainText('An unsaved draft that must survive')
+  await expect(page.locator('#editor-doc')).toHaveAttribute('contenteditable', 'true')
+  expect(connections).toBe(0)
+  expect(actions.some(a => a.path.endsWith('/publish'))).toBe(false)
+})
+test('a held save finishes before connection and the saved text returns even without unload beacons', async ({ page }) => {
+  const actions = await setup(page)
+  await page.evaluate(() => { navigator.sendBeacon = () => false })
+  let release!: () => void, saving!: () => void, connected = 0
+  const held = new Promise<void>(r => { release = r }), started = new Promise<void>(r => { saving = r })
+  await page.route('**/api/editor/doc/google-draft', async route => { if (route.request().method() === 'PUT') { saving(); await held }; return route.fallback() })
+  await page.route('**/api/google/connect', route => { connected++; return route.fulfill({ json: { url: 'https://accounts.google.com/o/oauth2/v2/auth?state=' + FLOW_STATE } }) })
+  await page.route('https://accounts.google.com/**', route => route.fulfill({ contentType: 'text/html', body: '<p>Google consent fixture</p>' }))
+  await page.route('**/api/google/callback', route => route.fulfill({ json: { ...accounts, connection: { outcome: 'connected', accountId: 'two' } } }))
+  const text = ('The complete saved draft. ' + 'Additional saved words. '.repeat(4000)).trim()
+  await page.locator('#editor-doc').fill(text)
+  await page.getByRole('button', { name: 'Publish', exact: true }).click()
+  const panel = page.getByRole('dialog', { name: 'Publish', exact: true })
+  await panel.getByRole('button', { name: 'Add Google account', exact: true }).click()
+  await started
+  await expect(page.locator('#editor-doc')).toHaveAttribute('contenteditable', 'false')
+  expect(connected).toBe(0)
+  release()
+  await expect(page).toHaveURL(/accounts\.google\.com/)
+  expect(connected).toBe(1)
+  await page.goto('/?google_state=' + FLOW_STATE)
+  await expect(page.getByRole('dialog', { name: 'Publish', exact: true })).toBeVisible()
+  await expect(page.locator('#editor-doc')).toContainText('The complete saved draft.')
+  expect((await page.locator('#editor-doc').innerText()).trim()).toBe(text)
+  expect(actions.some(a => a.path.endsWith('/publish'))).toBe(false)
+})
+test('a missing original draft opens Accounts instead of another draft or publication', async ({ page }) => {
+  const actions = await setup(page); await retainedFlow(page, 'publish')
+  await page.route('**/api/editor/docs', route => route.fulfill({ json: { docs: [{ slug: 'different-draft', title: 'Different', updated_at: '', size: 10 }] } }))
+  await page.route('**/api/google/callback', route => route.fulfill({ json: { ...accounts, connection: { outcome: 'connected', accountId: 'two' } } }))
+  await page.goto('/?google_state=' + FLOW_STATE)
+  await expect(page.locator('.google-account-status')).toContainText('original draft is unavailable')
+  await expect(page.getByRole('dialog', { name: 'Publish', exact: true })).toHaveCount(0)
+  expect(actions.some(a => a.path.endsWith('/publish'))).toBe(false)
+})
+test('an opener clone inherits flow possession but only the first verified completion succeeds', async ({ page, context }) => {
+  await workspace(page, 'current', undefined, { preserveOnReload: true }); await retainedFlow(page)
+  await context.route('**/clone-proof', route => route.fulfill({ contentType: 'text/html', body: '<p>Tab clone fixture</p>' }))
+  const popup = page.waitForEvent('popup')
+  await page.evaluate(() => { window.open('/clone-proof', '_blank') })
+  const child = await popup
+  expect(await child.evaluate(() => sessionStorage.getItem('poise-google-flow'))).toBe(await page.evaluate(() => sessionStorage.getItem('poise-google-flow')))
+  await workspace(child, 'current', undefined, { preserveOnReload: true, path: '/clone-proof' })
+  let consumed = false, attempts = 0
+  for (const target of [page, child]) {
+    await target.route('**/api/google/accounts', route => route.fulfill({ json: accounts }))
+    await target.route('**/api/google/callback', route => { attempts++; if (consumed) return route.fulfill({ status: 403, json: { error: 'Google sign-in was already used.' } }); consumed = true; return route.fulfill({ json: { ...accounts, connection: { outcome: 'connected', accountId: 'one' } } }) })
+  }
+  await child.goto('/?google_state=' + FLOW_STATE)
+  await expect(child.locator('.google-account-status')).toHaveText('Google account connected.')
+  await page.goto('/?google_state=' + FLOW_STATE)
+  await expect(page.locator('.google-account-status')).toContainText('already used')
+  expect(attempts).toBe(2)
+  await child.close()
+})
+test('Reconnect from Accounts replaces stale Publish intent and binds the expected subject', async ({ page }) => {
+  await workspace(page, 'current', undefined, { preserveOnReload: true }); await retainedFlow(page, 'publish', 'one')
+  await page.route('**/api/google/accounts', route => route.fulfill({ json: { ...accounts, accounts: [accounts.accounts[0], { ...accounts.accounts[1], connected: false, state: 'expired' }] } }))
+  let connecting: { accountId?: string; browserSecret: string } | undefined
+  await page.route('**/api/google/connect', route => { connecting = route.request().postDataJSON() as typeof connecting; return route.fulfill({ json: { url: 'https://accounts.google.com/o/oauth2/v2/auth?state=' + FLOW_STATE } }) })
+  await page.route('https://accounts.google.com/**', route => route.fulfill({ contentType: 'text/html', body: '<p>Google consent fixture</p>' }))
+  await page.route('**/api/google/callback', route => route.fulfill({ json: { ...accounts, connection: { outcome: 'connected', accountId: 'two' } } }))
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover').getByRole('button', { name: 'Accounts', exact: true }).click()
+  await page.locator('[data-google-account="two"]').getByRole('button', { name: 'Reconnect', exact: true }).click()
+  await expect(page).toHaveURL(/accounts\.google\.com/)
+  expect(connecting?.accountId).toBe('two')
+  await page.goto('/?google_state=' + FLOW_STATE)
+  await expect(page.locator('.google-account-status')).toHaveText('Google account connected.')
+  await expect(page.getByRole('dialog', { name: 'Publish', exact: true })).toHaveCount(0)
+})
+test('unavailable browser storage keeps the saved draft on screen and never starts authorization', async ({ page }) => {
+  const actions = await setup(page)
+  let connected = 0
+  await page.route('**/api/google/connect', route => { connected++; return route.fulfill({ json: {} }) })
+  await page.evaluate(() => {
+    const original = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key: string, value: string) { if (key === 'poise-google-flow') throw new DOMException('disabled', 'SecurityError'); return original.call(this, key, value) }
+  })
+  await page.locator('#editor-doc').fill('A draft retained when browser storage is unavailable.')
+  await page.getByRole('button', { name: 'Publish', exact: true }).click()
+  const panel = page.getByRole('dialog', { name: 'Publish', exact: true })
+  await panel.getByRole('button', { name: 'Add Google account', exact: true }).click()
+  await expect(panel.getByRole('status')).toContainText('Browser storage is unavailable')
+  await expect(page.locator('#editor-doc')).toHaveAttribute('contenteditable', 'true')
+  await expect(page.locator('#editor-doc')).toContainText('A draft retained')
+  expect(connected).toBe(0)
+  expect(actions.some(a => a.path.endsWith('/publish'))).toBe(false)
+})
+test('pending annotations must be acknowledged before leaving for Google', async ({ page }) => {
+  await page.clock.install()
+  const actions = await setup(page)
+  let release!: () => void, saving!: () => void, connected = 0
+  const held = new Promise<void>(r => { release = r }), pending = new Promise<void>(r => { saving = r })
+  await page.route('**/api/editor/doc/google-draft/annotations', async route => {
+    if (route.request().method() !== 'GET') { saving(); await held }
+    return route.fallback()
+  })
+  await page.route('**/api/google/connect', route => { connected++; return route.fulfill({ json: { url: 'https://accounts.google.com/o/oauth2/v2/auth?state=' + FLOW_STATE } }) })
+  await page.route('https://accounts.google.com/**', route => route.fulfill({ contentType: 'text/html', body: '<p>Google consent fixture</p>' }))
+  await page.evaluate(() => {
+    const line = document.querySelector('#editor-doc')!.children[2], range = document.createRange()
+    range.selectNodeContents(line)
+    const selection = window.getSelection()!; selection.removeAllRanges(); selection.addRange(range)
+    document.dispatchEvent(new Event('selectionchange'))
+  })
+  await page.locator('#editor-comment-btn').click()
+  await page.getByRole('textbox', { name: 'Add a comment…', exact: true }).fill('Keep this annotation before connecting.')
+  await page.getByRole('button', { name: 'Publish', exact: true }).click()
+  await page.getByRole('dialog', { name: 'Publish', exact: true }).getByRole('button', { name: 'Add Google account', exact: true }).click()
+  await pending
+  await expect(page.locator('#editor-doc')).toHaveAttribute('contenteditable', 'false')
+  expect(connected).toBe(0)
+  release()
+  await expect(page).toHaveURL(/accounts\.google\.com/)
+  expect(connected).toBe(1)
+  expect(actions.some(a => a.path.endsWith('/annotations') && JSON.stringify(a.body).includes('Keep this annotation'))).toBe(true)
+  expect(actions.some(a => a.path.endsWith('/publish'))).toBe(false)
+})
+test('a disconnected return account never falls back to another publishing identity', async ({ page }) => {
+  const actions = await setup(page); await retainedFlow(page, 'publish')
+  await page.route('**/api/google/callback', route => route.fulfill({ json: { ...accounts, connection: { outcome: 'connected', accountId: 'two' } } }))
+  await page.route('**/api/google/accounts', route => route.fulfill({ json: { ...accounts, accounts: [accounts.accounts[0]] } }))
+  await page.goto('/?google_state=' + FLOW_STATE)
+  const panel = page.getByRole('dialog', { name: 'Publish', exact: true })
+  await expect(panel.getByRole('status')).toContainText('no longer connected')
+  await expect(panel.getByLabel('Google publishing account')).toHaveValue('')
+  await expect(panel.getByRole('button', { name: 'Publish to Google', exact: true })).toBeDisabled()
+  await expect(panel.getByRole('button', { name: 'Reconnect Google account', exact: true })).toBeVisible()
+  expect(actions.some(a => a.path.endsWith('/publish'))).toBe(false)
+  await panel.getByLabel('Google publishing account').selectOption('one')
+  await expect(panel.getByRole('button', { name: 'Publish to Google', exact: true })).toBeEnabled()
+  expect(actions.some(a => a.path.endsWith('/publish'))).toBe(false)
+})
+for (const place of ['accounts', 'publish'] as const) test(`persisted pageshow releases ${place} connection controls and Editor mutations`, async ({ page }) => {
+  await setup(page)
+  await page.route('**/api/google/connect', route => route.fulfill({ json: { url: 'https://accounts.google.com/o/oauth2/v2/auth?state=' + FLOW_STATE } }))
+  await page.route('https://accounts.google.com/**', route => route.abort('aborted'))
+  const aborted = page.waitForEvent('requestfailed', { predicate: req => req.isNavigationRequest() && req.url().startsWith('https://accounts.google.com/') })
+  if (place === 'accounts') {
+    await page.getByRole('button', { name: 'Menu', exact: true }).click()
+    await page.locator('#menu-popover').getByRole('button', { name: 'Accounts', exact: true }).click()
+    await page.locator('.st-google-accounts').getByRole('button', { name: 'Add Google account', exact: true }).click({ noWaitAfter: true })
+  } else {
+    await page.getByRole('button', { name: 'Publish', exact: true }).click()
+    await page.getByRole('dialog', { name: 'Publish', exact: true }).getByRole('button', { name: 'Add Google account', exact: true }).click({ noWaitAfter: true })
+  }
+  await aborted
+  // Cancel navigation before commit so the original document and its handlers
+  // remain available; exercise the persisted return without a hanging request.
+  const states = await page.evaluate(() => {
+    const editor = document.querySelector('#editor-doc')!
+    const before = editor.getAttribute('contenteditable')
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false }))
+    const ordinary = editor.getAttribute('contenteditable')
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))
+    return { before, ordinary, restored: editor.getAttribute('contenteditable') }
+  })
+  expect(states).toEqual({ before: 'false', ordinary: 'false', restored: 'true' })
+  await expect(page.locator('#editor-doc')).toHaveAttribute('contenteditable', 'true')
+  if (place === 'accounts') await expect(page.locator('.st-google-accounts').getByRole('button', { name: 'Add Google account', exact: true })).toBeEnabled()
+  else expect(await page.getByRole('dialog', { name: 'Publish', exact: true }).evaluate(el => (el as HTMLElement).inert)).toBe(false)
 })

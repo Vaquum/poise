@@ -15,6 +15,7 @@ Everything comes from the environment and is validated at startup. Every problem
 | `POISE_DOMAIN` | yes | | Apex host name with at least two labels, for example `poise.example.com` or `poise.localhost` |
 | `POISE_GITHUB_CLIENT_ID` | yes | | GitHub OAuth App client ID |
 | `POISE_GITHUB_CLIENT_SECRET` | yes | | GitHub OAuth App client secret |
+| `POISE_GOOGLE_CLIENT_ID`, `POISE_GOOGLE_CLIENT_SECRET` | together, optional | disabled | Deployment Google web client; [configuration and trust](../docs/Google-connections.md) |
 | `POISE_ADMINS` | yes | | GitHub logins that may use Settings → Admin and `/admin`; admins may always sign in |
 | `POISE_ALLOWED_USERS` | | | Logins seeded into the allow list |
 | `POISE_ALLOWED_ORGS` | | | Organisations whose active members may sign in; adds the `read:org` scope |

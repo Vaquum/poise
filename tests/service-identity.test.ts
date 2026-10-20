@@ -137,3 +137,9 @@ describe('assertion scope by route', () => {
     }
   })
 })
+
+it('accepts only a signed bounded gateway port on browser assertions', () => {
+  expect(verifyAt(at({ gport: 8080 }))).toEqual({ ok: true, assertion: { subject: OWNER, scope: 'browser', gatewayPort: 8080 } })
+  for (const value of [0, -1, 65536, 1.5, '8080', null]) expect(refused(at({ gport: value }))).toBe('the identity assertion has an invalid gateway port')
+  for (const scope of ['link', 'admin']) expect(refused(at({ scope, gport: 8080 }))).toBe('the identity assertion has an invalid gateway port')
+})

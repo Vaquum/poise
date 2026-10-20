@@ -20,6 +20,7 @@ export interface Config {
   insecureHttp: boolean
   githubClientId: string
   githubClientSecret: string
+  google: { clientId: string; clientSecret: string } | null
   githubUrl: string
   githubApiUrl: string
   allowedUsers: string[]
@@ -125,6 +126,10 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
 
   const githubClientId = required('POISE_GITHUB_CLIENT_ID', 'the GitHub OAuth App client ID')
   const githubClientSecret = required('POISE_GITHUB_CLIENT_SECRET', 'the GitHub OAuth App client secret')
+  const googleClientId = read('POISE_GOOGLE_CLIENT_ID'), googleClientSecret = read('POISE_GOOGLE_CLIENT_SECRET')
+  if (!!googleClientId !== !!googleClientSecret) problems.push('POISE_GOOGLE_CLIENT_ID and POISE_GOOGLE_CLIENT_SECRET must be configured together')
+  if (googleClientId && !/^[A-Za-z0-9._-]{1,256}\.apps\.googleusercontent\.com$/.test(googleClientId)) problems.push('POISE_GOOGLE_CLIENT_ID must be a Google web OAuth client ID')
+  if (googleClientSecret && (!/^[A-Za-z0-9_-]+$/.test(googleClientSecret) || googleClientSecret.length > 4096)) problems.push('POISE_GOOGLE_CLIENT_SECRET is invalid')
 
   const serviceUrl = (name: string, standard: string): string => {
     const value = read(name) ?? standard
@@ -252,6 +257,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     insecureHttp,
     githubClientId,
     githubClientSecret,
+    google: googleClientId && googleClientSecret ? { clientId: googleClientId, clientSecret: googleClientSecret } : null,
     githubUrl,
     githubApiUrl,
     allowedUsers,

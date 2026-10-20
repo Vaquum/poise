@@ -18,6 +18,7 @@ export type AssertionScope = typeof ASSERTION_SCOPES[number]
 export interface IdentityAssertion {
   subject: string
   scope: AssertionScope
+  gatewayPort?: number
 }
 
 export interface AssertionExpectation {
@@ -72,7 +73,8 @@ export function verifyIdentityAssertion(token: string, expected: AssertionExpect
   if (exp - iat > ASSERTION_MAX_LIFETIME_SECONDS) return refuse('the identity assertion lives longer than 120 seconds')
   if (iat > nowSeconds + ASSERTION_SKEW_SECONDS) return refuse('the identity assertion is issued in the future')
   if (nowSeconds >= exp + ASSERTION_SKEW_SECONDS) return refuse('the identity assertion has expired')
-  return { ok: true, assertion: { subject: claims.sub, scope: claims.scope as AssertionScope } }
+  if (claims.gport !== undefined && (claims.scope !== 'browser' || typeof claims.gport !== 'number' || !Number.isInteger(claims.gport) || claims.gport < 1 || claims.gport > 65535)) return refuse('the identity assertion has an invalid gateway port')
+  return { ok: true, assertion: { subject: claims.sub, scope: claims.scope as AssertionScope, ...(typeof claims.gport === 'number' ? { gatewayPort: claims.gport } : {}) } }
 }
 
 /** Scopes by route: the browser reaches everything, a paired Poise Link only

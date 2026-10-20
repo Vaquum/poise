@@ -27,6 +27,7 @@ describe('configuration', () => {
       insecureHttp: false,
       githubClientId: 'id',
       githubClientSecret: 'secret',
+      google: null,
       githubUrl: 'https://github.com',
       githubApiUrl: 'https://api.github.com',
       allowedUsers: [],
@@ -203,4 +204,13 @@ describe('configuration', () => {
     expect(loadConfig({ ...BASE, POISE_GITHUB_URL: 'http://127.0.0.1:4000/', POISE_GITHUB_API_URL: 'http://localhost:4001' }))
       .toMatchObject({ githubUrl: 'http://127.0.0.1:4000', githubApiUrl: 'http://localhost:4001' })
   })
+})
+
+it('configures Google only as a complete deployment pair and never repeats secret values in errors', () => {
+  expect(loadConfig({ ...BASE, POISE_GOOGLE_CLIENT_ID: 'poise.apps.googleusercontent.com', POISE_GOOGLE_CLIENT_SECRET: 'private-google-secret' }).google).toEqual({ clientId: 'poise.apps.googleusercontent.com', clientSecret: 'private-google-secret' })
+  for (const values of [{ POISE_GOOGLE_CLIENT_ID: 'poise.apps.googleusercontent.com' }, { POISE_GOOGLE_CLIENT_SECRET: 'private-google-secret' }, { POISE_GOOGLE_CLIENT_ID: 'invalid-client', POISE_GOOGLE_CLIENT_SECRET: 'private-google-secret' }]) {
+    const result = problems({ ...BASE, ...values })
+    expect(result.join(' ')).toContain('POISE_GOOGLE_')
+    expect(result.join(' ')).not.toMatch(/private-google-secret|invalid-client/)
+  }
 })

@@ -13,6 +13,7 @@ import type { Orchestrator, UpstreamResolver } from './orchestrator.js'
 import { FONT_ORIGIN } from './pages.js'
 import type { Session, Store, User } from './store.js'
 import { LoggingQueryPool } from './diagnostics/query-pool.js'
+import { GoogleConnections } from './google.js'
 
 export const APEX_COOKIE = 'poise_gw'
 export const WORKSPACE_COOKIE = 'poise_ws'
@@ -44,6 +45,9 @@ export interface Principal {
 
 /** What every route needs: dependencies, the public origins and the session rules. */
 export class Context {
+  private googleBroker: GoogleConnections | null = null
+  get googleConnections(): GoogleConnections { return this.googleBroker ??= new GoogleConnections(this) }
+  closeGoogleConnections(): void { this.googleBroker?.close() }
   private loggingReader: LoggingQueryPool | null = null
   get loggingQueries(): LoggingQueryPool { return this.loggingReader ??= new LoggingQueryPool() }
   async closeLoggingReads(): Promise<void> { await this.loggingReader?.close() }
@@ -134,7 +138,7 @@ export class Context {
     }
   }
 
-  assertion(user: User, scope: Scope): string {
-    return signAssertion(this.deps.keys.privateKey, { handle: user.handle, login: user.login, scope }, this.deps.now())
+  assertion(user: User, scope: Scope, session?: Session): string {
+    return signAssertion(this.deps.keys.privateKey, { handle: user.handle, login: user.login, scope, ...(scope === 'browser' ? { gatewayPort: this.deps.config.port, ...(session ? { sessionIdHash: session.idHash } : {}) } : {}) }, this.deps.now())
   }
 }

@@ -15,6 +15,8 @@ export interface AssertionClaims {
   iat: number
   exp: number
   jti: string
+  sid?: string
+  gport?: number
 }
 
 export interface AssertionSubject {
@@ -22,6 +24,8 @@ export interface AssertionSubject {
   /** The GitHub login in GitHub's case. */
   login: string
   scope: Scope
+  sessionIdHash?: string
+  gatewayPort?: number
 }
 
 /** Signs the identity assertion the gateway sends to a workspace in X-Poise-Identity. */
@@ -35,6 +39,8 @@ export function signAssertion(privateKey: KeyObject, subject: AssertionSubject, 
     iat,
     exp: iat + ASSERTION_LIFETIME_SECONDS,
     jti: randomBytes(16).toString('base64url'),
+    ...(subject.scope === 'browser' && subject.sessionIdHash ? { sid: subject.sessionIdHash } : {}),
+    ...(subject.scope === 'browser' && subject.gatewayPort ? { gport: subject.gatewayPort } : {}),
   }
   const signingInput = `${HEADER}.${Buffer.from(JSON.stringify(claims)).toString('base64url')}`
   const signature = sign(null, Buffer.from(signingInput), privateKey).toString('base64url')

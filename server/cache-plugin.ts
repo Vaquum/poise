@@ -31,6 +31,7 @@ import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, write
 import { handleSnippetApi } from './snippet-api'
 import { handlePublishingApi } from './publishing-api'
 import { handleGoogleApi } from './google/api'
+import { validateGoogleEnvironment } from './google/accounts'
 import { getBehaviorDiagnosticIncidents } from './behaviors'
 import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
@@ -144,6 +145,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   // First: a malformed seed stops the start before anything is running.
   seedAgentAccount(opts.reviewAgentUsername)
   const service = serviceOf(opts)
+  validateGoogleEnvironment(!!service)
   if (service) applyServiceEnvironment()
   startLogging()
   void startBehaviorLedger()
@@ -1284,7 +1286,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           }
         }
 
-        if (await handleGoogleApi(req, res, url)) return
+        if (await handleGoogleApi(req, res, url, service)) return
         if (await handlePublishingApi(req, res, url)) return
         if (await handleSnippetApi(req, res, url)) return
 

@@ -48,3 +48,19 @@ describe('Google Drive conditional content access', () => {
     await expect(readGoogleFile('one', 'file')).rejects.toThrow()
   })
 })
+
+it('separates app-specific file authorization from account sign-in without making a mutation', async () => {
+  fake.mockResolvedValueOnce(Response.json({ error: { errors: [{ reason: 'appNotAuthorizedToFile' }] } }, { status: 403 }))
+  await expect(readGoogleFile('one', 'file')).rejects.toThrow('Reconnecting cannot grant file access')
+  fake.mockResolvedValueOnce(Response.json({ error: {} }, { status: 404 }))
+  await expect(readGoogleFile('one', 'file')).rejects.toThrow('reconnecting may not restore access')
+  expect(fake.mock.calls.every(call => !call[1]?.method)).toBe(true)
+  expect(credentials).not.toHaveBeenCalledWith('one', true)
+})
+it('probes authoritative grant revocation after Drive401 without replaying the remote request', async () => {
+  credentials.mockResolvedValueOnce('private-access').mockRejectedValueOnce(new Error('Google sign-in has ended. Reconnect this account.'))
+  fake.mockResolvedValueOnce(new Response('{}', { status: 401 }))
+  await expect(updateGoogleFile('one', 'file', 'draft', '"revision"')).rejects.toThrow('sign-in has ended')
+  expect(credentials).toHaveBeenCalledWith('one', true)
+  expect(fake).toHaveBeenCalledTimes(1)
+})

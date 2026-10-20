@@ -11,8 +11,8 @@ import { deviceState, hashSecret, type Session, type User } from './store.js'
 import { workspaceApi, WORKSPACE_API_PREFIX } from './workspace-api.js'
 
 type Authentication =
-  | { kind: 'ok'; scope: 'browser'; device: null }
-  | { kind: 'ok'; scope: 'link'; device: string }
+  | { kind: 'ok'; scope: 'browser'; device: null; session: Session }
+  | { kind: 'ok'; scope: 'link'; device: string; session?: never }
   | { kind: 'unauthenticated'; bearer: boolean; error: string; message: string }
   | { kind: 'forbidden'; message: string }
 
@@ -79,8 +79,9 @@ function authenticate(ctx: Context, req: IncomingMessage, owner: User): Authenti
     return { kind: 'ok', scope: 'link', device: device.id }
   }
   const sessions = ctx.workspaceSessions(req)
-  if (sessions.some((session) => isOwnSession(session, owner))) {
-    return ctx.isAllowed(owner) ? { kind: 'ok', scope: 'browser', device: null } : { kind: 'forbidden', message: ACCESS_REMOVED }
+  const session = sessions.find((session) => isOwnSession(session, owner))
+  if (session) {
+    return ctx.isAllowed(owner) ? { kind: 'ok', scope: 'browser', device: null, session } : { kind: 'forbidden', message: ACCESS_REMOVED }
   }
   if (sessions.length > 0) return { kind: 'forbidden', message: 'This workspace belongs to someone else.' }
   return { kind: 'unauthenticated', bearer: false, error: 'unauthorized', message: 'Sign in to use this workspace.' }
@@ -209,7 +210,7 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
   const readiness = await orchestrator.readiness(owner.handle, owner.login)
   if (!readiness.ready) return starting(ctx, req, res, owner, readiness.problem)
   const headers = forwardHeaders(req, {
-    assertion: ctx.assertion(owner, auth.scope),
+    assertion: ctx.assertion(owner, auth.scope, auth.session),
     proto: ctx.scheme,
     dropAuthorization: auth.scope === 'link',
   })
@@ -292,7 +293,7 @@ export async function workspaceUpgrade(ctx: Context, req: IncomingMessage, socke
     return
   }
   const headers = forwardHeaders(req, {
-    assertion: ctx.assertion(owner, auth.scope),
+    assertion: ctx.assertion(owner, auth.scope, auth.session),
     proto: ctx.scheme,
     dropAuthorization: auth.scope === 'link',
   })

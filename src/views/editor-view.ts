@@ -5,6 +5,7 @@ import { patchContent } from '../dom-patch'
 import { registerReloadGuard, registerReloadSnapshot } from '../self-update-watch'
 import { editorHistoryKey, HISTORY_LIMIT, readEditorHistory, writeEditorHistory, type EditorHistoryEntry } from '../editor-history'
 import { ICON_PUBLISH, closePublishPanel, togglePublishPanel } from './editor-publish'
+import { setGoogleConnectionResult, setGoogleNavigationGuard, takeGoogleConnectionResult, takeGooglePublishReturn } from '../google'
 import { EditorReviews } from './editor-reviews'
 import { GoogleDocuments } from './google-documents'
 import type { ArticleReview } from '../publishing-review'
@@ -2901,6 +2902,24 @@ async function flushEditorSaves(): Promise<boolean> {
   }
 }
 
+async function prepareGoogleNavigation(): Promise<() => void> {
+  if (googleImporting) throw new Error('Wait for the current Google action to finish before connecting.')
+  const slug = currentSlug, wasInert = viewEl.inert
+  googleImporting = true; viewEl.inert = true
+  if (docEl) docEl.contentEditable = 'false'
+  let released = false
+  const release = () => {
+    if (released) return
+    released = true; googleImporting = false; viewEl.inert = wasInert
+    if (docEl) docEl.contentEditable = currentSlug ? 'true' : 'false'
+  }
+  try {
+    if (!await flushEditorSaves()) throw new Error('The draft could not be saved. Keep it open and resolve the save before connecting Google.')
+    if (currentSlug !== slug) throw new Error('The open document changed. Connect Google again from that document.')
+    return release
+  } catch (error) { release(); throw error }
+}
+
 async function discardEditorSaves(): Promise<void> {
   clearSaveTimer()
   clearAnnotationsSaveTimer()
@@ -4911,6 +4930,7 @@ export async function initEditorView() {
       },
     })
     attachHandlers()
+    setGoogleNavigationGuard(prepareGoogleNavigation)
   }
   // The editor owns unsaved text, selection and undo history. A return only
   // refreshes its picker; reopening the same file would replace that state.
@@ -4930,6 +4950,20 @@ export async function initEditorView() {
 }
 
 async function openInitialDocument(): Promise<void> {
+  const returned = takeGooglePublishReturn()
+  if (returned) {
+    takeGoogleConnectionResult()
+    const read = await fetchDocs()
+    if (read && docs.some(d => d.slug === returned.slug)) await loadDoc(returned.slug)
+    if (!read || currentSlug !== returned.slug) {
+      setGoogleConnectionResult(`${returned.message} The original draft is unavailable. Open it in the Editor before publishing.`)
+      window.dispatchEvent(new CustomEvent('poise:open-settings', { detail: { section: 'accounts' } }))
+      return
+    }
+    const anchor = viewEl.querySelector<HTMLButtonElement>('.editor-publish-btn')!
+    togglePublishPanel(anchor, { slug: () => currentSlug, flush: flushEditorSaves, version: () => currentSlug ? documentVersions.get(currentSlug) ?? null : null, published: () => { void articleReviews?.synchronize(true) } }, returned)
+    return
+  }
   const listing = fetchDocs()
   let target: string | null = null
   try { target = localStorage.getItem(LAST_OPEN_KEY) } catch { /* ignore */ }

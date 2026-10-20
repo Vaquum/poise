@@ -1,6 +1,8 @@
-.google-publish { border-top: 1px solid var(--border); margin-top: 12px; padding: 12px; display: grid; gap: 10px; }
-.google-publish h3 { margin: 0; font-size: 13px; }
-.google-publish select { max-width: 100%; color: inherit; background: var(--bg); padding: 6px; }
+.google-publish { border-top: var(--b-base); margin-top: var(--sp-3); padding: var(--sp-3); display: grid; gap: var(--sp-2); }
+.google-publish h3, .google-publish-status { margin: 0; }
+.google-publish select { width: 100%; min-width: 0; }
+.st-google-accounts .st-account-name { overflow-wrap: anywhere; min-width: 0; }
+.google-account-status:empty { display: none; }
 .google-documents { margin: 0 24px 12px; font-size: 13px; max-height: 48vh; overflow: auto; flex-shrink: 0; }
 .google-documents summary { cursor: pointer; padding: 8px 0; }
 .google-document-body { padding: 8px 0; }
@@ -12,9 +14,6 @@
 .google-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .google-compare section { min-width: 0; }
 .google-compare pre { max-height: 24vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-.google-config { margin-top: 12px; }
-.google-config label { display: grid; gap: 5px; margin: 10px 0; }
-.google-config code { overflow-wrap: anywhere; }
 @media (max-width: 600px) { .google-compare { grid-template-columns: 1fr; } }
 
 .google-comment-reply { border-top: 1px solid var(--border); padding: 8px 0 0 12px; margin-top: 8px; }

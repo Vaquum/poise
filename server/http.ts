@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ServiceConfig } from './service/config'
 import { IDENTITY_HEADER, scopeAllowsPath, verifyIdentityAssertion, type AssertionScope } from './service/identity'
+import { retainRequestIdentity } from './service/request-identity'
 
 export const JSON_BODY_MAX_BYTES = 1 * 1024 * 1024
 export const ATTACHMENT_MAX_BYTES = 2 * 1024 * 1024
@@ -76,6 +77,7 @@ function isLoopbackPeer(req: IncomingMessage): boolean {
  *  The assertion header is removed before anything can refuse the request,
  *  so nothing downstream can echo, log or forward it. */
 function enforceGatewayRequest(req: IncomingMessage, service: ServiceConfig, api: boolean): RequestAuthority {
+  retainRequestIdentity(req, null)
   const token = header(req, IDENTITY_HEADER)
   delete req.headers[IDENTITY_HEADER]
   if (urlFromHost(header(req, 'host'), service.publicProtocol)?.host !== service.publicHost) throw new HttpError(403, 'host is not allowed')
@@ -91,6 +93,7 @@ function enforceGatewayRequest(req: IncomingMessage, service: ServiceConfig, api
   if (!scopeAllowsPath(result.assertion.scope, path)) {
     throw new HttpError(403, `an identity assertion with the ${result.assertion.scope} scope does not reach this route`)
   }
+  if (api && result.assertion.scope === 'browser') retainRequestIdentity(req, { token, peer: req.socket.remoteAddress ?? '', gatewayPort: result.assertion.gatewayPort })
   return { kind: 'gateway', scope: result.assertion.scope }
 }
 

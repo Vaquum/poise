@@ -182,6 +182,8 @@ client sent.
   | `scope` | `browser`, `link` or `admin` |
   | `iat`, `exp` | seconds; `exp` is `iat + 60` |
   | `jti` | random, unique per assertion |
+  | `sid` | browser only: opaque hash reference to the authenticated workspace session |
+  | `gport` | browser only: gateway listening port for private Google delegation |
 
 - The gateway generates its key pair on first start and keeps it in its data
   volume. Workspaces receive the public key as `POISE_GATEWAY_PUBLIC_KEY`, the
@@ -843,18 +845,34 @@ authority, persistence or collection; absent responses establish no timing.
 
 ## Google document publishing
 
-Google OAuth belongs to the individual workspace, independently of gateway
-sign-in and CLI accounts. Only browser scope reaches its routes; existing
-identity and origin checks cover every Google API action.
+Google account grants belong to the gateway, partitioned by immutable GitHub
+owner ID and Google subject. One deployment Google client redirects to the apex
+`/auth/google/callback`. The secret and refresh tokens never enter user workspaces
+or browser responses. [Google connections](Google-connections.md) defines the
+operator configuration, encrypted vault, session-bound delegation, operation
+deadlines, browser proof and migration limits.
 
-- `GET /api/google/accounts` returns configuration status, client ID/origin and
-  `{id,email,connected}` accounts. It never returns secrets or tokens.
-- `POST /api/google/config` configures `{clientId,clientSecret,origin}`;
-  `/connect` starts PKCE authorization bound to a client-generated
-  `{browserSecret}` kept in tab storage; `/callback` exchanges
-  `{code,state,browserSecret}`, and `/disconnect` forgets `{accountId}`.
-- The OAuth redirect URI is the workspace's ordinary root page. Google callback
-  parameters are exchanged via a same-origin POST, then removed from the URL.
+- `GET /api/google/accounts` returns `{configured,accounts:[{id,email,connected,state}]}`.
+- `POST /api/google/connect` accepts `{browserSecret,accountId?}` and returns the
+  central browser start URL. Reconnect verifies the expected subject.
+- `POST /api/google/callback` accepts `{state,browserSecret}` from the returning
+  flow, consumes its staged result under the publication lock, and returns
+  settings plus `{connection:{outcome,accountId?,message?}}`.
+- `POST /api/google/disconnect` forgets `{accountId}`. `/config` returns 404;
+  Google app configuration is deployment-owned.
+- Browser assertions carry signed `sid`. The workspace guard strips the header
+  and retains only verified delegation privately against that request. The fixed
+  broker `POST /_gateway/google` admits an operation with `open`, then
+  accepts purpose-limited `settings`, `begin`, `finish`, `token`, `disconnect`
+  and `close`. Workspace calls use the verified TCP gateway peer and signed
+  `gport` over the private network, addressed to the fixed internal gateway host;
+  no public-apex egress or Docker DNS is needed. Its server-only credential has a fixed twenty-minute deadline;
+  every action requires the exact original live login and current owner/access.
+  This changes neither Link/admin scopes nor the ordinary sixty-second assertion
+  lifetime. No browser cookie or arbitrary upstream URL reaches the broker.
+- Local Poise uses operator environment configuration or existing private direct
+  grants, the same account UI, and its loopback root callback. It retains the
+  random browser-flow proof; it never requires a workspace cookie.
 - `GET /api/editor/doc/:slug/google` returns local publication bindings. POST
   suffixes `/sync`, `/publish`, `/review` and `/import` read remote state, publish
   the specified `{accountId,localVersion}`, review that account's remote text,

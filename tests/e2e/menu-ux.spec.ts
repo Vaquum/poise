@@ -155,7 +155,7 @@ for (const theme of ['light', 'dark']) test(`fits every destination at a narrow 
     await page.locator('#menu-popover').getByRole('button', { name: section, exact: true }).click()
     const panel = page.locator('#menu-surface .menu-panel.open')
     await expect(panel.locator('.tp-close')).toHaveCount(0)
-    if (section === 'Accounts') await expect(panel.locator('.st-account')).toHaveCount(2)
+    if (section === 'Accounts') await expect(panel.locator('.st-account')).toHaveCount(3)
     await attached(page)
     const sizes = await panel.evaluate((element) => ({ width: element.clientWidth, scroll: element.scrollWidth }))
     expect(sizes.scroll).toBeLessThanOrEqual(sizes.width + 1)

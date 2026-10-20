@@ -8,8 +8,18 @@ export async function driveRequest(accountId: string, url: string, init: Request
   const token = await googleAccessToken(accountId)
   const response = await fetch(url, { ...init, headers: { ...init.headers, Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30_000), redirect: 'error' })
   if (!response.ok) {
+    if (response.status === 401) {
+      // Establish whether the offline grant ended. Never replay the remote request.
+      await googleAccessToken(accountId, true)
+      throw new HttpError(502, 'Google rejected this request. Review the destination before trying again.')
+    }
+    if (response.status === 403) {
+      let failure: { error?: { errors?: Array<{ reason?: string }> } }
+      try { failure = await response.json() as typeof failure } catch { throw new HttpError(502, 'Google returned an unreadable access failure.') }
+      if (failure.error?.errors?.some(e => e.reason === 'appNotAuthorizedToFile')) throw new HttpError(422, 'This Google document is not authorized for this Poise Google app. Reconnecting cannot grant file access. Keep the existing file and comments; ask the Poise operator to retain the original Google app, or continue editing it in Google Docs.')
+    }
     const status = response.status === 412 ? 409 : response.status === 404 ? 404 : 502
-    throw new HttpError(status, response.status === 412 ? 'Google changed during publishing. Review the latest version and try again.' : response.status === 404 ? 'This Google file is missing or this account no longer has access.' : response.status === 401 || response.status === 403 ? 'Google access was rejected. Reconnect the account and check file permissions.' : `Google Drive answered ${response.status}; no automatic retry was made.`)
+    throw new HttpError(status, response.status === 412 ? 'Google changed during publishing. Review the latest version and try again.' : response.status === 404 ? 'This linked Google file is missing or unavailable to this Poise Google app. Keep its binding and check the original file in Google Docs; reconnecting may not restore access.' : response.status === 403 ? 'This Google account cannot access this document. Check its file permissions and Google app authorization.' : `Google Drive answered ${response.status}; no automatic retry was made.`)
   }
   return response
 }

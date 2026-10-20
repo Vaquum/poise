@@ -1,4 +1,5 @@
 import { mountGooglePublish } from './google-documents'
+import type { GooglePublishReturn } from '../google'
 import { retire, reveal } from '../motion'
 import { patchContent } from '../dom-patch'
 import {
@@ -551,7 +552,7 @@ export function closePublishPanel(): void {
 }
 
 /** Opens the panel under `anchor` for the document open now, or closes it. */
-export function togglePublishPanel(anchor: HTMLElement, host: PublishPanelHost): void {
+export function togglePublishPanel(anchor: HTMLElement, host: PublishPanelHost, returned?: GooglePublishReturn): void {
   if (panel) { closePublishPanel(); return }
   const slug = host.slug()
   if (!slug) return
@@ -563,7 +564,7 @@ export function togglePublishPanel(anchor: HTMLElement, host: PublishPanelHost):
   panel.setAttribute('role', 'dialog')
   panel.setAttribute('aria-label', 'Publish')
   panel.innerHTML = '<div class="ep-body"></div>'
-  mountGooglePublish(panel, host)
+  mountGooglePublish(panel, host, returned)
   panel.addEventListener('input', onInput)
   panel.addEventListener('change', onInput)
   panel.addEventListener('click', (event) => onClick(event, host))
@@ -585,6 +586,6 @@ export function togglePublishPanel(anchor: HTMLElement, host: PublishPanelHost):
       message = (error as Error).message
     }
     render()
-    panel?.querySelector<HTMLElement>('.ep-title, .ep-publish, .ep-link')?.focus({ preventScroll: true })
+    if (!returned) panel?.querySelector<HTMLElement>('.ep-title, .ep-publish, .ep-link')?.focus({ preventScroll: true })
   })()
 }
