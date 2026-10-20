@@ -202,6 +202,10 @@ client sent.
   it. Nor does it forward a device token's `Authorization` header.
 - Workspaces cannot set cookies: the gateway drops every `Set-Cookie` from
   their responses. An answer with a status outside 100–599 becomes a 502.
+- The gateway retires pooled HTTP sockets after four idle seconds, before
+  the workspace's five-second keep-alive closes them. This is an idle pool
+  limit; active responses, long polls and event streams remain open. Failed
+  requests are not replayed, including mutations with an unknown outcome.
 - A request on a bodiless method (`GET`, `HEAD`, `OPTIONS`, `DELETE`, `TRACE`)
   that carries a body is refused with 400, and every forwarded body is framed,
   so nothing can ride along as a second request.

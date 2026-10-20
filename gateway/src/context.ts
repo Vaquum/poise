@@ -50,7 +50,9 @@ export class Context {
   readonly scheme: 'http' | 'https'
   readonly apexOrigin: string
   readonly pageHeaders: Record<string, string>
-  readonly agent = new http.Agent({ keepAlive: true })
+  // Retire idle sockets before the workspace's five-second keep-alive closes
+  // them. An unbounded pool can reuse a closing socket and reset the request.
+  readonly agent = new http.Agent({ keepAlive: true, timeout: 4_000 })
   /** Recent user-code submissions per apex session, for the /link rate limit. */
   readonly codeAttempts = new Map<string, number[]>()
   /** The Link event streams open through this gateway, per paired device. */
