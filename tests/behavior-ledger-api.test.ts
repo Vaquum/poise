@@ -56,7 +56,7 @@ function cli(args: string[]): Promise<{ code: number; stdout: string; stderr: st
 }
 
 interface Caller { identity?: string; peer?: boolean; host?: string; origin?: string; site?: string }
-function call(path: string, method = 'GET', caller: Caller = {}): Promise<{ status: number; body: LedgerReply; allow?: string }> {
+function call(path: string, method = 'GET', caller: Caller = {}): Promise<{ status: number; body: LedgerReply; allow?: string; timing?: string; retryAfter?: string }> {
   return new Promise((resolve, reject) => {
     const req = httpRequest(base + path, { method, agent: false, headers: {
       host: caller.host ?? (caller.peer ? PUBLIC_HOST : new URL(base).host),
@@ -67,7 +67,8 @@ function call(path: string, method = 'GET', caller: Caller = {}): Promise<{ stat
     } }, (res) => {
       const chunks: Buffer[] = []
       res.on('data', (chunk: Buffer) => chunks.push(chunk))
-      res.on('end', () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as LedgerReply, allow: res.headers.allow }))
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as LedgerReply,
+        allow: res.headers.allow, timing: res.headers['server-timing'] as string | undefined, retryAfter: res.headers['retry-after'] }))
     })
     req.on('error', reject)
     req.end()
@@ -166,6 +167,50 @@ it('freezes listing boundaries and resumes changes across interleaved creation',
   expect(mocks.runFile.mock.calls.some(([, args]) => Array.isArray(args) && args[0] === '--logs')).toBe(false)
 })
 
+it('reports bounded real-worker phases outside the version 1 body', async () => {
+  const reply = await call(`${PREFIX}?limit=1`)
+  expect(reply.status).toBe(200)
+  expect(reply.timing!.length).toBeLessThan(512)
+  const metrics = reply.timing!.split(', ')
+  for (const name of ['handler', 'queue', 'active', 'worker', 'read', 'pending', 'encode', 'budget-scan']) {
+    expect(metrics.some((metric) => new RegExp(`^ledger-${name};dur=\\d+\\.\\d$`).test(metric)), name).toBe(true)
+  }
+  expect(metrics).toHaveLength(8)
+  expect(reply.body).not.toHaveProperty('timing')
+  expect(reply.body.health).not.toHaveProperty('timing')
+  expect(reply.timing).not.toContain(reply.body.records![0].id)
+})
+
+it('omits invalid or unavailable diagnostic phases without changing replies', async () => {
+  const body: LedgerReply = { version: 1, health: (await ledger.readBehaviorLedger({ operation: 'health' })).body.health,
+    error: 'ledger_read_timeout' }
+  const read = vi.spyOn(ledger, 'readBehaviorLedger')
+  try {
+    read.mockResolvedValue({ status: 503, body, timing: { queueMs: 2000, timeout: 'queued',
+      blocking: { kind: 'loss', elapsedMs: 2500 } } })
+    const queued = await call(PREFIX)
+    expect(queued.status).toBe(503)
+    expect(queued.body).toEqual(body)
+    expect(queued.timing).toMatch(/^ledger-handler;dur=\d+\.\d, ledger-queue;dur=2000\.0, ledger-queue-timeout;dur=2000\.0, ledger-blocked-loss;dur=2500\.0$/)
+    read.mockResolvedValue({ status: 503, body, timing: { queueMs: 20, activeMs: 1980, timeout: 'active' } })
+    const active = await call(PREFIX)
+    expect(active.body).toEqual(body)
+    expect(active.timing).toMatch(/^ledger-handler;dur=\d+\.\d, ledger-queue;dur=20\.0, ledger-active;dur=1980\.0, ledger-active-timeout;dur=1980\.0$/)
+    read.mockResolvedValue({ status: 503, body, timing: { queueMs: Number.NaN, activeMs: -1, timeout: 'active',
+      worker: { totalMs: Number.POSITIVE_INFINITY, budgetScanMs: 86_400_001, pendingMs: -2, encodeMs: 0 } } })
+    const invalid = await call(PREFIX)
+    expect(invalid.status).toBe(503)
+    expect(invalid.body).toEqual(body)
+    expect(invalid.timing).toMatch(/^ledger-handler;dur=\d+\.\d, ledger-encode;dur=0\.0$/)
+    read.mockResolvedValue({ status: 429, body: { ...body, error: 'ledger_busy' } })
+    const busy = await call(PREFIX)
+    expect(busy.status).toBe(429)
+    expect(busy.retryAfter).toBe('1')
+    expect(busy.body).toEqual({ ...body, error: 'ledger_busy' })
+    expect(busy.timing).toMatch(/^ledger-handler;dur=\d+\.\d$/)
+  } finally { read.mockRestore() }
+})
+
 it('rejects mutation methods and ambiguous or unsupported selectors', async () => {
   const denied = await call(PREFIX, 'POST')
   expect(denied.status).toBe(405)
@@ -190,7 +235,11 @@ it('keeps the existing owner, assertion, Host, Origin and cross-site boundary', 
     { peer: true, identity, origin: 'https://other.example' },
     { peer: true, identity, site: 'cross-site' },
   ]
-  for (const caller of refused) expect([401, 403]).toContain((await call(PREFIX, 'GET', caller)).status)
+  for (const caller of refused) {
+    const denied = await call(PREFIX, 'GET', caller)
+    expect([401, 403]).toContain(denied.status)
+    expect(denied.timing).toBeUndefined()
+  }
   for (const scope of ['link', 'admin']) {
     for (const suffix of ['', '/changes?cursor=x', '/health', '/' + 'f'.repeat(64)]) {
       expect((await call(PREFIX + suffix, 'GET', { peer: true, identity: signAssertion(keys.privateKey, { scope }) })).status).toBe(403)

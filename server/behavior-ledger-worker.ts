@@ -1,10 +1,26 @@
 import { parentPort, workerData } from 'node:worker_threads'
 import { BehaviorLedgerStore } from './behavior-ledger-store'
-import { LEDGER_RESPONSE_BYTES, type LedgerPending, type LedgerWorkerData, type LedgerWorkerReply, type LedgerWorkerRequest } from './behavior-ledger-contract'
+import { LEDGER_RESPONSE_BYTES, type LedgerPending, type LedgerReply, type LedgerWorkerData, type LedgerWorkerReply, type LedgerWorkerRequest, type LedgerWorkerTiming } from './behavior-ledger-contract'
 
 export function executeLedgerRequest(store: BehaviorLedgerStore, request: LedgerWorkerRequest): LedgerWorkerReply {
+  const startedAt = performance.now()
+  const scanBefore = store.budgetScanMs
+  const timing: LedgerWorkerTiming | undefined = request.operation === 'read' ? { totalMs: 0, budgetScanMs: 0 } : undefined
+  const measure = <T>(phase: 'readMs' | 'pendingMs' | 'encodeMs', operation: () => T): T => {
+    if (!timing) return operation()
+    const start = performance.now()
+    try { return operation() } finally { timing[phase] = performance.now() - start }
+  }
   const pending = (): LedgerPending[] => {
-    try { return store.pending() } catch { return [] }
+    try { return measure('pendingMs', () => store.pending()) } catch { return [] }
+  }
+  const reply = (result: { status: number; body: LedgerReply }): LedgerWorkerReply => {
+    const rows = pending()
+    if (timing) {
+      timing.totalMs = performance.now() - startedAt
+      timing.budgetScanMs = store.budgetScanMs - scanBefore
+    }
+    return { id: request.id, ...result, pending: rows, ...(timing ? { timing } : {}) }
   }
   try {
     if (request.operation === 'capture') {
@@ -12,14 +28,15 @@ export function executeLedgerRequest(store: BehaviorLedgerStore, request: Ledger
       store.capture(request.observation)
     } else if (request.operation === 'read') {
       if (!request.request) throw new Error('Missing ledger read')
-      const reply = store.read(request.request)
-      if (Buffer.byteLength(JSON.stringify(reply.body)) > LEDGER_RESPONSE_BYTES) throw new Error('Ledger response bound')
-      return { id: request.id, ...reply, pending: pending() }
+      const read = request.request
+      const result = measure('readMs', () => store.read(read))
+      if (measure('encodeMs', () => Buffer.byteLength(JSON.stringify(result.body))) > LEDGER_RESPONSE_BYTES) throw new Error('Ledger response bound')
+      return reply(result)
     } else if (request.operation === 'close') store.close()
     else if (request.operation !== 'pending') throw new Error('Unknown ledger operation')
-    return { id: request.id, status: 200, body: { version: 1, health: store.health() }, pending: pending() }
+    return reply({ status: 200, body: { version: 1, health: store.health() } })
   } catch {
-    return { id: request.id, status: 503, body: { version: 1, health: store.health(), error: 'ledger_unavailable' }, pending: pending() }
+    return reply({ status: 503, body: { version: 1, health: store.health(), error: 'ledger_unavailable' } })
   }
 }
 

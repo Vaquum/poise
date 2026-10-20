@@ -36,7 +36,27 @@ an operator-directed fresh bootstrap. Read saturation returns 429 with
 with status 200 when storage is unavailable. Existing authentication and request
 guards still apply.
 
-The shipped command uses the same fixed GET routes:
+Responses also carry bounded `Server-Timing` headers, without changing their
+version 1 JSON. `ledger-handler` starts at the guarded ledger handler, not at
+socket arrival. `ledger-queue` measures admission to dispatch; `ledger-active`
+measures dispatch to resolution, including IPC and main-thread scheduling.
+`ledger-queue-timeout` and `ledger-active-timeout` distinguish where the existing
+deadline expired. A queued timeout may identify the fixed blocking operation
+as `ledger-blocked-loss`, `ledger-blocked-caller`, or another ledger operation.
+
+Completed reads may include `ledger-worker`, `ledger-read`, `ledger-pending`
+and `ledger-encode` wall durations. `ledger-budget-scan` measures only the
+existing usage-count/byte and retention-boundary SELECT groups, including
+prepare, binding and row materialization. It is part of those worker phases,
+not total SQL-engine time; do not add nested durations together. Missing,
+invalid or over-one-day timings are omitted. A still-active operation has no
+completed worker timings. No early headers or late-result wait is added.
+Rejected selectors may measure their existing health fallback.
+Headers contain fixed metric names and numeric milliseconds only, with no
+identifiers or payloads; they are not retained. When a client receives no
+usable response, handler arrival and the missing phases remain unknown.
+
+The shipped command uses the same fixed GET routes and emits JSON only:
 
 ```sh
 node dist/behavior-ledger.js list --limit 50

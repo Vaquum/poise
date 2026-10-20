@@ -25,6 +25,30 @@ async function fixture(body: string, options: ConstructorParameters<typeof Behav
   await observer.start()
   return observer
 }
+const workerTiming = { totalMs: 7, readMs: 2, pendingMs: 3, encodeMs: 1, budgetScanMs: .5 }
+function blockedWorker(operation: 'capture' | 'read'): string {
+  return `
+    import { appendFileSync, existsSync, watch } from 'node:fs';
+    const timing=${JSON.stringify(workerTiming)};
+    let blocked=false;
+    port.postMessage({ready:true,health,pending:[]});
+    port.on('message',request=>{
+      appendFileSync(new URL('./operations',import.meta.url),
+        (request.operation==='read'?request.request.operation:request.operation)+'\\n');
+      const reply=()=>port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[],
+        ...(request.operation==='read'?{timing}:{})});
+      if(request.operation!==${JSON.stringify(operation)}||blocked) { reply(); return; }
+      blocked=true;
+      const release=new URL('./release',import.meta.url);
+      let released=false;
+      const watcher=watch(new URL('.',import.meta.url),()=>check());
+      function check() {
+        if(released||!existsSync(release)) return;
+        released=true; watcher.close(); reply();
+      }
+      check();
+    });`
+}
 afterEach(async () => {
   await Promise.all(observers.splice(0).map((observer) => observer.stop()))
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
@@ -139,6 +163,63 @@ describe('bounded behavior ledger transport', () => {
     await vi.waitFor(async () => {
       expect(await observer.read({ operation: 'health' })).toMatchObject({ status: 200, body: { health: { status: 'ok', pending: 0, dropped: 0 } } })
     }, { timeout: 1500, interval: 25 })
+  })
+
+  it('reports a queued timeout with only the blocking capture kind and elapsed time', async () => {
+    const observer = await fixture(blockedWorker('capture'), { readLimit: 1, readTimeoutMs: 200 })
+    const directory = directories.at(-1)!
+    const release = join(directory, 'release')
+    observer.capture(admission)
+    try {
+      const reply = await observer.read({ operation: 'list' })
+      expect(reply).toMatchObject({ status: 503, body: { error: 'ledger_read_timeout' } })
+      expect(reply.timing).toEqual({ queueMs: expect.any(Number), timeout: 'queued',
+        blocking: { kind: 'admit', elapsedMs: expect.any(Number) } })
+      expect(reply.timing!.queueMs).toBeGreaterThanOrEqual(0)
+      expect(reply.timing!.blocking!.elapsedMs).toBeGreaterThanOrEqual(0)
+      expect(reply.body).not.toHaveProperty('timing')
+      const next = observer.read({ operation: 'health' })
+      expect((await observer.read({ operation: 'list' })).status).toBe(429)
+      await writeFile(release, '')
+      expect((await next).status).toBe(200)
+      expect((await readFile(join(directory, 'operations'), 'utf8')).trim().split('\n')).toEqual(['capture', 'health'])
+    } finally { await writeFile(release, '') }
+  })
+
+  it('reports an active timeout and retains its slot until the late acknowledgement without changing timing', async () => {
+    const observer = await fixture(blockedWorker('read'), { readLimit: 1, readTimeoutMs: 30 })
+    const release = join(directories.at(-1)!, 'release')
+    const settled = vi.fn()
+    try {
+      const reply = await observer.read({ operation: 'list' }).then((value) => { settled(value); return value })
+      expect(reply).toMatchObject({ status: 503, body: { error: 'ledger_read_timeout' } })
+      expect(reply.timing).toEqual({ queueMs: expect.any(Number), activeMs: expect.any(Number), timeout: 'active' })
+      expect(reply.timing!.queueMs).toBeGreaterThanOrEqual(0)
+      expect(reply.timing!.activeMs!).toBeGreaterThanOrEqual(0)
+      const timing = JSON.stringify(reply.timing)
+      expect((await observer.read({ operation: 'health' })).status).toBe(429)
+      await writeFile(release, '')
+      await vi.waitFor(async () => {
+        expect(await observer.read({ operation: 'health' })).toMatchObject({ status: 200,
+          body: { health: { status: 'ok' } }, timing: { worker: workerTiming } })
+      }, { timeout: 1500, interval: 25 })
+      expect(settled).toHaveBeenCalledExactlyOnceWith(reply)
+      expect(JSON.stringify(reply.timing)).toBe(timing)
+      expect(reply.timing).not.toHaveProperty('worker')
+      expect(reply.body).not.toHaveProperty('timing')
+    } finally { await writeFile(release, '') }
+  })
+
+  it('reports successful queue, active and optional worker timings outside the response body', async () => {
+    const observer = await fixture(`
+      port.postMessage({ready:true,health,pending:[]});
+      port.on('message',request=>port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[],
+        ...(request.operation==='read'?{timing:${JSON.stringify(workerTiming)}}:{})}));`)
+    const reply = await observer.read({ operation: 'health' })
+    expect(reply.body).toEqual({ version: 1, health })
+    expect(reply.timing).toEqual({ queueMs: expect.any(Number), activeMs: expect.any(Number), worker: workerTiming })
+    expect(reply.timing!.queueMs).toBeGreaterThanOrEqual(0)
+    expect(reply.timing!.activeMs!).toBeGreaterThanOrEqual(0)
   })
 
   it('keeps a failed startup observational and health readable', async () => {

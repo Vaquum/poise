@@ -140,6 +140,21 @@ export interface LedgerReply {
   error?: string
 }
 export interface LedgerPending { nativeId: string; callId: string | null }
+export interface LedgerWorkerTiming {
+  totalMs: number
+  readMs?: number
+  pendingMs?: number
+  encodeMs?: number
+  budgetScanMs: number
+}
+export interface LedgerReadTiming {
+  queueMs: number
+  activeMs?: number
+  timeout?: 'queued' | 'active'
+  blocking?: { kind: LedgerObservation['type'] | LedgerWorkerRequest['operation']; elapsedMs: number }
+  worker?: LedgerWorkerTiming
+}
+export interface LedgerReadReply { status: number; body: LedgerReply; timing?: LedgerReadTiming }
 export interface LedgerWorkerRequest {
   id: number
   operation: 'capture' | 'read' | 'pending' | 'close'
@@ -151,6 +166,7 @@ export interface LedgerWorkerReply {
   status: number
   body: LedgerReply
   pending: LedgerPending[]
+  timing?: LedgerWorkerTiming
 }
 export interface LedgerWorkerData { path: string; workspace?: string; policy?: Partial<LedgerPolicy> }
 export class LedgerError extends Error {

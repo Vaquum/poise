@@ -44,6 +44,9 @@ export class BehaviorLedgerStore {
   private data = emptyHealth()
   private cursorKey = ''
   private initialized = false
+  private budgetScanTime = 0
+
+  get budgetScanMs(): number { return this.budgetScanTime }
 
   constructor(readonly path: string, policy: Partial<LedgerPolicy> = {}, private readonly now: () => number = Date.now) {
     this.policy = { ...DEFAULT_LEDGER_POLICY, ...policy }
@@ -374,14 +377,20 @@ export class BehaviorLedgerStore {
     this.put({ ...record, omittedAttempts: record.omittedAttempts + Math.min(count, victims.length) }, root)
   }
   private usage(): { instances: number; changes: number; bytes: number } {
-    const a = this.connection().prepare('SELECT count(*) AS count,coalesce(sum(bytes),0) AS bytes FROM ledger_instances').get() as { count: number; bytes: number }
-    const b = this.connection().prepare('SELECT count(*) AS count,coalesce(sum(bytes),0) AS bytes FROM ledger_changes').get() as { count: number; bytes: number }
-    return { instances: a.count, changes: b.count, bytes: a.bytes + b.bytes }
+    return this.budgetScan(() => {
+      const a = this.connection().prepare('SELECT count(*) AS count,coalesce(sum(bytes),0) AS bytes FROM ledger_instances').get() as { count: number; bytes: number }
+      const b = this.connection().prepare('SELECT count(*) AS count,coalesce(sum(bytes),0) AS bytes FROM ledger_changes').get() as { count: number; bytes: number }
+      return { instances: a.count, changes: b.count, bytes: a.bytes + b.bytes }
+    })
+  }
+  private budgetScan<T>(query: () => T): T {
+    const startedAt = performance.now()
+    try { return query() } finally { this.budgetScanTime += performance.now() - startedAt }
   }
   private trimChanges(): void {
     const cutoff = new Date(this.now() - this.policy.retentionMs).toISOString()
-    const expired = this.connection().prepare('SELECT max(seq) AS seq FROM ledger_changes WHERE created_at < ? OR seq IN (SELECT seq FROM ledger_changes ORDER BY seq DESC LIMIT -1 OFFSET ?)')
-      .get(cutoff, this.policy.maxChanges) as { seq: number | null }
+    const expired = this.budgetScan(() => this.connection().prepare('SELECT max(seq) AS seq FROM ledger_changes WHERE created_at < ? OR seq IN (SELECT seq FROM ledger_changes ORDER BY seq DESC LIMIT -1 OFFSET ?)')
+      .get(cutoff, this.policy.maxChanges)) as { seq: number | null }
     if (expired.seq !== null) this.dropChangesThrough(expired.seq)
   }
   private dropChangesThrough(sequence: number): void {

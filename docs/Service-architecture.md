@@ -837,6 +837,9 @@ no new Caller reads, gateway scope, public machine credential or proxy delivery
 is introduced. It shares the current workspace owner/operator boundary and
 cannot influence execution. Concrete pilot deployment remains outside this
 package contract.
+Existing ledger responses may include fixed, bounded `Server-Timing` headers
+for handler, queue and completed worker phases. They add no JSON fields,
+authority, persistence or collection; absent responses establish no timing.
 
 ## Google document publishing
 

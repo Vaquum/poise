@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { readBehaviorLedger } from './behavior-ledger'
-import { LEDGER_RESPONSE_BYTES, type LedgerRead, type LedgerReply } from './behavior-ledger-contract'
+import { LEDGER_RESPONSE_BYTES, type LedgerRead, type LedgerReadTiming, type LedgerReply } from './behavior-ledger-contract'
 
 const PREFIX = '/api/behavior-ledger'
 const ID = /^[a-f0-9]{64}$/
@@ -54,7 +54,31 @@ export function parseBehaviorLedgerRead(target: string): LedgerRead {
     ...(parent === null ? {} : { parent: identifier(parent) }) }
 }
 
-function send(res: ServerResponse, status: number, body: LedgerReply): void {
+function serverTiming(startedAt: number, timing?: LedgerReadTiming): string {
+  const metrics: string[] = []
+  const add = (name: string, duration: unknown) => {
+    if (typeof duration === 'number' && Number.isFinite(duration) && duration >= 0 && duration <= 86_400_000) {
+      metrics.push(`${name};dur=${duration.toFixed(1)}`)
+    }
+  }
+  add('ledger-handler', performance.now() - startedAt)
+  add('ledger-queue', timing?.queueMs)
+  add('ledger-active', timing?.activeMs)
+  if (timing?.timeout === 'queued') add('ledger-queue-timeout', timing.queueMs)
+  if (timing?.timeout === 'active') add('ledger-active-timeout', timing.activeMs)
+  const blocked = timing?.blocking
+  if (blocked && ['admit', 'result', 'caller', 'heartbeat', 'loss', 'capture', 'read', 'pending', 'close'].includes(blocked.kind)) {
+    add(`ledger-blocked-${blocked.kind}`, blocked.elapsedMs)
+  }
+  add('ledger-worker', timing?.worker?.totalMs)
+  add('ledger-read', timing?.worker?.readMs)
+  add('ledger-pending', timing?.worker?.pendingMs)
+  add('ledger-encode', timing?.worker?.encodeMs)
+  add('ledger-budget-scan', timing?.worker?.budgetScanMs)
+  return metrics.join(', ')
+}
+
+function send(res: ServerResponse, status: number, body: LedgerReply, startedAt: number, timing?: LedgerReadTiming): void {
   let text = JSON.stringify(body)
   if (Buffer.byteLength(text) > LEDGER_RESPONSE_BYTES) {
     status = 503
@@ -62,6 +86,7 @@ function send(res: ServerResponse, status: number, body: LedgerReply): void {
   }
   res.statusCode = status
   res.setHeader('Content-Type', 'application/json')
+  res.setHeader('Server-Timing', serverTiming(startedAt, timing))
   if (status === 429) res.setHeader('Retry-After', '1')
   if (status === 405) res.setHeader('Allow', 'GET')
   res.end(text)
@@ -69,15 +94,16 @@ function send(res: ServerResponse, status: number, body: LedgerReply): void {
 
 /** Called only after the current workspace/local request guards succeed. */
 export async function handleBehaviorLedger(req: IncomingMessage, res: ServerResponse, target: string): Promise<void> {
+  const startedAt = performance.now()
   let request: LedgerRead
   try {
     if (req.method !== 'GET') throw new InvalidRead(405, 'method_not_allowed')
     request = parseBehaviorLedgerRead(target)
   } catch (error) {
     if (!(error instanceof InvalidRead)) throw error
-    const { body } = await readBehaviorLedger({ operation: 'health' })
-    return send(res, error.status, { version: 1, health: body.health, error: error.code })
+    const { body, timing } = await readBehaviorLedger({ operation: 'health' })
+    return send(res, error.status, { version: 1, health: body.health, error: error.code }, startedAt, timing)
   }
-  const { status, body } = await readBehaviorLedger(request)
-  send(res, status, body)
+  const { status, body, timing } = await readBehaviorLedger(request)
+  send(res, status, body, startedAt, timing)
 }

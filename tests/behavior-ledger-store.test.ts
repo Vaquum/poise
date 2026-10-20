@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import type { LedgerAdmission, LedgerCaller, LedgerPolicy, LedgerRecord } from '../server/behavior-ledger-contract'
 
@@ -51,6 +51,19 @@ afterEach(() => {
 })
 
 describe('behavior firing ledger store', () => {
+  it('measures the existing budget SELECT group without adding timing to the body', () => {
+    const db = store()
+    const before = db.budgetScanMs
+    const monotonic = vi.spyOn(performance, 'now').mockReturnValueOnce(10).mockReturnValueOnce(17)
+    try {
+      const reply = db.read({ operation: 'health' })
+      expect(reply.status).toBe(200)
+      expect(reply.body).not.toHaveProperty('timing')
+      expect(db.budgetScanMs - before).toBeCloseTo(7, 6)
+      expect(monotonic).toHaveBeenCalledTimes(2)
+    } finally { monotonic.mockRestore() }
+  })
+
   it('groups delayed siblings and retry attempts through the explicit admission, preserving the original plan', () => {
     const db = store()
     db.capture(admission('primary-1', { plannedSlots: ['primary', 'secondary'] }))

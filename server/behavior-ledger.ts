@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { AgentLogSnapshot, LogEntry } from './agent'
 import type {
   LedgerAdmission, LedgerCaller, LedgerHealth, LedgerObservation, LedgerPending, LedgerPolicy,
-  LedgerRead, LedgerReply, LedgerResult, LedgerWorkerReply, LedgerWorkerRequest,
+  LedgerRead, LedgerReadReply, LedgerReadTiming, LedgerReply, LedgerResult, LedgerWorkerReply, LedgerWorkerRequest,
 } from './behavior-ledger-contract'
 
 interface Options {
@@ -24,8 +24,10 @@ interface Job {
   observation?: LedgerObservation
   request?: LedgerRead
   bytes: number
-  resolve?: (reply: { status: number; body: LedgerReply }) => void
+  resolve?: (reply: LedgerReadReply) => void
   timer?: ReturnType<typeof setTimeout>
+  enqueuedAt?: number
+  dispatchedAt?: number
 }
 const emptyHealth = (): LedgerHealth => ({
   status: 'unavailable', coverageStart: null, observedAt: null, callerObservedAt: null,
@@ -159,18 +161,24 @@ export class BehaviorLedgerObserver {
       body: { version: 1, health, ...(request.operation === 'health' ? {} : { error }) } }
   }
 
-  read(request: LedgerRead): Promise<{ status: number; body: LedgerReply }> {
+  read(request: LedgerRead): Promise<LedgerReadReply> {
     if (this.failed || this.closed || this.stopping) return Promise.resolve(this.unavailable(request))
     if (this.reads >= (this.options.readLimit ?? 16)) return Promise.resolve({ status: 429,
       body: { version: 1, health: this.projectedHealth(), error: 'ledger_busy' } })
     this.reads++
     return new Promise((resolveReply) => {
-      const job: Job = { id: ++this.sequence, operation: 'read', request, bytes: 0, resolve: resolveReply }
+      const job: Job = { id: ++this.sequence, operation: 'read', request, bytes: 0, resolve: resolveReply, enqueuedAt: performance.now() }
       job.timer = setTimeout(() => {
         if (!job.resolve) return
         // A late active reply still owns its bounded worker slot until it arrives.
         if (this.active !== job) this.reads--
-        job.resolve(this.unavailable(request, 'ledger_read_timeout'))
+        const timing = this.readTiming(job)
+        timing.timeout = this.active === job ? 'active' : 'queued'
+        if (timing.timeout === 'queued' && this.active?.dispatchedAt !== undefined) {
+          timing.blocking = { kind: this.active.observation?.type ?? this.active.operation,
+            elapsedMs: performance.now() - this.active.dispatchedAt }
+        }
+        job.resolve({ ...this.unavailable(request, 'ledger_read_timeout'), timing })
         job.resolve = undefined
         this.queue = this.queue.filter((candidate) => candidate !== job)
       }, this.options.readTimeoutMs ?? 2_000)
@@ -181,6 +189,12 @@ export class BehaviorLedgerObserver {
 
   private setPending(rows: LedgerPending[]): void {
     this.pending = new Map(rows.map((row) => [row.nativeId, row.callId]))
+  }
+
+  private readTiming(job: Job): LedgerReadTiming {
+    const now = performance.now()
+    return { queueMs: (job.dispatchedAt ?? now) - job.enqueuedAt!,
+      ...(job.dispatchedAt === undefined ? {} : { activeMs: now - job.dispatchedAt }) }
   }
 
   private receive(message: LedgerWorkerReply): void {
@@ -201,7 +215,8 @@ export class BehaviorLedgerObserver {
     if (job.operation === 'read') this.reads--
     if (job.resolve) {
       clearTimeout(job.timer)
-      job.resolve({ status: message.status, body: { ...message.body, health: this.projectedHealth() } })
+      job.resolve({ status: message.status, body: { ...message.body, health: this.projectedHealth() },
+        ...(job.operation === 'read' ? { timing: { ...this.readTiming(job), worker: message.timing } } : {}) })
     }
     this.pump(job.operation === 'capture')
   }
@@ -219,6 +234,7 @@ export class BehaviorLedgerObserver {
     const job = readIndex < 0 ? this.queue.shift() : this.queue.splice(readIndex, 1)[0]
     if (!job) { this.worker.unref(); return }
     this.active = job
+    job.dispatchedAt = performance.now()
     this.worker.ref()
     try { this.worker.postMessage({ id: job.id, operation: job.operation,
       observation: job.observation, request: job.request } satisfies LedgerWorkerRequest) }
@@ -346,7 +362,7 @@ export function captureBehaviorOutcome(input: Omit<LedgerResult, 'type'>): void 
 }
 export function observeAgentSnapshot(snapshot: AgentLogSnapshot): void { observer?.observe(snapshot) }
 export function behaviorLedgerHeartbeat(): void { observer?.capture({ type: 'heartbeat' }) }
-export function readBehaviorLedger(request: LedgerRead): Promise<{ status: number; body: LedgerReply }> {
+export function readBehaviorLedger(request: LedgerRead): Promise<LedgerReadReply> {
   return observer ? observer.read(request) : Promise.resolve({ status: request.operation === 'health' ? 200 : 503,
     body: { version: 1, health: emptyHealth(), ...(request.operation === 'health' ? {} : { error: 'ledger_unavailable' }) } })
 }
