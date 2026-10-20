@@ -69,6 +69,23 @@ export function moveNavigation(preferences: NavigationPreferences, surface: Navi
   return { ...preferences, [`${surface}Order`]: order }
 }
 
+/** One placement transaction; source=null copies from the reusable view palette. */
+export function placeNavigation(preferences: NavigationPreferences, view: ViewName, source: NavigationSurface | null, target: NavigationSurface, index: number): NavigationPreferences {
+  if (!Number.isInteger(index)) throw new Error('Navigation position must be an integer.')
+  if (source && !preferences[view][source]) throw new Error(`Cannot move a hidden ${view} shortcut.`)
+  const visible = navigationViews(preferences, target).map(({ key }) => key)
+  const next = visible.filter((key) => key !== view)
+  const position = Math.max(0, Math.min(index, next.length))
+  next.splice(position, 0, view)
+  const removesSource = source !== null && source !== target
+  if (!removesSource && preferences[view][target] && visible.every((key, i) => key === next[i])) return preferences
+  const field = `${target}Order` as const
+  const order = preferences[field].filter((key) => key !== view)
+  const anchor = next[position + 1]
+  order.splice(anchor ? order.indexOf(anchor) : order.length, 0, view)
+  return { ...preferences, [field]: order, [view]: { ...preferences[view], [target]: true, ...(removesSource ? { [source!]: false } : {}) } }
+}
+
 export function getNavigation(): NavigationPreferences {
   try {
     const saved = localStorage.getItem(NAVIGATION_KEY)

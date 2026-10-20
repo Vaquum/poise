@@ -1148,6 +1148,7 @@ export function openSettingsAt(tab: SettingsSection): void {
 }
 
 export function closeSettingsPanel() {
+  window.dispatchEvent(new Event('poise:settings-closed'))
   organizationsPollGeneration++
   if (organizationsPollTimer) clearTimeout(organizationsPollTimer)
   organizationsPollTimer = null
@@ -1163,6 +1164,8 @@ export function closeSettingsPanel() {
 
 function onSettingsKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape') return
+  // Navigation pickups stop propagation; other view handlers can save an
+  // editor on the same Escape that dismisses Settings.
   if (!panelEl?.classList.contains('open')) return
   // Escape inside a terminal belongs to the program running there.
   if ((e.target as Element | null)?.closest?.('.st-terminal')) return

@@ -1392,16 +1392,51 @@ tr:hover .review-btn { opacity: 1; }
    open, which is what you'd expect. */
 
 /* Navigation uses the same quiet rows and controls as other settings. */
-.st-navigation-list { list-style: none; padding: 0; margin: 0; }
-.st-navigation-row { display: flex; align-items: center; gap: var(--sp-1); min-height: 36px; border-bottom: var(--b-hair); }
-.st-navigation-choice { display: flex; align-items: center; gap: var(--sp-2); flex: 1; min-width: 0; min-height: 36px; font-size: .8125rem; cursor: pointer; }
-.st-navigation-choice input { width: 14px; height: 14px; margin: 0; accent-color: var(--text); cursor: pointer; }
-.st-navigation-move { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; flex-shrink: 0; border: none; border-radius: var(--r-sm); background: transparent; color: var(--text-secondary); cursor: pointer; }
-.st-navigation-move:hover:not(:disabled) { color: var(--text); background: var(--hover); }
-.st-navigation-move:disabled { opacity: .25; cursor: default; }
-.st-navigation-add { margin-top: var(--sp-2); }
+/* Navigation uses the same quiet surface and motion primitives as Settings. */
+.st-navigation { container: navigation-settings / inline-size; }
+.st-navigation-intro { margin: 0 0 var(--sp-4); }
+.st-navigation-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-4); }
+.st-navigation-columns > div { min-width: 0; }
+.st-navigation-heading { font-size: .625rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--text-tertiary); margin-bottom: var(--sp-2); }
+.st-navigation-list { position: relative; list-style: none; padding: var(--sp-1); margin: 0; min-height: 18.25rem; border: var(--b-hair); border-radius: var(--r-sm); background: var(--bg); }
+.st-navigation-target { border-color: var(--text-secondary); background: var(--hover); }
+.st-navigation-row { position: relative; display: flex; align-items: center; gap: 2px; min-height: 2.5rem; }
+.st-navigation-handle { display: flex; align-items: center; gap: var(--sp-1); flex: 1; min-width: 0; min-height: 2.25rem; padding: 0 var(--sp-1); background: transparent; border: none; border-radius: var(--r-sm); color: var(--text); font: inherit; font-size: .8125rem; text-align: left; cursor: grab; touch-action: none; user-select: none; }
+.st-navigation-handle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-navigation-handle svg, .st-navigation-source svg { color: var(--text-tertiary); flex-shrink: 0; }
+.st-navigation-handle:hover { background: var(--hover); }
+.st-navigation-remove { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 24px; height: 32px; padding: 0; border: none; border-radius: var(--r-sm); color: var(--text-tertiary); background: transparent; cursor: pointer; }
+.st-navigation-remove:hover { color: var(--text); background: var(--hover); }
+.st-navigation-gap { display: flex; align-items: center; padding: 0 var(--sp-2); height: 2.5rem; border: 1px dashed var(--text-secondary); border-radius: var(--r-sm); color: var(--text-secondary); background: var(--hover); font-size: .8125rem; }
+.st-navigation-empty { padding: var(--sp-4) var(--sp-1); text-align: center; font-size: .75rem; color: var(--text-secondary); pointer-events: none; }
+.st-navigation-library { border-top: var(--b-hair); padding-top: var(--sp-4); margin-top: var(--sp-5); }
+.st-navigation-library .st-help { margin: 0 0 var(--sp-3); font-size: .6875rem; }
+.st-navigation-palette { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.st-navigation-source { display: inline-flex; align-items: center; gap: var(--sp-1); padding: var(--sp-1) var(--sp-2); border: var(--b-hair); border-radius: var(--r-sm); color: var(--text); background: var(--bg); font: inherit; font-size: .75rem; cursor: grab; touch-action: none; user-select: none; }
+.st-navigation-source:hover { border-color: var(--text-secondary); background: var(--hover); }
+.st-navigation-choices { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3); font-size: .75rem; }
+.st-navigation-choices[hidden] { display: none; }
+.st-navigation-choices button:disabled { opacity: .4; cursor: default; }
+.st-navigation-footer { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); flex-wrap: wrap; border-top: var(--b-hair); padding-top: var(--sp-3); margin-top: var(--sp-5); color: var(--text-secondary); font-size: .6875rem; }
+.st-navigation-reset { padding: var(--sp-1) 0; color: var(--text-secondary); background: transparent; border: none; font: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.st-navigation-held, .st-navigation-held * { cursor: grabbing; }
+.st-navigation-ghost { position: fixed; z-index: 200; display: flex; align-items: center; gap: var(--sp-2); max-width: calc(100vw - 8px); min-width: 120px; padding: var(--sp-2) var(--sp-3); border: 1px solid var(--text-secondary); border-radius: var(--r-sm); color: var(--text); background: var(--surface); box-shadow: var(--e-2); font-size: .8125rem; transform: rotate(-2deg); pointer-events: none; user-select: none; }
+.st-navigation-ghost span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-navigation-ghost svg { flex-shrink: 0; color: var(--text-tertiary); }
+.st-navigation-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); padding: 0; border: 0; }
+.st-navigation-sr[hidden] { display: none; }
 #menu-surface .st-tab[data-tab="navigation"] .st-navigation-status { display: block; margin: 0; }
 #menu-surface .st-tab[data-tab="navigation"] .st-navigation-status:not(:empty) { margin-top: var(--sp-2); }
+@container navigation-settings (max-width: 320px) {
+  .st-navigation-columns { grid-template-columns: minmax(0, 1fr); }
+  .st-navigation-list { min-height: 5rem; }
+}
+@media (pointer: coarse) {
+  .st-navigation-handle, .st-navigation-remove, .st-navigation-source, .st-navigation-choices button, .st-navigation-reset { min-height: 44px; }
+  .st-navigation-remove { width: 44px; }
+  .st-navigation-gap { height: max(2.5rem, 44px); }
+}
+
 
 /* Burger toggle — top right, aligned to the view-header's filter row. */
 #menu-toggle {

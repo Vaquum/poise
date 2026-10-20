@@ -13,15 +13,26 @@ to the running program.
 If Writer mode is enabled with a panel open, the single close button remains
 visible until the surface is dismissed.
 
-Navigation chooses and arranges the shortcuts above Settings in the menu and
-in the top bar. Each surface has its own ordered list. Add a view with the
-picker; uncheck it to remove its shortcut from that surface. A view can appear
-in either list, both, or neither. Move shortcuts up or down with the arrow
-buttons; the two lists have independent orders. Controls work with a keyboard
-and announce each move.
+Navigation chooses and arranges shortcuts above Settings in the menu and in
+the top bar. Drag within either area to reorder, or into the other area to
+move. Drag from the reusable All views palette below to add to either or both.
+An existing destination shortcut is repositioned, without duplicates. The close
+button removes only that area's shortcut. Changes reach actual navigation after
+a successful drop; the insertion gap is a local preview. Dropping outside or
+pressing Escape cancels. An unchanged drop does not write preferences.
+
+Click or tap a shortcut to pick it up without holding, then click or tap its
+insertion position to place it. All views also opens Add to top bar / Add to
+menu buttons. With a keyboard, Space or Enter picks up a shortcut; Up/Down
+arrange, Home/End reach the ends, Left chooses Top bar, Right chooses Menu,
+and Space/Enter drops. Escape cancels and returns focus to the origin; Escape
+while idle closes Settings. Tab cancels and continues traversal. Position and
+completion are announced. Short panels scroll within Settings, including during
+a held drag; narrow panels stack the two areas. External preference changes,
+panel dismissal, resize and focus/typography changes discard an active move.
 
 Changes apply immediately and stay in this browser, including across reloads
-and other open tabs. Reset navigation restores the original visibility and
+and other open tabs. Restore defaults restores the original visibility and
 order: Analytics then Logging in the menu; Current, Swarm, Chat, Archive,
 Behaviors, Snippets then Editor in the top bar. Settings and release information
 remain accessible. Hiding the current view's shortcuts leaves that view open.

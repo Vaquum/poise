@@ -42,7 +42,7 @@ its retained incident. Source time is displayed in Settings' timezone; missing
 source time is explicitly labeled as ingestion time. Today, Yesterday and This
 week use civil boundaries in that timezone. Custom intervals require UTC offsets.
 
-Settings → Navigation can place Logging in the top bar, reorder its shortcut,
+Settings → Navigation can drag Logging into the top bar, arrange its shortcut,
 or hide it on either surface. Hiding shortcuts preserves diagnostic deep links.
 
 Column headers own the severity, time, source and exact identity filters. Columns selects optional workspace/account/repository/call/correlation/incident fields; an active filter keeps its field visible until cleared. Search and the event count remain in the native toolbar. Filters stay usable after a failed query.
