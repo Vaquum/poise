@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import { build } from 'esbuild'
 import { workspace } from './fixtures/workspace'
-import { settled } from './fixtures/motion'
+import { freeze, settled } from './fixtures/motion'
 
 declare global { interface Window { Motion: typeof import('../../src/motion'); Patch: typeof import('../../src/dom-patch'); Builder: typeof import('../../src/views/jev-builder'); Results: typeof import('../../src/views/jev-results') } }
 
@@ -581,16 +581,27 @@ test('view departure batches presentation reads before completing rows', async (
   await runtime(page)
   const cdp = await page.context().newCDPSession(page)
   await cdp.send('Performance.enable')
+  // Inspector round trips must not count intervening animation frames.
+  await freeze(page)
   await page.evaluate(() => {
     const root = document.createElement('div'); root.id = 'finish-batch'; root.style.cssText = 'position:fixed;top:0;left:0;width:240px'
     root.innerHTML = '<div style="height:4px">Row</div>'.repeat(80); document.body.append(root)
     for (const actor of root.children) window.Motion.reveal(actor as HTMLElement)
   })
   const before = await cdp.send('Performance.getMetrics')
-  await page.evaluate(() => window.Motion.finishMotion(document.getElementById('finish-batch')!, true))
+  // Exercise delayed driver delivery as well as an idle local inspector.
+  await new Promise(resolve => setTimeout(resolve, 150))
+  const active = await page.evaluate(() => {
+    const root = document.getElementById('finish-batch')!
+    const active = root.querySelectorAll('[data-motion-running]').length
+    window.Motion.finishMotion(root, true)
+    return active
+  })
   const after = await cdp.send('Performance.getMetrics')
   const styles = (metrics: typeof before) => metrics.metrics.find(metric => metric.name === 'RecalcStyleCount')!.value
+  console.log(JSON.stringify({ motionCompletion: { styleRecalculations: styles(after) - styles(before), active } }))
   expect(styles(after) - styles(before)).toBeLessThan(10)
+  expect(active).toBe(80)
   await expect(page.locator('#finish-batch [data-motion-running]')).toHaveCount(0)
 })
 
