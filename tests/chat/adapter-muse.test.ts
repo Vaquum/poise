@@ -65,7 +65,15 @@ describe('Muse adapter', () => {
     writeFileSync(join(host.checkout, 'GONE.md'), 'bye\n')
     writeFileSync(join(host.checkout, 'BIG.md'), 'big\n')
     const readTextFile = host.readTextFile
-    host.readTextFile = (path, options) => path.endsWith('BIG.md') ? Promise.reject(new Error('file too large (limit 2 MB)')) : readTextFile(path, options)
+    host.readTextFile = async (path, options) => {
+      if (path.endsWith('BIG.md')) throw new Error('file too large (limit 2 MB)')
+      const text = await readTextFile(path, options)
+      // Independent snapshots can finish in the opposite order to tool starts.
+      if (path.endsWith('README.md') && text === 'new\n') {
+        await host.waitFor(event => event.type === 'diff' && event.path === 'GONE.md')
+      }
+      return text
+    }
     await adapter.start(MODEL)
     const result = await adapter.prompt('turn-1', prompt('hello'), new AbortController().signal)
     expect(result).toEqual({ stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } })
@@ -108,18 +116,24 @@ describe('Muse adapter', () => {
     expect(host.permissions.filter((request) => request.title.startsWith('edit ') || request.title.startsWith('patch ')).map((request) => request.title)).toEqual(['edit README.md', 'patch GONE.md', 'edit BIG.md'])
     expect(readFileSync(join(host.checkout, 'README.md'), 'utf8')).toBe('new\n')
     expect(readFileSync(join(host.checkout, 'NEW.md'), 'utf8')).toBe('hello\n')
-    expect(host.ofType('diff')).toEqual([
+    const diffs = host.ofType('diff')
+    expect(diffs.map(event => event.toolId)).toEqual([edits[2].id, edits[0].id])
+    expect(diffs).toHaveLength(2)
+    expect(new Set(diffs.map(event => event.diffId)).size).toBe(2)
+    for (const expected of [
       { type: 'diff', turnId: 'turn-1', toolId: edits[0].id, diffId: expect.stringMatching(/^[0-9a-f-]{36}$/), path: 'README.md', oldText: 'old\n', newText: 'new\n', oldExists: true, newExists: true },
-      { type: 'diff', turnId: 'turn-1', toolId: edits[2].id, diffId: expect.any(String), path: 'GONE.md', oldText: 'bye\n', newText: '', oldExists: true, newExists: false },
-    ])
+      { type: 'diff', turnId: 'turn-1', toolId: edits[2].id, diffId: expect.stringMatching(/^[0-9a-f-]{36}$/), path: 'GONE.md', oldText: 'bye\n', newText: '', oldExists: true, newExists: false },
+    ]) expect(diffs.filter(event => event.toolId === expected.toolId)).toEqual([expected])
     expect(host.logs.some((line) => line.includes('no reversible diff recorded for NEW.md') && line.includes('without an approval round-trip'))).toBe(true)
     expect(host.logs.some((line) => line.includes('no reversible diff recorded for BIG.md') && line.includes('file too large'))).toBe(true)
     expect(host.ofType('tool.finished').find((event) => event.id === edits[0].id)).toMatchObject({ status: 'completed', content: [{ type: 'text', text: '1 file(s) changed, +1 −1' }] })
     expect(host.ofType('tool.finished').find((event) => event.id === edits[1].id)).toMatchObject({ status: 'completed' })
     expect(host.ofType('tool.finished').find((event) => event.id === edits[3].id)).toMatchObject({ status: 'completed', content: [{ type: 'text', text: '1 file(s) changed, +1 −1' }] })
-    for (const [index, edit] of [edits[0], edits[2]].entries()) {
-      const diff = host.ofType('diff')[index]
-      expect(host.events.indexOf(diff)).toBeLessThan(host.events.indexOf(host.ofType('tool.finished').find((event) => event.id === edit.id)!))
+    for (const diff of diffs) {
+      const finished = host.ofType('tool.finished').filter(event => event.id === diff.toolId)
+      expect(finished).toHaveLength(1)
+      expect(finished[0]).toMatchObject({ turnId: 'turn-1', status: 'completed' })
+      expect(host.events.indexOf(diff)).toBeLessThan(host.events.indexOf(finished[0]))
     }
 
     // Question: single and multi select; answers off the option list are dropped.
