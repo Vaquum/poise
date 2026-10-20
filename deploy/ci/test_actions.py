@@ -34,10 +34,12 @@ def write_script(path, text):
 
 
 class EnvFileTest(unittest.TestCase):
-    def env_file(self, variables, secret: 'str | None' = 's3cret'):
+    def env_file(self, variables, secret: 'str | None' = 's3cret', google_secret=None):
         env = clean_env(VARS=json.dumps(variables))
         if secret is not None:
             env['POISE_GITHUB_CLIENT_SECRET'] = secret
+        if google_secret is not None:
+            env['POISE_GOOGLE_CLIENT_SECRET'] = google_secret
         return subprocess.run([os.path.join(ACTIONS, 'env.sh')], capture_output=True, text=True, env=env)
 
     def test_writes_the_poise_variables_then_the_client_secret(self):
@@ -68,6 +70,34 @@ class EnvFileTest(unittest.TestCase):
             result = self.env_file(variables, secret)
             self.assertEqual(result.returncode, 1, variables)
             self.assertIn(says, result.stderr)
+
+
+    def test_google_client_pair_is_optional_and_secret_is_not_a_variable(self):
+        for variables, google_secret, error in [
+            ({'POISE_GOOGLE_CLIENT_ID': 'google-client'}, None, 'must be set together'),
+            ({}, 'google-test-secret', 'must be set together'),
+            ({'POISE_GOOGLE_CLIENT_SECRET': 'variable-test-secret'}, None, 'make it a secret instead'),
+            ({'POISE_GOOGLE_CLIENT_ID': 'google-client', 'POISE_GOOGLE_CLIENT_SECRET': 'variable-test-secret'},
+             'google-test-secret', 'make it a secret instead'),
+            ({'POISE_GOOGLE_CLIENT_ID': 'google-client'}, 'first\nsecond', 'secret spans more than one line'),
+            ({'POISE_GOOGLE_CLIENT_ID': 'google-client'}, 'first\rsecond', 'secret spans more than one line'),
+        ]:
+            with self.subTest(variables=list(variables), error=error):
+                result = self.env_file(variables, google_secret=google_secret)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(error, result.stderr)
+                self.assertEqual(result.stdout, '')
+                for value in ('variable-test-secret', 'google-test-secret', 'first', 'second', 's3cret'):
+                    self.assertNotIn(value, result.stderr)
+
+    def test_empty_google_client_pair_stays_disabled(self):
+        result = self.env_file({'POISE_GOOGLE_CLIENT_ID': ''}, google_secret='')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('POISE_GOOGLE_CLIENT_SECRET=', result.stdout)
+
+    def test_workflow_supplies_the_google_actions_secret(self):
+        with open(WORKFLOWS[0]) as file:
+            self.assertIn('POISE_GOOGLE_CLIENT_SECRET: ${{ secrets.POISE_GOOGLE_CLIENT_SECRET }}', file.read())
 
 
 class SshSetupTest(unittest.TestCase):
@@ -189,7 +219,7 @@ class DeployTest(unittest.TestCase):
         self.git('-C', self.seed, 'push', '--quiet', 'origin', 'HEAD:main')
         return self.git('-C', self.seed, 'rev-parse', 'HEAD')
 
-    def deploy(self, sha, variables=None):
+    def deploy(self, sha, variables=None, google_secret=None):
         env = clean_env(
             HOME=self.work.name,
             PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}',
@@ -200,6 +230,8 @@ class DeployTest(unittest.TestCase):
             VARS=json.dumps(variables or {'POISE_DOMAIN': 'poise.example.com', 'POISE_ADMINS': 'root'}),
             POISE_GITHUB_CLIENT_SECRET='s3cret',
         )
+        if google_secret is not None:
+            env['POISE_GOOGLE_CLIENT_SECRET'] = google_secret
         return subprocess.run([os.path.join(ACTIONS, 'deploy.sh')], capture_output=True, text=True, env=env)
 
     def calls_made(self):
@@ -233,6 +265,39 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(self.calls_made(), [f'install.sh  {first}', f'upgrade.sh --no-pull {second}'])
         with open(env_file) as file:
             self.assertIn('POISE_ADMINS=root,alice\n', file.read())
+
+    def test_google_pair_survives_rewrite_and_invalid_pair_never_reaches_server(self):
+        first, second = self.commits
+        variables = {'POISE_DOMAIN': 'poise.example.com', 'POISE_GOOGLE_CLIENT_ID': 'google-client'}
+        result = self.deploy(first, variables, google_secret='google-test-secret')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('google-test-secret', result.stdout + result.stderr)
+        env_file = os.path.join(self.path, 'deploy', '.env')
+        with open(env_file) as file:
+            original = file.read()
+        self.assertIn('POISE_GOOGLE_CLIENT_ID=google-client\n', original)
+        self.assertIn('POISE_GOOGLE_CLIENT_SECRET=google-test-secret\n', original)
+        self.assertEqual(stat.S_IMODE(os.stat(env_file).st_mode), 0o600)
+        with open(self.ssh_calls) as file:
+            original_calls = file.read()
+        for invalid, secret in [
+            (variables, None),
+            ({'POISE_DOMAIN': 'poise.example.com'}, 'google-test-secret'),
+            ({**variables, 'POISE_GOOGLE_CLIENT_SECRET': 'variable-test-secret'}, 'google-test-secret'),
+        ]:
+            result = self.deploy(second, invalid, google_secret=secret)
+            self.assertEqual(result.returncode, 1)
+            for value in ('google-test-secret', 'variable-test-secret', 's3cret'):
+                self.assertNotIn(value, result.stdout + result.stderr)
+            with open(env_file) as file:
+                self.assertEqual(file.read(), original)
+            with open(self.ssh_calls) as file:
+                self.assertEqual(file.read(), original_calls)
+            self.assertEqual(self.checkout('rev-parse', 'HEAD'), first)
+        result = self.deploy(second)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(env_file) as file:
+            self.assertNotIn('POISE_GOOGLE_', file.read())
 
     def test_keeps_the_token_and_settings_off_command_lines_and_out_of_the_checkout(self):
         result = self.deploy(self.commits[0])

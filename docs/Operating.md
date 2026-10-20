@@ -328,6 +328,16 @@ server: the checkout fetches with the run's own token, which expires with the
 run, and the settings reach the server over SSH alone, never on a command
 line.
 
+**Google OAuth client settings.** To supply an optional Google client through
+Actions, add
+`POISE_GOOGLE_CLIENT_ID` as an Actions repository **variable** and
+`POISE_GOOGLE_CLIENT_SECRET` as an Actions repository **secret**. Set both
+together; leaving both unset omits Google client credentials from the generated
+deployment environment. The Deploy workflow
+rejects an incomplete pair or a Google secret stored as a variable before
+contacting the server. It rewrites both values into the protected `deploy/.env`
+on each deployment, so configure them in Actions rather than editing that file.
+
 **Keeping up with autonomio/poise.** For the fork to update itself, it needs
 both of these:
 

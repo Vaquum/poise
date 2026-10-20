@@ -5,7 +5,7 @@
 # On a push to main, or when started by hand on main, it signs in to the
 # server over SSH, brings the server's checkout to this commit, writes
 # deploy/.env from the repository's POISE_ variables and its
-# POISE_GITHUB_CLIENT_SECRET secret, and applies it with deploy/install.sh,
+# OAuth client secrets, and applies it with deploy/install.sh,
 # or deploy/upgrade.sh --no-pull once installed.
 name: Deploy
 
@@ -50,4 +50,5 @@ jobs:
           TOKEN: ${{ github.token }}
           VARS: ${{ toJSON(vars) }}
           POISE_GITHUB_CLIENT_SECRET: ${{ secrets.POISE_GITHUB_CLIENT_SECRET }}
+          POISE_GOOGLE_CLIENT_SECRET: ${{ secrets.POISE_GOOGLE_CLIENT_SECRET }}
         run: deploy/actions/deploy.sh
