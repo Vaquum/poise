@@ -52,8 +52,11 @@ Run `npm run build` first when using it locally.
 The merged-detail benchmark prepares the production query and its legacy
 reference on one connection, warms both, then measures eight counterbalanced
 pairs over identical rows. Assertions and report aggregation stay outside both
-clocks. The optimized median must remain strictly faster. Full-report equality
-is checked separately. A native SQLite delegation counts large-input extraction
+clocks. The cost guard compares process CPU time (user plus system) so scheduler
+delay cannot masquerade as query work. The optimized CPU median must remain
+strictly faster; all elapsed-time samples remain in the diagnostic output.
+Full-report equality is checked separately. A native SQLite delegation counts
+large-input extraction
 calls: the production query must use one per merged row, while the legacy
 reference uses more. Restoring the legacy query therefore fails a deterministic
 work bound as well as retaining the measured speed comparison.
