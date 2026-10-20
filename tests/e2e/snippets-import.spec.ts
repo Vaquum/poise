@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test, type Page } from '@playwright/test'
 
 // Snippets → Import against the real server: an Espanso file's plain pairs
@@ -62,12 +63,12 @@ test('imports the plain pairs of a pasted Espanso file and lists what it skipped
   await panel.getByRole('textbox', { name: 'Espanso match file' }).fill(file)
   await panel.getByRole('button', { name: 'Import', exact: true }).click()
 
-  await expect(panel.locator('.snip-import-status')).toHaveText('Added 2 snippets. Skipped 3:')
-  await expect(panel.getByRole('list', { name: 'Skipped entries' }).getByRole('listitem')).toHaveText([
-    'global_vars is not a snippet',
-    `${pwn} — not a plain snippet: it runs a shell command`,
-    `${addr} — duplicate trigger: an earlier entry in this file has this trigger`,
-  ])
+  const report = await feedback(page, 'Snippet import completed')
+  await expect(report).toContainText('Added 2 snippets. Skipped 3:')
+  await expect(report).toContainText('global_vars is not a snippet')
+  await expect(report).toContainText(`${pwn} — not a plain snippet: it runs a shell command`)
+  await expect(report).toContainText(`${addr} — duplicate trigger: an earlier entry in this file has this trigger`)
+  await page.locator('#notification-bell').click()
   await expect(view.locator(`.snip-row[data-trigger="${addr}"]`)).toContainText('1 Main St')
   await expect(view.locator(`.snip-row[data-trigger="${sig}"]`)).toContainText('Best, Octo')
   await expect(view.locator(`.snip-row[data-trigger="${pwn}"]`)).toHaveCount(0)
@@ -75,7 +76,8 @@ test('imports the plain pairs of a pasted Espanso file and lists what it skipped
 
   // The same file again: everything is already there.
   await panel.getByRole('button', { name: 'Import', exact: true }).click()
-  await expect(panel.locator('.snip-import-status')).toHaveText('No new snippets to add. Skipped 5:')
+  await expect(await feedback(page, 'Snippet import completed')).toContainText('Added 0 snippets. Skipped 5:')
+  await page.locator('#notification-bell').click()
 
   const library = await (await page.request.get('/api/snippets')).json() as { snippets: Array<{ trigger: string, replace: string }> }
   expect(library.snippets).toEqual(expect.arrayContaining([{ trigger: addr, replace: '1 Main St' }, { trigger: sig, replace: 'Best, Octo' }]))
@@ -85,6 +87,12 @@ test('imports the plain pairs of a pasted Espanso file and lists what it skipped
   expect(desktop.yaml).not.toContain(pwn)
   expect(desktop.yaml).not.toContain('whoami')
 
+  await panel.getByRole('textbox', { name: 'Espanso match file' }).fill('backend: Clipboard\n')
+  await panel.getByRole('button', { name: 'Import', exact: true }).click()
+  const failedImport = await feedback(page)
+  await expect(failedImport.locator('.nr-card').filter({ hasText: 'Snippet import completed' })).toHaveCount(0)
+  await expect(failedImport).toContainText('Snippet import needs attention')
+  await page.locator('#notification-bell').click()
   await panel.getByRole('button', { name: 'Close', exact: true }).click()
   await expect(panel).toBeHidden()
 })
@@ -100,14 +108,13 @@ test('loads a chosen file to check before importing it, and says why a file is r
 
   await panel.locator('.snip-import-file').setInputFiles({ name: 'base.yml', mimeType: 'text/yaml', buffer: Buffer.from(file) })
   await expect(text).toHaveValue(file)
-  await expect(panel.locator('.snip-import-status')).toHaveText('Loaded base.yml. Check it, then choose Import.')
+  await expect(panel.locator('.snip-import-status')).toHaveCount(0)
   await text.press('ControlOrMeta+Enter')
-  await expect(panel.locator('.snip-import-status')).toHaveText('Added 1 snippet.')
-  await expect(panel.locator('.snip-import-report')).toBeHidden()
+  await expect(panel.locator('.snip-import-report')).toHaveCount(0)
   await expect(view.locator(`.snip-row[data-trigger=":chosen-${id}"]`)).toBeVisible()
 
   await text.fill('backend: Clipboard\n')
   await panel.getByRole('button', { name: 'Import', exact: true }).click()
-  await expect(panel.locator('.snip-import-status')).toHaveText('This is not an Espanso match file: it has no list of matches.')
-  await expect(panel.locator('.snip-import-status')).toHaveClass(/st-help-error/)
+  await expect(await feedback(page, 'Snippet import needs attention')).toContainText('This is not an Espanso match file: it has no list of matches.')
+  await expect(page.locator('#view-snippets .snip-import-status')).toHaveCount(0)
 })

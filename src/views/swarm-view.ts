@@ -1,3 +1,4 @@
+import { viewDiagnostic, viewFeedback } from '../view-feedback'
 import { layout, retire, scrollToActor } from '../motion'
 import { patchContent, patchNode } from '../dom-patch'
 import { mountOrganizationFilter, organizationUrl, getSelectedOrganization, setSelectedOrganization } from '../organizations'
@@ -208,28 +209,13 @@ function escapeHtml(s: string): string {
 }
 
 
-function quarantineRecordMarkup(row: QuarantinedLog): string {
+function quarantineDescription(row: QuarantinedLog): string {
   const target = row.repo || row.prId
     ? `Reported target: ${row.repo || 'unknown repository'}${row.prId ? `#${row.prId}` : ''}`
     : row.sessionId ? `Reported session: ${row.sessionId}` : 'Target unknown'
-  const identity = [
-    `Call: ${row.id || 'unknown'}`,
-    row.correlationId ? `Correlation: ${row.correlationId}` : '',
-    row.behavior ? `Behavior: ${row.behavior}` : '',
-    row.sessionId && (row.repo || row.prId) ? `Session: ${row.sessionId}` : '',
-    `Log index: ${row.index}`,
-  ].filter(Boolean).join(' · ')
-  return `<div role="listitem" class="swarm-quarantine-record"><p class="st-help"><strong>${escapeHtml(target)}</strong></p>`
-    + `<pre class="agent-response-error">${escapeHtml(row.error)}</pre>`
-    + `<p class="st-help">${escapeHtml(identity)}</p></div>`
-}
-
-function renderQuarantine(): void {
-  const el = viewEl.querySelector<HTMLElement>('#swarm-quarantine')!
-  el.hidden = quarantined.length === 0
-  patchContent(el, quarantined.length === 0 ? ''
-    : '<p class="st-help">Unreadable worker records. Reported identity may be incomplete or conflicting; outcomes are unverified.</p>'
-      + `<div role="list">${quarantined.map(quarantineRecordMarkup).join('')}</div>`)
+  return [target, `Call: ${row.id || 'unknown'}`, row.correlationId ? `Correlation: ${row.correlationId}` : '',
+    row.behavior ? `Behavior: ${row.behavior}` : '', row.sessionId ? `Session: ${row.sessionId}` : '',
+    `Log index: ${row.index}`, row.error].filter(Boolean).join(' · ')
 }
 
 // Status is a coloured icon and the status in a word. The status and outcome
@@ -367,8 +353,8 @@ const reasoning = new Map<string, { chars: number, body: string, loading: boolea
 function reasoningDetail(e: LogEntry): string {
   if (e.progress?.reasoning_available === undefined) return ''
   const saved = reasoning.get(e.id)
-  const body = saved?.body || (e.progress.reasoning_available ? 'Open to load provider reasoning.' : 'The provider has not exposed reasoning text.')
-  return `<details class="agent-reasoning" data-reasoning-id="${escapeHtml(e.id)}"><summary>Provider reasoning</summary><p>Latest 65,536 characters supplied by the provider.</p><pre class="agent-reasoning-body">${escapeHtml(body)}</pre></details>`
+  const body = saved?.body || ''
+  return `<details class="agent-reasoning" data-reasoning-id="${escapeHtml(e.id)}"><summary>Provider reasoning</summary><pre class="agent-reasoning-body">${escapeHtml(body)}</pre></details>`
 }
 
 async function loadReasoning(id: string): Promise<void> {
@@ -378,15 +364,17 @@ async function loadReasoning(id: string): Promise<void> {
   const saved = reasoning.get(id)
   const chars = entry.progress.reasoning_chars || 0
   if (saved?.loading || saved?.chars === chars) return
-  reasoning.set(id, { chars: saved?.chars ?? -1, body: saved?.body || 'Loading…', loading: true })
+  reasoning.set(id, { chars: saved?.chars ?? -1, body: saved?.body || '', loading: true })
   try {
     const response = await fetch(`/api/agent-reasoning/${encodeURIComponent(id)}`)
     if (!response.ok) throw new Error(`Could not load reasoning (${response.status})`)
     const data = await response.json()
     if (typeof data.body !== 'string') throw new Error('Invalid reasoning response')
-    reasoning.set(id, { chars, body: data.body || 'No reasoning text available.', loading: false })
+    reasoning.set(id, { chars, body: data.body || '', loading: false })
+    viewFeedback(`swarm-reasoning:${id}`, 'Swarm reasoning unavailable', '')
   } catch (error) {
-    reasoning.set(id, { chars: -1, body: (error as Error).message, loading: false })
+    reasoning.set(id, { chars: -1, body: saved?.body || '', loading: false })
+    viewFeedback(`swarm-reasoning:${id}`, 'Swarm reasoning unavailable', (error as Error).message, 'read_failed')
   }
   const row = bodyEl.querySelector<HTMLTableRowElement>(`.agent-expand-row[data-expand-for="${id}"]`)
   if (row) refreshRunDetail(row, entry)
@@ -539,37 +527,12 @@ function isReplayable(e: LogEntry): boolean {
 // outlive the DOM node.
 const replaysInFlight = new Set<string>()
 
-// Why a replay was refused, by row id. The server holds a replay to the check
-// the scheduler applies and names the check that failed; that answer belongs
-// under the row Replay was pressed on, and stays until it is dismissed or the
-// row is replayed again. Kept here, like the in-flight guard, so a render does
-// not lose it.
-const replayRefusals = new Map<string, string>()
-
-// The message alone is the alert, so the Dismiss button is not read with it.
-function refusalMarkup(message: string): string {
-  return `<td colspan="${COLUMN_COUNT}"><div class="agent-refusal">`
-    + `<span class="agent-refusal-text" role="alert">${escapeHtml(message)}</span>`
-    + '<button type="button" class="agent-refusal-dismiss" aria-label="Dismiss">&times;</button></div></td>'
-}
-
-function buildRefusalRow(id: string, message: string): HTMLTableRowElement {
-  const tr = document.createElement('tr')
-  tr.className = 'agent-refusal-row'
-  tr.dataset.refusalFor = id
-  tr.innerHTML = refusalMarkup(message)
-  return tr
-}
-
 function showReplayRefusal(id: string, message: string): void {
-  replayRefusals.set(id, message)
-  bodyEl.querySelector(`tr.agent-refusal-row[data-refusal-for="${id}"]`)?.remove()
-  bodyEl.querySelector(`tr.agent-row[data-id="${id}"]`)?.insertAdjacentElement('afterend', buildRefusalRow(id, message))
+  viewFeedback(`swarm-replay:${id}`, 'Swarm replay refused', message, 'action_needed')
 }
 
 function clearReplayRefusal(id: string): void {
-  replayRefusals.delete(id)
-  bodyEl.querySelector(`tr.agent-refusal-row[data-refusal-for="${id}"]`)?.remove()
+  viewFeedback(`swarm-replay:${id}`, 'Swarm replay refused', '')
 }
 
 function replayCell(e: LogEntry): string {
@@ -611,8 +574,6 @@ function renderShell() {
       </div>
     </header>
     <main>
-      <p id="swarm-stale" class="st-help st-help-error" role="status" hidden></p>
-      <section id="swarm-quarantine" aria-label="Unreadable worker records" hidden></section>
       <table id="swarm-table">
         <thead>
           <tr>
@@ -631,7 +592,6 @@ function renderShell() {
         </thead>
         <tbody id="swarm-tbody"></tbody>
       </table>
-      <p id="swarm-empty" hidden>No agent calls.</p>
       <div id="swarm-loader" class="loader" hidden><span></span><span></span><span></span></div>
     </main>
   `
@@ -736,10 +696,10 @@ function setExpandContent(tr: HTMLTableRowElement, id: string) {
     : ''
   const activity = entry ? progressDetail(entry) : ''
   const inner = state.loading
-    ? '<div class="agent-response-loading">Loading…</div>'
+    ? '<div class="loader" role="status" aria-label="Loading response"><span></span><span></span><span></span></div>'
     : (state.body
         ? `<pre class="agent-response-body">${escapeHtml(state.body)}</pre>`
-        : (errorBlock || activity ? '' : '<div class="agent-response-empty">No response body.</div>'))
+        : (errorBlock || activity ? '' : ''))
   patchContent(tr, `<td colspan="${COLUMN_COUNT}">${activity}${errorBlock}${inner}</td>`)
 }
 
@@ -779,16 +739,13 @@ function reconcileRows(nextRows: RunRow[]): void {
   layout(bodyEl, () => {
   const main = new Map<string, HTMLTableRowElement>()
   const detail = new Map<string, HTMLTableRowElement>()
-  const refusal = new Map<string, HTMLTableRowElement>()
   for (const row of [...bodyEl.children] as HTMLTableRowElement[]) {
     if (row.dataset.id) main.set(row.dataset.id, row)
     if (row.dataset.expandFor) detail.set(row.dataset.expandFor, row)
-    if (row.dataset.refusalFor) refusal.set(row.dataset.refusalFor, row)
   }
   const ids = new Set(nextRows.map(({ entry }) => entry.id))
   for (const [id, row] of main) if (!ids.has(id)) retire(row)
   for (const [id, row] of detail) if (!ids.has(id) || !expanded.has(id)) retire(row)
-  for (const [id, row] of refusal) if (!ids.has(id) || !replayRefusals.has(id)) retire(row)
   let cursor: ChildNode | null = bodyEl.firstChild
   const place = (row: HTMLTableRowElement) => {
     if (cursor !== row) bodyEl.insertBefore(row, cursor)
@@ -813,8 +770,6 @@ function reconcileRows(nextRows: RunRow[]): void {
       mainRowMarkup.set(row, markup)
     }
     place(row)
-    const refused = replayRefusals.get(entry.id)
-    if (refused !== undefined) place(refusal.get(entry.id) ?? buildRefusalRow(entry.id, refused))
     if (expanded.has(entry.id)) {
       const expandedRow = detail.get(entry.id) || buildExpandRow(entry)
       refreshRunDetail(expandedRow, entry)
@@ -830,39 +785,15 @@ function render() {
   // a fetch, a parse and a full table rebuild every minute, on the main thread,
   // while the person was typing in another view.
   if (!viewEl || viewEl.hidden) return
-  renderQuarantine()
   const list = visible()
   const groups = groupRuns(list)
   displayedGroups = new Map(groups.map((group) => [group.entries[0].id, group]))
-  const empty = viewEl.querySelector<HTMLElement>('#swarm-empty')!
   const table = viewEl.querySelector<HTMLElement>('#swarm-table')!
   const countEl = viewEl.querySelector<HTMLElement>('#swarm-count')!
-  if (entries.length === 0) {
-    table.hidden = true
-    empty.textContent = lastLoadError ? `Error: ${lastLoadError}`
-      : !lastLoadedAt ? 'Loading…' : quarantined.length > 0 ? 'No readable agent calls.' : 'No agent calls.'
-    empty.hidden = false
-    countEl.textContent = ''
-    bodyEl.innerHTML = ''
-    return
-  }
   const runCount = list.length === entries.length ? `${entries.length}` : `${list.length} / ${entries.length}`
-  const count = groups.length < list.length ? `${groups.length} groups · ${runCount} runs` : runCount
-  countEl.textContent = incompleteTotal === null ? count : `${count} · ${entries.length} of ${incompleteTotal} runs loaded`
-  // A filter matching nothing used to leave a bare header strip over blank
-  // space, with only a small count pill to explain it. Archive says so in
-  // words for exactly this case.
-  if (list.length === 0) {
-    table.hidden = true
-    empty.textContent = incompleteTotal === null ? 'No runs match this filter.'
-      : loadingHistory ? 'No loaded runs match this filter. Older runs are still loading.'
-        : 'No loaded runs match this filter. Older runs are unavailable.'
-    empty.hidden = false
-    bodyEl.innerHTML = ''
-    return
-  }
-  table.hidden = false
-  empty.hidden = true
+  countEl.textContent = entries.length ? runCount : ''
+  table.hidden = list.length === 0
+  if (!list.length) { bodyEl.replaceChildren(); return }
   reconcileRows(groupRows(groups))
 }
 
@@ -893,8 +824,10 @@ async function loadResponse(id: string, refresh = false) {
     }
     const data = await res.json()
     next = { body: data.body || '', loading: false }
+    viewFeedback(`swarm-response:${id}`, 'Swarm response unavailable', '')
   } catch (err) {
-    next = { body: `Error: ${(err as Error).message}`, loading: false }
+    next = { body: null, loading: false }
+    viewFeedback(`swarm-response:${id}`, 'Swarm response unavailable', (err as Error).message, 'read_failed')
   }
 
   // The person may have collapsed the row while this was out. Writing the
@@ -957,12 +890,13 @@ function attachClicks() {
         })
         const data = await res.json().catch(() => ({}))
         if (!res.ok) throw new Error(String(data.error || `HTTP ${res.status}`))
+        viewFeedback(`swarm-stop:${id}`, 'Swarm stop failed', '')
         // Pull the log right away so the row settles without waiting for
         // the 15s poll.
         window.setTimeout(() => { void pollOnce() }, 300)
       } catch (err) {
         console.error('[swarm] stop failed:', err)
-        alert(`Stop failed: ${(err as Error).message}`)
+        viewFeedback(`swarm-stop:${id}`, 'Swarm stop failed', (err as Error).message)
       } finally {
         stopsInFlight.delete(id)
         const cell = bodyEl.querySelector<HTMLElement>(`tr.agent-row[data-id="${id}"] .stop-cell`)
@@ -1011,7 +945,7 @@ function attachClicks() {
         window.setTimeout(() => { void pollOnce() }, 800)
       } catch (err) {
         console.error('[swarm] replay failed:', err)
-        alert(`Replay failed: ${(err as Error).message}`)
+        viewFeedback(`swarm-replay:${id}`, 'Swarm replay failed', (err as Error).message)
       } finally {
         replaysInFlight.delete(id)
         // The button that was clicked may have been replaced by a render while
@@ -1025,15 +959,6 @@ function attachClicks() {
           current.title = 'Replay this run'
         }
       }
-      return
-    }
-
-    // Dismissing a refusal hands focus back to the Replay it answered.
-    const dismiss = target.closest<HTMLButtonElement>('.agent-refusal-dismiss')
-    if (dismiss) {
-      const id = dismiss.closest<HTMLTableRowElement>('tr')?.dataset.refusalFor || ''
-      clearReplayRefusal(id)
-      bodyEl.querySelector<HTMLButtonElement>(`tr.agent-row[data-id="${id}"] .replay-btn`)?.focus()
       return
     }
 
@@ -1125,6 +1050,7 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
 const highlightTimers = new WeakMap<HTMLTableRowElement, number>()
 
 function highlightRow(row: HTMLTableRowElement): void {
+  viewFeedback('swarm-navigation', 'Swarm run unavailable', '')
   scrollToActor(row, 'center')
   const previous = highlightTimers.get(row)
   if (previous !== undefined) window.clearTimeout(previous)
@@ -1186,14 +1112,7 @@ export async function focusCall(callId: string): Promise<void> {
 // Following a link and landing on nothing, with no explanation, is worse than
 // being told the run is not here.
 function notFocusable(message: string): void {
-  const el = viewEl?.querySelector<HTMLElement>('#swarm-stale')
-  if (!el) return
-  el.textContent = message
-  el.hidden = false
-  window.setTimeout(() => {
-    // Leave a real load error in place; only clear our own transient note.
-    if (el.textContent === message) renderStaleBanner()
-  }, 6000)
+  viewFeedback('swarm-navigation', 'Swarm run unavailable', message, 'action_needed')
 }
 
 // The in-flight request itself, not just a flag. `focusRow` awaits pollOnce to
@@ -1264,13 +1183,6 @@ function pollOnce(): Promise<void> {
       loadingHistory = false
       lastLoadError = (err as Error).message
       if (entries.length > 0) render()
-      if (entries.length === 0) {
-        const empty = viewEl?.querySelector<HTMLElement>('#swarm-empty')
-        if (empty) {
-          empty.textContent = `Error: ${lastLoadError}`
-          empty.hidden = false
-        }
-      }
       renderStaleBanner()
     } finally {
       if (mine === pollSequence) pollInFlight = null
@@ -1289,32 +1201,15 @@ let lastLoadError: string | null = null
 let lastLoadedAt = 0
 
 function renderStaleBanner(): void {
-  if (!viewEl) return
-  const el = viewEl.querySelector<HTMLElement>('#swarm-stale')
-  if (!el) return
-  const failed = !!lastLoadError || quarantined.length > 0
-  el.classList.toggle('st-help-error', failed)
-  el.classList.toggle('st-help-info', !failed)
-  if (!lastLoadError && loadingHistory) {
-    el.textContent = `Loading older runs… Showing ${entries.length} of ${incompleteTotal} runs.`
-      + (quarantined.length ? ` ${quarantined.length} unreadable worker log row(s) isolated.` : '')
-    el.hidden = false
-    return
-  }
-  if (!lastLoadError && quarantined.length > 0) {
-    el.textContent = `${quarantined.length} unreadable worker log row(s) isolated. Other runs continue updating.`
-    el.hidden = false
-    return
-  }
-  if (!lastLoadError || (entries.length === 0 && quarantined.length === 0)) {
-    el.hidden = true
-    el.textContent = ''
-    return
-  }
-  const age = lastLoadedAt ? relFromMs(lastLoadedAt) : 'unknown'
-  el.textContent = `Not updating — ${lastLoadError}. Showing the last successful read from ${age} ago.`
-    + (incompleteTotal === null ? '' : ` Only ${entries.length} of ${incompleteTotal} runs loaded.`)
-  el.hidden = false
+  const partial = incompleteTotal === null ? '' : `Only ${entries.length} of ${incompleteTotal} runs loaded.`
+  viewDiagnostic('swarm-history', loadingHistory ? `Loading older runs. ${partial}` : '')
+  const age = lastLoadedAt ? new Date(lastLoadedAt).toISOString() : 'none'
+  viewFeedback('swarm-read', 'Swarm is not updating', lastLoadError
+    ? `${lastLoadError}. Last successful read: ${age}. ${partial}` : '', 'read_failed')
+  viewFeedback('swarm-records', 'Unreadable Swarm records', quarantined.length
+    ? `${quarantined.length} unreadable worker log row(s) isolated. Other runs continue updating.\n`
+      + quarantined.map(quarantineDescription).join('\n')
+    : '', 'read_failed')
 }
 
 // The Started column shows a relative time ("3m") computed at render.
@@ -1383,8 +1278,6 @@ export async function initSwarmView() {
       loadingHistory = false
       bodyEl.replaceChildren()
       viewEl.querySelector<HTMLElement>('#swarm-table')!.hidden = true
-      const empty = viewEl.querySelector<HTMLElement>('#swarm-empty')!
-      empty.textContent = 'Loading…'; empty.hidden = false
       viewEl.querySelector<HTMLElement>('#swarm-count')!.textContent = ''
       expanded.clear()
       expandedGroups.clear()

@@ -1,8 +1,9 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test, type Page } from '@playwright/test'
 import { settled } from './fixtures/motion'
 import { emptyAnalyticsReport } from './fixtures/analytics'
 import type { Organization } from '../../src/config'
-import type { BehaviorDiagnostics } from '../../src/behaviors'
+import { BEHAVIORS, type BehaviorDiagnostics } from '../../src/behaviors'
 
 function organization(login: string, status: Organization['status'] = 'ready'): Organization {
   return { login, managed: true, status, stage: status === 'initializing' ? 'syncing' : status, error: null, activatedAt: status === 'ready' ? '2026-10-01T08:00:00Z' : null }
@@ -82,6 +83,7 @@ async function setup(page: Page, initial = [organization('acme')], me = 'octocat
     }
     if (url.pathname === '/api/models') return route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } })
     if (url.pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
+    if (url.pathname === '/api/behavior-metrics') return route.fulfill({ json: { behaviors: Object.fromEntries(BEHAVIORS.map(({ key }) => [key, null])), error: null } })
     if (url.pathname === '/api/analytics') return route.fulfill({ json: emptyAnalyticsReport(url) })
     return route.fulfill({ json: {} })
   })
@@ -159,7 +161,7 @@ test('uses one global behavior configuration regardless of the dashboard account
   const state = await setup(page, [organization('acme'), organization('beta')])
   state.partial = true
   await page.goto('/')
-  await expect(page.locator('#main-load-error')).toContainText('beta: Sync unavailable')
+  await expect(await feedback(page)).toContainText('beta: Sync unavailable')
   await expect(page.locator('#tbody tr')).toHaveCount(2)
   await page.locator('#main-filters').getByLabel('Organization filter').selectOption('beta')
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
@@ -234,10 +236,10 @@ test('continues Archive pagination when an organization is missing only from the
   })
   await page.goto('/')
   await expect(page.locator('#tbody tr')).toHaveCount(20)
-  await expect(page.locator('#main-load-error')).toContainText('beta: Count unavailable')
+  await expect(await feedback(page)).toContainText('beta: Count unavailable')
   await page.locator('#main-sentinel').scrollIntoViewIfNeeded()
   await expect(page.locator('#tbody tr')).toHaveCount(25)
-  await expect(page.locator('#count')).toHaveText('25 available')
+  await expect(page.locator('#count')).toHaveText('25')
 })
 
 
@@ -515,7 +517,8 @@ test('preserves selected repositories when one account cannot be listed', async 
   await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
   await page.locator('tr[data-behavior="review-new-issues"] .behavior-triggers-btn').click()
   const dialog = page.getByRole('dialog', { name: /Review New Issues/ })
-  await expect(dialog).toContainText('mikkokotila: Sync unavailable')
+  await expect(await feedback(page, 'Behavior repositories unavailable')).toContainText('mikkokotila: Sync unavailable')
+  await page.locator('#notification-bell').click()
   await expect.poll(() => dialog.evaluate(element => element.getBoundingClientRect().bottom <= innerHeight)).toBe(true)
   await expect(dialog.getByRole('checkbox', { name: 'mikkokotila/same-repo', exact: true })).toBeChecked()
   await dialog.getByRole('checkbox', { name: 'acme/same-repo', exact: true }).check()

@@ -5,7 +5,8 @@ import { evidenceAttachment, evidenceReferences, keepKnownEvidence, type Evidenc
 // shows the same ones: what one tab puts away, the others drop on their next read.
 
 export const NOTICE_KINDS = ['chat_waiting', 'sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'pr_ready', 'chat_turn_finished', 'github_quota_warning', 'github_quota_exhausted', 'storage_low'] as const
-export type NoticeKind = typeof NOTICE_KINDS[number] | 'read_failed'
+export const LOCAL_NOTICE_KINDS = ['read_failed', 'action_failed', 'action_needed', 'action_finished'] as const
+export type NoticeKind = typeof NOTICE_KINDS[number] | typeof LOCAL_NOTICE_KINDS[number]
 
 export interface ReadFailure { key: string, title: string, body: string, target?: NoticeTarget }
 
@@ -128,6 +129,10 @@ export function sendLatest<T>(send: (value: T) => Promise<void>, failed: (error:
   }
 }
 
+export interface LocalNotice extends ReadFailure {
+  kind?: typeof LOCAL_NOTICE_KINDS[number]
+}
+
 type Listener = (state: NoticesState) => void
 
 /** A notice this tab put away, kept away until an answer that knows of it. */
@@ -147,7 +152,7 @@ export class NoticeFeed {
   private state: NoticesState = { enabled: false, notices: [] }
   private server: NoticesState = { enabled: false, notices: [] }
   private readonly putAway = new Map<string, PutAway>()
-  private readonly readFailures = new Map<string, ReadFailure[]>()
+  private readonly readFailures = new Map<string, LocalNotice[]>()
   private readonly local = new Map<string, Notice>()
   private readonly dismissedLocal = new Set<string>()
   private localSequence = 0
@@ -195,15 +200,23 @@ export class NoticeFeed {
    *  share a key so day, baseline and history report an account only once.
    *  These tab-local failures never post another request. */
   reportReadErrors(source: string, failures: ReadFailure[]): void {
+    this.reportLocalNotices(source, failures)
+  }
+
+  /** Tab-local action and read feedback shares dismissal and recovery across views. */
+  reportLocalNotices(source: string, failures: LocalNotice[]): void {
     this.readFailures.set(source, failures)
     const pending = new Map([...this.readFailures.values()].flat().map((failure) => [failure.key, failure]))
     for (const [key, notice] of this.local) {
       if (!pending.has(key)) { this.local.delete(key); this.dismissedLocal.delete(notice.id) }
     }
     for (const [key, failure] of pending) {
-      const previous = this.local.get(key)
+      const existing = this.local.get(key)
+      const kind = failure.kind ?? 'read_failed'
+      const previous = existing?.body === failure.body && existing.title === failure.title && existing.kind === kind ? existing : undefined
+      if (existing && !previous) this.dismissedLocal.delete(existing.id)
       const at = new Date().toISOString()
-      this.local.set(key, { id: previous?.id ?? `read:${++this.localSequence}`, kind: 'read_failed',
+      this.local.set(key, { id: previous?.id ?? `read:${++this.localSequence}`, kind,
         title: failure.title, body: failure.body, since: previous?.since ?? at, due: previous?.due ?? at,
         silenceable: false, target: failure.target ?? null })
     }

@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test, type Page } from '@playwright/test'
 import { BEHAVIORS } from '../../src/behaviors'
 
@@ -65,7 +66,7 @@ test('filters the entire metrics section in the configured timezone without chan
   state.fail = true
   await page.locator('#behaviors-time-picker [data-time="today"]').click()
   await expect(row.locator('.behavior-metric')).toHaveText(['—', '—', '—'])
-  await expect(page.locator('#behavior-metrics-error')).toHaveText('Run history unavailable')
+  await expect(await feedback(page)).toContainText('Run history unavailable')
 })
 
 test('keeps the selected period when an earlier metrics read finishes later', async ({ page }) => {

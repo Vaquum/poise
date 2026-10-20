@@ -274,3 +274,24 @@ it('shares browser read failures across sources, dismisses locally, clears on re
   feed.reportReadErrors('day', [])
   expect(feed.current.notices).toEqual([])
 })
+
+
+it('keeps local action feedback independent of read recovery, retains dismissal, and resurfaces changed failures', async () => {
+  const feed = new NoticeFeed(vi.fn())
+  const failure = { key: 'save', title: 'Editor save failed', body: 'Disk full', kind: 'action_failed' as const }
+  feed.reportLocalNotices('editor', [failure])
+  const first = feed.current.notices[0]
+  expect(first.kind).toBe('action_failed')
+  feed.reportReadErrors('analytics', [{ key: 'quota', title: 'Quota unavailable', body: 'Offline' }])
+  feed.reportReadErrors('analytics', [])
+  expect(feed.current.notices).toEqual([first])
+  await feed.dismiss(first.id)
+  feed.reportLocalNotices('editor', [failure])
+  expect(feed.current.notices).toEqual([])
+  feed.reportLocalNotices('editor', [{ ...failure, body: 'Changed elsewhere', kind: 'action_needed' }])
+  expect(feed.current.notices).toHaveLength(1)
+  expect(feed.current.notices[0]).toMatchObject({ body: 'Changed elsewhere', kind: 'action_needed' })
+  expect(feed.current.notices[0].id).not.toBe(first.id)
+  feed.reportLocalNotices('editor', [])
+  expect(feed.current.notices).toEqual([])
+})

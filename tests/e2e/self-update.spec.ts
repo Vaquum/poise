@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
 import { execFileSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
@@ -626,19 +627,19 @@ test.describe('on a release build', () => {
     await doc.click()
     await page.keyboard.press('End')
     await page.keyboard.type(' and more')
-    await expect(page.locator('#editor-meta')).toContainText(/Editing|Saving/)
+    await expect(page.locator('#editor-meta')).toHaveCount(0)
     // Leaving the Editor flushes the save, which is now stuck on the wire.
     await page.locator('.nav-item[data-view="chat"]').click()
     await expect(page.locator('#view-editor')).toBeHidden()
     await expect.poll(() => saves).toBe(1)
-    await expect(page.locator('#editor-meta')).toHaveText('Saving…')
+    await expect(page.locator('#editor-meta')).toHaveCount(0)
     const banner = page.locator('.self-update-banner')
     await banner.locator('.self-update-refresh').click()
     await expect(banner).toContainText('Refresh is waiting for the document being saved')
     await page.waitForTimeout(3_000)
     expect(loads).toBe(1)
     releaseSave!()
-    await expect(page.locator('#editor-meta')).toContainText('saved')
+    await expect(page.locator('#editor-meta')).toHaveCount(0)
     await page.waitForFunction(() => performance.getEntriesByType('navigation').some((e) => (e as PerformanceNavigationTiming).type === 'reload'), null, { timeout: 15_000 })
     await expect.poll(() => loads).toBe(2)
   })
@@ -669,12 +670,12 @@ test.describe('on a release build', () => {
     await expect(doc).toHaveText('original')
     await doc.press('ControlOrMeta+End')
     await page.keyboard.type(' first')
-    await expect(page.locator('#editor-meta')).toContainText('saved')
+    await expect.poll(() => content).toBe(await doc.innerText())
     await page.keyboard.type(' second')
-    await expect(page.locator('#editor-meta')).toContainText('saved')
+    await expect.poll(() => content).toBe(await doc.innerText())
     await doc.press('ControlOrMeta+z')
     await expect(doc).toHaveText('original first')
-    await expect(page.locator('#editor-meta')).toContainText('saved')
+    await expect.poll(() => content).toBe(await doc.innerText())
     if (refresh === 'storage-full') {
       await page.evaluate(() => {
         const original = Storage.prototype.setItem
@@ -688,7 +689,7 @@ test.describe('on a release build', () => {
     if (refresh === 'storage-full') {
       await page.locator('.editor-doc-trigger').click()
       await page.locator('.editor-doc-item[data-slug="other"]').click()
-      await expect(page.locator('#editor-meta')).toContainText('Undo history could not be preserved')
+      await expect(await feedback(page)).toContainText('Undo history could not be preserved')
       await expect(doc).toHaveText('original first')
     }
     // The update must preserve the hidden Editor too.
@@ -711,7 +712,7 @@ test.describe('on a release build', () => {
     await expect(doc).toHaveText('original first')
     await doc.press('ControlOrMeta+z')
     await expect(doc).toHaveText('original')
-    await expect(page.locator('#editor-meta')).toContainText('saved')
+    await expect.poll(() => content).toBe(await doc.innerText())
     // Redo survives an ordinary refresh as well as an update.
     await page.reload()
     await expect(doc).toHaveText('original')

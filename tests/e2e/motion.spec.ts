@@ -81,28 +81,18 @@ for (const entering of [false, true]) test(`setup retirement preserves its ${ent
   await expect(page.locator('.ob-backdrop')).toHaveCount(0)
 })
 
-test('Current keeps each empty-lane explanation through background refreshes', async ({ page }) => {
+test('Current keeps empty lanes free of messages through filters and background refreshes', async ({ page }) => {
   await workspace(page)
-  await page.locator('#current-status-filter [data-status="all"]').click()
-  await page.locator('#current-time-picker [data-time="all"]').click()
-  const notes = page.locator('#view-current .lane[data-lane-type="live"] .lane-empty')
-  await expect(notes).toHaveText(['Nothing here.', 'Nothing here.'])
-  await settled(page)
-  let refreshes = 0
-  await page.route('**/api/agent-logs**', route => { refreshes++; return route.fulfill({ json: { logs: [] } }) })
+  const notes = page.locator('#view-current .lane-empty')
+  await expect(notes).toHaveCount(0)
   for (const query of ['', 'missing']) {
     await page.locator('#current-search').fill(query)
-    const explanation = query ? 'Nothing matches the current filter.' : 'Nothing here.'
-    await expect(notes).toHaveText([explanation, explanation])
-    const original = await notes.first().elementHandle()
-    const before = refreshes
     await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
-    await expect.poll(() => refreshes).toBeGreaterThan(before)
-    await expect(notes).toHaveText([explanation, explanation])
-    expect(await original!.evaluate(element => element.isConnected)).toBe(true)
+    await settled(page)
+    await expect(notes).toHaveCount(0)
+    await expect(page.locator('#view-current')).not.toContainText('Nothing matches')
   }
 })
-
 test('closed menu retains its words until exit while focus and interaction close immediately', async ({ page }) => {
   await workspace(page)
   await page.locator('#menu-toggle').click()

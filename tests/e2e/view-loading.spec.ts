@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test, type Page } from '@playwright/test'
 
 function deferred() {
@@ -74,7 +75,7 @@ test('Current paints personal cards before a delayed GitHub failure and preserve
     const card = page.getByRole('button', { name: 'Edit card: Available personal card', exact: true })
     await expect(card).toBeVisible({ timeout: 2000 })
     live.release()
-    await expect(page.locator('#view-current')).toContainText('Could not load GitHub issues and pull requests.')
+    await expect(await feedback(page)).toContainText('Could not load GitHub issues and pull requests.')
     await expect(card).toBeVisible()
   } finally { live.release() }
 })
@@ -114,7 +115,7 @@ test('Archive paints rows before its total-count response and reports a late cou
     await expect(page.locator('#tbody')).toContainText('Available GitHub issue', { timeout: 2000 })
     console.log(`Archive first rows: ${Date.now() - start}ms; total-count response still held`)
     count.release()
-    await expect(page.locator('#view-main')).toContainText('Total count unavailable.')
+    await expect(await feedback(page)).toContainText('Total count unavailable.')
     await expect(page.locator('#tbody')).toContainText('Available GitHub issue')
   } finally { count.release() }
 })
@@ -145,7 +146,7 @@ test('a late repository failure is visible without discarding Current cards', as
     await page.goto('/')
     await expect(page.getByRole('link', { name: /Available GitHub issue/ })).toBeVisible({ timeout: 2000 })
     repos.release()
-    await expect(page.locator('#view-current')).toContainText('Could not load the repository list.')
+    await expect(await feedback(page)).toContainText('Could not load the repository list.')
     await expect(page.getByRole('button', { name: 'Edit card: Available personal card', exact: true })).toBeVisible()
   } finally { repos.release() }
 })
@@ -235,7 +236,7 @@ test('promoting a linked card preserves its intended repository before and after
     const picker = page.getByLabel('Repository for the new issue')
     await expect(picker).toHaveValue('acme/intended')
     repos.release()
-    await expect(page.locator('#view-current')).toContainText('Partial repository discovery')
+    await expect(await feedback(page)).toContainText('Partial repository discovery')
     await expect(picker).toHaveValue('acme/intended')
     await expect(page.getByRole('button', { name: 'Edit card: Promote this linked card', exact: true })).toBeVisible()
   } finally { repos.release() }
@@ -289,7 +290,7 @@ test('an issue composer reports discovery failure without an unhandled rejection
     const composer = page.locator('.composer-issue')
     await expect(composer).toBeVisible()
     repos.release()
-    await expect(composer).toContainText('Could not load repositories')
+    await expect(await feedback(page)).toContainText('Could not load repositories')
     expect(errors).toEqual([])
   } finally { repos.release() }
 })

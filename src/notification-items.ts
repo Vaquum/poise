@@ -48,6 +48,9 @@ export interface NotificationItem extends EvidenceAttachment {
 export type ItemCounts = Record<ItemGroup, number> & { open: number }
 
 export const NOTICE_LOOK: Record<NoticeKind, { group: ItemGroup, tone: ItemTone, icon: ItemIcon, source: string }> = {
+  action_failed: { group: 'faults', tone: 'red', icon: 'fault', source: 'Action' },
+  action_needed: { group: 'needs', tone: 'amber', icon: 'held', source: 'Action' },
+  action_finished: { group: 'ready', tone: 'green', icon: 'check', source: 'Action' },
   read_failed: { group: 'faults', tone: 'red', icon: 'fault', source: 'Data' },
   chat_waiting: { group: 'needs', tone: 'blue', icon: 'chat', source: 'Chat' },
   sign_in_needed: { group: 'needs', tone: 'amber', icon: 'key', source: 'Accounts' },

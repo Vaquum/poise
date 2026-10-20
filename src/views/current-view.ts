@@ -1,3 +1,4 @@
+import { viewFeedback } from '../view-feedback'
 // Current — five-lane kanban that mixes free-form thinking with live GitHub
 // activity. The first three lanes (Idea / Concept / Plan) are manual cards
 // you drag around; the last two (Issue / PR) are read-only feeds pulled
@@ -259,18 +260,14 @@ function renderShell(): string {
         <input class="search-input" id="current-search" type="search" placeholder="Filter…" autocomplete="off" spellcheck="false" aria-label="Filter cards" />
       </div>
     </header>
-    <p id="current-load-error" class="st-help st-help-error" role="status" hidden></p>
     <div class="kanban">${lanes}</div>
   `
 }
 
-// A source that did not load is worth one line. Silence made a GitHub outage
-// look like an empty board.
+// Read failures remain available across views in the notification rail.
 function showLoadError(message: string): void {
-  const el = viewEl?.querySelector<HTMLElement>('#current-load-error')
-  if (!el) return
-  el.textContent = message
-  el.hidden = !message
+  const completed = /^(Card added|Issue created)/.test(message)
+  viewFeedback(completed ? 'current-created' : 'current-read', completed ? 'Current item created' : 'Current is not updating', message, completed ? 'action_finished' : 'read_failed')
 }
 
 // ── Card chrome strategy ──────────────────────────────────────────────
@@ -539,30 +536,10 @@ function renderAll(type?: LaneType) {
       const count = manual.length + live.length
       laneCountEl(lane.key).textContent = lane.type === 'live' && liveTruncated ? `${count}+` : String(count)
       laneCountEl(lane.key).title = lane.type === 'live' && liveTruncated ? `Showing the ${LIVE_LIMIT} most recently updated issues and pull requests combined; older ones are not loaded.` : ''
-      renderLaneEmptyState(lane, count)
     }
     for (const actor of existing.values()) if (!keep.has(actor)) retire(actor)
   }, '.lane-list > .card')
   if (type !== 'live' && !viewEl.querySelector('.card.editing')) restoreOpenEdit(draft)
-}
-
-// An empty lane and a lane emptied by a filter look identical, and the second
-// one is the confusing case: the board looks like it has lost your work.
-function renderLaneEmptyState(l: LaneConfig, count: number): void {
-  const list = laneListEl(l.key)
-  const existing = list.querySelector<HTMLParagraphElement>('.lane-empty')
-  if (count > 0) { existing?.remove(); return }
-  const filtered = l.type === 'manual'
-    ? !!searchQuery
-    : !!searchQuery || timeFilter !== 'all' || statusFilter !== 'all'
-  const note = existing ?? document.createElement('p')
-  note.className = 'lane-empty'
-  note.textContent = filtered
-    ? (l.type === 'live' && liveTruncated
-        ? 'Nothing matches — and this lane is capped, so older items are not loaded.'
-        : 'Nothing matches the current filter.')
-    : (l.type === 'manual' ? 'No cards yet.' : 'Nothing here.')
-  if (!existing) list.appendChild(note)
 }
 
 function renderLiveOnly() {
@@ -584,7 +561,6 @@ function renderLiveLaneAnimated(laneKey: 'issue' | 'pr') {
       cursor = el.nextSibling
       if (!existing.has(prKey(item))) reveal(el)
     }
-    renderLaneEmptyState(LANES.find(lane => lane.key === laneKey)!, items.length)
   }, ':scope > .card')
   laneCountEl(laneKey).textContent = String(items.length)
 }
@@ -891,9 +867,7 @@ function openManualComposer(lane: 'idea' | 'concept' | 'plan') {
     <div class="composer-row">
       <button class="composer-add">Add</button>
       <button class="composer-cancel" type="button">Cancel</button>
-      <span class="composer-hint">⌘↵ to add</span>
     </div>
-    <p class="composer-error st-help st-help-error" role="alert" hidden></p>
   `
   laneNode.insertBefore(composer, addBtn)
   disclosure(composer, true, undefined, 0)
@@ -901,7 +875,7 @@ function openManualComposer(lane: 'idea' | 'concept' | 'plan') {
   const repoSel = composer.querySelector<HTMLSelectElement>('.manual-repo')!
   const addB = composer.querySelector<HTMLButtonElement>('.composer-add')!
   const cancelB = composer.querySelector<HTMLButtonElement>('.composer-cancel')!
-  const errEl = composer.querySelector<HTMLElement>('.composer-error')!
+  const reportError = (message: string) => viewFeedback(`current-create:${lane}`, 'Current action needs attention', message, 'action_needed')
 
   const close = () => { retire(composer); addBtn.hidden = false }
   let adding = false
@@ -911,7 +885,7 @@ function openManualComposer(lane: 'idea' | 'concept' | 'plan') {
     if (!text) { close(); return }
     adding = true
     addB.disabled = true
-    errEl.hidden = true
+    reportError('')
     try {
       const repo = repoSel.value || null
       const card = await api<ManualCard>('POST', '/api/current', { text, lane, repo })
@@ -922,14 +896,13 @@ function openManualComposer(lane: 'idea' | 'concept' | 'plan') {
       // creation, which is indistinguishable from the write having failed.
       if (searchQuery && !matchesSearch(card.text)) {
         showLoadError('Card added — the filter is hiding it.')
-        window.setTimeout(() => showLoadError(''), 5000)
+        window.setTimeout(() => viewFeedback('current-created', 'Current item created', ''), 5000)
       }
     } catch (err) {
       // A failed create was a silent no-op: the Add button simply stopped
       // responding and the reason went to the console.
       addB.disabled = false
-      errEl.textContent = `Not added — ${(err as Error).message}`
-      errEl.hidden = false
+      reportError(`Not added — ${(err as Error).message}`)
     } finally {
       adding = false
     }
@@ -992,9 +965,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
     <div class="composer-row">
       <button class="composer-add">Open issue</button>
       <button class="composer-cancel" type="button">Cancel</button>
-      <span class="composer-hint">⌘↵ to submit</span>
     </div>
-    <div class="composer-error" hidden></div>
   `
   laneNode.insertBefore(composer, addBtn)
   disclosure(composer, true, undefined, 0)
@@ -1003,7 +974,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
   const repoSel = composer.querySelector<HTMLSelectElement>('.issue-repo')!
   const addB = composer.querySelector<HTMLButtonElement>('.composer-add')!
   const cancelB = composer.querySelector<HTMLButtonElement>('.composer-cancel')!
-  const errEl = composer.querySelector<HTMLElement>('.composer-error')!
+  const reportError = (message: string) => viewFeedback('current-create:issue', 'Current action needs attention', message, 'action_needed')
 
   // The list was a one-shot snapshot taken when the composer opened. If
   // /api/repos had not answered yet it silently degraded to the repos inside
@@ -1029,8 +1000,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
     addBtn.hidden = false
   }
   const showError = (msg: string) => {
-    errEl.textContent = msg
-    errEl.hidden = false
+    reportError(msg)
   }
   // Disabling the button is not a guard: ⌘↵ calls submit() directly and never
   // looks at it. The gh call can take the best part of a minute, so a repeated
@@ -1047,8 +1017,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
 
     submitting = true
     addB.disabled = true
-    addB.textContent = 'Opening…'
-    errEl.hidden = true
+    reportError('')
     try {
       const ghRes = await fetch('/api/gh', {
         method: 'POST',
@@ -1104,7 +1073,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
       const created = pendingLiveItems.find((p) => p.repo === repo)
       if (created && !withinActiveWindow(created)) {
         showLoadError('Issue created — the current filter is hiding it.')
-        window.setTimeout(() => showLoadError(''), 6000)
+        window.setTimeout(() => viewFeedback('current-created', 'Current item created', ''), 6000)
       }
     } catch (err) {
       addB.disabled = false
@@ -1153,11 +1122,10 @@ function startEdit(cardEl: HTMLElement, draft?: EditDraft) {
       <button class="composer-add">Save</button>
       <button class="composer-cancel" type="button">Cancel</button>
     </div>
-    <p class="card-edit-error st-help st-help-error" role="alert" hidden></p>
   `
   const ta = wrapper.querySelector<HTMLTextAreaElement>('textarea')!
   const repoSel = wrapper.querySelector<HTMLSelectElement>('.manual-repo')!
-  const errEl = wrapper.querySelector<HTMLElement>('.card-edit-error')!
+  const reportError = (message: string) => viewFeedback(`current-edit:${id}`, 'Current action needs attention', message, 'action_needed')
   // A restored draft is text the person typed that was never stored; it wins
   // over the saved value.
   ta.value = draft ? draft.text : originalText
@@ -1189,7 +1157,7 @@ function startEdit(cardEl: HTMLElement, draft?: EditDraft) {
     if (!text) { close(); return }
     if (text === originalText && repo === originalRepo) { close(); return }
     saving = true
-    errEl.hidden = true
+    reportError('')
     try {
       const patch: Record<string, unknown> = {}
       if (text !== originalText) patch.text = text
@@ -1210,8 +1178,7 @@ function startEdit(cardEl: HTMLElement, draft?: EditDraft) {
       // Closing here threw the rewritten text away and reverted the card, with
       // the reason going only to the console. The editor stays open, holding
       // the only copy, and says what went wrong.
-      errEl.textContent = `Not saved — ${(err as Error).message}`
-      errEl.hidden = false
+      reportError(`Not saved — ${(err as Error).message}`)
       ta.focus()
     } finally {
       saving = false
@@ -1546,6 +1513,7 @@ function attachCardClickHandlers() {
           const text = await res.text().catch(() => '')
           throw new Error(text ? `${res.status}: ${text.slice(0, 200)}` : `HTTP ${res.status}`)
         }
+        viewFeedback(`current-review:${item.url}`, 'Current action needs attention', '')
         reviewBtn.classList.remove('running')
         reviewBtn.classList.add('done')
         reviewBtn.innerHTML = PR_REVIEW_PLAY_SVG
@@ -1569,7 +1537,7 @@ function attachCardClickHandlers() {
         reviewBtn.disabled = false
         reviewBtn.innerHTML = PR_REVIEW_PLAY_SVG
         console.error('PR review trigger failed:', err)
-        alert(`Could not start review: ${(err as Error).message}`)
+        viewFeedback(`current-review:${item.url}`, 'Current action needs attention', `Could not start review: ${(err as Error).message}`)
       }
       return
     }
@@ -1585,8 +1553,8 @@ function attachCardClickHandlers() {
       const card = manualCards.find((c) => c.id === id)
       const preview = (card?.text || '').trim().replace(/\s+/g, ' ').slice(0, 80)
       if (!window.confirm(preview ? `Delete this card?\n\n${preview}${preview.length === 80 ? '…' : ''}` : 'Delete this card?')) return
-      try { await deleteManualCard(id) }
-      catch (err) { alert(`Could not delete the card: ${(err as Error).message}`) }
+      try { await deleteManualCard(id); viewFeedback(`current-delete:${id}`, 'Current action needs attention', '') }
+      catch (err) { viewFeedback(`current-delete:${id}`, 'Current action needs attention', `Could not delete the card: ${(err as Error).message}`) }
       return
     }
     const cardEl = target.closest<HTMLElement>('.card')

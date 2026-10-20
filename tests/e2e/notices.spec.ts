@@ -1,10 +1,11 @@
+import { feedback } from './fixtures/view-feedback'
 import { build } from 'esbuild'
 import { execFileSync } from 'node:child_process'
 import { resolve } from 'node:path'
 import { mkdirSync } from 'node:fs'
 import { isolatedEnvironment } from '../fixtures/cli-isolation'
 import { expect, test, type Page } from '@playwright/test'
-import type { BehaviorDiagnostics } from '../../src/behaviors'
+import { BEHAVIORS, type BehaviorDiagnostics } from '../../src/behaviors'
 import type { Notice } from '../../src/notices'
 import { freeze, resume, settled } from './fixtures/motion'
 import { emptyAnalyticsReport } from './fixtures/analytics'
@@ -97,9 +98,11 @@ async function workspace(page: Page, notices: Notice[], options: { enabled?: boo
       'review-new-prs': behavior({ setting: 'p2', reviewers: 1 }), 'approve-prs': behavior(), 'resolve-unblocking': behavior({ scratchpad: null }),
       diagnostics: state.diagnostics,
     } })
+    if (pathname === '/api/current') return route.fulfill({ json: { cards: [] } })
     if (pathname === '/api/workspace') return route.fulfill({ json: { mode: 'local' } })
     if (pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (pathname === '/api/agent-logs') return route.fulfill({ json: { logs: [failedRun()] } })
+    if (pathname === '/api/behavior-metrics') return route.fulfill({ json: { behaviors: Object.fromEntries(BEHAVIORS.map(({ key }) => [key, null])), error: null } })
     if (pathname === '/api/analytics') return route.fulfill({ json: emptyAnalyticsReport(new URL(request.url())) })
     return route.fulfill({ json: {} })
   })
@@ -320,7 +323,7 @@ test('focuses an older grouped failure while already in Swarm, clears filters, a
   await expect(focused).toHaveCount(0)
   await expect(page.locator(`.agent-row[data-id="${newest}"]`).getByRole('button', { name: 'Show 1 identical earlier run (2 total)' })).toBeVisible()
   await page.locator('#swarm-search').fill('does-not-match-any-run')
-  await expect(page.locator('#swarm-empty')).toHaveText('No runs match this filter.')
+  await expect(page.locator('#swarm-empty')).toHaveCount(0)
   const accountLoaded = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/agent-logs'
     && new URL(response.url()).searchParams.get('org') === 'beta')
   await page.locator('#swarm-filters').getByRole('combobox', { name: 'Organization filter' }).selectOption('beta')
@@ -358,14 +361,26 @@ test('focuses an older grouped failure while already in Swarm, clears filters, a
 
 test('reports a missing notification run instead of opening another run on the same target', async ({ page }) => {
   const absent = 'f'.repeat(32)
-  await workspace(page, [{ ...HELD, target: { swarm: absent } }])
+  const state = await workspace(page, [{ ...HELD, target: { swarm: absent } }])
+  const logs = [failedRun()]
+  await page.route('**/api/agent-logs**', route => route.fulfill({ json: { logs } }))
   await page.goto('/')
   await openRail(page)
   await expand(page, HELD.id)
   await card(page, HELD.id).getByRole('button', { name: 'Open the run in Swarm' }).click()
   await expect(page.locator('#view-swarm')).toBeVisible()
-  await expect(page.locator('#swarm-stale')).toHaveText(`No run found for call ${absent}.`)
+  await expect(await feedback(page)).toContainText(`No run found for call ${absent}.`)
   await expect(page.locator('.agent-row-focus')).toHaveCount(0)
+  await page.locator('#notification-bell').click()
+  logs.push(failedRun(absent))
+  const recovered = { ...HELD, id: 'aaaaaaaaaaaa-4', target: { swarm: absent } }
+  state.notices = [recovered]
+  await reread(page)
+  await openRail(page)
+  await expand(page, recovered.id)
+  await card(page, recovered.id).getByRole('button', { name: 'Open the run in Swarm' }).click()
+  await expect(page.locator(`.agent-row[data-id="${absent}"]`)).toHaveClass(/agent-row-focus/)
+  await expect(await feedback(page)).not.toContainText('Swarm run unavailable')
 })
 
 test('keeps the last opened notice in control when two navigations share a pending account request', async ({ page }) => {
@@ -415,7 +430,7 @@ test('keeps the last opened notice in control when two navigations share a pendi
   await expect(focused).toHaveClass(/agent-row-focus/)
   await expect(focused.getByRole('button', { name: 'Toggle detail' })).toBeFocused()
   await expect(account).toHaveValue('beta')
-  await expect(page.locator('#swarm-stale')).toBeHidden()
+  await expect(page.locator('#swarm-stale')).toHaveCount(0)
   await expect(page.locator(`.agent-row[data-id="${HELD_CALL}"]`)).toHaveCount(0)
   expect(allRequests).toBe(unfilteredBefore)
   expect(heldRequests).toBe(1)

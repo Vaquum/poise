@@ -1,3 +1,4 @@
+import { BEHAVIORS } from '../../../src/behaviors'
 import type { Page } from '@playwright/test'
 
 export async function workspace(page: Page, view = 'current', fontResponse?: Promise<void>, options: { preserveOnReload?: boolean; realLogging?: boolean; path?: string; timezone?: string } = {}): Promise<void> {
@@ -22,6 +23,7 @@ export async function workspace(page: Page, view = 'current', fontResponse?: Pro
     if (path === '/api/current') return route.fulfill({ json: { cards: [] } })
     if (path === '/api/repos') return route.fulfill({ json: { repos: [] } })
     if (path === '/api/gh') return route.fulfill({ json: { records: [], count: 0, errors: [] } })
+    if (path === '/api/behavior-metrics') return route.fulfill({ json: { behaviors: Object.fromEntries(BEHAVIORS.map(({ key }) => [key, null])), error: null } })
     if (path === '/api/agent-logs') return route.fulfill({ json: { logs: [] } })
     if (path === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (path === '/api/notices') return route.fulfill({ json: { enabled: false, notices: [] } })

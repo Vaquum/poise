@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test } from '@playwright/test'
 import { build } from 'esbuild'
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -252,10 +253,12 @@ test('executes an idle five-item queue after the first task through real ACP, SQ
       await expect(other.locator('.chat-session-item.active')).toBeVisible()
       await otherInput.fill('/create /shared-edit Changed from another tab'); await otherInput.press('Enter')
       await expect(other.locator('.chat-notice')).toContainText('Updated /shared-edit')
-      await expect(snippetsView.locator('.snip-status')).toContainText('changed elsewhere')
+      await expect(await feedback(page)).toContainText('changed elsewhere')
+      await page.locator('#notification-bell').click()
       await expect(snippetsView.getByRole('textbox', { name: 'Snippet instructions' })).toHaveValue('My preserved local edit')
       await snippetsView.getByRole('button', { name: 'Save', exact: true }).click()
-      await expect(snippetsView.locator('.snip-status')).toContainText('Review and save again')
+      await expect(await feedback(page)).toContainText('Review and save again')
+      await page.locator('#notification-bell').click()
       await expect(snippetsView.getByRole('textbox', { name: 'Snippet instructions' })).toHaveValue('My preserved local edit')
       await snippetsView.getByRole('button', { name: 'Save', exact: true }).click()
       await expect(snippetsView.locator('.snip-expand-row')).toHaveCount(0)

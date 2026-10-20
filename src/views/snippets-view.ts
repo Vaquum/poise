@@ -1,3 +1,4 @@
+import { viewDiagnostic, viewFeedback } from '../view-feedback'
 import { disclosure, layout, retire } from '../motion'
 import { patchContent } from '../dom-patch'
 // Snippets — manage espanso text-expansion pairs from Poise.
@@ -25,7 +26,6 @@ let tbodyEl: HTMLTableSectionElement
 let initialized = false
 let snippets: Snippet[] = []
 let snippetVersion = ''
-let espansoOk = true
 let skills: ChatSwitches = { revision: 0, switches: [] }
 let saving = false
 let loadGeneration = 0
@@ -59,17 +59,12 @@ function renderShell(): string {
     <main>
       <section class="snip-import" aria-label="Import snippets from Espanso" hidden>
         <div class="snip-edit">
-          <p class="st-help st-help-info">Paste an Espanso match file, such as <code>base.yml</code>, or choose one. Its plain trigger and replacement pairs are added; entries that run commands or use other Espanso features are skipped, and snippets you already have are kept.</p>
           <textarea class="st-input snip-import-text" aria-label="Espanso match file" placeholder="matches:&#10;  - trigger: &quot;:hi&quot;&#10;    replace: Hello" spellcheck="false"></textarea>
           <div class="st-row">
             <button type="button" class="st-save snip-import-run">Import</button>
             <button type="button" class="st-clear snip-import-choose">Choose file…</button>
             <input type="file" class="snip-import-file" accept=".yml,.yaml" hidden />
             <button type="button" class="st-clear snip-import-close">Close</button>
-          </div>
-          <div>
-            <p class="st-help st-help-info snip-import-status" role="status"></p>
-            <ul class="st-help snip-import-report" aria-label="Skipped entries" hidden></ul>
           </div>
         </div>
       </section>
@@ -84,14 +79,7 @@ function renderShell(): string {
         <tbody id="snippets-tbody"></tbody>
       </table>
       <p class="st-help snip-skill-help">Every snippet is a Chat skill. Use <code>;name</code> for text expansion and <code>/name</code> in Chat. Skills saved with <code>/create</code> appear here too.</p>
-      <p class="snip-empty" hidden>No snippets yet. Add one here, or use <code>/create /name</code> in Chat.</p>
-      <div class="snip-load-error" hidden>
-        <p class="snip-load-error-title">Your snippets could not be read.</p>
-        <p class="snip-load-error-detail"></p>
-        <p class="snip-load-error-where">They are still on disk in the espanso match file — nothing has been
-          lost, and nothing will be written until the file can be read again.</p>
-        <button type="button" class="st-save snip-retry">Try again</button>
-      </div>
+      <button type="button" class="st-save snip-retry" hidden>Try again</button>
     </main>
   `
 }
@@ -113,7 +101,7 @@ function refreshLibraryView(): void {
   if (!initialized || saving || viewEl.hidden) return
   const editor = tbodyEl.querySelector('.snip-expand-row')
   if (editor) {
-    setStatus(editor.querySelector('.snip-status'), 'The library changed elsewhere. Your edit is kept; Save will check for conflicts.', 'info')
+    setStatus('The library changed elsewhere. Your edit is kept; Save will check for conflicts.', 'info')
     return
   }
   void fetchSnippets().then(loaded => { if (loaded && !tbodyEl.querySelector('.snip-expand-row')) renderRows() })
@@ -145,23 +133,14 @@ function renderRows() {
   const failed = loadError !== null
   updateSnippetCount()
   viewEl.querySelector<HTMLElement>('#snippets-table')!.hidden = failed || n === 0
-  // "No snippets yet" is a statement about the user's data. Only make it
-  // when the data was actually read.
-  viewEl.querySelector<HTMLElement>('.snip-empty')!.hidden = failed || n > 0
-  viewEl.querySelector<HTMLElement>('.snip-espanso-hint')!.hidden = failed || espansoOk
+  viewEl.querySelector<HTMLButtonElement>('.snip-retry')!.hidden = !failed
+  viewFeedback('snippets-read', 'Snippets could not be read', loadError || '', 'read_failed')
 
-  const errorBox = viewEl.querySelector<HTMLElement>('.snip-load-error')!
-  errorBox.hidden = !failed
-  if (failed) {
-    viewEl.querySelector<HTMLElement>('.snip-load-error-detail')!.textContent = loadError!
-  }
 }
 
 // ── inline edit row (expand-to-edit) ──────────────────────────────────────
-function setStatus(el: HTMLElement | null, text: string, cls: 'info' | 'ok' | 'error' = 'info') {
-  if (!el) return
-  el.textContent = text
-  el.className = `st-help st-help-${cls} snip-status`
+function setStatus(text: string, cls: 'info' | 'ok' | 'error' = 'info') {
+  viewFeedback('snippets-edit', 'Snippet edit needs attention', cls !== 'ok' ? text : '', 'action_needed')
 }
 
 function buildEditRow(snip: Snippet | null, isDraft: boolean): HTMLTableRowElement {
@@ -175,7 +154,6 @@ function buildEditRow(snip: Snippet | null, isDraft: boolean): HTMLTableRowEleme
         <div class="st-row">
           <button type="button" class="st-save snip-save">Save</button>
           <button type="button" class="st-clear snip-delete">${isDraft ? 'Discard' : 'Delete'}</button>
-          <span class="st-help st-help-info snip-status" role="status"></span>
         </div>
       </div>
     </td>
@@ -221,7 +199,6 @@ function collapseOpen() {
   // re-entered. Put the empty state back when nothing is left.
   if (!snippets.length && loadError === null) {
     viewEl.querySelector<HTMLElement>('#snippets-table')!.hidden = true
-    viewEl.querySelector<HTMLElement>('.snip-empty')!.hidden = false
   }
 }
 
@@ -267,7 +244,6 @@ async function putSnippets(list: Snippet[]): Promise<SnippetState> {
 }
 
 async function preserveEditAfterConflict(
-  status: HTMLElement | null,
   intent: 'save' | 'delete' = 'save',
 ): Promise<void> {
   const refreshed = await fetchSnippets()
@@ -289,7 +265,7 @@ async function preserveEditAfterConflict(
     : (refreshed
       ? 'Snippets changed elsewhere. Latest data loaded; your unsaved edit is preserved. Review and save again.'
       : 'Snippets changed elsewhere. Your unsaved edit is preserved; reload before saving.')
-  setStatus(status, message, 'error')
+  setStatus(message, 'error')
 }
 
 // Refresh every saved row's rendering in place, leaving the open edit row and
@@ -338,13 +314,12 @@ async function save(editRow: HTMLTableRowElement) {
   const editingTrigger = isDraft ? null : (main?.dataset.trigger ?? null)
   const triggerInput = editRow.querySelector<HTMLInputElement>('.snip-trigger-input')!
   const bodyInput = editRow.querySelector<HTMLTextAreaElement>('.snip-body-input')!
-  const status = editRow.querySelector<HTMLElement>('.snip-status')
   const trigger = triggerInput.value.trim()
   const replace = bodyInput.value
-  if (!trigger) { setStatus(status, 'Trigger is required.', 'error'); triggerInput.focus(); return }
-  if (!replace.trim()) { setStatus(status, 'Snippet body is required.', 'error'); bodyInput.focus(); return }
+  if (!trigger) { setStatus('Trigger is required.', 'error'); triggerInput.focus(); return }
+  if (!replace.trim()) { setStatus('Snippet body is required.', 'error'); bodyInput.focus(); return }
   if (editingTrigger != null && !snippets.some((s) => s.trigger === editingTrigger)) {
-    setStatus(status, 'This snippet was removed or renamed elsewhere. Your edit is preserved; copy it before reloading.', 'error')
+    setStatus('This snippet was removed or renamed elsewhere. Your edit is preserved; copy it before reloading.', 'error')
     return
   }
   // Preserve order: edit replaces in place, add appends.
@@ -352,7 +327,7 @@ async function save(editRow: HTMLTableRowElement) {
     ? snippets.map((s) => (s.trigger === editingTrigger ? { trigger, replace } : s))
     : [...snippets, { trigger, replace }]
   if (next.filter((s) => s.trigger === trigger).length > 1) {
-    setStatus(status, `A snippet with trigger "${trigger}" already exists.`, 'error')
+    setStatus(`A snippet with trigger "${trigger}" already exists.`, 'error')
     return
   }
   const saveBtn = editRow.querySelector<HTMLButtonElement>('.snip-save')!
@@ -360,16 +335,16 @@ async function save(editRow: HTMLTableRowElement) {
   loadGeneration++
   setMutationDisabled(editRow, true)
   saveBtn.disabled = true
-  saveBtn.textContent = 'Saving…'
   try {
     const saved = await putSnippets(next)
     snippets = saved.snippets
     snippetVersion = saved.version
     if (saved.skills) skills = saved.skills
+    setStatus('', 'ok')
     renderRows()                                       // rebuild collapses the (transient) edit row
   } catch (err) {
-    if (err instanceof SnippetConflictError) await preserveEditAfterConflict(status)
-    else setStatus(status, (err as Error).message || 'Failed to save.', 'error')
+    if (err instanceof SnippetConflictError) await preserveEditAfterConflict()
+    else setStatus((err as Error).message || 'Failed to save.', 'error')
     saveBtn.disabled = false
     saveBtn.textContent = 'Save'
   } finally { saving = false; setMutationDisabled(editRow, false) }
@@ -397,11 +372,11 @@ async function del(editRow: HTMLTableRowElement) {
     snippets = saved.snippets
     snippetVersion = saved.version
     if (saved.skills) skills = saved.skills
+    setStatus('', 'ok')
     renderRows()
   } catch (err) {
-    const status = editRow.querySelector<HTMLElement>('.snip-status')
-    if (err instanceof SnippetConflictError) await preserveEditAfterConflict(status, 'delete')
-    else setStatus(status, (err as Error).message || 'Failed to delete.', 'error')
+    if (err instanceof SnippetConflictError) await preserveEditAfterConflict('delete')
+    else setStatus((err as Error).message || 'Failed to delete.', 'error')
     delBtn.disabled = false
   } finally { saving = false; setMutationDisabled(editRow, false) }
 }
@@ -423,7 +398,6 @@ function openAdd() {
   collapseOpen()
   // The table is hidden while the saved list is empty — show it for the draft.
   viewEl.querySelector<HTMLElement>('#snippets-table')!.hidden = false
-  viewEl.querySelector<HTMLElement>('.snip-empty')!.hidden = true
   const main = document.createElement('tr')
   main.className = 'snip-row snip-draft'
   main.innerHTML = `
@@ -457,9 +431,8 @@ function importEl<T extends HTMLElement>(selector: string): T {
 }
 
 function setImportStatus(text: string, cls: 'info' | 'ok' | 'error'): void {
-  const el = importEl('.snip-import-status')
-  el.textContent = text
-  el.className = `st-help st-help-${cls} snip-import-status`
+  viewDiagnostic('snippets-import', cls !== 'error' ? text : '')
+  viewFeedback('snippets-import', 'Snippet import needs attention', cls === 'error' ? text : '', 'action_needed')
 }
 
 function toggleImport(open: boolean): void {
@@ -468,18 +441,11 @@ function toggleImport(open: boolean): void {
   if (open) importEl<HTMLTextAreaElement>('.snip-import-text').focus()
 }
 
-function renderSkip(skip: ImportSkip): string {
-  // A top-level key (global_vars, imports) is not an entry; its detail names it.
-  if (skip.entry === null) return `<li>${escapeHtml(skip.detail)}</li>`
-  const what = skip.trigger !== null ? `<code>${escapeHtml(skip.trigger)}</code>` : `Entry ${skip.entry}`
-  return `<li>${what} — ${SKIP_REASONS[skip.reason] ?? escapeHtml(skip.reason)}: ${escapeHtml(skip.detail)}</li>`
-}
-
 async function runImport(): Promise<void> {
   if (importing || saving) return
+  viewFeedback('snippets-import-result', 'Snippet import completed', '')
   const text = importEl<HTMLTextAreaElement>('.snip-import-text')
   const run = importEl<HTMLButtonElement>('.snip-import-run')
-  const report = importEl<HTMLUListElement>('.snip-import-report')
   if (!text.value.trim()) {
     setImportStatus('Paste an Espanso match file or choose one first.', 'error')
     text.focus()
@@ -488,9 +454,6 @@ async function runImport(): Promise<void> {
   importing = true
   loadGeneration++
   run.disabled = true
-  run.textContent = 'Importing…'
-  report.hidden = true
-  report.innerHTML = ''
   setImportStatus('', 'info')
   try {
     const res = await fetch('/api/snippets/import', {
@@ -518,8 +481,8 @@ async function runImport(): Promise<void> {
       `${added ? `Added ${added} snippet${added === 1 ? '' : 's'}.` : 'No new snippets to add.'}${skipped.length ? ` Skipped ${skipped.length}:` : ''}`,
       added ? 'ok' : 'info',
     )
-    report.innerHTML = skipped.map(renderSkip).join('')
-    report.hidden = skipped.length === 0
+    viewFeedback('snippets-import-result', 'Snippet import completed', skipped.length
+      ? `Added ${added} snippets. Skipped ${skipped.length}:\n${skipped.map(skip => `${skip.trigger ?? `Entry ${skip.entry ?? 'file'}`} — ${SKIP_REASONS[skip.reason] ?? skip.reason}: ${skip.detail}`).join('\n')}` : '', 'action_needed')
   } catch (err) {
     setImportStatus((err as Error).message || 'The import failed.', 'error')
   } finally {
@@ -585,7 +548,7 @@ async function fetchSnippets(): Promise<boolean> {
     skills = parseChatSwitches(data.skills) ?? skills
     snippets = Array.isArray(data.snippets) ? data.snippets : []
     snippetVersion = data.version
-    espansoOk = data.espansoDetected !== false
+    viewEl.querySelector<HTMLElement>('.snip-espanso-hint')!.hidden = data.espansoDetected !== false
     loadError = null
     return true
   } catch (err) {
@@ -594,6 +557,8 @@ async function fetchSnippets(): Promise<boolean> {
       ? `Could not reach Poise to read your snippets (${(err as Error).message}).`
       : 'Could not reach Poise to read your snippets.'
     return false
+  } finally {
+    if (generation === loadGeneration) viewFeedback('snippets-read', 'Snippets could not be read', loadError || '', 'read_failed')
   }
 }
 

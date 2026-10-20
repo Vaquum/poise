@@ -1611,14 +1611,15 @@ test('reads both periods for the selected account and shows slower merges in red
   await expect(mergeTrend(page).getByRole('img')).toHaveAccessibleName('200% slower versus the preceding 7-day median')
 })
 
-test('names an empty baseline instead of inventing a trend', async ({ page }) => {
+test('keeps empty-baseline values without inventing a trend or status message', async ({ page }) => {
   const state = await workspace(page)
   state.baselineMerged = 0
   await page.goto('/')
   await openAnalytics(page)
   await expect(value(page, 'Time to merge')).toHaveText('6h')
   await expect(mergeTrend(page).getByRole('img')).toHaveCount(0)
-  await expect(page.locator('#view-analytics')).toContainText('7-day median: — · 0 PRs · No baseline')
+  await expect(page.locator('#view-analytics')).toContainText('7-day median: — · 0 PRs')
+  await expect(page.locator('#view-analytics')).not.toContainText('No baseline')
 })
 
 for (const day of [
@@ -1983,7 +1984,7 @@ test('shows only the 24-hour quota chart and visibly explains an unset agent', a
   await expect(page.locator('.quota-distribution')).toHaveCount(0)
   const agent = page.locator('.analytics-tile').filter({ has: page.locator('.analytics-label', { hasText: /^Merged by agent$/ }) })
   await expect(agent.locator('.analytics-value')).toHaveText('—')
-  await expect(agent.locator('.analytics-note')).toHaveText('No agent account in Settings')
+  await expect(agent.locator('.analytics-note')).toHaveText('')
 })
 
 test('reopens a chart readout after keyboard focus leaves while the pointer stays inside', async ({ page }) => {

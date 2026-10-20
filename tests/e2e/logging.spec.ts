@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, test, type Page } from '@playwright/test'
@@ -143,7 +144,7 @@ test('real retained Caller evidence supports bounded native filters, expansion, 
   const run = page.getByRole('button', { name: 'Open Caller run in Swarm', exact: true })
   const call = await run.getAttribute('data-call')
   await run.click()
-  await expect(page.locator('#view-swarm')).toContainText('No run found for call ' + call)
+  await expect(await feedback(page)).toContainText('No run found for call ' + call)
 
 })
 

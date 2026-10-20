@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test, type Page } from '@playwright/test'
 
 // Skip repositories in the Behaviors view, and a replay refused in Swarm. The
@@ -169,29 +170,27 @@ test('saves Review New Pull Requests\' ceiling and skipped repositories together
   await expect(page.getByLabel('Edit memory for review-new-prs')).toBeVisible()
 })
 
-test('shows why a replay was refused on its row until it is dismissed', async ({ page }) => {
+test('keeps a replay refusal in notifications until dismissed or replay succeeds', async ({ page }) => {
   const state = await setup(page)
   await page.goto('/')
   await page.getByRole('button', { name: 'Swarm', exact: true }).click()
   const row = page.locator(`#swarm-tbody tr.agent-row[data-id="${'a'.repeat(32)}"]`)
   await expect(row).toBeVisible()
   await row.getByRole('button', { name: 'Replay this run' }).click()
-  const notice = page.locator(`#swarm-tbody tr.agent-refusal-row[data-refusal-for="${'a'.repeat(32)}"]`)
-  await expect(notice.getByRole('alert')).toHaveText('Replay refused: acme/api#7 is a draft.')
+  const notice = await feedback(page, 'Swarm replay refused')
+  await expect(notice).toContainText('Replay refused: acme/api#7 is a draft.')
   expect(state.replays).toEqual([{ behavior: 'pr_review', repo: 'acme/api', pr_id: '7' }])
-  // Directly under the row it answers, not on any other.
-  await expect(row.locator('xpath=following-sibling::tr[1]')).toHaveClass('agent-refusal-row')
-  await expect(page.locator('#swarm-tbody tr.agent-refusal-row')).toHaveCount(1)
-  // A refresh keeps it in place.
+  await expect(page.locator('#swarm-tbody tr.agent-refusal-row')).toHaveCount(0)
   await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
   await expect(notice).toBeVisible()
-  await notice.getByRole('button', { name: 'Dismiss' }).click()
+  await notice.locator('.nr-card-head').click()
+  await notice.getByRole('button', { name: 'Dismiss', exact: true }).click()
   await expect(notice).toHaveCount(0)
-  await expect(row.getByRole('button', { name: 'Replay this run' })).toBeFocused()
+  await page.locator('#notification-bell').click()
 
   // A replay the server accepts clears an earlier refusal.
   await row.getByRole('button', { name: 'Replay this run' }).click()
-  await expect(notice).toBeVisible()
+  await expect(notice).toHaveCount(0)
   state.replay = { status: 200, json: { ok: true, source: 'poise:replay', correlationId: 'c-1' } }
   await row.getByRole('button', { name: 'Replay this run' }).click()
   await expect(notice).toHaveCount(0)

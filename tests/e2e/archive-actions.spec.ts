@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test } from '@playwright/test'
 import { workspace } from './fixtures/workspace'
 
@@ -77,16 +78,16 @@ test('snapshot limits stay out of Archive while failed refreshes and recovery re
   await page.getByRole('button', { name: 'Archive', exact: true }).click()
   await expect(page.locator('#tbody')).toContainText('Deploy')
   await expect(page.locator('#view-main')).not.toContainText('showing the latest')
-  await expect(page.locator('#main-load-error')).toBeHidden()
+  await expect((await feedback(page)).locator('.nr-card').filter({ hasText: 'Archive data is incomplete' })).toHaveCount(0)
   failed = true
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
-  await expect(page.locator('#main-load-error')).toContainText('Not updating')
+  await expect(await feedback(page)).toContainText('Not updating')
   await expect(page.locator('#tbody')).toContainText('Deploy')
   failed = false
   recovered = true
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
   await expect(page.locator('#tbody tr')).toHaveCount(0)
-  await expect(page.locator('#main-load-error')).toBeHidden()
+  await expect((await feedback(page)).locator('.nr-card').filter({ hasText: 'Archive data is incomplete' })).toHaveCount(0)
 })
 
 for (const width of [390, 1280]) test(`fourteen repository snapshot limits produce no Archive notices at ${width}px`, async ({ page }) => {
@@ -100,7 +101,7 @@ for (const width of [390, 1280]) test(`fourteen repository snapshot limits produ
   })
   await page.getByRole('button', { name: 'Archive', exact: true }).click()
   await expect(page.locator('#tbody')).toContainText('Deploy')
-  await expect(page.locator('#main-load-error')).toContainText('Repository unavailable')
+  await expect(await feedback(page)).toContainText('Repository unavailable')
   await expect(page.locator('#view-main')).not.toContainText('showing the latest')
   await expect(page.locator('#view-main')).not.toContainText('Open GitHub for older runs')
   await expect(page.locator('#main-history-notice')).toHaveCount(0)
@@ -108,9 +109,10 @@ for (const width of [390, 1280]) test(`fourteen repository snapshot limits produ
 })
 
 
-test('empty Actions report no failures and account changes while hidden do not read workflows', async ({ page }) => {
+test('empty Actions stay free of messages and account changes while hidden do not read workflows', async ({ page }) => {
   await workspace(page, 'main')
-  await expect(page.locator('#empty')).toHaveText('No failed workflow runs for the current filters.')
+  await expect(page.locator('#empty')).toHaveCount(0)
+  await expect(page.locator('#view-main')).not.toContainText('No failed workflow runs')
   let reads = 0
   await page.route('**/api/gh', route => { reads++; return route.fulfill({ json: { records: [], count: 0 } }) })
   await page.getByRole('button', { name: 'Swarm', exact: true }).click()
@@ -333,7 +335,7 @@ test('healthy-source pagination cannot restart an exhausted failed source', asyn
     return route.fulfill({ json: { records: Array.from({ length: 20 }, (_, i) => ({ ...pullRequest, number: offset + i + 1 })) } })
   })
   await page.getByRole('button', { name: 'Archive', exact: true }).click()
-  await expect(page.locator('#main-load-error')).toContainText('Github 502')
+  await expect(await feedback(page)).toContainText('Github 502')
   await page.getByRole('button', { name: 'PR', exact: true }).click()
   await expect(page.locator('#count')).toContainText('20')
   while (actionsReads < 5) {
@@ -422,7 +424,7 @@ test('adding a type preserves scheduled recovery for another selected source', a
   await page.getByRole('button', { name: 'Archive', exact: true }).click()
   await expect(page.locator('#tbody')).toContainText(failedRun.title)
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
-  await expect(page.locator('#main-load-error')).toContainText('Github 502')
+  await expect(await feedback(page)).toContainText('Github 502')
   await page.getByRole('button', { name: 'PR', exact: true }).click()
   await expect(page.locator('#tbody')).toContainText('Recovered workflow', { timeout: 4000 })
   expect(reads).toBe(3)

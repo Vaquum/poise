@@ -39,8 +39,14 @@ stays expanded through refreshes.
 ## What shows
 
 Server notices are unresolved alerts, the same alerts
-[Poise Link](Poise-Link.md) shows on the desktop. Analytics also reports browser
-read failures here as tab-local Poise faults. These failures are shared across
+[Poise Link](Poise-Link.md) shows on the desktop. Swarm, Current, Archive, Behaviors, Snippets, Editor and Analytics report browser
+read failures here as tab-local Poise faults. Failed writes and conflicts also
+appear here, classified as faults or actions needing the person. Changed failures
+receive a fresh notice; repeating the same failure keeps its dismissal. These
+views show no local loading, empty-state, save-status or explanatory messages.
+Routine loading and saving diagnostics go to the browser console. Data labels,
+controls and Chat-related guidance remain. Chat, JEV, Settings, Publishing and
+reviews, Admin and pairing, Setup and terminal messages are unchanged. These failures are shared across
 views, deduplicated across requests, dismissible without a request, and cleared
 on recovery. They remain accessible when Notifications are off; the switch
 suppresses their popups. See

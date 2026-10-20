@@ -36,10 +36,9 @@ function reserveQuotaRead(): void {
   const heights = new Map([...viewEl.querySelectorAll<HTMLElement>('[data-group="quota"]')].map(card => [card.dataset.id, card.offsetHeight || parseFloat(card.style.height) || 0]))
   for (const card of template.content.children) {
     const header = card.querySelector('.github-quota-card-header')!
-    header.querySelector('.github-quota-checked')?.remove()
     const loading = document.createElement('div')
     loading.className = 'github-quota-unavailable github-quota-loading'
-    loading.textContent = 'Reading live quota…'
+    loading.setAttribute('aria-label', 'Reading live quota')
     card.replaceChildren(header, loading)
     card.setAttribute('aria-busy', 'true')
     card.setAttribute('data-placeholder-height', String(heights.get(card.getAttribute('data-id')!) ?? 0))
@@ -152,7 +151,7 @@ async function readQuota(): Promise<void> {
         <div class="github-quota-identity">
           <span class="github-quota-avatar" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="3.5"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg><img class="last-avatar${failedAvatars.has(avatar(account.login)) ? ' broken' : ''}" src="${avatar(account.login)}" alt="" width="40" height="40"></span>
           <div><h3>${escapeHtml(account.login)}</h3><p class="analytics-note">${escapeHtml(account.roles.join(' + '))}</p>
-          ${account.checkedAt ? `<p class="analytics-note github-quota-checked">Checked ${escapeHtml(time(account.checkedAt))}</p>` : ''}</div>
+          </div>
         </div></div>
         ${account.error ? '<div class="github-quota-unavailable" aria-label="Quota unavailable">—</div>' : account.buckets.filter((bucket) => bucket.resource === 'core' || bucket.resource === 'graphql').map((bucket) => {
           const minutes = Math.max(0, (Date.parse(bucket.resetAt) - now) / 60_000)
@@ -160,11 +159,11 @@ async function readQuota(): Promise<void> {
           return `<div class="github-quota-bucket">
             <h4>${escapeHtml(bucket.label)}</h4>
             <p class="github-quota-usage">${number(bucket.used)} / ${number(bucket.limit)} used <span>· ${number(bucket.remaining)} left</span></p>
-            ${bucket.limit === 0 ? '<p class="analytics-note">Unavailable for this account</p>' : `
+            ${bucket.limit === 0 ? '<p class="analytics-note">—</p>' : `
               <progress max="${bucket.limit}" value="${bucket.used}" aria-label="${escapeHtml(bucket.label)} quota used"></progress>
               <p class="analytics-note">Reset ${escapeHtml(time(bucket.resetAt))} · ${minutes.toFixed(1)} min left</p>
-              <p class="analytics-note">${bucket.perMinute === null ? 'Collecting usage samples…' : `${number(Math.round(bucket.perMinute * 10) / 10)} / min used · ${(bucket.remaining / Math.max(minutes, 1 / 60)).toFixed(1)} / min available`}</p>
-              <p class="github-quota-risk ${quotaRiskTone(risk)}" tabindex="0" data-help="Estimated chance of exhausting this budget before reset if the recently observed rate continues. Requires at least 15 seconds of samples; live quota is independent of the selected day and organization.">${risk === null ? minutes === 0 ? 'Awaiting reset refresh' : 'Risk: collecting samples…' : `${risk}% estimated risk${bucket.remaining === 0 ? ' · Exhausted' : ''}`}</p>
+              <p class="analytics-note">${bucket.perMinute === null ? '—' : `${number(Math.round(bucket.perMinute * 10) / 10)} / min used · ${(bucket.remaining / Math.max(minutes, 1 / 60)).toFixed(1)} / min available`}</p>
+              <p class="github-quota-risk ${quotaRiskTone(risk)}" tabindex="0" data-help="Estimated chance of exhausting this budget before reset if the recently observed rate continues. Requires at least 15 seconds of samples; live quota is independent of the selected day and organization.">${risk === null ? '—' : `${risk}% estimated risk${bucket.remaining === 0 ? ' · Exhausted' : ''}`}</p>
             `}
             ${quotaCharts(bucket, now)}
           </div>`
@@ -260,7 +259,7 @@ function groupMarkup(group: AnalyticsGroup): string {
             <dt class="analytics-label">${dragHandle(tile.label)}</dt>
             <dd class="analytics-summary ${tile.trend?.direction ?? 'neutral'}${tile.trend?.onPace ? ' on-pace' : ''}">
               <div class="analytics-value-row"><span class="analytics-value" data-help="${escapeHtml([measurementHelp[tile.label], tile.note].filter(Boolean).join(' '))}" tabindex="0">${escapeHtml(tile.value)}</span>${tile.valueLabel ? `<span class="analytics-work-label">${escapeHtml(tile.valueLabel)}</span>` : ''}${tile.trend ? `<span class="analytics-arrow" role="img" aria-label="${escapeHtml(tile.trend.description)}" data-help="${escapeHtml(tile.trend.caption)}" tabindex="0">${escapeHtml(tile.trend.text.slice(0, 1))}</span>` : ''}</div>
-              ${tile.workTypes ? '' : `<div class="analytics-trend">${tile.trend ? `<span class="analytics-delta" data-help="${escapeHtml(tile.trend.description)}" tabindex="0">${escapeHtml(tile.trend.text.slice(2))}</span>` : ''}<span class="analytics-note">${tile.comparison ? escapeHtml(tile.comparison) : ''}</span></div>`}
+              ${tile.workTypes ? '' : `<div class="analytics-trend">${tile.trend ? `<span class="analytics-delta" data-help="${escapeHtml(tile.trend.description)}" tabindex="0">${escapeHtml(tile.trend.text.slice(2))}</span>` : ''}<span class="analytics-note">${tile.comparison && tile.comparison !== 'No agent account in Settings' ? escapeHtml(tile.comparison.replace(' · No baseline', '')) : ''}</span></div>`}
             </dd>
             ${tile.workTypes ? workTypeMarkup(tile) : historyMarkup(tile, series, group.id === 'work-review')}
           </dl></article>`).join('')}`

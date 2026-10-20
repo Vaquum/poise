@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test, type Page } from '@playwright/test'
 import { workspace } from './fixtures/workspace'
 import { settled } from './fixtures/motion'
@@ -32,16 +33,15 @@ test('Swarm paints recent calls before the complete history arrives and retains 
     const start = Date.now()
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
     await expect(page.locator(rows)).toHaveCount(50, { timeout: 2000 })
-    await expect(page.locator('#swarm-stale')).toContainText('Loading older runs')
-    await expect(page.locator('#swarm-stale')).toHaveCSS('color', 'rgb(142, 149, 158)')
-    await expect(page.locator('#swarm-count')).toContainText('50 of 60 runs loaded')
+    await expect(page.locator('#swarm-stale')).toHaveCount(0)
+    await expect(page.locator('#swarm-count')).toHaveText('50')
     console.log(`Swarm recent calls: ${Date.now() - start}ms; full-history response still held`)
     const control = await page.locator(rows).first().getByRole('button', { name: 'Toggle detail' }).elementHandle()
     await control!.focus()
     older.release()
     await expect(page.locator(rows)).toHaveCount(60)
     expect(await control!.evaluate(element => element.isConnected && document.activeElement === element)).toBe(true)
-    await expect(page.locator('#swarm-stale')).toBeHidden()
+    await expect(page.locator('#swarm-stale')).toHaveCount(0)
     await expect(page.locator('#swarm-count')).not.toContainText('loaded')
     await page.locator('#swarm-search').fill('acme run 60')
     await expect(page.locator(rows)).toHaveCount(1)
@@ -100,15 +100,15 @@ test('a failed complete-history read keeps recent calls, reports incompleteness 
   })
   await page.getByRole('button', { name: 'Swarm', exact: true }).click()
   await expect(page.locator(rows)).toHaveCount(50)
-  await expect(page.locator('#swarm-stale')).toContainText('History unavailable')
-  await expect(page.locator('#swarm-stale')).toHaveCSS('color', 'rgb(184, 80, 72)')
-  await expect(page.locator('#swarm-stale')).toContainText('Only 50 of 60 runs loaded')
+  await expect(await feedback(page)).toContainText('History unavailable')
+  await expect(await feedback(page)).toContainText('Only 50 of 60 runs loaded')
   await page.locator('#swarm-search').fill('acme run 60')
-  await expect(page.locator('#swarm-empty')).toContainText('Older runs are unavailable')
+  await expect(page.locator('#swarm-empty')).toHaveCount(0)
   await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
   await expect(page.locator(rows)).toHaveCount(1)
   await expect(page.locator(rows)).toContainText('#60')
-  await expect(page.locator('#swarm-stale')).toBeHidden()
+  await expect(page.locator('#swarm-stale')).toHaveCount(0)
+  await expect((await feedback(page)).locator('.nr-card').filter({ hasText: 'Swarm is not updating' })).toHaveCount(0)
 })
 
 test('returning to Swarm paints history received while hidden before its new refresh', async ({ page }) => {
@@ -180,7 +180,7 @@ test('switching accounts supersedes an older pending full-history read', async (
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
     await expect(page.locator(rows)).toHaveCount(1)
     await expect(page.locator(rows)).toContainText('beta')
-    await expect(page.locator('#swarm-stale')).toBeHidden()
+    await expect(page.locator('#swarm-stale')).toHaveCount(0)
   } finally { older.release() }
 })
 
@@ -197,14 +197,15 @@ test('an empty-history refresh failure remains visible on re-entry while another
   })
   try {
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
-    await expect(page.locator('#swarm-empty')).toHaveText('No agent calls.')
+    await expect(page.locator('#swarm-empty')).toHaveCount(0)
     await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
-    await expect(page.locator('#swarm-empty')).toContainText('History unavailable')
+    await expect(await feedback(page)).toContainText('History unavailable')
     await page.getByRole('button', { name: 'Archive', exact: true }).click()
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
     await expect.poll(() => completeReads).toBe(2)
-    await expect(page.locator('#swarm-empty')).toContainText('History unavailable')
+    await expect(await feedback(page)).toContainText('History unavailable')
     refresh.release()
-    await expect(page.locator('#swarm-empty')).toHaveText('No agent calls.')
+    await expect((await feedback(page)).locator('.nr-card').filter({ hasText: 'Swarm is not updating' })).toHaveCount(0)
+    await expect(page.locator('#swarm-empty')).toHaveCount(0)
   } finally { refresh.release() }
 })

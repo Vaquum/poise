@@ -6,8 +6,8 @@
 // Refresh waits for them) and soft states (only an automatic reload waits).
 //
 // The DOM reading uses the app's actual signals — panels are open only with
-// `.open` and are `inert` when closed, the Editor writes its save state into
-// `#editor-meta`, Settings' Save button says `Saving…` — and never treats an
+// `.open` and are `inert` when closed, Settings' Save button says `Saving…`
+// — and never treats an
 // off-screen, closed control as something a person is using. Fields count as
 // dirty only after the person typed into them and only while their value still
 // differs from what it was when they arrived; the chat composer is excluded
@@ -112,10 +112,6 @@ export function domBlockers(doc: Document = document): string[] {
     const typed = Array.from(card.querySelectorAll<HTMLInputElement>('.chat-q-text')).some((i) => i.value.trim())
     if (typed || card.querySelector('input:checked')) { out.push('question-form'); break }
   }
-  // The Editor's own words about the document, whether or not its view is on
-  // screen: a debounced save keeps running after the person left the view.
-  const meta = doc.getElementById('editor-meta')?.textContent || ''
-  if (/editing|saving|failed|conflict|not saved/i.test(meta)) out.push('editor')
   const saveBtn = doc.querySelector<HTMLElement>('#settings-panel .st-save')
   if (saveBtn?.textContent?.trim() === 'Saving…') out.push('save')
   if (doc.getElementById('settings-panel')?.classList.contains('open')) out.push('settings-open')

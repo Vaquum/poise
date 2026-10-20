@@ -71,7 +71,7 @@ test('shows native comments, reviews incoming changes and imports only after exp
   await google.getByRole('button', { name: 'Review Google changes', exact: true }).click()
   await google.getByRole('button', { name: 'Import Google version', exact: true }).click()
   await expect(page.locator('#editor-doc')).toContainText('The Google paragraph.')
-  await expect(page.locator('#editor-meta')).toHaveText('8 words · saved')
+  await expect.poll(async () => (await page.locator('#editor-doc').innerText()).replace(/\s+/g, ' ').trim()).toBe('Draft The Google paragraph. Additional imported words.')
   expect(actions.find(action => action.path.endsWith('/google/import'))?.body).toEqual({ accountId: 'one', localVersion: VERSION, remoteSha: REMOTE, fileId: 'file-one', connectionVersion: 'connection-one' })
   expect(actions.some(action => action.path.endsWith('/google/publish'))).toBe(false)
 })

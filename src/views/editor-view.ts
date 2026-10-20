@@ -1,3 +1,4 @@
+import { isNotificationInteraction, viewDiagnostic, viewFeedback } from '../view-feedback'
 import { scrollToActor } from '../motion'
 import { retire, reveal, watchPanel } from '../motion'
 import { patchContent } from '../dom-patch'
@@ -101,7 +102,6 @@ let docEl: HTMLElement | null = null
 let triggerEl: HTMLButtonElement | null = null
 let triggerTitleEl: HTMLElement | null = null
 let menuEl: HTMLElement | null = null
-let metaEl: HTMLElement | null = null
 let copyBtnEl: HTMLButtonElement | null = null
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -244,11 +244,9 @@ let annotationsSaveRevision = 0
 
 const documentSaveQueue = createSerializedSaveQueue(
   persistDocumentSnapshot,
-  (error, snapshot) => {
+  (error) => {
     console.error('[editor] save failed:', error)
-    if (currentSlug === snapshot.slug) {
-      setMeta((error as Error)?.message?.includes('changed since') ? 'Conflict — reload' : 'Save failed')
-    }
+    setMeta((error as Error)?.message?.includes('changed since') ? 'Conflict — reload' : 'Save failed')
   },
 )
 
@@ -256,7 +254,7 @@ const annotationsSaveQueue = createSerializedSaveQueue(
   persistAnnotationsSnapshot,
   (error) => {
     console.error('[editor] save annotations failed:', error)
-    setMeta((error as Error)?.message?.includes('changed since') ? 'Conflict — reload' : 'Annotation save failed')
+    setMeta((error as Error)?.message?.includes('changed since') ? 'Annotation conflict — reload' : 'Annotation save failed')
   },
 )
 
@@ -264,7 +262,7 @@ const annotationsSaveQueue = createSerializedSaveQueue(
 // A release refresh must wait for the actual queues, not visible status text.
 registerReloadGuard(() =>
   documentSaveQueue.isDirty() || annotationsSaveQueue.isDirty() || saveTimer || annotationsSaveTimer || deletingSlug
-    ? ['save'] : [],
+    ? ['editor'] : [],
 )
 
 function isEditorVersion(value: unknown): value is string {
@@ -359,7 +357,6 @@ function renderShell(): string {
         <button type="button" class="editor-bar-btn editor-delete-btn" title="Delete" aria-label="Delete">${ICON_TRASH}</button>
       </div>
       <div class="editor-bar-right">
-        <span class="editor-meta" id="editor-meta"></span>
         <div class="editor-doc-wrap">
           <button type="button" class="editor-doc-trigger" aria-haspopup="menu" aria-expanded="false">
             <span class="editor-doc-trigger-title">Untitled</span>
@@ -2109,16 +2106,15 @@ function refreshCaretLineReveal(): void {
 }
 
 function setMeta(text: string) {
-  if (metaEl) metaEl.textContent = text
-}
-
-function wordCount(s: string): number {
-  return (s.match(/\S+/g) || []).length
+  const source = text.startsWith('Annotation') ? 'editor-annotations' : 'editor-save'
+  const routine = /^(Editing|Saving)/.test(text)
+  if (routine) viewDiagnostic(source, text)
+  else viewFeedback(source, 'Editor needs attention', text, /conflict|changed elsewhere/i.test(text) ? 'action_needed' : 'action_failed')
 }
 
 function setMetaForCurrent() {
-  const wc = wordCount(serializeDoc())
-  setMeta(wc === 0 ? 'Empty · saved' : `${wc} word${wc === 1 ? '' : 's'} · saved`)
+  viewDiagnostic('editor-save', 'Saved')
+  viewFeedback('editor-save', 'Editor needs attention', '')
 }
 
 function currentDoc(): DocSummary | null {
@@ -2145,7 +2141,7 @@ function setTriggerTitle() {
 function renderDocMenu() {
   if (!menuEl) return
   if (!docs.length) {
-    menuEl.innerHTML = '<div class="editor-doc-empty">No notes yet.</div>'
+    menuEl.replaceChildren()
     return
   }
   const buckets: { name: string, items: DocSummary[] }[] = []
@@ -2218,10 +2214,11 @@ async function fetchDocs(): Promise<boolean> {
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     docs = (data.docs || []) as DocSummary[]
+    viewFeedback('editor-documents', 'Editor documents unavailable', '')
     return true
   } catch (err) {
     console.error('[editor] fetchDocs failed:', err)
-    setMeta('Could not load documents')
+    viewFeedback('editor-documents', 'Editor documents unavailable', (err as Error).message, 'read_failed')
     return false
   }
 }
@@ -2810,6 +2807,7 @@ async function fetchAnnotations(slug: string): Promise<void> {
     annotations = data.annotations as Annotation[]
     annotationsVersions.set(slug, data.version)
     annotationsReadySlug = slug
+    viewFeedback('editor-annotations', 'Editor annotations unavailable', '')
   } catch (err) {
     console.error('[editor] fetchAnnotations failed:', err)
     if (currentSlug === slug) setMeta('Annotations unavailable')
@@ -2832,6 +2830,7 @@ async function persistAnnotationsSnapshot(snapshot: AnnotationsSaveSnapshot): Pr
   const data = await res.json()
   if (!isEditorVersion(data.version)) throw new Error('save response omitted annotations version')
   if (data.stale !== true) annotationsVersions.set(snapshot.slug, data.version)
+  viewFeedback('editor-annotations', 'Editor annotations unavailable', '')
 }
 
 function clearAnnotationsSaveTimer(): void {
@@ -3436,9 +3435,7 @@ function openIssueComposerFromSelection(): void {
     <div class="composer-row">
       <button class="composer-add">Open issue</button>
       <button class="composer-cancel" type="button">Cancel</button>
-      <span class="composer-hint">⌘↵ to submit</span>
     </div>
-    <div class="composer-error" hidden></div>
   `
   document.body.appendChild(composer)
   reveal(composer, { distance: 8 })
@@ -3449,7 +3446,6 @@ function openIssueComposerFromSelection(): void {
   const repoSel = composer.querySelector<HTMLSelectElement>('.issue-repo')!
   const addB = composer.querySelector<HTMLButtonElement>('.composer-add')!
   const cancelB = composer.querySelector<HTMLButtonElement>('.composer-cancel')!
-  const errEl = composer.querySelector<HTMLElement>('.composer-error')!
 
   // Selection text seeds the body so the user can flesh out the
   // issue without retyping. Same prefill model as Current's
@@ -3468,7 +3464,7 @@ function openIssueComposerFromSelection(): void {
     })
   }
 
-  const showError = (msg: string) => { errEl.textContent = msg; errEl.hidden = false }
+  const showError = (msg: string) => viewFeedback('editor-action', 'Editor action needs attention', msg, 'action_needed')
   const submit = async () => {
     // Cmd+Enter auto-repeats while held, and the shortcut called this directly
     // — the disabled button only guarded the click. Holding it opened several
@@ -3481,8 +3477,7 @@ function openIssueComposerFromSelection(): void {
     if (!repo)  { showError('Repo is required'); return }
 
     addB.disabled = true
-    addB.textContent = 'Opening…'
-    errEl.hidden = true
+    showError('')
     try {
       const ghRes = await fetch('/api/gh', {
         method: 'POST',
@@ -3519,6 +3514,7 @@ function openIssueComposerFromSelection(): void {
   // before the editor sees the click (it would otherwise refocus
   // the doc and collapse anything still selected).
   const outside = (e: MouseEvent) => {
+    if (isNotificationInteraction(e.target)) return
     if (!issueComposerEl) { document.removeEventListener('mousedown', outside, true); return }
     const t = e.target as Node
     if (issueComposerEl.contains(t)) return
@@ -3566,9 +3562,7 @@ function openSnippetComposerFromSelection(): void {
     <div class="composer-row">
       <button class="composer-add">Save snippet</button>
       <button class="composer-cancel" type="button">Cancel</button>
-      <span class="composer-hint">⌘↵ to save</span>
     </div>
-    <div class="composer-error" hidden></div>
   `
   document.body.appendChild(composer)
   reveal(composer, { distance: 8 })
@@ -3578,7 +3572,6 @@ function openSnippetComposerFromSelection(): void {
   const bodyTa = composer.querySelector<HTMLTextAreaElement>('.snippet-body')!
   const addB = composer.querySelector<HTMLButtonElement>('.composer-add')!
   const cancelB = composer.querySelector<HTMLButtonElement>('.composer-cancel')!
-  const errEl = composer.querySelector<HTMLElement>('.composer-error')!
 
   // The selected text seeds the body so the user only has to name the
   // trigger; the body stays editable.
@@ -3586,7 +3579,7 @@ function openSnippetComposerFromSelection(): void {
 
   placeComposerNearRect(composer, rect)
 
-  const showError = (msg: string) => { errEl.textContent = msg; errEl.hidden = false }
+  const showError = (msg: string) => viewFeedback('editor-action', 'Editor action needs attention', msg, 'action_needed')
   const submit = async () => {
     const trigger = triggerInput.value.trim()
     const replace = bodyTa.value
@@ -3594,8 +3587,7 @@ function openSnippetComposerFromSelection(): void {
     if (!replace.trim()) { showError('Snippet text is required'); bodyTa.focus(); return }
 
     addB.disabled = true
-    addB.textContent = 'Saving…'
-    errEl.hidden = true
+    showError('')
     try {
       const res = await fetch('/api/snippets', {
         method: 'POST',
@@ -3623,6 +3615,7 @@ function openSnippetComposerFromSelection(): void {
   triggerInput.addEventListener('keydown', onKey)
   bodyTa.addEventListener('keydown', onKey)
   const outside = (e: MouseEvent) => {
+    if (isNotificationInteraction(e.target)) return
     if (!snippetComposerEl) { document.removeEventListener('mousedown', outside, true); return }
     const t = e.target as Node
     if (snippetComposerEl.contains(t)) return
@@ -4863,7 +4856,6 @@ export async function initEditorView() {
     triggerEl      = viewEl.querySelector<HTMLButtonElement>('.editor-doc-trigger')
     triggerTitleEl = viewEl.querySelector<HTMLElement>('.editor-doc-trigger-title')
     menuEl         = viewEl.querySelector<HTMLElement>('#editor-doc-menu')
-    metaEl         = viewEl.querySelector<HTMLElement>('#editor-meta')
     googleDocuments = new GoogleDocuments({
       view: viewEl, flush: flushEditorSaves,
       imported: async (slug, content, version) => {

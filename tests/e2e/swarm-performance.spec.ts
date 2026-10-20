@@ -1,3 +1,4 @@
+import { feedback } from './fixtures/view-feedback'
 import { expect, test } from '@playwright/test'
 import { workspace } from './fixtures/workspace'
 import { settled } from './fixtures/motion'
@@ -116,6 +117,6 @@ test('a filtered prepared row reflects replay completion before it is revealed',
     await (await response).finished()
     await page.locator('#swarm-search').fill('')
     await expect(replay).toBeEnabled()
-    await expect(page.locator('#swarm-tbody > .agent-refusal-row').getByRole('alert')).toHaveText('Replay refused for this test.')
+    await expect(await feedback(page, 'Swarm replay refused')).toContainText('Replay refused for this test.')
   } finally { release() }
 })

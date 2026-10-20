@@ -2936,6 +2936,10 @@ tr:hover .review-btn { opacity: 1; }
   margin-inline: calc(50% - var(--page-w, 100vw) / 2 + 24px);
 }
 
+/* Empty tables retain a content surface after their status prose is removed. */
+#view-main main,
+#view-swarm main { min-height: var(--sp-6); }
+
 /* Identity columns scale with the table; Status takes what is left, since
    its note (live activity, or why a run failed) is the only free text.
    Started + Elapsed right-align as numeric columns. Scoped to the table
@@ -4772,7 +4776,7 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
    one editor-line (with a <br> filler) even when "empty", to give
    contenteditable a place for the caret. */
 .editor-doc[data-empty="true"]::before {
-  content: 'Start writing…';
+  content: '';
   color: var(--text-tertiary);
   font-style: italic;
   pointer-events: none;

@@ -10,5 +10,8 @@ export const NOTIFICATION_PLACEMENT = {
   github_quota_warning: { actor: 'user-operator', logging: 'sustained-forecast', lifecycle: 'fifty-percent-thirty-seconds-reset-keyed' },
   github_quota_exhausted: { actor: 'account-operator', logging: 'observed-exhaustion', lifecycle: 'zero-until-confirmed-capacity' },
   pr_ready: { actor: 'user', logging: 'none', lifecycle: 'ready-two-minute-check-fifteen-minute-reminder' },
+  action_failed: { actor: 'poise', logging: 'known-source-only', lifecycle: 'tab-dedupe-until-action-recovery' },
+  action_needed: { actor: 'user', logging: 'none', lifecycle: 'tab-dedupe-until-action-recovery' },
+  action_finished: { actor: 'user', logging: 'none', lifecycle: 'tab-local-until-dismissed-or-cleared' },
   read_failed: { actor: 'user', logging: 'known-source-only', lifecycle: 'tab-dedupe-until-read-recovery' },
 } as const satisfies Record<NoticeKind, { actor: string; logging: string; lifecycle: string }>
