@@ -66,6 +66,7 @@ describe('sign-in alerts from Connected accounts', () => {
     producers.accountsChecked([cli('codex', false)], nobody)
     for (const accounts of [
       [cli('codex', null)],
+      [{ ...cli('codex', null), signInRecordedAt: '2026-10-09T06:00:00Z' }],
       [cli('codex', false, false)],
       [cli('grok', null), cli('muse', null), cli('antigravity', null)],
       [cli('claude', false), cli('claude', true)],

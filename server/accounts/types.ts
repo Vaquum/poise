@@ -5,6 +5,8 @@
 export const ACCOUNT_IDS = ['claude', 'codex', 'gh', 'grok', 'muse', 'antigravity'] as const
 export type AccountId = typeof ACCOUNT_IDS[number]
 
+export const UNREPORTED_SIGN_IN: readonly AccountId[] = ['grok', 'muse', 'antigravity']
+
 export function isAccountId(value: unknown): value is AccountId {
   return typeof value === 'string' && (ACCOUNT_IDS as readonly string[]).includes(value)
 }
@@ -41,6 +43,8 @@ export interface ConnectedAccount {
   version: string | null
   /** null when the CLI has no way to tell. */
   signedIn: boolean | null
+  /** Historical completion/confirmation in Poise, never a live status assertion. */
+  signInRecordedAt?: string
   /** The account name the status command prints, and nothing more. */
   identity: string | null
   detail: string | null
@@ -48,4 +52,10 @@ export interface ConnectedAccount {
   login: { label: string }
   /** gh only: every account it holds for github.com. */
   accounts?: GhAccount[]
+}
+
+/** History is usable only for installed providers that have no status command. */
+export function hasRecordedSignIn(account: ConnectedAccount): boolean {
+  return account.installed && account.version !== null && account.signedIn === null
+    && UNREPORTED_SIGN_IN.includes(account.id) && !!account.signInRecordedAt
 }

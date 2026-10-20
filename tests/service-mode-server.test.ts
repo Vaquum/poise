@@ -453,6 +453,19 @@ describe('Poise in service mode', () => {
     expect(login.frames.at(-1)).toEqual({ type: 'exit', code: 0 })
     await vi.waitFor(async () => expect((await send('GET', '/api/onboarding', fromGateway())).json.logins).toHaveProperty('grok'), { timeout: 2_000, interval: 20 })
 
+    const grok = (await send('GET', '/api/accounts?id=grok', fromGateway())).json.accounts[0]
+    expect(grok).toMatchObject({ signedIn: null, identity: null, signInRecordedAt: expect.any(String) })
+    for (const id of ['grok', 'muse', 'antigravity']) {
+      await send('GET', `/api/accounts?id=${id}`, fromGateway())
+      for (const signedIn of [true, false]) {
+        expect((await send('POST', '/api/onboarding', fromGateway(), { account: id, signedIn })).status).toBe(200)
+        for (const query of ['', `?id=${id}`]) {
+          const accounts = (await send('GET', `/api/accounts${query}`, fromGateway())).json.accounts
+          expect(!!accounts.find((account: { id: string }) => account.id === id).signInRecordedAt).toBe(signedIn)
+        }
+      }
+    }
+
     // The GitHub check runs gh as the person's stored account; this fake gh holds no token for it.
     expect((await send('POST', '/api/onboarding/github', fromGateway(), { role: 'me', login: 'octocat' })).json).toMatchObject({ ok: false, reason: 'not-signed-in' })
   })

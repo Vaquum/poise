@@ -468,6 +468,14 @@ not use the gateway's discarded OAuth token.
     --json hosts --hostname github.com` with no token from the environment.
     Grok, Muse and Antigravity have no status command: their `signedIn` is
     `null` and `detail` says so.
+  - `signInRecordedAt`, when present, is historical completion/confirmation
+    for installed Grok, Muse or Antigravity with a successful version probe.
+    Their `signedIn` stays `null` and `identity` stays unasserted. Accounts and
+    setup display **Signed in here** and Reconnect; this does not verify a
+    current session. CLI status failures and Claude subscription rejection
+    always retain their own status and detail, regardless of stored history.
+    This history is joined after cached probes settle, so setup confirmation
+    and withdrawal immediately affect both the full list and `?id=` reads.
   - `identity` is the account name the status command prints (Claude's email,
     gh's active login); no token, key or organisation id is returned.
   - The gh row marks the person's own account and the agent account among
@@ -494,6 +502,15 @@ not use the gateway's discarded OAuth token.
   | Antigravity | `agy`, which has no login subcommand: it opens its sign-in screen when it starts signed out |
 
   Credentials go straight from the CLI to its own files; Poise never reads them.
+  In local and service mode, a successful Connect exit records a timestamp in
+  Poise's existing `account_logins` map, independently of setup progress. Grok
+  and Muse can therefore show the completed sign-in immediately and after a
+  restart. A failed/signaled login, startup failure or shell exit adds no
+  evidence; failed reconnects retain any earlier historical confirmation.
+  Antigravity's app exit never creates a confirmation. Existing entries,
+  including indistinguishable older automatic Antigravity entries, are kept.
+  Missing CLIs and failed version probes retain history without showing a
+  positive sign-in state. Setup's explicit withdrawal removes the record.
 - `/ws/terminal?preset=<id>|shell` is browser scope only.
   - Client to server: `{type:"input", data}` and `{type:"resize", cols, rows}`,
     with `cols` from 2 to 500, `rows` from 2 to 200 and frames up to 64 KiB.

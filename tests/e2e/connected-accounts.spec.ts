@@ -1,30 +1,41 @@
 import { expect, test, type Page, type TestInfo } from '@playwright/test'
 import { build } from 'esbuild'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdir } from 'node:fs/promises'
+import { chmod, mkdir, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { STATUS, fakeCalls, script, writeFakeClis } from '../fixtures/accounts/fake-clis'
+import { STATUS, fakeCalls, script, setScript, writeFakeClis } from '../fixtures/accounts/fake-clis'
 import { cliHomes } from '../fixtures/cli-isolation'
+import { CATALOG } from '../model-catalog-fixture'
+import { gatewayKeys, serviceEnvironment } from '../service-fixture'
+import { WebSocket } from 'ws'
 import { workspace } from './fixtures/workspace'
 
-// Settings → Connected accounts against fake CLIs: the real accounts route
-// and the real terminal, with nothing but the fakes on the server's PATH.
+// Settings → Connected accounts against fake CLIs: the production server
+// and its real terminal, with nothing but the fakes on the server's PATH.
 
 const DEVICE_PROMPT = 'Follow these steps to sign in with ChatGPT using device code authorization:\n\n1. Open this link in your browser and sign in to your account\n   https://auth.openai.com/codex/device\n\n2. Enter this one-time code (expires in 15 minutes)\n   ABCD-1234\n'
 
-async function start(page: Page, info: TestInfo, assets: string) {
+async function start(page: Page, info: TestInfo, options: { service?: boolean, reuse?: boolean, seed?: Record<string, string>, antigravity?: boolean } = {}) {
   const root = info.outputPath('runtime')
   const bin = join(root, 'bin')
   const home = join(root, 'home')
-  await mkdir(root, { recursive: true })
-  await writeFakeClis(bin, home, {
-    claude: script('claude', STATUS.claudeSubscription),
-    codex: script('codex', STATUS.codexSignedOut, { prompt: DEVICE_PROMPT, afterLogin: STATUS.codexChatGpt }),
-    gh: script('gh', STATUS.ghTwoAccounts),
-    grok: script('grok'),
-    muse: script('muse'),
-  })
+  await mkdir(join(root, 'agent'), { recursive: true })
+  if (!options.reuse) {
+    await writeFakeClis(bin, home, {
+      claude: script('claude', STATUS.claudeSubscription),
+      codex: script('codex', STATUS.codexSignedOut, { prompt: DEVICE_PROMPT, afterLogin: STATUS.codexChatGpt }),
+      gh: script('gh', STATUS.ghTwoAccounts),
+      grok: script('grok', undefined, { prompt: 'Open https://example.test/device and enter ABCD-1234\n' }),
+      muse: script('muse', undefined, { prompt: 'Open https://example.test/device and enter ABCD-1234\n' }),
+      ...(options.antigravity ? { antigravity: script('antigravity', undefined, { prompt: 'Sign in to Antigravity\n' }) } : {}),
+    })
+    await writeFile(join(bin, 'caller.cjs'), `process.stdout.write(process.argv.includes('--models') ? ${JSON.stringify(JSON.stringify(CATALOG))} : '[]')`)
+    for (const command of ['agent-interface', 'github-interface', 'github-datastore']) {
+      await writeFile(join(bin, command), '#!/bin/sh\nexec node "${0%/*}/caller.cjs" "$@"\n')
+      await chmod(join(bin, command), 0o755)
+    }
+  }
   const bundle = join(root, 'accounts-server.mjs')
   await build({
     entryPoints: ['tests/fixtures/accounts/accounts-server.ts'], outfile: bundle, bundle: true, platform: 'node', format: 'esm', packages: 'external',
@@ -36,7 +47,7 @@ async function start(page: Page, info: TestInfo, assets: string) {
     cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
     // Only the fakes on PATH, and every CLI's configuration in folders of its
     // own; HOME is the fakes' home, where they keep their state.
-    env: { ...cliHomes(join(root, 'homes')), HOME: home, PATH: bin, LANG: 'en_US.UTF-8', ACCOUNTS_ASSETS_URL: assets, FAKE_CLI_BIN: bin },
+    env: { ...cliHomes(join(root, 'homes')), ...(options.service ? serviceEnvironment(gatewayKeys()) : {}), HOME: home, PATH: bin, LANG: 'en_US.UTF-8', FAKE_CLI_BIN: bin, CALLER_BIN_ROOT: bin, AGENT_INTERFACE_ROOT: join(root, 'agent'), ACCOUNTS_SEED: options.seed ? JSON.stringify(options.seed) : '' },
   })
   let stderr = ''
   child.stderr!.on('data', (chunk) => { stderr = (stderr + String(chunk)).slice(-4096) })
@@ -65,9 +76,9 @@ async function stop(child: ChildProcess) {
   })
 }
 
-test('connects a CLI from Settings in a terminal and shows its new sign-in', async ({ page, baseURL }, info) => {
+test('connects a CLI from Settings in a terminal and shows its new sign-in', async ({ page }, info) => {
   test.setTimeout(90_000)
-  const fixture = await start(page, info, baseURL!)
+  const fixture = await start(page, info)
   try {
     // Where a sign-in alert opens the workspace: Settings → Connected accounts.
     await page.goto(`${fixture.origin}/?settings=accounts`)
@@ -171,4 +182,124 @@ test('account sign-in notices are amber while account read failures stay red', a
     await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
     await expect.soft(page.locator('.st-account-checks-status')).toHaveCSS('color', 'rgb(184, 80, 72)')
   }
+})
+
+
+for (const service of [false, true]) {
+  test(`retains Grok and Muse terminal sign-ins across Settings and process restarts (${service ? 'service' : 'local'})`, async ({ page }, info) => {
+    test.setTimeout(120_000)
+    let fixture = await start(page, info, { service })
+    try {
+      // Login before any onboarding request: the production exit hook must be independent of setup.
+      await new Promise<void>((resolve, reject) => {
+        const socket = new WebSocket(`${fixture.origin.replace('http:', 'ws:')}/ws/terminal?preset=muse`, { origin: fixture.origin })
+        socket.on('error', reject)
+        socket.on('message', raw => {
+          const frame = JSON.parse(String(raw))
+          if (frame.type === 'output' && Buffer.from(frame.data, 'base64').toString().includes('ABCD-1234')) socket.send(JSON.stringify({ type: 'input', data: '\r' }))
+          if (frame.type === 'exit') { socket.close(); if (frame.code === 0) resolve(); else reject(new Error(`login exit ${frame.code}`)) }
+        })
+      })
+      await page.goto(`${fixture.origin}/?settings=accounts`)
+      const row = (id: string) => page.locator(`.st-account[data-account="${id}"]`)
+      await expect(row('muse').locator('.st-account-state')).toHaveText('Signed in here', { timeout: 20_000 })
+      await row('grok').getByRole('button', { name: 'Connect Grok' }).click()
+      const terminal = page.locator('.st-terminal[data-preset="grok"]')
+      await expect(terminal.locator('.xterm-rows')).toContainText('ABCD-1234')
+      await page.keyboard.press('Enter')
+      await expect(terminal.locator('.st-terminal-status')).toHaveText('Exited with code 0.')
+      await expect(row('grok').locator('.st-account-state')).toHaveText('Signed in here', { timeout: 20_000 })
+      await expect(row('grok')).toContainText('The CLI cannot verify its current status.')
+      await expect(row('grok').getByRole('button', { name: 'Reconnect Grok' })).toBeEnabled()
+      await terminal.getByRole('button', { name: 'Close' }).click()
+      await page.keyboard.press('Escape')
+      await page.locator('#menu-toggle').click()
+      await page.locator('#menu-popover [data-settings="accounts"]').click()
+      await expect(row('grok').locator('.st-account-state')).toHaveText('Signed in here')
+      await page.reload()
+      await page.goto(`${fixture.origin}/?settings=accounts`)
+      await expect(row('grok').locator('.st-account-state')).toHaveText('Signed in here', { timeout: 20_000 })
+      const before = await (await page.request.get(`${fixture.origin}/api/accounts?id=grok`)).json()
+      expect(before.accounts[0]).toMatchObject({ signedIn: null, identity: null, signInRecordedAt: expect.any(String) })
+      await page.locator('#settings-panel').screenshot({ path: info.outputPath('completed-grok-login.png') })
+      await stop(fixture.child)
+      fixture = await start(page, info, { service, reuse: true })
+      await page.goto(`${fixture.origin}/?settings=accounts`)
+      await expect(row('grok').locator('.st-account-state')).toHaveText('Signed in here', { timeout: 20_000 })
+      await expect(row('muse').locator('.st-account-state')).toHaveText('Signed in here')
+      const after = await (await page.request.get(`${fixture.origin}/api/accounts?id=grok`)).json()
+      expect(after.accounts[0].signInRecordedAt).toBe(before.accounts[0].signInRecordedAt)
+      const setup = await (await page.request.get(`${fixture.origin}/api/onboarding`)).json()
+      if (service) expect(setup).toMatchObject({ status: 'done', step: 'finish', completedAt: '2026-10-09T07:00:00Z' })
+      else {
+        expect(setup).toEqual({ available: false, status: 'done' })
+        expect((await page.request.post(`${fixture.origin}/api/onboarding`, { data: { account: 'grok', signedIn: false } })).status()).toBe(404)
+      }
+    } finally { await stop(fixture.child) }
+  })
+}
+
+test('preserves legacy confirmations and setup controls with production Accounts responses', async ({ page }, info) => {
+  test.setTimeout(120_000)
+  const at = '2026-10-09T06:00:00Z'
+  const seed = { grok: at, muse: at, antigravity: at, claude: at, codex: at, gh: at }
+  const fixture = await start(page, info, { service: true, seed, antigravity: true })
+  try {
+    await setScript(fixture.home, 'codex', { ...script('codex'), 'login status': { stdout: 'unreadable status' } })
+    await page.goto(`${fixture.origin}/?settings=accounts`)
+    const row = (id: string) => page.locator(`.st-account[data-account="${id}"]`)
+    for (const id of ['grok', 'muse', 'antigravity']) await expect(row(id).locator('.st-account-state')).toHaveText('Signed in here', { timeout: 20_000 })
+    await expect(row('codex').locator('.st-account-state')).toHaveText('Sign-in not reported')
+    await expect(row('codex')).toContainText('gave no answer Poise can read')
+    expect((await (await page.request.get(`${fixture.origin}/api/onboarding`)).json()).logins).toEqual(seed)
+    // Warm both cache shapes; changes must be visible immediately, with no 15s wait.
+    for (const id of ['grok', 'muse', 'antigravity']) {
+      await page.request.get(`${fixture.origin}/api/accounts?id=${id}`)
+      for (const signedIn of [false, true]) {
+        await page.request.post(`${fixture.origin}/api/onboarding`, { data: { account: id, signedIn } })
+        for (const query of ['', `?id=${id}`]) {
+          const body = await (await page.request.get(`${fixture.origin}/api/accounts${query}`)).json()
+          expect(!!body.accounts.find((account: { id: string }) => account.id === id).signInRecordedAt).toBe(signedIn)
+        }
+        await page.goto(`${fixture.origin}/?settings=accounts`)
+        await expect(row(id).locator('.st-account-state')).toHaveText(signedIn ? 'Signed in here' : 'Sign-in not reported')
+      }
+    }
+    await page.request.post(`${fixture.origin}/api/onboarding`, { data: { restart: true } })
+    await page.request.post(`${fixture.origin}/api/onboarding`, { data: { step: 'ai' } })
+    await page.goto(fixture.origin)
+    const setupGrok = page.locator('.ob-ai-row[data-account="grok"]')
+    await expect(setupGrok.locator('.ob-ai-state')).toHaveText('Signed in here')
+    await setupGrok.locator('.ob-ai-mark').click()
+    await expect(setupGrok.locator('.ob-ai-state')).toHaveText('Not signed in yet')
+    await expect(page.locator('.ob-ai-row[data-account="codex"] .ob-ai-mark')).toHaveCount(0)
+    await page.locator('.ob-next').click()
+    await expect(page.locator('.ob-chip-on')).toHaveText(['Claude', 'Antigravity', 'Muse'])
+    const stored = await (await page.request.get(`${fixture.origin}/api/onboarding`)).json()
+    expect(stored.logins).toMatchObject({ claude: at, codex: at, gh: at })
+    expect(stored.logins).not.toHaveProperty('grok')
+  } finally { await stop(fixture.child) }
+})
+
+
+test('can withdraw a retained setup confirmation while the version probe fails', async ({ page }, info) => {
+  test.setTimeout(90_000)
+  const fixture = await start(page, info, { service: true, seed: { grok: '2026-10-09T06:00:00Z' } })
+  try {
+    await setScript(fixture.home, 'grok', { '--version': { stderr: 'broken installation', code: 1 } })
+    await page.request.post(`${fixture.origin}/api/onboarding`, { data: { restart: true } })
+    await page.request.post(`${fixture.origin}/api/onboarding`, { data: { step: 'ai' } })
+    await page.goto(fixture.origin)
+    const row = page.locator('.ob-ai-row[data-account="grok"]')
+    await expect(row.locator('.ob-ai-state')).toContainText('broken installation')
+    await expect(row.locator('.ob-ai-mark')).toHaveText('Not signed in')
+    await row.locator('.ob-ai-mark').click()
+    await expect(row.locator('.ob-ai-mark')).toHaveCount(0)
+    await expect(row.locator('.ob-ai-state')).toContainText('broken installation')
+    const setup = await (await page.request.get(`${fixture.origin}/api/onboarding`)).json()
+    expect(setup.logins).not.toHaveProperty('grok')
+    const accounts = await (await page.request.get(`${fixture.origin}/api/accounts?id=grok`)).json()
+    expect(accounts.accounts[0]).toMatchObject({ signedIn: null, detail: expect.stringContaining('broken installation') })
+    expect(accounts.accounts[0]).not.toHaveProperty('signInRecordedAt')
+  } finally { await stop(fixture.child) }
 })

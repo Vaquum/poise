@@ -2,7 +2,7 @@
 // status command says (GET /api/accounts), and the button that opens its
 // login in a terminal.
 
-import type { AccountId, ConnectedAccount } from '../../server/accounts/types'
+import { hasRecordedSignIn, type AccountId, type ConnectedAccount } from '../../server/accounts/types'
 
 const ACCOUNT_NAMES: Record<AccountId, string> = {
   claude: 'Claude',
@@ -30,6 +30,7 @@ function state(account: ConnectedAccount): { text: string, tone: 'on' | 'off' | 
   if (!account.installed) return { text: 'Not installed', tone: 'unknown' }
   if (account.signedIn === true) return { text: account.identity ? `Signed in as ${account.identity}` : 'Signed in', tone: 'on' }
   if (account.signedIn === false) return { text: 'Not signed in', tone: 'off' }
+  if (hasRecordedSignIn(account)) return { text: 'Signed in here', tone: 'on' }
   return { text: 'Sign-in not reported', tone: 'unknown' }
 }
 
@@ -74,8 +75,9 @@ export function accountsHtml(accounts: ConnectedAccount[], identities: GitHubIde
   const rows = (entries: ConnectedAccount[]) => entries.map((account) => {
     const name = ACCOUNT_NAMES[account.id]
     const { text, tone } = state(account)
-    const action = account.signedIn ? 'Reconnect' : 'Connect'
+    const action = tone === 'on' ? 'Reconnect' : 'Connect'
     const disabled = busy || !account.installed
+    const detail = hasRecordedSignIn(account) ? 'Sign-in completed or confirmed in Poise. The CLI cannot verify its current status.' : account.detail
     return `
     <div class="st-account" data-account="${account.id}">
       <div class="st-account-head">
@@ -84,7 +86,7 @@ export function accountsHtml(accounts: ConnectedAccount[], identities: GitHubIde
         <button type="button" class="st-clear st-account-connect" data-connect="${account.id}" data-help="Opens a sign-in terminal: ${escapeHtml(account.login.label)}" aria-label="${action} ${escapeHtml(name)}"${disabled ? ' disabled' : ''}>${action}</button>
       </div>
       <div class="st-account-state st-account-state-${tone}">${escapeHtml(text)}</div>
-      ${account.detail ? `<div class="st-help st-help-info st-account-detail">${escapeHtml(account.detail)}</div>` : ''}
+      ${detail ? `<div class="st-help st-help-info st-account-detail">${escapeHtml(detail)}</div>` : ''}
       ${ghAccounts(account, identities)}
     </div>`
   }).join('')

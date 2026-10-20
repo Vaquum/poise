@@ -1,8 +1,8 @@
 # Connected accounts
 
 Menu → Settings → Accounts separates AI provider sign-ins (Claude Code, Codex, Grok,
-Muse and Antigravity) from GitHub sign-ins. Each CLI's status command reports them,
-and opens each one's login in a terminal inside Settings. In a workspace that
+Muse and Antigravity) from GitHub sign-ins. Each row shows the CLI's status
+or a recorded sign-in, and opens its login in a terminal inside Settings. In a workspace that
 is how a person connects their own accounts; on a personal computer it works
 the same way. [Service architecture](Service-architecture.md#accounts-identities-and-the-terminal)
 is the contract.
@@ -34,8 +34,18 @@ within 10 seconds, is reported with the reason.
   when either of those two is not signed in to gh, and names any account whose
   token gh can no longer use. It reads the stored accounts; a `GH_TOKEN` in
   Poise's environment is kept out of both the status and the login.
-- **Grok, Muse and Antigravity** have no command that reports sign-in, so their
-  rows say so rather than guess.
+- **Grok and Muse** show **Signed in here** and Reconnect once their Connect
+  login exits successfully. This records history in Poise, survives reopening
+  Settings and server restarts, and does not verify the session is still valid.
+- **Antigravity** requires confirmation in setup: closing its app cannot prove
+  a sign-in. Existing confirmations remain available, including older entries
+  whose manual/automatic origin cannot be distinguished.
+- Setup can confirm or withdraw these three providers; Accounts reflects that
+  immediately. Without a record their rows say **Sign-in not reported**.
+  Failed reconnects preserve earlier history; failed/signaled logins and shell
+  exits never create a confirmation. Missing CLIs or failed version probes
+  display their problem even when history exists. Claude, Codex and GitHub
+  always use their own status, including errors, regardless of saved history.
 
 Poise never opens a CLI's credential files. It runs only the status commands
 above and passes on only the account name one prints. Answers are kept for 15

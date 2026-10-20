@@ -167,7 +167,10 @@ has data.
 
 Settings → Accounts shows each agent CLI (Claude Code, Codex, gh, Grok, Muse,
 Antigravity) with its version and what its own status command says about its
-sign-in; gh lists every account it holds, marks your GitHub account and the
+sign-in. Grok, Muse and Antigravity have no status command; **Signed in here**
+records a completed Connect login or setup confirmation, survives restarts,
+and does not verify current validity. Antigravity needs manual confirmation
+in setup; an app exit is insufficient. gh lists every account it holds, marks your GitHub account and the
 agent account, and says when either is not signed in to gh. A CLI or GitHub
 account that is not signed in also raises a sign-in alert, which opens this
 tab (`/?settings=accounts`). Connect opens a

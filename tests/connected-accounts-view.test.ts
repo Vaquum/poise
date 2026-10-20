@@ -73,3 +73,22 @@ describe('the gh row', () => {
     expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;')
   })
 })
+
+
+describe('recorded provider sign-ins', () => {
+  const provider: ConnectedAccount = { id: 'grok', installed: true, version: '1.0.62', signedIn: null, identity: null, detail: 'No status command', login: { label: 'grok login --device-auth' }, signInRecordedAt: '2026-10-09T06:00:00Z' }
+  const render = (account: ConnectedAccount) => accountsHtml([account], { me: '', agentAccount: '' }, false)
+  it('shows historical confirmation and Reconnect without claiming live validity', () => {
+    expect(render(provider)).toContain('Signed in here')
+    expect(render(provider)).toContain('Reconnect Grok')
+    expect(render(provider)).toContain('The CLI cannot verify its current status.')
+  })
+  it('never masks installation failures or own-status results', () => {
+    const absent = render({ ...provider, installed: false, version: null })
+    expect(absent).toContain('Not installed')
+    expect(absent).toContain(' disabled')
+    expect(absent).not.toContain('Signed in here')
+    for (const signedIn of [false, null]) expect(render({ ...provider, id: 'codex', signedIn })).not.toContain('Signed in here')
+    expect(render({ ...provider, version: null, detail: 'broken installation' })).toContain('broken installation')
+  })
+})

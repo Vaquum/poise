@@ -6,9 +6,11 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AccountsCache, ACCOUNTS_CACHE_MS, ACCOUNTS_CHECK_MS, scheduleAccountsCheck } from '../server/accounts'
+import { invalidateAccounts, listAccounts, AccountsCache, ACCOUNTS_CACHE_MS, ACCOUNTS_CHECK_MS, scheduleAccountsCheck } from '../server/accounts'
 import { probeAccount, probeAccounts, type RunCommand } from '../server/accounts/status'
 import type { ConnectedAccount } from '../server/accounts/types'
+import { accountLogins, markLogin, recordLogin } from '../server/accounts/logins'
+import { setMeta } from '../server/db'
 import { runFile } from '../server/process'
 import { STATUS, fakeCalls, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 
@@ -17,6 +19,8 @@ let bin = ''
 let home = ''
 
 beforeEach(async () => {
+  setMeta('account_logins', '{}')
+  invalidateAccounts()
   root = await mkdtemp(join(tmpdir(), 'poise-accounts-'))
   bin = join(root, 'bin')
   home = join(root, 'home')
@@ -303,3 +307,86 @@ describe('the scheduled accounts check', () => {
     }
   })
 })
+
+
+describe('durable login evidence joined to Accounts', () => {
+  it('shares existing confirmations and immediately joins confirm/withdraw after cached probes', async () => {
+    await writeFakeClis(bin, home, { grok: script('grok'), muse: script('muse'), antigravity: script('antigravity') })
+    const at = '2026-10-09T06:00:00Z'
+    setMeta('account_logins', JSON.stringify({ grok: at, muse: at, antigravity: at, codex: at }))
+    for (const id of ['grok', 'muse', 'antigravity'] as const) {
+      expect((await listAccounts(id))[0]).toMatchObject({ signedIn: null, identity: null, signInRecordedAt: at })
+      markLogin(id, false)
+      expect((await listAccounts(id))[0]).not.toHaveProperty('signInRecordedAt')
+      expect((await listAccounts()).find(account => account.id === id)).not.toHaveProperty('signInRecordedAt')
+      markLogin(id, true)
+      expect((await listAccounts(id))[0].signInRecordedAt).toBe(accountLogins()[id])
+    }
+    expect(accountLogins().codex).toBe(at)
+  })
+
+  it('does not carry an old confirmation through a probe pending during withdrawal', async () => {
+    await writeFakeClis(bin, home, { grok: { '--version': { stdout: 'grok 1.0.62' } } })
+    markLogin('grok', true)
+    const pending = listAccounts('grok')
+    markLogin('grok', false)
+    const after = listAccounts('grok')
+    for (const result of await Promise.all([pending, after])) expect(result[0]).not.toHaveProperty('signInRecordedAt')
+  })
+
+  it('keeps negative exits historical, never confirms app/shell exits, and hides history for missing or failing CLIs', async () => {
+    await writeFakeClis(bin, home, { grok: { '--version': { stderr: 'broken installation', code: 1 } } })
+    for (const [id, code] of [['grok', 1], ['muse', 143], ['shell', 0], ['antigravity', 0]] as const) recordLogin(id, code)
+    expect(accountLogins()).toEqual({})
+    recordLogin('grok', 0)
+    recordLogin('muse', 0)
+    markLogin('antigravity', true)
+    const earlier = accountLogins()
+    recordLogin('grok', 1)
+    recordLogin('muse', 143)
+    recordLogin('antigravity', 0)
+    expect(accountLogins()).toEqual(earlier)
+    const accounts = await listAccounts()
+    expect(accounts.find(account => account.id === 'grok')).toMatchObject({ version: null, detail: expect.stringContaining('broken installation') })
+    for (const id of ['grok', 'muse', 'antigravity']) expect(accounts.find(account => account.id === id)).not.toHaveProperty('signInRecordedAt')
+    expect(accountLogins()).toEqual(earlier)
+  })
+
+  it.each(['true', 'false', 'malformed', 'failed'] as const)('never replaces own-status results (%s) with legacy timestamps', async state => {
+    const at = '2026-10-09T06:00:00Z'
+    setMeta('account_logins', JSON.stringify({ claude: at, codex: at, gh: at }))
+    const status = {
+      claude: state === 'true' ? STATUS.claudeSubscription : state === 'false' ? STATUS.claudeSignedOut : { stdout: 'unreadable', code: state === 'failed' ? 2 : 0 },
+      codex: state === 'true' ? STATUS.codexChatGpt : state === 'false' ? STATUS.codexSignedOut : { stdout: 'unreadable', code: state === 'failed' ? 2 : 0 },
+      gh: state === 'true' ? STATUS.ghTwoAccounts : state === 'false' ? STATUS.ghSignedOut : { stdout: 'unreadable', code: state === 'failed' ? 2 : 0 },
+    }
+    await writeFakeClis(bin, home, { claude: script('claude', status.claude), codex: script('codex', status.codex), gh: script('gh', status.gh) })
+    const probed = await probeAccounts(runFile)
+    const listed = await listAccounts()
+    for (const id of ['claude', 'codex', 'gh']) {
+      expect(listed.find(account => account.id === id)).toEqual(probed.find(account => account.id === id))
+      expect(listed.find(account => account.id === id)?.signedIn).toBe(state === 'true' ? true : state === 'false' ? false : null)
+    }
+  })
+
+  it('never overrides Claude subscription rejection with a successful terminal record', async () => {
+    await writeFakeClis(bin, home, { claude: script('claude', STATUS.claudeConsole) })
+    recordLogin('claude', 0)
+    expect((await listAccounts('claude'))[0]).toMatchObject({ signedIn: false, detail: expect.stringContaining('not to a Claude subscription') })
+    expect((await listAccounts('claude'))[0]).not.toHaveProperty('signInRecordedAt')
+  })
+})
+
+
+it('keeps timed-out own-status probes unknown despite legacy sign-in history', async () => {
+  setMeta('account_logins', JSON.stringify({ claude: '2026-10-09T06:00:00Z', codex: '2026-10-09T06:00:00Z', gh: '2026-10-09T06:00:00Z' }))
+  await writeFakeClis(bin, home, {})
+  for (const name of ['claude', 'codex', 'gh']) {
+    await writeFile(join(bin, name), '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.2.3; exit 0; fi\nexec /bin/sleep 30\n')
+    await chmod(join(bin, name), 0o755)
+  }
+  for (const [account] of await Promise.all((['claude', 'codex', 'gh'] as const).map(id => listAccounts(id)))) {
+    expect(account).toMatchObject({ signedIn: null, identity: null, detail: expect.stringContaining('did not answer within 10 seconds') })
+    expect(account).not.toHaveProperty('signInRecordedAt')
+  }
+}, 40_000)

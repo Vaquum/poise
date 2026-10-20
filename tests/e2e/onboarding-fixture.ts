@@ -3,7 +3,7 @@
 // are tested on their own sides (tests/onboarding.test.ts, gateway/tests).
 
 import type { Page } from '@playwright/test'
-import type { ConnectedAccount } from '../../server/accounts/types'
+import { hasRecordedSignIn, type ConnectedAccount } from '../../server/accounts/types'
 import type { Organization } from '../../src/config'
 import type { PairedDevice } from '../../src/gateway-client'
 
@@ -106,7 +106,10 @@ export async function setupWorkspace(page: Page, initial: Partial<SetupState> = 
       case '/api/organizations':
         if (body?.org) state.organizations = [...state.organizations, organization(String(body.org), 'initializing')]
         return route.fulfill({ status: body ? 202 : 200, json: { organizations: state.organizations } })
-      case '/api/accounts': return route.fulfill({ json: { accounts: ACCOUNTS } })
+      case '/api/accounts': return route.fulfill({ json: { accounts: ACCOUNTS.map(account => {
+        const recorded = { ...account, signInRecordedAt: state.logins[account.id] }
+        return hasRecordedSignIn(recorded) ? recorded : account
+      }) } })
       case '/api/models': return route.fulfill({ json: { catalog: CATALOG, places: PLACES, fixed: [], refresh: null } })
       case '/api/claude-auth': return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
       case '/api/current': return route.fulfill({ json: { cards: [] } })

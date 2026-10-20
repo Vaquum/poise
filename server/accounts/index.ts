@@ -4,7 +4,8 @@
 
 import { runFile } from '../process'
 import { probeAccount } from './status'
-import { ACCOUNT_IDS, type AccountId, type ConnectedAccount } from './types'
+import { accountLogins } from './logins'
+import { ACCOUNT_IDS, hasRecordedSignIn, type AccountId, type ConnectedAccount } from './types'
 
 export const ACCOUNTS_CACHE_MS = 15_000
 
@@ -52,8 +53,14 @@ export function scheduleAccountsCheck(check: () => Promise<unknown>, intervalMs 
 const accounts = new Map(ACCOUNT_IDS.map(id => [id, new AccountsCache(async () => [await probeAccount(id, runFile)])]))
 
 export async function listAccounts(id?: AccountId): Promise<ConnectedAccount[]> {
-  if (id) return accounts.get(id)!.list()
-  return (await Promise.all(ACCOUNT_IDS.map(id => accounts.get(id)!.list()))).flat()
+  const result = id ? await accounts.get(id)!.list() : (await Promise.all(ACCOUNT_IDS.map(id => accounts.get(id)!.list()))).flat()
+  // Join after the cached probe settles: setup edits must be visible at once,
+  // including when a probe was already pending before a confirmation was removed.
+  const logins = accountLogins()
+  return result.map(account => {
+    const recorded = { ...account, signInRecordedAt: logins[account.id] }
+    return hasRecordedSignIn(recorded) ? recorded : account
+  })
 }
 
 export function invalidateAccounts(): void {

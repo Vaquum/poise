@@ -52,7 +52,8 @@ import { countDebate } from './service/caller-calls'
 import { DailyModelRefresh } from './service/model-refresh'
 import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
 import { invalidateAccounts, listAccounts, scheduleAccountsCheck } from './accounts'
-import { accountLogins, connectGitHubAccount, onboardingState, recordLogin, updateOnboarding } from './service/onboarding'
+import { accountLogins, recordLogin } from './accounts/logins'
+import { connectGitHubAccount, onboardingState, updateOnboarding } from './service/onboarding'
 import { isAccountId, type AccountId, type ConnectedAccount } from './accounts/types'
 import { TerminalSocketServer } from './terminal/server'
 import type { TerminalCommand } from './terminal/pty'
@@ -188,8 +189,8 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     // Claude-backed work, so it is verified now instead of at the next poll.
     terminalSockets.on('exit', (preset, code) => {
       invalidateAccounts()
-      // First-run setup counts a finished login for the CLIs that report no sign-in.
-      if (service) recordLogin(preset, code)
+      // Accounts and setup share completed logins in both local and service mode.
+      recordLogin(preset, code)
       if (preset === 'claude') void auth.check({ forceLive: true })
     })
     if (service) {
