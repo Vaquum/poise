@@ -4854,8 +4854,8 @@ function sendPendingEditorBeacons(): void {
 // main.ts uses this when /content in the chat pane finishes
 // authoring — chat dispatches poise:open-editor-doc, main.ts
 // switches the view + re-dispatches the load event for us. We need
-// to refresh the doc list first (the new article won't be in our
-// in-memory `docs` array yet).
+// to start fresh discovery (the new article won't be in our
+// in-memory `docs` array or an older discovery response yet).
 if (typeof window !== 'undefined') {
   window.addEventListener('poise:editor-load-doc', (ev) => {
     const slug = (ev as CustomEvent<{ slug: string }>).detail?.slug
@@ -4866,7 +4866,7 @@ if (typeof window !== 'undefined') {
         // triggers it. Wait one tick.
         await new Promise((r) => setTimeout(r, 100))
       }
-      void fetchDocs()
+      void fetchDocs({ fresh: true })
       await loadDoc(slug)
     })()
   })

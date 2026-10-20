@@ -524,3 +524,37 @@ test('Editor binds reviews and Google publications before annotations and resume
     await expect.poll(() => googleReads).toBeGreaterThan(previousGoogle)
   } finally { annotations.release() }
 })
+
+test('external document opens supersede library discovery captured before creation', async ({ page }) => {
+  await setup(page, 'editor', 'remembered')
+  await editorDocuments(page)
+  const old = deferred()
+  let reads = 0
+  await page.route('**/api/editor/docs', async route => {
+    if (++reads === 1) {
+      await old.promise
+      return route.fulfill({ json: { docs: [summary('remembered')] } })
+    }
+    await route.fulfill({ json: { docs: [summary('from-chat'), summary('remembered')] } })
+  })
+  try {
+    await page.goto('/')
+    const doc = page.locator('#editor-doc')
+    await expect(doc).toContainText('Note remembered')
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:open-editor-doc', { detail: { slug: 'from-chat' } })))
+    await expect(doc).toContainText('Note from-chat', { timeout: 2000 })
+    await doc.press('ControlOrMeta+End'); await doc.pressSequentially(' preserved draft')
+    await page.locator('.editor-doc-trigger').click()
+    const item = page.locator('.editor-doc-item[data-slug="from-chat"]')
+    await expect(item).toHaveCount(1, { timeout: 2000 })
+    const actor = await item.elementHandle()
+    await item.focus()
+    const received = page.waitForResponse(response => new URL(response.url()).pathname === '/api/editor/docs')
+    old.release()
+    await (await received).finished()
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    await expect(item).toHaveCount(1)
+    await expect(doc).toContainText('preserved draft')
+    expect(await actor!.evaluate(node => node.isConnected && document.activeElement === node)).toBe(true)
+  } finally { old.release() }
+})

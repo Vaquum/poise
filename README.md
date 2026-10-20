@@ -42,6 +42,8 @@ usable while typography is unavailable or still loading.
 Editor and Snippets start independently of GitHub settings. Editor opens the
 remembered document while discovering the library; its open selector updates as
 soon as discovery finishes and distinguishes loading, failure and an empty library.
+Opening a Chat-created document starts fresh discovery without delaying its body;
+an older library response cannot remove the new selector entry or disturb a draft.
 Discovery reads through the first nonempty title line, uses at most eight concurrent
 file reads and reuses summaries while filesystem metadata is unchanged.
 Returning to Editor keeps the open document, draft, selection and undo history;
