@@ -1,3 +1,4 @@
+import { finishGoogleConnection } from './google'
 import './style.css'
 import './motion.css'
 import { finishMotion, initMotion, reveal } from './motion'
@@ -31,6 +32,7 @@ import './views/notification-rail.css'
 import './views/updating.css'
 import './views/editor-publish.css'
 import './views/editor-reviews.css'
+import './views/google-documents.css'
 
 const viewMainEl = document.getElementById('view-main')!
 const viewCurrentEl = document.getElementById('view-current')!
@@ -193,6 +195,7 @@ watchForUpdates()
 watchForSignOut()
 
 ;(async () => {
+  const googleReturned = await finishGoogleConnection()
   await loadSettings()
   if (new URLSearchParams(location.search).get('view') === 'logging') menu.switchTo('logging')
   else showView(menu.currentView())
@@ -214,6 +217,7 @@ watchForSignOut()
   const place = takeServicePlace()
   // A workspace that still has to be set up opens first-run setup instead, at
   // pairing when Poise Link sent the person here.
+  if (googleReturned) { openSettingsAt('accounts'); return }
   if (await startOnboarding(place)) return
   if (place) {
     void openServicePlace(place)

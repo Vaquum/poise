@@ -1,0 +1,20 @@
+.google-publish { border-top: 1px solid var(--border); margin-top: 12px; padding: 12px; display: grid; gap: 10px; }
+.google-publish h3 { margin: 0; font-size: 13px; }
+.google-publish select { max-width: 100%; color: inherit; background: var(--bg); padding: 6px; }
+.google-documents { margin: 0 24px 12px; font-size: 13px; max-height: 48vh; overflow: auto; flex-shrink: 0; }
+.google-documents summary { cursor: pointer; padding: 8px 0; }
+.google-document-body { padding: 8px 0; }
+.google-publication { border-top: 1px solid var(--border); padding: 12px 0; }
+.google-publication > span { display: block; opacity: .7; margin-top: 4px; }
+.google-comment { border-left: 2px dashed currentColor; padding: 4px 12px; margin-top: 12px; }
+.google-comment p, .google-comment blockquote { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; }
+.google-comment blockquote { opacity: .7; }
+.google-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.google-compare section { min-width: 0; }
+.google-compare pre { max-height: 24vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.google-config { margin-top: 12px; }
+.google-config label { display: grid; gap: 5px; margin: 10px 0; }
+.google-config code { overflow-wrap: anywhere; }
+@media (max-width: 600px) { .google-compare { grid-template-columns: 1fr; } }
+
+.google-comment-reply { border-top: 1px solid var(--border); padding: 8px 0 0 12px; margin-top: 8px; }

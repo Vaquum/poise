@@ -18,6 +18,7 @@ import { getSettings as getCachedSettings, setLocalSettings, loadSettings, setti
 import { productionSummary, type ProductionUpdate } from './production-status'
 import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, type ConnectedAccount } from '../server/accounts/types'
 import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
+import { googleAccountsSection } from './views/google-accounts'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
 import { publishingSection, type PublishingSection } from './views/publishing-settings'
 import { sendLatest } from './notices'
@@ -368,7 +369,10 @@ function accountChecksStatus(text: string, failed = false): void {
   el.className = `st-help st-help-${failed ? 'error' : 'info'} st-account-checks-status`
 }
 
+let googleAccountsPanel: ReturnType<typeof googleAccountsSection> | null = null
+
 function loadAccounts(force = false): Promise<void> {
+  void googleAccountsPanel?.refresh()
   if (!accountsEl) return Promise.resolve()
   if (!force && accountsLoading) return accountsLoading
   const generation = ++accountsGeneration
@@ -990,6 +994,7 @@ function buildPanel(): HTMLElement {
       <section class="st-tab" data-tab="accounts" hidden>
         <div class="st-terminal-slot"></div>
         <div class="st-accounts" aria-live="polite"></div>
+        <section class="st-google-accounts" aria-label="Google accounts"></section>
         <div class="st-help st-help-info st-account-checks-status" role="status"></div>
         <div class="st-help st-help-info st-accounts-status" role="status"></div>
 
@@ -1037,6 +1042,7 @@ function buildPanel(): HTMLElement {
   publishing = publishingSection()
   panel.querySelector('.st-tab[data-tab="publishing"]')!.append(publishing.element)
   accountsEl = panel.querySelector('.st-accounts')
+  googleAccountsPanel = googleAccountsSection(panel.querySelector<HTMLElement>('.st-google-accounts')!)
   accountsStatusEl = panel.querySelector('.st-accounts-status')
   terminalSlot = panel.querySelector('.st-terminal-slot')
   shellBtn = panel.querySelector('.st-open-shell') as HTMLButtonElement

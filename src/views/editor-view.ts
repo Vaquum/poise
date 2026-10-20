@@ -5,6 +5,7 @@ import { registerReloadGuard, registerReloadSnapshot } from '../self-update-watc
 import { editorHistoryKey, HISTORY_LIMIT, readEditorHistory, writeEditorHistory, type EditorHistoryEntry } from '../editor-history'
 import { ICON_PUBLISH, closePublishPanel, togglePublishPanel } from './editor-publish'
 import { EditorReviews } from './editor-reviews'
+import { GoogleDocuments } from './google-documents'
 import type { ArticleReview } from '../publishing-review'
 // Editor — minimalist markdown writing surface.
 //
@@ -113,6 +114,8 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null
 // across annotations — only one is visible at a time.
 let annotations: Annotation[] = []
 let articleReviews: EditorReviews | undefined
+let googleImporting = false
+let googleDocuments: GoogleDocuments | null = null
 const reviewSessions = new Map<string, string>()
 let annotationsReadySlug: string | null = null
 const documentVersions = new Map<string, string>()
@@ -219,6 +222,7 @@ export function createSerializedSaveQueue<T>(
 }
 
 interface DocumentSaveSnapshot {
+  baseVersion: string
   slug: string
   content: string
   clientId: string
@@ -1254,6 +1258,7 @@ function restoreHistoryEntry(entry: EditorHistoryEntry): void {
 }
 
 function undoEditor(): void {
+  if (googleImporting) return
   closeHistoryBatch()
   const prev = historyUndo.pop()
   if (!prev) return
@@ -1263,6 +1268,7 @@ function undoEditor(): void {
 }
 
 function redoEditor(): void {
+  if (googleImporting) return
   closeHistoryBatch()
   const next = historyRedo.pop()
   if (!next) return
@@ -2289,6 +2295,7 @@ async function loadDoc(slug: string) {
     if (!persistEditorHistory()) return
     currentSlug = nextSlug
     articleReviews?.clear()
+    googleDocuments?.load(null)
     documentVersions.set(currentSlug, data.version)
     loadIntoEditor(data.content)
     // History is per-document: undo must never walk back into the
@@ -2320,6 +2327,7 @@ async function loadDoc(slug: string) {
     if (requestId !== loadRequestId) return
     renderAnnotationOverlay()
     void articleReviews?.load(currentSlug)
+    googleDocuments?.load(currentSlug)
   } catch (err) {
     console.error('[editor] loadDoc failed:', err)
   }
@@ -2409,6 +2417,7 @@ async function deleteCurrent() {
   annotationsVersions.delete(d.slug)
   currentSlug = null
   articleReviews?.clear()
+    googleDocuments?.load(null)
   annotations = []
   annotationsReadySlug = null
   if (docEl) {
@@ -2686,7 +2695,7 @@ function clearEditHoverHighlight(): void {
 // open — rewriting a document the agent never saw, and silently not applying
 // the edit to the one it was about.
 function applyEditToDoc(edit: EditCardData, slug: string): 'applied' | 'conflict' {
-  if (!docEl) return 'conflict'
+  if (!docEl || googleImporting) return 'conflict'
   if (currentSlug !== slug) return 'conflict'
   const snap = docTextSnapshot()
   const charRange = findCharRangeForEdit(snap.text, edit)
@@ -2710,7 +2719,7 @@ function applyEditToDoc(edit: EditCardData, slug: string): 'applied' | 'conflict
 
 async function persistDocumentSnapshot(snapshot: DocumentSaveSnapshot): Promise<void> {
   if (currentSlug === snapshot.slug) setMeta('Saving…')
-  const baseVersion = requiredVersion(documentVersions, snapshot.slug, 'document')
+  const baseVersion = snapshot.baseVersion
   const res = await fetch(`/api/editor/doc/${encodeURIComponent(snapshot.slug)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -2757,8 +2766,9 @@ async function flushSave(): Promise<boolean> {
 }
 
 function scheduleSave(): void {
-  if (!docEl || !currentSlug || currentSlug === deletingSlug) return
+  if (!docEl || !currentSlug || currentSlug === deletingSlug || googleImporting) return
   documentSaveQueue.enqueue({
+    baseVersion: requiredVersion(documentVersions, currentSlug, 'document'),
     slug: currentSlug,
     content: serializeDoc(),
     clientId: EDITOR_CLIENT_ID,
@@ -2858,11 +2868,11 @@ function scheduleAnnotationsSave(): void {
 }
 
 async function flushEditorSaves(): Promise<boolean> {
-  const [docSaved, annotationsSaved] = await Promise.all([
-    flushSave(),
-    flushAnnotationsSave(),
-  ])
-  return docSaved && annotationsSaved
+  for (;;) {
+    const [docSaved, annotationsSaved] = await Promise.all([flushSave(), flushAnnotationsSave()])
+    if (!docSaved || !annotationsSaved) return false
+    if (!documentSaveQueue.isDirty() && !annotationsSaveQueue.isDirty()) return true
+  }
 }
 
 async function discardEditorSaves(): Promise<void> {
@@ -4082,7 +4092,7 @@ function attachHandlers() {
     .addEventListener('click', () => { void deleteCurrent() })
   const publishBtn = viewEl.querySelector<HTMLButtonElement>('.editor-publish-btn')!
   publishBtn.addEventListener('click', () => {
-    togglePublishPanel(publishBtn, { slug: () => currentSlug, flush: flushEditorSaves, published: () => { void articleReviews?.synchronize(true) } })
+    togglePublishPanel(publishBtn, { slug: () => currentSlug, flush: flushEditorSaves, version: () => currentSlug ? documentVersions.get(currentSlug) ?? null : null, published: () => { void articleReviews?.synchronize(true) } })
   })
   copyBtnEl = viewEl.querySelector<HTMLButtonElement>('.editor-copy-btn')!
   copyBtnEl.addEventListener('click', () => { void copyDoc() })
@@ -4555,6 +4565,11 @@ function attachHandlers() {
   // (a few transient absolute divs), so we do it eagerly.
   window.addEventListener('resize', renderAnnotationOverlay)
 
+  for (const eventName of ['keydown', 'beforeinput', 'paste', 'cut', 'drop']) {
+    docEl!.addEventListener(eventName, event => {
+      if (googleImporting) { event.preventDefault(); event.stopImmediatePropagation() }
+    }, { capture: true })
+  }
   docEl!.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 's') {
       e.preventDefault()
@@ -4772,7 +4787,7 @@ function sendPendingEditorBeacons(): void {
   const doc = documentSaveQueue.pending()
   if (doc) {
     try {
-      const baseVersion = requiredVersion(documentVersions, doc.slug, 'document')
+      const baseVersion = doc.baseVersion
       const body = new Blob(
         [JSON.stringify({
           content: doc.content,
@@ -4849,6 +4864,20 @@ export async function initEditorView() {
     triggerTitleEl = viewEl.querySelector<HTMLElement>('.editor-doc-trigger-title')
     menuEl         = viewEl.querySelector<HTMLElement>('#editor-doc-menu')
     metaEl         = viewEl.querySelector<HTMLElement>('#editor-meta')
+    googleDocuments = new GoogleDocuments({
+      view: viewEl, flush: flushEditorSaves,
+      imported: async (slug, content, version) => {
+        // A successful import invalidates the old editor version before any further save.
+        if (currentSlug !== slug) return
+        documentVersions.set(slug, version)
+        loadIntoEditor(content); resetEditorHistory(); setMetaForCurrent()
+        googleDocuments?.load(slug)
+      },
+      freeze: frozen => {
+        googleImporting = frozen
+        if (docEl) docEl.contentEditable = !frozen && currentSlug ? 'true' : 'false'
+      },
+    })
     articleReviews = new EditorReviews({
       view: viewEl, document: docEl!, text: serializeDoc,
       range: (start, end) => domRangeForCharRange(docTextSnapshot(), start, end),
@@ -4865,8 +4894,9 @@ export async function initEditorView() {
   }
   // The editor owns unsaved text, selection and undo history. A return only
   // refreshes its picker; reopening the same file would replace that state.
+  articleReviews?.resume()
+  googleDocuments?.resume()
   if (currentSlug) {
-    articleReviews?.resume()
     void fetchDocs()
     requestAnimationFrame(() => { if (!viewEl.hidden) renderAnnotationOverlay() })
     return
@@ -4893,6 +4923,7 @@ async function openInitialDocument(): Promise<void> {
 
 export function stopEditorRefresh() {
   articleReviews?.stop()
+  googleDocuments?.stop()
   clearSaveTimer()
   clearAnnotationsSaveTimer()
   void flushEditorSaves()

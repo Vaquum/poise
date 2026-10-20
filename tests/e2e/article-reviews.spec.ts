@@ -27,6 +27,7 @@ async function editorWithReviews(page: Page, initial: ArticleReview[] = [review(
       return route.fulfill({ json: { slug: 'draft', title: 'A question', content, updated_at: '2026-10-18T08:00:00Z', version: VERSION } })
     }
     if (path.endsWith('/annotations')) return route.fulfill({ json: { annotations: [], version: VERSION } })
+    if (path.endsWith('/google/sync')) return route.fulfill({ json: { publications: [], version: VERSION } })
     if (path.endsWith('/reviews')) return route.fulfill({ json: { ...data, reviews: [], checkedAt: null, stale: true } })
     if (path.endsWith('/reviews/sync')) { calls.push({ path, body }); return route.fulfill({ json: data }) }
     if (path.endsWith('/reviews/action')) {
@@ -167,6 +168,7 @@ test('switching documents during a GitHub reply does not suspend the new documen
   await page.route('**/api/editor/doc/another**', (route) => {
     const path = new URL(route.request().url()).pathname
     if (path.endsWith('/annotations')) return route.fulfill({ json: { annotations: [], version: VERSION } })
+    if (path.endsWith('/google/sync')) return route.fulfill({ json: { publications: [], version: VERSION } })
     if (path.endsWith('/reviews/sync')) secondSyncs++
     if (path.includes('/reviews')) return route.fulfill({ json: second })
     return route.fulfill({ json: { slug: 'another', content: '# Another\n\nDifferent paragraph.', version: VERSION } })
