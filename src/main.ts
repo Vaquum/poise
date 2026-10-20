@@ -7,7 +7,7 @@ installIconTooltips()
 import { initTypography, toggleTypographyPanel, closeTypographyPanel } from './typo'
 import { initSettings, openSettingsPanel, openSettingsAt, closeSettingsPanel, isFullyConfigured } from './settings'
 import { initMenu } from './menu'
-import { initAnalyticsView, stopAnalyticsRefresh } from './views/analytics-view'
+import { initAnalyticsView, prepareAnalyticsView, stopAnalyticsRefresh } from './views/analytics-view'
 import { initLoggingView, refreshLoggingView, stopLoggingRefresh } from './views/logging-view'
 import { loggingCallId, loggingHref, type LoggingLink } from './logging'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
@@ -196,6 +196,7 @@ watchForSignOut()
   await loadSettings()
   if (new URLSearchParams(location.search).get('view') === 'logging') menu.switchTo('logging')
   else showView(menu.currentView())
+  prepareAnalyticsView()
   // Single shared refresh clock — every view listens for poise:refresh-tick
   // and refreshes on it. Wall-clock-aligned so switching views never causes
   // an off-cycle re-fetch. (Behaviors run server-side on their own

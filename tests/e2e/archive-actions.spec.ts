@@ -319,6 +319,9 @@ test('re-enabling an unfinished cached source resumes paging without another obs
 })
 
 test('healthy-source pagination cannot restart an exhausted failed source', async ({ page }) => {
+  // This case owns its refresh ticks. Crossing a real minute boundary can
+  // legitimately admit another scheduled refresh after exhaustion.
+  await page.clock.setFixedTime(new Date('2026-10-09T12:00:01Z'))
   await page.setViewportSize({ width: 1280, height: 300 })
   await workspace(page, 'swarm')
   let actionsReads = 0

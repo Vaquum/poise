@@ -113,9 +113,16 @@ Analytics does not change Current's filters. The selected calendar date stays
 fixed across midnight; labels and forward navigation refresh when the local
 day changes.
 
-When opening Analytics, changing its day or account, or saving Settings,
-previous values are removed immediately and the standard three-dot loading
-indicator appears. The server reads the local datastore views directly,
+The browser prepares today's day and baseline while another view is visible,
+at startup and on the shared refresh tick. Opening Analytics uses that prepared
+snapshot immediately when its date, organization, identities and timezone match
+and it is within the configured refresh interval. Its original read time is
+retained for pace calculations. An in-flight preparation is shared with opening
+the view; the click does not start duplicate reads. History and quota are not
+prefetched. Settings/account changes cannot reuse another scope's snapshot.
+
+Without a matching fresh preparation, previous values are removed immediately
+and the standard three-dot loading indicator appears. The server reads the local datastore views directly,
 without starting a CLI process for each scope.
 Each account read keeps one database snapshot and yields to other server
 work after 64 records or once eight milliseconds of processing have elapsed. Discussion
@@ -125,8 +132,13 @@ reviews do not parse unrelated discussion payloads; year history therefore
 does not hold up day or quota reads while processing its records.
 Involvement membership comes directly from the indexed associations, without
 aggregating the evidence descriptions that the full user view supplies.
-Leaving Analytics stops its reads: a late answer is discarded, and quota is
-not refreshed until it is chosen again.
+The date filter narrows items before each indexed membership lookup; merged
+PR sizes and merger identity come from one parse of each stored payload.
+The selected day and its baseline load first. The year request starts after
+the cards render, so its larger scan cannot delay their initial appearance.
+Leaving Analytics stops its foreground reads: a late answer is discarded, and
+history and quota are not refreshed until it is chosen again. Day preparation
+continues on shared ticks only while the browser tab is visible.
 
 While Analytics and its browser tab are visible, the shared refresh clock
 quietly rereads the selected day's numbers and seven-day baseline from local

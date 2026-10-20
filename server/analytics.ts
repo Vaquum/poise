@@ -270,9 +270,17 @@ async function readOrganization(org: Organization, me: string, window: Analytics
     const scopeByKind = { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) }
     db.exec('BEGIN')
     const mergedDetails = db.prepare<[number], Pick<DatastoreRecord, 'comments_count' | 'review_comments_count' | 'additions' | 'deletions' | 'merged_by'>>(`
-      SELECT comments_count, review_comments_count, additions, deletions,
-        json_extract(i.expanded_json, '$.pull.merged_by.login') AS merged_by
-      FROM prs JOIN items i ON i.item_id = pr_ref WHERE pr_ref = ?
+      WITH payload AS MATERIALIZED (
+        SELECT item_id, json_extract(expanded_json,
+          '$.pull.graphql.additions', '$.pull.graphql.deletions', '$.pull.merged_by.login') AS details
+        FROM items WHERE item_id = ?
+      )
+      SELECT (SELECT count(*) FROM comments c WHERE c.item_id = payload.item_id) AS comments_count,
+        (SELECT count(*) FROM review_comments c WHERE c.item_id = payload.item_id) AS review_comments_count,
+        CAST(json_extract(details, '$[0]') AS INTEGER) AS additions,
+        CAST(json_extract(details, '$[1]') AS INTEGER) AS deletions,
+        json_extract(details, '$[2]') AS merged_by
+      FROM payload
     `)
     const mergedReviews = db.prepare<[number], ReviewSummary>(`
       SELECT count(DISTINCT nullif(trim(r.commit_id), '')) AS rounds,
@@ -288,26 +296,26 @@ async function readOrganization(org: Organization, me: string, window: Analytics
       const view = kind === 'pr' ? 'prs' : 'issues'
       const ref = kind === 'pr' ? 'pr_ref' : 'issue_ref'
       const params: string[] = []
+      const filters: string[] = []
+      // Narrow items before checking involvement. Building the union of
+      // every association first scans old discussion evidence on each read.
+      if (window.since) {
+        filters.push('updated_at >= ?')
+        params.push(new Date(window.since).toISOString().slice(0, 19))
+      }
       const scopes = scopeByKind[kind].map(scope => {
         const user = scope[0] === 'user'
-        const filters: string[] = []
         if (user) {
-          filters.push('a.username = ?', 'i.item_type = ?')
-          params.push(me, kind)
-        } else if (scope[1] === '--author') {
-          filters.push('author = ?')
+          params.push(me)
+          return `EXISTS (SELECT 1 FROM associations a WHERE a.item_id = v.${ref} AND a.username = ?)`
+        }
+        if (scope[1] === '--author') {
           params.push(scope[2])
+          return 'author = ?'
         }
-        // Match the CLI's second-resolution narrowing; computeAnalytics
-        // applies the exact inclusive/exclusive millisecond boundaries.
-        if (window.since) {
-          filters.push('updated_at >= ?')
-          params.push(new Date(window.since).toISOString().slice(0, 19))
-        }
-        // Only membership is needed. user_items groups all involvement
-        // evidence into explanations before it can return these same IDs.
-        return `SELECT ${user ? 'a.item_id' : ref} FROM ${user ? 'associations a JOIN items i ON i.item_id = a.item_id' : view}${filters.length ? ` WHERE ${filters.join(' AND ')}` : ''}`
+        return '1'
       })
+      filters.push(`(${scopes.join(' OR ')})`)
       // A pending review is not submitted, and an author's own review is a
       // reply. A review counts unless it is known to be the author's: a
       // deleted account leaves either login NULL.
@@ -319,7 +327,7 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         : '0 AS comments_count'
       const query = db.prepare<string[], DatastoreRecord>(`
         SELECT repo, number, status, author, updated_at, created_at, closed_at, title, url, ${details}
-        FROM ${view} WHERE ${ref} IN (${scopes.join(' UNION ')})
+        FROM ${view} v WHERE ${filters.join(' AND ')}
       `)
       const rows: DatastoreRecord[] = []
       let sliceStart = performance.now()

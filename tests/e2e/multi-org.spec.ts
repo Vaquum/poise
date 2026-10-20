@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { settled } from './fixtures/motion'
+import { emptyAnalyticsReport } from './fixtures/analytics'
 import type { Organization } from '../../src/config'
 import type { BehaviorDiagnostics } from '../../src/behaviors'
 
@@ -81,6 +82,7 @@ async function setup(page: Page, initial = [organization('acme')], me = 'octocat
     }
     if (url.pathname === '/api/models') return route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } })
     if (url.pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
+    if (url.pathname === '/api/analytics') return route.fulfill({ json: emptyAnalyticsReport(url) })
     return route.fulfill({ json: {} })
   })
   return state

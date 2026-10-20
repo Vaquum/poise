@@ -562,6 +562,32 @@ describe('reading what Current shows', () => {
     } finally { db.close() }
   })
 
+  it('parses merged discussion payloads once while preserving every measurement', async () => {
+    const rows = Array.from({ length: 64 }, (_, i) => pr(i + 1, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', {
+      additions: i, deletions: 2, comments_count: 3, review_comments_count: 2, merged_by: 'robot',
+      review_summary: { rounds: 0, missingCommits: 0, changeRequests: 0, dismissed: 0 },
+    }))
+    rows.forEach(row => seed(row, 'pr', true))
+    const db = new Database(mocks.orgs[0].datastorePath)
+    try {
+      db.prepare("UPDATE items SET expanded_json = json_set(expanded_json, '$.discussion', ?)").run('x'.repeat(1024 * 1024))
+      const eager = db.prepare<[number], Pick<DatastoreRecord, 'comments_count' | 'review_comments_count' | 'additions' | 'deletions' | 'merged_by'>>(`
+        SELECT comments_count, review_comments_count, additions, deletions,
+          json_extract(i.expanded_json, '$.pull.merged_by.login') AS merged_by
+        FROM prs JOIN items i ON i.item_id = pr_ref WHERE pr_ref = ?
+      `)
+      const start = performance.now()
+      rows.forEach((row, i) => expect(eager.get(i + 1)).toEqual({ comments_count: 3, review_comments_count: 2, additions: row.additions, deletions: 2, merged_by: 'robot' }))
+      const eagerMs = performance.now() - start
+      const readStart = performance.now()
+      const report = await readAnalytics(WEEK, 'alpha')
+      const readMs = performance.now() - readStart
+      expect(report).toEqual(computeAnalytics({ window: WEEK, issues: [], prs: rows, behaviors: [], agent: 'robot' }))
+      console.info(`Analytics 64 MiB merged discussions: repeated parse ${eagerMs.toFixed(1)} ms; single parse ${readMs.toFixed(1)} ms`)
+      expect(readMs).toBeLessThan(eagerMs)
+    } finally { db.close() }
+  })
+
   it('names unreadable accounts, retains sync errors and fails when none are readable', async () => {
     rmSync(mocks.orgs[1].datastorePath)
     mocks.orgs[0].error = 'sync failed'

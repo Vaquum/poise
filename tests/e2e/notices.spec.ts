@@ -7,6 +7,7 @@ import { expect, test, type Page } from '@playwright/test'
 import type { BehaviorDiagnostics } from '../../src/behaviors'
 import type { Notice } from '../../src/notices'
 import { freeze, resume, settled } from './fixtures/motion'
+import { emptyAnalyticsReport } from './fixtures/analytics'
 
 // The notification rail (src/views/notification-rail.ts): the bell and its
 // count, the rail docked beside the page or floating over it, entries that
@@ -99,6 +100,7 @@ async function workspace(page: Page, notices: Notice[], options: { enabled?: boo
     if (pathname === '/api/workspace') return route.fulfill({ json: { mode: 'local' } })
     if (pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (pathname === '/api/agent-logs') return route.fulfill({ json: { logs: [failedRun()] } })
+    if (pathname === '/api/analytics') return route.fulfill({ json: emptyAnalyticsReport(new URL(request.url())) })
     return route.fulfill({ json: {} })
   })
   return state

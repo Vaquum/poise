@@ -1245,9 +1245,12 @@ test('refreshes one quiet local pair on ticks and visibility return while keepin
   await leaveAnalytics(page)
   const hiddenSummary = await merged.textContent()
   await refreshAnalytics(page)
+  // A visible alternate view prepares one new pair without repainting the
+  // hidden Analytics view or refreshing quota/history. Visibility coalesces.
+  await expect.poll(() => state.reads.length).toBe(8)
   await changeVisibility(page, 'visible')
   await expect(merged).toHaveText(hiddenSummary!)
-  expect(state.reads).toHaveLength(6)
+  expect(state.reads).toHaveLength(8)
   expect(state.historyReads).toHaveLength(1)
   expect(state.quotaReads).toBe(3)
 })
@@ -1753,6 +1756,99 @@ for (const failure of ['HTTP', 'account'] as const) {
     expect(state.historyReads).toHaveLength(1)
   })
 }
+
+test('opens immediately from a prepared scope without fetching again or redating its pace', async ({ page }) => {
+  const state = await workspace(page)
+  await page.goto('/')
+  await expect.poll(() => state.reads.length).toBe(2)
+  await page.waitForLoadState('networkidle')
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  let readsAfterPreparation = 0
+  await page.route('**/api/analytics?**', async route => {
+    readsAfterPreparation++
+    await held
+    await route.fallback()
+  })
+  try {
+    await openAnalytics(page)
+    const panel = page.locator('#view-analytics')
+    await expect(value(page, 'Pull requests merged')).toHaveText('4', { timeout: 500 })
+    await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeHidden()
+    expect(readsAfterPreparation).toBe(0)
+    const timestamp = await value(page, 'Pull requests merged').getAttribute('data-help')
+    await leaveAnalytics(page)
+    await openAnalytics(page)
+    await expect(value(page, 'Pull requests merged')).toHaveText('4', { timeout: 500 })
+    expect(await value(page, 'Pull requests merged').getAttribute('data-help')).toBe(timestamp)
+    expect(readsAfterPreparation).toBe(0)
+    await panel.getByLabel('Organization filter').selectOption('beta')
+    await expect(panel.getByRole('status', { name: 'Loading analytics' })).toBeVisible()
+    await expect(panel.locator('.analytics-tile')).toHaveCount(0)
+    await expect.poll(() => readsAfterPreparation).toBe(2)
+  } finally { release() }
+})
+
+test('clears an earlier day failure when a healthy prepared snapshot reopens immediately', async ({ page }) => {
+  const state = await workspace(page)
+  await installRefreshClock(page)
+  await page.goto('/')
+  await pauseRefreshClock(page)
+  await openAnalytics(page)
+  await page.waitForLoadState('networkidle')
+  state.fail = true
+  await refreshAnalytics(page)
+  await page.locator('.nr-bell').click()
+  const failure = page.locator('.nr-rail .nr-card').filter({ hasText: 'acme: datastore offline' })
+  await expect(failure).toHaveCount(1)
+  await leaveAnalytics(page)
+  state.fail = false
+  await refreshAnalytics(page)
+  await expect.poll(() => state.reads.length).toBe(6)
+  await page.waitForLoadState('networkidle')
+  await openAnalytics(page)
+  await expect(value(page, 'Pull requests merged')).toHaveText('4', { timeout: 500 })
+  // Opening the menu closes the floating rail; its hidden markup is lazy.
+  await page.locator('.nr-bell').click()
+  await expect(failure).toHaveCount(0)
+  expect(state.reads).toHaveLength(6)
+})
+
+test('renders day cards before admitting year history and skips history after leaving a pending day', async ({ page }) => {
+  await workspace(page)
+  let release!: () => void
+  let held = new Promise<void>(resolve => { release = resolve })
+  let dayReads = 0
+  let historyReads = 0
+  let historySawCards = false
+  await page.route('**/api/analytics?**', async route => {
+    dayReads++
+    await held
+    await route.fallback()
+  })
+  await page.route('**/api/analytics/history?**', async route => {
+    historyReads++
+    historySawCards = await page.locator('#view-analytics .analytics-tile').count() > 0
+    await route.fallback()
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  try {
+    await expect.poll(() => dayReads).toBe(2)
+    expect(historyReads).toBe(0)
+    release()
+    await expect(value(page, 'Pull requests merged')).toHaveText('4')
+    await expect.poll(() => historyReads).toBe(1)
+    await expect.poll(() => historySawCards).toBe(true)
+    held = new Promise<void>(resolve => { release = resolve })
+    await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
+    await expect.poll(() => dayReads).toBe(4)
+    expect(historyReads).toBe(1)
+    await leaveAnalytics(page)
+  } finally { release() }
+  await page.waitForLoadState('networkidle')
+  expect(historyReads).toBe(1)
+})
 
 test('shows the standard loader with no old values on initial load, day/account changes and reopening', async ({ page }, info) => {
   await workspace(page)

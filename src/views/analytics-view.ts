@@ -2,10 +2,11 @@ import { reveal } from '../motion'
 import { analyticsLayout } from '../analytics-layout'
 // Day, history and live quota retain independent read ownership on one card board.
 import { analyticsGroups, formatCount, formatRate, type AnalyticsGroup, type AnalyticsReport, type AnalyticsTile } from '../analytics-format'
-import { analyticsDay, analyticsDayProgress, analyticsDailyBounds, analyticsHistoryBounds } from '../analytics-day'
+import { analyticsDay, analyticsDayProgress, analyticsHistoryBounds } from '../analytics-day'
+import { analyticsSnapshotScope, hasNewAccountFailure, preparedAnalytics, readAnalyticsSnapshot, type AnalyticsSnapshot } from '../analytics-snapshot'
 import { HISTORY_BASELINE, historyChart, histogram, historySeries, periodLabel, type AnalyticsHistory, type HistorySeries } from '../analytics-history'
 import { mountOrganizationFilter, organizationUrl } from '../organizations'
-import { effectiveTimezone } from '../config'
+import { effectiveTimezone, getRefreshRateMs, settingsReady } from '../config'
 import { noticeFeed, type ReadFailure } from '../notices'
 import { GITHUB_QUOTA_REFRESH_MS, quotaRiskTone, quotaHours, type GithubQuotaReport, type GithubQuotaBucket } from '../github-quota'
 
@@ -59,11 +60,14 @@ let analyticsRead: AbortController | null = null
 let lastReadAt = 0
 let quotaGeneration = 0
 let historyGeneration = 0
+let historyRead: AbortController | null = null
 let quotaTimer: ReturnType<typeof setInterval> | undefined
 // The day on screen and the past year it is drawn with. The year arrives on
 // its own: until then each headline tile holds its chart's place.
 let shown: { report: AnalyticsReport, baseline: AnalyticsReport, progress: number | undefined, snapshotTime: string | undefined } | null = null
 let history: { data: AnalyticsHistory | null, error: string } = { data: null, error: '' }
+let historyScope = ''
+let historyReadAt = 0
 // The period a chart's cursor rests on, by tile, while hovered or focused.
 const cursors = new Map<string, number>()
 let hoverTimer: ReturnType<typeof setTimeout> | undefined
@@ -192,11 +196,6 @@ function readFailure(title: string, error: unknown): ReadFailure {
 
 function accountFailures(data: { errors: Array<{ org: string, error: string, stale?: boolean }> }): ReadFailure[] {
   return data.errors.map(({ org, error, stale }) => ({ key: `account:${org.toLowerCase()}`, title: `GitHub data for ${org} ${stale ? 'is not updating' : 'is unavailable'}`, body: error }))
-}
-
-function hasNewAccountFailure(report: AnalyticsReport, previous: AnalyticsReport): boolean {
-  const missing = new Set(previous.errors.filter((error) => !error.stale).map((error) => error.org.toLowerCase()))
-  return report.errors.some((error) => !error.stale && !missing.has(error.org.toLowerCase()))
 }
 
 function historyMarkup(tile: AnalyticsTile, all: HistorySeries[] | null, compact = false): string {
@@ -385,21 +384,29 @@ function onPlotKey(event: KeyboardEvent): void {
 
 async function readHistory(bounds: string[]): Promise<void> {
   const generation = ++historyGeneration
+  const scope = analyticsSnapshotScope(dayOffset, dayAnchor)
+  historyRead?.abort()
+  const controller = new AbortController()
+  historyRead = controller
   history = { data: null, error: '' }
   cursors.clear()
   cancelHover()
   hoveredSeries = null
   try {
-    const res = await fetch(organizationUrl(`/api/analytics/history?${new URLSearchParams({ bounds: bounds.join(',') })}`))
+    const res = await fetch(organizationUrl(`/api/analytics/history?${new URLSearchParams({ bounds: bounds.join(',') })}`), { signal: controller.signal })
     const data = await res.json().catch(() => null)
     if (!res.ok || !Array.isArray(data?.periods)) throw new Error(data?.error || `The past year could not be read (HTTP ${res.status})`)
     if (generation !== historyGeneration) return
     history = { data: data as AnalyticsHistory, error: '' }
+    historyScope = scope
+    historyReadAt = Date.now()
     noticeFeed.reportReadErrors('analytics-history', accountFailures(data))
   } catch (error) {
     if (generation !== historyGeneration) return
     history = { data: null, error: error instanceof Error ? error.message : String(error) }
     noticeFeed.reportReadErrors('analytics-history', [readFailure('Analytics history is unavailable', error)])
+  } finally {
+    if (historyRead === controller) historyRead = null
   }
   render()
 }
@@ -410,19 +417,20 @@ async function readAnalytics(background = false): Promise<void> {
   analyticsRead?.abort()
   const controller = new AbortController()
   analyticsRead = controller
+  // Admission time also deduplicates the shared tick and midnight timer
+  // when a read fails; the visible pace keeps the snapshot's actual time.
+  lastReadAt = Date.now()
   const groups = viewEl.querySelector<HTMLElement>('.analytics-groups')!
-  const day = analyticsDay(dayOffset, dayAnchor)
-  // Totals and typical-by-now must describe the same read, even on later renders.
-  const capturedAt = Date.now()
-  lastReadAt = capturedAt
-  const progress = day.isToday ? analyticsDayProgress(day.since, day.until, capturedAt) : undefined
-  const snapshotTime = day.isToday ? new Intl.DateTimeFormat('en-GB', {
-    timeZone: effectiveTimezone(), day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
-  }).format(capturedAt) : undefined
   if (!background) {
     shown = null
+    historyGeneration++
+    historyRead?.abort()
+    historyRead = null
+    history = { data: null, error: '' }
+    cursors.clear()
+    cancelHover()
+    hoveredSeries = null
     render()
-    void readHistory(analyticsHistoryBounds(dayOffset, dayAnchor))
     cardLayout.cancel()
     const skeleton = document.createElement('template')
     skeleton.innerHTML = metricMarkup
@@ -437,26 +445,17 @@ async function readAnalytics(background = false): Promise<void> {
     viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = false
     groups.setAttribute('aria-busy', 'true')
   }
-  const read = async (since: string, until: string, dailyBounds?: string[]): Promise<AnalyticsReport> => {
-    const query = new URLSearchParams({ since, until, ...(dailyBounds ? { dailyBounds: dailyBounds.join(',') } : {}) })
-    const res = await fetch(organizationUrl(`/api/analytics?${query}`), { signal: controller.signal })
-    const data = await res.json().catch(() => null)
-    if (!res.ok || !data) throw new Error(data?.error || `Analytics could not be read (HTTP ${res.status})`)
-    return data as AnalyticsReport
-  }
   try {
-    const [data, baseline] = await Promise.all([
-      read(day.since, day.until),
-      read(day.baselineSince, day.since, analyticsDailyBounds(dayOffset, dayAnchor)),
-    ])
+    const snapshot = await readAnalyticsSnapshot(dayOffset, dayAnchor, controller.signal)
+    const { report: data, baseline } = snapshot
     if (generation !== readGeneration) return
     const failures = [...accountFailures(data), ...accountFailures(baseline)]
     if (background && shown && (hasNewAccountFailure(data, shown.report) || hasNewAccountFailure(baseline, shown.baseline))) {
       noticeFeed.reportReadErrors('analytics-day', failures)
       return
     }
-    shown = { report: data, baseline, progress, snapshotTime }
-    render()
+    showSnapshot(snapshot)
+    noticeFeed.reportReadErrors('analytics-preload', [])
     noticeFeed.reportReadErrors('analytics-day', failures)
   } catch (error) {
     if (generation !== readGeneration) return
@@ -470,9 +469,40 @@ async function readAnalytics(background = false): Promise<void> {
       viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = true
       groups.removeAttribute('aria-busy')
       groups.style.minHeight = ''
+      // Admit the year only after the selected-day cards have rendered.
+      // Its synchronous SQLite slices must not compete with the first paint.
+      void readHistory(analyticsHistoryBounds(dayOffset, dayAnchor))
     }
   }
 }
+
+function showSnapshot(snapshot: AnalyticsSnapshot): void {
+  const day = analyticsDay(dayOffset, dayAnchor)
+  lastReadAt = snapshot.capturedAt
+  const progress = day.isToday ? analyticsDayProgress(day.since, day.until, snapshot.capturedAt) : undefined
+  const snapshotTime = day.isToday ? new Intl.DateTimeFormat('en-GB', {
+    timeZone: effectiveTimezone(), day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+  }).format(snapshot.capturedAt) : undefined
+  shown = { ...snapshot, progress, snapshotTime }
+  render()
+}
+
+/** Prepare only lightweight day data while another view is visible. */
+export function prepareAnalyticsView(force = false): void {
+  if (active || document.visibilityState !== 'visible' || !settingsReady()) return
+  if (!force && preparedAnalytics(0, new Date())) return
+  void readAnalyticsSnapshot(0, new Date()).then(snapshot => {
+    noticeFeed.reportReadErrors('analytics-preload', [...accountFailures(snapshot.report), ...accountFailures(snapshot.baseline)])
+  }, error => {
+    if (error instanceof DOMException && error.name === 'AbortError') return
+    noticeFeed.reportReadErrors('analytics-preload', [readFailure('Analytics could not prepare', error)])
+  })
+}
+
+window.addEventListener('poise:refresh-tick', () => prepareAnalyticsView(true))
+window.addEventListener('poise:synced', () => prepareAnalyticsView())
+window.addEventListener('poise:organization-filter-changed', () => prepareAnalyticsView())
+document.addEventListener('visibilitychange', () => prepareAnalyticsView())
 
 function scheduleMidnightRead(): void {
   clearTimeout(midnightTimer)
@@ -540,7 +570,18 @@ export function initAnalyticsView(): void {
     quotaTimer = setInterval(refreshQuota, GITHUB_QUOTA_REFRESH_MS)
   }
   scheduleMidnightRead()
-  void readAnalytics()
+  const snapshot = preparedAnalytics(dayOffset, dayAnchor)
+  if (snapshot) {
+    const reopening = shown?.report === snapshot.report && shown.baseline === snapshot.baseline
+    const keepHistory = history.data && historyScope === analyticsSnapshotScope(dayOffset, dayAnchor) && Date.now() - historyReadAt <= getRefreshRateMs()
+    if (!keepHistory) { history = { data: null, error: '' }; cursors.clear() }
+    showSnapshot(snapshot)
+    noticeFeed.reportReadErrors('analytics-day', [...accountFailures(snapshot.report), ...accountFailures(snapshot.baseline)])
+    viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = true
+    if (!keepHistory || history.data?.errors.length) void readHistory(analyticsHistoryBounds(dayOffset, dayAnchor))
+    if (reopening && (snapshot.report.errors.length || snapshot.baseline.errors.length)) void readAnalytics(true)
+  }
+  else void readAnalytics()
   void readQuota()
 }
 
@@ -553,6 +594,8 @@ export function stopAnalyticsRefresh(): void {
   analyticsRead = null
   quotaGeneration++
   historyGeneration++
+  historyRead?.abort()
+  historyRead = null
   cancelHover()
   hoveredSeries = null
   clearInterval(quotaTimer)
