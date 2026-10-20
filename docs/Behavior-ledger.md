@@ -92,10 +92,12 @@ A separate worker owns `behavior-ledger.db` beside `POISE_DB` (by default
 the ledger ephemeral. Files use private permissions and SQLite rollback
 journaling. Capture is bounded to 1,000 queued observations or 2 MiB, dropping
 new arrivals explicitly on overflow. Reads allow 16 outstanding requests and a
-two-second budget. Startup yields after two seconds while the same worker may
-still initialize; reads remain unavailable until valid readiness arrives, then
-queued capture resumes. Actual worker failures remain unavailable. Shutdown is
-bounded to two seconds.
+two-second budget. Each completed capture permits one waiting read before
+ordinary FIFO resumes. Reads can return a committed prefix with pending
+captures reported in health. Startup yields after two seconds while the same
+worker may still initialize; reads remain unavailable until valid readiness
+arrives, then queued capture resumes. Actual worker failures remain unavailable.
+Shutdown is bounded to two seconds.
 
 Retention targets 30 days from meaningful updates, bounded by 10,000 instances,
 30,000 changes, 32 MiB accounted metadata, a 64 MiB main database, at most

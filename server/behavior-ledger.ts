@@ -203,10 +203,10 @@ export class BehaviorLedgerObserver {
       clearTimeout(job.timer)
       job.resolve({ status: message.status, body: { ...message.body, health: this.projectedHealth() } })
     }
-    this.pump()
+    this.pump(job.operation === 'capture')
   }
 
-  private pump(): void {
+  private pump(preferRead = false): void {
     if (!this.ready || this.closed || this.failed || this.active || !this.worker) return
     // A loss marker has a reserved slot; dropping it would hide capture loss.
     if (this.unreportedLoss && !this.queue.some((job) => job.observation?.type === 'loss')) {
@@ -214,7 +214,9 @@ export class BehaviorLedgerObserver {
         observation: { type: 'loss', count: this.unreportedLoss } })
       this.captures++
     }
-    const job = this.queue.shift()
+    // Read deadlines include queue wait; permit a turn without starving capture.
+    const readIndex = preferRead ? this.queue.findIndex((job) => job.operation === 'read') : -1
+    const job = readIndex < 0 ? this.queue.shift() : this.queue.splice(readIndex, 1)[0]
     if (!job) { this.worker.unref(); return }
     this.active = job
     this.worker.ref()

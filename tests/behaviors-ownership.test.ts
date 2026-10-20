@@ -254,6 +254,9 @@ describe('launch ownership and resolution', () => {
         .toEqual({ totalRuns: 0, durationMinutes: 0, successRate: null })
 
       if (observer) {
+        if (mode === 'healthy') await vi.waitFor(async () => {
+          expect((await observer.read({ operation: 'health' })).body.health.pending).toBe(0)
+        })
         const reply = await observer.read({ operation: 'list' })
         if (mode === 'healthy') {
           expect(reply.status).toBe(200)

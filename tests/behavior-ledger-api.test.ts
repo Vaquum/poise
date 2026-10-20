@@ -74,12 +74,18 @@ function call(path: string, method = 'GET', caller: Caller = {}): Promise<{ stat
   })
 }
 
+async function flushCaptures(): Promise<void> {
+  await vi.waitFor(async () => {
+    expect((await ledger.readBehaviorLedger({ operation: 'health' })).body.health.pending).toBe(0)
+  })
+}
+
 async function firing(): Promise<void> {
   const nativeId = randomUUID()
   ledger.captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'merge-prs', source: 'poise:merge-prs',
     owner: 'octocat', actor: 'octobot', repository: 'example/project', number: 7, head: 'a'.repeat(40) })
   ledger.captureBehaviorOutcome({ nativeId, state: 'completed', activity: 'settled', stateSource: 'native', outcome: 'not_ready', completedAt: new Date().toISOString() })
-  await ledger.readBehaviorLedger({ operation: 'health' })
+  await flushCaptures()
 }
 
 beforeAll(async () => {
@@ -240,6 +246,7 @@ it('requires the original correlation even after a Caller call ID is known', asy
   ledger.captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'review-new-prs', source: 'poise:review-new-prs',
     owner: 'octocat', actor: 'octobot', repository: 'example/project', number: 9, head, slot: 'primary', plannedSlots: ['primary'], startedAt })
   ledger.captureBehaviorOutcome({ nativeId, state: 'unknown', activity: 'unknown', callId, stateSource: 'native' })
+  await flushCaptures()
   const listing = await ledger.readBehaviorLedger({ operation: 'list', limit: 100 })
   const record = listing.body.records!.find((row) => row.kind === 'firing' && row.behavior === 'review-new-prs' && row.target.number === 9)!
   const entry: LogEntry = { id: callId, pr_id: '9', repo: 'example/project', actor: 'octobot', model: 'fixture', behavior: 'pr_review',
@@ -248,9 +255,11 @@ it('requires the original correlation even after a Caller call ID is known', asy
     correlation_id: nativeId, action: 'reviewed_clean', response: null, error: '' }
   for (const correlation of ['foreign-correlation', null]) {
     ledger.observeAgentSnapshot({ entries: [{ ...entry, correlation_id: correlation }], quarantined: [] })
+    await flushCaptures()
     expect((await call(`${PREFIX}/${record.id}`)).body.record).toMatchObject({ state: 'unknown', activity: 'unknown' })
   }
   ledger.observeAgentSnapshot({ entries: [entry], quarantined: [] })
+  await flushCaptures()
   expect((await call(`${PREFIX}/${record.id}`)).body.record).toMatchObject({ state: 'completed', activity: 'settled', outcome: 'clean' })
 })
 
@@ -259,9 +268,11 @@ it('keeps direct work out of Caller snapshots before the admission is acknowledg
   ledger.captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'merge-prs', source: 'poise:merge-prs',
     owner: 'octocat', actor: 'octobot', repository: 'example/project', number: 11, head: 'd'.repeat(40), startedAt: new Date().toISOString() })
   ledger.observeAgentSnapshot({ entries: [], quarantined: [] })
+  await flushCaptures()
   const records = (await call(`${PREFIX}?limit=100`)).body.records!
   const record = records.find((row) => row.kind === 'firing' && row.behavior === 'merge-prs' && row.target.number === 11)!
   expect(record).toMatchObject({ state: 'running', activity: 'running' })
   ledger.captureBehaviorOutcome({ nativeId, state: 'completed', activity: 'settled', stateSource: 'native', outcome: 'not_ready', completedAt: new Date().toISOString() })
+  await flushCaptures()
   expect((await call(`${PREFIX}/${record.id}`)).body.record).toMatchObject({ state: 'completed', activity: 'settled' })
 })
