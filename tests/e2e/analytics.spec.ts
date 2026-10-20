@@ -1355,8 +1355,9 @@ test('keeps the last complete snapshot on a quiet failure, cancels the other hal
   state.stale = true
   await refreshAnalytics(page)
   await expect(merged.locator('.analytics-value')).toHaveText('20')
-  await expect(merged.locator('.analytics-arrow')).toHaveCount(0)
-  await expect(merged.locator('.analytics-delta')).toHaveCount(0)
+  await expect(merged).toHaveClass(/good/)
+  await expect(merged.locator('.analytics-arrow')).toHaveText('↑')
+  await expect(merged.locator('.analytics-delta')).toHaveText('11.1% ahead of pace')
   await expect(merged).toContainText('Typical by now: 18.0 · 7-day median: 27.0 / day')
   await expect(merged.locator('.analytics-value')).toHaveAttribute('data-help', /Pace as of 9 Oct 2026, 16:00 UTC/)
   await expect(partialFailure).toHaveCount(0)
@@ -1502,7 +1503,7 @@ for (const rate of ['1m', '5m'] as const) {
   })
 }
 
-test('keeps stale totals and their pacing context without judging Today, while retaining completed-day comparisons', async ({ page }) => {
+test('retains stale totals, colors and arrows for Today and completed days', async ({ page }) => {
   const state = await workspace(page)
   state.pacing = { merged: 15, median: 27 }
   state.stale = true
@@ -1511,9 +1512,9 @@ test('keeps stale totals and their pacing context without judging Today, while r
   await openAnalytics(page)
   const merged = countTrend(page)
   await expect(merged.locator('.analytics-value')).toHaveText('15')
-  await expect(merged).toHaveClass(/neutral/)
-  await expect(merged.locator('.analytics-arrow')).toHaveCount(0)
-  await expect(merged.locator('.analytics-delta')).toHaveCount(0)
+  await expect(merged).toHaveClass(/bad/)
+  await expect(merged.locator('.analytics-arrow')).toHaveText('↓')
+  await expect(merged.locator('.analytics-delta')).toHaveText('25.9% behind pace')
   await expect(merged).toContainText('Typical by now: 20.3 · 7-day median: 27.0 / day')
   expect(state.reads).toHaveLength(2)
   expect(state.historyReads).toHaveLength(1)
@@ -2056,7 +2057,8 @@ test('routes repeated account, history and quota failures into global notificati
     const query = new URL(route.request().url()).searchParams
     const baseline = query.has('dailyBounds')
     const data = report(baseline ? 8 : 4, baseline ? 54 : 27)
-    if (baseline) data.daily = Array.from({ length: 7 }, () => ({ issues: { opened: 2, closed: 1 }, pullRequests: report(1).pullRequests }))
+    data.pullRequests.lines.counted = data.pullRequests.merged
+    if (baseline) data.daily = Array.from({ length: 7 }, () => ({ issues: { opened: 2, closed: 1 }, pullRequests: { ...report(1).pullRequests, lines: { total: 1000, median: 1000, counted: 1 } } }))
     data.errors = failed ? [{ org: 'vaquum', error: detail, stale: true }] : []
     return route.fulfill({ json: data })
   })
@@ -2069,6 +2071,19 @@ test('routes repeated account, history and quota failures into global notificati
   await expect(summary.locator('.analytics-arrow')).toHaveText('↓')
   await expect(summary.locator('.analytics-delta')).toHaveText('50%')
   await expect(summary).toHaveClass(/good/)
+  for (const [label, tone, arrow] of [
+    ['Pull requests opened', 'good', '↑'], ['Pull requests merged', 'good', '↑'],
+    ['Closed without merging', 'bad', '↑'], ['Lines changed', 'good', '↑'], ['Issues opened', 'good', '↑'], ['Issues closed', 'good', '↑'],
+  ]) {
+    const card = value(page, label).locator('..').locator('..')
+    await expect(card).toHaveClass(new RegExp(tone))
+    await expect(card.locator('.analytics-arrow')).toHaveText(arrow)
+    const colors = await card.evaluate(el => ['.analytics-value', '.analytics-arrow', '.analytics-delta'].map(selector => getComputedStyle(el.querySelector(selector)!).color))
+    expect(new Set(colors).size).toBe(1)
+    const green = await summary.locator('.analytics-value').evaluate(el => getComputedStyle(el).color)
+    if (tone === 'good') expect(colors[0]).toBe(green)
+    else expect(colors[0]).not.toBe(green)
+  }
   const colors = await summary.evaluate(el => [getComputedStyle(el.querySelector('.analytics-value')!).color, getComputedStyle(el.querySelector('.analytics-arrow')!).color, getComputedStyle(el.querySelector('.analytics-delta')!).color])
   expect(new Set(colors).size).toBe(1)
   const figure = (await summary.locator('.analytics-value').boundingBox())!

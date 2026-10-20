@@ -135,7 +135,6 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
   const { lines, behaviors } = pr
   const none = pr.merged === 0
   const complete = ![...report.errors, ...baseline.errors].some((error) => !error.stale)
-  const countsComplete = dayProgress === undefined ? complete : report.errors.length === 0 && baseline.errors.length === 0
   const paceNote = dayProgress !== undefined && snapshotTime ? `Pace as of ${snapshotTime}, when totals were read.` : undefined
   const dailyMedian = (value: (day: NonNullable<AnalyticsReport['daily']>[number]) => number | null): number | null => {
     if (baseline.daily?.length !== 7) return null
@@ -149,7 +148,7 @@ export function analyticsGroups(report: AnalyticsReport, baseline: AnalyticsRepo
       label,
       value: current === null ? UNKNOWN : formatCount(current),
       note: paceNote,
-      trend: !countsComplete ? undefined : dayProgress === undefined ? metricTrend(current, previous, undefined, 'median', true, lowerIsBetter) : paceTrend(current, typical, lowerIsBetter),
+      trend: !complete ? undefined : dayProgress === undefined ? metricTrend(current, previous, undefined, 'median', true, lowerIsBetter) : paceTrend(current, typical, lowerIsBetter),
       comparison: `${dayProgress === undefined ? '' : `Typical by now: ${formatRate(typical)} · `}7-day median: ${formatRate(previous)} / day`,
     }
   }

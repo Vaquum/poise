@@ -153,7 +153,7 @@ request, or an account becoming unreadable in either report, preserves the
 previous snapshot and reports the failure in Notifications. A snapshot that
 already lacks an account can still refresh its other accounts while the same
 account remains unreadable. Readable stale caches update with the existing
-warning and pace suppression.
+sync warning and comparisons over the stored totals.
 These local reads make no GitHub requests and consume no GitHub API quota.
 They show the datastore's latest stored records; freshness still depends on
 the existing GitHub sync, whose schedule and requests are unchanged.
@@ -243,9 +243,10 @@ upward arrow and absolute increase, without dividing by zero.
 Except for that zero-typical closure comparison, a zero typical value withholds
 the arrow, percentage and directional color. Missing daily data or partial
 line-size coverage in either report also withholds these for the affected tile.
-Any read error in either report, including a stale-cache
-warning, withholds these for every Today cumulative tile. Known totals, Typical
-and median remain visible: zero Typical shows 0.0, an unknown baseline shows —,
+An unreadable account in either report withholds these for every Today
+cumulative tile. Readable caches with sync warnings retain their colors, arrows
+and comparisons over the stored totals; the warning remains in Notifications.
+Known totals, Typical and median remain visible: zero Typical shows 0.0, an unknown baseline shows —,
 and partial current lines retain their count and coverage note beside the known
 baseline context.
 
@@ -284,7 +285,7 @@ unchanged value is neutral. Agent merges compare shares, explicitly
 labelled “7-day share” because a binary merger's median would lose the share.
 An unreadable account withholds comparisons. A readable cache with a sync
 warning retains the existing completed-day, duration and per-PR comparisons
-over its stored records; Today's cumulative pace is withheld. The warning is
+over its stored records, including Today's cumulative pace. The warning is
 notified.
 
 ## The past year

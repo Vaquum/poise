@@ -304,7 +304,7 @@ describe('elapsed-day pacing', () => {
     expect(tile(buildGroups(day, week, 0.5), 'Pull requests merged').trend).toBeUndefined()
   })
 
-  it.each(['current', 'baseline'] as const)('withholds live cumulative trends for a stale %s report while retaining other comparisons', (stale) => {
+  it.each(['current', 'baseline'] as const)('retains cumulative trends for a readable stale %s report', (stale) => {
     const day = report()
     const week = report()
     const fresh = buildGroups(day, week, 0.5)
@@ -313,15 +313,19 @@ describe('elapsed-day pacing', () => {
     staleReport.errors = [{ org: 'offline', error: 'sync failed', stale: true }]
     const groups = buildGroups(day, week, 0.5)
     for (const label of ['Pull requests opened', 'Pull requests merged', 'Closed without merging', 'Lines changed', 'Issues opened', 'Issues closed']) {
-      expect(tile(groups, label).trend).toBeUndefined()
-      expect(tile(groups, label).value).toBe(tile(fresh, label).value)
-      expect(tile(groups, label).comparison).toBe(tile(fresh, label).comparison)
+      expect(tile(groups, label).trend).toBeDefined()
+      expect(tile(groups, label)).toEqual(tile(fresh, label))
     }
     expect(tile(groups, 'Pull requests merged').comparison).toBe('Typical by now: 1.0 · 7-day median: 2.0 / day')
     for (const label of ['Time to first review', 'Time to merge', 'Comments', 'Median lines', 'Behaviors', 'Median time', 'Merged by agent']) {
       expect(tile(groups, label)).toEqual(tile(fresh, label))
     }
     expect(buildGroups(day, week)).toEqual(historical)
+    staleReport.errors.push({ org: 'missing', error: 'unreadable' })
+    const partial = buildGroups(day, week, 0.5)
+    for (const label of ['Pull requests opened', 'Pull requests merged', 'Closed without merging', 'Lines changed', 'Issues opened', 'Issues closed']) {
+      expect(tile(partial, label).trend).toBeUndefined()
+    }
   })
 
   it('identifies the totals snapshot in cumulative-card notes only for a paced day', () => {
