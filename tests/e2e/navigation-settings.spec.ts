@@ -523,12 +523,58 @@ for (const [width, fontSize, theme] of [[320, 32, 'light'], [420, 20, 'dark'], [
   await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging'])
 })
 
-test('native touch scrolls content, drags through the gutter and taps close without picking up', async ({ page, browserName }) => {
+test('native touch scrolls content, drags through the gutter and taps close without picking up', async ({ page, browserName }, info) => {
   test.skip(browserName !== 'chromium', 'Chromium provides native CDP touch input.')
   await page.setViewportSize({ width: 640, height: 820 })
   await workspace(page)
   await navigation(page)
   const client = await page.context().newCDPSession(page)
+  // Buffer delivery after the drag commit; export only after the native sequence.
+  const delivery = await page.evaluateHandle(() => {
+    const entries: Record<string, unknown>[] = []
+    const records = new WeakMap<Event, Record<string, unknown>>()
+    let placed = false
+    window.addEventListener('poise:navigation-changed', () => { placed = true }, { once: true })
+    const box = (element: Element | null | undefined) => {
+      const rect = element?.getBoundingClientRect()
+      return rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null
+    }
+    for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'gotpointercapture', 'lostpointercapture', 'touchstart', 'touchend', 'touchcancel', 'mousedown', 'mouseup', 'click', 'dblclick']) {
+      document.addEventListener(type, event => {
+        if (!placed) return
+        const target = event.target instanceof Element ? event.target : null
+        const button = target?.closest('button')
+        const pointer = event instanceof PointerEvent ? event : null
+        const touch = event instanceof TouchEvent ? event.changedTouches.item(0) : null
+        const point = touch ?? (event instanceof MouseEvent ? event : null)
+        const hit = point ? document.elementFromPoint(point.clientX, point.clientY)?.closest('button') : null
+        const entry: Record<string, unknown> = {
+          type, at: performance.now(), timestamp: event.timeStamp, trusted: event.isTrusted,
+          pointerId: pointer?.pointerId, pointerType: pointer?.pointerType, primary: pointer?.isPrimary,
+          button: event instanceof MouseEvent ? event.button : null, detail: event instanceof MouseEvent ? event.detail : null,
+          point: point ? { x: point.clientX, y: point.clientY } : null,
+          target: target?.nodeName, targetClass: target?.getAttribute('class'), label: button?.getAttribute('aria-label'), targetBox: box(button),
+          connected: target?.isConnected, inert: !!target?.closest('[inert]'), hit: hit?.getAttribute('aria-label'),
+          wantedBox: box(document.querySelector('[data-navigation-focus="remove-topBar-logging"]')),
+          defaultPrevented: event.defaultPrevented, held: !!document.querySelector('.st-navigation-held'),
+          viewport: { x: visualViewport?.offsetLeft, y: visualViewport?.offsetTop, scale: visualViewport?.scale, scrollX, scrollY },
+        }
+        entries.push(entry)
+        records.set(event, entry)
+      }, { capture: true })
+      document.addEventListener(type, event => {
+        const entry = records.get(event)
+        if (entry) {
+          const target = event.target instanceof Element ? event.target : null
+          entry['bubbled'] = { defaultPrevented: event.defaultPrevented, connected: target?.isConnected,
+            remaining: document.querySelectorAll('[data-navigation-focus="remove-topBar-logging"]').length,
+            status: document.querySelector('.st-navigation-status')?.textContent }
+        }
+      })
+    }
+    return entries
+  })
+  let requestedRemove: { x: number; y: number; width: number; height: number } | null = null
   try {
     await client.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 })
     await settingsBody(page).evaluate(element => { element.scrollTop = 0 })
@@ -547,6 +593,7 @@ test('native touch scrolls content, drags through the gutter and taps close with
     await settled(page)
     const removeButton = page.getByRole('button', { name: 'Remove Logging from top bar', exact: true })
     const close = (await removeButton.boundingBox())!
+    requestedRemove = close
     await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: point(close.x + close.width / 2, close.y + close.height / 2) })
     await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
     await expect(shortcut(page, 'Logging', 'top bar')).toHaveCount(0)
@@ -571,7 +618,13 @@ test('native touch scrolls content, drags through the gutter and taps close with
     await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: point(targetTap.x + 20, targetTap.y + 3) })
     await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
     await expect(page.locator('#top-nav .nav-item').first()).toHaveText('Logging')
-  } finally { await client.detach() }
+  } finally {
+    try {
+      await info.attach('navigation-native-removal', {
+        body: JSON.stringify({ requestedRemove, events: await delivery.jsonValue() }, null, 2), contentType: 'application/json',
+      })
+    } finally { await Promise.all([delivery.dispose(), client.detach()]) }
+  }
 })
 
 test('native touch scrolls a short settings body without moving the page', async ({ page, browserName }) => {
