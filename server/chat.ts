@@ -585,7 +585,8 @@ export async function runDebate(topic: string, rounds: number = 1): Promise<Deba
       },
     ))
   } catch (err: any) {
-    claudeAuth.observeProcessFailure(err)
+    // Unattributable across five providers: a debate failure must not move
+    // the Claude gate, whose observers guarantee Claude attribution.
     const detail = String(err?.stderr || err?.stdout || '').trim()
     if (detail) throw new Error(detail)
     throw err

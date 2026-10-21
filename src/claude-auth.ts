@@ -10,6 +10,7 @@ type ClaudeAuthStatus =
   | 'checking'
   | 'authenticated'
   | 'reauth_required'
+  | 'quota_exhausted'
   | 'signing_in'
   | 'degraded'
   | 'unavailable'
@@ -29,6 +30,7 @@ const UNHEALTHY_POLL_MS = 2_000
 const REQUEST_TIMEOUT_MS = 15_000
 const VISIBLE_STATUSES = new Set<ClaudeAuthStatus>([
   'reauth_required',
+  'quota_exhausted',
   'signing_in',
   'degraded',
   'unavailable',
@@ -122,6 +124,12 @@ function bannerCopy(status: ClaudeAuthStatus): { title: string, message: string 
     return {
       title: 'Complete Claude sign-in in your browser',
       message: 'Poise will verify the Claude subscription and resume Claude-backed work automatically.',
+    }
+  }
+  if (status === 'quota_exhausted') {
+    return {
+      title: 'Claude subscription quota exhausted',
+      message: 'Signed in, but out of quota: Claude-backed work is paused until more quota is available. No need to sign in again.',
     }
   }
   if (status === 'unavailable') {

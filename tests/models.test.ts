@@ -48,6 +48,12 @@ describe('the catalog Poise reads from Caller', () => {
     expect(models.isClaudeModel(catalog, 'gpt-5.6-sol-ultra')).toBe(false)
     expect(models.isClaudeModel(null, 'opus-5-max')).toBe(true)
   })
+
+  it('runs the sign-in canary on the cheapest Claude row', () => {
+    expect(models.canaryClaudeModel(catalog)?.identity).toBe('opus-5-xhigh')
+    const museOnly = { ...catalog, models: catalog.models.filter((row: any) => row.provider === 'muse') }
+    expect(models.canaryClaudeModel(museOnly)).toBeNull()
+  })
 })
 
 describe('resolving a place against the live catalog', () => {

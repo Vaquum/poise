@@ -94,20 +94,22 @@ environment allowlist, an isolated Anthropic profile store, and one merged
 settings overlay that neutralizes provider credentials and credential helpers.
 Immediately before each model process, it requires Claude Code to report the
 Claude.ai first-party provider. This keeps Poise-owned calls from silently
-switching to Console/API credentials. Independent authentication checks control
-provider readiness; ordinary worker errors do not change that shared state or
-trigger extra probes. Poise disables Claude Code's built-in request retry loop.
+switching to Console/API credentials. Real Claude failures update the shared
+readiness state reactively: an expired credential demands sign-in again, while
+quota exhaustion holds launches as signed-in-but-out-of-quota without asking
+for a re-login. Anything else leaves the shared state alone. Poise disables
+Claude Code's built-in request retry loop.
 
-Verification uses local status polling once per minute plus one minimal Haiku
-request at startup, after sign-in, every six hours while
-healthy, and immediately before a scheduled agent launch when the last canary
-is at least one minute old. Concurrent launch gates share the fresh result.
-These probes consume Pro/Max usage. Anthropic can bill account-level [Usage
+Verification polls free local status once per minute, plus one minimal canary
+on the cheapest catalog Claude row at startup, after sign-in, and while
+unhealthy only. Launches never probe first; concurrent launch gates share the
+cached result. The rare canary consumes Pro/Max usage. Anthropic can bill
+account-level [Usage
 Credits](https://support.claude.com/en/articles/12429409-manage-usage-credits-for-paid-claude-plans)
 after included limits; disable them under Claude account Settings > Usage if you
 need a hard spending cap. Poise can isolate provider credentials, but it cannot
-change that account-level billing control. Transient probe failures back off for
-up to one hour; expired tokens fail closed until sign-in succeeds. Worker retry
+change that account-level billing control. Transient canary failures back off
+for up to one hour; expired tokens fail closed until sign-in succeeds. Worker retry
 delays apply only to the failed target and reviewer. Retryable failures require
 proof that no action was posted; bounded failures remain held on unchanged input.
 Target and repository checks keep their own retry delays and diagnostics; a missing
@@ -719,7 +721,8 @@ files and shared Memories remain intact. See [Chat context controls](docs/Chat-c
 ## Model and CLI freshness
 
 Poise checks and updates installed provider CLIs before discovery and native
-Chat turns. Settings → Models → Check now shows progress and failures explicitly;
+Chat turns. Discovery itself runs no inference: every family is read from a
+free source. Settings → Models → Check now shows progress and failures explicitly;
 fresh chats follow the latest discovered Opus High rather than a pinned version.
 See [Provider CLI and model freshness](docs/Model-freshness.md).
 

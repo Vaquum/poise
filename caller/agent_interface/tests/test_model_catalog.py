@@ -271,16 +271,38 @@ class TestCatalogRefresh(TestCase):
         self.assertEqual(catalog_refresh.claude_identity_base("claude-fable-5-1"), "fable-5.1")
         self.assertEqual(catalog_refresh.claude_identity_base("claude-opus-5"), "opus-5")
 
-    def test_claude_alias_resolves_to_its_own_family_row(self) -> None:
-        usage = {"claude-haiku-4-5-20251001": {}, "claude-opus-5": {}}
-        turn = SimpleNamespace(returncode=0, stdout=json.dumps({"modelUsage": usage}), stderr="")
-        with patch.object(catalog_refresh, "run", return_value=turn):
-            self.assertEqual(catalog_refresh.claude_turn("opus", "max"), ("claude-opus-5", True))
-            with self.assertRaisesRegex(RuntimeError, "did not report the model behind fable"):
-                catalog_refresh.claude_turn("fable", "max")
-        rejected = SimpleNamespace(returncode=0, stdout=json.dumps({"modelUsage": usage}), stderr="Warning: Unknown --effort value 'ultra'\n")
-        with patch.object(catalog_refresh, "run", return_value=rejected):
-            self.assertEqual(catalog_refresh.claude_turn("opus", "ultra"), ("claude-opus-5", False))
+    def test_claude_lines_come_from_the_local_model_cache(self) -> None:
+        home = Path(self.work.name)
+        cache = home / "config" / "cache" / "model-catalog"
+        cache.mkdir(parents=True)
+        options = [{"id": effort} for effort in ("low", "medium", "high", "xhigh", "max")]
+        (cache / "org-cc.json").write_text(json.dumps({"catalog": {"config": {"models": [
+            {"id": "claude-opus-5-5", "thinking": {"type": "effort", "effort_options": options}},
+            {"id": "claude-opus-4-8", "thinking": {"type": "effort", "effort_options": options}},
+            {"id": "claude-fable-5-1", "thinking": {"type": "effort", "effort_options": options}},
+            {"id": "claude-haiku-4-5-20251001"},
+        ]}}}))
+        with patch.dict(catalog_refresh.os.environ, {"CLAUDE_CONFIG_DIR": str(home / "config")}):
+            with patch.object(catalog_refresh, "run", side_effect=AssertionError("discovery must not run inference")):
+                found = catalog_refresh.claude()
+        self.assertEqual(
+            [(m.identity, m.selector, m.effort) for m in found],
+            [(f"opus-5.5-{effort}", "claude-opus-5-5", effort) for effort in ("max", "xhigh", "high")]
+            + [(f"fable-5.1-{effort}", "claude-fable-5-1", effort) for effort in ("max", "xhigh", "high")],
+        )
+
+    def test_claude_without_a_cache_keeps_its_rows(self) -> None:
+        home = Path(self.work.name)
+        (home / "empty-config").mkdir()
+        with patch.dict(catalog_refresh.os.environ, {"CLAUDE_CONFIG_DIR": str(home / "empty-config")}):
+            report = catalog_refresh.refresh(self.probes(claude=catalog_refresh.claude), self.target)
+        self.assertFalse(report["changed"])
+        self.assertEqual(report["families"]["claude"]["status"], "unavailable")
+        self.assertIn("model cache", report["families"]["claude"]["error"])
+        self.assertEqual(
+            report["families"]["claude"]["models"],
+            ["opus-5-max", "opus-5-xhigh", "opus-5-high", "fable-5.1-max", "fable-5.1-xhigh", "fable-5.1-high"],
+        )
 
     def test_sources_are_read_from_the_cli_caches(self) -> None:
         home = Path(self.work.name)
@@ -306,6 +328,11 @@ class TestCatalogRefresh(TestCase):
 
 
 class TestMuseContributorDiscovery(TestCase):
+    def setUp(self) -> None:
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.target = Path(self.work.name) / "models.toml"
+
     def test_discovery_host_explicitly_enables_contributor_mode(self) -> None:
         proc = MagicMock()
         listed = [{"modelId": "muse-spark-1.3-contributor"}]
@@ -316,33 +343,42 @@ class TestMuseContributorDiscovery(TestCase):
         self.assertEqual(args[args.index("--contributor-mode") + 1], "on")
         proc.terminate.assert_called_once()
 
-    def test_ordinary_default_is_never_probed(self) -> None:
-        listed = [{"modelId": "muse-spark-1.3", "isDefault": True},
-                  {"modelId": "muse-spark-1.3-contributor", "isDefault": False}]
+    def test_quality_levels_come_from_the_free_model_list(self) -> None:
+        listed = [{"modelId": "muse-spark-1.3-contributor", "isDefault": True,
+                   "variants": ["minimal", "low", "medium", "high", "xhigh", "max"]}]
         with patch.object(catalog_refresh, "muse_models", return_value=listed), \
-             patch.object(catalog_refresh, "muse_effort_available", return_value=True) as probe:
+             patch.object(catalog_refresh, "run", side_effect=AssertionError("discovery must not run inference")):
+            found = catalog_refresh.muse()
+        self.assertEqual(
+            [(m.identity, m.selector, m.effort) for m in found],
+            [("muse-spark-1.3-contributor-max", "muse-spark-1.3-contributor", "max"),
+             ("muse-spark-1.3-contributor-xhigh", "muse-spark-1.3-contributor", "xhigh")],
+        )
+
+    def test_ordinary_default_yields_to_the_contributor_row(self) -> None:
+        listed = [{"modelId": "muse-spark-1.3", "isDefault": True, "variants": ["max"]},
+                  {"modelId": "muse-spark-1.3-contributor", "isDefault": False, "variants": ["high", "xhigh"]}]
+        with patch.object(catalog_refresh, "muse_models", return_value=listed), \
+             patch.object(catalog_refresh, "run", side_effect=AssertionError("discovery must not run inference")):
             found = catalog_refresh.muse()
         self.assertEqual({m.selector for m in found}, {"muse-spark-1.3-contributor"})
-        self.assertTrue(probe.called)
-        self.assertTrue(all(call.args[0] == "muse-spark-1.3-contributor" for call in probe.call_args_list))
+        self.assertEqual([m.effort for m in found], ["xhigh", "high"])
 
     def test_missing_contributor_fails_without_inference(self) -> None:
-        for listed in ([], [{"modelId": "muse-spark-1.3", "isDefault": True}]):
+        for listed in ([], [{"modelId": "muse-spark-1.3", "isDefault": True, "variants": ["max"]}]):
             with self.subTest(listed=listed), \
                  patch.object(catalog_refresh, "muse_models", return_value=listed), \
-                 patch.object(catalog_refresh, "muse_effort_available") as probe:
+                 patch.object(catalog_refresh, "run", side_effect=AssertionError("discovery must not run inference")):
                 with self.assertRaisesRegex(RuntimeError, "no contributor"):
                     catalog_refresh.muse()
-                probe.assert_not_called()
 
-    def test_probe_rejects_ordinary_model_before_execution(self) -> None:
-        with patch.object(catalog_refresh, "run") as run:
-            with self.assertRaisesRegex(RuntimeError, "contributor"):
-                catalog_refresh.muse_effort_available("muse-spark-1.3", "max")
-        run.assert_not_called()
-
-    def test_probe_explicitly_enables_contributor_mode(self) -> None:
-        with patch.object(catalog_refresh, "run", return_value=SimpleNamespace(returncode=0, stderr="")) as run:
-            self.assertTrue(catalog_refresh.muse_effort_available("muse-spark-1.3-contributor", "max"))
-        args = run.call_args.args[0]
-        self.assertEqual(args[args.index("--contributor-mode") + 1], "on")
+    def test_contributor_without_quality_levels_keeps_its_rows(self) -> None:
+        listed = [{"modelId": "muse-spark-1.3-contributor", "isDefault": True}]
+        with patch.object(catalog_refresh, "muse_models", return_value=listed):
+            report = catalog_refresh.refresh(
+                TestCatalogRefresh.probes(muse=catalog_refresh.muse),
+                self.target,
+            )
+        self.assertFalse(report["changed"])
+        self.assertEqual(report["families"]["muse"]["status"], "unavailable")
+        self.assertIn("quality levels", report["families"]["muse"]["error"])

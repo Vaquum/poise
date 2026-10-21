@@ -197,6 +197,18 @@ async function sourceSession(runtime: import('../../server/chat/runtime').ChatRu
 }
 
 describe('/poise change sessions', () => {
+  it('refuses a source whose model left the catalog, before the controller prepares anything', async () => {
+    const bridge = fakeBridge('poise-test:db')
+    const { runtime, events } = makeRuntime({ bridge })
+    const source = await sourceSession(runtime, events)
+    const stored = storage.getSession(source.id)!
+    storage.saveSession({ ...stored, model: 'grok-4.0-retired' })
+    const retry = makeRuntime({ bridge })
+    await expect(retry.runtime.startPoiseChange(source.id, 'Improve the console', randomUUID()))
+      .rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('unknown model') })
+    expect(bridge.calls.some((call) => call.op === 'prepare')).toBe(false)
+  }, 20_000)
+
   it('refuses actionably when no controller is configured and creates nothing', async () => {
     const { runtime, events } = makeRuntime({ bridge: null })
     const source = await sourceSession(runtime, events)

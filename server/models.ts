@@ -114,6 +114,24 @@ export function isReviewModel(catalog: Catalog, identity: string): boolean {
   return !!row && catalog.review_providers.includes(row.provider)
 }
 
+// Claude effort tiers, lowest first. The sign-in canary proves the
+// subscription on the cheapest row rather than a hardcoded model name.
+const CLAUDE_EFFORT_LADDER = ['low', 'medium', 'high', 'xhigh', 'max']
+
+/** The cheapest Claude row for the sign-in canary; null when the catalog names none. */
+export function canaryClaudeModel(catalog: Catalog): CatalogModel | null {
+  const rank = (effort: string): number => {
+    const index = CLAUDE_EFFORT_LADDER.indexOf(effort)
+    return index < 0 ? CLAUDE_EFFORT_LADDER.length : index
+  }
+  let best: CatalogModel | null = null
+  for (const row of catalog.models) {
+    if (row.provider !== 'claude') continue
+    if (!best || rank(row.effort) < rank(best.effort)) best = row
+  }
+  return best
+}
+
 // The providers a place can launch; null when every catalog provider can.
 export function placeProviders(catalog: Catalog, place: ModelPlace): string[] | null {
   if (place === 'issue_review') return catalog.issue_review_providers ?? []

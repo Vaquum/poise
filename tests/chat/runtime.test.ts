@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -14,6 +15,7 @@ let repo = ''
 let runtimeModule: typeof import('../../server/chat/runtime')
 let storage: typeof import('../../server/chat/storage')
 let worker: typeof import('../../server/chat/worker')
+let queueModule: typeof import('../../server/chat/message-queue')
 
 function git(args: string[], cwd = repo): string {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.invalid' } })
@@ -94,14 +96,14 @@ function fakeCaller(): CallerTurns & { starts: any[], finishes: any[] } {
 
 const runtimes: Array<import('../../server/chat/runtime').ChatRuntime> = []
 
-function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: FakeControls, caller?: CallerTurns | null, leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions, prepareCli?: import('../../server/chat/runtime').RuntimeOptions['prepareCli'] } = {}) {
+function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: FakeControls, caller?: CallerTurns | null, leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions, prepareCli?: import('../../server/chat/runtime').RuntimeOptions['prepareCli'], catalog?: () => Promise<any> } = {}) {
   const controls: FakeControls = options.controls ?? { hosts: [], adapters: [], startCount: 0 }
   const runtime = new runtimeModule.ChatRuntime({
     instance: options.instance ?? 'poise-test:db',
     instanceLabel: 'test',
     adapters: { [options.agent ?? 'grok']: (host: AdapterHost) => { const a = new FakeAdapter(host, controls); a.agent = options.agent ?? 'grok'; controls.hosts.push(host); controls.adapters.push(a); return a } },
     callerTurns: options.caller === undefined ? fakeCaller() : options.caller,
-    catalog: async () => CATALOG as any,
+    catalog: options.catalog ?? (async () => CATALOG as any),
     resolveCheckout: async () => repo,
     idleTimeoutMinutes: () => 0,
     requireClaudeReady: async () => {},
@@ -182,6 +184,7 @@ beforeAll(async () => {
   runtimeModule = await import('../../server/chat/runtime')
   storage = await import('../../server/chat/storage')
   worker = await import('../../server/chat/worker')
+  queueModule = await import('../../server/chat/message-queue')
   const { db } = await import('../../server/db')
   waitingAlerts = (sessionId) => db.prepare('SELECT resolved_at AS resolved FROM alerts WHERE dedupe_key = ? ORDER BY id').all(`chat-waiting:${sessionId}`) as Array<Record<string, unknown>>
 })
@@ -925,6 +928,93 @@ it.each(['close', 'resume'])('QC2: a failed worker stop retains its lease until 
     expect(successor.controls.startCount).toBe(1)
   } finally { refuseTermination = false; controls.startWait = undefined; release(); spy.mockRestore(); await runtime.stop() }
 }, 30_000)
+
+describe('retired model identities', () => {
+  it('refuses to fork a session whose model left the catalog, before starting anything', async () => {
+    const { runtime, events } = makeRuntime()
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const stored = storage.getSession(session.id)!
+    storage.saveSession({ ...stored, model: 'grok-4.0-retired' })
+    const revived = makeRuntime()
+    await expect(revived.runtime.fork(session.id)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('unknown model') })
+    expect(revived.controls.startCount).toBe(0)
+    expect(revived.runtime.list().some((record) => record.forkedFrom === session.id)).toBe(false)
+  })
+
+  it('deletes sessions with retired models on recovery and keeps the rest', async () => {
+    const maker = makeRuntime({ instance: 'poise-purge:db' })
+    const keep = await maker.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    const drop = await maker.runtime.create({ agent: 'grok', model: 'grok-4.6-high', repo: 'acme/repo', branch: { existing: 'main' } })
+    const stored = storage.getSession(drop.id)!
+    storage.saveSession({ ...stored, model: 'grok-4.0-retired' })
+    const revived = makeRuntime({ instance: 'poise-purge:db' })
+    await revived.runtime.recover()
+    expect(storage.getSession(drop.id)).toBeNull()
+    expect(storage.getSession(keep.id)).not.toBeNull()
+  })
+
+  it('purges nothing when the catalog itself is unavailable', async () => {
+    const maker = makeRuntime({ instance: 'poise-purge-skip:db' })
+    const session = await maker.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    const stored = storage.getSession(session.id)!
+    storage.saveSession({ ...stored, model: 'grok-4.0-retired' })
+    const revived = makeRuntime({ instance: 'poise-purge-skip:db', catalog: async () => { throw new Error('catalog down') } })
+    await revived.runtime.recover()
+    expect(storage.getSession(session.id)).not.toBeNull()
+  })
+
+  it('keeps a retired session whose worker survived recovery unverified', async () => {
+    const maker = makeRuntime({ instance: 'poise-purge-worker:db' })
+    const session = await maker.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    const stored = storage.getSession(session.id)!
+    storage.saveSession({ ...stored, model: 'grok-4.0-retired' })
+    const pgid = Number(spawnSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).stdout.trim())
+    expect(pgid).toBeGreaterThan(1)
+    storage.recordWorker({
+      sessionId: session.id,
+      gatePid: process.pid,
+      gatePgid: pgid,
+      ident: 'deadbeef-1234',
+      checkout: stored.checkout,
+      leaseToken: null,
+      command: 'test',
+      startedAt: new Date().toISOString(),
+    })
+    try {
+      const revived = makeRuntime({ instance: 'poise-purge-worker:db' })
+      await revived.runtime.recover()
+      const kept = storage.getSession(session.id)
+      expect(kept).not.toBeNull()
+      expect(kept!.orphanNotice).toMatch(/could not be verified/)
+      expect(storage.listWorkers().some((worker) => worker.sessionId === session.id)).toBe(true)
+    } finally {
+      storage.forgetWorker(session.id)
+    }
+  })
+
+  it('moves borrowed queue context to the surviving executor before purging the donor', async () => {
+    ensureBranch('chat/alpha')
+    const maker = makeRuntime({ instance: 'poise-purge-deleg:db' })
+    const donor = await maker.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'chat/alpha' } })
+    const executor = await maker.runtime.create({ agent: 'grok', model: 'grok-4.6-high', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(maker.events, donor.id) === 'idle' && lastStatus(maker.events, executor.id) === 'idle')
+    const saved = await maker.runtime.saveAttachment(donor.id, 'notes.txt', Buffer.from('borrowed bytes'))
+    await maker.runtime.enqueue(donor.id, randomUUID(), { text: 'use the notes', attachments: [saved], mentions: [] })
+    queueModule.delegateQueue(donor.id, executor.id)
+    const stored = storage.getSession(donor.id)!
+    storage.saveSession({ ...stored, model: 'grok-4.0-retired' })
+    const revived = makeRuntime({ instance: 'poise-purge-deleg:db' })
+    await revived.runtime.recover()
+    expect(storage.getSession(donor.id)).toBeNull()
+    const items = queueModule.readQueue(executor.id).items
+    expect(items).toHaveLength(1)
+    const [attachment] = items[0].prompt.attachments
+    const record = storage.getAttachment(attachment.id)
+    expect(record?.sessionId).toBe(executor.id)
+    expect(await readFile(join(repo, record!.path), 'utf8')).toBe('borrowed bytes')
+  })
+})
 
 it.each([false, true])('QC2: an early steer waits for native prompt startup, or is preserved on Stop (stop=%s)', async stopping => {
   const { runtime, events } = makeRuntime()

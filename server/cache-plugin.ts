@@ -7,7 +7,7 @@ import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
 import type { ServerResponse } from 'node:http'
 import { agentAccount, callerAccounts, getModelSettings, getSettings, seedAgentAccount, setSettings } from './settings'
-import { MODEL_PLACES, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
+import { MODEL_PLACES, canaryClaudeModel, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
 import { refreshModelCatalog } from './models-refresh'
 import { deleteModelPreset, listModelPresets, saveModelPreset } from './model-presets'
 import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
@@ -518,7 +518,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               { key: 'consensus', label: '/consensus', model: catalog.behaviors.debate_moderator, why: `Moderates the debate; participants: ${catalog.debate_participants.join(', ')}.` },
               { key: 'fix_failing_ci', label: 'Fix failing CI', model: catalog.behaviors.fix_failing_ci, why: 'Caller behavior; set by the Caller catalog.' },
               { key: 'issue_simplify', label: 'Simplify issue', model: catalog.behaviors.issue_simplify, why: 'Caller behavior; set by the Caller catalog.' },
-              { key: 'canary', label: 'Sign-in check', model: 'haiku', why: 'One minimal Claude request that proves the Claude.ai sign-in; fixed.' },
+              { key: 'canary', label: 'Sign-in check', model: canaryClaudeModel(catalog)?.identity ?? 'unavailable', why: 'One minimal Claude request on the cheapest catalog row that proves the Claude.ai sign-in; runs once at boot and while unhealthy, never per launch.' },
             ]
             return json(res, 200, { catalog, places, fixed, refresh: await readCatalogReport(), presets: listModelPresets() })
           } catch (err: any) {

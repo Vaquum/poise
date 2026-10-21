@@ -201,7 +201,9 @@ env.CLAUDE_CODE_MAX_RETRIES = '0'
 env.CLAUDE_CODE_RETRY_WATCHDOG = ''
 
 const modelIndex = args.indexOf('--model')
-const retryProtected = modelIndex >= 0 && args[modelIndex + 1] !== 'haiku'
+// The sign-in canary verifies recovery, so it must run even right after a
+// failure; everything else backs off behind the breaker.
+const retryProtected = modelIndex >= 0 && args[modelIndex + 1] !== 'haiku' && process.env.POISE_CLAUDE_CANARY !== '1'
 const failureMarker = join(tmpdir(), `poise-claude-failure-${process.ppid}`)
 const FAILURE_TTL_MS = 30_000
 

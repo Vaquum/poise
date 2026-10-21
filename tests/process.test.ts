@@ -733,6 +733,48 @@ process.exit(1)
     }
   })
 
+  it('lets the sign-in canary verify recovery right after a failure', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-canary-breaker-'))
+    const rawClaude = join(root, 'claude')
+    const attempts = join(root, 'attempts')
+    const failureMarker = join(tmpdir(), `poise-claude-failure-${process.pid}`)
+    const source = `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs')
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  process.stdout.write(JSON.stringify({
+    loggedIn: true,
+    authMethod: 'claude.ai',
+    apiProvider: 'firstParty',
+  }))
+  process.exit(0)
+}
+appendFileSync(process.argv.at(-1), 'attempt\\n')
+if (args.includes('--no-session-persistence')) {
+  process.stdout.write('OK')
+  process.exit(0)
+}
+process.stderr.write('Provider Error: 502 Bad Gateway')
+process.exit(1)
+`
+    try {
+      await rm(failureMarker, { force: true })
+      await writeFile(rawClaude, source, { mode: 0o700 })
+      const options = { env: { PATH: `${root}${delimiter}${process.env.PATH || ''}` } }
+      await expect(runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--model', 'opus', '--print', attempts,
+      ], options)).rejects.toMatchObject({ code: 1 })
+      await expect(runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--model', 'opus', '--print', '--no-session-persistence', attempts,
+      ], { env: { ...options.env, POISE_CLAUDE_CANARY: '1' } })).resolves.toMatchObject({ stdout: 'OK' })
+      expect((await readFile(attempts, 'utf8')).trim().split('\n')).toHaveLength(2)
+    } finally {
+      await rm(failureMarker, { force: true })
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('lets a worker start a session over after Claude reports the resumed one is gone', async () => {
     if (process.platform === 'win32') return
     const root = await mkdtemp(join(tmpdir(), 'poise-claude-stale-session-'))

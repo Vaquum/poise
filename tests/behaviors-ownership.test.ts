@@ -119,7 +119,7 @@ describe('launch ownership and resolution', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
   })
 
-  it('requires a fresh live auth gate before a scheduled worker launch', async () => {
+  it('holds a scheduled worker launch while the cached auth gate is closed', async () => {
     arrangeCli(false)
     mocks.spawnDetached.mockResolvedValue(undefined)
     const { database: db, behaviors: runtime } = await loadModules()
@@ -128,17 +128,15 @@ describe('launch ownership and resolution', () => {
     db.setMeta('behavior_review_new_prs_keyver', '3')
     db.setMeta('behavior_review_new_prs_enabled', '1')
     db.recordSeen('review-new-prs', '__snapshot_v3__')
-    mocks.requireAuth.mockImplementation((options?: { liveWithinMs?: number }) => {
-      if (options?.liveWithinMs === 60_000) {
-        mocks.authStatus = 'degraded'
-        throw new Error('fresh Claude canary failed')
-      }
+    mocks.requireAuth.mockImplementation(() => {
+      mocks.authStatus = 'quota_exhausted'
+      throw new Error('Claude subscription authentication is not ready')
     })
 
     await runtime.runEnabledBehaviorsOnce()
 
-    expect(mocks.requireAuth).toHaveBeenCalledWith({ liveWithinMs: 60_000 })
-    expect(mocks.authStatus).toBe('degraded')
+    expect(mocks.requireAuth).toHaveBeenCalledWith()
+    expect(mocks.authStatus).toBe('quota_exhausted')
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 

@@ -5,10 +5,10 @@ import {
   type RunFileOptions,
   type RunFileResult,
 } from './process'
+import { canaryClaudeModel, loadCatalog } from './models'
 import { HttpError } from './http'
 
 export const CLAUDE_AUTH_POLL_MS = 60_000
-export const CLAUDE_AUTH_LIVE_INTERVAL_MS = 6 * 60 * 60_000
 export const CLAUDE_AUTH_LOGIN_TIMEOUT_MS = 10 * 60_000
 export const CLAUDE_AUTH_RETRY_BASE_MS = 60_000
 export const CLAUDE_AUTH_RETRY_MAX_MS = 60 * 60_000
@@ -23,6 +23,7 @@ export type ClaudeAuthStatus =
   | 'checking'
   | 'authenticated'
   | 'reauth_required'
+  | 'quota_exhausted'
   | 'signing_in'
   | 'degraded'
   | 'unavailable'
@@ -54,15 +55,12 @@ export interface ClaudeAuthClock {
 export interface ClaudeAuthMonitorOptions {
   runFile?: ClaudeAuthRunFile
   clock?: ClaudeAuthClock
+  /** Resolves the canary's Claude model row; production reads the live catalog. */
+  canaryModel?: () => Promise<{ selector: string, effort: string }>
 }
 
 export interface ClaudeAuthCheckOptions {
   forceLive?: boolean
-}
-
-export interface ClaudeAuthReadyOptions {
-  /** Require a successful live canary no older than this many milliseconds. */
-  liveWithinMs?: number
 }
 
 const systemClock: ClaudeAuthClock = {
@@ -75,6 +73,7 @@ const REASONS: Record<ClaudeAuthStatus, string | null> = {
   checking: 'Checking Claude subscription authentication.',
   authenticated: null,
   reauth_required: 'Claude subscription sign-in is required.',
+  quota_exhausted: 'Claude subscription is signed in but out of quota; launches are held until more quota is available.',
   signing_in: 'Waiting for Claude subscription sign-in.',
   degraded: 'Claude subscription authentication could not be verified.',
   unavailable: 'Claude CLI authentication is unavailable.',
@@ -153,14 +152,37 @@ function errorStdout(error: unknown): string | null {
 
 function isDefinitiveAuthFailure(error: unknown): boolean {
   const text = failureText(error)
+  // GitHub-attributed failures (a gh 401 from inside an agent turn) say
+  // nothing about the Claude subscription.
+  if (!text || /github/i.test(text) || /\bgh:/i.test(text)) return false
   return /(?:\b401\b|authentication[_ ]error|invalid\s+(?:x-)?api[- ]?key)/i.test(text)
     || /(?:oauth|token|credential)[^\n]{0,80}\bexpired\b/i.test(text)
     || /\bexpired\b[^\n]{0,80}(?:oauth|token|credential)/i.test(text)
 }
 
+/** Quota or credit exhaustion, as distinct from sign-in state. A saturated
+ *  subscription stays signed in: launches hold without demanding a re-login. */
+function isQuotaExhaustion(error: unknown): boolean {
+  const text = failureText(error)
+  if (!text || /github/i.test(text) || /\bgh:/i.test(text)) return false
+  return /\b429\b/.test(text)
+    || /rate[\s_-]*limit/i.test(text)
+    || /quota/i.test(text)
+    || /usage[\s_-]*limit/i.test(text)
+    || /credits?\b[^\n]{0,40}(?:exhausted|depleted|insufficient)/i.test(text)
+    || /out of[^\n]{0,20}credits?/i.test(text)
+}
+
+async function defaultCanaryModel(): Promise<{ selector: string, effort: string }> {
+  const model = canaryClaudeModel(await loadCatalog())
+  if (!model) throw new Error('the model catalog names no Claude model for the sign-in check')
+  return { selector: model.selector, effort: model.effort }
+}
+
 export class ClaudeAuthMonitor {
   private readonly run: ClaudeAuthRunFile
   private readonly clock: ClaudeAuthClock
+  private readonly canaryModel: () => Promise<{ selector: string, effort: string }>
   private currentStatus: ClaudeAuthStatus = 'checking'
   private readonly statusListeners = new Set<(status: ClaudeAuthStatus) => void>()
   private checkedAtMs: number | null = null
@@ -184,6 +206,7 @@ export class ClaudeAuthMonitor {
   constructor(options: ClaudeAuthMonitorOptions = {}) {
     this.run = options.runFile ?? defaultRunFile
     this.clock = options.clock ?? systemClock
+    this.canaryModel = options.canaryModel ?? defaultCanaryModel
   }
 
   // Every status the monitor decides passes through here, so a listener
@@ -314,27 +337,47 @@ export class ClaudeAuthMonitor {
     return this.snapshot()
   }
 
-  async requireReady(options: ClaudeAuthReadyOptions = {}): Promise<void> {
-    const liveWithinMs = options.liveWithinMs
-    if (liveWithinMs !== undefined && (!Number.isFinite(liveWithinMs) || liveWithinMs < 0)) {
-      throw new TypeError('liveWithinMs must be a non-negative finite number')
-    }
-    const liveIsStale = liveWithinMs !== undefined
-      && (this.verifiedAtMs === null || this.clock.now() - this.verifiedAtMs >= liveWithinMs)
-    if (this.status === 'authenticated' && !liveIsStale) return
-    if (!this.stopped && this.status !== 'reauth_required' && !this.loginInProgress) {
+  async requireReady(): Promise<void> {
+    if (this.status === 'authenticated') return
+    if (!this.stopped && this.status !== 'reauth_required' && this.status !== 'quota_exhausted' && !this.loginInProgress) {
       await this.check({
-        forceLive: liveIsStale || this.status === 'degraded' || this.status === 'unavailable',
+        forceLive: this.status === 'degraded' || this.status === 'unavailable',
       })
     }
     const current = this.snapshot().status
     if (current !== 'authenticated') throw new ClaudeAuthReadinessError(current)
   }
 
-  observeProcessFailure(_resultOrError: unknown): void {
-    // Worker output can report GitHub, other providers, or task-local failures;
-    // it cannot establish Claude authentication state, even when it says 401.
-    // Only the scheduled auth checks and launch freshness checks own this gate.
+  /** Classify a real Claude failure observed elsewhere: a failed agent call
+   *  on a Claude model, a dead launch. Callers guarantee Claude attribution
+   *  (the auth/quota patterns alone cannot tell providers apart); anything
+   *  that matches neither pattern is ignored. Only ever downgrades — the
+   *  scheduled checks own every upgrade back — and never disturbs a login.
+   *  A confirmed dead credential outranks quota: a late quota error from an
+   *  already-running process cannot prove the current credential works. */
+  observeProcessFailure(resultOrError: unknown): void {
+    if (this.stopped || this.loginInProgress) return
+    if (isDefinitiveAuthFailure(resultOrError)) {
+      if (this.status === 'reauth_required') return
+      this.status = 'reauth_required'
+      this.authMethod = null
+      this.subscriptionType = null
+      this.liveFailureCount = 0
+      this.checkedAtMs = this.clock.now()
+      this.nextLiveAttemptAtMs = this.clock.now() + CLAUDE_AUTH_RETRY_MAX_MS
+      // Invalidate in-flight polls: their local evidence predates this
+      // failure and must not overwrite it.
+      this.stateGeneration += 1
+      return
+    }
+    if (isQuotaExhaustion(resultOrError)) {
+      if (this.status === 'quota_exhausted' || this.status === 'reauth_required') return
+      this.status = 'quota_exhausted'
+      this.liveFailureCount = 0
+      this.checkedAtMs = this.clock.now()
+      this.nextLiveAttemptAtMs = this.clock.now() + CLAUDE_AUTH_RETRY_BASE_MS
+      this.stateGeneration += 1
+    }
   }
 
   private schedulePoll(lifecycle: number): void {
@@ -434,19 +477,22 @@ export class ClaudeAuthMonitor {
     this.subscriptionType = local.subscriptionType
     const now = this.clock.now()
     const retryDue = this.nextLiveAttemptAtMs === null || now >= this.nextLiveAttemptAtMs
+    // A healthy sign-in is never re-proved on a timer: the free status poll
+    // watches for logout, and real failures downgrade reactively. The canary
+    // runs once at boot, while unhealthy, or when explicitly forced.
     const liveWanted = this.forceLiveRequested
       || this.verifiedAtMs === null
-      || now - this.verifiedAtMs >= CLAUDE_AUTH_LIVE_INTERVAL_MS
       || previousStatus === 'degraded'
       || previousStatus === 'unavailable'
       || previousStatus === 'reauth_required'
+      || previousStatus === 'quota_exhausted'
       || preserveSigningIn
     const liveRequired = liveWanted && (retryDue || preserveSigningIn)
 
     if (!liveRequired) {
       this.forceLiveRequested = false
-      this.status = previousStatus === 'reauth_required'
-        ? 'reauth_required'
+      this.status = previousStatus === 'reauth_required' || previousStatus === 'quota_exhausted'
+        ? previousStatus
         : previousStatus === 'degraded'
           ? 'degraded'
           : 'authenticated'
@@ -458,12 +504,15 @@ export class ClaudeAuthMonitor {
     }
 
     try {
+      const canary = await this.canaryModel()
       await this.run(
         CLAUDE_COMMAND,
         [
           '--print',
           '--model',
-          'haiku',
+          canary.selector,
+          '--effort',
+          canary.effort,
           '--permission-mode',
           'dontAsk',
           '--tools',
@@ -472,7 +521,9 @@ export class ClaudeAuthMonitor {
           LIVE_PROMPT,
         ],
         {
-          env: claudeSubscriptionEnvironment(),
+          // The canary verifies recovery, so the wrapper's retry breaker
+          // exempts it even right after a failure.
+          env: { ...claudeSubscriptionEnvironment(), POISE_CLAUDE_CANARY: '1' },
           timeoutMs: LIVE_TIMEOUT_MS,
           maxOutputBytes: MAX_AUTH_OUTPUT_BYTES,
           signal,
@@ -496,6 +547,16 @@ export class ClaudeAuthMonitor {
           // but do not turn the known 401 into a once-per-minute live probe.
           // A user-initiated login resets this deadline and verifies at once.
           this.nextLiveAttemptAtMs = this.clock.now() + CLAUDE_AUTH_RETRY_MAX_MS
+        } else if (isQuotaExhaustion(error)) {
+          // Still signed in: keep the identity, hold launches, and re-probe
+          // on a backoff so recovery is noticed without hammering.
+          this.liveFailureCount += 1
+          const delay = Math.min(
+            CLAUDE_AUTH_RETRY_BASE_MS * (2 ** Math.min(this.liveFailureCount - 1, 20)),
+            CLAUDE_AUTH_RETRY_MAX_MS,
+          )
+          this.nextLiveAttemptAtMs = this.clock.now() + delay
+          this.status = 'quota_exhausted'
         } else {
           this.liveFailureCount += 1
           const delay = Math.min(

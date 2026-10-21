@@ -30,8 +30,13 @@ on success and failure, with bounded failure diagnostics when spawning fails.
 Direct script runs, including the personal-install launchd job, resolve the
 same setting themselves.
 
+Discovery never runs inference. Claude reads its local model cache, Codex and
+Grok read their model caches, Antigravity lists its models, and Muse reads the
+quality levels straight from its free model list. A family whose free source is
+unavailable keeps its current rows and reports the cause; nothing is dropped.
+
 Muse discovery considers only explicit `muse-…-contributor` selectors. An ordinary
-Muse default is never probed or admitted. No contributor model means discovery
+Muse default is never admitted. No contributor model means discovery
 fails for Muse and retains its existing contributor choices. Caller rejects
 ordinary Muse selectors in persisted catalogs; Poise rejects them on catalog
 import and native Chat startup, model changes and subsequent turns.
@@ -84,4 +89,6 @@ Upgrade compatibility: older pages stored the fixed `opus-5-high` fresh-console
 default without recording whether it was explicitly chosen. That legacy value
 now restores as automatic Opus High, with draft text preserved. New snapshots
 record automatic versus explicit selection, so future reloads preserve a
-person's intentional model choice. Existing sessions retain their selected model.
+person's intentional model choice. Sessions whose model left the catalog are
+deleted on startup, so a retired identity can never be resumed, forked, or
+copied into a `/poise` change; every other session keeps its selected model.

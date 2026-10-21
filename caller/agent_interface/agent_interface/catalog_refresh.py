@@ -3,11 +3,11 @@
 Claude and Codex each keep two lines (Opus and Fable; Astra and Sol), the
 latest model of each line.
 
-Each family has a source the routine can call rather than research: Claude
-Code resolves an alias to a concrete model in its JSON print output, Codex and
-Grok Build keep a models cache written from their backends, Antigravity lists
-models on demand, and Muse serves its catalog over MSP. A family whose source is
-unavailable keeps its current rows; nothing is ever dropped silently.
+Discovery never runs inference: every family is read from a free source —
+Claude Code's local model cache, Codex's and Grok Build's model caches,
+Antigravity's model listing, and Muse's catalog over MSP (which names each
+model's quality levels). A family whose source is unavailable keeps its
+current rows; nothing is ever dropped silently.
 """
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ from .model_catalog import (
     load_catalog,
 )
 
-PROBE_PROMPT = "Reply with exactly OK."
 FAMILIES = ("claude", "codex", "grok", "antigravity", "muse")
 CLAUDE_LINES = ("opus", "fable")
 CODEX_LINES = ("astra", "sol")
@@ -68,35 +67,60 @@ def claude_identity_base(selector: str) -> str:
     return re.sub(r"-(\d+)-(\d+)(?=$|-)", r"-\1.\2", re.sub(r"^claude-", "", selector))
 
 
-def claude_turn(alias: str, effort: str) -> tuple[str, bool]:
-    done = run(
-        [os.getenv("CLAUDE_CLI", "claude"), "--print", "--model", alias, "--effort", effort, "--output-format", "json",
-         "--no-session-persistence", "--permission-mode", "dontAsk", "--tools", ""],
-        input=PROBE_PROMPT,
-    )
-    if done.returncode:
-        raise RuntimeError((done.stderr or done.stdout).strip() or f"claude exited {done.returncode}")
-    # Helper calls (a Haiku title pass, a hook) show up in modelUsage too; the
-    # alias resolves to the one row of its own family.
-    usage = json.loads(done.stdout).get("modelUsage") or {}
-    family = [name for name in usage if name.startswith(f"claude-{alias}-")]
-    if len(family) != 1:
-        raise RuntimeError(f"claude did not report the model behind {alias}: {sorted(usage)}")
-    return family[0], "Unknown --effort value" not in done.stderr
+def claude_cache_dir() -> Path:
+    return Path(os.getenv("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "cache" / "model-catalog"
+
+
+def claude_cache_models() -> list[dict]:
+    cache = claude_cache_dir()
+    try:
+        files = sorted((p for p in cache.iterdir() if p.suffix == ".json"), key=lambda p: p.stat().st_mtime)
+    except OSError as error:
+        raise RuntimeError(f"claude model cache is unreadable: {cache}: {error}") from error
+    if not files:
+        raise RuntimeError(f"claude model cache is empty: {cache}")
+    latest = files[-1]
+    try:
+        models = json.loads(latest.read_text()).get("catalog", {}).get("config", {}).get("models")
+    except (OSError, ValueError, AttributeError) as error:
+        raise RuntimeError(f"claude model cache {latest.name} is unusable: {error}") from error
+    if not isinstance(models, list) or not models:
+        raise RuntimeError(f"claude model cache {latest.name} lists no models")
+    return models
+
+
+def claude_line_version(selector: str, alias: str) -> tuple[int, ...] | None:
+    prefix = f"claude-{alias}-"
+    if not selector.startswith(prefix):
+        return None
+    parts: list[int] = []
+    for chunk in selector[len(prefix):].split("-"):
+        if not chunk.isdigit():
+            return None
+        parts.append(int(chunk))
+    return tuple(parts) if parts else None
 
 
 def claude() -> list[Model]:
+    cached = claude_cache_models()
     found: list[Model] = []
     for alias in CLAUDE_LINES:
-        accepted: list[str] = []
-        selector = None
-        for effort in reversed(PROVIDER_EFFORTS["claude"]):
-            selector, ok = claude_turn(alias, effort)
-            if ok:
-                accepted.append(effort)
-            if len(accepted) == tiers("claude"):
-                break
-        found += rows("claude", claude_identity_base(selector), selector, accepted)
+        best: tuple[tuple[int, ...], str, list[str]] | None = None
+        for entry in cached:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                continue
+            version = claude_line_version(entry["id"], alias)
+            thinking = entry.get("thinking")
+            options = thinking.get("effort_options") if isinstance(thinking, dict) else None
+            efforts = [option["id"] for option in options or [] if isinstance(option, dict) and isinstance(option.get("id"), str)]
+            if version is None or not efforts:
+                continue
+            if best is None or version > best[0]:
+                best = (version, entry["id"], efforts)
+        if best is None:
+            raise RuntimeError(f"claude model cache lists no {alias} model with quality levels")
+        _, selector, efforts = best
+        found += rows("claude", claude_identity_base(selector), selector, efforts)
     return found
 
 
@@ -196,31 +220,18 @@ def wait(replies: dict[int, dict], request_id: int, timeout_s: int = 60) -> dict
     return replies[request_id]
 
 
-def muse_effort_available(selector: str, effort: str) -> bool:
-    if not MUSE_CONTRIBUTOR_RE.fullmatch(selector):
-        raise RuntimeError("Muse requires an explicit contributor model selector")
-    done = run(
-        [os.getenv("MUSE_CLI", "muse"), "exec", "--contributor-mode", "on", "--model", selector, "--reasoning-effort", effort,
-         "--disable-shell", "--disable-write", PROBE_PROMPT],
-        cwd=str(Path.home()),
-    )
-    if done.returncode:
-        raise RuntimeError((done.stderr or done.stdout).strip() or f"muse exited {done.returncode}")
-    return f"reasoning effort {effort} is not available" not in done.stderr
-
-
 def muse() -> list[Model]:
-    models = [m for m in muse_models() if MUSE_CONTRIBUTOR_RE.fullmatch(m.get("modelId", ""))]
+    models = [m for m in muse_models() if isinstance(m, dict) and MUSE_CONTRIBUTOR_RE.fullmatch(m.get("modelId", ""))]
     if not models:
         raise RuntimeError("muse lists no contributor models; ordinary Muse models are prohibited")
-    latest = next((m for m in models if m.get("isDefault")), models[0])["modelId"]
-    accepted: list[str] = []
-    for effort in reversed(PROVIDER_EFFORTS["muse"]):
-        if muse_effort_available(latest, effort):
-            accepted.append(effort)
-        if len(accepted) == tiers("muse"):
-            break
-    return rows("muse", latest, latest, accepted)
+    latest = next((m for m in models if m.get("isDefault")), models[0])
+    model_id = latest.get("modelId")
+    if not isinstance(model_id, str):
+        raise RuntimeError("muse lists a contributor model without a model id")
+    variants = [v for v in latest.get("variants", []) if isinstance(v, str)]
+    if not variants:
+        raise RuntimeError(f"muse lists no quality levels for {model_id}")
+    return rows("muse", model_id, model_id, variants)
 
 
 PROBES = {"claude": claude, "codex": codex, "grok": grok, "antigravity": antigravity, "muse": muse}

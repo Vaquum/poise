@@ -228,7 +228,7 @@ describe('chat runtime hardening', () => {
     expect(mocks.runFile.mock.calls[0][1]).toEqual(['--models'])
   })
 
-  it('does not classify another debate provider\'s 401 as Claude auth failure', async () => {
+  it('never reports a debate failure to the Claude gate, unattributable across providers', async () => {
     const failure = new Error('401 invalid API key')
     // The CLI-maintenance preflight reads the catalogue first; fail the debate itself.
     mocks.runFile.mockImplementation(async (_command, args) => {
@@ -240,7 +240,7 @@ describe('chat runtime hardening', () => {
 
     await expect(chat.runDebate('Compare the providers')).rejects.toBe(failure)
 
-    expect(mocks.observeAuthFailure).toHaveBeenCalledWith(failure)
+    expect(mocks.observeAuthFailure).not.toHaveBeenCalled()
   })
 
   it('atomically migrates only uniquely attributable legacy attachment directories', async () => {

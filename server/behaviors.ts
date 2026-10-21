@@ -87,7 +87,6 @@ const GH_INTERFACE = 'github-interface'
 const AGENT_INTERFACE = 'agent-interface'
 const LEGACY_REVIEW_SNAPSHOT_TARGET = '__snapshot_v2__'
 const REVIEW_SNAPSHOT_TARGET = '__snapshot_v3__'
-const BEHAVIOR_AUTH_FRESHNESS_MS = 60_000
 const DATASTORE_MAX_AGE_SECONDS = 120
 const SHA_PATTERN = /^[0-9a-f]{40}$/
 const GITHUB_USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
@@ -1723,13 +1722,13 @@ async function fireReview(
   const { model, recovery, catalog } = resolved
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
-  if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
+  if (claude) await waitForBehavior(claudeAuth.requireReady())
   const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], claimId)
   // mkdir the cwd hack dir — agent-interface needs it to exist for
   // --pwd resolution behavior identical to triggerPrReview in agent.ts.
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
   if (!isEnabled('review-new-prs')) return false
-  if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
+  if (claude) await waitForBehavior(claudeAuth.requireReady())
   if (!isEnabled('review-new-prs') || behaviorAborted()) return false
   const expectedHead = await currentHeadSha(pr.repo, pr.number, actor)
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead)
@@ -2604,11 +2603,11 @@ async function fireApprove(
   const actor = configuredReviewer()
   if (admittedReviewer && (actor.toLowerCase() !== admittedReviewer.toLowerCase()
     || await dismissedApprovalHeld(pr, expectedHead, model))) return false
-  if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
+  if (claude) await waitForBehavior(claudeAuth.requireReady())
   const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], claimId)
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
   if (!isEnabled('approve-prs')) return false
-  if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
+  if (claude) await waitForBehavior(claudeAuth.requireReady())
   if (!isEnabled('approve-prs') || behaviorAborted()) return false
   const currentHead = await currentHeadSha(pr.repo, pr.number, actor)
   // The head-SHA lookup above is a subprocess with a 30s timeout, so the user
@@ -3849,7 +3848,7 @@ async function fireIssueReview(
   const { model, recovery, catalog } = resolved
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
-  if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
+  if (claude) await waitForBehavior(claudeAuth.requireReady())
   const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery])
   // The CLI check and the model read can each take a while; turning the
   // behavior off, deselecting the repository, untrusting the author or
