@@ -951,7 +951,8 @@ tr:hover .review-btn { opacity: 1; }
 /* ── Side panels (Typography, Settings, Behavior memory) ── */
 #typo-panel,
 #settings-panel,
-#behavior-memory-panel {
+#behavior-memory-panel,
+#extensions-panel {
   position: fixed;
   /* Below the control bar rather than under it: the burger doubles as
      these panels' close button, so it has to stay visible and clickable
@@ -975,17 +976,20 @@ tr:hover .review-btn { opacity: 1; }
    grey strip down the right edge of every view, darker with each panel. */
 #typo-panel:not(.open),
 #settings-panel:not(.open),
-#behavior-memory-panel:not(.open) {
+#behavior-memory-panel:not(.open),
+#extensions-panel:not(.open) {
   box-shadow: none;
 }
 
-/* The memory editor holds a multi-line textarea, so it gets more room
+/* The memory editor's textarea and an extension's details need more room
    than the form-field panels. */
-#behavior-memory-panel { width: 420px; }
+#behavior-memory-panel,
+#extensions-panel { width: 420px; }
 
 #typo-panel.open,
 #settings-panel.open,
-#behavior-memory-panel.open {
+#behavior-memory-panel.open,
+#extensions-panel.open {
   transform: translateX(0);
 }
 

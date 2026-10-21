@@ -8,6 +8,7 @@
 // requests; it never persists anything and never talks to the browser.
 
 import type { ChildProcess } from 'node:child_process'
+import type { ResolvedServer, Skipped } from '../../extensions/types'
 import type {
   AgentId,
   Capabilities,
@@ -80,6 +81,9 @@ export interface AdapterStartOptions {
   resume?: string
   /** Create the native session by forking this one (agents with `fork`). */
   forkFrom?: string
+  /** The Extensions switched on for this chat's workspace, secrets resolved.
+   *  Sent through the agent's protocol, never on its command line. */
+  mcpServers?: readonly ResolvedServer[]
 }
 
 export interface AdapterStartResult {
@@ -91,6 +95,11 @@ export interface AdapterStartResult {
   mode?: string
   modes?: ModeOption[]
   commands?: CommandOption[]
+  /** Servers this agent could not take, and why. */
+  mcpSkipped?: Skipped[]
+  /** The servers could not be attached in this start (a Muse fork): the
+   *  runtime resumes the session with them before the next turn. */
+  mcpPending?: boolean
 }
 
 export interface TurnResult {

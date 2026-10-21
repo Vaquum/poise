@@ -1,5 +1,5 @@
 import { noticeEvidence, behaviorEvidence } from './notification-evidence'
-import { startLogging, stopLogging } from './logging'
+import { addDiagnosticSecrets, startLogging, stopLogging } from './logging'
 import { localLogging, stopLoggingApi } from './logging-api'
 import { startBehaviorLedger, stopBehaviorLedger } from './behavior-ledger'
 import { handleBehaviorLedger } from './behavior-ledger-http'
@@ -30,6 +30,11 @@ import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, getOrCreateChatSession, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
 import { handlePublishingApi } from './publishing-api'
+import { createExtensionsApi } from './extensions/http'
+import { runtimeExtensions } from './extensions/delivery'
+import { redactSecrets, secretValues } from './extensions/store'
+import { workspaceOf } from './extensions/types'
+import { listSessions } from './chat/storage'
 import { handleGoogleApi } from './google/api'
 import { validateGoogleEnvironment } from './google/accounts'
 import { getBehaviorDiagnosticIncidents } from './behaviors'
@@ -104,6 +109,9 @@ let serviceControl: ServiceControl | null = null
 let dailyModelRefresh: DailyModelRefresh | null = null
 // What paired Poise Link devices read: snippets, alerts and the event stream.
 let linkApi: LinkApi | null = null
+const handleExtensionsApi = createExtensionsApi({
+  recentWorkspaces: () => chatRuntime ? listSessions(chatRuntime.instance).map(workspaceOf) : [],
+})
 
 function serviceOf(opts: CachePluginOptions): ServiceConfig | null {
   return opts.service === undefined ? readServiceConfig() : opts.service
@@ -183,9 +191,11 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
         if (!chatControl) throw new Error('the native chat control is not started')
         return chatControl.context(id)
       },
+      extensions: runtimeExtensions,
     })
     chatControl = new ChatControl(chatRuntime)
-    chatRuntime.on('log', (line: string) => console.log(line))
+    addDiagnosticSecrets(secretValues)
+    chatRuntime.on('log', (line: string) => console.log(redactSecrets(line)))
     chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
     terminalSockets = new TerminalSocketServer({ allowedHosts: opts.allowedHosts, service }, { command: opts.terminalCommand })
     // A login may have just changed an account. Claude's sign-in also gates
@@ -1289,6 +1299,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
 
         if (await handleGoogleApi(req, res, url, service)) return
         if (await handlePublishingApi(req, res, url)) return
+        if (await handleExtensionsApi(req, res, url)) return
         if (await handleSnippetApi(req, res, url)) return
 
         return next()

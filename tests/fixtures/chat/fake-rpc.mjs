@@ -4,7 +4,11 @@
 // real binaries produced.
 
 import { createInterface } from 'node:readline'
-import { readFileSync } from 'node:fs'
+import { appendFileSync, readFileSync } from 'node:fs'
+
+// `--record <file>`: every request the adapter sends, one JSON line each.
+const recordAt = process.argv.indexOf('--record')
+const record = recordAt === -1 ? null : process.argv[recordAt + 1]
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -37,6 +41,7 @@ export function createPeer(handlers) {
     let message
     try { message = JSON.parse(line) } catch { return }
     if (typeof message.method === 'string') {
+      if (record && message.id !== undefined && message.id !== null) appendFileSync(record, JSON.stringify({ method: message.method, params: message.params ?? {} }) + '\n')
       if (message.id !== undefined && message.id !== null) {
         Promise.resolve()
           .then(() => handlers.request(message.method, message.params ?? {}, message.id))

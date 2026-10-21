@@ -4,8 +4,16 @@ import { defaultNavigation, moveNavigation, navigationViews, parseNavigation, pl
 describe('navigation preferences', () => {
   it('preserves the existing menu and top bar by default', () => {
     const preferences = defaultNavigation()
-    expect(navigationViews(preferences, 'menu').map(({ key }) => key)).toEqual(['analytics', 'logging'])
+    expect(navigationViews(preferences, 'menu').map(({ key }) => key)).toEqual(['analytics', 'logging', 'extensions'])
     expect(navigationViews(preferences, 'topBar').map(({ key }) => key)).toEqual(['current', 'swarm', 'chat', 'main', 'behaviors', 'snippets', 'editor'])
+  })
+
+  it('places Extensions in the menu, not the top bar, for preferences saved before it existed', () => {
+    const saved = { ...Object.fromEntries(['current', 'swarm', 'chat', 'main', 'behaviors', 'snippets', 'editor', 'analytics', 'logging'].map((key) => [key, { menu: key === 'logging', topBar: key !== 'logging' }])), menuOrder: ['logging'], topBarOrder: ['current'] }
+    const preferences = parseNavigation(saved)
+    expect(preferences.extensions).toEqual({ menu: true, topBar: false })
+    expect(navigationViews(preferences, 'menu').map(({ key }) => key)).toEqual(['logging', 'extensions'])
+    expect(navigationViews(preferences, 'topBar').some(({ key }) => key === 'extensions')).toBe(false)
   })
 
   it('accepts both, neither and either surface, keeping defaults for newly introduced views', () => {
@@ -21,7 +29,7 @@ describe('navigation preferences', () => {
   })
   it('restores orders and appends newly introduced views without changing saved positions', () => {
     const preferences = parseNavigation({ menuOrder: ['logging', 'analytics'], topBarOrder: ['chat', 'current'] })
-    expect(navigationViews(preferences, 'menu').map(({ key }) => key)).toEqual(['logging', 'analytics'])
+    expect(navigationViews(preferences, 'menu').map(({ key }) => key)).toEqual(['logging', 'analytics', 'extensions'])
     expect(navigationViews(preferences, 'topBar').map(({ key }) => key)).toEqual(['chat', 'current', 'swarm', 'main', 'behaviors', 'snippets', 'editor'])
     expect(parseNavigation({})).toEqual(defaultNavigation())
   })
@@ -56,7 +64,7 @@ describe('navigation preferences', () => {
     original.current.menu = true
     const moved = placeNavigation(original, 'current', 'topBar', 'menu', 0)
     expect(moved.current).toEqual({ menu: true, topBar: false })
-    expect(navigationViews(moved, 'menu').map(v => v.key)).toEqual(['current', 'analytics', 'logging'])
+    expect(navigationViews(moved, 'menu').map(v => v.key)).toEqual(['current', 'analytics', 'logging', 'extensions'])
     expect(navigationViews(moved, 'topBar').some(v => v.key === 'current')).toBe(false)
     expect(moved.menuOrder.filter(key => key === 'current')).toHaveLength(1)
     const reverse = placeNavigation(moved, 'logging', 'menu', 'topBar', 1)
@@ -69,7 +77,7 @@ describe('navigation preferences', () => {
     const original = defaultNavigation()
     const copied = placeNavigation(original, 'current', null, 'menu', 1)
     expect(copied.current).toEqual({ menu: true, topBar: true })
-    expect(navigationViews(copied, 'menu').map(v => v.key)).toEqual(['analytics', 'current', 'logging'])
+    expect(navigationViews(copied, 'menu').map(v => v.key)).toEqual(['analytics', 'current', 'logging', 'extensions'])
     expect(placeNavigation(copied, 'current', null, 'menu', 1)).toBe(copied)
     expect(placeNavigation(copied, 'current', 'menu', 'menu', 1)).toBe(copied)
     expect(navigationViews(placeNavigation(copied, 'current', null, 'menu', 0), 'menu')[0].key).toBe('current')

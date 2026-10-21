@@ -58,6 +58,8 @@ export default defineConfig({
       JEV_API_KEY: '', // Live account is never used by the automated preview.
       POISE_DB: resolve(e2eRoot, 'cache.db'),
       POISE_PORT: String(port),
+      // tests/e2e/extensions.spec.ts serves a registry here; nothing reaches the real one.
+      POISE_MCP_REGISTRY_URL: `http://127.0.0.1:${port + 3}`,
       POISE_EDITOR_DIR: resolve(e2eRoot, 'editor'),
       POISE_CHAT_ATTACHMENTS_DIR: resolve(e2eRoot, 'chat-attachments'),
       POISE_ESPANSO_MATCH_DIR: resolve(e2eRoot, 'espanso-match'),

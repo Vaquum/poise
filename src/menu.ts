@@ -8,6 +8,7 @@ const VIEW_KEY = 'poise-view'
 
 const ICON_TYPO  = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 3h10M4 3v8M10 3v8M4 11h1.5M8.5 11H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
 const ICON_ANALYTICS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 12h10M3.5 10V7M7 10V3M10.5 10V5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
+const ICON_EXTENSIONS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M5 1.8v2.6M9 1.8v2.6M3.6 4.4h6.8v2.2a3.4 3.4 0 0 1-6.8 0z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M7 10v2.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
 const ICON_MODELS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 3.5h10M2 7h10M2 10.5h10" stroke="currentColor" stroke-width="1.3"/><circle cx="5" cy="3.5" r="1.5" fill="var(--surface)" stroke="currentColor" stroke-width="1.3"/><circle cx="9" cy="7" r="1.5" fill="var(--surface)" stroke="currentColor" stroke-width="1.3"/><circle cx="5" cy="10.5" r="1.5" fill="var(--surface)" stroke="currentColor" stroke-width="1.3"/></svg>'
 const ICON_ACCOUNTS = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="4" r="2.3" stroke="currentColor" stroke-width="1.3"/><path d="M2 12c0-2.8 2-4.5 5-4.5s5 1.7 5 4.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
 const ICON_PUBLISHING = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 9V2.5M4.25 5.25 7 2.5l2.75 2.75M2.5 9.5v2h9v-2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>'
@@ -29,7 +30,7 @@ function loadView(): ViewName {
       localStorage.setItem(VIEW_KEY, 'current')
       return 'current'
     }
-    if (v === 'current' || v === 'swarm' || v === 'chat' || v === 'main' || v === 'behaviors' || v === 'snippets' || v === 'editor' || v === 'analytics' || v === 'logging') return v
+    if (v === 'current' || v === 'swarm' || v === 'chat' || v === 'main' || v === 'behaviors' || v === 'snippets' || v === 'editor' || v === 'analytics' || v === 'logging' || v === 'extensions') return v
   } catch { /* ignore */ }
   return 'current'
 }
@@ -269,7 +270,7 @@ export function initMenu(callbacks: MenuCallbacks): { switchTo: (v: ViewName) =>
     nav.hidden = !nav.childElementCount
     const menuItems = navigationViews(preferences, 'menu')
     menu.querySelector('.menu-views')!.innerHTML = menuItems.map(({ key, label }) => `<button type="button" class="menu-item" data-action="${key}" data-view="${key}">
-      <span class="menu-icon">${key === 'analytics' ? ICON_ANALYTICS : ICON_MODELS}</span><span class="menu-text">${label}</span>
+      <span class="menu-icon">${key === 'analytics' ? ICON_ANALYTICS : key === 'extensions' ? ICON_EXTENSIONS : ICON_MODELS}</span><span class="menu-text">${label}</span>
     </button>`).join('')
     menu.querySelector<HTMLElement>('.menu-views-divider')!.hidden = menuItems.length === 0
     setActiveItem()

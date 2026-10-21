@@ -34,6 +34,7 @@ import { PassThrough } from 'node:stream'
 import { CLAUDE_SUBSCRIPTION_CLI, claudeSubscriptionEnvironment, scrubbedChildEnvironment } from '../../process'
 import { CHAT_LIMITS, type Capabilities, type CommandOption, type ContentBlock, type ModeOption, type PromptInput, type Question, type StopReason, type ToolKind } from '../protocol'
 import { AdapterError, assertRequiredCapabilities, type Adapter, type AdapterHost, type AdapterStartOptions, type AdapterStartResult, type TurnResult } from './types'
+import { forClaude, type Skipped } from '../../extensions/types'
 
 export const CLAUDE_SDK_VERSION = '0.3.274'
 export const CLAUDE_CODE_VERSION = '2.1.274'
@@ -110,6 +111,7 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
   let mode = 'default'
   let commands: CommandOption[] = []
   let efforts: string[] = EFFORTS
+  let mcpSkipped: Skipped[] = []
   let alive = false
   let processExited = false
   let proxy: ProxyProcess | null = null
@@ -586,6 +588,15 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
       throw new Error(`Claude Code offers efforts ${efforts.join(', ') || '(none)'} for ${options.modelId}, not ${options.effort}`)
     }
     modelId = model?.resolvedModel || model?.value || options.modelId || modelId
+    // Over the control channel: `mcpServers` in Options would put every
+    // header and environment value on the CLI's command line.
+    mcpSkipped = []
+    if (options.mcpServers?.length) {
+      const result = await active.setMcpServers(forClaude(options.mcpServers))
+      for (const [name, error] of Object.entries(result.errors ?? {})) {
+        mcpSkipped.push({ name: options.mcpServers.find((server) => server.name === name)?.title ?? name, reason: `Claude Code could not connect to it (${error})` })
+      }
+    }
   }
 
   const adapter: Adapter = {
@@ -605,7 +616,7 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
       host.emit({ type: 'commands.updated', commands })
       host.emit({ type: 'mode.updated', mode, modes: MODES })
       assertRequiredCapabilities('claude', CAPABILITIES)
-      return { nativeSessionId: sessionId!, capabilities: CAPABILITIES, modelId, effort, efforts, mode, modes: MODES, commands }
+      return { nativeSessionId: sessionId!, capabilities: CAPABILITIES, modelId, effort, efforts, mode, modes: MODES, commands, ...(mcpSkipped.length ? { mcpSkipped } : {}) }
     },
 
     async prompt(id: string, input: PromptInput, signal: AbortSignal): Promise<TurnResult> {

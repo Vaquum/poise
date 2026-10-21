@@ -1,11 +1,11 @@
 # Menu and Settings
 
 The burger at the top right opens a surface attached to the button. Choose
-Analytics, Logging, or a destination under Settings: General, Navigation, Models, Accounts,
-Publishing or Typography. Service administrators also see Admin. Analytics and Logging
-are views of their own: choosing it closes the menu and
+Analytics, Logging, Extensions, or a destination under Settings: General, Navigation, Models, Accounts,
+Publishing or Typography. Service administrators also see Admin. Analytics, Logging and
+Extensions are views of their own: choosing one closes the menu and
 replaces the page, and the menu marks it as the current page while it shows
-(see [Analytics](Analytics.md) and [Logging](Logging.md)). There is no second tab strip inside
+(see [Analytics](Analytics.md), [Logging](Logging.md) and [Extensions](Extensions.md)). There is no second tab strip inside
 Settings. Back returns to the menu on the same surface. The burger becomes
 the single close button while the menu or a panel is open; clicking it or
 pressing Escape closes the surface. Escape inside an account terminal belongs
@@ -35,8 +35,9 @@ panel dismissal, resize and focus/typography changes discard an active move.
 
 Changes apply immediately and stay in this browser, including across reloads
 and other open tabs. Restore defaults restores the original visibility and
-order: Analytics then Logging in the menu; Current, Swarm, Chat, Archive,
-Behaviors, Snippets then Editor in the top bar. Settings and release information
+order: Analytics, Logging then Extensions in the menu; Current, Swarm, Chat, Archive,
+Behaviors, Snippets then Editor in the top bar. A view added to Poise later
+starts where its default places it, after your saved order. Settings and release information
 remain accessible. Hiding the current view's shortcuts leaves that view open.
 Selecting Analytics on either surface opens Today.
 

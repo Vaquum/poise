@@ -204,6 +204,14 @@ function handle(frame) {
       case 'apply_flag_settings':
         respond(requestId, {})
         return
+      case 'mcp_set_servers': {
+        note(`mcp_set_servers ${JSON.stringify(request.servers)}`)
+        const names = Object.keys(request.servers || {})
+        // `--mcp-refuse <name>` reports that server as failing to connect.
+        const refused = process.argv.includes('--mcp-refuse') ? process.argv[process.argv.indexOf('--mcp-refuse') + 1] : null
+        respond(requestId, { added: names, removed: [], errors: refused ? { [refused]: 'connection refused' } : {} })
+        return
+      }
       default:
         write({ type: 'control_response', response: { subtype: 'error', request_id: requestId, error: `unsupported ${request.subtype}` } })
     }

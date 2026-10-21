@@ -67,6 +67,7 @@ import { createCodexAdapter } from './adapters/codex'
 import { createGrokAdapter } from './adapters/grok'
 import { createMuseAdapter } from './adapters/muse'
 import type { Adapter, AdapterHost, PermissionRequest, QuestionAnswers, QuestionRequest } from './adapters/types'
+import { skippedNotice, type ResolvedServer, type Skipped } from '../extensions/types'
 import { SELF_UPDATE_REPOSITORY, SelfUpdateBridgeError, SelfUpdateUnavailableError, UUID_PATTERN, type SelfUpdateBridge } from '../self-update-bridge'
 import * as finishOutbox from '../self-update-outbox'
 import { poiseChangePrompt, poiseChangeTitle } from '../self-update-runbook'
@@ -152,6 +153,10 @@ interface LiveSession {
   nativeCliVersion?: string
   cliCheck?: { agent: AgentId, turnId?: string, result: Awaited<ReturnType<typeof prepareProviderCli>> }
   nativeSafeMode?: boolean
+  /** Fingerprint of the Extensions the native process runs with. */
+  nativeExtensions?: string
+  /** The Extensions notices last shown, so a resume does not repeat them. */
+  extensionNotices?: string
   worker: WorkerHandle | null
   lease: CheckoutLease | null
   turn: RunningTurn | null
@@ -196,6 +201,16 @@ export interface RuntimeOptions {
   /** The self-update controller client. Absent or unconfigured: `/poise`
    *  answers with an actionable error and no controller IO ever happens. */
   selfUpdate?: SelfUpdateBridge | null
+  /** Extensions: the MCP servers switched on for a session's workspace. */
+  extensions?: RuntimeExtensions | null
+}
+
+export interface RuntimeExtensions {
+  resolve(record: SessionRecord): Promise<{ servers: ResolvedServer[], notices: string[], fingerprint: string }>
+  delivered(record: SessionRecord, set: { servers: ResolvedServer[], notices: string[], fingerprint: string }, skipped: readonly Skipped[]): void
+  /** Stored secret values replaced in a transcript event or a line of text. */
+  scrub(event: ChatEvent): ChatEvent
+  redact(text: string): string
 }
 
 /** What the release controller sees before restarting this server. */
@@ -799,6 +814,8 @@ export class ChatRuntime extends EventEmitter {
         this.saveRecord(session)
       }
       signal.throwIfAborted()
+      const extensions = this.options.extensions ? await this.options.extensions.resolve(record) : null
+      signal.throwIfAborted()
       const host = this.hostFor(session)
       const adapter = this.adapters[record.agent](host)
       session.adapter = adapter
@@ -811,12 +828,14 @@ export class ChatRuntime extends EventEmitter {
         ...(options.forkFrom
           ? (record.agent === 'claude' ? { forkFrom: options.forkFrom.nativeSessionId } : { resume: record.nativeSessionId })
           : record.nativeSessionId ? { resume: record.nativeSessionId } : {}),
+        ...(extensions?.servers.length ? { mcpServers: extensions.servers } : {}),
       }
       const started = await adapter.start(startOptions)
       signal.throwIfAborted()
       session.nativeCliVersion = cli?.launchVersion || cli?.after || cli?.before
       session.nativeSafeMode = startOptions.safeMode
       record.safeModePending = session.nativeSafeMode !== (record.safeMode === true)
+      if (extensions) this.reportExtensions(session, extensions, started.mcpSkipped ?? [], started.mcpPending === true)
       record.nativeSessionId = started.nativeSessionId
       record.capabilities = started.capabilities
       record.modelId = started.modelId || record.modelId
@@ -1783,6 +1802,9 @@ export class ChatRuntime extends EventEmitter {
         // At this idle boundary, resume the same native session on the new CLI.
         if (cli?.after && cli.status !== 'unavailable' && cli.after !== session.nativeCliVersion) await this.stopProcess(session)
       }
+      // Extensions switched on, off or changed since the process started:
+      // resume the same native session with the new set before this turn.
+      if (session.adapter?.alive && this.options.extensions && (await this.options.extensions.resolve(record)).fingerprint !== session.nativeExtensions) await this.stopProcess(session)
       if (!session.adapter?.alive) await this.startSession(session, { fresh: !record.nativeSessionId && !record.branch.baseSha && record.branch.provisional, ...(lease ? { lease } : {}) })
       let adapter = session.adapter!
       const isFirst = !storage.findEvent(record.id, (e) => e.type === 'turn.started')
@@ -1972,7 +1994,7 @@ export class ChatRuntime extends EventEmitter {
       if (terminalRecorded && turn.callId && this.caller) {
         const outcome = storage.listFinishOutbox(this.instance).find(row => row.callId === turn.callId)
         try {
-          if (outcome) await this.caller.finish(turn.callId, outcome.status, outcome.error ?? undefined)
+          if (outcome) await this.caller.finish(turn.callId, outcome.status, outcome.error ? this.options.extensions?.redact(outcome.error) ?? outcome.error : undefined)
           storage.finishDelivered(turn.callId)
         } catch (e) {
           try { this.emit_(record.id, { type: 'error', message: `Caller did not record the turn end (it will be retried when Poise restarts): ${e instanceof Error ? e.message : String(e)}`, recoverable: true }) } catch { /* mirror */ }
@@ -2674,12 +2696,26 @@ export class ChatRuntime extends EventEmitter {
     storage.saveSession(session.record)
   }
 
+  /** Record what the native process runs with, and tell the chat once
+   *  about every switched-on server it does not have. */
+  private reportExtensions(session: LiveSession, set: { servers: ResolvedServer[], notices: string[], fingerprint: string }, skipped: readonly Skipped[], pending: boolean): void {
+    session.nativeExtensions = pending ? undefined : set.fingerprint
+    this.options.extensions!.delivered(session.record, set, skipped)
+    const notices = [...set.notices, ...skipped.map(skippedNotice)]
+    const shown = notices.join('\n')
+    if (shown && shown !== session.extensionNotices) {
+      for (const message of notices) this.emit_(session.record.id, { type: 'error', message, recoverable: true })
+    }
+    session.extensionNotices = shown
+  }
+
   /** Append to the mirror, then broadcast. Throws when the mirror cannot be
    *  written; callers that run on the agent's behalf turn that into a stop. */
   private emit_(sessionId: string, event: ChatEvent): ChatEnvelope {
     if (event.type === 'session.created' || event.type === 'session.resumed' || event.type === 'session.updated') {
       event = { ...event, session: this.withLive(event.session) }
     }
+    if (this.options.extensions) event = this.options.extensions.scrub(event)
     const envelope = storage.appendEvent(sessionId, event)
     const live = this.live.get(sessionId)
     if (live) live.record.lastSeq = envelope.seq

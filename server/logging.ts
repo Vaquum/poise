@@ -31,6 +31,13 @@ export function loggingRuntime(): DiagnosticRuntime | null { return active }
 export function loggingWorkspace(): string { return workspace }
 export function loggingPath(): string | null { return active ? path : null }
 
+const secretSources: Array<() => readonly string[]> = []
+
+/** Values that are secret without an environment variable naming them (Extensions). */
+export function addDiagnosticSecrets(source: () => readonly string[]): void {
+  secretSources.push(source)
+}
+
 export function diagnostic(input: Omit<DiagnosticInput, 'source' | 'workspace'> & { source?: string }, secrets: readonly string[] = []): string | null {
   if (!active) return null
   let accepted: string | null = null
@@ -39,7 +46,7 @@ export function diagnostic(input: Omit<DiagnosticInput, 'source' | 'workspace'> 
       source: input.source ?? 'poise', workspace, visibility: 'workspace',
       instance: input.instance === undefined ? process.env.POISE_WORKSPACE_HANDLE ?? process.env.POISE_INSTANCE_LABEL ?? 'local' : input.instance,
       container: input.container === undefined ? process.env.POISE_MODE === 'service' ? process.env.HOSTNAME ?? null : null : input.container,
-      release: input.release === undefined ? process.env.POISE_RELEASE || process.env.POISE_SOURCE_SHA || null : input.release }, Date.now(), [...environmentSecrets(), ...secrets])
+      release: input.release === undefined ? process.env.POISE_RELEASE || process.env.POISE_SOURCE_SHA || null : input.release }, Date.now(), [...environmentSecrets(), ...secretSources.flatMap((source) => source()), ...secrets])
     if (!event) return null
     accepted = active.ingest(event)
     if (!accepted) return null

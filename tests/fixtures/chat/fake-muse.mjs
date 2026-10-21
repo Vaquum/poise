@@ -51,7 +51,9 @@ function scripted() {
           dialogs = !!params.capabilities?.userInputDialogs
           return {
             serverInfo: { name: 'muse', version: '1.3.0' }, userAgent: 'fake-muse/1.3.0', museHome: '/tmp/muse', platformFamily: 'unix',
-            platformOs: 'macos', schema: { version: 1, fingerprint: 'sha256:fake' }, grantedCapabilities: [], experimentalApi: false, sessionDurability: 'durable',
+            platformOs: 'macos', schema: { version: 1, fingerprint: 'sha256:fake' }, experimentalApi: false, sessionDurability: 'durable',
+            // Like Muse 1.4, grants session MCP servers when asked; `--no-session-mcp` withholds it.
+            grantedCapabilities: (params.capabilities?.requestedCapabilities ?? []).filter((name) => name === 'sessionMcp' && !process.argv.includes('--no-session-mcp')),
           }
         case 'model/list':
           return { providerId: 'meta', profileId: 'tbh', source: 'providerCatalog', models }

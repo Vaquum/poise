@@ -34,7 +34,7 @@ test('opens Settings destinations directly on one frame and returns to the menu'
   await workspace(page)
   await page.locator('#menu-toggle').click()
   await expect(page.locator('#menu-popover .menu-group-label')).toHaveText('Settings')
-  await expect(page.locator('#menu-popover .menu-item:not([hidden])')).toHaveText(['Analytics', 'Logging', 'General', 'Navigation', 'Models', 'Accounts', 'Publishing', 'Typography'])
+  await expect(page.locator('#menu-popover .menu-item:not([hidden])')).toHaveText(['Analytics', 'Logging', 'Extensions', 'General', 'Navigation', 'Models', 'Accounts', 'Publishing', 'Typography'])
   await attached(page)
   for (const section of ['General', 'Navigation', 'Models', 'Accounts', 'Publishing', 'Typography']) {
     await page.locator('#menu-popover').getByRole('button', { name: section, exact: true }).click()
@@ -70,6 +70,8 @@ test('rapid close and reopen never loses the menu, and keyboard navigation reach
   await expect(page.getByRole('button', { name: 'Analytics', exact: true })).toBeFocused()
   await page.keyboard.press('ArrowDown')
   await expect(page.getByRole('button', { name: 'Logging', exact: true })).toBeFocused()
+  await page.keyboard.press('ArrowDown')
+  await expect(page.getByRole('button', { name: 'Extensions', exact: true })).toBeFocused()
   await page.keyboard.press('ArrowDown')
   await expect(page.getByRole('button', { name: 'General', exact: true })).toBeFocused()
   await page.keyboard.press('Enter')

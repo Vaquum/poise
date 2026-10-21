@@ -12,7 +12,11 @@ export const VIEW_ITEMS = [
   { key: 'editor', label: 'Editor' },
   { key: 'analytics', label: 'Analytics' },
   { key: 'logging', label: 'Logging' },
+  { key: 'extensions', label: 'Extensions' },
 ] as const
+
+/** Views placed in the menu, not the top bar, until someone moves them. */
+const MENU_VIEWS: readonly string[] = ['analytics', 'logging', 'extensions']
 export type ViewName = typeof VIEW_ITEMS[number]['key']
 export type NavigationPlacement = { menu: boolean, topBar: boolean }
 export type NavigationSurface = keyof NavigationPlacement
@@ -20,9 +24,9 @@ export type NavigationPreferences = Record<ViewName, NavigationPlacement> & { me
 
 export function defaultNavigation(): NavigationPreferences {
   return { ...Object.fromEntries(VIEW_ITEMS.map(({ key }) => [key, {
-    menu: key === 'analytics' || key === 'logging',
-    topBar: key !== 'analytics' && key !== 'logging',
-  }])), menuOrder: ['analytics', 'logging', ...VIEW_ITEMS.map(({ key }) => key).filter((key) => key !== 'analytics' && key !== 'logging')],
+    menu: MENU_VIEWS.includes(key),
+    topBar: !MENU_VIEWS.includes(key),
+  }])), menuOrder: [...MENU_VIEWS, ...VIEW_ITEMS.map(({ key }) => key).filter((key) => !MENU_VIEWS.includes(key))],
   topBarOrder: VIEW_ITEMS.map(({ key }) => key) } as NavigationPreferences
 }
 

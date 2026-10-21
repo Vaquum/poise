@@ -91,6 +91,7 @@ import type { ChatEvent, ContentBlock, PermissionOption, PermissionOptionKind, P
 import { StdioRpc } from '../rpc'
 import { AdapterError } from './types'
 import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, TurnResult } from './types'
+import { forMuse, type Skipped } from '../../extensions/types'
 import { assertMuseContributor } from '../../models'
 import pkg from '../../../package.json'
 
@@ -1131,19 +1132,28 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       } catch (error) {
         throw new AdapterError(AGENT, `${LABEL} could not be launched: ${error instanceof Error ? error.message : String(error)}`, 'start_failed')
       }
+      const extensions = forMuse(options.mcpServers ?? [])
+      const skipped: Skipped[] = [...extensions.skipped]
+      let mcpPending = false
       try {
-        await call('initialize', {
+        const init = await call('initialize', {
           clientInfo: { name: 'poise', title: 'Poise', version: pkg.version },
-          capabilities: { userInputDialogs: true },
+          capabilities: { userInputDialogs: true, requestedCapabilities: ['sessionMcp'] },
         }, { timeoutMs: 30_000 })
         link().notify(INITIALIZED)
+        const wanted = Object.keys(extensions.mcpServers)
+        // Without the grant Muse would ignore the servers; say so instead.
+        const config = wanted.length && init.grantedCapabilities?.includes('sessionMcp') ? { config: { mcpServers: extensions.mcpServers } } : {}
+        if (wanted.length && !('config' in config)) {
+          for (const name of wanted) skipped.push({ name: options.mcpServers!.find((server) => server.name === name)!.title, reason: 'this Muse did not grant session MCP servers' })
+        }
         modelId = await validateModel(options.modelId)
         effort = chooseEffort(options.effort)
 
         let id: string
         if (options.resume) {
           // session/resume subscribes this connection to the session view.
-          const response = await call('session/resume', { commandId: uuidv7(), sessionId: options.resume, excludeItems: true }, { timeoutMs: 60_000 })
+          const response = await call('session/resume', { commandId: uuidv7(), sessionId: options.resume, excludeItems: true, ...config }, { timeoutMs: 60_000 })
           id = response.session.sessionId
           sessionId = id
           if (response.session.modelId !== modelId) {
@@ -1153,6 +1163,8 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
           const response = await call('session/fork', { commandId: uuidv7(), sessionId: options.forkFrom, excludeItems: true }, { timeoutMs: 60_000 })
           id = response.session.sessionId
           sessionId = id
+          // session/fork takes no configuration; the runtime resumes the fork with it.
+          mcpPending = 'config' in config
           // The schema documents auto-subscription for resume only; subscribing
           // is idempotent, so a fork is attached explicitly.
           await call('view/subscribe', { sessionId: id }, { timeoutMs: 30_000 })
@@ -1165,6 +1177,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
             workspaceRoot: host.checkout,
             approvalMode: options.safeMode === true ? 'onRequest' : 'allowAll',
             modelId,
+            ...config,
           }, { timeoutMs: 60_000 })
           assertMuseContributor(response.session.modelId)
           id = response.session.sessionId
@@ -1176,7 +1189,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
         if (error instanceof AdapterError) throw error
         throw new AdapterError(AGENT, `${LABEL} failed to start: ${error instanceof Error ? error.message : String(error)}`, 'start_failed')
       }
-      return { nativeSessionId: sessionId!, capabilities: CAPABILITIES, modelId, effort, efforts: [...EFFORTS] }
+      return { nativeSessionId: sessionId!, capabilities: CAPABILITIES, modelId, effort, efforts: [...EFFORTS], ...(skipped.length ? { mcpSkipped: skipped } : {}), ...(mcpPending ? { mcpPending } : {}) }
     },
 
     async prompt(turnId, input, signal): Promise<TurnResult> {

@@ -33,6 +33,7 @@ and `deploy/restore.sh` back it up and restore it.
 - **Editor** — atomic Markdown storage, annotations, and agent-backed chat.
 - **Publishing** — an Editor document published as a pull request to one or more websites kept in GitHub repositories, each described by its own `publish.yaml`. See [Publishing](docs/Publishing.md).
 - **Analytics** — a full view from the burger menu, one day at a time against a seven-day baseline. Reorder cards for productivity, work type and review friction, per merged pull request and live GitHub API quota by dragging their headers or using the keyboard. The browser remembers their order; two shared heights and the Tactile spring keep the layout consistent. See [Analytics](docs/Analytics.md) for layout and measurement definitions.
+- **Extensions** — MCP servers for Chat, from the burger menu: a directory mirrored from the official MCP Registry, custom remote or local servers, and a switch per workspace. Claude, Codex, Muse and Grok chats get the servers switched on for their repository from their next turn; secrets stay write-only and out of logs and transcripts. See [Extensions](docs/Extensions.md).
 - **Notifications** — what needs you and what Behaviors is doing, in a rail that docks beside the page on a wide window. It covers a failed behavior, a sign-in or a Chat waiting for you, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. See [Notifications](docs/Notifications.md).
 
 Settings reads only the selected section's expensive data. Accounts shows each

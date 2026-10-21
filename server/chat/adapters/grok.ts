@@ -28,6 +28,7 @@ import { CHAT_LIMITS, type Capabilities, type CommandOption, type ContentBlock, 
 import { RpcError, StdioRpc } from '../rpc'
 import { readCheckoutTextFile } from '../client-fs'
 import { AdapterError, assertRequiredCapabilities, type Adapter, type AdapterHost, type AdapterStartOptions, type AdapterStartResult, type TurnResult } from './types'
+import { forAcp } from '../../extensions/types'
 
 export const GROK_COMMAND = 'grok'
 export const GROK_ARGS = ['--sandbox', 'off', '--permission-mode', 'bypassPermissions', 'agent', 'stdio'] as const
@@ -102,6 +103,8 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
   let child: ChildProcess | null = null
   let sessionId: string | undefined
   let modelId = ''
+  // What `initialize` says this Grok accepts besides stdio MCP servers.
+  let mcpCapabilities: { http?: boolean, sse?: boolean } = {}
   let effort = ''
   let efforts: string[] | undefined
   let commands: CommandOption[] = []
@@ -374,6 +377,8 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
     if (init?.protocolVersion !== GROK_ACP_VERSION) {
       throw new AdapterError('grok', `Grok Build speaks ACP protocol version ${init?.protocolVersion}, Poise needs ${GROK_ACP_VERSION}`, 'start_failed')
     }
+    const advertised = init?.agentCapabilities?.mcpCapabilities
+    mcpCapabilities = { http: advertised?.http === true, sse: advertised?.sse === true }
   }
 
   const adapter: Adapter = {
@@ -390,18 +395,19 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
         throw new AdapterError('grok', `Grok Build could not start: ${error instanceof Error ? error.message : String(error)}`, 'start_failed')
       }
       const link = requireRpc()
+      const { mcpServers, skipped } = forAcp(options.mcpServers ?? [], mcpCapabilities)
       let result: any
       try {
         if (options.forkFrom) {
           const fork = await link.request<any>('_x.ai/session/fork', { sourceSessionId: options.forkFrom, sourceCwd: host.checkout, newCwd: host.checkout }, { timeoutMs: 60_000 })
           sessionId = String(fork?.newSessionId || '')
           if (!sessionId) throw new Error('fork returned no session id')
-          result = await link.request<any>('session/resume', { sessionId, cwd: host.checkout, mcpServers: [] }, { timeoutMs: 120_000 })
+          result = await link.request<any>('session/resume', { sessionId, cwd: host.checkout, mcpServers }, { timeoutMs: 120_000 })
         } else if (options.resume) {
           sessionId = options.resume
-          result = await link.request<any>('session/resume', { sessionId, cwd: host.checkout, mcpServers: [] }, { timeoutMs: 120_000 })
+          result = await link.request<any>('session/resume', { sessionId, cwd: host.checkout, mcpServers }, { timeoutMs: 120_000 })
         } else {
-          result = await link.request<any>('session/new', { cwd: host.checkout, mcpServers: [] }, { timeoutMs: 120_000 })
+          result = await link.request<any>('session/new', { cwd: host.checkout, mcpServers }, { timeoutMs: 120_000 })
           sessionId = String(result?.sessionId || '')
           if (!sessionId) throw new Error('session/new returned no session id')
         }
@@ -412,7 +418,7 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
       if (options.modelId && options.modelId !== modelId) await setConfigOption('model', options.modelId)
       if (options.effort && options.effort !== effort) await setConfigOption('reasoning_effort', options.effort)
       assertRequiredCapabilities('grok', CAPABILITIES)
-      return { nativeSessionId: sessionId!, capabilities: CAPABILITIES, modelId, effort, efforts, commands }
+      return { nativeSessionId: sessionId!, capabilities: CAPABILITIES, modelId, effort, efforts, commands, ...(skipped.length ? { mcpSkipped: skipped } : {}) }
     },
 
     async prompt(id: string, input: PromptInput, signal: AbortSignal): Promise<TurnResult> {

@@ -32,6 +32,8 @@ interface FakeControls {
   failStart?: string
   startWait?: Promise<void>
   spawnDuringStart?: boolean
+  mcpSkipped?: Array<{ name: string, reason: string }>
+  mcpPending?: boolean
 }
 class FakeAdapter implements Adapter {
   agent: AgentId = 'grok'
@@ -60,7 +62,8 @@ class FakeAdapter implements Adapter {
     if (this.controls.failStart) throw new Error(this.controls.failStart)
     this.alive = true
     this.nativeSessionId = options.resume || options.forkFrom || `native-${this.controls.startCount}`
-    return { nativeSessionId: this.nativeSessionId, capabilities: this.capabilities, modelId: options.modelId, effort: options.effort, efforts: ['high', 'xhigh'], commands: [{ name: 'compact' }] }
+    return { nativeSessionId: this.nativeSessionId, capabilities: this.capabilities, modelId: options.modelId, effort: options.effort, efforts: ['high', 'xhigh'], commands: [{ name: 'compact' }],
+      ...(this.controls.mcpSkipped ? { mcpSkipped: this.controls.mcpSkipped } : {}), ...(this.controls.mcpPending ? { mcpPending: true } : {}) }
   }
   async prompt(turnId: string, input: PromptInput, signal: AbortSignal) {
     this.inputs.push(input)
@@ -96,7 +99,7 @@ function fakeCaller(): CallerTurns & { starts: any[], finishes: any[] } {
 
 const runtimes: Array<import('../../server/chat/runtime').ChatRuntime> = []
 
-function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: FakeControls, caller?: CallerTurns | null, leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions, prepareCli?: import('../../server/chat/runtime').RuntimeOptions['prepareCli'], catalog?: () => Promise<any> } = {}) {
+function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: FakeControls, caller?: CallerTurns | null, leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions, prepareCli?: import('../../server/chat/runtime').RuntimeOptions['prepareCli'], catalog?: () => Promise<any>, extensions?: import('../../server/chat/runtime').RuntimeExtensions } = {}) {
   const controls: FakeControls = options.controls ?? { hosts: [], adapters: [], startCount: 0 }
   const runtime = new runtimeModule.ChatRuntime({
     instance: options.instance ?? 'poise-test:db',
@@ -109,6 +112,7 @@ function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: F
     requireClaudeReady: async () => {},
     leaseProbes: options.leaseProbes,
     prepareCli: options.prepareCli,
+    extensions: options.extensions,
   })
   const events: ChatEnvelope[] = []
   runtime.on('event', (e: ChatEnvelope) => events.push(e))
@@ -1044,4 +1048,81 @@ it.each([false, true])('QC2: an early steer waits for native prompt startup, or 
     }
     expect(ofType(events, s.id, 'steer.sent')).toHaveLength(0)
   } finally { revived.controls.startWait = undefined; release(); await revived.runtime.stop() }
+})
+
+describe('Extensions in the runtime', () => {
+  const server = (name: string, token: string) => ({ id: name, name, title: name[0].toUpperCase() + name.slice(1), transport: 'stdio' as const, command: 'node', args: [`${name}.mjs`], env: { TOKEN: token } })
+  function extensions(state: { servers: ReturnType<typeof server>[], notices: string[], secret?: string }) {
+    const delivered: Array<{ servers: string[], skipped: string[] }> = []
+    const hooks: import('../../server/chat/runtime').RuntimeExtensions = {
+      async resolve() { return { servers: state.servers, notices: state.notices, fingerprint: JSON.stringify(state.servers) } },
+      delivered(_record, set, skipped) { delivered.push({ servers: set.servers.map((s) => s.name), skipped: skipped.map((s) => s.name) }) },
+      scrub(event) { return state.secret ? JSON.parse(JSON.stringify(event).split(state.secret).join('[redacted]')) : event },
+      redact(text) { return state.secret ? text.split(state.secret).join('[redacted]') : text },
+    }
+    return { hooks, delivered }
+  }
+
+  it('starts the agent with the workspace\'s servers and shows what it could not take once', async () => {
+    const state = { servers: [server('probe', 'one')], notices: ['Extensions: Linear needs a sign-in, so this chat runs without it.'] }
+    const ext = extensions(state)
+    const controls: FakeControls = { hosts: [], adapters: [], startCount: 0, mcpSkipped: [{ name: 'Probe', reason: 'Grok refused it' }] }
+    const { runtime, events } = makeRuntime({ controls, extensions: ext.hooks })
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'ext-start' } })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(controls.adapters[0].starts[0].mcpServers).toEqual(state.servers)
+    expect(ext.delivered).toEqual([{ servers: ['probe'], skipped: ['Probe'] }])
+    const notices = () => ofType(events, session.id, 'error').map((e) => e.message)
+    expect(notices()).toEqual(['Extensions: Linear needs a sign-in, so this chat runs without it.', 'Extensions: Probe is not available in this chat: Grok refused it.'])
+    // A resume with the same set says nothing new.
+    await controls.adapters[0].close()
+    runtime.prompt(session.id, { text: 'again', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    expect(controls.startCount).toBe(2)
+    expect(notices()).toHaveLength(2)
+  })
+
+  it('resumes the native session with the new set before the next turn, and only when it changed', async () => {
+    const state = { servers: [server('probe', 'one')], notices: [] as string[] }
+    const ext = extensions(state)
+    const { runtime, controls, events } = makeRuntime({ extensions: ext.hooks })
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'ext-next-turn' } })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.prompt(session.id, { text: 'first', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    expect(controls.startCount).toBe(1)
+    state.servers = []
+    runtime.prompt(session.id, { text: 'second', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    expect(controls.startCount).toBe(2)
+    expect(controls.adapters[0].closed).toBe(1)
+    expect(controls.adapters[1].starts[0]).toMatchObject({ resume: controls.adapters[0].nativeSessionId })
+    expect(controls.adapters[1].starts[0].mcpServers).toBeUndefined()
+    expect(controls.adapters[1].inputs.map((input) => input.text)).toEqual(['second'])
+  })
+
+  it('resumes an agent that could not attach the servers at start before its next turn', async () => {
+    const state = { servers: [server('probe', 'one')], notices: [] as string[] }
+    const controls: FakeControls = { hosts: [], adapters: [], startCount: 0, mcpPending: true }
+    const { runtime, events } = makeRuntime({ controls, extensions: extensions(state).hooks })
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'ext-pending' } })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    controls.mcpPending = false
+    runtime.prompt(session.id, { text: 'go', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    expect(controls.startCount).toBe(2)
+    expect(controls.adapters[1].starts[0].mcpServers).toEqual(state.servers)
+  })
+
+  it('stores transcript events with secret values scrubbed', async () => {
+    const state = { servers: [server('probe', 'one')], notices: [] as string[], secret: 'sk-live-0123456789' }
+    const { runtime, events } = makeRuntime({ extensions: extensions(state).hooks })
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'ext-scrub' } })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.prompt(session.id, { text: 'print sk-live-0123456789', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    const stored = JSON.stringify(storage.listEvents(session.id, 0).events)
+    expect(stored).not.toContain('sk-live-0123456789')
+    expect(stored).toContain('echo: print [redacted]')
+  })
 })

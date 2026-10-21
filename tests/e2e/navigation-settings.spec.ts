@@ -10,7 +10,7 @@ async function navigation(page: Page): Promise<void> {
 }
 
 const shortcut = (page: Page, name: string, surface: 'menu' | 'top bar') => page.getByRole('button', { name: `Arrange ${name} in ${surface}`, exact: true })
-const views = ['Current', 'Swarm', 'Chat', 'Archive', 'Behaviors', 'Snippets', 'Editor', 'Analytics', 'Logging']
+const views = ['Current', 'Swarm', 'Chat', 'Archive', 'Behaviors', 'Snippets', 'Editor', 'Analytics', 'Logging', 'Extensions']
 async function add(page: Page, name: string, surface: 'menu' | 'top bar'): Promise<void> {
   if (await shortcut(page, name, surface).count()) return
   await page.getByRole('button', { name: `Add ${name}`, exact: true }).click()
@@ -55,7 +55,7 @@ test('moves views between surfaces immediately, preserves active state and persi
   await add(page, 'Logging', 'top bar')
   await remove(page, 'Analytics', 'menu')
   await page.getByRole('button', { name: 'Back to menu' }).click()
-  await expect(page.locator('.menu-views .menu-item')).toHaveText(['Logging', 'Current'])
+  await expect(page.locator('.menu-views .menu-item')).toHaveText(['Logging', 'Extensions', 'Current'])
   await expect(page.locator('.menu-views [data-view="current"]')).toHaveAttribute('aria-current', 'page')
   await expect(page.locator('#top-nav [data-view="current"]')).toHaveCount(0)
   await page.locator('#menu-toggle').click()
@@ -81,7 +81,7 @@ test('moves views between surfaces immediately, preserves active state and persi
   await page.reload()
   await expect(page.locator('#top-nav .nav-item')).toHaveText(['Current', 'Swarm', 'Chat', 'Archive', 'Behaviors', 'Snippets', 'Editor'])
   await page.locator('#menu-toggle').click()
-  await expect(page.locator('.menu-views .menu-item')).toHaveText(['Analytics', 'Logging'])
+  await expect(page.locator('.menu-views .menu-item')).toHaveText(['Analytics', 'Logging', 'Extensions'])
 })
 
 test('all view shortcuts can be hidden while Settings and keyboard access remain available', async ({ page }) => {
@@ -168,9 +168,9 @@ for (const width of [420, 640, 900]) test(`all top bar shortcuts fit at ${width}
   await workspace(page)
   await navigation(page)
   for (const name of views) await add(page, name, 'top bar')
-  await expect(shortcut(page, 'Logging', 'top bar')).toBeFocused()
+  await expect(shortcut(page, 'Extensions', 'top bar')).toBeFocused()
   await page.locator('#menu-toggle').click()
-  await expect(page.locator('#top-nav .nav-item')).toHaveCount(9)
+  await expect(page.locator('#top-nav .nav-item')).toHaveCount(10)
   expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1)
   const logging = page.locator('#top-nav').getByRole('button', { name: 'Logging', exact: true })
   await logging.click()
@@ -186,7 +186,7 @@ test('orders both surfaces independently, keeps keyboard focus and saves order a
   await controller.press('ArrowUp')
   await controller.press('Enter')
   await expect(shortcut(page, 'Logging', 'menu')).toBeFocused()
-  await expect(rows(page, 'menu')).toHaveText(['Logging', 'Analytics'])
+  await expect(rows(page, 'menu')).toHaveText(['Logging', 'Analytics', 'Extensions'])
   await shortcut(page, 'Current', 'top bar').press('Enter')
   await controller.press('ArrowDown')
   await controller.press('ArrowDown')
@@ -199,11 +199,11 @@ test('orders both surfaces independently, keeps keyboard focus and saves order a
   await expect(page.locator('#top-nav [data-view="current"]')).toHaveAttribute('aria-current', 'page')
   await page.reload()
   await page.locator('#menu-toggle').click()
-  await expect(page.locator('.menu-views .menu-item')).toHaveText(['Logging', 'Analytics'])
+  await expect(page.locator('.menu-views .menu-item')).toHaveText(['Logging', 'Analytics', 'Extensions'])
   await expect(page.locator('#top-nav .nav-item')).toHaveText(['Swarm', 'Chat', 'Current', 'Archive', 'Behaviors', 'Snippets', 'Editor'])
   await page.locator('#menu-popover').getByRole('button', { name: 'Navigation', exact: true }).click()
   await page.getByRole('button', { name: 'Restore defaults' }).click()
-  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging'])
+  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging', 'Extensions'])
   await expect(rows(page, 'topBar')).toHaveText(['Current', 'Swarm', 'Chat', 'Archive', 'Behaviors', 'Snippets', 'Editor'])
 })
 
@@ -213,7 +213,7 @@ test('a full menu scrolls on a short phone viewport and still reaches Navigation
   await navigation(page)
   for (const name of views) await add(page, name, 'menu')
   await page.getByRole('button', { name: 'Back to menu' }).click()
-  await expect(page.locator('.menu-views .menu-item')).toHaveCount(9)
+  await expect(page.locator('.menu-views .menu-item')).toHaveCount(10)
   await expect.poll(() => page.locator('#menu-popover').evaluate((menu) => menu.scrollHeight - menu.clientHeight)).toBeGreaterThan(0)
   await page.locator('#menu-popover').getByRole('button', { name: 'Navigation', exact: true }).click()
   await expect(page.locator('#settings-panel .tp-title')).toHaveText('Navigation')
@@ -237,7 +237,7 @@ test('the live status region is exposed before the first announcement', async ({
   await expect(status).toHaveText('Navigation reset.')
 })
 
-for (const width of [821, 900]) test(`large text and nine shortcuts leave local controls reachable at ${width}px`, async ({ page }, info) => {
+for (const width of [821, 900]) test(`large text and every shortcut leave local controls reachable at ${width}px`, async ({ page }, info) => {
   await page.setViewportSize({ width, height: 900 })
   await workspace(page)
   await page.evaluate(() => { document.documentElement.style.fontSize = '20px' })
@@ -280,7 +280,7 @@ test('pointer previews stay local, cross the gutter and commit one complete tran
   await before(page, shortcut(page, 'Current', 'top bar'))
   await page.mouse.up()
   await expect(page.locator('#top-nav .nav-item').first()).toHaveText('Logging')
-  await expect(rows(page, 'menu')).toHaveText(['Analytics'])
+  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Extensions'])
   await expect(shortcut(page, 'Logging', 'top bar')).toBeFocused()
   await expect(page.locator('html')).toHaveAttribute('data-navigation-events', '1')
   await expect(page.locator('.st-navigation-ghost, .st-navigation-gap')).toHaveCount(0)
@@ -288,7 +288,7 @@ test('pointer previews stay local, cross the gutter and commit one complete tran
   expect(persisted.logging).toEqual({ menu: false, topBar: true })
   await page.reload()
   await navigation(page)
-  await expect(rows(page, 'menu')).toHaveText(['Analytics'])
+  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Extensions'])
   await expect(rows(page, 'topBar').first()).toHaveText('Logging')
 })
 
@@ -298,16 +298,16 @@ test('palette drops copy and reposition existing shortcuts, and transfer merges 
   await beginDrag(page, page.getByRole('button', { name: 'Add Current', exact: true }))
   await before(page, shortcut(page, 'Analytics', 'menu'))
   await page.mouse.up()
-  await expect(rows(page, 'menu')).toHaveText(['Current', 'Analytics', 'Logging'])
+  await expect(rows(page, 'menu')).toHaveText(['Current', 'Analytics', 'Logging', 'Extensions'])
   await expect(shortcut(page, 'Current', 'top bar')).toBeVisible()
   await beginDrag(page, page.getByRole('button', { name: 'Add Logging', exact: true }))
   await before(page, shortcut(page, 'Current', 'menu'))
   await page.mouse.up()
-  await expect(rows(page, 'menu')).toHaveText(['Logging', 'Current', 'Analytics'])
+  await expect(rows(page, 'menu')).toHaveText(['Logging', 'Current', 'Analytics', 'Extensions'])
   await beginDrag(page, shortcut(page, 'Current', 'top bar'))
   await before(page, shortcut(page, 'Logging', 'menu'))
   await page.mouse.up()
-  await expect(rows(page, 'menu')).toHaveText(['Current', 'Logging', 'Analytics'])
+  await expect(rows(page, 'menu')).toHaveText(['Current', 'Logging', 'Analytics', 'Extensions'])
   await expect(shortcut(page, 'Current', 'top bar')).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Add Current', exact: true })).toBeVisible()
   await remove(page, 'Current', 'menu')
@@ -335,7 +335,7 @@ test('unchanged and outside drops never write or publish the last preview', asyn
   await page.mouse.up()
   expect(await saved(page)).toBeNull()
   await expect(page.locator('html')).toHaveAttribute('data-navigation-events', '0')
-  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging'])
+  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging', 'Extensions'])
   await expect(page.locator('.st-navigation-ghost, .st-navigation-gap')).toHaveCount(0)
   await expect(shortcut(page, 'Logging', 'menu')).toBeFocused()
 })
@@ -347,11 +347,12 @@ test('click-only copy, reorder, transfer and empty-area placement work without h
   await shortcut(page, 'Logging', 'menu').click()
   await expect(status(page)).toContainText('Click in either area to place')
   await shortcut(page, 'Analytics', 'menu').click({ position: { x: 30, y: 3 } })
-  await expect(rows(page, 'menu')).toHaveText(['Logging', 'Analytics', 'Current'])
+  await expect(rows(page, 'menu')).toHaveText(['Logging', 'Analytics', 'Extensions', 'Current'])
   await shortcut(page, 'Logging', 'menu').click()
   await shortcut(page, 'Current', 'top bar').click({ position: { x: 30, y: 3 } })
   await expect(rows(page, 'topBar').first()).toHaveText('Logging')
   await remove(page, 'Analytics', 'menu')
+  await remove(page, 'Extensions', 'menu')
   await remove(page, 'Current', 'menu')
   await expect(page.getByRole('button', { name: 'Add Current', exact: true })).toBeFocused()
   await shortcut(page, 'Logging', 'top bar').click()
@@ -366,6 +367,7 @@ test('keyboard transfer enters an empty area, reveals the target and owns Escape
   await navigation(page)
   await remove(page, 'Analytics', 'menu')
   await remove(page, 'Logging', 'menu')
+  await remove(page, 'Extensions', 'menu')
   await shortcut(page, 'Current', 'top bar').press('Space')
   const controller = page.locator('[data-keyboard]')
   await expect(controller).toBeFocused()
@@ -407,7 +409,7 @@ test('drop write failure restores both areas, exposes the error, and recovers on
   await before(page, shortcut(page, 'Current', 'top bar'))
   await page.mouse.up()
   await expect(status(page)).toHaveText('Navigation was not saved: Storage is full')
-  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging'])
+  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging', 'Extensions'])
   await expect(page.locator('#top-nav .nav-item')).toHaveText(views.slice(0, 7))
   await expect(shortcut(page, 'Logging', 'menu')).toBeFocused()
   await expect(page.locator('.st-navigation-ghost, .st-navigation-gap')).toHaveCount(0)
@@ -417,7 +419,7 @@ test('drop write failure restores both areas, exposes the error, and recovers on
   await beginDrag(page, shortcut(page, 'Logging', 'menu'))
   await before(page, shortcut(page, 'Current', 'top bar'))
   await page.mouse.up()
-  await expect(rows(page, 'menu')).toHaveText(['Analytics'])
+  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Extensions'])
   await expect(page.locator('#top-nav .nav-item').first()).toHaveText('Logging')
   await expect(page.locator('html')).toHaveAttribute('data-navigation-events', '1')
 })
@@ -453,7 +455,7 @@ for (const operation of ['write', 'remove', 'clear'] as const) test(`external ${
     await expect(page.getByRole('button', { name: 'Add Current', exact: true })).toBeFocused()
   } else {
     expect(await saved(page)).toBeNull()
-    await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging'])
+    await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging', 'Extensions'])
   }
 })
 
@@ -497,7 +499,7 @@ for (const reduced of [false, true]) test(`drag geometry and motion remain usabl
   else await expect(page.locator('.st-navigation-row[data-motion-running]')).not.toHaveCount(0)
   await page.screenshot({ path: info.outputPath(`navigation-held-${reduced ? 'reduced' : 'normal'}.png`) })
   await page.mouse.up()
-  await expect(rows(page, 'menu')).toHaveText(['Logging', 'Analytics'])
+  await expect(rows(page, 'menu')).toHaveText(['Logging', 'Analytics', 'Extensions'])
   await settled(page)
   await expect(page.locator('.st-navigation-row[data-motion-running]')).toHaveCount(0)
 })
@@ -508,8 +510,8 @@ for (const [width, fontSize, theme] of [[320, 32, 'light'], [420, 20, 'dark'], [
   await page.evaluate(({ fontSize, theme }) => { document.documentElement.style.fontSize = `${fontSize}px`; document.documentElement.dataset.theme = theme }, { fontSize, theme })
   await navigation(page)
   for (const name of views) for (const surface of ['menu', 'top bar'] as const) await add(page, name, surface)
-  await expect(rows(page, 'menu')).toHaveCount(9)
-  await expect(rows(page, 'topBar')).toHaveCount(9)
+  await expect(rows(page, 'menu')).toHaveCount(10)
+  await expect(rows(page, 'topBar')).toHaveCount(10)
   for (const name of ['Remove Logging from menu', 'Remove Logging from top bar', 'Add Logging', 'Restore defaults']) {
     const button = page.getByRole('button', { name, exact: true })
     await button.scrollIntoViewIfNeeded()
@@ -520,7 +522,7 @@ for (const [width, fontSize, theme] of [[320, 32, 'light'], [420, 20, 'dark'], [
   expect(await settingsBody(page).evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1)
   await page.screenshot({ path: info.outputPath(`navigation-full-${width}-${theme}.png`) })
   await page.getByRole('button', { name: 'Restore defaults', exact: true }).click()
-  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging'])
+  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging', 'Extensions'])
 })
 
 test('native touch scrolls content, drags through the gutter and taps close without picking up', async ({ page, browser, browserName }, info) => {
@@ -620,7 +622,7 @@ test('native touch scrolls content, drags through the gutter and taps close with
     const destination = (await shortcut(page, 'Analytics', 'menu').boundingBox())!
     await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: point(destination.x + 20, destination.y + 3) })
     await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
-    await expect(rows(page, 'menu')).toHaveText(['Logging', 'Analytics'])
+    await expect(rows(page, 'menu')).toHaveText(['Logging', 'Analytics', 'Extensions'])
     const originTap = (await shortcut(page, 'Logging', 'menu').boundingBox())!
     await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: point(originTap.x + 20, originTap.y + 15) })
     await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
@@ -741,7 +743,7 @@ test('failed addition keeps the initiating choice focused and reset aborts a key
   await expect(reset).toBeFocused()
   await expect(status(page)).toHaveText('Navigation reset.')
   await expect(page.locator('.st-navigation-ghost, .st-navigation-gap')).toHaveCount(0)
-  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging'])
+  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging', 'Extensions'])
 })
 
 for (const mode of ['pointer', 'click'] as const) test(`${mode} pickup keeps Escape inside Settings before idle dismissal`, async ({ page }) => {
@@ -805,7 +807,7 @@ for (const failure of ['corrupt', 'unreadable'] as const) test(`${failure} prefe
   await navigation(page)
   await page.evaluate(() => document.documentElement.setAttribute('data-navigation-read-recovered', ''))
   await page.getByRole('button', { name: 'Restore defaults', exact: true }).click()
-  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging'])
+  await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging', 'Extensions'])
   await expect(page.locator('#top-nav .nav-item')).toHaveText(views.slice(0, 7))
   expect(JSON.parse((await saved(page))!).menuOrder.slice(0, 2)).toEqual(['analytics', 'logging'])
   await page.locator('#menu-toggle').click()
@@ -823,7 +825,7 @@ test('native tap transfers exclude an existing destination copy from insertion i
   await shortcut(page, 'Current', 'menu').press('Space')
   await page.locator('[data-keyboard]').press('Home')
   await page.locator('[data-keyboard]').press('Enter')
-  await expect(rows(page, 'menu')).toHaveText(['Current', 'Analytics', 'Logging'])
+  await expect(rows(page, 'menu')).toHaveText(['Current', 'Analytics', 'Logging', 'Extensions'])
   const client = await page.context().newCDPSession(page)
   const tap = async (target: Locator, y: number) => {
     await target.scrollIntoViewIfNeeded()
@@ -835,7 +837,7 @@ test('native tap transfers exclude an existing destination copy from insertion i
     await client.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 })
     await tap(shortcut(page, 'Current', 'top bar'), 15)
     await tap(shortcut(page, 'Analytics', 'menu'), 3)
-    await expect(rows(page, 'menu')).toHaveText(['Current', 'Analytics', 'Logging'])
+    await expect(rows(page, 'menu')).toHaveText(['Current', 'Analytics', 'Logging', 'Extensions'])
     await expect(shortcut(page, 'Current', 'top bar')).toHaveCount(0)
     await add(page, 'Current', 'top bar')
     await shortcut(page, 'Current', 'top bar').press('Space')
@@ -844,6 +846,6 @@ test('native tap transfers exclude an existing destination copy from insertion i
     await tap(shortcut(page, 'Current', 'menu'), 15)
     await tap(shortcut(page, 'Swarm', 'top bar'), 3)
     await expect(rows(page, 'topBar')).toHaveText(views.slice(0, 7))
-    await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging'])
+    await expect(rows(page, 'menu')).toHaveText(['Analytics', 'Logging', 'Extensions'])
   } finally { await client.detach() }
 })

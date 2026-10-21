@@ -10,6 +10,7 @@ import { initSettings, openSettingsPanel, openSettingsAt, closeSettingsPanel, is
 import { initMenu } from './menu'
 import { initAnalyticsView, prepareAnalyticsView, stopAnalyticsRefresh } from './views/analytics-view'
 import { initLoggingView, refreshLoggingView, stopLoggingRefresh } from './views/logging-view'
+import { finishExtensionSignIn, initExtensionsView, stopExtensionsRefresh } from './views/extensions-view'
 import { loggingCallId, loggingHref, type LoggingLink } from './logging'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
 import { initCurrentView, stopCurrentPolling } from './views/current-view'
@@ -43,13 +44,14 @@ const viewSnippetsEl = document.getElementById('view-snippets')!
 const viewEditorEl = document.getElementById('view-editor')!
 const viewAnalyticsEl = document.getElementById('view-analytics')!
 const viewLoggingEl = document.getElementById('view-logging')!
+const viewExtensionsEl = document.getElementById('view-extensions')!
 
 const visitedViews = new WeakSet<HTMLElement>()
 
-type ViewSlug = 'main' | 'current' | 'swarm' | 'chat' | 'behaviors' | 'snippets' | 'editor' | 'analytics' | 'logging'
+type ViewSlug = 'main' | 'current' | 'swarm' | 'chat' | 'behaviors' | 'snippets' | 'editor' | 'analytics' | 'logging' | 'extensions'
 
 function showView(v: ViewSlug) {
-  const all = [viewMainEl, viewCurrentEl, viewSwarmEl, viewChatEl, viewBehaviorsEl, viewSnippetsEl, viewEditorEl, viewAnalyticsEl, viewLoggingEl]
+  const all = [viewMainEl, viewCurrentEl, viewSwarmEl, viewChatEl, viewBehaviorsEl, viewSnippetsEl, viewEditorEl, viewAnalyticsEl, viewLoggingEl, viewExtensionsEl]
   if (v !== 'logging') {
     const url = new URL(location.href)
     if (url.searchParams.get('view') === 'logging') {
@@ -66,6 +68,7 @@ function showView(v: ViewSlug) {
     : v === 'snippets'  ? viewSnippetsEl
     : v === 'analytics' ? viewAnalyticsEl
     : v === 'logging'   ? viewLoggingEl
+    : v === 'extensions' ? viewExtensionsEl
     :                     viewEditorEl
 
   // Polling stays attached across view changes — every view that has
@@ -101,6 +104,8 @@ function showView(v: ViewSlug) {
   // Analytics' quota refresh and midnight re-read stop with the view.
   if (v !== 'analytics') stopAnalyticsRefresh()
   if (v !== 'logging') stopLoggingRefresh()
+  // Extensions follows background checks while shown, and its details panel belongs to it.
+  if (v !== 'extensions') stopExtensionsRefresh()
   // Chat keeps its socket (a running turn keeps being mirrored) but stops
   // the per-second tick and parks the composer draft.
   if (v !== 'chat') stopChatRefresh()
@@ -120,6 +125,7 @@ function showView(v: ViewSlug) {
   else if (v === 'snippets')  initSnippetsView()
   else if (v === 'analytics') initAnalyticsView()
   else if (v === 'logging')   initLoggingView()
+  else if (v === 'extensions') initExtensionsView()
   else                        initEditorView()
 
   for (const el of all) {
@@ -195,15 +201,19 @@ watchForUpdates()
 watchForSignOut()
 
 ;(async () => {
+  // An Extensions sign-in comes back to /extensions/oauth?code&state. Finish
+  // it before anything else reads that query: Google's return looks the same.
+  const extensionsReturned = await finishExtensionSignIn()
   const initialView = menu.currentView()
   const query = new URLSearchParams(location.search)
   const logging = query.get('view') === 'logging'
-  const googleReturning = query.has('google_state') || (query.has('state') && (query.has('code') || query.has('error')))
+  const googleReturning = !extensionsReturned && (query.has('google_state') || (query.has('state') && (query.has('code') || query.has('error'))))
   // Personal views open independently; a Google return must restore its draft first.
-  const openedEarly = !logging && !googleReturning && (initialView === 'editor' || initialView === 'snippets' || initialView === 'chat')
+  const openedEarly = !logging && !googleReturning && !extensionsReturned && (initialView === 'editor' || initialView === 'snippets' || initialView === 'chat')
   if (openedEarly) showView(initialView)
   const [googleReturned] = await Promise.all([finishGoogleConnection(), loadSettings()])
   if (googleReturned === 'publish') menu.switchTo('editor')
+  else if (extensionsReturned) menu.switchTo('extensions')
   else if (logging) menu.switchTo('logging')
   else if (!openedEarly || menu.currentView() !== initialView) showView(menu.currentView())
   prepareAnalyticsView()

@@ -36,6 +36,7 @@ import type { ChatEvent, ContentBlock, PlanEntry, PromptInput, StopReason, ToolK
 import { RpcError, StdioRpc } from '../rpc'
 import { AdapterError } from './types'
 import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, PermissionRequest, TurnResult } from './types'
+import { forCodex, type Skipped } from '../../extensions/types'
 import pkg from '../../../package.json'
 
 const AGENT = 'codex' as const
@@ -891,6 +892,7 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
 
     async start(options: AdapterStartOptions): Promise<AdapterStartResult> {
       safeMode = options.safeMode === true
+      let skipped: Skipped[] = []
       if (child) throw new AdapterError(AGENT, `${LABEL} adapter already started`, 'protocol')
       try {
         await launch()
@@ -908,12 +910,15 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
         effort = chooseEffort(model, options.effort)
         efforts = model.supportedReasoningEfforts.map((option) => option.reasoningEffort)
 
+        const extensions = forCodex(options.mcpServers ?? [])
+        skipped = extensions.skipped
+        const mcp = Object.keys(extensions.config).length ? { config: extensions.config } : {}
         let thread: v2.Thread
         if (options.resume) {
-          const response = await call<'thread/resume', v2.ThreadResumeResponse>('thread/resume', { threadId: options.resume, excludeTurns: true, approvalPolicy: safeMode ? 'on-request' : 'never', sandbox: 'danger-full-access' }, { timeoutMs: 60_000 })
+          const response = await call<'thread/resume', v2.ThreadResumeResponse>('thread/resume', { threadId: options.resume, excludeTurns: true, approvalPolicy: safeMode ? 'on-request' : 'never', sandbox: 'danger-full-access', ...mcp }, { timeoutMs: 60_000 })
           thread = response.thread
         } else if (options.forkFrom) {
-          const response = await call<'thread/fork', v2.ThreadForkResponse>('thread/fork', { threadId: options.forkFrom, excludeTurns: true, approvalPolicy: safeMode ? 'on-request' : 'never', sandbox: 'danger-full-access' }, { timeoutMs: 60_000 })
+          const response = await call<'thread/fork', v2.ThreadForkResponse>('thread/fork', { threadId: options.forkFrom, excludeTurns: true, approvalPolicy: safeMode ? 'on-request' : 'never', sandbox: 'danger-full-access', ...mcp }, { timeoutMs: 60_000 })
           thread = response.thread
         } else {
           const response = await call<'thread/start', v2.ThreadStartResponse>('thread/start', {
@@ -922,6 +927,7 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
             sandbox: 'danger-full-access',
             model: modelId,
             ephemeral: false,
+            ...mcp,
           }, { timeoutMs: 60_000 })
           thread = response.thread
         }
@@ -930,7 +936,7 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
         if (error instanceof AdapterError) throw error
         throw new AdapterError(AGENT, `${LABEL} failed to start: ${error instanceof Error ? error.message : String(error)}`, 'start_failed')
       }
-      return { nativeSessionId: threadId, capabilities: CAPABILITIES, modelId, effort, efforts }
+      return { nativeSessionId: threadId, capabilities: CAPABILITIES, modelId, effort, efforts, ...(skipped.length ? { mcpSkipped: skipped } : {}) }
     },
 
     async prompt(turnId, input, signal): Promise<TurnResult> {
