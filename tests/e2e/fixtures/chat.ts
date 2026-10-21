@@ -1,6 +1,6 @@
 import type { ChatSwitches } from '../../../src/chat-switches'
 import { expect, type Page, type WebSocketRoute } from '@playwright/test'
-import type { ChatEnvelope, ChatEvent, ClientFrame, SessionRecord } from '../../../server/chat/protocol'
+import type { ChatEnvelope, ChatEvent, ClientFrame, SessionRecord, SwitchboardState } from '../../../server/chat/protocol'
 
 // The Chat view against a scripted server: REST through page.route, the
 // socket through page.routeWebSocket. The mock says hello, acks every frame
@@ -34,8 +34,18 @@ const AGENTS: { agents: unknown[], defaults: { model: string, fallback: string, 
   settings: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 },
 }
 
+/** The Switchboard as the server reports it; never started unless a test says so. */
+function switchboardState(overrides: Partial<SwitchboardState> = {}): SwitchboardState {
+  return { revision: 1, status: 'off', sessionId: null, sessionStatus: null, model: 'muse-spark-1.3-contributor-max', error: null,
+    checking: false, lastCheckAt: null, lastCheckTokens: null, nextCheckAt: null, chats: 0, items: [], ...overrides }
+}
+
 interface ServerState {
   serverStartedAt?: string
+  switchboard?: SwitchboardState
+  switchboardStart?: () => { status: number, json: unknown }
+  switchboardAnswer?: (id: number, body: { optionId: string } | { text: string }) => SwitchboardState
+  switchboardExplain?: (id: number) => SwitchboardState
   switches?: ChatSwitches
   sessions: SessionRecord[]
   history: Record<string, ChatEnvelope[]>
@@ -57,6 +67,18 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     if (path === '/api/settings') {
       if (method === 'POST') state.settings = { ...state.settings, ...(body as object) }
       await route.fulfill({ json: state.settings })
+      return
+    }
+    if (path === '/api/chat/switchboard' || path.startsWith('/api/chat/switchboard/')) {
+      const board = state.switchboard ?? switchboardState()
+      const item = /\/items\/(\d+)\/(answer|explain)$/.exec(path)
+      if (path.endsWith('/start') && state.switchboardStart) { const answer = state.switchboardStart(); await route.fulfill({ status: answer.status, json: answer.json }); return }
+      if (item?.[2] === 'answer' && state.switchboardAnswer) { await route.fulfill({ json: state.switchboardAnswer(Number(item[1]), body as { optionId: string } | { text: string }) }); return }
+      if (item?.[2] === 'explain' && state.switchboardExplain) { await route.fulfill({ json: state.switchboardExplain(Number(item[1])) }); return }
+      if (path.endsWith('/check')) { await route.fulfill({ json: { queued: false, reason: 'nothing changed', state: board } }); return }
+      if (path.endsWith('/off')) { state.switchboard = switchboardState({ revision: board.revision + 1, items: board.items }); await route.fulfill({ json: state.switchboard }); return }
+      if (path.endsWith('/restart')) { state.switchboard = { ...board, revision: board.revision + 1, status: 'live', error: null }; await route.fulfill({ json: state.switchboard }); return }
+      await route.fulfill({ json: board })
       return
     }
     if (path === '/api/models') { await route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } }); return }
@@ -216,4 +238,4 @@ function makeState(sessions: SessionRecord[], history: Record<string, ChatEnvelo
 const input = (page: Page) => page.locator('.chat-v-composer .chat-input')
 
 
-export { NOW, AGENTS, session, installRoutes, installSocket, env, makeState, input }
+export { NOW, AGENTS, session, installRoutes, installSocket, env, makeState, input, switchboardState }

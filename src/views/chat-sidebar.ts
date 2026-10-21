@@ -5,6 +5,8 @@ const STATE_KEY = 'poise-chat-sidebar'
 const DEFAULT_WIDTH = 260
 const MIN_WIDTH = 200
 const MAX_WIDTH = 480
+/** The chat's own floor while panes dock beside it. */
+export const CHAT_MIN_WIDTH = 320
 
 function stored(key: string): string | null {
   try { return localStorage.getItem(key) } catch { return null }
@@ -27,10 +29,12 @@ export function attachChatSidebar(view: HTMLElement, onLayout: () => void): { ca
     sidebar.style.flexBasis = `${Math.max(0, pixels)}px`
     sidebar.style.width = `${Math.max(0, pixels)}px`
   }
+  // Docked panes on the right take their width from the chat, not the overlay ones.
+  const docked = () => [view.querySelector<HTMLElement>('.chat-memories-pane'), view.querySelector<HTMLElement>('.chat-switchboard-pane')]
+    .filter((pane): pane is HTMLElement => !!pane)
   const bounds = () => {
-    const memories = view.querySelector<HTMLElement>('.chat-memories-pane')
-    const occupied = memories && getComputedStyle(memories).position !== 'absolute' ? memories.getBoundingClientRect().width : 0
-    const max = Math.max(160, Math.min(MAX_WIDTH, layout.clientWidth - occupied - 320))
+    const occupied = docked().reduce((sum, pane) => getComputedStyle(pane).position !== 'absolute' ? sum + pane.getBoundingClientRect().width : sum, 0)
+    const max = Math.max(160, Math.min(MAX_WIDTH, layout.clientWidth - occupied - CHAT_MIN_WIDTH))
     return { min: Math.min(MIN_WIDTH, max), max }
   }
   function resize(next = preferred): void {
@@ -110,8 +114,7 @@ export function attachChatSidebar(view: HTMLElement, onLayout: () => void): { ca
   // pane without replacing its saved preferred width. Returning restores it.
   const observer = new ResizeObserver(() => { resize(); onLayout() })
   observer.observe(layout)
-  const memories = view.querySelector<HTMLElement>('.chat-memories-pane')
-  if (memories) observer.observe(memories)
+  for (const pane of docked()) observer.observe(pane)
   resize()
   setCollapsed(collapsed, false)
   return { cancelResize }

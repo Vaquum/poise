@@ -356,6 +356,12 @@ computer.
   and explicit issue/PR ownership persist in the workspace's SQLite store.
   Dispatch pauses while draining; running monitor reads join the existing
   background-work barrier. See [Chat orchestration](Chat-orchestration.md).
+- The Switchboard pane's actions (`POST /api/chat/switchboard/…`) act for the
+  owner, so they also require an `Origin`, checked as below. A loopback
+  request without one, such as a native chat's `api` operation, is refused
+  with 403; in service mode only a request admitted with the gateway's
+  assertion qualifies. Reading `GET /api/chat/switchboard` keeps the ordinary
+  rules. See [Switchboard](Switchboard.md).
 - Non-loopback requests need a valid assertion with the right scope: API
   routes, static assets and the page itself alike. The assertion header is
   removed before any check, so Poise never echoes, logs or forwards it.

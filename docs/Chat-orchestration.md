@@ -77,6 +77,43 @@ statuses and a reference to the saved supervision instruction and bindings.
 They cannot stop delivery to other chats. Work notices are bounded likewise;
 the owner must inspect complete evidence before acting on a truncated notice.
 
+## The Switchboard
+
+The [Switchboard](Switchboard.md) is a chat Poise runs as an observer for the
+Switchboard pane. Every turn's control context carries its brief in place of
+the worker guidance above. It may call only `help`, `list`, `read` and `inbox`,
+plus six operations that return 403 for every other chat:
+
+| Operation | Input | Result |
+| --- | --- | --- |
+| `switchboard.read` | `sessionId`, `afterSeq`, optional `throughSeq` | The chat condensed: prompts, merged replies, tool calls with their outcome, edits, questions, permissions, resolutions, turn ends and errors, within about 64 KiB; continue from `nextSeq` while `truncated` |
+| `switchboard.items` | `sessionId` | Its ten newest updates about that chat, and whether each decision is open, answered or settled |
+| `switchboard.post` | `sourceSessionId`, `sourceSeq`, `kind` (`progress`, `blocked`, `done` or `decision`), `text` (one line, 240 characters), optional `detail` (600); a decision adds 0–4 `options` with a unique `label` (80), optional `detail` (200) and at most one `recommended` | `itemId`; the same source event and kind again returns the first item with `duplicate: true` |
+| `switchboard.resolve` | `itemId`, `reason` | Settles an open decision that was answered in its own chat |
+| `switchboard.explain` | `itemId`, `changed`, `matters`, `uncertain` | Answers the person's Explain request for that item |
+| `switchboard.checked` | `checkId` | Finishes a check and moves each listed chat's read position to the end of its range |
+
+`switchboard.read` and `switchboard.items` change nothing and need no
+`requestId`. A post's source event must still be in the chat's transcript, and
+a question or permission the chat asked natively is posted as `blocked`, never
+as a decision. Open decisions are capped at five a chat and fifty a workspace.
+
+`create`, `send`, `steer`, `answer`, `bind`, `unbind`, `supervise`,
+`unsupervise` and `stop` return 403 for it, before any receipt is recorded;
+so do `send`, `steer`, `answer`, `stop` and `supervise` aimed at it by any
+other chat. Like every chat, the Switchboard runs as the workspace's
+operating-system user and can reach the loopback APIs, so this narrows the
+control interface; it is not a sandbox. Its reports are accepted while Poise
+drains, since they start no work.
+
+The person's answers from the pane are not the Switchboard's messages. Poise
+records each answer once and delivers it to the chat that asked, through the
+same inbox and idle-boundary dispatch, headed "[Poise message N: the person's
+answer, given in the Switchboard pane and relayed by Poise]" rather than as
+source data; every chat's control context says that only Poise sends that
+header. The pane's actions require a browser Origin, which the `api`
+operation never sends, so no chat can answer through Poise's API.
+
 ## Issue and PR ownership
 
 Bind only work the chat is actually carrying out. Reading a URL or transcript

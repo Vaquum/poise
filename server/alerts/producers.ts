@@ -13,6 +13,7 @@ import { materialFailureCause } from '../../gateway/src/diagnostics/material-cau
 import { CONNECTED_ACCOUNTS_PATH, GITHUB_AUTOMATION_SIGN_IN_TITLE, type AccountId, type ConnectedAccount } from '../accounts/types'
 import type { ClaudeAuthStatus } from '../claude-auth'
 import type { StopReason } from '../chat/protocol'
+import { isSwitchboardSession } from '../chat/switchboard-store'
 import { isServiceMode } from '../service/config'
 import { openAlerts, raiseAlert, resolveAlert, type AlertTarget } from './store'
 
@@ -222,11 +223,12 @@ export function chatWaitingEnded(sessionId: string): void {
 }
 
 /** A Chat turn finished. Only a turn that ran longer than two minutes alerts,
- *  and a turn the person stopped does not. */
+ *  and neither a turn the person stopped nor the Switchboard's finished checks do. */
 export function chatTurnFinished(session: ChatSessionAlertContext, turn: { id: string, stopReason: StopReason, durationMs: number }): void {
   if (turn.stopReason === 'cancelled' || turn.durationMs <= LONG_CHAT_TURN_MS) return
   const finished = turn.stopReason === 'end_turn'
-  record(`the finished-turn alert for Chat turn ${turn.id}`, () => raiseAlert({
+  // Inside record: a failed lookup is logged, never thrown at the turn.
+  record(`the finished-turn alert for Chat turn ${turn.id}`, () => finished && isSwitchboardSession(session.sessionId) ? undefined : raiseAlert({
     kind: 'chat_turn_finished',
     dedupeKey: `chat-turn-finished:${turn.id}`,
     title: finished ? `${session.agent} finished` : `${session.agent} stopped early`,

@@ -20,7 +20,7 @@ import { STATUS_CODES, type IncomingMessage, type Server, type ServerResponse } 
 import type { Duplex } from 'node:stream'
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer, WebSocket } from 'ws'
-import { ATTACHMENT_MAX_BYTES, HttpError, enforceApiRequest, httpStatus, readBuffer, readJson, type ApiRequestPolicy } from '../http'
+import { ATTACHMENT_MAX_BYTES, HttpError, enforceApiRequest, httpStatus, readBuffer, readJson, type ApiRequestPolicy, type RequestAuthority } from '../http'
 import { SELF_UPDATE_OFF, SERVICE_MODE_CODE } from '../service/turned-off'
 import { runFile } from '../process'
 import { handleGhBody } from '../gh'
@@ -31,6 +31,7 @@ import { ChatError, type ChatRuntime } from './runtime'
 import * as storage from './storage'
 import { executeCommandOnce } from './command-receipts'
 import { clientEnvelope } from './event-preview'
+import { SWITCHBOARD_CHAT_COMMANDS, SWITCHBOARD_PATH, type Switchboard } from './switchboard'
 
 const MAX_CONNECTION_COMMANDS = 64
 const REPLAY_BATCH = 100
@@ -93,13 +94,18 @@ export class ChatSocketServer {
       connection.replays.delete(sessionId)
     }
   }
+  // Every open Chat view hears of it; the pane reads the state over REST.
+  private readonly onSwitchboard = (revision: number) => {
+    for (const connection of this.connections) this.send(connection, { kind: 'switchboard.updated', revision })
+  }
 
-  constructor(private readonly runtime: ChatRuntime, private readonly policy: ApiRequestPolicy = {}) {
+  constructor(private readonly runtime: ChatRuntime, private readonly policy: ApiRequestPolicy = {}, private readonly switchboard?: Switchboard) {
     this.wss = new WebSocketServer({ noServer: true, maxPayload: CHAT_LIMITS.frameBytes, perMessageDeflate: false })
     runtime.on('switches', this.onSwitches)
     snippetLibraryEvents.on('changed', this.onSwitches)
     runtime.on('event', this.onEvent)
     runtime.on('deleted', this.onDeleted)
+    runtime.on('switchboard', this.onSwitchboard)
   }
 
   /** Attach to an HTTP server's upgrade event. Other upgrades (Vite HMR)
@@ -200,6 +206,11 @@ export class ChatSocketServer {
 
   private async execute(connection: Connection, command: ChatCommand): Promise<unknown> {
     const runtime = this.runtime
+    const target = 'sessionId' in command ? command.sessionId : 'id' in command ? command.id : undefined
+    // Poise runs the Switchboard chat; the person only follows it and answers what it asks.
+    if (typeof target === 'string' && this.switchboard?.isSwitchboard(target) && !SWITCHBOARD_CHAT_COMMANDS.has(command.type)) {
+      throw new ChatError(409, 'Poise runs the Switchboard chat; use the Switchboard pane', 'invalid')
+    }
     switch (command.type) {
       case 'switch.create':
         return { catalogue: await runtime.createSwitch(command) }
@@ -320,6 +331,7 @@ export class ChatSocketServer {
     clearInterval(this.libraryPoll)
     this.runtime.off('event', this.onEvent)
     this.runtime.off('deleted', this.onDeleted)
+    this.runtime.off('switchboard', this.onSwitchboard)
     for (const [server, listener] of this.upgrades) server.off('upgrade', listener)
     this.upgrades.clear()
     this.closing = new Promise<void>(resolve => {
@@ -372,11 +384,25 @@ export async function listFiles(checkout: string, query: string): Promise<string
   return out
 }
 
-/** Handle /api/chat/* routes; returns false when the url is not ours. */
-export async function handleChatApi(req: IncomingMessage, res: ServerResponse, url: string, runtime: ChatRuntime): Promise<boolean> {
+/** Whether a request speaks for the person: a browser's request carries
+ *  Origin (checked against the host by enforceApiRequest); the control
+ *  command's api operation sends none. In service mode it must also have come
+ *  through the gateway. A local process can still forge the header: this keeps
+ *  cooperating agents out, it is not a security boundary. */
+export function speaksForPerson(req: IncomingMessage, service: boolean, authority: RequestAuthority): boolean {
+  return !!req.headers.origin && (!service || authority.kind === 'gateway')
+}
+
+/** Handle /api/chat/* routes; returns false when the url is not ours.
+ *  `person`: the request has the person's authority (see Switchboard.handle). */
+export async function handleChatApi(req: IncomingMessage, res: ServerResponse, url: string, runtime: ChatRuntime, switchboard?: Switchboard, person = true): Promise<boolean> {
   const path = url.split('?')[0]
   const query = new URLSearchParams(url.split('?')[1] || '')
   if (!path.startsWith('/api/chat/')) return false
+  if (switchboard && (path === SWITCHBOARD_PATH || path.startsWith(`${SWITCHBOARD_PATH}/`))) {
+    await switchboard.handle(req, res, path, person)
+    return true
+  }
   try {
     if (path === '/api/chat/switches') {
       if (req.method === 'GET') return json(res, 200, (await readSkillSnippets()).skills), true
@@ -453,6 +479,9 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
     const match = path.match(/^\/api\/chat\/sessions\/([0-9a-f-]{36})(?:\/([a-z]+))?$/)
     if (match) {
       const [, id, action] = match
+      if (switchboard?.isSwitchboard(id) && (req.method === 'PATCH' || ['fork', 'handoff', 'close'].includes(action ?? ''))) {
+        throw new ChatError(409, 'Poise runs the Switchboard chat; use the Switchboard pane', 'invalid')
+      }
       if (!action && req.method === 'GET') {
         const session = runtime.get(id)
         if (!session) throw new ChatError(404, 'unknown session', 'unknown_session')

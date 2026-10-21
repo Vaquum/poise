@@ -46,7 +46,8 @@ import { retryFailedPrReviews } from './behaviors'
 import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders, type RequestAuthority } from './http'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
-import { ChatSocketServer, handleChatApi } from './chat/transport'
+import { ChatSocketServer, handleChatApi, speaksForPerson } from './chat/transport'
+import { Switchboard } from './chat/switchboard'
 import { getChatSettings } from './settings'
 import { buildIdentity } from './build-identity'
 import { setCallerAccounts } from './process'
@@ -99,6 +100,7 @@ export interface CachePluginOptions {
 // servers' sessions and two different databases never mix.
 let chatRuntime: ChatRuntime | null = null
 let chatControl: ChatControl | null = null
+let chatSwitchboard: Switchboard | null = null
 let chatSockets: ChatSocketServer | null = null
 let terminalSockets: TerminalSocketServer | null = null
 // Service mode only: Connected accounts read on a schedule, for their alerts.
@@ -193,10 +195,12 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       },
       extensions: runtimeExtensions,
     })
-    chatControl = new ChatControl(chatRuntime)
+    // Before recovery, so it sees the turns a restart cut.
+    chatSwitchboard = new Switchboard(chatRuntime)
+    chatControl = new ChatControl(chatRuntime, { switchboard: chatSwitchboard })
     addDiagnosticSecrets(secretValues)
     chatRuntime.on('log', (line: string) => console.log(redactSecrets(line)))
-    chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service })
+    chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service }, chatSwitchboard)
     terminalSockets = new TerminalSocketServer({ allowedHosts: opts.allowedHosts, service }, { command: opts.terminalCommand })
     // A login may have just changed an account. Claude's sign-in also gates
     // Claude-backed work, so it is verified now instead of at the next poll.
@@ -218,7 +222,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     } else {
       selfUpdate = new SelfUpdateService(chatRuntime, bridge)
     }
-    void chatRuntime.recover().then(() => chatControl?.start()).catch((error: unknown) => {
+    void chatRuntime.recover().then(() => { chatControl?.start(); chatSwitchboard?.start() }).catch((error: unknown) => {
       console.error('[chat] startup reconciliation failed:', error)
     })
   }
@@ -233,6 +237,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   activeClaudeAuthRuntimes.clear()
   const chatStop = chatRuntime?.stop() ?? Promise.resolve()
   const controlStop = chatControl?.stop(chatStop) ?? Promise.resolve()
+  const switchboardStop = chatSwitchboard?.stop() ?? Promise.resolve()
   const socketStop = chatSockets?.close() ?? Promise.resolve()
   const terminalStop = terminalSockets?.close() ?? Promise.resolve()
   stopAccountsCheck?.()
@@ -245,13 +250,14 @@ export async function stopPoiseRuntime(): Promise<void> {
   setCallerAccounts(null)
   chatRuntime = null
   chatControl = null
+  chatSwitchboard = null
   chatSockets = null
   terminalSockets = null
   selfUpdate = null
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), controlStop, chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
   await stopBehaviorLedger()
   await stopLoggingApi()
   await stopLogging()
@@ -914,7 +920,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // Handled before the legacy per-card chat below, whose matchers use
         // the exact `/api/chat` path or the `/api/chat-…` prefixes.
         if (url.startsWith('/api/chat/') && chatRuntime) {
-          if (await handleChatApi(req, res, url, chatRuntime)) return
+          if (await handleChatApi(req, res, url, chatRuntime, chatSwitchboard ?? undefined, speaksForPerson(req, !!service, authority))) return
         }
 
         // ── /api/chat — per-card long-lived chats via agent-interface ──

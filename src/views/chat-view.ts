@@ -33,6 +33,7 @@ import { reconcileSession } from '../chat-session-state'
 import { reserveQueuedMessage, releaseQueuedMessage } from '../chat-queue'
 import { createQueuePanel } from './chat-queue'
 import { createMemoriesPane } from './chat-memories'
+import { createSwitchboardPane, ICON_SWITCHBOARD } from './chat-switchboard'
 import { renderNewSessionDialog } from './chat-new-session'
 import {
   createModel, applyEvent, addOptimisticTurn, dropOptimisticTurns, focusedPending, createTranscriptView, pickQuestionOption,
@@ -88,6 +89,7 @@ let jev: ReturnType<typeof createJevWorkspace>
 let beforeJev: string | null = null
 let filePreview: ReturnType<typeof createFilePreview>
 let memories: ReturnType<typeof createMemoriesPane>
+let switchboard: ReturnType<typeof createSwitchboardPane>
 let memorySubmissions = 0
 let messageQueue: ReturnType<typeof createQueuePanel>
 let queueAddChain: Promise<void> = Promise.resolve()
@@ -262,6 +264,7 @@ function renderShell(): void {
       <div class="filter-cluster chat-view-controls">
         <button type="button" class="chat-icon-btn chat-sidebar-toggle" title="Toggle sessions" aria-label="Toggle sessions" aria-controls="chat-sessions-pane" aria-expanded="true" aria-pressed="true">${ICON_SIDEBAR}</button>
         <button type="button" class="chat-icon-btn chat-new-btn" title="New session" aria-label="New session">${ICON_PLUS}</button>
+        <button type="button" class="chat-icon-btn chat-switchboard-toggle" aria-label="Switchboard" aria-controls="chat-switchboard-pane" aria-expanded="false" aria-pressed="false" data-tooltip="Switchboard">${ICON_SWITCHBOARD}<span class="chat-switchboard-badge" aria-hidden="true" hidden></span></button>
         <span class="chat-conn" role="status" hidden></span>
       </div>
     </header>
@@ -398,8 +401,16 @@ function renderShell(): void {
 
   memories = createMemoriesPane(viewEl, queueRender)
   viewEl.querySelector('.chat-layout')!.append(memories.el)
+  switchboard = createSwitchboardPane(viewEl, viewEl.querySelector<HTMLButtonElement>('.chat-switchboard-toggle')!, {
+    openChat: id => { void openChatSession(id) },
+    onLayout: () => { composer.layout(); queueRender() },
+    // Floating, the two right-hand panes would stack: opening one closes the other.
+    onOpen: () => { if (switchboard.overlaid && memories.open) { memories.toggle(); renderHeader() } },
+  })
+  viewEl.querySelector('.chat-layout')!.append(switchboard.el)
   splitPane = attachChatSidebar(viewEl, () => { composer.layout(); queueRender() })
   memories.mount()
+  switchboard.mount()
   jev = createJevWorkspace(mainEl, viewEl.querySelector<HTMLElement>('.chat-sidebar')!, {
     activate(id) {
       if (!activeId?.startsWith('jev:')) {
@@ -418,7 +429,7 @@ function renderShell(): void {
       if (beforeJev && sessions.has(beforeJev)) void selectSession(beforeJev)
       else { activeId = null; composer.setDraft(freshDraft); composerStateFor(null); queueRender() }
     },
-    memories() { memories.toggle() },
+    memories() { toggleMemories() },
     async flushMemories() { await memories.editor.flush() },
   })
   attachSidebar()
@@ -575,12 +586,19 @@ function renderSidebar(): void {
   layout(listEl, () => patchContent(listEl, html, retire))
 }
 
+/** The Switchboard's own chat has its pane; a fork of it is an ordinary chat. */
+function listed(id: string): boolean {
+  const record = sessions.get(id)?.record
+  return record?.context?.kind !== 'switchboard' || !!record.forkedFrom
+}
+
 function sidebarHtml(): string {
-  if (!order.length) {
+  const visible = order.filter(listed)
+  if (!visible.length) {
     return '<div class="chat-empty chat-sidebar-empty">No sessions yet.</div>'
   }
   const records = order.map((id) => sessions.get(id)!.record)
-  return order.map((id) => {
+  return visible.map((id) => {
     const e = sessions.get(id)!
     const s = e.record
     const running = isRunning(s.status)
@@ -699,7 +717,8 @@ async function deleteSession(id: string): Promise<void> {
       composerStateFor(null)
       transcript.clear()
       composer.setDraft(freshDraft)
-      if (order[0]) void selectSession(order[0])
+      const next = order.find(listed)
+      if (next) void selectSession(next)
       else { composer.setDraft(freshDraft); setNotice(null) }
     }
     // The server reports what the delete actually did; only a Poise-local
@@ -1703,6 +1722,12 @@ async function toggleSafeMode(): Promise<void> {
   await update
 }
 
+/** Floating, the two right-hand panes would stack: opening Memories hides the Switchboard. */
+function toggleMemories(): void {
+  memories.toggle()
+  if (memories.open && switchboard.overlaid) switchboard.hide()
+}
+
 function memoriesButton(): string {
   const open = memories?.open ?? false
   const error = memories?.editor.state.error
@@ -1713,6 +1738,14 @@ function headerHtml(): string {
   const e = entry()
   if (!e) return `<div class="chat-h-row chat-h-fresh"><span class="chat-controls-spacer"></span>${reasoningButton()}${autoMergeButton(freshAutoMerge, !!quickSessionPromise || firstPromptPending)}${safeModeButton(freshSafeMode, !!quickSessionPromise || firstPromptPending)}${memoriesButton()}</div>`
   const s = e.record
+  // Poise runs the Switchboard's chat: it can be followed and its own questions
+  // answered, but its model, settings and messages are not the person's to change.
+  if (!listed(s.id)) {
+    return `<div class="chat-h-row"><span class="chat-pill chat-h-agent">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)}</span><span class="chat-h-model">${escapeHtml(s.model)}</span>`
+      + `<span class="chat-h-status" data-status="${s.status}">${escapeHtml(statusText(s))}</span><span class="chat-controls-spacer"></span>`
+      + `${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" title="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}</div>`
+      + '<div class="st-help st-help-info chat-observer-note">Poise runs this chat for the Switchboard pane. It takes no messages; answer here only what it asks you.</div>'
+  }
   const agent = agentFor(s.agent)
   const between = !isRunning(s.status) && s.status !== 'starting' && s.status !== 'closed'
   const models = agent?.models.map((m) => m.identity) || []
@@ -1782,7 +1815,7 @@ function attachHeader(): void {
   headerEl.addEventListener('click', (e) => {
     const t = e.target as HTMLElement
     if (t.closest('.chat-h-stop')) { void cancelTurn(); return }
-    if (t.closest('.chat-h-memories')) { memories.toggle(); renderHeader(); return }
+    if (t.closest('.chat-h-memories')) { toggleMemories(); renderHeader(); return }
     if (t.closest('.chat-h-safe-mode')) { void toggleSafeMode(); return }
     if (t.closest('.chat-h-reasoning')) {
       showReasoning = !showReasoning
@@ -1896,6 +1929,7 @@ function render(): void {
   if (jev?.visible) return
   renderHeader()
   const e = entry()
+  mainEl.classList.toggle('chat-observer', !!e && !listed(e.record.id))
   composerStateFor(e)
   renderQueue()
   // A deploy card is content too: the console must not lift over it.
@@ -2155,7 +2189,8 @@ export async function initChatView(): Promise<void> {
   if (restoreActive && !activeId && sessions.has(restoreActive) && dialogEl.hidden) await selectSession(restoreActive, true)
   // A handoff may have opened the New session dialog while the list loaded;
   // auto-selecting would close it.
-  if (!activeId && !quickSessionPromise && !composer.getDraft().text && order.length && dialogEl.hidden) await selectSession(order[0], true)
+  const first = order.find(listed)
+  if (!activeId && !quickSessionPromise && !composer.getDraft().text && first && dialogEl.hidden) await selectSession(first, true)
   void jev.init(); jev.resume()
   scheduleSelfPoll(0)
   queueRender()

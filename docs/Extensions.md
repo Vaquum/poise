@@ -109,6 +109,9 @@ receives the servers through its own protocol, never on a command line:
 | Grok | ACP `mcpServers` on `session/new` and `session/resume` | HTTP or SSE when its `initialize` does not advertise them |
 | Muse | `config.mcpServers` on `session/start` and `session/resume`, after asking for the `sessionMcp` capability | SSE; every server when Muse does not grant `sessionMcp`. A fork takes no configuration, so it resumes with the servers before its first turn |
 
+The [Switchboard](Switchboard.md)'s chat gets no servers: it reads other
+chats only through Poise.
+
 A server a chat does not get is never dropped silently. The chat shows a line
 naming it and why, once per change: it needs a sign-in, a secret is missing,
 the agent cannot take its transport, or the agent could not connect to it.

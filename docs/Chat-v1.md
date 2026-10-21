@@ -58,6 +58,11 @@ The fresh console has a 640 px maximum width, a taller writing area and a
 slightly elevated position. Its border uses a low-opacity neutral hairline,
 with no resting or focus shadow, in both light and dark themes.
 
+The Switchboard pane docks on the right, after Memories, and its button sits
+beside the sessions toggle with the mirrored icon. It opens at one third of the
+view, resizes from its left edge with snaps at one third and one half, and
+remembers its width as a share of the view. See [Switchboard](Switchboard.md).
+
 ## Transcript presentation and file links
 
 New session, Fork and Hand off use icon buttons with accessible labels and
@@ -117,7 +122,9 @@ kept, and the delete confirmation says which applies. Lock files are never
 deleted, and no server sweeps workspaces by its own session table: development
 and production share the chat root but keep separate session tables. A setting
 caps concurrently running Poise-local turns (default 4); a turn held by the
-cap shows `queued` with its own reason, "waiting for a free agent slot".
+cap shows `queued` with its own reason, "waiting for a free agent slot". The
+Switchboard's chat runs one turn at a time outside that cap, so it keeps
+reporting while every slot is busy.
 
 The checkout lease is shared by Poise development, Poise production and the
 compatible Caller writing behavior. Turns in different checkouts can run

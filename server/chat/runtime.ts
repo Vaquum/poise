@@ -87,6 +87,8 @@ const PROVIDER_AGENT: Record<string, AgentId> = { claude: 'claude', codex: 'code
 const AGENT_COMMAND: Record<AgentId, string> = { claude: 'claude', codex: 'codex', grok: 'grok', muse: 'muse' }
 const AGENT_LABEL: Record<AgentId, string> = { claude: 'Claude Code', codex: 'Codex', grok: 'Grok Build', muse: 'Muse' }
 const alertContext = (record: SessionRecord): ChatSessionAlertContext => ({ sessionId: record.id, agent: AGENT_LABEL[record.agent], title: record.title })
+/** The Switchboard's own chat (docs/Switchboard.md); a fork of it is an ordinary chat. */
+const isSwitchboardChat = (record: SessionRecord): boolean => record.context?.kind === 'switchboard' && !record.forkedFrom
 
 export const DEFAULT_IDLE_TIMEOUT_MINUTES = 120
 export const DEFAULT_BRANCH_PREFIX = 'chat/'
@@ -694,6 +696,16 @@ export class ChatRuntime extends EventEmitter {
     })
   }
 
+  /** A Poise-owned chat in its own scratch workspace, with no manager: the
+   *  Switchboard. Without Safe mode, so no one has to approve its reads. */
+  async createDetached(request: Pick<NewSessionRequest, 'model' | 'effort' | 'title' | 'context'>): Promise<SessionRecord> {
+    this.assertAcceptingWork()
+    return this.track(async () => {
+      const { agent } = await this.resolveModel(request.model, request.effort)
+      return this.createSession({ ...request, agent, deferStart: true, safeMode: false }, true)
+    })
+  }
+
   private async createSession(request: NewSessionRequest, isolated = false): Promise<SessionRecord> {
     if (this.stopped) throw new ChatError(503, 'the chat runtime is stopping', 'agent_error')
     if (request.deferStart !== undefined && typeof request.deferStart !== 'boolean') throw new ChatError(400, 'deferStart must be a boolean', 'invalid')
@@ -814,7 +826,8 @@ export class ChatRuntime extends EventEmitter {
         this.saveRecord(session)
       }
       signal.throwIfAborted()
-      const extensions = this.options.extensions ? await this.options.extensions.resolve(record) : null
+      // An observer reading untrusted transcripts gets no MCP servers.
+      const extensions = this.options.extensions && !isSwitchboardChat(record) ? await this.options.extensions.resolve(record) : null
       signal.throwIfAborted()
       const host = this.hostFor(session)
       const adapter = this.adapters[record.agent](host)
@@ -1804,7 +1817,7 @@ export class ChatRuntime extends EventEmitter {
       }
       // Extensions switched on, off or changed since the process started:
       // resume the same native session with the new set before this turn.
-      if (session.adapter?.alive && this.options.extensions && (await this.options.extensions.resolve(record)).fingerprint !== session.nativeExtensions) await this.stopProcess(session)
+      if (session.adapter?.alive && this.options.extensions && !isSwitchboardChat(record) && (await this.options.extensions.resolve(record)).fingerprint !== session.nativeExtensions) await this.stopProcess(session)
       if (!session.adapter?.alive) await this.startSession(session, { fresh: !record.nativeSessionId && !record.branch.baseSha && record.branch.provisional, ...(lease ? { lease } : {}) })
       let adapter = session.adapter!
       const isFirst = !storage.findEvent(record.id, (e) => e.type === 'turn.started')
@@ -1825,7 +1838,9 @@ export class ChatRuntime extends EventEmitter {
       this.setStatus(session, 'queued')
       // Poise-local turns share a bounded pool of agent slots; a turn past
       // the cap waits here with its own reason instead of starting an agent.
-      if (record.workspaceKind === 'poise-local') await this.acquireLocalTurnSlot(session, turn)
+      // The Switchboard's one observer turn stays outside it, so it still
+      // reports when every slot is busy.
+      if (record.workspaceKind === 'poise-local' && !isSwitchboardChat(record)) await this.acquireLocalTurnSlot(session, turn)
       // Created after the title settled: the label names what is queued behind.
       if (!lease) {
         lease = this.leaseFor(session)

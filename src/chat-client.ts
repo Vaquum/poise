@@ -25,6 +25,7 @@ import type {
   PoiseChangeAck,
   AutoMergeAck,
   SafeModeAck,
+  SwitchboardState,
 } from '../server/chat/protocol'
 import type { SelfChange, SelfUpdateStatus } from './self-update-types'
 import { parseMessageQueue } from './chat-queue'
@@ -92,6 +93,8 @@ export interface ChatClientEvents {
   /** The server's start time changed between hellos: it restarted, and the
    *  session list may have changed underneath us. */
   restart: () => void
+  /** The Switchboard's state changed; its pane reads it again. */
+  switchboard: (revision: number) => void
 }
 
 const BACKOFF_MIN_MS = 500
@@ -150,6 +153,7 @@ export class ChatClient {
     event: new Set(),
     connection: new Set(),
     restart: new Set(),
+    switchboard: new Set(),
   }
   /** Gap refills in flight, so one slow subscriber does not fan out fetches. */
   private refilling = new Set<string>()
@@ -288,6 +292,10 @@ export class ChatClient {
       case 'switches.updated': {
         const catalogue = parseChatSwitches(frame.catalogue)
         if (catalogue) for (const fn of this.listeners.switches) fn(catalogue)
+        return
+      }
+      case 'switchboard.updated': {
+        if (Number.isSafeInteger(frame.revision)) for (const fn of this.listeners.switchboard) fn(frame.revision)
         return
       }
       case 'session.created':
@@ -517,6 +525,40 @@ export class ChatClient {
 
   agents(): Promise<AgentsResponse> {
     return jsonFetch('/api/chat/agents')
+  }
+
+  // ── Switchboard (docs/Switchboard.md) ─────────────────────────────────
+
+  switchboard(): Promise<unknown> {
+    return jsonFetch('/api/chat/switchboard', { cache: 'no-store' })
+  }
+
+  startSwitchboard(): Promise<SwitchboardState> {
+    return post('/api/chat/switchboard/start')
+  }
+
+  checkSwitchboard(): Promise<{ queued: boolean, reason?: string, state: SwitchboardState }> {
+    return post('/api/chat/switchboard/check')
+  }
+
+  pauseSwitchboard(paused: boolean): Promise<SwitchboardState> {
+    return post('/api/chat/switchboard/pause', { paused })
+  }
+
+  restartSwitchboard(): Promise<SwitchboardState> {
+    return post('/api/chat/switchboard/restart')
+  }
+
+  turnOffSwitchboard(): Promise<SwitchboardState> {
+    return post('/api/chat/switchboard/off')
+  }
+
+  explainSwitchboardItem(id: number): Promise<SwitchboardState> {
+    return post(`/api/chat/switchboard/items/${id}/explain`)
+  }
+
+  answerSwitchboardItem(id: number, answer: { optionId: string } | { text: string }): Promise<SwitchboardState> {
+    return post(`/api/chat/switchboard/items/${id}/answer`, answer)
   }
 
   repos(): Promise<{ repos: string[] }> {

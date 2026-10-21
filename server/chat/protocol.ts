@@ -200,8 +200,10 @@ export interface WorkspaceState {
 
 export interface SessionContext {
   /** `poise-change`: the exact `/poise` request (`body`) and the session it
-   *  was typed in (`fromSession`); the server composes the first prompt. */
-  kind: 'card' | 'document' | 'handoff' | 'poise-change'
+   *  was typed in (`fromSession`); the server composes the first prompt.
+   *  `switchboard`: the observer chat Poise creates for the Switchboard pane;
+   *  browsers can never set it. */
+  kind: 'card' | 'document' | 'handoff' | 'poise-change' | 'switchboard'
   title: string
   body?: string
   url?: string
@@ -405,6 +407,8 @@ export interface ClientFrame {
 export type ServerFrame =
   | { kind: 'session.created' | 'session.updated', session: SessionRecord }
   | { kind: 'switches.updated', catalogue: ChatSwitches }
+  /** The Switchboard's state changed; read it again from `/api/chat/switchboard`. */
+  | { kind: 'switchboard.updated', revision: number }
   | { kind: 'ack', id: string, ok: true, result?: unknown }
   | { kind: 'ack', id: string, ok: false, error: string, code?: string }
   | { kind: 'event', envelope: ChatEnvelope }
@@ -427,6 +431,60 @@ export type ChatErrorCode =
   | 'draining'
   /** `/poise` needs the separately installed self-update controller. */
   | 'self_update_unavailable'
+
+// ── Switchboard: the observer pane (docs/Switchboard.md) ─────────────────
+
+export type SwitchboardKind = 'progress' | 'blocked' | 'done' | 'decision'
+
+/** One of the asking chat's own choices; the open-text answer is not one. */
+export interface SwitchboardOption { id: string, label: string, detail: string | null, recommended: boolean }
+
+export interface SwitchboardItem {
+  id: number
+  kind: SwitchboardKind
+  /** The chat the update is about: its live identity, or what it was when deleted. */
+  source: { sessionId: string, title: string, agent: AgentId, model: string, exists: boolean
+    /** For an open decision: turns the chat has started since it asked. */
+    turnsSince?: number }
+  /** The transcript event the update rests on. */
+  sourceSeq: number
+  text: string
+  detail: string | null
+  createdAt: string
+  /** A decision's choices, the asking chat's own, its recommendation first; none means an open question. */
+  options?: SwitchboardOption[]
+  /** The person's answer to a decision. `relay` follows its delivery to the asking chat; `held`:
+   *  that chat is stopped, failed or deleted and takes no message until resumed. */
+  answer?: { label: string, freeText: boolean, at: string, relay: 'queued' | 'delivered' | 'held' }
+  /** A decision settled in its own chat. */
+  resolved?: { at: string, reason: string }
+  explanation:
+    | { state: 'none' }
+    | { state: 'pending', since: string }
+    | { state: 'failed', error: string }
+    | { state: 'ready', changed: string, matters: string, uncertain: string, at: string }
+}
+
+export interface SwitchboardState {
+  /** Increases with every change; a lower one is stale. */
+  revision: number
+  /** `stopped`: its delivery is paused or its chat failed; a restart is needed. */
+  status: 'off' | 'live' | 'paused' | 'stopped'
+  sessionId: string | null
+  sessionStatus: SessionStatus | null
+  model: string
+  error: string | null
+  /** A check is waiting for the Switchboard to finish it. */
+  checking: boolean
+  lastCheckAt: string | null
+  /** What the last finished check's turn cost, when its agent reported usage. */
+  lastCheckTokens: number | null
+  nextCheckAt: string | null
+  /** Chats it observes: every chat of this instance but itself. */
+  chats: number
+  /** Every open decision and each chat's five newest updates, newest first. */
+  items: SwitchboardItem[]
+}
 
 export const WS_PATH = '/ws/chat'
 

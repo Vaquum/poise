@@ -670,6 +670,16 @@ steering, handoffs and Poise implementation messages. Closing the pane leaves
 memories active; clearing the text removes the appendix from future messages.
 See [Memories](docs/Memories.md) for persistence and recovery details.
 
+## Switchboard
+
+The Switchboard pane, on the right of Chat, shows what every chat in the
+workspace is doing: what is blocked, what finished and what needs your
+decision. A Muse chat observes the other chats and reports; Poise schedules
+it, shows its reports as one row per chat, and delivers your answers to the
+chat that asked. Every update has **Explain**, and every decision offers the
+chat's own choices plus an answer in your own words. Drag the pane to any
+width; it snaps at one third and one half. See [Switchboard](docs/Switchboard.md).
+
 ## Chat reliability
 
 Unsent composer drafts and partial question answers survive ordinary tab
