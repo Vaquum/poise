@@ -559,6 +559,7 @@ export function markBehaviorLaunchIntentOwned(input: {
   actor: string
   source: string
   correlationId: string
+  replacesFailedCallId?: string
   // Issue reviews only: the sub-issues this launch also comments on.
   covers?: readonly string[]
   leaseMs?: number
@@ -583,6 +584,11 @@ export function markBehaviorLaunchIntentOwned(input: {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.correlationId)) {
     throw new Error('invalid behavior correlation id')
   }
+  if (input.replacesFailedCallId !== undefined
+    && (input.key !== 'approve-prs' || input.launchBehavior !== 'pr_approve' || input.source !== 'poise:approve-prs'
+      || !/^[0-9a-f]{32}$/.test(input.replacesFailedCallId) || input.claimId !== input.correlationId)) {
+    throw new Error('invalid failed approval replacement')
+  }
   if ((input.covers?.length ?? 0) > 0 && input.launchBehavior !== 'issue_review') {
     throw new Error('only an issue review covers sub-issues')
   }
@@ -592,15 +598,23 @@ export function markBehaviorLaunchIntentOwned(input: {
     .slice(0, MAX_LAUNCH_COVERS)
   const info = db.prepare(`
     UPDATE behavior_seen
-    SET launch_behavior = ?, launch_repo = ?, launch_pr = ?,
+    SET claim_id = ?, launch_behavior = ?, launch_repo = ?, launch_pr = ?,
         launch_requested_at = ?, launch_call_id = NULL, launch_error = NULL, launch_quarantine = NULL,
         launch_quarantine_may_run = 1,
         launch_outcome = NULL, launch_completed_at = NULL, launch_head_sha = NULL,
         launch_expected_head = ?, launch_actor = ?, launch_source = ?,
         launch_correlation_id = ?, launch_action = NULL, launch_covers = ?,
         lease_until = ?
-    WHERE key = ? AND target = ? AND claim_id = ? AND claim_id <> ''
+    WHERE key = ? AND target = ? AND (
+      (? IS NULL AND claim_id = ? AND claim_id <> '')
+      OR (? IS NOT NULL AND key = 'approve-prs' AND claim_id = ''
+        AND launch_call_id = ? AND launch_expected_head = ?
+        AND launch_behavior = 'pr_approve' AND launch_repo = ? AND launch_pr = ?
+        AND lower(launch_actor) = lower(?) AND launch_source = 'poise:approve-prs'
+        AND launch_error IS NOT NULL AND launch_outcome IS NULL AND launch_quarantine IS NULL)
+    )
   `).run(
+    input.claimId,
     input.launchBehavior,
     input.repo,
     input.pr,
@@ -613,7 +627,14 @@ export function markBehaviorLaunchIntentOwned(input: {
     Date.now() + leaseMs,
     input.key,
     input.target,
+    input.replacesFailedCallId ?? null,
     input.claimId,
+    input.replacesFailedCallId ?? null,
+    input.replacesFailedCallId ?? null,
+    input.expectedHead,
+    input.repo,
+    input.pr,
+    input.actor,
   )
   return info.changes === 1
 }
@@ -1275,6 +1296,33 @@ export function latestApprovalBasisLaunch(
     completedAt: row.launch_completed_at,
     headSha: row.launch_head_sha,
   } : null
+}
+
+// A completed negative review proves prior inspection, never approval.
+export function latestCompletedChangeRequestLaunch(
+  repo: string,
+  pr: number,
+  actor: string,
+): CompletedApprovalBasisLaunch | null {
+  const row = db.prepare(`
+    SELECT launch_call_id AS callId, launch_completed_at AS completedAt, launch_head_sha AS headSha
+    FROM behavior_seen
+    WHERE claim_id = '' AND launch_error IS NULL AND launch_quarantine IS NULL
+      AND launch_repo = ? AND launch_pr = ? AND lower(launch_actor) = lower(?)
+      AND launch_action = 'requested_changes' AND launch_outcome = 'changes_requested'
+      AND (
+        (key = 'review-new-prs' AND launch_behavior = 'pr_review'
+          AND launch_source IN ('poise:review-new-prs', 'poise:replay'))
+        OR (key = 'approve-prs' AND launch_behavior = 'pr_approve'
+          AND launch_source IN ('poise:approve-prs', 'poise:replay'))
+      )
+      AND launch_requested_at IS NOT NULL
+      AND launch_call_id IS NOT NULL AND launch_call_id <> ''
+      AND launch_completed_at IS NOT NULL AND launch_expected_head = launch_head_sha
+    ORDER BY launch_completed_at DESC LIMIT 1
+  `).get(repo, pr, actor) as CompletedApprovalBasisLaunch | undefined
+  return row && /^[0-9a-f]{40}$/.test(row.headSha)
+    && Number.isFinite(Date.parse(row.completedAt)) ? row : null
 }
 
 // Wipe the ledger for a key — used when the user disables the

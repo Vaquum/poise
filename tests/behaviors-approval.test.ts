@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, arrangeCli, recordCompletedInitialReview, fixture, type ReviewActivityFixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, arrangeCli, recordCompletedInitialReview, launchApprovalBeforeCrash, agentLog, fixture, type ReviewActivityFixture } from './behaviors-runtime-fixture'
 
 describe('approval eligibility and review activity', () => {
 
@@ -503,5 +503,238 @@ describe('approval eligibility and review activity', () => {
       ([command, args]) => command === 'github-interface'
         && args[0] === '--review-activity-since',
     )).toBe(false)
+  })
+
+  it('recovers a dismissed superseded approval from a completed negative review', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
+    const prior = await launchApprovalBeforeCrash()
+    recordCompletedInitialReview(prior.database, {
+      target: `${pr.repo}#${pr.number}:tertiary`, outcome: 'changes_requested',
+    })
+    prior.database.recordSeen('review-new-prs', `${pr.repo}#${pr.number}`)
+    prior.database.recordSeen('review-new-prs', `${pr.repo}#${pr.number}:secondary`)
+    expect(prior.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
+    fixture.agentLogs = [agentLog({
+      behavior: 'pr_approve', status: 'superseded', outcome: 'superseded',
+      expected_head: prior.expectedHead, head_sha: NEXT_HEAD_SHA,
+      started_at: new Date(Date.parse(prior.requestedAt) + 1_000).toISOString(),
+      completed_at: new Date().toISOString(), review_id: 91,
+      actor: prior.actor, source: prior.source, correlation_id: prior.correlationId,
+    })]
+    arrangeCli(false, false, {
+      headSha: NEXT_HEAD_SHA, reviewerLatestState: 'DISMISSED', reviewerLatestCommit: HEAD_SHA,
+      latestActivityAt: new Date().toISOString(),
+    }, { reviewer_latest_state: 'DISMISSED' })
+    let modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+
+    await modules.behaviors.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    const args: string[] = mocks.spawnDetached.mock.calls[1][1]
+    expect(args).toEqual(expect.arrayContaining(['--pr-approve', '#17', '--expected-head', NEXT_HEAD_SHA]))
+    expect(modules.database.hasSeen('approve-prs', `${pr.repo}#17@head=${NEXT_HEAD_SHA}`)).toBe(true)
+    expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
+    expect(mocks.captureOutcome).not.toHaveBeenCalledWith(expect.objectContaining({ outcome: 'approved' }))
+    expect(mocks.runFile.mock.calls.some(([, argv]) => argv[0] === '--approve-pr')).toBe(false)
+
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+
+    vi.setSystemTime(Date.now() + 2_000)
+    fixture.agentLogs.push(agentLog({
+      id: 'e'.repeat(32), behavior: 'pr_approve', status: 'completed',
+      action: 'approved', outcome: 'approved', expected_head: NEXT_HEAD_SHA, head_sha: NEXT_HEAD_SHA,
+      review_id: 92, correlation_id: args[args.indexOf('--correlation-id') + 1],
+    }))
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)?.headSha).toBe(NEXT_HEAD_SHA)
+    modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+  })
+
+  it('can use a completed approval change request by the same reviewer', async () => {
+    const prior = await launchApprovalBeforeCrash()
+    const callId = 'b'.repeat(32)
+    expect(prior.database.linkBehaviorLaunchCallOwned('approve-prs', prior.target, prior.correlationId, callId)).toBe(true)
+    expect(prior.database.completeBehaviorLaunchOwned({
+      key: 'approve-prs', target: prior.target, claimId: prior.correlationId,
+      action: 'requested_changes', outcome: 'changes_requested',
+      completedAt: new Date().toISOString(), headSha: HEAD_SHA,
+    })).toBe(true)
+    expect(prior.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
+    expect(prior.database.latestCompletedChangeRequestLaunch(pr.repo, pr.number, 'REVIEW-BOT')).toMatchObject({
+      callId, headSha: HEAD_SHA,
+    })
+  })
+
+  it.each([
+    ['launch_actor', 'another-reviewer'], ['launch_source', 'another-system'],
+    ['launch_behavior', 'issue_review'], ['launch_action', 'approved'],
+    ['launch_outcome', 'superseded'], ['claim_id', 'inflight'],
+    ['launch_error', 'unreadable'], ['launch_quarantine', 'unreadable'],
+    ['launch_requested_at', null], ['launch_call_id', null], ['launch_call_id', ''],
+    ['launch_completed_at', null], ['launch_completed_at', 'invalid'],
+    ['launch_expected_head', NEXT_HEAD_SHA], ['launch_head_sha', 'x'.repeat(40)],
+  ] as const)('rejects invalid prior change-request evidence (%s=%s)', async (column, value) => {
+    const { database: db } = await loadModules()
+    recordCompletedInitialReview(db, { outcome: 'changes_requested' })
+    db.db.prepare(`UPDATE behavior_seen SET ${column} = ? WHERE key = 'review-new-prs'`).run(value)
+    if (column === 'launch_head_sha') db.db.prepare("UPDATE behavior_seen SET launch_expected_head = ?").run(value)
+    expect(db.latestCompletedChangeRequestLaunch(pr.repo, pr.number, 'review-bot')).toBeNull()
+  })
+
+  it.each([
+    'missing-review', 'same-head', 'head-race', 'dismissal-race', 'missing-activity',
+    'active-request', 'live-conversation', 'draft', 'closed',
+  ] as const)('does not recover a dismissal with %s', async (blocked) => {
+    const activity: ReviewActivityFixture = {
+      headSha: blocked === 'same-head' ? HEAD_SHA : NEXT_HEAD_SHA,
+      reviewerLatestState: blocked === 'dismissal-race' ? null : 'DISMISSED',
+      latestActivityAt: blocked === 'missing-activity' ? null : new Date().toISOString(),
+      activeChangeRequestAuthors: blocked === 'active-request' ? ['another-reviewer'] : [],
+      unresolvedLiveConversationCount: blocked === 'live-conversation' ? 1 : 0,
+      unresolvedConversationCount: blocked === 'live-conversation' ? 1 : 0,
+      unresolvedLiveConversationAuthors: blocked === 'live-conversation' ? ['another-reviewer'] : [],
+      draft: blocked === 'draft', state: blocked === 'closed' ? 'CLOSED' : 'OPEN',
+    }
+    arrangeCli(false, false, activity, {
+      reviewer_latest_state: 'DISMISSED',
+      ...(blocked === 'head-race' ? { head_sha: HEAD_SHA } : {}),
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    if (blocked !== 'missing-review') recordCompletedInitialReview(db, { outcome: 'changes_requested' })
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
+  })
+
+  it.each(['--review-activity-since', '--local-checkout-path'])('abandons dismissed recovery when the reviewer changes during %s', async (stage) => {
+    arrangeCli(false, false, { headSha: NEXT_HEAD_SHA, reviewerLatestState: 'DISMISSED',
+      latestActivityAt: new Date().toISOString() }, { reviewer_latest_state: 'DISMISSED' })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    recordCompletedInitialReview(db, { outcome: 'changes_requested' })
+    const original = mocks.runFile.getMockImplementation()!
+    let changed = false
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
+      const result = await original(command, args, options)
+      if (args[0] === stage && !changed) { changed = true; db.setMeta('agentAccount', 'replacement-bot') }
+      return result
+    })
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(changed).toBe(true)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.hasSeen('approve-prs', `${pr.repo}#17@head=${NEXT_HEAD_SHA}`)).toBe(false)
+    expect(db.listBehaviorLaunchClaims('approve-prs')).toEqual([])
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    const target = `${pr.repo}#17:replacement`
+    recordCompletedInitialReview(db, { target, outcome: 'changes_requested', callId: 'd'.repeat(32) })
+    db.db.prepare('UPDATE behavior_seen SET launch_actor = ? WHERE target = ?').run('replacement-bot', target)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--actor', 'replacement-bot']))
+  })
+
+  it.each([
+    'stopped', 'review_provider_blocked', 'new-head', 'new-model', 'receipt', 'executed-head',
+    'ambiguous-action', 'missing-call', 'wrong-source', 'retry-delay',
+    'head-receipt', 'head-executed-head', 'head-ambiguous-action', 'head-new-model',
+    'head-model-rollback', 'head-reviewer-change', 'head-preparation-failure',
+  ] as const)('preserves a held approval across dismissal and key changes (%s)', async (variant) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
+    const prior = await launchApprovalBeforeCrash()
+    const args: string[] = mocks.spawnDetached.mock.calls[0][1]
+    const model = args[args.indexOf('--model') + 1]
+    recordCompletedInitialReview(prior.database, { target: `${pr.repo}#17:tertiary`,
+      outcome: 'changes_requested', headSha: NEXT_HEAD_SHA })
+    const call = agentLog({
+      behavior: 'pr_approve', status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      review_policy: 'bounded-v1', error_code: variant === 'review_provider_blocked' ? variant : 'stopped',
+      error: 'Review needs attention', model, expected_head: prior.expectedHead,
+      actor: prior.actor, source: prior.source, correlation_id: prior.correlationId,
+      started_at: new Date(Date.parse(prior.requestedAt) + 1_000).toISOString(),
+    })
+    fixture.agentLogs = [call]
+    arrangeCli(true, false, {}, { commits_after_request: 0, response_count: 0 })
+    let modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('approve-prs', prior.target)).not.toBeNull()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    const occupiedHead = variant.startsWith('head-')
+    const heldTarget = occupiedHead ? `${pr.repo}#17@head=${HEAD_SHA}` : prior.target
+    if (occupiedHead) {
+      modules.database.db.prepare('UPDATE behavior_seen SET target = ? WHERE key = ? AND target = ?')
+        .run(heldTarget, 'approve-prs', prior.target)
+      modules.database.db.prepare('UPDATE behavior_dead_letters SET target = ? WHERE behavior = ? AND target = ?')
+        .run(heldTarget, 'approve-prs', prior.target)
+    }
+    if (occupiedHead || ['new-model', 'receipt', 'executed-head', 'ambiguous-action', 'missing-call', 'wrong-source', 'retry-delay'].includes(variant)) {
+      modules.database.setMeta('models', JSON.stringify({ pr_approve: {
+        default: model === 'gpt-6-astra-ultra' ? 'opus-5-xhigh' : 'gpt-6-astra-ultra', fallback: model,
+      } }))
+    }
+    if (variant === 'receipt' || variant === 'head-receipt') call.review_id = 91
+    if (variant === 'executed-head' || variant === 'head-executed-head') call.head_sha = HEAD_SHA
+    if (variant === 'ambiguous-action' || variant === 'head-ambiguous-action') { call.action = null; call.outcome = null }
+    if (variant === 'missing-call') fixture.agentLogs = []
+    if (variant === 'wrong-source') call.source = 'another-system'
+    if (variant === 'retry-delay') modules.database.setMeta(`behavior_approve_prs_failure:${prior.target}`, JSON.stringify({
+      kind: 'worker', consecutiveFailures: 1, lastFailureAtMs: Date.now(), nextRetryAtMs: Date.now() + 60_000,
+    }))
+    const head = variant === 'new-head' ? 'e'.repeat(40) : HEAD_SHA
+    arrangeCli(false, false, { headSha: head, reviewerLatestState: 'DISMISSED',
+      latestActivityAt: new Date().toISOString() }, { reviewer_latest_state: 'DISMISSED' })
+    const abortPreparation = ['head-model-rollback', 'head-reviewer-change', 'head-preparation-failure'].includes(variant)
+    let interrupted = false
+    if (abortPreparation) {
+      const original = mocks.runFile.getMockImplementation()!
+      mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
+        const result = await original(command, args, options)
+        if (args[0] === '--local-checkout-path' && !interrupted) {
+          interrupted = true
+          if (variant === 'head-reviewer-change') modules.database.setMeta('agentAccount', 'replacement-bot')
+          else if (variant === 'head-preparation-failure') throw new Error('checkout unavailable')
+          else modules.database.setMeta('models', JSON.stringify({ pr_approve: { default: model, fallback: model } }))
+        }
+        return result
+      })
+    }
+
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    if (abortPreparation) {
+      expect(interrupted).toBe(true)
+      expect(modules.database.getFailedBehaviorLaunch('approve-prs', heldTarget)?.launchCallId).toBe(call.id)
+      modules.database.setMeta('agentAccount', prior.actor)
+      modules.database.setMeta('models', JSON.stringify({ pr_approve: { default: model, fallback: model } }))
+    }
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+
+    const eligible = variant === 'new-head' || variant === 'new-model' || variant === 'head-new-model'
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(eligible ? 2 : 1)
+    expect(modules.database.hasSeen('approve-prs', `${pr.repo}#17@head=${head}`)).toBe(eligible || occupiedHead)
+    if (variant !== 'head-new-model') expect(modules.database.getFailedBehaviorLaunch('approve-prs', heldTarget)).not.toBeNull()
+    expect(modules.database.listBehaviorDeadLetters()).toHaveLength(1)
   })
 })

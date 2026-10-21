@@ -45,6 +45,7 @@ import {
   getMeta as databaseGetMeta,
   hasSeen,
   latestApprovalBasisLaunch,
+  latestCompletedChangeRequestLaunch,
   linkBehaviorLaunchCallOwned,
   listBehaviorLaunchClaims as databaseListBehaviorLaunchClaims,
   listBehaviorDeadLetters as databaseListBehaviorDeadLetters,
@@ -758,6 +759,7 @@ function markLaunchIntent(
   actor: string,
   slot: ReviewerSlot = 'primary',
   plannedSlots: ReviewerSlot[] = ['primary'],
+  replacesFailedCallId?: string,
 ): boolean {
   const source = `poise:${behavior}` as const
   const startedAt = new Date().toISOString()
@@ -773,6 +775,7 @@ function markLaunchIntent(
     actor,
     source,
     correlationId: claimId,
+    replacesFailedCallId,
   })
   if (admitted) captureBehaviorAdmission({
     admissionKey: behavior === 'review-new-prs'
@@ -2093,12 +2096,15 @@ async function tickReviewNewPrs(): Promise<void> {
 // For each open PR by the configured user, re-evaluate either an addressed
 // change request left by the configured review agent or a clean PR that
 // explicitly requests that identity's initial approval.
+// A dismissed review can re-arm inspection on a changed head when a completed
+// change request by that reviewer supplies the prior independent review.
 //
 // Follow-ups dedupe by request timestamp + response count. A clean initial
 // review becomes eligible on the next scheduler scan and dedupes by head SHA.
 
 interface ChangesAddressedResult {
   hasChangeRequest: boolean
+  reviewerLatestState: string | null
   latestRequestAt: string | null
   headSha: string
   commitsAfterRequest: number
@@ -2544,6 +2550,7 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
   }
   return {
     hasChangeRequest,
+    reviewerLatestState: latestState,
     latestRequestAt,
     headSha,
     commitsAfterRequest,
@@ -2554,11 +2561,38 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
   }
 }
 
+async function dismissedApprovalHeld(pr: DatastorePr, head: string, model: string): Promise<boolean> {
+  const failed = failedBehaviorLaunches('approve-prs').filter((claim) =>
+    claim.launchRepo === pr.repo && claim.launchPr === pr.number && claim.launchExpectedHead === head)
+  if (!failed.length) return false
+  const snapshot = await readBehaviorLogSnapshot()
+  return failed.some((claim) => {
+    const call = snapshot.entries.find((row) => row.id === claim.launchCallId)
+    if (claim.launchQuarantine || !call || !unambiguousAgentCall(snapshot, call)
+      || logQuarantine(snapshot, claimLogIdentity(claim), true)
+      || claim.launchBehavior !== 'pr_approve' || claim.launchSource !== 'poise:approve-prs'
+      || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase())
+      || call.behavior !== claim.launchBehavior || call.repo !== claim.launchRepo
+      || String(call.pr_id) !== String(claim.launchPr)
+      || call.actor?.toLowerCase() !== claim.launchActor.toLowerCase()
+      || call.source !== claim.launchSource || call.correlation_id !== claim.launchCorrelationId
+      || call.expected_head !== head || !Number.isFinite(Date.parse(claim.launchRequestedAt))
+      || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
+      || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)
+      || call.action !== 'not_started' || call.outcome !== 'preflight_failed'
+      || call.head_sha !== null || call.review_id != null || call.receipts != null || call.review_comments != null) return true
+    return boundedReviewFailure(call) && call.model === model
+      || !behaviorRetryDue('approve-prs', claim.target)
+  })
+}
+
 async function fireApprove(
   pr: DatastorePr,
   claimTarget: string,
   claimId: string,
   expectedHead: string,
+  admittedReviewer?: string,
+  replacesFailedCallId?: string,
 ): Promise<boolean> {
   return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
   if (!isEnabled('approve-prs')) return false
@@ -2568,6 +2602,8 @@ async function fireApprove(
   const { model, recovery, catalog } = await waitForBehavior(reviewChoice('pr_approve'))
   const claude = needsClaude(catalog, model)
   const actor = configuredReviewer()
+  if (admittedReviewer && (actor.toLowerCase() !== admittedReviewer.toLowerCase()
+    || await dismissedApprovalHeld(pr, expectedHead, model))) return false
   if (claude) await waitForBehavior(claudeAuth.requireReady({ liveWithinMs: BEHAVIOR_AUTH_FRESHNESS_MS }))
   const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], claimId)
   await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
@@ -2588,6 +2624,10 @@ async function fireApprove(
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead)
   if (!isEnabled('approve-prs') || behaviorAborted() || !stillEligible('approve-prs', pr)) return false
   if ((await reviewChoice('pr_approve')).model !== model) return false
+  if (admittedReviewer && configuredReviewer().toLowerCase() !== admittedReviewer.toLowerCase()) return false
+  if (replacesFailedCallId && !renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
+    throw new Error(`approval PR operation ownership was lost for ${pr.repo}#${pr.number}`)
+  }
   const source = 'poise:approve-prs'
   const args = [
     '--pr-approve',
@@ -2615,6 +2655,9 @@ async function fireApprove(
     claimId,
     expectedHead,
     actor,
+    'primary',
+    ['primary'],
+    replacesFailedCallId,
   )) return false
   if (!renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
     captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
@@ -2659,9 +2702,14 @@ async function tickApprovePrs(): Promise<void> {
           checked = true
           return
         }
+        let dismissedReview: ReturnType<typeof latestCompletedChangeRequestLaunch> = null
         if (!check.hasChangeRequest && !latestApprovalBasisLaunch(pr.repo, pr.number)) {
-          checked = true
-          return
+          dismissedReview = check.reviewerLatestState === 'DISMISSED'
+            ? latestCompletedChangeRequestLaunch(pr.repo, pr.number, reviewer) : null
+          if (!dismissedReview) {
+            checked = true
+            return
+          }
         }
         if (hasActiveAgentLaunchForPr(pr.repo, pr.number)) return
         operationId = await claimEligiblePrOperation('approve-prs', prTarget)
@@ -2687,6 +2735,7 @@ async function tickApprovePrs(): Promise<void> {
         let seenTarget = ''
         let firedReason = ''
         let expectedHead = ''
+        let admittedReviewer: string | undefined
         if (check.hasChangeRequest) {
           if (check.responseCount < 1 || check.latestRequestAt === null) {
             checked = true
@@ -2713,7 +2762,8 @@ async function tickApprovePrs(): Promise<void> {
           seenTarget = `${pr.repo}#${pr.number}@req=${check.latestRequestAt}/r=${check.responseCount}/head=${check.headSha}`
           firedReason = `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}inline+${check.authorPrCommentsAfterRequest}pr-comment+${check.resolvedRequestThreads}resolved, head=${check.headSha.slice(0, 8)}`
         } else {
-          const review = latestApprovalBasisLaunch(pr.repo, pr.number)
+          const cleanReview = latestApprovalBasisLaunch(pr.repo, pr.number)
+          const review = cleanReview ?? dismissedReview
           if (!review) {
             checked = true
             return
@@ -2724,6 +2774,12 @@ async function tickApprovePrs(): Promise<void> {
             reviewer,
             review.completedAt,
           )
+          if (!cleanReview && (activity.reviewerLatestState !== 'DISMISSED'
+            || activity.headSha !== check.headSha || activity.headSha === review.headSha)) {
+            checked = true
+            return
+          }
+          if (!cleanReview) admittedReviewer = reviewer
           const reapprovalOwnsEveryUnresolvedConversation =
             activity.reviewerLatestState === 'APPROVED'
             && activity.reviewerLatestCommit !== null
@@ -2747,24 +2803,32 @@ async function tickApprovePrs(): Promise<void> {
           }
           expectedHead = activity.headSha
           seenTarget = `${pr.repo}#${pr.number}@head=${activity.headSha}`
-          firedReason = `clean review ${review.callId.slice(0, 8)}, head=${activity.headSha.slice(0, 8)}`
+          firedReason = `${cleanReview ? 'clean' : 'dismissed'} review ${review.callId.slice(0, 8)}, head=${activity.headSha.slice(0, 8)}`
         }
         if (!behaviorRetryDue('approve-prs', seenTarget)) return
         let claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
+        let replacesFailedCallId: string | undefined
         if (!claimId) {
-          const recovered = await releaseFailedBehaviorIfNoAction(
-            'approve-prs',
-            pr.repo,
-            pr.number,
-            seenTarget,
-          )
-          if (!recovered) return
-          claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
+          if (admittedReviewer) {
+            const held = getFailedBehaviorLaunch('approve-prs', seenTarget)
+            if (!held?.launchCallId || await dismissedApprovalHeld(
+              pr, expectedHead, (await reviewChoice('pr_approve')).model,
+            )) return
+            // Keep the held record until preparation admits a complete new intent.
+            replacesFailedCallId = held.launchCallId
+            claimId = operationId
+          } else {
+            const recovered = await releaseFailedBehaviorIfNoAction(
+              'approve-prs', pr.repo, pr.number, seenTarget,
+            )
+            if (!recovered) return
+            claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
+          }
         }
         if (!claimId) return
         trackClaim('approve-prs', seenTarget, claimId)
         try {
-          const accepted = await fireApprove(pr, seenTarget, claimId, expectedHead)
+          const accepted = await fireApprove(pr, seenTarget, claimId, expectedHead, admittedReviewer, replacesFailedCallId)
           if (!accepted) {
             releaseOwnedClaim('approve-prs', seenTarget, claimId)
             return

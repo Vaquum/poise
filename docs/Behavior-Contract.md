@@ -93,6 +93,13 @@ outdated can be reaffirmed without another inline comment when the reviewer
 confirms it still blocks the supplied head. A terminal review contract violation
 is held on unchanged input and model instead of repeatedly launching the same
 worker. A clean review becomes approval-eligible on the next scheduler scan.
+After a dismissal and a head change, a completed change-request review by the
+configured reviewer can admit a fresh head-pinned approval evaluation through
+the same activity and ownership guards. Dismissal never counts as approval.
+The recovery retains the admitted reviewer through preparation and preserves
+same-head/model failure holds across request and head dedupe keys.
+An occupied head's failed record remains through preparation; an eligible model
+change replaces it atomically with the admitted intent before normal launch.
 Provider account blocks (`review_provider_blocked`) use the same hold, preventing
 an exhausted balance or local account latch from launching identical workers.
 Codex input overflow is staged within the existing total review budget, with
