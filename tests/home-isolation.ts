@@ -17,12 +17,12 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll } from 'vitest'
-import { credentialVariables, isolatedEnvironment } from './fixtures/cli-isolation'
+import { isolatedEnvironment, removeCredentialVariables } from './fixtures/cli-isolation'
 
 // The PATH this process started with, so a process that runs several test
 // files does not stack their stand-ins.
 process.env.POISE_TEST_BASE_PATH ??= process.env.PATH ?? ''
-for (const name of credentialVariables(process.env)) delete process.env[name]
+removeCredentialVariables(process.env)
 const root = mkdtempSync(join(tmpdir(), 'poise-home-isolation-'))
 Object.assign(process.env, isolatedEnvironment(root, process.env.POISE_TEST_BASE_PATH))
 afterAll(() => { rmSync(root, { recursive: true, force: true }) })

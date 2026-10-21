@@ -43,10 +43,18 @@ export function agentCliStandIns(dir: string): string {
 }
 
 /** The names in `env` whose values Poise's diagnostics redact as credentials,
- *  as the redactor itself judges each one. tests/home-isolation.ts removes
- *  them from every vitest process. */
+ *  as the redactor itself judges each one. */
 export function credentialVariables(env: Readonly<Record<string, string | undefined>>): string[] {
   return Object.keys(env).filter((name) => environmentSecrets({ [name]: env[name] }).length > 0)
+}
+
+/** Removes from `env` the variables credentialVariables names, and
+ *  GIT_CONFIG_COUNT: the GIT_CONFIG_KEY_<n> it counts are among them, and git
+ *  refuses a count whose keys are missing. tests/home-isolation.ts applies
+ *  this to every vitest process, and playwright.config.ts to the end-to-end
+ *  runner, which starts the server and its workers. */
+export function removeCredentialVariables(env: NodeJS.ProcessEnv): void {
+  for (const name of [...credentialVariables(env), 'GIT_CONFIG_COUNT']) delete env[name]
 }
 
 /** The environment of a process isolated under `root`: its own homes, and
