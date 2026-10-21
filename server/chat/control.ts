@@ -216,6 +216,7 @@ export class ChatControl {
   /** Before any receipt: a refusal is a 403, never a recorded outcome. The
    *  Switchboard observes and reports; only it reports. */
   private authorize(id: string, operation: string, command: Record<string, unknown>): void {
+    if (operation === 'create' && command.role !== undefined) throw new HttpError(403, 'A Manager is created by the person in the New session dialog.')
     const switchboard = this.options.switchboard
     if (!switchboard) return
     if (operation.startsWith('switchboard.')) {
@@ -347,6 +348,7 @@ export class ChatControl {
       if (!this.runtime.ownsSession(item.recipient)) continue
       const session = this.runtime.get(item.recipient)
       if (!session || session.status !== 'idle' || session.contextResetting || session.contextCompacting || session.queue?.items.length) continue
+      if (session.role === 'manager' && session.retiredModel) continue
       // No native steering, invented answers, or retries of admitted work. A
       // restart interrupts an admitted turn through normal Chat recovery.
       try {

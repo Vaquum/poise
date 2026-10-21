@@ -1,10 +1,10 @@
 // SQLite mirror for Chat v1: the session table, the per-session event log
 // that the browser renders history from, the unanswered requests that must
 // survive a reload, and the worker gates this server spawned (for startup
-// cleanup). Lives in Poise's own database (server/db.ts), so dev and
-// production keep separate session tables; the checkout lock is what they
-// share. Every write is one short transaction; nothing here talks to an
-// agent.
+// cleanup). Lives in Poise's own database (server/db.ts); sessions are
+// separated by the `instance` column, and dev and production normally use
+// separate `POISE_DB` files. The checkout lock is what they share. Every
+// write is one short transaction; nothing here talks to an agent.
 
 import { db } from '../db'
 import { claimQueuedMessage, delegateQueue, deleteMessageQueue, pauseQueue, settleQueuedTurn, queueOwner, readQueue } from './message-queue'
@@ -81,12 +81,32 @@ db.exec(`
   );
 `)
 
+// The Manager's role column and singleton index. The shape duplicates
+// server/db.ts: an immediate transaction serializes a second process
+// starting at the same moment. If it still meets a duplicate column, the
+// column is treated as present; any other error stops startup.
+try {
+  db.transaction(() => {
+    const cols = db.prepare('PRAGMA table_info(chat_sessions)').all() as Array<{ name: string }>
+    if (!cols.some((c) => c.name === 'role')) {
+      db.exec('ALTER TABLE chat_sessions ADD COLUMN role TEXT')
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS chat_sessions_one_manager ON chat_sessions(instance) WHERE role = 'manager'`)
+  }).immediate()
+} catch (error) {
+  if (error instanceof Error && error.message.includes('duplicate column name: role')) {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS chat_sessions_one_manager ON chat_sessions(instance) WHERE role = 'manager'`)
+  } else {
+    throw error
+  }
+}
+
 const EVENT_MAX_BYTES = 4 * 1024 * 1024
 
 export function insertSession(record: SessionRecord): void {
   db.prepare(`
-    INSERT INTO chat_sessions (id, record, agent, repo, checkout, branch, status, title, native_session_id, instance, created_at, updated_at, last_seq)
-    VALUES (@id, @record, @agent, @repo, @checkout, @branch, @status, @title, @native, @instance, @created, @updated, 0)
+    INSERT INTO chat_sessions (id, record, agent, repo, checkout, branch, status, title, native_session_id, instance, created_at, updated_at, last_seq, role)
+    VALUES (@id, @record, @agent, @repo, @checkout, @branch, @status, @title, @native, @instance, @created, @updated, 0, @role)
   `).run({
     id: record.id,
     record: JSON.stringify({ ...record, queue: undefined }),
@@ -100,7 +120,15 @@ export function insertSession(record: SessionRecord): void {
     instance: record.instance,
     created: record.createdAt,
     updated: record.updatedAt,
+    role: record.role ?? null,
   })
+}
+
+/** The instance's Manager, read from the role column, or null. */
+export function managerSession(instance: string): SessionRecord | null {
+  const row = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? AND role = \'manager\' LIMIT 1')
+    .get(instance) as { record: string, last_seq: number, status: string, role: string | null } | undefined
+  return row ? parseRecord(row) : null
 }
 
 export function saveSession(record: SessionRecord): void {
@@ -123,16 +151,19 @@ export function saveSession(record: SessionRecord): void {
   })
 }
 
-function parseRecord(row: { record: string, last_seq: number, status: string }): SessionRecord {
+function parseRecord(row: { record: string, last_seq: number, status: string, role?: string | null }): SessionRecord {
   const record = JSON.parse(row.record) as SessionRecord
   record.lastSeq = row.last_seq
   record.status = row.status as SessionStatus
+  // The column is the role's only source; any role in the record JSON is ignored.
+  if (row.role === 'manager') record.role = 'manager'
+  else delete record.role
   record.pendingRequests = listPendingRequests(record.id).map((p) => p.requestId)
   return record
 }
 
 export function getSession(id: string): SessionRecord | null {
-  const row = db.prepare('SELECT record, last_seq, status FROM chat_sessions WHERE id = ?').get(id) as { record: string, last_seq: number, status: string } | undefined
+  const row = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE id = ?').get(id) as { record: string, last_seq: number, status: string, role: string | null } | undefined
   return row ? parseRecord(row) : null
 }
 
@@ -143,8 +174,8 @@ export function sessionInstance(id: string): string | null {
 }
 
 export function listSessions(instance: string): SessionRecord[] {
-  const rows = db.prepare('SELECT record, last_seq, status FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
-    .all(instance) as Array<{ record: string, last_seq: number, status: string }>
+  const rows = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
+    .all(instance) as Array<{ record: string, last_seq: number, status: string, role: string | null }>
   return rows.map(parseRecord)
 }
 

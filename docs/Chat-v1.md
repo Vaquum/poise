@@ -116,8 +116,28 @@ repository inside each workspace provides checkpoints and safe Revert without
 switching or committing the outer Poise checkout. The session branch is an
 internal implementation detail. The dialog contains no repository, branch, PR,
 or location picker, and both REST and WebSocket creation routes discard such
-fields. Card/document handoffs supply context, not permission to check out
-another repository.
+fields, except `role`, which only REST accepts. Card/document handoffs supply
+context, not permission to check out another repository.
+
+One Manager session can exist per Poise instance (`ChatRuntime.instance`,
+`poise-<label>:<POISE_DB>`), enforced by a unique SQLite index on
+`chat_sessions(instance)` where the role column is `'manager'`. The person
+creates it in the New session dialog, which offers a Type choice of Chat or
+Manager; only REST `POST /api/chat/sessions` with a browser `Origin` creates
+one (in service mode, through the gateway's assertion). WebSocket `session.new`
+and control `create` refuse a role. The `Origin` rule is cooperative: it refuses
+the documented non-browser paths, but a loopback process can still send
+`curl -H 'Origin: http://127.0.0.1:<port>' …` and create a Manager. The Manager
+runs in the default isolated workspace every new local chat gets, takes only
+its own checkout lease, and runs outside the cap on concurrent local turns, so
+it still runs while its workers hold every slot.
+
+The Manager is never auto-titled, cannot be forked or handed off, and keeps its
+role through rename, close, resume, reset and compact. Deleting it frees the
+singleton at once. When its model leaves the catalogue, the next startup keeps
+the Manager instead of deleting it, marks `retiredModel`, and refuses every
+turn until the person picks another model with `set_model`; retirement is
+detected at startup only. A closed Manager still holds the key.
 
 Existing repository-bound sessions and their transcripts remain intact. They
 still use their original checkout and branch; this change does not move files
@@ -139,7 +159,8 @@ and production share the chat root but keep separate session tables. A setting
 caps concurrently running Poise-local turns (default 4); a turn held by the
 cap shows `queued` with its own reason, "waiting for a free agent slot". The
 Switchboard's chat runs one turn at a time outside that cap, so it keeps
-reporting while every slot is busy.
+reporting while every slot is busy, and the Manager's turns run outside it
+too, so supervision still runs when every slot is busy.
 
 The checkout lease is shared by Poise development, Poise production and the
 compatible Caller writing behavior. Turns in different checkouts can run

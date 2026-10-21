@@ -1,10 +1,11 @@
 // New Chat sessions use ignored Poise-owned storage. Its private Git
 // repository is only a checkpoint mechanism; it never switches Poise itself.
-import { lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { db } from '../db'
 import { CLAUDE_SUBSCRIPTION_CLI, runFile } from '../process'
 import { isServiceMode, serviceStatePath } from '../service/config'
-import { CheckoutLease, canonicalCheckout } from './checkout-lock'
+import { CheckoutLease, canonicalCheckout, type CheckoutLeaseOptions } from './checkout-lock'
 import { runGuarded } from './git'
 import { pgidAlive } from './worker'
 
@@ -153,4 +154,50 @@ export function workerWorkspaceRef(root: string, checkout: string): { id: string
     return null
   }
   return { id, home: dirname(checkout) }
+}
+
+/** Under the checkout's lease, taken without waiting: remove a workers/<id>/workspace that no session row claims and that carries Poise's owner marker. Anything else is kept. Lock files are never touched. */
+export async function discardUnclaimedWorkspace(root: string, checkout: string, instance: string, probes?: CheckoutLeaseOptions): Promise<'removed' | 'kept'> {
+  const ref = workerWorkspaceRef(root, checkout)
+  if (!ref) {
+    console.log(`[chat] kept unclaimed workspace ${checkout}: not a workers/<id>/workspace directory; remove it by hand`)
+    return 'kept'
+  }
+  let canonical: string
+  try {
+    canonical = canonicalCheckout(checkout)
+  } catch (error) {
+    console.log(`[chat] kept unclaimed workspace ${checkout}: ${error instanceof Error ? error.message : String(error)}; remove it by hand`)
+    return 'kept'
+  }
+  const lease = new CheckoutLease(canonical, {
+    ownerKind: 'poise:chat',
+    ownerId: `discard:${ref.id}`,
+    ownerLabel: `Discarding unclaimed workspace ${ref.id}`,
+    instance,
+  }, probes)
+  if (!lease.tryAcquire().acquired) {
+    console.log(`[chat] kept unclaimed workspace ${canonical}: the checkout lease is busy; remove it by hand`)
+    return 'kept'
+  }
+  try {
+    if (!(await workspaceMarkerValid(canonical))) {
+      console.log(`[chat] kept unclaimed workspace ${canonical}: invalid or missing owner marker; remove it by hand`)
+      return 'kept'
+    }
+    const claimed = db.prepare('SELECT id FROM chat_sessions WHERE checkout = ? LIMIT 1').get(canonical) as { id: string } | undefined
+    if (claimed) {
+      console.log(`[chat] kept unclaimed workspace ${canonical}: a session row still claims it; remove it by hand`)
+      return 'kept'
+    }
+    try {
+      await rm(ref.home, { recursive: true, force: true })
+    } catch (error) {
+      console.log(`[chat] kept unclaimed workspace ${canonical}: ${error instanceof Error ? error.message : String(error)}; remove it by hand`)
+      return 'kept'
+    }
+    return 'removed'
+  } finally {
+    if (lease.held) lease.release()
+  }
 }

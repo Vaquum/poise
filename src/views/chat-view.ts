@@ -515,6 +515,8 @@ function sortOrder(): void {
     const ea = sessions.get(a)!, eb = sessions.get(b)!
     // A pending session is the newest thing there is.
     if (ea.pending !== eb.pending) return ea.pending ? -1 : 1
+    const ma = ea.record.role === 'manager', mb = eb.record.role === 'manager'
+    if (ma !== mb) return ma ? -1 : 1
     return (eb.record.createdAt || '').localeCompare(ea.record.createdAt || '')
   })
 }
@@ -608,6 +610,7 @@ function sidebarHtml(): string {
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0">`
       + `<div class="chat-session-title" title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</div>`
       + `<div class="chat-session-meta">`
+      + (s.role === 'manager' ? `<span class="chat-pill chat-pill-manager">Manager</span>` : '')
       + `<span class="chat-pill">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)} · ${escapeHtml(s.model)}</span>`
       + `<span class="chat-session-date">${escapeHtml(dateLabel(s.createdAt))}</span>`
       + (running ? `<span class="chat-session-running${waiting ? ' waiting' : ''}" title="${escapeHtml(statusText(s))}" aria-label="${escapeHtml(statusText(s))}"></span>` : '')
@@ -1628,6 +1631,8 @@ function renderHeader(): void {
   headerEl.hidden = !html
   const focusMemories = !!document.activeElement?.closest('.chat-h-memories')
   headerEl.innerHTML = html
+  const retired = headerEl.querySelector<HTMLElement>('.chat-retired-model')
+  if (retired) retired.textContent = `The Manager's model ${retired.dataset.model} was retired. Choose another model to continue.`
   if (focusMemories) headerEl.querySelector<HTMLButtonElement>('.chat-h-memories')?.focus()
 }
 
@@ -1758,6 +1763,7 @@ function headerHtml(): string {
     ? `<select class="chat-h-select chat-mode-select" aria-label="Mode"${between ? '' : ' disabled'}>${s.modes.map((m) => `<option value="${escapeHtml(m.id)}"${m.id === s.mode ? ' selected' : ''}>${escapeHtml(m.name)}</option>`).join('')}</select>`
     : ''
   const others = (agentsInfo?.agents || []).filter((a) => a.id !== s.agent)
+  const isManager = s.role === 'manager'
   return `
     <div class="chat-h-row">
       <span class="chat-pill chat-h-agent">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)}</span>
@@ -1770,15 +1776,16 @@ function headerHtml(): string {
       <span class="chat-h-status" data-status="${s.status}">${escapeHtml(statusText(s))}</span>
       <span class="chat-controls-spacer"></span>
       ${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" title="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}
-      ${s.capabilities?.fork ? `<button type="button" class="chat-icon-btn chat-h-fork" title="Fork session" aria-label="Fork"${between ? '' : ' disabled'}>${ICON_FORK}</button>` : ''}
+      ${!isManager && s.capabilities?.fork ? `<button type="button" class="chat-icon-btn chat-h-fork" title="Fork session" aria-label="Fork"${between ? '' : ' disabled'}>${ICON_FORK}</button>` : ''}
       <button type="button" class="chat-icon-btn chat-h-activity" aria-label="${showActivity ? 'Hide activity' : 'Show activity'}" data-tooltip="Activity" aria-pressed="${showActivity}" aria-controls="chat-transcript">${ICON_ACTIVITY}</button>
-      ${others.length ? `<span class="chat-h-handoff-wrap"><button type="button" class="chat-icon-btn chat-h-handoff" title="Hand off to another agent" aria-label="Hand off…" aria-haspopup="true" aria-expanded="${handoffOpen}">${ICON_HANDOFF}</button>${handoffOpen ? handoffMenu(others) : ''}</span>` : ''}
+      ${!isManager && others.length ? `<span class="chat-h-handoff-wrap"><button type="button" class="chat-icon-btn chat-h-handoff" title="Hand off to another agent" aria-label="Hand off…" aria-haspopup="true" aria-expanded="${handoffOpen}">${ICON_HANDOFF}</button>${handoffOpen ? handoffMenu(others) : ''}</span>` : ''}
       ${reasoningButton()}
       ${autoMergeButton(s.autoMerge === true, e.pending || autoMergeUpdates.has(s.id))}
       ${safeModeButton(s.safeMode === true, e.pending || safeModeUpdates.has(s.id) || s.status === 'closed', s.safeModePending === true)}
       ${memoriesButton()}
     </div>
     ${s.safeModePending ? '<div id="chat-safe-mode-status" class="st-help chat-safe-mode-status" role="status">Permission change queued for the next turn; current native permissions are unchanged.</div>' : ''}
+    ${s.retiredModel ? `<div class="st-help st-help-error chat-retired-model" role="status" data-model="${escapeHtml(s.retiredModel)}"></div>` : ''}
     ${s.cliWarning ? `<div class="st-help st-help-warn chat-cli-warning" role="status">${escapeHtml(s.cliWarning)}</div>` : ''}
     ${s.orphanNotice ? `<div class="st-help st-help-error">${escapeHtml(s.orphanNotice)}</div>` : ''}
   `
@@ -1896,6 +1903,7 @@ function composerStateFor(e: SessionEntry | null): void {
   let placeholder: string | undefined
   if (e.pending) { disabled = true; placeholder = 'Starting the session…' }
   else if (s.status === 'closed') { disabled = true; placeholder = 'This session is closed' }
+  else if (s.retiredModel) { disabled = true; placeholder = 'Choose another model to continue' }
   else if (s.status === 'interrupted') { disabled = true; placeholder = 'Interrupted — Resume to continue, or /reset to start fresh' }
   else if (s.status === 'error') { disabled = true; placeholder = 'The session failed — Resume to try again, or /reset to start fresh' }
   composer.setCommands(s.commands || [], { modes: !!s.capabilities?.modes, fork: !!s.capabilities?.fork })
@@ -2020,7 +2028,9 @@ async function openNewSessionDialog(prefill: NewSessionPrefill = {}): Promise<vo
     dialogEl.querySelector('.chat-dialog-cancel')!.addEventListener('click', closeDialog)
     return
   }
-  renderNewSessionDialog(dialogEl, agents, prefill.context, (request, error) => { void createSession(request, error) }, closeDialog, openPrimitiveWorkspace)
+  const existingManager = [...sessions.values()].map(e => e.record).find(r => r.role === 'manager')
+  renderNewSessionDialog(dialogEl, agents, prefill.context, (request, error) => { void createSession(request, error) }, closeDialog, openPrimitiveWorkspace,
+    { existing: existingManager ? { id: existingManager.id, title: existingManager.title } : null, onOpen: (id) => { closeDialog(); void selectSession(id) } })
 }
 
 function closeDialog(): void {
@@ -2091,8 +2101,21 @@ async function createSession(req: NewSessionRequest, errorEl: HTMLElement): Prom
       : message
     await openNewSessionDialog({ context: req.context })
     const el = dialogEl.querySelector<HTMLElement>('.chat-dialog-error') || errorEl
-    el.textContent = text
     el.hidden = false
+    el.textContent = ''
+    const span = document.createElement('span')
+    span.textContent = text
+    el.appendChild(span)
+    if (code === 'manager_exists' && err instanceof ChatHttpError && err.manager) {
+      const id = err.manager.id
+      el.appendChild(document.createTextNode(' '))
+      const open = document.createElement('button')
+      open.type = 'button'
+      open.className = 'st-clear chat-dialog-open-existing'
+      open.textContent = 'Open it'
+      open.addEventListener('click', () => { closeDialog(); void loadSessions().then(() => selectSession(id)) })
+      el.appendChild(open)
+    }
     queueRender()
   }
 }

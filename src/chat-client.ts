@@ -69,10 +69,12 @@ export class ChatCommandError extends Error {
 export class ChatHttpError extends Error {
   status: number
   code?: string
-  constructor(status: number, message: string, code?: string) {
+  manager?: { id: string }
+  constructor(status: number, message: string, code?: string, manager?: { id: string }) {
     super(message)
     this.status = status
     this.code = code
+    this.manager = manager
   }
 }
 
@@ -111,12 +113,14 @@ function requestId(): string {
 async function readError(res: Response): Promise<ChatHttpError> {
   let message = `HTTP ${res.status}`
   let code: string | undefined
+  let manager: { id: string } | undefined
   try {
     const data = await res.json()
     if (data && typeof data.error === 'string') message = data.error
     if (data && typeof data.code === 'string') code = data.code
+    if (data && data.manager && typeof data.manager.id === 'string') manager = { id: data.manager.id }
   } catch { /* keep the status */ }
-  return new ChatHttpError(res.status, message, code)
+  return new ChatHttpError(res.status, message, code, manager)
 }
 
 async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {

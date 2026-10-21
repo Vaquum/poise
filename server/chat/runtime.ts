@@ -42,7 +42,7 @@ import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
 import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertContext } from '../alerts/producers'
 import { localCheckoutPath } from '../gh'
-import { ensureLocalWorkspace, ensureWorkerWorkspace, LOCAL_CHAT_ROOT, workerWorkspaceRef, workspaceMarkerValid } from './local-workspace'
+import { discardUnclaimedWorkspace, ensureLocalWorkspace, ensureWorkerWorkspace, LOCAL_CHAT_ROOT, workerWorkspaceRef, workspaceMarkerValid } from './local-workspace'
 import { catalogueAgents } from './catalog-agents'
 import { runFile } from '../process'
 import { CheckoutLease, canonicalCheckout, describeHolder, type AcquireResult, type CheckoutLeaseOptions } from './checkout-lock'
@@ -102,7 +102,7 @@ const TITLE_CHARS = 60
 const AVAILABILITY_TTL_MS = 60_000
 
 export class ChatError extends HttpError {
-  constructor(statusCode: number, message: string, readonly code: string) {
+  constructor(statusCode: number, message: string, readonly code: string, readonly detail?: { manager?: { id: string } }) {
     super(statusCode, message)
     this.name = 'ChatError'
   }
@@ -325,6 +325,18 @@ export class ChatRuntime extends EventEmitter {
       .map(worker => worker.sessionId))
     for (const record of storage.listSessions(this.instance)) {
       if (protectedSessions.has(record.id) || liveWorkers.has(record.id) || catalogModel(catalog, record.model)) continue
+      if (record.role === 'manager') {
+        const live = this.requireLive(record.id)
+        const previous = live.record.retiredModel
+        live.record.retiredModel = live.record.model
+        this.saveRecord(live)
+        this.emit_(live.record.id, { type: 'session.updated', session: live.record })
+        if (previous !== live.record.retiredModel) {
+          this.emit_(live.record.id, { type: 'error', message: `The Manager's model ${live.record.model} was retired. Choose another model to continue.`, recoverable: true })
+        }
+        this.emit('log', `[chat] kept Manager ${record.id.slice(0, 8)} whose model ${record.model} retired`)
+        continue
+      }
       await this.preserveBorrowedQueueContext(record.id)
       storage.deleteSession(record.id)
       this.emit('log', `[chat] deleted session ${record.id.slice(0, 8)} with retired model ${record.model}`)
@@ -682,6 +694,15 @@ export class ChatRuntime extends EventEmitter {
 
   async create(request: NewSessionRequest): Promise<SessionRecord> {
     this.assertAcceptingWork() // before any await: the drain flag is checked atomically
+    if (request.role !== undefined && request.role !== 'manager') throw new ChatError(400, 'role must be "manager" or absent', 'invalid')
+    if (request.role === 'manager') {
+      if (request.repo !== undefined || request.branch !== undefined || request.checkout !== undefined) {
+        throw new ChatError(400, 'A Manager runs in its own local workspace; repo, branch and checkout are not accepted.', 'invalid')
+      }
+      if (request.context !== undefined) throw new ChatError(400, 'A Manager starts without card or document context.', 'invalid')
+      const existing = storage.managerSession(this.instance)
+      if (existing) throw new ChatError(409, 'A Manager already exists.', 'manager_exists', { manager: { id: existing.id } })
+    }
     return this.track(() => this.createSession(request))
   }
 
@@ -733,7 +754,7 @@ export class ChatRuntime extends EventEmitter {
           : await ensureLocalWorkspace(root, this.instance)
         : canonicalCheckout(await this.resolveCheckout(request.repo!))
     const now = new Date().toISOString()
-    const title = (request.title || request.context?.title || 'New session').slice(0, CHAT_LIMITS.titleChars)
+    const title = request.role === 'manager' ? 'Manager' : (request.title || request.context?.title || 'New session').slice(0, CHAT_LIMITS.titleChars)
     const record: SessionRecord = {
       id,
       agent,
@@ -755,8 +776,18 @@ export class ChatRuntime extends EventEmitter {
       context: request.context,
       ...(request.autoMerge !== undefined ? { autoMerge: request.autoMerge } : {}),
       safeMode: request.safeMode === true,
+      ...(request.role === 'manager' ? { role: 'manager' as const } : {}),
     }
-    storage.insertSession(record)
+    try {
+      storage.insertSession(record)
+    } catch (error) {
+      if (request.role === 'manager' && (error as { code?: string })?.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        await discardUnclaimedWorkspace(root, checkout, this.instance, this.leaseProbes).catch(() => 'kept' as const)
+        const winner = storage.managerSession(this.instance)
+        throw new ChatError(409, 'A Manager already exists.', 'manager_exists', winner ? { manager: { id: winner.id } } : undefined)
+      }
+      throw error
+    }
     const live = this.requireLive(record.id)
     this.emit_(record.id, { type: 'session.created', session: record })
     if (!request.deferStart) void this.serialized(live, () => this.startSession(live, { fresh: true })).catch(() => undefined)
@@ -1054,6 +1085,7 @@ export class ChatRuntime extends EventEmitter {
     this.assertAcceptingWork()
     const source = this.requireLive(id)
     if (source.record.selfChangeId) throw new ChatError(409, 'a Poise change session cannot be forked; its checkout belongs to the release controller', 'unsupported')
+    if (source.record.role === 'manager') throw new ChatError(409, 'The Manager cannot be forked; start a new chat instead.', 'unsupported')
     return this.serialized(source, async () => {
       if (!source.record.capabilities.fork) throw new ChatError(409, `${AGENT_LABEL[source.record.agent]} sessions cannot be forked`, 'unsupported')
       if (source.turn) throw new ChatError(409, 'a turn is running; fork after it finishes', 'turn_in_progress')
@@ -1100,6 +1132,7 @@ export class ChatRuntime extends EventEmitter {
     const source = this.requireLive(id)
     if (source.turn) throw new ChatError(409, 'a turn is running; hand off after it finishes', 'turn_in_progress')
     if (source.record.selfChangeId) throw new ChatError(409, 'a Poise change session cannot be handed off; its checkout belongs to the release controller', 'unsupported')
+    if (source.record.role === 'manager') throw new ChatError(409, 'The Manager cannot be handed off; change its model instead.', 'unsupported')
     const summary = this.handoffSummary(source.record)
     const created = await this.create({
       agent: target.agent,
@@ -1423,6 +1456,9 @@ export class ChatRuntime extends EventEmitter {
   /** Reserve the turn synchronously — before any await — so a second prompt
    *  in the same tick is refused, and persist it before acknowledging. */
   private reserveTurn(session: LiveSession, queueItem?: QueuedMessage, internalMessageSeq?: number): RunningTurn {
+    if (session.record.role === 'manager' && session.record.retiredModel) {
+      throw new ChatError(409, `The Manager's model ${session.record.retiredModel} was retired. Choose another model to continue.`, 'invalid')
+    }
     if (session.record.contextResetting) throw new ChatError(409, 'The chat is resetting; wait for it to finish.', 'turn_in_progress')
     if (session.turn) throw new ChatError(409, 'a turn is already running; Enter steers it', 'turn_in_progress')
     if (session.record.status === 'closed') throw new ChatError(409, 'the session is closed; resume it first', 'no_turn')
@@ -1441,6 +1477,9 @@ export class ChatRuntime extends EventEmitter {
   prompt(id: string, input: PromptInput, internalMessageSeq?: number): { turnId: string } {
     this.assertAcceptingWork()
     const session = this.requireLive(id)
+    if (session.record.role === 'manager' && session.record.retiredModel) {
+      throw new ChatError(409, `The Manager's model ${session.record.retiredModel} was retired. Choose another model to continue.`, 'invalid')
+    }
     const prompt = this.validatePrompt(id, input)
     const chain = parseCommands(prompt.text)
     if (chain.missingModel) throw new ChatError(400, 'Choose a model from /model first.', 'invalid')
@@ -1557,6 +1596,7 @@ export class ChatRuntime extends EventEmitter {
    *  queue; execution waits for its lifecycle/lease cleanup to finish. */
   private scheduleQueue(session: LiveSession): void {
     const id = session.record.id
+    if (session.record.role === 'manager' && session.record.retiredModel) return
     if (this.stopped || this.recovering || this.drainState || session.lifecycle.signal.aborted || session.record.status === 'closed'
       || session.record.contextResetting || session.record.orphanNotice || session.turn || this.queuePumps.has(id) || this.queueTimers.has(id) || !this.messageQueue(id).ready) return
     const executor = this.messageQueue(id).executorSessionId
@@ -1636,9 +1676,12 @@ export class ChatRuntime extends EventEmitter {
       if (applied.effort && applied.effort !== target.effort) throw new ChatError(409, 'The agent did not apply the selected effort.', 'agent_error')
     } else if (record.modelId !== target.model.selector) record.efforts = undefined
     record.model = target.model.identity; record.modelId = nativeModelId; record.effort = target.effort
+    const recovered = record.retiredModel !== undefined
+    delete record.retiredModel
     this.saveRecord(session)
     this.emit_(record.id, { type: 'model.updated', model: record.model, modelId: record.modelId, effort: record.effort, efforts: record.efforts })
     this.emit_(record.id, { type: 'session.updated', session: record })
+    if (recovered) this.scheduleQueue(session)
   }
 
   /** Stage an uploaded file inside the session's checkout, under the lease.
@@ -1821,8 +1864,8 @@ export class ChatRuntime extends EventEmitter {
       if (!session.adapter?.alive) await this.startSession(session, { fresh: !record.nativeSessionId && !record.branch.baseSha && record.branch.provisional, ...(lease ? { lease } : {}) })
       let adapter = session.adapter!
       const isFirst = !storage.findEvent(record.id, (e) => e.type === 'turn.started')
-      // A change session is titled by its request, not by the runbook's first line.
-      if ((record.title === 'New session' || (isFirst && !record.contextResetSeq)) && !record.selfChangeId && !internalTurn(turn.id)) {
+      // A change session is titled by its request, not by the runbook's first line. The Manager keeps its title.
+      if ((record.title === 'New session' || (isFirst && !record.contextResetSeq)) && !record.selfChangeId && !internalTurn(turn.id) && record.role !== 'manager') {
         record.title = (input.text.split('\n')[0] || record.title).slice(0, TITLE_CHARS) || record.title
         this.saveRecord(session)
         this.emit_(record.id, { type: 'session.updated', session: record })
@@ -1838,9 +1881,9 @@ export class ChatRuntime extends EventEmitter {
       this.setStatus(session, 'queued')
       // Poise-local turns share a bounded pool of agent slots; a turn past
       // the cap waits here with its own reason instead of starting an agent.
-      // The Switchboard's one observer turn stays outside it, so it still
-      // reports when every slot is busy.
-      if (record.workspaceKind === 'poise-local' && !isSwitchboardChat(record)) await this.acquireLocalTurnSlot(session, turn)
+      // The Switchboard's one observer turn and the Manager's turns stay
+      // outside it, so supervision still runs when every slot is busy.
+      if (record.workspaceKind === 'poise-local' && !isSwitchboardChat(record) && record.role !== 'manager') await this.acquireLocalTurnSlot(session, turn)
       // Created after the title settled: the label names what is queued behind.
       if (!lease) {
         lease = this.leaseFor(session)

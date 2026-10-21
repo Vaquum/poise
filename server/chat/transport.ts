@@ -44,9 +44,9 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body))
 }
 
-function errorBody(error: unknown): { error: string, code?: string } {
+function errorBody(error: unknown): { error: string, code?: string, manager?: { id: string } } {
   const message = error instanceof Error ? error.message : String(error)
-  return error instanceof ChatError ? { error: message, code: error.code } : { error: message }
+  return error instanceof ChatError ? { error: message, code: error.code, ...error.detail } : { error: message }
 }
 
 function errorStatus(error: unknown): number {
@@ -252,6 +252,7 @@ export class ChatSocketServer {
       case 'session.list':
         return { sessions: runtime.list() }
       case 'session.new': {
+        if (command.role !== undefined) throw new ChatError(400, 'A Manager is created from the New session dialog in the browser.', 'invalid')
         return { session: await runtime.create(localSessionRequest(command)) }
       }
       case 'context.reset':
@@ -473,6 +474,11 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
     }
     if (path === '/api/chat/sessions' && req.method === 'POST') {
       const body = await readJson<any>(req)
+      if (body?.role !== undefined) {
+        if (!person) throw new ChatError(403, 'A Manager is created from the New session dialog in the browser.', 'invalid')
+        const session = await runtime.create({ ...localSessionRequest(body), role: body.role })
+        return json(res, 201, { session }), true
+      }
       const session = await runtime.create(localSessionRequest(body))
       return json(res, 201, { session }), true
     }

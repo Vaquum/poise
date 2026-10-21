@@ -5765,6 +5765,11 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
   max-width: 100%;
 }
 
+.chat-pill-manager {
+  background: var(--tint-a2);
+  color: var(--text-primary);
+}
+
 /* A live session pulses teal; one waiting on the person pulses amber. */
 .chat-session-running {
   flex: 0 0 auto;

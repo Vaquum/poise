@@ -94,10 +94,18 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     if (path === '/api/chat/sessions' && method === 'GET') { await route.fulfill({ json: { sessions: state.sessions, instance: 'poise-dev:test' } }); return }
     if (path === '/api/chat/sessions' && method === 'POST') {
       if (state.createDelay) await state.createDelay()
-      const req2 = body as { agent: SessionRecord['agent'], model: string, effort: string, autoMerge?: boolean, safeMode?: boolean, deferStart?: boolean }
+      const req2 = body as { agent: SessionRecord['agent'], model: string, effort: string, autoMerge?: boolean, safeMode?: boolean, deferStart?: boolean, role?: string }
+      if (req2.role === 'manager') {
+        const existing = state.sessions.find((s) => s.role === 'manager')
+        if (existing) {
+          await route.fulfill({ status: 409, json: { error: 'A Manager already exists.', code: 'manager_exists', manager: { id: existing.id } } })
+          return
+        }
+      }
       const created = session({ id: `new-${state.sessions.length + 1}`, agent: req2.agent, model: req2.model, effort: req2.effort, autoMerge: req2.autoMerge, safeMode: req2.safeMode === true,
         repo: '', checkout: '/poise/.poise-chat/workspace', workspaceKind: 'poise-local', title: '', status: req2.deferStart ? 'idle' : 'starting', createdAt: new Date().toISOString(),
-        branch: { name: 'chat/generated', origin: 'new', provisional: true } })
+        branch: { name: 'chat/generated', origin: 'new', provisional: true },
+        ...(req2.role === 'manager' ? { role: 'manager' as const, title: 'Manager' } : {}) })
       state.sessions.unshift(created)
       state.history[created.id] = []
       await route.fulfill({ status: 201, json: { session: created } })

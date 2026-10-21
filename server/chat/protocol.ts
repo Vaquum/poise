@@ -153,6 +153,10 @@ export interface SessionRecord {
   /** Unanswered permission/question requests, by id. */
   pendingRequests: string[]
   forkedFrom?: string
+  /** The one workspace Manager. Set at creation; never changes; read from the chat_sessions.role column. */
+  role?: 'manager'
+  /** The Manager's catalogue model was retired; every turn is refused until set_model picks one. */
+  retiredModel?: string
   /** Which Poise server owns the session: `poise-dev:<db>` or `poise-prod:<db>`. */
   instance: string
   /** Set when a turn was cut by a crash or restart and never replayed. */
@@ -352,6 +356,8 @@ export interface NewSessionRequest {
   deferStart?: boolean
   autoMerge?: boolean
   safeMode?: boolean
+  /** Only POST /api/chat/sessions with a browser Origin passes it; never with repo, branch, checkout or context. */
+  role?: 'manager'
 }
 
 export type ChatCommand =
@@ -431,6 +437,7 @@ export type ChatErrorCode =
   | 'draining'
   /** `/poise` needs the separately installed self-update controller. */
   | 'self_update_unavailable'
+  | 'manager_exists'
 
 // ── Switchboard: the observer pane (docs/Switchboard.md) ─────────────────
 

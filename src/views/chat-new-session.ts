@@ -3,9 +3,11 @@ import type { AgentsResponse } from '../chat-client'
 import { catalogueFamilies, familyForIdentity } from '../chat-catalog'
 import { escapeHtml } from '../markdown'
 
+export interface ManagerChoice { existing: { id: string, title: string } | null, onOpen: (id: string) => void }
+
 export function renderNewSessionDialog(
   container: HTMLElement, info: AgentsResponse, context: SessionContext | undefined,
-  onCreate: (request: NewSessionRequest, error: HTMLElement) => void, onCancel: () => void, onJev?: () => void,
+  onCreate: (request: NewSessionRequest, error: HTMLElement) => void, onCancel: () => void, onJev?: () => void, manager?: ManagerChoice,
 ): void {
   const families = catalogueFamilies(info.agents)
   const initial = familyForIdentity(families, info.defaults.model) ?? families.find(f => f.agent.available) ?? families[0]
@@ -14,6 +16,14 @@ export function renderNewSessionDialog(
     <legend>Model provider</legend><div class="st-help st-help-warn">${escapeHtml(info.defaults.fallbackReason)}</div>
     <label class="chat-radio"><input type="radio" name="fallback" value="default" checked> Use the default, <code>${escapeHtml(info.defaults.model)}</code></label>
     <label class="chat-radio"><input type="radio" name="fallback" value="fallback"> Use the fallback, <code>${escapeHtml(info.defaults.fallback)}</code></label></fieldset>` : ''
+  const showType = !context || (context.kind !== 'card' && context.kind !== 'document')
+  const typeField = showType ? `<fieldset class="chat-dialog-field chat-dialog-type">
+    <legend>Type</legend>
+    <label class="chat-radio"><input type="radio" name="type" value="chat" checked> Chat</label>
+    <label class="chat-radio"><input type="radio" name="type" value="manager"${manager?.existing ? ' disabled' : ''}> Manager</label>
+    <div class="st-help">Supervises your chats. Only one Manager can exist.</div>
+    ${manager?.existing ? `<button type="button" class="st-clear chat-dialog-open-manager">Open the Manager</button>` : ''}
+    </fieldset>` : ''
   container.innerHTML = `<form class="chat-dialog-body">
     <div class="chat-dialog-title">New session</div>
     ${context ? `<div class="chat-dialog-context"><span class="chat-pill">${escapeHtml(context.kind)}</span> ${escapeHtml(context.title)}</div>` : ''}
@@ -21,7 +31,7 @@ export function renderNewSessionDialog(
       <label class="chat-dialog-field">Model<select class="st-select chat-d-model" aria-label="Model">${options}${onJev ? '<optgroup label="Typed evaluations"><option value="jev-primitives">JEV · Primitive builder</option></optgroup>' : ''}</select></label>
       <label class="chat-dialog-field">Effort<select class="st-select chat-d-effort" aria-label="Effort"></select></label>
     </div>
-    <div class="st-help chat-dialog-model-state" role="status"></div>${fallback}
+    <div class="st-help chat-dialog-model-state" role="status"></div>${fallback}${typeField}
     <div class="st-help chat-dialog-location">Sessions and their files stay local to Poise.</div>
     <div class="st-help st-help-error chat-dialog-error" role="alert" hidden></div>
     <div class="st-row"><button type="submit" class="st-save chat-dialog-create">Create</button>
@@ -38,6 +48,7 @@ export function renderNewSessionDialog(
     effort.closest<HTMLElement>('label')!.hidden = jev
     container.querySelector<HTMLElement>('.chat-dialog-context')?.toggleAttribute('hidden', jev)
     form.querySelector<HTMLElement>('.chat-dialog-fallback')?.toggleAttribute('hidden', jev)
+    form.querySelector<HTMLElement>('.chat-dialog-type')?.toggleAttribute('hidden', jev)
     if (jev) { status.textContent = 'Build Choice, Score and Noul questions; get typed results, not chat replies.'; status.classList.remove('st-help-error'); create.disabled = false; create.textContent = 'Open builder'; return }
     create.textContent = 'Create'
     const family = families.find(f => f.key === model.value)
@@ -59,6 +70,9 @@ export function renderNewSessionDialog(
     if (radio.checked) pick(radio.value === 'fallback' ? info.defaults.fallback : info.defaults.model)
   }))
   form.querySelector('.chat-dialog-cancel')!.addEventListener('click', onCancel)
+  form.querySelector('.chat-dialog-open-manager')?.addEventListener('click', () => {
+    if (manager?.existing) manager.onOpen(manager.existing.id)
+  })
   form.addEventListener('submit', event => {
     event.preventDefault()
     if (model.value === 'jev-primitives' && onJev) { onJev(); return }
@@ -70,8 +84,10 @@ export function renderNewSessionDialog(
       return
     }
     const useFallback = form.querySelector<HTMLInputElement>('input[name="fallback"][value="fallback"]')?.checked
+    const wantManager = form.querySelector<HTMLInputElement>('input[name="type"][value="manager"]')?.checked === true
     onCreate({ agent: family.agent.id as AgentId, model: selected.identity, effort: selected.effort, context,
-      ...(useFallback && selected.identity === info.defaults.fallback ? { fallbackModel: selected.identity } : {}) }, error)
+      ...(useFallback && selected.identity === info.defaults.fallback ? { fallbackModel: selected.identity } : {}),
+      ...(wantManager ? { role: 'manager' as const } : {}) }, error)
   })
   model.focus()
 }

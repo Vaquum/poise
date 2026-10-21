@@ -77,6 +77,14 @@ statuses and a reference to the saved supervision instruction and bindings.
 They cannot stop delivery to other chats. Work notices are bounded likewise;
 the owner must inspect complete evidence before acting on a truncated notice.
 
+## Workspace Manager
+
+The workspace Manager (the `role: 'manager'` chat) supervises the chats in its
+Poise instance. Until cross-chat supervision ships, it has the same control
+reach as any chat: it lists and reads chats, creates workers, sends messages,
+and supervises them. This is a different "manager" from a chat's manager (the
+chat that created it), which the docs call the creating chat from here on.
+
 ## The Switchboard
 
 The [Switchboard](Switchboard.md) is a chat Poise runs as an observer for the

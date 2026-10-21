@@ -549,6 +549,14 @@ describe('Poise in service mode', () => {
     local.open.terminate()
   })
 
+  it('creates a Manager only from the owner\'s browser', async () => {
+    const body = { agent: 'grok', model: 'grok-4.6-xhigh', role: 'manager' }
+    const created = await send('POST', '/api/chat/sessions', { ...fromGateway(), origin: PUBLIC_ORIGIN }, body)
+    expect(created.status).toBe(201)
+    expect(created.json.session.role).toBe('manager')
+    expect(await send('POST', '/api/chat/sessions', {}, body)).toMatchObject({ status: 403 })
+  })
+
   it('never echoes or logs the identity assertion', async () => {
     const lines: string[] = []
     const capture = (...args: unknown[]) => { lines.push(args.map((arg) => arg instanceof Error ? `${arg.message} ${arg.stack}` : typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ')) }
