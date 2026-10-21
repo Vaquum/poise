@@ -10,12 +10,17 @@ from time import monotonic
 
 STDERR_BYTES = 16 * 1024
 MARKER = "\n[stderr truncated; incomplete boundary lines omitted]\n"
+# What redact() writes, and the truncation marker. Secrets are replaced in one
+# pass that keeps these whole, so a secret of a letter or two neither splits a
+# marker nor grows it again when evidence is redacted twice, as failure() does.
+KEPT = re.compile(r"\[redacted(?: header| credential)?\]|" + re.escape(MARKER.strip()))
 
 
 def redact(text: str, env: dict[str, str]) -> str:
+    # Every nonempty secret, whatever its length, as Poise's canonical
+    # redactor requires: a short password echoed as a bare value is still one.
     secrets = {value for key, value in env.items()
-               if re.search(r"TOKEN|KEY|SECRET|PASSWORD|AUTH|GIT_CONFIG_VALUE", key, re.I)
-               and len(value) >= 8}
+               if re.search(r"TOKEN|KEY|SECRET|PASSWORD|AUTH|GIT_CONFIG_VALUE", key, re.I) and value}
     for value in list(secrets):
         match = re.search(r"(?i)authorization: basic ([A-Za-z0-9+/=]+)", value)
         if match:
@@ -28,13 +33,17 @@ def redact(text: str, env: dict[str, str]) -> str:
                 continue
             if ":" in decoded:
                 secrets.add(decoded.split(":", 1)[1])
-    for value in sorted((value for value in secrets if value), key=len, reverse=True):
-        text = text.replace(value, "[redacted]")
     text = re.sub(r"(?im)\b(?:proxy-authorization|authorization|set-cookie|cookie)\s*[:=][^\r\n]*", "[redacted header]", text)
     text = re.sub(r"(?i)\b(?:basic|bearer|token)\s+[^\s,;\"']+", "[redacted credential]", text)
     text = re.sub(r"(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "[redacted]", text)
     text = re.sub(r"(https?://)[^\s/@]+@", r"\1[redacted]@", text)
     text = re.sub(r"(?i)([?&](?:token|key|secret|password|auth|signature)=)[^\s&#]+", r"\1[redacted]", text)
+    # Secrets last, as in the canonical redactor: replaced first, a short one
+    # could split the header and keyword names the patterns above look for.
+    values = sorted((value for value in secrets if value), key=len, reverse=True)
+    if values:
+        secret = re.compile(KEPT.pattern + "|" + "|".join(map(re.escape, values)))
+        text = secret.sub(lambda match: match[0] if KEPT.fullmatch(match[0]) else "[redacted]", text)
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
 
 

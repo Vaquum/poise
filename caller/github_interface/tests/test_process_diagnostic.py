@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from github_interface import cli
 from github_interface.atoms import review_diff as rd
-from github_interface.atoms.process_diagnostic import GitProcessError, STDERR_BYTES
+from github_interface.atoms.process_diagnostic import MARKER, GitProcessError, STDERR_BYTES, redact
 
 
 class TestProcessDiagnostic(TestCase):
@@ -72,6 +72,23 @@ class TestProcessDiagnostic(TestCase):
         self.assertEqual(record['operation'], 'fetch')
         for secret in ('test-private-token', credential, 'hidden-cookie', 'password', 'hidden-query', 'ghp_hiddenkey'):
             self.assertNotIn(secret, output.getvalue())
+
+    def test_secrets_of_every_length_are_redacted(self):
+        self.env.update(TEST_PASSWORD='pw7!', TEST_TOKEN='s2')
+        self.fake('import sys\nsys.stderr.write("fatal: pw7! rejected for s2\\n")\nsys.exit(128)\n')
+        error = self.failure('fetch')
+        self.assertEqual(error.diagnostic['stderr'], 'fatal: [redacted] rejected for [redacted]')
+        for secret in ('pw7!', 's2'):
+            self.assertNotIn(secret, str(error))
+
+    def test_a_one_letter_secret_keeps_header_redaction_and_markers_whole(self):
+        self.env['TEST_KEY'] = 'e'
+        self.fake('import sys\nsys.stderr.write("fatal: e\\nSet-Cookie: session=hidden\\n")\nsys.exit(128)\n')
+        error = self.failure('fetch')
+        self.assertEqual(error.diagnostic['stderr'], 'fatal: [redacted]\n[redacted header]')
+        once = redact('kept' + MARKER + 'e [redacted credential]', self.env)
+        self.assertEqual(once, 'k[redacted]pt' + MARKER + '[redacted] [redacted credential]')
+        self.assertEqual(redact(once, self.env), once)
 
     def test_signal_timeout_missing_binary_and_empty_stderr_are_distinct(self):
         self.fake('import os, signal\nos.kill(os.getpid(), signal.SIGTERM)\n')

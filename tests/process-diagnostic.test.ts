@@ -22,6 +22,22 @@ it('redacts every allowed string field before the evidence reaches Poise respons
   }
 })
 
+it('redacts configured secrets of every length, as Logging does', () => {
+  vi.stubEnv('TEST_PASSWORD', 'pw7!')
+  vi.stubEnv('TEST_TOKEN', 's2')
+  const event = parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error', operation: 'fetch', phase: 'checkout',
+    outcome: 'exit', stderr: 'fatal: pw7! rejected for s2', stderr_truncated: false, cwd: '/srv/s2', filesystem: { measurement_error: 'denied: pw7!' } })
+  expect(event).toMatchObject({ stderr: 'fatal: [redacted] rejected for [redacted]', context: { cwd: '/srv/[redacted]' },
+    filesystem: { measurement_error: 'denied: [redacted]' } })
+})
+
+it('leaves its markers whole when a secret is a single character', () => {
+  vi.stubEnv('TEST_KEY', 'e')
+  const event = parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error', operation: 'fetch', phase: 'checkout',
+    outcome: 'exit', stderr: 'fatal: e\nAuthorization: Basic Zm9v', stderr_truncated: false, filesystem: null })
+  expect(event?.stderr).toBe('fatal: [redacted]\n[redacted header]')
+})
+
 it('keeps historical absence readable and refuses unsupported or malformed diagnostics', () => {
   expect(parseProcessDiagnostic(undefined)).toBeNull()
   for (const value of ['error', [], { version: 2 }, { version: 1, source: 'caller', severity: 'info' }]) {

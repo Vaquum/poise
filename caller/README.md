@@ -151,7 +151,8 @@ and `agent-interface --logs`. `github-interface` emits the same redacted JSON
 as `caller_diagnostic: …` on stderr; agent-interface preserves it across packet
 acquisition, checkout and inspection. Poise's agent-log API exposes its bounded
 cause as `diagnostic` (identity/process fields under `context`), and validated
-behavior incidents carry `processDiagnostic` alongside their classification.
+behavior incidents carry `processDiagnostic` alongside their classification;
+both pass through Poise's canonical redactor first, as Logging does.
 
 The evidence records the actual Git subcommand after global options, exit or
 signal, deadline, elapsed time, configured/resolved executable, working path,
@@ -161,9 +162,11 @@ keep their existing stopped/superseded lifecycle and retry ownership.
 
 Stderr is drained concurrently, retaining at most 16 KiB plus a truncation
 marker. Partial lines at capture boundaries are omitted to avoid leaking
-credential fragments. Credentials, encoded Git authentication, URL passwords,
-authorization headers and cookies are redacted before CLI output or durable
-storage. Neither stdout, prompts, argv nor the environment enter the diagnostic.
+credential fragments. Credentials of every length, encoded Git authentication,
+URL passwords, authorization headers and cookies are redacted before CLI output
+or durable storage. Secrets are replaced last, in one pass that keeps the
+redaction and truncation markers whole, so redacting twice changes nothing.
+Neither stdout, prompts, argv nor the environment enter the diagnostic.
 An empty stderr says the cause is unknown. Explicit ENOSPC/quota evidence also
 records filesystem bytes/inodes measured immediately after the process failure,
 with its own measurement time; unavailable readings are null with the measurement
