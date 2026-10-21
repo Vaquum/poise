@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/**/*.test.ts'],
+    setupFiles: ['tests/credential-isolation.ts'],
     testTimeout: 15_000,
   },
 })
