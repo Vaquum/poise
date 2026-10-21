@@ -45,7 +45,7 @@ export interface AgentInfo {
 export interface AgentsResponse {
   agents: AgentInfo[]
   defaults: { model: string, fallback: string, fallbackReason?: string }
-  settings: { branchPrefix: string, idleTimeoutMinutes: number }
+  settings: { branchPrefix: string, idleTimeoutMinutes: number, maxConcurrentLocalTurns: number }
 }
 export interface RepoInfo {
   checkout: string
@@ -495,7 +495,7 @@ export class ChatClient {
     return post(`/api/chat/sessions/${encodeURIComponent(id)}`, { title }, 'PATCH')
   }
 
-  deleteSession(id: string): Promise<{ ok: true }> {
+  deleteSession(id: string): Promise<{ ok: true, workspaceRemoved: boolean }> {
     return jsonFetch(`/api/chat/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 

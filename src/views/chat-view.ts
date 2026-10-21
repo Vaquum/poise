@@ -50,6 +50,7 @@ import { isTerminal, nextPollDelay, POLL_ACTIVE_MS, POLL_IDLE_MS, selectChangeFo
 import { takeDraftSnapshot, buildDraftSnapshot, saveDraftSnapshot, type DraftSnapshot } from '../self-update-drafts'
 import { installSelfUpdateWatch, registerDraftProvider, registerReloadGuard } from '../self-update-watch'
 import { BUILD_SHA } from '../build-identity'
+import { deleteConfirmCopy, queuedStatusText } from '../chat-text'
 import { RELOADED_RELEASE_KEY } from '../self-update-reload'
 import type { SelfChange, SelfUpdateStatus } from '../self-update-types'
 import { POISE_REPOSITORY } from '../poise-repository'
@@ -177,7 +178,7 @@ function statusText(s: SessionRecord): string {
   switch (s.status) {
     case 'starting': return s.cliChecking ? 'checking CLI…' : 'starting…'
     case 'idle': return 'idle'
-    case 'queued': return `queued behind ${s.queuedBehind || 'another session'}`
+    case 'queued': return queuedStatusText(s.queuedBehind)
     case 'running': return 'running'
     case 'waiting': return 'waiting for you'
     case 'stopping': return 'stopping…'
@@ -578,11 +579,13 @@ function sidebarHtml(): string {
   if (!order.length) {
     return '<div class="chat-empty chat-sidebar-empty">No sessions yet.</div>'
   }
+  const records = order.map((id) => sessions.get(id)!.record)
   return order.map((id) => {
     const e = sessions.get(id)!
     const s = e.record
     const running = isRunning(s.status)
     const armed = armedDelete?.id === id && armedDelete.until > Date.now()
+    const confirm = armed ? deleteConfirmCopy(s, records) : null
     const waiting = s.status === 'waiting' || (s.pendingRequests?.length || 0) > 0
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0">`
       + `<div class="chat-session-title" title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</div>`
@@ -591,7 +594,7 @@ function sidebarHtml(): string {
       + `<span class="chat-session-date">${escapeHtml(dateLabel(s.createdAt))}</span>`
       + (running ? `<span class="chat-session-running${waiting ? ' waiting' : ''}" title="${escapeHtml(statusText(s))}" aria-label="${escapeHtml(statusText(s))}"></span>` : '')
       + `</div>`
-      + `<button type="button" class="chat-session-delete${armed ? ' armed' : ''}" data-id="${escapeHtml(id)}" title="${armed ? 'Confirm delete' : 'Delete session'}" aria-label="${armed ? 'Confirm deleting session' : 'Delete session'}">${armed ? 'Sure?' : '×'}</button>`
+      + `<button type="button" class="chat-session-delete${armed ? ' armed' : ''}" data-id="${escapeHtml(id)}" title="${escapeHtml(confirm ? confirm.title : 'Delete session')}" aria-label="${escapeHtml(confirm ? confirm.label : 'Delete session')}">${armed ? 'Sure?' : '×'}</button>`
       + `</div>`
   }).join('')
 }
@@ -685,7 +688,7 @@ async function deleteSession(id: string): Promise<void> {
   const e = sessions.get(id)
   if (!e) return
   try {
-    if (!e.pending) await chatClient.deleteSession(id)
+    const removed = !e.pending ? (await chatClient.deleteSession(id)).workspaceRemoved : false
     chatClient.unsubscribe(id)
     sessions.delete(id)
     order = order.filter((x) => x !== id)
@@ -699,6 +702,10 @@ async function deleteSession(id: string): Promise<void> {
       if (order[0]) void selectSession(order[0])
       else { composer.setDraft(freshDraft); setNotice(null) }
     }
+    // The server reports what the delete actually did; only a Poise-local
+    // session can take a workspace with it.
+    if (removed) setNotice('Session deleted; its workspace was removed.', 'info')
+    else if (e.record.workspaceKind === 'poise-local') setNotice('Session deleted; its workspace was kept.', 'info')
     queueRender()
   } catch (err) {
     setNotice(`Delete failed — ${(err as Error).message}`)
@@ -1584,7 +1591,7 @@ async function handoff(agent: AgentId, model: string, effort?: string): Promise<
 
 function workspaceText(s: SessionRecord): { text: string, cls: string } {
   const w = s.workspace
-  if (s.status === 'queued' && s.queuedBehind) return { text: `queued behind ${s.queuedBehind}`, cls: 'warn' }
+  if (s.status === 'queued' && s.queuedBehind) return { text: queuedStatusText(s.queuedBehind), cls: 'warn' }
   if (!w) return { text: '', cls: '' }
   if (w.lockedBy && s.status === 'queued') return { text: `queued behind ${w.lockedBy}`, cls: 'warn' }
   if (!w.onBranch) return { text: `off-branch (on ${w.currentBranch})`, cls: 'warn' }

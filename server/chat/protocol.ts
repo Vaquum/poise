@@ -23,6 +23,10 @@ export const AGENT_LABELS: Record<AgentId, string> = {
   muse: 'Muse',
 }
 
+/** Why a Poise-local turn is `queued` while it waits for a free agent slot —
+ *  distinct from queueing behind another checkout holder. */
+export const SLOT_WAIT_REASON = 'waiting for a free agent slot'
+
 /** Which optional controls the view shows for a session. `permissions`,
  *  `questions`, `steer` and `resume` are required of every v1 adapter; the
  *  rest are honest flags — a control for a false flag is hidden, never faked. */
@@ -333,6 +337,10 @@ export interface NewSessionRequest {
   /** Optional effort override, one of the agent's advertised efforts. */
   effort?: string
   repo?: string
+  /** Server-only: bind the new session to this existing checkout instead of
+   *  provisioning one (a handoff stays in its source's workspace). Browser
+   *  creation routes discard it with repo/branch/path. */
+  checkout?: string
   branch?: BranchRequest
   title?: string
   context?: SessionContext

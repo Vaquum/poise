@@ -25,7 +25,7 @@ beforeEach(() => {
 describe('what the settings model accepts', () => {
   it('stores a well-formed org, username and timezone', () => {
     const s = setSettings({ org: ' Vaquum ', me: ' mikkokotila ', timezone: 'Europe/Helsinki' })
-    expect(s).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'Europe/Helsinki', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 }, notifications: { enabled: true } })
+    expect(s).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'Europe/Helsinki', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 }, notifications: { enabled: true } })
   })
 
   it('refuses a pasted URL rather than storing something no query can use', () => {
@@ -57,7 +57,7 @@ describe('a rejected save changes nothing at all', () => {
     setSettings({ org: 'Vaquum', me: 'mikkokotila', timezone: 'UTC' })
     expect(() => setSettings({ timezone: 'Europe/Berlin', org: 'not a valid org' })).toThrow()
     // The timezone in the same call must not have landed.
-    expect(getSettings()).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 }, notifications: { enabled: true } })
+    expect(getSettings()).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 }, notifications: { enabled: true } })
   })
 })
 
@@ -121,6 +121,29 @@ describe('changing the organization drops the org-scoped repo cache', () => {
     mocks.invalidateRepoListCache.mockClear()
     setSettings({ org: 'Vaquum', me: 'mikkokotila' })
     expect(mocks.invalidateRepoListCache).not.toHaveBeenCalled()
+  })
+})
+
+describe('the concurrent local turns cap', () => {
+  const chat = (maxConcurrentLocalTurns: number) => ({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns })
+  it('defaults to 4 and accepts 1 through 64', () => {
+    expect(getSettings().chat).toMatchObject({ maxConcurrentLocalTurns: 4 })
+    expect(setSettings({ chat: chat(1) }).chat.maxConcurrentLocalTurns).toBe(1)
+    expect(setSettings({ chat: chat(64) }).chat.maxConcurrentLocalTurns).toBe(64)
+  })
+
+  it('refuses anything outside 1 through 64 without saving it', () => {
+    for (const value of [0, 65, 1.5, Number.NaN, 'four']) {
+      expect(() => setSettings({ chat: chat(value as never) })).toThrow(/concurrent local turns/)
+    }
+    expect(getSettings().chat.maxConcurrentLocalTurns).toBe(4)
+  })
+
+  it('falls back to 4 for a corrupt stored value', () => {
+    mocks.store.set('chat_settings', JSON.stringify({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 0 }))
+    expect(getSettings().chat.maxConcurrentLocalTurns).toBe(4)
+    mocks.store.set('chat_settings', 'not json')
+    expect(getSettings().chat).toEqual({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 })
   })
 })
 

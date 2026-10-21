@@ -87,27 +87,45 @@ submitted identity always matches that effort. An unavailable provider stays
 visible with its reason; Poise does not invent interactive capabilities or
 silently choose a different model.
 
-New sessions use `.poise-chat/workspace/` inside the running Poise installation.
-The root `/.poise-chat/` ignore rule keeps workspace files out of Poise commits.
-An independently initialized, remote-free Git repository inside that directory
-provides checkpoints and safe Revert without switching or committing the outer
-Poise checkout. The session branch is an internal implementation detail. The
-dialog contains no repository, branch, PR, or location picker, and both REST and
-WebSocket creation routes discard such fields. Card/document handoffs supply
-context, not permission to check out another repository.
+Each new Poise-local session gets its own scratch workspace,
+`.poise-chat/workers/<id>/workspace/` inside the running Poise installation,
+reusing the same primitive managed workers use. The root `/.poise-chat/`
+ignore rule keeps workspace files out of Poise commits; every workspace under
+the default root requires it. An independently initialized, remote-free Git
+repository inside each workspace provides checkpoints and safe Revert without
+switching or committing the outer Poise checkout. The session branch is an
+internal implementation detail. The dialog contains no repository, branch, PR,
+or location picker, and both REST and WebSocket creation routes discard such
+fields. Card/document handoffs supply context, not permission to check out
+another repository.
 
 Existing repository-bound sessions and their transcripts remain intact. They
 still use their original checkout and branch; this change does not move files
-or rewrite their history. Transcript metadata continues in Poise's existing
-SQLite store. Legacy session switching checkpoints owned dirty branches as
+or rewrite their history. Sessions already on the legacy shared workspace,
+`.poise-chat/workspace/`, also stay where they are and keep queueing behind
+each other; nothing is migrated. Transcript metadata continues in Poise's
+existing SQLite store. Legacy session switching checkpoints owned dirty branches as
 `wip(poise): checkpoint` and refuses unowned dirty work. A new local session
 never stashes, commits, or switches the enclosing Poise source checkout.
 
+A fork or handoff stays in its source session's workspace, sharing that
+checkout and its lease with the source; while the source family's turn runs,
+the fork or handoff is visibly queued behind it. Deleting a session removes
+its own scratch workspace only when no other session still uses it, its
+branch tip never moved, and its tree is clean; otherwise the workspace is
+kept, and the delete confirmation says which applies. Lock files are never
+deleted, and no server sweeps workspaces by its own session table: development
+and production share the chat root but keep separate session tables. A setting
+caps concurrently running Poise-local turns (default 4); a turn held by the
+cap shows `queued` with its own reason, "waiting for a free agent slot".
+
 The checkout lease is shared by Poise development, Poise production and the
 compatible Caller writing behavior. Turns in different checkouts can run
-concurrently; another session on the same checkout is visibly queued. The
-lease covers startup, execution, tool services and process cleanup, not only
-the subprocess launch. Worker gates register a process group before allowing
+concurrently; another session on the same checkout is visibly queued.
+Per-session workspaces make same-checkout contention rare; it remains for
+forks and handoffs on one workspace, development versus production, and
+orphan holds. The lease covers startup, execution, tool services and
+process cleanup, not only the subprocess launch. Worker gates register a process group before allowing
 it to run. An unverified surviving worker keeps the checkout blocked. A
 Poise-side filesystem operation must finish before the lease is released;
 killing an agent cannot cancel filesystem work already executing in Poise.
@@ -115,7 +133,9 @@ killing an agent cannot cancel filesystem work already executing in Poise.
 These are cooperative application locks. They do not prevent a person or an
 unrelated program from modifying the checkout outside Poise. Native agents
 also retain their own tool and sandbox policies; a working directory alone is
-not an operating-system sandbox. See SECURITY.md for the trust boundary.
+not an operating-system sandbox. Separate working trees are not
+confidentiality: agents run as the same operating-system user and can still
+read each other's files. See SECURITY.md for the trust boundary.
 
 ## Persistence and recovery
 

@@ -252,8 +252,7 @@ export class ChatSocketServer {
       case 'session.close':
         return { session: await runtime.close(String(command.id || '')) }
       case 'session.delete':
-        await runtime.delete(String(command.id || ''))
-        return {}
+        return await runtime.delete(String(command.id || ''))
       case 'session.rename':
         return { session: await runtime.rename(String(command.id || ''), String(command.title || '')) }
       case 'prompt':
@@ -356,7 +355,7 @@ function validAttachments(value: unknown): Attachment[] {
 
 // ── REST ───────────────────────────────────────────────────────────────────
 
-async function listFiles(checkout: string, query: string): Promise<string[]> {
+export async function listFiles(checkout: string, query: string): Promise<string[]> {
   const q = query.trim().toLowerCase()
   const tracked = (await runFile('git', ['ls-files', '-z'], { cwd: checkout, timeoutMs: 15_000, maxOutputBytes: 16 * 1024 * 1024 }).catch(() => ({ stdout: '' }))).stdout.split('\0')
   const untracked = (await runFile('git', ['ls-files', '-z', '--others', '--exclude-standard'], { cwd: checkout, timeoutMs: 15_000, maxOutputBytes: 16 * 1024 * 1024 }).catch(() => ({ stdout: '' }))).stdout.split('\0')
@@ -466,8 +465,8 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
         return json(res, 200, { session: await runtime.rename(id, String(body.title || '')) }), true
       }
       if (!action && req.method === 'DELETE') {
-        await runtime.delete(id)
-        return json(res, 200, { ok: true }), true
+        const { workspaceRemoved } = await runtime.delete(id)
+        return json(res, 200, { ok: true, workspaceRemoved }), true
       }
       if (action && req.method === 'POST') {
         if (action === 'resume') return json(res, 200, { session: await runtime.resume(id) }), true

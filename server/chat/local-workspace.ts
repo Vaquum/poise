@@ -1,7 +1,7 @@
 // New Chat sessions use ignored Poise-owned storage. Its private Git
 // repository is only a checkpoint mechanism; it never switches Poise itself.
 import { lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { CLAUDE_SUBSCRIPTION_CLI, runFile } from '../process'
 import { isServiceMode, serviceStatePath } from '../service/config'
 import { CheckoutLease, canonicalCheckout } from './checkout-lock'
@@ -41,11 +41,20 @@ async function readyWorkspace(checkout: string): Promise<boolean> {
   } catch (error: any) { if (error?.code === 'ENOENT') return false; throw error }
 }
 
+/** Storage inside the installation's own checkout must be ignored by it —
+ *  the default root and every workspace under it. Any other root (service
+ *  mode's, a release's, a test's) needs no checkout of Poise at all. */
+export function needsIgnoreCheck(root: string): boolean {
+  if (root === DEFAULT_LOCAL_CHAT_ROOT) return true
+  const rel = relative(DEFAULT_LOCAL_CHAT_ROOT, root)
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
+}
+
 export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'poise'): Promise<string> {
   // Only the installation's own default storage must be ignored by its
   // checkout; any other root (service mode's, a release's) needs no checkout
   // of Poise at all.
-  if (root === DEFAULT_LOCAL_CHAT_ROOT) {
+  if (needsIgnoreCheck(root)) {
     await runFile('git', ['check-ignore', '--quiet', '--no-index', '.poise-chat/workspace'], { cwd: POISE_ROOT })
       .catch(() => { throw new Error('Poise must ignore /.poise-chat/ before local Chat storage can be created') })
   }
@@ -106,9 +115,42 @@ export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'p
 
 /** Validate every managed parent before using the private workspace initializer. */
 export async function ensureWorkerWorkspace(root: string, id: string, instance: string): Promise<string> {
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Invalid worker workspace ID')
+  if (!WORKSPACE_ID.test(id)) throw new Error('Invalid worker workspace ID')
   await privateDirectory(root)
   const workers = join(root, 'workers')
   await privateDirectory(workers)
   return ensureLocalWorkspace(join(workers, id), instance)
+}
+
+const WORKSPACE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** True only for a directory Poise itself initialized as Chat storage. A
+ *  missing or foreign marker fails safe: the directory is kept, never
+ *  removed. */
+export async function workspaceMarkerValid(checkout: string): Promise<boolean> {
+  try {
+    const marker = join(checkout, '.poise-workspace-owner')
+    const info = await lstat(marker)
+    return info.isFile() && !info.isSymbolicLink() && (await readFile(marker, 'utf8')) === OWNER
+  } catch {
+    return false
+  }
+}
+
+/** When `checkout` is exactly one `workers/<id>/workspace` directory under
+ *  `root`, its id and parent directory (for best-effort cleanup of the
+ *  emptied parent). Anything else — the legacy shared workspace, a
+ *  repository checkout, another root — is not ours to remove. */
+export function workerWorkspaceRef(root: string, checkout: string): { id: string, home: string } | null {
+  if (basename(checkout) !== 'workspace') return null
+  const id = basename(dirname(checkout))
+  if (!WORKSPACE_ID.test(id)) return null
+  const workers = dirname(dirname(checkout))
+  if (basename(workers) !== 'workers') return null
+  try {
+    if (canonicalCheckout(dirname(workers)) !== canonicalCheckout(root)) return null
+  } catch {
+    return null
+  }
+  return { id, home: dirname(checkout) }
 }

@@ -27,9 +27,10 @@ export interface AppSettings {
   // Per place that launches a model (chat, editor, pr_review, pr_approve):
   // the identities picked as default and fallback. Absent = Caller default.
   models?: Partial<Record<string, ModelChoice>>
-  // Chat view: the prefix for branches new sessions cut, and how long an idle
-  // session keeps its agent process alive.
-  chat?: { branchPrefix: string, idleTimeoutMinutes: number }
+  // Chat view: the prefix for branches new sessions cut, how long an idle
+  // session keeps its agent process alive, and how many Poise-local turns may
+  // run concurrently.
+  chat?: { branchPrefix: string, idleTimeoutMinutes: number, maxConcurrentLocalTurns: number }
   // The notifications at the top of the page; on unless turned off.
   notifications?: { enabled: boolean }
 }

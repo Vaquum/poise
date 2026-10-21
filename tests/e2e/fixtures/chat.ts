@@ -31,7 +31,7 @@ const AGENTS: { agents: unknown[], defaults: { model: string, fallback: string, 
     { id: 'muse', label: 'Muse', available: true, models: [{ identity: 'muse-spark-1.3-contributor-max', selector: 'muse-spark-1.3-contributor', effort: 'max' }, { identity: 'muse-spark-1.3-contributor-xhigh', selector: 'muse-spark-1.3-contributor', effort: 'xhigh' }], efforts: ['max', 'xhigh'] },
   ],
   defaults: { model: 'opus-5-max', fallback: 'gpt-6-astra-ultra' },
-  settings: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 },
+  settings: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 },
 }
 
 interface ServerState {
@@ -95,7 +95,7 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
         return
       }
       if (method === 'PATCH') { s.title = (body as { title: string }).title; await route.fulfill({ json: { session: s } }); return }
-      if (method === 'DELETE') { state.sessions = state.sessions.filter((x) => x.id !== id); await route.fulfill({ json: { ok: true } }); return }
+      if (method === 'DELETE') { state.sessions = state.sessions.filter((x) => x.id !== id); await route.fulfill({ json: { ok: true, workspaceRemoved: false } }); return }
       const after = Number(url.searchParams.get('after') || 0)
       await route.fulfill({ json: { session: s, events: (state.history[id] || []).filter((e) => e.seq > after) } })
       return
@@ -210,7 +210,7 @@ function env(sessionId: string, seq: number, event: ChatEvent): ChatEnvelope {
 }
 
 function makeState(sessions: SessionRecord[], history: Record<string, ChatEnvelope[]> = {}): ServerState {
-  return { sessions, history, calls: [], settings: { org: 'acme', me: 'octocat', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 } } }
+  return { sessions, history, calls: [], settings: { org: 'acme', me: 'octocat', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 } } }
 }
 
 const input = (page: Page) => page.locator('.chat-v-composer .chat-input')

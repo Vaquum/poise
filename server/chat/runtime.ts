@@ -35,14 +35,14 @@ import { parseChatCommandChain, commandBody } from './commands'
 import { latestReviewTarget, prepareReview, type ReviewTarget } from './review'
 import type { AutoMergeAck, SafeModeAck } from './protocol'
 import type { ChildProcess } from 'node:child_process'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, rm, rmdir, writeFile } from 'node:fs/promises'
 import { basename, dirname } from 'node:path'
 import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../models'
 import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
 import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertContext } from '../alerts/producers'
 import { localCheckoutPath } from '../gh'
-import { ensureLocalWorkspace, ensureWorkerWorkspace, LOCAL_CHAT_ROOT } from './local-workspace'
+import { ensureLocalWorkspace, ensureWorkerWorkspace, LOCAL_CHAT_ROOT, workerWorkspaceRef, workspaceMarkerValid } from './local-workspace'
 import { catalogueAgents } from './catalog-agents'
 import { runFile } from '../process'
 import { CheckoutLease, canonicalCheckout, describeHolder, type AcquireResult, type CheckoutLeaseOptions } from './checkout-lock'
@@ -56,7 +56,7 @@ import {
   inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
 } from './git'
 import {
-  AGENT_IDS, CHAT_LIMITS, type AgentId, type Attachment, type BranchRequest, type ChatEnvelope, type ChatEvent, type NewSessionRequest,
+  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatEnvelope, type ChatEvent, type NewSessionRequest,
   type PermissionOption, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type WorkspaceState,
 } from './protocol'
 import * as storage from './storage'
@@ -89,6 +89,7 @@ const alertContext = (record: SessionRecord): ChatSessionAlertContext => ({ sess
 
 export const DEFAULT_IDLE_TIMEOUT_MINUTES = 120
 export const DEFAULT_BRANCH_PREFIX = 'chat/'
+export const DEFAULT_MAX_CONCURRENT_LOCAL_TURNS = 4
 const STOP_SETTLE_MS = 2_000
 const CLOSE_GRACE_MS = 5_000
 const SERVICE_SETTLE_MS = 5_000
@@ -139,6 +140,8 @@ interface RunningTurn {
   commandModel?: string
   contextAction?: 'compact' | 'reset'
   review?: { target: ReviewTarget, throughSeq: number }
+  /** True while the turn holds one of the bounded Poise-local agent slots. */
+  localSlot?: boolean
 }
 
 interface LiveSession {
@@ -183,6 +186,7 @@ export interface RuntimeOptions {
   localWorkspaceRoot?: string
   idleTimeoutMinutes?: () => number
   branchPrefix?: () => string
+  maxConcurrentLocalTurns?: () => number
   requireClaudeReady?: () => Promise<void>
   /** Whether an agent's CLI is launchable; replaced in tests. */
   prepareCli?: typeof prepareProviderCli
@@ -223,6 +227,10 @@ export class ChatRuntime extends EventEmitter {
   private readonly resolveCheckout: (repo: string) => Promise<string>
   private readonly idleTimeoutMinutes: () => number
   private readonly branchPrefix: () => string
+  private readonly maxConcurrentLocalTurns: () => number
+  /** Poise-local agent slots in use, and turns waiting for one in FIFO order. */
+  private localTurnSlots = 0
+  private readonly localTurnWaiters: Array<{ resolve: () => void, reject: (error: Error) => void }> = []
   private readonly requireClaudeReady: () => Promise<void>
   private readonly probeAgent: (agent: AgentId) => Promise<{ ok: boolean, reason?: string }>
   private readonly leaseProbes: CheckoutLeaseOptions
@@ -252,6 +260,7 @@ export class ChatRuntime extends EventEmitter {
     })
     this.idleTimeoutMinutes = options.idleTimeoutMinutes ?? (() => DEFAULT_IDLE_TIMEOUT_MINUTES)
     this.branchPrefix = options.branchPrefix ?? (() => DEFAULT_BRANCH_PREFIX)
+    this.maxConcurrentLocalTurns = options.maxConcurrentLocalTurns ?? (() => DEFAULT_MAX_CONCURRENT_LOCAL_TURNS)
     this.requireClaudeReady = options.requireClaudeReady ?? (() => claudeAuth.requireReady())
     this.probeAgent = options.probeAgent ?? defaultProbeAgent
     this.leaseProbes = options.leaseProbes ?? {}
@@ -683,11 +692,19 @@ export class ChatRuntime extends EventEmitter {
     if (!local && !/^[^/\s]+\/[^/\s]+$/.test(request.repo!)) throw new ChatError(400, 'repo must be owner/name', 'invalid')
     const branch = normalizeBranchRequest(request.branch ?? { new: `chat/${id}` }, this.branchPrefix())
     if (agent === 'claude' && !request.deferStart) await this.requireClaudeReady()
-    const checkout = local
-      ? isolated
-        ? await ensureWorkerWorkspace(this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT, id, this.instance)
-        : await ensureLocalWorkspace(this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT, this.instance)
-      : canonicalCheckout(await this.resolveCheckout(request.repo!))
+    // A bound checkout wins: a handoff stays in its source's workspace
+    // instead of provisioning a fresh one. Otherwise every new Poise-local
+    // session gets its own scratch workspace, as managed workers already do;
+    // only a local session binding a pre-existing branch without one (a
+    // legacy path the browser cannot create) keeps the shared workspace.
+    const root = this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT
+    const checkout = request.checkout
+      ? canonicalCheckout(request.checkout)
+      : local
+        ? isolated || branch.origin === 'new'
+          ? await ensureWorkerWorkspace(root, id, this.instance)
+          : await ensureLocalWorkspace(root, this.instance)
+        : canonicalCheckout(await this.resolveCheckout(request.repo!))
     const now = new Date().toISOString()
     const title = (request.title || request.context?.title || 'New session').slice(0, CHAT_LIMITS.titleChars)
     const record: SessionRecord = {
@@ -932,41 +949,73 @@ export class ChatRuntime extends EventEmitter {
     })
   }
 
-  async delete(id: string): Promise<void> {
+  async delete(id: string): Promise<{ workspaceRemoved: boolean }> {
     this.assertAcceptingWork()
     return this.track(() => this.deleteSession(id))
   }
 
-  private async deleteSession(id: string): Promise<void> {
+  private async deleteSession(id: string): Promise<{ workspaceRemoved: boolean }> {
     const session = this.requireLive(id)
     session.lifecycle.abort()
     await this.forceStop(session, 'session deleted')
-    await this.serialized(session, async () => {
+    return this.serialized(session, async () => {
       await this.shutdownSession(session)
       if (session.turn || session.worker?.alive) throw new ChatError(409, 'the agent could not be stopped; the session was not deleted', 'agent_error')
       const record = session.record
       if (session.staged) { await unstageDocument(record.checkout, record.id); session.staged = null; record.staged = undefined }
       await this.preserveBorrowedQueueContext(id)
       await this.removeAttachments(session)
-      if (record.branch.origin === 'new' && record.branch.provisional && record.branch.baseSha) {
-        // A branch Poise created whose tip never moved goes with the session.
-        const lease = this.leaseFor(session)
-        try {
-          await lease.acquire({ onBusy: (busy) => this.reportBusy(session, busy) })
-          if (await branchExists(record.checkout, record.branch.name) && (await branchTip(record.checkout, record.branch.name)) === record.branch.baseSha) {
-            await deleteBranch(lease, record.checkout, record.branch.name)
-          }
-        } catch (error) {
-          this.emit_(id, { type: 'error', message: `branch ${record.branch.name} was kept: ${error instanceof Error ? error.message : String(error)}`, recoverable: true })
-        } finally {
-          if (lease.held) lease.release()
-        }
-      }
+      const workspaceRemoved = await this.removeOwnedWorkspace(session)
       this.emit_(id, { type: 'session.closed', reason: 'deleted' })
       storage.deleteSession(id)
       this.live.delete(id)
       this.emit('deleted', id)
+      return { workspaceRemoved }
     })
+  }
+
+  /** Branch and workspace cleanup for a session being deleted. A branch Poise
+   *  created whose tip never moved goes with the session — unless another
+   *  Poise-local session still binds it. A session-owned scratch workspace
+   *  goes only when no other session still uses it, its branch never moved,
+   *  and its tree is clean. Everything runs under the workspace's lease;
+   *  anything uncertain is kept, and lock files are never deleted. */
+  private async removeOwnedWorkspace(session: LiveSession): Promise<boolean> {
+    const record = session.record
+    const ref = record.workspaceKind === 'poise-local'
+      ? workerWorkspaceRef(this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT, record.checkout)
+      : null
+    const branchRule = record.branch.origin === 'new' && record.branch.provisional && !!record.branch.baseSha
+    if (!branchRule && !ref) return false
+    const lease = this.leaseFor(session)
+    try {
+      await lease.acquire({ onBusy: (busy) => this.reportBusy(session, busy) })
+      // Decided under the lease, before anything is removed.
+      const exists = await branchExists(record.checkout, record.branch.name)
+      const unmoved = !!record.branch.baseSha && exists && (await branchTip(record.checkout, record.branch.name)) === record.branch.baseSha
+      const siblings = storage.listSessions(this.instance).filter((s) => s.id !== record.id && s.checkout === record.checkout)
+      if (branchRule && unmoved && !(record.workspaceKind === 'poise-local' && siblings.some((s) => s.branch.name === record.branch.name))) {
+        await deleteBranch(lease, record.checkout, record.branch.name)
+      }
+      if (ref && siblings.length === 0 && unmoved && !(await inspectCheckout(record.checkout)).dirty && await workspaceMarkerValid(record.checkout)) {
+        try {
+          await rm(record.checkout, { recursive: true, force: true })
+        } catch (error) {
+          this.emit_(record.id, { type: 'error', message: `workspace ${record.checkout} was kept: ${error instanceof Error ? error.message : String(error)}`, recoverable: true })
+          return false
+        }
+        // The emptied parent is tidied best-effort; anything unexpected left
+        // in it keeps it.
+        await rmdir(ref.home).catch(() => undefined)
+        return true
+      }
+      return false
+    } catch (error) {
+      this.emit_(record.id, { type: 'error', message: `branch ${record.branch.name} was kept: ${error instanceof Error ? error.message : String(error)}`, recoverable: true })
+      return false
+    } finally {
+      if (lease.held) lease.release()
+    }
   }
 
   async fork(id: string): Promise<SessionRecord> {
@@ -1025,6 +1074,7 @@ export class ChatRuntime extends EventEmitter {
       model: target.model,
       effort: target.effort,
       repo: source.record.repo,
+      checkout: source.record.checkout,
       branch: { existing: source.record.branch.name },
       title: `${source.record.title} → ${AGENT_LABEL[target.agent]}`.slice(0, CHAT_LIMITS.titleChars),
       autoMerge: source.record.autoMerge,
@@ -1032,6 +1082,13 @@ export class ChatRuntime extends EventEmitter {
       context: { kind: 'handoff', title: source.record.title, body: summary, fromSession: source.record.id },
     })
     const live = this.requireLive(created.id)
+    // The family's branch reference point travels with a local handoff, so
+    // the last session deleted from a shared workspace can still tell
+    // whether its branch never moved.
+    if (source.record.workspaceKind === 'poise-local' && source.record.branch.baseSha) {
+      live.record.branch.baseSha = source.record.branch.baseSha
+      this.saveRecord(live)
+    }
     void this.serialized(live, async () => {
       if (live.record.status === 'error' || live.lifecycle.signal.aborted) return
       const turn = this.reserveTurn(live)
@@ -1744,6 +1801,9 @@ export class ChatRuntime extends EventEmitter {
       this.emit_(record.id, { type: 'turn.started', turnId: turn.id, prompt: turn.shown ?? nativeInput, callId: turn.callId ?? undefined, agent: record.agent, model: record.model, ...(turn.queueItem ? { queueItemId: turn.queueItem.id } : {}) })
       started = true
       this.setStatus(session, 'queued')
+      // Poise-local turns share a bounded pool of agent slots; a turn past
+      // the cap waits here with its own reason instead of starting an agent.
+      if (record.workspaceKind === 'poise-local') await this.acquireLocalTurnSlot(session, turn)
       // Created after the title settled: the label names what is queued behind.
       if (!lease) {
         lease = this.leaseFor(session)
@@ -1848,6 +1908,7 @@ export class ChatRuntime extends EventEmitter {
       } catch { /* mirror */ }
     } finally {
       turn.releasePrompt()
+      this.releaseLocalTurnSlot(turn)
       if (record.contextCompacting) {
         record.contextCompacting = false
         try { this.saveRecord(session); this.emit_(record.id, { type: 'session.updated', session: record }) }
@@ -2260,6 +2321,45 @@ export class ChatRuntime extends EventEmitter {
       session.record.queuedBehind = label
       this.setStatus(session, 'queued', label)
     }
+  }
+
+  /** Take one of the bounded Poise-local agent slots, FIFO. A turn that
+   *  waits shows `queued` with the cap's own reason; cancelling the turn
+   *  wakes it. Lowering the cap converges as running turns release. */
+  private async acquireLocalTurnSlot(session: LiveSession, turn: RunningTurn): Promise<void> {
+    const cap = Math.max(1, this.maxConcurrentLocalTurns())
+    // A raised cap frees earlier waiters first; the arrival never jumps them.
+    while (this.localTurnWaiters.length > 0 && this.localTurnSlots < cap) {
+      this.localTurnSlots += 1
+      this.localTurnWaiters.shift()!.resolve()
+    }
+    if (this.localTurnSlots < cap) {
+      this.localTurnSlots += 1
+      turn.localSlot = true
+      return
+    }
+    session.record.queuedBehind = SLOT_WAIT_REASON
+    this.setStatus(session, 'queued')
+    await new Promise<void>((resolve, reject) => {
+      const waiter = { resolve, reject }
+      this.localTurnWaiters.push(waiter)
+      turn.abort.signal.addEventListener('abort', () => {
+        const at = this.localTurnWaiters.indexOf(waiter)
+        if (at >= 0) {
+          this.localTurnWaiters.splice(at, 1)
+          reject(new Error(turn.failure || 'cancelled before it started'))
+        }
+      }, { once: true })
+    })
+    turn.localSlot = true
+  }
+
+  private releaseLocalTurnSlot(turn: RunningTurn): void {
+    if (!turn.localSlot) return
+    turn.localSlot = false
+    const next = this.localTurnSlots <= Math.max(1, this.maxConcurrentLocalTurns()) ? this.localTurnWaiters.shift() : undefined
+    if (next) next.resolve()
+    else this.localTurnSlots -= 1
   }
 
   /** Fresh session: cut/verify/check out its branch under the lease. */

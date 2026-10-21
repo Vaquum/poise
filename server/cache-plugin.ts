@@ -177,6 +177,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       instanceLabel: label,
       idleTimeoutMinutes: () => getChatSettings().idleTimeoutMinutes,
       branchPrefix: () => getChatSettings().branchPrefix,
+      maxConcurrentLocalTurns: () => getChatSettings().maxConcurrentLocalTurns,
       selfUpdate: bridge,
       controlContext: id => {
         if (!chatControl) throw new Error('the native chat control is not started')

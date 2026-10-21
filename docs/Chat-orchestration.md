@@ -39,10 +39,11 @@ recorded result, a changed payload conflicts, and an uncertain receipt never
 executes again automatically. Ordinary `api` calls retain their endpoint's
 existing semantics; the control receipt does not make arbitrary APIs idempotent.
 
-Workers inherit the manager's saved Safe mode and Auto-merge choices. Each
-gets its own Poise-owned local Git workspace and checkout lease, so several
-workers can run while their manager is working. Repository work must be set
-up within that worker's workspace using the context supplied in its task.
+Workers inherit the manager's saved Safe mode and Auto-merge choices. Every
+Poise-local session, top-level or worker, gets its own Poise-owned local Git
+workspace and checkout lease, so several chats can run while their manager is
+working. Repository work must be set up within that session's workspace
+using the context supplied in its task.
 Creating a chat does not give it another chat's checkout or native history.
 Workers appear in the sidebar immediately without selecting them or disturbing
 the manager's draft. Their status updates without loading their transcripts.
