@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { AgentLogSnapshot, LogEntry } from './agent'
+import { LEDGER_STALE_MS } from './behavior-ledger-contract'
 import type {
   LedgerAdmission, LedgerCaller, LedgerHealth, LedgerObservation, LedgerPending, LedgerPolicy,
   LedgerRead, LedgerReadReply, LedgerReadTiming, LedgerReply, LedgerResult, LedgerWorkerReply, LedgerWorkerRequest,
@@ -17,6 +18,7 @@ interface Options {
   captureBytes?: number
   readLimit?: number
   readTimeoutMs?: number
+  callerRefreshMs?: number
 }
 interface Job {
   id: number
@@ -54,6 +56,7 @@ export class BehaviorLedgerObserver {
   private health = emptyHealth()
   private pending = new Map<string, string | null>()
   private admitted = new Map<string, string | null>()
+  private callerProjections = new Map<string, { projection: string; sentAt: number }>()
   private developmentDirectory: string | null = null
 
   constructor(private readonly options: Options = {}) {}
@@ -189,6 +192,9 @@ export class BehaviorLedgerObserver {
 
   private setPending(rows: LedgerPending[]): void {
     this.pending = new Map(rows.map((row) => [row.nativeId, row.callId]))
+    for (const nativeId of this.callerProjections.keys()) {
+      if (!this.pending.has(nativeId) && !this.admitted.has(nativeId)) this.callerProjections.delete(nativeId)
+    }
   }
 
   private readTiming(job: Job): LedgerReadTiming {
@@ -255,12 +261,27 @@ export class BehaviorLedgerObserver {
     this.captures = 0
     this.captureBytes = 0
     this.admitted.clear()
+    this.callerProjections.clear()
     for (const job of jobs) {
       if (job.operation === 'read') this.reads--
       if (!job.resolve) continue
       clearTimeout(job.timer)
       job.resolve(this.unavailable(job.request ?? { operation: 'health' }))
     }
+  }
+
+  private captureCaller(nativeId: string, observation: LedgerCaller): void {
+    // Snapshots repeat unchanged Caller evidence while the store ignores
+    // semantic duplicates, so only changed projections reach the worker queue.
+    // Running projections still refresh ahead of the staleness decay.
+    const projection = JSON.stringify(observation)
+    const running = observation.mayRun === true
+      || observation.status === 'running' || observation.status === 'in_progress'
+    const prior = this.callerProjections.get(nativeId)
+    const refreshMs = this.options.callerRefreshMs ?? LEDGER_STALE_MS / 2
+    if (prior && prior.projection === projection && (!running || Date.now() - prior.sentAt < refreshMs)) return
+    this.callerProjections.set(nativeId, { projection, sentAt: Date.now() })
+    this.capture(observation)
   }
 
   observe(snapshot: AgentLogSnapshot): void {
@@ -306,11 +327,11 @@ export class BehaviorLedgerObserver {
           uncertain: quarantined, mayRun: correlationMatches && /^(running|in_progress)$/.test(row.status),
           interrupted: row.error_code === 'interrupted',
         }
-        this.capture(observation)
+        this.captureCaller(nativeId, observation)
       }
       for (const [nativeId, callId] of pending) {
         if (related.has(nativeId)) continue
-        this.capture({ type: 'caller', nativeId, callId, repository: null, number: null, actor: null,
+        this.captureCaller(nativeId, { type: 'caller', nativeId, callId, repository: null, number: null, actor: null,
           source: null, behavior: null, expectedHead: null, head: null, status: null,
           action: null, outcome: null, startedAt: null, completedAt: null, uncertain: true, mayRun: false })
       }

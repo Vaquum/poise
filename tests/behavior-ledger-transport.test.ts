@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BehaviorLedgerObserver } from '../server/behavior-ledger'
+import type { LogEntry } from '../server/agent'
 import type { LedgerAdmission, LedgerHealth } from '../server/behavior-ledger-contract'
 
 const health: LedgerHealth = {
@@ -220,6 +221,86 @@ describe('bounded behavior ledger transport', () => {
     expect(reply.timing).toEqual({ queueMs: expect.any(Number), activeMs: expect.any(Number), worker: workerTiming })
     expect(reply.timing!.queueMs).toBeGreaterThanOrEqual(0)
     expect(reply.timing!.activeMs!).toBeGreaterThanOrEqual(0)
+  })
+
+  it('emits each Caller projection once per change instead of once per snapshot', async () => {
+    const observer = await fixture(`
+      const pending=[{nativeId:'native',callId:null}];
+      port.postMessage({ready:true,health,pending});
+      port.on('message',request=>port.postMessage({id:request.id,status:200,body:{version:1,health},pending}));`)
+    const snapshot = { entries: [], quarantined: [] }
+    observer.observe(snapshot)
+    observer.observe(snapshot)
+    observer.observe(snapshot)
+    expect((await observer.read({ operation: 'health' })).body.health.pending).toBe(0)
+  })
+
+  it('re-emits Caller projections on change and refreshes only running ones', async () => {
+    const observer = await fixture(`
+      import { appendFileSync } from 'node:fs';
+      const pending=[{nativeId:'idle',callId:null},{nativeId:'busy',callId:null}];
+      port.postMessage({ready:true,health,pending});
+      port.on('message',request=>{
+        if(request.operation==='capture') appendFileSync(new URL('./captures',import.meta.url),'capture\\n');
+        port.postMessage({id:request.id,status:200,body:{version:1,health},pending});
+      });`, { callerRefreshMs: 30 })
+    const captures = async (): Promise<number> => (await readFile(join(directories.at(-1)!, 'captures'), 'utf8')).trim().split('\n').length
+    const flush = async (): Promise<void> => {
+      await vi.waitFor(async () => {
+        expect((await observer.read({ operation: 'health' })).body.health.pending).toBe(0)
+      }, { timeout: 1500, interval: 25 })
+    }
+    const row: LogEntry = { id: 'b'.repeat(32), pr_id: '9', repo: 'example/project', actor: 'octobot', model: 'fixture',
+      behavior: 'pr_review', session_id: null, prompt: '', started_at: new Date().toISOString(), time_elapsed: '0',
+      status: 'running', outcome: null, head_sha: null, expected_head: null, source: 'poise:review-new-prs',
+      correlation_id: 'busy', action: null, response: null, error: '' }
+    const absent = { entries: [], quarantined: [] }
+    const running = { entries: [row], quarantined: [] }
+    observer.observe(absent)
+    await flush()
+    expect(await captures()).toBe(2)
+    observer.observe(absent)
+    await flush()
+    expect(await captures()).toBe(2)
+    observer.observe(running)
+    await flush()
+    expect(await captures()).toBe(3)
+    observer.observe(running)
+    await flush()
+    expect(await captures()).toBe(3)
+    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+    observer.observe(running)
+    await flush()
+    expect(await captures()).toBe(4)
+    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+    observer.observe(absent)
+    await flush()
+    expect(await captures()).toBe(5)
+  })
+
+  it('forgets Caller projections that leave the pending set', async () => {
+    const observer = await fixture(`
+      import { appendFileSync } from 'node:fs';
+      let seen=0;
+      const pendingFor=()=>seen<1?[{nativeId:'native',callId:null}]:seen<2?[]:[{nativeId:'native',callId:null}];
+      port.postMessage({ready:true,health,pending:pendingFor()});
+      port.on('message',request=>{
+        seen++;
+        if(request.operation==='capture') appendFileSync(new URL('./captures',import.meta.url),'capture\\n');
+        port.postMessage({id:request.id,status:200,body:{version:1,health},pending:pendingFor()});
+      });`)
+    const captures = async (): Promise<number> => (await readFile(join(directories.at(-1)!, 'captures'), 'utf8')).trim().split('\n').length
+    const snapshot = { entries: [], quarantined: [] }
+    observer.observe(snapshot)
+    await vi.waitFor(async () => {
+      expect((await observer.read({ operation: 'health' })).body.health.pending).toBe(0)
+    }, { timeout: 1500, interval: 25 })
+    expect(await captures()).toBe(1)
+    observer.observe(snapshot)
+    await vi.waitFor(async () => {
+      expect((await observer.read({ operation: 'health' })).body.health.pending).toBe(0)
+    }, { timeout: 1500, interval: 25 })
+    expect(await captures()).toBe(2)
   })
 
   it('keeps a failed startup observational and health readable', async () => {
