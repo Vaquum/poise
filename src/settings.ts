@@ -908,7 +908,7 @@ function buildPanel(): HTMLElement {
         <div class="tp-group-label">Time</div>
 
         <div class="tp-section">
-          <label class="tp-label" for="st-timezone" ${helpAttributes("Sets the day and week boundaries in Current, Archive and Analytics.")}>Time zone</label>
+          <label class="tp-label" for="st-timezone" ${helpAttributes("Sets the day and week boundaries in Current, Archive and Analytics, and the times in Chat.")}>Time zone</label>
           <select id="st-timezone" class="st-select st-input-tz">${tzOptionsHtml}</select>
 
         </div>

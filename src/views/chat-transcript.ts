@@ -28,6 +28,8 @@ import type {
 } from '../../server/chat/protocol'
 import { AGENT_LABELS } from '../../server/chat/protocol'
 import { consoleModelLabel } from '../chat-catalog'
+import { clockDay, turnTime } from '../chat-turn-time'
+import { effectiveTimezone } from '../config'
 import { renderMarkdown, escapeHtml } from '../markdown'
 
 // ── Model ──────────────────────────────────────────────────────────────────
@@ -95,7 +97,8 @@ export interface TurnModel extends Keyed {
   items: TurnItem[]
   /** Set locally the moment a prompt is sent, cleared when turn.started lands. */
   optimistic?: boolean
-  finished?: { stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number }
+  /** `at` is the server's time on the turn.finished envelope: when the turn ended. */
+  finished?: { stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, at: string }
 }
 
 export type Block =
@@ -221,7 +224,7 @@ export function applyEvent(model: TranscriptModel, env: ChatEnvelope): void {
     }
     case 'turn.finished': {
       const turn = ensureTurn(model, e.turnId, at)
-      turn.finished = { stopReason: e.stopReason, error: e.error, usage: e.usage, durationMs: e.durationMs }
+      turn.finished = { stopReason: e.stopReason, error: e.error, usage: e.usage, durationMs: e.durationMs, at }
       if (model.running?.turnId === e.turnId) model.running = null
       // Tools still marked running when the turn ends were cut with it.
       for (const it of turn.items) {
@@ -437,7 +440,8 @@ const ICONS: Record<ToolKind, string> = {
 const ICON_CHECK = '<svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M3 7.5l3 3 5-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 const ICON_CROSS = '<svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
 const ICON_SPIN = '<svg width="11" height="11" viewBox="0 0 14 14" fill="none" class="spin"><circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.5" stroke-dasharray="8 6" stroke-linecap="round"/></svg>'
-const ICON_COPY = '<svg width="11" height="11" viewBox="0 0 14 14" fill="none"><rect x="3" y="3" width="7" height="8" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M5.5 3V2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>'
+const ICON_COPY = '<svg class="chat-copy-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="3" y="3" width="7" height="8" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M5.5 3V2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>'
+const ICON_COPIED = '<svg class="chat-copy-done" width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3 7.5l3 3 5-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 const ICON_CHEV = '<svg class="chev" width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M4 2.5l4 3.5-4 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 
 /** Terminal output taller than this is capped until "Show all". */
@@ -503,6 +507,17 @@ function renderList(turn: TurnModel): RenderItem[] {
 
 interface UiState { expanded?: boolean, showAll?: boolean, answers?: Array<{ name: string, type: string, value: string, checked: boolean }> }
 
+/** The time zone and instant turn times are labelled against. */
+interface Clock { zone: string, now: number }
+
+function lastText(turn: TurnModel): TextItem | undefined {
+  for (let i = turn.items.length - 1; i >= 0; i--) {
+    const it = turn.items[i]
+    if (it.kind === 'text') return it
+  }
+  return undefined
+}
+
 export interface TranscriptView {
   render(model: TranscriptModel, ctx: RenderContext): void
   clear(): void
@@ -527,6 +542,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
   } catch { /* malformed or unavailable draft storage does not affect rendering */ }
   const texts = new Map<string, string>()
   let lastCtxKey = ''
+  let renderedDay = ''
 
   function ensure(parent: HTMLElement, key: string, before: HTMLElement | null, cls: string): { el: HTMLElement, fresh: boolean } {
     let entry = nodes.get(key)
@@ -580,10 +596,15 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     return `${queued}<div class="chat-msg chat-msg-user"><div class="chat-msg-body">${escapeHtml(p.text)}${extrasHtml}</div></div>`
   }
 
-  function textHtml(item: TextItem): string {
+  function copyButton(key: string): string {
+    return `<button type="button" class="chat-copy-btn" data-copy="${escapeHtml(key)}" aria-label="Copy message">${ICON_COPY}${ICON_COPIED}</button>`
+  }
+
+  // A finished turn's last message has its copy button in the turn's meta row.
+  function textHtml(item: TextItem, final: boolean): string {
     texts.set(item.key, item.text)
-    return `<div class="chat-msg chat-msg-agent"><div class="chat-msg-body chat-msg-md">${renderMarkdown(item.text, { localFileLinks: !!handlers.onFile })}</div>`
-      + `<button type="button" class="chat-copy-btn" data-copy="${escapeHtml(item.key)}" title="Copy" aria-label="Copy message">${ICON_COPY}<span class="chat-copy-label">Copy</span></button></div>`
+    return `<div class="chat-msg chat-msg-agent${final ? ' chat-msg-final' : ''}"><div class="chat-msg-body chat-msg-md">${renderMarkdown(item.text, { localFileLinks: !!handlers.onFile })}</div>`
+      + `${final ? '' : copyButton(item.key)}</div>`
   }
 
   function thoughtHtml(item: ThoughtItem, key: string): string {
@@ -730,10 +751,22 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     return `<div class="chat-card chat-question${item.answered ? ' resolved' : ' pending'}${focused ? ' focused' : ''}" data-request="${escapeHtml(item.id)}">${qs}${actions}</div>`
   }
 
-  function footerHtml(turn: TurnModel, ctx: RenderContext): string {
+  // The visible time is short. The full one is what a screen reader reads and
+  // what the tooltip shows on hover or keyboard focus; the ARIA 1.3 draft
+  // prohibits naming the time role with aria-label.
+  function timeHtml(f: NonNullable<TurnModel['finished']>, clock: Clock): string {
+    const time = turnTime(f.at, f.stopReason, clock.zone, clock.now)
+    return `<time class="chat-turn-time" datetime="${escapeHtml(f.at)}" tabindex="0" data-help="${escapeHtml(time.label)}">`
+      + `<span aria-hidden="true">${escapeHtml(time.text)}</span><span class="chat-turn-time-label">${escapeHtml(time.label)}</span></time>`
+  }
+
+  // One meta row: when the turn ended, how it stopped, what it took, and the
+  // copy button of its last message.
+  function footerHtml(turn: TurnModel, ctx: RenderContext, clock: Clock, final: TextItem | undefined): string {
     const parts: string[] = []
     const f = turn.finished
     if (f) {
+      parts.push(timeHtml(f, clock))
       if (f.stopReason !== 'end_turn') {
         const label = f.stopReason === 'error' ? `Error: ${f.error || 'unknown'}` : STOP_LABEL[f.stopReason]
         parts.push(`<span class="chat-turn-stop${f.stopReason === 'error' ? ' bad' : ''}">${escapeHtml(label)}</span>`)
@@ -744,7 +777,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     } else if (ctx.interruptedTurnId === turn.turnId) {
       parts.push('<span class="chat-turn-stop">Interrupted</span>')
     }
-    return parts.length ? `<div class="chat-turn-footer">${parts.join('<span class="chat-turn-dot">·</span>')}</div>` : ''
+    return parts.length ? `<div class="chat-turn-footer">${parts.join('<span class="chat-turn-dot">·</span>')}${final ? copyButton(final.key) : ''}</div>` : ''
   }
 
   // ── Render ───────────────────────────────────────────────────────────
@@ -768,7 +801,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     }
   }
 
-  function renderTurn(el: HTMLElement, turn: TurnModel, ctx: RenderContext, focused: PermissionItem | QuestionItem | null, isLast: boolean): void {
+  function renderTurn(el: HTMLElement, turn: TurnModel, ctx: RenderContext, clock: Clock, focused: PermissionItem | QuestionItem | null, isLast: boolean): void {
     let head = el.querySelector<HTMLElement>(':scope > .chat-turn-head')
     let items = el.querySelector<HTMLElement>(':scope > .chat-turn-items')
     let foot = el.querySelector<HTMLElement>(':scope > .chat-turn-foot')
@@ -783,19 +816,21 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
 
     const keep = new Set<string>()
     const list = renderList(turn)
+    const final = turn.finished ? lastText(turn) : undefined
     let cursor = items.firstElementChild as HTMLElement | null
     for (const item of list) {
       keep.add(item.key)
       const { el: node, fresh } = ensure(items, item.key, cursor, `chat-item chat-item-${item.kind}`)
       const focusedHere = focused !== null && (item.kind === 'permission' || item.kind === 'question') && item.id === focused.id
-      // Expansion changes markup; request focus is only a CSS class.
-      // Rebuilding a form on focus changes would erase a partially typed answer.
+      // Expansion, and becoming a finished turn's last message, change markup;
+      // request focus is only a CSS class. Rebuilding a form on focus changes
+      // would erase a partially typed answer.
       const uiRev = (ui.get(item.key)?.expanded ? 1 : 0)
-      const rev = item.rev * 4 + uiRev
+      const rev = item.rev * 4 + uiRev + (item === final ? 2 : 0)
       if (setRev(item.key, rev) || (item.kind === 'tool' && node.childElementCount === 0)) {
         const paint = () => {
         switch (item.kind) {
-          case 'text': patchContent(node, textHtml(item)); break
+          case 'text': patchContent(node, textHtml(item, item === final)); break
           case 'thought': patchContent(node, thoughtHtml(item, item.key)); break
           case 'tool': patchContent(node, toolHtml(item)); break
           case 'readgroup': patchContent(node, readGroupHtml(item.key, item.tools)); break
@@ -839,13 +874,16 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       el.insertBefore(dotsEl, foot)
     } else if (!dots && dotsEl) dotsEl.remove()
 
-    const footHtml = footerHtml(turn, ctx)
+    const footHtml = footerHtml(turn, ctx, clock, final)
     if (foot.dataset.html !== footHtml) { foot.innerHTML = footHtml; foot.dataset.html = footHtml }
   }
 
   function render(model: TranscriptModel, ctx: RenderContext): void {
     const focused = focusedPending(model)
-    const ctxKey = `${ctx.running ? 1 : 0}:${ctx.interruptedTurnId || ''}:${focused?.id || ''}:${ctx.showActivity !== false}:${ctx.showReasoning === true}:${ctx.agent || ''}`
+    const clock: Clock = { zone: effectiveTimezone(), now: Date.now() }
+    // A new day or time zone relabels every turn's time.
+    renderedDay = clockDay(clock.zone, clock.now)
+    const ctxKey = `${ctx.running ? 1 : 0}:${ctx.interruptedTurnId || ''}:${focused?.id || ''}:${ctx.showActivity !== false}:${ctx.showReasoning === true}:${ctx.agent || ''}:${renderedDay}`
     const ctxChanged = ctxKey !== lastCtxKey
     lastCtxKey = ctxKey
     const keep = new Set<string>()
@@ -860,7 +898,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
         // and the turn holding the request; both sit in the item revisions,
         // so a turn renders when its rev moved or the context did.
         const isLast = b.key === lastTurnKey
-        if (setRev(b.key, b.turn.rev) || ctxChanged || isLast) renderTurn(el, b.turn, b.turn.agent ? { ...ctx, agent: b.turn.agent } : ctx, focused, isLast)
+        if (setRev(b.key, b.turn.rev) || ctxChanged || isLast) renderTurn(el, b.turn, b.turn.agent ? { ...ctx, agent: b.turn.agent } : ctx, clock, focused, isLast)
       } else if (setRev(b.key, b.rev)) {
         el.innerHTML = b.kind === 'error'
           ? `<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(b.message)}</div></div>`
@@ -878,10 +916,13 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     nodes.clear()
     texts.clear()
     lastCtxKey = ''
+    renderedDay = ''
   }
 
   function tick(): void {
     const now = Date.now()
+    // Midnight, or a time zone saved in Settings, relabels turn times without an event.
+    if (renderedDay && clockDay(effectiveTimezone(), now) !== renderedDay) container.dispatchEvent(new CustomEvent('chat:rerender'))
     for (const el of container.querySelectorAll<HTMLElement>('.chat-tool.running .chat-tool-elapsed')) {
       const started = Number(el.dataset.started)
       if (!Number.isFinite(started)) continue
@@ -939,12 +980,11 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       const text = texts.get(copy.dataset.copy!) || ''
       void copyText(text).then((ok) => {
         if (!ok) return
-        const label = copy.querySelector<HTMLElement>('.chat-copy-label')
         copy.classList.add('is-copied')
-        if (label) label.textContent = 'Copied'
+        copy.setAttribute('aria-label', 'Copied')
         window.setTimeout(() => {
           copy.classList.remove('is-copied')
-          if (label) label.textContent = 'Copy'
+          copy.setAttribute('aria-label', 'Copy message')
         }, 1500)
       })
       return
