@@ -7,6 +7,7 @@ import { dirname, extname, join, resolve } from 'node:path'
 import type { ChatEnvelope, ChatEvent, ClientFrame, SessionRecord } from '../../server/chat/protocol'
 import type { SelfChange, SelfUpdateStatus } from '../../src/self-update-types'
 import { POISE_REPOSITORY as REPOSITORY } from '../../src/poise-repository'
+import { SERVICE_POISE_NOTE, servicePoiseTurnText } from '../../src/poise-service-turn'
 
 // The browser side of a Poise self-change against a scripted server: the
 // typed `/poise` entrypoint, the deploy card that follows the supervisor's
@@ -59,6 +60,8 @@ interface ServerState {
   revert: (body: { changeId: string, expectedReleaseId: string }) => { status: number, json: unknown }
   /** `/api/health` body; `{}` (no build identity) unless a test sets it. */
   health: unknown
+  /** `/api/workspace` body; local unless a test sets it. */
+  workspace: unknown
   /** Editor API, for the tests that open a document. */
   editor?: (path: string, method: string, route: Route) => Promise<void>
 }
@@ -68,6 +71,7 @@ function makeState(sessions: SessionRecord[]): ServerState {
     sessions, history: Object.fromEntries(sessions.map((s) => [s.id, []])), calls: [], status: null,
     revert: () => ({ status: 500, json: { error: 'not scripted' } }),
     health: {},
+    workspace: { mode: 'local' },
   }
 }
 
@@ -80,6 +84,7 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     const body = method === 'POST' || method === 'PATCH' ? (req.postDataJSON?.() ?? null) : null
     state.calls.push({ method, path, query: Object.fromEntries(url.searchParams), body })
     if (path === '/api/health') { await route.fulfill({ json: state.health }); return }
+    if (path === '/api/workspace') { await route.fulfill({ json: state.workspace }); return }
     if (/^\/api\/editor\/doc\/[^/]+\/reviews(?:\/sync)?$/.test(path)) { await route.fulfill({ json: { reviews: [], checkedAt: null, active: false, stale: false, problems: [] } }); return }
     if (state.editor && path.startsWith('/api/editor/')) { await state.editor(path, method, route); return }
     if (path === '/api/settings') { await route.fulfill({ json: { org: 'acme', me: 'octocat', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 } } }); return }
@@ -247,22 +252,80 @@ for (const prefix of ['', '/poise ']) test(`${prefix ? '/poise' : 'A natural req
   await expect(revert).toHaveCount(0)
 })
 
-test('says /poise is turned off in service mode and keeps the request', async ({ page }) => {
+test('a refused live route still sends the request as an ordinary turn', async ({ page }) => {
   const state = makeState([session()])
   await installRoutes(page, state)
   const sock = await installSocket(page)
-  const reason = 'Improve Poise from Poise is turned off in service mode: this workspace runs the Poise image its server deploys, and /poise cannot change that image.'
-  sock.onPoiseChange = () => ({ ok: false, error: reason, code: 'service_mode' })
+  sock.onPoiseChange = () => ({ ok: false, error: 'Improve Poise from Poise is turned off in service mode.', code: 'service_mode' })
   await page.goto('/')
   await sock.subscribed('s1')
   await input(page).fill('/poise Rename the Swarm view')
   await input(page).press('Enter')
   await expect.poll(() => sock.framesOf('poise.change').length).toBe(1)
-  const notice = page.locator('.chat-notice')
-  await expect(notice).toHaveText(`${reason} Your request is still in the composer; nothing was sent to a model.`)
-  await expect(input(page)).toHaveValue('/poise Rename the Swarm view')
-  expect(sock.framesOf('prompt')).toHaveLength(0)
+  await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
+  expect(sock.framesOf('prompt')[0].command).toMatchObject({ type: 'prompt', sessionId: 's1', text: servicePoiseTurnText('Rename the Swarm view') })
+  await expect(page.locator('.chat-notice')).toHaveText(SERVICE_POISE_NOTE)
+  await expect(input(page)).toHaveValue('')
+  await expect(page.locator('.chat-session-item')).toHaveCount(1)
   await expect(card(page)).toHaveCount(0)
+})
+
+test('in service mode a natural request sends as an ordinary turn without touching the live route', async ({ page }) => {
+  const state = makeState([session()])
+  state.workspace = { mode: 'service', owner: 'octocat' }
+  await installRoutes(page, state)
+  const sock = await installSocket(page)
+  sock.onPoiseChange = () => ({ ok: false, error: 'the live route must not be attempted in service mode' })
+  await page.goto('/')
+  await sock.subscribed('s1')
+  await input(page).fill('Add a Stop button to the Swarm header')
+  await input(page).press('Enter')
+  await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
+  expect(sock.framesOf('prompt')[0].command).toMatchObject({ type: 'prompt', sessionId: 's1', text: 'Add a Stop button to the Swarm header' })
+  expect(sock.framesOf('poise.change')).toHaveLength(0)
+  await expect(page.locator('.chat-notice')).not.toContainText('turned off in service mode')
+  await expect(input(page)).toHaveValue('')
+  await expect(card(page)).toHaveCount(0)
+})
+
+test('in service mode /poise sends a PR-framed turn with the one-line note', async ({ page }) => {
+  const state = makeState([session()])
+  state.workspace = { mode: 'service', owner: 'octocat' }
+  await installRoutes(page, state)
+  const sock = await installSocket(page)
+  sock.onPoiseChange = () => ({ ok: false, error: 'the live route must not be attempted in service mode' })
+  await page.goto('/')
+  await sock.subscribed('s1')
+  await input(page).fill('/poise Rename the Swarm view')
+  await input(page).press('Enter')
+  await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
+  expect(sock.framesOf('prompt')[0].command).toMatchObject({ type: 'prompt', sessionId: 's1', text: servicePoiseTurnText('Rename the Swarm view') })
+  expect(sock.framesOf('poise.change')).toHaveLength(0)
+  await expect(page.locator('.chat-notice')).toHaveText(SERVICE_POISE_NOTE)
+  await expect(input(page)).toHaveValue('')
+  await expect(page.locator('.chat-session-item')).toHaveCount(1)
+  await expect(card(page)).toHaveCount(0)
+})
+
+test('in service mode /poise from a fresh console keeps a typed /model choice', async ({ page }) => {
+  const state = makeState([])
+  state.workspace = { mode: 'service', owner: 'octocat' }
+  await installRoutes(page, state)
+  const sock = await installSocket(page)
+  sock.onPoiseChange = () => ({ ok: false, error: 'the live route must not be attempted in service mode' })
+  await page.goto('/')
+  await expect(page.locator('.chat-main')).toHaveClass(/chat-empty-session/)
+  await input(page).fill('/model opus-5-max /poise Rename the Swarm view')
+  await page.locator('.chat-send').click()
+  const framed = `/model opus-5-max ${servicePoiseTurnText('Rename the Swarm view')}`
+  await expect.poll(() => state.calls.filter((c) => c.method === 'POST' && c.path === '/api/chat/sessions').map((c) => c.body)).toEqual([
+    { agent: 'claude', model: 'opus-5-max', effort: 'max', title: framed.slice(0, 200), safeMode: false },
+  ])
+  await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
+  expect(sock.framesOf('prompt')[0].command).toMatchObject({ type: 'prompt', sessionId: 'new-1', text: framed })
+  expect(sock.framesOf('poise.change')).toHaveLength(0)
+  await expect(page.locator('.chat-notice')).toHaveText(SERVICE_POISE_NOTE)
+  await expect(input(page)).toHaveValue('')
 })
 
 test('keeps the request in the composer, sends no prompt and opens nothing when the feature is not set up', async ({ page }) => {

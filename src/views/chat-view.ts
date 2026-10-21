@@ -46,6 +46,8 @@ import { createFilePreview } from './chat-file-preview'
 import { ICON_FORK, ICON_HANDOFF, ICON_ACTIVITY, ICON_AUTO_MERGE, ICON_MEMORIES, ICON_SAFE_MODE, ICON_REASONING } from './chat-icons'
 import { createDeployCard, type DeployCard, type LocalPendingChange } from './chat-deploy-card'
 import { recognisePoiseRequest } from '../poise-request-intent'
+import { planPoiseTurn } from '../poise-service-turn'
+import { workspaceMode } from '../workspace-mode'
 import { parsePoiseCommand, reconcilePendingChanges, releaseChangeId, reserveChangeId, type PoiseCommand } from '../self-update-command'
 import { isTerminal, nextPollDelay, POLL_ACTIVE_MS, POLL_IDLE_MS, selectChangeForSession } from '../self-update-state'
 import { takeDraftSnapshot, buildDraftSnapshot, saveDraftSnapshot, type DraftSnapshot } from '../self-update-drafts'
@@ -1006,6 +1008,27 @@ function keepDraft(sessionId: string | null, draft: ComposerDraft): void {
   restoreDraftTo(sessionId, draft)
 }
 
+/** Whether live self-update is off because this is a service workspace. Asked
+ *  once per page; a failed read answers local — the send that follows either
+ *  succeeds there or fails loudly, and a service refusal still falls back to
+ *  an ordinary turn in startPoiseChange. */
+async function isServiceWorkspace(): Promise<boolean> {
+  try { return (await workspaceMode()).service }
+  catch { return false }
+}
+
+/** Send a Poise request where live self-update is off: a natural-language
+ *  match goes as the ordinary turn it already is, an explicit command as an
+ *  ordinary turn whose deliverable is a PR, with the one-line note. A picked
+ *  or typed model choice travels with the framed turn, as it does on the
+ *  live path. */
+async function sendServiceTurn(cmd: PoiseCommand, draft: ComposerDraft): Promise<void> {
+  const plan = planPoiseTurn(cmd, true, draft.model || parseChatCommandChain(draft.text).model)
+  const turn = plan.kind === 'service' ? { ...draft, text: plan.text } : draft
+  const sent = await sendOrdinaryTurn(turn, activeId)
+  if (sent && plan.kind === 'service') { setNotice(plan.note, 'info'); queueRender() }
+}
+
 /** `/poise <request>`: one explicit command, one change id, one dedicated
  *  session. The source session gets no ordinary prompt — the request travels
  *  inside the command and the server injects it into the new session's first
@@ -1022,6 +1045,14 @@ async function startPoiseChange(cmd: PoiseCommand, draft: ComposerDraft): Promis
   if (poiseInFlight) {
     setNotice('A Poise change is already being started; wait for it to be acknowledged.', 'info')
     keepDraft(activeId, draft)
+    return
+  }
+  const origin = activeId
+  if (await isServiceWorkspace()) {
+    // The live change route does not exist here; service mode never blocks
+    // a message, so the send becomes an ordinary turn.
+    if (activeId !== origin) { restoreDraftTo(origin, draft); return }
+    await sendServiceTurn(cmd, draft)
     return
   }
   poiseInFlight = true
@@ -1055,6 +1086,15 @@ async function startPoiseChange(cmd: PoiseCommand, draft: ComposerDraft): Promis
   } catch (err) {
     if (source) localChanges.delete(source.record.id)
     const code = err instanceof ChatCommandError ? err.code : err instanceof ChatHttpError ? err.code : undefined
+    if (code === 'service_mode') {
+      // The service check misreported and the server refused the live route:
+      // the message still goes as an ordinary turn, never unsent — unless the
+      // session changed mid-flight, in which case the draft stays with its origin.
+      if (changeId) releaseChangeId(pendingStore, changeId)
+      if (activeId !== source?.record.id) { keepDraft(source?.record.id ?? null, draft); return }
+      await sendServiceTurn(cmd, draft)
+      return
+    }
     const message = (err as Error).message || String(err)
     if (code === 'command_in_doubt') {
       // The reserved id stays: resending the same request replays it.
@@ -1062,7 +1102,6 @@ async function startPoiseChange(cmd: PoiseCommand, draft: ComposerDraft): Promis
     } else {
       if (changeId) releaseChangeId(pendingStore, changeId)
       const why = code === 'self_update_unavailable' ? `Poise self-updates are not set up on this server — ${message}`
-        : code === 'service_mode' ? message
         : code === 'draining' ? `Poise is installing an update and refuses new work until it restarts — ${message}`
         : `Poise change not started${code ? ` (${code})` : ''} — ${message}`
       setNotice(`${why} Your request is still in the composer; nothing was sent to a model.`)
@@ -1325,6 +1364,58 @@ function applyResetRecord(e: SessionEntry, record: SessionRecord): void {
   }
 }
 
+/** Send one ordinary turn on the active session, creating it from the draft
+ *  when the console is fresh. True when the prompt was sent. */
+async function sendOrdinaryTurn(draft: ComposerDraft, sourceId: string | null): Promise<boolean> {
+  let e = entry()
+  if (!e || e.pending) {
+    if (firstPromptPending) {
+      // Two Send actions can be released by one Memories save before the
+      // first session exists. Only the first may launch it; keep the other
+      // draft with that session instead of silently dropping its text.
+      const startup = quickSessionPromise
+      try {
+        const target = startup ? await startup : e
+        restoreDraftTo(target?.record.id ?? sourceId, draft)
+      } catch { restoreDraftTo(sourceId, draft) }
+      queueRender()
+      return false
+    }
+    firstPromptPending = true
+    try {
+      e = await ensureQuickSession(draft)
+      freshDraft = null
+    } catch (err) {
+      restoreDraftTo(null, draft)
+      commandFailed(err, 'Start session')
+      queueRender()
+      return false
+    } finally { firstPromptPending = false }
+  }
+  const prompt = { text: draft.text, attachments: draft.attachments, mentions: draft.mentions }
+  // Reuse the immediate first-message preview made during session creation.
+  dropOptimisticTurns(e.model)
+  addOptimisticTurn(e.model, prompt)
+  if (!e.record.title) e.record = { ...e.record, title: draft.text.slice(0, 200) }
+  e.record = { ...e.record, status: 'running' }
+  if (activeId === e.record.id) { setNotice(null); scrollToBottom(true) }
+  queueRender()
+  try {
+    await chatClient.send({ type: 'prompt', sessionId: e.record.id, ...prompt })
+    // Keep status current for a session linked to an existing Poise change.
+    if (activeId === e.record.id) scheduleSelfPoll(POLL_ACTIVE_MS)
+    return true
+  } catch (err) {
+    dropOptimisticTurns(e.model)
+    if (e.record.status === 'running' && !e.model.running) e.record = { ...e.record, status: 'idle' }
+    restoreDraftTo(e.record.id, draft)
+    if (activeId === e.record.id) commandFailed(err, 'Send')
+    else e.error = `Send failed — ${(err as Error).message}`
+    queueRender()
+    return false
+  }
+}
+
 async function sendPrompt(draft: ComposerDraft): Promise<void> {
   const origin = activeId
   await Promise.resolve() // The composer clears after passing us the immutable draft.
@@ -1403,51 +1494,7 @@ async function sendPrompt(draft: ComposerDraft): Promise<void> {
     }
     await startPoiseChange(poise, draft); return
   }
-  let e = entry()
-  if (!e || e.pending) {
-    if (firstPromptPending) {
-      // Two Send actions can be released by one Memories save before the
-      // first session exists. Only the first may launch it; keep the other
-      // draft with that session instead of silently dropping its text.
-      const startup = quickSessionPromise
-      try {
-        const target = startup ? await startup : e
-        restoreDraftTo(target?.record.id ?? sourceId, draft)
-      } catch { restoreDraftTo(sourceId, draft) }
-      queueRender()
-      return
-    }
-    firstPromptPending = true
-    try {
-      e = await ensureQuickSession(draft)
-      freshDraft = null
-    } catch (err) {
-      restoreDraftTo(null, draft)
-      commandFailed(err, 'Start session')
-      queueRender()
-      return
-    } finally { firstPromptPending = false }
-  }
-  const prompt = { text: draft.text, attachments: draft.attachments, mentions: draft.mentions }
-  // Reuse the immediate first-message preview made during session creation.
-  dropOptimisticTurns(e.model)
-  addOptimisticTurn(e.model, prompt)
-  if (!e.record.title) e.record = { ...e.record, title: draft.text.slice(0, 200) }
-  e.record = { ...e.record, status: 'running' }
-  if (activeId === e.record.id) { setNotice(null); scrollToBottom(true) }
-  queueRender()
-  try {
-    await chatClient.send({ type: 'prompt', sessionId: e.record.id, ...prompt })
-    // Keep status current for a session linked to an existing Poise change.
-    if (activeId === e.record.id) scheduleSelfPoll(POLL_ACTIVE_MS)
-  } catch (err) {
-    dropOptimisticTurns(e.model)
-    if (e.record.status === 'running' && !e.model.running) e.record = { ...e.record, status: 'idle' }
-    restoreDraftTo(e.record.id, draft)
-    if (activeId === e.record.id) commandFailed(err, 'Send')
-    else e.error = `Send failed — ${(err as Error).message}`
-    queueRender()
-  }
+  await sendOrdinaryTurn(draft, sourceId)
 }
 
 async function steer(draft: ComposerDraft): Promise<void> {
