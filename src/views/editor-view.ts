@@ -2974,6 +2974,20 @@ function textNodeAtOffset(line: HTMLElement, offset: number): { node: Node, offs
   return null
 }
 
+// The text a range covers, its lines joined with '\n': the snippet an
+// annotation records, and what re-anchoring compares it with. Null when
+// the range does not fit the document's lines.
+function rangeText(lines: HTMLElement[], range: AnnotationRange): string | null {
+  const first = lines[range.start_line]
+  const last  = lines[range.end_line]
+  if (!first || !last || range.end_line < range.start_line) return null
+  if (range.start_line === range.end_line) return (first.textContent || '').slice(range.start_offset, range.end_offset)
+  const parts = [(first.textContent || '').slice(range.start_offset)]
+  for (let i = range.start_line + 1; i < range.end_line; i++) parts.push(lines[i].textContent || '')
+  parts.push((last.textContent || '').slice(0, range.end_offset))
+  return parts.join('\n')
+}
+
 // Best-effort re-anchoring: returns the (start_line, start_offset,
 // end_line, end_offset) where the snippet currently lives, or null if
 // it can't be found. The recorded position is checked first; if the
@@ -2983,13 +2997,7 @@ function textNodeAtOffset(line: HTMLElement, offset: number): { node: Node, offs
 function reAnchorAnnotation(a: Annotation): AnnotationRange | null {
   if (!docEl) return null
   const lines = Array.from(docEl.children) as HTMLElement[]
-  const startLine = lines[a.range.start_line]
-  const endLine   = lines[a.range.end_line]
-  if (startLine && endLine && a.range.start_line === a.range.end_line) {
-    const text = startLine.textContent || ''
-    const slice = text.slice(a.range.start_offset, a.range.end_offset)
-    if (slice === a.snippet) return a.range          // fast path: still in place
-  }
+  if (rangeText(lines, a.range) === a.snippet) return a.range          // fast path: still in place
   // Snippet drifted — search the whole doc for a single-line match.
   // We don't try to rebind multi-line snippets in this pass; those
   // simply orphan if they shift, until the user re-annotates.
@@ -3135,21 +3143,9 @@ function selectionAsAnnotationRange(): { range: AnnotationRange, snippet: string
   // Build the snippet from the lines' textContent so it captures the
   // visible characters the user highlighted (markers included — they
   // round-trip with the source).
-  let snippet: string
-  if (s.line === e.line) {
-    snippet = (lines[s.line].textContent || '').slice(s.offset, e.offset)
-  } else {
-    const parts: string[] = []
-    parts.push((lines[s.line].textContent || '').slice(s.offset))
-    for (let i = s.line + 1; i < e.line; i++) parts.push(lines[i].textContent || '')
-    parts.push((lines[e.line].textContent || '').slice(0, e.offset))
-    snippet = parts.join('\n')
-  }
-
-  return {
-    range: { start_line: s.line, start_offset: s.offset, end_line: e.line, end_offset: e.offset },
-    snippet,
-  }
+  const span = { start_line: s.line, start_offset: s.offset, end_line: e.line, end_offset: e.offset }
+  const snippet = rangeText(lines, span)
+  return snippet === null ? null : { range: span, snippet }
 }
 
 // Hide the whole floating selection cluster. Always dismiss the three
