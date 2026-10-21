@@ -47,6 +47,39 @@ describe('what the settings model accepts', () => {
     setSettings({ org: 'Vaquum' })
     expect(setSettings({ org: undefined, me: 'mikkokotila' }).org).toBe('Vaquum')
   })
+
+  it('refuses a time zone Intl does not know, naming it, and changes nothing of that save', () => {
+    setSettings({ org: 'acme', me: 'mikkokotila', timezone: 'UTC' })
+    const before = getSettings()
+    mocks.invalidateRepoListCache.mockClear()
+    expect(() => setSettings({ org: 'new-org', me: 'octocat', timezone: 'Mars/Olympus' }))
+      .toThrow('timezone must be a time zone the Poise server knows, such as Europe/Helsinki; "Mars/Olympus" is not one')
+    expect(getSettings()).toEqual(before)
+    expect(mocks.invalidateRepoListCache).not.toHaveBeenCalled()
+  })
+
+  it('names at most 100 characters of a refused time zone', () => {
+    expect(() => setSettings({ timezone: 'x'.repeat(1000) })).toThrow(`; "${'x'.repeat(100)}…" is not one`)
+  })
+
+  it('reports the first refused field, in the order org, me, agent account, time zone', () => {
+    expect(() => setSettings({ timezone: 'Mars/Olympus', me: 'not a name' })).toThrow(/^me must be a GitHub name/)
+  })
+
+  // Intl here (Node 22, ICU 78) accepts any letter case and both spellings of
+  // Kolkata, and spells them its own way (Asia/Kolkata as Asia/Calcutta). That
+  // spelling differs between ICU versions, so a zone is stored as given.
+  it('stores the zones Intl knows as given, UTC, aliases and other letter cases included', () => {
+    for (const zone of ['Europe/Helsinki', 'europe/helsinki', 'UTC', 'Etc/UTC', 'Asia/Kolkata', 'Asia/Calcutta']) expect(setSettings({ timezone: zone }).timezone).toBe(zone)
+  })
+
+  it('clears the time zone with an empty or blank one, and ignores one that is not a string', () => {
+    setSettings({ timezone: 'UTC' })
+    expect(setSettings({ timezone: 123 as unknown as string }).timezone).toBe('UTC')
+    expect(setSettings({ timezone: '   ' }).timezone).toBe('')
+    setSettings({ timezone: 'UTC' })
+    expect(setSettings({ timezone: '' }).timezone).toBe('')
+  })
 })
 
 // The write loop applied key by key, so a value rejected halfway through left

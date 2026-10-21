@@ -57,20 +57,22 @@ function diagnostics(overrides: Partial<BehaviorDiagnostics> = {}): BehaviorDiag
 
 interface Workspace {
   enabled: boolean
+  /** The time zone Settings holds. */
+  timezone: string
   notices: Notice[]
   diagnostics: BehaviorDiagnostics | null
   /** The notice actions and settings the page sent, in order. */
   sent: string[]
 }
 
-async function workspace(page: Page, notices: Notice[], options: { enabled?: boolean, accounts?: string[], diagnostics?: BehaviorDiagnostics, realEvidence?: boolean } = {}): Promise<Workspace> {
+async function workspace(page: Page, notices: Notice[], options: { enabled?: boolean, accounts?: string[], diagnostics?: BehaviorDiagnostics, realEvidence?: boolean, timezone?: string } = {}): Promise<Workspace> {
   const accounts = options.accounts ?? ['acme']
-  const state: Workspace = { enabled: options.enabled ?? true, notices: [...notices], diagnostics: options.diagnostics ?? null, sent: [] }
+  const state: Workspace = { enabled: options.enabled ?? true, timezone: options.timezone ?? 'UTC', notices: [...notices], diagnostics: options.diagnostics ?? null, sent: [] }
   await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'current') })
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com)\//, (route) => route.abort())
   await page.context().route('https://github.com/**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<p>GitHub</p>' }))
   const answer = () => ({ enabled: state.enabled, notices: state.enabled ? state.notices : [] })
-  const settings = () => ({ org: 'acme', me: 'octocat', agentAccount: 'octo-agent', timezone: 'UTC', models: {}, notifications: { enabled: state.enabled }, organizations: accounts.map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })) })
+  const settings = () => ({ org: 'acme', me: 'octocat', agentAccount: 'octo-agent', timezone: state.timezone, models: {}, notifications: { enabled: state.enabled }, organizations: accounts.map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })) })
   const behavior = (extra: Record<string, unknown> = {}) => ({ owner: 'octo-agent', enabled: true, setting: null, reviewers: null, scratchpad: '', lastTriggered: null, ...extra })
   await page.route('**/api/**', async (route) => {
     const request = route.request()
@@ -86,7 +88,12 @@ async function workspace(page: Page, notices: Notice[], options: { enabled?: boo
     }
     if (pathname === '/api/settings') {
       if (request.method() === 'POST') {
-        const body = request.postDataJSON() as { notifications?: { enabled: boolean } }
+        const body = request.postDataJSON() as { notifications?: { enabled: boolean }, timezone?: string }
+        if (typeof body.timezone === 'string') {
+          // As the server refuses a zone its Intl does not know (server/settings.ts).
+          if (body.timezone && !knownZone(body.timezone)) return route.fulfill({ status: 400, json: { error: `timezone must be a time zone the Poise server knows, such as Europe/Helsinki; "${body.timezone}" is not one` } })
+          state.timezone = body.timezone
+        }
         if (body.notifications) {
           state.enabled = body.notifications.enabled
           state.sent.push(`notifications ${state.enabled ? 'on' : 'off'}`)
@@ -111,6 +118,7 @@ async function workspace(page: Page, notices: Notice[], options: { enabled?: boo
 
 const bell = (page: Page) => page.locator('#notification-bell')
 const rail = (page: Page) => page.getByRole('complementary', { name: 'Notifications' })
+const knownZone = (name: string) => { try { new Intl.DateTimeFormat('en-US', { timeZone: name }); return true } catch { return false } }
 const card = (page: Page, id: string) => page.locator(`#notification-rail .nr-card[data-id="${id}"]`)
 const reread = (page: Page) => page.evaluate(() => window.dispatchEvent(new Event('focus')))
 
@@ -516,6 +524,45 @@ test('never tucks away an arrival card the person is using', async ({ page }) =>
   await expect(page.locator('.nr-toast')).toHaveCount(4)
   await expect(first).not.toHaveAttribute('data-leaving', 'true')
   await expect(first.getByRole('button', { name: 'Show' })).toBeFocused()
+})
+
+test.describe('in a browser on UTC', () => {
+  test.use({ timezoneId: 'UTC' })
+
+  test('names a saved time zone this browser does not know until one it knows is chosen', async ({ page }) => {
+    // The same day as the history line, so it reads as a time alone.
+    await page.clock.setFixedTime(new Date('2026-10-09T12:00:00Z'))
+    await workspace(page, [HELD], { timezone: 'Mars/Olympus', diagnostics: diagnostics({ deadLetters: [
+      { id: 'today', behavior: 'review-new-prs', target: 'acme/api#9', error: 'The reviewer stopped before posting.', createdAt: '2026-10-09T10:02:00.000Z', attemptCount: 1, callId: HELD_CALL },
+    ] }) })
+    await page.goto('/')
+    await openRail(page)
+    const notice = rail(page).locator('.nr-card', { hasText: 'Choose a time zone in Settings' })
+    await expect(notice).toHaveCount(1)
+    await notice.locator('.nr-card-head').click()
+    await expect(notice).toContainText('The saved time zone “Mars/Olympus” is not one this browser knows, so times use UTC until you choose one in Settings → General.')
+    // Times keep rendering meanwhile, in the browser's zone.
+    await expand(page, HELD.id)
+    await expect(card(page, HELD.id).locator('.nr-history time')).toHaveText('10:02')
+    await notice.getByRole('button', { name: 'Open Settings' }).click()
+    const settings = page.locator('#settings-panel')
+    const zone = settings.locator('#st-timezone')
+    await expect(zone).toHaveValue('Mars/Olympus')
+    // Saving it as it is is refused, in words that name it.
+    await settings.locator('.st-save').click()
+    await expect(settings.locator('.st-status')).toHaveText('timezone must be a time zone the Poise server knows, such as Europe/Helsinki; "Mars/Olympus" is not one')
+    await zone.selectOption('Europe/Helsinki')
+    await settings.locator('.st-save').click()
+    await expect(settings.locator('.st-status')).toHaveText('Saved.')
+    await expect(rail(page).locator('.nr-card', { hasText: 'Choose a time zone in Settings' })).toHaveCount(0)
+    // Open put the notice away until the next load. A zone this browser knows
+    // is what clears it, so it stays gone after a reload, and times follow it.
+    await page.reload()
+    await openRail(page)
+    await expand(page, HELD.id)
+    await expect(card(page, HELD.id).locator('.nr-history time')).toHaveText('13:02')
+    await expect(rail(page).locator('.nr-card', { hasText: 'Choose a time zone in Settings' })).toHaveCount(0)
+  })
 })
 
 test.describe('in an en-US browser', () => {

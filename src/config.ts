@@ -112,9 +112,28 @@ export function setOrganizations(organizations: Organization[]): void {
   if (before !== after) window.dispatchEvent(new CustomEvent('poise:synced'))
 }
 
-// Default to the browser's timezone if the user hasn't picked one yet.
+// Views ask on every render, and building a formatter is the costly part.
+const knownZones = new Map<string, boolean>()
+function knownTimezone(name: string): boolean {
+  let known = knownZones.get(name)
+  if (known === undefined) {
+    try { new Intl.DateTimeFormat('en-US', { timeZone: name }); known = true } catch { known = false }
+    knownZones.set(name, known)
+  }
+  return known
+}
+
+/** The saved time zone when this browser does not know it, else null.
+ *  Settings refuses such a zone, so it can only be older or hand-written;
+ *  main.ts names it in a notice. */
+export function unknownSavedTimezone(): string | null {
+  return current.timezone && !knownTimezone(current.timezone) ? current.timezone : null
+}
+
+// The saved zone, or the browser's while none is saved or while the saved one
+// is unknown to this browser (which unknownSavedTimezone reports).
 export function effectiveTimezone(): string {
-  if (current.timezone) return current.timezone
+  if (current.timezone && knownTimezone(current.timezone)) return current.timezone
   try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return 'UTC' }
 }
 

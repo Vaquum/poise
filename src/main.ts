@@ -20,7 +20,7 @@ import { initBehaviorsView, stopBehaviorsRefresh } from './views/behaviors-view'
 import { initSnippetsView } from './views/snippets-view'
 import { initEditorView, stopEditorRefresh } from './views/editor-view'
 import { toggle as toggleChat, close as closeChatPane } from './views/chat-pane'
-import { loadSettings, startRefreshTicker, applyTheme, getTheme } from './config'
+import { loadSettings, startRefreshTicker, applyTheme, getTheme, effectiveTimezone, unknownSavedTimezone } from './config'
 import { initClaudeAuth } from './claude-auth'
 import { getSelectedOrganization, setSelectedOrganization } from './organizations'
 import { initServiceSettings, openServicePlace, takeServicePlace } from './service-settings'
@@ -188,6 +188,19 @@ function openNotice(target: NoticeTarget): void {
 const notificationRail = mountNotificationRail(notices, { open: openNotice, inView: (target) => 'chat' in target && chatSessionInView() === target.chat })
 window.addEventListener('poise:notifications-changed', () => { void notices.refresh() })
 
+// A saved time zone this browser does not know would break every time Poise
+// shows. Times use the browser's own zone meanwhile, and this notice says so
+// until Settings holds one it knows.
+function reportTimezone(): void {
+  const unknown = unknownSavedTimezone()
+  notices.reportLocalNotices('settings-timezone', unknown ? [{
+    key: 'settings-timezone', kind: 'action_needed', target: { settings: 'general' },
+    title: 'Choose a time zone in Settings',
+    body: `The saved time zone “${unknown}” is not one this browser knows, so times use ${effectiveTimezone()} until you choose one in Settings → General.`,
+  }] : [])
+}
+window.addEventListener('poise:synced', reportTimezone)
+
 // On load: pull settings first so views render with the correct org/me/timezone,
 // then show the initial view. The user's external service keeps the data
 // fresh; Poise only reads.
@@ -212,6 +225,7 @@ watchForSignOut()
   const openedEarly = !logging && !googleReturning && !extensionsReturned && (initialView === 'editor' || initialView === 'snippets' || initialView === 'chat')
   if (openedEarly) showView(initialView)
   const [googleReturned] = await Promise.all([finishGoogleConnection(), loadSettings()])
+  reportTimezone()
   if (googleReturned === 'publish') menu.switchTo('editor')
   else if (extensionsReturned) menu.switchTo('extensions')
   else if (logging) menu.switchTo('logging')
