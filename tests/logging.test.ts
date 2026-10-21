@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { diagnostic, diagnosticFailure, diagnosticPage, fatalDiagnostic, loggingRuntime, startLogging, stopLogging } from '../server/logging'
 import { runFile } from '../server/process'
 import * as processes from '../server/process'
+import { credentialVariables } from './fixtures/cli-isolation'
 
 let directory = ''
 afterEach(async () => { await stopLogging(); vi.restoreAllMocks(); vi.unstubAllEnvs(); if (directory) rmSync(directory, { recursive: true, force: true }) })
@@ -27,6 +28,23 @@ describe('independent application capture', () => {
     expect(diagnosticPage(null).events.find((record) => record.operation === 'chain.failed')).toMatchObject({
       message: 'cause-0', cause: Array.from({ length: Math.min(length, 8) }, (_, i) => 'cause-' + (i + 1)), truncated: length > 8,
     })
+  })
+
+  it('loses the chain to flags a harness names like credentials until the test isolation removes them', () => {
+    // Claude Code exports these to every command it runs.
+    vi.stubEnv('CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH', '1')
+    vi.stubEnv('USE_STAGING_OAUTH', '0')
+    vi.stubEnv('USE_LOCAL_OAUTH', '0')
+    start()
+    const recorded = (operation: string) => {
+      diagnosticFailure(operation, new Error('cause-0', { cause: new Error('cause-1') }))
+      loggingRuntime()!.flush()
+      return diagnosticPage(null).events.find((record) => record.operation === operation)
+    }
+    expect(recorded('chain.harness')).toMatchObject({ message: 'cause-[redacted]', cause: ['cause-[redacted]'] })
+    // As tests/home-isolation.ts removes them before any test runs.
+    for (const name of credentialVariables(process.env)) vi.stubEnv(name, undefined)
+    expect(recorded('chain.isolated')).toMatchObject({ message: 'cause-0', cause: ['cause-1'] })
   })
 
   it('marks a cyclic exception chain incomplete without repeating the outer error', () => {

@@ -4,6 +4,9 @@
 // so now every test process runs with its own home folder and CLI
 // configuration and with stand-ins first on PATH, and a Connect terminal in a
 // test refuses, before anything starts, a preset whose CLI is not its fake.
+// Every test process also runs without the variables Poise's diagnostics
+// redact as credentials, so a harness flag named like one cannot turn the
+// digits a test reads back into "[redacted]".
 
 import { spawnSync } from 'node:child_process'
 import { existsSync, realpathSync } from 'node:fs'
@@ -18,7 +21,7 @@ import { TerminalSocketServer } from '../server/terminal/server'
 import type { TerminalPreset } from '../server/terminal/protocol'
 import { COMMANDS, STATUS, fakeCalls, resolveOnPath, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 import { fakePresetCommand } from './fixtures/accounts/fake-presets'
-import { AGENT_CLI_NAMES, CLI_HOME_VARIABLES } from './fixtures/cli-isolation'
+import { AGENT_CLI_NAMES, CLI_HOME_VARIABLES, credentialVariables } from './fixtures/cli-isolation'
 
 describe('every test process', () => {
   it('has a home folder and agent-CLI configuration of its own', () => {
@@ -43,6 +46,20 @@ describe('every test process', () => {
       expect(run.status, name).toBe(127)
       expect(run.stderr).toContain(`${name} is a stand-in`)
     }
+  })
+
+  it('carries no variable whose value the diagnostics redact as a credential', () => {
+    // Names only: a failure must not print the developer's tokens.
+    expect(credentialVariables(process.env)).toEqual([])
+  })
+})
+
+describe('credential variables', () => {
+  it('are the variables with a value the diagnostics redactor collects', () => {
+    expect(credentialVariables({
+      CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH: '1', USE_STAGING_OAUTH: '0', USE_LOCAL_OAUTH: '', GH_TOKEN: 'fixture',
+      SSH_AUTH_SOCK: '/tmp/agent', PATH: '/bin', HOME: '/home/fixture',
+    })).toEqual(['CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH', 'USE_STAGING_OAUTH', 'GH_TOKEN', 'SSH_AUTH_SOCK'])
   })
 })
 

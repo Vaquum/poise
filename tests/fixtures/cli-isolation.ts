@@ -14,6 +14,7 @@
 
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
+import { environmentSecrets } from '../../gateway/src/diagnostics/contract'
 
 /** Where the agent CLIs keep their logins and settings. */
 export const CLI_HOME_VARIABLES = [
@@ -39,6 +40,13 @@ export function agentCliStandIns(dir: string): string {
     chmodSync(path, 0o755)
   }
   return dir
+}
+
+/** The names in `env` whose values Poise's diagnostics redact as credentials,
+ *  as the redactor itself judges each one. tests/home-isolation.ts removes
+ *  them from every vitest process. */
+export function credentialVariables(env: Readonly<Record<string, string | undefined>>): string[] {
+  return Object.keys(env).filter((name) => environmentSecrets({ [name]: env[name] }).length > 0)
 }
 
 /** The environment of a process isolated under `root`: its own homes, and
