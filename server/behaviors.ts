@@ -241,6 +241,10 @@ async function withBehaviorProcessLock<T>(
     errorFactory: (message) => message === BEHAVIOR_LOCK_BUSY_MESSAGE
       ? new BehaviorProcessLockContentionError()
       : new HttpError(503, message),
+    // A superseded tick abandons its wait instead of waking into a stale
+    // critical section; runBehaviorCycle already skips failure recording
+    // once the lifecycle is aborted.
+    signal: behaviorSignal(),
   }, operation)
 }
 
@@ -425,6 +429,56 @@ function refreshFailureDiagnostic(behavior: BehaviorKey, target: string, call: L
 
 function clearBehaviorFailure(key: BehaviorKey, target?: string): void {
   setMeta(failureKey(key, target), '')
+}
+
+// A lost lock race is not a failure: another process owns this behavior's
+// tick, so this attempt defers explicitly and the next tick retries on its
+// normal cadence, with no failure record and no retry backoff.
+export interface BehaviorDeferral {
+  code: string
+  message: string
+  cause?: string
+  at: string
+}
+
+function deferralKey(key: BehaviorKey): string {
+  return `${META_PREFIX}${key.replace(/-/g, '_')}_deferral`
+}
+
+export function readBehaviorDeferral(key: BehaviorKey): BehaviorDeferral | null {
+  const raw = getMeta(deferralKey(key))
+  if (!raw) return null
+  try {
+    const value = JSON.parse(raw) as Partial<BehaviorDeferral>
+    if (typeof value.code !== 'string' || !value.code
+      || typeof value.message !== 'string' || !value.message
+      || typeof value.at !== 'string' || !Number.isFinite(Date.parse(value.at))) return null
+    return {
+      code: value.code.slice(0, 64),
+      message: value.message.slice(0, 300),
+      ...(typeof value.cause === 'string' && value.cause ? { cause: value.cause.slice(0, 300) } : {}),
+      at: value.at,
+    }
+  } catch {
+    return null
+  }
+}
+
+function recordBehaviorDeferral(key: BehaviorKey, cause: unknown): void {
+  const error = cause instanceof Error ? cause : new Error(String(cause))
+  const code = (cause as { code?: unknown })?.code
+  const original = error.cause instanceof Error ? error.cause.message : String(error.cause ?? '')
+  setMeta(deferralKey(key), JSON.stringify({
+    code: typeof code === 'string' && code ? code : 'BEHAVIOR_DEFERRED',
+    message: error.message,
+    ...(original ? { cause: original } : {}),
+    at: new Date().toISOString(),
+  } satisfies BehaviorDeferral))
+  console.log(`[behaviors] ${key} deferred: ${error.message}${original ? ` (${original})` : ''}`)
+}
+
+function clearBehaviorDeferral(key: BehaviorKey): void {
+  setMeta(deferralKey(key), '')
 }
 
 // Retry delays belong to one PR/issue and reviewer. Legacy behavior-wide
@@ -1705,96 +1759,138 @@ async function slotModel(slot: ReviewerSlot): Promise<{ model: string, recovery:
   return reviewer ? { model: reviewer.model, recovery: panel.recovery, catalog: panel.catalog } : null
 }
 
-async function fireReview(
+interface PreparedReviewTarget {
+  pr: DatastorePr
+  num: string
+  key: string
+  slot: ReviewerSlot
+  target: string
+  checkTarget: string
+  operationId: string
+  owner: string
+  repo: string
+  reviewer: string
+  actor: string
+  model: string
+  recovery: string
+  catalog: Catalog
+  modelCliEnv: NodeJS.ProcessEnv
+  expectedHead: string
+  pwd: string
+  changes: ChangesAddressedResult | null
+  source: string
+}
+
+// Slow idempotent preparation: eligibility probes, model resolution, sign-in
+// gate, provider CLI updates, head and checkout reads. Runs without the
+// behavior lock and takes no ownership; null means this target must not
+// launch this tick. The PR-operation lease is released on every exit except
+// a returned bundle, which carries it into the claim phase.
+async function prepareReviewTarget(
   pr: DatastorePr,
-  claimTarget: string,
-  claimId: string,
-  slot: ReviewerSlot = 'primary',
-  plannedSlots: ReviewerSlot[] = ['primary'],
-): Promise<boolean> {
-  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
-  if (!isEnabled('review-new-prs')) return false
-  const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
-  if (!m) throw new Error('not a github PR url: ' + pr.url)
-  const [, owner, repo, num] = m
-  const resolved = await waitForBehavior(slotModel(slot))
-  if (!resolved) return false
-  const { model, recovery, catalog } = resolved
-  const claude = needsClaude(catalog, model)
-  const actor = configuredReviewer()
-  if (claude) await waitForBehavior(claudeAuth.requireReady())
-  const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], claimId)
-  // mkdir the cwd hack dir — agent-interface needs it to exist for
-  // --pwd resolution behavior identical to triggerPrReview in agent.ts.
-  await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
-  if (!isEnabled('review-new-prs')) return false
-  if (claude) await waitForBehavior(claudeAuth.requireReady())
-  if (!isEnabled('review-new-prs') || behaviorAborted()) return false
-  const expectedHead = await currentHeadSha(pr.repo, pr.number, actor)
-  const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead)
-  // The head-SHA lookup above is a subprocess with a 30s timeout, so the user
-  // has a real window to turn the behaviour off while it is out. Nothing
-  // re-read the flag between it returning and the spawn below, so a toggle-off
-  // in that window still posted on the pull request it was meant to stop.
-  if (!isEnabled('review-new-prs') || behaviorAborted() || !stillEligible('review-new-prs', pr)) return false
-  // Read the ceiling here rather than taking a snapshot from the top of the
-  // tick. A tick fans out over every open pull request, and each one waits on
-  // auth, a checkout resolve and the head-SHA subprocess above — minutes, in
-  // the worst case. Narrowing the ceiling in the view took effect immediately
-  // on screen while the run already under way kept spawning agents at the old
-  // one, so the view understated which pull requests were being acted on.
-  const setting = getSetting('review-new-prs')
-  // Pass the priority ceiling through as `--p`. agent-interface forwards
-  // it to github-interface as `--p <value>`; for review-new-prs the
-  // possible values are p0 / p1 / p2.
-  if ((await slotModel(slot))?.model !== model) return false
-  const source = 'poise:review-new-prs'
+  key: string,
+  slot: ReviewerSlot,
+): Promise<PreparedReviewTarget | null> {
+  const target = reviewSlotTarget(key, slot)
+  const checkTarget = `${target}:check`
+  if (!isEnabled('review-new-prs') || behaviorAborted()) return null
+  if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) return null
+  if (await packetBlocked('review-new-prs', pr.repo, pr.number)) {
+    if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
+    return null
+  }
+  const operationId = await claimEligiblePrOperation('review-new-prs', target)
+  if (!operationId) {
+    console.log(`[behaviors] review-new-prs deferred for ${key}: PR operation busy`)
+    return null
+  }
+  let prepared: PreparedReviewTarget | null = null
+  try {
+    return await withNoticeDiagnosticIdentity({ correlationId: operationId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
+      // Recovery probe only: release a dead no-action launch so the claim
+      // phase can reclaim this target. Its own writes are claim-guarded.
+      await releaseFailedBehaviorIfNoAction('review-new-prs', pr.repo, pr.number, target)
+      const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
+      if (!m) throw new Error('not a github PR url: ' + pr.url)
+      const [, owner, repo, num] = m
+      const resolved = await waitForBehavior(slotModel(slot))
+      if (!resolved || !isEnabled('review-new-prs') || behaviorAborted()) return null
+      const { model, recovery, catalog } = resolved
+      const claude = needsClaude(catalog, model)
+      const reviewer = configuredReviewer()
+      const actor = reviewer
+      if (claude) await waitForBehavior(claudeAuth.requireReady())
+      const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], operationId)
+      // mkdir the cwd hack dir — agent-interface needs it to exist for
+      // --pwd resolution behavior identical to triggerPrReview in agent.ts.
+      await mkdir(join(GH_INTERFACE_CWD_ROOT, owner, repo), { recursive: true })
+      if (!isEnabled('review-new-prs')) return null
+      if (claude) await waitForBehavior(claudeAuth.requireReady())
+      if (!isEnabled('review-new-prs') || behaviorAborted()) return null
+      if (!renewPrOperationOwned(operationId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
+        captureBehaviorOutcome({ nativeId: operationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'preflight_failed' })
+        throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
+      }
+      const expectedHead = await currentHeadSha(pr.repo, pr.number, actor)
+      const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead)
+      if (!isEnabled('review-new-prs') || behaviorAborted() || !stillEligible('review-new-prs', pr)) return null
+      let changes: ChangesAddressedResult | null = null
+      if (reviewer) {
+        changes = await checkChangesAddressed(pr.repo, pr.number, reviewer)
+        if (!isEnabled('review-new-prs') || behaviorAborted()) return null
+      }
+      prepared = {
+        pr, num, key, slot, target, checkTarget, operationId,
+        owner, repo, reviewer, actor, model, recovery, catalog,
+        modelCliEnv, expectedHead, pwd, changes, source: 'poise:review-new-prs',
+      }
+      return prepared
+    })
+  } finally {
+    if (!prepared) releasePrOperationOwned(operationId)
+  }
+}
+
+// Fire-and-forget spawn for an already claimed target. Runs without the
+// behavior lock: the atomic claim plus launch intent is the ownership.
+async function spawnReviewLaunch(prepared: PreparedReviewTarget, claimId: string, setting: BehaviorSetting): Promise<void> {
+  const { pr, target: claimTarget } = prepared
   const args = [
     '--pr-review',
-    `#${num}`,
+    `#${prepared.num}`,
     '--model',
-    model,
+    prepared.model,
     '--recovery-model',
-    recovery,
+    prepared.recovery,
     '--actor',
-    actor,
+    prepared.actor,
     '--expected-head',
-    expectedHead,
+    prepared.expectedHead,
     '--source',
-    source,
+    prepared.source,
     '--correlation-id',
     claimId,
     '--pwd',
-    pwd,
+    prepared.pwd,
     '--p',
     setting,
     ...noteArgs('review-new-prs'),
   ]
-  if (!markLaunchIntent(
-    'review-new-prs',
-    pr,
-    claimTarget,
-    claimId,
-    expectedHead,
-    actor,
-    slot,
-    plannedSlots,
-  )) return false
-  if (!renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
-    captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
-      outcome: 'preflight_failed', completedAt: new Date().toISOString() })
-    throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
-  }
-  try { await spawnDetached(AGENT_INTERFACE, args, {
-    cwd: agentInterfaceCwd(),
-    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
-    onExit: settleClaimAfterExit('review-new-prs', claimTarget, claimId),
-  }) } catch (error) {
-    captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
-    throw error
-  }
-  markClaimLaunched(claimId)
-  return true
+  await withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
+    if (!renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
+      captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
+        outcome: 'preflight_failed', completedAt: new Date().toISOString() })
+      throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
+    }
+    try { await spawnDetached(AGENT_INTERFACE, args, {
+      cwd: agentInterfaceCwd(),
+      env: { ...claudeSubscriptionEnvironment(), ...prepared.modelCliEnv },
+      onExit: settleClaimAfterExit('review-new-prs', claimTarget, claimId),
+    }) } catch (error) {
+      captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
+      throw error
+    }
+    markClaimLaunched(claimId)
   })
 }
 
@@ -1961,11 +2057,20 @@ async function tickReviewNewPrs(): Promise<void> {
   if (!isEnabled('review-new-prs')) return
   const author = getMeta('me') || ''
   if (!author) return
+  // Settle launch claims before any eligibility read in this tick. The
+  // approve-prs tick runs concurrently and evaluates against settled
+  // review state, so reconciliation keeps its historical tick-head
+  // position even though claiming moved after preparation. Contention
+  // here defers before any slow CLI work runs.
+  await withBehaviorProcessLock('review-new-prs', async () => {
+    await reconcileBehaviorLaunchClaims('review-new-prs')
+  })
   const reviewer = configuredReviewer()
 
   // keyver=3 restores one initial review per PR. Convert a complete v2 ledger
   // in place so a PR opened during downtime is not absorbed by a deploy-time
   // snapshot, while historical launch evidence remains available to approval.
+  // Idempotent writes only; concurrent ticks converge on the same rows.
   migrateReviewNewPrsLedger()
 
   if (await initializeReviewBaseline()) return
@@ -1976,111 +2081,168 @@ async function tickReviewNewPrs(): Promise<void> {
     const prs = await listEligiblePrs('review-new-prs', author)
     await recoverSnapshotReviews(prs, reviewer)
     let failure: unknown
-    await Promise.all(prs.flatMap((pr) => {
+    const candidates = prs.flatMap((pr) => {
       const key = `${pr.repo}#${pr.number}`
-      // A fresh primary admits the current panel; already handled PRs do
-      // not gain new reviewers when the configured panel grows.
+      // Advisory only: the claim phase re-derives admission from fresh
+      // reads. A fresh primary admits the current panel; already handled
+      // PRs do not gain new reviewers when the configured panel grows.
       const primaryFresh = !hasSeen('review-new-prs', key) || !!getFailedBehaviorLaunch('review-new-prs', key)
       // Remember the original panel even if one provider cannot start yet.
       // Its admitted reviewers still run after a sibling finishes; increasing
       // the panel later must not add reviewers to historical PRs.
       const panelKey = `${META_PREFIX}review_new_prs_panel:${key}`
-      let admitted = parseJsonMeta(panelKey)
-      if (!Array.isArray(admitted)) {
-        admitted = primaryFresh ? panel.reviewers.map(({ slot }) => slot) : []
-        if (primaryFresh) setMeta(panelKey, JSON.stringify(admitted))
-      }
-      const admittedSlots = new Set(admitted as ReviewerSlot[])
+      const admitted = parseJsonMeta(panelKey)
+      const admittedSlots = new Set(
+        (Array.isArray(admitted) ? admitted : primaryFresh ? panel.reviewers.map(({ slot }) => slot) : []) as ReviewerSlot[],
+      )
       return slots.filter((slot) => {
         const target = reviewSlotTarget(key, slot)
         if (slot === 'primary') return primaryFresh
         return (admittedSlots.has(slot) && !hasSeen('review-new-prs', target)) || !!getFailedBehaviorLaunch('review-new-prs', target)
-      }).map((slot) => [pr, key, slot, [...admittedSlots]] as const)
-    }).map(async ([pr, key, slot, plannedSlots]) => {
-      if (!isEnabled('review-new-prs') || behaviorAborted()) return
+      }).map((slot) => [pr, key, slot] as const)
+    })
+    // Phase 1 — prepare every candidate without the behavior lock. Slow
+    // idempotent work only; nothing here takes ownership.
+    const prepared: PreparedReviewTarget[] = []
+    await Promise.all(candidates.map(async ([pr, key, slot]) => {
       const target = reviewSlotTarget(key, slot)
       const checkTarget = `${target}:check`
-      if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) return
-      let operationId: string | null = null
-      let launched = false
-      let checked = false
       try {
-        if (await packetBlocked('review-new-prs', pr.repo, pr.number)) {
-          checked = true
-          return
-        }
-        operationId = await claimEligiblePrOperation('review-new-prs', target)
-        if (!operationId) {
-          console.log(`[behaviors] review-new-prs deferred for ${key}: PR operation busy`)
-          return
-        }
-        // Atomic claim: exactly one caller succeeds for any given key
-        // across all concurrent runtimes. Losers skip silently.
-        let claimId = claimSeenOwnedAs('review-new-prs', target, operationId)
-        if (!claimId) {
-          const recovered = await releaseFailedBehaviorIfNoAction(
-            'review-new-prs',
-            pr.repo,
-            pr.number,
-            target,
-          )
-          if (!recovered) return
-          claimId = claimSeenOwnedAs('review-new-prs', target, operationId)
-        }
-        if (!claimId) return
-        trackClaim('review-new-prs', target, claimId)
-
-        try {
-          // Guard against double-firing with approve-prs: if the agent account
-          // has an outstanding CHANGES_REQUESTED on this PR, the follow-up
-          // loop is approve-prs's job. This is an intentional terminal skip,
-          // so its claim is retained.
-          if (reviewer) {
-            try {
-              const ch = await checkChangesAddressed(pr.repo, pr.number, reviewer)
-              if (!isEnabled('review-new-prs')) {
-                releaseOwnedClaim('review-new-prs', target, claimId)
-                return
-              }
-              if (ch.hasChangeRequest) {
-                checked = true
-                completeOwnedClaim('review-new-prs', target, claimId)
-                console.log(`[behaviors] review-new-prs skipped for ${pr.repo}#${pr.number} — outstanding CHANGES_REQUESTED, approve-prs owns it`)
-                return
-              }
-            } catch (err) {
-              if (behaviorAborted()) {
-                releaseOwnedClaim('review-new-prs', target, claimId)
-                return
-              }
-              releaseOwnedClaim('review-new-prs', target, claimId)
-              throw err
-            }
-          }
-
-          const accepted = await fireReview(pr, target, claimId, slot, [...plannedSlots])
-          if (!accepted) {
-            releaseOwnedClaim('review-new-prs', target, claimId)
-            return
-          }
-          launched = true
-          checked = true
-          console.log(`[behaviors] review-new-prs fired for ${pr.repo}#${pr.number} (p=${getSetting('review-new-prs')}, ${slot})`)
-        } catch (err) {
-          // Pre-launch work and spawn acknowledgement are part of the claim.
-          // Release on failure so the next tick can retry this exact target.
-          releaseOwnedClaim('review-new-prs', target, claimId)
-          throw err
-        }
+        const bundle = await prepareReviewTarget(pr, key, slot)
+        if (bundle) prepared.push(bundle)
       } catch (err) {
-        checked = false
         if (behaviorAborted()) return
         console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
-      } finally {
-        if (checked && !behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
-        if (!launched && operationId) releasePrOperationOwned(operationId)
+      }
+    }))
+    if (behaviorAborted()) {
+      for (const bundle of prepared) releasePrOperationOwned(bundle.operationId)
+      return
+    }
+    // Phase 2 — one short critical section per tick: re-evaluate every
+    // prepared target from fresh reads, claim and record intent. Local
+    // SQLite only. Losing the race defers the whole tick explicitly via
+    // runBehaviorCycle; prepared leases are released first.
+    const claimed: { prepared: PreparedReviewTarget, claimId: string, setting: BehaviorSetting }[] = []
+    const releasePhase2Leases = () => {
+      const released = new Set(claimed.map((entry) => entry.prepared))
+      for (const entry of claimed) {
+        releaseOwnedClaim('review-new-prs', entry.prepared.target, entry.claimId)
+        releasePrOperationOwned(entry.prepared.operationId)
+      }
+      claimed.length = 0
+      for (const bundle of prepared) {
+        if (!released.has(bundle)) releasePrOperationOwned(bundle.operationId)
+      }
+    }
+    try {
+      await withBehaviorProcessLock('review-new-prs', async () => {
+        const fresh = await reviewPanel(getReviewers('review-new-prs'))
+        const freshModels = new Map(fresh.reviewers.map((entry) => [entry.slot, entry.model]))
+        // Read the ceiling here, closest to the spawn: narrowing it in the
+        // view must take effect on launches already being prepared.
+        const setting = getSetting('review-new-prs')
+        for (const bundle of prepared) {
+          const { pr, key, slot, target, checkTarget, operationId } = bundle
+          const releaseLeases = (claimId: string | null) => {
+            if (claimId) releaseOwnedClaim('review-new-prs', target, claimId)
+            releasePrOperationOwned(operationId)
+          }
+          // A throw after the atomic claim but before the push below must
+          // release the claim, not just the operation lease. Cleared
+          // wherever the claim transfers (claimed push, explicit release)
+          // or is intentionally retained (terminal changes-skip).
+          let ownedClaimId: string | null = null
+          try {
+            if (behaviorAborted()) { releasePhase2Leases(); return }
+            if (!isEnabled('review-new-prs')) { releaseLeases(null); continue }
+            if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) { releaseLeases(null); continue }
+            if (!stillEligible('review-new-prs', pr)) { releaseLeases(null); continue }
+            const primaryFresh = !hasSeen('review-new-prs', key) || !!getFailedBehaviorLaunch('review-new-prs', key)
+            const panelKey = `${META_PREFIX}review_new_prs_panel:${key}`
+            let admitted = parseJsonMeta(panelKey)
+            if (!Array.isArray(admitted)) {
+              admitted = primaryFresh ? fresh.reviewers.map(({ slot: admittedSlot }) => admittedSlot) : []
+              if (primaryFresh) setMeta(panelKey, JSON.stringify(admitted))
+            }
+            const admittedSlots = new Set(admitted as ReviewerSlot[])
+            const admittedNow = slot === 'primary'
+              ? primaryFresh
+              : (admittedSlots.has(slot) && !hasSeen('review-new-prs', target)) || !!getFailedBehaviorLaunch('review-new-prs', target)
+            if (!admittedNow) { releaseLeases(null); continue }
+            // The panel may have changed while this target was prepared;
+            // the prepared CLI environment belongs to the prepared model.
+            if (freshModels.get(slot) !== bundle.model) { releaseLeases(null); continue }
+            // Atomic claim: exactly one caller succeeds for any given key
+            // across all concurrent runtimes. Losers skip silently.
+            const claimId = claimSeenOwnedAs('review-new-prs', target, operationId)
+            if (!claimId) { releaseLeases(null); continue }
+            ownedClaimId = claimId
+            trackClaim('review-new-prs', target, claimId)
+            // Guard against double-firing with approve-prs: if the agent account
+            // has an outstanding CHANGES_REQUESTED on this PR, the follow-up
+            // loop is approve-prs's job. This is an intentional terminal skip,
+            // so its claim is retained. The address check ran during
+            // preparation, so a request landing in the seconds since is
+            // caught on the next tick.
+            if (bundle.changes?.hasChangeRequest) {
+              completeOwnedClaim('review-new-prs', target, claimId)
+              ownedClaimId = null
+              releasePrOperationOwned(operationId)
+              if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
+              console.log(`[behaviors] review-new-prs skipped for ${pr.repo}#${pr.number} — outstanding CHANGES_REQUESTED, approve-prs owns it`)
+              continue
+            }
+            if (!markLaunchIntent(
+              'review-new-prs',
+              pr,
+              target,
+              claimId,
+              bundle.expectedHead,
+              bundle.actor,
+              slot,
+              // Fresh, not the bundle's advisory copy: the panel may have
+              // changed while this target was prepared.
+              [...admittedSlots],
+            )) { ownedClaimId = null; releaseLeases(claimId); continue }
+            claimed.push({ prepared: bundle, claimId, setting })
+            ownedClaimId = null
+          } catch (err) {
+            if (behaviorAborted()) {
+              if (ownedClaimId) releaseOwnedClaim('review-new-prs', target, ownedClaimId)
+              releasePhase2Leases()
+              return
+            }
+            console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
+            if (err instanceof BehaviorLogFeedError) failure ??= err
+            else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
+            releaseLeases(ownedClaimId)
+          }
+        }
+      })
+    } catch (err) {
+      releasePhase2Leases()
+      throw err
+    }
+    // Phase 3 — spawn every claimed target without the behavior lock: the
+    // atomic claim plus launch intent is the ownership.
+    await Promise.all(claimed.map(async ({ prepared: bundle, claimId, setting }) => {
+      const { pr, slot, target, checkTarget } = bundle
+      try {
+        await spawnReviewLaunch(bundle, claimId, setting)
+        if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
+        console.log(`[behaviors] review-new-prs fired for ${pr.repo}#${pr.number} (p=${setting}, ${slot})`)
+      } catch (err) {
+        // A superseded spawn releases its claim like any other launch
+        // failure; the exit settler tolerates the missing claim.
+        releaseOwnedClaim('review-new-prs', target, claimId)
+        releasePrOperationOwned(bundle.operationId)
+        if (behaviorAborted()) return
+        console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
+        if (err instanceof BehaviorLogFeedError) failure ??= err
+        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
       }
     }))
     if (failure) throw failure
@@ -4471,8 +4633,12 @@ async function runBehaviorCycle(
     if (recovered || readBehaviorFailure(key)?.kind === 'operation') {
       clearBehaviorFailure(key)
     }
+    clearBehaviorDeferral(key)
   } catch (error) {
-    if (error instanceof BehaviorProcessLockContentionError) return
+    if (error instanceof BehaviorProcessLockContentionError) {
+      recordBehaviorDeferral(key, error)
+      return
+    }
     if (lifecycle?.aborted !== true) {
       recordBehaviorFailure(key, 'operation', error)
       console.error(`[behaviors] ${key} operation failed:`, error)
@@ -4496,12 +4662,12 @@ export async function runEnabledBehaviorsOnce(
   const operations: Promise<void>[] = []
   if (isEnabled('review-new-prs')
     && (!options.skipBusy || !behaviorOperationTails.has(operationKey('review-new-prs')))) {
+    // review-new-prs manages its own phased lock inside tickReviewNewPrs:
+    // reconcile, then prepare and spawn unlocked around a short claim
+    // critical section.
     operations.push(runBehaviorCycle('review-new-prs', async () => {
-      return await withBehaviorProcessLock('review-new-prs', async () => {
-        await reconcileBehaviorLaunchClaims('review-new-prs')
-        await tickReviewNewPrs()
-        return listBehaviorLaunchClaims('review-new-prs').length === 0
-      })
+      await tickReviewNewPrs()
+      return listBehaviorLaunchClaims('review-new-prs').length === 0
     }))
   }
   if (isEnabled('approve-prs')

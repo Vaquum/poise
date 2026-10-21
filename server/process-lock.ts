@@ -24,6 +24,8 @@ export interface ProcessLockOptions {
   unavailableMessage?: string
   timeoutMessage?: string
   errorFactory?: (message: string, cause: unknown) => Error
+  /** Abandon the wait when signalled; the callback never runs without ownership. */
+  signal?: AbortSignal
 }
 
 type LockDatabase = InstanceType<typeof Database>
@@ -36,6 +38,22 @@ function isSqliteContention(error: unknown): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function lockError(options: ProcessLockOptions, message: string, cause: unknown, elapsedMs: number): Error {
@@ -52,7 +70,18 @@ async function acquireProcessLock(options: ProcessLockOptions): Promise<LockData
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const began = performance.now()
   const deadline = Date.now() + timeoutMs
-  await mkdir(dirname(options.path), { recursive: true })
+  options.signal?.throwIfAborted()
+  try {
+    await mkdir(dirname(options.path), { recursive: true })
+  } catch (error) {
+    throw lockError(
+      options,
+      options.unavailableMessage ?? 'process lock is unavailable',
+      error,
+      performance.now() - began,
+    )
+  }
+  options.signal?.throwIfAborted()
 
   while (true) {
     let lock: LockDatabase | undefined
@@ -79,7 +108,8 @@ async function acquireProcessLock(options: ProcessLockOptions): Promise<LockData
           performance.now() - began,
         )
       }
-      await delay(RETRY_MIN_MS + Math.random() * RETRY_JITTER_MS)
+      if (options.signal) await abortableDelay(RETRY_MIN_MS + Math.random() * RETRY_JITTER_MS, options.signal)
+      else await delay(RETRY_MIN_MS + Math.random() * RETRY_JITTER_MS)
     }
   }
 }
