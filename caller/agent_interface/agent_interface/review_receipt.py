@@ -8,6 +8,7 @@ reviewers Poise runs in parallel — can tell this run's review from its own.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sqlite3
@@ -18,17 +19,54 @@ SUBMISSIONS = {"requested_changes", "reviewed_clean", "approved_pr"}
 _current: ContextVar[dict | None] = ContextVar("review_receipt", default=None)
 _call: ContextVar[tuple[Path, str] | None] = ContextVar("review_receipt_call", default=None)
 _failure: ContextVar[str | None] = ContextVar("review_submission_failure", default=None)
+_QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-remaining",
+                  "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
 
 
 class SubmissionError(RuntimeError):
     """An observed transient GitHub command failure, not a verdict defect."""
 
 
+def _quota_failure(tail: str) -> str | None:
+    match = re.match(r" (\{[^\n{}]{1,2048}\})(?: body=|\Z)", tail)
+    if not match:
+        return None
+    try:
+        node = ast.parse(match[1], mode="eval").body
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(node, ast.Dict) or not 1 <= len(node.keys) <= len(_QUOTA_HEADERS):
+        return None
+    headers = {}
+    for key, value in zip(node.keys, node.values):
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                and isinstance(value, ast.Constant) and isinstance(value.value, str)):
+            return None
+        if key.value not in _QUOTA_HEADERS or key.value in headers:
+            return None
+        pattern = r"core" if key.value == "x-ratelimit-resource" else r"[0-9]{1,20}"
+        if not re.fullmatch(pattern, value.value):
+            return None
+        headers[key.value] = value.value
+    if headers.get("x-ratelimit-resource") != "core" or headers.get("x-ratelimit-remaining") != "0":
+        return None
+    return f"error: GitHub 403 rate-limit: {headers}"
+
+
 def record_failure(text: str) -> str | None:
     # Only controller-observed command errors qualify. Provider prose never
     # calls this path, and validation/authentication failures remain held.
-    if re.search(r"(?:^|\n)(?:error: )?GitHub (?:408|429|5\d\d)(?: rate-limit)?:", text):
-        message = text.strip()[:4096]
+    observed = re.search(r"(?:^|\n)(?:error: )?GitHub (\d{3})( rate-limit)?:", text)
+    if not observed:
+        return None
+    status = observed[1]
+    if status == "403":
+        message = _quota_failure(text[observed.end():].rstrip()) if observed[2] else None
+    elif status in {"408", "429"} or status.startswith("5"):
+        message = text[observed.start():].strip()[:4096]
+    else:
+        message = None
+    if message is not None:
         _failure.set(message)
         return message
     return None

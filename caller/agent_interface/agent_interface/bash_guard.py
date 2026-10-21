@@ -68,10 +68,10 @@ def main():
         with open(staged, "w") as handle:
             handle.write(done.stdout)
         os.replace(staged, receipt)
-    elif done.returncode and record_failure(done.stderr or done.stdout):
+    elif done.returncode and (failure_message := record_failure(done.stderr or done.stdout)):
         staged = receipt + ".failure.tmp"
         with open(staged, "w") as handle:
-            handle.write(done.stderr or done.stdout)
+            handle.write(failure_message)
         os.replace(staged, receipt + ".failure")
     raise SystemExit(done.returncode)
 

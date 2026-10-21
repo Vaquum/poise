@@ -88,6 +88,15 @@ hold. A verified accepted review wins over a lost response; Caller never retries
 the write automatically. Claude's pinned inspection root is also carried in its
 explicit settings so shell tools retain repository access.
 
+An outer GitHub 403 submission error qualifies only when its validated quota
+headers identify `core` with string remaining `0`; authorization/validation
+errors cannot inherit a transient status from response-body text. Quota failure
+errors and Claude's `.failure` sidecar retain only bounded ASCII rate metadata,
+at most 4096 characters, without the body. Optional reset data remains unknown
+when absent; invalid metadata is rejected. Raw response artifacts and unavailable
+final-inventory handling are unchanged; live receipt and head checks still run
+before the failure marker can determine the outcome.
+
 PR reviews and approvals default to `opus-5-high`; on a Claude output limit they
 recover once with `gpt-6-astra-ultra`. Pass `--model` and `--recovery-model` to
 `--pr-review` or `--pr-approve` with any identity from the catalog.

@@ -5,7 +5,7 @@ import os
 import sqlite3
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -21,6 +21,10 @@ HEAD = "a" * 40
 CHANGES = {"id": 91, "node_id": "PRR_91", "state": "CHANGES_REQUESTED", "commit": HEAD, "submitted_at": "2026-09-17T10:05:00Z"}
 CLEAN = {"id": 92, "node_id": "PRR_92", "state": "COMMENTED", "commit": HEAD, "submitted_at": "2026-09-17T10:06:00Z"}
 APPROVAL = {"id": 93, "node_id": "PRR_93", "state": "APPROVED", "commit": HEAD, "submitted_at": "2026-09-17T10:07:00Z"}
+QUOTA_HEADERS = {"x-ratelimit-resource": "core", "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "0",
+                 "x-ratelimit-used": "5000", "x-ratelimit-reset": "1792564636"}
+QUOTA_FAILURE = f"error: GitHub 403 rate-limit: {QUOTA_HEADERS}"
+QUOTA_ERROR = QUOTA_FAILURE + ' body={"message":"API rate limit exceeded"}'
 
 
 def facts(items=(), **updates):
@@ -49,6 +53,7 @@ class TestOwnReviews(TestCase):
         patch.object(api, "RESPONSES", Path(self.directory.name) / "responses").start()
         patch.object(api, "sleep").start()
         api.init_db()
+        review_receipt.bind(api.DB, "me")
 
     def row(self, call_id, review_id=None):
         with sqlite3.connect(api.DB) as conn:
@@ -112,6 +117,21 @@ class TestOwnReviews(TestCase):
     def test_logs_carry_the_review_id(self):
         self.row("me", 92)
         self.assertEqual(api.logs()[0]["review_id"], 92)
+
+    def test_quota_marker_cannot_override_live_review_or_receipt_checks(self):
+        review_receipt.bind(api.DB, "me")
+        review_receipt.record_failure(QUOTA_ERROR)
+        for behavior, review, outcome in (("pr_review", CLEAN, "clean"), ("pr_review", CHANGES, "changes_requested"),
+                                          ("pr_approve", APPROVAL, "approved")):
+            with self.subTest(outcome=outcome):
+                self.assertEqual(self.outcome(behavior, facts(), facts([review]))["outcome"], outcome)
+        with self.assertRaisesRegex(budget.ReviewLimitError, "exactly one"):
+            self.outcome("pr_approve", facts(), facts([CHANGES]), receipt=receipt("approved_pr", 93))
+        with self.assertRaisesRegex(RuntimeError, "expected head"):
+            self.outcome("pr_approve", facts(), facts([{**APPROVAL, "commit": "b" * 40}]), receipt=receipt("approved_pr", 93))
+        with self.assertRaisesRegex(budget.ReviewLimitError, "exactly one"):
+            self.outcome("pr_review", facts(), facts([CLEAN, CHANGES]))
+        self.assertEqual(self.outcome("pr_approve", facts(), facts(head_sha="b" * 40))["outcome"], "superseded")
 
 
 class TestReceiptRecording(TestCase):
@@ -179,9 +199,60 @@ class TestReceiptRecording(TestCase):
 
     def test_validation_auth_and_provider_prose_are_not_transient_submission_errors(self):
         for text in ("error: GitHub 422: invalid review", "error: GitHub 403: forbidden",
-                     "The model says GitHub 500: failed", "invalid model verdict"):
-            self.assertIsNone(review_receipt.record_failure(text))
+                     "The model says GitHub 500: failed", "invalid model verdict",
+                     "error: GitHub 422: invalid review\nGitHub 500: body text",
+                     f"error: GitHub 403 rate-limit: {dict(QUOTA_HEADERS, **{'x-ratelimit-remaining': '4800', 'x-ratelimit-used': '200'})} body={QUOTA_ERROR}\nGitHub 503: body text"):
+            with self.subTest(text=text):
+                review_receipt.bind(api.DB, "run")
+                self.assertIsNone(review_receipt.record_failure(text))
+                self.assertIsNone(review_receipt.failure())
+
+    def test_malformed_quota_metadata_cannot_be_rescued_by_body_text(self):
+        invalid = [
+            {k: v for k, v in QUOTA_HEADERS.items() if k != "x-ratelimit-resource"},
+            {k: v for k, v in QUOTA_HEADERS.items() if k != "x-ratelimit-remaining"},
+            {**QUOTA_HEADERS, "x-ratelimit-remaining": 0},
+            {**QUOTA_HEADERS, "x-ratelimit-remaining": "00"},
+            {**QUOTA_HEADERS, "x-ratelimit-reset": "secret-marker"},
+            {**QUOTA_HEADERS, "x-ratelimit-reset": "1" * 21},
+            {**QUOTA_HEADERS, "authorization": "secret-marker"},
+        ]
+        literals = [str(headers) for headers in invalid] + [
+            "{'x-ratelimit-resource': 'core', 'x-ratelimit-remaining': '4', 'x-ratelimit-remaining': '0'}",
+            "{'x-ratelimit-resource': 'core', 'x-ratelimit-remaining': {'value': '0'}}",
+            "{'x-ratelimit-resource': 'core', 'x-ratelimit-remaining': '0'",
+            "{'x-ratelimit-resource': 'core', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '" + "1" * 2048 + "'}",
+        ]
+        for index, headers in enumerate(literals):
+            with self.subTest(case=index):
+                review_receipt.bind(api.DB, "run")
+                self.assertIsNone(review_receipt.record_failure(f"error: GitHub 403 rate-limit: {headers} body={QUOTA_ERROR}\nGitHub 500: body text"))
+                self.assertIsNone(review_receipt.failure())
+
+    def test_quota_without_optional_reset_retains_only_observed_metadata(self):
+        headers = {"x-ratelimit-resource": "core", "x-ratelimit-remaining": "0"}
+        self.assertEqual(review_receipt.record_failure(f"GitHub 403 rate-limit: {headers} body=omitted"),
+                         f"error: GitHub 403 rate-limit: {headers}")
+        self.assertNotIn("reset", review_receipt.failure())
+        self.assertIsNone(review_receipt.get())
+
+    def test_genuine_outer_transient_statuses_survive_nested_body_errors(self):
+        for status in (408, 429, 500, 503, 599):
+            with self.subTest(status=status):
+                review_receipt.bind(api.DB, "run")
+                message = f"error: GitHub {status}: actual failure\nGitHub 403: nested body text"
+                self.assertEqual(review_receipt.record_failure("warning before error\n" + message), message)
+                self.assertIsNone(review_receipt.get())
+
+    def test_provider_failure_with_exact_quota_prose_is_not_a_submission_failure(self):
+        with patch.object(ReviewWatch, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=QUOTA_ERROR)), \
+                patch.object(structured_review.subprocess, "run") as submit:
+            with self.assertRaises(api.atoms.AgentPreflightError):
+                structured_review.run("/repo", "system", "packet", CATALOG.resolve("grok-4.6-xhigh"), "pr_review",
+                                      "https://github.com/o/r/pull/1", "bit-mis", HEAD, 60)
+        submit.assert_not_called()
         self.assertIsNone(review_receipt.failure())
+        self.assertIsNone(self.stored())
 
     def test_claude_guard_leaves_the_reply_for_the_run_and_the_model(self):
         head = HEAD
@@ -239,7 +310,7 @@ class TestRecoveryWithSiblings(TestCase):
         api.init_db()
         self.mod = SimpleNamespace(pr_number=lambda _: "1", repo_name=lambda *_: "o/r", run=Mock())
 
-    def execute(self, runs, checks):
+    def execute(self, runs, checks, behavior="pr_review", model=None):
         steps = iter(runs)
 
         def dispatch(*args, **kwargs):
@@ -250,11 +321,92 @@ class TestRecoveryWithSiblings(TestCase):
         self.mod.run.side_effect = dispatch
         with patch.object(api, "review_facts", side_effect=checks), redirect_stdout(io.StringIO()):
             try:
-                api.run_governed_behavior(self.mod, "pr_review", "https://github.com/o/r/pull/1",
-                                          "bit-mis", HEAD, "poise:review-new-prs", uuid4().hex, pwd=self.directory.name)
+                api.run_governed_behavior(self.mod, behavior, "https://github.com/o/r/pull/1",
+                                          "bit-mis", HEAD, "poise:approve-prs" if behavior == "pr_approve" else "poise:review-new-prs",
+                                          uuid4().hex, pwd=self.directory.name, model=model)
             except SystemExit:
                 pass
         return api.logs()[-1]
+
+    def test_confirmed_quota_structured_approval_records_failure_without_retry(self):
+        submissions = []
+        verdict = {"action": "request_changes", "comments": [{"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "[p2] Retained finding."}]}
+
+        def submit(*args, **kwargs):
+            def process(command, **options):
+                if command[0] == "github-interface":
+                    submissions.append(command)
+                    return SimpleNamespace(returncode=1, stdout="", stderr=QUOTA_ERROR)
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"stopReason": "end_turn", "num_turns": 1,
+                                                                       "structuredOutput": verdict}), stderr="")
+            with patch.object(ReviewWatch, "run", side_effect=process), patch.object(structured_review.subprocess, "run", side_effect=process):
+                return structured_review.run(self.directory.name, "system", "packet", CATALOG.resolve("grok-4.6-xhigh"), "pr_approve",
+                                             "https://github.com/o/r/pull/1", "bit-mis", HEAD, 60)
+        row = self.execute([submit], [facts(), facts()], behavior="pr_approve", model="grok-4.6-xhigh")
+        self.assertEqual(row["error_code"], "review_submission_failed")
+        self.assertEqual(row["error"], QUOTA_FAILURE)
+        self.assertEqual(row["status"], "failed")
+        for field in ("action", "outcome", "review_id"):
+            self.assertIsNone(row[field])
+        self.assertEqual(len(submissions), 1)
+        self.assertIn("--request-changes", submissions[0])
+        self.assertEqual(self.mod.run.call_count, 1)
+
+    def test_confirmed_quota_claude_sidecar_is_bounded_redacted_and_reclassified(self):
+        command = f"github-interface --request-changes #1 --expected-head {HEAD} --token-user bit-mis"
+        path = Path(self.directory.name) / "receipt.json"
+        error = QUOTA_ERROR + " credential-marker=private-token " + "\u00e9" * 10_000
+        with patch.dict(os.environ, {"AGENT_INTERFACE_BASH_ALLOW": json.dumps([command]), "AGENT_INTERFACE_REVIEW_RECEIPT": str(path)}), \
+                patch.object(sys, "argv", ["bash_guard.py", command]), \
+                patch.object(bash_guard.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=error)) as submit, \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as stopped:
+                bash_guard.main()
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(submit.call_count, 1)
+        retained = Path(str(path) + ".failure").read_text()
+        self.assertEqual(retained, QUOTA_FAILURE)
+        self.assertLessEqual(len(retained), 4096)
+        self.assertLessEqual(len(retained.encode("utf-8")), 4096)
+        self.assertNotIn("credential-marker", retained)
+        self.assertNotIn("body=", retained)
+        self.assertFalse(path.exists())
+
+        def parent(*args, **kwargs):
+            self.assertIsNone(review_receipt.failure())
+            self.assertIsNone(review_receipt.record_file(path))
+            return "valid verdict; publication failed"
+        row = self.execute([parent], [facts(), facts()], behavior="pr_approve")
+        self.assertEqual(row["error_code"], "review_submission_failed")
+        self.assertEqual(row["error"], QUOTA_FAILURE)
+        for field in ("action", "outcome", "review_id"):
+            self.assertIsNone(row[field])
+        self.assertEqual(self.mod.run.call_count, 1)
+
+    def test_quota_does_not_adopt_sibling_or_pending_reviews(self):
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("insert into calls (id, behavior, repo, pr_id, review_id, started_at) values ('sibling', 'pr_review', 'o/r', '1', '91', 0)")
+
+        def failed(*args, **kwargs):
+            review_receipt.record_failure(QUOTA_ERROR)
+            return "submission failed"
+        row = self.execute([failed], [facts(), facts([CHANGES], reviewer_pending_reviews=1)])
+        self.assertEqual(row["error_code"], "review_submission_failed")
+        self.assertIsNone(row["review_id"])
+        self.assertIsNone(row["action"])
+        self.assertIsNone(row["outcome"])
+        self.assertEqual(self.mod.run.call_count, 1)
+
+    def test_quota_does_not_bypass_unavailable_final_inventory(self):
+        def failed(*args, **kwargs):
+            review_receipt.record_failure(QUOTA_ERROR)
+            return "submission failed"
+        row = self.execute([failed], [facts(), RuntimeError("final inventory unavailable")])
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNone(row["error_code"])
+        self.assertIsNone(row["action"])
+        self.assertIsNone(row["outcome"])
+        self.assertEqual(self.mod.run.call_count, 1)
 
     def test_github_outage_is_retryable_but_never_claims_no_action(self):
         def failed(*args, **kwargs):
