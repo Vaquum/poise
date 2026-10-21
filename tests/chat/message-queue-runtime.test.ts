@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
@@ -14,7 +14,11 @@ let storage: typeof import('../../server/chat/storage')
 let queues: typeof import('../../server/chat/message-queue')
 const runtimes: InstanceType<typeof Runtime>[] = []
 const pause = (ms = 30) => new Promise(resolve => setTimeout(resolve, ms))
-async function until(check: () => boolean, ms = 8_000): Promise<void> {
+// Every case drives real git and SQLite lifecycles, and under suite load one
+// of their steps can stall past eight seconds: each readiness wait gets 20 s,
+// and each case and hook 25 s, instead of vitest's global 10 s.
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
+async function until(check: () => boolean, ms = 20_000): Promise<void> {
   const end = Date.now() + ms
   while (!check()) { if (Date.now() > end) throw new Error('Queue condition did not settle'); await pause() }
 }
@@ -102,15 +106,14 @@ describe('deferred message execution', () => {
     expect(w.runtime.get(w.s.id)?.queue?.ready).toBe(false)
     expect(w.runtime.events(w.s.id, 0).events.some(e => e.event.type === 'turn.started')).toBe(false)
     w.runtime.prompt(w.s.id, input('Do this first'))
-    // Real git startup can exceed eight seconds under suite load. Each turn
-    // has a readiness bound; the whole case retains its 25-second ceiling.
-    for (let completed = 1; completed <= 6; completed++) await until(() => w.turns().length >= completed, 20_000)
+    // Each turn has its own readiness bound; six turns are not one deadline.
+    for (let completed = 1; completed <= 6; completed++) await until(() => w.turns().length >= completed)
     await until(() => w.runtime.get(w.s.id)?.status === 'idle')
     expect(w.c.calls.map(call => call.input.text)).toEqual(['Do this first', 'Queue 1', 'Queue 2', 'Queue 3', 'Queue 4', 'Queue 5'])
     expect(w.c.maximum).toBe(1); expect(w.runtime.get(w.s.id)?.queue?.items).toEqual([])
     await w.add('A later idle task'); await pause(100)
     expect(w.c.calls).toHaveLength(6)
-  }, 25_000)
+  })
 
   it('enqueues during an active turn without steering it and waits through real pending questions', async () => {
     const w = await world({ auto: false })
@@ -149,7 +152,7 @@ describe('deferred message execution', () => {
     expect(starts.slice(1).map(e => e.prompt.text)).toEqual(['Claude task', 'Codex task', 'Muse task', 'Grok task'])
     expect(starts.slice(1).map(e => e.agent)).toEqual(['claude', 'codex', 'muse', 'grok'])
     expect(w.runtime.get(w.s.id)?.effort).toBe('xhigh'); expect(w.c.maximum).toBe(1)
-  }, 20_000)
+  })
 
   it('retains validated attachments until the item is dispatched, including a native handoff', async () => {
     const w = await world({ deferStart: true })
@@ -162,7 +165,7 @@ describe('deferred message execution', () => {
     expect(w.c.calls[1].input.attachments[0].text).toBe('Important attached text')
     expect(w.c.calls[1].input.mentions).toEqual([{ path: 'README.md' }])
     await expect(w.runtime.enqueue(w.s.id, randomUUID(), { text: 'Forged', attachments: [{ ...file, size: 100 }], mentions: [] })).rejects.toMatchObject({ code: 'invalid' })
-  }, 20_000)
+  })
 
   it.each(['cancelled', 'error'] as const)('does not drain after a %s turn; later successful work continues the untouched tail', async reason => {
     const w = await world({ auto: false })
@@ -302,7 +305,7 @@ it('uses the latest shared memories at dispatch for normal messages, queued task
     await until(() => w.turns().length === 3)
     expect(w.c.calls[2].input.memories).toBe('')
   } finally { save('') }
-}, 15_000)
+})
 
 
 it('QC: Stop cancels a first turn waiting for another checkout owner without later launching its agent', async () => {
@@ -318,7 +321,7 @@ it('QC: Stop cancels a first turn waiting for another checkout owner without lat
   expect(w.c.adapters).toHaveLength(1)
   w.c.auto = true; w.finish(); await pause(120)
   expect(w.c.calls).toHaveLength(1)
-}, 15_000)
+})
 
 it('QC: native effort limits from one model do not reject another model family', async () => {
   const w = await world()
@@ -369,7 +372,7 @@ describe('Chained models and reply review', () => {
       expect(starts[1].prompt.text).toBe(command)
       expect(starts[1]).toMatchObject({ model, agent: call.agent })
       expect(w.c.maximum).toBe(1); expect(git(w.repo, 'status', '--porcelain')).toBe('')
-    }, 20_000)
+    })
   it('leaves a fresh conversation untouched when there is no reply to review', async () => {
     const w = await world({ deferStart: true })
     expect(() => w.runtime.prompt(w.s.id, input('/model opus-5-max /review'))).toThrow(/no assistant reply/)
@@ -393,7 +396,7 @@ describe('Chained models and reply review', () => {
     expect(w.c.calls[1].input.text).toContain('The final proposed result.')
     expect(w.c.calls[1].input.text).toContain('assess the result')
     expect(w.c.adapters[0].steered).toEqual([])
-  }, 20_000)
+  })
   it('makes the complete long reply and all earlier history pages available privately', async () => {
     const w = await world()
     w.runtime.prompt(w.s.id, input('Original request with essential context'))
@@ -415,7 +418,7 @@ describe('Chained models and reply review', () => {
     expect(events.map(event => event.seq)).toEqual(Array.from({ length: through }, (_, i) => i + 1))
     expect(new Set(events.map(event => event.sessionId))).toEqual(new Set([w.s.id]))
     expect(git(w.repo, 'status', '--porcelain')).toBe('')
-  }, 25_000)
+  })
   it('applies a model before passing the following native command without rewriting it', async () => {
     const w = await world()
     w.runtime.prompt(w.s.id, input('/model gpt-6-astra-max /context inspect architecture'))
@@ -718,7 +721,7 @@ it('CLI updates: waits before native startup, leaves active work alone, and resu
   await until(() => w.c.calls.length === 3)
   expect(prepareCli).toHaveBeenCalledTimes(3); expect(w.c.adapters).toHaveLength(2)
   w.finish(); await until(() => w.turns().length === 3)
-}, 20_000)
+})
 
 it('CLI updates: Stop cancels a waiting startup without launching the agent later', async () => {
   let release!: () => void
@@ -743,4 +746,9 @@ it('CLI updates: a failed latest check is visible and does not discard the task'
   await until(() => w.turns().length === 1)
   expect(w.c.calls[0].input.text).toBe('Keep my task')
   expect(w.events.some(row => row.event.type === 'status.changed' && row.event.detail?.includes('download unavailable'))).toBe(true)
+})
+
+it('gives every case 25 s instead of the global 10 s', ({ task }) => {
+  const cases = (tasks: RunnerTask[]): RunnerTestCase[] => tasks.flatMap(t => t.type === 'test' ? [t] : cases(t.tasks))
+  expect(cases(task.file.tasks).filter(t => t.timeout !== 25_000).map(t => t.fullTestName)).toEqual([])
 })
