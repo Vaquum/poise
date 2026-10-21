@@ -2,7 +2,8 @@
 // (src/views/notification-rail.ts): what it says, what it offers, and how old
 // it reads.
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
+import { setLocalSettings } from '../src/config'
 import type { Notice } from '../src/notices'
 import { notificationItems } from '../src/notification-items'
 import { ago, itemHtml } from '../src/views/notification-rail'
@@ -83,5 +84,24 @@ describe('how old an entry reads', () => {
     expect(ago(iso(0), T0 + 4 * 60_000)).toBe('4m')
     expect(ago(iso(0), T0 + 3 * 3_600_000)).toBe('3h')
     expect(ago(iso(0), T0 + 49 * 3_600_000)).toBe('2d')
+  })
+})
+
+describe('when its history happened', () => {
+  afterEach(() => setLocalSettings({ org: '', me: '', timezone: '' }))
+
+  it("reads on Chat's 24-hour clock in Settings' time zone, with the date for another day", () => {
+    setLocalSettings({ org: 'acme', me: 'octocat', timezone: 'Europe/Helsinki' })
+    const now = Date.parse('2026-10-17T17:00:00Z')
+    const letter = (id: string, createdAt: string) => ({ id, behavior: 'review-new-prs', target: 'acme/api#9', error: `attempt ${id}`, createdAt, attemptCount: 1, callId: 'call' })
+    const [held] = notificationItems([notice('h', { kind: 'behavior_held', target: { swarm: 'call' }, subject: { behavior: 'review-new-prs', target: 'acme/api#9' } })], {
+      status: 'ok', agentLogsError: null,
+      datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+      identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [],
+      deadLetters: [letter('today', '2026-10-17T16:38:00.000Z'), letter('yesterday', '2026-10-16T16:38:00.000Z')],
+    }, now)
+    const html = itemHtml(held, true, now)
+    expect(html).toContain('<time datetime="2026-10-17T16:38:00.000Z">19:38</time>')
+    expect(html).toContain('<time datetime="2026-10-16T16:38:00.000Z">16 Oct 19:38</time>')
   })
 })

@@ -4,7 +4,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { StopReason } from '../server/chat/protocol'
-import { clockDay, turnTime } from '../src/chat-turn-time'
+import { clockDay, shortTime, turnTime } from '../src/chat-turn-time'
 import { applyEvent, createModel } from '../src/views/chat-transcript'
 
 const NOW = Date.parse('2026-10-21T17:00:00Z')
@@ -22,6 +22,14 @@ describe("a turn's end time", () => {
 
   it("uses en-GB month names, so September is 'Sept'", () => {
     expect(turnTime('2026-09-03T21:30:00.000Z', 'end_turn', 'Europe/Helsinki', NOW).text).toBe('4 Sept 00:30')
+  })
+
+  it("gives the notification rail the same short time as Chat's turns", () => {
+    for (const [at, text] of [['2026-10-21T16:38:12.000Z', '19:38'], ['2026-10-20T14:05:12.000Z', '20 Oct 17:05'], ['2025-12-31T21:05:00.000Z', '31 Dec 2025 23:05']]) {
+      expect(shortTime(at, 'Europe/Helsinki', NOW)).toBe(text)
+      expect(turnTime(at, 'end_turn', 'Europe/Helsinki', NOW).text).toBe(text)
+    }
+    expect(() => shortTime('not a time', 'UTC', NOW)).toThrow(RangeError)
   })
 
   it('compares calendar days, so a time ahead of the clock is labelled the same way', () => {

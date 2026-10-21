@@ -518,6 +518,25 @@ test('never tucks away an arrival card the person is using', async ({ page }) =>
   await expect(first.getByRole('button', { name: 'Show' })).toBeFocused()
 })
 
+test.describe('in an en-US browser', () => {
+  test.use({ locale: 'en-US' })
+
+  test("dates a history on Chat's 24-hour clock, with the day when it is not today", async ({ page }) => {
+    await page.clock.setFixedTime(new Date('2026-10-09T12:00:00Z'))
+    await workspace(page, [HELD], { diagnostics: diagnostics({ deadLetters: [
+      { id: 'today', behavior: 'review-new-prs', target: 'acme/api#9', error: 'The reviewer stopped before posting.', createdAt: '2026-10-09T10:02:00.000Z', attemptCount: 1, callId: HELD_CALL },
+      { id: 'yesterday', behavior: 'review-new-prs', target: 'acme/api#9', error: 'The reviewer timed out.', createdAt: '2026-10-08T15:30:00.000Z', attemptCount: 1, callId: HELD_CALL },
+    ] }) })
+    await page.goto('/')
+    await openRail(page)
+    await expand(page, HELD.id)
+    // Settings' time zone is UTC here; the browser's language must not turn this into "10:02 AM".
+    const line = (text: string) => card(page, HELD.id).locator('.nr-history li', { hasText: text }).locator('time')
+    await expect(line('The reviewer stopped before posting.')).toHaveText('10:02')
+    await expect(line('The reviewer timed out.')).toHaveText('8 Oct 15:30')
+  })
+})
+
 test('shows a failed behavior and its diagnostic as one entry, and counts it on its Behaviors row', async ({ page }) => {
   await workspace(page, [HELD], { diagnostics: diagnostics({ deadLetters: [
     { id: 'letter', behavior: 'review-new-prs', target: 'acme/api#9', error: 'The reviewer stopped before posting.', createdAt: iso(2), attemptCount: 3, callId: HELD_CALL },

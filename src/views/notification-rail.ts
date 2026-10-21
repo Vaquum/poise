@@ -5,6 +5,7 @@ import { cancelMotion, disclosure, layout, retire, scrollToActor, spring, watchP
 import { patchContent } from '../dom-patch'
 import { BEHAVIORS, getBehaviorDiagnostics, refreshState } from '../behaviors'
 import { effectiveTimezone } from '../config'
+import { shortTime } from '../chat-turn-time'
 import {
   GROUPS, behaviorCounts, countItems, headTone, notificationItems, openLabel,
   type ItemCounts, type ItemGroup, type ItemIcon, type NotificationItem,
@@ -102,8 +103,10 @@ export function ago(iso: string, now: number): string {
   return hours < 24 ? `${hours}h` : `${Math.floor(hours / 24)}d`
 }
 
-function clock(iso: string): string {
-  return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', timeZone: effectiveTimezone() }).format(new Date(iso))
+// Chat's clock: 24-hour whatever the browser's locale, with the date when it
+// is not today.
+function clock(iso: string, now: number): string {
+  return shortTime(iso, effectiveTimezone(), now)
 }
 
 // A stable element id for an item id, which may hold any character.
@@ -122,7 +125,7 @@ export function itemHtml(item: NotificationItem, opened: boolean, now: number): 
   const meta = [item.source, item.scope === item.source ? null : item.scope, item.meta].filter(Boolean).map((part) => escapeHtml(part!)).join(' · ')
   const when = item.when && Number.isFinite(Date.parse(item.when)) ? `<time datetime="${escapeHtml(item.when)}">${ago(item.when, now)}</time>` : ''
   const history = item.details.length
-    ? `<ol class="nr-history">${item.details.map((entry) => `<li>${entry.at && Number.isFinite(Date.parse(entry.at)) ? `<time datetime="${escapeHtml(entry.at)}">${clock(entry.at)}</time>` : ''}<span>${escapeHtml(entry.detail)}</span></li>`).join('')}</ol>`
+    ? `<ol class="nr-history">${item.details.map((entry) => `<li>${entry.at && Number.isFinite(Date.parse(entry.at)) ? `<time datetime="${escapeHtml(entry.at)}">${clock(entry.at, now)}</time>` : ''}<span>${escapeHtml(entry.detail)}</span></li>`).join('')}</ol>`
     : ''
   const notice = item.notice
   const label = notice?.target ? openLabel(notice.target) : null

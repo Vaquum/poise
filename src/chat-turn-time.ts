@@ -1,7 +1,8 @@
 // When a Chat turn ended, as its meta row shows it: the time alone for a turn
 // that ended today, with the date for another day and the year for another
-// year, in the person's timezone. Kept free of runtime imports so it can be
-// tested under the node environment.
+// year, in the person's timezone. The notification rail's history uses the
+// same short time. Kept free of runtime imports so it can be tested under the
+// node environment.
 
 import type { StopReason } from '../server/chat/protocol'
 
@@ -49,17 +50,29 @@ export function clockDay(timeZone: string, now: number): string {
   return `${timeZone} ${day.year}-${day.month}-${day.day}`
 }
 
-/** `at` is the time the server stamped on the turn's turn.finished event. A
- *  value that is not a time, or a time zone Intl does not know, throws a
- *  RangeError: neither has a right answer to show. */
+function short(at: Record<string, string>, today: Record<string, string>): string {
+  const time = `${at.hour}:${at.minute}`
+  const thisYear = at.year === today.year
+  return thisYear && at.month === today.month && at.day === today.day ? time
+    : `${at.day} ${at.month}${thisYear ? '' : ` ${at.year}`} ${time}`
+}
+
+/** "19:38" on the day of `now`, "20 Oct 17:05" on another day and
+ *  "31 Dec 2025 23:05" in another year. A value that is not a time, or a time
+ *  zone Intl does not know, throws a RangeError: neither has a right answer
+ *  to show. */
+export function shortTime(at: string, timeZone: string, now: number): string {
+  return short(parts(new Date(at), timeZone, 'ended'), parts(new Date(now), timeZone, 'ended'))
+}
+
+/** `at` is the time the server stamped on the turn's turn.finished event;
+ *  it throws as `shortTime` does. */
 export function turnTime(at: string, stopReason: StopReason, timeZone: string, now: number): TurnTime {
   const date = new Date(at)
   const ended = parts(date, timeZone, 'ended')
-  const today = parts(new Date(now), timeZone, 'ended')
   const long = parts(date, timeZone, 'long')
-  const time = `${ended.hour}:${ended.minute}`
-  const thisYear = ended.year === today.year
-  const text = thisYear && ended.month === today.month && ended.day === today.day ? time
-    : `${ended.day} ${ended.month}${thisYear ? '' : ` ${ended.year}`} ${time}`
-  return { text, label: `${ENDED[stopReason]} ${long.weekday} ${long.day} ${long.month} ${long.year} at ${time}:${ended.second} ${ended.timeZoneName}` }
+  return {
+    text: short(ended, parts(new Date(now), timeZone, 'ended')),
+    label: `${ENDED[stopReason]} ${long.weekday} ${long.day} ${long.month} ${long.year} at ${ended.hour}:${ended.minute}:${ended.second} ${ended.timeZoneName}`,
+  }
 }
