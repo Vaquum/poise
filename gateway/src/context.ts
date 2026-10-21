@@ -14,6 +14,7 @@ import { FONT_ORIGIN } from './pages.js'
 import type { Session, Store, User } from './store.js'
 import { LoggingQueryPool } from './diagnostics/query-pool.js'
 import { GoogleConnections } from './google.js'
+import { loadPublicPages, type PublicPages } from './public-pages.js'
 
 export const APEX_COOKIE = 'poise_gw'
 export const WORKSPACE_COOKIE = 'poise_ws'
@@ -53,6 +54,7 @@ export class Context {
   async closeLoggingReads(): Promise<void> { await this.loggingReader?.close() }
   readonly scheme: 'http' | 'https'
   readonly apexOrigin: string
+  readonly publicPages: PublicPages | null
   readonly pageHeaders: Record<string, string>
   // Retire idle sockets before the workspace's five-second keep-alive closes
   // them. An unbounded pool can reuse a closing socket and reset the request.
@@ -65,6 +67,7 @@ export class Context {
   constructor(readonly deps: GatewayDeps) {
     this.scheme = deps.config.insecureHttp ? 'http' : 'https'
     this.apexOrigin = `${this.scheme}://${deps.config.domain}`
+    this.publicPages = loadPublicPages(deps.config.dataDir)
     this.pageHeaders = {
       // Workspace-host forms (sign-out) redirect to the apex, so the apex is an allowed form target everywhere.
       // The pages use Poise's typeface, Inter, from where Poise itself loads it.

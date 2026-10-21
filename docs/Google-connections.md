@@ -32,6 +32,10 @@ Google can expire those test grants. Production consent-screen status and brandi
 remain deployment responsibilities. Requests use `openid`, `email` and
 `https://www.googleapis.com/auth/drive.file`; no broader Drive access is requested.
 
+For a repeatable public home page, privacy notice and terms on your own domain,
+use [public deployment pages](Public-pages.md). The operator supplies and reviews
+the content; no installation-specific address or policy is shipped as a default.
+
 On a personal computer, set the same client pair and `POISE_GOOGLE_ORIGIN` to the
 literal local HTTP loopback origin (for example `http://127.0.0.1:5555`) in the
 private application environment. Register that origin plus `/` with Google. All

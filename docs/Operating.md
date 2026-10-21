@@ -190,6 +190,10 @@ starting page links there when a start failed.
 
 ## Behind your own proxy
 
+For repeatable public deployment descriptions and OAuth policy pages, use the
+gateway's [operator-approved public pages](Public-pages.md). They use the current
+deployment domain and persisted operator content, including behind an external proxy.
+
 When the server already runs a web server or reverse proxy on ports 80 and
 443, such as a Caddy or nginx serving other sites, Poise runs behind it
 instead of with a Caddy of its own. Set `POISE_PROXY_LISTEN` in

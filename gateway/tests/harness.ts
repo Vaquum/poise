@@ -1,5 +1,5 @@
 import { createPublicKey, verify } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import http, { type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -69,6 +69,7 @@ export interface Harness {
 }
 
 export interface HarnessOptions {
+  publicPages?: unknown
   env?: Record<string, string | undefined>
   drainPollMs?: number
   drainRenewMs?: number
@@ -121,6 +122,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   const dir = mkdtempSync(join(tmpdir(), 'gw-'))
   const dataDir = join(dir, 'data')
   mkdirSync(dataDir)
+  if (options.publicPages !== undefined) writeFileSync(join(dataDir, 'public-pages.json'), JSON.stringify(options.publicPages))
   const github = await startFakeGitHub('client-id', 'client-secret')
   for (const [login, id, orgs] of [
     ['root', 1000, undefined],

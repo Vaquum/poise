@@ -10,6 +10,7 @@ import { classifyHost } from './hosts.js'
 import { HttpError, readForm, redirect, safeEqual, sendHtml } from './http.js'
 import { errorMessage } from './log.js'
 import { homePage, messagePage, signInPage, signOutPage } from './pages.js'
+import { publicLandingPage } from './public-pages.js'
 import { newSecret } from './store.js'
 
 export type ReturnTo = { kind: 'apex'; path: string } | { kind: 'workspace'; handle: string; path: string }
@@ -67,7 +68,7 @@ export function postPrincipal(ctx: Context, req: IncomingMessage): Principal {
 export function home(ctx: Context, req: IncomingMessage, res: ServerResponse): void {
   const principal = ctx.apexPrincipal(req)
   if (!principal) {
-    sendHtml(res, 200, signInPage(ctx.deps.config.domain), ctx.pageHeaders)
+    sendHtml(res, 200, ctx.publicPages ? publicLandingPage(ctx.publicPages, ctx.apexOrigin) : signInPage(ctx.deps.config.domain), ctx.pageHeaders)
     return
   }
   const workspaceOrigin = ctx.workspaceOrigin(principal.user.handle)

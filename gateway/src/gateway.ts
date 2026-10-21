@@ -10,12 +10,22 @@ import * as link from './link.js'
 import { errorMessage } from './log.js'
 import { messagePage } from './pages.js'
 import { rejectUpgrade } from './proxy.js'
+import { publicPolicyPage } from './public-pages.js'
 import { workspaceRequest, workspaceUpgrade } from './workspace.js'
 
 type Handler = (ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL) => void | Promise<void>
 
+function policy(kind: 'privacy' | 'terms'): Handler {
+  return (ctx, _req, res) => {
+    if (!ctx.publicPages) throw new HttpError(404, 'There is nothing at this address.')
+    sendHtml(res, 200, publicPolicyPage(kind, ctx.publicPages, ctx.apexOrigin), ctx.pageHeaders)
+  }
+}
+
 const APEX_ROUTES: Record<string, Record<string, Handler>> = {
   '/': { GET: auth.home, HEAD: auth.home },
+  '/privacy': { GET: policy('privacy'), HEAD: policy('privacy') },
+  '/terms': { GET: policy('terms'), HEAD: policy('terms') },
   '/auth/login': { GET: auth.login },
   '/auth/callback': { GET: auth.callback },
   '/auth/google/start': { GET: google.start },
@@ -100,6 +110,8 @@ async function handle(ctx: Context, req: IncomingMessage, res: ServerResponse): 
   const url = requestUrl(req)
   const host = classifyHost(req.headers.host, ctx.deps.config.domain)
   if (host.kind === 'apex') {
+    if (ctx.publicPages && ['/', '/privacy', '/terms'].includes(url.pathname) && (req.url ?? '/').split('?')[0] !== url.pathname) return answer(ctx, req, res, 404, 'There is nothing at this address.')
+    if (!ctx.publicPages && (url.pathname === '/privacy' || url.pathname === '/terms')) return answer(ctx, req, res, 404, 'There is nothing at this address.')
     const route = APEX_ROUTES[url.pathname]
     if (!route) return answer(ctx, req, res, 404, 'There is nothing at this address.')
     const handler = route[req.method ?? '']

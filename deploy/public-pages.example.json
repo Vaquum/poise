@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "appName": "Poise",
+  "contactEmail": "operator@example.com",
+  "description": "A private workspace for writing, agents and development work. Connect Google accounts, explicitly publish Markdown documents, read native comments and review incoming edits before importing them.",
+  "privacy": [
+    "This notice covers {{appName}} at {{origin}} and its personal workspaces. Contact the deployment operator at {{contactEmail}}.",
+    "The service uses your GitHub identity to sign you into your workspace. Connecting Google records your Google account identifier and email address and stores an encrypted authorization grant on the gateway. The integration requests access to specific Drive files used with the app, rather than general access to your Drive.",
+    "Google access supports the document operations you request: publication, reading text and native comments, detecting changes, and explicitly importing or publishing an update. Connecting an account does not publish a document. Incoming Google edits do not automatically replace your draft.",
+    "Your workspace retains drafts, annotations, publication records and imported document history. Disconnecting Google removes its usable gateway grant; it does not delete your Google files, saved drafts or history. The operator controls the server, administrative access and backups. Contact {{contactEmail}} for retained-data or deletion questions, and revoke the app in your Google Account to end provider authorization.",
+    "Review and replace this example with a notice describing your deployment's complete data use, sharing, retention, support and backup practices before publishing."
+  ],
+  "terms": [
+    "This private {{appName}} deployment is available only to accounts admitted by its operator. Use only accounts and documents you are authorized to access.",
+    "Review the selected account, destination and changes before publishing or importing. Connected providers operate under their own terms and availability limits. Contact {{contactEmail}} about this deployment.",
+    "Review and replace this example with the terms applicable to your deployment before publishing."
+  ]
+}

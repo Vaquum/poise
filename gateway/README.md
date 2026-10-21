@@ -8,7 +8,12 @@ It is a standalone Node 22 TypeScript service built on `node:http` and `node:cry
 
 ## Configuration
 
-Everything comes from the environment and is validated at startup. Every problem is reported at once and the process exits with status 1.
+Runtime settings come from the environment and are validated at startup. Every problem is reported at once and the process exits with status 1.
+
+Operators can separately publish reviewed deployment descriptions and policies
+with the [public page setup command](../docs/Public-pages.md). Its bounded
+`public-pages.json` stays in the gateway data volume; no installation-specific
+address, contact or policy is included in the image or overwritten on upgrade.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |

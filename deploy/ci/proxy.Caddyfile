@@ -27,3 +27,18 @@ https://*.{$POISE_DOMAIN}:8443 {
 	}
 	reverse_proxy {$POISE_PROXY_LISTEN}
 }
+
+# A separate listener models an operator's additional login boundary.
+http://:8081 {
+	@public {
+		host {$POISE_DOMAIN}
+		method GET HEAD
+		expression `{orig_uri}.matches('^/(privacy|terms)?([?].*)?$')`
+	}
+	handle @public {
+		reverse_proxy {$POISE_PROXY_LISTEN}
+	}
+	handle {
+		respond "External proxy authentication required" 401
+	}
+}

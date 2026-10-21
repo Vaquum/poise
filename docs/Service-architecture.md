@@ -69,6 +69,19 @@ workspace can reach another one.
 
 ## Sign-in and sessions
 
+**Optional public deployment content.** An operator can explicitly install a
+bounded `public-pages.json` in `POISE_GATEWAY_DATA` through
+`deploy/public-pages.sh` ([Public pages](Public-pages.md)). The gateway loads and
+validates it at startup. Its absence preserves existing behavior; invalid or
+unreadable content stops startup. On the configured apex only, anonymous `/`
+shows the deployment description and policy links, while `/privacy` and `/terms`
+serve the approved plain-text paragraphs with GET/HEAD and existing page security
+headers. Domain/origin substitutions use the gateway configuration. Authenticated
+home, workspace identity and every other route retain their checks. No workspace
+can install this content, and no upgrade generates or replaces it. The existing
+gateway data backup includes it. A proxy with an additional login must forward
+only these exact apex public paths and methods without that additional login.
+
 - Sign-in is a GitHub OAuth App web flow on the apex: `/auth/login` →
   GitHub → `/auth/callback`. The gateway requests `read:user`, plus `read:org`
   only when organisation-based access is configured. It reads the login and
