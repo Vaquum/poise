@@ -212,7 +212,12 @@ describe('agent log quarantine', () => {
       behavior: 'pr_review',
       sessionId: 'session-1',
     }])
-    expect(mocks.runFile).toHaveBeenCalledWith('agent-interface', ['--logs'], expect.objectContaining({ signal: controller.signal }))
+    // The spawn carries the shared read's own abort signal, not the caller's:
+    // one waiter leaving must not kill the read for the others.
+    const childSignal = mocks.runFile.mock.calls[0][2].signal as AbortSignal
+    expect(childSignal).toBeInstanceOf(AbortSignal)
+    expect(childSignal).not.toBe(controller.signal)
+    expect(childSignal.aborted).toBe(false)
     await expect(fetchAgentLogs()).rejects.toThrow(/log row 1 has invalid actor/)
   })
 
@@ -347,6 +352,207 @@ describe('agent log quarantine', () => {
 
     expect(quarantinedLogMayMatch(row, { repo: 'owner/legacy-repo' })).toBe(true)
     expect(quarantinedLogMayMatch(row, { repo: 'owner/another-repo' })).toBe(false)
+  })
+})
+
+describe('agent log snapshot sharing', () => {
+  // Braces, not an expression body: vitest would run a returned function as
+  // a teardown, calling the mock once more after every test.
+  beforeEach(() => { mocks.runFile.mockReset() })
+
+  it('queues overlapping readers onto one follow-up read that sees later rows', async () => {
+    const releases: Array<(value: { stdout: string, stderr: string }) => void> = []
+    mocks.runFile.mockImplementation(() => new Promise((resolve) => { releases.push(resolve) }))
+    const first = fetchAgentLogSnapshot()
+    const late = Array.from({ length: 10 }, () => fetchAgentLogSnapshot())
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    releases[0]!({ stdout: JSON.stringify([logRow({ id: 'a'.repeat(32) })]), stderr: '' })
+    const firstSnapshot = await first
+    expect(firstSnapshot.entries.map((row) => row.id)).toEqual(['a'.repeat(32)])
+    // The queued read starts when the running one settles.
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    releases[1]!({ stdout: JSON.stringify([logRow({ id: 'a'.repeat(32) }), logRow({ id: 'b'.repeat(32) })]), stderr: '' })
+    const snapshots = await Promise.all(late)
+    for (const snapshot of snapshots) expect(snapshot).toBe(snapshots[0])
+    // Every late caller arrived after row B was written, and sees it.
+    expect(snapshots[0]?.entries.map((row) => row.id)).toEqual(['b'.repeat(32), 'a'.repeat(32)])
+    expect(mocks.observeSnapshot).toHaveBeenCalledTimes(2)
+  })
+
+  it('reads again once the shared read has settled', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await fetchAgentLogSnapshot()
+    await fetchAgentLogSnapshot()
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects one waiter’s abort without disturbing the other reader', async () => {
+    const releases: Array<(value: { stdout: string, stderr: string }) => void> = []
+    mocks.runFile.mockImplementation(() => new Promise((resolve) => { releases.push(resolve) }))
+    const first = fetchAgentLogSnapshot()
+    const leaving = new AbortController()
+    const staying = new AbortController()
+    const gone = fetchAgentLogSnapshot({ signal: leaving.signal })
+    const kept = fetchAgentLogSnapshot({ signal: staying.signal })
+    const reason = new Error('waiter is gone')
+    leaving.abort(reason)
+    const failure = await gone.catch((error) => error)
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).name).toBe('AbortError')
+    expect((failure as Error).message).toBe('The operation was aborted')
+    expect((failure as { code?: unknown }).code).toBe('ABORT_ERR')
+    expect((failure as Error).cause).toBe(reason)
+    releases[0]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await expect(first).resolves.toBeDefined()
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    const childSignal = mocks.runFile.mock.calls[1][2].signal as AbortSignal
+    expect(childSignal.aborted).toBe(false)
+    releases[1]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await expect(kept).resolves.toMatchObject({ entries: [{ id: 'a'.repeat(32) }] })
+  })
+
+  it('drops a queued read its waiters all abandon before it spawns', async () => {
+    const releases: Array<(value: { stdout: string, stderr: string }) => void> = []
+    mocks.runFile.mockImplementation(() => new Promise((resolve) => { releases.push(resolve) }))
+    const controller = new AbortController()
+    const first = fetchAgentLogSnapshot()
+    const queued = fetchAgentLogSnapshot({ signal: controller.signal })
+    controller.abort()
+    await expect(queued).rejects.toThrow('The operation was aborted')
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    releases[0]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await expect(first).resolves.toBeDefined()
+    // Nothing was left queued: the next call spawns fresh.
+    const third = fetchAgentLogSnapshot()
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    releases[1]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await expect(third).resolves.toBeDefined()
+  })
+
+  it('aborts the child once every waiter is gone, and a new caller spawns fresh', async () => {
+    // Like the real runFile: the child dies when its own signal aborts.
+    const releases: Array<(value: { stdout: string, stderr: string }) => void> = []
+    mocks.runFile.mockImplementation((_command: string, _args: readonly string[],
+      options: { signal?: AbortSignal }) => new Promise((resolve, reject) => {
+      releases.push(resolve)
+      options.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')), { once: true })
+    }))
+    const running = fetchAgentLogSnapshot()
+    const first = new AbortController()
+    const second = new AbortController()
+    const one = fetchAgentLogSnapshot({ signal: first.signal })
+    const two = fetchAgentLogSnapshot({ signal: second.signal })
+    releases[0]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await expect(running).resolves.toBeDefined()
+    // Both waiters share the promoted second read.
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    const childSignal = mocks.runFile.mock.calls[1][2].signal as AbortSignal
+    first.abort()
+    await expect(one).rejects.toThrow('The operation was aborted')
+    expect(childSignal.aborted).toBe(false)
+    second.abort()
+    await expect(two).rejects.toThrow('The operation was aborted')
+    expect(childSignal.aborted).toBe(true)
+    // The slot cleared synchronously: a caller arriving during kill
+    // teardown joins no dying child.
+    const fresh = fetchAgentLogSnapshot()
+    expect(mocks.runFile).toHaveBeenCalledTimes(3)
+    releases[2]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await expect(fresh).resolves.toBeDefined()
+  })
+
+  it('rejects a pre-aborted caller without spawning', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    await expect(fetchAgentLogSnapshot({ signal: controller.signal })).rejects.toThrow()
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('fails a read’s waiters, still runs the queued read, then retries', async () => {
+    mocks.runFile.mockRejectedValueOnce(new Error('Caller is down'))
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    const one = fetchAgentLogSnapshot()
+    const two = fetchAgentLogSnapshot()
+    await expect(one).rejects.toThrow('Caller is down')
+    // The queued read is its own attempt, not the failure inherited.
+    await expect(two).resolves.toBeDefined()
+    expect(mocks.observeSnapshot).toHaveBeenCalledTimes(1)
+    await expect(fetchAgentLogSnapshot()).resolves.toBeDefined()
+    expect(mocks.runFile).toHaveBeenCalledTimes(3)
+  })
+
+  it('freezes the shared snapshot so co-waiters cannot corrupt each other', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([
+      logRow({ id: 'a'.repeat(32) }),
+      logRow({ id: 'b'.repeat(32), actor: 42 }),
+    ]), stderr: '' })
+    const snapshot = await fetchAgentLogSnapshot()
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    expect(Object.isFrozen(snapshot.entries)).toBe(true)
+    expect(Object.isFrozen(snapshot.quarantined)).toBe(true)
+    expect(Object.isFrozen(snapshot.entries[0])).toBe(true)
+    expect(Object.isFrozen(snapshot.quarantined[0])).toBe(true)
+    expect(() => snapshot.entries.push(snapshot.entries[0]!)).toThrow(TypeError)
+  })
+
+  it('ignores an abort that lands after the read has settled', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    const controller = new AbortController()
+    await expect(fetchAgentLogSnapshot({ signal: controller.signal })).resolves.toBeDefined()
+    controller.abort()
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    await fetchAgentLogSnapshot()
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+  })
+
+  it('spawns every shared read under its own diagnostic identity', async () => {
+    const { diagnosticIdentity, withNoticeDiagnosticIdentity } = await import('../server/logging-context')
+    const seen: Array<{ correlationId: string }> = []
+    const releases: Array<(value: { stdout: string, stderr: string }) => void> = []
+    mocks.runFile.mockImplementation(() => new Promise((resolve) => {
+      seen.push(diagnosticIdentity() as { correlationId: string })
+      releases.push(resolve)
+    }))
+    const outer = { correlationId: 'outer', behavior: 'review-new-prs', repository: 'o/r', target: 'o/r#1', account: 'a' }
+    const first = withNoticeDiagnosticIdentity(outer, () => fetchAgentLogSnapshot())
+    const second = withNoticeDiagnosticIdentity(outer, () => fetchAgentLogSnapshot())
+    releases[0]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await first
+    // The queued read starts inside the first read's settle callback.
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    releases[1]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await second
+    expect(seen).toHaveLength(2)
+    for (const identity of seen) {
+      expect(identity).toMatchObject({ behavior: 'agent-logs', repository: '', target: '', account: null })
+      expect(identity.correlationId).not.toBe('outer')
+    }
+    expect(seen[0]!.correlationId).not.toBe(seen[1]!.correlationId)
+  })
+
+  it('gives each waiter its own error object when a shared read fails', async () => {
+    const shared = Object.assign(new Error('Caller is down'), { code: 1, killed: false, signal: null, stdout: '', stderr: 'boom' })
+    mocks.runFile.mockRejectedValue(shared)
+    const first = fetchAgentLogSnapshot()
+    const second = fetchAgentLogSnapshot()
+    const third = fetchAgentLogSnapshot()
+    const failures = await Promise.all([
+      first.catch((error) => error),
+      second.catch((error) => error),
+      third.catch((error) => error),
+    ])
+    // Second and third co-wait on the queued read: distinct objects.
+    expect(failures[0]).not.toBe(failures[1])
+    expect(failures[1]).not.toBe(failures[2])
+    expect(failures[0]).not.toBe(shared)
+    for (const failure of failures) {
+      expect(failure).toBeInstanceOf(Error)
+      expect(failure.message).toBe('Caller is down')
+      expect(failure.name).toBe('Error')
+      expect(failure.code).toBe(1)
+      expect(failure.stderr).toBe('boom')
+      expect(failure.cause).toBe(shared)
+    }
   })
 })
 

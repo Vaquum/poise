@@ -19,6 +19,7 @@ import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
 import { needsClaude, reviewChoice } from './review-model'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
+import { withNoticeDiagnosticIdentity } from './logging-context'
 import { requireAgentAccount } from './settings'
 
 const CLI = 'agent-interface'
@@ -218,15 +219,145 @@ export function scopedAgentLogs(snapshot: AgentLogSnapshot, identity?: AgentLogI
   return snapshot.entries
 }
 
+// One `--logs` child runs at a time. The dump holds the whole Caller log
+// (thousands of rows), and a behavior tick plus open browser views used to
+// spawn a dozen of them at the same minute boundary, convoying on Caller's
+// database until each hit its 30 s timeout. A caller arriving mid-read
+// queues for the *next* read, which starts when the running one settles, so
+// every waiter gets data from a child spawned after it called: joining can
+// never serve pre-arrival data, and read-after-write callers stay correct.
+interface AgentLogWaiter {
+  signal: AbortSignal | undefined
+  onAbort: () => void
+  resolve: (snapshot: AgentLogSnapshot) => void
+  reject: (error: unknown) => void
+}
+
+interface AgentLogRead {
+  controller: AbortController
+  waiters: Set<AgentLogWaiter>
+  started: boolean
+  settled: boolean
+}
+
+let runningAgentLogRead: AgentLogRead | null = null
+let queuedAgentLogRead: AgentLogRead | null = null
+
+// Shaped like runFile's own abort rejection, minus the child-kill fields:
+// the child may live on for the remaining waiters.
+function agentLogAbortError(signal: AbortSignal): Error {
+  const error = new Error('The operation was aborted', { cause: signal.reason })
+  error.name = 'AbortError'
+  return Object.assign(error, { code: 'ABORT_ERR' })
+}
+
 export async function fetchAgentLogSnapshot(
   options: { signal?: AbortSignal } = {},
 ): Promise<AgentLogSnapshot> {
-  const { stdout } = await runFile(CLI, ['--logs'], {
+  // A caller that is already gone never joins work it cannot use.
+  options.signal?.throwIfAborted()
+  const read = runningAgentLogRead ? (queuedAgentLogRead ?? createAgentLogRead()) : startAgentLogRead(createAgentLogRead())
+  return new Promise<AgentLogSnapshot>((resolve, reject) => {
+    const waiter: AgentLogWaiter = { signal: options.signal, onAbort: () => {}, resolve, reject }
+    const signal = waiter.signal
+    if (signal) {
+      waiter.onAbort = () => {
+        read.waiters.delete(waiter)
+        if (read.waiters.size === 0 && !read.settled) {
+          if (!read.started) {
+            // Dropped before it ever spawned.
+            if (queuedAgentLogRead === read) queuedAgentLogRead = null
+          } else {
+            // Clear synchronously so a caller arriving during kill
+            // teardown spawns fresh instead of joining a dying child.
+            read.controller.abort()
+            if (runningAgentLogRead === read) {
+              runningAgentLogRead = null
+              promoteQueuedAgentLogRead()
+            }
+          }
+        }
+        reject(agentLogAbortError(signal))
+      }
+      signal.addEventListener('abort', waiter.onAbort, { once: true })
+    }
+    read.waiters.add(waiter)
+  })
+}
+
+function createAgentLogRead(): AgentLogRead {
+  const read: AgentLogRead = { controller: new AbortController(), waiters: new Set(), started: false, settled: false }
+  if (runningAgentLogRead) queuedAgentLogRead = read
+  return read
+}
+
+function startAgentLogRead(read: AgentLogRead): AgentLogRead {
+  read.started = true
+  runningAgentLogRead = read
+  readAgentLogSnapshot(read.controller.signal).then(
+    (snapshot) => settleAgentLogRead(read, { snapshot }),
+    (error) => settleAgentLogRead(read, { error }),
+  )
+  return read
+}
+
+function promoteQueuedAgentLogRead(): void {
+  // A queued read starts even after a failure: its waiters arrived for
+  // data, and the running read's failure is not theirs.
+  if (queuedAgentLogRead && !runningAgentLogRead) {
+    const next = queuedAgentLogRead
+    queuedAgentLogRead = null
+    startAgentLogRead(next)
+  }
+}
+
+function settleAgentLogRead(read: AgentLogRead, outcome: { snapshot: AgentLogSnapshot } | { error: unknown }): void {
+  read.settled = true
+  if (runningAgentLogRead === read) runningAgentLogRead = null
+  for (const waiter of read.waiters) {
+    read.waiters.delete(waiter)
+    // Completion wins over a racing abort once the read has settled,
+    // matching a directly linked child.
+    waiter.signal?.removeEventListener('abort', waiter.onAbort)
+    if ('snapshot' in outcome) waiter.resolve(outcome.snapshot)
+    else waiter.reject(copyAgentLogError(outcome.error))
+  }
+  promoteQueuedAgentLogRead()
+}
+
+// Each waiter gets its own error object, as if it had spawned its own
+// child: sharing one object would attribute it to whichever waiter's
+// diagnostic context logged it last.
+function copyAgentLogError(error: unknown): unknown {
+  if (!(error instanceof Error)) return error
+  const copy = new Error(error.message, { cause: error })
+  copy.name = error.name
+  copy.stack = error.stack
+  const source = error as unknown as Record<string, unknown>
+  const target = copy as unknown as Record<string, unknown>
+  for (const field of ['code', 'killed', 'signal', 'stdout', 'stderr']) {
+    if (source[field] !== undefined) target[field] = source[field]
+  }
+  return copy
+}
+
+async function readAgentLogSnapshot(signal: AbortSignal): Promise<AgentLogSnapshot> {
+  // The child serves every waiter, so it runs under the shared read's own
+  // diagnostic identity — never the AsyncLocalStorage context of whoever
+  // started the preceding read, whose correlationId would otherwise own
+  // this read's timeouts.
+  const { stdout } = await withNoticeDiagnosticIdentity({
+    correlationId: randomUUID(),
+    behavior: 'agent-logs',
+    repository: '',
+    target: '',
+    account: null,
+  }, () => runFile(CLI, ['--logs'], {
     cwd: agentCwd(),
     timeoutMs: 30_000,
     maxOutputBytes: 32 * 1024 * 1024,
-    signal: options.signal,
-  })
+    signal,
+  }))
   const trimmed = stdout.trim()
   if (!trimmed) throw new Error('agent-interface --logs returned empty output')
   // agent-interface returns oldest-first (`order by started_at`).
@@ -244,6 +375,12 @@ export async function fetchAgentLogSnapshot(
     catch (error) { quarantined.push(quarantineLogEntry(value, index, error)) }
   })
   const snapshot = { entries: entries.reverse(), quarantined }
+  // Co-waiters alias this snapshot; freezing makes misuse fail loud.
+  for (const row of snapshot.entries) Object.freeze(row)
+  for (const row of snapshot.quarantined) Object.freeze(row)
+  Object.freeze(snapshot.entries)
+  Object.freeze(snapshot.quarantined)
+  Object.freeze(snapshot)
   observeAgentSnapshot(snapshot)
   return snapshot
 }
