@@ -20,6 +20,7 @@ import { HttpError } from './http'
 import { needsClaude, reviewChoice } from './review-model'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
 import { withNoticeDiagnosticIdentity } from './logging-context'
+import { diagnostic } from './logging'
 import { requireAgentAccount } from './settings'
 
 const CLI = 'agent-interface'
@@ -219,6 +220,15 @@ export function scopedAgentLogs(snapshot: AgentLogSnapshot, identity?: AgentLogI
   return snapshot.entries
 }
 
+// `--logs` still dumps the whole Caller log on every read, and runFile kills
+// the child once stdout passes the cap below: reads work fully until then,
+// then all fail at once. Warn into the workspace diagnostics at 75% of the
+// cap so the cliff is seen first. At most hourly: every spawn would refire.
+const AGENT_LOG_READ_CAP_BYTES = 32 * 1024 * 1024
+const AGENT_LOG_CAP_WARN_BYTES = (AGENT_LOG_READ_CAP_BYTES * 3) / 4
+const AGENT_LOG_CAP_WARN_INTERVAL_MS = 60 * 60 * 1000
+let lastAgentLogCapWarningAt = 0
+
 // One `--logs` child runs at a time. The dump holds the whole Caller log
 // (thousands of rows), and a behavior tick plus open browser views used to
 // spawn a dozen of them at the same minute boundary, convoying on Caller's
@@ -358,7 +368,7 @@ async function readAgentLogSnapshot(signal: AbortSignal): Promise<AgentLogSnapsh
   }, () => runFile(CLI, ['--logs'], {
     cwd: agentCwd(),
     timeoutMs: 30_000,
-    maxOutputBytes: 32 * 1024 * 1024,
+    maxOutputBytes: AGENT_LOG_READ_CAP_BYTES,
     signal,
   }))
   const trimmed = stdout.trim()
@@ -385,7 +395,18 @@ async function readAgentLogSnapshot(signal: AbortSignal): Promise<AgentLogSnapsh
   Object.freeze(snapshot.quarantined)
   Object.freeze(snapshot)
   observeAgentSnapshot(snapshot)
+  warnAgentLogCap(stdout, list.length)
   return snapshot
+}
+
+function warnAgentLogCap(stdout: string, rows: number): void {
+  const bytes = Buffer.byteLength(stdout, 'utf8')
+  const now = Date.now()
+  if (bytes < AGENT_LOG_CAP_WARN_BYTES || now - lastAgentLogCapWarningAt < AGENT_LOG_CAP_WARN_INTERVAL_MS) return
+  lastAgentLogCapWarningAt = now
+  diagnostic({ level: 'warning', operation: 'agent.logs.cap', condition: 'agent_logs_read_cap',
+    message: `agent-interface --logs is ${bytes} bytes (${rows} row${rows === 1 ? '' : 's'}), past 75% of the ${AGENT_LOG_READ_CAP_BYTES}-byte read cap`,
+    resources: { bytes, rows, cap: AGENT_LOG_READ_CAP_BYTES } })
 }
 
 function validateLogEntry(value: unknown, index: number): LogEntry {
