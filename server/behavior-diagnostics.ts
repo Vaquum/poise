@@ -1,4 +1,5 @@
-import { classifyBehaviorDiagnostic, diagnosticClassification, terminalProviderMessage } from '../src/behavior-failure-cause'
+import { classifyBehaviorDiagnostic, diagnosticClassification, jsonMessageCause, lastCauseLine, terminalProviderMessage } from '../src/behavior-failure-cause'
+import { environmentSecrets, redact } from '../gateway/src/diagnostics/redaction.mjs'
 import type { fetchAgentLogSnapshot } from './agent'
 import type { BehaviorDeadLetter, BehaviorLaunchClaim } from './db'
 
@@ -39,21 +40,20 @@ export function behaviorIncidentDiagnostics(incidents: BehaviorDeadLetter[], sna
 }
 
 // Keep bounded, redacted CLI evidence in health instead of an opaque exit code.
+// The useful cause is selected before redaction and bounding: a formatted
+// JSON body ends in `}`, which a last-line fallback would keep alone.
 export function behaviorErrorMessage(error: unknown, maxLength = 300): string {
   const message = error instanceof Error ? error.message : String(error)
   const stderr = (error as { stderr?: unknown } | null)?.stderr
-  const detail = typeof stderr === 'string' ? stderr.trim().split('\n').at(-1)?.trim() : ''
-  let result = terminalProviderMessage(typeof stderr === 'string' ? stderr : '')
-    ?? terminalProviderMessage(message) ?? (detail ? `${message}: ${detail}` : message)
-  for (const [key, value] of Object.entries(process.env)) {
-    if (/TOKEN|KEY|SECRET|PASSWORD|AUTH/i.test(key) && value && value.length >= 8) {
-      result = result.split(value).join('[redacted]')
-    }
+  const raw = typeof stderr === 'string' ? stderr : ''
+  const terminal = terminalProviderMessage(raw) ?? terminalProviderMessage(message)
+  let result: string
+  if (terminal !== null) result = terminal
+  else {
+    const cause = jsonMessageCause(raw) ?? lastCauseLine(raw)
+    result = cause !== null ? `${message}: ${cause}` : (jsonMessageCause(message) ?? message)
   }
-  return result
-    .replace(/(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/g, '[redacted]')
-    .replace(/(https?:\/\/)[^\s/]+@/g, '$1[redacted]@')
-    .replace(/\b(Bearer|token)\s+[^\s,;"']+/gi, '$1 [redacted]')
-    .replace(/[\x00-\x1f\x7f]/g, ' ')
-    .slice(0, maxLength)
+  // The canonical redactor Logging applies to the same stderr, so a summary
+  // still joins its retained event; the bound applies only after redaction.
+  return redact(result, environmentSecrets()).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, maxLength)
 }

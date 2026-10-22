@@ -200,6 +200,14 @@ source: GitHub GraphQL only
 
 If health fails, consumers must treat datastore output as stale.
 
+When upstream changes while a connection is paged (a `totalCount` change or a
+received-count mismatch), the reader discards the partial pass and restarts
+that enumeration from its first page with the original watermark, up to three
+attempts per enumeration. Persistent drift fails the sync without advancing
+either watermark, so health keeps reporting stale until a complete sync
+commits. Malformed responses, cursor violations, duplicate identities, missing
+stored items and backward timestamps still fail on the first attempt.
+
 Poise runs daily reconciliation in resumable 20-second work chunks between
 ordinary syncs. A chunk may finish its in-flight GraphQL work beyond the budget.
 Partial reconciliation does not advance either success watermark or invalidate

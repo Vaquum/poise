@@ -1,7 +1,13 @@
+import copy
 import unittest
 from unittest.mock import Mock
 
-from github_datastore.github_api import GitHubApiError, GitHubOrgReader
+from github_datastore.github_api import (
+    ENUMERATION_DRIFT_MAX_ATTEMPTS,
+    GitHubApiError,
+    GitHubEnumerationDriftError,
+    GitHubOrgReader,
+)
 
 
 WATERMARK = "2026-08-29T12:00:00Z"
@@ -172,6 +178,10 @@ class GitHubOrgReaderTest(unittest.TestCase):
                     response["repositoryOwner"] = None
                 elif failure == "partial":
                     conn["totalCount"] = 2
+                    for _ in range(ENUMERATION_DRIFT_MAX_ATTEMPTS - 1):
+                        extra = org_response()
+                        extra["repositoryOwner"]["repositories"]["totalCount"] = 2
+                        pages.append(extra)
                 elif failure == "duplicate":
                     conn["totalCount"] = 2
                     conn["nodes"].append(repo_node())
@@ -181,8 +191,38 @@ class GitHubOrgReaderTest(unittest.TestCase):
                     conn["totalCount"] = 2
                     conn["pageInfo"] = {"hasNextPage": True, "endCursor": "next"}
                     pages.append(org_response())
+                    for _ in range(ENUMERATION_DRIFT_MAX_ATTEMPTS - 1):
+                        extra = org_response()
+                        extra["repositoryOwner"]["repositories"]["totalCount"] = 2
+                        extra["repositoryOwner"]["repositories"]["pageInfo"] = {"hasNextPage": True, "endCursor": "next"}
+                        pages.extend([extra, org_response()])
                 with self.assertRaises(GitHubApiError):
                     GitHubOrgReader(ScriptedClient(pages)).list_org_repos("Vaquum")
+
+    def test_owner_inventory_restarts_after_mid_page_repo_creation(self) -> None:
+        repos = [repo_node(), repo_node(), repo_node()]
+        repos[1].update({"databaseId": 11, "id": "R_11", "name": "Other", "nameWithOwner": "Vaquum/Other"})
+        repos[2].update({"databaseId": 12, "id": "R_12", "name": "Third", "nameWithOwner": "Vaquum/Third"})
+
+        def inventory_page(nodes: list[dict], total: int, has_next: bool, cursor: str | None) -> dict:
+            response = org_response()
+            conn = response["repositoryOwner"]["repositories"]
+            conn["nodes"] = nodes
+            conn["totalCount"] = total
+            conn["pageInfo"] = {"hasNextPage": has_next, "endCursor": cursor}
+            return response
+
+        client = ScriptedClient([
+            inventory_page(repos[:1], 2, True, "next"),
+            inventory_page(repos[1:2], 3, False, None),
+            inventory_page(repos[:1], 3, True, "next"),
+            inventory_page(repos[1:], 3, False, None),
+        ])
+        rows = GitHubOrgReader(client).list_org_repos("Vaquum")
+        self.assertEqual([row["full_name"] for row in rows], ["Vaquum/Test", "Vaquum/Other", "Vaquum/Third"])
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(client.calls[2][1], {"org": "Vaquum", "cursor": None})
+        client.assert_exhausted()
 
     def test_incremental_query_combines_issue_delta_and_all_pr_stubs(self) -> None:
         issue = issue_stub(1, "2026-08-29T12:01:00Z")
@@ -307,16 +347,33 @@ class GitHubOrgReaderTest(unittest.TestCase):
 
     def test_full_enumeration_rejects_incomplete_issue_or_pr_results(self) -> None:
         cases = [
-            [repository_page("issues", [issue_stub(1, WATERMARK)], False, None, 2)],
+            [repository_page("issues", [issue_stub(1, WATERMARK)], False, None, 2)
+             for _ in range(ENUMERATION_DRIFT_MAX_ATTEMPTS)],
             [
                 repository_page("issues", [], False, None, 0),
-                repository_page("pullRequests", [pull_stub(1, WATERMARK)], False, None, 2),
+                *[repository_page("pullRequests", [pull_stub(1, WATERMARK)], False, None, 2)
+                  for _ in range(ENUMERATION_DRIFT_MAX_ATTEMPTS)],
             ],
         ]
         for responses in cases:
             with self.subTest(responses=responses):
                 with self.assertRaisesRegex(GitHubApiError, "enumeration count mismatch"):
                     GitHubOrgReader(ScriptedClient(responses)).list_repo_issues("Vaquum/Test")
+
+    def test_full_enumeration_restarts_pr_connection_after_mid_page_creation(self) -> None:
+        pulls = [pull_stub(number, WATERMARK) for number in range(1, 4)]
+        client = ScriptedClient([
+            repository_page("issues", [], False, None, 0),
+            repository_page("pullRequests", pulls[:1], True, "cursor-1", 2),
+            repository_page("pullRequests", pulls[1:], False, None, 3),
+            repository_page("pullRequests", pulls[:1], True, "cursor-1", 3),
+            repository_page("pullRequests", pulls[1:], False, None, 3),
+        ])
+        rows = GitHubOrgReader(client).list_repo_issues("Vaquum/Test")
+        self.assertEqual([(row["item_kind"], row["number"]) for row in rows], [("pr", 1), ("pr", 2), ("pr", 3)])
+        self.assertEqual(len(client.calls), 5)
+        self.assertEqual(client.calls[3][1]["cursor"], None)
+        client.assert_exhausted()
 
     def test_full_enumeration_rejects_duplicate_item_ids(self) -> None:
         issue = issue_stub(1, WATERMARK)
@@ -380,30 +437,34 @@ class GitHubOrgReaderTest(unittest.TestCase):
 
     def test_incremental_query_rejects_incomplete_issue_enumeration(self) -> None:
         client = ScriptedClient(
-            [incremental_response([issue_stub(1, WATERMARK)], [], issue_total_count=2)]
+            [incremental_response([issue_stub(1, WATERMARK)], [], issue_total_count=2)
+             for _ in range(ENUMERATION_DRIFT_MAX_ATTEMPTS)]
         )
         with self.assertRaisesRegex(GitHubApiError, "issue enumeration count mismatch"):
             GitHubOrgReader(client).list_repo_changed_items("Vaquum/Test", WATERMARK, {})
 
     def test_incremental_continuation_rejects_changed_or_missing_total_count(self) -> None:
         cases = [
-            repository_page("issues", [issue_stub(2, WATERMARK)], False, None, 3),
-            repository_page("issues", [issue_stub(2, WATERMARK)], False, None),
+            (3, ENUMERATION_DRIFT_MAX_ATTEMPTS),
+            (None, 1),
         ]
-        for continuation in cases:
-            with self.subTest(continuation=continuation):
-                client = ScriptedClient(
-                    [
+        for total, attempts in cases:
+            with self.subTest(total=total):
+                responses = []
+                for _ in range(attempts):
+                    responses.append(
                         incremental_response(
                             [issue_stub(1, WATERMARK)],
                             [],
                             issue_has_next=True,
                             issue_cursor="cursor-1",
                             issue_total_count=2,
-                        ),
-                        continuation,
-                    ]
-                )
+                        )
+                    )
+                    responses.append(
+                        repository_page("issues", [issue_stub(2, WATERMARK)], False, None, total)
+                    )
+                client = ScriptedClient(responses)
                 with self.assertRaises(GitHubApiError):
                     GitHubOrgReader(client).list_repo_changed_items(
                         "Vaquum/Test", WATERMARK, {}
@@ -411,10 +472,26 @@ class GitHubOrgReaderTest(unittest.TestCase):
 
     def test_incremental_query_rejects_incomplete_pr_enumeration(self) -> None:
         client = ScriptedClient(
-            [incremental_response([], [pull_stub(1, WATERMARK)], pull_total_count=2)]
+            [incremental_response([], [pull_stub(1, WATERMARK)], pull_total_count=2)
+             for _ in range(ENUMERATION_DRIFT_MAX_ATTEMPTS)]
         )
         with self.assertRaisesRegex(GitHubApiError, "enumeration count mismatch"):
             GitHubOrgReader(client).list_repo_changed_items("Vaquum/Test", WATERMARK, {})
+
+    def test_incremental_query_restarts_after_mid_page_pr_creation(self) -> None:
+        pulls = [pull_stub(number, WATERMARK) for number in range(1, 4)]
+        client = ScriptedClient([
+            incremental_response([], pulls[:1], pull_has_next=True, pull_cursor="cursor-1", pull_total_count=2),
+            repository_page("pullRequests", pulls[1:2], False, None, 3),
+            incremental_response([], pulls[:1], pull_has_next=True, pull_cursor="cursor-1", pull_total_count=3),
+            repository_page("pullRequests", pulls[1:], False, None, 3),
+        ])
+        items = GitHubOrgReader(client).list_repo_changed_items("Vaquum/Test", WATERMARK, {})
+        self.assertEqual([(item["item_kind"], item["number"]) for item in items], [("pr", 1), ("pr", 2), ("pr", 3)])
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(client.calls[2][1]["since"], WATERMARK)
+        self.assertNotIn("cursor", client.calls[2][1])
+        client.assert_exhausted()
 
     def test_repository_page_rejects_nonadvancing_cursor(self) -> None:
         pulls = [pull_stub(1, WATERMARK), pull_stub(2, WATERMARK)]
@@ -496,9 +573,12 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
         client.assert_exhausted()
 
     def test_pr_only_batch_still_rejects_missing_pages_and_cyclic_cursors(self) -> None:
-        first = self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], False, None, 2)
+        responses = [
+            {"repo_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], False, None, 2)}
+            for _ in range(ENUMERATION_DRIFT_MAX_ATTEMPTS)
+        ]
         with self.assertRaisesRegex(GitHubApiError, "enumeration count mismatch"):
-            GitHubOrgReader(ScriptedClient([{"repo_0": first}])).list_repos_changed_items(
+            GitHubOrgReader(ScriptedClient(responses)).list_repos_changed_items(
                 ["owner/repo"], WATERMARK, {}, include_issues=False,
             )
         first = self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], True, "first", 4)
@@ -508,6 +588,37 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
             GitHubOrgReader(ScriptedClient([{"repo_0": first}, {"page_0": second}, {"page_0": third}])).list_repos_changed_items(
                 ["owner/repo"], WATERMARK, {}, include_issues=False,
             )
+
+    def test_changed_batch_restarts_after_mid_page_pr_creation(self) -> None:
+        name = "Vaquum/design-system"
+        before = [pull_stub(number, WATERMARK) for number in range(1, 110)]
+        after = [pull_stub(number, WATERMARK) for number in range(1, 111)]
+        client = ScriptedClient([
+            {"repo_0": self.batch_page(name, "pullRequests", before[:100], True, "cursor-100", 109)},
+            {"page_0": self.batch_page(name, "pullRequests", before[100:], False, None, 110)},
+            {"repo_0": self.batch_page(name, "pullRequests", after[:100], True, "cursor-100", 110)},
+            {"page_0": self.batch_page(name, "pullRequests", after[100:], False, None, 110)},
+        ])
+        result = GitHubOrgReader(client).list_repos_changed_items([name], WATERMARK, {}, include_issues=False)
+        self.assertEqual([item["number"] for item in result[name]], list(range(1, 111)))
+        self.assertEqual(len(client.calls), 4)
+        self.assertIn("repo_0:", client.calls[2][0])
+        self.assertNotIn("cursor0", client.calls[2][1])
+        client.assert_exhausted()
+
+    def test_changed_batch_fails_loudly_after_persistent_drift(self) -> None:
+        self.assertTrue(issubclass(GitHubEnumerationDriftError, GitHubApiError))
+        name = "owner/repo"
+        responses = []
+        for attempt in range(ENUMERATION_DRIFT_MAX_ATTEMPTS):
+            total = 2 + attempt
+            responses.append({"repo_0": self.batch_page(name, "pullRequests", [pull_stub(1, WATERMARK)], True, "cursor-1", total)})
+            responses.append({"page_0": self.batch_page(name, "pullRequests", [pull_stub(2, WATERMARK)], False, None, total + 1)})
+        client = ScriptedClient(responses)
+        with self.assertRaisesRegex(GitHubEnumerationDriftError, "totalCount changed"):
+            GitHubOrgReader(client).list_repos_changed_items([name], WATERMARK, {}, include_issues=False)
+        self.assertEqual(len(client.calls), 2 * ENUMERATION_DRIFT_MAX_ATTEMPTS)
+        client.assert_exhausted()
 
     def test_batch_matches_individual_complete_changed_items(self) -> None:
         first = incremental_response([issue_stub(1, WATERMARK)], [pull_stub(1, WATERMARK), pull_stub(2, WATERMARK)])
@@ -630,35 +741,45 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
         self.assertEqual([call.args for call in reader.list_repo_issues.call_args_list], [("owner/a",), ("owner/b",)])
 
     def test_batch_rejects_missing_ids_counts_and_nonadvancing_cursors(self) -> None:
+        drifting = ENUMERATION_DRIFT_MAX_ATTEMPTS
         cases = [
-            (self.batch_result("owner/repo", [], [], issue_total_count=1), [], {}),
-            (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)], pull_total_count=2), [], {}),
-            (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)]), [], {999: WATERMARK}),
-            (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)] * 2), [], {}),
+            (self.batch_result("owner/repo", [], [], issue_total_count=1), [], {}, drifting),
+            (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)], pull_total_count=2), [], {}, drifting),
+            (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)]), [], {999: WATERMARK}, 1),
+            (self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)] * 2), [], {}, 1),
             (self.batch_result("owner/repo", [], [], pull_has_next=True, pull_cursor="cursor", pull_total_count=2),
-             [{"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], True, "cursor", 2)}], {}),
+             [{"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], True, "cursor", 2)}], {}, 1),
             (self.batch_result("owner/repo", [], [], pull_has_next=True, pull_cursor="cursor", pull_total_count=2),
-             [{"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], False, None, 3)}], {}),
+             [{"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], False, None, 3)}], {}, drifting),
         ]
-        for first, continuations, stored in cases:
+        for first, continuations, stored, attempts in cases:
             with self.subTest(first=first, continuations=continuations, stored=stored), self.assertRaises(GitHubApiError):
-                GitHubOrgReader(ScriptedClient([{"repo_0": first}, *continuations])).list_repos_changed_items(["owner/repo"], WATERMARK, {"owner/repo": stored})
+                responses = []
+                for _ in range(attempts):
+                    responses.append({"repo_0": copy.deepcopy(first)})
+                    responses.extend(copy.deepcopy(continuations))
+                GitHubOrgReader(ScriptedClient(responses)).list_repos_changed_items(["owner/repo"], WATERMARK, {"owner/repo": stored})
 
     def test_continuations_reject_incomplete_duplicate_and_inaccessible_data(self) -> None:
         first = self.batch_result("owner/repo", [], [pull_stub(1, WATERMARK)], pull_has_next=True, pull_cursor="first", pull_total_count=2)
+        drifting = ENUMERATION_DRIFT_MAX_ATTEMPTS
         cases = [
-            {},
-            {"page_0": None},
-            {"page_0": self.batch_page("other/repo", "pullRequests", [pull_stub(2, WATERMARK)], False, None, 2)},
-            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, WATERMARK)], False, None, None)},
-            {"page_0": self.batch_page("owner/repo", "pullRequests", [], False, None, 2)},
-            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], False, None, 2)},
-            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, "invalid")], False, None, 2)},
-            {"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, WATERMARK)], True, None, 2)},
+            ({}, 1),
+            ({"page_0": None}, 1),
+            ({"page_0": self.batch_page("other/repo", "pullRequests", [pull_stub(2, WATERMARK)], False, None, 2)}, 1),
+            ({"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, WATERMARK)], False, None, None)}, 1),
+            ({"page_0": self.batch_page("owner/repo", "pullRequests", [], False, None, 2)}, drifting),
+            ({"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(1, WATERMARK)], False, None, 2)}, 1),
+            ({"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, "invalid")], False, None, 2)}, 1),
+            ({"page_0": self.batch_page("owner/repo", "pullRequests", [pull_stub(2, WATERMARK)], True, None, 2)}, 1),
         ]
-        for continuation in cases:
+        for continuation, attempts in cases:
             with self.subTest(continuation=continuation), self.assertRaises(GitHubApiError):
-                GitHubOrgReader(ScriptedClient([{"repo_0": first}, continuation])).list_repos_changed_items(["owner/repo"], WATERMARK, {})
+                responses = []
+                for _ in range(attempts):
+                    responses.append({"repo_0": copy.deepcopy(first)})
+                    responses.append(copy.deepcopy(continuation))
+                GitHubOrgReader(ScriptedClient(responses)).list_repos_changed_items(["owner/repo"], WATERMARK, {})
 
     def test_continuations_reject_cyclic_cursors(self) -> None:
         client = ScriptedClient([

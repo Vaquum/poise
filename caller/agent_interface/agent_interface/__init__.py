@@ -1473,7 +1473,7 @@ def main():
         print(json.dumps(diagnostics(after, limit), allow_nan=False))
         return
     if sys.argv[1:] == ["--logs"]:
-        print(json.dumps(logs(), indent=2))
+        print(json.dumps(logs(), separators=(",", ":")))
         return
     if sys.argv[1:] == ["--pr-stop-gate"]:
         pr_stop_gate.run()
