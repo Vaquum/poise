@@ -2418,6 +2418,9 @@ export class ChatRuntime extends EventEmitter {
       turn.localSlot = true
       return
     }
+    // A turn stopped before it reaches the queue must never park: its abort
+    // already fired, so the waiter's listener below would never wake it again.
+    turn.abort.signal.throwIfAborted()
     session.record.queuedBehind = SLOT_WAIT_REASON
     this.setStatus(session, 'queued')
     await new Promise<void>((resolve, reject) => {
