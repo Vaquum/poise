@@ -158,6 +158,10 @@ describe('the terminal presets', () => {
       vi.unstubAllEnvs()
     }
   })
+
+  it('runs the Muse API-key entry as exactly `muse auth set --api-key-stdin`', () => {
+    expect(presetCommand('muse-api-key')).toMatchObject({ command: 'muse', args: ['auth', 'set', '--api-key-stdin'] })
+  })
 })
 
 // ── The WebSocket ─────────────────────────────────────────────────────────
@@ -271,7 +275,7 @@ describe('the terminal WebSocket', () => {
 
   it('refuses a preset it does not know', async () => {
     await serve({})
-    expect(await open('bash')).toEqual({ status: 400, body: 'preset must be one of claude, codex, gh, grok, muse, antigravity, shell' })
+    expect(await open('bash')).toEqual({ status: 400, body: 'preset must be one of claude, codex, gh, grok, muse, antigravity, shell, muse-api-key' })
     expect(await open('')).toMatchObject({ status: 400 })
   })
 

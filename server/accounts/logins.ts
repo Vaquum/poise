@@ -24,10 +24,12 @@ export function accountLogins(): AccountLogins {
 }
 
 /** A Connect terminal's login exited with `code`; a clean exit is a finished
- *  login, except where the terminal runs a whole app rather than a login. */
+ *  login, except where the terminal runs a whole app rather than a login.
+ *  Storing a Muse API key counts as its login. */
 export function recordLogin(preset: string, code: number): void {
-  if (code !== 0 || !isAccountId(preset) || EXIT_IS_NO_LOGIN.has(preset)) return
-  setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [preset]: new Date().toISOString() }))
+  const id = preset === 'muse-api-key' ? 'muse' : preset
+  if (code !== 0 || !isAccountId(id) || EXIT_IS_NO_LOGIN.has(id)) return
+  setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [id]: new Date().toISOString() }))
 }
 
 /** The person says whether a CLI that reports no sign-in is signed in. */

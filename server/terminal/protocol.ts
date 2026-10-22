@@ -2,15 +2,17 @@
 // identities and the terminal"). Shared with the browser, so nothing here may
 // depend on Node.
 
-import { isAccountId, type AccountId } from '../accounts/types'
+import { ACCOUNT_IDS, type AccountId } from '../accounts/types'
 
 export const TERMINAL_WS_PATH = '/ws/terminal'
 
-/** A CLI's own login, or the person's login shell. */
-export type TerminalPreset = AccountId | 'shell'
+/** A CLI's own login, the Muse API-key entry, or the person's login shell. */
+export type TerminalPreset = AccountId | 'shell' | 'muse-api-key'
+
+export const TERMINAL_PRESETS: readonly TerminalPreset[] = [...ACCOUNT_IDS, 'shell', 'muse-api-key']
 
 export function isTerminalPreset(value: unknown): value is TerminalPreset {
-  return value === 'shell' || isAccountId(value)
+  return (TERMINAL_PRESETS as readonly unknown[]).includes(value)
 }
 
 export const TERMINAL_LIMITS = {

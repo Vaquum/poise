@@ -372,6 +372,13 @@ function withTimeout(promise: Promise<void>, ms: number): Promise<boolean> {
   })
 }
 
+/** A turn that died on subscription quota ran on the account login: an API
+ *  key has no subscription quota. Say so, with where to switch. */
+function turnError(message: string): string {
+  if (!message.includes('Subscription quota exhausted')) return `${LABEL}: ${message}`
+  return `${LABEL}: ${message} Muse is running on the account login, not an API key. Switch it in Settings → Accounts → Muse → Use an API key.`
+}
+
 /** "Muse exited (code): last stderr lines" once the process is gone; the
  *  link's own reason when it is still running (a framing failure). */
 async function exitMessage(process: ChildProcess, link: StdioRpc, fallback: Error): Promise<string> {
@@ -767,7 +774,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       turn.endedNativeIds.add(params.turnId)
       if (params.terminal === 'cancelled') turn.interruptRequested = true
       else if (params.terminal !== 'completed') {
-        turn.terminalError = `${LABEL}: ${params.error?.message ?? params.reason ?? `turn ended with ${params.terminal}`}`
+        turn.terminalError = turnError(params.error?.message ?? params.reason ?? `turn ended with ${params.terminal}`)
         turn.interruptRequested = true
       }
       if (turn.steers.size > 0) {
