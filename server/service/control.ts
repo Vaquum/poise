@@ -55,6 +55,20 @@ export const DRAINING_ERROR = 'Poise is installing an update; try again after it
 /** A drain lapses this long after the gateway's own drain timeout. */
 export const DRAIN_GRACE_SECONDS = 300
 
+/** How long one Chat turn may hold a refusing drain: past this the drain
+ *  stops it through the person's Stop path, with a transcript notice naming
+ *  the update, instead of refusing new work until the gateway's own timeout
+ *  recreates the container. Well inside that timeout's 90-minute default, so
+ *  a stopped turn settles before anything is cut. */
+export const DRAIN_TURN_DEADLINE_MS = 30 * 60_000
+
+/** What a turn stopped for the drain's turn deadline reads in its
+ *  transcript: the update that stopped it, and that the agent keeps its
+ *  context for the next prompt. */
+export const DRAIN_TURN_STOPPED =
+  `Poise stopped this turn after it held an update for ${DRAIN_TURN_DEADLINE_MS / 60_000} minutes; ` +
+  'the agent keeps its context, so send a new prompt to continue.'
+
 // Browser routes that start a Caller call or the model check.
 const LAUNCH_ROUTES = new Set(['/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/chat', '/api/models/refresh'])
 
@@ -86,6 +100,7 @@ export class ServiceControl {
   private drainOn = false
   private launches = 0
   private lapse: unknown = null
+  private turnDeadline: unknown = null
   private switchTo: string | null = null
   private switchPoll: unknown = null
   private readonly timer: DrainTimer
@@ -203,13 +218,16 @@ export class ServiceControl {
   }
 
   /** Every call starts the lapse again: the gateway renews a drain by
-   *  calling drain again while it waits. */
+   *  calling drain again while it waits. The turn deadline is armed once per
+   *  drain: renewals must never move it. */
   drain(): ServiceHealth {
+    const first = !this.drainOn
     pauseReleaseBackground()
     // The release drain's gate; its id only names who asked.
     this.runtime.startDrain('service')
     this.drainOn = true
     this.renewLapse()
+    if (first) this.armTurnDeadline()
     return this.health()
   }
 
@@ -252,9 +270,20 @@ export class ServiceControl {
     }, seconds * 1000)
   }
 
+  private armTurnDeadline(): void {
+    this.turnDeadline = this.timer.setTimeout(() => {
+      this.turnDeadline = null
+      if (!this.drainOn) return
+      this.log('[service] the drain reached the Chat-turn deadline; turns still running are stopped for the update')
+      void this.runtime.stopTurnsForDrain(DRAIN_TURN_STOPPED)
+    }, DRAIN_TURN_DEADLINE_MS)
+  }
+
   private lift(): void {
     if (this.lapse !== null) this.timer.clearTimeout(this.lapse)
     this.lapse = null
+    if (this.turnDeadline !== null) this.timer.clearTimeout(this.turnDeadline)
+    this.turnDeadline = null
     this.runtime.endDrain()
     resumeReleaseBackground()
     this.drainOn = false

@@ -48,6 +48,23 @@ def db():
 def init_db():
     RESPONSES.mkdir(parents=True, exist_ok=True)
     with db() as conn:
+        # WAL first, outside any transaction: readers stop blocking writers'
+        # commits and commits stop blocking readers. The mode persists in the
+        # file, so old releases keep working and repeats cost nothing. A live
+        # workspace may hold the lock; retry, then fail naming the file.
+        for _ in range(50):
+            try:
+                mode = conn.execute("pragma journal_mode=WAL").fetchone()[0]
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower():
+                    raise
+                sleep(0.1)
+                continue
+            if str(mode).lower() != "wal":
+                raise RuntimeError(f"calls database {DB} did not switch to WAL (journal_mode={mode})")
+            break
+        else:
+            raise RuntimeError(f"calls database {DB} is locked; could not switch to WAL")
         conn.execute(
             "create table if not exists calls (id text primary key, model text, prompt text, started_at real, ended_at real, status text, response_path text, error text)"
         )
@@ -113,7 +130,8 @@ def init_db():
             begin insert or ignore into diagnostic_calls(call_id) values(new.id); end;
         """)
         conn.execute("create table if not exists diagnostic_stream (id integer primary key check(id=1), generation text not null)")
-        conn.execute("insert or ignore into diagnostic_stream values(1,?)", (uuid4().hex,))
+        if conn.execute("select 1 from diagnostic_stream where id=1").fetchone() is None:
+            conn.execute("insert or ignore into diagnostic_stream values(1,?)", (uuid4().hex,))
 
 
 init_db()

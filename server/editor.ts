@@ -243,8 +243,9 @@ function fileFor(slug: string): string {
 // through verbatim.
 //
 // Kept deliberately literal: this mirrors the small inline grammar the
-// editor itself renders (bold, inline code, block markers) and nothing
-// more. Truncated at 200 chars so titles can't dominate the list.
+// editor itself renders (bold, italic, inline code, links, block
+// markers) and nothing more. Truncated at 200 chars so titles can't
+// dominate the list.
 function deriveTitle(content: string): string {
   const line = (content || '').split('\n').find((l) => l.trim().length > 0)
   if (!line) return 'Untitled'
@@ -261,12 +262,20 @@ export function stripMarkdownForTitle(line: string): string {
   t = t.replace(/^(?:-\s+|\d+[.)]\s+)/, '')
   // Fenced-code markers carry no prose; drop the fence and any language.
   t = t.replace(/^```+\s*\S*\s*/, '')
-  // Inline runs: unwrap the content, drop the delimiters. Bold before
-  // italic so `**x**` isn't consumed one asterisk at a time. Whitespace
-  // that sat inside a delimiter (`**Portfolio **`) is preserved as the
-  // space it renders as, then collapsed below.
-  t = t.replace(/\*\*([^*]+)\*\*/g, '$1')
-  t = t.replace(/`([^`]+)`/g, '$1')
+  // Inline runs in one left-to-right pass, the way the editor parses
+  // them: a code span matches whole, so markup inside backticks is
+  // never unwrapped. Alternation order is precedence — bold before
+  // italic so `**x**` isn't consumed one asterisk at a time. Italic
+  // keeps the editor's own rules (word edges both sides, no space
+  // inside the delimiters), so arithmetic and identifiers stay
+  // literal, and the link URL stops at the first `)`, as the
+  // editor's parser does. Whitespace that sat inside a delimiter
+  // (`**Portfolio **`) is preserved as the space it renders as, then
+  // collapsed below.
+  t = t.replace(
+    /`([^`]+)`|\*\*([^*]+)\*\*|(?<!\w)\*(\S|\S.*?\S)\*(?!\w)|(?<!\w)_(\S|\S.*?\S)_(?!\w)|\[([^\]]+)\]\(\S+?\)/g,
+    (_match, code, bold, star, underscore, link) => code ?? bold ?? star ?? underscore ?? link,
+  )
   // Any delimiters left over are unmatched, so they render literally in
   // the editor too — leave them alone rather than guess.
   return t.replace(/\s+/g, ' ').trim()

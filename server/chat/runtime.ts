@@ -911,6 +911,27 @@ export class ChatRuntime extends EventEmitter {
     for (const session of this.live.values()) this.scheduleQueue(session)
   }
 
+  /** The drain outlasted its turns: stop every running one through the
+   *  person's Stop path, with the given notice in its transcript. Sessions
+   *  without a turn are left alone. Resolves with the number of turns
+   *  stopped, never rejects: a session that fails to stop is logged, and
+   *  the gateway's own timeout still cuts what will not settle. */
+  async stopTurnsForDrain(notice: string): Promise<number> {
+    if (!this.drainState) throw new Error('cannot stop turns for a drain without an active drain')
+    let stopped = 0
+    for (const session of this.live.values()) {
+      if (!session.turn) continue
+      try {
+        this.emit_(session.record.id, { type: 'error', message: notice, recoverable: true })
+        await this.cancel(session.record.id)
+        stopped += 1
+      } catch (error) {
+        this.emit('log', `[chat ${session.record.id.slice(0, 8)}] turn not stopped for the drain: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return stopped
+  }
+
   /** Inside the session's chain: close an idle agent process for the
    *  restart. Verifiable — a process that will not go stays counted. */
   private async closeForDrain(session: LiveSession): Promise<void> {

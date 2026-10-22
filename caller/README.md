@@ -83,7 +83,8 @@ versions against `caller/`. Run it again when a Caller change adds a
 dependency.
 
 Without `AGENT_INTERFACE_DATA_DIR`, `agent-interface` keeps its calls and
-responses in `caller/agent_interface/data`, which Git ignores.
+responses in `caller/agent_interface/data`, which Git ignores. `calls.sqlite3`
+runs in WAL mode, so its `-wal` and `-shm` companions live alongside it.
 
 ## Tests
 

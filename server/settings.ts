@@ -3,7 +3,8 @@ import { invalidateRepoListCache } from './gh'
 import { type Catalog, type ModelSettings, isModelPlace, validateModelSettings } from './models'
 
 // GitHub logins and organization names: 1–39 characters, alphanumerics and
-// single hyphens, not leading or trailing. Stored with nothing but .trim()
+// hyphens, not leading or trailing; your account and the agent account
+// refuse consecutive hyphens as well. Stored with nothing but .trim()
 // before, so a pasted URL saved cleanly and every query built from it came
 // back empty with no indication why.
 const GITHUB_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/
@@ -168,7 +169,15 @@ export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Sett
     const v = partial[k]
     if (typeof v !== 'string') continue
     const trimmed = v.trim()
-    if (ACCOUNT_KEYS.has(k) && trimmed && !GITHUB_NAME.test(trimmed)) {
+    // The legacy org keeps the shape check only: saveAll() re-sends the
+    // stored org on every save, and there is no org field left to fix a
+    // stored value with, so tightening it here would brick Settings saves.
+    // A value identical to the stored one is likewise grandfathered past the
+    // consecutive-hyphen check: the account fields ride along on every save,
+    // so refusing a stored value would refuse every save on installs that
+    // stored one while the rule was permissive.
+    const unchanged = (k === 'me' || k === 'agentAccount') && trimmed === (getMeta(k) || '')
+    if (ACCOUNT_KEYS.has(k) && trimmed && (!GITHUB_NAME.test(trimmed) || (k !== 'org' && !unchanged && trimmed.includes('--')))) {
       throw new Error(`${k} must be a GitHub name: letters, digits and single hyphens`)
     }
     if (k === 'timezone' && trimmed && !knownTimeZone(trimmed)) {

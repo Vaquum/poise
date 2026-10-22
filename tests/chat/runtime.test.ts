@@ -266,6 +266,31 @@ describe('chat runtime', () => {
     await runtime.stop()
   }, 40_000)
 
+  it('stops running turns with notice for a drain, leaves idle sessions alone, and refuses to outside a drain', async () => {
+    ensureBranch('chat/alpha')
+    const { runtime, controls, events } = makeRuntime()
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'chat/alpha' } })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    // On chat/alpha, never main: a later test refuses dirty state on a branch no session owns.
+    const idle = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'chat/alpha' } })
+    await waitFor(() => lastStatus(events, idle.id) === 'idle')
+    controls.adapters[0].auto = false
+    await runtime.prompt(session.id, { text: 'long one', attachments: [], mentions: [] })
+    await waitFor(() => lastStatus(events, session.id) === 'running')
+
+    await expect(runtime.stopTurnsForDrain('notice')).rejects.toThrow(/without an active drain/)
+    runtime.startDrain('service')
+    const idleErrors = ofType(events, idle.id, 'error').length
+    const stopped = await runtime.stopTurnsForDrain('the update stopped this turn')
+    expect(stopped).toBe(1)
+    expect(ofType(events, session.id, 'error').at(-1)).toMatchObject({ message: 'the update stopped this turn', recoverable: true })
+    expect(ofType(events, session.id, 'turn.finished').at(-1).stopReason).toBe('cancelled')
+    expect(ofType(events, idle.id, 'error')).toHaveLength(idleErrors)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.endDrain()
+    await runtime.stop()
+  }, 40_000)
+
   it('answers permissions and questions inline, remembers "always" only for the session, and clears them on cancel', async () => {
     ensureBranch('chat/alpha')
     const { runtime, controls, events } = makeRuntime()

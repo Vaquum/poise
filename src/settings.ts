@@ -749,7 +749,8 @@ async function saveAll() {
   if (!saveBtn || !orgInput || !meInput || !agentInput || !tzSelect) return
   if (saving) return
 
-  const org = getCachedSettings().org
+  const cached = getCachedSettings()
+  const org = cached.org
   const me = meInput.value.trim()
   const agentAccount = agentInput.value.trim()
   const tz = tzSelect.value
@@ -762,12 +763,15 @@ async function saveAll() {
     setHelp('Your GitHub account is required.', 'error')
     return
   }
-  if (!GITHUB_NAME.test(me)) {
+  // A field the person did not change is grandfathered past the
+  // consecutive-hyphen check, mirroring the server: refusing a stored value
+  // would refuse every save on installs that stored one while permissive.
+  if (!GITHUB_NAME.test(me) || (me.includes('--') && me !== cached.me)) {
     setHelp('Your GitHub account must be a GitHub login, not a URL or email.', 'error')
     meInput.focus()
     return
   }
-  if (agentAccount && !GITHUB_NAME.test(agentAccount)) {
+  if (agentAccount && (!GITHUB_NAME.test(agentAccount) || (agentAccount.includes('--') && agentAccount !== (cached.agentAccount ?? '')))) {
     setHelp('The agent account must be a GitHub login, not a URL or email.', 'error')
     agentInput.focus()
     return
