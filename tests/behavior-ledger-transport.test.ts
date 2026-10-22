@@ -20,7 +20,7 @@ async function fixture(body: string, options: ConstructorParameters<typeof Behav
   const directory = await mkdtemp(join(tmpdir(), 'ledger-transport-'))
   directories.push(directory)
   const workerPath = join(directory, 'worker.mjs')
-  await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\n${body}`)
+  await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\n${body}\nport.on('message',request=>{if(request.operation==='close')port.close()});`)
   const observer = new BehaviorLedgerObserver({ workerPath, ...options })
   observers.push(observer)
   await observer.start()
