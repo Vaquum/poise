@@ -1306,7 +1306,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (await handleGoogleApi(req, res, url, service)) return
         if (await handlePublishingApi(req, res, url)) return
         if (await handleExtensionsApi(req, res, url)) return
-        if (await handleSnippetApi(req, res, url)) return
+        if (await handleSnippetApi(req, res, url, speaksForPerson(req, !!service, authority))) return
 
         return next()
       }

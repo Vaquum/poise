@@ -115,6 +115,38 @@ reach as any chat: it lists and reads chats, creates workers, sends messages,
 and supervises them. This is a different "manager" from a chat's manager (the
 chat that created it), which the docs call the creating chat from here on.
 
+**Manager charter.** The workspace Manager above — the `role: 'manager'`
+chat, not a creating chat — runs on standing instructions called its
+charter: the built-in `/manager` snippet. The person edits it in Snippets
+like any snippet, and nothing can delete it. While a Manager exists, Poise
+creates it from the default text in `server/chat/manager-default.ts` when no
+snippet is named `manager`; an existing snippet of that name is adopted as it
+is, and an existing `/manager` is never replaced. It holds up to 64 KiB. In
+any other chat, `/manager` is not supported.
+
+Every Manager turn carries the current text at the end of its control
+context, as the authorization for turns the person did not start. When the
+person's direct request, the charter and Memories conflict, that is also
+their precedence: the person's request first, then the charter, then
+Memories. On a turn the person started, the native prompt runs Auto-merge
+mode text when set, `[User request]` when set, the control context, the
+charter block, `[Request]` with the request, then `[Memories]`; on a turn a
+chat, Poise or a timer started, the same without `[User request]`. An edit
+applies from the next turn; it does not clear the Manager's native history,
+so the block states the current revision supersedes earlier ones, and
+`/reset` gives a clean context.
+
+The charter rides on every Manager turn, up to 64 KiB of input each time,
+and its `;manager` trigger also expands wherever Espanso runs, including
+desktops Poise Link feeds — so it must hold no secrets. Any local caller can
+read it. Only requests that speak for the person can change it or Memories:
+a browser `Origin`, and in service mode the gateway's assertion. That closes
+the documented agent paths, not every path — a same-user process can forge
+an `Origin` header or edit `poise.yml` directly, the Manager's own agent
+included. Every new revision still writes a `chat.manager.charter.changed`
+diagnostic. Under a service drain, editing `/manager` still works; under a
+local release drain it returns 503 like other snippet saves.
+
 ## The Switchboard
 
 The [Switchboard](Switchboard.md) is a chat Poise runs as an observer for the

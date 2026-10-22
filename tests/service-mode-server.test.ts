@@ -557,6 +557,34 @@ describe('Poise in service mode', () => {
     expect(await send('POST', '/api/chat/sessions', {}, body)).toMatchObject({ status: 403 })
   })
 
+  it('edits /manager only from the owner\'s browser, including during a service drain', async () => {
+    const created = await send('POST', '/api/chat/sessions', { ...fromGateway(), origin: PUBLIC_ORIGIN }, { agent: 'grok', model: 'grok-4.6-xhigh', role: 'manager' })
+    expect([201, 409]).toContain(created.status)
+    const list = await send('GET', '/api/snippets', fromGateway())
+    expect(list.status).toBe(200)
+    expect(list.json.snippets.some((snippet: { trigger: string }) => snippet.trigger === ';manager')).toBe(true)
+    const edit = (text: string, version: string) => ({ snippets: list.json.snippets.map((snippet: { trigger: string, replace: string }) =>
+      snippet.trigger === ';manager' ? { ...snippet, replace: text } : snippet), base_version: version })
+
+    const saved = await send('PUT', '/api/snippets', { ...fromGateway(), origin: PUBLIC_ORIGIN }, edit('Owner text', list.json.version))
+    expect(saved.status).toBe(200)
+    const version = saved.json.version as string
+
+    expect(await send('PUT', '/api/snippets', { ...fromGateway(), origin: undefined }, edit('No origin', version)))
+      .toMatchObject({ status: 403, json: { error: 'The /manager snippet is edited in the browser.' } })
+    expect(await send('PUT', '/api/snippets', {}, edit('Container local', version)))
+      .toMatchObject({ status: 403, json: { error: 'The /manager snippet is edited in the browser.' } })
+
+    expect(await send('POST', '/api/service/drain', fromGateway('admin'))).toMatchObject({ status: 200, json: { draining: true } })
+    try {
+      const drained = await send('PUT', '/api/snippets', { ...fromGateway(), origin: PUBLIC_ORIGIN }, edit('During drain', version))
+      expect(drained.status).toBe(200)
+      expect((await send('GET', '/api/snippets', fromGateway())).json.snippets).toContainEqual({ trigger: ';manager', replace: 'During drain' })
+    } finally {
+      expect(await send('POST', '/api/service/resume', fromGateway('admin'))).toMatchObject({ status: 200, json: { draining: false } })
+    }
+  })
+
   it('never echoes or logs the identity assertion', async () => {
     const lines: string[] = []
     const capture = (...args: unknown[]) => { lines.push(args.map((arg) => arg instanceof Error ? `${arg.message} ${arg.stack}` : typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ')) }

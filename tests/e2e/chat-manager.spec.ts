@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test'
-import { NOW, session, installRoutes, installSocket, makeState } from './fixtures/chat'
+import { NOW, session, installRoutes, installSocket, makeState, input } from './fixtures/chat'
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
@@ -91,6 +91,62 @@ test('hides Fork and Hand off for the Manager and escapes its title', async ({ p
   await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/active/)
   await expect(page.locator('.chat-h-fork')).toHaveCount(1)
   await expect(page.locator('.chat-h-handoff')).toHaveCount(1)
+})
+
+test('marks /manager as built in, edits it without a Delete, and refuses it in regular chats', async ({ page }) => {
+  const evil = '<img src=x onerror=alert(1)>'
+  const skills = { revision: 1, switches: [
+    { name: 'manager', content: evil, revision: 1, updatedAt: NOW, snippetTrigger: ';manager' },
+    { name: 'other', content: 'Other text', revision: 1, updatedAt: NOW, snippetTrigger: ';other' },
+  ] }
+  const state = makeState([
+    session({ id: 's1', title: 'Ordinary', createdAt: NOW }),
+    session({ id: 'm1', title: 'Manager', role: 'manager', createdAt: '2026-09-18T10:00:00.000Z' }),
+  ])
+  state.switches = skills
+  state.snippets = { snippets: [{ trigger: ';manager', replace: evil }, { trigger: ';other', replace: 'Other text' }], version: 'fixture-v1', skills }
+  await installRoutes(page, state)
+  const sock = await installSocket(page, state)
+  await page.goto('/')
+  await sock.subscribed('m1')
+
+  await page.getByRole('button', { name: 'Snippets', exact: true }).click()
+  const view = page.locator('#view-snippets')
+  const row = view.locator('.snip-row[data-trigger=";manager"]')
+  await expect(row.locator('.snip-builtin')).toHaveText('built in')
+  await expect(view.locator('.snip-builtin')).toHaveCount(1)
+  await row.click()
+  const editor = view.locator('.snip-expand-row')
+  await expect(editor.locator('.snip-trigger-input')).toHaveAttribute('readonly', '')
+  await expect(editor.locator('.snip-delete')).toHaveCount(0)
+  await expect(editor.locator('.snip-builtin-note')).toContainText('Built in: the Manager\'s standing instructions')
+  await expect(editor.getByRole('textbox', { name: 'Snippet instructions' })).toHaveValue(evil)
+  await expect(page.locator('img')).toHaveCount(0)
+  await editor.getByRole('textbox', { name: 'Snippet instructions' }).fill('Keep every chat moving')
+  await editor.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(view.locator('.snip-expand-row')).toHaveCount(0)
+  const put = state.calls.find(call => call.method === 'PUT' && call.path === '/api/snippets')
+  expect(put?.body).toMatchObject({ snippets: [
+    { trigger: ';manager', replace: 'Keep every chat moving' },
+    { trigger: ';other', replace: 'Other text' },
+  ] })
+
+  await page.getByRole('button', { name: 'Chat', exact: true }).click()
+  await page.locator('.chat-session-item[data-id="s1"]').click()
+  await expect(page.locator('.chat-session-item[data-id="s1"]')).toHaveClass(/active/)
+  await input(page).fill('/manager hello')
+  await input(page).press('Enter')
+  await expect(page.locator('.chat-notice')).toHaveText('/manager is not supported in regular chats.')
+  await expect(page.locator('.chat-notice')).toHaveClass(/st-help-info/)
+  await expect(input(page)).toHaveValue('/manager hello')
+  expect(sock.framesOf('prompt')).toEqual([])
+
+  await page.locator('.chat-session-item[data-id="m1"]').click()
+  await expect(page.locator('.chat-session-item[data-id="m1"]')).toHaveClass(/active/)
+  await input(page).fill('/manager hello')
+  await input(page).press('Enter')
+  await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
+  expect(sock.framesOf('prompt')[0].command).toMatchObject({ type: 'prompt', sessionId: 'm1', text: '/manager hello' })
 })
 
 test('shows the retired-model notice in the Manager header', async ({ page }) => {

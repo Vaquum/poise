@@ -1,7 +1,7 @@
 import { createJevWorkspace } from './jev-workspace'
 import { cancelMotion, layout, motionValue, retire, spring } from '../motion'
 import { patchContent } from '../dom-patch'
-import { parseSwitchCreation, RESERVED_SWITCHES, type ChatSwitches } from '../chat-switches'
+import { MANAGER_SWITCH, parseSwitchCreation, RESERVED_SWITCHES, type ChatSwitches } from '../chat-switches'
 // Chat — one view for a full coding-agent conversation with any installed
 // agent, running as itself under a Poise-native interface. Sessions live on
 // the Poise server (server/chat/); this view is the window: a sidebar of
@@ -924,6 +924,11 @@ async function queueDraft(draft: ComposerDraft): Promise<void> {
   }
   const source = entry()
   const chain = parseChatCommandChain(draft.text)
+  if (chain.switches?.includes(MANAGER_SWITCH) && source?.record.role !== 'manager') {
+    restoreDraftTo(origin, draft)
+    if (activeId === origin) setNotice('/manager is not supported in regular chats.', 'info')
+    queueRender(); return
+  }
   const requestedModel = draft.model || chain.model || source?.record.model || freshModelIdentity
   const model = requestedModel || quickSessionModel(agentsInfo?.agents || [])?.identity || ''
   const agent = agentsInfo?.agents.find(agent => agent.models.some(option => option.identity === model))
@@ -1449,6 +1454,7 @@ async function sendPrompt(draft: ComposerDraft): Promise<void> {
     if (activeId !== origin) { restoreDraftTo(origin, draft); return }
   }
   const chain = parseChatCommandChain(draft.text)
+  if (chain.switches?.includes(MANAGER_SWITCH) && entry()?.record.role !== 'manager') { restoreDraftTo(origin, draft); setNotice('/manager is not supported in regular chats.', 'info'); return }
   if (chain.missingModel) { restoreDraftTo(origin, draft); setNotice('Choose a model from /model first.'); return }
   if (chain.review && !entry()) { restoreDraftTo(origin, draft); setNotice('There is no reply to review yet.'); return }
   if (chain.context === 'compact' && !entry() && !chain.review && !chain.text && !chain.switches?.length && !draft.attachments.length) {
@@ -1520,6 +1526,7 @@ async function steer(draft: ComposerDraft): Promise<void> {
   if (activeId !== e.record.id) { restoreDraftTo(e.record.id, draft); return }
   const chain = parseChatCommandChain(commandDraftText(draft))
   if (chain.create) { await createSavedSwitch(draft, e.record.id); return }
+  if (chain.switches?.includes(MANAGER_SWITCH) && e.record.role !== 'manager') { restoreDraftTo(e.record.id, draft); setNotice('/manager is not supported in regular chats.', 'info'); return }
   if (chain.context === 'reset' && !chain.queue) { await resetPrompt(draft, e.record.id); return }
   if (chain.queue || chain.context || chain.review || chain.model) { queueDraft(draft); return }
   try {

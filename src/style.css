@@ -6756,6 +6756,8 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 
 /* One library: show the Chat invocation beside the text-expansion trigger. */
 .snip-skill-name { display: block; color: var(--text-tertiary); font-size: .6875rem; overflow-wrap: anywhere; }
+.snip-builtin { display: block; color: var(--text-tertiary); font-size: .6875rem; font-style: italic; }
+.snip-builtin-note { margin: var(--sp-2) 0 0; }
 .snip-skill-help { margin-top: var(--sp-3); }
 
 /* JEV is a typed evaluation workspace, not a conversational agent. */

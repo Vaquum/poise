@@ -14,7 +14,7 @@ import { patchContent } from '../dom-patch'
 // on each save and espanso hot-reloads, so a `;trigger` goes live at once.
 
 import { chatClient } from '../chat-client'
-import { parseChatSwitches, type ChatSwitches } from '../chat-switches'
+import { MANAGER_SWITCH, parseChatSwitches, type ChatSwitches } from '../chat-switches'
 
 interface Snippet { trigger: string; replace: string }
 interface SnippetState { snippets: Snippet[]; version: string; skills?: ChatSwitches }
@@ -92,7 +92,9 @@ function previewLine(body: string): string {
 
 function skillBadge(trigger: string): string {
   const name = skills.switches.find(skill => skill.snippetTrigger === trigger)?.name
-  return name ? `<span class="snip-skill-name" aria-label="Chat skill /${escapeHtml(name)}">/${escapeHtml(name)}</span>` : ''
+  if (!name) return ''
+  const builtin = name === MANAGER_SWITCH ? '<span class="snip-builtin" title="Built in: the Manager\'s standing instructions">built in</span>' : ''
+  return `<span class="snip-skill-name" aria-label="Chat skill /${escapeHtml(name)}">/${escapeHtml(name)}</span>${builtin}`
 }
 function libraryChanged(catalogue: ChatSwitches): void {
   if (catalogue.revision > skills.revision) refreshLibraryView()
@@ -146,14 +148,16 @@ function setStatus(text: string, cls: 'info' | 'ok' | 'error' = 'info') {
 function buildEditRow(snip: Snippet | null, isDraft: boolean): HTMLTableRowElement {
   const tr = document.createElement('tr')
   tr.className = 'snip-expand-row'
+  const builtin = !isDraft && !!snip && skills.switches.some(skill => skill.snippetTrigger === snip.trigger && skill.name === MANAGER_SWITCH)
   tr.innerHTML = `
     <td colspan="3">
       <div class="snip-edit">
-        <input type="text" class="st-input snip-trigger-input" aria-label="Snippet trigger" placeholder=";hello" autocomplete="off" spellcheck="false" />
+        <input type="text" class="st-input snip-trigger-input" aria-label="Snippet trigger" placeholder=";hello" autocomplete="off" spellcheck="false"${builtin ? ' readonly' : ''} />
         <textarea class="st-input snip-body-input" aria-label="Snippet instructions" placeholder="Text to expand, or instructions to include in Chat…" spellcheck="false"></textarea>
+        ${builtin ? '<p class="st-help snip-builtin-note">Built in: the Manager\'s standing instructions, sent to its model on every Manager turn. Edit it freely; it cannot be deleted. Keep secrets out of it.</p>' : ''}
         <div class="st-row">
           <button type="button" class="st-save snip-save">Save</button>
-          <button type="button" class="st-clear snip-delete">${isDraft ? 'Discard' : 'Delete'}</button>
+          ${builtin ? '' : `<button type="button" class="st-clear snip-delete">${isDraft ? 'Discard' : 'Delete'}</button>`}
         </div>
       </div>
     </td>
@@ -165,7 +169,7 @@ function buildEditRow(snip: Snippet | null, isDraft: boolean): HTMLTableRowEleme
   bodyInput.value = snip?.replace ?? ''
 
   tr.querySelector('.snip-save')!.addEventListener('click', () => void save(tr))
-  tr.querySelector('.snip-delete')!.addEventListener('click', () => void del(tr))
+  tr.querySelector('.snip-delete')?.addEventListener('click', () => void del(tr))
   // Escape collapses (discard); ⌘/Ctrl+↵ saves; plain Enter in the
   // trigger jumps to the body (which keeps Enter for newlines).
   triggerInput.addEventListener('keydown', (e) => {

@@ -10,6 +10,9 @@ import { requireAgentAccount } from '../settings'
 import { diagnostic } from '../logging'
 import { releaseBackgroundPaused, trackReleaseBackground } from '../release-background'
 import { POISE_ROOT } from './local-workspace'
+import { MANAGER_SNIPPET_DEFAULT } from './manager-default'
+import { ensureSnippetSwitch, readSwitch } from '../snippet-library'
+import { MANAGER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '../../src/chat-switches'
 import { executeCommandOnce } from './command-receipts'
 import { actorOf, nativeName } from './actors'
 import type { ChatEnvelope, SessionRecord, TurnSource } from './protocol'
@@ -159,7 +162,7 @@ export class ChatControl {
 
   async context(id: string): Promise<string> {
     if (!this.origin || this.stopped) throw new Error('Poise chat control has no active local listener')
-    this.session(id)
+    const record = this.session(id)
     this.root ??= mkdtemp(join(tmpdir(), 'poise-chat-control-'))
     const config = join(await this.root, `${id}.json`)
     await writeFile(config, JSON.stringify({ origin: this.origin, sessionId: id, token: this.token(id) }), { mode: 0o600 })
@@ -171,7 +174,7 @@ export class ChatControl {
     // The Switchboard's brief replaces the worker guidance on every turn.
     if (this.options.switchboard?.isSwitchboard(id)) return [...command, this.options.switchboard.instructions()].join('\n')
     const owned = store.bindings(this.runtime.instance).filter(b => b.session === id)
-    return [
+    const base = [
       ...command,
       'Start with {"operation":"help"}. You can create chats, read transcripts, send messages, schedule supervision, claim work, and call Poise APIs with {"operation":"api","path":"/api/behaviors","method":"GET"}.',
       'Every mutating control operation needs a requestId UUID. Retain it on retries; changing it can execute the action again. The api operation retains each endpoint\'s existing semantics, not the control receipt guarantee: inspect state after a lost API write before retrying. An uncertain result requires inspection, never blind replay.',
@@ -184,6 +187,24 @@ export class ChatControl {
       `Poise behaviors: ${JSON.stringify({ enabled: getEnabledMap(), health: getBehaviorsRuntimeHealth() })}. Read /api/behaviors for current configuration, skips and diagnostics before duplicating automated work.`,
       `Your bound behavior operations: ${JSON.stringify(owned.map(b => ({ target: b.target, ...this.workOperations(store.workTarget(b.target)) })))}`,
     ].join('\n')
+    if (record.role !== 'manager') return base
+    return `${base}\n${await this.managerCharter()}`
+  }
+
+  /** The Manager's standing instructions: the current /manager text, read fresh
+   *  for every turn, so an edit applies from the next turn. */
+  private async managerCharter(): Promise<string> {
+    await ensureSnippetSwitch(MANAGER_SWITCH, MANAGER_SNIPPET_DEFAULT)
+    let charter: ChatSwitch | null
+    try {
+      charter = readSwitch(MANAGER_SWITCH)
+    } catch (error) {
+      throw new Error(`The /manager snippet could not be read: ${error instanceof Error ? error.message : String(error)}. Snippets shows the problem.`)
+    }
+    if (!charter) throw new Error('The /manager snippet could not be read: it is missing. Snippets shows the problem.')
+    if (Buffer.byteLength(charter.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new Error('The /manager snippet is larger than 64 KiB. Shorten it in Snippets.')
+    if (!charter.content.trim()) return '[Manager charter] The /manager snippet is empty. Ask the person to write it in Snippets.'
+    return `[Manager charter — the /manager snippet, revision ${charter.revision}, which the person edits in Snippets. It supersedes all earlier revisions. It is the person's standing instruction and authorizes turns the person did not start; a direct request from the person in this chat takes precedence, and it takes precedence over Memories where they conflict. Chats cannot change it.]\n${charter.content}`
   }
 
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

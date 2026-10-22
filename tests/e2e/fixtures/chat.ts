@@ -40,8 +40,15 @@ function switchboardState(overrides: Partial<SwitchboardState> = {}): Switchboar
     checking: false, lastCheckAt: null, lastCheckTokens: null, nextCheckAt: null, chats: 0, items: [], ...overrides }
 }
 
+interface SnippetLibrary {
+  snippets: Array<{ trigger: string, replace: string }>
+  version: string
+  skills: ChatSwitches
+}
+
 interface ServerState {
   serverStartedAt?: string
+  snippets?: SnippetLibrary
   switchboard?: SwitchboardState
   switchboardStart?: () => { status: number, json: unknown }
   switchboardAnswer?: (id: number, body: { optionId: string } | { text: string }) => SwitchboardState
@@ -62,8 +69,8 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     const url = new URL(req.url())
     const path = url.pathname
     const method = req.method()
-    const body = method === 'POST' || method === 'PATCH' ? (req.postDataJSON?.() ?? null) : null
-    if (path.startsWith('/api/chat') || path === '/api/settings' || path === '/api/repos') state.calls.push({ method, path, body })
+    const body = method === 'POST' || method === 'PATCH' || method === 'PUT' ? (req.postDataJSON?.() ?? null) : null
+    if (path.startsWith('/api/chat') || path === '/api/settings' || path === '/api/repos' || path === '/api/snippets') state.calls.push({ method, path, body })
     if (path === '/api/settings') {
       if (method === 'POST') state.settings = { ...state.settings, ...(body as object) }
       await route.fulfill({ json: state.settings })
@@ -85,6 +92,15 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     if (path === '/api/claude-auth') { await route.fulfill({ json: { status: 'authenticated', reason: null, checkedAt: NOW, verifiedAt: NOW, authMethod: 'claude.ai', subscriptionType: 'max', loginInProgress: false } }); return }
     if (path === '/api/repos') { await route.fulfill({ json: { repos: ['acme/app', 'acme/docs'] } }); return }
     if (path === '/api/chat/switches') { await route.fulfill({ json: state.switches || { revision: 0, switches: [] } }); return }
+    if (path === '/api/snippets') {
+      state.snippets ??= { snippets: [], version: 'fixture-v1', skills: { revision: 0, switches: [] } }
+      if (method === 'PUT') {
+        const incoming = (body as { snippets?: SnippetLibrary['snippets'], base_version?: unknown } | null)?.snippets
+        if (Array.isArray(incoming)) state.snippets = { snippets: incoming, version: `fixture-v${state.calls.length}`, skills: state.snippets.skills }
+      }
+      await route.fulfill({ json: state.snippets })
+      return
+    }
     if (path === '/api/chat/agents') { await route.fulfill({ json: state.agents || AGENTS }); return }
     if (path === '/api/chat/repo') {
       await route.fulfill({ json: { checkout: '/tmp/app', currentBranch: 'main', defaultBranch: 'main', dirty: false, dirtyFiles: 0, branches: ['main', 'feature/x'], prs: [{ number: 42, title: 'Add login', branch: 'feature/login' }] } })

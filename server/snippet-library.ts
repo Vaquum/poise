@@ -5,9 +5,10 @@ import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { db, getMeta, setMeta } from './db'
 import { HttpError } from './http'
+import { diagnostic } from './logging'
 import { MATCH_FILE, MAX_SNIPPETS_BYTES, readSnippetSnapshotSync, mutateSnippetLibrary, validateSnippets, SnippetConflictError, type Snippet, type SnippetState } from './snippets'
 import { judgeEntry, parseMatchFile, type MatchFile } from './link/espanso'
-import { parseChatSwitches, RESERVED_SWITCHES, switchName, SWITCH_LIMITS, type ChatSwitches } from '../src/chat-switches'
+import { MANAGER_SWITCH, parseChatSwitches, RESERVED_SWITCHES, switchName, SWITCH_LIMITS, type ChatSwitch, type ChatSwitches } from '../src/chat-switches'
 
 const PREFIX = '# poise-chat-library-v1 '
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
@@ -104,6 +105,8 @@ function project(prepared: Plan): ChatSwitches {
   const signature = hash(JSON.stringify(live.map(({ snippet, name, digest }) => [snippet.trigger, name, digest])))
   if (signature !== index.signature) {
     if (live.length || index.entries.length) index.revision++
+    const manager = live.find(({ name }) => name === MANAGER_SWITCH)
+    const managerBefore = manager ? previous.get(manager.snippet.trigger) : undefined
     for (const { snippet, name, digest } of live) {
       const old = previous.get(snippet.trigger)
       if (!old || old.removed || old.digest !== digest || old.name !== name) previous.set(snippet.trigger, {
@@ -116,6 +119,13 @@ function project(prepared: Plan): ChatSwitches {
     }
     index.signature = signature; index.entries = [...previous.values()]
     setMeta(INDEX_KEY, JSON.stringify(index))
+    if (manager && previous.get(manager.snippet.trigger)!.revision !== managerBefore?.revision) {
+      const created = !managerBefore || managerBefore.removed === true
+      // Warning, not info: the diagnostics pipeline drops info and below, so
+      // only warning and above leave the audit record this revision needs.
+      diagnostic({ level: 'warning', operation: 'chat.manager.charter.changed', message: 'The /manager snippet changed',
+        context: { revision: previous.get(manager.snippet.trigger)!.revision, bytes: Buffer.byteLength(manager.snippet.replace, 'utf8'), ...(created ? { created: true } : {}) } })
+    }
   }
   return { revision: index.revision, switches: live.map(({ snippet, name }) => {
     const indexed = previous.get(snippet.trigger)!
@@ -129,6 +139,33 @@ const snapshotLibrary = db.transaction((): SkillSnippetState => {
   return { ...prepared.state, skills: project(prepared) }
 })
 export function readSwitches(): ChatSwitches { return snapshotLibrary.immediate().skills }
+
+/** The live switch with that name, or null. Throws when the library cannot be read. */
+export function readSwitch(name: string): ChatSwitch | null {
+  return snapshotLibrary.immediate().skills.switches.find(item => item.name === name) ?? null
+}
+
+function boundMetadata(snapshot: { raw: string | null, state: SnippetState }): Metadata {
+  const metadata = metadataFrom(snapshot.raw)
+  bind(snapshot.state.snippets, metadata)
+  return metadata
+}
+
+function liveManager(snippets: Snippet[], metadata: Metadata): { trigger: string, content: string } | null {
+  const bindings = new Map(metadata.names)
+  const found = snippets.find(snippet => bindings.get(snippet.trigger) === MANAGER_SWITCH)
+  return found ? { trigger: found.trigger, content: found.replace } : null
+}
+
+/** The built-in /manager is edited freely but never deleted or re-triggered,
+ *  and only by a request that speaks for the person. A write that leaves it
+ *  unchanged is not affected. */
+function guardManagerBuiltIn(before: { trigger: string, content: string } | null, after: { trigger: string, content: string } | null, person: boolean): void {
+  if (before && !after) throw new HttpError(400, '/manager is built in. You can edit its text, but not delete it or change its trigger.')
+  const changed = after && (!before || after.trigger !== before.trigger || after.content !== before.content)
+  if (changed && !person) throw new HttpError(403, 'The /manager snippet is edited in the browser.')
+  if (changed && Buffer.byteLength(after.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new HttpError(413, 'The /manager snippet holds up to 64 KiB. Nothing was saved.')
+}
 
 async function importLegacy(): Promise<void> {
   const current = plan(readSnippetSnapshotSync())
@@ -151,13 +188,15 @@ function publish(): SkillSnippetState {
   snippetLibraryEvents.emit('changed', state.skills)
   return state
 }
-export async function saveSkillSnippets(input: unknown, version: unknown): Promise<SkillSnippetState> {
+export async function saveSkillSnippets(input: unknown, version: unknown, person = true): Promise<SkillSnippetState> {
   if (typeof version !== 'string' || !/^[a-f0-9]{64}$/.test(version)) throw new HttpError(400, 'base_version must be a SHA-256 version')
   await importLegacy()
   await mutateSnippetLibrary(snapshot => {
     if (snapshot.state.version !== version) throw new SnippetConflictError(snapshot.state.version)
     const snippets = validateSnippets(input), metadata = metadataFrom(snapshot.raw)
+    const before = liveManager(snapshot.state.snippets, boundMetadata(snapshot))
     bind(snippets, metadata)
+    guardManagerBuiltIn(before, liveManager(snippets, metadata), person)
     return { snippets, header: header(metadata) }
   })
   return publish()
@@ -174,7 +213,7 @@ export interface ImportReport extends SkillSnippetState { added: string[], skipp
 /** Snippets → Import: adds an Espanso match file's plain pairs (what Poise
  * Link delivers, and nothing else) through the same compare-and-swap as every
  * other write. A trigger already in the library is never replaced. */
-export async function importEspansoSnippets(raw: unknown): Promise<ImportReport> {
+export async function importEspansoSnippets(raw: unknown, person = true): Promise<ImportReport> {
   if (typeof raw !== 'string' || !raw.trim()) throw new HttpError(400, 'Paste or choose an Espanso match file to import.')
   if (Buffer.byteLength(raw, 'utf8') > MAX_SNIPPETS_BYTES) throw new HttpError(413, `The file is larger than ${MAX_SNIPPETS_BYTES} bytes. Nothing was imported.`)
   let file: MatchFile
@@ -206,18 +245,22 @@ export async function importEspansoSnippets(raw: unknown): Promise<ImportReport>
     })
     if (!additions.length) return null
     const snippets = validateSnippets([...snapshot.state.snippets, ...additions]), metadata = metadataFrom(snapshot.raw)
+    const before = liveManager(snapshot.state.snippets, boundMetadata(snapshot))
     bind(snippets, metadata)
+    guardManagerBuiltIn(before, liveManager(snippets, metadata), person)
     return { snippets, header: header(metadata) }
   })
   return { ...(added.length ? publish() : snapshotLibrary.immediate()), added, skipped }
 }
 
-export async function addSkillSnippet(input: unknown): Promise<{ snippet: Snippet, version: string, skills: ChatSwitches }> {
+export async function addSkillSnippet(input: unknown, person = true): Promise<{ snippet: Snippet, version: string, skills: ChatSwitches }> {
   const [snippet] = validateSnippets([input])
   await importLegacy()
   await mutateSnippetLibrary(snapshot => {
     const snippets = validateSnippets([...snapshot.state.snippets, snippet]), metadata = metadataFrom(snapshot.raw)
+    const before = liveManager(snapshot.state.snippets, boundMetadata(snapshot))
     bind(snippets, metadata)
+    guardManagerBuiltIn(before, liveManager(snippets, metadata), person)
     return { snippets, header: header(metadata) }
   })
   const state = publish()
@@ -249,6 +292,30 @@ export async function saveSwitch(input: { name: string, content: string, revisio
     return { snippets, header: header(prepared.metadata) }
   })
   return publish().skills
+}
+/** Creates the named snippet only when no live snippet has that name; never replaces one.
+ *  Only a library that cannot be read returns 'unreadable'; write failures
+ *  and conflicts throw, as they do for every other library write. */
+export async function ensureSnippetSwitch(name: string, content: string): Promise<'present' | 'created' | 'unreadable'> {
+  try {
+    plan(readSnippetSnapshotSync())
+  } catch {
+    return 'unreadable'
+  }
+  await importLegacy()
+  let created = false
+  await mutateSnippetLibrary(snapshot => {
+    const prepared = plan(snapshot)
+    const bindings = new Map(prepared.metadata.names)
+    if (prepared.state.snippets.some(snippet => bindings.get(snippet.trigger) === name)) return null
+    let trigger = [...bindings].find(([, alias]) => alias === name)?.[0] || `;${name}`
+    for (let n = 2; prepared.state.snippets.some(snippet => snippet.trigger === trigger); n++) trigger = `;${name}-${n}`
+    bindings.set(trigger, name)
+    prepared.metadata.names = [...bindings]
+    created = true
+    return { snippets: [...prepared.state.snippets, { trigger, replace: content }], header: header(prepared.metadata) }
+  })
+  return created ? 'created' : 'present'
 }
 export function savedSwitchNames(): Set<string> {
   // Retired invocation names remain recognizable. A queued or recalled use of

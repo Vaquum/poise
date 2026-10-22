@@ -33,7 +33,11 @@ GET/PUT `/api/chat/memories` use the existing local, same-origin API boundary.
 Saves compare revisions in one SQLite transaction. A stale tab cannot overwrite
 another tab's edit silently; its draft remains available for an explicit retry.
 Repeated saves of the same text are idempotent. Text is limited to 64 KiB of
-UTF-8 with an explicit error, never silent truncation.
+UTF-8 with an explicit error, never silent truncation. A PUT additionally
+needs a request that speaks for the person — the browser's `Origin`, and in
+service mode the gateway's assertion — so a chat that rewrites Memories
+through the control `api` operation gets a 403 and nothing is written, while
+reads are unchanged.
 
 The browser serializes autosaves and waits for pending memory edits before
 sending a message. A failed save keeps both the memory draft and the submitted

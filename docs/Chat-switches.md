@@ -1,7 +1,8 @@
 # Create reusable Chat switches
 
-`/create` saves a text skill under a name you choose. There are no bundled
-custom skills and no special behavior for any example name.
+`/create` saves a text skill under a name you choose. There is one built-in
+skill, `/manager` — the Manager's standing instructions — and no special
+behavior for any other example name.
 
 ```text
 /create /my-skill
@@ -79,8 +80,18 @@ records stable skill names and import receipts without changing Espanso pairs.
 Comments and advanced Espanso options are preserved by the existing file editor.
 
 Unusual or reserved snippet triggers receive a valid, distinct Chat name shown
-in Snippets. Normal `;name` triggers use `/name`; no particular skill is bundled.
-Catalogue updates reach open tabs immediately for Poise saves; another process
-or file editor is detected by the Chat connection's two-second library check.
-An open Snippets editor retains its text and uses the existing version conflict
-check before overwriting a change made elsewhere.
+in Snippets. Normal `;name` triggers use `/name`. Catalogue updates reach open
+tabs immediately for Poise saves; another process or file editor is detected by
+the Chat connection's two-second library check. An open Snippets editor retains
+its text and uses the existing version conflict check before overwriting a
+change made elsewhere.
+
+One skill is built in: `/manager`, the Manager's standing instructions (see
+[Chat orchestration](Chat-orchestration.md)). While a Manager exists, Poise
+creates it from its default text when no snippet is named `manager` — an
+existing snippet of that name is kept as it is — and never replaces it
+afterwards, through restarts or updates. It is edited freely in Snippets,
+which marks it **built in**, but it cannot be deleted and its trigger is
+fixed. In any chat but the Manager, `/manager` is not supported: Poise says
+so, keeps the draft and sends nothing to a model. Its `;manager` trigger
+expands through Espanso and Poise Link like any snippet.

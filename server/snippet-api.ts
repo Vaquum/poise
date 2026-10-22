@@ -10,7 +10,7 @@ const IMPORT_BODY_MAX_BYTES = MAX_SNIPPETS_BYTES * 6 + 1024
 
 /** Shared by the application and isolated browser journeys. The caller applies
  * the normal host/origin policy before dispatching any API route. */
-export async function handleSnippetApi(req: IncomingMessage, res: ServerResponse, url: string): Promise<boolean> {
+export async function handleSnippetApi(req: IncomingMessage, res: ServerResponse, url: string, person = true): Promise<boolean> {
   const path = url.split('?')[0]
   if (path !== '/api/snippets' && path !== '/api/snippets/import') return false
   function send(status: number, body: unknown): true {
@@ -26,15 +26,15 @@ export async function handleSnippetApi(req: IncomingMessage, res: ServerResponse
         return send(405, { error: 'Use POST to import snippets.' })
       }
       const body = await readJson<{ yaml?: unknown }>(req, IMPORT_BODY_MAX_BYTES)
-      return send(200, await importEspansoSnippets(body?.yaml))
+      return send(200, await importEspansoSnippets(body?.yaml, person))
     }
     if (req.method === 'GET') return send(200, { ...await readSkillSnippets(), ...snippetDelivery() })
     if (req.method === 'PUT') {
       const body = await readJson<{ snippets?: unknown, base_version?: unknown }>(req)
       if (body?.base_version === undefined) return send(428, { error: 'snippet write precondition is required; reload snippets' })
-      return send(200, await saveSkillSnippets(body.snippets, body.base_version))
+      return send(200, await saveSkillSnippets(body.snippets, body.base_version, person))
     }
-    if (req.method === 'POST') return send(200, await addSkillSnippet(await readJson(req)))
+    if (req.method === 'POST') return send(200, await addSkillSnippet(await readJson(req), person))
     res.setHeader('Allow', 'GET, PUT, POST')
     return send(405, { error: 'Use GET, PUT or POST for snippets.' })
   } catch (error) {

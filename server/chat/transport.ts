@@ -1,5 +1,6 @@
-import { readSwitches, readSkillSnippets, snippetLibraryEvents } from '../snippet-library'
-import type { ChatSwitches } from '../../src/chat-switches'
+import { ensureSnippetSwitch, readSwitches, readSkillSnippets, snippetLibraryEvents } from '../snippet-library'
+import { MANAGER_SWITCH, type ChatSwitches } from '../../src/chat-switches'
+import { MANAGER_SNIPPET_DEFAULT } from './manager-default'
 import { readChatFile } from './file-preview'
 import { readMemories, saveMemories } from './memories'
 // The browser-facing side of Chat v1: the WebSocket at /ws/chat (events
@@ -411,7 +412,10 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
     }
     if (path === '/api/chat/memories') {
       if (req.method === 'GET') return json(res, 200, readMemories()), true
-      if (req.method === 'PUT') return json(res, 200, saveMemories(await readJson(req))), true
+      if (req.method === 'PUT') {
+        if (!person) return json(res, 403, { error: 'Memories are edited in the browser.' }), true
+        return json(res, 200, saveMemories(await readJson(req))), true
+      }
       return json(res, 405, { error: 'Use GET or PUT for memories.' }), true
     }
     if (path === '/api/chat/agents' && req.method === 'GET') {
@@ -477,6 +481,13 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
       if (body?.role !== undefined) {
         if (!person) throw new ChatError(403, 'A Manager is created from the New session dialog in the browser.', 'invalid')
         const session = await runtime.create({ ...localSessionRequest(body), role: body.role })
+        try {
+          if (await ensureSnippetSwitch(MANAGER_SWITCH, MANAGER_SNIPPET_DEFAULT) === 'unreadable') {
+            runtime.emit('log', '[chat] /manager could not be read; Snippets shows the problem')
+          }
+        } catch (error) {
+          runtime.emit('log', `[chat] creating /manager failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
         return json(res, 201, { session }), true
       }
       const session = await runtime.create(localSessionRequest(body))
