@@ -335,17 +335,22 @@ describe('the switch bound', () => {
     w.c.auto = false
     for (const agent of agents) w.runtime.prompt(ids.get(agent)!, input(`Interrupted ${agent} work`))
     expect(agents.map(agent => storage.getOpenTurn(ids.get(agent)!)).every(open => open !== null)).toBe(true)
-    const { service } = await expired(w)
+    // Exercise cancellation after native work has started, not only while
+    // every interrupted turn is still waiting for the shared checkout.
+    await until(() => w.c.calls.length > agents.length)
+    const { service, restart } = await expired(w)
     try {
       for (const agent of agents) await until(() => w.turns(ids.get(agent)!).length === 2)
       for (const agent of agents) {
         expect(w.turns(ids.get(agent)!).map(t => (t.event as { stopReason: string }).stopReason)).toEqual(['end_turn', 'cancelled'])
       }
+      await until(() => restart.mock.calls.length === 1)
+      const callsBeforeResume = w.c.calls.length
       w.c.auto = true
       const next = w.make()
       await next.recover()
-      await until(() => w.c.calls.length === 8, 100_000)
-      expect(w.c.calls.slice(4).map(call => call.input.text)).toEqual([
+      await until(() => w.c.calls.length === callsBeforeResume + agents.length, 100_000)
+      expect(w.c.calls.slice(callsBeforeResume).map(call => call.input.text)).toEqual([
         'Poise restarted for an update while your turn was running. Continue where you left off.',
         'Poise restarted for an update while your turn was running. Continue where you left off.',
         'Poise restarted for an update while your turn was running. Continue where you left off.',
