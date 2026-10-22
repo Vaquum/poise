@@ -166,6 +166,8 @@ export class Orchestrator {
   private upgrading = false
   /** The release each workspace was asked to switch to, and when, until it runs it; see updateInPlace. */
   private readonly updating = new Map<string, { release: string; since: number }>()
+  /** When each workspace's probes for its target release started missing in a row; see updateInPlace. */
+  private readonly unreachableSince = new Map<string, { release: string; since: number }>()
   /** The release last installed into each workspace's home volume. */
   private readonly installed = new Map<string, string>()
   /** A release a workspace refused because it failed to start there, so it is not asked for again. */
@@ -420,13 +422,15 @@ export class Orchestrator {
       health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
-      // Restarting onto a release it was asked for takes seconds; a workspace that stays unreachable is hung
-      // or crashing, and gets a new container, as before releases switched in place.
-      const asked = this.updating.get(handle)
-      if (asked && this.deps.now() - asked.since < SWITCH_GRACE_MS) return true
+      // A workspace that stays unreachable cannot take the switch and gets a new container, as before
+      // releases switched in place. One missed probe is a transient stall, though, not a hung
+      // workspace — even long after the switch was asked for, while Poise still waits for a quiet
+      // moment — so until the grace passes a later pass asks again instead of starting a drain.
+      if (this.withinUnreachableGrace(handle, target.release)) return true
       this.deps.log.warn('workspace.update.unreachable', { handle, error: errorMessage(error) })
       return false
     }
+    this.unreachableSince.delete(handle)
     if (health.release === null) return false
     if (health.release === target.release) {
       await this.withdrawSwitch(handle, login, health, target)
@@ -452,6 +456,23 @@ export class Orchestrator {
       this.lifecycle('workspace.update.requested', handle, { release: target.release, from: health.release })
     }
     return true
+  }
+
+  /**
+   * Whether a workspace that did not answer a probe stays on the in-place path: the first miss in a
+   * row for this release starts the switch grace, which answering again clears, and only a workspace
+   * unreachable past the grace takes the drain path. A miss belongs to its release: a workspace that
+   * left the in-place path before answering again starts a fresh grace for the next one.
+   */
+  private withinUnreachableGrace(handle: string, release: string): boolean {
+    const missed = this.unreachableSince.get(handle)
+    if (missed?.release !== release) {
+      this.unreachableSince.set(handle, { release, since: this.deps.now() })
+      return true
+    }
+    if (this.deps.now() - missed.since < SWITCH_GRACE_MS) return true
+    this.unreachableSince.delete(handle)
+    return false
   }
 
   /**

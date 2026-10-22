@@ -737,6 +737,81 @@ describe('updates in place', () => {
     expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
   })
 
+  it('rides out one missed probe long after the switch was asked for, and asks again on the next pass', async () => {
+    await start()
+    const before = containerId()
+    await h.orchestrator.upgradePass()
+    // The switch waits server-side for a quiet moment, long past the grace, while the workspace answers.
+    h.advance(30 * 60_000)
+    h.workspace.reachable = false
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    expect(h.workspace.serviceRequests.some((request) => request.url === '/api/service/drain')).toBe(false)
+    expect(h.orchestrator.updatingTo('alice')).toBe('new-release')
+    h.workspace.reachable = true
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release', 'new-release'])
+    expect(containerId()).toBe(before)
+  })
+
+  it('asks again on the next pass when a workspace not yet asked misses one probe', async () => {
+    await start()
+    const before = containerId()
+    h.workspace.reachable = false
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    expect(h.workspace.serviceRequests.some((request) => request.url === '/api/service/drain')).toBe(false)
+    h.workspace.reachable = true
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+    expect(containerId()).toBe(before)
+  })
+
+  it('recreates a workspace never asked that stays unreachable past the grace', async () => {
+    await start()
+    const before = containerId()
+    h.workspace.reachable = false
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    h.advance(11 * 60_000)
+    await h.orchestrator.upgradePass()
+    expect(containerId()).not.toBe(before)
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
+  })
+
+  it('starts a fresh grace when the target release changes after missed probes', async () => {
+    await start()
+    const before = containerId()
+    h.workspace.reachable = false
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    h.advance(11 * 60_000)
+    // A newer image arrives while the workspace is still dark: its misses belong to the old release.
+    h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'third-release', 'poise.base': BASE })
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    expect(h.workspace.serviceRequests.some((request) => request.url === '/api/service/drain')).toBe(false)
+    h.advance(11 * 60_000)
+    await h.orchestrator.upgradePass()
+    expect(containerId()).not.toBe(before)
+    expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
+  })
+
+  it('forgets missed probes once the workspace answers again', async () => {
+    await start()
+    const before = containerId()
+    h.workspace.reachable = false
+    await h.orchestrator.upgradePass()
+    h.workspace.reachable = true
+    h.workspace.health.release = 'new-release'
+    await h.orchestrator.upgradePass()
+    h.advance(11 * 60_000)
+    h.workspace.reachable = false
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    expect(h.workspace.serviceRequests.some((request) => request.url === '/api/service/drain')).toBe(false)
+  })
+
   it('recreates a stopped workspace on the new image, with the new release current', async () => {
     await start({ running: false })
     await h.orchestrator.upgradePass()

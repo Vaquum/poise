@@ -326,6 +326,9 @@ reconciles them as after any restart.
   and restarts at the first moment no Chat turn and no work of its own runs;
   it waits for no agent call. The gateway asks again on later passes until
   health reports the release, which the request makes idempotent.
+- **Unreachable.** A workspace that does not answer a probe keeps its
+  container; the gateway probes again on later passes, and only a workspace
+  unreachable past the switch grace gets a new container, drained first.
 - **Meanwhile.** While the workspace restarts, the gateway answers for it
   with `x-poise-updating: 1`: "Updating to the latest version" for a page, 503
   `workspace_updating` for anything else. Poise dims the open page with the
