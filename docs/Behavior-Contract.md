@@ -176,23 +176,32 @@ exposed in the Caller batch packet.
 `rerun-grey-ci` is off unless `behavior_rerun_grey_ci_enabled` is `1`. It reads
 `--grey-ci-candidates --requests-json JSON --token-user AGENT` in batches of 50
 with no REST polling. Current-head workflow check suites identify only completed
-cancelled/stale GitHub Actions runs. Additional GraphQL pages complete truncated
-workflow inventories. The latest run per workflow/event excludes superseded
-interruptions; third-party checks and intentional skips do not become reruns.
+cancelled/stale/timed-out GitHub Actions runs. Additional GraphQL pages complete
+truncated workflow inventories. The latest run per workflow/event excludes
+superseded interruptions; third-party checks and intentional skips do not become
+reruns. An unreadable batch or PR records that target's failure and the scan
+continues with the rest; one PR never stops another's rerun.
 
 A ready candidate takes the shared PR operation lock. Immediately before launch,
 Poise rereads skips, enable and acting identity, then atomically records a durable
 workflow/head/event intent. Caller `--rerun-grey-ci-if-ready` rechecks the author,
 head, exact run/attempt, every job and latest replacement run, then requests one
-workflow rerun. Failed/timed-out/unknown or active jobs refuse recovery. The normal
-path uses five REST reads and one write; paginated job lists add reads. The API
-has no atomic expected-head parameter, so the PR head is rechecked immediately
-before the final workflow read and write.
+workflow rerun. Every job must be completed with a known conclusion, and at least
+one job must prove interruption (cancelled, stale or timed out): a failed job
+beside an interrupted one is collateral, since rollups fail because a sibling was
+interrupted, while a run whose jobs show no interruption merely failed and is left
+alone. Unknown or active jobs refuse recovery. The normal path uses five REST
+reads and one write; paginated job lists add reads. The API has no atomic
+expected-head parameter, so the PR head is rechecked immediately before the final
+workflow read and write.
 
 Only `rerun_requested` updates Last triggered with a workflow URL. `not_ready`
 and `superseded` prove no write and release the exact intent. Missing/malformed
 receipts preserve the intent and visible held diagnostics across restarts. There
 is one automatic recovery per workflow, event and head; no running CI is cancelled.
+A rate-limit error retries at GitHub's stated reset instead of inside the blocked
+window. Every completed scan stamps Last succeeded, so a stale stamp with no
+visible failure is a silent stop, not a quiet queue.
 The behavior needs no model and adds zero GitHub traffic when disabled.
 
 New behaviors must add the required atomic fact or mutation upstream first.

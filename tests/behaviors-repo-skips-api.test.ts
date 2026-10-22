@@ -169,7 +169,7 @@ describe('Skip repositories API', () => {
   })
 
   it('starts grey CI recovery off and persists its global toggle and repository skips', async () => {
-    expect((await behaviorState())['rerun-grey-ci']).toMatchObject({ enabled: false, skipRepos: [], lastTriggered: null })
+    expect((await behaviorState())['rerun-grey-ci']).toMatchObject({ enabled: false, skipRepos: [], lastTriggered: null, lastSucceeded: null })
     expect((await post('/api/behaviors/rerun-grey-ci?org=beta', { enabled: true, skipRepos: [REPO] })).status).toBe(200)
     expect((await behaviorState())['rerun-grey-ci']).toMatchObject({ enabled: true, skipRepos: [REPO] })
   })
