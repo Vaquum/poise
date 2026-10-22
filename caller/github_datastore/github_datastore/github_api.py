@@ -6,7 +6,7 @@ import re
 import subprocess
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 
 class GitHubApiError(RuntimeError):
@@ -17,6 +17,33 @@ class GitHubRateLimitError(GitHubApiError):
     def __init__(self, message: str, reset_at: int) -> None:
         self.reset_at = reset_at
         super().__init__(f"{message} GITHUB_RATE_LIMIT_RESET={reset_at}")
+
+
+ENUMERATION_DRIFT_MAX_ATTEMPTS = 3
+
+
+class GitHubEnumerationDriftError(GitHubApiError):
+    """Upstream changed while a connection was being paged.
+
+    The partial pass is discarded and the enumeration restarts from its
+    first page with the original watermark. Drift past the attempt budget
+    still fails loudly.
+    """
+
+
+_T = TypeVar("_T")
+
+
+def _retry_enumeration_on_drift(operation: Callable[[], _T]) -> _T:
+    """Restart a connection enumeration while upstream drifts mid-page."""
+    attempts = 0
+    while True:
+        try:
+            return operation()
+        except GitHubEnumerationDriftError:
+            attempts += 1
+            if attempts >= ENUMERATION_DRIFT_MAX_ATTEMPTS:
+                raise
 
 
 def split_http_response(stdout: str) -> tuple[dict[str, str], str]:
@@ -431,6 +458,9 @@ class GitHubOrgReader:
         self.client = client
 
     def list_org_repos(self, org: str) -> list[dict[str, Any]]:
+        return _retry_enumeration_on_drift(lambda: self._list_org_repos_once(org))
+
+    def _list_org_repos_once(self, org: str) -> list[dict[str, Any]]:
         # Keep the historical method/CLI name while accepting either owner
         # kind. OWNER excludes organizations and repositories a user merely
         # collaborates on; those belong to their own datastore scope.
@@ -463,7 +493,7 @@ class GitHubOrgReader:
             if type(count) is not int or count < 0:
                 raise GitHubApiError(f"invalid repository totalCount for {org}")
             if expected_count is not None and count != expected_count:
-                raise GitHubApiError(f"repository totalCount changed while listing {org}")
+                raise GitHubEnumerationDriftError(f"repository totalCount changed while listing {org}")
             expected_count = count
             for node in conn["nodes"]:
                 repo = graphql_repo_to_row(node)
@@ -481,15 +511,17 @@ class GitHubOrgReader:
         if len(ids) != len(set(ids)):
             raise GitHubApiError(f"duplicate repo ids returned for owner {org}")
         if len(repos) != expected_count:
-            raise GitHubApiError(f"incomplete repository enumeration for {org}: expected {expected_count}, got {len(repos)}")
+            raise GitHubEnumerationDriftError(f"incomplete repository enumeration for {org}: expected {expected_count}, got {len(repos)}")
         return repos
 
     def list_repo_issues(
         self, full_name: str, since: str | None = None, *, include_issues: bool = True,
     ) -> list[dict[str, Any]]:
         owner, name = split_full_name(full_name)
-        issues = self._list_issue_nodes(owner, name, since, changed_only=False) if include_issues else []
-        pulls = self._list_pull_nodes(owner, name)
+        issues = _retry_enumeration_on_drift(
+            lambda: self._list_issue_nodes(owner, name, since, changed_only=False)
+        ) if include_issues else []
+        pulls = _retry_enumeration_on_drift(lambda: self._list_pull_nodes(owner, name))
         return self._merge_item_nodes(full_name, issues, pulls)
 
     def list_repo_changed_items(
@@ -501,7 +533,9 @@ class GitHubOrgReader:
         if since is None:
             return self.list_repo_issues(full_name)
         owner, name = split_full_name(full_name)
-        issues, pulls = self._list_changed_issue_and_pull_nodes(owner, name, since)
+        issues, pulls = _retry_enumeration_on_drift(
+            lambda: self._list_changed_issue_and_pull_nodes(owner, name, since)
+        )
         pulls = self._changed_pull_nodes(full_name, pulls, stored_pr_updated_at)
         return self._merge_item_nodes(full_name, issues, pulls)
 
@@ -524,46 +558,57 @@ class GitHubOrgReader:
         # supply all direct-association evidence through the existing reader.
         for start in range(0, len(full_names), 20):
             names = full_names[start:start + 20]
-            declarations = ["$since: DateTime!"] if include_issues else []
-            fields: list[str] = []
-            variables: dict[str, Any] = {"since": since} if include_issues else {}
-            issue_selection = f"""
-                    issues(first: 100, states: [OPEN, CLOSED], filterBy: {{since: $since}}, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
-                      totalCount
-                      pageInfo {{ hasNextPage endCursor }}
-                      nodes {{ {ISSUE_STUB_FIELDS} }}
-                    }}
-            """ if include_issues else ""
-            for index, full_name in enumerate(names):
-                owner, name = split_full_name(full_name)
-                declarations.extend([f"$owner{index}: String!", f"$name{index}: String!"])
-                variables.update({f"owner{index}": owner, f"name{index}": name})
-                fields.append(f"""
-                  repo_{index}: repository(owner: $owner{index}, name: $name{index}) {{
-                    nameWithOwner
-                    {issue_selection}
-                    pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], orderBy: {{field: CREATED_AT, direction: ASC}}) {{
-                      totalCount
-                      pageInfo {{ hasNextPage endCursor }}
-                      nodes {{ {PULL_STUB_FIELDS} }}
-                    }}
-                  }}
-                """)
-            query = "query(" + ", ".join(declarations) + ") {" + "".join(fields) + "}"
-            data = self.client.graphql(query, variables)
-            repositories = {}
-            for index, full_name in enumerate(names):
-                repo = data.get(f"repo_{index}")
-                if not isinstance(repo, dict):
-                    raise GitHubApiError(f"missing repository batch result: {full_name}")
-                if str(repo.get("nameWithOwner", "")).casefold() != full_name.casefold():
-                    raise GitHubApiError(f"repository batch result does not match: {full_name}")
-                repositories[full_name] = repo
-            completed = self._complete_changed_repository_batch(names, since, repositories, include_issues=include_issues)
+            completed = _retry_enumeration_on_drift(
+                lambda: self._list_changed_item_chunk(names, since, include_issues=include_issues)
+            )
             for full_name, (issues, pulls) in completed.items():
                 pulls = self._changed_pull_nodes(full_name, pulls, stored_pr_updated_at.get(full_name, {}))
                 result[full_name] = self._merge_item_nodes(full_name, issues, pulls)
         return result
+
+    def _list_changed_item_chunk(
+        self,
+        names: list[str],
+        since: str,
+        *,
+        include_issues: bool,
+    ) -> dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
+        declarations = ["$since: DateTime!"] if include_issues else []
+        fields: list[str] = []
+        variables: dict[str, Any] = {"since": since} if include_issues else {}
+        issue_selection = f"""
+                issues(first: 100, states: [OPEN, CLOSED], filterBy: {{since: $since}}, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
+                  totalCount
+                  pageInfo {{ hasNextPage endCursor }}
+                  nodes {{ {ISSUE_STUB_FIELDS} }}
+                }}
+        """ if include_issues else ""
+        for index, full_name in enumerate(names):
+            owner, name = split_full_name(full_name)
+            declarations.extend([f"$owner{index}: String!", f"$name{index}: String!"])
+            variables.update({f"owner{index}": owner, f"name{index}": name})
+            fields.append(f"""
+              repo_{index}: repository(owner: $owner{index}, name: $name{index}) {{
+                nameWithOwner
+                {issue_selection}
+                pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], orderBy: {{field: CREATED_AT, direction: ASC}}) {{
+                  totalCount
+                  pageInfo {{ hasNextPage endCursor }}
+                  nodes {{ {PULL_STUB_FIELDS} }}
+                }}
+              }}
+            """)
+        query = "query(" + ", ".join(declarations) + ") {" + "".join(fields) + "}"
+        data = self.client.graphql(query, variables)
+        repositories = {}
+        for index, full_name in enumerate(names):
+            repo = data.get(f"repo_{index}")
+            if not isinstance(repo, dict):
+                raise GitHubApiError(f"missing repository batch result: {full_name}")
+            if str(repo.get("nameWithOwner", "")).casefold() != full_name.casefold():
+                raise GitHubApiError(f"repository batch result does not match: {full_name}")
+            repositories[full_name] = repo
+        return self._complete_changed_repository_batch(names, since, repositories, include_issues=include_issues)
 
     def _complete_changed_repository_batch(
         self,
@@ -631,7 +676,7 @@ class GitHubOrgReader:
                     conn = repo[key]
                     total_count = required_total_count(conn, owner, name, key)
                     if total_count != totals[identity]:
-                        raise GitHubApiError(f"{key} totalCount changed while enumerating {full_name}: {totals[identity]} to {total_count}")
+                        raise GitHubEnumerationDriftError(f"{key} totalCount changed while enumerating {full_name}: {totals[identity]} to {total_count}")
                     for node in conn["nodes"]:
                         updated_at = parse_graphql_datetime(node.get("updatedAt"), f"{full_name} {key} node")
                         if key == "pullRequests" or updated_at >= since_at:
@@ -651,7 +696,7 @@ class GitHubOrgReader:
                 label = "issue" if key == "issues" else "pull request"
                 identity = (full_name, key)
                 if len(nodes[identity]) != totals[identity]:
-                    raise GitHubApiError(f"{label} enumeration count mismatch for {full_name}: expected {totals[identity]}, received {len(nodes[identity])}")
+                    raise GitHubEnumerationDriftError(f"{label} enumeration count mismatch for {full_name}: expected {totals[identity]}, received {len(nodes[identity])}")
             completed[full_name] = (nodes[(full_name, "issues")] if include_issues else [], nodes[(full_name, "pullRequests")])
         return completed
 
@@ -721,12 +766,12 @@ class GitHubOrgReader:
                 )
             )
         if len(issues) != total_issue_count:
-            raise GitHubApiError(
+            raise GitHubEnumerationDriftError(
                 f"issue enumeration count mismatch for {owner}/{name}: "
                 f"expected {total_issue_count}, received {len(issues)}"
             )
         if len(pulls) != total_pull_count:
-            raise GitHubApiError(
+            raise GitHubEnumerationDriftError(
                 f"pull request enumeration count mismatch for {owner}/{name}: "
                 f"expected {total_pull_count}, received {len(pulls)}"
             )
@@ -963,7 +1008,7 @@ class GitHubOrgReader:
                 if expected_total is None:
                     expected_total = total_count
                 elif total_count != expected_total:
-                    raise GitHubApiError(
+                    raise GitHubEnumerationDriftError(
                         f"{key} totalCount changed while enumerating {owner}/{name}: "
                         f"{expected_total} to {total_count}"
                     )
@@ -982,7 +1027,7 @@ class GitHubOrgReader:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         if validate_total and expected_total is not None and received_count != expected_total:
-            raise GitHubApiError(
+            raise GitHubEnumerationDriftError(
                 f"{key} enumeration count mismatch for {owner}/{name}: "
                 f"expected {expected_total}, received {received_count}"
             )
