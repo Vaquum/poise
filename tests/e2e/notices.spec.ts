@@ -582,6 +582,27 @@ test.describe('in an en-US browser', () => {
     await expect(line('The reviewer stopped before posting.')).toHaveText('10:02')
     await expect(line('The reviewer timed out.')).toHaveText('8 Oct 15:30')
   })
+
+  test('names a failing behavior’s next check on the clock, and aligns every history line’s words', async ({ page }) => {
+    await page.clock.setFixedTime(new Date('2026-10-09T12:00:00Z'))
+    await workspace(page, [HELD], { diagnostics: diagnostics({
+      failures: [{ behavior: 'review-new-prs', target: 'acme/api#9', kind: 'operation', consecutiveFailures: 2,
+        lastFailureAt: '2026-10-09T10:02:00.000Z', nextRetryAt: '2026-10-09T10:06:00.000Z', error: 'GitHub 404: Not Found' }],
+      deadLetters: [
+        { id: 'yesterday', behavior: 'review-new-prs', target: 'acme/api#9', error: 'The reviewer timed out.', createdAt: '2026-10-08T15:30:00.000Z', attemptCount: 1, callId: HELD_CALL },
+        { id: 'undated', behavior: 'review-new-prs', target: 'acme/api#9', error: 'The reviewer stopped before posting.', createdAt: '', attemptCount: 1, callId: HELD_CALL },
+      ],
+    }) })
+    await page.goto('/')
+    await openRail(page)
+    await expand(page, HELD.id)
+    const history = card(page, HELD.id).locator('.nr-history')
+    await expect(history.locator('li', { hasText: 'GitHub 404' })).toContainText('next check 10:06')
+    await expect(history).not.toContainText('2026-10-09T10:06:00.000Z')
+    const lefts = await history.locator('li > span').evaluateAll((spans) => spans.map((span) => span.getBoundingClientRect().left))
+    expect(lefts).toHaveLength(3)
+    expect(new Set(lefts).size).toBe(1)
+  })
 })
 
 test('shows a failed behavior and its diagnostic as one entry, and counts it on its Behaviors row', async ({ page }) => {

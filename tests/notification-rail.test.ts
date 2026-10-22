@@ -104,4 +104,34 @@ describe('when its history happened', () => {
     expect(html).toContain('<time datetime="2026-10-17T16:38:00.000Z">19:38</time>')
     expect(html).toContain('<time datetime="2026-10-16T16:38:00.000Z">16 Oct 19:38</time>')
   })
+
+  it('names a failing behavior’s next check on the same clock, never as a raw timestamp', () => {
+    setLocalSettings({ org: 'acme', me: 'octocat', timezone: 'Europe/Helsinki' })
+    const now = Date.parse('2026-10-17T17:00:00Z')
+    const [failing] = notificationItems([], {
+      status: 'ok', agentLogsError: null,
+      datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+      identity: { status: 'valid', actor: 'bit-mis', error: null },
+      failures: [{ behavior: 'review-new-prs', target: 'acme/api#9', kind: 'operation', consecutiveFailures: 2,
+        lastFailureAt: '2026-10-17T16:38:00.000Z', nextRetryAt: '2026-10-17T16:43:00.000Z', error: 'GitHub 404: Not Found' }],
+      deadLetters: [],
+    }, now)
+    const html = itemHtml(failing, true, now)
+    expect(html).toContain('; next check 19:43</span>')
+    expect(html).not.toContain('2026-10-17T16:43:00.000Z')
+  })
+
+  it('leaves out a next check it cannot read', () => {
+    setLocalSettings({ org: 'acme', me: 'octocat', timezone: 'Europe/Helsinki' })
+    const now = Date.parse('2026-10-17T17:00:00Z')
+    const [failing] = notificationItems([], {
+      status: 'ok', agentLogsError: null,
+      datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+      identity: { status: 'valid', actor: 'bit-mis', error: null },
+      failures: [{ behavior: 'review-new-prs', target: 'acme/api#9', kind: 'operation', consecutiveFailures: 2,
+        lastFailureAt: '2026-10-17T16:38:00.000Z', nextRetryAt: 'soon', error: 'GitHub 404: Not Found' }],
+      deadLetters: [],
+    }, now)
+    expect(itemHtml(failing, true, now)).not.toContain('next check')
+  })
 })

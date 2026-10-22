@@ -278,8 +278,14 @@ body.notifications-docked:not(.editor-writer-mode) .self-update-banner { right: 
 .nr-card.is-open .nr-card-side .nr-chev { transform: rotate(180deg); }
 
 .nr-details { padding: 2px var(--sp-3) 14px 48px; }
-/* What happened: mono per DS (timestamps, IDs). */
+/* What happened: mono per DS (timestamps, IDs). The times share one column
+ * per card, as wide as its widest time, so every line's words start even —
+ * including lines with no time, whose words sit in the second column too. */
 .nr-history {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: var(--sp-3);
+  row-gap: 6px;
   margin: 0 0 var(--sp-3);
   padding: 0;
   list-style: none;
@@ -289,9 +295,9 @@ body.notifications-docked:not(.editor-writer-mode) .self-update-banner { right: 
   color: var(--text-secondary);
   overflow-wrap: anywhere;
 }
-.nr-history li { display: flex; gap: var(--sp-3); }
-.nr-history li + li { margin-top: 6px; }
-.nr-history time { flex: 0 0 auto; color: var(--text-tertiary); }
+.nr-history li { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; }
+.nr-history li > span { grid-column: 2; }
+.nr-history time { color: var(--text-tertiary); }
 .nr-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .nr-btn {
   display: inline-flex;

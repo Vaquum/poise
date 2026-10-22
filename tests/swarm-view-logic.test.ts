@@ -17,7 +17,7 @@ type Helpers = {
   elapsedText: (e: any) => string
   hasDetail: (e: any) => boolean
   progressText: (e: any) => string
-  progressDetail: (e: any) => string
+  progressDetail: (e: any, zone?: string, now?: number) => string
   quarantineDescription: (e: any) => string
   groupRuns: (entries: any[]) => Array<{ key: string, entries: any[] }>
 }
@@ -266,6 +266,22 @@ describe('progress reports observations without inventing model activity', () =>
     expect(helpers.progressText(row)).toContain('Progress incomplete')
     expect(helpers.progressDetail(row)).toContain('Stage deadline passed; awaiting worker outcome')
     expect(row.status).toBe('running')
+  })
+
+  it('dates a finished run’s last heartbeat and provider event on Poise’s clock, never as raw timestamps', () => {
+    const zone = 'Europe/Helsinki'
+    const now = Date.parse('2026-10-21T17:00:05Z')
+    const row = entry({ status: 'completed', completed_at: '2026-10-21T17:00:00.000Z', progress: {
+      version: 1, phase: 'finished', phase_started_at: '2026-10-21T16:59:00.000Z',
+      heartbeat_at: '2026-10-21T16:59:58.000Z', last_provider_event_at: '2026-10-21T16:59:57.000Z',
+      deadline_at: null, warning: null,
+      events: [{ at: '2026-10-21T16:59:58.000Z', message: 'Past minute: new reasoning activity (3 events)' }],
+    } })
+    const detail = helpers.progressDetail(row, zone, now)
+    expect(detail).toContain('Last worker heartbeat: 19:59:58')
+    expect(detail).toContain('Last provider event: 19:59:57')
+    const facts = detail.match(/<p>(.*?)<\/p>/)![1]
+    expect(facts).not.toMatch(/\d{4}-\d{2}-\d{2}T/)
   })
 })
 

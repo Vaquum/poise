@@ -1,7 +1,8 @@
 import { viewFeedback } from '../view-feedback'
 // Main table view — reads through /api/gh from the unified /github API.
 
-import { getSettings, getOrganizations, midnightInZone, startOfWeekInZone } from '../config'
+import { getSettings, getOrganizations, effectiveTimezone, midnightInZone, startOfWeekInZone } from '../config'
+import { fullTime } from '../clock'
 import { layout, retire } from '../motion'
 import { patchContent } from '../dom-patch'
 import { mountOrganizationFilter, organizationPayload, organizationErrors } from '../organizations'
@@ -134,6 +135,13 @@ function relativeDate(iso: string): string {
   return `${Math.floor(months / 12)}y`
 }
 
+// The updated cell's tooltip: the exact time on Poise's clock, or no tooltip
+// when the time does not parse — relativeDate shows '—' then, and fullTime
+// throws for what it cannot read.
+function updatedTitle(iso: string, zone: string): string | null {
+  return Number.isFinite(Date.parse(iso)) ? fullTime(iso, zone) : null
+}
+
 // Attribute-safe HTML escape. textContent → innerHTML only escapes &,
 // <, >; we also need to escape " and ' so attribute interpolations
 // like `title="${escapeHtml(text)}"` don't break on quoted content.
@@ -253,6 +261,7 @@ function paintRow(tr: HTMLTableRowElement, item: PrRow): void {
   const [org, repo] = item.repo.split('/', 2)
   const repoUrl = `https://github.com/${encodeURIComponent(org)}/${encodeURIComponent(repo)}`
   const tone = action ? st.cls : st.cls === 'open' ? 'live' : st.cls === 'merged' ? 'ok' : 'flat'
+  const updated = updatedTitle(item.updated_at, effectiveTimezone())
   patchContent(tr, `
     <td><span class="type-toggle ${pr ? 'pr' : action ? 'action' : 'issue'}">${pr ? 'PR' : action ? 'CI' : 'IS'}</span></td>
     <td class="title-cell"><a href="${safeHttpsUrl(item.html_url)}" target="_blank" rel="noopener" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</a></td>
@@ -261,7 +270,7 @@ function paintRow(tr: HTMLTableRowElement, item: PrRow): void {
     <td><a class="agent-repo repo-name" href="${repoUrl}" target="_blank" rel="noopener" title="${escapeHtml(item.repo)}">${escapeHtml(repo)}</a></td>
     <td class="${action ? 'branch-cell' : 'last-cell'}">${action ? `<span class="agent-pr" title="${escapeHtml(item.event || '')}">${escapeHtml(item.branch || '—')}</span>` : ownerCell(item)}</td>
     <td><span class="agent-status ${tone}"><span class="agent-status-label">${escapeHtml(st.text)}</span></span></td>
-    <td class="updated-cell"><span class="date" title="${escapeHtml(item.updated_at)}">${relativeDate(item.updated_at)}</span></td>
+    <td class="updated-cell"><span class="date"${updated === null ? '' : ` title="${escapeHtml(updated)}"`}>${relativeDate(item.updated_at)}</span></td>
     <td class="action-cell">${actionHtml}</td>
   `)
 }
@@ -415,6 +424,9 @@ function paintSources(): void {
         if (item && date) {
           const text = relativeDate(item.updated_at)
           if (date.textContent !== text) date.textContent = text
+          const tip = updatedTitle(item.updated_at, effectiveTimezone())
+          if (tip === null) date.removeAttribute('title')
+          else if (date.getAttribute('title') !== tip) date.setAttribute('title', tip)
         }
       }
     }

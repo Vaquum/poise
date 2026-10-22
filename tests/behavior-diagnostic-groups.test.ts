@@ -130,12 +130,31 @@ describe('behavior diagnostic groups', () => {
       consecutiveFailures: 2, lastFailureAt: '2026-10-17T10:05:00.000Z', nextRetryAt: '', error: 'GitHub 404: Not Found' })
     diagnostics.deadLetters.push({ id: 'letter', behavior: 'approve-prs', target: 'acme/web#3', error: 'No verdict.',
       createdAt: '2026-10-17T10:07:00.000Z', attemptCount: 2, diagnostic: { severity: 'error', code: 'invalid_agent_result' } })
-    const entries = behaviorDiagnosticGroups(diagnostics).map((group) => group.entries.map(({ behavior, target, at }) => ({ behavior, target, at })))
+    const entries = behaviorDiagnosticGroups(diagnostics).map((group) => group.entries.map(({ behavior, target, at, next }) => ({ behavior, target, at, next })))
     expect(entries).toEqual([
-      [{ behavior: null, target: null, at: null }],
-      [{ behavior: 'review-new-prs', target: 'acme/api#9:secondary:check', at: '2026-10-17T10:05:00.000Z' }],
-      [{ behavior: 'approve-prs', target: 'acme/web#3', at: '2026-10-17T10:07:00.000Z' }],
+      [{ behavior: null, target: null, at: null, next: null }],
+      [{ behavior: 'review-new-prs', target: 'acme/api#9:secondary:check', at: '2026-10-17T10:05:00.000Z', next: null }],
+      [{ behavior: 'approve-prs', target: 'acme/web#3', at: '2026-10-17T10:07:00.000Z', next: null }],
     ])
     for (const group of behaviorDiagnosticGroups(diagnostics)) expect(group.entries.map((entry) => entry.detail)).toEqual(group.details)
+  })
+
+  it('carries a failing behavior’s next check as its own field, not inside the detail text', () => {
+    const diagnostics = snapshot()
+    diagnostics.failures.push({ behavior: 'review-new-prs', target: 'acme/api#9', kind: 'operation',
+      consecutiveFailures: 2, lastFailureAt: '2026-10-17T10:05:00.000Z', nextRetryAt: '2026-10-17T10:10:00.000Z', error: 'GitHub 404: Not Found' })
+    const [entry] = behaviorDiagnosticGroups(diagnostics)[0]!.entries
+    expect(entry!.next).toBe('2026-10-17T10:10:00.000Z')
+    expect(entry!.detail).not.toContain('next check')
+    expect(entry!.detail).not.toContain('2026-10-17T10:10:00.000Z')
+  })
+
+  it('keeps failures apart when only their next check differs', () => {
+    const diagnostics = snapshot()
+    for (const nextRetryAt of ['2026-10-17T10:10:00.000Z', '2026-10-17T10:20:00.000Z']) {
+      diagnostics.failures.push({ behavior: 'review-new-prs', target: 'acme/api#9', kind: 'operation',
+        consecutiveFailures: 2, lastFailureAt: '2026-10-17T10:05:00.000Z', nextRetryAt, error: 'GitHub 404: Not Found' })
+    }
+    expect(behaviorDiagnosticGroups(diagnostics)[0]!.entries).toHaveLength(2)
   })
 })

@@ -13,6 +13,8 @@ export interface DiagnosticEntry extends EvidenceAttachment {
   target: string | null
   /** When it last happened, when known. */
   at: string | null
+  /** When the next check runs, for a failing behavior with one scheduled. */
+  next: string | null
   detail: string
 }
 
@@ -47,13 +49,13 @@ function diagnosticMessage(code: string, cause: string): string {
 export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): BehaviorDiagnosticGroup[] {
   const groups = new Map<string, BehaviorDiagnosticGroup>()
   const add = (classification: DiagnosticClassification, scope: string, message: string, detail: string,
-    about: Omit<DiagnosticEntry, 'detail'> = { behavior: null, target: null, at: null }) => {
+    about: Omit<DiagnosticEntry, 'detail'> = { behavior: null, target: null, at: null, next: null }) => {
     const key = JSON.stringify([classification.severity, classification.code, scope, message])
     const entry = { ...about, detail }
     const existing = groups.get(key)
     if (existing) {
       if (!existing.details.includes(detail)) existing.details.push(detail)
-      const identity = (row: DiagnosticEntry) => JSON.stringify([row.behavior, row.target, row.callId, row.correlationId, row.at, row.detail])
+      const identity = (row: DiagnosticEntry) => JSON.stringify([row.behavior, row.target, row.callId, row.correlationId, row.at, row.next, row.detail])
       if (!existing.entries.some((row) => identity(row) === identity(entry))) existing.entries.push(entry)
     } else groups.set(key, { ...classification, scope, message, details: [detail], entries: [entry] })
   }
@@ -80,8 +82,8 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
     const message = classification.code === 'github_access'
       ? `GitHub target is unavailable to ${diagnostics.identity.actor || 'the reviewer'}; check repository access.`
       : diagnosticMessage(classification.code, cause)
-    const detail = `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}${failure.target ? ` ${failure.target}` : ''}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s) — ${cause}${failure.nextRetryAt ? `; next check ${failure.nextRetryAt}` : ''}`
-    add(classification, scope, message, detail, { behavior: failure.behavior, target: failure.target ?? null, at: failure.lastFailureAt || null, callId: failure.callId, correlationId: failure.correlationId, ...evidenceAttachment(failure) })
+    const detail = `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}${failure.target ? ` ${failure.target}` : ''}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s) — ${cause}`
+    add(classification, scope, message, detail, { behavior: failure.behavior, target: failure.target ?? null, at: failure.lastFailureAt || null, next: failure.nextRetryAt || null, callId: failure.callId, correlationId: failure.correlationId, ...evidenceAttachment(failure) })
   }
   for (const letter of diagnostics.deadLetters) {
     const ref = targetRef(letter.target)
@@ -94,7 +96,7 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
     if (existing && (!letter.diagnostic || (existing.code === classification.code && existing.severity === classification.severity))) continue
     add(classification, ref, diagnosticMessage(classification.code, cause),
       `${letter.behavior} ${letter.target}: ${cause} (${letter.attemptCount ?? 1} attempts)`,
-      { behavior: letter.behavior, target: letter.target, at: letter.createdAt || null, callId: letter.callId, correlationId: letter.correlationId, ...evidenceAttachment(letter) })
+      { behavior: letter.behavior, target: letter.target, at: letter.createdAt || null, next: null, callId: letter.callId, correlationId: letter.correlationId, ...evidenceAttachment(letter) })
   }
   if (diagnostics.runtimeError) {
     add(diagnosticClassification('runtime_unhealthy'), 'Behaviors', diagnostics.runtimeError, 'Poise runtime needs repair.')

@@ -39,6 +39,17 @@ for (const width of [1280, 1920]) {
   })
 }
 
+test('tooltips the updated cell with the exact time on Poise’s clock, not the raw timestamp', async ({ page }) => {
+  await workspace(page, 'swarm')
+  await page.route('**/api/gh', route => {
+    const body = route.request().postDataJSON() as Record<string, unknown>
+    return route.fulfill({ json: body.count_only ? { count: 1 } : { records: [failedRun], count: 1 } })
+  })
+  await page.getByRole('button', { name: 'Archive', exact: true }).click()
+  // Settings' time zone is UTC here.
+  await expect(page.locator('#tbody .updated-cell .date')).toHaveAttribute('title', 'Wednesday 14 October 2026 at 08:00:00 UTC')
+})
+
 test('outcomes, issue history and persistent filters remain selectable', async ({ page }) => {
   await workspace(page, 'swarm', undefined, { preserveOnReload: true })
   await page.route('**/api/gh', route => {

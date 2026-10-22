@@ -95,7 +95,7 @@ describe('a failed behavior', () => {
       id: 'held', group: 'needs', tone: 'amber', title: held.title, scope: 'acme/api#9',
       body: 'The review outcome needs verification before retry.', behaviors: ['review-new-prs'], notice: held,
     })
-    expect(items[0].details).toEqual([{ behavior: 'review-new-prs', target: 'acme/api#9', at: iso(5), detail: 'review-new-prs acme/api#9: The reviewer stopped before posting. (3 attempts)' }])
+    expect(items[0].details).toEqual([{ behavior: 'review-new-prs', target: 'acme/api#9', at: iso(5), next: null, detail: 'review-new-prs acme/api#9: The reviewer stopped before posting. (3 attempts)' }])
   })
 
   it('takes its group from the diagnostic: a Poise fault, or handled automatically', () => {

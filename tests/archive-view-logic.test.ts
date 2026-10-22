@@ -11,6 +11,7 @@ type Helpers = {
   reviewButtonHtml: (item: any, st: { text: string, cls: string }) => string
   stateLabel: (item: any) => { text: string, cls: string }
   relativeDate: (iso: string) => string
+  updatedTitle: (iso: string, zone: string) => string | null
   rowKey: (item: any) => string
   retainUnchangedRows: (previous: ReturnType<typeof pr>[], incoming: ReturnType<typeof pr>[]) => ReturnType<typeof pr>[]
   markReviewing: (url: string, on: boolean) => void
@@ -20,7 +21,7 @@ async function loadHelpers(): Promise<Helpers> {
   const source = await readFile(SRC, 'utf8')
   const patched = source + `
 export const __test = {
-  reviewButtonHtml, stateLabel, relativeDate, rowKey, retainUnchangedRows,
+  reviewButtonHtml, stateLabel, relativeDate, updatedTitle, rowKey, retainUnchangedRows,
   markReviewing: (url: string, on: boolean) => { on ? reviewing.add(url) : reviewing.delete(url) },
 }
 `
@@ -119,6 +120,20 @@ describe('relative dates use the same vocabulary as the other views', () => {
 
   it('says nothing rather than NaN for an unparseable date', () => {
     expect(h.relativeDate('not a date')).toBe('—')
+  })
+})
+
+// The updated cell's tooltip names the exact time; it used to carry the raw
+// timestamp the relative label abbreviates.
+describe('the updated cell tooltips its exact time on Poise’s clock', () => {
+  it('reads the full time in the configured zone', () => {
+    expect(h.updatedTitle('2026-10-14T08:00:00Z', 'Europe/Helsinki')).toBe('Wednesday 14 October 2026 at 11:00:00 EEST')
+    expect(h.updatedTitle('2026-10-14T08:00:00Z', 'UTC')).toBe('Wednesday 14 October 2026 at 08:00:00 UTC')
+  })
+
+  it('offers no tooltip for a time it cannot read', () => {
+    expect(h.updatedTitle('not a time', 'Europe/Helsinki')).toBeNull()
+    expect(h.updatedTitle('', 'Europe/Helsinki')).toBeNull()
   })
 })
 

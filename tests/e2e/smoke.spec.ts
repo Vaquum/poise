@@ -756,6 +756,26 @@ test.describe('in an en-US browser in New York', () => {
     await expect(time).toHaveText('16:59:58')
     await expect(time).toHaveAttribute('datetime', at)
   })
+
+  test('writes a finished run’s last heartbeat and provider event on the clock, not as raw timestamps', async ({ page }) => {
+    await page.clock.setFixedTime(new Date('2026-10-21T17:00:05Z'))
+    const id = 'e'.repeat(32)
+    const at = '2026-10-21T16:59:58.000Z'
+    const row = { id, model: 'opus-5-high', behavior: 'pr_approve', repo: 'Vaquum/Origo', pr_id: '321',
+      status: 'completed', started_at: at, started_at_precise: at, completed_at: '2026-10-21T17:00:00.000Z',
+      time_elapsed: '2s', response: '', error: '',
+      progress: { version: 1, phase: 'finished', phase_started_at: at, heartbeat_at: at,
+        last_provider_event_at: at, deadline_at: null, warning: null,
+        events: [{ at, message: 'Past minute: new reasoning activity (3 events)' }] } }
+    await page.route(/\/api\/agent-logs(?:\?.*)?$/, (route) => route.fulfill({ json: { logs: [row] } }))
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+    await page.locator(`.agent-row[data-id="${id}"]`).getByRole('button', { name: 'Toggle detail' }).click()
+    const detail = page.locator('.agent-progress-detail')
+    await expect(detail).toContainText('Last worker heartbeat: 16:59:58')
+    await expect(detail).toContainText('Last provider event: 16:59:58')
+    await expect(detail).not.toContainText('2026-10-21T16:59:58.000Z')
+  })
 })
 
 test('updates activity without detaching rows or collapsing provider reasoning', async ({ page }) => {

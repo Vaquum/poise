@@ -331,13 +331,13 @@ function progressText(e: LogEntry): string {
   return `${label} · ${relFromMs(Date.parse(p.phase_started_at))} in stage`
 }
 
-function progressDetail(e: LogEntry): string {
+function progressDetail(e: LogEntry, zone: string = effectiveTimezone(), now: number = Date.now()): string {
   const p = e.progress
   if (!p) return ''
   const live = isRunning(e)
-  const heartbeat = live ? `Worker heartbeat ${relFromMs(Date.parse(p.heartbeat_at))} ago` : `Last worker heartbeat: ${p.heartbeat_at}`
+  const heartbeat = live ? `Worker heartbeat ${relFromMs(Date.parse(p.heartbeat_at))} ago` : `Last worker heartbeat: ${logTime(p.heartbeat_at, zone, now)}`
   const provider = p.last_provider_event_at
-    ? (live ? `Last provider event ${relFromMs(Date.parse(p.last_provider_event_at))} ago` : `Last provider event: ${p.last_provider_event_at}`)
+    ? (live ? `Last provider event ${relFromMs(Date.parse(p.last_provider_event_at))} ago` : `Last provider event: ${logTime(p.last_provider_event_at, zone, now)}`)
     : 'No provider event received'
   let deadline = ''
   if (live && p.deadline_at) {
@@ -346,7 +346,7 @@ function progressDetail(e: LogEntry): string {
   }
   const facts = [heartbeat, provider, deadline].filter(Boolean).map(escapeHtml).join(' · ')
   const warning = `<p class="agent-response-error"${p.warning ? '' : ' hidden'}>${escapeHtml(p.warning || '')}</p>`
-  const events = p.events.map((event) => `<li><time datetime="${escapeHtml(event.at)}">${escapeHtml(logTime(event.at, effectiveTimezone(), Date.now()))}</time> ${escapeHtml(event.message)}</li>`).join('')
+  const events = p.events.map((event) => `<li><time datetime="${escapeHtml(event.at)}">${escapeHtml(logTime(event.at, zone, now))}</time> ${escapeHtml(event.message)}</li>`).join('')
   return `<section class="agent-progress-detail" aria-label="Run activity"><p>${facts}</p>${warning}<ol>${events}</ol>${reasoningDetail(e)}</section>`
 }
 
