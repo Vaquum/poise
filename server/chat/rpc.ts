@@ -402,6 +402,9 @@ export class StdioRpc extends EventEmitter {
     }
     const id = message.id
     const key = `${typeof id}:${String(id)}`
+    // A recorded response proves this request already ran. Suppress the
+    // handler itself, including filesystem writes and delayed responses.
+    if (this.replaying && this.respondedBeforeRestart.has(key)) return
     if (this.inbound.has(key)) {
       this.emit('duplicate-request', id)
       this.respondError(id, { code: -32600, message: `request id ${String(id)} is already in flight` })

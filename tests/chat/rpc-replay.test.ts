@@ -103,6 +103,46 @@ describe('StdioRpc replay', () => {
     expect(out).toContain('"held":false')
   })
 
+  it('does not repeat a completed filesystem write or send its delayed response after LIVE', async () => {
+    const { rpc, receive, written } = fixture()
+    let content = 'newer agent edit'
+    let writes = 0
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    rpc.onRequest('fs/write_text_file', async () => {
+      writes++
+      await held
+      content = 'old recorded content'
+      return {}
+    })
+    rpc.beginReplay(OUTBOUND)
+    receive({ jsonrpc: '2.0', id: 7, method: 'fs/write_text_file', params: { content: 'old recorded content' } })
+    await new Promise(resolve => setImmediate(resolve))
+    rpc.endReplay()
+    release()
+    await new Promise(resolve => setImmediate(resolve))
+    expect(writes).toBe(0)
+    expect(content).toBe('newer agent edit')
+    expect(written.join('')).toBe('')
+  })
+
+  it('finishes an unacknowledged replayed handler after LIVE and accepts a fresh live reuse of a completed id', async () => {
+    const { rpc, receive, written } = fixture()
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    let calls = 0
+    rpc.onRequest('ask', async () => { calls++; await held; return 'answer' })
+    rpc.beginReplay(OUTBOUND)
+    receive({ jsonrpc: '2.0', id: 9, method: 'ask' })
+    await new Promise(resolve => setImmediate(resolve))
+    rpc.endReplay()
+    receive({ jsonrpc: '2.0', id: 7, method: 'ask' })
+    release()
+    await new Promise(resolve => setImmediate(resolve))
+    expect(calls).toBe(2)
+    expect(written.join('').split('\n').filter(Boolean).map(line => JSON.parse(line).id).sort()).toEqual([7, 9])
+  })
+
   it('hands orphan responses to the adapter with their message', async () => {
     const { rpc, receive } = fixture()
     rpc.beginReplay(OUTBOUND)
