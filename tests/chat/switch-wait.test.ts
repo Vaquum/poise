@@ -255,6 +255,30 @@ describe('the switch bound', () => {
     }
   })
 
+  it('keeps waited prompts in arrival order when the restart is refused', async () => {
+    const w = await world()
+    const timer = new FakeTimer()
+    const restart = vi.fn(() => false)
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: () => {}, releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => 5_000_000,
+    })
+    try {
+      service.switchRelease('r2')
+      for (const text of ['First', 'Second', 'Third']) {
+        expect(w.runtime.prompt(w.s.id, input(text))).toHaveProperty('waitId')
+      }
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      await until(() => w.turns(w.s.id).length === 3)
+      expect(w.c.calls.map(call => call.input.text)).toEqual(['First', 'Second', 'Third'])
+      expect(w.runtime.switchPending).toBeNull()
+      expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([])
+    } finally {
+      service.reset()
+    }
+  })
+
   it('cancels a turn still running past the bound and restarts; after the restart its session gets exactly one continue prompt on its resumed native session', async () => {
     const w = await world({ auto: false })
     w.runtime.prompt(w.s.id, input('Keep working'))
@@ -335,20 +359,25 @@ describe('the switch bound', () => {
     w.c.auto = false
     for (const agent of agents) w.runtime.prompt(ids.get(agent)!, input(`Interrupted ${agent} work`))
     expect(agents.map(agent => storage.getOpenTurn(ids.get(agent)!)).every(open => open !== null)).toBe(true)
-    const { service } = await expired(w)
+    // Exercise cancellation after native work has started, not only while
+    // every interrupted turn is still waiting for the shared checkout.
+    await until(() => w.c.calls.length > agents.length)
+    const { service, restart } = await expired(w)
     try {
       for (const agent of agents) await until(() => w.turns(ids.get(agent)!).length === 2)
       for (const agent of agents) {
         expect(w.turns(ids.get(agent)!).map(t => (t.event as { stopReason: string }).stopReason)).toEqual(['end_turn', 'cancelled'])
       }
+      await until(() => restart.mock.calls.length === 1)
+      const callsBeforeResume = w.c.calls.length
       w.c.auto = true
       const next = w.make()
       await next.recover()
       // At least: the four continues run concurrently and two prompts can land
       // between polls. Exactness is pinned below instead of in the wait.
-      await until(() => w.c.calls.length >= 8, 100_000)
-      expect(w.c.calls).toHaveLength(8)
-      expect(w.c.calls.slice(4).map(call => call.input.text)).toEqual([
+      await until(() => w.c.calls.length >= callsBeforeResume + agents.length, 100_000)
+      expect(w.c.calls).toHaveLength(callsBeforeResume + agents.length)
+      expect(w.c.calls.slice(callsBeforeResume).map(call => call.input.text)).toEqual([
         'Poise restarted for an update while your turn was running. Continue where you left off.',
         'Poise restarted for an update while your turn was running. Continue where you left off.',
         'Poise restarted for an update while your turn was running. Continue where you left off.',

@@ -30,7 +30,7 @@ const iso = (value: string | null | undefined): boolean => value == null || (typ
 const safeId = (value: number): boolean => Number.isSafeInteger(value) && value > 0
 const recordOf = (row: Row): LedgerRecord => JSON.parse(row.payload) as LedgerRecord
 const encodedBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value))
-const emptyHealth = (): LedgerHealth => ({ status: 'unavailable', coverageStart: null, observedAt: null, callerObservedAt: null,
+const emptyHealth = (): LedgerHealth => ({ status: 'unavailable', unavailableReason: null, coverageStart: null, observedAt: null, callerObservedAt: null,
   pending: 0, dropped: 0, gaps: [], generation: null, retainedFrom: null, changeLowerBound: null, lastSequence: null, instances: null, changes: null })
 
 /** Synchronous I/O belongs exclusively to the observer worker. */
@@ -53,10 +53,27 @@ export class BehaviorLedgerStore {
     this.journalPath = path === ':memory:' ? null : path + '.coverage.json'
     this.loadJournal()
     this.data.coverageStart ??= this.time()
+    this.openDatabase()
+    this.persistJournal(this.currentHealth())
+  }
+
+  private lastOpenAttempt = 0
+
+  private ensureOpen(): void {
+    // A failed open retries on later operations so the ledger recovers by
+    // itself once storage is back; attempts stay at most one per second.
+    if (this.db || this.closed) return
+    const now = this.now()
+    if (now - this.lastOpenAttempt < 1000) return
+    this.lastOpenAttempt = now
+    this.openDatabase()
+  }
+
+  private openDatabase(): void {
     try {
       if (!Object.values(this.policy).every((n) => Number.isSafeInteger(n) && n > 0)) throw new Error('Invalid ledger policy')
-      if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
-      this.db = new Database(path, { timeout: 0 })
+      if (this.path !== ':memory:') mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 })
+      this.db = new Database(this.path, { timeout: 0 })
       this.db.pragma('busy_timeout = 0')
       const existingMeta = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_meta'").get()
       if (existingMeta) {
@@ -70,7 +87,7 @@ export class BehaviorLedgerStore {
       this.db.pragma('cache_size = -2048')
       const page = this.db.pragma('page_size', { simple: true }) as number
       this.db.pragma(`max_page_count = ${Math.floor(this.policy.maxPagesBytes / page)}`)
-      if (path !== ':memory:') chmodSync(path, 0o600)
+      if (this.path !== ':memory:') chmodSync(this.path, 0o600)
       this.db.exec(`CREATE TABLE IF NOT EXISTS ledger_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ledger_instances (
           creation_seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,parent_id TEXT,
@@ -106,10 +123,10 @@ export class BehaviorLedgerStore {
       })()
       this.data.observedAt = this.time()
     } catch {
+      // No gap: a failed open holds captures for retry instead of losing
+      // them, and health names the cause until the store reopens.
       this.db?.close(); this.db = null
-      this.gap('unavailable')
     }
-    this.persistJournal()
   }
 
   private time(): string { return new Date(this.now()).toISOString() }
@@ -141,11 +158,11 @@ export class BehaviorLedgerStore {
       if (!prior.closed) this.gap('unclean_restart')
     } catch { this.gap('unavailable'); this.journalAvailable = false }
   }
-  private persistJournal(): void {
+  private persistJournal(health: LedgerHealth): void {
     if (!this.journalPath) return
     const temporary = this.journalPath + '.' + this.epoch + '.tmp'
     try {
-      const journal: Journal = { version: 1, epoch: this.epoch, closed: this.closed, health: this.health() }
+      const journal: Journal = { version: 1, epoch: this.epoch, closed: this.closed, health }
       const payload = JSON.stringify(journal)
       if (Buffer.byteLength(payload) > 8192) throw new Error('Ledger coverage limit')
       writeFileSync(temporary, payload, { mode: 0o600 })
@@ -153,12 +170,15 @@ export class BehaviorLedgerStore {
       this.journalAvailable = true
     } catch { this.journalAvailable = false }
   }
-  loss(count = 1): void { this.gap('capture_loss', count); this.persistJournal() }
+  loss(count = 1): void { this.gap('capture_loss', count); this.persistJournal(this.currentHealth()) }
 
   capture(observation: LedgerObservation): void {
+    // A failed capture stays unaccounted here: storage failures are held for
+    // retry by the observer, and poison is shed with loss accounting there.
+    this.ensureOpen()
     try {
       if (observation.type === 'loss') {
-        if (!Number.isSafeInteger(observation.count) || observation.count < 1) throw new Error('Invalid loss count')
+        if (!Number.isSafeInteger(observation.count) || observation.count < 1) throw new LedgerError(400, 'invalid_observation')
         this.loss(observation.count); return
       }
       this.connection().transaction(() => {
@@ -169,8 +189,7 @@ export class BehaviorLedgerStore {
         this.prune()
       })()
       this.data.observedAt = this.time()
-    } catch (error) { this.loss(); throw error }
-    finally { this.persistJournal() }
+    } finally { this.persistJournal(this.currentHealth()) }
   }
 
   private validateAdmission(input: LedgerAdmission): void {
@@ -182,11 +201,11 @@ export class BehaviorLedgerStore {
       || ![ `poise:${input.behavior}`, 'poise:manual-review', 'poise:replay' ].includes(input.source)
       || (input.source === 'poise:manual-review' && input.behavior !== 'review-new-prs')
       || (input.source === 'poise:replay' && DIRECT.has(input.behavior))
-      || (input.slot !== undefined && !SLOTS.includes(input.slot))) throw new Error('Invalid ledger admission')
+      || (input.slot !== undefined && !SLOTS.includes(input.slot))) throw new LedgerError(400, 'invalid_observation')
     if (input.plannedSlots && (input.plannedSlots.length > 3 || new Set(input.plannedSlots).size !== input.plannedSlots.length
-      || input.plannedSlots.some((slot) => !SLOTS.includes(slot)))) throw new Error('Invalid ledger slots')
+      || input.plannedSlots.some((slot) => !SLOTS.includes(slot)))) throw new LedgerError(400, 'invalid_observation')
     if (input.workflow && (!safeId(input.workflow.id) || !safeId(input.workflow.runId) || !safeId(input.workflow.attempt)
-      || !/^[a-z_]{1,64}$/.test(input.workflow.event))) throw new Error('Invalid workflow identity')
+      || !/^[a-z_]{1,64}$/.test(input.workflow.event))) throw new LedgerError(400, 'invalid_observation')
   }
   private admit(input: LedgerAdmission): void {
     this.validateAdmission(input)
@@ -194,7 +213,7 @@ export class BehaviorLedgerStore {
     if (existing) {
       const record = recordOf(existing)
       if (record.behavior !== input.behavior || record.target.repository !== input.repository || record.target.number !== input.number
-        || record.source !== input.source || record.actor !== input.actor || record.head !== input.head) throw new Error('Conflicting ledger attempt')
+        || record.source !== input.source || record.actor !== input.actor || record.head !== input.head) throw new LedgerError(400, 'invalid_observation')
       return
     }
     let root = this.connection().prepare('SELECT * FROM ledger_instances WHERE admission_key=?').get(input.admissionKey) as Row | undefined
@@ -213,7 +232,7 @@ export class BehaviorLedgerStore {
     }
     const parent = recordOf(root)
     if (parent.behavior !== input.behavior || parent.source !== input.source || parent.target.repository !== input.repository
-      || parent.target.number !== input.number || parent.owner !== input.owner) throw new Error('Conflicting ledger admission')
+      || parent.target.number !== input.number || parent.owner !== input.owner) throw new LedgerError(400, 'invalid_observation')
     const direct = DIRECT.has(input.behavior)
     const record: LedgerRecord = { ...parent, id: hash(), kind: 'attempt', parentId: parent.id, head: input.head,
       slot: direct ? null : input.slot ?? 'primary', actor: input.actor, plannedSlots: [], state: direct ? 'running' : 'pending', stateSource: 'native', activity: direct ? 'running' : 'unknown', outcome: null,
@@ -231,7 +250,7 @@ export class BehaviorLedgerStore {
   }
   private checkRecord(record: LedgerRecord): void {
     if (encodedBytes(record.target) > 512 || encodedBytes(record) > 4096 || record.refs.length > 8
-      || record.refs.some((ref) => encodedBytes(ref) > 256)) throw new Error('Ledger record exceeds its bound')
+      || record.refs.some((ref) => encodedBytes(ref) > 256)) throw new LedgerError(400, 'invalid_observation')
   }
   private put(record: LedgerRecord, row: Row, force = false, nativeOverride = row.native_override, sourceAt = row.source_at): void {
     const before = recordOf(row)
@@ -258,13 +277,13 @@ export class BehaviorLedgerStore {
     if (refs.length > 8 || refs.some((ref) => !['caller', 'correlation', 'review', 'comment', 'workflow', 'intent', 'logging'].includes(ref.kind)
       || !['available', 'unavailable', 'unknown'].includes(ref.availability) || typeof ref.identity !== 'string'
       || !/^[A-Za-z0-9][A-Za-z0-9._:#/-]{0,159}$/.test(ref.identity) || encodedBytes(ref) > 256
-      || (ref.kind === 'caller' && !CALL.test(ref.identity)))) throw new Error('Invalid ledger reference')
+      || (ref.kind === 'caller' && !CALL.test(ref.identity)))) throw new LedgerError(400, 'invalid_observation')
   }
   private result(input: LedgerResult): void {
     if (!NATIVE.test(input.nativeId) || !LEDGER_STATES.includes(input.state)
       || !['running', 'settled', 'unknown'].includes(input.activity)
       || (input.outcome != null && !OUTCOMES.has(input.outcome)) || (input.callId && !CALL.test(input.callId))
-      || (input.head != null && !SHA.test(input.head)) || !iso(input.completedAt)) throw new Error('Invalid ledger result')
+      || (input.head != null && !SHA.test(input.head)) || !iso(input.completedAt)) throw new LedgerError(400, 'invalid_observation')
     if (input.refs) this.validateRefs(input.refs)
     const row = this.row(input.nativeId)
     if (!row) return
@@ -282,7 +301,7 @@ export class BehaviorLedgerStore {
   }
 
   private caller(input: LedgerCaller): void {
-    if (!NATIVE.test(input.nativeId) || (input.callId !== null && !CALL.test(input.callId))) throw new Error('Invalid Caller identity')
+    if (!NATIVE.test(input.nativeId) || (input.callId !== null && !CALL.test(input.callId))) throw new LedgerError(400, 'invalid_observation')
     const row = this.row(input.nativeId)
     if (!row) return
     const record = recordOf(row)
@@ -425,6 +444,17 @@ export class BehaviorLedgerStore {
     })
   }
   health(): LedgerHealth {
+    this.ensureOpen()
+    const health = this.currentHealth()
+    // Reads alone must observe recovery: re-probe the journal while it is down.
+    if (!this.journalAvailable) {
+      this.persistJournal(health)
+      if (this.journalAvailable) return this.currentHealth()
+    }
+    return health
+  }
+
+  private currentHealth(): LedgerHealth {
     if (this.db && !this.closed && this.initialized) {
       try {
         const usage = this.usage()
@@ -433,12 +463,14 @@ export class BehaviorLedgerStore {
         this.data.retainedFrom = first.first
         this.data.changeLowerBound = Number(this.meta('change_floor'))
         this.data.lastSequence = this.lastSequence()
-      } catch { return { ...this.data, status: 'unavailable', gaps: [...this.data.gaps] } }
+      } catch { return { ...this.data, status: 'unavailable', unavailableReason: 'store_unavailable', gaps: [...this.data.gaps] } }
     }
     const stale = !this.data.observedAt || this.now() - Date.parse(this.data.observedAt) > LEDGER_STALE_MS
     const status: LedgerHealth['status'] = this.closed ? 'stopped' : !this.db || !this.journalAvailable ? 'unavailable'
       : stale ? 'stale' : this.data.dropped > 0 || this.data.gaps.length > 0 ? 'incomplete' : 'ok'
-    return { ...this.data, status, gaps: [...this.data.gaps] }
+    const unavailableReason = this.closed || status !== 'unavailable' ? null
+      : !this.db ? 'store_unavailable' : !this.journalAvailable ? 'journal_unavailable' : 'store_unavailable'
+    return { ...this.data, status, unavailableReason, gaps: [...this.data.gaps] }
   }
   private lastSequence(): number {
     const row = this.connection().prepare("SELECT seq FROM sqlite_sequence WHERE name='ledger_changes'").get() as { seq: number } | undefined
@@ -468,6 +500,7 @@ export class BehaviorLedgerStore {
     }
   }
   read(request: LedgerRead): { status: number; body: LedgerReply } {
+    this.ensureOpen()
     const envelope = (extra: Omit<LedgerReply, 'version' | 'health'> = {}): LedgerReply => ({ version: 1, health: this.health(), ...extra })
     if (request.operation === 'health') return { status: 200, body: envelope() }
     try {
@@ -511,7 +544,7 @@ export class BehaviorLedgerStore {
   close(): void {
     if (this.closed) return
     this.closed = true
-    this.persistJournal()
+    this.persistJournal(this.currentHealth())
     this.db?.close()
     this.db = null
   }

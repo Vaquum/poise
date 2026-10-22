@@ -78,6 +78,9 @@ export interface BranchBinding {
 export interface QueuedMessage {
   /** Validated attachment/mention provenance across an isolated Poise handoff. */
   sourceSessionId?: string
+  /** Actor whose deferred steer this row continues; dispatched as source
+   *  data under that actor, never as the person's request. */
+  source?: ChatActor | PoiseActor
   id: string
   prompt: PromptInput
   agent: AgentId
@@ -296,8 +299,9 @@ export interface ChatActor { kind: 'chat', sessionId: string, title: string, rol
 /** Poise itself acting on a chat: supervision, the work monitor, or a relay. */
 export interface PoiseActor { kind: 'poise', name: string }
 /** What started a turn the person did not start: a chat or Poise, delivered
- *  through the control inbox. `seq` is the delivered inbox row. */
-export type TurnSource = (ChatActor | PoiseActor) & { seq: number }
+ *  through the control inbox. `seq` is the delivered inbox row, absent when
+ *  the turn continues a deferred steer rather than an inbox delivery. */
+export type TurnSource = (ChatActor | PoiseActor) & { seq?: number }
 
 export interface Attachment {
   /** Server-issued id; the record behind it is what a prompt is checked against. */
