@@ -1411,7 +1411,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
         internalItems: new Set(),
         pending: new Set(),
         finishing: false,
-        steers: new Set(),
+        steers: new Map(),
         nativeIds: [],
         endedNativeIds: new Set(),
         cancellationRequests: new Map(),
