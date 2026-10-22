@@ -69,8 +69,12 @@ Without `--resume`, initialization still clears and rebuilds the index.
 Incremental sync batches the first issue/PR probe for up to 20 repositories per
 GraphQL request. Subsequent pages share requests across up to 20 independent
 issue/PR connections, using each connection's own returned cursor. Every page
-and complete association graph is still read; total-count, identity and cursor
-checks still reject incomplete enumeration.
+and complete association graph is still read. When upstream changes while a
+connection is paged, the reader discards the partial pass and restarts that
+enumeration from its first page with the original watermark, up to three
+attempts; persistent drift still fails the sync without advancing freshness.
+Identity, cursor, missing-item and backward-timestamp checks still reject on
+the first attempt.
 A primary quota failure raises `GitHubRateLimitError` with `reset_at` (Unix seconds)
 and `GITHUB_RATE_LIMIT_RESET=<seconds>` in the CLI error. Callers must wait until
 that deadline before retrying; the CLI does not sleep through a quota window.

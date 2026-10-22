@@ -58,7 +58,10 @@ async def preflight(client: GitHubClient, owner: str, repo: str, number: int, he
     if not eligible_run(workflow, run_id, attempt, head, number):
         return "not_ready"
     # Verify the exact attempt, including every matrix job, before rerunning
-    # a whole workflow. Failures and active jobs are never swept into recovery.
+    # a whole workflow. Active or unknown jobs are never swept into recovery.
+    # A failed job beside an interrupted one is collateral: rollup jobs fail
+    # *because* a sibling was cancelled, so the run still needs a rerun. A run
+    # whose jobs show no interruption merely failed and is left alone.
     page = 1
     jobs = []
     while True:
@@ -76,8 +79,10 @@ async def preflight(client: GitHubClient, owner: str, repo: str, number: int, he
         page += 1
     if any(job.get("run_id") != run_id or job.get("run_attempt") != attempt
                        or job.get("status") != "completed"
-                       or job.get("conclusion") not in {"success", "skipped", "neutral", *GREY_CONCLUSIONS}
+                       or job.get("conclusion") not in {"success", "skipped", "neutral", "failure", *GREY_CONCLUSIONS}
                        for job in jobs):
+        return "not_ready"
+    if jobs and not any(job.get("conclusion") in GREY_CONCLUSIONS for job in jobs):
         return "not_ready"
     # Changes between discovery and mutation refuse the operation, including
     # a manually started rerun of this same workflow.

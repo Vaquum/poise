@@ -642,6 +642,25 @@ test('shows a failed behavior and its diagnostic as one entry, and counts it on 
   await expect(rail(page).locator('.nr-card')).toHaveCount(2)
 })
 
+test('shows a quota-exhausted check as automatic with its reset, not a repository-access warning', async ({ page }) => {
+  const error = 'Command failed (1): github-interface: GitHub 403 rate-limit '
+    + '{\'x-ratelimit-resource\': \'core\', \'x-ratelimit-remaining\': \'0\', \'x-ratelimit-reset\': \'1800000000\'}: '
+    + 'API rate limit exceeded for user ID 42.'
+  await workspace(page, [], { diagnostics: diagnostics({ failures: [{ behavior: 'approve-prs', target: 'acme/api#9:check',
+    kind: 'operation', consecutiveFailures: 3, lastFailureAt: iso(0), nextRetryAt: iso(0), error,
+    diagnostic: { severity: 'info', code: 'rate_limit' } }] }) })
+  await page.goto('/')
+  await openRail(page)
+  const automatic = rail(page).getByRole('region', { name: 'Handled automatically' })
+  await expect(automatic).toContainText('The service is limiting requests. Poise will try again.')
+  await expect(rail(page)).not.toContainText('check repository access')
+  const entry = automatic.locator('.nr-card').filter({ hasText: 'limiting requests' }).first()
+  await entry.locator('.nr-card-head').click()
+  await expect(entry.locator('.nr-card-head')).toHaveAttribute('aria-expanded', 'true')
+  await expect(entry.locator('.nr-history')).toContainText('API rate limit exceeded for user ID 42.')
+  await expect(entry.locator('.nr-history')).toContainText('1800000000')
+})
+
 test('counts Behaviors’ diagnostics on the bell once the page has settled, with one read and the rail closed', async ({ page }) => {
   await workspace(page, [WAITING], { diagnostics: diagnostics({ agentLogsError: 'agent-interface --logs exited with status 1' }) })
   let reads = 0

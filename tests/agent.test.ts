@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
+  diagnostic: vi.fn(),
   runFile: vi.fn(),
   models: {} as Record<string, { default: string, fallback: string }>,
   agentAccount: 'bit-mis',
@@ -20,6 +21,10 @@ vi.mock('../server/settings', () => ({
 vi.mock('../server/behavior-ledger', () => ({
   captureBehaviorAdmission: mocks.captureAdmission, captureBehaviorOutcome: mocks.captureOutcome,
   observeAgentSnapshot: mocks.observeSnapshot, behaviorLedgerHeartbeat: vi.fn(),
+}))
+
+vi.mock('../server/logging', () => ({
+  diagnostic: mocks.diagnostic,
 }))
 
 vi.mock('../server/process', () => ({
@@ -70,6 +75,7 @@ function logRow(overrides: Record<string, unknown> = {}): Record<string, unknown
 
 beforeEach(() => {
   mocks.captureAdmission.mockClear(); mocks.captureOutcome.mockClear(); mocks.observeSnapshot.mockClear()
+  mocks.diagnostic.mockClear()
 })
 
 describe('agent log compatibility', () => {
@@ -82,6 +88,25 @@ describe('agent log compatibility', () => {
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
     expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs'])
     expect(mocks.captureAdmission).not.toHaveBeenCalled()
+    expect(mocks.diagnostic).not.toHaveBeenCalled()
+  })
+
+  // Every --logs read still dumps the whole Caller log, and the 32 MiB
+  // runFile cap fails all of them at once. A read past 75% of the cap warns
+  // into the workspace diagnostics, at most hourly, and still resolves.
+  it('warns once as --logs nears the read cap, and still resolves', async () => {
+    const huge = logRow({ prompt: 'x'.repeat(25 * 1024 * 1024) })
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([huge]), stderr: '' })
+    const first = await fetchAgentLogSnapshot()
+    const second = await fetchAgentLogSnapshot()
+    expect(first.entries).toHaveLength(1)
+    expect(second.entries).toHaveLength(1)
+    expect(mocks.diagnostic).toHaveBeenCalledTimes(1)
+    const warning = mocks.diagnostic.mock.calls[0][0]
+    expect(warning).toMatchObject({ level: 'warning', operation: 'agent.logs.cap' })
+    expect(warning.resources).toEqual({ bytes: expect.any(Number), rows: 1, cap: 32 * 1024 * 1024 })
+    expect(warning.resources.bytes).toBeGreaterThan(24 * 1024 * 1024)
+    expect(warning.message).toContain('33554432')
   })
 
   // Fields agent-interface added over time — expected_head, source,
