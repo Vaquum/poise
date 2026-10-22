@@ -35,6 +35,9 @@ interface FakeControls {
   exitAware?: boolean
   /** Makes replayTurn throw: a handoff that must fall back. */
   failReplay?: string
+  /** Hold replay until another server has adopted the same open turn. */
+  replayGate?: Promise<void>
+  failReplayAfterGate?: string
   /** Manual turns resolve with terminate: true. */
   terminateTurns?: boolean
 }
@@ -78,6 +81,8 @@ class FakeAdapter implements Adapter {
     this.controls.replayTurns.push(init)
     this.alive = true
     this.nativeSessionId = init.session.nativeSessionId
+    await this.controls.replayGate
+    if (this.controls.failReplayAfterGate) throw new Error(this.controls.failReplayAfterGate)
     return { stopReason: 'end_turn' as const, usage: { totalTokens: 3 } }
   }
   async steer() {}
@@ -161,6 +166,109 @@ const ofType = (events: ChatEnvelope[], id: string, type: ChatEvent['type']) => 
 const lastStatus = (events: ChatEnvelope[], id: string) => ofType(events, id, 'status.changed').at(-1)?.status
 
 describe('relay handover between servers', () => {
+  async function heldTurn(instance: string) {
+    const first = makeRuntime(instance)
+    first.controls.auto = false
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    first.runtime.prompt(session.id, { text: 'Prime the relay', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    await waitFor(() => worker.pgidAlive(peer.gatePgid))
+    first.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    const { turnId } = first.runtime.prompt(session.id, { text: 'Survive the restart', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    await first.runtime.stop()
+    return { first, session, peer, turnId }
+  }
+
+  it.each(['resolve', 'reject'] as const)('leaves a twice handed-over turn alone when old replay later %ss', async (outcome) => {
+    const instance = `poise-relay-second-restart-${outcome}:db`
+    const { session, peer, turnId } = await heldTurn(instance)
+    const lock = await import('../../server/chat/checkout-lock')
+    let releaseOld = () => {}
+    let releaseCurrent = () => {}
+    const second = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [],
+      replayGate: new Promise<void>((resolve) => { releaseOld = resolve }),
+      ...(outcome === 'reject' ? { failReplayAfterGate: 'old replay detached' } : {}) })
+    const third = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [],
+      replayGate: new Promise<void>((resolve) => { releaseCurrent = resolve }) })
+    const signals = vi.spyOn(worker, 'signalGroup')
+    try {
+      await second.runtime.recover()
+      await waitFor(() => second.controls.replayTurns.length === 1)
+      await second.runtime.stop()
+      await third.runtime.recover()
+      await waitFor(() => third.controls.replayTurns.length === 1)
+      const lease = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance })
+      const ownerToken = lease.read()?.token
+      expect(ownerToken).toBeTruthy()
+      releaseOld()
+      // Drain replay's completion microtasks before inspecting its effects.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(signals).not.toHaveBeenCalled()
+      expect(ofType(second.events, session.id, 'turn.finished')).toEqual([])
+      expect(second.finishes).toEqual([])
+      expect(storage.getOpenTurn(session.id)?.turnId).toBe(turnId)
+      expect(storage.getWorker(session.id)?.gatePgid).toBe(peer.gatePgid)
+      expect(storage.getRelay(session.id)).not.toBeNull()
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
+      expect(lease.read()?.token).toBe(ownerToken)
+      releaseCurrent()
+      await waitFor(() => ofType(third.events, session.id, 'turn.finished').length === 1)
+      expect(ofType(third.events, session.id, 'turn.finished')[0]).toMatchObject({ turnId, stopReason: 'end_turn' })
+      expect(third.finishes).toHaveLength(1)
+    } finally {
+      signals.mockRestore()
+      releaseOld()
+      releaseCurrent()
+    }
+  }, 60_000)
+
+  it('does not terminate a worker adopted between recovery inspection and lease adoption', async () => {
+    const instance = 'poise-relay-adoption-race:db'
+    const { session, peer, turnId } = await heldTurn(instance)
+    const lock = await import('../../server/chat/checkout-lock')
+    // A distinct live PID represents the winning server; the original
+    // server is dead from this holder's point of view, as after a restart.
+    const winner = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance },
+      { hostPid: peer.relayPid, pidAlive: (pid) => pid !== process.pid && worker.pidAlive(pid) })
+    const adopt = lock.CheckoutLease.prototype.adoptLiveWorker
+    const adoption = vi.spyOn(lock.CheckoutLease.prototype, 'adoptLiveWorker').mockImplementationOnce(function (this: InstanceType<typeof lock.CheckoutLease>, expected) {
+      expect(adopt.call(winner, expected)).toBe(true)
+      return adopt.call(this, expected)
+    })
+    const signals = vi.spyOn(worker, 'signalGroup')
+    const second = makeRuntime(instance)
+    try {
+      await second.runtime.recover()
+      await waitFor(() => adoption.mock.calls.length === 1)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      await second.runtime.stop({ handover: false })
+      expect(signals).not.toHaveBeenCalled()
+      expect(second.controls.replayTurns).toEqual([])
+      expect(second.finishes).toEqual([])
+      expect(ofType(second.events, session.id, 'turn.finished')).toEqual([])
+      expect(storage.getOpenTurn(session.id)?.turnId).toBe(turnId)
+      expect(storage.getSession(session.id)?.status).toBe('running')
+      expect(storage.getWorker(session.id)?.gatePgid).toBe(peer.gatePgid)
+      expect(storage.getRelay(session.id)).not.toBeNull()
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
+      expect(winner.read()).toMatchObject({ token: winner.currentToken, host_pid: peer.relayPid, worker_pgid: peer.gatePgid })
+    } finally {
+      adoption.mockRestore()
+      signals.mockRestore()
+      worker.signalGroup(peer.gatePgid, 'SIGKILL')
+      await waitFor(() => !worker.pgidAlive(peer.gatePgid), 10_000)
+      winner.release()
+      storage.forgetWorker(session.id)
+      storage.forgetRelay(session.id)
+      await rm(peer.dir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
   it('keeps a relay-held turn running through a restart', async () => {
     const instance = 'poise-relay-handover:db'
     const first = makeRuntime(instance)

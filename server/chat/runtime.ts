@@ -608,7 +608,24 @@ export class ChatRuntime extends EventEmitter {
       if (record.workspaceKind === 'poise-local' && !isSwitchboardChat(record) && record.role !== 'manager') await this.acquireLocalTurnSlot(session, turn)
       turn.abort.signal.throwIfAborted()
       if (!lease.adoptLiveWorker({ workerPid: worker.gatePid, workerPgid: worker.gatePgid, workerIdent: worker.ident, ownerId: record.id })) {
-        throw new Error('the checkout lease is held by a live server')
+        // Recovery's first holder check preceded async relay inspection. A
+        // server that adopted meanwhile owns the worker and its ending.
+        let transferred = false
+        try {
+          const holder = lease.read()
+          transferred = !!holder && holder.owner_id === record.id && holder.instance === this.instance
+            && holder.host_pid !== this.hostPid && (this.leaseProbes.pidAlive ?? pidAlive)(holder.host_pid)
+        } catch (error) {
+          this.emit('log', `[chat ${record.id.slice(0, 8)}] relay ownership could not be verified; preserving its worker: ${error instanceof Error ? error.message : String(error)}`)
+          transferred = true
+        }
+        if (transferred) {
+          session.relayDetached = true
+          this.releaseLocalTurnSlot(turn)
+          session.turn = null
+          return
+        }
+        throw new Error('the checkout lease could not be adopted')
       }
       session.lease = lease
       lease.onLost(() => {
@@ -672,8 +689,12 @@ export class ChatRuntime extends EventEmitter {
       } finally {
         turn.relayHeld = false
       }
+      // A second restart can hand this adopted turn to the next server
+      // while replay is pending. Its result belongs to that server now.
+      if (session.relayDetached) { this.releaseLocalTurnSlot(turn); session.turn = null; return }
       await this.settleReplayedTurn(session, turn, lease, result)
     } catch (error) {
+      if (session.relayDetached) { this.releaseLocalTurnSlot(turn); session.turn = null; return }
       const cancelled = turn.abort.signal.aborted
       const message = error instanceof Error ? error.message : String(error)
       this.emit('log', `[chat ${record.id.slice(0, 8)}] relay handoff failed (${message}); falling back to interrupt-and-resume`)
