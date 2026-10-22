@@ -240,7 +240,12 @@ function streamSpool(socket, onDone) {
     onDone()
     return
   }
+  // A replacement supersedes any replay still in flight: every byte the
+  // old queue holds was appended before this hello, so the bounded stream
+  // below already covers it — drop the queue or those bytes go out twice.
   replaying = true
+  replayQueue = []
+  replayQueueBytes = 0
   // Bounded to the bytes the hello saw: live chunks appended while this
   // streams travel through the replay queue instead, so no byte goes out
   // twice. (This runs in one tick with the stat above, so nothing lands
