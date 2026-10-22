@@ -93,8 +93,8 @@ describe('approve-prs cursor rotation', () => {
     expect(addressed).toHaveLength(1)
     expect(batchRequests(addressed[0][1]).map((request) => request.number)).toEqual([20, 21, 22, 17, 18, 19])
     expect(db.getMeta('behavior_approve_prs_cursor')).toBe(`${pr.repo}#19`)
-    expect(mocks.spawnDetached.mock.calls.map(([, args]) => (args as string[])[1])).toEqual(
-      ['#20', '#21', '#22', '#17', '#18', '#19'])
+    expect(mocks.spawnDetached.mock.calls.map(([, args]) => (args as string[])[1]).sort()).toEqual(
+      ['#17', '#18', '#19', '#20', '#21', '#22'])
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   })
 })
@@ -255,6 +255,70 @@ describe('event-loop visibility', () => {
       maxMs: expect.any(Number),
       meanMs: expect.any(Number),
       samples: expect.any(Number),
+      windowStartedAt: expect.any(String),
     })
+  })
+})
+
+describe('batch evidence alignment', () => {
+  it('rejects mismatched records instead of evaluating the wrong pull request', async () => {
+    fixture.listedPrs = openPrs(2)
+    arrangeCli(true)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && args.includes('--requests-json')) {
+        const packet = JSON.parse((await original(command, args, options)).stdout)
+        return {
+          stdout: JSON.stringify({ ...packet, records: [...packet.records].reverse() }),
+          stderr: '',
+        }
+      }
+      return original(command, args, options)
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    const failures = runtime.getBehaviorsRuntimeHealth().failures
+    expect(failures).toHaveLength(2)
+    for (const failure of failures) {
+      expect(failure.error).toMatch(/misaligned batch evidence/)
+    }
+  })
+})
+
+describe('shared discovery failure', () => {
+  it('fails every consumer visibly and recovers on the next scan', async () => {
+    arrangeCli(true)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const original = mocks.runFile.getMockImplementation()!
+    let healthCalls = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-datastore' && args[0] === 'health' && healthCalls++ === 0) {
+        throw new Error('datastore unavailable')
+      }
+      return original(command, args, options)
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    db.setMeta('behavior_resolve_unblocking_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    const failed = runtime.getBehaviorsRuntimeHealth().failures
+    expect(failed.filter((failure) => !failure.target)).toHaveLength(2)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   })
 })

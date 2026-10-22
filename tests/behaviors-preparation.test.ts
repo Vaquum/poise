@@ -106,13 +106,16 @@ describe('provider preparation and authentication', () => {
     await headEntered.promise
     await vi.advanceTimersByTimeAsync(25_000)
     headReady.resolve()
+    // The peer's preparation finishes before the launch checkout: review
+    // claims only after every candidate prepared, so the fast review cannot
+    // reach its launch checkout while the peer is still preparing.
+    slow.resolve({})
     await checkoutEntered.promise
     await vi.advanceTimersByTimeAsync(16_000)
     const competing = db.claimPrOperationOwned(`${fastPr!.repo}#${fastPr!.number}`, 65_000)
     if (competing) db.releasePrOperationOwned(competing)
     await vi.advanceTimersByTimeAsync(9_000)
     checkoutReady.resolve()
-    slow.resolve({})
     await cycle
     expect(competing).toBeNull()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)

@@ -9,6 +9,11 @@ MAX_REQUESTS = 50
 # One client's reads run together; a small bound keeps one slow pull request
 # from stalling the batch while sharing the process and its connection setup.
 BATCH_CONCURRENCY = 5
+# Each record settles on its own budget: a hung read becomes that record's
+# error instead of killing the batch envelope with every completed sibling.
+# Ten requests over five workers settle in two waves, inside the enclosing
+# 30 s CLI budget with interpreter startup to spare.
+REQUEST_TIMEOUT = 10
 
 
 def read_requests(payload: dict[str, Any], extra: tuple[str, ...] = ()) -> list[dict[str, Any]]:
@@ -45,7 +50,13 @@ async def run_batch(
     async def guarded(request: dict[str, Any]) -> dict[str, Any]:
         async with semaphore:
             try:
-                return {**await read(request), "error": None}
+                return {**await asyncio.wait_for(read(request), REQUEST_TIMEOUT), "error": None}
+            except TimeoutError:
+                return {
+                    "repository": request["repository"],
+                    "pull_number": request["number"],
+                    "error": f"request timed out after {REQUEST_TIMEOUT} seconds",
+                }
             except Exception as error:
                 message = str(error).strip() or type(error).__name__
                 return {"repository": request["repository"], "pull_number": request["number"], "error": message}

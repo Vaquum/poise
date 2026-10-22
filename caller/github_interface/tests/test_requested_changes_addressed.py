@@ -1,3 +1,4 @@
+import asyncio
 from copy import deepcopy
 from io import StringIO
 import json
@@ -6,6 +7,7 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
 from github_interface import cli
+from github_interface.atoms import request_batch
 from github_interface.behaviors import requested_changes_addressed
 from github_interface.behaviors.request_changes import REAFFIRM_BODY
 
@@ -136,6 +138,8 @@ class BatchFakeClient:
     async def get(self, path):
         self.calls.append(path)
         state = self.pulls[self._number(path)]
+        if state.get("hang"):
+            await asyncio.sleep(30)
         if state.get("fail"):
             raise RuntimeError("GitHub 500: boom")
         return {"user": {"login": "author"}, "head": {"sha": HEAD}}
@@ -198,6 +202,17 @@ class TestRequestedChangesAddressedBatch(IsolatedAsyncioTestCase):
         self.assertEqual(records[1]["repository"], "owner/repo")
         self.assertEqual(records[1]["pull_number"], 8)
         self.assertEqual(records[1]["error"], "GitHub 500: boom")
+
+    async def test_slow_pr_times_out_while_its_sibling_completes(self):
+        client = self.client()
+        client.pulls[8]["hang"] = True
+        with patch.object(request_batch, "REQUEST_TIMEOUT", 0.05):
+            result = await requested_changes_addressed.run(client, batch_payload([7, 8]))
+        records = result["records"]
+        self.assertIsNone(records[0]["error"])
+        self.assertTrue(records[0]["has_change_request"])
+        self.assertEqual(records[1]["pull_number"], 8)
+        self.assertIn("timed out", records[1]["error"])
 
     async def test_empty_batch_reads_nothing(self):
         client = self.client()

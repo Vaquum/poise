@@ -918,13 +918,18 @@ function completeOwnedClaim(behavior: ActiveClaim['behavior'], target: string, c
 export const BEHAVIOR_REGISTRATION_GRACE_MS = 5 * 60_000
 const BEHAVIOR_CLAIM_RENEWAL_MS = 2 * 60 * 60_000
 const PR_OPERATION_EVALUATION_LEASE_MS = 65_000
-// One behavior tick's per-PR reads stay inside the CLI budget: evidence
-// batches of ten fit the 30 s CLI budget under load, and review preparation
-// runs a small pool instead of fanning out over every candidate at once.
+// One behavior tick's per-PR work stays inside the CLI budget: evidence
+// batches of ten fit the 30 s CLI budget under load, and preparation and
+// approval launches run in small pools instead of fanning out over every
+// candidate at once.
 export const PR_READ_BATCH_SIZE = 10
 export const REVIEW_PREPARE_CONCURRENCY = 5
+export const APPROVE_FIRE_CONCURRENCY = 3
 // Organizations start their ticks apart so their CLI bursts don't serialize
-// on the main thread at the same minute boundary.
+// on the main thread at the same minute boundary. The total spread stays
+// well under the minute: release switching needs a quiet interval with no
+// background work every minute, and short post-batch sweeps leave most of
+// it empty.
 export const BEHAVIOR_ORG_STAGGER_MS = 5_000
 const PR_OPERATION_WAIT_MS = 10_000
 const PR_OPERATION_RETRY_MS = 50
@@ -1827,7 +1832,12 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
   const shared = sharedPrListing.getStore()
   if (shared && (shared.promise === null || shared.author === author)) {
     shared.author = author
-    return (shared.promise ??= readOpenPrsByAuthor(author))
+    // Each waiter keeps its own abort: a consumer whose deadline expires
+    // stops waiting while the read continues for the rest. No refcount is
+    // needed because the shared read carries its own 30 s CLI budget, which
+    // always settles strictly inside every 55 s sweep deadline, so the read
+    // can never still be pending when a waiter aborts.
+    return waitForBehavior((shared.promise ??= readOpenPrsByAuthor(author)))
   }
   return readOpenPrsByAuthor(author)
 }
@@ -3410,7 +3420,9 @@ async function tickApprovePrs(): Promise<void> {
           }
         }
       }
-      for (const launch of launches) {
+      // Launches run in a small pool: preparations overlap the way the
+      // provider layer expects, while the sweep stays bounded.
+      await forEachPool(launches, APPROVE_FIRE_CONCURRENCY, async (launch) => {
         if (!isEnabled('approve-prs') || behaviorAborted()) return
         const { pr, expectedHead, seenTarget, firedReason, admittedReviewer } = launch
         const prTarget = `${pr.repo}#${pr.number}`
@@ -3419,14 +3431,14 @@ async function tickApprovePrs(): Promise<void> {
         let launched = false
         let checked = false
         try {
-          if (hasActiveAgentLaunchForPr(pr.repo, pr.number)) continue
+          if (hasActiveAgentLaunchForPr(pr.repo, pr.number)) return
           operationId = await claimEligiblePrOperation('approve-prs', prTarget)
           if (!operationId) {
             console.log(`[behaviors] approve-prs deferred for ${prTarget}: PR operation busy`)
-            continue
+            return
           }
-          if (!isEnabled('approve-prs')) continue
-          if (!behaviorRetryDue('approve-prs', seenTarget)) continue
+          if (!isEnabled('approve-prs')) return
+          if (!behaviorRetryDue('approve-prs', seenTarget)) return
           let claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
           let replacesFailedCallId: string | undefined
           if (!claimId) {
@@ -3434,7 +3446,7 @@ async function tickApprovePrs(): Promise<void> {
               const held = getFailedBehaviorLaunch('approve-prs', seenTarget)
               if (!held?.launchCallId || await dismissedApprovalHeld(
                 pr, expectedHead, (await reviewChoice('pr_approve')).model,
-              )) continue
+              )) return
               // Keep the held record until preparation admits a complete new intent.
               replacesFailedCallId = held.launchCallId
               claimId = operationId
@@ -3442,17 +3454,17 @@ async function tickApprovePrs(): Promise<void> {
               const recovered = await releaseFailedBehaviorIfNoAction(
                 'approve-prs', pr.repo, pr.number, seenTarget,
               )
-              if (!recovered) continue
+              if (!recovered) return
               claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
             }
           }
-          if (!claimId) continue
+          if (!claimId) return
           trackClaim('approve-prs', seenTarget, claimId)
           try {
             const accepted = await fireApprove(pr, seenTarget, claimId, expectedHead, admittedReviewer, replacesFailedCallId)
             if (!accepted) {
               releaseOwnedClaim('approve-prs', seenTarget, claimId)
-              continue
+              return
             }
             launched = true
             checked = true
@@ -3471,7 +3483,7 @@ async function tickApprovePrs(): Promise<void> {
           if (checked) clearCheck(checkTarget)
           if (!launched && operationId) releasePrOperationOwned(operationId)
         }
-      }
+      })
     }
     if (failure) throw failure
   } catch (err) {
@@ -3534,12 +3546,17 @@ export function getResolveUnblockingLastFired(): { at: string, target: string } 
   return null
 }
 
-async function resolveNonblockingIfReady(repo: string, number: number): Promise<ResolveResult> {
+// The expected head comes from the pre-check's observed activity, not a
+// separate lookup: the primitive revalidates it against a fresh read at
+// execution time and reports superseded when the head already moved.
+async function resolveNonblockingIfReady(repo: string, number: number, expectedHead: string): Promise<ResolveResult> {
   const [owner, name] = repo.split('/', 2)
+  if (!owner || !name || !Number.isSafeInteger(number) || number < 1) {
+    throw new Error(`invalid GitHub PR identity: ${repo}#${number}`)
+  }
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
   const reviewer = configuredReviewer()
-  const expectedHead = await currentHeadSha(repo, number, reviewer)
   const nativeId = randomUUID()
   captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
     source: 'poise:resolve-unblocking', owner: currentOrganization()?.login ?? null,
@@ -3660,7 +3677,7 @@ async function tickResolveUnblocking(): Promise<void> {
         }
         continue
       }
-      const actionable: DatastorePr[] = []
+      const actionable: { pr: DatastorePr, headSha: string }[] = []
       for (const { pr, result, error } of records) {
         const key = `${pr.repo}#${pr.number}`
         const checkTarget = `${key}:check`
@@ -3675,9 +3692,9 @@ async function tickResolveUnblocking(): Promise<void> {
           if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
           continue
         }
-        actionable.push(pr)
+        actionable.push({ pr, headSha: activity.headSha })
       }
-      for (const pr of actionable) {
+      for (const { pr, headSha } of actionable) {
         if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
         const key = `${pr.repo}#${pr.number}`
         const checkTarget = `${key}:check`
@@ -3692,7 +3709,7 @@ async function tickResolveUnblocking(): Promise<void> {
           // whose repository was just skipped, from starting another resolve.
           if (!isEnabled('resolve-unblocking') || !stillEligible('resolve-unblocking', pr)) continue
           runId = startDirectBehaviorRun('resolve-unblocking')
-          const result = await resolveNonblockingIfReady(pr.repo, pr.number)
+          const result = await resolveNonblockingIfReady(pr.repo, pr.number, headSha)
           if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true)
           else discardDirectBehaviorRun(runId)
           runId = null

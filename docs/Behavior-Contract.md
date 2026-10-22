@@ -142,9 +142,12 @@ evidence in batches of ten over one process per batch, and a per-account
 cursor rotates coverage so a sweep cut short by its deadline resumes beyond
 the blocked batch. One pull request's batch error holds only that target's
 check on the usual backoff; a failed batch holds each of its targets the
-same way. Review preparation runs a small pool, and its checkout provisions
-in the launch phase after the claim, outside the sweep deadline; a checkout
-failure there releases the claim and records a `preflight_failed` outcome.
+same way. Each record settles on its own timeout inside the batch, so one
+hung read cannot take its completed siblings with it. Review preparation
+and approval launches run in small pools instead of one process per pull
+request at once. The review checkout provisions in the launch phase after
+the claim, outside the sweep deadline; a checkout failure there releases
+the claim and records a `preflight_failed` outcome.
 Scheduled ticks start each ready account a few seconds apart so their CLI
 bursts don't collide, and the service health and behavior diagnostics expose
 the current minute window of event-loop delay, where fan-out stalls show up

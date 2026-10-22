@@ -134,8 +134,8 @@ describe('approve-prs under load', () => {
     mocks.runFile.mockImplementation(original)
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(12)
-    expect(mocks.spawnDetached.mock.calls[10]?.[1]).toContain('#27')
-    expect(mocks.spawnDetached.mock.calls[11]?.[1]).toContain('#28')
+    const resumed = mocks.spawnDetached.mock.calls.slice(10).map(([, args]) => args[1])
+    expect(resumed.sort()).toEqual(['#27', '#28'])
   })
 
   it('records a launch failure instead of dropping it when the sweep deadline already expired', async () => {
