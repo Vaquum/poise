@@ -38,6 +38,34 @@ describe('what the settings model accepts', () => {
     expect(() => setSettings({ org: 'trailing-' })).toThrow(/GitHub name/)
   })
 
+  it('refuses consecutive hyphens in your account and the agent account, naming the single-hyphen rule', () => {
+    expect(() => setSettings({ me: 'a--b' })).toThrow(/single hyphens/)
+    expect(() => setSettings({ agentAccount: 'x--y' })).toThrow(/single hyphens/)
+    expect(() => setSettings({ me: '  a--b  ' })).toThrow(/single hyphens/)
+    expect(() => setSettings({ agentAccount: 'A--B' })).toThrow(/single hyphens/)
+  })
+
+  it('still saves single-hyphen, single-character and 39-character account names', () => {
+    expect(setSettings({ me: 'a-b' }).me).toBe('a-b')
+    expect(setSettings({ me: 'a' }).me).toBe('a')
+    expect(setSettings({ me: 'a'.repeat(39) }).me).toBe('a'.repeat(39))
+    expect(setSettings({ agentAccount: 'ab-cd-ef' }).agentAccount).toBe('ab-cd-ef')
+    expect(() => setSettings({ me: 'a'.repeat(40) })).toThrow(/GitHub name/)
+  })
+
+  it('keeps the legacy org on the shape check, so a stored value cannot brick Settings saves', () => {
+    expect(setSettings({ org: 'a--b' }).org).toBe('a--b')
+  })
+
+  it('grandfathers a stored consecutive-hyphen value a save does not change', () => {
+    mocks.store.set('me', 'a--b')
+    mocks.store.set('agentAccount', 'x--y')
+    expect(setSettings({ me: 'a--b', timezone: 'UTC' })).toMatchObject({ me: 'a--b', timezone: 'UTC' })
+    expect(setSettings({ agentAccount: 'x--y' }).agentAccount).toBe('x--y')
+    expect(() => setSettings({ me: 'c--d' })).toThrow(/single hyphens/)
+    expect(() => setSettings({ agentAccount: 'z--w' })).toThrow(/single hyphens/)
+  })
+
   it('allows clearing a field back to empty', () => {
     setSettings({ org: 'Vaquum', me: 'mikkokotila' })
     expect(setSettings({ org: '' }).org).toBe('')
@@ -91,6 +119,12 @@ describe('a rejected save changes nothing at all', () => {
     expect(() => setSettings({ timezone: 'Europe/Berlin', org: 'not a valid org' })).toThrow()
     // The timezone in the same call must not have landed.
     expect(getSettings()).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 }, notifications: { enabled: true } })
+  })
+
+  it('does not keep the valid half when consecutive hyphens reject the other half', () => {
+    setSettings({ me: 'octocat', timezone: 'UTC' })
+    expect(() => setSettings({ timezone: 'Europe/Berlin', me: 'a--b' })).toThrow(/single hyphens/)
+    expect(getSettings()).toMatchObject({ me: 'octocat', timezone: 'UTC' })
   })
 })
 

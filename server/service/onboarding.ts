@@ -163,7 +163,7 @@ export async function connectGitHubAccount(input: unknown): Promise<GitHubCheck>
   const body = input && typeof input === 'object' ? input as Record<string, unknown> : {}
   if (body.role !== 'me' && body.role !== 'agent') throw new Error('role must be "me" or "agent"')
   const login = typeof body.login === 'string' ? body.login.trim() : ''
-  if (!GITHUB_NAME.test(login)) throw new Error('login must be a GitHub login: letters, digits and single hyphens')
+  if (!GITHUB_NAME.test(login) || login.includes('--')) throw new Error('login must be a GitHub login: letters, digits and single hyphens')
   const check = await checkGitHubAccount(login)
   if (!check.ok) return check
   setSettings(body.role === 'me' ? { me: check.login } : { agentAccount: check.login })

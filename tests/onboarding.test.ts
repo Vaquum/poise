@@ -203,4 +203,17 @@ describe('connecting an account in setup', () => {
     await expect(connectGitHubAccount({ role: 'admin', login: 'octocat' })).rejects.toThrow(/role/)
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
+
+  it('refuses consecutive hyphens before any gh check, for either role', async () => {
+    gh({ tokens: { octocat: TOKEN }, user: () => ({ login: 'octocat', scopes: 'repo, read:org' }) })
+    await expect(connectGitHubAccount({ role: 'me', login: 'a--b' })).rejects.toThrow(/single hyphens/)
+    await expect(connectGitHubAccount({ role: 'agent', login: 'x--y' })).rejects.toThrow(/single hyphens/)
+    expect(mocks.runFile).not.toHaveBeenCalled()
+    expect(mocks.setSettings).not.toHaveBeenCalled()
+  })
+
+  it('leaves the shape check on GitHub\u2019s own answer untouched', async () => {
+    gh({ tokens: { 'a--b': TOKEN }, user: () => ({ login: 'a--b', scopes: 'repo, read:org' }) })
+    expect(await checkGitHubAccount('a--b')).toMatchObject({ ok: true, login: 'a--b' })
+  })
 })
