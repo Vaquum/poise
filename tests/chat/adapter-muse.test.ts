@@ -347,6 +347,16 @@ describe('Muse adapter', () => {
     expect(result).toEqual({ stopReason: 'error', error: 'Muse: provider returned 503' })
   })
 
+  it('says a quota-exhausted turn ran on the account login, not an API key', async () => {
+    const { adapter } = setup()
+    await adapter.start(MODEL)
+    const result = await adapter.prompt('turn-1', prompt('fail-quota'), new AbortController().signal)
+    expect(result.stopReason).toBe('error')
+    expect(result.error).toContain('Subscription quota exhausted')
+    expect(result.error).toContain('Muse is running on the account login, not an API key')
+    expect(result.error).toContain('Settings → Accounts → Muse → Use an API key')
+  })
+
   it('answers an unknown server request with a JSON-RPC error instead of hanging', async () => {
     const { host, adapter } = setup()
     await adapter.start(MODEL)

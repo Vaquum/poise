@@ -13,7 +13,7 @@ export function fakePresetCommand(bin: string): (preset: TerminalPreset) => Term
   return (preset) => {
     if (preset === 'shell') throw new Error('a test may not open the login shell: it has no fake')
     const command = presetCommand(preset)
-    assertFake(bin, COMMANDS[preset], command.env.PATH ?? '')
+    assertFake(bin, COMMANDS[preset === 'muse-api-key' ? 'muse' : preset], command.env.PATH ?? '')
     return command
   }
 }

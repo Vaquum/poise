@@ -101,6 +101,7 @@ export class ServiceControl {
   private launches = 0
   private lapse: unknown = null
   private turnDeadline: unknown = null
+  // Drives the switch poll; health reports the persisted record, not this.
   private switchTo: string | null = null
   private switchPoll: unknown = null
   private readonly timer: DrainTimer
@@ -140,8 +141,24 @@ export class ServiceControl {
       idle: calls.known && activeChatTurns + calls.count + backgroundWork === 0,
       draining: this.drainOn,
       release: this.release.name,
-      switching: this.switchTo,
+      switching: this.pendingSwitch(),
     }
+  }
+
+  /** The pending switch as the supervisor will see it: the release queued in
+   *  `releases/next`, the record switchRelease writes. Health reads the
+   *  record rather than the in-memory poll, so what it reports is what a
+   *  restart switches onto — including after one, when the supervisor has
+   *  consumed the record and nothing is pending. A record naming no release
+   *  is none either: the supervisor falls back to the current release. */
+  private pendingSwitch(): string | null {
+    let next: string
+    try {
+      next = readFileSync(join(this.releasesDir, 'next'), 'utf8').trim()
+    } catch {
+      return null
+    }
+    return RELEASE_NAME.test(next) ? next : null
   }
 
   /**

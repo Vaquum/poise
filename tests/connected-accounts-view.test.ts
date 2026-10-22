@@ -92,3 +92,32 @@ describe('recorded provider sign-ins', () => {
     expect(render({ ...provider, version: null, detail: 'broken installation' })).toContain('broken installation')
   })
 })
+
+
+describe('the Muse row', () => {
+  const muse: ConnectedAccount = { id: 'muse', installed: true, version: '1.4.2', signedIn: null, identity: null, detail: 'No status command', login: { label: 'muse login' } }
+  const render = (account: ConnectedAccount) => accountsHtml([account], { me: '', agentAccount: '' }, false)
+
+  it('names the API key or the account login its auth file holds', () => {
+    expect(render({ ...muse, credential: 'api-key' })).toContain('Credential: API key.')
+    expect(render({ ...muse, credential: 'account-login' })).toContain('Credential: Account login (device code).')
+    expect(render(muse)).not.toContain('Credential:')
+  })
+
+  it('offers Use an API key, on the Muse row only', () => {
+    const html = render({ ...muse, credential: 'account-login' })
+    expect(html).toContain('data-connect="muse-api-key"')
+    expect(html).toContain('muse auth set --api-key-stdin')
+    expect(html).toContain('Poise never sees or stores it.')
+    expect(html).toContain('>Use an API key<')
+    expect(render({ ...muse, id: 'grok' })).not.toContain('muse-api-key')
+  })
+
+  it('warns that Connect switches Muse to the account login and its subscription quota', () => {
+    const html = render({ ...muse, credential: 'api-key' })
+    expect(html).toContain('Warning: this switches Muse to the account login and its subscription quota.')
+    expect(html).toContain('Connect switches Muse to the account login and its subscription quota.')
+    expect(render({ ...muse, credential: 'account-login' })).not.toContain('st-account-warning')
+    expect(render({ ...muse, id: 'codex' })).not.toContain('switches Muse')
+  })
+})

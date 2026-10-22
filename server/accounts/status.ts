@@ -1,10 +1,12 @@
 // Each CLI's sign-in state, read from its own non-interactive status command
-// and nothing else: no credential file is ever opened. Only the account name
-// a status command prints leaves this module, never a token or key.
+// and nothing else, except Muse's auth file, read for its non-secret fields
+// only (muse-credential.ts). Only the account name a status command prints
+// leaves this module, never a token or key.
 
 import { CLAUDE_SUBSCRIPTION_CLI, claudeSubscriptionEnvironment, type RunFileOptions, type RunFileResult } from '../process'
 import { claudeSubscriptionReady, sanitizeSubscriptionType } from '../claude-auth'
 import { ACCOUNT_CLIS, GH_STORED_ACCOUNTS_ENV, type AccountCli } from './clis'
+import { readMuseCredential } from './muse-credential'
 import { ACCOUNT_IDS, type AccountId, type ConnectedAccount, type GhAccount } from './types'
 
 export type RunCommand = (command: string, args: readonly string[], options?: RunFileOptions) => Promise<RunFileResult>
@@ -195,7 +197,10 @@ async function probe(cli: AccountCli, run: RunCommand): Promise<ConnectedAccount
     }
     return { ...known, installed: true, version: null, ...unknown(failure(`${cli.command} --version`, error)) }
   }
-  return { ...known, installed: true, version: versionOf(version), ...await SIGN_IN[cli.id](run) }
+  const probed = { ...known, installed: true, version: versionOf(version), ...await SIGN_IN[cli.id](run) }
+  if (cli.id !== 'muse') return probed
+  const credential = readMuseCredential()
+  return credential ? { ...probed, credential } : probed
 }
 
 /** Every CLI at once, each bounded by PROBE_TIMEOUT_MS per command. */

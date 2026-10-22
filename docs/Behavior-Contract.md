@@ -100,8 +100,17 @@ The recovery retains the admitted reviewer through preparation and preserves
 same-head/model failure holds across request and head dedupe keys.
 An occupied head's failed record remains through preparation; an eligible model
 change replaces it atomically with the admitted intent before normal launch.
-Provider account blocks (`review_provider_blocked`) use the same hold, preventing
-an exhausted balance or local account latch from launching identical workers.
+A failure about the reviewer's account, not the review — a 402 or "balance
+exhausted", or "not signed in" or missing credentials — trips that reviewer
+instead of holding the target: Poise records one failure naming the reviewer,
+the cause and the fix, launches the next configured reviewer in its place, or
+waits when none is healthy. The trip retries on the usual backoff and clears
+when the reviewer succeeds again, with a single probe launch per window. A
+failure Caller's recovery reports trips the recovery model while its target
+holds, and a run that posted anything holds without tripping. Other provider
+blocks (a local account
+latch, safeguards) keep the per-target hold, preventing them from launching
+identical workers.
 Codex input overflow is staged within the existing total review budget, with
 every fragment acknowledged in one native conversation before a single final
 verdict can be submitted. Ordinary messages are unchanged. The bounds and

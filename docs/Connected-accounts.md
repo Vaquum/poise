@@ -20,7 +20,7 @@ on keyboard focus. See [Menu and Settings](Menu.md).
 | Codex | `codex login status` | `codex login --device-auth` |
 | GitHub | `gh auth status --json hosts --hostname github.com` | `gh auth login --hostname github.com --git-protocol https --web` |
 | Grok | no status command | `grok login --device-auth` |
-| Muse | no status command | `muse login` |
+| Muse | its auth file's non-secret fields: API key or account login | `muse login`; `muse auth set --api-key-stdin` stores an API key |
 | Antigravity | no status command | `agy`, which shows its sign-in screen when it starts signed out (`/login` signs in again) |
 
 The version comes from `<cli> --version`; a CLI Poise cannot find on its
@@ -37,6 +37,12 @@ within 10 seconds, is reported with the reason.
 - **Grok and Muse** show **Signed in here** and Reconnect once their Connect
   login exits successfully. This records history in Poise, survives reopening
   Settings and server restarts, and does not verify the session is still valid.
+- **Muse** also shows which credential its auth file holds: **API key**, or
+  **Account login (device code)**. Its Connect warns that `muse login`
+  switches Muse to the account login and its subscription quota; **Use an API
+  key** runs `muse auth set --api-key-stdin` in a terminal instead, where the
+  person pastes the key. A Muse turn that fails on subscription quota says
+  Muse is running on the account login, not an API key.
 - **Antigravity** requires confirmation in setup: closing its app cannot prove
   a sign-in. Existing confirmations remain available, including older entries
   whose manual/automatic origin cannot be distinguished.
@@ -47,10 +53,11 @@ within 10 seconds, is reported with the reason.
   display their problem even when history exists. Claude, Codex and GitHub
   always use their own status, including errors, regardless of saved history.
 
-Poise never opens a CLI's credential files. It runs only the status commands
-above and passes on only the account name one prints. Answers are kept for 15
-seconds, so reopening Settings does not run every CLI again, and dropped
-whenever a terminal exits.
+Poise never opens a CLI's credential files, except Muse's auth file, which it
+reads for its non-secret fields only: which credential it holds, never a key
+or token. Otherwise it runs only the status commands above and passes on only
+the account name one prints. Answers are kept for 15 seconds, so reopening
+Settings does not run every CLI again, and dropped whenever a terminal exits.
 
 ## Alerts
 
@@ -70,9 +77,12 @@ Connect opens a terminal in Settings, running that CLI's login in your home
 folder, with the same environment allowlists as every process Poise starts.
 The device-code logins (Codex, gh, Grok, Muse) print a link and a code to enter
 in your own browser; Claude prints a link and asks for the code the page gives
-back. When the login exits, the terminal says with which code and the rows
-refresh. After Claude's login Poise also verifies the Claude subscription at
-once, so its sign-in banner clears without waiting for the next check.
+back. Muse's Use an API key instead runs `muse auth set --api-key-stdin`: the
+person pastes the key into that terminal, and it travels on stdin straight to
+Muse, so Poise never sees or stores it. When the login exits, the terminal
+says with which code and the rows refresh. After Claude's login Poise also
+verifies the Claude subscription at once, so its sign-in banner clears without
+waiting for the next check.
 
 Open a shell starts your login shell instead, for anything the logins do not
 cover (for example `gh auth switch`).
