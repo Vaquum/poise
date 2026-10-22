@@ -344,7 +344,10 @@ describe('the switch bound', () => {
       w.c.auto = true
       const next = w.make()
       await next.recover()
-      await until(() => w.c.calls.length === 8, 100_000)
+      // At least: the four continues run concurrently and two prompts can land
+      // between polls. Exactness is pinned below instead of in the wait.
+      await until(() => w.c.calls.length >= 8, 100_000)
+      expect(w.c.calls).toHaveLength(8)
       expect(w.c.calls.slice(4).map(call => call.input.text)).toEqual([
         'Poise restarted for an update while your turn was running. Continue where you left off.',
         'Poise restarted for an update while your turn was running. Continue where you left off.',
