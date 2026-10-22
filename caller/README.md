@@ -60,6 +60,14 @@ is `merged` with `merge_sha`, `not_ready`, `superseded`, or `already_merged`.
 API errors fail visibly; a lost merge response can be reconciled by the next
 read without merging twice. This operation requires an explicit acting account.
 
+`github-interface --update-branch-if-behind '#7' --expected-head SHA --author
+USER --token-user AGENT` updates only the named author's open, non-draft head
+that is mergeable but behind its base with nothing else blocking. It revalidates
+checks, conversation completeness and merge state on fresh head-pinned reads,
+then sends the expected SHA to GitHub's update-branch endpoint. The JSON outcome
+is `updated`, `not_ready`, or `superseded`. This operation requires an explicit
+acting account.
+
 ## Setup
 
 Caller needs Python 3.13 (`brew install python@3.13`; `POISE_PYTHON` names
@@ -93,10 +101,13 @@ every Python file and checks each CLI's `--help`.
 '[{"repository":"owner/repo","number":7}]' --token-user AGENT` reads up to 50
 explicit targets in one GraphQL query. It returns the acting account,
 `graphql_cost` in GitHub points, and ordered records with `repository`, `number`,
-`head_sha`, `author`, `ready` and `error`. The green predicate is shared with the
-merge primitive. A partial query error is returned on its affected target;
-unscoped errors and missing identity/cost evidence fail the operation visibly.
-The read does not merge or use REST polling. An empty list adds no API requests.
+`head_sha`, `author`, `ready`, `behind`, `approved_at` and `error`. The green
+predicate is shared with the merge primitive; `behind` is true when the same
+predicate holds except the branch is out of date with its base, and
+`approved_at` is the latest approval time or null. A partial query error is
+returned on its affected target; unscoped errors and missing identity/cost
+evidence fail the operation visibly. The read does not merge or use REST
+polling. An empty list adds no API requests.
 
 ## GitHub polling reads
 

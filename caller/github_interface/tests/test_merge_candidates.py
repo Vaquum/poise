@@ -7,8 +7,10 @@ from unittest.mock import AsyncMock, patch
 from github_interface import cli, interface
 from github_interface.behaviors import merge_candidates, mergeable
 HEAD = 'a' * 40
+APPROVED_AT = '2026-10-22T00:00:00Z'
 READY = {'state': 'OPEN', 'isDraft': False, 'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN',
          'headRefOid': HEAD, 'commits': {'nodes': [{'commit': {'statusCheckRollup': {'state': 'SUCCESS'}}}]},
+         'reviews': {'nodes': [{'state': 'APPROVED', 'submittedAt': APPROVED_AT}], 'pageInfo': {'hasNextPage': False}},
          'reviewThreads': {'nodes': [], 'pageInfo': {'hasNextPage': False}}}
 
 REQUESTS = [{'repository': 'acme/app', 'number': n} for n in range(1, 11)]
@@ -57,11 +59,13 @@ class TestMergeCandidates(IsolatedAsyncioTestCase):
     async def test_ready_packets_keep_the_exact_head_and_author(self):
         result = await self.read()
         self.assertEqual(result['records'][0], {'repository': 'acme/app', 'number': 1,
-                         'ready': True, 'head_sha': HEAD, 'author': 'octocat', 'error': None})
+                         'ready': True, 'behind': False, 'head_sha': HEAD, 'author': 'octocat',
+                         'approved_at': APPROVED_AT, 'error': None})
 
     async def test_discovery_preserves_the_existing_readiness_predicate(self):
         cases = [({}, True), ({'state': 'CLOSED'}, False), ({'isDraft': True}, False),
                  ({'mergeable': 'UNKNOWN'}, False), ({'mergeStateStatus': 'BLOCKED'}, False),
+                 ({'mergeStateStatus': 'BEHIND'}, False), ({'mergeStateStatus': 'DIRTY'}, False),
                  ({'mergeStateStatus': 'UNSTABLE'}, True), ({'mergeStateStatus': 'HAS_HOOKS'}, True),
                  ({'commits': None}, False), ({'commits': {'nodes': []}}, False),
                  ({'commits': {'nodes': [{'commit': {}}]}}, False),
@@ -81,6 +85,42 @@ class TestMergeCandidates(IsolatedAsyncioTestCase):
                 self.assertEqual(result['records'][0]['ready'], expected)
                 self.assertEqual(result['records'][0]['ready'],
                                  mergeable.readiness_status({**deepcopy(READY), **fields}) == 'green')
+
+    async def test_behind_packets_are_not_ready_but_carry_behind_and_approval(self):
+        self.client.request.return_value = response(fields={'mergeStateStatus': 'BEHIND'})
+        record = (await self.read())['records'][0]
+        self.assertEqual((record['ready'], record['behind'], record['approved_at'], record['error']),
+                         (False, True, APPROVED_AT, None))
+
+    async def test_blocked_dirty_or_checked_states_are_neither_ready_nor_behind(self):
+        cases = [{'mergeStateStatus': 'BLOCKED'}, {'mergeStateStatus': 'DIRTY', 'mergeable': 'CONFLICTING'},
+                 {'mergeStateStatus': 'BEHIND',
+                  'commits': {'nodes': [{'commit': {'statusCheckRollup': {'state': 'PENDING'}}}]}},
+                 {'mergeStateStatus': 'BEHIND',
+                  'reviewThreads': {'pageInfo': {'hasNextPage': False},
+                                    'nodes': [{'isResolved': False, 'isOutdated': False}]}}]
+        for fields in cases:
+            with self.subTest(fields=fields):
+                self.client.request.return_value = response(fields=fields)
+                record = (await self.read())['records'][0]
+                self.assertEqual((record['ready'], record['behind'], record['error']), (False, False, None))
+
+    async def test_approved_at_is_the_latest_approval_or_none(self):
+        reviews = [{'state': 'APPROVED', 'submittedAt': '2026-10-21T23:00:00Z'},
+                   {'state': 'CHANGES_REQUESTED', 'submittedAt': '2026-10-21T23:30:00Z'},
+                   {'state': 'COMMENTED', 'submittedAt': '2026-10-22T01:00:00Z'},
+                   {'state': 'APPROVED', 'submittedAt': '2026-10-22T00:30:00Z'}]
+        self.client.request.return_value = response(
+            fields={'reviews': {'nodes': reviews, 'pageInfo': {'hasNextPage': False}}})
+        self.assertEqual((await self.read())['records'][0]['approved_at'], '2026-10-22T00:30:00Z')
+        for nodes, more in [([], False), ([{'state': 'CHANGES_REQUESTED', 'submittedAt': APPROVED_AT}], False),
+                            ([{'state': 'APPROVED', 'submittedAt': APPROVED_AT}], True)]:
+            with self.subTest(nodes=nodes, more=more):
+                self.client.request.return_value = response(
+                    fields={'reviews': {'nodes': nodes, 'pageInfo': {'hasNextPage': more}}})
+                record = (await self.read())['records'][0]
+                self.assertIsNone(record['approved_at'])
+                self.assertIsNone(record['error'])
 
     async def test_unchanged_head_becomes_ready_when_checks_finish(self):
         self.client.request.return_value = response(fields={

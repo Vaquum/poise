@@ -124,8 +124,9 @@ rail names a timed-out sweep as stalled instead of repeating the timeout text.
 It uses Caller directly without a model launch: after fresh datastore eligibility,
 it discovers up to 50 eligible PRs per ready account with one fresh
 `--merge-candidates --requests-json JSON --token-user AGENT` GraphQL read.
-The packet carries current head, author and the existing green readiness predicate;
-unchanged heads are still reevaluated for completed checks and conversations.
+The packet carries current head, author, the existing green readiness predicate,
+a behind flag for branches that are only out of date, and the latest approval
+time; unchanged heads are still reevaluated for completed checks and conversations.
 Scoped GraphQL errors hold only their target; identity or unscoped errors hold the
 whole batch visibly. Discovery sends no REST reads or writes. For a ready candidate
 it holds the shared per-PR operation lock, then calls
@@ -140,11 +141,20 @@ A confirmed `merged` receipt alone updates the per-account Last triggered event;
 operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
-A per-account cursor advances before each batch read and each merge attempt, so
+After the merges, one scan updates at most one behind branch, oldest approval
+first, so updates don't churn CI: the oldest-approved behind candidate holds the
+shared per-PR operation lock for
+`--update-branch-if-behind PR --expected-head SHA --author USER --token-user AGENT`.
+Caller revalidates the behind predicate on fresh head-pinned reads and sends the
+expected SHA to GitHub's update-branch endpoint. Anything else blocking, and a
+branch that caught up on its own, report `not_ready`. It reports `updated`,
+`not_ready`, or `superseded`; an update is not a merge and leaves Last triggered
+alone. A per-account cursor advances before each batch read and each merge attempt, so
 a scan cut short by its deadline resumes beyond the blocked batch or candidate.
 Ten blocked PRs in one account add 60 GraphQL queries per hour at the one-minute
 cadence. Each successful merge adds three REST reads, one GraphQL query and one
-REST write; transient retries may add requests. GitHub's returned query cost is
+REST write; each branch update adds the same without the repository read.
+Transient retries may add requests. GitHub's returned query cost is
 exposed in the Caller batch packet.
 
 `rerun-grey-ci` is off unless `behavior_rerun_grey_ci_enabled` is `1`. It reads

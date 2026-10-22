@@ -22,11 +22,14 @@ let root = ''
 let db: typeof import('../server/db')
 let runtime: typeof import('../server/behaviors')
 let outcome = 'merged'
+let updateOutcome = 'updated'
 let error: Error | null = null
 let healthError: Error | null = null
 let response: Record<string, unknown> = {}
 let pulls: Array<Record<string, unknown>> = []
 let readyNumbers: Set<number> | null = null
+let behindNumbers = new Set<number>()
+let approvedAts: Record<number, string | null> = {}
 let unreadableNumbers = new Set<number>()
 let batchGate: { reached: () => void, wait: Promise<void> } | null = null
 
@@ -35,6 +38,9 @@ function pull(repo = REPO, number = 7, fields: Record<string, unknown> = {}) {
 }
 function mergeCalls() {
   return mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-interface' && args[0] === '--merge-if-ready')
+}
+function updateCalls() {
+  return mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-interface' && args[0] === '--update-branch-if-behind')
 }
 async function cli(command: string, args: string[], options: RunFileOptions) {
   const json = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' })
@@ -55,6 +61,9 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
     const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
     return json({ action: 'merge_candidates', actor: 'review-bot', graphql_cost: 1, records: requests.map((request) => ({
       ...request, head_sha: HEAD, author: 'octocat', ready: !unreadableNumbers.has(request.number) && (readyNumbers === null || readyNumbers.has(request.number)),
+      behind: !unreadableNumbers.has(request.number) && behindNumbers.has(request.number),
+      approved_at: request.number in approvedAts ? approvedAts[request.number]!
+        : behindNumbers.has(request.number) ? '2026-10-22T00:00:00Z' : null,
       error: unreadableNumbers.has(request.number) ? 'GitHub could not read this target' : null,
     })) })
   }
@@ -62,6 +71,11 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
     if (error) throw error
     return json({ action: 'merge_if_ready', repository: repo, pull_number: number, head_sha: HEAD,
       outcome, merge_sha: 'b'.repeat(40), ...response })
+  }
+  if (command === 'github-interface' && args[0] === '--update-branch-if-behind') {
+    if (error) throw error
+    return json({ action: 'update_branch_if_behind', repository: repo, pull_number: number, head_sha: HEAD,
+      outcome: updateOutcome, ...response })
   }
   throw new Error(`unexpected CLI: ${command} ${args.join(' ')}`)
 }
@@ -71,8 +85,8 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-merge-'))
   process.env.POISE_DB = join(root, 'cache.db')
   pulls = [pull()]
-  outcome = 'merged'; error = null; healthError = null; response = {}; batchGate = null
-  readyNumbers = null; unreadableNumbers = new Set()
+  outcome = 'merged'; updateOutcome = 'updated'; error = null; healthError = null; response = {}; batchGate = null
+  readyNumbers = null; behindNumbers = new Set(); approvedAts = {}; unreadableNumbers = new Set()
   mocks.runFile.mockReset().mockImplementation(cli)
   mocks.spawnDetached.mockReset()
   vi.spyOn(console, 'log').mockImplementation(() => undefined)
@@ -209,6 +223,58 @@ describe('Merge Pull Requests', () => {
     await runtime.runEnabledBehaviorsOnce()
     expect(mergeCalls()).toHaveLength(1)
     expect(mergeCalls()[0]![1]).toContain(HEAD)
+  })
+  it('updates an approved behind branch exactly once without reporting a merge', async () => {
+    enable(); readyNumbers = new Set(); behindNumbers = new Set([7])
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(1)
+    expect(updateCalls()[0]![1]).toEqual(['--update-branch-if-behind', '#7', '--expected-head', HEAD,
+      '--author', 'octocat', '--token-user', 'review-bot'])
+    expect(mergeCalls()).toEqual([])
+    expect(runtime.getMergePrsLastFired()).toBeNull()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+    expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      state: 'completed', outcome: 'updated',
+    }))
+  })
+  it('leaves PRs that are neither ready nor behind alone', async () => {
+    // Caller clears the behind flag for conflicts and change requests; the
+    // scheduler acts only on the flag. See caller's merge-candidates suite.
+    enable(); pulls = [pull(), pull(REPO, 8)]; readyNumbers = new Set()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toEqual([])
+    expect(mergeCalls()).toEqual([])
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+  it('updates two behind branches one at a time, oldest approval first', async () => {
+    enable(); pulls = [pull(), pull(REPO, 8)]; readyNumbers = new Set(); behindNumbers = new Set([7, 8])
+    approvedAts = { 7: '2026-10-22T02:00:00Z', 8: '2026-10-22T01:00:00Z' }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls().map(([, args]) => args[1])).toEqual(['#8'])
+    behindNumbers = new Set([7])
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls().map(([, args]) => args[1])).toEqual(['#8', '#7'])
+    expect(mergeCalls()).toEqual([])
+  })
+  it('backs off a persistently failing branch update instead of retrying every scan', async () => {
+    enable(); readyNumbers = new Set(); behindNumbers = new Set([7]); error = new Error('GitHub unavailable')
+    vi.useFakeTimers()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_RETRY_BASE_MS)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(2)
+    await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_RETRY_BASE_MS)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(2)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ target: `${REPO}#7` })])
+  })
+  it('refuses a malformed update receipt', async () => {
+    enable(); readyNumbers = new Set(); behindNumbers = new Set([7]); response = { outcome: 'unknown' }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(1)
+    expect(runtime.getMergePrsLastFired()).toBeNull()
+    expect(runtime.getBehaviorsRuntimeHealth().failures[0]?.error).toContain('malformed state')
   })
   it('merges a readable ready PR while recording a different target\'s partial read error', async () => {
     enable(); pulls.push(pull(REPO, 8)); unreadableNumbers.add(8)

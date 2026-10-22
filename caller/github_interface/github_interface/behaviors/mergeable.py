@@ -41,6 +41,28 @@ def readiness_status(readiness: dict[str, Any]) -> str | None:
     }, (commit["statusCheckRollup"] or {}).get("state"), unresolved, not threads["pageInfo"]["hasNextPage"])
 
 
+def behind_status(pull: dict[str, Any], checks_state: str | None, unresolved: int, all_threads_read: bool = True) -> str | None:
+    """`behind` when the branch is mergeable but out of date with its base
+    and nothing else blocks it: open, not a draft, no conflicts, an
+    update-branch away from the green button, checks passed and no
+    conversation left unresolved. Anything else blocking is None."""
+    if pull.get("state") != "open" or pull.get("draft") or pull.get("mergeable") is not True:
+        return None
+    if pull.get("mergeable_state") != "behind":
+        return None
+    return "behind" if checks_state in (None, "SUCCESS") and unresolved == 0 and all_threads_read else None
+
+
+def readiness_behind(readiness: dict[str, Any]) -> str | None:
+    """`behind` when GitHub reports the pull request mergeable but out of
+    date with its base and the green predicate holds on everything else."""
+    if readiness.get("mergeStateStatus") != "BEHIND":
+        return None
+    if readiness_status({**readiness, "mergeStateStatus": "CLEAN"}) != "green":
+        return None
+    return "behind"
+
+
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     owner, repo = repository(payload)
     pull_number = parse_pull_number(payload)

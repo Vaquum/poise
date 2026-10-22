@@ -138,7 +138,8 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
     if (args[0] === '--merge-candidates') {
       const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
       return json({ action: 'merge_candidates', actor: AGENT, graphql_cost: 1,
-        records: requests.map((request) => ({ ...request, head_sha: HEAD, author: ME, ready: true, error: null })) })
+        records: requests.map((request) => ({ ...request, head_sha: HEAD, author: ME,
+          ready: true, behind: false, approved_at: null, error: null })) })
     }
     if (args[0] === '--merge-if-ready') return json({ action: 'merge_if_ready', repository, pull_number: number, head_sha: HEAD, outcome: 'merged', merge_sha: 'b'.repeat(40) })
     if (args[0] === '--sub-issues') return json({ action: 'sub_issues', repository, issue_number: number, sub_issues: [] })

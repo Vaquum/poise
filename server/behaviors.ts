@@ -3287,8 +3287,10 @@ export const MERGE_CANDIDATE_BATCH_SIZE = 50
 interface MergeCandidate {
   pr: DatastorePr
   ready: boolean
+  behind: boolean
   head: string | null
   author: string | null
+  approvedAt: string | null
   error: string | null
 }
 
@@ -3308,15 +3310,27 @@ async function readMergeCandidates(prs: DatastorePr[], actor: string): Promise<M
     const record = objectValue(row, 'merge candidate')
     const pr = prs[index]!
     if (record.repository !== pr.repo || record.number !== pr.number || typeof record.ready !== 'boolean'
+      || typeof record.behind !== 'boolean'
       || !(record.head_sha === null || (typeof record.head_sha === 'string' && SHA_PATTERN.test(record.head_sha)))
       || !(record.author === null || typeof record.author === 'string')
+      || !(record.approved_at === null || (typeof record.approved_at === 'string' && Number.isFinite(Date.parse(record.approved_at))))
       || !(record.error === null || (typeof record.error === 'string' && record.error.length > 0))
-      || (record.ready && (record.head_sha === null || !record.author || record.error !== null))) {
+      || (record.ready && (record.head_sha === null || !record.author || record.error !== null))
+      || (record.behind && (record.ready || record.head_sha === null || !record.author || record.error !== null))) {
       throw new Error('github-interface --merge-candidates returned malformed candidate evidence')
     }
-    return { pr, ready: record.ready, head: record.head_sha as string | null,
-      author: record.author as string | null, error: record.error as string | null }
+    return { pr, ready: record.ready, behind: record.behind, head: record.head_sha as string | null,
+      author: record.author as string | null, approvedAt: record.approved_at as string | null,
+      error: record.error as string | null }
   })
+}
+
+// Oldest approval first; never-approved candidates sort last with a stable tiebreak.
+function compareBehindCandidates(a: MergeCandidate, b: MergeCandidate): number {
+  const aAt = a.approvedAt === null ? Number.POSITIVE_INFINITY : Date.parse(a.approvedAt)
+  const bAt = b.approvedAt === null ? Number.POSITIVE_INFINITY : Date.parse(b.approvedAt)
+  if (aAt !== bAt) return aAt - bAt
+  return a.pr.repo.localeCompare(b.pr.repo) || a.pr.number - b.pr.number
 }
 
 async function tickMergePrs(): Promise<void> {
@@ -3328,6 +3342,7 @@ async function tickMergePrs(): Promise<void> {
   const start = (prs.findIndex((pr) => `${pr.repo}#${pr.number}` === cursor) + 1) % Math.max(prs.length, 1)
   const ordered = [...prs.slice(start), ...prs.slice(0, start)]
   const actor = configuredReviewer()
+  const behind: MergeCandidate[] = []
   for (let offset = 0; offset < ordered.length; offset += MERGE_CANDIDATE_BATCH_SIZE) {
     if (!isEnabled('merge-prs') || behaviorAborted()) return
     const batch = ordered.slice(offset, offset + MERGE_CANDIDATE_BATCH_SIZE)
@@ -3346,6 +3361,11 @@ async function tickMergePrs(): Promise<void> {
         continue
       }
       if (!candidate.ready || candidate.author?.toLowerCase() !== author.toLowerCase()) {
+        if (candidate.behind && candidate.author?.toLowerCase() === author.toLowerCase()) {
+          // A failed update keeps its failure record so retries back off like merges.
+          behind.push(candidate)
+          continue
+        }
         clearBehaviorFailure('merge-prs', target)
         continue
       }
@@ -3394,6 +3414,56 @@ async function tickMergePrs(): Promise<void> {
         releasePrOperationOwned(operationId)
       }
     }
+  }
+  // One branch update per scan, after the merges, so an updated branch already
+  // includes what just merged and updates don't churn CI.
+  if (behind.length === 0 || !isEnabled('merge-prs') || behaviorAborted()) return
+  behind.sort(compareBehindCandidates)
+  const update = behind[0]!
+  const updatePr = update.pr
+  const updateTarget = `${updatePr.repo}#${updatePr.number}`
+  if (!stillEligible('merge-prs', updatePr) || !behaviorRetryDue('merge-prs', updateTarget)) return
+  const updateOperationId = claimPrOperationOwned(updateTarget, PR_OPERATION_EVALUATION_LEASE_MS)
+  if (!updateOperationId) return
+  let updateRunId: string | null = null
+  try {
+    const expectedHead = update.head!
+    const [owner, name] = updatePr.repo.split('/', 2)
+    const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
+    await mkdir(cwd, { recursive: true })
+    if (!isEnabled('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', updatePr)
+      || configuredReviewer() !== actor) return
+    updateRunId = startDirectBehaviorRun('merge-prs')
+    captureBehaviorAdmission({ admissionKey: updateRunId, nativeId: updateRunId, behavior: 'merge-prs',
+      source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
+      actor, repository: updatePr.repo, number: updatePr.number, head: expectedHead, startedAt: new Date().toISOString() })
+    const { stdout } = await runFile(GH_INTERFACE, [
+      '--update-branch-if-behind', `#${updatePr.number}`, '--expected-head', expectedHead,
+      '--author', author, '--token-user', actor,
+    ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() })
+    const result = objectValue(parseJson(stdout, 'github-interface --update-branch-if-behind'), 'update-branch-if-behind')
+    if (result.action !== 'update_branch_if_behind' || result.repository !== updatePr.repo
+      || result.pull_number !== updatePr.number || result.head_sha !== expectedHead
+      || !['updated', 'not_ready', 'superseded'].includes(String(result.outcome))) {
+      throw new Error('github-interface --update-branch-if-behind returned malformed state')
+    }
+    captureBehaviorOutcome({ nativeId: updateRunId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
+      activity: 'settled', stateSource: 'native', outcome: result.outcome as 'updated' | 'not_ready' | 'superseded',
+      head: expectedHead, completedAt: new Date().toISOString() })
+    finishDirectBehaviorRun(updateRunId, true)
+    updateRunId = null
+    if (result.outcome === 'updated') {
+      console.log(`[behaviors] merge-prs updated ${updateTarget}`)
+    }
+    clearBehaviorFailure('merge-prs', updateTarget)
+  } catch (error) {
+    if (updateRunId) captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+    if (behaviorAborted()) return
+    recordBehaviorFailure('merge-prs', 'operation', error, updateTarget)
+    console.error(`[behaviors] merge-prs failed for ${updateTarget}:`, error)
+  } finally {
+    if (updateRunId) finishDirectBehaviorRun(updateRunId, false)
+    releasePrOperationOwned(updateOperationId)
   }
 }
 
