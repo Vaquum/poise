@@ -245,12 +245,16 @@ If accepted messages cannot be accounted for, the process is ended and the
 turn fails visibly rather than being labelled successful. A stopped Claude
 session resumes its native ID on the next explicit action.
 
-Muse steering can create a subsequent native turn. Stop accounts for every
-accepted send: it reclaims queued turns through the native queue interface
-or interrupts their exact IDs if launch won the race. Completion of the old
-foreground turn alone is not proof that queued work has stopped. Missing
-steering outcomes fail visibly, and a forced protocol close asks the runtime
-to verify worker termination before releasing the checkout.
+Muse steering is either absorbed into the running turn or runs as a
+subsequent native turn. Stop accounts for every accepted send: it reclaims
+queued turns through the native queue interface or interrupts their exact
+IDs if launch won the race. A steer the agent never ran does not fail the
+turn: the turn completes normally, the process is kept, and the steer's
+original text runs as the next prompt through the durable queue, headed by
+a note that it arrived after the turn. A turn that fails or is stopped
+drops its unrun steers and reports its real outcome instead. A forced
+protocol close asks the runtime to verify worker termination before
+releasing the checkout.
 
 ## Files, attachments and Editor
 

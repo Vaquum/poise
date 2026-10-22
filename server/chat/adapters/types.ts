@@ -131,6 +131,10 @@ export interface TurnResult {
    *  the runtime terminates the worker group (verified) before the checkout
    *  is released. */
   terminate?: boolean
+  /** Correlation ids (from `steer()`) of accepted steers that never ran
+   *  before the turn settled: the runtime queues their original text as the
+   *  next prompt instead of failing the turn. */
+  unrunSteers?: string[]
 }
 
 /** Reconnecting to a turn that outlived its Poise: the relay peer carries
@@ -177,10 +181,11 @@ export interface Adapter {
    *  interrupt-and-resume instead. */
   replayTurn?(init: ReplayInit): Promise<TurnResult>
   /** Interject into the running turn. Rejects with `unsupported` when the
-   *  agent has no steering. */
+   *  agent has no steering. The runtime passes a correlation id so an
+   *  adapter that reports `unrunSteers` can name which steer never ran. */
   /** Native context maintenance, not a request for an ordinary summary reply. */
   compact?(turnId: string, memories: string, signal: AbortSignal): Promise<TurnResult>
-  steer(text: string): Promise<void>
+  steer(text: string, opts?: { correlationId?: string }): Promise<void>
   /** Cancel the running turn; the pending `prompt()` then resolves with
    *  `stopReason: 'cancelled'`. */
   cancel(): Promise<void>
