@@ -609,13 +609,13 @@ async function fetchAllRepos(sequence = currentLoadSequence) {
   refreshRepositorySelectors()
 }
 
-// Pull /api/agent-logs and rebuild the set of running-job keys. Called
-// alongside fetchLive on each refresh tick. Errors are swallowed —
-// the breathing accent simply doesn't show.
+// Pull the running-only /api/agent-logs read and rebuild the set of
+// running-job keys. Called alongside fetchLive on each refresh tick.
+// Errors are swallowed — the breathing accent simply doesn't show.
 async function fetchAgentActive(sequence = currentLoadSequence) {
   const org = getSelectedOrganization()
   try {
-    const res = await fetch(organizationUrl('/api/agent-logs'))
+    const res = await fetch(organizationUrl('/api/agent-logs?status=running'))
     if (!res.ok) return
     const data = await res.json()
     const next = new Set<string>()

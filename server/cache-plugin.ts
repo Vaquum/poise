@@ -614,10 +614,15 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // under a `logs` envelope so the front-end can extend it later
         // without a breaking change.
         if (path === '/api/agent-logs' && req.method === 'GET') {
-          const limitText = new URLSearchParams(url.split('?')[1] || '').get('limit')
+          const query = new URLSearchParams(url.split('?')[1] || '')
+          const limitText = query.get('limit')
           const limit = limitText === null ? undefined : Number(limitText)
           if (limitText !== null && (!/^[1-9]\d*$/.test(limitText) || !Number.isSafeInteger(limit) || limit! > 100)) {
             return json(res, 400, { error: 'limit must be an integer from 1 to 100' })
+          }
+          const status = query.get('status')
+          if (status !== null && status !== 'running') {
+            return json(res, 400, { error: 'status must be running' })
           }
           try {
             const orgs = selectedOrg ? selectOrganizations(selectedOrg) : null
@@ -627,9 +632,15 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             const quarantined = snapshot.quarantined.filter((row) => !row.repo || belongs(row.repo)
               || selected.some((entry) => row.id === entry.id
                 || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
-            const logs = selected.filter((entry) => !snapshot.quarantined.some((row) => row.id === entry.id
+            const readable = selected.filter((entry) => !snapshot.quarantined.some((row) => row.id === entry.id
                 || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
-            return json(res, 200, { logs: limit === undefined ? logs : logs.slice(0, limit), quarantined,
+            // A running-only read filters the same scoped snapshot Current
+            // used to download whole; quarantined rows stay when their status
+            // is unreadable (uncertainty, not absence) or matches.
+            const logs = status === null ? readable : readable.filter((entry) => entry.status === status)
+            const scopedQuarantined = status === null ? quarantined
+              : quarantined.filter((row) => !row.status || row.status === status)
+            return json(res, 200, { logs: limit === undefined ? logs : logs.slice(0, limit), quarantined: scopedQuarantined,
               ...(limit === undefined ? {} : { total: logs.length }) })
           } catch (err: any) {
             return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })

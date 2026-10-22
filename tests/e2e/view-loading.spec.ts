@@ -525,6 +525,19 @@ test('Editor binds reviews and Google publications before annotations and resume
   } finally { annotations.release() }
 })
 
+test('Current rebuilds its running-job accent from the running-only agent-log read', async ({ page }) => {
+  await setup(page)
+  const agentLogsUrls: string[] = []
+  await page.route(/\/api\/agent-logs(?:\?.*)?$/, (route) => {
+    agentLogsUrls.push(route.request().url())
+    return route.fulfill({ json: { logs: [{ status: 'running', repo: 'acme/project', pr_id: '7' }] } })
+  })
+  await page.goto('/')
+  await expect(page.locator('.card[data-id="acme/project#7"].card-active')).toHaveCount(1, { timeout: 5000 })
+  expect(agentLogsUrls.length).toBeGreaterThan(0)
+  for (const url of agentLogsUrls) expect(new URL(url).searchParams.get('status')).toBe('running')
+})
+
 test('external document opens supersede library discovery captured before creation', async ({ page }) => {
   await setup(page, 'editor', 'remembered')
   await editorDocuments(page)

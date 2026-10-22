@@ -586,6 +586,9 @@ are never made actionable by the preview. Returning to Swarm paints received
 history immediately while a fresh read runs. The optional `limit=1` through
 `limit=100` on `GET /api/agent-logs` returns a newest-first preview and its
 `total` readable-run count. Unbounded reads retain the full-history response.
+The optional `status=running` returns only running rows (plus quarantined rows
+whose status is unreadable or running); Current's running-job accent uses it
+instead of the full history.
 
 With a current Caller release, review/approval rows show the last
 observed stage. Expand a row for timestamped activity, worker heartbeat age, last

@@ -413,6 +413,40 @@ describe('global behavior settings API', () => {
     expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs')).toHaveLength(before)
   })
 
+  it('serves a running-only agent-log read for the Current accent', async () => {
+    const row = (index: number, status = 'running', repo = 'Legacy/same-repo') => ({
+      id: index.toString(16).padStart(32, '0'), repo, pr_id: String(index), model: 'test',
+      behavior: 'pr_review', prompt: '', actor: 'review-bot', status,
+      started_at: '2026-10-01T12:00:00Z',
+      completed_at: status === 'running' ? null : '2026-10-01T12:01:00Z',
+      time_elapsed: '1m', outcome: null,
+    })
+    behaviorLogs = [
+      row(1, 'running'),
+      row(2, 'completed'),
+      row(3, 'running', 'beta/other'),
+      { ...row(4, 'completed'), actor: 42 },
+      { ...row(5, 'running'), status: 42 },
+      { ...row(6, 'running'), correlation_id: 'dupe-run' },
+      { ...row(7, 'running'), correlation_id: 'dupe-run', actor: 42 },
+      row(8, 'running'),
+    ]
+    const running = await (await fetch(`${base}/api/agent-logs?org=Legacy&status=running`)).json()
+    expect(running.logs.map((entry: { id: string }) => entry.id)).toEqual([row(8).id, row(1).id])
+    expect(running.quarantined.map((entry: { id: string }) => entry.id)).toEqual([row(5).id, row(7).id])
+    expect(running).not.toHaveProperty('total')
+    const full = await (await fetch(`${base}/api/agent-logs?org=Legacy`)).json()
+    expect(running.logs).toEqual(full.logs.filter((entry: { status: string }) => entry.status === 'running'))
+    const preview = await (await fetch(`${base}/api/agent-logs?org=Legacy&status=running&limit=1`)).json()
+    expect(preview.logs.map((entry: { id: string }) => entry.id)).toEqual([row(8).id])
+    expect(preview.total).toBe(2)
+    const before = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs').length
+    const rejected = await fetch(`${base}/api/agent-logs?status=completed`)
+    expect(rejected.status).toBe(400)
+    expect((await rejected.json()).error).toContain('status must be running')
+    expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs')).toHaveLength(before)
+  })
+
   it('classifies retained no-action incidents even after their failure summary is gone', async () => {
     const target = 'Legacy/same-repo#18'
     const claimId = database!.claimSeenOwned('review-new-prs', target)!
