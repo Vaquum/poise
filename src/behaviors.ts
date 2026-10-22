@@ -112,6 +112,7 @@ const enabledByKey: Partial<Record<BehaviorKey, boolean>> = {}
 const settingByKey: Partial<Record<BehaviorKey, BehaviorSetting>> = {}
 const reviewersByKey: Partial<Record<BehaviorKey, ReviewerCount>> = {}
 const lastByKey: Partial<Record<BehaviorKey, LastTriggered | null>> = {}
+const lastSucceededByKey: Partial<Record<BehaviorKey, { at: string } | null>> = {}
 const scratchpadByKey: Partial<Record<BehaviorKey, string>> = {}
 // Review New Issues: the repositories that trigger it and the trusted authors.
 const reposByKey: Partial<Record<BehaviorKey, string[]>> = {}
@@ -135,6 +136,11 @@ export function getReviewers(key: BehaviorKey): ReviewerCount {
 
 export function getLastTriggered(key: BehaviorKey): LastTriggered | null {
   return lastByKey[key] || null
+}
+
+export function getLastSucceeded(key: BehaviorKey): { at: string } | null {
+  const last = lastSucceededByKey[key]
+  return last && typeof last.at === 'string' && Number.isFinite(Date.parse(last.at)) ? last : null
 }
 
 export function getScratchpad(key: BehaviorKey): string {
@@ -368,6 +374,7 @@ export async function refreshState(): Promise<void> {
       // Server-owned columns are safe either way — nothing the person does
       // here writes them, so a slightly old value is just a slightly old value.
       lastByKey[k] = data[k]?.lastTriggered ?? null
+      lastSucceededByKey[k] = data[k]?.lastSucceeded ?? null
       // These three the person can change from this view. If they did so while
       // this read was out, the read predates the change and must not undo it.
       if (!readIsCurrentFor(k, seen.started, seen.busy)) continue

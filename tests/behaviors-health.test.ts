@@ -115,6 +115,45 @@ describe('scan health and dependency recovery', () => {
     },
   )
 
+  it('persists a useful cause for a multiline approve-prs check failure through restart', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-02T12:00:00Z'))
+    arrangeCli(true)
+    const original = mocks.runFile.getMockImplementation()!
+    const stderr = 'error: GitHub 403 rate-limit: {\'x-ratelimit-resource\': \'core\', \'x-ratelimit-remaining\': \'0\', '
+      + '\'x-ratelimit-reset\': \'1800000000\'} body={\n\t"message": "API rate limit exceeded for user ID 42.",\n\t"status": "403"\n}'
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed') {
+        throw Object.assign(new Error('Command failed (1): github-interface'), { code: 1, stdout: '', stderr })
+      }
+      return original(command, args, options)
+    })
+    let modules = await loadModules()
+    modules.behaviors.startBehaviorsRuntime()
+    modules.database.setMeta('me', 'poise-user')
+    modules.database.setMeta('behavior_approve_prs_enabled', '1')
+    modules.database.setMeta('behavior_review_new_prs_keyver', '3')
+    modules.database.recordSeen('review-new-prs', '__snapshot_v3__')
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    const failure = { behavior: 'approve-prs', kind: 'operation', target: `${pr.repo}#17:check`, consecutiveFailures: 1,
+      error: 'Command failed (1): github-interface: GitHub 403 rate-limit '
+        + '{\'x-ratelimit-resource\': \'core\', \'x-ratelimit-remaining\': \'0\', \'x-ratelimit-reset\': \'1800000000\'}: '
+        + 'API rate limit exceeded for user ID 42.',
+      diagnostic: { severity: 'info', code: 'rate_limit' }, nextRetryAt: '2026-10-02T12:01:00.000Z' }
+    expect(modules.behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', running: true, failures: [failure] })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ failures: [failure] })
+    expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--requested-changes-addressed')).toHaveLength(1)
+    arrangeCli(false)
+    vi.setSystemTime(Date.now() + 60_000)
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', failures: [] })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
   it.each(['review-new-prs', 'approve-prs'] as const)('isolates a missing checkout during %s without blocking another repository', async (behavior) => {
     fixture.listedPrs = [pr, { ...pr, repo: 'Vaquum/healthy', number: 18, url: 'https://github.com/Vaquum/healthy/pull/18' }]
     arrangeCli(behavior === 'approve-prs')

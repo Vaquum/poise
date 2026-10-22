@@ -12,7 +12,7 @@ import { layout, watchPanel } from '../motion'
 // runtime — the view is just a UI for state, not the place where
 // agent automations actually run.
 
-import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
+import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getLastSucceeded, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
 import { organizationErrors } from '../organizations'
 import { notificationCountsFor, onNotificationItems, openNotifications } from './notification-rail'
 import type { ItemGroup } from '../notification-items'
@@ -215,11 +215,14 @@ function lastTriggeredCell(key: BehaviorKey): string {
   if (!last && (stateUnknown() || key !== 'merge-prs' && key !== 'rerun-grey-ci' && lastTriggeredUnavailable())) {
     return '<span class="last-dash" title="The latest history could not be read, so this is unknown — not necessarily never.">?</span>'
   }
-  if (!last) return '<span class="last-dash">—</span>'
   if (key === 'rerun-grey-ci') {
-    if (!last.url || !/^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/actions\/runs\/[1-9]\d*$/.test(last.url)) return '<span class="last-dash">?</span>'
-    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(last.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
+    const succeeded = getLastSucceeded(key)
+    const checked = succeeded ? ` <span class="behavior-last-checked" title="Last completed scan: ${escapeHtml(succeeded.at)}">· checked ${escapeHtml(relTime(succeeded.at))} ago</span>` : ''
+    if (!last) return `<span class="last-dash">—</span>${checked}`
+    if (!last.url || !/^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/actions\/runs\/[1-9]\d*$/.test(last.url)) return `<span class="last-dash">?</span>${checked}`
+    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(last.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>${checked}`
   }
+  if (!last) return '<span class="last-dash">—</span>'
   if (key === 'merge-prs') {
     const match = last.target.match(/^([^/\s]+\/[^#\s]+)#(\d+)$/)
     if (!match) return '<span class="last-dash">?</span>'

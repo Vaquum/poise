@@ -72,7 +72,7 @@ import {
 } from './db'
 import { HttpError } from './http'
 import { behaviorErrorMessage, behaviorIncidentDiagnostics } from './behavior-diagnostics'
-import { classifyBehaviorDiagnostic, diagnosticClassification, isTimeoutCause, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
+import { classifyBehaviorDiagnostic, diagnosticClassification, isTimeoutCause, rateLimitRetryAtMs, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { resolveReviewCheckout } from './review-checkout'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
@@ -416,11 +416,16 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
   )
   const now = Date.now()
   const diagnostic = classifyBehaviorDiagnostic(error ?? '', { held: kind === 'worker', ...options })
+  // A rate limit states its own reset: resume then, not on a backoff that
+  // lands inside the blocked window and doubles with every premature retry.
+  // Past the hourly ceiling the next attempt rereads a fresh reset instead.
+  const nextRetryAtMs = Math.min(Math.max(now + delayMs, rateLimitRetryAtMs(error ?? '', now) ?? 0),
+    now + BEHAVIOR_RETRY_MAX_MS)
   setMeta(failureKey(key, target), JSON.stringify({
     kind,
     consecutiveFailures,
     lastFailureAtMs: now,
-    nextRetryAtMs: now + delayMs,
+    nextRetryAtMs,
     ...(error ? { error } : {}),
     diagnostic,
     ...(options.callId ? { callId: options.callId } : {}),
@@ -2955,6 +2960,11 @@ async function fireApprove(
   if (!isEnabled('approve-prs')) return false
   if (claude) await waitForBehavior(claudeAuth.requireReady())
   if (!isEnabled('approve-prs') || behaviorAborted()) return false
+  // Provider preparation keeps the operation deadline and its accounting; the
+  // launch below runs under the lifecycle signal so an expired sweep deadline
+  // does not discard it. Only shutdown or disable discards prepared work.
+  return underLifecycleSignal(async () => {
+  try {
   const currentHead = await currentHeadSha(pr.repo, pr.number, actor)
   // The head-SHA lookup above is a subprocess with a 30s timeout, so the user
   // has a real window to turn the behaviour off while it is out. Nothing
@@ -3019,6 +3029,16 @@ async function fireApprove(
   }
   markClaimLaunched(claimId)
   return true
+  } catch (err) {
+    // The sweep deadline may expire while a launch is in flight; tickApprovePrs
+    // reads that as an abort and would drop a genuine failure silently, so log
+    // and record it here, as review-new-prs phase 3 does.
+    if (behaviorAborted()) return false
+    console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
+    recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+    return false
+  }
+  })
   })
 }
 
@@ -3654,6 +3674,21 @@ export function getGreyCiLastFired(): { at: string, target: string, url: string 
   }
 }
 
+export function getGreyCiLastSucceeded(): { at: string } | null {
+  if (behaviorOrganization.getStore() === undefined) {
+    const events = readyOrganizations().map((org) => behaviorOrganization.run(org, getGreyCiLastSucceeded))
+      .filter((event): event is { at: string } => event !== null)
+    return events.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0] ?? null
+  }
+  const raw = getMeta('behavior_rerun_grey_ci_last_success')
+  if (!raw) return null
+  if (!Number.isFinite(Date.parse(raw))) {
+    console.error('[behaviors] grey CI last success could not be read: not a timestamp')
+    return null
+  }
+  return { at: raw }
+}
+
 export const GREY_CI_INTENT_KEY = 'grey-ci-recovery'
 
 async function tickRerunGreyCi(): Promise<void> {
@@ -3671,14 +3706,24 @@ async function tickRerunGreyCi(): Promise<void> {
     const batch = ordered.slice(offset, offset + MERGE_CANDIDATE_BATCH_SIZE)
     const last = batch[batch.length - 1]!
     setMeta('behavior_rerun_grey_ci_cursor', `${last.repo}#${last.number}`)
-    const { stdout } = await runFile(GH_INTERFACE, ['--grey-ci-candidates', '--requests-json',
-      JSON.stringify(batch.map((pr) => ({ repository: pr.repo, number: pr.number }))), '--token-user', actor],
-    { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
-    const packet = objectValue(parseJson(stdout, 'grey CI candidates'), 'grey CI candidates')
-    if (packet.action !== 'grey_ci_candidates' || packet.actor !== actor
-      || !Number.isSafeInteger(packet.graphql_cost) || Number(packet.graphql_cost) < 1
-      || !Array.isArray(packet.records) || packet.records.length !== batch.length) {
-      throw new Error('github-interface returned malformed grey CI batch evidence')
+    let packet: Record<string, unknown>
+    try {
+      const { stdout } = await runFile(GH_INTERFACE, ['--grey-ci-candidates', '--requests-json',
+        JSON.stringify(batch.map((pr) => ({ repository: pr.repo, number: pr.number }))), '--token-user', actor],
+      { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+      packet = objectValue(parseJson(stdout, 'grey CI candidates'), 'grey CI candidates')
+      if (packet.action !== 'grey_ci_candidates' || packet.actor !== actor
+        || !Number.isSafeInteger(packet.graphql_cost) || Number(packet.graphql_cost) < 1
+        || !Array.isArray(packet.records) || packet.records.length !== batch.length) {
+        throw new Error('github-interface returned malformed grey CI batch evidence')
+      }
+    } catch (error) {
+      // One unreadable batch must not stop the others: each of its targets
+      // keeps a visible failure and the scan continues. An aborted tick ends.
+      if (behaviorAborted()) throw error
+      if (!isEnabled(behavior)) return
+      for (const pr of batch) recordBehaviorFailure(behavior, 'operation', error, `${pr.repo}#${pr.number}`)
+      continue
     }
     for (let index = 0; index < batch.length; index++) {
       if (!isEnabled(behavior) || behaviorAborted()) return
@@ -3686,13 +3731,22 @@ async function tickRerunGreyCi(): Promise<void> {
       const target = `${pr.repo}#${pr.number}`
       setMeta('behavior_rerun_grey_ci_cursor', target)
       if (!stillEligible(behavior, pr) || !behaviorRetryDue(behavior, target)) continue
-      const row = objectValue(packet.records[index], 'grey CI candidate')
-      if (row.repository !== pr.repo || row.number !== pr.number || !Array.isArray(row.runs)
-        || !(row.error === null || typeof row.error === 'string')) throw new Error('malformed grey CI target evidence')
-      if (row.error !== null) { recordBehaviorFailure(behavior, 'operation', row.error, target); continue }
-      if (typeof row.head_sha !== 'string' || !SHA_PATTERN.test(row.head_sha)
-        || !(row.author === null || typeof row.author === 'string')) throw new Error('missing grey CI head or author evidence')
-      if (row.author === null || row.author.toLowerCase() !== author.toLowerCase()) continue
+      let row: Record<string, unknown>
+      try {
+        row = objectValue(packet.records[index], 'grey CI candidate')
+        if (row.repository !== pr.repo || row.number !== pr.number || !Array.isArray(row.runs)
+          || !(row.error === null || typeof row.error === 'string')) throw new Error('malformed grey CI target evidence')
+        if (row.error !== null) { recordBehaviorFailure(behavior, 'operation', row.error, target); continue }
+        if (typeof row.head_sha !== 'string' || !SHA_PATTERN.test(row.head_sha)
+          || !(row.author === null || typeof row.author === 'string')) throw new Error('missing grey CI head or author evidence')
+      } catch (error) {
+        // One PR's unreadable evidence must not stop the readable ones.
+        if (behaviorAborted()) throw error
+        if (!isEnabled(behavior)) return
+        recordBehaviorFailure(behavior, 'operation', error, target)
+        continue
+      }
+      if (row.author === null || (row.author as string).toLowerCase() !== author.toLowerCase()) continue
       clearBehaviorFailure(behavior, target)
       // Rehydrate every unconfirmed intent on this head, even when its CI is
       // now green or running and discovery no longer returns a grey candidate.
@@ -3706,17 +3760,30 @@ async function tickRerunGreyCi(): Promise<void> {
       }
       for (const value of row.runs) {
         if (!isEnabled(behavior) || behaviorAborted()) return
-        const run = objectValue(value, 'grey CI workflow')
-        const runId = safeInteger(run.run_id, 'workflow run id')
-        const attempt = safeInteger(run.run_attempt, 'workflow attempt')
-        const workflowId = safeInteger(run.workflow_id, 'workflow id')
-        if (!runId || !attempt || !workflowId || run.status !== 'completed'
-          || !['cancelled', 'stale'].includes(String(run.conclusion))
-          || typeof run.event !== 'string' || !/^[a-z_]+$/.test(run.event)) throw new Error('unsafe grey CI workflow evidence')
+        let runId: number
+        let attempt: number
+        let workflowId: number
+        let event: string
+        try {
+          const run = objectValue(value, 'grey CI workflow')
+          runId = safeInteger(run.run_id, 'workflow run id')
+          attempt = safeInteger(run.run_attempt, 'workflow attempt')
+          workflowId = safeInteger(run.workflow_id, 'workflow id')
+          if (!runId || !attempt || !workflowId || run.status !== 'completed'
+            || !['cancelled', 'stale', 'timed_out'].includes(String(run.conclusion))
+            || typeof run.event !== 'string' || !/^[a-z_]+$/.test(run.event)) throw new Error('unsafe grey CI workflow evidence')
+          event = run.event
+        } catch (error) {
+          // One workflow's unsafe evidence must not stop the readable ones.
+          if (behaviorAborted()) throw error
+          if (!isEnabled(behavior)) return
+          recordBehaviorFailure(behavior, 'operation', error, target)
+          continue
+        }
         const claimKey = GREY_CI_INTENT_KEY
-        const source = `workflow:${workflowId}:${run.event}:${row.head_sha}`
+        const source = `workflow:${workflowId}:${event}:${row.head_sha}`
         const failureTarget = `${target}:${source}`
-        const claimTarget = `${pr.repo.toLowerCase()}:${row.head_sha}:${workflowId}:${run.event}`
+        const claimTarget = `${pr.repo.toLowerCase()}:${row.head_sha}:${workflowId}:${event}`
         if (hasSeen(claimKey, claimTarget) || !behaviorRetryDue(behavior, failureTarget)) continue
         const claimId = randomUUID()
         const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
@@ -3740,7 +3807,7 @@ async function tickRerunGreyCi(): Promise<void> {
           captureBehaviorAdmission({ admissionKey: metricRunId, nativeId: metricRunId, behavior,
             source: 'poise:rerun-grey-ci', owner: currentOrganization()?.login ?? null,
             actor, repository: pr.repo, number: pr.number, head: row.head_sha,
-            workflow: { id: workflowId, runId, attempt, event: run.event }, startedAt: new Date().toISOString() })
+            workflow: { id: workflowId, runId, attempt, event }, startedAt: new Date().toISOString() })
           const { stdout: receipt } = await runFile(GH_INTERFACE, ['--rerun-grey-ci-if-ready', `#${pr.number}`,
             '--run-id', String(runId), '--run-attempt', String(attempt), '--expected-head', row.head_sha,
             '--author', author, '--token-user', actor],
@@ -3779,6 +3846,10 @@ async function tickRerunGreyCi(): Promise<void> {
       }
     }
   }
+  // The scan completed: per-target failures above are recorded individually,
+  // and this stamp proves the behavior itself is alive. A stale stamp with no
+  // failures is a silent stop, not a quiet queue.
+  setMeta('behavior_rerun_grey_ci_last_success', new Date().toISOString())
 }
 
 // ── review-new-issues implementation ────────────────────────────────────

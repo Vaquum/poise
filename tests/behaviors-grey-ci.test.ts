@@ -32,6 +32,8 @@ let response: Record<string, unknown> = {}
 let pulls: Array<Record<string, unknown>> = []
 let greyNumbers: Set<number> | null = null
 let unreadableNumbers = new Set<number>()
+let malformedNumbers = new Set<number>()
+let batchFailures = 0
 let batchGate: { reached: () => void, wait: Promise<void> } | null = null
 
 function pull(repo = REPO, number = 7, fields: Record<string, unknown> = {}) {
@@ -56,11 +58,14 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
   const number = Number(args[1]?.slice(1))
   if (command === 'github-interface' && args[0] === '--grey-ci-candidates') {
     if (batchGate) { batchGate.reached(); await batchGate.wait }
+    if (batchFailures > 0) { batchFailures -= 1; throw new Error('batch read unavailable') }
     const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
-    return json({ action: 'grey_ci_candidates', actor: args[args.indexOf('--token-user') + 1], graphql_cost: 1, records: requests.map((request) => ({
-      ...request, head_sha: HEAD, author: ghostNumbers.has(request.number) ? null : 'octocat', runs: greyNumbers === null || greyNumbers.has(request.number) ? greyRuns : [],
-      error: unreadableNumbers.has(request.number) ? 'GitHub could not read this target' : null,
-    })) })
+    return json({ action: 'grey_ci_candidates', actor: args[args.indexOf('--token-user') + 1], graphql_cost: 1, records: requests.map((request) => {
+      const runs: unknown = malformedNumbers.has(request.number) ? 'oops'
+        : greyNumbers === null || greyNumbers.has(request.number) ? greyRuns : []
+      return ({ ...request, head_sha: HEAD, author: ghostNumbers.has(request.number) ? null : 'octocat', runs,
+        error: unreadableNumbers.has(request.number) ? 'GitHub could not read this target' : null })
+    }) })
   }
   if (command === 'github-interface' && args[0] === '--rerun-grey-ci-if-ready') {
     if (error) throw error
@@ -78,7 +83,8 @@ beforeEach(async () => {
   process.env.POISE_DB = join(root, 'cache.db')
   pulls = [pull()]
   outcome = 'rerun_requested'; error = null; healthError = null; response = {}; batchGate = null
-  greyNumbers = null; unreadableNumbers = new Set(); greyRuns = [GREY_RUN]; errorRunIds = new Set(); ghostNumbers = new Set()
+  greyNumbers = null; unreadableNumbers = new Set(); malformedNumbers = new Set(); batchFailures = 0
+  greyRuns = [GREY_RUN]; errorRunIds = new Set(); ghostNumbers = new Set()
   mocks.runFile.mockReset().mockImplementation(cli)
   mocks.spawnDetached.mockReset()
   vi.spyOn(console, 'log').mockImplementation(() => undefined)
@@ -241,6 +247,64 @@ describe('Rerun Grey CI', () => {
     enable(); response = fields; await runtime.runEnabledBehaviorsOnce()
     expect(runtime.getGreyCiLastFired()).toBeNull()
     expect(runtime.getBehaviorsRuntimeHealth().failures[0]?.error).toContain('malformed')
+  })
+  it('reruns a timed-out run exactly once across ticks', async () => {
+    enable(); greyRuns = [{ ...GREY_RUN, conclusion: 'timed_out' }]
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(rerunCalls()).toHaveLength(1)
+  })
+  it('launches exactly one rerun for a cancelled run across ticks', async () => {
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(rerunCalls()).toHaveLength(1)
+  })
+  it('holds the next launch until a rate-limit reset passes', async () => {
+    enable(); outcome = 'read_failed'
+    const reset = Math.floor(Date.now() / 1000) + 600
+    response = { error: `GitHub 403 rate-limit: {'x-ratelimit-resource': 'core', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '${reset}'} body={"message":"API rate limit exceeded"}` }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(rerunCalls()).toHaveLength(1)
+    vi.useFakeTimers(); await vi.advanceTimersByTimeAsync(61_000)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(rerunCalls()).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(600_000)
+    outcome = 'rerun_requested'; response = {}
+    await runtime.runEnabledBehaviorsOnce()
+    expect(rerunCalls()).toHaveLength(2)
+  })
+  it('retries a non-exhausted 403 on backoff instead of its distant reset', async () => {
+    enable(); outcome = 'read_failed'
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    response = { error: `GitHub 403 rate-limit: {'x-ratelimit-remaining': '4999', 'x-ratelimit-reset': '${reset}'} body={"message":"Resource not accessible by integration"}` }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(rerunCalls()).toHaveLength(1)
+    vi.useFakeTimers(); await vi.advanceTimersByTimeAsync(61_000)
+    outcome = 'rerun_requested'; response = {}
+    await runtime.runEnabledBehaviorsOnce()
+    expect(rerunCalls()).toHaveLength(2)
+  })
+  it('reruns later batches when an earlier batch read fails', async () => {
+    enable(); pulls = Array.from({ length: 51 }, (_, i) => pull(REPO, i + 1)); greyNumbers = new Set([51])
+    batchFailures = 1
+    await runtime.runEnabledBehaviorsOnce()
+    expect(rerunCalls()[0]![1][1]).toBe('#51')
+    const failures = runtime.getBehaviorsRuntimeHealth().failures
+    expect(failures).toHaveLength(50)
+    expect(failures).toEqual(expect.arrayContaining([expect.objectContaining({ target: `${REPO}#1`, error: 'batch read unavailable' })]))
+  })
+  it('reruns readable PRs when another PR returns malformed evidence', async () => {
+    enable(); pulls.push(pull(REPO, 8)); malformedNumbers.add(7)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(rerunCalls()).toHaveLength(1)
+    expect(rerunCalls()[0]![1][1]).toBe('#8')
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ target: `${REPO}#7` })])
+  })
+  it('reports when its last scan succeeded', async () => {
+    expect(runtime.getGreyCiLastSucceeded()).toBeNull()
+    enable(); await runtime.runEnabledBehaviorsOnce()
+    expect(runtime.getGreyCiLastSucceeded()).toEqual({ at: expect.any(String) })
   })
   it('resumes beyond a timed-out batch and does not drop PRs after the first fifty', async () => {
     enable(); pulls = Array.from({ length: 51 }, (_, i) => pull(REPO, i + 1)); greyNumbers = new Set([51])

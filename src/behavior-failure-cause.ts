@@ -3,7 +3,7 @@
 // holds a brace: a Grok balance error showed as "Internal error: {" or "}".
 
 import { terminalProviderMessage } from '../gateway/src/diagnostics/material-cause'
-export { failureCause, terminalProviderMessage } from '../gateway/src/diagnostics/material-cause'
+export { failureCause, jsonMessageCause, lastCauseLine, terminalProviderMessage } from '../gateway/src/diagnostics/material-cause'
 
 export type DiagnosticSeverity = 'error' | 'warning' | 'info'
 export interface DiagnosticClassification { severity: DiagnosticSeverity; code: string }
@@ -37,8 +37,37 @@ export function isTimeoutCause(error: string): boolean {
   return /aborted due to timeout|timed out/i.test(error)
 }
 
+// GitHub states when a rate limit lifts, and Caller surfaces it in 403/429
+// errors: `x-ratelimit-reset` epoch seconds and `retry-after` delay seconds.
+// Retrying before then provably fails, so the retry clock honors the later of
+// the stated time and its own backoff. The reset binds only when the quota is
+// exhausted: Caller attaches these headers to every 403/429, including
+// permission errors and secondary throttles whose reset is far away while
+// `retry-after` is short. Anything without a sane stated time is not a schedule.
+export function rateLimitRetryAtMs(error: string, nowMs: number): number | null {
+  const remaining = /x-ratelimit-remaining['"]?\s*:\s*['"]?(\d+)['"]?/.exec(error)?.[1]
+  const exhausted = remaining !== undefined && Number(remaining) === 0
+  const reset = exhausted ? /x-ratelimit-reset['"]?\s*:\s*['"]?(\d+)['"]?/.exec(error)?.[1] : undefined
+  const retryAfter = /retry-after['"]?\s*:\s*['"]?(\d+)['"]?/.exec(error)?.[1]
+  const candidates = [
+    reset === undefined ? null : Number(reset) * 1000,
+    retryAfter === undefined ? null : nowMs + Number(retryAfter) * 1000,
+  ].filter((candidate): candidate is number => candidate !== null && Number.isSafeInteger(candidate)
+    && candidate > Date.parse('2020-01-01T00:00:00Z') && candidate <= nowMs + 24 * 3600_000)
+  return candidates.length ? Math.max(...candidates) : null
+}
+
 // Warning rules are an allowlist of observable transient outcomes. Neither a
 // retry count nor text saying "warning" can downgrade unknown or held evidence.
+// A 403 with explicit quota-exhaustion evidence is a rate limit, not a
+// repository-access failure: Caller's `rate-limit:` prefix alone also fires
+// for access refusals with remaining quota, so it proves nothing by itself.
+function quotaExhausted(cause: string): boolean {
+  return /\b(?:GitHub|HTTP)\s*403\b/.test(cause)
+    && (/x-ratelimit-remaining['"]?\s*[:=]\s*['"]?0\b/i.test(cause)
+      || /rate[ -]?limit exceeded|exceeded a secondary rate limit/i.test(cause))
+}
+
 export function classifyBehaviorDiagnostic(error: string, options: DiagnosticOptions = {}): DiagnosticClassification {
   const blockingCode = ['invalid_agent_result', 'review_provider_blocked', 'review_packet_too_large',
     'review_contract_violation', 'review_recovery_failed', 'review_budget_exhausted', 'model_output_limit']
@@ -56,7 +85,7 @@ export function classifyBehaviorDiagnostic(error: string, options: DiagnosticOpt
     return diagnosticClassification('head_changed')
   }
   if (/\b(?:GitHub|HTTP|http_status["']?\s*[:=]|unexpected status|status)\s*["']?\s*429\b/.test(cause)
-    || options.errorCode === 'rate_limit') return diagnosticClassification('rate_limit')
+    || options.errorCode === 'rate_limit' || quotaExhausted(cause)) return diagnosticClassification('rate_limit')
   if (/\b(?:GitHub|HTTP|http_status["']?\s*[:=]|unexpected status|status)\s*["']?\s*5\d\d\b/.test(cause)
     || options.errorCode === 'server_error') return diagnosticClassification('upstream_unavailable')
   if (/\b(?:httpx\.(?:ReadTimeout|ConnectTimeout|ConnectError)|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN)\b/.test(cause)) {

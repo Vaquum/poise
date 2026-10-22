@@ -2,7 +2,7 @@ import type { LogEvent } from './contract.js'
 import type { DiagnosticStore } from './store.js'
 import type { LogAccess } from './query-contract.js'
 import type { EvidenceAttachment } from './evidence-contract.js'
-import { failureCause, materialFailureCause } from './material-cause.js'
+import { failureCause, lastCauseLine, materialFailureCause, selectFailureCause } from './material-cause.js'
 
 /** Internal exact-key join; public Logging HTTP routes cannot submit these selectors. */
 export interface EvidenceSelector {
@@ -31,7 +31,11 @@ function matches(event: LogEvent, selector: EvidenceSelector): boolean {
     const canonicalCause = (value: string) => materialFailureCause(failureCause(value).replace(/[\x00-\x1f\x7f]/g, ' '))
     const expected = canonicalCause(selector.cause)
     const tail = event.stderr?.trim().split('\n').pop()?.trim()
-    const candidates = [event.message, event.stderr ?? '', tail ? `${event.message}: ${tail}` : event.message]
+    // The selected-cause summary health stores, mirroring its exact
+    // selection, next to the legacy last-line form it replaced.
+    const cause = event.stderr?.trim() ? (selectFailureCause(event.stderr) ?? lastCauseLine(event.stderr)) : null
+    const selected = cause ? `${event.message}: ${cause}` : event.message
+    const candidates = [event.message, event.stderr ?? '', tail ? `${event.message}: ${tail}` : event.message, selected]
     if (!candidates.some((cause) => canonicalCause(cause) === expected)) return false
   }
   return true
