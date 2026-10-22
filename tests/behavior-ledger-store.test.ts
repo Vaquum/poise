@@ -1,10 +1,10 @@
 import Database from 'better-sqlite3'
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
-import type { LedgerAdmission, LedgerCaller, LedgerPolicy, LedgerRecord } from '../server/behavior-ledger-contract'
+import { LedgerError, type LedgerAdmission, type LedgerCaller, type LedgerPolicy, type LedgerRecord } from '../server/behavior-ledger-contract'
 
 const roots: string[] = []
 const stores: BehaviorLedgerStore[] = []
@@ -269,12 +269,14 @@ describe('behavior firing ledger store', () => {
     const input = { ...admission(), prompt: 'must never enter storage', stderr: 'also forbidden' }
     db.capture(input)
     expect(JSON.stringify(records(db))).not.toContain('must never')
-    expect(() => db.capture(admission('bad', { admissionKey: 'x'.repeat(1025) }))).toThrow()
-    expect(db.health()).toMatchObject({ status: 'incomplete', dropped: 1 })
+    const invalid = () => db.capture(admission('bad', { admissionKey: 'x'.repeat(1025) }))
+    expect(invalid).toThrow(LedgerError)
+    try { invalid(); expect.unreachable() } catch (error) { expect((error as LedgerError).status).toBe(400) }
+    expect(db.health()).toMatchObject({ status: 'ok', dropped: 0 })
     expect(records(db)).toHaveLength(2)
   })
 
-  it('fails contested writes immediately, keeps committed evidence and reports capture loss independently', () => {
+  it('fails contested writes immediately as retryable and keeps committed evidence', () => {
     const db = store()
     db.capture(admission())
     const blocking = new Database(db.path)
@@ -282,11 +284,13 @@ describe('behavior firing ledger store', () => {
     blocking.exec('BEGIN EXCLUSIVE')
     try {
       const before = Date.now()
-      expect(() => db.capture(admission('blocked', { admissionKey: 'blocked' }))).toThrow()
+      const contended = () => db.capture(admission('blocked', { admissionKey: 'blocked' }))
+      expect(contended).toThrow()
+      try { contended(); expect.unreachable() } catch (error) { expect(error).not.toBeInstanceOf(LedgerError) }
       expect(Date.now() - before).toBeLessThan(200)
       expect(db.read({ operation: 'health' }).status).toBe(200)
     } finally { blocking.exec('ROLLBACK'); blocking.close() }
-    expect(db.health().dropped).toBe(1)
+    expect(db.health().dropped).toBe(0)
     expect(records(db)).toHaveLength(2)
   })
 
@@ -336,9 +340,24 @@ describe('behavior firing ledger store', () => {
     } finally { retained.close() }
   })
 
+  it('reopens the store after an outage and recovers to ok', () => {
+    const root = mkdtempSync(join(tmpdir(), 'poise-ledger-reopen-'))
+    roots.push(root)
+    const path = join(root, 'behavior-ledger.db')
+    mkdirSync(path)
+    const db = store({}, path)
+    expect(db.health()).toMatchObject({ status: 'unavailable', unavailableReason: 'store_unavailable' })
+    expect(db.read({ operation: 'list' })).toMatchObject({ status: 503 })
+    rmdirSync(path)
+    clock += 1001
+    expect(db.health()).toMatchObject({ status: 'ok', unavailableReason: null })
+    expect(db.read({ operation: 'list', limit: 50 })).toMatchObject({ status: 200 })
+  })
+
   it('keeps unavailable health readable when initialization cannot allocate its bounded store', () => {
     const db = store({ maxPagesBytes: 4096 })
-    expect(db.read({ operation: 'health' })).toMatchObject({ status: 200, body: { health: { status: 'unavailable' } } })
+    expect(db.read({ operation: 'health' })).toMatchObject({ status: 200,
+      body: { health: { status: 'unavailable', unavailableReason: 'store_unavailable' } } })
     expect(db.read({ operation: 'list' })).toMatchObject({ status: 503, body: { error: 'ledger_unavailable' } })
   })
 
