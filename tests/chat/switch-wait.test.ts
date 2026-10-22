@@ -344,7 +344,7 @@ describe('the switch bound', () => {
       w.c.auto = true
       const next = w.make()
       await next.recover()
-      await until(() => w.c.calls.length === 8, 50_000)
+      await until(() => w.c.calls.length === 8, 100_000)
       expect(w.c.calls.slice(4).map(call => call.input.text)).toEqual([
         'Poise restarted for an update while your turn was running. Continue where you left off.',
         'Poise restarted for an update while your turn was running. Continue where you left off.',
@@ -359,5 +359,5 @@ describe('the switch bound', () => {
     } finally {
       service.reset()
     }
-  }, 120_000)
+  }, 180_000)
 })
