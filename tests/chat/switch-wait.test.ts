@@ -293,7 +293,7 @@ describe('the switch bound', () => {
     })
     try {
       service.switchRelease('r2')
-      expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+      await w.runtime.enqueue(w.s.id, randomUUID(), input('Waited follow-up'))
       now += 15 * 60_000
       timer.fire()
       await until(() => w.turns(w.s.id).length === 3)
@@ -303,6 +303,53 @@ describe('the switch bound', () => {
       ])
       expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
     } finally { service.reset() }
+  })
+
+  it('keeps polling a retargeted switch after an earlier cancellation settles', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.c.calls.length === 1)
+    let release!: () => void
+    let cancelled!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const settled = new Promise<void>(resolve => { cancelled = resolve })
+    const cancel = w.runtime.cancel.bind(w.runtime)
+    const delayed = vi.spyOn(w.runtime, 'cancel').mockImplementation(async id => {
+      const result = await cancel(id)
+      cancelled()
+      await held
+      return result
+    })
+    const timer = new FakeTimer()
+    let now = 5_000_000
+    const logs: string[] = []
+    const restart = vi.fn(() => true)
+    const releasesDir = await releases()
+    await mkdir(join(releasesDir, 'r3'))
+    await writeFile(join(releasesDir, 'r3', 'base'), 'b1\n')
+    await writeFile(join(releasesDir, 'r3', 'installed'), '')
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: line => logs.push(line), releasesDir,
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => now,
+    })
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await settled
+      expect(w.runtime.prompt(w.s.id, input('Wait behind the retargeted update'))).toHaveProperty('waitId')
+      service.switchRelease('r3')
+      expect(timer.timers.size).toBe(1)
+      release()
+      await until(() => logs.some(line => line.includes('superseded while cancellation settled')))
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(w.runtime.switchPending?.release).toBe('r3')
+    } finally {
+      release()
+      delayed.mockRestore()
+      service.reset()
+    }
   })
 
   it('does not restart a fresh switch when an earlier cancellation settles', async () => {

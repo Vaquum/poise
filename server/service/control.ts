@@ -207,13 +207,14 @@ export class ServiceControl {
     writeFileSync(`${next}.tmp`, `${release}\n`)
     renameSync(`${next}.tmp`, next)
     const first = this.switchTo === null
+    const retargeted = this.switchTo !== release
     this.switchTo = release
     this.runtime.setSwitchPending(release)
     if (first) {
       this.switchPendingSince = this.now()
       this.log(`[service] switching to release ${release} once no Chat turn and no work of this server runs; new turns wait behind the update`)
-      this.pollSwitch()
     }
+    if ((first || retargeted) && this.switchPoll === null && !this.restarting) this.pollSwitch()
     return { release, switching: true }
   }
 
