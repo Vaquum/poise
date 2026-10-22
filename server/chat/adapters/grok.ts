@@ -23,11 +23,11 @@ import { memorySuffix } from '../memory-content'
 // named below are read; every other notification is dropped by name.
 
 import { randomUUID } from 'node:crypto'
-import type { ChildProcess } from 'node:child_process'
+
 import { CHAT_LIMITS, type Capabilities, type CommandOption, type ContentBlock, type PermissionOption, type PermissionOptionKind, type PromptInput, type Question, type StopReason, type ToolKind, type ToolStatus } from '../protocol'
-import { RpcError, StdioRpc } from '../rpc'
+import { RpcError, StdioRpc, outboundHasMethod } from '../rpc'
 import { readCheckoutTextFile } from '../client-fs'
-import { AdapterError, assertRequiredCapabilities, type Adapter, type AdapterHost, type AdapterStartOptions, type AdapterStartResult, type TurnResult } from './types'
+import { AdapterError, assertRequiredCapabilities, type Adapter, type AdapterHost, type AdapterStartOptions, type AdapterStartResult, type AgentProcess, type ReplayInit, type TurnResult } from './types'
 import { forAcp } from '../../extensions/types'
 
 export const GROK_COMMAND = 'grok'
@@ -100,7 +100,7 @@ function stopReason(value: unknown): StopReason {
 
 export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs?: number } = {}): Adapter {
   let rpc: StdioRpc | null = null
-  let child: ChildProcess | null = null
+  let child: AgentProcess | null = null
   let sessionId: string | undefined
   let modelId = ''
   // What `initialize` says this Grok accepts besides stdio MCP servers.
@@ -289,8 +289,35 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
     applyConfigOptions(result?.configOptions)
   }
 
-  async function launch(safeMode: boolean): Promise<void> {
-    child = await host.spawn(GROK_COMMAND, grokArgs(safeMode))
+  function mapPromptResult(result: any): TurnResult {
+    const meta = result?._meta || {}
+    const usage = meta.usage || {}
+    return {
+      stopReason: cancelRequested && stopReason(result?.stopReason) === 'end_turn' ? 'cancelled' : stopReason(result?.stopReason),
+      usage: {
+        inputTokens: numberOr(usage.inputTokens ?? meta.inputTokens),
+        outputTokens: numberOr(usage.outputTokens ?? meta.outputTokens),
+        totalTokens: numberOr(usage.totalTokens ?? meta.totalTokens),
+      },
+    }
+  }
+
+  function settlePrompt(id: string, admission: { ready: Promise<void>, release(): void }, signal: AbortSignal, onAbort: () => void): void {
+    admission.release()
+    if (promptAdmission === admission) promptAdmission = null
+    signal.removeEventListener('abort', onAbort)
+    for (const [toolId, open] of openTools) {
+      host.emit({ type: 'tool.finished', turnId: id, id: toolId, status: 'cancelled', durationMs: Date.now() - open.startedAt })
+    }
+    openTools.clear()
+    turnId = null
+  }
+
+  /** Wire a link — a fresh child or a replayed relay peer — to the
+   *  session handlers. The handshake stays with the caller: replay never
+   *  re-runs it against the running agent. */
+  function attachLink(peer: AgentProcess): void {
+    child = peer
     alive = true
     rpc = new StdioRpc(child, { label: 'Grok Build', onStderr: () => {} })
     rpc.on('unhandled-notification', (method: string) => logOnce(String(method), 'ignored notification'))
@@ -369,7 +396,11 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
       await host.writeTextFile(params.path, params.content)
       return {}
     })
-    const init = await rpc.request<any>('initialize', {
+  }
+
+  async function launch(safeMode: boolean): Promise<void> {
+    attachLink(await host.spawn(GROK_COMMAND, grokArgs(safeMode)))
+    const init = await requireRpc().request<any>('initialize', {
       protocolVersion: GROK_ACP_VERSION,
       clientInfo: { name: 'poise', title: 'Poise', version: '0.1.0' },
       clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
@@ -456,29 +487,65 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
         if (signal.aborted || cancelRequested) return { stopReason: 'cancelled' }
         const response = link.request<any>('session/prompt', { sessionId, prompt: blocks }, { timeoutMs: 0 })
         admission.release()
-        const result = await response
-        const meta = result?._meta || {}
-        const usage = meta.usage || {}
-        return {
-          stopReason: cancelRequested && stopReason(result?.stopReason) === 'end_turn' ? 'cancelled' : stopReason(result?.stopReason),
-          usage: {
-            inputTokens: numberOr(usage.inputTokens ?? meta.inputTokens),
-            outputTokens: numberOr(usage.outputTokens ?? meta.outputTokens),
-            totalTokens: numberOr(usage.totalTokens ?? meta.totalTokens),
-          },
-        }
+        return mapPromptResult(await response)
       } catch (error) {
         if (signal.aborted || cancelRequested) return { stopReason: 'cancelled' }
         return { stopReason: 'error', error: `Grok Build: ${error instanceof Error ? error.message : String(error)}` }
       } finally {
-        admission.release()
-        if (promptAdmission === admission) promptAdmission = null
-        signal.removeEventListener('abort', onAbort)
-        for (const [toolId, open] of openTools) {
-          host.emit({ type: 'tool.finished', turnId: id, id: toolId, status: 'cancelled', durationMs: Date.now() - open.startedAt })
-        }
-        openTools.clear()
-        turnId = null
+        settlePrompt(id, admission, signal, onAbort)
+      }
+    },
+
+    async replayTurn(init: ReplayInit): Promise<TurnResult> {
+      // The prompt is the one request the agent must have heard: its answer
+      // is the turn result, and a turn the agent never got must be
+      // re-prompted, not replayed.
+      if (init.outboundTruncated) throw new AdapterError('grok', 'the relay cannot prove what Grok Build heard; the turn is interrupted instead', 'protocol')
+      if (!outboundHasMethod(init.outbound, 'session/prompt')) throw new AdapterError('grok', 'the turn never reached Grok Build; it is interrupted instead', 'protocol')
+      sessionId = init.session.nativeSessionId
+      modelId = init.session.modelId
+      effort = init.session.effort
+      efforts = init.session.efforts
+      commands = init.session.commands ?? []
+      attachLink(init.peer)
+      const link = requireRpc()
+      link.beginReplay(init.outbound)
+      turnId = init.turnId
+      messageCounter = 0
+      newMessageIds()
+      cancelRequested = false
+      let release!: () => void
+      const admission = { ready: new Promise<void>(resolve => { release = resolve }), release: () => release() }
+      promptAdmission = admission
+      admission.release()
+      if (init.signal.aborted || cancelRequested) {
+        settlePrompt(init.turnId, admission, init.signal, () => {})
+        return { stopReason: 'cancelled' }
+      }
+      const onAbort = () => { void adapter.cancel() }
+      init.signal.addEventListener('abort', onAbort, { once: true })
+      try {
+        // session/prompt is the only request whose answer carries a
+        // stopReason, so its orphan — matched by shape, not by id — is the
+        // turn result however the restart landed.
+        const result = await new Promise<any>((resolve, reject) => {
+          const orphan = (_id: unknown, message: any) => {
+            if (!message || typeof message !== 'object' || typeof message.result?.stopReason !== 'string') return
+            link.off('orphan-response', orphan)
+            resolve(message.result)
+          }
+          link.on('orphan-response', orphan)
+          void init.live.then(
+            () => link.endReplay(),
+            (error) => { link.off('orphan-response', orphan); reject(error) },
+          )
+        })
+        return mapPromptResult(result)
+      } catch (error) {
+        if (init.signal.aborted || cancelRequested) return { stopReason: 'cancelled' }
+        return { stopReason: 'error', error: `Grok Build: ${error instanceof Error ? error.message : String(error)}` }
+      } finally {
+        settlePrompt(init.turnId, admission, init.signal, onAbort)
       }
     },
 

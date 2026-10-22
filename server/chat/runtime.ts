@@ -35,9 +35,9 @@ import { steeringContext } from './steering-context'
 import { parseChatCommandChain, commandBody } from './commands'
 import { latestReviewTarget, prepareReview, type ReviewTarget } from './review'
 import type { AutoMergeAck, SafeModeAck } from './protocol'
-import type { ChildProcess } from 'node:child_process'
+import { homedir } from 'node:os'
 import { mkdir, rm, rmdir, writeFile } from 'node:fs/promises'
-import { basename, dirname } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../models'
 import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
@@ -45,7 +45,7 @@ import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertC
 import { localCheckoutPath } from '../gh'
 import { discardUnclaimedWorkspace, ensureLocalWorkspace, ensureWorkerWorkspace, LOCAL_CHAT_ROOT, workerWorkspaceRef, workspaceMarkerValid } from './local-workspace'
 import { catalogueAgents } from './catalog-agents'
-import { runFile } from '../process'
+import { runFile, scrubbedChildEnvironment } from '../process'
 import { CheckoutLease, canonicalCheckout, describeHolder, type AcquireResult, type CheckoutLeaseOptions } from './checkout-lock'
 import { ATTACHMENT_DIR, attachmentPath, ensureExcluded, inlineText, safeAttachmentName, sha256Of } from './attachments'
 import { readCheckoutBytes, readCheckoutTextFile, writeCheckoutTextFile } from './client-fs'
@@ -58,7 +58,7 @@ import {
   inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
 } from './git'
 import {
-  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
+  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, canonicalJson, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
   type PermissionOption, type PoiseActor, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
@@ -67,12 +67,14 @@ import { actorOf, nativeName } from './actors'
 import { SWITCHBOARD_PERSON } from './switchboard'
 import * as storage from './storage'
 import { internalTurn } from './control-store'
-import { pgidAlive, pidAlive, signalGroup, spawnWorker, workerIdentityMatches, type WorkerHandle } from './worker'
+import { pgidAlive, pidAlive, signalGroup, workerIdentityMatches } from './worker'
+import { attachRelay, livePromise, relayDirFor, relayIdentityMatches, spawnRelay, type RelayConnection } from './relay'
+import { createReplayHost, recalledDiffs } from './replay'
 import { createClaudeAdapter } from './adapters/claude'
 import { createCodexAdapter } from './adapters/codex'
 import { createGrokAdapter } from './adapters/grok'
 import { createMuseAdapter } from './adapters/muse'
-import type { Adapter, AdapterHost, PermissionRequest, QuestionAnswers, QuestionRequest } from './adapters/types'
+import type { Adapter, AdapterHost, AgentProcess, PermissionRequest, QuestionAnswers, QuestionRequest, TurnResult } from './adapters/types'
 import { skippedNotice, type ResolvedServer, type Skipped } from '../extensions/types'
 import { SELF_UPDATE_REPOSITORY, SelfUpdateBridgeError, SelfUpdateUnavailableError, UUID_PATTERN, type SelfUpdateBridge } from '../self-update-bridge'
 import * as finishOutbox from '../self-update-outbox'
@@ -171,7 +173,14 @@ interface LiveSession {
   nativeExtensions?: string
   /** The Extensions notices last shown, so a resume does not repeat them. */
   extensionNotices?: string
-  worker: WorkerHandle | null
+  /** The agent's relay: Poise talks to the agent through it, and a
+   *  restart hands the running turn to the next server instead of
+   *  stopping it. Null once the agent is verifiably gone. */
+  relay: RelayConnection | null
+  /** Set when this server handed a running turn to its relay for the
+   *  next server: the turn settles without recording anything, and
+   *  nothing here may stop the relay afterwards. */
+  relayDetached: boolean
   lease: CheckoutLease | null
   turn: RunningTurn | null
   pending: Map<string, PendingRequest>
@@ -212,6 +221,8 @@ export interface RuntimeOptions {
   probeAgent?: (agent: AgentId) => Promise<{ ok: boolean, reason?: string }>
   /** Lease liveness probes; tests use them to make this host look dead. */
   leaseProbes?: CheckoutLeaseOptions
+  /** Where per-session relay directories live; next to POISE_DB by default. */
+  relayDir?: string
   /** The self-update controller client. Absent or unconfigured: `/poise`
    *  answers with an actionable error and no controller IO ever happens. */
   selfUpdate?: SelfUpdateBridge | null
@@ -321,8 +332,9 @@ export class ChatRuntime extends EventEmitter {
   /** Crash reconciliation. Leftover workers this instance recorded are
    *  terminated only after their identity is verified and never while the
    *  lease they hold belongs to a live process (another server with the
-   *  same instance name). Turns that were open are marked interrupted and
-   *  their prompts cancelled; nothing is replayed. */
+   *  same instance name). A turn a live relay holds is adopted instead:
+   *  the next paragraphs of recoverState reconnect and replay it. Turns
+   *  with no live relay are marked interrupted and #446 resumes them. */
   async recover(): Promise<void> {
     this.recovering = true
     try {
@@ -379,67 +391,85 @@ export class ChatRuntime extends EventEmitter {
     // Sessions whose lease another live server of this instance holds are
     // that server's: their workers, turns and Caller rows are left alone.
     const protectedSessions = new Set<string>()
+    // Sessions whose running turn a live relay holds: recovery adopts the
+    // turn instead of interrupting it, and the loops below leave them alone.
+    const reattached = new Set<string>()
+    // Sessions whose relay handoff already failed above: the turn loop
+    // records the interrupt-and-resume fallback and says so.
+    const fallbackNotes = new Map<string, string>()
+    const openTurns = new Map(storage.listOpenTurns(this.instance).map((open) => [open.sessionId, open]))
     for (const worker of storage.listWorkers()) {
       if (storage.sessionInstance(worker.sessionId) !== this.instance) continue
       const record = storage.getSession(worker.sessionId)
       let holderAlive = false
-      if (worker.leaseToken) {
-        try {
-          const row = new CheckoutLease(worker.checkout, { ownerKind: 'poise:chat', ownerId: worker.sessionId, ownerLabel: '', instance: this.instance }, this.leaseProbes).read()
-          holderAlive = !!row && row.token === worker.leaseToken && row.host_pid !== this.hostPid && (this.leaseProbes.pidAlive ?? pidAlive)(row.host_pid)
-        } catch { holderAlive = true } // the lock file is unreadable: do not touch anything
-      }
+      try {
+        const row = new CheckoutLease(worker.checkout, { ownerKind: 'poise:chat', ownerId: worker.sessionId, ownerLabel: '', instance: this.instance }, this.leaseProbes).read()
+        // Owner and host, not the token: an adoption by another server
+        // rotates the token, and that server owns the session now.
+        holderAlive = !!row && row.owner_id === worker.sessionId && row.instance === this.instance
+          && row.host_pid !== this.hostPid && (this.leaseProbes.pidAlive ?? pidAlive)(row.host_pid)
+      } catch { holderAlive = true } // the lock file is unreadable: do not touch anything
       if (holderAlive) { protectedSessions.add(worker.sessionId); continue }
+      const relayRow = storage.getRelay(worker.sessionId)
+      const open = openTurns.get(worker.sessionId)
+      const relayOk = relayRow ? await relayIdentityMatches(relayRow.relayPid, relayRow.relayIdent).catch(() => false) : false
       const verified = await workerIdentityMatches(worker.gatePid, worker.ident)
       const groupAlive = pgidAlive(worker.gatePgid)
+      if (relayRow && open && relayOk && verified) {
+        // Both ends are ours. A turn the agent never reached (no spool
+        // for it) is not replayed: the agent is idle, so it is stopped
+        // as today, with today's message — the relay did not fail.
+        const spoolTurn = await attachRelay({ sessionId: worker.sessionId, dir: relayRow.dir, socketPath: relayRow.socket,
+          relayPid: relayRow.relayPid, relayIdent: relayRow.relayIdent,
+          log: (message) => this.emit('log', `[chat ${worker.sessionId.slice(0, 8)}] ${message}`),
+        }).then(({ connection, ready }) => { connection.detach(); return ready.spoolTurn }, () => undefined)
+        if (spoolTurn === open.turnId) {
+          reattached.add(worker.sessionId)
+          this.launchRelayReattach(worker, relayRow, open)
+          continue
+        }
+        if (spoolTurn !== undefined) {
+          if (!(await this.terminateRecordedWorker(worker, record))) continue
+          if (worker.leaseToken) { try { CheckoutLease.releaseByToken(worker.checkout, worker.leaseToken) } catch { /* the lock file may be gone */ } }
+          storage.forgetWorker(worker.sessionId)
+          storage.forgetRelay(worker.sessionId)
+          await rm(relayRow.dir, { recursive: true, force: true }).catch(() => undefined)
+          continue
+        }
+        fallbackNotes.set(worker.sessionId, 'the relay did not answer after the restart')
+      } else if (relayRow && open && verified) {
+        // Our agent outlived its relay: it is stopped below, then falls back.
+        fallbackNotes.set(worker.sessionId, 'the relay was gone after the restart')
+      } else if (relayRow && open && !verified && !groupAlive) {
+        fallbackNotes.set(worker.sessionId, 'the agent was gone after the restart')
+      }
       if (!verified && groupAlive) {
         if (record) {
           record.orphanNotice = `a worker recorded for this session (pid ${worker.gatePid}) is still running but could not be verified; stop it by hand`
           storage.saveSession(record)
         }
+        // A verified relay may still hold the agent (pid confusion on the
+        // gate): its row stays so a later restart can retry the handoff.
+        if (relayRow && !relayOk) storage.forgetRelay(worker.sessionId)
         continue
       }
       if (verified) {
-        signalGroup(worker.gatePgid, 'SIGTERM')
-        if (!(await waitDead(worker.gatePgid, CLOSE_GRACE_MS))) {
-          signalGroup(worker.gatePgid, 'SIGKILL')
-          if (!(await waitDead(worker.gatePgid, CLOSE_GRACE_MS))) {
-            if (record) {
-              record.orphanNotice = `the worker group ${worker.gatePgid} of this session survived termination; stop it by hand`
-              storage.saveSession(record)
-            }
-            continue
-          }
-        }
+        if (!(await this.terminateRecordedWorker(worker, record))) continue
       }
       if (worker.leaseToken) { try { CheckoutLease.releaseByToken(worker.checkout, worker.leaseToken) } catch { /* the lock file may be gone */ } }
       storage.forgetWorker(worker.sessionId)
+      // The agent is gone, so its relay leaves on its own; its row is stale.
+      if (relayRow) {
+        storage.forgetRelay(worker.sessionId)
+        await rm(relayRow.dir, { recursive: true, force: true }).catch(() => undefined)
+      }
     }
     for (const open of storage.listOpenTurns(this.instance)) {
-      if (protectedSessions.has(open.sessionId)) continue
-      const record = storage.getSession(open.sessionId)
-      if (!record) continue
-      for (const pending of storage.listPendingRequests(open.sessionId)) {
-        this.emit_(open.sessionId, pending.kind === 'permission'
-          ? { type: 'permission.resolved', id: pending.requestId, optionId: '', by: 'cancelled' }
-          : { type: 'question.answered', id: pending.requestId, answers: {}, by: 'cancelled' })
-      }
-      // No request outlives the process that asked it.
-      if (record.status === 'waiting') chatWaitingEnded(record.id)
-      const envelope = storage.finalizeTurn(open.sessionId,
-        { type: 'turn.finished', turnId: open.turnId, stopReason: 'interrupted', error: 'Poise restarted while this turn was running' },
-        open.callId ? { callId: open.callId, instance: this.instance } : undefined)
-      const terminal = envelope.event as Extract<ChatEvent, { type: 'turn.finished' }>
-      // Older builds could leave open flags after recording a terminal event.
-      // Honor that event instead of overwriting it with an interruption.
-      const interrupted = terminal.stopReason === 'interrupted'
-      if (interrupted) record.interruptedTurnId = open.turnId
-      record.status = interrupted || terminal.stopReason === 'error' ? 'interrupted' : 'idle'
-      record.lastSeq = envelope.seq
-      storage.saveSession(record)
-      this.emit('event', envelope)
-      this.emit_(open.sessionId, { type: 'status.changed', status: record.status,
-        detail: interrupted ? 'Poise restarted while this turn was running' : 'previous turn outcome recovered' })
+      if (protectedSessions.has(open.sessionId) || reattached.has(open.sessionId)) continue
+      const fallback = fallbackNotes.get(open.sessionId)
+      this.interruptOpenTurn(open, fallback
+        ? { stopReason: 'interrupted', error: `Poise restarted while this turn was running; ${fallback}, so the turn was interrupted` }
+        : { stopReason: 'interrupted', error: 'Poise restarted while this turn was running' })
     }
     if (this.caller) {
       for (const row of storage.listFinishOutbox(this.instance)) {
@@ -453,7 +483,7 @@ export class ChatRuntime extends EventEmitter {
       }
     }
     for (const record of storage.listSessions(this.instance)) {
-      if (protectedSessions.has(record.id)) continue
+      if (protectedSessions.has(record.id) || reattached.has(record.id)) continue
       if (record.contextResetting || record.contextCompacting) {
         record.contextResetting = false; record.contextCompacting = false
         storage.saveSession(record)
@@ -482,6 +512,276 @@ export class ChatRuntime extends EventEmitter {
     return protectedSessions
   }
 
+  /** SIGTERM a verified recorded group, SIGKILL after the grace period.
+   *  True when the group is gone; on survival the session says so and
+   *  both rows stay for the next recovery. */
+  private async terminateRecordedWorker(worker: Pick<storage.WorkerRow, 'gatePgid'>, record: SessionRecord | null): Promise<boolean> {
+    signalGroup(worker.gatePgid, 'SIGTERM')
+    if (!(await waitDead(worker.gatePgid, CLOSE_GRACE_MS))) {
+      signalGroup(worker.gatePgid, 'SIGKILL')
+      if (!(await waitDead(worker.gatePgid, CLOSE_GRACE_MS))) {
+        if (record) {
+          record.orphanNotice = `the worker group ${worker.gatePgid} of this session survived termination; stop it by hand`
+          storage.saveSession(record)
+        }
+        return false
+      }
+    }
+    return true
+  }
+
+  /** Finalize an open turn recovery could not hand over: its requests are
+   *  cancelled and #446 resumes it. `request` is today's restart message,
+   *  the relay fallback message, or a handoff cancellation. */
+  private interruptOpenTurn(open: { sessionId: string, turnId: string, callId: string | null },
+    request: { stopReason: 'interrupted' | 'cancelled', error: string }): void {
+    const record = storage.getSession(open.sessionId)
+    if (!record) return
+    for (const pending of storage.listPendingRequests(open.sessionId)) {
+      this.emit_(open.sessionId, pending.kind === 'permission'
+        ? { type: 'permission.resolved', id: pending.requestId, optionId: '', by: 'cancelled' }
+        : { type: 'question.answered', id: pending.requestId, answers: {}, by: 'cancelled' })
+    }
+    // No request outlives the process that asked it.
+    if (record.status === 'waiting') chatWaitingEnded(record.id)
+    const envelope = storage.finalizeTurn(open.sessionId,
+      { type: 'turn.finished', turnId: open.turnId, stopReason: request.stopReason, error: request.error },
+      open.callId ? { callId: open.callId, instance: this.instance } : undefined)
+    const terminal = envelope.event as Extract<ChatEvent, { type: 'turn.finished' }>
+    // Older builds could leave open flags after recording a terminal event.
+    // Honor that event instead of overwriting it with an interruption.
+    const interrupted = terminal.stopReason === 'interrupted'
+    if (interrupted) record.interruptedTurnId = open.turnId
+    record.status = interrupted || terminal.stopReason === 'error' ? 'interrupted' : 'idle'
+    record.lastSeq = envelope.seq
+    storage.saveSession(record)
+    this.emit('event', envelope)
+    this.emit_(open.sessionId, { type: 'status.changed', status: record.status,
+      detail: terminal.stopReason === request.stopReason ? request.error : 'previous turn outcome recovered' })
+  }
+
+  /** Adopt a turn a live relay holds: reconnect, rebuild the adapter over
+   *  the spooled bytes, and settle like a locally run turn. Launched
+   *  without awaiting: recovery must not wait out a coding turn. Any
+   *  failure falls back to interrupt-and-resume and says so. */
+  private launchRelayReattach(worker: storage.WorkerRow, relay: storage.RelayRow, open: { sessionId: string, turnId: string, callId: string | null }): void {
+    const session = this.requireLive(open.sessionId)
+    const turn: RunningTurn = {
+      id: open.turnId, callId: open.callId, startedAt: Date.now(),
+      abort: new AbortController(), stopping: false,
+      promptReady: Promise.resolve(), releasePrompt: () => {},
+    }
+    if (session.record.selfChangeId && !finishOutbox.getFinish(session.record.selfChangeId)) turn.implementsChange = true
+    session.turn = turn
+    session.staged = session.record.staged ?? null
+    // Recovery's own reset loop skips this session; a maintenance flag the
+    // old server held died with it either way.
+    if (session.record.contextResetting || session.record.contextCompacting) {
+      session.record.contextResetting = false; session.record.contextCompacting = false
+      this.saveRecord(session)
+    }
+    void this.reattachRelayTurn(session, turn, worker, relay, open).catch((error: unknown) => {
+      this.emit('log', `[chat ${open.sessionId.slice(0, 8)}] relay reattach failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
+
+  private async reattachRelayTurn(session: LiveSession, turn: RunningTurn, worker: storage.WorkerRow, relay: storage.RelayRow,
+    open: { sessionId: string, turnId: string, callId: string | null }): Promise<void> {
+    const record = session.record
+    const lease = this.leaseFor(session)
+    let peer: RelayConnection | null = null
+    try {
+      if (record.workspaceKind === 'poise-local' && !isSwitchboardChat(record) && record.role !== 'manager') await this.acquireLocalTurnSlot(session, turn)
+      turn.abort.signal.throwIfAborted()
+      if (!lease.adoptLiveWorker({ workerPid: worker.gatePid, workerPgid: worker.gatePgid, workerIdent: worker.ident, ownerId: record.id })) {
+        throw new Error('the checkout lease is held by a live server')
+      }
+      session.lease = lease
+      lease.onLost(() => {
+        try { this.emit_(record.id, { type: 'error', message: 'the checkout lease was lost; stopping the turn', recoverable: true }) } catch { /* mirror */ }
+        turn.failure = 'the checkout lease was lost'
+        turn.abort.abort()
+        void session.adapter?.cancel()
+      })
+      // The checkout must already be on the session's branch: switching it
+      // under a running agent would move the agent's writes elsewhere.
+      const state = await inspectCheckout(record.checkout)
+      if (state.currentBranch !== record.branch.name) {
+        throw new Error(`the checkout is on ${state.currentBranch || 'a detached HEAD'}, not ${record.branch.name}`)
+      }
+      turn.abort.signal.throwIfAborted()
+      const attached = await attachRelay({ sessionId: record.id, dir: relay.dir, socketPath: relay.socket,
+        relayPid: relay.relayPid, relayIdent: relay.relayIdent,
+        log: (message) => this.emit('log', `[chat ${record.id.slice(0, 8)}] ${message}`) })
+      peer = attached.connection
+      session.relay = peer
+      peer.once('exit', (code, signal) => {
+        if (code === null && signal === null) return
+        if (session.relay === peer) {
+          session.relay = null
+          storage.forgetWorker(record.id)
+          storage.forgetRelay(record.id)
+        }
+      })
+      const outbound = await peer.getOutbound()
+      const persisted = this.turnSlice(record.id, open.turnId)
+      const replayHost = createReplayHost({ inner: this.hostFor(session), turnId: open.turnId, persisted,
+        registerPending: (requestId, pending) => { session.pending.set(requestId, pending) } })
+      const adapter = this.adapters[record.agent](replayHost)
+      if (!adapter.replayTurn) throw new Error(`${AGENT_LABEL[record.agent]} cannot replay turns`)
+      session.adapter = adapter
+      adapter.onExit((code, signal) => this.onAdapterExit(session, adapter, code, signal))
+      // "Always" answers the old server remembered must survive it.
+      for (const envelope of persisted) {
+        const event = envelope.event
+        if (event.type !== 'permission.resolved' || !event.optionId) continue
+        const requested = persisted.find((candidate) => candidate.event.type === 'permission.requested' && candidate.event.id === event.id)?.event
+        if (!requested || requested.type !== 'permission.requested') continue
+        const option = requested.options.find((o) => o.id === event.optionId)
+        if (option && (option.kind === 'allow_always' || option.kind === 'reject_always')) {
+          session.grants.set(`${requested.title}\0${canonicalJson(requested.input)}`, { id: event.optionId, kind: option.kind })
+        }
+      }
+      const result = await adapter.replayTurn({
+        turnId: open.turnId, signal: turn.abort.signal, peer,
+        live: livePromise(peer), outbound: outbound.bytes, outboundTruncated: outbound.truncated,
+        session: { nativeSessionId: record.nativeSessionId ?? '', modelId: record.modelId, effort: record.effort,
+          ...(record.mode ? { mode: record.mode } : {}), safeMode: record.safeMode === true,
+          ...(record.efforts ? { efforts: record.efforts } : {}), ...(record.commands ? { commands: record.commands } : {}) },
+        recalledDiffs: recalledDiffs(persisted.map((envelope) => envelope.event), open.turnId),
+      })
+      await this.settleReplayedTurn(session, turn, lease, result)
+    } catch (error) {
+      const cancelled = turn.abort.signal.aborted
+      const message = error instanceof Error ? error.message : String(error)
+      this.emit('log', `[chat ${record.id.slice(0, 8)}] relay handoff failed (${message}); falling back to interrupt-and-resume`)
+      peer?.detach()
+      session.adapter = null
+      session.relay = null
+      session.turn = null
+      // The agent is stopped verified, like any worker recovery gives up on.
+      const killed = await this.terminateRecordedWorker(worker, storage.getSession(record.id)).catch(() => false)
+      if (killed) {
+        if (worker.leaseToken) { try { CheckoutLease.releaseByToken(record.checkout, worker.leaseToken) } catch { /* the lock file may be gone */ } }
+        storage.forgetWorker(record.id)
+        storage.forgetRelay(record.id)
+        await rm(relay.dir, { recursive: true, force: true }).catch(() => undefined)
+      }
+      if (lease.held) { lease.clearWorker(); lease.release() }
+      if (session.lease === lease && !lease.held) session.lease = null
+      this.releaseLocalTurnSlot(turn)
+      this.interruptOpenTurn(open, cancelled
+        ? { stopReason: 'cancelled', error: 'the turn was cancelled during the relay handoff' }
+        : { stopReason: 'interrupted', error: `Poise restarted while this turn was running; the relay handoff failed (${message}), so the turn was interrupted` })
+      if (turn.implementsChange && record.selfChangeId) {
+        try { await this.settleChange(session, { stopReason: cancelled ? 'cancelled' : 'interrupted', error: message, freed: killed, terminalRecorded: true }) }
+        catch (failure) { this.emit('log', `[chat ${record.id.slice(0, 8)}] change settlement failed: ${failure instanceof Error ? failure.message : String(failure)}`) }
+      }
+      this.scheduleQueue(session)
+    }
+  }
+
+  /** The turn's persisted events after its turn.started, in seq order —
+   *  what replay matches the spooled bytes against. Throws when the turn
+   *  cannot be sliced exactly (no start, or past the event window). */
+  private turnSlice(sessionId: string, turnId: string): ChatEnvelope[] {
+    const started = storage.findEvent(sessionId, (event) => event.type === 'turn.started' && event.turnId === turnId)
+    if (!started) throw new Error('the turn has no recorded start')
+    const page = storage.listEvents(sessionId, started.seq)
+    if (page.truncated) throw new Error('the turn runs past the transcript window')
+    const slice: ChatEnvelope[] = []
+    for (const envelope of page.events) {
+      if (envelope.event.type === 'turn.started') break
+      slice.push(envelope)
+    }
+    return slice
+  }
+
+  /** Settle a replayed turn: the same ending a locally run turn gets —
+   *  terminal event, Caller finish, lease release, queue advance — minus
+   *  the checkout backstop (its before-snapshot died with the old
+   *  server; the agent's own diffs replayed from the spool). Mirrors
+   *  runTurn's finally block step for step; keep them in sync. */
+  private async settleReplayedTurn(session: LiveSession, turn: RunningTurn, lease: CheckoutLease, result: TurnResult): Promise<void> {
+    const record = session.record
+    this.releaseLocalTurnSlot(turn)
+    this.settlePending(session, 'cancelled')
+    let freed = true
+    let stopReason: StopReason = turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
+    let error = result.error
+    if (turn.failure && stopReason !== 'cancelled') { stopReason = 'error'; error = turn.failure }
+    if (result.terminate === true || (session.adapter && !session.adapter.alive)) {
+      try { await this.stopProcess(session) } catch { freed = false }
+    }
+    session.draining = true
+    if (!(await this.waitForServices(session, SERVICE_SETTLE_MS))) {
+      try { await this.stopProcess(session) } catch { freed = false }
+      await this.waitForServices(session, Number.POSITIVE_INFINITY)
+    }
+    if (session.staged && lease.held) {
+      const report = await writeBackDocument(record.checkout, session.staged, record.id).catch((e) => ({ kind: 'conflict' as const, message: `document write-back failed: ${e instanceof Error ? e.message : String(e)}` }))
+      if (report.kind !== 'unchanged' && report.kind !== 'missing') this.saveRecord(session) // revision/version moved
+      if (isBridgeProblem(report)) { try { this.emit_(record.id, { type: 'error', message: report.message, recoverable: true }) } catch { /* mirror */ } }
+    }
+    if (turn.failure && !turn.stopping) { stopReason = 'error'; error = turn.failure }
+    let terminalRecorded = false
+    const durationMs = Date.now() - turn.startedAt
+    try {
+      const envelope = storage.finalizeTurn(record.id,
+        { type: 'turn.finished', turnId: turn.id, stopReason, error, usage: result.usage, durationMs, ...(stopReason === 'cancelled' && turn.stoppedBy ? { stoppedBy: turn.stoppedBy } : {}) },
+        turn.callId ? { callId: turn.callId, instance: this.instance } : undefined,
+        freed && !turn.stopping && !this.stopped && !session.lifecycle.signal.aborted)
+      terminalRecorded = true
+      record.lastSeq = envelope.seq
+      this.emit('event', envelope)
+      chatTurnFinished(alertContext(record), { id: turn.id, stopReason, durationMs })
+    } catch (failure) {
+      // Preserve the open turn on storage failure; do not acknowledge a
+      // ledger result whose recovery record was never made durable.
+      this.emit('log', `[chat] terminal outcome could not be published: ${failure instanceof Error ? failure.message : String(failure)}`)
+    }
+    session.turn = null
+    if (terminalRecorded && turn.callId && this.caller) {
+      const outcome = storage.listFinishOutbox(this.instance).find(row => row.callId === turn.callId)
+      try {
+        if (outcome) await this.caller.finish(turn.callId, outcome.status, outcome.error ? this.options.extensions?.redact(outcome.error) ?? outcome.error : undefined)
+        storage.finishDelivered(turn.callId)
+      } catch (e) {
+        try { this.emit_(record.id, { type: 'error', message: `Caller did not record the turn end (it will be retried when Poise restarts): ${e instanceof Error ? e.message : String(e)}`, recoverable: true }) } catch { /* mirror */ }
+      }
+    }
+    if (lease.held) {
+      if (freed) { lease.clearWorker(); lease.release() }
+      else { try { this.emit_(record.id, { type: 'error', message: 'the checkout stays locked: the agent process could not be stopped', recoverable: false }) } catch { /* mirror */ } }
+    }
+    if (session.lease === lease && !lease.held) session.lease = null
+    // A fork learns its native id from the agent's first frames.
+    if (session.adapter?.nativeSessionId && session.adapter.nativeSessionId !== record.nativeSessionId) {
+      record.nativeSessionId = session.adapter.nativeSessionId
+      this.saveRecord(session)
+    }
+    await this.refreshWorkspace(session).catch(() => undefined)
+    if (record.status !== 'closed') {
+      if (!freed) this.setStatus(session, 'error', record.orphanNotice || 'the agent process could not be stopped')
+      else if (session.adapter?.alive) this.setStatus(session, 'idle')
+      // An agent that closed itself after a turn (Claude does after a stop,
+      // so a queued interjection can never run) resumes on the next prompt.
+      else if (stopReason === 'cancelled' || stopReason === 'end_turn') this.setStatus(session, 'idle', 'agent process closed after the turn; it resumes on the next prompt')
+      else this.setStatus(session, 'interrupted')
+    }
+    this.armIdleTimer(session)
+    // Last: the controller hears about a change only once its worker is
+    // verifiably gone and the checkout is released above. Only the
+    // implementing turn settles it; later discussion in the session does not.
+    if (turn.implementsChange && record.selfChangeId) {
+      try { await this.settleChange(session, { stopReason, error, freed, terminalRecorded }) }
+      catch (failure) { this.emit('log', `[chat ${record.id.slice(0, 8)}] change settlement failed: ${failure instanceof Error ? failure.message : String(failure)}`) }
+    }
+    if (terminalRecorded) this.publishQueue(session)
+    if (this.drainState) await this.closeForDrain(session).catch(() => undefined)
+    else if (terminalRecorded && freed) this.scheduleQueue(session)
+  }
+
   /** Deliver every recorded change outcome the controller has not
    *  acknowledged. Safe to call at any time: rows are immutable and a
    *  delivery that fails stays queued. */
@@ -502,23 +802,47 @@ export class ChatRuntime extends EventEmitter {
     }
   }
 
-  async stop(): Promise<void> {
+  /** Stop the server. Running turns a healthy relay holds are handed to
+   *  the next server by default; `handover: false` stops everything
+   *  instead (tests use it for isolation). */
+  async stop(options: { handover?: boolean } = {}): Promise<void> {
     this.stopped = true
+    const handover = options.handover ?? true
     for (const timer of this.queueTimers.values()) clearTimeout(timer)
     this.queueTimers.clear()
     await Promise.all([...this.live.values()].map(async (session) => {
       session.lifecycle.abort()
-      await this.forceStop(session, 'server stopping')
+      await this.forceStop(session, 'server stopping', handover)
+      // A handed-over turn belongs to the next server now: no shutdown, no
+      // lease release, no waiting on a runTurn that already left quietly.
+      if (session.relayDetached) {
+        if (session.idleTimer) clearTimeout(session.idleTimer)
+        return
+      }
       await this.serialized(session, () => this.shutdownSession(session)).catch(() => undefined)
     }))
   }
 
   /** Outside the operation chain: cancel a turn and, if the agent does not
    *  settle, terminate its process. Resolves once the turn's own cleanup
-   *  can run (or the process is gone). */
-  private async forceStop(session: LiveSession, reason: string): Promise<void> {
+   *  can run (or the process is gone). On server stop a turn a healthy
+   *  relay holds is handed over instead: the relay keeps the agent
+   *  running, the turn settles without recording anything, and the lease
+   *  row stays for the next server to adopt. Nothing is written to the
+   *  agent. Explicit close/delete/reset never hand over: the person asked
+   *  to stop. */
+  private async forceStop(session: LiveSession, reason: string, handover = false): Promise<void> {
     const turn = session.turn
     if (!turn) return
+    if (handover && session.relay?.healthy) {
+      session.relayDetached = true
+      turn.stopping = true
+      const relay = session.relay
+      relay.detach()
+      if (await this.waitForTurnEnd(session, STOP_SETTLE_MS)) return
+      this.emit('log', `[chat ${session.record.id.slice(0, 8)}] turn did not settle after detach; leaving it for adoption`)
+      return
+    }
     turn.stopping = true
     turn.failure ??= reason
     this.settlePending(session, 'cancelled')
@@ -532,6 +856,7 @@ export class ChatRuntime extends EventEmitter {
   }
 
   private async shutdownSession(session: LiveSession): Promise<void> {
+    if (session.relayDetached) return
     if (session.idleTimer) clearTimeout(session.idleTimer)
     if (session.turn) return // still running after forceStop: leave it, the lease stays
     await this.stopProcess(session)
@@ -544,7 +869,7 @@ export class ChatRuntime extends EventEmitter {
   private releaseSettledLease(session: LiveSession): void {
     const lease = session.lease
     if (!lease?.held) return
-    if (session.startup || session.services || session.turn?.agentInvoked || session.worker?.alive || session.adapter?.alive) {
+    if (session.startup || session.services || session.turn?.agentInvoked || session.relay?.healthy || session.adapter?.alive) {
       throw new ChatError(409, 'the checkout still has active work; its lease remains held', 'checkout_busy')
     }
     lease.clearWorker()
@@ -575,7 +900,7 @@ export class ChatRuntime extends EventEmitter {
   startDrain(releaseId: string): DrainState {
     if (!this.drainState || this.drainState.releaseId !== releaseId) this.drainState = { releaseId, since: new Date().toISOString() }
     for (const session of this.live.values()) {
-      if (session.turn || !(session.adapter?.alive || session.worker?.alive)) continue
+      if (session.turn || !(session.adapter?.alive || session.relay?.healthy)) continue
       void this.serialized(session, () => this.closeForDrain(session)).catch(() => undefined)
     }
     return this.drainState
@@ -590,7 +915,7 @@ export class ChatRuntime extends EventEmitter {
    *  restart. Verifiable — a process that will not go stays counted. */
   private async closeForDrain(session: LiveSession): Promise<void> {
     if (!this.drainState || session.turn || session.record.status === 'closed') return
-    if (!(session.adapter?.alive || session.worker?.alive)) return
+    if (!(session.adapter?.alive || session.relay?.healthy)) return
     if (session.idleTimer) { clearTimeout(session.idleTimer); session.idleTimer = null }
     await this.stopProcess(session)
     this.emit_(session.record.id, { type: 'status.changed', status: session.record.status, detail: 'agent process closed for the Poise update; it resumes on the next prompt' })
@@ -605,23 +930,36 @@ export class ChatRuntime extends EventEmitter {
     let count = this.inflightOps + (this.recovering ? 1 : 0)
     for (const session of this.live.values()) {
       const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
-      count += own > 0 ? own : ACTIVE_STATUSES.includes(session.record.status) || session.adapter?.alive || session.worker?.alive ? 1 : 0
+      count += own > 0 ? own : ACTIVE_STATUSES.includes(session.record.status) || session.adapter?.alive || session.relay?.healthy ? 1 : 0
     }
     return count
   }
 
   /**
    * The work a server restart would cut: what busy() counts, except agent
-   * processes that sit idle between turns, which the next turn starts again.
+   * processes that sit idle between turns, which the next turn starts again,
+   * and turns a healthy relay holds, which the next server adopts.
    * A release switch waits for this alone.
    */
   working(): number {
     let count = this.inflightOps + (this.recovering ? 1 : 0)
     for (const session of this.live.values()) {
+      if (session.turn && session.relay?.healthy) continue
       const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
       count += own > 0 ? own : ACTIVE_STATUSES.includes(session.record.status) ? 1 : 0
     }
     return count
+  }
+
+  /** Sessions whose running turn a healthy relay holds: a restart hands
+   *  them to the next server instead of cutting them, so the release
+   *  switch does not wait for their turns either. */
+  relayHeldSessions(): Set<string> {
+    const held = new Set<string>()
+    for (const session of this.live.values()) {
+      if (session.turn && session.relay?.healthy) held.add(session.record.id)
+    }
+    return held
   }
 
   private assertAcceptingWork(): void {
@@ -710,7 +1048,7 @@ export class ChatRuntime extends EventEmitter {
     if (!live) {
       // The staged document rides on the record: the live object and the
       // persisted one are the same reference, so saving the record saves it.
-      live = { record, adapter: null, startup: null, worker: null, lease: null, turn: null, pending: new Map(), grants: new Map(), idleTimer: null, lifecycle: new AbortController(), services: 0, draining: false, staged: record.staged ?? null, chain: Promise.resolve(), steering: Promise.resolve(), pendingOps: 0 }
+      live = { record, adapter: null, startup: null, relay: null, relayDetached: false, lease: null, turn: null, pending: new Map(), grants: new Map(), idleTimer: null, lifecycle: new AbortController(), services: 0, draining: false, staged: record.staged ?? null, chain: Promise.resolve(), steering: Promise.resolve(), pendingOps: 0 }
       this.live.set(id, live)
     }
     return live
@@ -1081,7 +1419,7 @@ export class ChatRuntime extends EventEmitter {
 
   /** Called only with the native worker stopped and the checkout held. */
   private clearContext(session: LiveSession): void {
-    if (session.worker?.alive || session.adapter?.alive || session.services || !session.lease?.held) {
+    if (session.relay?.healthy || session.adapter?.alive || session.services || !session.lease?.held) {
       throw new ChatError(409, 'The previous agent has not settled; history has not been reset.', 'checkout_busy')
     }
     const committed = storage.resetConversation(session.record)
@@ -1134,7 +1472,7 @@ export class ChatRuntime extends EventEmitter {
     await this.forceStop(session, 'session deleted')
     return this.serialized(session, async () => {
       await this.shutdownSession(session)
-      if (session.turn || session.worker?.alive) throw new ChatError(409, 'the agent could not be stopped; the session was not deleted', 'agent_error')
+      if (session.turn || session.relay?.healthy) throw new ChatError(409, 'the agent could not be stopped; the session was not deleted', 'agent_error')
       const record = session.record
       if (session.staged) { await unstageDocument(record.checkout, record.id); session.staged = null; record.staged = undefined }
       await this.preserveBorrowedQueueContext(id)
@@ -2033,8 +2371,10 @@ export class ChatRuntime extends EventEmitter {
         void adapter.cancel()
       })
       await this.prepareCheckout(session, lease)
-      if (session.worker) {
-        if (!lease.registerWorker({ pid: session.worker.pid, pgid: session.worker.pgid, ident: session.worker.ident })) throw new Error('the checkout lease was lost before the turn started')
+      if (session.relay) {
+        const gateIdent = storage.getWorker(record.id)?.ident
+        if (!gateIdent) throw new Error('the checkout lease was lost before the turn started')
+        if (!lease.registerWorker({ pid: session.relay.gatePid, pgid: session.relay.gatePgid, ident: gateIdent })) throw new Error('the checkout lease was lost before the turn started')
         storage.setWorkerLeaseToken(record.id, lease.currentToken)
       }
       let adapterInput = await this.resolveInput(session, nativeInput, turn.queueItem?.sourceSessionId)
@@ -2106,9 +2446,19 @@ export class ChatRuntime extends EventEmitter {
       // person's request — except a Switchboard relay, which is the person's
       // own answer.
       const personRelay = turn.source?.kind === 'poise' && turn.source.name === SWITCHBOARD_PERSON
+      // The spool brackets the agent's bytes for this turn: a restart
+      // replays exactly what it captured. On a handed-over turn the peer
+      // is already detached, so the finish below is a silent no-op and the
+      // spool stays for the next server.
+      session.relay?.turnStart(turn.id)
       const response = adapter.prompt(turn.id, withAutoMergeInstructions({ ...adapterInput, text: controlContext ? `${controlContext}\n\n[Request]\n${expanded}` : expanded, memories: readMemories().text }, record.autoMerge, turn.implementsChange, turn.source && !personRelay ? 'source' : 'person'), turn.abort.signal)
       turn.releasePrompt()
-      const result = await response
+      let result: TurnResult
+      try {
+        result = await response
+      } finally {
+        session.relay?.turnFinish()
+      }
       agentSettled = true
       if (record.queuedHandoff && result.stopReason === 'end_turn') { record.queuedHandoff = undefined; this.saveRecord(session) }
       stopReason = turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
@@ -2117,15 +2467,18 @@ export class ChatRuntime extends EventEmitter {
       terminate = result.terminate === true
       if (turn.failure && stopReason !== 'cancelled') { stopReason = 'error'; error = turn.failure }
     } catch (err) {
-      const cancelled = turn.abort.signal.aborted
-      stopReason = cancelled ? 'cancelled' : 'error'
-      error = cancelled
-        ? (turn.failure && turn.failure !== 'cancelled before it started' ? turn.failure : undefined)
-        : err instanceof CallerCompatError ? err.message : `${err instanceof Error ? err.message : String(err)}`
-      try {
-        if (!started) this.emit_(record.id, { type: 'turn.started', turnId: turn.id, prompt: turn.shown ?? input, callId: turn.callId ?? undefined, ...(turn.source ? { source: turn.source } : {}) })
-        if (!cancelled) this.emit_(record.id, { type: 'error', message: error || 'turn failed', recoverable: true })
-      } catch { /* mirror */ }
+      // A handed-over turn records nothing: the next server owns its ending.
+      if (!session.relayDetached) {
+        const cancelled = turn.abort.signal.aborted
+        stopReason = cancelled ? 'cancelled' : 'error'
+        error = cancelled
+          ? (turn.failure && turn.failure !== 'cancelled before it started' ? turn.failure : undefined)
+          : err instanceof CallerCompatError ? err.message : `${err instanceof Error ? err.message : String(err)}`
+        try {
+          if (!started) this.emit_(record.id, { type: 'turn.started', turnId: turn.id, prompt: turn.shown ?? input, callId: turn.callId ?? undefined, ...(turn.source ? { source: turn.source } : {}) })
+          if (!cancelled) this.emit_(record.id, { type: 'error', message: error || 'turn failed', recoverable: true })
+        } catch { /* mirror */ }
+      }
     } finally {
       turn.releasePrompt()
       this.releaseLocalTurnSlot(turn)
@@ -2135,6 +2488,10 @@ export class ChatRuntime extends EventEmitter {
         catch (failure) { turn.failure ??= `Compaction status could not be recorded: ${String(failure)}` }
       }
       turn.abort.signal.removeEventListener('abort', turn.releasePrompt)
+      // A handed-over turn leaves everything for the next server: the open
+      // turn row, the lease row, the pending requests, the queue. Only the
+      // in-memory turn is cleared, so shutdown does not wait on it.
+      if (session.relayDetached) { session.turn = null; return }
       this.settlePending(session, 'cancelled')
       // The lease is released only once nothing of this turn can still write:
       // the agent reported the turn finished (or its process is verifiably
@@ -2715,7 +3072,10 @@ export class ChatRuntime extends EventEmitter {
         return this.spawnAgent(session, launchPath || command, args, options?.env)
       },
       emit: (event) => {
-        if (!currentContext() || session.record.status === 'closed') return
+        // A handed-over turn's emissions are link-death artifacts: the
+        // agent never saw them, and replay re-derives from the spool what
+        // its bytes produced. Recording them would duplicate the replay.
+        if (!currentContext() || session.record.status === 'closed' || session.relayDetached) return
         // Native compaction chatter is maintenance, not a new assistant reply.
         if (session.record.contextCompacting && (event.type === 'text.delta' || event.type === 'thought.delta')) return
         try {
@@ -2756,46 +3116,89 @@ export class ChatRuntime extends EventEmitter {
     }
   }
 
-  private async spawnAgent(session: LiveSession, command: string, args: readonly string[], env?: NodeJS.ProcessEnv): Promise<ChildProcess> {
+  private relayRoot(): string {
+    if (this.options.relayDir) return this.options.relayDir
+    const db = process.env.POISE_DB && process.env.POISE_DB !== ':memory:'
+      ? process.env.POISE_DB
+      : join(homedir(), '.poise', 'cache.db')
+    return join(dirname(db), 'chat-relays')
+  }
+
+  /** Start the agent under its per-session relay and return the peer the
+   *  adapter talks through. The relay survives this server, so a restart
+   *  hands the running turn to the next server instead of stopping it. */
+  private async spawnAgent(session: LiveSession, command: string, args: readonly string[], env?: NodeJS.ProcessEnv): Promise<AgentProcess> {
     if (session.lifecycle.signal.aborted || session.startup?.signal.aborted || session.turn?.abort.signal.aborted) throw new Error('agent startup was cancelled')
-    if (session.worker?.alive) throw new Error('the session already has a worker')
+    if (session.relay?.healthy) throw new Error('the session already has a worker')
     const record = session.record
     const lease = session.lease
     if (!lease?.held) throw new Error('the checkout lease is not held; the agent cannot start')
-    const worker = spawnWorker(command, args, {
+    // The Claude SDK asks for `node <wrapper>`: scrub by the wrapper's name.
+    const envCommand = record.agent === 'codex' && command === session.cliCheck?.result.launchPath ? 'codex'
+      : command === process.execPath && args[0] ? basename(args[0]) : undefined
+    const dir = relayDirFor(this.relayRoot(), record.id)
+    const gateIdent = randomUUID()
+    const peer = await spawnRelay({
+      sessionId: record.id,
+      dir,
+      command,
+      args,
+      env: scrubbedChildEnvironment(envCommand ?? command, env, args),
       cwd: record.checkout,
-      env,
-      // The Claude SDK asks for `node <wrapper>`: scrub by the wrapper's name.
-      envCommand: record.agent === 'codex' && command === session.cliCheck?.result.launchPath ? 'codex'
-        : command === process.execPath && args[0] ? basename(args[0]) : undefined,
+      gateIdent,
+      log: (message) => this.emit('log', `[chat ${record.id.slice(0, 8)}] ${message}`),
     })
-    session.worker = worker
+    session.relay = peer
+    const startedAt = new Date().toISOString()
     storage.recordWorker({
       sessionId: record.id,
-      gatePid: worker.pid,
-      gatePgid: worker.pgid,
-      ident: worker.ident,
+      gatePid: peer.gatePid,
+      gatePgid: peer.gatePgid,
+      ident: gateIdent,
       checkout: record.checkout,
       leaseToken: lease.currentToken,
       command,
-      startedAt: new Date().toISOString(),
+      startedAt,
     })
-    // Registered before GO: nothing runs unregistered.
-    if (!lease.registerWorker({ pid: worker.pid, pgid: worker.pgid, ident: worker.ident })) {
-      await worker.terminate(1_000).catch(() => undefined)
+    storage.recordRelay({
+      sessionId: record.id,
+      relayPid: peer.relayPid,
+      relayIdent: peer.ident,
+      socket: peer.socketPath,
+      dir,
+      startedAt,
+    })
+    const forget = () => {
+      if (session.relay === peer) session.relay = null
       storage.forgetWorker(record.id)
+      storage.forgetRelay(record.id)
+    }
+    // Registered before GO: nothing runs unregistered.
+    if (!lease.registerWorker({ pid: peer.gatePid, pgid: peer.gatePgid, ident: gateIdent })) {
+      await peer.shutdown().catch(() => undefined)
+      forget()
       throw new Error('the checkout lease was lost before the agent could start')
     }
-    worker.go()
-    void worker.exited.then(() => {
-      // Only a settled group is forgotten; a dead leader with live children
-      // stays recorded so startup cleanup and the lease keep seeing it.
-      if (session.worker === worker && !worker.alive) {
-        session.worker = null
+    try {
+      await peer.go()
+    } catch (error) {
+      await peer.shutdown().catch(() => undefined)
+      forget()
+      throw error
+    }
+    // The relay leaves only after its agent is gone, so an exit here means
+    // the group settled; until then the rows stay for recovery and the lease.
+    // A detach exit (no code, no signal) is the link dying, not the agent:
+    // the rows stay for the server that adopts the relay.
+    peer.once('exit', (code, signal) => {
+      if (code === null && signal === null) return
+      if (session.relay === peer) {
+        session.relay = null
         storage.forgetWorker(record.id)
+        storage.forgetRelay(record.id)
       }
     })
-    return worker.child
+    return peer
   }
 
   private onAdapterExit(session: LiveSession, adapter: Adapter, code: number | null, signal: NodeJS.Signals | null): void {
@@ -2810,25 +3213,33 @@ export class ChatRuntime extends EventEmitter {
     } catch { /* mirror */ }
   }
 
-  /** Close the adapter and terminate its process group, verified. On
-   *  failure the worker stays recorded, the session says so, and the error
-   *  propagates so no caller releases the checkout. */
+  /** Close the adapter and shut the relay down, verifying the agent's
+   *  process group is gone. On failure the relay stays recorded, the
+   *  session says so, and the error propagates so no caller releases the
+   *  checkout. Never runs for a handed-over turn: the next server owns
+   *  that relay now. */
   private async stopProcess(session: LiveSession): Promise<void> {
+    if (session.relayDetached) return
     const adapter = session.adapter
     session.adapter = null
     if (adapter) { try { await adapter.close() } catch { /* terminating below */ } }
-    const worker = session.worker
-    if (!worker) return
+    const relay = session.relay
+    if (!relay) return
     try {
-      await worker.terminate(CLOSE_GRACE_MS)
+      await relay.shutdown()
+      if (pgidAlive(relay.gatePgid) || pidAlive(relay.gatePid)) {
+        throw new Error(`worker group ${relay.gatePgid} is still alive after shutdown`)
+      }
     } catch (error) {
       session.record.orphanNotice = error instanceof Error ? error.message : String(error)
       this.saveRecord(session)
       try { this.emit_(session.record.id, { type: 'error', message: session.record.orphanNotice, recoverable: false }) } catch { /* mirror */ }
       throw error
     }
-    if (session.worker === worker) session.worker = null
+    if (session.relay === relay) session.relay = null
     storage.forgetWorker(session.record.id)
+    storage.forgetRelay(session.record.id)
+    await rm(relay.dir, { recursive: true, force: true }).catch(() => undefined)
   }
 
   /** Publishing a native request is part of its admission. If it cannot be
@@ -3064,14 +3475,6 @@ function implementingTurnOutcome(sessionId: string): { started: boolean, finishe
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
-}
-
-/** Recursive canonical form: nested input keys count, so two commands that
- *  differ below the top level never share a permission grant. */
-export function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined'
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  return `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as any)[key])}`).join(',')}}`
 }
 
 function delay(ms: number): Promise<void> {

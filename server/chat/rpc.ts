@@ -22,8 +22,8 @@
 // Releasing the checkout the child was writing to is the runtime's job and
 // happens only after the gate's process group is gone.
 
-import type { ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import type { AgentProcess } from './adapters/types'
 
 export interface JsonRpcError { code: number, message: string, data?: unknown }
 
@@ -79,8 +79,52 @@ function validId(value: unknown): value is number | string {
     || (typeof value === 'number' && Number.isFinite(value))
 }
 
+function idKey(id: number | string): string {
+  return `${typeof id}:${String(id)}`
+}
+
+/** Request ids this client used, and the agent requests it answered, as the
+ *  relay recorded them. Replay continues the numbering past every id the
+ *  previous Poise used, so a fresh request can never collide with one the
+ *  agent still has in flight. */
+export function outboundProgress(outbound: Buffer): { maxRequestId: number, responded: Set<string> } {
+  let maxRequestId = 0
+  const responded = new Set<string>()
+  for (const line of outbound.toString('utf8').split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let message: any = null
+    try { message = JSON.parse(trimmed) } catch { continue }
+    if (!message || typeof message !== 'object' || Array.isArray(message)) continue
+    if (typeof message.method === 'string') {
+      if (typeof message.id === 'number' && Number.isSafeInteger(message.id) && message.id > maxRequestId) maxRequestId = message.id
+      continue
+    }
+    if (validId(message.id)) responded.add(idKey(message.id))
+  }
+  return { maxRequestId, responded }
+}
+
+/** Whether the recorded outbound stream carries a client request for
+ *  `method`. Replay sends the turn's initiating request itself when the
+ *  previous Poise never got it out. */
+export function outboundHasMethod(outbound: Buffer, method: string): boolean {
+  for (const line of outbound.toString('utf8').split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed || !trimmed.includes(method)) continue
+    try {
+      const message = JSON.parse(trimmed) as { method?: unknown, id?: unknown }
+      if (message && typeof message === 'object' && message.method === method && message.id !== undefined) return true
+    } catch { /* not a frame */ }
+  }
+  return false
+}
+
 export class StdioRpc extends EventEmitter {
   private nextId = 1
+  private replaying = false
+  private respondedBeforeRestart = new Set<string>()
+  private readonly deferred: Array<() => void> = []
   private readonly pending = new Map<number | string, Pending>()
   private readonly requestHandlers = new Map<string, RpcRequestHandler>()
   private readonly notificationHandlers = new Map<string, RpcNotificationHandler>()
@@ -96,7 +140,7 @@ export class StdioRpc extends EventEmitter {
   readonly droppedFrames = { count: 0 }
   private readonly options: Required<Omit<RpcOptions, 'onStderr'>> & Pick<RpcOptions, 'onStderr'>
 
-  constructor(readonly child: ChildProcess, options: RpcOptions = {}) {
+  constructor(readonly child: AgentProcess, options: RpcOptions = {}) {
     super()
     this.options = {
       maxLineBytes: options.maxLineBytes ?? DEFAULT_MAX_LINE,
@@ -124,6 +168,30 @@ export class StdioRpc extends EventEmitter {
 
   get isClosed(): boolean { return this.closed }
   get stderr(): string { return this.stderrTail }
+  /** True while spooled bytes are being replayed: writes are deduplicated
+   *  against what the agent already got, and new requests wait for live. */
+  get isReplaying(): boolean { return this.replaying }
+
+  /** Replay the previous Poise's turn: continue request numbering past its
+   *  ids, drop answers it already sent, and hold new requests until
+   *  endReplay. Answers the agent never got are still sent — an agent
+   *  waiting on one must hear it — so replay writes nothing twice but
+   *  completes what the restart cut short. */
+  beginReplay(outbound: Buffer): void {
+    if (this.replaying) throw new Error('replay is already active on this link')
+    const progress = outboundProgress(outbound)
+    this.nextId = progress.maxRequestId + 1
+    this.respondedBeforeRestart = progress.responded
+    this.replaying = true
+  }
+
+  /** The spool is consumed and the link is live: send what replay held. */
+  endReplay(): void {
+    if (!this.replaying) throw new Error('replay is not active on this link')
+    this.replaying = false
+    this.respondedBeforeRestart.clear()
+    for (const send of this.deferred.splice(0)) send()
+  }
 
   onRequest(method: string, handler: RpcRequestHandler): void {
     this.requestHandlers.set(method, handler)
@@ -133,7 +201,9 @@ export class StdioRpc extends EventEmitter {
     this.notificationHandlers.set(method, handler)
   }
 
-  /** Send a request and wait for its result. */
+  /** Send a request and wait for its result. While replaying, the send
+   *  waits for live; the deadline runs from the send, and an abort before
+   *  that rejects at once. */
   request<T = unknown>(method: string, params?: unknown, options: { timeoutMs?: number, signal?: AbortSignal } = {}): Promise<T> {
     if (this.closed) return Promise.reject(this.closeReason ?? new RpcClosedError())
     if (options.signal?.aborted) return Promise.reject(abortError(options.signal))
@@ -141,7 +211,28 @@ export class StdioRpc extends EventEmitter {
     return new Promise<T>((resolve, reject) => {
       const timeoutMs = options.timeoutMs ?? this.options.requestTimeoutMs
       let timer: ReturnType<typeof setTimeout> | null = null
+      const send = () => {
+        this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, cleanup })
+        // A frame that cannot be serialized or is over the bound never reaches
+        // the peer; the caller learns at once and nothing is left pending.
+        const error = this.write({ jsonrpc: '2.0', id, method, params: params ?? {} })
+        if (error) {
+          this.pending.delete(id)
+          cleanup()
+          reject(error)
+          return
+        }
+        if (timeoutMs > 0) {
+          timer = setTimeout(() => {
+            this.pending.delete(id)
+            cleanup()
+            reject(new RpcError(-32000, `${this.options.label}: ${method} timed out after ${timeoutMs}ms`))
+          }, timeoutMs)
+        }
+      }
       const onAbort = () => {
+        const held = this.deferred.indexOf(send)
+        if (held !== -1) this.deferred.splice(held, 1)
         this.pending.delete(id)
         cleanup()
         reject(abortError(options.signal!))
@@ -152,37 +243,25 @@ export class StdioRpc extends EventEmitter {
         options.signal?.removeEventListener('abort', onAbort)
       }
       options.signal?.addEventListener('abort', onAbort, { once: true })
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, cleanup })
-      // A frame that cannot be serialized or is over the bound never reaches
-      // the peer; the caller learns at once and nothing is left pending.
-      const error = this.write({ jsonrpc: '2.0', id, method, params: params ?? {} })
-      if (error) {
-        this.pending.delete(id)
-        cleanup()
-        reject(error)
-        return
-      }
-      if (timeoutMs > 0) {
-        timer = setTimeout(() => {
-          this.pending.delete(id)
-          cleanup()
-          reject(new RpcError(-32000, `${this.options.label}: ${method} timed out after ${timeoutMs}ms`))
-        }, timeoutMs)
-      }
+      if (this.replaying && !this.closed) this.deferred.push(send)
+      else send()
     })
   }
 
   notify(method: string, params?: unknown): void {
-    if (this.closed) return
+    if (this.closed || this.replaying) return
     this.write({ jsonrpc: '2.0', method, params: params ?? {} })
   }
 
-  /** Answer a request the peer sent us. */
+  /** Answer a request the peer sent us. While replaying, an answer the
+   *  previous Poise already sent is dropped; anything else goes out. */
   respond(id: number | string, result: unknown): void {
+    if (this.replaying && this.respondedBeforeRestart.has(idKey(id))) return
     this.write({ jsonrpc: '2.0', id, result })
   }
 
   respondError(id: number | string, error: JsonRpcError): void {
+    if (this.replaying && this.respondedBeforeRestart.has(idKey(id))) return
     this.write({ jsonrpc: '2.0', id, error })
   }
 
@@ -292,7 +371,7 @@ export class StdioRpc extends EventEmitter {
       }
       const pending = this.pending.get(message.id)
       if (!pending) {
-        this.emit('orphan-response', message.id)
+        this.emit('orphan-response', message.id, message)
         return
       }
       this.pending.delete(message.id)
@@ -367,6 +446,8 @@ export class StdioRpc extends EventEmitter {
     if (this.closed) return
     this.closed = true
     this.closeReason = error
+    // Held sends run against the closed link and reject themselves.
+    for (const send of this.deferred.splice(0)) send()
     for (const [id, pending] of this.pending) {
       this.pending.delete(id)
       pending.cleanup()

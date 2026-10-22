@@ -1,0 +1,252 @@
+// Runtime relay behavior through real servers sharing one database: a
+// relay-held turn survives from one ChatRuntime to the next (handover,
+// adopt, replay, settle), and a dead relay falls back to
+// interrupt-and-resume with the transcript saying so.
+
+import { spawnSync } from 'node:child_process'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import type { AgentId, ChatEnvelope, ChatEvent, PromptInput } from '../../server/chat/protocol'
+import type { Adapter, AdapterHost, AdapterStartOptions, ReplayInit } from '../../server/chat/adapters/types'
+import type { CallerTurns } from '../../server/chat/caller-turns'
+import type { RelayConnection } from '../../server/chat/relay'
+import { CATALOG } from '../model-catalog-fixture'
+
+let root = ''
+let repo = ''
+let runtimeModule: typeof import('../../server/chat/runtime')
+let storage: typeof import('../../server/chat/storage')
+let worker: typeof import('../../server/chat/worker')
+
+function git(args: string[], cwd = repo): string {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.invalid' } })
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`)
+  return result.stdout.trim()
+}
+
+interface FakeControls {
+  hosts: AdapterHost[]
+  adapters: FakeAdapter[]
+  auto: boolean
+  replayTurns: ReplayInit[]
+  /** False simulates a crashed server: a dead link settles nothing. */
+  exitAware?: boolean
+}
+
+class FakeAdapter implements Adapter {
+  agent: AgentId = 'grok'
+  nativeSessionId: string | undefined
+  capabilities = { steer: true, fork: true, thought: true, plan: true, commands: true, modes: false, permissions: true, questions: true, resume: true, images: false }
+  alive = false
+  inputs: PromptInput[] = []
+  private finishTurn: ((stop?: 'end_turn' | 'cancelled') => void) | null = null
+  private exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = []
+  constructor(readonly host: AdapterHost, readonly controls: FakeControls) {
+    // Like a real adapter, a dead link settles a pending prompt.
+    const spawn = host.spawn.bind(host)
+    host.spawn = (async (command, args, options) => {
+      const peer = await spawn(command, args, options)
+      if (this.controls.exitAware !== false) peer.once('exit', () => this.finishTurn?.('cancelled'))
+      return peer
+    })
+  }
+  async start(options: AdapterStartOptions) {
+    this.alive = true
+    this.nativeSessionId = options.resume || `native-${this.controls.adapters.length}`
+    return { nativeSessionId: this.nativeSessionId, capabilities: this.capabilities, modelId: options.modelId, effort: options.effort, efforts: ['high', 'xhigh'] }
+  }
+  async prompt(turnId: string, input: PromptInput, signal: AbortSignal) {
+    this.inputs.push(input)
+    this.host.emit({ type: 'text.delta', turnId, messageId: `${turnId}:m1`, delta: `echo: ${input.text}` })
+    if (this.controls.auto) return { stopReason: 'end_turn' as const, usage: { totalTokens: 3 } }
+    return new Promise<{ stopReason: 'end_turn' | 'cancelled' }>((resolve) => {
+      this.finishTurn = (stop = 'end_turn') => { this.finishTurn = null; resolve({ stopReason: stop }) }
+      signal.addEventListener('abort', () => this.finishTurn?.('cancelled'), { once: true })
+    })
+  }
+  async replayTurn(init: ReplayInit) {
+    this.controls.replayTurns.push(init)
+    this.alive = true
+    this.nativeSessionId = init.session.nativeSessionId
+    return { stopReason: 'end_turn' as const, usage: { totalTokens: 3 } }
+  }
+  async steer() {}
+  finish() { this.finishTurn?.('end_turn') }
+  async cancel() { this.finishTurn?.('cancelled') }
+  async setModel(modelId: string, effort: string) { return { modelId, effort } }
+  async setMode() {}
+  async fork() { return `${this.nativeSessionId}-fork` }
+  async close() { this.alive = false; for (const l of this.exitListeners) l(0, null) }
+  onExit(listener: (code: number | null, signal: NodeJS.Signals | null) => void) { this.exitListeners.push(listener) }
+}
+
+const runtimes: Array<import('../../server/chat/runtime').ChatRuntime> = []
+
+function makeRuntime(instance: string, controls?: FakeControls) {
+  const owned: FakeControls = controls ?? { hosts: [], adapters: [], auto: true, replayTurns: [] }
+  const finishes: Array<{ callId: string, status: string, error?: string }> = []
+  const caller: CallerTurns = {
+    async start() { return 'a'.repeat(32) },
+    async finish(callId, status, error) { finishes.push({ callId, status, error }); return { id: callId, status } },
+  }
+  const runtime = new runtimeModule.ChatRuntime({
+    instance,
+    instanceLabel: 'test',
+    adapters: { grok: (host: AdapterHost) => { const a = new FakeAdapter(host, owned); owned.hosts.push(host); owned.adapters.push(a); return a } },
+    callerTurns: caller,
+    catalog: async () => CATALOG as any,
+    resolveCheckout: async () => repo,
+    idleTimeoutMinutes: () => 0,
+    requireClaudeReady: async () => {},
+  })
+  const events: ChatEnvelope[] = []
+  runtime.on('event', (e: ChatEnvelope) => events.push(e))
+  runtimes.push(runtime)
+  return { runtime, controls: owned, events, finishes }
+}
+
+beforeAll(async () => {
+  root = await mkdtemp(join(tmpdir(), 'poise-chat-relay-runtime-'))
+  process.env.POISE_DB = join(root, 'cache.db')
+  process.env.POISE_LOCK_DIR = join(root, 'locks')
+  repo = join(root, 'repo')
+  await mkdir(repo)
+  git(['init', '-q', '-b', 'main'])
+  git(['config', 'user.email', 't@example.invalid'])
+  git(['config', 'user.name', 't'])
+  await writeFile(join(repo, 'README.md'), '# repo\n')
+  git(['add', '-A'])
+  git(['commit', '-q', '-m', 'init'])
+  vi.resetModules()
+  runtimeModule = await import('../../server/chat/runtime')
+  storage = await import('../../server/chat/storage')
+  worker = await import('../../server/chat/worker')
+})
+
+afterAll(async () => {
+  const { closeDatabase } = await import('../../server/db')
+  closeDatabase()
+  delete process.env.POISE_DB
+  delete process.env.POISE_LOCK_DIR
+  vi.resetModules()
+  await rm(root, { recursive: true, force: true })
+})
+
+afterEach(async () => {
+  for (const runtime of runtimes.splice(0)) await runtime.stop({ handover: false }).catch(() => undefined)
+  spawnSync('git', ['checkout', '-q', '--', '.'], { cwd: repo })
+  spawnSync('git', ['clean', '-fdq'], { cwd: repo })
+  spawnSync('git', ['switch', '-q', 'main'], { cwd: repo })
+})
+
+async function waitFor(check: () => boolean, ms = 8_000): Promise<void> {
+  const deadline = Date.now() + ms
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error('condition not met in time')
+    await new Promise((r) => setTimeout(r, 20))
+  }
+}
+
+const ofType = (events: ChatEnvelope[], id: string, type: ChatEvent['type']) => events.filter((e) => e.sessionId === id && e.event.type === type).map((e) => e.event as any)
+const lastStatus = (events: ChatEnvelope[], id: string) => ofType(events, id, 'status.changed').at(-1)?.status
+
+describe('relay handover between servers', () => {
+  it('keeps a relay-held turn running through a restart', async () => {
+    const instance = 'poise-relay-handover:db'
+    const first = makeRuntime(instance)
+    first.controls.auto = false
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    // A first turn starts the agent, as the adapter's start would; the
+    // handover turn below then finds the relay already holding it.
+    first.runtime.prompt(session.id, { text: 'Start the agent', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    const pgid = peer.gatePgid
+    await waitFor(() => worker.pgidAlive(pgid))
+    first.controls.adapters[0].finish()
+    // The full settle, not just the terminal event: the next prompt must
+    // observe the idle edge, never the previous turn's running status.
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    const { turnId } = first.runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    // Let the turn-start frame flush to the relay before stopping: a real
+    // restart lands seconds later, but this test stops within microseconds.
+    await new Promise((r) => setTimeout(r, 200))
+    // A turn a healthy relay holds is invisible to the release switch while
+    // its open row still counts it running.
+    expect(first.runtime.working()).toBe(0)
+    expect(first.runtime.relayHeldSessions()).toEqual(new Set([session.id]))
+    expect(storage.listOpenTurns(instance)).toHaveLength(1)
+
+    await first.runtime.stop()
+    expect(storage.getOpenTurn(session.id)?.turnId).toBe(turnId)
+    expect(worker.pgidAlive(pgid)).toBe(true)
+    expect(storage.getRelay(session.id)).not.toBeNull()
+
+    const second = makeRuntime(instance)
+    await second.runtime.recover()
+    await waitFor(() => second.controls.replayTurns.length === 1)
+    expect(second.controls.replayTurns[0].turnId).toBe(turnId)
+    await waitFor(() => ofType(second.events, session.id, 'turn.finished').length === 1)
+    expect(ofType(second.events, session.id, 'turn.finished')[0]).toMatchObject({ turnId, stopReason: 'end_turn' })
+    expect(second.finishes).toHaveLength(1)
+    expect(second.finishes[0]).toMatchObject({ status: 'completed' })
+    // The adopted agent was not stopped: its rows and process survive.
+    await waitFor(() => second.runtime.get(session.id)?.status === 'idle')
+    expect(worker.pgidAlive(pgid)).toBe(true)
+    expect(storage.getRelay(session.id)).not.toBeNull()
+
+    // The next turn reuses the adopted agent.
+    second.controls.auto = true
+    second.runtime.prompt(session.id, { text: 'Again', attachments: [], mentions: [] })
+    await waitFor(() => ofType(second.events, session.id, 'turn.finished').length === 2)
+    expect(second.controls.adapters).toHaveLength(1)
+
+    await second.runtime.stop({ handover: false })
+    await waitFor(() => !worker.pgidAlive(pgid), 10_000)
+    expect(storage.getRelay(session.id)).toBeNull()
+    await first.runtime.stop({ handover: false })
+  }, 60_000)
+
+  it('falls back to interrupt-and-resume when the relay is gone', async () => {
+    const instance = 'poise-relay-fallback:db'
+    const first = makeRuntime(instance)
+    first.controls.auto = false
+    first.controls.exitAware = false
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    const { turnId } = first.runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    const pgid = peer.gatePgid
+    await waitFor(() => worker.pgidAlive(pgid))
+    const workerRow = storage.getWorker(session.id)!
+    const relayRow = storage.getRelay(session.id)!
+
+    // The relay dies without a handover; its gate tears the agent down.
+    // The rows are re-recorded afterwards: a crashed server never runs
+    // the exit handler that would have forgotten them.
+    process.kill(peer.relayPid, 'SIGKILL')
+    await waitFor(() => !worker.pgidAlive(pgid) && !worker.pidAlive(peer.relayPid), 10_000)
+    await waitFor(() => storage.getRelay(session.id) === null)
+    storage.recordWorker(workerRow)
+    storage.recordRelay(relayRow)
+    // The old server is gone with the crash: it is never stopped here (its
+    // dangling turn settles in afterEach, after the assertions below).
+
+    const second = makeRuntime(instance)
+    await second.runtime.recover()
+    expect(second.controls.replayTurns).toHaveLength(0)
+    const finished = ofType(second.events, session.id, 'turn.finished')
+    expect(finished).toHaveLength(1)
+    expect(finished[0]).toMatchObject({ turnId, stopReason: 'interrupted' })
+    expect(finished[0].error).toContain('the agent was gone after the restart')
+    expect(second.runtime.get(session.id)?.status).toBe('interrupted')
+    expect(second.runtime.get(session.id)?.interruptedTurnId).toBe(turnId)
+    expect(storage.listWorkers().filter((row) => row.sessionId === session.id)).toEqual([])
+    expect(storage.getRelay(session.id)).toBeNull()
+  }, 60_000)
+})

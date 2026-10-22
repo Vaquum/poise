@@ -28,12 +28,11 @@ import { appendMemories } from '../memory-content'
 // assistant/user frames that carry tool calls and their results.
 
 import { query, type CanUseTool, type HookCallback, type Options, type Query, type SDKMessage, type SDKUserMessage, type SpawnedProcess } from '@anthropic-ai/claude-agent-sdk'
-import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { PassThrough } from 'node:stream'
 import { CLAUDE_SUBSCRIPTION_CLI, claudeSubscriptionEnvironment, scrubbedChildEnvironment } from '../../process'
 import { CHAT_LIMITS, type Capabilities, type CommandOption, type ContentBlock, type ModeOption, type PromptInput, type Question, type StopReason, type ToolKind } from '../protocol'
-import { AdapterError, assertRequiredCapabilities, type Adapter, type AdapterHost, type AdapterStartOptions, type AdapterStartResult, type TurnResult } from './types'
+import { AdapterError, assertRequiredCapabilities, type Adapter, type AdapterHost, type AdapterStartOptions, type AdapterStartResult, type AgentProcess, type ReplayInit, type TurnResult } from './types'
 import { forClaude, type Skipped } from '../../extensions/types'
 
 export const CLAUDE_SDK_VERSION = '0.3.274'
@@ -100,7 +99,7 @@ function textOf(content: unknown): string {
 export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: number, queueSettleMs?: number, compactTimeoutMs?: number } = {}): Adapter {
   const exitGraceMs = options.exitGraceMs ?? EXIT_GRACE_MS
   const queueSettleMs = options.queueSettleMs ?? QUEUE_SETTLE_MS
-  let nativeChild: ChildProcess | null = null
+  let nativeChild: AgentProcess | null = null
   let compactBoundaries = 0
   let compactFailure: string | undefined
   let active: Query | null = null
@@ -114,7 +113,10 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
   let mcpSkipped: Skipped[] = []
   let alive = false
   let processExited = false
-  let proxy: ProxyProcess | null = null
+  let proxy: ProxyProcess | ReplayProcess | null = null
+  /** A replayed turn adopts the native message uuids it observes: the sends
+   *  are the previous Poise's, unknown to this process. */
+  let replaying = false
   const exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = []
   // Waiters for an exit Poise asked for; the runtime's listeners hear only
   // exits it did not ask for.
@@ -156,6 +158,8 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
     settling: boolean
     /** A result left sends unconsumed and their native turn has not started yet. */
     awaitingQueued: boolean
+    /** Transcript diffs to replay verbatim instead of re-reading the disk. */
+    recalled: Map<string, { oldText: string, newText: string, oldExists: boolean, newExists: boolean }>
   }
   let turn: Turn | null = null
   // Set while Poise itself ends the query, so a process exit is not an error.
@@ -310,7 +314,10 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
     clearQueueSettle()
     const current = turn
     const stamped = (message as { user_message_uuid?: unknown }).user_message_uuid
-    if (current && typeof stamped === 'string' && current.sent.has(stamped)) current.awaitingQueued = false
+    if (current && typeof stamped === 'string') {
+      if (replaying) current.sent.add(stamped)
+      if (current.sent.has(stamped)) current.awaitingQueued = false
+    }
     try {
       dispatch(message)
     } finally {
@@ -466,6 +473,13 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
     if (!structured || typeof structured !== 'object') return
     const rawPath = typeof structured.filePath === 'string' ? structured.filePath : tool.input?.file_path
     if (typeof rawPath !== 'string') return
+    const recalled = current.recalled.get(`${toolId}\0${rawPath}`)
+    if (recalled) {
+      // Replayed from the transcript: the pre-image the hook captured is
+      // gone with the previous Poise, and the disk moved on since.
+      host.emit({ type: 'diff', turnId: current.id, toolId, diffId: randomUUID(), path: rawPath, oldText: recalled.oldText, newText: recalled.newText, oldExists: recalled.oldExists, newExists: recalled.newExists })
+      return
+    }
     if (tool.name === 'Edit' || tool.name === 'MultiEdit') {
       const original = typeof structured.originalFile === 'string' ? structured.originalFile : preImages.get(rawPath) ?? null
       preImages.delete(rawPath)
@@ -512,6 +526,31 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
     }
   }
 
+  function wireExit(peer: AgentProcess): void {
+    peer.once('exit', (code, signal) => {
+      alive = false
+      processExited = true
+      for (const waiter of exitWaiters.splice(0)) waiter()
+      if (!closing) for (const listener of exitListeners) listener(code, signal)
+    })
+  }
+
+  /** Take commands, model and efforts from an initialization answer — the
+   *  CLI's at launch, the recorded session's at replay. */
+  function applyInit(init: { commands?: any, models?: any }, wantedModel: string | undefined, wantedEffort: string | undefined): void {
+    commands = (init.commands || []).map((c: any) => ({ name: String(c.name || '').replace(/^\//, ''), description: typeof c.description === 'string' ? c.description : undefined }))
+    const model = (init.models || []).find((m: any) => m.value === wantedModel || m.resolvedModel === wantedModel) as any
+    if (model?.supportedEffortLevels?.length) efforts = model.supportedEffortLevels
+    else if (model && model.supportsEffort === false) efforts = []
+    if (wantedModel && !(init.models || []).some((m: any) => m.value === wantedModel || m.resolvedModel === wantedModel)) {
+      host.log(`claude: model ${wantedModel} is not in the CLI's model list; the CLI decides what it launches`)
+    }
+    if (wantedEffort && !efforts.includes(wantedEffort)) {
+      throw new Error(`Claude Code offers efforts ${efforts.join(', ') || '(none)'} for ${wantedModel}, not ${wantedEffort}`)
+    }
+    modelId = model?.resolvedModel || model?.value || wantedModel || modelId
+  }
+
   async function launch(options: AdapterStartOptions): Promise<void> {
     safeMode = options.safeMode === true
     mode = options.mode === 'plan' ? 'plan' : 'default'
@@ -540,7 +579,7 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
       // The SDK asks for `node <wrapper> …`; the gate runs exactly that.
       spawnClaudeCodeProcess: (spawnOptions) => spawnThroughGate(spawnOptions) as unknown as SpawnedProcess,
     }
-    let pendingChild: Promise<ChildProcess> | null = null
+    let pendingChild: Promise<AgentProcess> | null = null
     function spawnThroughGate(spawnOptions: { command: string, args: string[], cwd?: string, env?: NodeJS.ProcessEnv }): ProxyProcess {
       proxy = new ProxyProcess((text) => host.log(`claude stderr: ${text.trim().slice(0, 300)}`))
       const current = proxy
@@ -551,12 +590,7 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
         nativeChild = child
         current.attach(child)
         alive = true
-        child.once('exit', (code, signal) => {
-          alive = false
-          processExited = true
-          for (const waiter of exitWaiters.splice(0)) waiter()
-          if (!closing) for (const listener of exitListeners) listener(code, signal)
-        })
+        wireExit(child)
       }, (error) => { processExited = true; current.fail(error) })
       return current
     }
@@ -577,17 +611,7 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
       throw error
     })
     sessionId = sessionId || minted || options.resume
-    commands = (init.commands || []).map((c: any) => ({ name: String(c.name || '').replace(/^\//, ''), description: typeof c.description === 'string' ? c.description : undefined }))
-    const model = (init.models || []).find((m: any) => m.value === options.modelId || m.resolvedModel === options.modelId) as any
-    if (model?.supportedEffortLevels?.length) efforts = model.supportedEffortLevels
-    else if (model && model.supportsEffort === false) efforts = []
-    if (options.modelId && !(init.models || []).some((m: any) => m.value === options.modelId || m.resolvedModel === options.modelId)) {
-      host.log(`claude: model ${options.modelId} is not in the CLI's model list; the CLI decides what it launches`)
-    }
-    if (options.effort && !efforts.includes(options.effort)) {
-      throw new Error(`Claude Code offers efforts ${efforts.join(', ') || '(none)'} for ${options.modelId}, not ${options.effort}`)
-    }
-    modelId = model?.resolvedModel || model?.value || options.modelId || modelId
+    applyInit(init, options.modelId, options.effort)
     // Over the control channel: `mcpServers` in Options would put every
     // header and environment value on the CLI's command line.
     mcpSkipped = []
@@ -629,7 +653,7 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
           : `\n[Attached file: ${attachment.path}]`)
       }
       return new Promise<TurnResult>((resolve) => {
-        const current: Turn = { id, resolve, startedAt: Date.now(), messageCounter: 0, messageId: '', thoughtId: '', textSeen: new Set(), tools: new Map(), refused: false, cancelled: false, sent: new Set(), inputTokens: 0, outputTokens: 0, settling: false, awaitingQueued: false }
+        const current: Turn = { id, resolve, startedAt: Date.now(), messageCounter: 0, messageId: '', thoughtId: '', textSeen: new Set(), tools: new Map(), refused: false, cancelled: false, sent: new Set(), inputTokens: 0, outputTokens: 0, settling: false, awaitingQueued: false, recalled: new Map() }
         turn = current
         newMessageIds(current)
         const onAbort = () => { void adapter.cancel() }
@@ -637,6 +661,84 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
         current.resolve = (result: TurnResult) => { signal.removeEventListener('abort', onAbort); resolve(result) }
         send(current, appendMemories(parts.join('\n'), input.memories))
       })
+    },
+
+    async replayTurn(init: ReplayInit): Promise<TurnResult> {
+      // Without the turn's user message the CLI never heard it: that turn
+      // must be re-prompted, not replayed.
+      if (init.outboundTruncated) throw new AdapterError('claude', 'the relay cannot prove what Claude Code heard; the turn is interrupted instead', 'protocol')
+      if (!outboundHasUserFrame(init.outbound)) throw new AdapterError('claude', 'the turn never reached Claude Code; it is interrupted instead', 'protocol')
+      if (turn) throw new AdapterError('claude', 'Claude Code is already running a turn', 'protocol')
+      safeMode = init.session.safeMode
+      mode = init.session.mode === 'plan' ? 'plan' : 'default'
+      sessionId = init.session.nativeSessionId
+      modelId = init.session.modelId
+      effort = init.session.effort
+      efforts = init.session.efforts ?? []
+      commands = init.session.commands ?? []
+      replaying = true
+      nativeChild = init.peer
+      alive = true
+      const replayProxy = new ReplayProcess(init.peer, {
+        responded: outboundControlResponses(init.outbound),
+        session: { modelId, efforts, commands },
+        log: (message) => host.log(message),
+        onStderr: (text) => host.log(`claude stderr: ${text.trim().slice(0, 300)}`),
+      })
+      proxy = replayProxy
+      wireExit(init.peer)
+      let replayFailed: Error | null = null
+      const abortReplay = (error: Error) => { replayFailed = error; replayProxy.fail(error) }
+      replayProxy.onProtocolError = abortReplay
+      const sdkOptions: Options = {
+        cwd: host.checkout,
+        model: modelId || undefined,
+        effort: EFFORTS.includes(effort) ? effort as Options['effort'] : undefined,
+        permissionMode: mode === 'plan' ? 'plan' : safeMode ? 'auto' : 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        sandbox: { enabled: false },
+        canUseTool,
+        hooks: { PreToolUse: [{ matcher: 'Write|Edit|MultiEdit', hooks: [preToolUse] }] },
+        includePartialMessages: true,
+        pathToClaudeCodeExecutable: CLAUDE_SUBSCRIPTION_CLI,
+        env: { ...scrubbedChildEnvironment('claude-subscription.mjs', claudeSubscriptionEnvironment()) },
+        sessionId,
+        spawnClaudeCodeProcess: () => replayProxy as unknown as SpawnedProcess,
+      }
+      active = query({ prompt: inputStream(), options: sdkOptions })
+      void consume(active)
+      const result = new Promise<TurnResult>((resolve) => {
+        const current: Turn = { id: init.turnId, resolve, startedAt: Date.now(), messageCounter: 0, messageId: '', thoughtId: '', textSeen: new Set(), tools: new Map(), refused: false, cancelled: false, sent: new Set(), inputTokens: 0, outputTokens: 0, settling: false, awaitingQueued: false, recalled: init.recalledDiffs }
+        turn = current
+        newMessageIds(current)
+        const onAbort = () => { void adapter.cancel() }
+        init.signal.addEventListener('abort', onAbort, { once: true })
+        current.resolve = (outcome: TurnResult) => { init.signal.removeEventListener('abort', onAbort); resolve(outcome) }
+      })
+      void init.live.then(
+        () => { replaying = false; replayProxy.goLive() },
+        (error) => abortReplay(error instanceof Error ? error : new Error(String(error))),
+      )
+      // The handshake is synthesized locally, so this only trips on an SDK
+      // that stopped asking — fail fast into the fallback, not after the
+      // two minutes a cold CLI is allowed.
+      try {
+        const sdkInit = await Promise.race([
+          active.initializationResult(),
+          new Promise<never>((_, reject) => {
+            const timer = setTimeout(() => reject(new Error('Claude Code did not initialize its replay within 10 s')), 10_000)
+            timer.unref()
+          }),
+        ])
+        applyInit(sdkInit as { commands?: any, models?: any }, modelId, effort)
+      } catch (error) {
+        throw new AdapterError('claude', `Claude Code could not reconnect: ${error instanceof Error ? error.message : String(error)}`, 'protocol')
+      }
+      // Servers stay as the running CLI has them; reconfiguring mid-turn is
+      // a protocol violation, not a kindness.
+      const outcome = await result
+      if (replayFailed) throw replayFailed
+      return outcome
     },
 
     async compact(id, memories, signal) {
@@ -730,13 +832,13 @@ class ProxyProcess {
   exitCode: number | null = null
   signalCode: NodeJS.Signals | null = null
   stderrTail = ''
-  private child: ChildProcess | null = null
+  private child: AgentProcess | null = null
   private readonly listeners = new Map<string, Array<(...args: any[]) => void>>()
   private pendingKill: NodeJS.Signals | null = null
 
   constructor(private readonly onStderr: (text: string) => void) {}
 
-  attach(child: ChildProcess) {
+  attach(child: AgentProcess) {
     this.child = child
     this.stdin.pipe(child.stdin!)
     // stdout is ended by its own EOF, never by the exit event: a final frame
@@ -783,5 +885,193 @@ class ProxyProcess {
 
   off(event: string, listener: (...args: any[]) => void): void {
     this.listeners.set(event, (this.listeners.get(event) || []).filter((l) => l !== listener))
+  }
+}
+
+/** Whether the recorded outbound stream carries a user message: the turn's
+ *  prompt reached the CLI. */
+function outboundHasUserFrame(outbound: Buffer): boolean {
+  for (const line of outbound.toString('utf8').split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      if ((JSON.parse(trimmed) as { type?: unknown }).type === 'user') return true
+    } catch { /* not a frame */ }
+  }
+  return false
+}
+
+/** The CLI-bound answers the previous Poise sent, by their request id. */
+function outboundControlResponses(outbound: Buffer): Set<string> {
+  const answered = new Set<string>()
+  for (const line of outbound.toString('utf8').split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      const frame = JSON.parse(trimmed) as { type?: unknown, response?: { request_id?: unknown } }
+      if (frame?.type === 'control_response' && typeof frame.response?.request_id === 'string') answered.add(frame.response.request_id)
+    } catch { /* not a frame */ }
+  }
+  return answered
+}
+
+/** A replayed session's stand-in for the CLI process: the SDK speaks to the
+ *  relay peer through it. Agent bytes flow to the SDK untouched, but nothing
+ *  the previous Poise already sent goes out twice: the initialize handshake
+ *  is answered from the recorded session (never forwarded to the running
+ *  CLI), answers the CLI heard are dropped, and new requests wait for live.
+ *  Anything the gate cannot classify fails the replay in the open. */
+class ReplayProcess {
+  stdin = new PassThrough()
+  stdout = new PassThrough()
+  killed = false
+  exitCode: number | null = null
+  signalCode: NodeJS.Signals | null = null
+  stderrTail = ''
+  private readonly listeners = new Map<string, Array<(...args: any[]) => void>>()
+  private readonly peer: AgentProcess
+  private readonly responded: Set<string>
+  private readonly synthesized: { modelId: string, efforts: string[], commands: CommandOption[] }
+  private readonly log: (message: string) => void
+  private readonly onStderr: (text: string) => void
+  private live = false
+  private inputBuffer = ''
+  private readonly deferred: string[] = []
+  onProtocolError: (error: Error) => void = () => {}
+
+  constructor(peer: AgentProcess, options: {
+    responded: Set<string>
+    session: { modelId: string, efforts: string[], commands: CommandOption[] }
+    log: (message: string) => void
+    onStderr: (text: string) => void
+  }) {
+    this.peer = peer
+    this.responded = options.responded
+    this.synthesized = options.session
+    this.log = options.log
+    this.onStderr = options.onStderr
+    peer.stdout!.pipe(this.stdout)
+    peer.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8')
+      this.stderrTail = (this.stderrTail + text).slice(-8_192)
+      this.onStderr(text)
+    })
+    peer.once('exit', (code, signal) => {
+      this.exitCode = code
+      this.signalCode = signal
+      for (const listener of this.listeners.get('exit') || []) listener(code, signal)
+    })
+    peer.once('error', (error) => { for (const listener of this.listeners.get('error') || []) listener(error) })
+    this.stdin.on('data', (chunk: Buffer) => this.onSdkBytes(chunk.toString('utf8')))
+    // Ending input ends the agent, replaying or not: teardown proceeds.
+    this.stdin.on('finish', () => { try { peer.stdin?.end() } catch { /* gone */ } })
+  }
+
+  /** The spool is consumed: send what replay held, then everything live. */
+  goLive(): void {
+    this.live = true
+    for (const line of this.deferred.splice(0)) this.forward(line)
+  }
+
+  fail(error: Error) {
+    this.exitCode = 1
+    this.stdout.end()
+    for (const listener of this.listeners.get('error') || []) listener(error)
+    for (const listener of this.listeners.get('exit') || []) listener(1, null)
+  }
+
+  kill(signal: NodeJS.Signals): boolean {
+    this.killed = true
+    try { return this.peer.kill(signal) } catch { return false }
+  }
+
+  on(event: string, listener: (...args: any[]) => void): void {
+    this.listeners.set(event, [...(this.listeners.get(event) || []), listener])
+  }
+
+  once(event: string, listener: (...args: any[]) => void): void {
+    const wrapped = (...args: any[]) => { this.off(event, wrapped); listener(...args) }
+    this.on(event, wrapped)
+  }
+
+  off(event: string, listener: (...args: any[]) => void): void {
+    this.listeners.set(event, (this.listeners.get(event) || []).filter((l) => l !== listener))
+  }
+
+  private onSdkBytes(chunk: string): void {
+    this.inputBuffer += chunk
+    let index: number
+    while ((index = this.inputBuffer.indexOf('\n')) !== -1) {
+      const line = this.inputBuffer.slice(0, index)
+      this.inputBuffer = this.inputBuffer.slice(index + 1)
+      if (line.trim()) this.onSdkLine(line)
+    }
+  }
+
+  private onSdkLine(line: string): void {
+    let frame: any = null
+    try { frame = JSON.parse(line) } catch { /* rejected below */ }
+    if (!frame || typeof frame !== 'object') return this.unknown(line, 'is not JSON')
+    if (frame.type === 'control_response') {
+      const id = frame.response?.request_id
+      // An answer the CLI heard stays answered; anything else may be an
+      // agent waiting on it, so it goes out at once.
+      if (!this.live && typeof id === 'string' && this.responded.has(id)) return
+      this.forward(line)
+      return
+    }
+    if (frame.type === 'control_request' && frame.request?.subtype === 'initialize' && typeof frame.request_id === 'string') {
+      this.answerInit(frame.request_id)
+      return
+    }
+    if (!this.live && (frame.type === 'control_request' || frame.type === 'user')) {
+      // New — the previous Poise's prompt is already with the CLI, so user
+      // sends and control requests during replay are this Poise's own — but
+      // the CLI is mid-replay: hold them for live.
+      this.deferred.push(line)
+      return
+    }
+    if (frame.type === 'control_request' || frame.type === 'control_response' || frame.type === 'user') {
+      this.forward(line)
+      return
+    }
+    this.unknown(line, `has an unknown frame type ${String(frame.type).slice(0, 40)}`)
+  }
+
+  private unknown(line: string, reason: string): void {
+    this.log(`claude: SDK output ${reason}; ${this.live ? 'forwarded live' : 'the replay fails rather than guess'}`)
+    if (this.live) this.forward(line)
+    else this.onProtocolError(new Error(`Claude Code SDK output ${reason}`))
+  }
+
+  /** Answer the handshake from the recorded session: commands, the model
+   *  and its efforts are exactly what the start established. */
+  private answerInit(requestId: string): void {
+    const { modelId, efforts, commands } = this.synthesized
+    this.stdout.write(`${JSON.stringify({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: requestId,
+        response: {
+          commands: commands.map((c) => ({ name: c.name, ...(c.description ? { description: c.description } : {}) })),
+          output_style: 'default',
+          available_output_styles: ['default'],
+          models: [{ value: modelId, displayName: modelId, description: '', resolvedModel: modelId, supportsEffort: efforts.length > 0, supportedEffortLevels: efforts }],
+          account: {},
+          agents: [],
+          skills: [],
+          plugins: [],
+        },
+      },
+    })}\n`)
+  }
+
+  private forward(line: string): void {
+    try {
+      this.peer.stdin?.write(`${line}\n`, (error) => { if (error) this.log(`claude: relay write failed: ${error.message}`) })
+    } catch (error) {
+      this.log(`claude: relay write failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 }
