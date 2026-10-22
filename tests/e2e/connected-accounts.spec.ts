@@ -76,10 +76,19 @@ async function stop(child: ChildProcess) {
   })
 }
 
+// The first accounts read spawns every CLI at once; under load the page's six
+// parallel checks must not be the ones that warm it. One read here proves the
+// fixture answers HTTP and warms every account's cache before the browser
+// opens, so a loaded machine serves cache hits instead of failing to fetch.
+async function ready(page: Page, origin: string) {
+  await expect.poll(async () => (await page.request.get(`${origin}/api/accounts`)).ok(), { timeout: 30_000 }).toBe(true)
+}
+
 test('connects a CLI from Settings in a terminal and shows its new sign-in', async ({ page }, info) => {
   test.setTimeout(90_000)
   const fixture = await start(page, info)
   try {
+    await ready(page, fixture.origin)
     // Where a sign-in alert opens the workspace: Settings → Connected accounts.
     await page.goto(`${fixture.origin}/?settings=accounts`)
     await expect(page.locator('#settings-panel')).toHaveClass(/open/)
@@ -200,6 +209,7 @@ for (const service of [false, true]) {
           if (frame.type === 'exit') { socket.close(); if (frame.code === 0) resolve(); else reject(new Error(`login exit ${frame.code}`)) }
         })
       })
+      await ready(page, fixture.origin)
       await page.goto(`${fixture.origin}/?settings=accounts`)
       const row = (id: string) => page.locator(`.st-account[data-account="${id}"]`)
       await expect(row('muse').locator('.st-account-state')).toHaveText('Signed in here', { timeout: 20_000 })
@@ -224,6 +234,7 @@ for (const service of [false, true]) {
       await page.locator('#settings-panel').screenshot({ path: info.outputPath('completed-grok-login.png') })
       await stop(fixture.child)
       fixture = await start(page, info, { service, reuse: true })
+      await ready(page, fixture.origin)
       await page.goto(`${fixture.origin}/?settings=accounts`)
       await expect(row('grok').locator('.st-account-state')).toHaveText('Signed in here', { timeout: 20_000 })
       await expect(row('muse').locator('.st-account-state')).toHaveText('Signed in here')
@@ -246,6 +257,7 @@ test('preserves legacy confirmations and setup controls with production Accounts
   const fixture = await start(page, info, { service: true, seed, antigravity: true })
   try {
     await setScript(fixture.home, 'codex', { ...script('codex'), 'login status': { stdout: 'unreadable status' } })
+    await ready(page, fixture.origin)
     await page.goto(`${fixture.origin}/?settings=accounts`)
     const row = (id: string) => page.locator(`.st-account[data-account="${id}"]`)
     for (const id of ['grok', 'muse', 'antigravity']) await expect(row(id).locator('.st-account-state')).toHaveText('Signed in here', { timeout: 20_000 })
@@ -289,6 +301,7 @@ test('can withdraw a retained setup confirmation while the version probe fails',
     await setScript(fixture.home, 'grok', { '--version': { stderr: 'broken installation', code: 1 } })
     await page.request.post(`${fixture.origin}/api/onboarding`, { data: { restart: true } })
     await page.request.post(`${fixture.origin}/api/onboarding`, { data: { step: 'ai' } })
+    await ready(page, fixture.origin)
     await page.goto(fixture.origin)
     const row = page.locator('.ob-ai-row[data-account="grok"]')
     await expect(row.locator('.ob-ai-state')).toContainText('broken installation')
