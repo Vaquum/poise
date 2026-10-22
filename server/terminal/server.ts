@@ -15,12 +15,11 @@ import { EventEmitter } from 'node:events'
 import { STATUS_CODES, type IncomingMessage, type Server } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer, type RawData } from 'ws'
-import { ACCOUNT_IDS } from '../accounts/types'
 import { HttpError, enforceApiRequest, type ApiRequestPolicy } from '../http'
 import { presetCommand } from './presets'
 import { PtyProcess, type TerminalCommand, type TerminalProcess, type TerminalSize } from './pty'
 import {
-  TERMINAL_CLOSE, TERMINAL_LIMITS, TERMINAL_WS_PATH, isTerminalPreset,
+  TERMINAL_CLOSE, TERMINAL_LIMITS, TERMINAL_PRESETS, TERMINAL_WS_PATH, isTerminalPreset,
   type TerminalClientFrame, type TerminalPreset, type TerminalServerFrame,
 } from './protocol'
 
@@ -221,7 +220,7 @@ export class TerminalSocketServer extends EventEmitter<TerminalServerEvents> {
         throw new HttpError(403, 'the terminal is open to the workspace owner\'s browser only')
       }
       const requested = new URLSearchParams(queryAt < 0 ? '' : url.slice(queryAt + 1)).get('preset')
-      if (!isTerminalPreset(requested)) throw new HttpError(400, `preset must be one of ${[...ACCOUNT_IDS, 'shell'].join(', ')}`)
+      if (!isTerminalPreset(requested)) throw new HttpError(400, `preset must be one of ${TERMINAL_PRESETS.join(', ')}`)
       preset = requested
     } catch (error) {
       refuse(socket, error)

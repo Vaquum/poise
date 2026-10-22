@@ -17,7 +17,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
 import { productionSummary, type ProductionUpdate } from './production-status'
 import { clockDay, logTime, shortTime } from './clock'
-import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, type ConnectedAccount } from '../server/accounts/types'
+import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, MUSE_API_KEY_LOGIN, type ConnectedAccount } from '../server/accounts/types'
 import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
 import { googleAccountsSection } from './views/google-accounts'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
@@ -411,7 +411,9 @@ function loadAccounts(force = false): Promise<void> {
 }
 
 function terminalTitle(preset: TerminalPreset): string {
-  return preset === 'shell' ? 'Login shell' : ACCOUNT_LOGINS[preset].join(' ')
+  if (preset === 'shell') return 'Login shell'
+  if (preset === 'muse-api-key') return MUSE_API_KEY_LOGIN.join(' ')
+  return ACCOUNT_LOGINS[preset].join(' ')
 }
 
 async function connect(preset: TerminalPreset): Promise<void> {

@@ -28,6 +28,15 @@ export const ACCOUNT_LOGINS: Record<AccountId, readonly string[]> = {
   antigravity: ['agy'],
 }
 
+/** What the Muse row's Use-an-API-key terminal runs, checked against `muse
+ *  auth set --help`. The key travels on stdin, never the command line, so it
+ *  lands in neither shell history nor anything Poise sees or stores. */
+export const MUSE_API_KEY_LOGIN: readonly string[] = ['muse', 'auth', 'set', '--api-key-stdin']
+
+/** Which credential Muse's auth file names, from its non-secret fields: the
+ *  API key, or the account login from `muse login` (device code). */
+export type MuseCredential = 'api-key' | 'account-login'
+
 /** One account gh holds for github.com, as `gh auth status` reports it. */
 export interface GhAccount {
   login: string
@@ -52,6 +61,9 @@ export interface ConnectedAccount {
   login: { label: string }
   /** gh only: every account it holds for github.com. */
   accounts?: GhAccount[]
+  /** Muse only, and only when its auth file names one: which credential it
+   *  holds. Never a secret value. */
+  credential?: MuseCredential
 }
 
 /** History is usable only for installed providers that have no status command. */

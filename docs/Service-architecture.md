@@ -436,8 +436,12 @@ assertion may only resume, and anything else is refused with 403):
   - `release` is the installed release the supervisor started this server on
     ([Updates in place](#updates-in-place)), `null` without one.
   - `switching` is the release a pending switch restarts this server onto,
-    `null` when none is pending. Asking to switch to the release it runs calls
-    a pending switch off; the gateway does so when the target changes back.
+    `null` when none is pending. Health reads it from the `next` record in
+    `~/.poise/releases`, the same record the supervisor switches on, so it
+    stays truthful when this server restarts: once the switch has fired, the
+    record is consumed and nothing is pending. Asking to switch to the
+    release it runs calls a pending switch off; the gateway does so when the
+    target changes back.
   - `activeChatTurns` counts the Chat turns recorded open: reserved before
     their first write, closed once their outcome is recorded.
   - `runningCallerCalls` counts the Caller processes Poise launched for agent
@@ -500,13 +504,18 @@ not use the gateway's discarded OAuth token.
   terminal exit invalidates all of them.
   Each entry is `{ id, installed, version, signedIn: true | false | null,
   identity, detail, login: { label } }`; gh's also has `accounts: [{ login,
-  active, signedIn, detail }]`, every account gh holds for github.com.
+  active, signedIn, detail }]`, every account gh holds for github.com, and
+  Muse's has `credential: 'api-key' | 'account-login'` when its auth file
+  names one.
   - Each CLI's own status command answers, never its credential files:
     `claude auth status --json` through Poise's Claude wrapper (signed in
     means a Claude subscription), `codex login status`, and `gh auth status
     --json hosts --hostname github.com` with no token from the environment.
-    Grok, Muse and Antigravity have no status command: their `signedIn` is
-    `null` and `detail` says so.
+    Grok and Antigravity have no status command: their `signedIn` is `null`
+    and `detail` says so. Muse has none either, but its auth file's
+    non-secret fields say which credential it holds, so its `signedIn` stays
+    `null` while `credential` names the API key or the account login; no key
+    or token is returned.
   - `signInRecordedAt`, when present, is historical completion/confirmation
     for installed Grok, Muse or Antigravity with a successful version probe.
     Their `signedIn` stays `null` and `identity` stays unasserted. Accounts and
@@ -537,20 +546,23 @@ not use the gateway's discarded OAuth token.
   | Codex | `codex login --device-auth` |
   | gh | `gh auth login --hostname github.com --git-protocol https --web` |
   | Grok | `grok login --device-auth` |
-  | Muse | `muse login` |
+  | Muse | `muse login`, which warns it switches Muse to the account login and its subscription quota |
+  | Muse API key | `muse auth set --api-key-stdin`, pasted into the terminal; Poise never sees or stores the key |
   | Antigravity | `agy`, which has no login subcommand: it opens its sign-in screen when it starts signed out |
 
-  Credentials go straight from the CLI to its own files; Poise never reads them.
+  Credentials go straight from the CLI to its own files; Poise never reads them,
+  except Muse's auth file for its non-secret fields (which credential it holds).
   In local and service mode, a successful Connect exit records a timestamp in
   Poise's existing `account_logins` map, independently of setup progress. Grok
   and Muse can therefore show the completed sign-in immediately and after a
-  restart. A failed/signaled login, startup failure or shell exit adds no
-  evidence; failed reconnects retain any earlier historical confirmation.
+  restart; storing a Muse API key records Muse the same way. A failed/signaled
+  login, startup failure or shell exit adds no evidence; failed reconnects
+  retain any earlier historical confirmation.
   Antigravity's app exit never creates a confirmation. Existing entries,
   including indistinguishable older automatic Antigravity entries, are kept.
   Missing CLIs and failed version probes retain history without showing a
   positive sign-in state. Setup's explicit withdrawal removes the record.
-- `/ws/terminal?preset=<id>|shell` is browser scope only.
+- `/ws/terminal?preset=<id>|shell|muse-api-key` is browser scope only.
   - Client to server: `{type:"input", data}` and `{type:"resize", cols, rows}`,
     with `cols` from 2 to 500, `rows` from 2 to 200 and frames up to 64 KiB.
   - Server to client: `{type:"output", data}` (base64) and `{type:"exit",

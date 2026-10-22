@@ -2,7 +2,7 @@
 // status command says (GET /api/accounts), and the button that opens its
 // login in a terminal.
 
-import { hasRecordedSignIn, type AccountId, type ConnectedAccount } from '../../server/accounts/types'
+import { MUSE_API_KEY_LOGIN, hasRecordedSignIn, type AccountId, type ConnectedAccount } from '../../server/accounts/types'
 
 const ACCOUNT_NAMES: Record<AccountId, string> = {
   claude: 'Claude',
@@ -70,6 +70,28 @@ function ghAccounts(account: ConnectedAccount, identities: GitHubIdentities): st
   return list + missing.map((text) => `<div class="st-help st-help-warn st-gh-missing">${escapeHtml(text)}</div>`).join('')
 }
 
+const MUSE_LOGIN_WARNING = 'switches Muse to the account login and its subscription quota'
+
+/** Which credential Muse's auth file holds, when it names one. */
+function museCredential(account: ConnectedAccount): string {
+  if (account.id !== 'muse' || !account.credential) return ''
+  const text = account.credential === 'api-key' ? 'Credential: API key.' : 'Credential: Account login (device code).'
+  return `<div class="st-help st-help-info st-account-credential">${escapeHtml(text)}</div>`
+}
+
+/** Connect on an API-key Muse would silently move it to subscription quota. */
+function museLoginWarning(account: ConnectedAccount): string {
+  if (account.id !== 'muse' || account.credential !== 'api-key') return ''
+  return `<div class="st-help st-help-warn st-account-warning">${escapeHtml(`Connect ${MUSE_LOGIN_WARNING}.`)}</div>`
+}
+
+/** The Muse row also stores an API key, pasted into its own terminal. */
+function museApiKeyButton(account: ConnectedAccount, disabled: boolean): string {
+  if (account.id !== 'muse') return ''
+  const label = MUSE_API_KEY_LOGIN.join(' ')
+  return `<button type="button" class="st-clear st-account-connect" data-connect="muse-api-key" data-help="Opens a terminal: ${escapeHtml(label)}. Paste the key there; Poise never sees or stores it." aria-label="Use an API key for Muse"${disabled ? ' disabled' : ''}>Use an API key</button>`
+}
+
 /** The rows. `busy` while a terminal runs: one login at a time. */
 export function accountsHtml(accounts: ConnectedAccount[], identities: GitHubIdentities, busy: boolean): string {
   const rows = (entries: ConnectedAccount[]) => entries.map((account) => {
@@ -78,14 +100,18 @@ export function accountsHtml(accounts: ConnectedAccount[], identities: GitHubIde
     const action = tone === 'on' ? 'Reconnect' : 'Connect'
     const disabled = busy || !account.installed
     const detail = hasRecordedSignIn(account) ? 'Sign-in completed or confirmed in Poise. The CLI cannot verify its current status.' : account.detail
+    const help = account.id === 'muse' ? `Opens a sign-in terminal: ${account.login.label}. Warning: this ${MUSE_LOGIN_WARNING}.` : `Opens a sign-in terminal: ${account.login.label}`
     return `
     <div class="st-account" data-account="${account.id}">
       <div class="st-account-head">
         <span class="st-account-name">${escapeHtml(name)}</span>
         ${account.version ? `<span class="st-account-version" data-help="${escapeHtml(name)} version ${escapeHtml(account.version)}" tabindex="0">${escapeHtml(account.version)}</span>` : ''}
-        <button type="button" class="st-clear st-account-connect" data-connect="${account.id}" data-help="Opens a sign-in terminal: ${escapeHtml(account.login.label)}" aria-label="${action} ${escapeHtml(name)}"${disabled ? ' disabled' : ''}>${action}</button>
+        <button type="button" class="st-clear st-account-connect" data-connect="${account.id}" data-help="${escapeHtml(help)}" aria-label="${action} ${escapeHtml(name)}"${disabled ? ' disabled' : ''}>${action}</button>
+        ${museApiKeyButton(account, disabled)}
       </div>
       <div class="st-account-state st-account-state-${tone}">${escapeHtml(text)}</div>
+      ${museCredential(account)}
+      ${museLoginWarning(account)}
       ${detail ? `<div class="st-help st-help-info st-account-detail">${escapeHtml(detail)}</div>` : ''}
       ${ghAccounts(account, identities)}
     </div>`

@@ -477,7 +477,42 @@ describe('switching to another release', () => {
       expect(restart).toHaveBeenCalledTimes(1)
       expect(service.health().draining).toBe(false)
       expect(background.releaseBackgroundPaused()).toBe(false)
+      // The switch stays queued: the next exit of any kind still switches.
+      expect((await readFile(join(dir, 'next'), 'utf8')).trim()).toBe('r2')
+      expect(service.health().switching).toBe('r2')
     } finally {
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('reports a queued switch from the persisted record, even to a server that never asked for it', async () => {
+    const dir = await releases({ r2: 'b1' })
+    await writeFile(join(dir, 'next'), 'r2\n')
+    const { timer, service } = switching(dir)
+    try {
+      expect(service.health().switching).toBe('r2')
+      // Reporting never re-arms the poll: only asking for a switch does.
+      expect(timer.timers.size).toBe(0)
+      await rm(join(dir, 'next'))
+      expect(service.health().switching).toBeNull()
+      await writeFile(join(dir, 'next'), '../r2\n')
+      expect(service.health().switching).toBeNull()
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('stops reporting a switch once its persisted record is gone', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { service } = switching(dir)
+    try {
+      service.switchRelease('r2')
+      expect(service.health().switching).toBe('r2')
+      await rm(join(dir, 'next'))
+      expect(service.health().switching).toBeNull()
+    } finally {
+      service.reset()
       background.resumeReleaseBackground()
     }
   })

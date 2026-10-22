@@ -2,7 +2,7 @@
 // print what the real CLIs print. PATH holds only the fakes (and node), so a
 // real CLI can never answer in a test.
 
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -139,6 +139,53 @@ describe('GET /api/accounts', () => {
 
     const answer = JSON.stringify(await probeAccounts(runFile))
     for (const secret of ['sk-proj', 'E1234', '7a1c0f2e', 'Organization', 'keyring', 'scopes', '/home/poise']) {
+      expect(answer).not.toContain(secret)
+    }
+  })
+
+  it('reports the Muse credential from its auth file, preferring the oauth mechanism over a stale API key', async () => {
+    await writeFakeClis(bin, home, { muse: script('muse') })
+    const authDir = join(home, 'xdg', 'muse')
+    vi.stubEnv('XDG_CONFIG_HOME', join(home, 'xdg'))
+    await mkdir(authDir, { recursive: true })
+    const authFile = join(authDir, 'auth.json')
+
+    await writeFile(authFile, JSON.stringify({ schema_version: 1, providers: { meta: { api_key: 'LLM_fixture_api_key' } } }))
+    expect(await probeAccount('muse', runFile)).toMatchObject({ credential: 'api-key', signedIn: null })
+
+    // The outage shape: an account login beside a stale key still runs on the login.
+    await writeFile(authFile, JSON.stringify({ schema_version: 1, providers: { meta: {
+      mechanism: 'oauth', obtained_via: 'device_code', subs_active: false,
+      access_token: 'fixture_access_token', api_key: 'stale_fixture_key',
+    } } }))
+    expect(await probeAccount('muse', runFile)).toMatchObject({ credential: 'account-login', signedIn: null })
+
+    await writeFile(authFile, 'not json')
+    expect(await probeAccount('muse', runFile)).not.toHaveProperty('credential')
+    await rm(authFile)
+    expect(await probeAccount('muse', runFile)).not.toHaveProperty('credential')
+  })
+
+  it('reads the Muse auth file from ~/.config when no XDG_CONFIG_HOME is set', async () => {
+    await writeFakeClis(bin, home, { muse: script('muse') })
+    vi.stubEnv('XDG_CONFIG_HOME', '')
+    const authDir = join(home, '.config', 'muse')
+    await mkdir(authDir, { recursive: true })
+    await writeFile(join(authDir, 'auth.json'), JSON.stringify({ schema_version: 1, providers: { meta: { api_key: 'LLM_home_config_key' } } }))
+    expect(await probeAccount('muse', runFile)).toMatchObject({ credential: 'api-key' })
+  })
+
+  it('never lets a Muse secret reach the accounts answer', async () => {
+    await writeFakeClis(bin, home, { muse: script('muse') })
+    vi.stubEnv('XDG_CONFIG_HOME', join(home, 'xdg'))
+    const authDir = join(home, 'xdg', 'muse')
+    await mkdir(authDir, { recursive: true })
+    await writeFile(join(authDir, 'auth.json'), JSON.stringify({ schema_version: 1, providers: { meta: {
+      mechanism: 'oauth', obtained_via: 'device_code', subs_active: false,
+      api_key: 'LLM_muse_secret_key_9f8e', access_token: 'muse_access_secret_7d6c', refresh_token: 'muse_refresh_secret_5b4a',
+    } } }))
+    const answer = JSON.stringify(await probeAccounts(runFile))
+    for (const secret of ['LLM_muse_secret_key_9f8e', 'muse_access_secret_7d6c', 'muse_refresh_secret_5b4a']) {
       expect(answer).not.toContain(secret)
     }
   })
@@ -350,6 +397,13 @@ describe('durable login evidence joined to Accounts', () => {
     expect(accounts.find(account => account.id === 'grok')).toMatchObject({ version: null, detail: expect.stringContaining('broken installation') })
     for (const id of ['grok', 'muse', 'antigravity']) expect(accounts.find(account => account.id === id)).not.toHaveProperty('signInRecordedAt')
     expect(accountLogins()).toEqual(earlier)
+  })
+
+  it('counts a stored Muse API key as its login', () => {
+    recordLogin('muse-api-key', 1)
+    expect(accountLogins()).toEqual({})
+    recordLogin('muse-api-key', 0)
+    expect(accountLogins().muse).toEqual(expect.any(String))
   })
 
   it.each(['true', 'false', 'malformed', 'failed'] as const)('never replaces own-status results (%s) with legacy timestamps', async state => {

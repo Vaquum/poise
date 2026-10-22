@@ -153,6 +153,10 @@ checkout* and *Posting review comments*.
   deleted) does not stop the others from getting theirs.
 - Stopped, out of time (one hour of wall-clock time, sleep included, with
   the one recovery), recovery failed, or an issue too large to review: held.
+- Out of balance (402) or not signed in: the reviewer is tripped, not held —
+  the next configured reviewer takes its place, or the review waits when none
+  is healthy. The trip retries on the usual backoff and clears when the
+  reviewer succeeds again.
 - A worker whose launch was never recorded — the process died in between — is
   taken over by a later scan after five minutes. One that has not yet
   registered its run is not relaunched while it is still alive.

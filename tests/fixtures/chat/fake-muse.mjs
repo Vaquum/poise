@@ -193,6 +193,11 @@ function scripted() {
     item('item/updated', { itemId: reminderId, kind: 'reminderChild', fallbackText: 'Reminder child session', status: 'inProgress' })
     item('item/completed', { itemId: reminderId, kind: 'reminderChild', fallbackText: 'Reminder child session', status: 'completed' })
 
+    if (prompt.startsWith('fail-quota')) {
+      await completeTurn('failed', { error: { kind: 'modelError', message: 'API error 429 [request_id=fixture-quota]: Subscription quota exhausted. Your usage window resets at 2026-10-22T13:12:01Z. (rate_limit_error)', retryable: true } })
+      return
+    }
+
     if (prompt.startsWith('fail')) {
       await completeTurn('failed', { error: { kind: 'modelError', message: 'provider returned 503', retryable: true } })
       return
