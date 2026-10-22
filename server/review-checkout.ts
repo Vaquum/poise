@@ -142,10 +142,12 @@ export async function resolveReviewCheckout(
     const used = new Date()
     await utimes(headDirectory, used, used)
   })
+  // Local git shares the machine with agent turns; it gets the same timeout as
+  // other review CLI calls so load alone cannot fail verification.
   const verify = async (cwd: string): Promise<void> => {
-    const origin = await runFile('git', ['remote', 'get-url', 'origin'], { cwd, signal, timeoutMs: 5_000 })
-    const commit = await runFile('git', ['rev-parse', 'HEAD'], { cwd, signal, timeoutMs: 5_000 })
-    const status = await runFile('git', ['status', '--porcelain'], { cwd, signal, timeoutMs: 5_000 })
+    const origin = await runFile('git', ['remote', 'get-url', 'origin'], { cwd, signal, timeoutMs: 30_000 })
+    const commit = await runFile('git', ['rev-parse', 'HEAD'], { cwd, signal, timeoutMs: 30_000 })
+    const status = await runFile('git', ['status', '--porcelain'], { cwd, signal, timeoutMs: 30_000 })
     if (origin.stdout.trim().toLowerCase() !== remote.toLowerCase()
       || commit.stdout.trim() !== head || status.stdout.trim()) throw new Error('Managed review checkout differs from the expected repository/head or has local changes')
   }
@@ -173,7 +175,7 @@ export async function resolveReviewCheckout(
         || result.path !== checkout) throw new Error('github-interface --checkout-repo returned malformed state')
       // Caller owns network/authentication. Pin locally using only the history
       // Caller fetched; a fork commit absent from that history fails closed.
-      await runFile('git', ['checkout', '--quiet', '--detach', head], { cwd: checkout, signal, timeoutMs: 5_000 })
+      await runFile('git', ['checkout', '--quiet', '--detach', head], { cwd: checkout, signal, timeoutMs: 30_000 })
       await verify(checkout)
       signal?.throwIfAborted()
       await rename(checkout, path)

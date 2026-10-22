@@ -113,6 +113,13 @@ must be present in live evidence before it becomes durable approval evidence.
 resolution primitive, which revalidates the complete gate before every thread
 mutation.
 
+Load timeouts — an expired sweep deadline, a slow CLI, lock contention — retry
+on a short clock of a few minutes, not the hour-long backoff of hard failures.
+A `review-new-prs` sweep cut short by its deadline still claims and launches
+the reviews it managed to prepare; the next sweep prepares the rest. Its git
+verification uses the same 30-second CLI budget as other review reads, and the
+rail names a timed-out sweep as stalled instead of repeating the timeout text.
+
 `merge-prs` is disabled unless `behavior_merge_prs_enabled` is explicitly `1`.
 It uses Caller directly without a model launch: after fresh datastore eligibility,
 it discovers up to 50 eligible PRs per ready account with one fresh

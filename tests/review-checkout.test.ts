@@ -58,6 +58,14 @@ describe('review checkout provisioning through Caller', () => {
     expect(mocks.runFile).toHaveBeenCalledWith('git', ['checkout', '--quiet', '--detach', head], expect.any(Object))
     expect(mocks.runFile.mock.calls.some(([command]) => command === 'gh')).toBe(false)
   })
+  it('gives git verification the same timeout as other review CLI calls, so load does not fail it', async () => {
+    await resolveCheckout()
+    const gitCalls = mocks.runFile.mock.calls.filter(([command]) => command === 'git')
+    expect(gitCalls.length).toBeGreaterThan(0)
+    for (const [, , options] of gitCalls) {
+      expect((options as { timeoutMs?: number }).timeoutMs).toBe(30_000)
+    }
+  })
   it.each(['head changed', 'denied access', 'dirty checkout'] as const)('does not publish or retain staging after %s', async (cause) => {
     wrongHead = cause === 'head changed'
     failedFetch = cause === 'denied access'

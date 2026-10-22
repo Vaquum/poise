@@ -1,7 +1,7 @@
 import { evidenceAttachment, keepKnownEvidence, type EvidenceAttachment } from '../gateway/src/diagnostics/evidence-contract'
 import { materialFailureCause } from '../gateway/src/diagnostics/material-cause'
 import type { BehaviorDiagnostics } from './behaviors'
-import { classifyBehaviorDiagnostic, diagnosticClassification, failureCause, type DiagnosticClassification } from './behavior-failure-cause'
+import { classifyBehaviorDiagnostic, diagnosticClassification, failureCause, isTimeoutCause, type DiagnosticClassification } from './behavior-failure-cause'
 
 /** One line of a group's details, with what it is about. */
 export interface DiagnosticEntry extends EvidenceAttachment {
@@ -28,6 +28,9 @@ export function targetRef(target: string): string {
 }
 
 function diagnosticMessage(code: string, cause: string): string {
+  if (code === 'unknown' && isTimeoutCause(cause)) {
+    return 'The sweep is stalled under load. Poise retries automatically.'
+  }
   return ({
     head_changed: 'PR updated. Poise will reconsider the latest revision.',
     provider_capacity: 'The model is busy. Poise will try again.',

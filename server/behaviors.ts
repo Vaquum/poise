@@ -72,7 +72,7 @@ import {
 } from './db'
 import { HttpError } from './http'
 import { behaviorErrorMessage, behaviorIncidentDiagnostics } from './behavior-diagnostics'
-import { classifyBehaviorDiagnostic, diagnosticClassification, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
+import { classifyBehaviorDiagnostic, diagnosticClassification, isTimeoutCause, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { resolveReviewCheckout } from './review-checkout'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
@@ -263,6 +263,20 @@ function behaviorAborted(): boolean {
   return behaviorSignal()?.aborted === true
 }
 
+// Shutdown or disable, as opposed to an expired operation deadline: only the
+// lifecycle abort discards work the sweep already prepared.
+function behaviorLifecycleAborted(): boolean {
+  return behaviorAbortController?.signal.aborted === true
+}
+
+// Claiming and launching run under the lifecycle signal: an expired operation
+// deadline must not discard prepared work, while shutdown or disable still
+// stops everything.
+function underLifecycleSignal<T>(operation: () => Promise<T>): Promise<T> {
+  const lifecycle = behaviorAbortController?.signal
+  return lifecycle ? behaviorOperationSignal.run(lifecycle, operation) : operation()
+}
+
 function prOperationEvaluationLeaseMs(): number {
   const signal = behaviorSignal()
   const deadline = signal && behaviorOperationDeadline.get(signal)
@@ -336,6 +350,9 @@ function setPersistedEnabled(key: BehaviorKey, enabled: boolean) {
 
 export const BEHAVIOR_RETRY_BASE_MS = 60_000
 export const BEHAVIOR_RETRY_MAX_MS = 60 * 60_000
+// Load timeouts retry on a short clock: the machine may be busy, but the work
+// itself is unchanged. Hard failures keep the hour-long backoff.
+export const BEHAVIOR_RETRY_TRANSIENT_MAX_MS = 3 * 60_000
 
 type BehaviorFailureKind = 'operation' | 'worker'
 
@@ -391,12 +408,13 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
   if (!isEnabled(key)) return
   const previous = readBehaviorFailure(key, target)
   const consecutiveFailures = Math.min((previous?.consecutiveFailures ?? 0) + 1, 31)
+  const error = cause === undefined ? undefined : behaviorErrorMessage(cause)
+  const transient = kind === 'operation' && isTimeoutCause(error ?? '')
   const delayMs = Math.min(
     BEHAVIOR_RETRY_BASE_MS * (2 ** Math.min(consecutiveFailures - 1, 20)),
-    BEHAVIOR_RETRY_MAX_MS,
+    transient ? BEHAVIOR_RETRY_TRANSIENT_MAX_MS : BEHAVIOR_RETRY_MAX_MS,
   )
   const now = Date.now()
-  const error = cause === undefined ? undefined : behaviorErrorMessage(cause)
   const diagnostic = classifyBehaviorDiagnostic(error ?? '', { held: kind === 'worker', ...options })
   setMeta(failureKey(key, target), JSON.stringify({
     kind,
@@ -2117,7 +2135,10 @@ async function tickReviewNewPrs(): Promise<void> {
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
       }
     }))
-    if (behaviorAborted()) {
+    // An expired operation deadline must not discard prepared reviews: a slow
+    // sweep still claims and launches what it managed to prepare, and the next
+    // sweep prepares the rest.
+    if (behaviorLifecycleAborted() || !isEnabled('review-new-prs')) {
       for (const bundle of prepared) releasePrOperationOwned(bundle.operationId)
       return
     }
@@ -2138,7 +2159,7 @@ async function tickReviewNewPrs(): Promise<void> {
       }
     }
     try {
-      await withBehaviorProcessLock('review-new-prs', async () => {
+      await underLifecycleSignal(() => withBehaviorProcessLock('review-new-prs', async () => {
         const fresh = await reviewPanel(getReviewers('review-new-prs'))
         const freshModels = new Map(fresh.reviewers.map((entry) => [entry.slot, entry.model]))
         // Read the ceiling here, closest to the spawn: narrowing it in the
@@ -2221,14 +2242,14 @@ async function tickReviewNewPrs(): Promise<void> {
             releaseLeases(ownedClaimId)
           }
         }
-      })
+      }))
     } catch (err) {
       releasePhase2Leases()
       throw err
     }
     // Phase 3 — spawn every claimed target without the behavior lock: the
     // atomic claim plus launch intent is the ownership.
-    await Promise.all(claimed.map(async ({ prepared: bundle, claimId, setting }) => {
+    await underLifecycleSignal(() => Promise.all(claimed.map(async ({ prepared: bundle, claimId, setting }) => {
       const { pr, slot, target, checkTarget } = bundle
       try {
         await spawnReviewLaunch(bundle, claimId, setting)
@@ -2244,7 +2265,7 @@ async function tickReviewNewPrs(): Promise<void> {
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
       }
-    }))
+    })))
     if (failure) throw failure
   } catch (err) {
     console.error('[behaviors] tick failed:', err)

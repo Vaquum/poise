@@ -29,6 +29,14 @@ export function diagnosticClassification(code: string): DiagnosticClassification
   return { severity: placement.rail, code }
 }
 
+// Load timeouts: the sweep deadline ("The operation was aborted due to
+// timeout"), a slow CLI ("Command timed out after …") or lock contention
+// ("timed out waiting for process lock"). Callers scope it to the failures it
+// describes: operation retries and unknown diagnostics, never held worker results.
+export function isTimeoutCause(error: string): boolean {
+  return /aborted due to timeout|timed out/i.test(error)
+}
+
 // Warning rules are an allowlist of observable transient outcomes. Neither a
 // retry count nor text saying "warning" can downgrade unknown or held evidence.
 export function classifyBehaviorDiagnostic(error: string, options: DiagnosticOptions = {}): DiagnosticClassification {
