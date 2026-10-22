@@ -191,6 +191,41 @@ describe('turn-level checkout change mirror', () => {
     expect(changes).toEqual([{ path: 'nested', oldText: '', newText: 'now a regular file\n', oldExists: false, newExists: true }])
   })
 
+  it('does not report a symlink created during the turn as an unrevertable change', async () => {
+    const before = await captureCheckoutSnapshot(repo)
+    await symlink(join(repo, 'base.txt'), join(repo, 'link'))
+    const { changes, warnings } = compareCheckoutSnapshots(before, await after(before))
+    expect(warnings).toEqual([])
+    expect(changes).toEqual([])
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events).toEqual([])
+  })
+
+  it('reports a symlink removed during the turn as unrevertable', async () => {
+    await symlink(join(repo, 'base.txt'), join(repo, 'link'))
+    const before = await captureCheckoutSnapshot(repo)
+    await rm(join(repo, 'link'))
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events.map(event => event.type)).toEqual(['error'])
+    if (events[0].type !== 'error') throw new Error('expected an error event')
+    expect(events[0].message).toContain('link: symlink was removed')
+  })
+
+  it('reports a symlink retargeted during the turn as unrevertable', async () => {
+    await symlink(join(repo, 'base.txt'), join(repo, 'link'))
+    await writeFile(join(repo, 'other.txt'), 'other\n')
+    const before = await captureCheckoutSnapshot(repo)
+    await rm(join(repo, 'link'))
+    await symlink(join(repo, 'other.txt'), join(repo, 'link'))
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events.map(event => event.type)).toEqual(['error'])
+    if (events[0].type !== 'error') throw new Error('expected an error event')
+    expect(events[0].message).toContain('link: symlink target changed')
+  })
+
   it('emits a labelled whole-turn card rather than pretending shell changes came from a native edit tool', async () => {
     const before = await captureCheckoutSnapshot(repo)
     execFileSync('sh', ['-c', 'printf "shell edit\n" > base.txt'], { cwd: repo })

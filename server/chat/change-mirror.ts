@@ -4,7 +4,7 @@
 // Capture before invoking the agent, and compare only after workers and
 // Poise filesystem services have settled, while still holding the lease.
 import { createHash, randomUUID } from 'node:crypto'
-import { lstat } from 'node:fs/promises'
+import { lstat, readlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { runFile } from '../process'
 import { readCheckoutBytes } from './client-fs'
@@ -75,6 +75,15 @@ export async function captureCheckoutSnapshot(
     // a stable marker: metadata churn inside it never warns, creation stays
     // quiet, and removal still reports as unrevertable when compared.
     if (info.isDirectory()) { result.files.set(path, { exists: true, signature: 'directory', reason: 'directory contents are not snapshotted' }); continue }
+    // A symlink is tracked by its target: re-creating the same link stays
+    // quiet, creation stays quiet, and removal or retarget still reports.
+    if (info.isSymbolicLink()) {
+      try {
+        const target = await readlink(join(checkout, path))
+        result.files.set(path, { exists: true, signature: `symlink:${createHash('sha256').update(target).digest('hex')}`, reason: 'not a regular non-symlink file' })
+      } catch (error) { unknown(error instanceof Error ? error.message : String(error)) }
+      continue
+    }
     if (!info.isFile() || info.isSymbolicLink()) { unknown('not a regular non-symlink file'); continue }
     if (info.size > limits.maxFileBytes) { unknown(`file exceeds ${limits.maxFileBytes} bytes`); continue }
     if (info.size > budget) { unknown('turn snapshot byte budget exceeded'); continue }
@@ -108,6 +117,7 @@ function version(snapshot: CheckoutSnapshot, path: string): Version {
 }
 
 const isDirectoryVersion = (value: Version): boolean => value.exists && value.text === undefined && value.signature === 'directory'
+const isSymlinkVersion = (value: Version): boolean => value.exists && value.text === undefined && value.signature.startsWith('symlink:')
 
 export function compareCheckoutSnapshots(before: CheckoutSnapshot, after: CheckoutSnapshot): { changes: ObservedChange[], warnings: string[] } {
   const changes: ObservedChange[] = []
@@ -119,6 +129,13 @@ export function compareCheckoutSnapshots(before: CheckoutSnapshot, after: Checko
     if (!old.exists && isDirectoryVersion(next)) continue
     if (isDirectoryVersion(old) && !next.exists) { warnings.push(`${path}: directory was removed`); continue }
     if (!isDirectoryVersion(old) && isDirectoryVersion(next)) { warnings.push(`${path}: replaced by a directory`); continue }
+    if (!old.exists && isSymlinkVersion(next)) {
+      if ([...before.files.keys()].some(key => key.startsWith(`${path}/`))) warnings.push(`${path}: replaced by a symlink`)
+      continue
+    }
+    if (isSymlinkVersion(old) && !next.exists) { warnings.push(`${path}: symlink was removed`); continue }
+    if (isSymlinkVersion(old) && isSymlinkVersion(next)) { warnings.push(`${path}: symlink target changed`); continue }
+    if (old.exists && old.text !== undefined && isSymlinkVersion(next)) { warnings.push(`${path}: replaced by a symlink`); continue }
     if (old.text === undefined || next.text === undefined) {
       warnings.push(`${path}: ${old.reason || next.reason || 'a trustworthy before/after image is unavailable'}`)
       continue
