@@ -241,7 +241,11 @@ function streamSpool(socket, onDone) {
     return
   }
   replaying = true
-  const stream = createReadStream(spoolPath)
+  // Bounded to the bytes the hello saw: live chunks appended while this
+  // streams travel through the replay queue instead, so no byte goes out
+  // twice. (This runs in one tick with the stat above, so nothing lands
+  // between the size and the queue taking over.)
+  const stream = createReadStream(spoolPath, { end: size - 1 })
   stream.on('data', (chunk) => send(socket, encode(STDOUT, chunk)))
   stream.on('error', (error) => {
     log(`spool read failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -276,7 +280,11 @@ function attach(socket, hello) {
   let resolveGone
   clientGone = new Promise((resolve) => { resolveGone = resolve })
   socket.once('close', () => {
-    if (client === socket) client = null
+    // A replaced client (the readableEnded branch above) closes after its
+    // replacement already streams the spool: only the active client's
+    // close resets replay or ends a relay that never got GO.
+    if (client !== socket) { resolveGone(); return }
+    client = null
     replaying = false
     replayQueue = []
     replayQueueBytes = 0

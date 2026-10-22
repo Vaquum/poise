@@ -149,6 +149,10 @@ interface RunningTurn {
   shown?: PromptInput
   /** True only once the native prompt was invoked, not while queued/startup. */
   agentInvoked?: boolean
+  /** True while the relay spools this turn's bytes (between turnStart and
+   *  turnFinish): only then can a restart adopt it, so only then does the
+   *  release switch look past it. */
+  relayHeld?: boolean
   /** Settles at native prompt invocation, cancellation, or failed startup. */
   promptReady: Promise<void>
   releasePrompt(): void
@@ -642,14 +646,22 @@ export class ChatRuntime extends EventEmitter {
           session.grants.set(`${requested.title}\0${canonicalJson(requested.input)}`, { id: event.optionId, kind: option.kind })
         }
       }
-      const result = await adapter.replayTurn({
-        turnId: open.turnId, signal: turn.abort.signal, peer,
-        live: livePromise(peer), outbound: outbound.bytes, outboundTruncated: outbound.truncated,
-        session: { nativeSessionId: record.nativeSessionId ?? '', modelId: record.modelId, effort: record.effort,
-          ...(record.mode ? { mode: record.mode } : {}), safeMode: record.safeMode === true,
-          ...(record.efforts ? { efforts: record.efforts } : {}), ...(record.commands ? { commands: record.commands } : {}) },
-        recalledDiffs: recalledDiffs(persisted.map((envelope) => envelope.event), open.turnId),
-      })
+      // The spool the old server bracketed is still live: a further
+      // restart adopts this turn the same way, until the replay settles.
+      turn.relayHeld = true
+      let result: TurnResult
+      try {
+        result = await adapter.replayTurn({
+          turnId: open.turnId, signal: turn.abort.signal, peer,
+          live: livePromise(peer), outbound: outbound.bytes, outboundTruncated: outbound.truncated,
+          session: { nativeSessionId: record.nativeSessionId ?? '', modelId: record.modelId, effort: record.effort,
+            ...(record.mode ? { mode: record.mode } : {}), safeMode: record.safeMode === true,
+            ...(record.efforts ? { efforts: record.efforts } : {}), ...(record.commands ? { commands: record.commands } : {}) },
+          recalledDiffs: recalledDiffs(persisted.map((envelope) => envelope.event), open.turnId),
+        })
+      } finally {
+        turn.relayHeld = false
+      }
       await this.settleReplayedTurn(session, turn, lease, result)
     } catch (error) {
       const cancelled = turn.abort.signal.aborted
@@ -667,12 +679,22 @@ export class ChatRuntime extends EventEmitter {
         storage.forgetRelay(record.id)
         await rm(relay.dir, { recursive: true, force: true }).catch(() => undefined)
       }
-      if (lease.held) { lease.clearWorker(); lease.release() }
+      // Like runTurn's finally: the adopted lease is released only once
+      // nothing of the turn can still write. A surviving agent keeps it.
+      if (lease.held) {
+        if (killed) { lease.clearWorker(); lease.release() }
+        else { try { this.emit_(record.id, { type: 'error', message: 'the checkout stays locked: the agent process could not be stopped', recoverable: false }) } catch { /* mirror */ } }
+      }
       if (session.lease === lease && !lease.held) session.lease = null
       this.releaseLocalTurnSlot(turn)
       this.interruptOpenTurn(open, cancelled
         ? { stopReason: 'cancelled', error: 'the turn was cancelled during the relay handoff' }
         : { stopReason: 'interrupted', error: `Poise restarted while this turn was running; the relay handoff failed (${message}), so the turn was interrupted` })
+      // interruptOpenTurn records through storage; refresh the live
+      // session adopted above, which still carries the pre-recovery
+      // record (status, interrupted turn, orphan notice).
+      const refreshed = storage.getSession(record.id)
+      if (refreshed) session.record = refreshed
       if (turn.implementsChange && record.selfChangeId) {
         try { await this.settleChange(session, { stopReason: cancelled ? 'cancelled' : 'interrupted', error: message, freed: killed, terminalRecorded: true }) }
         catch (failure) { this.emit('log', `[chat ${record.id.slice(0, 8)}] change settlement failed: ${failure instanceof Error ? failure.message : String(failure)}`) }
@@ -834,7 +856,10 @@ export class ChatRuntime extends EventEmitter {
   private async forceStop(session: LiveSession, reason: string, handover = false): Promise<void> {
     const turn = session.turn
     if (!turn) return
-    if (handover && session.relay?.healthy) {
+    // Only a turn the relay spools is handed over: before turnStart or
+    // past turnFinish there is no spool for the next server to adopt,
+    // so those turns settle here instead of being interrupted there.
+    if (handover && turn.relayHeld && session.relay?.healthy) {
       session.relayDetached = true
       turn.stopping = true
       const relay = session.relay
@@ -959,26 +984,28 @@ export class ChatRuntime extends EventEmitter {
   /**
    * The work a server restart would cut: what busy() counts, except agent
    * processes that sit idle between turns, which the next turn starts again,
-   * and turns a healthy relay holds, which the next server adopts.
+   * and turns whose spool a healthy relay holds, which the next server
+   * adopts. A turn still before its turnStart, or already past its
+   * turnFinish in its settle, has no spool to adopt and is waited for.
    * A release switch waits for this alone.
    */
   working(): number {
     let count = this.inflightOps + (this.recovering ? 1 : 0)
     for (const session of this.live.values()) {
-      if (session.turn && session.relay?.healthy) continue
+      if (session.turn?.relayHeld && session.relay?.healthy) continue
       const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
       count += own > 0 ? own : ACTIVE_STATUSES.includes(session.record.status) ? 1 : 0
     }
     return count
   }
 
-  /** Sessions whose running turn a healthy relay holds: a restart hands
-   *  them to the next server instead of cutting them, so the release
+  /** Sessions whose running turn's spool a healthy relay holds: a restart
+   *  hands them to the next server instead of cutting them, so the release
    *  switch does not wait for their turns either. */
   relayHeldSessions(): Set<string> {
     const held = new Set<string>()
     for (const session of this.live.values()) {
-      if (session.turn && session.relay?.healthy) held.add(session.record.id)
+      if (session.turn?.relayHeld && session.relay?.healthy) held.add(session.record.id)
     }
     return held
   }
@@ -2472,13 +2499,15 @@ export class ChatRuntime extends EventEmitter {
       // is already detached, so the finish below is a silent no-op and the
       // spool stays for the next server.
       session.relay?.turnStart(turn.id)
-      const response = adapter.prompt(turn.id, withAutoMergeInstructions({ ...adapterInput, text: controlContext ? `${controlContext}\n\n[Request]\n${expanded}` : expanded, memories: readMemories().text }, record.autoMerge, turn.implementsChange, turn.source && !personRelay ? 'source' : 'person'), turn.abort.signal)
-      turn.releasePrompt()
+      if (session.relay) turn.relayHeld = true
       let result: TurnResult
       try {
+        const response = adapter.prompt(turn.id, withAutoMergeInstructions({ ...adapterInput, text: controlContext ? `${controlContext}\n\n[Request]\n${expanded}` : expanded, memories: readMemories().text }, record.autoMerge, turn.implementsChange, turn.source && !personRelay ? 'source' : 'person'), turn.abort.signal)
+        turn.releasePrompt()
         result = await response
       } finally {
         session.relay?.turnFinish()
+        turn.relayHeld = false
       }
       agentSettled = true
       if (record.queuedHandoff && result.stopReason === 'end_turn') { record.queuedHandoff = undefined; this.saveRecord(session) }

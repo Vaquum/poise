@@ -11,7 +11,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, sep } from 'node:path'
-import type { Adapter, AdapterHost, AdapterStartResult, PermissionRequest, QuestionAnswers, QuestionRequest, TurnResult } from '../../server/chat/adapters/types'
+import type { Adapter, AdapterHost, PermissionRequest, QuestionAnswers, QuestionRequest, TurnResult } from '../../server/chat/adapters/types'
 import type { ChatEnvelope, ChatEvent } from '../../server/chat/protocol'
 import { attachRelay, livePromise, spawnRelay, type RelayConnection } from '../../server/chat/relay'
 import { createReplayHost, recalledDiffs } from '../../server/chat/replay'
@@ -71,7 +71,7 @@ export class RelayTranscript {
     return this.events.slice(index).map((event, order) => ({ seq: order + 2, sessionId: 'relay-session', at, event }))
   }
 
-  askPermission(request: PermissionRequest, id = randomUUID(), publish = true): Promise<string> {
+  askPermission(request: PermissionRequest, id: string = randomUUID(), publish = true): Promise<string> {
     // Mirrors the runtime: the request is published synchronously, the
     // resolution when the answer arrives. Replayed requests are already
     // published, so only their answers are recorded.
@@ -90,7 +90,7 @@ export class RelayTranscript {
     })
   }
 
-  askQuestion(request: QuestionRequest, id = randomUUID(), publish = true): Promise<QuestionAnswers> {
+  askQuestion(request: QuestionRequest, id: string = randomUUID(), publish = true): Promise<QuestionAnswers> {
     if (publish) this.events.push({ type: 'question.asked', id, turnId: this.turnId, toolId: request.toolId, questions: request.questions })
     return new Promise<QuestionAnswers>((resolve, reject) => {
       this.questionGates.push({

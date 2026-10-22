@@ -169,7 +169,8 @@ export class StdioRpc extends EventEmitter {
   get isClosed(): boolean { return this.closed }
   get stderr(): string { return this.stderrTail }
   /** True while spooled bytes are being replayed: writes are deduplicated
-   *  against what the agent already got, and new requests wait for live. */
+   *  against what the agent already got, and new requests and notifications
+   *  wait for live. */
   get isReplaying(): boolean { return this.replaying }
 
   /** Replay the previous Poise's turn: continue request numbering past its
@@ -248,8 +249,14 @@ export class StdioRpc extends EventEmitter {
     })
   }
 
+  /** Notifications sent while replaying wait for live like requests do:
+   *  a cancel issued mid-replay must still reach the agent. */
   notify(method: string, params?: unknown): void {
-    if (this.closed || this.replaying) return
+    if (this.closed) return
+    if (this.replaying) {
+      this.deferred.push(() => { this.write({ jsonrpc: '2.0', method, params: params ?? {} }) })
+      return
+    }
     this.write({ jsonrpc: '2.0', method, params: params ?? {} })
   }
 

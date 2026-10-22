@@ -346,6 +346,16 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
       this.settled(code ?? (signal ? null : 1), signal)
       return
     }
+    // Adopted: the relay deliberately keeps the agent after dropping a
+    // client (replay overflow, spool failure), so a living relay is a dead
+    // link, not a dead agent. Settle it like a detach — no code, no
+    // signal — so the runtime keeps the worker and relay rows (and the
+    // lease) for a verified shutdown. Only a dead relay is death.
+    if (pidAlive(this.relayPid)) {
+      this.log('relay socket lost; the relay lives on without this link')
+      this.settled(null, null)
+      return
+    }
     this.log('relay socket lost; the relay is gone')
     this.settled(1, null)
   }
@@ -415,9 +425,10 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
 
   async shutdown(): Promise<void> {
     const child = this.child
-    const asked = this.socket && !this.socket.destroyed && !this.exitedEmitted
+    const asked = !!(this.socket && !this.socket.destroyed && !this.exitedEmitted)
     try { this.socket?.write(encodeJson(SHUTDOWN, {})) } catch { /* already gone */ }
-    if (!child || child.exitCode !== null || child.signalCode !== null) return
+    if (!child) { await this.shutdownAdopted(asked); return }
+    if (child.exitCode !== null || child.signalCode !== null) return
     const waitExit = (ms: number): Promise<boolean> => new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => resolve(false), ms)
       timer.unref()
@@ -436,6 +447,23 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
       await waitExit(5_000)
     }
     if (child.exitCode === null && child.signalCode === null) throw new Error(`relay ${child.pid} (${this.sessionIdValue}) is still alive after SIGKILL`)
+  }
+
+  /** Shut down a relay another Poise spawned: no child handle, so the
+   *  recorded relay pid is waited on and, when it outlasts SHUTDOWN,
+   *  signalled — but only after its identity proves it is still our
+   *  relay. An unproven pid is left alone; the runtime's group probe
+   *  then decides whether the agent is gone. */
+  private async shutdownAdopted(asked: boolean): Promise<void> {
+    const pid = this.relayPid
+    if (asked) await waitPidGone(pid, SHUTDOWN_TIMEOUT_MS)
+    if (!pidAlive(pid)) return
+    if (!(await relayIdentityMatches(pid, this.identValue))) return
+    try { process.kill(pid, 'SIGTERM') } catch { /* gone */ }
+    if (await waitPidGone(pid, 5_000)) return
+    try { process.kill(pid, 'SIGKILL') } catch { /* gone */ }
+    if (await waitPidGone(pid, 5_000)) return
+    throw new Error(`relay ${pid} (${this.sessionIdValue}) is still alive after SIGKILL`)
   }
 
   detach(): void {
@@ -535,6 +563,15 @@ export function relayLogTail(dir: string): string {
   } catch {
     return 'no relay log'
   }
+}
+
+async function waitPidGone(pid: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms
+  while (pidAlive(pid)) {
+    if (Date.now() >= deadline) return false
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return true
 }
 
 /** Whether `pid` is still the relay recorded: its command line must be the

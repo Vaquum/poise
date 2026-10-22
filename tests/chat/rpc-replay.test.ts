@@ -89,15 +89,18 @@ describe('StdioRpc replay', () => {
     expect(out).toContain('"id":9')
   })
 
-  it('drops notifications while replaying and sends them once live', async () => {
+  it('holds notifications while replaying and sends them once live', async () => {
     const { rpc, written } = fixture()
     rpc.beginReplay(OUTBOUND)
-    rpc.notify('session/cancel', {})
+    rpc.notify('session/cancel', { held: true })
     expect(written.join('')).toBe('')
     rpc.endReplay()
-    rpc.notify('session/cancel', {})
+    rpc.notify('session/cancel', { held: false })
     await new Promise((resolve) => setImmediate(resolve))
-    expect(written.join('')).toContain('session/cancel')
+    const out = written.join('')
+    // The cancel issued mid-replay reaches the agent; it is not lost.
+    expect(out).toContain('"held":true')
+    expect(out).toContain('"held":false')
   })
 
   it('hands orphan responses to the adapter with their message', async () => {

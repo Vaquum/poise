@@ -33,6 +33,10 @@ interface FakeControls {
   replayTurns: ReplayInit[]
   /** False simulates a crashed server: a dead link settles nothing. */
   exitAware?: boolean
+  /** Makes replayTurn throw: a handoff that must fall back. */
+  failReplay?: string
+  /** Manual turns resolve with terminate: true. */
+  terminateTurns?: boolean
 }
 
 class FakeAdapter implements Adapter {
@@ -61,12 +65,16 @@ class FakeAdapter implements Adapter {
     this.inputs.push(input)
     this.host.emit({ type: 'text.delta', turnId, messageId: `${turnId}:m1`, delta: `echo: ${input.text}` })
     if (this.controls.auto) return { stopReason: 'end_turn' as const, usage: { totalTokens: 3 } }
-    return new Promise<{ stopReason: 'end_turn' | 'cancelled' }>((resolve) => {
-      this.finishTurn = (stop = 'end_turn') => { this.finishTurn = null; resolve({ stopReason: stop }) }
+    return new Promise<{ stopReason: 'end_turn' | 'cancelled', terminate?: true }>((resolve) => {
+      this.finishTurn = (stop = 'end_turn') => {
+        this.finishTurn = null
+        resolve(this.controls.terminateTurns ? { stopReason: stop, terminate: true as const } : { stopReason: stop })
+      }
       signal.addEventListener('abort', () => this.finishTurn?.('cancelled'), { once: true })
     })
   }
   async replayTurn(init: ReplayInit) {
+    if (this.controls.failReplay) throw new Error(this.controls.failReplay)
     this.controls.replayTurns.push(init)
     this.alive = true
     this.nativeSessionId = init.session.nativeSessionId
@@ -248,5 +256,139 @@ describe('relay handover between servers', () => {
     expect(second.runtime.get(session.id)?.interruptedTurnId).toBe(turnId)
     expect(storage.listWorkers().filter((row) => row.sessionId === session.id)).toEqual([])
     expect(storage.getRelay(session.id)).toBeNull()
+  }, 60_000)
+
+  it('counts a turn still waiting for the checkout as work, not as relay-held', async () => {
+    const instance = 'poise-relay-prespool:db'
+    // Two servers, one checkout: the waiter's relay is primed first, then
+    // its next turn waits on the lease the holder's turn keeps.
+    const holder = makeRuntime(instance)
+    holder.controls.auto = false
+    const waiter = makeRuntime(instance)
+    waiter.controls.auto = false
+    const waiting = await waiter.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(waiter.events, waiting.id) === 'idle')
+    waiter.runtime.prompt(waiting.id, { text: 'Prime the relay', attachments: [], mentions: [] })
+    await waitFor(() => waiter.runtime.get(waiting.id)?.status === 'running')
+    const peer = await waiter.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    const pgid = peer.gatePgid
+    await waitFor(() => worker.pgidAlive(pgid))
+    waiter.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(waiter.events, waiting.id) === 'idle')
+
+    const holding = await holder.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(holder.events, holding.id) === 'idle')
+    holder.runtime.prompt(holding.id, { text: 'Hold the checkout', attachments: [], mentions: [] })
+    await waitFor(() => holder.runtime.get(holding.id)?.status === 'running')
+
+    // The waiter's turn exists but is still before turnStart: no spool,
+    // so a restart could not adopt it — the switch must wait for it.
+    const { turnId } = waiter.runtime.prompt(waiting.id, { text: 'Wait for the lease', attachments: [], mentions: [] })
+    await waitFor(() => waiter.events.some((e) => e.sessionId === waiting.id && e.event.type === 'turn.started' && (e.event as { turnId: string }).turnId === turnId))
+    expect(waiter.runtime.get(waiting.id)?.status).toBe('queued')
+    // Counted — the turn plus its chain entry — not skipped as held.
+    expect(waiter.runtime.working()).toBe(2)
+    expect(waiter.runtime.relayHeldSessions()).toEqual(new Set())
+
+    holder.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(holder.events, holding.id) === 'idle')
+    await waitFor(() => waiter.runtime.get(waiting.id)?.status === 'running')
+    waiter.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(waiter.events, waiting.id) === 'idle')
+    expect(worker.pgidAlive(pgid)).toBe(true)
+  }, 60_000)
+
+  it('counts a turn settling past turnFinish as work, not as relay-held', async () => {
+    const instance = 'poise-relay-settle:db'
+    const first = makeRuntime(instance)
+    first.controls.auto = false
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    // The agent ignores SIGTERM, so the settle's verified stop takes the
+    // relay's whole TERM grace: the settle window stays open for seconds.
+    first.runtime.prompt(session.id, { text: 'Prime the relay', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'trap "" TERM; exec sleep 60']) as RelayConnection
+    const pgid = peer.gatePgid
+    await waitFor(() => worker.pgidAlive(pgid))
+    first.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    first.controls.terminateTurns = true
+    first.runtime.prompt(session.id, { text: 'Settle slowly', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    // The second prompt reached the adapter, so turnStart ran: spool live.
+    await waitFor(() => first.controls.adapters[0].inputs.length === 2)
+    // Spool live: invisible to the switch while the agent runs.
+    expect(first.runtime.working()).toBe(0)
+    expect(first.runtime.relayHeldSessions()).toEqual(new Set([session.id]))
+    first.controls.adapters[0].finish()
+    // Past turnFinish, still settling the verified stop: only the prime
+    // turn finished, and the switch waits for this one.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    expect(ofType(first.events, session.id, 'turn.finished')).toHaveLength(1)
+    expect(first.runtime.working()).toBe(2)
+    expect(first.runtime.relayHeldSessions()).toEqual(new Set())
+    await waitFor(() => ofType(first.events, session.id, 'turn.finished').length === 2, 30_000)
+    expect(ofType(first.events, session.id, 'turn.finished')[1]).toMatchObject({ stopReason: 'end_turn' })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle', 30_000)
+    expect(worker.pgidAlive(pgid)).toBe(false)
+    expect(storage.getRelay(session.id)).toBeNull()
+  }, 60_000)
+
+  it('keeps the checkout locked when a failed handoff cannot stop the agent', async () => {
+    const instance = 'poise-relay-handoff-keeps-lease:db'
+    const lock = await import('../../server/chat/checkout-lock')
+    const first = makeRuntime(instance)
+    first.controls.auto = false
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    first.runtime.prompt(session.id, { text: 'Start the agent', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    const pgid = peer.gatePgid
+    const relayPid = peer.relayPid
+    const relayDir = peer.dir
+    await waitFor(() => worker.pgidAlive(pgid))
+    first.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    const { turnId } = first.runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    await new Promise((r) => setTimeout(r, 200))
+    await first.runtime.stop()
+    expect(storage.getOpenTurn(session.id)?.turnId).toBe(turnId)
+
+    // The replay fails, and the agent cannot be signalled: termination
+    // fails, so the fallback must keep the lease, the rows and the relay.
+    const second = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [], failReplay: 'replay exploded' })
+    const signals = vi.spyOn(worker, 'signalGroup').mockImplementation(() => {})
+    try {
+      await second.runtime.recover()
+      await waitFor(() => ofType(second.events, session.id, 'turn.finished').length === 1, 30_000)
+      const finished = ofType(second.events, session.id, 'turn.finished')[0]
+      expect(finished).toMatchObject({ turnId, stopReason: 'interrupted' })
+      expect(finished.error).toContain('relay handoff failed')
+      expect(worker.pgidAlive(pgid)).toBe(true)
+      expect(storage.getWorker(session.id)).not.toBeNull()
+      expect(storage.getRelay(session.id)).not.toBeNull()
+      expect(second.runtime.get(session.id)?.interruptedTurnId).toBe(turnId)
+      expect(second.runtime.get(session.id)?.orphanNotice).toContain('survived termination')
+      expect(second.events.some((e) => e.sessionId === session.id && e.event.type === 'error'
+        && (e.event as { message: string }).message === 'the checkout stays locked: the agent process could not be stopped')).toBe(true)
+      const row = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance }, {}).read()
+      expect(row?.worker_pgid).toBe(pgid)
+    } finally {
+      signals.mockRestore()
+      // Best-effort cleanup of what the fallback deliberately kept.
+      worker.signalGroup(pgid, 'SIGKILL')
+      await waitFor(() => !worker.pgidAlive(pgid), 10_000).catch(() => undefined)
+      try { process.kill(relayPid, 'SIGKILL') } catch { /* gone */ }
+      const row = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance }, {}).read()
+      if (row?.token) { try { lock.CheckoutLease.releaseByToken(repo, row.token) } catch { /* gone */ } }
+      storage.forgetWorker(session.id)
+      storage.forgetRelay(session.id)
+      await rm(relayDir, { recursive: true, force: true })
+      await second.runtime.stop({ handover: false }).catch(() => undefined)
+      await first.runtime.stop({ handover: false }).catch(() => undefined)
+    }
   }, 60_000)
 })
