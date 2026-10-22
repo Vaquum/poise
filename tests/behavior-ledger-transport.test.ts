@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BehaviorLedgerObserver } from '../server/behavior-ledger'
@@ -7,7 +7,7 @@ import type { LogEntry } from '../server/agent'
 import type { LedgerAdmission, LedgerHealth } from '../server/behavior-ledger-contract'
 
 const health: LedgerHealth = {
-  status: 'ok', coverageStart: '2026-10-19T00:00:00.000Z', observedAt: '2026-10-19T00:00:00.000Z',
+  status: 'ok', unavailableReason: null, coverageStart: '2026-10-19T00:00:00.000Z', observedAt: '2026-10-19T00:00:00.000Z',
   callerObservedAt: null, pending: 0, dropped: 0, gaps: [], generation: 'fixture', retainedFrom: null,
   changeLowerBound: 0, lastSequence: 0, instances: 0, changes: 0,
 }
@@ -56,7 +56,7 @@ afterEach(async () => {
 })
 
 describe('bounded behavior ledger transport', () => {
-  it('drops newest overflow, reserves a durable loss marker and never throws into work', async () => {
+  it('queues newest overflow while the worker drains and never throws into work', async () => {
     const observer = await fixture(`
       port.postMessage({ready:true,health,pending:[]});
       port.on('message', request => {
@@ -67,29 +67,29 @@ describe('bounded behavior ledger transport', () => {
         };
         setTimeout(reply,request.operation==='capture'?10:0);
       });`, { captureLimit: 1 })
-    expect(() => { observer.capture(admission); observer.capture({ ...admission, nativeId: 'dropped' }) }).not.toThrow()
+    expect(() => { observer.capture(admission); observer.capture({ ...admission, nativeId: 'second' }) }).not.toThrow()
     const reply = await observer.read({ operation: 'health' })
     expect(reply.status).toBe(200)
-    expect(reply.body.health.dropped).toBe(1)
+    expect(reply.body.health.dropped).toBe(0)
     expect(reply.body.health.pending).toBe(1)
     expect(reply.body.health.status).toBe('incomplete')
     expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({
-      pending: 0, dropped: 1, status: 'incomplete',
+      pending: 0, dropped: 0, status: 'ok',
     })
   })
 
-  it('persists overflow loss before acknowledgement and retains it after reopening', async () => {
+  it('persists spill loss before acknowledgement and retains it after reopening', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-overflow-'))
     directories.push(directory)
     const path = join(directory, 'ledger.db')
-    const observer = new BehaviorLedgerObserver({ path, captureLimit: 1 })
+    const observer = new BehaviorLedgerObserver({ path })
     observers.push(observer)
     await observer.start()
     observer.capture(admission)
-    observer.capture({ ...admission, nativeId: 'dropped' })
+    observer.capture({ ...admission, nativeId: 'oversized', admissionKey: 'x'.repeat(4097) })
     const prefix = await observer.read({ operation: 'list' })
-    expect(prefix).toMatchObject({ status: 200, body: { health: { status: 'incomplete', pending: 1, dropped: 1 } } })
-    observer.capture({ ...admission, nativeId: 'dropped-again' })
+    expect(prefix).toMatchObject({ status: 200, body: { health: { status: 'incomplete', dropped: 1 } } })
+    observer.capture({ ...admission, nativeId: 'oversized-again', admissionKey: 'y'.repeat(4097) })
     expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({ pending: 1, dropped: 2 })
     const retained = { pending: 0, dropped: 2, generation: prefix.body.health.generation,
       gaps: expect.arrayContaining([expect.objectContaining({ reason: 'capture_loss' })]) }
@@ -235,7 +235,7 @@ describe('bounded behavior ledger transport', () => {
     expect((await observer.read({ operation: 'health' })).body.health.pending).toBe(0)
   })
 
-  it('re-emits Caller projections on change and refreshes only running ones', async () => {
+  it('re-emits Caller projections on change without refreshing running ones', async () => {
     const observer = await fixture(`
       import { appendFileSync } from 'node:fs';
       const pending=[{nativeId:'idle',callId:null},{nativeId:'busy',callId:null}];
@@ -243,7 +243,7 @@ describe('bounded behavior ledger transport', () => {
       port.on('message',request=>{
         if(request.operation==='capture') appendFileSync(new URL('./captures',import.meta.url),'capture\\n');
         port.postMessage({id:request.id,status:200,body:{version:1,health},pending});
-      });`, { callerRefreshMs: 30 })
+      });`)
     const captures = async (): Promise<number> => (await readFile(join(directories.at(-1)!, 'captures'), 'utf8')).trim().split('\n').length
     const flush = async (): Promise<void> => {
       await vi.waitFor(async () => {
@@ -271,11 +271,11 @@ describe('bounded behavior ledger transport', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50))
     observer.observe(running)
     await flush()
-    expect(await captures()).toBe(4)
+    expect(await captures()).toBe(3)
     await new Promise<void>((resolve) => setTimeout(resolve, 50))
     observer.observe(absent)
     await flush()
-    expect(await captures()).toBe(5)
+    expect(await captures()).toBe(4)
   })
 
   it('forgets Caller projections that leave the pending set', async () => {
@@ -301,6 +301,144 @@ describe('bounded behavior ledger transport', () => {
       expect((await observer.read({ operation: 'health' })).body.health.pending).toBe(0)
     }, { timeout: 1500, interval: 25 })
     expect(await captures()).toBe(2)
+  })
+
+  it('drains a burst larger than the queue cap without dropping while storage is healthy', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-burst-'))
+    directories.push(directory)
+    const observer = new BehaviorLedgerObserver({ path: join(directory, 'ledger.db'), captureLimit: 25 })
+    observers.push(observer)
+    await observer.start()
+    expect((await observer.read({ operation: 'health' })).body.health.status).toBe('ok')
+    for (let index = 0; index < 75; index++) {
+      observer.capture({ ...admission, admissionKey: `burst-${index}`, nativeId: `burst-${index}` })
+    }
+    expect((await observer.read({ operation: 'health' })).body.health.dropped).toBe(0)
+    await vi.waitFor(async () => {
+      expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({ pending: 0, dropped: 0 })
+    }, { timeout: 9000, interval: 50 })
+    expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({ status: 'ok', gaps: [] })
+    const page = await observer.read({ operation: 'list', limit: 100 })
+    expect(page.status).toBe(200)
+    expect(page.body.records!.length).toBeGreaterThan(0)
+  })
+
+  it('holds a burst past the default queue cap without dropping while storage is healthy', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-burst-cap-'))
+    directories.push(directory)
+    const observer = new BehaviorLedgerObserver({ path: join(directory, 'ledger.db') })
+    observers.push(observer)
+    await observer.start()
+    for (let index = 0; index < 1050; index++) {
+      observer.capture({ ...admission, admissionKey: `burst-${index}`, nativeId: `burst-${index}` })
+    }
+    const held = (await observer.read({ operation: 'health' })).body.health
+    expect(held.dropped).toBe(0)
+    expect(held.pending).toBeGreaterThan(1000)
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    const after = (await observer.read({ operation: 'health' })).body.health
+    expect(after.dropped).toBe(0)
+    expect(after.pending).toBeLessThan(held.pending)
+  })
+
+  it('holds captures through a storage outage and recovers to ok with the list answering', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-outage-'))
+    directories.push(directory)
+    const blocked = join(directory, 'ledger.db')
+    await mkdir(blocked)
+    const observer = new BehaviorLedgerObserver({ path: blocked })
+    observers.push(observer)
+    await observer.start()
+    expect((await observer.read({ operation: 'health' })).body.health)
+      .toMatchObject({ status: 'unavailable', unavailableReason: 'store_unavailable' })
+    expect((await observer.read({ operation: 'list' })).status).toBe(503)
+    observer.capture(admission)
+    await rmdir(blocked)
+    await vi.waitFor(async () => {
+      expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({ status: 'ok', pending: 0, dropped: 0 })
+    }, { timeout: 9000, interval: 50 })
+    const page = await observer.read({ operation: 'list', limit: 100 })
+    expect(page.status).toBe(200)
+    expect(page.body.records!.some((record) => record.target.number === 1)).toBe(true)
+  })
+
+  it('queues overflow while the worker drains and spills only once the queue stalls', async () => {
+    const observer = await fixture(`
+      import { existsSync, watch } from 'node:fs';
+      let blocked=false;
+      port.postMessage({ready:true,health,pending:[]});
+      port.on('message',request=>{
+        const reply=()=>{
+          if(request.observation?.type==='loss') health.dropped+=request.observation.count;
+          if(health.dropped) health.status='incomplete';
+          port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});
+        };
+        if(request.operation!=='capture'||blocked) { reply(); return; }
+        blocked=true;
+        const release=new URL('./release',import.meta.url);
+        let released=false;
+        const watcher=watch(new URL('.',import.meta.url),()=>check());
+        function check() {
+          if(released||!existsSync(release)) return;
+          released=true; watcher.close(); reply();
+        }
+        check();
+      });`, { captureLimit: 1, stallTimeoutMs: 60, readTimeoutMs: 100 })
+    const release = join(directories.at(-1)!, 'release')
+    observer.capture(admission)
+    observer.capture({ ...admission, nativeId: 'second' })
+    try {
+      expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({ pending: 2, dropped: 0 })
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      observer.capture({ ...admission, nativeId: 'third' })
+      const stalled = (await observer.read({ operation: 'health' })).body.health
+      expect(stalled.dropped).toBe(1)
+      expect(stalled.pending).toBeGreaterThanOrEqual(2)
+      await writeFile(release, '')
+      await vi.waitFor(async () => {
+        expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({ pending: 0, dropped: 1, status: 'incomplete' })
+      }, { timeout: 1500, interval: 25 })
+    } finally { await writeFile(release, '') }
+  })
+
+  it('spills sustained overload after the stall budget even while captures succeed', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000_000)
+    try {
+      const observer = await fixture(`
+        port.postMessage({ready:true,health,pending:[]});
+        port.on('message', request => {
+          const reply=()=>{
+            if(request.observation?.type==='loss') health.dropped+=request.observation.count;
+            if(health.dropped) health.status='incomplete';
+            port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});
+          };
+          setTimeout(reply,request.operation==='capture'?10:0);
+        });`, { captureLimit: 1, stallTimeoutMs: 60 })
+      observer.capture(admission)
+      observer.capture({ ...admission, nativeId: 'second' })
+      // The first capture succeeds after the second was queued: progress
+      // must not exempt that remaining backlog from its age limit.
+      clock.mockReturnValue(1_000_001)
+      expect((await observer.read({ operation: 'health' })).body.health)
+        .toMatchObject({ pending: 1, dropped: 0 })
+      clock.mockReturnValue(1_000_061)
+      observer.capture({ ...admission, nativeId: 'third' })
+      expect((await observer.read({ operation: 'health' })).body.health.dropped).toBe(1)
+    } finally { clock.mockRestore() }
+  })
+
+  it('sheds invalid captures with loss accounting instead of retrying them', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-poison-'))
+    directories.push(directory)
+    const observer = new BehaviorLedgerObserver({ path: join(directory, 'ledger.db') })
+    observers.push(observer)
+    await observer.start()
+    observer.capture({ ...admission, admissionKey: 'x'.repeat(1025) })
+    await vi.waitFor(async () => {
+      expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({ pending: 0, dropped: 1 })
+    }, { timeout: 5000, interval: 25 })
+    expect((await observer.read({ operation: 'health' })).body.health.gaps).toEqual(
+      expect.arrayContaining([expect.objectContaining({ reason: 'capture_loss' })]))
   })
 
   it('keeps a failed startup observational and health readable', async () => {
