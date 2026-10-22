@@ -17,6 +17,33 @@ from agent_interface.model_catalog import CATALOG, ModelCatalogError
 
 REPO = "Vaquum/Origo"
 ACTOR = "bit-mis"
+MUSE_SESSION_ERROR = "muse: local session messaging disabled: session logging is required"
+
+
+def scripted_muse(directory: Path) -> Path:
+    """A muse CLI that enforces the session-logging requirement: it fails
+    exactly like the observed startup error when session logging is off,
+    and otherwise records its arguments and writes one session file."""
+    script = directory / "muse"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "if '--no-session-log' in sys.argv[1:]:\n"
+        f"    sys.stderr.write({MUSE_SESSION_ERROR!r} + '\\n')\n"
+        "    sys.exit(1)\n"
+        "store = os.path.join(os.environ['XDG_DATA_HOME'], 'muse', 'sessions')\n"
+        "os.makedirs(store, exist_ok=True)\n"
+        "with open(os.path.join(store, 'probe'), 'w') as handle:\n"
+        "    handle.write('session log\\n')\n"
+        "with open(os.environ['MUSE_ARGV_LOG'], 'w') as handle:\n"
+        "    handle.write('\\n'.join(sys.argv[1:]))\n"
+        "reply = os.environ.get('MUSE_SCRIPT_REPLY')\n"
+        "if reply:\n"
+        "    with open(reply) as handle:\n"
+        "        sys.stdout.write(handle.read())\n"
+    )
+    script.chmod(0o700)
+    return script
 
 
 def issue(number: int, **extra) -> dict:
@@ -412,6 +439,26 @@ class TestFullAccessCommands(TestCase):
         self.assertIn("--yolo", args)
         for restriction in ("--disable-shell", "--disable-write", "--disable-web-tools"):
             self.assertNotIn(restriction, args)
+
+    def test_muse_run_keeps_the_session_logging_the_cli_requires(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            checkout = root / "repo"
+            checkout.mkdir()
+            script = scripted_muse(root)
+            log = root / "argv.log"
+            with patch.dict(os.environ, {"MUSE_CLI": str(script), "MUSE_ARGV_LOG": str(log)}):
+                denied = subprocess.run([str(script), "exec", "--no-session-log"], text=True, capture_output=True)
+                self.assertEqual((denied.returncode, denied.stderr), (1, MUSE_SESSION_ERROR + "\n"))
+                args, stdin, env = issue_review.command(CATALOG.resolve("muse-spark-1.3-contributor-max"),
+                                                       "review this", checkout, root, 600)
+                self.assertNotIn("--no-session-log", args)
+                self.assertEqual(Path(env["XDG_DATA_HOME"]).resolve(), (root / "data").resolve())
+                done = issue_review.supervise(args, input=stdin, cwd=checkout, timeout=60, env=env,
+                                              provider="muse", cleanup_root=root)
+            self.assertEqual(done.returncode, 0)
+            self.assertNotIn("--no-session-log", log.read_text().splitlines())
+            self.assertTrue((root / "data" / "muse" / "sessions" / "probe").is_file())
 
 
 class TestComments(TestCase):

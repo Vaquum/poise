@@ -79,7 +79,9 @@ jobs:
     name: Browser Chromium (${{ matrix.shard }}/4)
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Worst observed 2026-10-22: ~11 min uncached Playwright install (slow apt
+    # mirror) + ~8 min slowest all-pass shard; 25 leaves about a third headroom.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
