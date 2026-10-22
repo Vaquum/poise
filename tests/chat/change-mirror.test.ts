@@ -23,6 +23,19 @@ beforeEach(async () => {
 })
 afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 const after = (before: Awaited<ReturnType<typeof captureCheckoutSnapshot>>) => captureCheckoutSnapshot(repo, [...before.files.keys()])
+const makeNestedRepo = async (name = 'nested') => {
+  const nested = join(repo, name)
+  await mkdir(nested)
+  const nestedGit = (...args: string[]) => execFileSync('git', args, { cwd: nested, encoding: 'utf8' })
+  nestedGit('init', '-q', '-b', 'main')
+  nestedGit('config', 'core.hooksPath', '/dev/null')
+  nestedGit('config', 'commit.gpgSign', 'false')
+  nestedGit('config', 'user.name', 'Fixture')
+  nestedGit('config', 'user.email', 'fixture@example.invalid')
+  await writeFile(join(nested, 'clone.txt'), 'nested work\n')
+  nestedGit('add', 'clone.txt'); nestedGit('commit', '-q', '-m', 'nested fixture')
+  return nested
+}
 
 describe('turn-level checkout change mirror', () => {
   it('records actual pre-turn content rather than HEAD, including untracked edits, additions and deletions', async () => {
@@ -105,6 +118,77 @@ describe('turn-level checkout change mirror', () => {
     const { changes, warnings } = compareCheckoutSnapshots(before, await captureCheckoutSnapshot(repo))
     expect(changes).toEqual([])
     expect(warnings.join(' ')).toContain('incomplete checkout inventory')
+  })
+
+  it('does not report a nested repository created during the turn as an unrevertable change', async () => {
+    const before = await captureCheckoutSnapshot(repo)
+    const nested = join(repo, 'nested')
+    await mkdir(nested)
+    const nestedGit = (...args: string[]) => execFileSync('git', args, { cwd: nested, encoding: 'utf8' })
+    nestedGit('init', '-q', '-b', 'main')
+    nestedGit('config', 'core.hooksPath', '/dev/null')
+    nestedGit('config', 'commit.gpgSign', 'false')
+    nestedGit('config', 'user.name', 'Fixture')
+    nestedGit('config', 'user.email', 'fixture@example.invalid')
+    await writeFile(join(nested, 'clone.txt'), 'nested work\n')
+    nestedGit('add', 'clone.txt'); nestedGit('commit', '-q', '-m', 'nested fixture')
+    const { changes, warnings } = compareCheckoutSnapshots(before, await after(before))
+    expect(warnings).toEqual([])
+    expect(changes).toEqual([])
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events).toEqual([])
+  })
+
+  it('still reports a change that genuinely cannot be reverted alongside a nested repository', async () => {
+    await symlink(join(root, 'outside.txt'), join(repo, 'link.txt'))
+    const before = await captureCheckoutSnapshot(repo)
+    const nested = join(repo, 'nested')
+    await mkdir(nested)
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: nested })
+    await rm(join(repo, 'link.txt'))
+    await writeFile(join(repo, 'link.txt'), 'now a regular file')
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events.map(event => event.type)).toEqual(['error'])
+    expect(events[0]).toMatchObject({ type: 'error' })
+    if (events[0].type !== 'error') throw new Error('expected an error event')
+    expect(events[0].message).toContain('link.txt')
+    expect(events[0].message).not.toContain('nested/')
+  })
+
+  it('stays quiet when a pre-existing nested repository changes internally during the turn', async () => {
+    const nested = await makeNestedRepo()
+    const before = await captureCheckoutSnapshot(repo)
+    await writeFile(join(nested, 'clone.txt'), 'nested work changed\n')
+    await writeFile(join(nested, 'another.txt'), 'more nested work\n')
+    const { changes, warnings } = compareCheckoutSnapshots(before, await after(before))
+    expect(warnings).toEqual([])
+    expect(changes).toEqual([])
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events).toEqual([])
+  })
+
+  it('reports a nested repository deleted during the turn as unrevertable', async () => {
+    const nested = await makeNestedRepo()
+    const before = await captureCheckoutSnapshot(repo)
+    await rm(nested, { recursive: true })
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events.map(event => event.type)).toEqual(['error'])
+    if (events[0].type !== 'error') throw new Error('expected an error event')
+    expect(events[0].message).toContain('nested/: directory was removed')
+  })
+
+  it('reports a nested repository replaced by a file while still recording the new file', async () => {
+    const nested = await makeNestedRepo()
+    const before = await captureCheckoutSnapshot(repo)
+    await rm(nested, { recursive: true })
+    await writeFile(join(repo, 'nested'), 'now a regular file\n')
+    const { changes, warnings } = compareCheckoutSnapshots(before, await after(before))
+    expect(warnings).toEqual(['nested/: directory was removed'])
+    expect(changes).toEqual([{ path: 'nested', oldText: '', newText: 'now a regular file\n', oldExists: false, newExists: true }])
   })
 
   it('emits a labelled whole-turn card rather than pretending shell changes came from a native edit tool', async () => {

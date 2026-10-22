@@ -71,6 +71,10 @@ export async function captureCheckoutSnapshot(
     }
     const signature = `${info.dev}:${info.ino}:${info.mode}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`
     const unknown = (reason: string) => { result.files.set(path, { exists: true, signature, reason }) }
+    // A nested repository or other directory is tracked by presence only, with
+    // a stable marker: metadata churn inside it never warns, creation stays
+    // quiet, and removal still reports as unrevertable when compared.
+    if (info.isDirectory()) { result.files.set(path, { exists: true, signature: 'directory', reason: 'directory contents are not snapshotted' }); continue }
     if (!info.isFile() || info.isSymbolicLink()) { unknown('not a regular non-symlink file'); continue }
     if (info.size > limits.maxFileBytes) { unknown(`file exceeds ${limits.maxFileBytes} bytes`); continue }
     if (info.size > budget) { unknown('turn snapshot byte budget exceeded'); continue }
@@ -103,6 +107,8 @@ function version(snapshot: CheckoutSnapshot, path: string): Version {
   return absent()
 }
 
+const isDirectoryVersion = (value: Version): boolean => value.exists && value.text === undefined && value.signature === 'directory'
+
 export function compareCheckoutSnapshots(before: CheckoutSnapshot, after: CheckoutSnapshot): { changes: ObservedChange[], warnings: string[] } {
   const changes: ObservedChange[] = []
   const warnings = [...before.warnings, ...after.warnings]
@@ -110,6 +116,9 @@ export function compareCheckoutSnapshots(before: CheckoutSnapshot, after: Checko
     const old = version(before, path)
     const next = version(after, path)
     if (old.exists === next.exists && old.signature === next.signature) continue
+    if (!old.exists && isDirectoryVersion(next)) continue
+    if (isDirectoryVersion(old) && !next.exists) { warnings.push(`${path}: directory was removed`); continue }
+    if (!isDirectoryVersion(old) && isDirectoryVersion(next)) { warnings.push(`${path}: replaced by a directory`); continue }
     if (old.text === undefined || next.text === undefined) {
       warnings.push(`${path}: ${old.reason || next.reason || 'a trustworthy before/after image is unavailable'}`)
       continue
