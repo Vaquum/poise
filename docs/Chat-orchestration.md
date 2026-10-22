@@ -261,6 +261,13 @@ notifications wait and retain the last settled state, including when other
 checks have failed. Unchanged settled failures deduplicate; unavailable reads are visible
 as unknown evidence. These observations confer no merge authority.
 
+A target that reads closed or merged in the local GitHub datastore drops late
+automation bookkeeping without waking its chat; only human activity still
+wakes, and CI polling stops for a closed or merged PR. The state is read only
+when a behavior notice is about to be queued, or alongside the five-minute CI
+poll, and cached for five minutes. An unreadable or unsynced target wakes as
+before: unknown is never treated as closed.
+
 Work changes also enter the existing structured diagnostic log with the target,
 repository and responsible chat. The native `api` operation reaches Poise's
 normal local API for Current, Swarm, Behaviors, Editor, snippets, settings,
