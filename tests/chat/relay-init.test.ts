@@ -13,14 +13,15 @@ afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup() })
 
 function replay(agent: 'grok' | 'codex' | 'muse', extraOutbound = '') {
   const host = createFakeHost('unused.mjs')
-  const peer = Object.assign(new EventEmitter(), {
+  const events = new EventEmitter()
+  const peer = Object.assign(events, {
     stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
     killed: false, exitCode: null as number | null,
     kill() {
       if (this.killed) return true
       this.killed = true
       this.exitCode = 0
-      this.emit('exit', 0, null)
+      events.emit('exit', 0, null)
       this.stdout.end()
       return true
     },
