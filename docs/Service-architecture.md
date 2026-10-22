@@ -427,8 +427,12 @@ assertion may only resume, and anything else is refused with 403):
   - `release` is the installed release the supervisor started this server on
     ([Updates in place](#updates-in-place)), `null` without one.
   - `switching` is the release a pending switch restarts this server onto,
-    `null` when none is pending. Asking to switch to the release it runs calls
-    a pending switch off; the gateway does so when the target changes back.
+    `null` when none is pending. Health reads it from the `next` record in
+    `~/.poise/releases`, the same record the supervisor switches on, so it
+    stays truthful when this server restarts: once the switch has fired, the
+    record is consumed and nothing is pending. Asking to switch to the
+    release it runs calls a pending switch off; the gateway does so when the
+    target changes back.
   - `activeChatTurns` counts the Chat turns recorded open: reserved before
     their first write, closed once their outcome is recorded.
   - `runningCallerCalls` counts the Caller processes Poise launched for agent
