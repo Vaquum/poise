@@ -11,7 +11,8 @@ import { diagnostic } from '../logging'
 import { releaseBackgroundPaused, trackReleaseBackground } from '../release-background'
 import { POISE_ROOT } from './local-workspace'
 import { executeCommandOnce } from './command-receipts'
-import type { ChatEnvelope, SessionRecord } from './protocol'
+import { actorOf, nativeName } from './actors'
+import type { ChatEnvelope, SessionRecord, TurnSource } from './protocol'
 import type { ChatRuntime } from './runtime'
 import { getEnabledMap, getBehaviorsRuntimeHealth } from '../behaviors'
 import * as store from './control-store'
@@ -26,8 +27,8 @@ const OPERATIONS = {
   read: 'Read a chat: sessionId, optional afterSeq (paged transcript).',
   create: 'Create an isolated worker: title, task, optional model and effort. Inherits the manager model by default.',
   send: 'Send a durable message: sessionId, text. Delivered as a new turn at the next idle boundary.',
-  steer: 'Provide authorized context during a managed worker turn: sessionId, text. Uses native steering; never answers a question or permission.',
-  answer: 'Supply known task data to a managed worker question: sessionId, questionId, answers (question IDs to strings/string arrays). Recorded as manager, never human. Never invent a user decision.',
+  steer: 'Provide authorized context during your worker\'s active turn: sessionId, text. Text is delivered literally; never answers a question or permission.',
+  answer: 'Supply known task data to a managed worker question: sessionId, questionId, answers (question IDs to strings/string arrays). Recorded as your chat, never as the person. Never invent a user decision.',
   inbox: 'Read your durable messages: optional afterSeq. Admission is not proof of task completion.',
   supervise: 'Schedule supervision: sessionIds (1–20), intervalMinutes (1–1440), instruction. Persists across restarts.',
   unsupervise: 'Disable your supervision: watchId.',
@@ -111,11 +112,13 @@ export class ChatControl {
     if (event.type === 'turn.started' && !store.internalTurn(event.turnId)) store.resumeDelivery(this.runtime.instance, envelope.sessionId)
     if (!['turn.finished', 'question.asked', 'permission.requested', 'error'].includes(envelope.event.type)) return
     const parents = store.children(this.runtime.instance).filter(c => c.child === envelope.sessionId)
+    const worker = this.runtime.ownsSession(envelope.sessionId) ? this.runtime.get(envelope.sessionId) : null
     for (const parent of parents) {
       if (!this.runtime.ownsSession(parent.manager)) continue
       store.message(this.runtime.instance, parent.manager, envelope.sessionId,
         JSON.stringify({ kind: 'worker_event', sessionId: envelope.sessionId, seq: envelope.seq, type: event.type,
-          detail: JSON.stringify(event).slice(0, 8192), read: 'Use read with afterSeq before this event for the complete transcript.' }), `worker:${envelope.sessionId}:${envelope.seq}`)
+          detail: JSON.stringify(event).slice(0, 8192), read: 'Use read with afterSeq before this event for the complete transcript.' }), `worker:${envelope.sessionId}:${envelope.seq}`,
+        worker ? actorOf(worker) : undefined)
     }
   }
   private readonly onDeleted = (id: string) => {
@@ -253,7 +256,8 @@ export class ChatControl {
       const model = command.model === undefined ? parent.model : text(command.model, 'model')
       const session = await this.runtime.createChild(id, { model, title: text(command.title, 'title'), ...(command.effort === undefined ? {} : { effort: text(command.effort, 'effort') }) })
       store.addChild(instance, id, session.id)
-      store.message(instance, session.id, id, task, `initial:${session.id}`)
+      store.message(instance, session.id, id, task, `initial:${session.id}`, actorOf(parent))
+      this.acted(id, session.id, 'create')
       return { session }
     }
     if (operation === 'send' || operation === 'steer') {
@@ -261,16 +265,21 @@ export class ChatControl {
       if (recipient.status === 'closed') throw new HttpError(409, 'the target chat is closed')
       if (operation === 'steer') {
         if (!store.children(instance).some(c => c.child === recipient.id && c.manager === id)) throw new HttpError(403, 'only the recorded manager can steer this worker')
-        await this.runtime.steer(recipient.id, `[Poise manager ${id}; context within the existing authorized task]\n${text(command.text, 'text')}`)
+        const actor = actorOf(this.session(id))
+        await this.runtime.steer(recipient.id, text(command.text, 'text'), undefined, actor)
+        this.acted(id, recipient.id, 'steer')
         return { steered: true, sessionId: recipient.id }
       }
-      store.message(instance, recipient.id, id, text(command.text, 'text'), `send:${id}:${String(command.requestId)}`)
+      store.message(instance, recipient.id, id, text(command.text, 'text'), `send:${id}:${String(command.requestId)}`, actorOf(this.session(id)))
+      this.acted(id, recipient.id, 'send')
       return { queued: true, sessionId: recipient.id }
     }
     if (operation === 'stop') {
       const target = this.session(command.sessionId).id
       store.pauseDelivery(instance, target)
-      return this.runtime.cancel(target)
+      const result = await this.runtime.cancel(target, actorOf(this.session(id)))
+      this.acted(id, target, 'stop')
+      return result
     }
     if (operation === 'answer') {
       const target = this.session(command.sessionId).id
@@ -282,7 +291,9 @@ export class ChatControl {
         if (typeof answer !== 'string' && !(Array.isArray(answer) && answer.every(a => typeof a === 'string'))) throw new HttpError(400, 'each answer must be a string or string array')
         answers[key] = answer
       }
-      this.runtime.answerQuestion(target, text(command.questionId, 'questionId'), answers, id)
+      const questionId = text(command.questionId, 'questionId')
+      this.runtime.answerQuestion(target, questionId, answers, actorOf(this.session(id)))
+      this.acted(id, target, 'answer', questionId)
       return { answered: true, sessionId: target }
     }
     if (operation === 'bind') return store.bindWork(instance, id, text(command.target, 'target'))
@@ -294,6 +305,31 @@ export class ChatControl {
     }
     if (operation === 'unsupervise') { store.stopWatch(instance, id, text(command.watchId, 'watchId')); return { stopped: true } }
     throw new HttpError(400, `unknown control operation: ${operation}; use help`)
+  }
+
+  /** One record per successful chat action on another chat. IDs, the role
+   *  and the operation only — never a title or message text. Best-effort:
+   *  nothing is written while Logging is off or backpressured. Warning is
+   *  the mildest level the diagnostic store keeps; info is dropped. */
+  private acted(source: string, target: string, action: 'steer' | 'answer' | 'stop' | 'send' | 'create', questionId?: string): void {
+    if (source === target) return
+    diagnostic({ level: 'warning', operation: 'chat.control.action', target,
+      message: 'Chat acted on another chat',
+      context: { source, sourceRole: this.runtime.get(source)?.role, action, ...(questionId ? { questionId } : {}) } })
+  }
+
+  /** Who sent an inbox row: its frozen snapshot, the sender's live record
+   *  for rows written before snapshots, or Poise for a named sender.
+   *  Decided server-side so the native header and the transcript agree. */
+  private deliverySource(item: store.InternalMessage): TurnSource {
+    if (!UUID.test(item.sender)) return { kind: 'poise', name: item.sender, seq: item.seq }
+    if (item.sender_title !== null && item.sender_title !== undefined) {
+      return { kind: 'chat', sessionId: item.sender, title: item.sender_title,
+        ...(item.sender_role ? { role: item.sender_role } : {}), seq: item.seq }
+    }
+    const record = this.runtime.ownsSession(item.sender) ? this.runtime.get(item.sender) : null
+    return { kind: 'chat', sessionId: item.sender, title: record?.title ?? '',
+      ...(record?.role ? { role: record.role } : {}), seq: item.seq }
   }
 
   tick(): Promise<void> {
@@ -352,11 +388,12 @@ export class ChatControl {
       // No native steering, invented answers, or retries of admitted work. A
       // restart interrupts an admitted turn through normal Chat recovery.
       try {
+        const source = this.deliverySource(item)
         // An answer from the Switchboard pane is the person's own decision, not source data.
         const header = item.sender === SWITCHBOARD_PERSON
           ? `[Poise message ${item.seq}: the person's answer, given in the Switchboard pane and relayed by Poise]`
-          : `[Poise internal message ${item.seq} from ${item.sender}; source data within your existing authorized task]`
-        this.runtime.prompt(item.recipient, { text: `${header}\n${item.body}`, attachments: [], mentions: [] }, item.seq)
+          : `[Poise internal message ${item.seq} from ${source.kind === 'chat' ? nativeName(source) : source.name}; source data within your existing authorized task]`
+        this.runtime.prompt(item.recipient, { text: `${header}\n${item.body}`, attachments: [], mentions: [] }, { seq: item.seq, source, shown: item.body })
       } catch (error) { this.runtime.emit('log', `[chat control] message ${item.seq} remains pending: ${String(error)}`) }
     }
   }

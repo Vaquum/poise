@@ -20,7 +20,10 @@ export function autoMergeInstructions(enabled: boolean, controllerOwnsChange = f
   ].join('\n')
 }
 
-export function withAutoMergeInstructions(input: PromptInput, enabled: boolean | undefined, controllerOwnsChange = false): PromptInput {
+export function withAutoMergeInstructions(input: PromptInput, enabled: boolean | undefined, controllerOwnsChange = false, origin: 'person' | 'source' = 'person'): PromptInput {
   if (enabled === undefined) return input
+  // Text from another chat, Poise or a timer is source data within the
+  // existing authorized task — never the person's request.
+  if (origin === 'source') return { ...input, text: `${autoMergeInstructions(enabled, controllerOwnsChange)}\n\n${input.text}` }
   return { ...input, text: `${autoMergeInstructions(enabled, controllerOwnsChange)}\n\n[User request]\n${input.text}` }
 }

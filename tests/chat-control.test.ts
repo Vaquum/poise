@@ -9,7 +9,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
-import type { Capabilities, PromptInput, ServerFrame, SessionRecord } from '../server/chat/protocol'
+import type { Capabilities, ChatEvent, PromptInput, ServerFrame, SessionRecord } from '../server/chat/protocol'
+import { autoMergeInstructions } from '../server/chat/auto-merge'
+import { actorName } from '../src/views/chat-transcript'
 import type { ChatRuntime } from '../server/chat/runtime'
 import type { ChatControl, CiObservation } from '../server/chat/control'
 
@@ -35,23 +37,28 @@ const hosts = new Map<string, AdapterHost>()
 const steers = new Map<string, string[]>()
 const ci = vi.fn<() => Promise<CiObservation>>()
 
-function adapter(host: AdapterHost): Adapter {
-  hosts.set(host.sessionId, host)
-  let alive = false
-  const nativeSessionId = randomUUID()
-  const finish = () => { finishes.get(host.sessionId)?.({ stopReason: 'cancelled' }); finishes.delete(host.sessionId) }
-  return {
-    agent: 'grok', nativeSessionId, capabilities: caps, get alive() { return alive },
-    async start(options) { alive = true; return { nativeSessionId, capabilities: caps, modelId: options.modelId, effort: options.effort } },
-    async prompt(_turn, input) {
-      prompts.set(host.sessionId, [...(prompts.get(host.sessionId) ?? []), input])
-      return new Promise<TurnResult>(done => finishes.set(host.sessionId, done))
-    },
-    async cancel() { finish() }, async close() { alive = false; finish() },
-    async steer(text) { steers.set(host.sessionId, [...(steers.get(host.sessionId) ?? []), text]) }, async setMode() {}, async setModel(modelId, effort) { return { modelId, effort } },
-    async fork() { return randomUUID() }, onExit() {},
+function adapterWith(capabilities: Capabilities) {
+  return function adapter(host: AdapterHost): Adapter {
+    hosts.set(host.sessionId, host)
+    let alive = false
+    const nativeSessionId = randomUUID()
+    const finish = () => { finishes.get(host.sessionId)?.({ stopReason: 'cancelled' }); finishes.delete(host.sessionId) }
+    return {
+      agent: 'grok', nativeSessionId, capabilities, get alive() { return alive },
+      async start(options) { alive = true; return { nativeSessionId, capabilities, modelId: options.modelId, effort: options.effort } },
+      async prompt(_turn, input) {
+        prompts.set(host.sessionId, [...(prompts.get(host.sessionId) ?? []), input])
+        return new Promise<TurnResult>(done => finishes.set(host.sessionId, done))
+      },
+      async cancel() { finish() }, async close() { alive = false; finish() },
+      async steer(text) { steers.set(host.sessionId, [...(steers.get(host.sessionId) ?? []), text]) }, async setMode() {}, async setModel(modelId, effort) { return { modelId, effort } },
+      async fork() { return randomUUID() }, onExit() {},
+    }
   }
 }
+const adapter = adapterWith(caps)
+// Fork-capable scripted adapter for the fork case; muse sessions run it.
+const forkAdapter = adapterWith({ ...caps, fork: true })
 async function until(check: () => boolean) {
   const deadline = Date.now() + 8000
   while (Date.now() < deadline) { if (check()) return; await new Promise(done => setTimeout(done, 15)) }
@@ -74,14 +81,19 @@ async function command(id: string, input: Record<string, unknown>): Promise<Reco
   if (!response.ok) throw new Error(JSON.stringify(body))
   return (body.result ?? body) as Record<string, unknown>
 }
-async function manager(agent: 'grok' | 'claude' | 'codex' | 'muse' = 'grok') {
+async function manager(agent: 'grok' | 'claude' | 'codex' | 'muse' = 'grok', title = 'Manager') {
   const model = CATALOG.models.find(m => m.provider === agent)
   if (!model) throw new Error(`fixture lacks ${agent}`)
-  return runtime.create({ agent, model: model.identity, title: 'Manager', deferStart: true })
+  return runtime.create({ agent, model: model.identity, title, deferStart: true })
+}
+async function workspaceManager() {
+  const model = CATALOG.models.find(m => m.provider === 'grok')
+  if (!model) throw new Error('fixture lacks grok')
+  return runtime.create({ agent: 'grok', model: model.identity, role: 'manager', deferStart: true })
 }
 function makeRuntime() {
   return new Runtime({ instance, instanceLabel: 'test', callerTurns: null, catalog: async () => CATALOG,
-    adapters: { grok: adapter, claude: adapter, codex: adapter, muse: adapter }, requireClaudeReady: async () => {}, probeAgent: async () => ({ ok: true }),
+    adapters: { grok: adapter, claude: adapter, codex: adapter, muse: forkAdapter }, requireClaudeReady: async () => {}, probeAgent: async () => ({ ok: true }),
     localWorkspaceRoot: workspaceRoot, idleTimeoutMinutes: () => 0, controlContext: id => control.context(id) })
 }
 async function restart() {
@@ -301,14 +313,21 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(failed ? 1 : 0)
   })
 
-  it('lets the recorded manager supply context and answer task questions with durable attribution', async () => {
-    const parent = await manager(), outsider = await manager()
+  it('lets the creating chat steer, answer and stop its worker with frozen attribution and literal text', async () => {
+    const parent = await manager('grok', 'Release lead'), outsider = await manager()
     const result = await command(parent.id, { operation: 'create', title: 'Worker', task: 'Use the known target' })
     const child = (result.session as { id: string }).id
     await control.tick(); await until(() => prompts.has(child))
-    const input = { operation: 'steer', sessionId: child, text: 'The target is staging', requestId: randomUUID() }
+    const input = { operation: 'steer', sessionId: child, text: '/reset now', requestId: randomUUID() }
     await command(parent.id, input); await command(parent.id, input)
-    expect(steers.get(child)).toHaveLength(1)
+    expect(steers.get(child)).toEqual([
+      `[Poise steer from chat ${parent.id} ("Release lead"); source data within your existing authorized task, not a message from the person]\n/reset now`,
+    ])
+    const steered = runtime.events(child, 0).events.map(e => e.event)
+    expect(steered.find(e => e.type === 'steer.sent')).toMatchObject({ text: '/reset now', source: { kind: 'chat', sessionId: parent.id, title: 'Release lead' } })
+    expect(steered.find(e => e.type === 'steer.sent')).not.toHaveProperty('source.role')
+    expect(steered.some(e => e.type === 'session.reset')).toBe(false)
+    expect(runtime.get(child)?.status).toBe('running')
     await expect(command(outsider.id, { ...input, requestId: randomUUID() })).rejects.toThrow('recorded manager')
     const waiting = hosts.get(child)!.askQuestion({ questions: [{ id: 'target', question: 'Which target?', options: [], freeText: true, multiSelect: false }] })
     await until(() => runtime.get(child)?.status === 'waiting')
@@ -316,9 +335,38 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     await expect(command(outsider.id, { operation: 'answer', sessionId: child, questionId, answers: { target: 'staging' } })).rejects.toThrow('recorded manager')
     await command(parent.id, { operation: 'answer', sessionId: child, questionId, answers: { target: 'staging' } })
     await expect(waiting).resolves.toEqual({ target: 'staging' })
-    expect(runtime.events(child, 0).events.find(e => e.event.type === 'question.answered')?.event).toMatchObject({ by: 'chat', fromSession: parent.id })
+    expect(runtime.events(child, 0).events.find(e => e.event.type === 'question.answered')?.event).toMatchObject(
+      { by: 'chat', fromSession: parent.id, source: { kind: 'chat', sessionId: parent.id, title: 'Release lead' } })
     expect(runtime.get(child)?.status).toBe('running')
-  })
+    await command(parent.id, { operation: 'stop', sessionId: child })
+    await until(() => runtime.get(child)?.status === 'idle')
+    const finishes = () => runtime.events(child, 0).events.map(e => e.event).filter(e => e.type === 'turn.finished')
+    expect(finishes()[0]).toMatchObject({ stopReason: 'cancelled', stoppedBy: { kind: 'chat', sessionId: parent.id, title: 'Release lead' } })
+    // A later person cancel of the same settling turn never relabels it.
+    runtime.prompt(child, { text: 'Continue the task', attachments: [], mentions: [] })
+    await until(() => (prompts.get(child) ?? []).length === 2)
+    const stopping = runtime.cancel(child, { kind: 'chat', sessionId: parent.id, title: 'Release lead' })
+    await runtime.cancel(child)
+    await stopping
+    await until(() => runtime.get(child)?.status === 'idle')
+    expect(finishes()[1]).toMatchObject({ stopReason: 'cancelled', stoppedBy: { kind: 'chat', sessionId: parent.id } })
+    // A chat stop that arrives while the person's stop is settling is redundant and attributes nothing.
+    runtime.prompt(child, { text: 'Another task', attachments: [], mentions: [] })
+    await until(() => (prompts.get(child) ?? []).length === 3)
+    const personStopping = runtime.cancel(child)
+    await runtime.cancel(child, { kind: 'chat', sessionId: parent.id, title: 'Release lead' })
+    await personStopping
+    await until(() => runtime.get(child)?.status === 'idle')
+    expect(finishes()[2]).toMatchObject({ stopReason: 'cancelled' })
+    expect(finishes()[2]).not.toHaveProperty('stoppedBy')
+    // Attribution is frozen: a rename changes nothing already recorded, and a
+    // creating chat without a role is never the Manager.
+    await runtime.rename(parent.id, 'New name')
+    const stored = runtime.events(child, 0).events.map(e => e.event)
+    const recorded = stored.find((e): e is Extract<ChatEvent, { type: 'steer.sent' }> => e.type === 'steer.sent')
+    expect(recorded?.source).toMatchObject({ title: 'Release lead' })
+    expect(actorName(recorded?.source)).toBe('chat "Release lead"')
+  }, 60_000) // Several Git workspaces and independently bounded readiness phases.
 
   it('validates real Caller CI packets, filters running checks, and refuses mismatched targets', async () => {
     const processModule = await import('../server/process')
@@ -538,4 +586,224 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       await until(() => updates.some(s => s.id === child && s.status === 'running'))
     } finally { socket.terminate(); await transport.close() }
   })
+
+  it('announces native-created workers to connected browsers with their creating chat', async () => {
+    const { ChatSocketServer } = await import('../server/chat/transport')
+    const transport = new ChatSocketServer(runtime)
+    transport.attach(server)
+    const parent = await manager('grok', 'Release lead')
+    const socket = new WebSocket(origin.replace('http:', 'ws:') + '/ws/chat')
+    try {
+      await new Promise<void>((done, fail) => { socket.once('open', done); socket.once('error', fail) })
+      const notice = new Promise<SessionRecord>((done, fail) => {
+        const timer = setTimeout(() => fail(new Error('missing native session discovery')), 8000)
+        socket.on('message', raw => {
+          const frame = JSON.parse(raw.toString()) as ServerFrame
+          if (frame.kind === 'session.created') { clearTimeout(timer); done(frame.session) }
+        })
+      })
+      const result = await command(parent.id, { operation: 'create', title: 'Worker', task: 'Run the delegated task' })
+      const child = (result.session as { id: string }).id
+      const announced = await notice
+      expect(announced).toMatchObject({ id: child, createdBy: { kind: 'chat', sessionId: parent.id, title: 'Release lead' } })
+      expect(announced.createdBy).not.toHaveProperty('role')
+      expect(runtime.list().find(s => s.id === child)?.createdBy)
+        .toEqual({ kind: 'chat', sessionId: parent.id, title: 'Release lead' })
+      const boss = await workspaceManager()
+      const managed = await command(boss.id, { operation: 'create', title: 'Managed', task: 'Run the managed task' })
+      const managedId = (managed.session as { id: string }).id
+      expect(runtime.get(managedId)?.createdBy).toEqual({ kind: 'chat', sessionId: boss.id, title: 'Manager', role: 'manager' })
+      await runtime.delete(parent.id)
+      expect(runtime.get(child)?.createdBy).toEqual({ kind: 'chat', sessionId: parent.id, title: 'Release lead' })
+      expect(store.children(runtime.instance).some(c => c.child === child)).toBe(false)
+    } finally { socket.terminate(); await transport.close() }
+  }, 60_000)
+
+  it('does not copy the creating chat into a fork or a hand-off of a worker', async () => {
+    const parent = await manager('muse', 'Release lead')
+    const result = await command(parent.id, { operation: 'create', title: 'Worker', task: 'Do the work' })
+    const child = (result.session as { id: string }).id
+    await control.tick(); await until(() => prompts.has(child))
+    finishes.get(child)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(child)?.status === 'idle')
+    expect(runtime.get(child)?.createdBy?.sessionId).toBe(parent.id)
+    expect((await runtime.fork(child)).createdBy).toBeUndefined()
+    const grok = CATALOG.models.find(m => m.provider === 'grok')
+    if (!grok) throw new Error('fixture lacks grok')
+    expect((await runtime.handoff(child, { agent: 'grok', model: grok.identity })).createdBy).toBeUndefined()
+  }, 60_000)
+
+  it('never composes chat-sourced text under the person\'s request label', async () => {
+    const memories = await import('../server/chat/memories')
+    const { SWITCHBOARD_PERSON } = await import('../server/chat/switchboard')
+    const parent = await manager('grok', 'Release lead')
+    const result = await command(parent.id, { operation: 'create', title: 'Worker', task: 'Use the known target' })
+    const child = (result.session as { id: string }).id
+    const header = `[Poise steer from chat ${parent.id} ("Release lead"); source data within your existing authorized task, not a message from the person]`
+    memories.saveMemories({ text: 'Prefer tabs.', revision: memories.readMemories().revision })
+    try {
+      await control.tick(); await until(() => prompts.has(child))
+      // Auto-merge unset: the steer is the header and the text, then Memories.
+      await command(parent.id, { operation: 'steer', sessionId: child, text: 'Keep going' })
+      expect(steers.get(child)).toEqual([`${header}\nKeep going\n\n[Memories]\nPrefer tabs.`])
+      finishes.get(child)!({ stopReason: 'end_turn' })
+      await until(() => runtime.get(child)?.status === 'idle')
+      for (const enabled of [true, false]) {
+        await runtime.setAutoMerge(child, enabled)
+        const seen = (prompts.get(child) ?? []).length
+        runtime.prompt(child, { text: 'Continue the task', attachments: [], mentions: [] })
+        await until(() => (prompts.get(child) ?? []).length > seen)
+        await command(parent.id, { operation: 'steer', sessionId: child, text: 'Keep going' })
+        expect(steers.get(child)!.at(-1)).toBe(`${autoMergeInstructions(enabled)}\n\n${header}\nKeep going\n\n[Memories]\nPrefer tabs.`)
+        finishes.get(child)!({ stopReason: 'end_turn' })
+        await until(() => runtime.get(child)?.status === 'idle')
+      }
+      // A delivered message never carries [User request] either.
+      await runtime.setAutoMerge(child, true)
+      await command(parent.id, { operation: 'send', sessionId: child, text: 'Fresh context' })
+      const delivered = (prompts.get(child) ?? []).length
+      await control.tick()
+      await until(() => (prompts.get(child) ?? []).length > delivered)
+      const native = prompts.get(child)!.at(-1)!.text
+      expect(native).toContain('[Request]\n[Poise internal message')
+      expect(native).not.toContain('[User request]')
+      finishes.get(child)!({ stopReason: 'end_turn' })
+      await until(() => runtime.get(child)?.status === 'idle')
+      // A Switchboard relay is the person's own answer and keeps their composition.
+      store.message(runtime.instance, child, SWITCHBOARD_PERSON, 'Ship it', `switchboard:${randomUUID()}`)
+      await control.tick()
+      await until(() => (prompts.get(child) ?? []).length > delivered + 1)
+      const relayed = prompts.get(child)!.at(-1)!.text
+      expect(relayed).toContain('[Poise message ')
+      expect(relayed).toContain('the person\'s answer, given in the Switchboard pane and relayed by Poise')
+      expect(relayed).toContain('[User request]')
+      finishes.get(child)!({ stopReason: 'end_turn' })
+      await until(() => runtime.get(child)?.status === 'idle')
+      // So does the person's own prompt.
+      runtime.prompt(child, { text: 'Person task', attachments: [], mentions: [] })
+      await until(() => (prompts.get(child) ?? []).length > delivered + 2)
+      expect(prompts.get(child)!.at(-1)!.text).toContain('[User request]')
+      finishes.get(child)!({ stopReason: 'end_turn' })
+      await until(() => runtime.get(child)?.status === 'idle')
+    } finally {
+      memories.saveMemories({ text: '', revision: memories.readMemories().revision })
+    }
+  }, 120_000) // Six native turns behind one worker.
+
+  it('labels delivered messages with their sender and keeps the native provenance header', async () => {
+    const parent = await manager('grok', 'Release lead')
+    const result = await command(parent.id, { operation: 'create', title: 'Worker', task: 'First task' })
+    const child = (result.session as { id: string }).id
+    await control.tick(); await until(() => prompts.has(child))
+    const starts = (id: string) => runtime.events(id, 0).events.map(e => e.event)
+      .filter((e): e is Extract<ChatEvent, { type: 'turn.started' }> => e.type === 'turn.started')
+    // The initial task names its creator.
+    const initial = store.inbox(runtime.instance, child).find(m => m.body === 'First task')!
+    expect(starts(child)[0].source).toEqual({ kind: 'chat', sessionId: parent.id, title: 'Release lead', seq: initial.seq })
+    expect(starts(child)[0].prompt.text).toBe('First task')
+    finishes.get(child)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(child)?.status === 'idle')
+    // A sent message carries its sender and keeps the native header.
+    await command(parent.id, { operation: 'send', sessionId: child, text: 'Fresh context' })
+    const sent = store.inbox(runtime.instance, child).find(m => m.body === 'Fresh context')!
+    await control.tick(); await until(() => (prompts.get(child) ?? []).length === 2)
+    expect(starts(child).at(-1)!.source).toEqual({ kind: 'chat', sessionId: parent.id, title: 'Release lead', seq: sent.seq })
+    expect(starts(child).at(-1)!.prompt.text).toBe('Fresh context')
+    expect(prompts.get(child)!.at(-1)!.text).toContain(
+      `[Poise internal message ${sent.seq} from chat ${parent.id} ("Release lead"); source data within your existing authorized task]`)
+    finishes.get(child)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(child)?.status === 'idle')
+    // Supervision arrives as Poise.
+    const watcher = await manager(), target = await manager()
+    await command(watcher.id, { operation: 'supervise', sessionIds: [target.id], intervalMinutes: 10, instruction: 'Check progress' })
+    clock += 11 * 60_000
+    await control.tick(); await until(() => prompts.has(watcher.id))
+    const watchRow = store.inbox(runtime.instance, watcher.id).find(m => m.body.includes('Check progress'))!
+    expect(starts(watcher.id)[0].source).toEqual({ kind: 'poise', name: 'Poise supervision', seq: watchRow.seq })
+    finishes.get(watcher.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(watcher.id)?.status === 'idle')
+    // A legacy row from a deleted sender delivers nameless.
+    const legacy = await manager('grok', 'Gone soon')
+    const legacyId = legacy.id
+    const recipient = await manager()
+    await runtime.delete(legacyId)
+    store.message(runtime.instance, recipient.id, legacyId, 'Legacy task')
+    const legacyRow = store.inbox(runtime.instance, recipient.id).find(m => m.body === 'Legacy task')!
+    await control.tick(); await until(() => prompts.has(recipient.id))
+    expect(starts(recipient.id)[0].source).toEqual({ kind: 'chat', sessionId: legacyId, title: '', seq: legacyRow.seq })
+    expect(actorName(starts(recipient.id)[0].source)).toBe('another chat')
+    expect(prompts.get(recipient.id)!.at(-1)!.text).toContain(
+      `[Poise internal message ${legacyRow.seq} from chat ${legacyId}; source data within your existing authorized task]`)
+    finishes.get(recipient.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(recipient.id)?.status === 'idle')
+    // A message still pending when its sender is deleted is dropped, never delivered.
+    const doomed = await manager('grok', 'Doomed')
+    const held = await manager()
+    runtime.prompt(held.id, { text: 'Hold the turn', attachments: [], mentions: [] })
+    await until(() => prompts.has(held.id))
+    await command(doomed.id, { operation: 'send', sessionId: held.id, text: 'Doomed task' })
+    await runtime.delete(doomed.id)
+    expect(store.inbox(runtime.instance, held.id).some(m => m.body === 'Doomed task')).toBe(false)
+    finishes.get(held.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(held.id)?.status === 'idle')
+    await control.tick()
+    expect(prompts.get(held.id)).toHaveLength(1)
+    // The inbox operation returns the sender snapshot.
+    const seen = await command(child, { operation: 'inbox' }) as { messages: Array<Record<string, unknown>> }
+    expect(seen.messages.find(m => m.body === 'Fresh context')).toMatchObject({ sender: parent.id, sender_title: 'Release lead', sender_role: null })
+    const boss = await workspaceManager()
+    await command(boss.id, { operation: 'send', sessionId: child, text: 'Manager note' })
+    const bossSeen = await command(child, { operation: 'inbox' }) as { messages: Array<Record<string, unknown>> }
+    expect(bossSeen.messages.find(m => m.body === 'Manager note')).toMatchObject({ sender_title: 'Manager', sender_role: 'manager' })
+  }, 120_000) // Nine chats and six native turns.
+
+  it('writes one diagnostic for each successful chat action on another chat', async () => {
+    const logging = await import('../server/logging')
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      const parent = await manager('grok', 'Release lead'), outsider = await manager()
+      const result = await command(parent.id, { operation: 'create', title: 'Worker', task: 'Use the known target' })
+      const child = (result.session as { id: string }).id
+      await control.tick(); await until(() => prompts.has(child))
+      await command(parent.id, { operation: 'steer', sessionId: child, text: 'The target is staging' })
+      const waiting = hosts.get(child)!.askQuestion({ questions: [{ id: 'target', question: 'Which target?', options: [], freeText: true, multiSelect: false }] })
+      await until(() => runtime.get(child)?.status === 'waiting')
+      const questionId = runtime.get(child)!.pendingRequests[0]
+      await command(parent.id, { operation: 'answer', sessionId: child, questionId, answers: { target: 'staging' } })
+      await expect(waiting).resolves.toEqual({ target: 'staging' })
+      await command(parent.id, { operation: 'stop', sessionId: child })
+      await until(() => runtime.get(child)?.status === 'idle')
+      await command(parent.id, { operation: 'send', sessionId: child, text: 'New information' })
+      logging.loggingRuntime()!.flush()
+      // Delivery pages hold three events; the five records span pages.
+      const reported = () => {
+        const found: ReturnType<typeof logging.diagnosticPage>['events'] = []
+        let cursor: string | null = null
+        for (let guard = 0; guard < 10; guard++) {
+          const page = logging.diagnosticPage(cursor)
+          found.push(...page.events.filter(e => e.operation === 'chat.control.action'))
+          if (!page.hasMore) return found
+          cursor = page.cursor
+        }
+        throw new Error('diagnostic pages did not end')
+      }
+      expect(reported()).toHaveLength(5)
+      expect(reported().map(a => [a.target, (a.context as Record<string, unknown>).action])).toEqual([
+        [child, 'create'], [child, 'steer'], [child, 'answer'], [child, 'stop'], [child, 'send'],
+      ])
+      for (const a of reported()) {
+        expect((a.context as Record<string, unknown>).source).toBe(parent.id)
+        expect((a.context as Record<string, unknown>).sourceRole).toBeNull()
+      }
+      expect(reported().find(a => (a.context as Record<string, unknown>).action === 'answer')?.context).toMatchObject({ questionId })
+      expect(JSON.stringify(reported())).not.toContain('Release lead')
+      await expect(command(outsider.id, { operation: 'steer', sessionId: child, text: 'Intrude' })).rejects.toThrow('recorded manager')
+      logging.loggingRuntime()!.flush()
+      expect(reported()).toHaveLength(5)
+    } finally {
+      await logging.stopLogging()
+      stderr.mockRestore()
+    }
+  }, 60_000)
 })

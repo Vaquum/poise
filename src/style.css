@@ -3857,6 +3857,7 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
 }
 .chat-msg-user  { align-items: flex-end;   }
 .chat-msg-agent { align-items: flex-start; }
+.chat-msg-chat  { align-items: flex-start; }
 
 .chat-msg-body {
   font-size: 0.9375rem;
@@ -3882,6 +3883,31 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
   padding: var(--sp-1) 0;
   max-width: 100%;
 }
+
+/* Another chat's message or steer: a quiet bubble on the agent's side, never
+   the person's pill. */
+.chat-msg-chat .chat-msg-body {
+  background: var(--surface);
+  border: var(--b-hair);
+  border-radius: 14px;
+  padding: var(--sp-2) var(--sp-3);
+  max-width: 85%;
+}
+.chat-msg-source {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-bottom: var(--sp-1);
+}
+.chat-msg-from { color: var(--text-secondary); }
+.chat-actor-btn {
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.chat-actor-btn:hover, .chat-actor-btn:focus-visible { text-decoration: underline; }
 .chat-msg-mono {
   font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
   font-size: 0.875rem;
@@ -5746,6 +5772,13 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
   font-size: 0.6875rem;
   color: var(--text-tertiary);
   min-width: 0;
+}
+.chat-session-creator {
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .chat-session-date { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
 

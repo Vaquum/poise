@@ -39,6 +39,7 @@ import { createSwitchboardPane, ICON_SWITCHBOARD } from './chat-switchboard'
 import { renderNewSessionDialog } from './chat-new-session'
 import {
   createModel, applyEvent, addOptimisticTurn, dropOptimisticTurns, focusedPending, createTranscriptView, pickQuestionOption,
+  shortActorTitle, actorTitleAttr,
   type TranscriptModel, type TranscriptView,
 } from './chat-transcript'
 import { createComposer, emptyDraft, type Composer, type ComposerDraft } from './chat-composer'
@@ -322,6 +323,7 @@ function renderShell(): void {
     onQuestion: (id, answers) => { void answerQuestion(id, answers) },
     onRevert: (diffId) => { void revertDiff(diffId) },
     onLoadDiff: (diffId) => { void loadCompleteDiff(diffId) },
+    onSelectSession: (id) => { void selectSession(id) },
   })
   transcriptEl.addEventListener('chat:rerender', () => queueRender())
 
@@ -595,6 +597,20 @@ function listed(id: string): boolean {
   return record?.context?.kind !== 'switchboard' || !!record.forkedFrom
 }
 
+/** The chat that created this one, when one did: the live creator while it
+ *  exists (following renames), the frozen snapshot once it is gone. */
+function creatorHtml(s: SessionRecord): string {
+  const createdBy = s.createdBy
+  if (!createdBy) return ''
+  const creator = sessions.get(createdBy.sessionId)?.record
+  if (creator) {
+    const text = creator.role === 'manager' ? 'from Manager' : `from chat "${shortActorTitle(creator.title)}"`
+    return `<div class="chat-session-creator" title="${escapeHtml(actorTitleAttr({ title: creator.title, sessionId: creator.id }))}">${escapeHtml(text)}</div>`
+  }
+  const text = createdBy.role === 'manager' ? 'from a deleted Manager' : `from a deleted chat "${shortActorTitle(createdBy.title)}"`
+  return `<div class="chat-session-creator" title="${escapeHtml(actorTitleAttr(createdBy))}">${escapeHtml(text)}</div>`
+}
+
 function sidebarHtml(): string {
   const visible = order.filter(listed)
   if (!visible.length) {
@@ -610,6 +626,7 @@ function sidebarHtml(): string {
     const waiting = s.status === 'waiting' || (s.pendingRequests?.length || 0) > 0
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0">`
       + `<div class="chat-session-title" title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</div>`
+      + creatorHtml(s)
       + `<div class="chat-session-meta">`
       + (s.role === 'manager' ? `<span class="chat-pill chat-pill-manager">Manager</span>` : '')
       + `<span class="chat-pill">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)} · ${escapeHtml(s.model)}</span>`
@@ -2038,7 +2055,8 @@ function render(): void {
   const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight
   const wasAtBottom = distance <= STICK_TO_BOTTOM_PX
   if (e) {
-    transcript.render(e.model, { showActivity, showReasoning, agent: e.record.agent, running: isRunning(e.record.status) || !!e.model.running, interruptedTurnId: e.record.interruptedTurnId })
+    transcript.render(e.model, { showActivity, showReasoning, agent: e.record.agent, running: isRunning(e.record.status) || !!e.model.running, interruptedTurnId: e.record.interruptedTurnId,
+      chats: [...sessions.values()].map((entry) => ({ id: entry.record.id, title: entry.record.title, role: entry.record.role })) })
   } else {
     transcript.clear()
   }

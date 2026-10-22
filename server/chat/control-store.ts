@@ -33,6 +33,19 @@ db.exec(`
   );
 `)
 
+// Sender snapshots for attribution: which chat sent each inbox row, frozen
+// when it was sent. Rows written before this slice read both as NULL.
+try {
+  db.transaction(() => {
+    const cols = db.prepare('PRAGMA table_info(chat_control_inbox)').all() as Array<{ name: string }>
+    if (!cols.some((c) => c.name === 'sender_title')) db.exec('ALTER TABLE chat_control_inbox ADD COLUMN sender_title TEXT')
+    if (!cols.some((c) => c.name === 'sender_role')) db.exec('ALTER TABLE chat_control_inbox ADD COLUMN sender_role TEXT')
+  }).immediate()
+} catch (error) {
+  // A concurrent process added the column first; anything else stops startup.
+  if (!(error instanceof Error) || !error.message.includes('duplicate column name')) throw error
+}
+
 export interface WorkTarget { url: string, repo: string, kind: 'issues' | 'pull', number: number }
 export function workTarget(value: string): WorkTarget {
   if (Buffer.byteLength(value) > 1024) throw new HttpError(400, 'a GitHub work target may contain at most 1024 UTF-8 bytes')
@@ -78,19 +91,19 @@ export function children(instance: string): Array<{ child: string, manager: stri
 
 export interface InternalMessage {
   seq: number, recipient: string, sender: string, body: string, created_at: number,
-  state: 'pending' | 'admitted', turn_id: string | null
+  state: 'pending' | 'admitted', turn_id: string | null, sender_title: string | null, sender_role: 'manager' | null
 }
-export function message(instance: string, recipient: string, sender: string, body: string, eventKey: string = randomUUID()): void {
+export function message(instance: string, recipient: string, sender: string, body: string, eventKey: string = randomUUID(), from?: { title: string, role?: 'manager' }): void {
   if (!body.trim() || Buffer.byteLength(body) > 32 * 1024) throw new HttpError(400, 'an internal message needs 1–32768 UTF-8 bytes')
-  db.prepare(`INSERT INTO chat_control_inbox(instance, recipient, sender, event_key, body, created_at)
-    VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(instance, recipient, event_key) DO NOTHING`).run(instance, recipient, sender, eventKey, body, Date.now())
+  db.prepare(`INSERT INTO chat_control_inbox(instance, recipient, sender, event_key, body, created_at, sender_title, sender_role)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance, recipient, event_key) DO NOTHING`).run(instance, recipient, sender, eventKey, body, Date.now(), from?.title ?? null, from?.role ?? null)
 }
 export function inbox(instance: string, recipient: string, after = 0): InternalMessage[] {
-  return db.prepare(`SELECT seq, recipient, sender, body, created_at, state, turn_id FROM chat_control_inbox
+  return db.prepare(`SELECT seq, recipient, sender, body, created_at, state, turn_id, sender_title, sender_role FROM chat_control_inbox
     WHERE instance = ? AND recipient = ? AND seq > ? ORDER BY seq LIMIT 100`).all(instance, recipient, after) as InternalMessage[]
 }
 export function pending(instance: string, afterRecipient = ''): InternalMessage[] {
-  const page = db.prepare(`SELECT seq, recipient, sender, body, created_at, state, turn_id FROM chat_control_inbox
+  const page = db.prepare(`SELECT seq, recipient, sender, body, created_at, state, turn_id, sender_title, sender_role FROM chat_control_inbox
     WHERE instance = ? AND state = 'pending'
       AND seq IN (SELECT MIN(seq) FROM chat_control_inbox WHERE instance = ? AND state = 'pending' GROUP BY recipient)
       AND recipient IN (SELECT id FROM chat_sessions WHERE status = 'idle')
@@ -140,4 +153,7 @@ export const forgetSession = db.transaction((instance: string, session: string):
   db.prepare('DELETE FROM chat_work_bindings WHERE instance = ? AND session = ?').run(instance, session)
   db.prepare('UPDATE chat_control_watches SET enabled = 0 WHERE instance = ? AND owner = ?').run(instance, session)
   db.prepare('DELETE FROM chat_control_children WHERE instance = ? AND (child = ? OR manager = ?)').run(instance, session, session)
+  // A deleted chat's undelivered messages go with it; delivered ones stay
+  // in the recipients' transcripts.
+  db.prepare(`DELETE FROM chat_control_inbox WHERE instance = ? AND sender = ? AND state = 'pending'`).run(instance, session)
 })

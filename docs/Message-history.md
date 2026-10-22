@@ -22,7 +22,10 @@ tasks. Recalled queued tasks retain the queue chip; attachment and mention
 references stay with their original conversation. Model and Auto-merge choices
 do not change. The usual message path supplies the latest Memories on send.
 Agent output, generated initial handoff summaries and unacknowledged optimistic
-requests are not recall candidates. Pending queue items remain in Queue.
+requests are not recall candidates. Messages and steers from other chats and
+from Poise are not recalled either, including ones written before attribution
+under a `[Poise manager …]` or `[Poise internal message …]` header. Pending
+queue items remain in Queue.
 
 The list reads the already loaded transcript, including restored history after
 reload. It performs no writes, agent calls or new network requests. An open

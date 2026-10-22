@@ -352,7 +352,7 @@ computer.
   process-scoped credential, a loopback peer and no browser Origin/fetch
   headers; even a valid gateway browser/admin assertion cannot call it.
   The native command can also use the normal loopback Poise APIs under their
-  existing policy. Manager/worker relationships, inbox admission, supervision
+  existing policy. Creating-chat and worker relationships, the workspace Manager's role, inbox admission, supervision
   and explicit issue/PR ownership persist in the workspace's SQLite store.
   Dispatch pauses while draining; running monitor reads join the existing
   background-work barrier. See [Chat orchestration](Chat-orchestration.md).

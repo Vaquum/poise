@@ -13,17 +13,20 @@ import { patchContent } from '../dom-patch'
 // a request with no resolved/answered event is still pending after a reload.
 
 import type {
+  ChatActor,
   ChatEnvelope,
   AgentId,
   ContentBlock,
   PermissionOption,
   PlanEntry,
+  PoiseActor,
   PromptInput,
   Question,
   StopReason,
   ToolKind,
   ToolLocation,
   ToolStatus,
+  TurnSource,
   TurnUsage,
 } from '../../server/chat/protocol'
 import { AGENT_LABELS } from '../../server/chat/protocol'
@@ -81,9 +84,9 @@ export interface QuestionItem extends Keyed {
   kind: 'question'
   id: string
   questions: Question[]
-  answered?: { answers: Record<string, string | string[]>, by: 'user' | 'chat' | 'cancelled' }
+  answered?: { answers: Record<string, string | string[]>, by: 'user' | 'chat' | 'cancelled', fromSession?: string, source?: ChatActor }
 }
-export interface SteerItem extends Keyed { kind: 'steer', text: string, attachments?: PromptInput['attachments'], mentions?: PromptInput['mentions'] }
+export interface SteerItem extends Keyed { kind: 'steer', text: string, attachments?: PromptInput['attachments'], mentions?: PromptInput['mentions'], source?: ChatActor | PoiseActor }
 export interface ErrorItem extends Keyed { kind: 'error', message: string }
 
 export type TurnItem = TextItem | ThoughtItem | ToolItem | PlanItem | PermissionItem | QuestionItem | SteerItem | ErrorItem
@@ -94,12 +97,14 @@ export interface TurnModel extends Keyed {
   queueItemId?: string
   agent?: AgentId
   model?: string
+  /** Set when another chat or Poise started the turn; absent for the person's turns. */
+  source?: TurnSource
   startedAt: string
   items: TurnItem[]
   /** Set locally the moment a prompt is sent, cleared when turn.started lands. */
   optimistic?: boolean
   /** `at` is the server's time on the turn.finished envelope: when the turn ended. */
-  finished?: { stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, at: string }
+  finished?: { stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, stoppedBy?: ChatActor, at: string }
 }
 
 export type Block =
@@ -176,6 +181,26 @@ export function dropOptimisticTurns(model: TranscriptModel): void {
   model.rev++
 }
 
+/** Actor titles show at most 60 characters; the full title stays in `title`. */
+export function shortActorTitle(title: string): string {
+  return title.length > 60 ? `${title.slice(0, 60)}…` : title
+}
+
+/** Plain-text name of a chat or Poise actor for transcript labels. Pure, so
+ *  unit tests prove the same mapping the transcript renders. */
+export function actorName(actor: ChatActor | PoiseActor | undefined): string {
+  if (!actor) return 'another chat'
+  if (actor.kind === 'poise') return actor.name
+  if (actor.role === 'manager') return 'Manager'
+  return actor.title ? `chat "${shortActorTitle(actor.title)}"` : 'another chat'
+}
+
+/** Tooltip for an actor label: the full frozen title and the short chat ID,
+ *  so two chats with one title can be told apart. */
+export function actorTitleAttr(actor: Pick<ChatActor, 'title' | 'sessionId'>): string {
+  return `${actor.title} (chat ${actor.sessionId.slice(0, 8)})`
+}
+
 function ensureTurn(model: TranscriptModel, turnId: string, at: string): TurnModel {
   let turn = model.turns.get(turnId)
   if (turn) return turn
@@ -205,12 +230,13 @@ export function applyEvent(model: TranscriptModel, env: ChatEnvelope): void {
     case 'turn.started': {
       // The optimistic turn for this prompt becomes the real one.
       dropOptimisticTurns(model)
-      const turn: TurnModel = { key: `turn:${e.turnId}`, rev: 0, turnId: e.turnId, prompt: e.prompt, startedAt: at, items: [], queueItemId: e.queueItemId, agent: e.agent, model: e.model }
+      const turn: TurnModel = { key: `turn:${e.turnId}`, rev: 0, turnId: e.turnId, prompt: e.prompt, startedAt: at, items: [], queueItemId: e.queueItemId, agent: e.agent, model: e.model, ...(e.source ? { source: e.source } : {}) }
       const existing = model.turns.get(e.turnId)
       if (existing) {
         existing.queueItemId = e.queueItemId
         existing.agent = e.agent
         existing.model = e.model
+        existing.source = e.source
         existing.prompt = e.prompt
         existing.startedAt = at
         model.running = existing
@@ -225,7 +251,7 @@ export function applyEvent(model: TranscriptModel, env: ChatEnvelope): void {
     }
     case 'turn.finished': {
       const turn = ensureTurn(model, e.turnId, at)
-      turn.finished = { stopReason: e.stopReason, error: e.error, usage: e.usage, durationMs: e.durationMs, at }
+      turn.finished = { stopReason: e.stopReason, error: e.error, usage: e.usage, durationMs: e.durationMs, ...(e.stoppedBy ? { stoppedBy: e.stoppedBy } : {}), at }
       if (model.running?.turnId === e.turnId) model.running = null
       // Tools still marked running when the turn ends were cut with it.
       for (const it of turn.items) {
@@ -240,7 +266,7 @@ export function applyEvent(model: TranscriptModel, env: ChatEnvelope): void {
     }
     case 'steer.sent': {
       const turn = ensureTurn(model, e.turnId, at)
-      const item: SteerItem = { kind: 'steer', key: `steer:${env.seq}`, rev: 0, text: e.text, ...(e.attachments ? { attachments: e.attachments } : {}), ...(e.mentions ? { mentions: e.mentions } : {}) }
+      const item: SteerItem = { kind: 'steer', key: `steer:${env.seq}`, rev: 0, text: e.text, ...(e.attachments ? { attachments: e.attachments } : {}), ...(e.mentions ? { mentions: e.mentions } : {}), ...(e.source ? { source: e.source } : {}) }
       turn.items.push(item)
       bump(model, item, turn)
       return
@@ -380,7 +406,7 @@ export function applyEvent(model: TranscriptModel, env: ChatEnvelope): void {
     case 'question.answered': {
       const item = model.questions.get(e.id)
       if (!item) return
-      item.answered = { answers: e.answers, by: e.by }
+      item.answered = { answers: e.answers, by: e.by, ...(e.fromSession ? { fromSession: e.fromSession } : {}), ...(e.source ? { source: e.source } : {}) }
       bump(model, item)
       return
     }
@@ -417,6 +443,7 @@ export interface TranscriptHandlers {
   onRevert(diffId: string): void
   onLoadDiff?(diffId: string): void
   onFile?(reference: string): void
+  onSelectSession?(id: string): void
 }
 
 export interface RenderContext {
@@ -427,6 +454,9 @@ export interface RenderContext {
   interruptedTurnId?: string
   /** Whether the session is running a turn right now (drives the dots). */
   running: boolean
+  /** Live chats for actor labels: a listed source is a select button, a
+   *  missing one renders with a deleted marker. */
+  chats?: Array<{ id: string, title: string, role?: 'manager' }>
 }
 
 const ICONS: Record<ToolKind, string> = {
@@ -543,6 +573,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
   } catch { /* malformed or unavailable draft storage does not affect rendering */ }
   const texts = new Map<string, string>()
   let lastCtxKey = ''
+  let lastChatsKey = ''
   let renderedDay = ''
 
   function ensure(parent: HTMLElement, key: string, before: HTMLElement | null, cls: string): { el: HTMLElement, fresh: boolean } {
@@ -590,10 +621,28 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     return extras.length ? `<div class="chat-turn-extras">${extras.join('')}</div>` : ''
   }
 
-  function userPill(turn: TurnModel): string {
+  /** An actor's name in a label: a button selecting its chat while the chat
+   *  exists, plain text with a deleted marker once it is gone. */
+  function actorHtml(actor: ChatActor | PoiseActor | undefined, ctx: RenderContext): string {
+    if (!actor || actor.kind === 'poise' || !actor.title) return `<span>${escapeHtml(actorName(actor))}</span>`
+    const label = escapeHtml(actorName(actor))
+    const tip = escapeHtml(actorTitleAttr(actor))
+    if ((ctx.chats || []).some((c) => c.id === actor.sessionId)) {
+      return `<button type="button" class="chat-actor-btn" data-chat-session="${escapeHtml(actor.sessionId)}" title="${tip}">${label}</button>`
+    }
+    return `<span title="${tip}">${label} (deleted)</span>`
+  }
+
+  function userPill(turn: TurnModel, ctx: RenderContext): string {
     const p = turn.prompt
     const extrasHtml = contextExtras(p)
     const queued = turn.queueItemId ? `<div class="chat-turn-queued">From queue${turn.agent ? ` · ${escapeHtml(AGENT_LABELS[turn.agent])}` : ''}${turn.model ? ` · ${escapeHtml(consoleModelLabel(turn.model))}` : ''}</div>` : ''
+    if (turn.source) {
+      const from = turn.source.kind === 'poise'
+        ? `From ${escapeHtml(turn.source.name)}`
+        : `Message from ${actorHtml(turn.source, ctx)}`
+      return `${queued}<div class="chat-msg chat-msg-chat"><div class="chat-msg-body"><div class="chat-msg-source">${from}</div>${escapeHtml(p.text)}${extrasHtml}</div></div>`
+    }
     return `${queued}<div class="chat-msg chat-msg-user"><div class="chat-msg-body">${escapeHtml(p.text)}${extrasHtml}</div></div>`
   }
 
@@ -732,7 +781,13 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       + `<div class="chat-card-title">Permission · ${escapeHtml(item.title)}</div>${desc}${input}${actions}</div>`
   }
 
-  function questionHtml(item: QuestionItem, focused: boolean): string {
+  function answerLabel(answered: NonNullable<QuestionItem['answered']>, ctx: RenderContext): string {
+    if (answered.by === 'cancelled') return 'Cancelled'
+    if (answered.by === 'user') return 'Answered'
+    return `Answered by ${actorHtml(answered.source, ctx)}`
+  }
+
+  function questionHtml(item: QuestionItem, focused: boolean, ctx: RenderContext): string {
     const qs = item.questions.map((q, qi) => {
       const answered = item.answered?.answers[q.id]
       const opts = q.options.map((o, oi) => {
@@ -747,7 +802,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       return `<div class="chat-q" data-qid="${escapeHtml(q.id)}" data-multi="${q.multiSelect ? '1' : '0'}">${q.header ? `<div class="chat-card-title">${escapeHtml(q.header)}</div>` : ''}<div class="chat-q-text-body">${escapeHtml(q.question)}</div><div class="chat-q-options">${opts}</div>${free}</div>`
     }).join('')
     const actions = item.answered
-      ? `<div class="chat-card-actions"><span class="chat-edit-card-badge chat-edit-card-badge-applied">${item.answered.by === 'cancelled' ? 'Cancelled' : item.answered.by === 'chat' ? 'Answered by manager' : 'Answered'}</span></div>`
+      ? `<div class="chat-card-actions"><span class="chat-edit-card-badge chat-edit-card-badge-applied">${answerLabel(item.answered, ctx)}</span></div>`
       : `<div class="chat-card-actions"><button type="button" class="chat-card-btn chat-q-submit" data-question="${escapeHtml(item.id)}">Submit</button></div>`
     return `<div class="chat-card chat-question${item.answered ? ' resolved' : ' pending'}${focused ? ' focused' : ''}" data-request="${escapeHtml(item.id)}">${qs}${actions}</div>`
   }
@@ -769,8 +824,12 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     if (f) {
       parts.push(timeHtml(f, clock))
       if (f.stopReason !== 'end_turn') {
-        const label = f.stopReason === 'error' ? `Error: ${f.error || 'unknown'}` : STOP_LABEL[f.stopReason]
-        parts.push(`<span class="chat-turn-stop${f.stopReason === 'error' ? ' bad' : ''}">${escapeHtml(label)}</span>`)
+        if (f.stopReason === 'cancelled' && f.stoppedBy) {
+          parts.push(`<span class="chat-turn-stop">Stopped by ${actorHtml(f.stoppedBy, ctx)}</span>`)
+        } else {
+          const label = f.stopReason === 'error' ? `Error: ${f.error || 'unknown'}` : STOP_LABEL[f.stopReason]
+          parts.push(`<span class="chat-turn-stop${f.stopReason === 'error' ? ' bad' : ''}">${escapeHtml(label)}</span>`)
+        }
       }
       if (ctx.showActivity !== false && f.durationMs !== undefined) parts.push(`<span>${fmtDuration(f.durationMs)}</span>`)
       const total = f.usage?.totalTokens ?? ((f.usage?.inputTokens ?? 0) + (f.usage?.outputTokens ?? 0) || undefined)
@@ -802,7 +861,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     }
   }
 
-  function renderTurn(el: HTMLElement, turn: TurnModel, ctx: RenderContext, clock: Clock, focused: PermissionItem | QuestionItem | null, isLast: boolean): void {
+  function renderTurn(el: HTMLElement, turn: TurnModel, ctx: RenderContext, clock: Clock, focused: PermissionItem | QuestionItem | null, isLast: boolean, repaintActors: boolean): void {
     let head = el.querySelector<HTMLElement>(':scope > .chat-turn-head')
     let items = el.querySelector<HTMLElement>(':scope > .chat-turn-items')
     let foot = el.querySelector<HTMLElement>(':scope > .chat-turn-foot')
@@ -812,7 +871,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       items = el.querySelector<HTMLElement>(':scope > .chat-turn-items')!
       foot = el.querySelector<HTMLElement>(':scope > .chat-turn-foot')!
     }
-    const headHtml = userPill(turn)
+    const headHtml = userPill(turn, ctx)
     if (head.dataset.html !== headHtml) { head.innerHTML = headHtml; head.dataset.html = headHtml }
 
     const keep = new Set<string>()
@@ -828,7 +887,11 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       // would erase a partially typed answer.
       const uiRev = (ui.get(item.key)?.expanded ? 1 : 0)
       const rev = item.rev * 4 + uiRev + (item === final ? 2 : 0)
-      if (setRev(item.key, rev) || (item.kind === 'tool' && node.childElementCount === 0)) {
+      // Actor labels follow the session list: a rename, delete or reload
+      // repaints the items that carry one. Drafts survive: questions
+      // remember and restore theirs around the repaint.
+      const actorItem = (item.kind === 'steer' && !!item.source) || (item.kind === 'question' && item.answered?.by === 'chat')
+      if ((repaintActors && actorItem) || setRev(item.key, rev) || (item.kind === 'tool' && node.childElementCount === 0)) {
         const paint = () => {
         switch (item.kind) {
           case 'text': patchContent(node, textHtml(item, item === final)); break
@@ -839,10 +902,12 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
           case 'permission': patchContent(node, permissionHtml(item, focusedHere)); break
           case 'question':
             rememberQuestion(node, item.key)
-            patchContent(node, questionHtml(item, focusedHere))
+            patchContent(node, questionHtml(item, focusedHere, ctx))
             restoreQuestion(node, item.key)
             break
-          case 'steer': node.innerHTML = `<div class="chat-msg chat-msg-user chat-msg-steer"><div class="chat-msg-body"><span class="chat-msg-mode-tag">steer</span>${escapeHtml(item.text)}${contextExtras(item)}</div></div>`; break
+          case 'steer': node.innerHTML = item.source
+            ? `<div class="chat-msg chat-msg-chat chat-msg-steer"><div class="chat-msg-body"><span class="chat-msg-mode-tag">steer</span> <span class="chat-msg-from">from ${actorHtml(item.source, ctx)}</span> ${escapeHtml(item.text)}${contextExtras(item)}</div></div>`
+            : `<div class="chat-msg chat-msg-user chat-msg-steer"><div class="chat-msg-body"><span class="chat-msg-mode-tag">steer</span>${escapeHtml(item.text)}${contextExtras(item)}</div></div>`; break
           case 'error': node.innerHTML = `<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(item.message)}</div></div>`; break
         }
         }
@@ -884,9 +949,14 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     const clock: Clock = { zone: effectiveTimezone(), now: Date.now() }
     // A new day or time zone relabels every turn's time.
     renderedDay = clockDay(clock.zone, clock.now)
-    const ctxKey = `${ctx.running ? 1 : 0}:${ctx.interruptedTurnId || ''}:${focused?.id || ''}:${ctx.showActivity !== false}:${ctx.showReasoning === true}:${ctx.agent || ''}:${renderedDay}`
+    // Actor labels follow the session list: a rename, delete or reload
+    // re-renders them without any new transcript event.
+    const chatsKey = (ctx.chats || []).map((c) => `${c.id}\n${c.role || ''}\n${c.title}`).join('\n')
+    const ctxKey = `${ctx.running ? 1 : 0}:${ctx.interruptedTurnId || ''}:${focused?.id || ''}:${ctx.showActivity !== false}:${ctx.showReasoning === true}:${ctx.agent || ''}:${renderedDay}:${chatsKey}`
     const ctxChanged = ctxKey !== lastCtxKey
     lastCtxKey = ctxKey
+    const chatsChanged = chatsKey !== lastChatsKey
+    lastChatsKey = chatsKey
     const keep = new Set<string>()
     let cursor = container.firstElementChild as HTMLElement | null
     let lastTurnKey = ''
@@ -899,7 +969,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
         // and the turn holding the request; both sit in the item revisions,
         // so a turn renders when its rev moved or the context did.
         const isLast = b.key === lastTurnKey
-        if (setRev(b.key, b.turn.rev) || ctxChanged || isLast) renderTurn(el, b.turn, b.turn.agent ? { ...ctx, agent: b.turn.agent } : ctx, clock, focused, isLast)
+        if (setRev(b.key, b.turn.rev) || ctxChanged || isLast) renderTurn(el, b.turn, b.turn.agent ? { ...ctx, agent: b.turn.agent } : ctx, clock, focused, isLast, chatsChanged)
       } else if (setRev(b.key, b.rev)) {
         el.innerHTML = b.kind === 'error'
           ? `<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(b.message)}</div></div>`
@@ -917,6 +987,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     nodes.clear()
     texts.clear()
     lastCtxKey = ''
+    lastChatsKey = ''
     renderedDay = ''
   }
 
@@ -988,6 +1059,11 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
           copy.setAttribute('aria-label', 'Copy message')
         }, 1500)
       })
+      return
+    }
+    const chat = target.closest<HTMLButtonElement>('[data-chat-session]')
+    if (chat) {
+      handlers.onSelectSession?.(chat.dataset.chatSession!)
       return
     }
     const perm = target.closest<HTMLButtonElement>('[data-permission]')

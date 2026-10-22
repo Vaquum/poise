@@ -153,6 +153,8 @@ export interface SessionRecord {
   /** Unanswered permission/question requests, by id. */
   pendingRequests: string[]
   forkedFrom?: string
+  /** The chat that created this one through the control create operation, frozen at creation. Never copied by fork. */
+  createdBy?: ChatActor
   /** The one workspace Manager. Set at creation; never changes; read from the chat_sessions.role column. */
   role?: 'manager'
   /** The Manager's catalogue model was retired; every turn is refused until set_model picks one. */
@@ -266,6 +268,17 @@ export interface PlanEntry {
   priority?: 'high' | 'medium' | 'low'
 }
 
+/** A chat acting on another chat through the native control. Frozen when the
+ *  action happens: `title` is the acting chat's title at that moment, at
+ *  most 200 characters, and `role` is copied from its `SessionRecord.role`,
+ *  so only the workspace Manager ever renders as the Manager. */
+export interface ChatActor { kind: 'chat', sessionId: string, title: string, role?: 'manager' }
+/** Poise itself acting on a chat: supervision, the work monitor, or a relay. */
+export interface PoiseActor { kind: 'poise', name: string }
+/** What started a turn the person did not start: a chat or Poise, delivered
+ *  through the control inbox. `seq` is the delivered inbox row. */
+export type TurnSource = (ChatActor | PoiseActor) & { seq: number }
+
 export interface Attachment {
   /** Server-issued id; the record behind it is what a prompt is checked against. */
   id: string
@@ -302,9 +315,9 @@ export type ChatEvent =
   | { type: 'queue.updated', queue: MessageQueue }
   | { type: 'session.closed', reason: string }
   | { type: 'status.changed', status: SessionStatus, queuedBehind?: string, detail?: string }
-  | { type: 'turn.started', turnId: string, prompt: PromptInput, callId?: string, queueItemId?: string, agent?: AgentId, model?: string }
-  | { type: 'steer.sent', turnId: string, text: string, attachments?: Attachment[], mentions?: Mention[] }
-  | { type: 'turn.finished', turnId: string, stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number }
+  | { type: 'turn.started', turnId: string, prompt: PromptInput, callId?: string, queueItemId?: string, agent?: AgentId, model?: string, source?: TurnSource }
+  | { type: 'steer.sent', turnId: string, text: string, attachments?: Attachment[], mentions?: Mention[], source?: ChatActor | PoiseActor }
+  | { type: 'turn.finished', turnId: string, stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, stoppedBy?: ChatActor }
   | { type: 'text.delta', turnId: string, messageId: string, delta: string }
   | { type: 'thought.delta', turnId: string, messageId: string, delta: string }
   | { type: 'tool.started', turnId: string, id: string, kind: ToolKind, title: string, locations?: ToolLocation[], input?: unknown }
@@ -316,7 +329,7 @@ export type ChatEvent =
   | { type: 'permission.requested', id: string, turnId: string, toolId?: string, title: string, description?: string, input?: unknown, options: PermissionOption[] }
   | { type: 'permission.resolved', id: string, optionId: string, by: 'user' | 'session' | 'auto_merge' | 'unrestricted' | 'cancelled' }
   | { type: 'question.asked', id: string, turnId: string, toolId?: string, questions: Question[] }
-  | { type: 'question.answered', id: string, answers: Record<string, string | string[]>, by: 'user' | 'chat' | 'cancelled', fromSession?: string }
+  | { type: 'question.answered', id: string, answers: Record<string, string | string[]>, by: 'user' | 'chat' | 'cancelled', fromSession?: string, source?: ChatActor }
   | { type: 'commands.updated', commands: CommandOption[] }
   | { type: 'mode.updated', mode: string, modes: ModeOption[] }
   | { type: 'model.updated', model: string, modelId: string, effort: string, efforts?: string[] }

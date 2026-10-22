@@ -6,9 +6,17 @@ export const MESSAGE_HISTORY_LIMIT = 10
 export interface MessageHistoryEntry { id: string, draft: ComposerDraft }
 export interface MessageHistorySnapshot { entries: MessageHistoryEntry[], loading?: boolean, error?: string | null }
 
+/** Prompts and steers written before attribution, when every chat-sourced
+ *  text arrived inline under one of these headers. A message the person
+ *  typed with exactly that prefix is not recalled either. */
+function isLegacySourced(text: string): boolean {
+  return text.startsWith('[Poise manager ') || text.startsWith('[Poise internal message ')
+}
+
 /** Visible, acknowledged user messages only, oldest to newest within the last
  *  ten. Never read another conversation, or recall generated agent output,
- *  memories or an optimistic request whose delivery is still uncertain. */
+ *  memories, messages and steers from other chats or Poise, or an
+ *  optimistic request whose delivery is still uncertain. */
 export function recentMessages(model: TranscriptModel, context?: SessionContext): MessageHistoryEntry[] {
   const recent: MessageHistoryEntry[] = []
   const firstTurn = context?.kind === 'handoff' ? model.blocks.find(block => block.kind === 'turn') : null
@@ -18,11 +26,12 @@ export function recentMessages(model: TranscriptModel, context?: SessionContext)
     const turn = block.turn
     for (let j = turn.items.length - 1; j >= 0 && recent.length < MESSAGE_HISTORY_LIMIT; j--) {
       const item = turn.items[j]
-      if (item.kind === 'steer' && (item.text.trim() || item.attachments?.length)) {
+      if (item.kind === 'steer' && !item.source && !isLegacySourced(item.text) && (item.text.trim() || item.attachments?.length)) {
         recent.push({ id: item.key, draft: { text: item.text, mode: null, attachments: (item.attachments || []).map(file => ({ ...file })), mentions: (item.mentions || []).map(mention => ({ ...mention })) } })
       }
     }
     if (recent.length >= MESSAGE_HISTORY_LIMIT || block === firstTurn) continue
+    if (turn.source || isLegacySourced(turn.prompt.text)) continue
     const prompt = turn.prompt
     if (!prompt.text.trim() && !prompt.attachments.length) continue
     recent.push({ id: turn.key, draft: { text: prompt.text, mode: turn.queueItemId ? 'queue' : null, ...(turn.queueItemId && turn.model ? { model: turn.model } : {}),

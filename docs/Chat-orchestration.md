@@ -19,18 +19,18 @@ between agents running as the same operating-system user.
 | Operation | Input | Result |
 | --- | --- | --- |
 | `help` | — | Control operations and Poise API discovery |
-| `list` | — | Chats, manager relationships, work bindings, supervision |
+| `list` | — | Chats, creating-chat relationships, work bindings, supervision |
 | `read` | `sessionId`, optional `afterSeq` | Session and paged transcript; continue from the last sequence while `truncated` |
-| `create` | `title`, `task`, optional `model`, `effort` | One independent worker with the manager's model by default |
-| `send` | `sessionId`, `text` | Durable internal message |
-| `steer` | Managed worker `sessionId`, `text` | Native context delivery during its active turn |
-| `answer` | Managed worker `sessionId`, `questionId`, `answers` | Supply known task data; transcript attributes the answer to the manager |
-| `inbox` | Optional `afterSeq` | Up to 100 durable messages in sequence order |
+| `create` | `title`, `task`, optional `model`, `effort` | One independent worker with the creating chat's model by default |
+| `send` | `sessionId`, `text` | Durable internal message; in this release any chat may send to any other chat |
+| `steer` | Managed worker `sessionId`, `text` | Native context delivery during its active turn; the transcript names the acting chat |
+| `answer` | Managed worker `sessionId`, `questionId`, `answers` | Supply known task data; the transcript names the acting chat |
+| `inbox` | Optional `afterSeq` | Up to 100 durable messages in sequence order, each with `sender_title` and `sender_role` |
 | `supervise` | `sessionIds`, `intervalMinutes`, `instruction` | Persistent supervision ID |
 | `unsupervise` | `watchId` | Disable the caller's supervision |
 | `bind` | Exact GitHub issue/PR `target` URL | Exclusive work ownership for the caller |
 | `unbind` | `target` | Release the caller's work |
-| `stop` | `sessionId` | Cancel its turn and pause automatic message dispatch |
+| `stop` | `sessionId` | Cancel its turn and pause automatic message dispatch; the transcript names the acting chat. In this release any chat may stop any other chat |
 | `api` (command only) | `path`, optional `method`, `body` | Normal local Poise API response |
 
 Mutating control requests use a UUID `requestId`. The command prints that ID
@@ -39,33 +39,63 @@ recorded result, a changed payload conflicts, and an uncertain receipt never
 executes again automatically. Ordinary `api` calls retain their endpoint's
 existing semantics; the control receipt does not make arbitrary APIs idempotent.
 
-Workers inherit the manager's saved Safe mode and Auto-merge choices. Every
+Workers inherit the creating chat's saved Safe mode and Auto-merge choices. Every
 Poise-local session, top-level or worker, gets its own Poise-owned local Git
-workspace and checkout lease, so several chats can run while their manager is
-working. Repository work must be set up within that session's workspace
+workspace and checkout lease, so several chats can run while their creating
+chat is working. Repository work must be set up within that session's workspace
 using the context supplied in its task.
 Creating a chat does not give it another chat's checkout or native history.
 Workers appear in the sidebar immediately without selecting them or disturbing
-the manager's draft. Their status updates without loading their transcripts.
+the creating chat's draft. Their status updates without loading their transcripts.
 Reconnecting refreshes the list for creations missed
 while disconnected; discovery never starts a native turn.
 
 Messages wait for an idle turn boundary. They do not steer a busy native turn,
-answer a question, or approve permissions. A manager receives notifications of
+answer a question, or approve permissions. A creating chat receives notifications of
 its workers' completion, errors, questions and permission requests, with the
-transcript sequence needed to inspect the original event. An active manager
-can read its inbox directly. Admission records the new turn ID; it is not proof
+transcript sequence needed to inspect the original event. An active creating
+chat can read its inbox directly. Admission records the new turn ID; it is not proof
 that the agent completed the task. Failed/stopped/interrupted work pauses
 automatic dispatch until explicit chat activity. Existing queued tasks take
 priority. Stop preserves pending messages and bindings.
 Dispatch preserves each recipient's message order while rotating across
 recipients, including those blocked behind a deferred queue.
 
-A manager can explicitly steer its own worker or answer its pending question
-with known task data. Native answer validation still applies. The transcript
-records the manager's chat ID and shows “Answered by manager”; it never labels
-that answer as the person's decision. Questions needing a new human decision
-and all permission requests remain with the person/native Safe mode.
+A creating chat can explicitly steer its own worker or answer its pending
+question with known task data. Native answer validation still applies. The
+transcript names the acting chat, as described under Attribution; it never
+labels that answer as the person's decision. Questions needing a new human
+decision and all permission requests remain with the person/native Safe mode.
+
+## Attribution
+
+Every control action one chat takes on another names the acting chat in the
+affected chat's transcript: which chat created it (in the sidebar), messaged,
+steered, answered or stopped it. Answer cards read “Answered by Manager”,
+“Answered by chat …” or “Answered by another chat”; steers, delivered messages
+and stops carry matching labels. `list`'s `children` rows keep the JSON key
+`manager` for compatibility.
+
+Labels use the acting chat's title frozen when it acted, with the full title
+and the short chat ID in the tooltip; a listed source is a button selecting
+that chat, a deleted one reads “(deleted)”. The native agent sees the same
+actor in a provenance header (`[Poise steer from …]`, `[Poise internal message
+…]`). Chat- and Poise-sourced text is composed as source data within
+the existing authorized task, never under `[User request]`; a chat's steer
+arrives literally, with no command parsing or switch expansion. Messages and
+steers from other chats and Poise are excluded from console history recall.
+
+Each successful action also writes one `chat.control.action` diagnostic
+carrying chat IDs, the role and the operation — never a title or message text.
+Refused or failed actions write none. Diagnostics are best-effort and kept at
+most 30 days or 50,000 events; command receipts stay an anti-replay store, not
+an audit trail.
+
+Attribution lasts as long as the transcript: `/reset` deletes a chat's
+transcript events, labels included. The record shows which chat says it acted;
+it does not authenticate it. Every chat's connection file is readable by the
+same OS user, and a forged `Origin` or an origin-less loopback `/ws/chat`
+command is recorded as the person.
 
 Supervision supports 1–20 other chats and intervals of 1–1440 minutes. It
 persists in SQLite and supplies current status, unanswered request IDs and

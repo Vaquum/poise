@@ -59,6 +59,18 @@ describe('recent user message history', () => {
     expect(items.map(historyLabel)).toEqual(['Continue', 'Continue', 'image.png'])
     expect(new Set(items.map(item => item.id)).size).toBe(3)
   })
+  it('skips messages and steers from other chats, Poise and legacy headers', () => {
+    const w = world()
+    w.turn('person', 'My own task')
+    w.emit({ type: 'turn.started', turnId: 'msg', prompt: prompt('Hello from worker'), source: { kind: 'chat', sessionId: 'other', title: 'Release lead', seq: 1 } })
+    w.emit({ type: 'turn.started', turnId: 'poise-msg', prompt: prompt('Poise note'), source: { kind: 'poise', name: 'Poise supervision', seq: 2 } })
+    w.emit({ type: 'steer.sent', turnId: 'msg', text: 'Chat steer', source: { kind: 'chat', sessionId: 'other', title: 'Release lead' } })
+    w.emit({ type: 'steer.sent', turnId: 'msg', text: 'Poise steer', source: { kind: 'poise', name: 'Poise supervision' } })
+    w.emit({ type: 'steer.sent', turnId: 'person', text: '[Poise manager abc; context] Old steer' })
+    w.turn('legacy', '[Poise internal message 3 from abc; source data] Old message')
+    w.emit({ type: 'steer.sent', turnId: 'person', text: 'My own steer' })
+    expect(recentMessages(w.model).map(entry => entry.draft.text)).toEqual(['My own task', 'My own steer'])
+  })
   it('only collapses whitespace in the label, preserving complete text for recall', () => {
     const w = world(); const text = 'Hello\n\nworld\t' + 'long text '.repeat(100)
     w.turn('1', text)
