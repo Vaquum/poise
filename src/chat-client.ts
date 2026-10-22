@@ -17,6 +17,7 @@ import type {
   MessageQueue,
   ChatCommand,
   ChatEnvelope,
+  ChatSubject,
   ClientFrame,
   NewSessionRequest,
   ServerFrame,
@@ -26,6 +27,7 @@ import type {
   AutoMergeAck,
   SafeModeAck,
   SwitchboardState,
+  LegacyConversation,
 } from '../server/chat/protocol'
 import type { SelfChange, SelfUpdateStatus } from './self-update-types'
 import { parseMessageQueue } from './chat-queue'
@@ -146,6 +148,10 @@ export class ChatClient {
   private pending = new Map<string, Pending>()
   /** Sessions the view wants live events for, with the last seq seen. */
   private subscriptions = new Map<string, number>()
+  /** Holders per session; the frame goes out only when the last one leaves. */
+  private holders = new Map<string, number>()
+  /** Subject creations in flight, so a tab sends one at a time. */
+  private creations = new Map<string, Promise<SessionRecord>>()
   private serverStartedAt: string | null = null
   private serverInstance: string | null = null
   private handshakeReady = false
@@ -431,8 +437,10 @@ export class ChatClient {
   }
 
   /** Start receiving events for a session from `afterSeq` (exclusive). Events
-   *  already delivered for the session are never repeated. */
+   *  already delivered for the session are never repeated. Each call holds
+   *  the subscription until its matching `unsubscribe`. */
   subscribe(sessionId: string, afterSeq: number): void {
+    this.holders.set(sessionId, (this.holders.get(sessionId) ?? 0) + 1)
     const current = this.subscriptions.get(sessionId)
     if (current !== undefined && current >= afterSeq) return
     this.subscriptions.set(sessionId, afterSeq)
@@ -442,14 +450,21 @@ export class ChatClient {
   }
 
   unsubscribe(sessionId: string): void {
+    const held = (this.holders.get(sessionId) ?? 0) - 1
+    if (held > 0) {
+      this.holders.set(sessionId, held)
+      return
+    }
+    this.holders.delete(sessionId)
     if (!this.subscriptions.delete(sessionId)) return
     this.bufferedEvents.delete(sessionId)
     this.sendFrame({ id: requestId(), command: { type: 'unsubscribe', sessionId } })
   }
 
-  /** Forget every subscription; the caller re-subscribes from its own state. */
+  /** Drop buffered wire state after a restart. Demand stays: every held
+   *  session keeps its watermark, and the hello handler re-subscribes each
+   *  one, so every open surface keeps receiving events. */
   resetSubscriptions(): void {
-    this.subscriptions.clear()
     this.bufferedEvents.clear()
   }
 
@@ -473,8 +488,40 @@ export class ChatClient {
     return jsonFetch('/api/chat/sessions')
   }
 
-  createSession(req: NewSessionRequest): Promise<{ session: SessionRecord }> {
-    return post('/api/chat/sessions', req)
+  /** One creation per subject in flight in a tab at a time; a second
+   *  caller adopts the first call's session with `existing: true`. */
+  createSession(req: NewSessionRequest): Promise<{ session: SessionRecord, existing?: boolean }> {
+    if (!req.subject) return post('/api/chat/sessions', req)
+    const key = `${req.subject.surface}:${req.subject.key}`
+    const flying = this.creations.get(key)
+    if (flying) return flying.then((session) => ({ session, existing: true }))
+    const task = post<{ session: SessionRecord, existing?: boolean }>('/api/chat/sessions', req)
+    const tracked = task.then((answer) => answer.session)
+    tracked.catch(() => undefined)
+    this.creations.set(key, tracked)
+    return task.finally(() => { if (this.creations.get(key) === tracked) this.creations.delete(key) })
+  }
+
+  /** The subject's session, or null when its first message has not been sent. */
+  async sessionForSubject(subject: ChatSubject): Promise<SessionRecord | null> {
+    const answer = await jsonFetch<{ session: SessionRecord | null }>(`/api/chat/sessions?subject=${encodeURIComponent(`${subject.surface}:${subject.key}`)}`)
+    return answer.session
+  }
+
+  /** The subject's earlier legacy conversation, if it has turns. */
+  async legacyConversation(subject: ChatSubject): Promise<LegacyConversation | null> {
+    const answer = await jsonFetch<{ conversation: LegacyConversation | null }>(`/api/chat/legacy?subject=${encodeURIComponent(`${subject.surface}:${subject.key}`)}`)
+    return answer.conversation
+  }
+
+  /** Run `/content` for a session. The article lands in the transcript's card. */
+  runContent(sessionId: string, topic: string): Promise<unknown> {
+    return post('/api/chat-content', { topic, chatSession: sessionId })
+  }
+
+  /** Run `/consensus` for a session. The synthesis lands in the transcript's card. */
+  runConsensus(sessionId: string, topic: string): Promise<{ id: string, synthesis: string, rounds: unknown[] }> {
+    return post('/api/debate', { topic, chatSession: sessionId })
   }
 
   filePreview(sessionId: string, reference: string): Promise<import('./chat-file-reference').ChatFilePreview> {

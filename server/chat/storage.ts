@@ -8,7 +8,7 @@
 
 import { db } from '../db'
 import { claimQueuedMessage, delegateQueue, deleteMessageQueue, pauseQueue, settleQueuedTurn, queueOwner, readQueue } from './message-queue'
-import type { ChatEnvelope, ChatEvent, SessionRecord, SessionStatus, MessageQueue } from './protocol'
+import type { ChatEnvelope, ChatEvent, SessionRecord, SessionStatus, MessageQueue, SubjectSurface } from './protocol'
 import type { AttachmentRecord } from './attachments'
 
 db.exec(`
@@ -30,6 +30,9 @@ db.exec(`
     open_call_id TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_chat_sessions_instance ON chat_sessions(instance, updated_at DESC);
+  CREATE UNIQUE INDEX IF NOT EXISTS chat_sessions_subject ON chat_sessions(
+    instance, json_extract(record, '$.subject.surface'), json_extract(record, '$.subject.key')
+  ) WHERE json_extract(record, '$.subject.key') IS NOT NULL;
 
   CREATE TABLE IF NOT EXISTS chat_events (
     session_id TEXT NOT NULL,
@@ -178,6 +181,25 @@ export function listSessions(instance: string): SessionRecord[] {
     .all(instance) as Array<{ record: string, last_seq: number, status: string, role: string | null }>
   return rows.map(parseRecord)
 }
+
+/** The subject's session id, in any state, or null. Keys compare exactly. */
+export function sessionForSubject(instance: string, surface: SubjectSurface, key: string): string | null {
+  const row = db.prepare(`SELECT id FROM chat_sessions WHERE instance = ?
+    AND json_extract(record, '$.subject.surface') = ? AND json_extract(record, '$.subject.key') = ? LIMIT 1`)
+    .get(instance, surface, key) as { id: string } | undefined
+  return row?.id ?? null
+}
+
+/** Move the subject from one record to another in one transaction. A
+ *  source without a subject leaves both records as they are. */
+export const moveSubject: (from: SessionRecord, to: SessionRecord) => void = db.transaction((from: SessionRecord, to: SessionRecord): void => {
+  if (!from.subject) return
+  const subject = from.subject
+  const source = { ...from }
+  delete source.subject
+  saveSession(source)
+  saveSession({ ...to, subject })
+})
 
 export function deleteSession(id: string): void {
   db.transaction(() => {

@@ -4,7 +4,7 @@ export interface ChatSwitches { revision: number, switches: ChatSwitch[] }
 export const SWITCH_LIMITS = { nameChars: 64, contentBytes: 64 * 1024, totalBytes: 512 * 1024, count: 128 } as const
 // Accept every readable snippet; expanded prompts retain their own byte limit.
 const LIBRARY_LIMITS = { count: 65_536, contentBytes: 1024 * 1024, totalBytes: 16 * 1024 * 1024 }
-export const RESERVED_SWITCHES = new Set(['create', 'model', 'review', 'queue', 'compact', 'reset', 'mode', 'fork', 'poise', 'context', 'clear', 'help', 'always-approve', 'deep-research'])
+export const RESERVED_SWITCHES = new Set(['create', 'model', 'review', 'queue', 'compact', 'reset', 'mode', 'fork', 'poise', 'context', 'clear', 'help', 'always-approve', 'deep-research', 'content', 'consensus'])
 /** The built-in snippet: the Manager's charter, used as /manager. */
 export const MANAGER_SWITCH = 'manager'
 export function switchName(value: string): string {

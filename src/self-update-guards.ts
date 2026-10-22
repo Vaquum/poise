@@ -10,8 +10,9 @@
 // — and never treats an
 // off-screen, closed control as something a person is using. Fields count as
 // dirty only after the person typed into them and only while their value still
-// differs from what it was when they arrived; the chat composer is excluded
-// because its draft is what the snapshot carries across.
+// differs from what it was when they arrived; the Chat view's composer is
+// excluded because its draft is what the snapshot carries across, while an
+// unsent side-pane draft blocks a reload.
 
 export type ReloadGuard = () => string[]
 export interface UnsavedState { dirty: boolean, saving?: boolean }
@@ -40,8 +41,8 @@ const baseline = new WeakMap<Element, string>()
 const edited = new WeakSet<Element>()
 let domInstalled = false
 
-const CLOSED = '[hidden], [inert], [aria-hidden="true"], #settings-panel:not(.open), #typo-panel:not(.open), #chat-panel:not(.open)'
-const EXCLUDED_INPUT = 'input[type="search"], .chat-v-composer .chat-input, #editor-doc'
+const CLOSED = '[hidden], [inert], [aria-hidden="true"], #settings-panel:not(.open), #typo-panel:not(.open), #chat-panel:not(.open), #chat-side-pane:not(.open)'
+const EXCLUDED_INPUT = 'input[type="search"], #view-chat .chat-v-composer .chat-input, #editor-doc'
 
 function isEditable(el: Element | null): el is HTMLElement {
   if (!el) return false
@@ -116,7 +117,7 @@ export function domBlockers(doc: Document = document): string[] {
   if (saveBtn?.textContent?.trim() === 'Saving…') out.push('save')
   if (doc.getElementById('settings-panel')?.classList.contains('open')) out.push('settings-open')
   if (doc.getElementById('typo-panel')?.classList.contains('open')) out.push('typography-open')
-  if (doc.getElementById('chat-panel')?.classList.contains('open')) out.push('chat-pane-open')
+  if (doc.getElementById('chat-panel')?.classList.contains('open') || doc.getElementById('chat-side-pane')?.classList.contains('open')) out.push('chat-pane-open')
   if (doc.querySelector('dialog[open], .chat-new-dialog:not([hidden])')) out.push('dialog-open')
   return out
 }

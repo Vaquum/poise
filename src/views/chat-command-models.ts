@@ -6,14 +6,15 @@ interface ModelChoice { identity: string, label: string, available: boolean, rea
 interface Handlers { load(): Promise<AgentInfo[]>, choose(identity: string): void, changed(): void }
 
 /** The /model extension shares the history layout and keeps focus in the input. */
-export function createCommandModels(input: HTMLTextAreaElement, handlers: Handlers) {
+export function createCommandModels(input: HTMLTextAreaElement, handlers: Handlers, options?: { idPrefix?: string }) {
+  const prefix = options?.idPrefix || ''
   const el = document.createElement('section')
   el.className = 'chat-message-history chat-command-models'
   el.hidden = true
   el.setAttribute('aria-label', 'Choose a model')
   el.innerHTML = '<div class="chat-history-heading"><span>Models</span><span class="chat-history-count"></span><span class="chat-history-help">↑↓ select · Enter choose · Esc close</span></div>'
     + '<div class="chat-history-state" role="status" hidden></div><button type="button" class="chat-command-model-retry" hidden>Try again</button>'
-    + '<div id="chat-command-model-list" class="chat-history-list" role="listbox" aria-label="Models"></div>'
+    + `<div id="${prefix}chat-command-model-list" class="chat-history-list" role="listbox" aria-label="Models"></div>`
   const list = el.querySelector<HTMLElement>('.chat-history-list')!
   const status = el.querySelector<HTMLElement>('[role="status"]')!
   const retry = el.querySelector<HTMLButtonElement>('.chat-command-model-retry')!
@@ -41,7 +42,7 @@ export function createCommandModels(input: HTMLTextAreaElement, handlers: Handle
     list.replaceChildren()
     visible.forEach((choice, i) => {
       const row = document.createElement('button')
-      row.type = 'button'; row.tabIndex = -1; row.id = `chat-command-model-${i}`
+      row.type = 'button'; row.tabIndex = -1; row.id = `${prefix}chat-command-model-${i}`
       row.className = 'chat-history-item chat-command-model-option'
       row.dataset.identity = choice.identity; row.dataset.index = String(i)
       row.setAttribute('role', 'option'); row.setAttribute('aria-disabled', String(!choice.available))
@@ -92,16 +93,23 @@ export function createCommandModels(input: HTMLTextAreaElement, handlers: Handle
   // swallowing the click. Submission itself closes it after activation.
   const submitting = (target: EventTarget | null) => target instanceof Element
     && !!target.closest('.chat-send') && input.form?.contains(target)
-  document.addEventListener('pointerdown', event => {
+  const onPointerDown = (event: PointerEvent) => {
     pointerSubmitting = !!submitting(event.target)
     if (event.target !== input && !el.contains(event.target as Node) && !pointerSubmitting) close()
-  })
-  document.addEventListener('pointercancel', () => { pointerSubmitting = false; close() })
+  }
+  const onPointerCancel = () => { pointerSubmitting = false; close() }
+  document.addEventListener('pointerdown', onPointerDown)
+  document.addEventListener('pointercancel', onPointerCancel)
   // Safari does not necessarily focus buttons after a pointer press. Retain
   // the pointer's intent as well as focus until submit closes the extension.
   input.addEventListener('blur', () => { setTimeout(() => { if (!pointerSubmitting && document.activeElement !== input && !el.contains(document.activeElement) && !submitting(document.activeElement)) close() }, 0) })
+  function destroy(): void {
+    document.removeEventListener('pointerdown', onPointerDown)
+    document.removeEventListener('pointercancel', onPointerCancel)
+    el.remove()
+  }
   return {
-    el, close,
+    el, close, destroy,
     get open() { return !el.hidden },
     get fixedHeight() { return el.querySelector<HTMLElement>('.chat-history-heading')!.offsetHeight + (status.hidden ? 0 : status.offsetHeight) + (retry.hidden ? 0 : retry.offsetHeight) + 10 },
     get rowsHeight() { return list.scrollHeight },

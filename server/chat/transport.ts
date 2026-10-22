@@ -27,8 +27,9 @@ import { runFile } from '../process'
 import { handleGhBody } from '../gh'
 import { getChatSettings } from '../settings'
 import { inspectCheckout } from './git'
-import { CHAT_LIMITS, WS_PATH, type Attachment, type ChatCommand, type ChatEnvelope, type ClientFrame, type ServerFrame } from './protocol'
+import { CHAT_LIMITS, WS_PATH, type Attachment, type ChatCommand, type ChatEnvelope, type ChatSubject, type ClientFrame, type ServerFrame } from './protocol'
 import { ChatError, type ChatRuntime } from './runtime'
+import { legacyIdFor, readLegacyConversation } from './legacy-import'
 import * as storage from './storage'
 import { executeCommandOnce } from './command-receipts'
 import { clientEnvelope } from './event-preview'
@@ -254,7 +255,12 @@ export class ChatSocketServer {
         return { sessions: runtime.list() }
       case 'session.new': {
         if (command.role !== undefined) throw new ChatError(400, 'A Manager is created from the New session dialog in the browser.', 'invalid')
-        return { session: await runtime.create(localSessionRequest(command)) }
+        const request = localSessionRequest(command)
+        if (request.subject) {
+          const { session, existing } = await runtime.createForSubject({ ...request, subject: request.subject })
+          return { session, existing }
+        }
+        return { session: await runtime.create(request) }
       }
       case 'context.reset':
         return { session: await runtime.reset(String(command.sessionId || '')) }
@@ -474,7 +480,25 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
       return json(res, 200, { attachment }), true
     }
     if (path === '/api/chat/sessions' && req.method === 'GET') {
+      const subjectParam = query.get('subject')
+      if (subjectParam !== null) {
+        const filter = subjectFilter(subjectParam)
+        const id = storage.sessionForSubject(runtime.instance, filter.surface, filter.key)
+        return json(res, 200, { session: id ? runtime.get(id) : null, instance: runtime.instance }), true
+      }
       return json(res, 200, { sessions: runtime.list(), instance: runtime.instance }), true
+    }
+    if (path === '/api/chat/legacy' && req.method === 'GET') {
+      const subjectParam = query.get('subject')
+      if (!subjectParam) throw new ChatError(400, 'subject is required', 'invalid')
+      const filter = subjectFilter(subjectParam)
+      const legacyId = await legacyIdFor({ surface: filter.surface, key: filter.key, label: '' })
+      if (!legacyId) return json(res, 200, { conversation: null }), true
+      try {
+        return json(res, 200, { conversation: await readLegacyConversation(legacyId) }), true
+      } catch (error) {
+        throw new ChatError(502, `Earlier conversation could not be read: ${error instanceof Error ? error.message : String(error)}`, 'legacy_unreadable')
+      }
     }
     if (path === '/api/chat/sessions' && req.method === 'POST') {
       const body = await readJson<any>(req)
@@ -490,7 +514,12 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
         }
         return json(res, 201, { session }), true
       }
-      const session = await runtime.create(localSessionRequest(body))
+      const request = localSessionRequest(body)
+      if (request.subject) {
+        const { session, existing } = await runtime.createForSubject({ ...request, subject: request.subject })
+        return json(res, existing ? 200 : 201, { session, existing }), true
+      }
+      const session = await runtime.create(request)
       return json(res, 201, { session }), true
     }
     const match = path.match(/^\/api\/chat\/sessions\/([0-9a-f-]{36})(?:\/([a-z]+))?$/)
@@ -553,9 +582,37 @@ function localSessionRequest(body: any): import('./protocol').NewSessionRequest 
     effort: body.effort ? String(body.effort) : undefined,
     title: typeof body.title === 'string' ? body.title : undefined,
     context: body.context && typeof body.context === 'object' ? sanitizeContext(body.context) : undefined,
+    subject: body?.subject === undefined ? undefined : sanitizeSubject(body.subject),
+    skipLegacy: body?.skipLegacy === true ? true : undefined,
     deferStart: body.deferStart,
     fallbackModel: typeof body.fallbackModel === 'string' ? body.fallbackModel : undefined,
     ...(body.autoMerge !== undefined ? { autoMerge: body.autoMerge } : {}),
     ...(body.safeMode !== undefined ? { safeMode: body.safeMode } : {}),
   }
+}
+
+/** `current` keys are the legacy chat ids the card builders make. Unlike
+ *  `sanitizeContext`, which drops what it cannot use, an invalid subject
+ *  is refused: it is never ignored. */
+function sanitizeSubject(value: unknown): ChatSubject {
+  if (!value || typeof value !== 'object') throw new ChatError(400, 'subject must be an object', 'invalid')
+  const candidate = value as Record<string, unknown>
+  if (candidate.surface !== 'current') throw new ChatError(400, `unknown subject surface ${String(candidate.surface)}`, 'invalid')
+  const key = candidate.key
+  const valid = typeof key === 'string'
+    && (/^poise\.card\.\d+$/.test(key) || /^poise\.(issue|pr)\.[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\.\d+$/.test(key))
+  if (!valid) throw new ChatError(400, 'invalid subject key', 'invalid')
+  const label = typeof candidate.label === 'string' ? candidate.label.slice(0, 200) : ''
+  if (!label) throw new ChatError(400, 'subject label is required', 'invalid')
+  const url = candidate.url
+  if (url !== undefined && (typeof url !== 'string' || !/^https:\/\/github\.com\//.test(url))) throw new ChatError(400, 'subject url must start with https://github.com/', 'invalid')
+  return { surface: 'current', key: key as string, label, ...(url !== undefined ? { url: (url as string).slice(0, 500) } : {}) }
+}
+
+/** A `?subject=<surface>:<key>` filter carries no label or url; the key
+ *  rules are the same as for creation. */
+function subjectFilter(value: string): Pick<ChatSubject, 'surface' | 'key'> {
+  const at = value.indexOf(':')
+  const checked = sanitizeSubject(at < 0 ? value : { surface: value.slice(0, at), key: value.slice(at + 1), label: 'lookup' })
+  return { surface: checked.surface, key: checked.key }
 }

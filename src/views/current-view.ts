@@ -1,4 +1,6 @@
 import { viewFeedback } from '../view-feedback'
+import { chatSidePane } from './chat-side-pane'
+import type { ChatSubject } from '../../server/chat/protocol'
 // Current — five-lane kanban that mixes free-form thinking with live GitHub
 // activity. The first three lanes (Idea / Concept / Plan) are manual cards
 // you drag around; the last two (Issue / PR) are read-only feeds pulled
@@ -7,7 +9,6 @@ import { viewFeedback } from '../view-feedback'
 // unaffected. The Issue lane has a richer composer (title / body / repo)
 // that opens a real GitHub issue via the proxy.
 
-import { getSettings } from '../config'
 import { disclosure, layout, retire, reveal } from '../motion'
 import { patchContent } from '../dom-patch'
 import { CURRENT_FILTER_KEY, TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../time-range'
@@ -296,9 +297,9 @@ const COPY_ICON_SVG = '<svg width="11" height="11" viewBox="0 0 14 14" fill="non
 // Checkmark shown for ~1.2s after a successful copy as visual feedback.
 const CHECK_ICON_SVG = '<svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M3 7.5l3 3 5-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 
-// Opens the Chat view's New session dialog with the card as context: a PR
-// binds to its head branch, an issue gets a new `<prefix>issue-<n>` branch.
-// The person confirms agent, model and branch before anything runs.
+// Opens the card's Chat session in the Chat view: its session when it has
+// one, else the composer with the card's prefill. The first message,
+// not the click, creates the session.
 const CHAT_SESSION_ICON_SVG = '<svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M2.5 3h9a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H7l-2.5 2v-2H2.5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linejoin="round"/><path d="M5 5.5l2 1.5-2 1.5M7.5 8.5h2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 
 function chatSessionButton(item: LiveItem): string {
@@ -390,6 +391,14 @@ function manualSessionId(card: ManualCard): string {
 
 function liveSessionId(item: LiveItem): string {
   return `poise.${item.is_pr === 1 ? 'pr' : 'issue'}.${item.repo}.${item.number}`
+}
+
+/** The card's Chat subject. Live cards carry their GitHub url, derived from
+ *  the key when only the button's dataset is at hand. */
+function cardSubject(key: string, label: string, url?: string): ChatSubject {
+  const live = /^poise\.(issue|pr)\.(.+)\.(\d+)$/.exec(key)
+  const derived = live ? `https://github.com/${live[2]}/${live[1] === 'pr' ? 'pull' : 'issues'}/${live[3]}` : undefined
+  return { surface: 'current', key, label, ...(url || derived ? { url: url || derived! } : {}) }
 }
 
 function renderManualCard(card: ManualCard): HTMLElement {
@@ -1452,9 +1461,9 @@ function attachCardClickHandlers() {
       return
     }
 
-    // Chat icon — opens (or toggles) the per-card chat pane on the
-    // left. Sibling of card-link / card-text so it doesn't propagate
-    // into navigation or edit.
+    // Chat icon — opens (or toggles) the card's Chat session in the side
+    // pane. Sibling of card-link / card-text so it doesn't propagate
+    // into navigation or edit. The prefill is the card's text, unsent.
     const chatBtn = target.closest<HTMLButtonElement>('.card-chat-btn')
     if (chatBtn) {
       e.preventDefault()
@@ -1463,13 +1472,12 @@ function attachCardClickHandlers() {
       const label = chatBtn.dataset.label || ''
       const draft = chatBtn.dataset.draft || ''
       if (!session) return
-      window.dispatchEvent(new CustomEvent('poise:open-chat', { detail: { session, label, draft } }))
+      chatSidePane.toggle({ subject: cardSubject(session, label), prefill: draft || undefined })
       return
     }
 
-    // Chat session icon — hands the card to the Chat view's New session
-    // dialog. The event carries what the dialog prefills; the person still
-    // confirms before a session starts.
+    // Chat session icon — opens the card's Chat session in the Chat view,
+    // or its composer with the card's prefill when it has no session yet.
     const chatSessionBtn = target.closest<HTMLButtonElement>('.card-chat-session-btn')
     if (chatSessionBtn) {
       e.preventDefault()
@@ -1477,12 +1485,10 @@ function attachCardClickHandlers() {
       const cardEl = chatSessionBtn.closest<HTMLElement>('.card')!
       const item = liveItems.find((i) => prKey(i) === (cardEl.dataset.id || ''))
       if (!item) return
-      const prefix = getSettings().chat?.branchPrefix || 'chat/'
       window.dispatchEvent(new CustomEvent('poise:open-chat-session', {
         detail: {
-          context: { kind: 'card', title: item.title, body: '', url: item.url },
-          repo: item.repo,
-          branch: item.is_pr === 1 ? { pr: item.number } : { new: `${prefix}issue-${item.number}` },
+          subject: cardSubject(liveSessionId(item), `${item.repo}#${item.number}`, item.url),
+          prefill: `${item.title}\n${item.url}`,
         },
       }))
       return

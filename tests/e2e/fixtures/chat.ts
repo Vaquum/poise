@@ -61,6 +61,20 @@ interface ServerState {
   agents?: typeof AGENTS
   /** Holds the POST /api/chat/sessions answer until released. */
   createDelay?: () => Promise<void>
+  /** Earlier conversations by subject key for GET /api/chat/legacy. */
+  legacy?: Record<string, { turns: Array<{ prompt: string, reply: string, at: string, status: string }>, omitted: number } | null>
+  /** Answer for POST /api/chat-content; recorded in state.calls. */
+  content?: (topic: string, chatSession: string) => { status: number, json: unknown }
+  /** Author-content jobs by call_id or launch_id for the status route. */
+  contentJobs?: Record<string, unknown>
+  /** Answer for POST /api/debate; recorded in state.calls. A test may hold
+   *  the answer open to stage what happens while a debate runs. */
+  debate?: (topic: string, chatSession: string) => { status: number, json: unknown } | Promise<{ status: number, json: unknown }>
+  /** Fail the legacy card-chat endpoints, so a card chat reaching
+   *  /api/chat again fails loudly instead of passing against {}. */
+  forbidLegacyChat?: boolean
+  /** Answer for GET /api/models; the surface reads the chat default. */
+  models?: unknown
 }
 
 async function installRoutes(page: Page, state: ServerState): Promise<void> {
@@ -70,7 +84,11 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     const path = url.pathname
     const method = req.method()
     const body = method === 'POST' || method === 'PATCH' || method === 'PUT' ? (req.postDataJSON?.() ?? null) : null
-    if (path.startsWith('/api/chat') || path === '/api/settings' || path === '/api/repos' || path === '/api/snippets') state.calls.push({ method, path, body })
+    if (path.startsWith('/api/chat') || path === '/api/debate' || path === '/api/settings' || path === '/api/repos' || path === '/api/snippets') state.calls.push({ method, path, body })
+    if (path === '/api/chat' && state.forbidLegacyChat) {
+      await route.fulfill({ status: 500, json: { error: 'legacy card chat is forbidden in this spec' } })
+      return
+    }
     if (path === '/api/settings') {
       if (method === 'POST') state.settings = { ...state.settings, ...(body as object) }
       await route.fulfill({ json: state.settings })
@@ -88,7 +106,31 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
       await route.fulfill({ json: board })
       return
     }
-    if (path === '/api/models') { await route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } }); return }
+    if (path === '/api/models') { await route.fulfill({ json: state.models || { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } }); return }
+    if (path === '/api/chat/legacy' && method === 'GET') {
+      const subject = url.searchParams.get('subject') || ''
+      const key = subject.slice(subject.indexOf(':') + 1)
+      await route.fulfill({ json: { conversation: state.legacy?.[key] ?? { turns: [], omitted: 0 } } })
+      return
+    }
+    if (path === '/api/chat-content' && method === 'POST') {
+      const { topic, chatSession } = (body || {}) as { topic: string, chatSession: string }
+      const answer = state.content ? state.content(topic, chatSession) : { status: 200, json: { call_id: 'c1', status: 'pending' } }
+      await route.fulfill(answer)
+      return
+    }
+    if (path === '/api/chat-content/status' && method === 'GET') {
+      const job = state.contentJobs?.[url.searchParams.get('call_id') || ''] ?? state.contentJobs?.[url.searchParams.get('launch_id') || '']
+      if (!job) { await route.fulfill({ status: 404, json: { error: 'author-content job not found' } }); return }
+      await route.fulfill({ json: job })
+      return
+    }
+    if (path === '/api/debate' && method === 'POST') {
+      const { topic, chatSession } = (body || {}) as { topic: string, chatSession: string }
+      const answer = state.debate ? await state.debate(topic, chatSession) : { status: 200, json: { id: 'd1', synthesis: 'Debated.', rounds: [] } }
+      await route.fulfill(answer)
+      return
+    }
     if (path === '/api/claude-auth') { await route.fulfill({ json: { status: 'authenticated', reason: null, checkedAt: NOW, verifiedAt: NOW, authMethod: 'claude.ai', subscriptionType: 'max', loginInProgress: false } }); return }
     if (path === '/api/repos') { await route.fulfill({ json: { repos: ['acme/app', 'acme/docs'] } }); return }
     if (path === '/api/chat/switches') { await route.fulfill({ json: state.switches || { revision: 0, switches: [] } }); return }
@@ -107,10 +149,20 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
       return
     }
     if (path === '/api/chat/files') { await route.fulfill({ json: { files: ['src/main.ts', 'src/menu.ts'].filter((f) => f.includes(url.searchParams.get('q') || '')) } }); return }
-    if (path === '/api/chat/sessions' && method === 'GET') { await route.fulfill({ json: { sessions: state.sessions, instance: 'poise-dev:test' } }); return }
+    if (path === '/api/chat/sessions' && method === 'GET') {
+      const subject = url.searchParams.get('subject')
+      if (subject !== null) {
+        const at = subject.indexOf(':')
+        const found = state.sessions.find((s) => s.subject?.surface === subject.slice(0, at) && s.subject?.key === subject.slice(at + 1)) || null
+        await route.fulfill({ json: { session: found, instance: 'poise-dev:test' } })
+        return
+      }
+      await route.fulfill({ json: { sessions: state.sessions, instance: 'poise-dev:test' } })
+      return
+    }
     if (path === '/api/chat/sessions' && method === 'POST') {
       if (state.createDelay) await state.createDelay()
-      const req2 = body as { agent: SessionRecord['agent'], model: string, effort: string, autoMerge?: boolean, safeMode?: boolean, deferStart?: boolean, role?: string }
+      const req2 = body as { agent: SessionRecord['agent'], model: string, effort: string, autoMerge?: boolean, safeMode?: boolean, deferStart?: boolean, role?: string, subject?: SessionRecord['subject'], skipLegacy?: boolean, title?: string }
       if (req2.role === 'manager') {
         const existing = state.sessions.find((s) => s.role === 'manager')
         if (existing) {
@@ -118,13 +170,21 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
           return
         }
       }
+      if (req2.subject) {
+        const winner = state.sessions.find((s) => s.subject?.surface === req2.subject!.surface && s.subject?.key === req2.subject!.key)
+        if (winner) {
+          await route.fulfill({ json: { session: winner, existing: true } })
+          return
+        }
+      }
       const created = session({ id: `new-${state.sessions.length + 1}`, agent: req2.agent, model: req2.model, effort: req2.effort, autoMerge: req2.autoMerge, safeMode: req2.safeMode === true,
-        repo: '', checkout: '/poise/.poise-chat/workspace', workspaceKind: 'poise-local', title: '', status: req2.deferStart ? 'idle' : 'starting', createdAt: new Date().toISOString(),
+        repo: '', checkout: '/poise/.poise-chat/workspace', workspaceKind: 'poise-local', title: req2.title || '', status: req2.deferStart ? 'idle' : 'starting', createdAt: new Date().toISOString(),
         branch: { name: 'chat/generated', origin: 'new', provisional: true },
+        ...(req2.subject ? { subject: req2.subject } : {}),
         ...(req2.role === 'manager' ? { role: 'manager' as const, title: 'Manager' } : {}) })
       state.sessions.unshift(created)
       state.history[created.id] = []
-      await route.fulfill({ status: 201, json: { session: created } })
+      await route.fulfill({ status: 201, json: { session: created, ...(req2.subject ? { existing: false } : {}) } })
       return
     }
     const m = /^\/api\/chat\/sessions\/([^/]+)(?:\/(resume|fork|close|handoff))?$/.exec(path)

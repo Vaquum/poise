@@ -10,15 +10,16 @@ interface HistoryHandlers {
 /** A selection list, not a second composer. Focus stays in the textarea and
  *  navigation never submits or replaces a draft. The snapshot stays stable
  *  during streaming; a still-loading transcript is filled when it arrives. */
-export function createMessageHistory(input: HTMLTextAreaElement, handlers: HistoryHandlers) {
+export function createMessageHistory(input: HTMLTextAreaElement, handlers: HistoryHandlers, options?: { idPrefix?: string }) {
+  const prefix = options?.idPrefix || ''
   const el = document.createElement('section')
   el.className = 'chat-message-history'
   el.hidden = true
   el.setAttribute('aria-label', 'Recent messages')
   el.innerHTML = `<div class="chat-history-heading"><span>Message history</span><span class="chat-history-count"></span>
-    <span id="chat-history-help" class="chat-history-help">↑↓ select · Enter recall · Esc close</span></div>
+    <span id="${prefix}chat-history-help" class="chat-history-help">↑↓ select · Enter recall · Esc close</span></div>
     <div class="chat-history-state" role="status" hidden></div>
-    <div id="chat-message-history-list" class="chat-history-list" role="listbox" aria-label="Message history"></div>`
+    <div id="${prefix}chat-message-history-list" class="chat-history-list" role="listbox" aria-label="Message history"></div>`
   const list = el.querySelector<HTMLElement>('.chat-history-list')!
   const status = el.querySelector<HTMLElement>('.chat-history-state')!
   const count = el.querySelector<HTMLElement>('.chat-history-count')!
@@ -52,7 +53,7 @@ export function createMessageHistory(input: HTMLTextAreaElement, handlers: Histo
       row.type = 'button'
       row.tabIndex = -1
       row.className = 'chat-history-item'
-      row.id = `chat-history-option-${i}`
+      row.id = `${prefix}chat-history-option-${i}`
       row.dataset.index = String(i)
       row.setAttribute('role', 'option')
       const label = historyLabel(entry)
@@ -91,14 +92,19 @@ export function createMessageHistory(input: HTMLTextAreaElement, handlers: Histo
     index = Number(row.dataset.index)
     recall()
   })
-  document.addEventListener('pointerdown', event => {
+  const onPointerDown = (event: PointerEvent) => {
     if (event.target !== input && !el.contains(event.target as Node)) close()
-  })
+  }
+  document.addEventListener('pointerdown', onPointerDown)
   input.addEventListener('blur', () => {
     setTimeout(() => { if (document.activeElement !== input && !el.contains(document.activeElement)) close() }, 0)
   })
+  function destroy(): void {
+    document.removeEventListener('pointerdown', onPointerDown)
+    el.remove()
+  }
   return {
-    el, close,
+    el, close, destroy,
     get open() { return !el.hidden },
     get fixedHeight() { return heading.offsetHeight + (status.hidden ? 0 : status.offsetHeight) + 10 },
     get rowsHeight() { return list.scrollHeight },
@@ -112,11 +118,11 @@ export function createMessageHistory(input: HTMLTextAreaElement, handlers: Histo
     key(event: KeyboardEvent, canOpen: boolean): boolean {
       if (event.isComposing || event.keyCode === 229 || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false
       if (el.hidden) {
-        if (event.key !== 'ArrowUp' || !canOpen) return false
+        if (event.key !== 'ArrowUp' || !canOpen || !el.isConnected) return false
         event.preventDefault()
         el.hidden = false
         input.setAttribute('aria-controls', list.id)
-        input.setAttribute('aria-describedby', 'chat-history-help')
+        input.setAttribute('aria-describedby', `${prefix}chat-history-help`)
         fill(handlers.read())
         disclosure(el, true)
         return true

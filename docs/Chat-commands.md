@@ -33,6 +33,19 @@ The selected catalogue effort travels with the model; a failed provider does
 not silently fall back to the previous agent. Draft model choices, attachments
 and command chips survive ordinary refresh and failed acknowledgements.
 
+## Content and consensus
+
+`/content <topic>` authors an article from the topic through the existing
+author-content pipeline, and `/consensus <topic>` debates the topic across
+models. Both run as composer commands, never as prompts, steers or queued
+messages — also while a turn runs. Each records a card in the transcript:
+the content card follows its article from launch to completion and opens it
+in the Editor, and the consensus card shows the running debate and then the
+synthesis, cut to 64 KiB when longer. A `/model` prefix still applies, and
+an empty topic asks for one instead of sending. Saved switches can no longer
+take either name; a stored or imported switch that already has one is renamed
+by the snippet library's existing rule.
+
 ## Adversarial review
 
 `/review` asks for an adversarial, evidence-based critical review of the most

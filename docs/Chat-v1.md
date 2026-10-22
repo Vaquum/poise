@@ -23,10 +23,14 @@ unsupported optional controls are not simulated.
 
 Current cards, Swarm rows and Editor documents can hand off into Chat. Changing
 the agent creates a new native session with a labelled context handoff, not a
-pretence that one vendor's session migrated to another. The existing chat pane
-remains for `/content`, `/consensus` and Editor annotations in v1. Its retirement
-belongs to v1.1. Antigravity models remain visible in the catalogue, but native
-Chat launches need a permission/question channel its current CLI does not offer.
+pretence that one vendor's session migrated to another. Each Current card has
+one Chat session of its own, opened from the card in the side pane or from
+Open in Chat in the Chat view; the pane shows the card's earlier conversation
+until the first message creates the session. `/content` and `/consensus` run
+as Chat composer commands with transcript cards. The legacy chat pane remains
+for Editor annotations until #370 retires it. Antigravity models remain visible
+in the catalogue, but native Chat launches need a permission/question channel
+its current CLI does not offer.
 pi, image input, worktrees and parallel turns on the same checkout are outside v1.
 
 ## Fresh console and split pane
@@ -120,6 +124,14 @@ internal implementation detail. The dialog contains no repository, branch, PR,
 or location picker, and both REST and WebSocket creation routes discard such
 fields, except `role`, which only REST accepts. Card/document handoffs supply
 context, not permission to check out another repository.
+
+At most one session per subject exists in a Poise instance, enforced by a
+unique SQLite index over the stored subject. A Current card's subject is its
+legacy chat id; opening the card resolves its session, and the first message
+or attach creates it and imports the earlier conversation as the session's
+first event. Creating for a subject that already has a session returns it.
+Handing off moves the subject to the new session; forking, resetting and
+deleting never duplicate it, and deleting frees it for the next chat.
 
 One Manager session can exist per Poise instance (`ChatRuntime.instance`,
 `poise-<label>:<POISE_DB>`), enforced by a unique SQLite index on

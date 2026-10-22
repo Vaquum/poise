@@ -3747,7 +3747,8 @@ tr:hover .stop-btn { opacity: 1; }
    the conversation stays readable on narrower viewports.
    ───────────────────────────────────────────────────────────────────────── */
 
-#chat-panel {
+#chat-panel,
+#chat-side-pane {
   position: fixed;
   /* Below the control bar, like the other fixed panels. The bar is a
      full-width opaque band at z-index 130, so a panel starting at y=0 has
@@ -3774,7 +3775,149 @@ tr:hover .stop-btn { opacity: 1; }
   overflow: hidden;
 }
 
-#chat-panel.open { transform: translateX(0); }
+#chat-panel.open,
+#chat-side-pane.open { transform: translateX(0); }
+
+/* A card's Chat session beside Current: header extras, the surface column,
+// the Earlier conversation block and the command cards. The pane frame
+// above is shared with the legacy pane until #370. */
+.chat-pane-state {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-right: auto;
+  margin-left: var(--sp-3);
+  white-space: nowrap;
+}
+
+.chat-pane-open {
+  border: none;
+  background: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  font-size: 0.75rem;
+  border-radius: var(--r-sm);
+  padding: var(--sp-1) var(--sp-2);
+  margin-right: var(--sp-1);
+  flex-shrink: 0;
+}
+.chat-pane-open:hover { color: var(--text); background: var(--hover); }
+
+.chat-side-surface {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chat-surface {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chat-surface-notice {
+  padding: var(--sp-3) var(--sp-5);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.chat-surface-earlier,
+.chat-surface-transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--sp-4) var(--sp-5);
+  min-height: 0;
+}
+
+.chat-surface-earlier:not([hidden]) + .chat-surface-transcript:empty {
+  display: none;
+}
+
+.chat-surface-queue,
+.chat-surface-composer {
+  flex-shrink: 0;
+}
+
+.chat-imported {
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.chat-imported summary {
+  cursor: pointer;
+  font-weight: 600;
+  margin-bottom: var(--sp-2);
+}
+
+.chat-imported-turn {
+  margin: var(--sp-3) 0;
+  padding-left: var(--sp-3);
+  border-left: 2px solid var(--border);
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.chat-imported-person {
+  white-space: pre-wrap;
+  color: var(--text);
+}
+
+.chat-imported-agent {
+  white-space: pre-wrap;
+}
+
+.chat-content-card,
+.chat-consensus-card {
+  display: grid;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0;
+}
+
+.chat-content-head,
+.chat-consensus-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.chat-content-status,
+.chat-consensus-status {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 0.8125rem;
+  color: var(--text-tertiary);
+}
+
+.chat-content-open {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  border-radius: var(--r-sm);
+  padding: var(--sp-2) var(--sp-3);
+}
+.chat-content-open:hover { background: var(--hover); }
+
+.chat-consensus-cut {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+}
+
+.chat-session-subject {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 /* Drag handle on the trailing edge. Sits inside the pane so it cannot be
    painted over by page content, and widens its hit area on hover. */

@@ -21,6 +21,7 @@ import type {
   SessionRecord,
   SessionStatus,
   AgentId,
+  ChatSubject,
 } from '../../server/chat/protocol'
 import { AGENT_LABELS } from '../../server/chat/protocol'
 import { chatClient, ChatCommandError, ChatHttpError, type AgentsResponse, type AgentInfo } from '../chat-client'
@@ -114,6 +115,8 @@ let tickTimer: ReturnType<typeof setInterval> | null = null
 let splitPane: ReturnType<typeof attachChatSidebar>
 let freshDraft: ComposerDraft | null = null
 let freshModelIdentity: string | null = null
+/** A card's subject waiting for its first message in the fresh console. */
+let freshSubject: ChatSubject | null = null
 let quickSessionPromise: Promise<SessionEntry> | null = null
 let firstPromptPending = false
 const AUTO_MERGE_DRAFT_KEY = 'poise-chat-fresh-auto-merge'
@@ -626,6 +629,7 @@ function sidebarHtml(): string {
     const waiting = s.status === 'waiting' || (s.pendingRequests?.length || 0) > 0
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0">`
       + `<div class="chat-session-title" title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</div>`
+      + (s.subject ? `<div class="chat-session-subject">From Current · ${escapeHtml(s.subject.label)}</div>` : '')
       + creatorHtml(s)
       + `<div class="chat-session-meta">`
       + (s.role === 'manager' ? `<span class="chat-pill chat-pill-manager">Manager</span>` : '')
@@ -767,6 +771,7 @@ async function selectSession(id: string, restoring = false): Promise<void> {
   const switching = activeId !== id
   if (switching) filePreview.close()
   activeId = id
+  freshSubject = null
   closeDialog()
   if (switching) {
     transcript.clear()
@@ -889,11 +894,13 @@ function ensureQuickSession(firstPrompt?: ComposerDraft, title?: string, deferSt
     const request = quickSessionRequest(catalogue.agents, selectedModel)
     if (selectedAutoMerge) request.autoMerge = true
     request.safeMode = selectedSafeMode
+    if (freshSubject) request.subject = freshSubject
     if (deferStart) request.deferStart = true
     if (firstPrompt?.text) request.title = firstPrompt.text.slice(0, 200)
     else if (title) request.title = title.slice(0, 200)
     const created = await createSessionEntry(request, draft, firstPrompt, null)
     freshModelIdentity = null
+    freshSubject = null
     setFreshAutoMerge(false)
     setFreshSafeMode(false)
     return created
@@ -1503,7 +1510,7 @@ async function sendPrompt(draft: ComposerDraft): Promise<void> {
   // A batch stays with its agent even when it includes Poise. Only the
   // explicit command selects the independent one-change release controller.
   const autoMerge = current ? current.autoMerge === true : freshAutoMerge
-  const natural = explicit || autoMerge || chain.review || chain.context ? null : recognisePoiseRequest(chain.text, { poiseChangeSession: current?.workspaceKind === 'poise-change' })
+  const natural = explicit || autoMerge || chain.review || chain.context || current?.subject || freshSubject ? null : recognisePoiseRequest(chain.text, { poiseChangeSession: current?.workspaceKind === 'poise-change' })
   // Vocabulary alone must not reinterpret work on another repository as a
   // Poise request. An explicit Poise target still means what the user wrote.
   const otherRepository = !!current?.repo && current.repo.toLowerCase() !== POISE_REPOSITORY.toLowerCase()
@@ -1659,11 +1666,43 @@ async function runOwnCommand(name: string, arg: string): Promise<void> {
     await startPoiseChange({ request: arg.trim(), form: 'slash' }, { ...emptyDraft(), text: `/poise ${arg}`.trim() })
     return
   }
+  // Content and consensus make their own session when the console has none.
+  if (name === 'content' || name === 'consensus') { await runChatCommand(name, arg); return }
   const e = entry()
   if (!e) return
   if (name === 'model') await setModel(arg, e.record.effort)
   else if (name === 'mode') await setMode(arg)
   else if (name === 'fork') await forkActive()
+}
+
+async function runChatCommand(name: 'content' | 'consensus', arg: string): Promise<void> {
+  let e = entry()
+  const submitted = composer.getDraft()
+  if (!e) {
+    try {
+      e = await ensureQuickSession()
+    } catch (err) {
+      commandFailed(err, 'Start session')
+      queueRender()
+      return
+    }
+  }
+  if (e.pending) return
+  const topic = arg.trim() || e.record.subject?.label.trim() || ''
+  if (!topic) { setNotice(`Give /${name} a topic.`); return }
+  // Clear at send, like a prompt: a debate holds its request for minutes,
+  // and nothing submitted later may be erased when it lands.
+  composer.setDraft({ ...emptyDraft(), model: submitted.model })
+  try {
+    if (name === 'content') await chatClient.runContent(e.record.id, topic)
+    else await chatClient.runConsensus(e.record.id, topic)
+    setNotice(null)
+  } catch (err) {
+    restoreDraftTo(e.record.id, submitted)
+    if (activeId === e.record.id) commandFailed(err, name === 'content' ? 'Content' : 'Consensus')
+    else e.error = `/${name} failed — ${(err as Error).message}`
+  }
+  queueRender()
 }
 
 async function handoff(agent: AgentId, model: string, effort?: string): Promise<void> {
@@ -2062,7 +2101,7 @@ function render(): void {
   const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight
   const wasAtBottom = distance <= STICK_TO_BOTTOM_PX
   if (e) {
-    transcript.render(e.model, { showActivity, showReasoning, agent: e.record.agent, running: isRunning(e.record.status) || !!e.model.running, interruptedTurnId: e.record.interruptedTurnId,
+    transcript.render(e.model, { showActivity, showReasoning, agent: e.record.agent, running: isRunning(e.record.status) || !!e.model.running, interruptedTurnId: e.record.interruptedTurnId, sessionId: e.record.id,
       chats: [...sessions.values()].map((entry) => ({ id: entry.record.id, title: entry.record.title, role: entry.record.role })) })
   } else {
     transcript.clear()
@@ -2206,6 +2245,44 @@ export async function openChatSession(id: string): Promise<void> {
   else setNotice(`Session ${id} was not found.`)
 }
 
+/** Open a card's chat: its session when it has one, else the fresh console
+ *  with the card's prefill. The first message creates the session. */
+export async function openChatForSubject(subject: ChatSubject, prefill?: string, draft?: ComposerDraft): Promise<void> {
+  await ensureInit()
+  let found: SessionRecord | null = null
+  try {
+    found = await chatClient.sessionForSubject(subject)
+  } catch (err) {
+    setNotice(`Could not open this card's chat — ${(err as Error).message}`)
+    return
+  }
+  if (found) {
+    upsertRecord(found)
+    await selectSession(found.id)
+    if (draft && (draft.text || draft.attachments.length)) {
+      const e = sessions.get(found.id)
+      if (e) {
+        e.draft = draft
+        if (activeId === found.id) composer.setDraft(draft)
+      }
+    }
+    return
+  }
+  if (activeId) {
+    const prev = sessions.get(activeId)
+    if (prev) prev.draft = composer.getDraft()
+  }
+  closeDialog()
+  activeId = null
+  freshSubject = subject
+  transcript.clear()
+  composer.setDraft(draft && (draft.text || draft.attachments.length) ? draft : prefill ? { ...emptyDraft(), text: prefill } : emptyDraft())
+  setNotice(null)
+  composerStateFor(null)
+  queueRender()
+  composer.focus()
+}
+
 /** Open the New session dialog prefilled from a card or a document. */
 export async function openChatWithContext(prefill: NewSessionPrefill): Promise<void> {
   await ensureInit()
@@ -2259,12 +2336,9 @@ export async function initChatView(): Promise<void> {
       savedSwitches = { revision: 0, switches: [] }; switchNames.clear()
       composer.setSwitches([])
       void loadSwitches(true).catch(() => undefined)
-      // Sessions may have been interrupted or cleaned up; re-read them and
-      // re-subscribe from what each transcript already holds.
+      // Sessions may have been interrupted or cleaned up; re-read them.
+      // The client re-subscribes every held session from its own watermark.
       chatClient.resetSubscriptions()
-      for (const e of sessions.values()) {
-        if (e.loaded) chatClient.subscribe(e.record.id, e.record.lastSeq || 0)
-      }
       void loadSessions()
       // A restart is what a promotion or rollback looks like from here.
       scheduleSelfPoll(0)

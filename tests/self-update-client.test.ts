@@ -9,6 +9,7 @@ import { HEALTH_POLL_MAX_MS, HEALTH_POLL_MS, IDLE_BEFORE_RELOAD_MS, OBSERVATION_
 import type { SelfChange, SelfUpdateStatus } from '../src/self-update-types'
 import { deployCardHtml } from '../src/views/chat-deploy-card'
 import { POISE_REPOSITORY as REPOSITORY } from '../src/poise-repository'
+import { domBlockers, installDomGuards } from '../src/self-update-guards'
 
 // The browser half of the self-improvement workflow, minus the DOM: how a
 // typed message becomes (or does not become) a change command, how the deploy
@@ -366,5 +367,141 @@ describe('deciding to reload', () => {
     none.c.requestRefresh()
     expect(none.c.plan([], 0)).toMatchObject({ action: 'reload', explicit: true })
     expect(none.c.markReloading({ sha: SHA_B, releaseId: 'r2' }, true)).toBe(true)
+  })
+})
+
+describe('the side pane draft guard', () => {
+  // The guards read a document; node has no DOM, so the test builds the
+  // smallest tree that answers tag, id, class, attribute and :not matching
+  // for the selectors the guards actually use.
+  interface FakeElement {
+    tag: string
+    id: string | null
+    classes: string[]
+    attrs: Record<string, string>
+    value: string
+    parent: FakeElement | null
+  }
+  function matchSimple(node: FakeElement, simple: string): boolean {
+    const not = /:not\(([^)]+)\)/.exec(simple)
+    const base = simple.replace(/:not\([^)]+\)/g, '')
+    const tag = /^[a-z][a-z0-9]*/i.exec(base)?.[0]
+    if (tag && node.tag !== tag.toLowerCase()) return false
+    const id = /#([A-Za-z0-9_-]+)/.exec(base)?.[1]
+    if (id && node.id !== id) return false
+    for (const cls of base.match(/\.[A-Za-z0-9_-]+/g) || []) {
+      if (!node.classes.includes(cls.slice(1))) return false
+    }
+    for (const attr of base.match(/\[[^\]]+\]/g) || []) {
+      const parsed = /\[([A-Za-z0-9_-]+)(?:="([^"]*)")?\]/.exec(attr)!
+      const value = node.attrs[parsed[1]]
+      if (value === undefined || (parsed[2] !== undefined && value !== parsed[2])) return false
+    }
+    if (not && matchSimple(node, not[1])) return false
+    return true
+  }
+  function matchChain(node: FakeElement, steps: string[]): boolean {
+    let current: FakeElement | null = node
+    for (let i = steps.length - 1; i >= 0; i--) {
+      while (current && !matchSimple(current, steps[i])) current = current.parent
+      if (!current) return false
+      if (i > 0) current = current.parent
+    }
+    return true
+  }
+  class FakeTextArea implements FakeElement {
+    tag = 'textarea'
+    id: string | null = null
+    classes: string[] = []
+    attrs: Record<string, string> = {}
+    value = ''
+    parent: FakeElement | null = null
+    isConnected = true
+    dataset: Record<string, string> = {}
+    getClientRects() { return [{}] }
+    matches(selector: string): boolean { return selector.split(',').some((part) => matchChain(this, part.trim().split(/\s+/))) }
+    closest(selector: string): FakeElement | null {
+      // eslint-disable-next-line @typescript-eslint/no-this-alias -- climbing the fake tree needs a cursor
+      let node: FakeElement | null = this
+      while (node) {
+        if (selector.split(',').some((part) => matchChain(node!, part.trim().split(/\s+/)))) return node
+        node = node.parent
+      }
+      return null
+    }
+  }
+
+  function fakeDoc() {
+    const listeners = new Map<string, Array<(e: { target: unknown }) => void>>()
+    let current: FakeTextArea | null = null
+    const paneOf = (node: FakeTextArea | null) => {
+      let found: FakeElement | null = node
+      while (found && found.id !== 'chat-side-pane') found = found.parent
+      return found
+    }
+    return {
+      activeElement: null,
+      addEventListener: (name: string, fn: (e: { target: unknown }) => void) => {
+        listeners.set(name, [...(listeners.get(name) || []), fn])
+      },
+      show: (input: FakeTextArea) => { current = input },
+      dispatch: (name: string, target: unknown) => { for (const fn of listeners.get(name) || []) fn({ target }) },
+      querySelectorAll: (selector: string) => selector.includes('textarea') && current ? [current] : [],
+      querySelector: (_selector: string) => null,
+      getElementById: (id: string) => {
+        const found = id === 'chat-side-pane' ? paneOf(current) : null
+        return found ? { classList: { contains: (name: string) => name === 'open' && found.classes.includes('open') } } : null
+      },
+    }
+  }
+
+  function paneInput(open: boolean): FakeTextArea {
+    const aside = new FakeTextArea()
+    aside.tag = 'aside'; aside.id = 'chat-side-pane'; aside.classes = open ? ['open'] : []
+    const form = new FakeTextArea()
+    form.tag = 'form'; form.classes = ['chat-v-composer']; form.parent = aside
+    const input = new FakeTextArea()
+    input.classes = ['chat-input']; input.parent = form
+    return input
+  }
+
+  function chatViewInput(): FakeTextArea {
+    const section = new FakeTextArea()
+    section.tag = 'section'; section.id = 'view-chat'
+    const form = new FakeTextArea()
+    form.tag = 'form'; form.classes = ['chat-v-composer']; form.parent = section
+    const input = new FakeTextArea()
+    input.classes = ['chat-input']; input.parent = form
+    return input
+  }
+
+  it('treats an unsent side-pane draft as unsaved work', () => {
+    ;(globalThis as any).HTMLTextAreaElement = FakeTextArea
+    ;(globalThis as any).HTMLInputElement = class {}
+    ;(globalThis as any).getComputedStyle = () => ({ visibility: 'visible' })
+    ;(globalThis as any).window = { addEventListener: () => {} }
+    try {
+      const doc = fakeDoc()
+      installDomGuards(doc as unknown as Document)
+      const type = (input: FakeTextArea) => {
+        doc.show(input)
+        doc.dispatch('focusin', input)
+        input.value = 'unsent words'
+        doc.dispatch('input', input)
+        return domBlockers(doc as unknown as Document)
+      }
+      // The open pane's composer is a dirty field: it blocks a reload.
+      expect(type(paneInput(true))).toContain('dirty-input')
+      expect(guardClass('dirty-input')).toBe('hard')
+      // The Chat view's composer is excluded: the snapshot carries its draft.
+      expect(type(chatViewInput())).not.toContain('dirty-input')
+      // A closed pane is not in use, draft or not.
+      expect(type(paneInput(false))).not.toContain('dirty-input')
+    } finally {
+      delete (globalThis as any).HTMLTextAreaElement
+      delete (globalThis as any).HTMLInputElement
+      delete (globalThis as any).getComputedStyle
+      delete (globalThis as any).window
+    }
   })
 })

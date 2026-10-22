@@ -152,6 +152,36 @@ it('reads a manual file edit on the next invocation and advances its revision', 
   expect(() => library.readSwitches()).toThrow(/metadata could not be read/)
 })
 
+it('renames a stored or imported skill named content or consensus instead of failing the library', async () => {
+  const header = (names: Array<[string, string]>) => `# poise-chat-library-v1 ${Buffer.from(JSON.stringify({ imports: [], names })).toString('base64url')}`
+  const reset = async () => {
+    database.setMeta('chat_custom_switches', '')
+    database.db.prepare("DELETE FROM meta WHERE key LIKE 'chat_snippet_%'").run()
+    await rm(join(root, 'match'), { recursive: true, force: true }); await mkdir(join(root, 'match'))
+  }
+  // Stored: bindings written before the names became reserved.
+  await writeFile(file, `${header([[';content', 'content'], [';consensus', 'consensus']])}\nmatches:\n  - trigger: ;content\n    replace: Content body\n  - trigger: ;consensus\n    replace: Consensus body\n`)
+  const stored = await library.readSkillSnippets()
+  expect(stored.skills.switches.map(skill => skill.name).sort()).toEqual(['snippet-consensus', 'snippet-content'])
+  expect(stored.skills.switches.find(skill => skill.snippetTrigger === ';content')).toMatchObject({ name: 'snippet-content', content: 'Content body' })
+  expect(library.expandSwitches('Task', ['snippet-content'])).toContain('Content body')
+  // The new names persist on the next write; the triggers never change.
+  const written = await library.addSkillSnippet({ trigger: ';extra', replace: 'Extra' })
+  expect(written.skills.switches.find(skill => skill.snippetTrigger === ';content')?.name).toBe('snippet-content')
+  const persisted = JSON.parse(Buffer.from((await readFile(file, 'utf8')).split('\n').find(line => line.startsWith('# poise-chat-library-v1 '))!.slice('# poise-chat-library-v1 '.length).trim(), 'base64url').toString('utf8'))
+  expect(persisted.names).toContainEqual([';content', 'snippet-content'])
+  expect(persisted.names).toContainEqual([';consensus', 'snippet-consensus'])
+  // Imported: legacy saved switches with the now-reserved names.
+  await reset()
+  database.setMeta('chat_custom_switches', JSON.stringify({ revision: 2, switches: [
+    { name: 'content', content: 'Old content skill', revision: 1, updatedAt: '2026-09-22' },
+    { name: 'consensus', content: 'Old consensus skill', revision: 1, updatedAt: '2026-09-22' },
+  ] }))
+  const imported = await library.readSkillSnippets()
+  expect(imported.skills.switches.map(skill => skill.name).sort()).toEqual(['snippet-consensus', 'snippet-content'])
+  expect(imported.skills.switches.find(skill => skill.name === 'snippet-content')?.content).toBe('Old content skill')
+})
+
 it('rejects a stale edit after a skill was deleted and recreated with the same body', async () => {
   await library.saveSwitch({ name: 'recreated', content: 'Same original body', revision: 0 })
   const original = await library.readSkillSnippets()

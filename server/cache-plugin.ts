@@ -40,7 +40,7 @@ import { validateGoogleEnvironment } from './google/accounts'
 import { getBehaviorDiagnosticIncidents } from './behaviors'
 import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
-import { ContentLaunchPendingError, getContentJobResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
+import { ContentLaunchPendingError, contentLaunchIdForCall, getContentJobResponse, getContentLaunchResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
 import { retryFailedPrReviews } from './behaviors'
 import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders, type RequestAuthority } from './http'
@@ -62,6 +62,8 @@ import { invalidateAccounts, listAccounts, scheduleAccountsCheck } from './accou
 import { accountLogins, recordLogin } from './accounts/logins'
 import { connectGitHubAccount, onboardingState, updateOnboarding } from './service/onboarding'
 import { isAccountId, type AccountId, type ConnectedAccount } from './accounts/types'
+import { randomUUID } from 'node:crypto'
+import { ChatError } from './chat/runtime'
 import { TerminalSocketServer } from './terminal/server'
 import type { TerminalCommand } from './terminal/pty'
 import type { TerminalPreset } from './terminal/protocol'
@@ -122,6 +124,28 @@ function serviceOf(opts: CachePluginOptions): ServiceConfig | null {
 export function getChatRuntime(): ChatRuntime {
   if (!chatRuntime) throw new Error('the chat runtime is not started')
   return chatRuntime
+}
+
+/** Refuse an unknown or foreign Chat session before anything launches. */
+function requireChatSession(runtime: ChatRuntime | null, id: string): void {
+  if (!runtime) throw new ChatError(503, 'the chat runtime is not started', 'agent_error')
+  if (!runtime.get(id)) throw new ChatError(404, 'unknown session', 'unknown_session')
+}
+
+const CONSENSUS_SYNTHESIS_MAX_BYTES = 64 * 1024
+
+/** Cut a synthesis to 64 KiB at a character boundary, stating the cut. */
+function cutSynthesis(synthesis: string): { synthesis: string, truncated: boolean } {
+  const text = String(synthesis ?? '')
+  if (Buffer.byteLength(text, 'utf8') <= CONSENSUS_SYNTHESIS_MAX_BYTES) return { synthesis: text, truncated: false }
+  let end = Math.min(text.length, CONSENSUS_SYNTHESIS_MAX_BYTES)
+  while (end > 0 && Buffer.byteLength(text.slice(0, end), 'utf8') > CONSENSUS_SYNTHESIS_MAX_BYTES) {
+    const over = Buffer.byteLength(text.slice(0, end), 'utf8') - CONSENSUS_SYNTHESIS_MAX_BYTES
+    end -= Math.max(1, Math.floor(over / 4))
+  }
+  let cut = text.slice(0, end)
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1)
+  return { synthesis: cut, truncated: true }
 }
 
 export function getSelfUpdateService(): SelfUpdateService {
@@ -987,8 +1011,20 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           try {
             const body = await readJson<any>(req)
             const topic   = String(body.topic   || '')
-            const session = String(body.session || '')
+            const chatSession = typeof body.chatSession === 'string' && body.chatSession ? body.chatSession : ''
+            const session = String(body.session || '') || chatSession
+            if (chatSession) requireChatSession(chatRuntime, chatSession)
             const job = await launchAndEnqueueContentJob(topic, session)
+            if (chatSession && chatRuntime) {
+              const pending = job as { pending?: boolean, launch_id?: string }
+              if (pending.pending && pending.launch_id) {
+                chatRuntime.recordCommandEvent(chatSession, { type: 'content.started', topic, launchId: pending.launch_id })
+              } else {
+                const linked = job as { call_id: string }
+                const launchId = contentLaunchIdForCall(linked.call_id)
+                chatRuntime.recordCommandEvent(chatSession, { type: 'content.started', topic, launchId, callId: linked.call_id })
+              }
+            }
             // 202 when the agent is running but its call row has not been
             // identified yet — the recovery pass links it shortly. It is not a
             // failure and must not be reported as one.
@@ -1007,6 +1043,12 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (url?.startsWith('/api/chat-content/status') && req.method === 'GET') {
           try {
             const qs = new URLSearchParams(url.split('?')[1] || '')
+            const launchId = qs.get('launch_id') || ''
+            if (launchId) {
+              const job = getContentLaunchResponse(launchId)
+              if (!job) return json(res, 404, { error: 'author-content job not found' })
+              return json(res, 200, job)
+            }
             const callId = qs.get('call_id') || ''
             if (!callId) return json(res, 400, { error: 'call_id is required' })
             const job = getContentJobResponse(callId)
@@ -1025,8 +1067,24 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (url === '/api/debate' && req.method === 'POST') {
           try {
             const body = await readJson<any>(req)
-            const result = await countDebate(() => runDebate(String(body.topic || ''), Number(body.rounds || 1)))
-            return json(res, 200, result)
+            const chatSession = typeof body.chatSession === 'string' && body.chatSession ? body.chatSession : ''
+            if (!chatSession) {
+              const result = await countDebate(() => runDebate(String(body.topic || ''), Number(body.rounds || 1)))
+              return json(res, 200, result)
+            }
+            requireChatSession(chatRuntime, chatSession)
+            const topic = String(body.topic || '')
+            const id = randomUUID()
+            chatRuntime!.recordCommandEvent(chatSession, { type: 'consensus.started', id, topic })
+            try {
+              const result = await countDebate(() => runDebate(topic, 1))
+              const { synthesis, truncated } = cutSynthesis(result.synthesis)
+              chatRuntime!.recordCommandEvent(chatSession, { type: 'consensus.finished', id, synthesis, ...(truncated ? { truncated: true } : {}) })
+              return json(res, 200, { ...result, id })
+            } catch (error: any) {
+              chatRuntime!.recordCommandEvent(chatSession, { type: 'consensus.finished', id, error: error?.message || String(error) })
+              throw error
+            }
           } catch (err: any) {
             return json(res, httpStatus(err, 500), { error: err?.message || String(err) })
           }

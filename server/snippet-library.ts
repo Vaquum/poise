@@ -31,8 +31,18 @@ function metadataFrom(raw: string | null): Metadata {
     if (!Array.isArray(value.imports) || !value.imports.every(id => typeof id === 'string' && /^[a-f0-9]{64}$/.test(id)) || !Array.isArray(value.names)) throw new Error('invalid header')
     const names = new Set<string>(), triggers = new Set<string>()
     for (const pair of value.names) {
-      if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== 'string' || typeof pair[1] !== 'string' || switchName(pair[1]) !== pair[1] || RESERVED_SWITCHES.has(pair[1]) || names.has(pair[1]) || triggers.has(pair[0])) throw new Error('invalid binding')
-      names.add(pair[1]); triggers.add(pair[0])
+      if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== 'string' || typeof pair[1] !== 'string' || triggers.has(pair[0])) throw new Error('invalid binding')
+      let name = pair[1]
+      if (RESERVED_SWITCHES.has(name)) {
+        // A stored name that became reserved (a new built-in took it) is
+        // renamed by the existing rule instead of failing the library. The
+        // text-expansion trigger is kept; the new name shows at once and is
+        // saved on the next write.
+        name = uniqueName(candidateName(pair[0]), pair[0], names)
+        pair[1] = name
+      }
+      if (switchName(name) !== name || RESERVED_SWITCHES.has(name) || names.has(name)) throw new Error('invalid binding')
+      names.add(name); triggers.add(pair[0])
     }
     return value
   } catch { throw new HttpError(500, 'The snippet skill-name metadata could not be read. No snippets or skills were replaced.') }
@@ -52,6 +62,28 @@ function uniqueName(candidate: string, trigger: string, used: Set<string>): stri
   let name = `${candidate.slice(0, 52)}-${suffix}`
   for (let n = 2; used.has(name) || RESERVED_SWITCHES.has(name); n++) name = `${candidate.slice(0, 46)}-${suffix}-${n}`
   return name
+}
+/** Rename imported skills whose names became reserved, by the existing
+ *  rule, before the strict shape check. Anything else still rejects. */
+function renameReservedImport(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return value
+  const data = value as { switches?: unknown }
+  if (!Array.isArray(data.switches)) return value
+  const used = new Set<string>()
+  for (const item of data.switches) {
+    const name = (item as { name?: unknown } | null)?.name
+    if (typeof name === 'string' && !RESERVED_SWITCHES.has(name)) used.add(name)
+  }
+  let changed = false
+  const switches = data.switches.map((item) => {
+    const name = (item as { name?: unknown } | null)?.name
+    if (typeof name !== 'string' || !RESERVED_SWITCHES.has(name)) return item
+    const renamed = uniqueName(candidateName(`;${name}`), `;${name}`, used)
+    used.add(renamed)
+    changed = true
+    return { ...(item as object), name: renamed }
+  })
+  return changed ? { ...(data as object), switches } : value
 }
 function bind(snippets: Snippet[], metadata: Metadata): Map<string, string> {
   const names = new Map(metadata.names), used = new Set(names.values())
@@ -74,7 +106,7 @@ function plan(snapshot: ReturnType<typeof readSnippetSnapshotSync>): Plan {
     const raw = getMeta('chat_custom_switches')
     if (raw) {
       let legacy: ChatSwitches | null = null
-      try { legacy = parseChatSwitches(JSON.parse(raw)) } catch { /* reject below */ }
+      try { legacy = parseChatSwitches(renameReservedImport(JSON.parse(raw))) } catch { /* reject below */ }
       if (!legacy) throw new HttpError(500, 'Saved switches could not be read. No definitions were replaced.')
       const used = new Set(metadata.names.map(([, name]) => name))
       for (const skill of legacy.switches) {

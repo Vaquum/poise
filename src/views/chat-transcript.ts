@@ -17,6 +17,7 @@ import type {
   ChatEnvelope,
   AgentId,
   ContentBlock,
+  LegacyConversation,
   PermissionOption,
   PlanEntry,
   PoiseActor,
@@ -111,6 +112,9 @@ export type Block =
   | { kind: 'turn', key: string, turn: TurnModel }
   | { kind: 'error', key: string, rev: number, message: string }
   | { kind: 'note', key: string, rev: number, text: string }
+  | { kind: 'imported', key: string, rev: number, legacyId: string, turns: LegacyConversation['turns'], omitted: number }
+  | { kind: 'content', key: string, rev: number, topic: string, launchId: string, callId?: string }
+  | { kind: 'consensus', key: string, rev: number, id: string, topic: string, synthesis?: string, truncated?: boolean, error?: string, finished: boolean }
 
 export interface TranscriptModel {
   /** Buffered history cannot cross a reset barrier. */
@@ -430,12 +434,74 @@ export function applyEvent(model: TranscriptModel, env: ChatEnvelope): void {
       bump(model, block)
       return
     }
+    case 'history.imported': {
+      const block: Block = { kind: 'imported', key: `imported:${env.seq}`, rev: 0, legacyId: e.legacyId, turns: e.turns, omitted: e.omitted }
+      model.blocks.push(block)
+      bump(model, block)
+      return
+    }
+    case 'content.started': {
+      const block: Block = { kind: 'content', key: `content:${e.launchId}`, rev: 0, topic: e.topic, launchId: e.launchId, ...(e.callId ? { callId: e.callId } : {}) }
+      model.blocks.push(block)
+      bump(model, block)
+      return
+    }
+    case 'consensus.started': {
+      const block: Block = { kind: 'consensus', key: `consensus:${e.id}`, rev: 0, id: e.id, topic: e.topic, finished: false }
+      model.blocks.push(block)
+      bump(model, block)
+      return
+    }
+    case 'consensus.finished': {
+      const block = model.blocks.find((b): b is Extract<Block, { kind: 'consensus' }> => b.kind === 'consensus' && b.id === e.id)
+      if (block) {
+        block.synthesis = e.synthesis
+        block.truncated = e.truncated
+        block.error = e.error
+        block.finished = true
+        bump(model, block)
+      } else {
+        // A result that lands after a reset has no start to complete.
+        const orphan: Block = { kind: 'consensus', key: `consensus:${e.id}`, rev: 0, id: e.id, topic: '', synthesis: e.synthesis, truncated: e.truncated, error: e.error, finished: true }
+        model.blocks.push(orphan)
+        bump(model, orphan)
+      }
+      return
+    }
     default:
       return
   }
 }
 
 // ── Rendering ──────────────────────────────────────────────────────────────
+
+/** The read-only Earlier conversation block, shared by the transcript's
+ *  import card and the surface's pre-session block. */
+export function renderImportedHtml(turns: LegacyConversation['turns'], omitted: number, open: boolean): string {
+  const count = `${turns.length} turn${turns.length === 1 ? '' : 's'}${omitted ? ` · ${omitted} earlier left out` : ''}`
+  const body = turns.map((turn) => `<div class="chat-imported-turn"><div class="chat-imported-person">${escapeHtml(turn.prompt)}</div>`
+    + `<div class="chat-imported-agent">${escapeHtml(turn.reply)}</div></div>`).join('')
+  return `<details class="chat-imported"${open ? ' open' : ''}><summary>Earlier conversation · ${escapeHtml(count)}</summary>${body}</details>`
+}
+
+export interface ContentCardState { status: string, slug?: string, error?: string }
+
+function contentCardHtml(block: Extract<Block, { kind: 'content' }>, state?: ContentCardState): string {
+  const head = `<div class="chat-content-head"><span class="chat-msg-mode-tag">/content</span> <span>${escapeHtml(block.topic)}</span></div>`
+  if (!state || (state.status !== 'completed' && state.status !== 'failed')) return `<div class="chat-content-card">${head}<div class="chat-content-status">${ICON_SPIN} Authoring…</div></div>`
+  if (state.status === 'failed' || !state.slug) {
+    return `<div class="chat-content-card">${head}<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(state.error || 'The article finished without a slug.')}</div></div></div>`
+  }
+  return `<div class="chat-content-card">${head}<div class="chat-content-done"><button type="button" class="chat-content-open" data-slug="${escapeHtml(state.slug)}">Open in Editor</button></div></div>`
+}
+
+function consensusCardHtml(block: Extract<Block, { kind: 'consensus' }>): string {
+  const head = block.topic ? `<div class="chat-consensus-head"><span class="chat-msg-mode-tag">/consensus</span> <span>${escapeHtml(block.topic)}</span></div>` : ''
+  if (!block.finished) return `<div class="chat-consensus-card">${head}<div class="chat-consensus-status">${ICON_SPIN} Debating…</div></div>`
+  if (block.error) return `<div class="chat-consensus-card">${head}<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(block.error)}</div></div></div>`
+  return `<div class="chat-consensus-card">${head}<div class="chat-msg-body">${renderMarkdown(block.synthesis || '')}</div>`
+    + (block.truncated ? '<div class="chat-consensus-cut">Cut to 64 KiB.</div>' : '') + '</div>'
+}
 
 export interface TranscriptHandlers {
   onPermission(id: string, optionId: string): void
@@ -454,6 +520,8 @@ export interface RenderContext {
   interruptedTurnId?: string
   /** Whether the session is running a turn right now (drives the dots). */
   running: boolean
+  /** The rendered session; question drafts are kept per session. */
+  sessionId?: string
   /** Live chats for actor labels: a listed source is a select button, a
    *  missing one renders with a deleted marker. */
   chats?: Array<{ id: string, title: string, role?: 'manager' }>
@@ -557,21 +625,95 @@ export interface TranscriptView {
   tick(): void
   /** Text of a rendered message, for the copy button. */
   textFor(key: string): string
+  destroy(): void
 }
+
+type DraftRow = [string, Array<{ name: string, type: string, value: string, checked: boolean }>]
 
 export function createTranscriptView(container: HTMLElement, handlers: TranscriptHandlers): TranscriptView {
   const nodes = new Map<string, { el: HTMLElement, rev: number }>()
   const ui = new Map<string, UiState>()
   const disclosures = new Set<string>()
   const questionDraftKey = 'poise-chat-question-drafts'
+  /** Saved drafts by session; two transcripts never clobber each other. */
+  const draftStore = new Map<string, DraftRow[]>()
+  /** The session whose drafts `ui` currently holds, if any render has run. */
+  let draftSession: string | null = null
+  function validDraftRow(row: unknown): row is DraftRow {
+    return Array.isArray(row) && typeof row[0] === 'string' && Array.isArray(row[1])
+      && (row[1] as unknown[]).every((answer: any) => answer && typeof answer.name === 'string' && typeof answer.type === 'string'
+        && typeof answer.value === 'string' && typeof answer.checked === 'boolean')
+  }
   try {
     const saved = JSON.parse(sessionStorage.getItem(questionDraftKey) || '[]')
-    if (Array.isArray(saved)) for (const row of saved) {
-      if (Array.isArray(row) && typeof row[0] === 'string' && Array.isArray(row[1])
-        && row[1].every((answer: any) => answer && typeof answer.name === 'string' && typeof answer.type === 'string'
-          && typeof answer.value === 'string' && typeof answer.checked === 'boolean')) ui.set(row[0], { answers: row[1] })
+    if (Array.isArray(saved)) {
+      const rows = (saved as unknown[]).filter(validDraftRow)
+      if (rows.length) draftStore.set('', rows)
+    } else if (saved && typeof saved === 'object') {
+      for (const [session, rows] of Object.entries(saved as Record<string, unknown>)) {
+        if (typeof session !== 'string' || !Array.isArray(rows)) continue
+        const valid = (rows as unknown[]).filter(validDraftRow)
+        if (valid.length) draftStore.set(session, valid)
+      }
     }
   } catch { /* malformed or unavailable draft storage does not affect rendering */ }
+  function stashDrafts(): void {
+    if (draftSession === null) return
+    const drafts = [...ui].filter(([, state]) => state.answers?.some(answer => answer.type === 'text' ? !!answer.value : answer.checked))
+      .map(([key, state]) => [key, state.answers!] as DraftRow)
+    if (drafts.length) draftStore.set(draftSession, drafts)
+    else draftStore.delete(draftSession)
+  }
+  /** Article-card job states, and their pollers while non-terminal. */
+  const contentState = new Map<string, ContentCardState>()
+  const contentPolls = new Map<string, { stopped: boolean }>()
+  let destroyed = false
+  function stopContentPolls(): void {
+    for (const poll of contentPolls.values()) poll.stopped = true
+    contentPolls.clear()
+  }
+  function pollContent(block: Extract<Block, { kind: 'content' }>, model: TranscriptModel): void {
+    if (destroyed || contentPolls.has(block.key)) return
+    const known = contentState.get(block.key)?.status
+    if (known === 'completed' || known === 'failed') return
+    const poll = { stopped: false }
+    contentPolls.set(block.key, poll)
+    const terminal = () => {
+      const status = contentState.get(block.key)?.status
+      return status === 'completed' || status === 'failed'
+    }
+    void (async () => {
+      while (!poll.stopped && !destroyed && contentPolls.get(block.key) === poll && model.blocks.some((b) => b.key === block.key) && !terminal()) {
+        try {
+          const url = block.callId
+            ? `/api/chat-content/status?call_id=${encodeURIComponent(block.callId)}`
+            : `/api/chat-content/status?launch_id=${encodeURIComponent(block.launchId)}`
+          const res = await fetch(url)
+          if (res.ok) {
+            const body = await res.json() as { status?: unknown, slug?: unknown, error?: unknown, call_id?: unknown }
+            const status = typeof body.status === 'string' ? body.status : 'pending'
+            contentState.set(block.key, { status,
+              ...(typeof body.slug === 'string' ? { slug: body.slug } : {}),
+              ...(typeof body.error === 'string' ? { error: body.error } : {}) })
+            if (!block.callId && typeof body.call_id === 'string') block.callId = body.call_id
+            if (model.blocks.some((b) => b.key === block.key)) {
+              bump(model, block)
+              container.dispatchEvent(new CustomEvent('chat:rerender'))
+            }
+          }
+        } catch { /* a network blip retries on the next poll */ }
+        if (!terminal() && !poll.stopped) await new Promise((done) => setTimeout(done, 2000))
+      }
+      if (contentPolls.get(block.key) === poll) contentPolls.delete(block.key)
+    })()
+  }
+  function swapDrafts(session: string): void {
+    if (session === draftSession) return
+    if (draftSession !== null) stashDrafts()
+    for (const state of ui.values()) delete state.answers
+    for (const [key, answers] of draftStore.get(session) || []) ui.set(key, { ...ui.get(key), answers })
+    draftSession = session
+  }
   const texts = new Map<string, string>()
   let lastCtxKey = ''
   let lastChatsKey = ''
@@ -946,6 +1088,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
   }
 
   function render(model: TranscriptModel, ctx: RenderContext): void {
+    swapDrafts(ctx.sessionId || '')
     const focused = focusedPending(model)
     const clock: Clock = { zone: effectiveTimezone(), now: Date.now() }
     // A new day or time zone relabels every turn's time.
@@ -972,9 +1115,18 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
         const isLast = b.key === lastTurnKey
         if (setRev(b.key, b.turn.rev) || ctxChanged || isLast) renderTurn(el, b.turn, b.turn.agent ? { ...ctx, agent: b.turn.agent } : ctx, clock, focused, isLast, chatsChanged)
       } else if (setRev(b.key, b.rev)) {
-        el.innerHTML = b.kind === 'error'
-          ? `<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(b.message)}</div></div>`
-          : `<div class="chat-note">${escapeHtml(b.text)}</div>`
+        if (b.kind === 'error') {
+          el.innerHTML = `<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(b.message)}</div></div>`
+        } else if (b.kind === 'imported') {
+          el.innerHTML = renderImportedHtml(b.turns, b.omitted, false)
+        } else if (b.kind === 'content') {
+          el.innerHTML = contentCardHtml(b, contentState.get(b.key))
+          pollContent(b, model)
+        } else if (b.kind === 'consensus') {
+          el.innerHTML = consensusCardHtml(b)
+        } else {
+          el.innerHTML = `<div class="chat-note">${escapeHtml(b.text)}</div>`
+        }
       }
       if (fresh) reveal(el, { distance: 8 })
       cursor = el.nextElementSibling as HTMLElement | null
@@ -984,6 +1136,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
 
   function clear(): void {
     for (const [key, node] of nodes) rememberQuestion(node.el, key)
+    stopContentPolls()
     container.innerHTML = ''
     nodes.clear()
     texts.clear()
@@ -1006,9 +1159,16 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
 
   function persistQuestionDrafts(): void {
     for (const [key, node] of nodes) rememberQuestion(node.el, key)
-    const drafts = [...ui].filter(([, state]) => state.answers?.some(answer => answer.type === 'text' ? !!answer.value : answer.checked))
-      .map(([key, state]) => [key, state.answers])
-    try { sessionStorage.setItem(questionDraftKey, JSON.stringify(drafts)) } catch { /* in-page state is still retained */ }
+    stashDrafts()
+    // Merge with the other transcript's sessions: read, set ours, write.
+    let merged: Record<string, DraftRow[]> = {}
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(questionDraftKey) || '{}')
+      if (saved && typeof saved === 'object' && !Array.isArray(saved)) merged = saved as Record<string, DraftRow[]>
+    } catch { /* keep ours alone */ }
+    for (const [session, rows] of draftStore) merged[session] = rows
+    if (draftSession !== null && !draftStore.has(draftSession)) delete merged[draftSession]
+    try { sessionStorage.setItem(questionDraftKey, JSON.stringify(merged)) } catch { /* in-page state is still retained */ }
   }
   window.addEventListener('beforeunload', persistQuestionDrafts)
   window.addEventListener('pagehide', persistQuestionDrafts)
@@ -1017,6 +1177,11 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
 
   container.addEventListener('click', (e) => {
     const target = e.target as HTMLElement
+    const article = target.closest<HTMLButtonElement>('.chat-content-open')
+    if (article?.dataset.slug) {
+      window.dispatchEvent(new CustomEvent('poise:open-editor-doc', { detail: { slug: article.dataset.slug } }))
+      return
+    }
     const file = target.closest<HTMLAnchorElement>('a[data-chat-file]')
     if (file && handlers.onFile) {
       e.preventDefault()
@@ -1103,7 +1268,15 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     return answers
   }
 
-  return { render, clear, tick, textFor: (key) => texts.get(key) || '' }
+  function destroy(): void {
+    destroyed = true
+    stopContentPolls()
+    persistQuestionDrafts()
+    window.removeEventListener('beforeunload', persistQuestionDrafts)
+    window.removeEventListener('pagehide', persistQuestionDrafts)
+  }
+
+  return { render, clear, tick, textFor: (key) => texts.get(key) || '', destroy }
 }
 
 /** Pick the nth option of a question card from the keyboard (first unanswered question). */

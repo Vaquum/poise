@@ -800,36 +800,115 @@ test('offers an explicit fallback choice when the default provider is not signed
   }
 })
 
-test('hands a Current card and an Editor document off to a prefilled New session dialog', async ({ page }) => {
+test('opens an issue card\'s chat from Open in Chat and creates its session on the first message', async ({ page }) => {
   const state = makeState([], {})
   await installRoutes(page, state)
   await page.route('**/api/gh', (route) => route.fulfill({ json: { records: [
-    { kind: 'pr', repo: 'acme/app', number: 42, state: 'open', title: 'Add login', url: 'https://github.com/acme/app/pull/42', created_at: NOW, updated_at: NOW, merged_at: null },
     { kind: 'issue', repo: 'acme/app', number: 7, state: 'open', title: 'Broken logout', url: 'https://github.com/acme/app/issues/7', created_at: NOW, updated_at: NOW, merged_at: null },
   ] } }))
   await page.route('**/api/current', (route) => route.fulfill({ json: { cards: [] } }))
-  await installSocket(page)
+  const sock = await installSocket(page)
   await page.addInitScript(() => localStorage.setItem('poise-view', 'current'))
   await page.goto('/')
-  const pr = page.locator('.card-live', { hasText: 'Add login' })
-  await pr.hover()
-  await pr.getByRole('button', { name: 'Open in Chat' }).click()
-  await expect(page.locator('#view-chat')).toBeVisible()
-  const dialog = page.getByRole('dialog', { name: 'New session' })
-  await expect(dialog).toContainText('Add login')
-  await expect(dialog.getByLabel('Repository')).toHaveCount(0)
-  await expect(dialog.locator('input[name="branch"]')).toHaveCount(0)
-  await expect(dialog.getByLabel('Model')).toHaveValue('opus-5-max')
-  await dialog.getByRole('button', { name: 'Cancel' }).click()
-  await page.getByRole('button', { name: 'Current', exact: true }).click()
   const issue = page.locator('.card-live', { hasText: 'Broken logout' })
   await issue.hover()
   await issue.getByRole('button', { name: 'Open in Chat' }).click()
-  await expect(dialog.locator('input[name="branch"]')).toHaveCount(0)
-  await dialog.getByRole('button', { name: 'Create' }).click()
-  await expect.poll(() => state.calls.filter((c) => c.method === 'POST' && c.path === '/api/chat/sessions').map((c) => c.body)).toEqual([
-    expect.objectContaining({ context: { kind: 'card', title: 'Broken logout', body: '', url: 'https://github.com/acme/app/issues/7' } }),
-  ])
+  await expect(page.locator('#view-chat')).toBeVisible()
+  await expect(input(page)).toHaveValue('Broken logout\nhttps://github.com/acme/app/issues/7')
+  expect(state.calls.filter((c) => c.method === 'POST' && c.path === '/api/chat/sessions')).toHaveLength(0)
+  await input(page).fill('Why does logout fail?')
+  await input(page).press('Enter')
+  await expect.poll(() => state.calls.filter((c) => c.method === 'POST' && c.path === '/api/chat/sessions')).toHaveLength(1)
+  const created = state.calls.find((c) => c.method === 'POST' && c.path === '/api/chat/sessions')!.body as Record<string, unknown>
+  expect(created).toMatchObject({ subject: { surface: 'current', key: 'poise.issue.acme/app.7', label: 'acme/app#7', url: 'https://github.com/acme/app/issues/7' } })
+  expect(created).not.toHaveProperty('context')
+  await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
+  const id = state.sessions[0].id
+  sock.push(id, { type: 'turn.started', turnId: 't1', prompt: { text: 'Why does logout fail?', attachments: [], mentions: [] } })
+  await expect(page.locator('#view-chat .chat-msg-user')).toContainText('Why does logout fail?')
+  await page.getByRole('button', { name: 'Current', exact: true }).click()
+  await issue.hover()
+  await issue.getByRole('button', { name: 'Open in Chat' }).click()
+  await expect(page.locator('#view-chat .chat-msg-user')).toContainText('Why does logout fail?')
+  expect(state.calls.filter((c) => c.method === 'POST' && c.path === '/api/chat/sessions')).toHaveLength(1)
+})
+
+test('shows the card under a card session\'s title in the sidebar', async ({ page }) => {
+  const state = makeState([session({ id: 'card-1', title: 'Broken logout', subject: { surface: 'current', key: 'poise.issue.acme/app.12', label: 'acme/app#12', url: 'https://github.com/acme/app/issues/12' } })], {})
+  await installRoutes(page, state)
+  await installSocket(page)
+  await page.goto('/')
+  await expect(page.locator('.chat-session-subject')).toHaveText('From Current · acme/app#12')
+})
+
+test('runs /content and /consensus from the Chat composer and shows their results', async ({ page }) => {
+  const state = makeState([session({ status: 'idle' })], { s1: [] })
+  state.contentJobs = { c1: { call_id: 'c1', status: 'completed', slug: 'release-notes' } }
+  await installRoutes(page, state)
+  const sock = await installSocket(page)
+  await page.goto('/')
+  await sock.subscribed('s1')
+  sock.seq = 0
+  await input(page).fill('/content Release notes')
+  await input(page).press('Enter')
+  await expect.poll(() => state.calls.filter((c) => c.method === 'POST' && c.path === '/api/chat-content')).toHaveLength(1)
+  expect(sock.framesOf('prompt')).toHaveLength(0)
+  sock.push('s1', { type: 'content.started', topic: 'Release notes', launchId: 'l1', callId: 'c1' })
+  await expect(page.locator('.chat-content-card')).toContainText('Release notes')
+  await expect(page.locator('.chat-content-open')).toBeVisible()
+  await input(page).fill('/consensus Which approach?')
+  await input(page).press('Enter')
+  await expect.poll(() => state.calls.filter((c) => c.method === 'POST' && c.path === '/api/debate')).toHaveLength(1)
+  sock.push('s1', { type: 'consensus.started', id: 'd1', topic: 'Which approach?' })
+  await expect(page.locator('.chat-consensus-card')).toContainText('Debating')
+  sock.push('s1', { type: 'consensus.finished', id: 'd1', synthesis: 'Use the second approach.' })
+  await expect(page.locator('.chat-consensus-card')).toContainText('Use the second approach.')
+})
+
+test('runs /consensus from a fresh console by creating its session first', async ({ page }) => {
+  const state = makeState([], {})
+  await installRoutes(page, state)
+  await installSocket(page)
+  await page.goto('/')
+  await expect(input(page)).toBeEnabled()
+  await input(page).fill('/consensus Which approach?')
+  await input(page).press('Enter')
+  await expect.poll(() => state.calls.filter((c) => c.method === 'POST' && c.path === '/api/chat/sessions')).toHaveLength(1)
+  await expect.poll(() => state.calls.filter((c) => c.method === 'POST' && c.path === '/api/debate')).toHaveLength(1)
+  const debate = state.calls.find((c) => c.method === 'POST' && c.path === '/api/debate')!.body as Record<string, unknown>
+  expect(debate).toMatchObject({ topic: 'Which approach?', chatSession: state.sessions[0].id })
+})
+
+test('clears /consensus at send and merges it back only if the debate fails', async ({ page }) => {
+  const state = makeState([session({ status: 'idle' })], { s1: [] })
+  let release!: (answer: { status: number, json: unknown }) => void
+  state.debate = () => new Promise((resolve) => { release = resolve })
+  await installRoutes(page, state)
+  const sock = await installSocket(page)
+  await page.goto('/')
+  await sock.subscribed('s1')
+  await input(page).fill('/consensus Which approach?')
+  await input(page).press('Enter')
+  await expect.poll(() => state.calls.filter((c) => c.method === 'POST' && c.path === '/api/debate')).toHaveLength(1)
+  // Cleared while the debate is still running, not when it lands.
+  await expect(input(page)).toHaveValue('')
+  await input(page).fill('Meanwhile, a follow-up')
+  release({ status: 500, json: { error: 'all models are busy' } })
+  await expect(input(page)).toHaveValue('/consensus Which approach?\n\nMeanwhile, a follow-up')
+})
+
+test('sends a card-like message in a card\'s session as a prompt, not a Poise change', async ({ page }) => {
+  const state = makeState([session({ subject: { surface: 'current', key: 'poise.card.9', label: 'A manual card' } })], { s1: [] })
+  await installRoutes(page, state)
+  const sock = await installSocket(page)
+  await page.goto('/')
+  await sock.subscribed('s1')
+  await input(page).fill('Add a button to the Current cards view')
+  await input(page).press('Enter')
+  await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
+  expect(sock.framesOf('prompt')[0].command).toMatchObject({ type: 'prompt', text: 'Add a button to the Current cards view' })
+  expect(sock.framesOf('poise.change')).toHaveLength(0)
+  await expect(page.locator('.chat-msg-user')).toContainText('Add a button to the Current cards view')
 })
 
 test('shows and saves the chat settings in General', async ({ page }) => {

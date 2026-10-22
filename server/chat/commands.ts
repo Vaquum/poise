@@ -9,7 +9,12 @@ export interface ChatCommandChain {
   queue: boolean
   text: string
   missingModel: boolean
+  /** Everything after the token is the topic, literally. */
+  content?: string
+  consensus?: string
 }
+
+const CHAIN_BUILTINS = ['model', 'review', 'queue', 'compact', 'reset', 'create', 'content', 'consensus']
 
 export function parseChatCommandChain(text: string, knownSwitches: ReadonlySet<string> = new Set()): ChatCommandChain {
   const result: ChatCommandChain = { review: false, queue: false, text: text.trim(), missingModel: false }
@@ -17,9 +22,10 @@ export function parseChatCommandChain(text: string, knownSwitches: ReadonlySet<s
     const match = /^\/([a-z][a-z0-9_-]*)(?=\s|$)/i.exec(result.text)
     if (!match) return result
     const name = match[1].toLowerCase()
-    if (!['model', 'review', 'queue', 'compact', 'reset', 'create'].includes(name) && !knownSwitches.has(name)) return result
+    if (!CHAIN_BUILTINS.includes(name) && !knownSwitches.has(name)) return result
     result.text = result.text.slice(match[0].length).trimStart()
     if (name === 'create') { result.create = true; return result }
+    if (name === 'content' || name === 'consensus') { result[name] = result.text; result.text = ''; return result }
     if (knownSwitches.has(name) && !['model', 'review', 'queue', 'compact', 'reset'].includes(name)) {
       result.switches ??= []
       if (!result.switches.includes(name)) result.switches.push(name)

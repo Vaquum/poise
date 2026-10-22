@@ -15,11 +15,12 @@ import { loggingCallId, loggingHref, type LoggingLink } from './logging'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
 import { initCurrentView, stopCurrentPolling } from './views/current-view'
 import { initSwarmView, stopSwarmRefresh, focusRow as focusSwarmRow, focusCall as focusSwarmCall } from './views/swarm-view'
-import { initChatView, stopChatRefresh, openChatSession, openChatWithContext, chatSessionInView, type NewSessionPrefill } from './views/chat-view'
+import { initChatView, stopChatRefresh, openChatSession, openChatWithContext, openChatForSubject, chatSessionInView, type NewSessionPrefill } from './views/chat-view'
 import { initBehaviorsView, stopBehaviorsRefresh } from './views/behaviors-view'
 import { initSnippetsView } from './views/snippets-view'
 import { initEditorView, stopEditorRefresh } from './views/editor-view'
 import { toggle as toggleChat, close as closeChatPane } from './views/chat-pane'
+import { chatSidePane } from './views/chat-side-pane'
 import { loadSettings, startRefreshTicker, applyTheme, getTheme, effectiveTimezone, unknownSavedTimezone } from './config'
 import { initClaudeAuth } from './claude-auth'
 import { getSelectedOrganization, setSelectedOrganization } from './organizations'
@@ -115,6 +116,7 @@ function showView(v: ViewSlug) {
   // and its composer stayed in the tab order — so a message could be sent
   // into a conversation the person had navigated away from.
   closeChatPane()
+  chatSidePane.close()
 
   // Initialize the target first so content exists before the animation starts
   if (v === 'main')           initMainView()
@@ -185,7 +187,7 @@ function openNotice(target: NoticeTarget): void {
   else window.open(target.pullRequest, '_blank', 'noopener,noreferrer')
 }
 // A Chat session on screen already shows what its notice would say.
-const notificationRail = mountNotificationRail(notices, { open: openNotice, inView: (target) => 'chat' in target && chatSessionInView() === target.chat })
+const notificationRail = mountNotificationRail(notices, { open: openNotice, inView: (target) => 'chat' in target && (chatSessionInView() === target.chat || chatSidePane.sessionInView() === target.chat) })
 window.addEventListener('poise:notifications-changed', () => { void notices.refresh() })
 
 // A saved time zone this browser does not know would break every time Poise
@@ -308,15 +310,16 @@ window.addEventListener('poise:open-chat', (ev) => {
 })
 
 // Chat handoffs. `{ id }` opens an existing session (Swarm's Target column);
-// `{ context, repo, branch }` opens the New session dialog prefilled from a
-// Current card or an Editor document, so the person confirms agent, model
-// and branch before anything runs.
+// `{ subject, prefill?, draft? }` opens a card's Chat session, or its
+// composer with the prefill when it has no session yet. `{ context, … }`
+// still opens the New session dialog, which the Editor uses until #370.
 window.addEventListener('poise:open-chat-session', (ev) => {
-  const detail = (ev as CustomEvent<{ id?: string } & NewSessionPrefill>).detail
+  const detail = (ev as CustomEvent<{ id?: string, subject?: import('../server/chat/protocol').ChatSubject, prefill?: string, draft?: import('./views/chat-composer').ComposerDraft } & NewSessionPrefill>).detail
   if (!detail) return
   menu.switchTo('chat')
   window.requestAnimationFrame(() => {
     if (detail.id) void openChatSession(detail.id)
+    else if (detail.subject) void openChatForSubject(detail.subject, detail.prefill, detail.draft)
     else void openChatWithContext(detail)
   })
 })

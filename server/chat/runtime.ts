@@ -51,13 +51,14 @@ import { ATTACHMENT_DIR, attachmentPath, ensureExcluded, inlineText, safeAttachm
 import { readCheckoutBytes, readCheckoutTextFile, writeCheckoutTextFile } from './client-fs'
 import { captureCheckoutSnapshot, emitCheckoutChanges, type CheckoutSnapshot } from './change-mirror'
 import { CallerCompatError, callerTurns as defaultCallerTurns, type CallerTurns } from './caller-turns'
+import { legacyIdFor, quoteImportedHistory, readLegacyConversation } from './legacy-import'
 import { forkStagedDocument, isBridgeProblem, refreshDocument, stageDocument, stagedDocumentPrompt, unstageDocument, writeBackDocument, type StagedDocument } from './editor-bridge'
 import {
   GitError, PathError, assertBranchName, branchExists, branchTip, checkoutPrHead, checkpoint, createBranch, deleteBranch,
   inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
 } from './git'
 import {
-  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type NewSessionRequest,
+  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
   type PermissionOption, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
@@ -246,6 +247,14 @@ function parseCommands(text: string) {
   return parseChatCommandChain(text, /^\s*\//.test(text) ? savedSwitchNames() : undefined)
 }
 
+/** A concurrent creation took the subject first; never leaves the runtime. */
+class SubjectTakenError extends Error {
+  constructor(readonly subject: ChatSubject) {
+    super(`the subject ${subject.surface}:${subject.key} already has a session`)
+    this.name = 'SubjectTakenError'
+  }
+}
+
 /** /manager carries the Manager's charter; no other chat may use it. */
 function refuseManagerSwitch(switches: readonly string[] | undefined, isManager: boolean): void {
   if (switches?.includes(MANAGER_SWITCH) && !isManager) throw new ChatError(400, '/manager is not supported in regular chats.', 'invalid')
@@ -276,6 +285,8 @@ export class ChatRuntime extends EventEmitter {
   private readonly availability = new Map<AgentId, { at: number, result: { ok: boolean, reason?: string } }>()
   private readonly selfUpdate: SelfUpdateBridge | null
   private readonly changeStarts = new Map<string, { sourceId: string, request: string, contextKey: string, promise: Promise<PoiseChangeResult> }>()
+  /** One creation per subject in flight at a time; the unique index guards across processes. */
+  private readonly subjectLocks = new Map<string, Promise<void>>()
   private readonly queuePumps = new Set<string>()
   private readonly queueTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly queueReleaseWait = new Set<string>()
@@ -715,6 +726,7 @@ export class ChatRuntime extends EventEmitter {
 
   async create(request: NewSessionRequest): Promise<SessionRecord> {
     this.assertAcceptingWork() // before any await: the drain flag is checked atomically
+    if (request.subject) return (await this.createForSubject({ ...request, subject: request.subject })).session
     if (request.role !== undefined && request.role !== 'manager') throw new ChatError(400, 'role must be "manager" or absent', 'invalid')
     if (request.role === 'manager') {
       if (request.repo !== undefined || request.branch !== undefined || request.checkout !== undefined) {
@@ -746,6 +758,75 @@ export class ChatRuntime extends EventEmitter {
       const { agent } = await this.resolveModel(request.model, request.effort)
       return this.createSession({ ...request, agent, deferStart: true, safeMode: false }, true)
     })
+  }
+
+  /** The subject's session: the existing one in any state, or a new one
+   *  whose first event imports the earlier conversation. Runs under a
+   *  per-subject lock in the process; the unique index is the final
+   *  authority across processes, and a request that loses the insert
+   *  removes the workspace it just made and returns the winner. */
+  async createForSubject(request: NewSessionRequest & { subject: ChatSubject }): Promise<{ session: SessionRecord, existing: boolean }> {
+    this.assertAcceptingWork()
+    if (request.role !== undefined) throw new ChatError(400, 'A Manager has no subject.', 'invalid')
+    const key = `${request.subject.surface}:${request.subject.key}`
+    const prior = this.subjectLocks.get(key)
+    let release!: () => void
+    const mine = new Promise<void>((resolve) => { release = resolve })
+    this.subjectLocks.set(key, mine)
+    await (prior ?? Promise.resolve()).catch(() => undefined)
+    try {
+      return await this.track(() => this.createSessionForSubject(request))
+    } finally {
+      release()
+      if (this.subjectLocks.get(key) === mine) this.subjectLocks.delete(key)
+    }
+  }
+
+  private async createSessionForSubject(request: NewSessionRequest & { subject: ChatSubject }): Promise<{ session: SessionRecord, existing: boolean }> {
+    const found = storage.sessionForSubject(this.instance, request.subject.surface, request.subject.key)
+    if (found) {
+      const session = this.get(found)
+      if (session) return { session, existing: true }
+    }
+    let legacyId: string | null = null
+    let legacy: { turns: Array<{ prompt: string, reply: string, at: string, status: string }>, omitted: number } | null = null
+    if (!request.skipLegacy) {
+      legacyId = await legacyIdFor(request.subject)
+      if (legacyId) {
+        try {
+          legacy = await readLegacyConversation(legacyId)
+        } catch (error) {
+          throw new ChatError(502, `Earlier conversation could not be read: ${error instanceof Error ? error.message : String(error)}`, 'legacy_unreadable')
+        }
+      }
+    }
+    let record: SessionRecord
+    try {
+      record = await this.createSession({ ...request, deferStart: false })
+    } catch (error) {
+      if (error instanceof SubjectTakenError) {
+        const winner = storage.sessionForSubject(this.instance, request.subject.surface, request.subject.key)
+        const session = winner ? this.get(winner) : null
+        if (session) return { session, existing: true }
+      }
+      throw error
+    }
+    if (legacy && legacyId && legacy.turns.length) {
+      record.importedFrom = legacyId
+      this.saveRecord(this.requireLive(record.id))
+      this.emit_(record.id, { type: 'history.imported', legacyId, turns: legacy.turns, omitted: legacy.omitted })
+    }
+    return { session: record, existing: false }
+  }
+
+  /** Record a `/content` or `/consensus` step in a session's transcript.
+   *  Neither command starts a native turn. Unknown and foreign sessions
+   *  are refused before the caller launches anything. */
+  recordCommandEvent(id: string, event: Extract<ChatEvent, { type: 'content.started' | 'consensus.started' | 'consensus.finished' }>): void {
+    const record = storage.getSession(id)
+    if (!record) throw new ChatError(404, 'unknown session', 'unknown_session')
+    if (record.instance !== this.instance) throw new ChatError(409, `this session belongs to another Poise server (${record.instance})`, 'foreign_session')
+    this.emit_(id, event)
   }
 
   private async createSession(request: NewSessionRequest, isolated = false, createdBy?: ChatActor): Promise<SessionRecord> {
@@ -795,6 +876,7 @@ export class ChatRuntime extends EventEmitter {
       pendingRequests: [],
       instance: this.instance,
       context: request.context,
+      ...(request.subject ? { subject: request.subject } : {}),
       ...(request.autoMerge !== undefined ? { autoMerge: request.autoMerge } : {}),
       safeMode: request.safeMode === true,
       ...(request.role === 'manager' ? { role: 'manager' as const } : {}),
@@ -807,6 +889,13 @@ export class ChatRuntime extends EventEmitter {
         await discardUnclaimedWorkspace(root, checkout, this.instance, this.leaseProbes).catch(() => 'kept' as const)
         const winner = storage.managerSession(this.instance)
         throw new ChatError(409, 'A Manager already exists.', 'manager_exists', winner ? { manager: { id: winner.id } } : undefined)
+      }
+      if (request.subject && String((error as { code?: string })?.code ?? '').startsWith('SQLITE_CONSTRAINT')
+        && storage.sessionForSubject(this.instance, request.subject.surface, request.subject.key)) {
+        // Lost the cross-process race: the workspace never ran, so discard
+        // it and let the caller return the winner. Nothing was emitted.
+        await discardUnclaimedWorkspace(root, checkout, this.instance, this.leaseProbes).catch(() => 'kept' as const)
+        throw new SubjectTakenError(request.subject)
       }
       throw error
     }
@@ -1132,6 +1221,8 @@ export class ChatRuntime extends EventEmitter {
         workspace: undefined,
         queue: undefined,
         queuedHandoff: undefined,
+        subject: undefined, // a fork is a new conversation, not the card's session
+        importedFrom: undefined,
         staged: undefined, // the fork stages its own copy on start
         createdBy: undefined, // the person made the fork, not the worker's creator
         branch: { ...source.record.branch, provisional: false },
@@ -1170,6 +1261,16 @@ export class ChatRuntime extends EventEmitter {
       context: { kind: 'handoff', title: source.record.title, body: summary, fromSession: source.record.id },
     })
     const live = this.requireLive(created.id)
+    if (source.record.subject) {
+      // The subject moves once the target exists and before its summary
+      // turn is scheduled. Until now it still opened the source.
+      const subject = source.record.subject
+      storage.moveSubject(source.record, live.record)
+      delete source.record.subject
+      live.record.subject = subject
+      this.emit_(source.record.id, { type: 'session.updated', session: source.record })
+      this.emit_(live.record.id, { type: 'session.updated', session: live.record })
+    }
     // The family's branch reference point travels with a local handoff, so
     // the last session deleted from a shared workspace can still tell
     // whether its branch never moved.
@@ -1509,6 +1610,7 @@ export class ChatRuntime extends EventEmitter {
     refuseManagerSwitch(chain.switches, session.record.role === 'manager')
     if (chain.missingModel) throw new ChatError(400, 'Choose a model from /model first.', 'invalid')
     if (chain.create) throw new ChatError(400, 'Save a switch with the create command, not an agent prompt.', 'invalid')
+    if (chain.content !== undefined || chain.consensus !== undefined) throw new ChatError(400, 'Run /content or /consensus as a chat command, not as an agent prompt.', 'invalid')
     expandSwitches(chain.text, chain.switches)
     if (chain.queue) throw new ChatError(400, 'Use the queue command to defer a message.', 'invalid')
     if (chain.context === 'reset' && chain.review) throw new ChatError(400, 'A reset removes the reply to review. Review it first or send a new message after resetting.', 'invalid')
@@ -1561,6 +1663,7 @@ export class ChatRuntime extends EventEmitter {
       const chain = parseCommands(submitted.text)
       refuseManagerSwitch(chain.switches, session.record.role === 'manager')
       if (chain.create) throw new ChatError(400, 'Save the switch directly with /create, then queue its use.', 'invalid')
+      if (chain.content !== undefined || chain.consensus !== undefined) throw new ChatError(400, 'Run /content or /consensus now; queueing them would run them as prompts.', 'invalid')
       expandSwitches(chain.text, chain.switches)
       if (chain.context === 'reset' && chain.review) throw new ChatError(400, 'A reset removes the reply to review.', 'invalid')
       if (chain.missingModel) throw new ChatError(400, 'Choose a model from /model first.', 'invalid')
@@ -2132,6 +2235,14 @@ export class ChatRuntime extends EventEmitter {
    *  handoff) to the agent; the transcript records what the agent got. */
   private async composePrompt(session: LiveSession, input: PromptInput, isFirst: boolean): Promise<PromptInput> {
     const context = session.record.context
+    if (isFirst && !context && session.record.importedFrom && session.turn) {
+      const imported = storage.findEvent(session.record.id, (event) => event.type === 'history.imported')
+      if (imported && imported.event.type === 'history.imported' && imported.event.turns.length) {
+        session.turn.shown ??= { ...input }
+        return { ...input, text: `${quoteImportedHistory(imported.event.turns, imported.event.omitted)}\n\n${input.text}` }
+      }
+      return input
+    }
     if (!isFirst || !context) return input
     const parts: string[] = []
     if (context.kind === 'card') {
@@ -2235,7 +2346,7 @@ export class ChatRuntime extends EventEmitter {
     // text, never run.
     const chain = actor ? null : parseCommands(shown.text)
     refuseManagerSwitch(chain?.switches, session.record.role === 'manager')
-    if (chain && (chain.create || chain.queue || chain.context || chain.review || chain.model)) throw new ChatError(400, 'This command starts a separate action; queue it instead of steering.', 'invalid')
+    if (chain && (chain.create || chain.queue || chain.context || chain.review || chain.model || chain.content !== undefined || chain.consensus !== undefined)) throw new ChatError(400, 'This command starts a separate action; queue it instead of steering.', 'invalid')
     // Do not put this wait on the control chain: startup drains that chain
     // before invoking the prompt. Early interjections belong after that boundary.
     if (!turn.agentInvoked) await this.track(() => turn.promptReady)

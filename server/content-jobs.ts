@@ -219,6 +219,27 @@ export function getContentJobResponse(callId: string): ContentJobResponse | null
   return job ? publicJob(job) : null
 }
 
+/** The launch that linked a call, for the transcript's content card. */
+export function contentLaunchIdForCall(callId: string): string {
+  const row = db.prepare('SELECT launch_id FROM content_launches WHERE call_id = ?').get(callId) as { launch_id: string } | undefined
+  if (!row) throw new Error(`author-content launch for call ${callId} not found`)
+  return row.launch_id
+}
+
+/** The article card polls this while its call is not linked yet. Once the
+ *  launch links, it answers the job; an expired unlinked launch shows its
+ *  error instead of spinning forever. */
+export function getContentLaunchResponse(launchId: string): ContentJobResponse | { launch_id: string, status: 'pending' | 'failed', error?: string } | null {
+  const launch = db.prepare('SELECT * FROM content_launches WHERE launch_id = ?').get(launchId) as ContentLaunchRow | undefined
+  if (!launch) return null
+  if (launch.call_id) {
+    const job = getContentJob(launch.call_id)
+    if (job) return publicJob(job)
+  }
+  if (launch.status === 'linked') return null
+  return { launch_id: launch.launch_id, status: launch.status === 'failed' ? 'failed' : 'pending', ...(launch.error ? { error: launch.error } : {}) }
+}
+
 const claimNextTransaction = db.transaction((
   owner: string,
   now: number,

@@ -7,7 +7,7 @@ interface PickerState { identity: string, label: string, visible: boolean, disab
 interface PickerHandlers { onJev?(): void; jevAvailable?(): boolean; loadModels(): Promise<AgentInfo[]>, onSelect(identity: string): void }
 
 /** A draft-only choice: opening or choosing never creates a native session. */
-export function attachModelPicker(container: HTMLElement, handlers: PickerHandlers) {
+export function attachModelPicker(container: HTMLElement, handlers: PickerHandlers, _options?: { idPrefix?: string }) {
   const trigger = container.querySelector<HTMLButtonElement>('.chat-default-model')!
   const label = trigger.querySelector<HTMLElement>('.chat-model-label')!
   const menu = container.querySelector<HTMLElement>('.chat-model-menu')!
@@ -28,7 +28,8 @@ export function attachModelPicker(container: HTMLElement, handlers: PickerHandle
 
   function position(): void {
     const anchor = trigger.getBoundingClientRect()
-    const bounds = container.closest('.chat-main')!.getBoundingClientRect()
+    const frame = container.closest('.chat-main') ?? container
+    const bounds = frame.getBoundingClientRect()
     const top = Math.max(bounds.top, 0) + 12
     const bottom = Math.min(bounds.bottom, window.innerHeight) - 12
     const above = Math.max(0, anchor.top - top - 8)
@@ -133,13 +134,22 @@ export function attachModelPicker(container: HTMLElement, handlers: PickerHandle
   container.addEventListener('focusout', event => {
     if (!container.contains(event.relatedTarget as Node | null)) close()
   })
-  document.addEventListener('pointerdown', event => {
+  const onPointerDown = (event: PointerEvent) => {
     if (!menu.hidden && !container.contains(event.target as Node)) close()
-  })
-  window.addEventListener('resize', () => { if (!menu.hidden) position() })
+  }
+  const onResize = () => { if (!menu.hidden) position() }
+  document.addEventListener('pointerdown', onPointerDown)
+  window.addEventListener('resize', onResize)
+
+  function destroy(): void {
+    document.removeEventListener('pointerdown', onPointerDown)
+    window.removeEventListener('resize', onResize)
+    if (positionFrame !== null) cancelAnimationFrame(positionFrame)
+    positionFrame = null
+  }
 
   return {
-    close,
+    close, destroy,
     layout() { if (!menu.hidden) position() },
     setState(next: PickerState): void {
       state = next
