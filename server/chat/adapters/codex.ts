@@ -32,7 +32,7 @@ import type {
 } from '../generated/codex'
 import { CHAT_LIMITS } from '../protocol'
 import type { ChatEvent, ContentBlock, PlanEntry, PromptInput, StopReason, ToolKind, ToolLocation, ToolStatus, TurnUsage } from '../protocol'
-import { RpcError, StdioRpc, outboundHasMethod } from '../rpc'
+import { RpcError, StdioRpc, outboundRequests } from '../rpc'
 import { AdapterError } from './types'
 import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, AgentProcess, PermissionRequest, ReplayInit, TurnResult } from './types'
 import { forCodex, type Skipped } from '../../extensions/types'
@@ -1006,7 +1006,8 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
       // Without the turn's initiating request the agent never heard it: that
       // turn must be re-prompted, not replayed.
       if (init.outboundTruncated) throw new AdapterError(AGENT, 'the relay cannot prove what Codex heard; the turn is interrupted instead', 'protocol')
-      if (!outboundHasMethod(init.outbound, 'turn/start')) throw new AdapterError(AGENT, 'the turn never reached Codex; it is interrupted instead', 'protocol')
+      const requestId = [...outboundRequests(init.outbound)].reverse().find(([, request]) => request.method === 'turn/start')?.[0]
+      if (requestId === undefined) throw new AdapterError(AGENT, 'the turn never reached Codex; it is interrupted instead', 'protocol')
       if (active) throw new AdapterError(AGENT, `${LABEL} is already running a turn`, 'protocol')
       threadId = init.session.nativeSessionId
       modelId = init.session.modelId
@@ -1033,7 +1034,12 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
       // The spooled turn/start answer adopts the native id exactly as the
       // prompt path would have; the stream binds it too when that answer
       // never arrived.
-      const orphan = (_id: unknown, message: any) => {
+      const orphan = (id: unknown, message: any) => {
+        if (id !== requestId) return
+        if (message?.error) {
+          finish(turn, { stopReason: 'error', error: `Codex could not start the turn: ${String(message.error.message || 'rpc error')}` })
+          return
+        }
         const native = message?.result?.turn
         if (!native || typeof native.id !== 'string') return
         replayLink.off('orphan-response', orphan)

@@ -25,7 +25,7 @@ import { memorySuffix } from '../memory-content'
 import { randomUUID } from 'node:crypto'
 
 import { CHAT_LIMITS, type Capabilities, type CommandOption, type ContentBlock, type PermissionOption, type PermissionOptionKind, type PromptInput, type Question, type StopReason, type ToolKind, type ToolStatus } from '../protocol'
-import { RpcError, StdioRpc, outboundHasMethod } from '../rpc'
+import { RpcError, StdioRpc, outboundRequests } from '../rpc'
 import { readCheckoutTextFile } from '../client-fs'
 import { AdapterError, assertRequiredCapabilities, type Adapter, type AdapterHost, type AdapterStartOptions, type AdapterStartResult, type AgentProcess, type ReplayInit, type TurnResult } from './types'
 import { forAcp } from '../../extensions/types'
@@ -501,7 +501,8 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
       // is the turn result, and a turn the agent never got must be
       // re-prompted, not replayed.
       if (init.outboundTruncated) throw new AdapterError('grok', 'the relay cannot prove what Grok Build heard; the turn is interrupted instead', 'protocol')
-      if (!outboundHasMethod(init.outbound, 'session/prompt')) throw new AdapterError('grok', 'the turn never reached Grok Build; it is interrupted instead', 'protocol')
+      const requestId = [...outboundRequests(init.outbound)].reverse().find(([, request]) => request.method === 'session/prompt')?.[0]
+      if (requestId === undefined) throw new AdapterError('grok', 'the turn never reached Grok Build; it is interrupted instead', 'protocol')
       sessionId = init.session.nativeSessionId
       modelId = init.session.modelId
       effort = init.session.effort
@@ -524,27 +525,33 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
       }
       const onAbort = () => { void adapter.cancel() }
       init.signal.addEventListener('abort', onAbort, { once: true })
+      let stopWaiting = () => {}
       try {
-        // session/prompt is the only request whose answer carries a
-        // stopReason, so its orphan — matched by shape, not by id — is the
-        // turn result however the restart landed.
         const result = await new Promise<any>((resolve, reject) => {
-          const orphan = (_id: unknown, message: any) => {
-            if (!message || typeof message !== 'object' || typeof message.result?.stopReason !== 'string') return
+          const cleanup = () => {
             link.off('orphan-response', orphan)
+            link.off('close', failed)
+          }
+          const failed = (error: Error) => { cleanup(); reject(error) }
+          const orphan = (id: unknown, message: any) => {
+            if (id !== requestId) return
+            if (message?.error) { failed(new RpcError(Number(message.error.code) || -32000, String(message.error.message || 'Grok prompt failed'))); return }
+            if (typeof message?.result?.stopReason !== 'string') { failed(new RpcError(-32603, 'Grok prompt result has no stop reason')); return }
+            cleanup()
             resolve(message.result)
           }
+          stopWaiting = cleanup
           link.on('orphan-response', orphan)
-          void init.live.then(
-            () => link.endReplay(),
-            (error) => { link.off('orphan-response', orphan); reject(error) },
-          )
+          link.on('close', failed)
+          if (link.isClosed) { failed(new Error('Grok relay closed before its prompt result')); return }
+          void init.live.then(() => link.endReplay()).catch(error => failed(error instanceof Error ? error : new Error(String(error))))
         })
         return mapPromptResult(result)
       } catch (error) {
         if (init.signal.aborted || cancelRequested) return { stopReason: 'cancelled' }
         return { stopReason: 'error', error: `Grok Build: ${error instanceof Error ? error.message : String(error)}` }
       } finally {
+        stopWaiting()
         settlePrompt(init.turnId, admission, init.signal, onAbort)
       }
     },

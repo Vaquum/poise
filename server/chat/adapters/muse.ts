@@ -87,7 +87,7 @@ import type {
 } from '../generated/muse/msp'
 import { CHAT_LIMITS } from '../protocol'
 import type { ChatEvent, ContentBlock, PermissionOption, PermissionOptionKind, PromptInput, Question, ToolKind, ToolLocation, ToolStatus, TurnUsage } from '../protocol'
-import { StdioRpc, outboundHasMethod } from '../rpc'
+import { StdioRpc, outboundRequests } from '../rpc'
 import { AdapterError } from './types'
 import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, AgentProcess, ReplayInit, TurnResult } from './types'
 import { forMuse, type Skipped } from '../../extensions/types'
@@ -423,7 +423,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     | { kind: 'approval', approvalId: string, sourceIndex: number, choiceId: string, requirementId: ApprovalRequestParams['currentRequirementId'] }
     | { kind: 'userInput', userInputId: string, answers: UserInputAnswer[] | null }
   > = []
-  /** Decision receipts the spool carried, keyed `approval:<id>` / `userInput:<id>`. */
+  /** Decision receipts keyed `approval:<id>:<sourceIndex>` / `userInput:<id>`. */
   const decisionReceipts = new Map<string, any>()
   let replayOutbound: Buffer | null = null
 
@@ -969,7 +969,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       if (seen.has(dedupe)) continue
       seen.add(dedupe)
       if (decision.kind === 'approval') {
-        const receipt = decisionReceipts.get(`approval:${decision.approvalId}`)
+        const receipt = decisionReceipts.get(`approval:${decision.approvalId}:${decision.sourceIndex}`)
         if (receipt && receipt.status === 'accepted') { applyApprovalReceipt(decision.approvalId, receipt); continue }
         if (outbound && outboundHasDecision(outbound, decision)) { listPendingRecovery(); continue }
         try {
@@ -1392,7 +1392,9 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       // Without the turn's initiating request the agent never heard it: that
       // turn must be re-prompted, not replayed.
       if (init.outboundTruncated) throw new AdapterError(AGENT, 'the relay cannot prove what Muse heard; the turn is interrupted instead', 'protocol')
-      if (!outboundHasMethod(init.outbound, 'turn/start')) throw new AdapterError(AGENT, 'the turn never reached Muse; it is interrupted instead', 'protocol')
+      const requests = outboundRequests(init.outbound)
+      const requestId = [...requests].reverse().find(([, request]) => request.method === 'turn/start')?.[0]
+      if (requestId === undefined) throw new AdapterError(AGENT, 'the turn never reached Muse; it is interrupted instead', 'protocol')
       if (active) throw new AdapterError(AGENT, `${LABEL} is already running a turn`, 'protocol')
       sessionId = init.session.nativeSessionId
       modelId = init.session.modelId
@@ -1425,11 +1427,21 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       // the link never sent their requests, so each arrives as an orphan.
       // Terminal receipts apply at once, so a late stage can never reopen a
       // settled approval; the rest is confirmed at live.
-      const orphan = (_id: unknown, message: any) => {
+      const orphan = (id: unknown, message: any) => {
+        if (id === requestId && message?.error) {
+          finish(turn, { stopReason: 'error', error: `Muse could not start the turn: ${String(message.error.message || 'rpc error')}` })
+          return
+        }
         const receipt = message?.result
         if (!receipt || typeof receipt !== 'object') return
         if (typeof receipt.approvalId === 'string') {
-          decisionReceipts.set(`approval:${receipt.approvalId}`, receipt)
+          const request = typeof id === 'string' || typeof id === 'number' ? requests.get(id) : undefined
+          const params = request?.params as Partial<ApprovalDecideParams> | undefined
+          const sourceIndex = params?.requirementId?.sourceIndex
+          if (request?.method === 'approval/decide' && params?.approvalId === receipt.approvalId
+            && typeof sourceIndex === 'number' && Number.isSafeInteger(sourceIndex)) {
+            decisionReceipts.set(`approval:${receipt.approvalId}:${sourceIndex}`, receipt)
+          }
           if (receipt.terminal === true) resolvedApprovals.add(receipt.approvalId)
           return
         }

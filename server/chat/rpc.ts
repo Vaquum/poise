@@ -120,6 +120,21 @@ export function outboundHasMethod(outbound: Buffer, method: string): boolean {
   return false
 }
 
+/** Correlate orphan responses with the exact recorded client request. */
+export function outboundRequests(outbound: Buffer): Map<number | string, { method: string, params: unknown }> {
+  const requests = new Map<number | string, { method: string, params: unknown }>()
+  for (const line of outbound.toString('utf8').split('\n')) {
+    if (!line.trim()) continue
+    try {
+      const message = JSON.parse(line) as { id?: unknown, method?: unknown, params?: unknown }
+      if (message && typeof message === 'object' && validId(message.id) && typeof message.method === 'string') {
+        requests.set(message.id, { method: message.method, params: message.params })
+      }
+    } catch { /* an incomplete recorded frame proves no request */ }
+  }
+  return requests
+}
+
 export class StdioRpc extends EventEmitter {
   private nextId = 1
   private replaying = false
