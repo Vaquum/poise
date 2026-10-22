@@ -414,6 +414,11 @@ def muse_environment(root: Path) -> dict:
                                   "run": {"toolset": [], "workflow_trigger_mode": "off"}}))
     settings.chmod(0o600)
     env["XDG_CONFIG_HOME"] = str(config.parent)
+    # This Muse CLI needs session logging for its local session messaging,
+    # so the run keeps its session store inside the run.
+    data = root / "data"
+    data.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env["XDG_DATA_HOME"] = str(data)
     return env
 
 
@@ -427,7 +432,7 @@ def ask_muse(root: Path, model: Model, system: str, text: str, schema: dict, wat
         "--disable-shell", "--disable-write", "--disable-web-tools",
         "--no-foreign-personal-context", "--disable-reminders",
         "--output-schema", str(root / "verdict.schema.json"), "--max-model-steps", "1",
-        "--approval-mode", "never", "--no-session-log",
+        "--approval-mode", "never",
         "--workspace", str(root), "--json",
     ]
     done = watch.run(args, input="", cwd=str(root), timeout=timeout, env=muse_environment(root), provider="muse")

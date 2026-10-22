@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from contextlib import redirect_stdout
 from contextlib import nullcontext
@@ -16,6 +17,33 @@ from agent_interface.model_catalog import CATALOG, ModelCatalogError
 from agent_interface.review_watch import ReviewWatch
 
 FINDING = {"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "[p1] O'Brien's input crashes."}
+MUSE_SESSION_ERROR = "muse: local session messaging disabled: session logging is required"
+
+
+def scripted_muse(directory: Path) -> Path:
+    """A muse CLI that enforces the session-logging requirement: it fails
+    exactly like the observed startup error when session logging is off,
+    and otherwise records its arguments and writes one session file."""
+    script = directory / "muse"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "if '--no-session-log' in sys.argv[1:]:\n"
+        f"    sys.stderr.write({MUSE_SESSION_ERROR!r} + '\\n')\n"
+        "    sys.exit(1)\n"
+        "store = os.path.join(os.environ['XDG_DATA_HOME'], 'muse', 'sessions')\n"
+        "os.makedirs(store, exist_ok=True)\n"
+        "with open(os.path.join(store, 'probe'), 'w') as handle:\n"
+        "    handle.write('session log\\n')\n"
+        "with open(os.environ['MUSE_ARGV_LOG'], 'w') as handle:\n"
+        "    handle.write('\\n'.join(sys.argv[1:]))\n"
+        "reply = os.environ.get('MUSE_SCRIPT_REPLY')\n"
+        "if reply:\n"
+        "    with open(reply) as handle:\n"
+        "        sys.stdout.write(handle.read())\n"
+    )
+    script.chmod(0o700)
+    return script
 
 
 class TestReviewModel(TestCase):
@@ -335,8 +363,10 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(args[args.index("--model") + 1], "muse-spark-1.3-contributor")
         self.assertEqual(args[args.index("--contributor-mode") + 1], "on")
         self.assertEqual(args[args.index("--reasoning-effort") + 1], "max")
-        for flag in ("--disable-shell", "--disable-write", "--disable-web-tools", "--no-session-log", "--json"):
+        for flag in ("--disable-shell", "--disable-write", "--disable-web-tools", "--json"):
             self.assertIn(flag, args)
+        self.assertNotIn("--no-session-log", args)
+        self.assertEqual(Path(kwargs["env"]["XDG_DATA_HOME"]), Path(kwargs["cwd"]) / "data")
         self.assertEqual(args[args.index("--approval-mode") + 1], "never")
         self.assertEqual(args[args.index("--workspace") + 1], kwargs["cwd"])
         self.assertNotEqual(kwargs["cwd"], "/repo")
@@ -345,6 +375,25 @@ class TestOtherProviderVerdicts(TestCase):
             self.assertIn(flag, args)
         self.assertEqual(args[args.index("--max-model-steps") + 1], "1")
         self.assertEqual(mutation[:3], ["github-interface", "--reviewed-clean", "#12"])
+
+    def test_muse_review_run_keeps_the_session_logging_the_cli_requires(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            script = scripted_muse(root)
+            reply = root / "reply.jsonl"
+            reply.write_text(muse_stream('{"action": "reviewed_clean", "comments": []}'))
+            log = root / "argv.log"
+            with patch.dict(os.environ, {"MUSE_CLI": str(script), "MUSE_ARGV_LOG": str(log),
+                                         "MUSE_SCRIPT_REPLY": str(reply)}):
+                denied = subprocess.run([str(script), "exec", "--no-session-log"], text=True, capture_output=True)
+                self.assertEqual((denied.returncode, denied.stderr), (1, MUSE_SESSION_ERROR + "\n"))
+                schema = structured_review.verdict_schema("pr_review")
+                with ReviewWatch("/repo", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40) as watch:
+                    answer = structured_review.ask_muse(root, CATALOG.resolve("muse-spark-1.3-contributor-max"),
+                                                       "system", "packet", schema, watch, 60)
+            self.assertEqual(answer, '{"action": "reviewed_clean", "comments": []}')
+            self.assertNotIn("--no-session-log", log.read_text().splitlines())
+            self.assertTrue((root / "data" / "muse" / "sessions" / "probe").is_file())
 
     def test_account_blocks_are_typed_without_submitting_or_hiding_transient_errors(self):
         for message in ("MUSE GUARD: Muse provider access is latched off locally.",
@@ -366,6 +415,7 @@ class TestOtherProviderVerdicts(TestCase):
             with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(original.parent)}):
                 env = structured_review.muse_environment(root)
             isolated = Path(env["XDG_CONFIG_HOME"]) / "muse"
+            self.assertEqual(Path(env["XDG_DATA_HOME"]), root / "data")
             self.assertEqual(json.loads((isolated / "settings.json").read_text())["run"],
                              {"toolset": [], "workflow_trigger_mode": "off"})
             self.assertEqual((isolated / "auth.json").read_text(), (original / "auth.json").read_text())

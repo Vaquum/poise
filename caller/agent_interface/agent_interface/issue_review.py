@@ -239,10 +239,15 @@ def command(model: Model, text: str, checkout: Path, work: Path, seconds: float)
             "--print-timeout", f"{max(1, int(seconds))}s",
         ], json.dumps(message) + "\n", env
     if model.provider == "muse":
+        # This Muse CLI needs session logging for its local session
+        # messaging, so the run keeps its session store inside the run.
+        data = work / "data"
+        data.mkdir(mode=0o700, exist_ok=True)
+        env["XDG_DATA_HOME"] = str(data)
         return [
             os.getenv("MUSE_CLI", "muse"), "exec", "--contributor-mode", "on", "--prompt-file", str(prompt_file),
             "--model", model.selector, "--reasoning-effort", model.effort,
-            "--yolo", "--workspace", str(checkout), "--json", "--no-session-log",
+            "--yolo", "--workspace", str(checkout), "--json",
         ], "", env
     raise AgentPreflightError(f"{model.provider} cannot run an issue review")
 

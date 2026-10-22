@@ -58,7 +58,7 @@ import {
   inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
 } from './git'
 import {
-  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, canonicalJson, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
+  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
   type PermissionOption, type PoiseActor, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
@@ -95,6 +95,9 @@ const PROVIDER_AGENT: Record<string, AgentId> = { claude: 'claude', codex: 'code
 const AGENT_COMMAND: Record<AgentId, string> = { claude: 'claude', codex: 'codex', grok: 'grok', muse: 'muse' }
 const AGENT_LABEL: Record<AgentId, string> = { claude: 'Claude Code', codex: 'Codex', grok: 'Grok Build', muse: 'Muse' }
 const alertContext = (record: SessionRecord): ChatSessionAlertContext => ({ sessionId: record.id, agent: AGENT_LABEL[record.agent], title: record.title })
+/** Transcript note when a Muse native session is restarted fresh because its
+ *  reasoning was encrypted for a previous credential holder. */
+const MUSE_RESTART_NOTE = 'Muse agent session was restarted on a fresh native session because Muse\'s credentials changed; the conversation continues from a summary.'
 /** The Switchboard's own chat (docs/Switchboard.md); a fork of it is an ordinary chat. */
 const isSwitchboardChat = (record: SessionRecord): boolean => record.context?.kind === 'switchboard' && !record.forkedFrom
 
@@ -1357,11 +1360,16 @@ export class ChatRuntime extends EventEmitter {
       // An observer reading untrusted transcripts gets no MCP servers.
       const extensions = this.options.extensions && !isSwitchboardChat(record) ? await this.options.extensions.resolve(record) : null
       signal.throwIfAborted()
-      const host = this.hostFor(session)
-      const adapter = this.adapters[record.agent](host)
-      session.adapter = adapter
-      adapter.onExit((code, signal) => this.onAdapterExit(session, adapter, code, signal))
-      const startOptions = {
+      // Each registration reports its own adapter instance: closing over the
+      // reassigned `adapter` below would attribute a late exit of the stopped
+      // process to the fresh adapter and tear down the restarted session.
+      const attach = (next: Adapter) => {
+        session.adapter = next
+        next.onExit((code, signal) => this.onAdapterExit(session, next, code, signal))
+      }
+      let adapter = this.adapters[record.agent](this.hostFor(session))
+      attach(adapter)
+      let startOptions = {
         modelId: record.modelId,
         effort: record.effort,
         safeMode: record.safeMode === true,
@@ -1371,7 +1379,25 @@ export class ChatRuntime extends EventEmitter {
           : record.nativeSessionId ? { resume: record.nativeSessionId } : {}),
         ...(extensions?.servers.length ? { mcpServers: extensions.servers } : {}),
       }
-      const started = await adapter.start(startOptions)
+      let started
+      try {
+        started = await adapter.start(startOptions)
+      } catch (error) {
+        if (record.agent !== 'muse' || !('resume' in startOptions) || !isStaleMuseCaller(error) || signal.aborted) throw error
+        try { await this.stopProcess(session) } catch { throw error }
+        signal.throwIfAborted()
+        this.clearStaleMuseSession(session)
+        adapter = this.adapters[record.agent](this.hostFor(session))
+        attach(adapter)
+        startOptions = {
+          modelId: record.modelId,
+          effort: record.effort,
+          safeMode: record.safeMode === true,
+          ...(record.mode ? { mode: record.mode } : {}),
+          ...(extensions?.servers.length ? { mcpServers: extensions.servers } : {}),
+        }
+        started = await adapter.start(startOptions)
+      }
       signal.throwIfAborted()
       session.nativeCliVersion = cli?.launchVersion || cli?.after || cli?.before
       session.nativeSafeMode = startOptions.safeMode
@@ -1672,7 +1698,7 @@ export class ChatRuntime extends EventEmitter {
     return created
   }
 
-  private handoffSummary(record: SessionRecord): string {
+  private collectRecentTurns(record: SessionRecord): Array<{ prompt: string, text: string, files: Set<string> }> {
     const turns: Array<{ prompt: string, text: string, files: Set<string> }> = []
     let cursor = 0
     while (true) {
@@ -1693,7 +1719,11 @@ export class ChatRuntime extends EventEmitter {
       if (!page.truncated || !page.events.length) break
       cursor = page.events[page.events.length - 1].seq
     }
-    const recent = turns
+    return turns
+  }
+
+  private handoffSummary(record: SessionRecord): string {
+    const recent = this.collectRecentTurns(record)
     const files = new Set(recent.flatMap(turn => [...turn.files]))
     const lines = [
       `[Handoff from a ${AGENT_LABEL[record.agent]} session "${record.title}" in ${record.repo} on branch ${record.branch.name}]`,
@@ -1705,6 +1735,63 @@ export class ChatRuntime extends EventEmitter {
     if (files.size) lines.push('', `Files the previous agent changed: ${[...files].slice(0, 40).join(', ')}`)
     lines.push('', 'Continue from here.')
     return lines.join('\n')
+  }
+
+  private restartSummary(record: SessionRecord): string {
+    const recent = this.collectRecentTurns(record)
+    const files = new Set(recent.flatMap(turn => [...turn.files]))
+    const lines = [
+      `[Restarted ${AGENT_LABEL[record.agent]} session "${record.title}" in ${record.repo} on branch ${record.branch.name}]`,
+      'The previous native session could not be used because Muse\'s credentials changed. Nothing from it carried over except this summary.',
+      '',
+      'Recent turns:',
+      ...recent.map((t, i) => `${i + 1}. User: ${clip(t.prompt, 600)}\n   Agent: ${clip(t.text.trim(), 900)}`),
+    ]
+    if (files.size) lines.push('', `Files the previous session changed: ${[...files].slice(0, 40).join(', ')}`)
+    lines.push('', 'Continue from here.')
+    return lines.join('\n')
+  }
+
+  /** Abandon a Muse native session whose reasoning was encrypted for a
+   *  previous credential holder: seed the restart summary, forget the native
+   *  id, and note the restart once in the transcript. Clearing the id cannot
+   *  retrigger branch creation: the branch was prepared by the earlier start
+   *  that produced the abandoned id. Returns the seeded summary, if any. */
+  private clearStaleMuseSession(session: LiveSession): string | undefined {
+    const record = session.record
+    const staleId = record.nativeSessionId
+    let summary: string | undefined
+    if (!record.queuedHandoff && storage.findEvent(record.id, (event) => event.type === 'text.delta')) {
+      summary = this.restartSummary(record)
+      record.queuedHandoff = summary
+    }
+    record.nativeSessionId = undefined
+    this.saveRecord(session)
+    this.emit_(record.id, { type: 'error', message: MUSE_RESTART_NOTE, recoverable: true })
+    this.emit('log', `[chat ${record.id.slice(0, 8)}] Muse native session ${staleId} abandoned (reasoning issued to another caller); restarting fresh`)
+    return summary
+  }
+
+  /** Recover a Muse turn that failed only because its native session is
+   *  unusable under the current credentials, inside this same turn: stop the
+   *  poisoned process, start fresh in the same checkout under the turn's
+   *  lease, and — when the failed attempt ran nothing — run the prompt there
+   *  once with the restart summary. Runs at most once per turn; a second
+   *  consecutive failure surfaces as an ordinary error. */
+  private async recoverStaleMuseTurn(session: LiveSession, turn: RunningTurn, lease: CheckoutLease, promptInput: PromptInput): Promise<TurnResult> {
+    await this.stopProcess(session)
+    turn.abort.signal.throwIfAborted()
+    const summary = this.clearStaleMuseSession(session)
+    await this.startSession(session, { lease })
+    turn.abort.signal.throwIfAborted()
+    // The failed attempt already ran tools, asked permissions or asked
+    // questions: re-running the prompt could repeat side effects, so the
+    // fresh session and its summary stand ready for the next prompt instead.
+    if (storage.findEvent(session.record.id, (event) => (event.type === 'tool.started' || event.type === 'permission.requested' || event.type === 'question.asked') && event.turnId === turn.id)) {
+      return { stopReason: 'error', error: 'The prompt was not re-run because the failed attempt had already run tools; the Muse session was restarted and the next prompt continues from a summary.' }
+    }
+    const retry = summary ? { ...promptInput, text: `${summary}\n\n[Current task]\n${promptInput.text}` } : promptInput
+    return session.adapter!.prompt(turn.id, retry, turn.abort.signal)
   }
 
   // ── Poise self-improvement ─────────────────────────────────────────────
@@ -2502,9 +2589,18 @@ export class ChatRuntime extends EventEmitter {
       if (session.relay) turn.relayHeld = true
       let result: TurnResult
       try {
-        const response = adapter.prompt(turn.id, withAutoMergeInstructions({ ...adapterInput, text: controlContext ? `${controlContext}\n\n[Request]\n${expanded}` : expanded, memories: readMemories().text }, record.autoMerge, turn.implementsChange, turn.source && !personRelay ? 'source' : 'person'), turn.abort.signal)
+        const promptInput = withAutoMergeInstructions({ ...adapterInput, text: controlContext ? `${controlContext}\n\n[Request]\n${expanded}` : expanded, memories: readMemories().text }, record.autoMerge, turn.implementsChange, turn.source && !personRelay ? 'source' : 'person')
+        const response = adapter.prompt(turn.id, promptInput, turn.abort.signal)
         turn.releasePrompt()
         result = await response
+        // A Muse turn that failed only because its native session's reasoning
+        // was encrypted for a previous credential holder restarts once, inside
+        // this same turn, on a fresh native session.
+        if (record.agent === 'muse' && result.stopReason === 'error' && result.error && isStaleMuseCaller(result.error)
+          && !turn.stopping && !turn.abort.signal.aborted && !turn.failure) {
+          result = await this.recoverStaleMuseTurn(session, turn, lease, promptInput)
+          adapter = session.adapter!
+        }
       } finally {
         session.relay?.turnFinish()
         turn.relayHeld = false
@@ -3525,6 +3621,22 @@ function implementingTurnOutcome(sessionId: string): { started: boolean, finishe
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+/** Muse rejects resuming a session whose reasoning was encrypted for a
+ *  previous credential holder (OAuth login vs API key). The native session
+ *  is unresumable; the chat restarts it fresh from a transcript summary. */
+function isStaleMuseCaller(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes('encrypted_content') && message.includes('was not issued to this caller')
+}
+
+/** Recursive canonical form: nested input keys count, so two commands that
+ *  differ below the top level never share a permission grant. */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined'
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  return `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as any)[key])}`).join(',')}}`
 }
 
 function delay(ms: number): Promise<void> {

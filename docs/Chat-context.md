@@ -52,6 +52,19 @@ Reset takes precedence over compaction when both occur in a chain. `/reset
 /review` cannot review an erased reply and is rejected before history changes;
 review before resetting, or supply a new task after reset.
 
+## Credential-change restart
+
+When a Muse native session can no longer run because its reasoning was
+encrypted for a previous credential holder (for example after switching Muse
+from the account login to an API key), the affected chat restarts the session
+instead of failing forever: Poise stops the poisoned process, starts a fresh
+native session in the same checkout and branch, and runs the prompt there with
+a bounded summary of the recent turns. The transcript records one restart note.
+The chat's identity, workspace, branch and history stay as they are; only the
+summary carries over, so the agent may need `git status` / `git log` for exact
+recent state. A failed attempt that had already run tools is not re-run; the
+fresh session stands ready for the next prompt instead.
+
 ## Reliability and verification
 
 Reset and its new sequence barrier commit in one SQLite transaction. Sequence
