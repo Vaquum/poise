@@ -255,6 +255,30 @@ describe('the switch bound', () => {
     }
   })
 
+  it('keeps waited prompts in arrival order when the restart is refused', async () => {
+    const w = await world()
+    const timer = new FakeTimer()
+    const restart = vi.fn(() => false)
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: () => {}, releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => 5_000_000,
+    })
+    try {
+      service.switchRelease('r2')
+      for (const text of ['First', 'Second', 'Third']) {
+        expect(w.runtime.prompt(w.s.id, input(text))).toHaveProperty('waitId')
+      }
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      await until(() => w.turns(w.s.id).length === 3)
+      expect(w.c.calls.map(call => call.input.text)).toEqual(['First', 'Second', 'Third'])
+      expect(w.runtime.switchPending).toBeNull()
+      expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([])
+    } finally {
+      service.reset()
+    }
+  })
+
   it('cancels a turn still running past the bound and restarts; after the restart its session gets exactly one continue prompt on its resumed native session', async () => {
     const w = await world({ auto: false })
     w.runtime.prompt(w.s.id, input('Keep working'))

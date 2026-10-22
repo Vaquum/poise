@@ -618,7 +618,7 @@ export class ChatRuntime extends EventEmitter {
     this.drainState = null
     // A server that is stopping leaves waited prompts durable for the next
     // server: consuming them now would refuse each against a closing session.
-    if (this.stopped) return
+    if (this.stopped || this.switchState) return
     // Prompts that waited behind an update start first, in order — the
     // synchronous reserves below land before the queue pump behind them —
     // then the queues pump.
