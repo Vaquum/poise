@@ -5240,6 +5240,13 @@ body.editor-writer-mode .editor-focus-btn:hover { color: var(--text); }
 .annotation-mark:hover {
   background: color-mix(in srgb, var(--a4, #c89b3c) 14%, transparent);
 }
+/* An orphaned note's mark: its passage is gone, so the amber underline
+   gives way to a short dotted tick in the muted tone. The element
+   carries both classes; JS sizes it to about one line-height at the
+   start of the line the note was last seen on. */
+.annotation-orphan {
+  border-bottom: 2px dotted var(--text-tertiary);
+}
 
 /* Floating Comment button — appears just above-right of the live
    selection inside the editor. position:fixed because the JS sets
@@ -5336,6 +5343,12 @@ body.editor-writer-mode .editor-focus-btn:hover { color: var(--text); }
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
+}
+/* Notice at the top of the panel when the note's passage is gone. */
+.editor-annotation-orphan {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
 }
 .editor-annotation-delete {
   background: transparent;

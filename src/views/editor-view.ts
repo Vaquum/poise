@@ -2991,17 +2991,15 @@ function rangeText(lines: HTMLElement[], range: AnnotationRange): string | null 
 // Best-effort re-anchoring: returns the (start_line, start_offset,
 // end_line, end_offset) where the snippet currently lives, or null if
 // it can't be found. The recorded position is checked first; if the
-// text there matches, no change. Otherwise we walk the doc's lines for
-// the first occurrence of the snippet and take that. No occurrence ⇒
-// the annotation has orphaned.
+// text there matches, no change. Otherwise the document's lines are
+// searched joined with '\n', the way snippets are recorded, and each
+// occurrence is mapped back to its start and end line and offset. No
+// occurrence ⇒ the annotation has orphaned.
 function reAnchorAnnotation(a: Annotation): AnnotationRange | null {
   if (!docEl) return null
   const lines = Array.from(docEl.children) as HTMLElement[]
+  if (!lines.length) return null
   if (rangeText(lines, a.range) === a.snippet) return a.range          // fast path: still in place
-  // Snippet drifted — search the whole doc for a single-line match.
-  // We don't try to rebind multi-line snippets in this pass; those
-  // simply orphan if they shift, until the user re-annotates.
-  if (a.snippet.includes('\n')) return null
 
   // Search outward from the line the annotation was last seen on, not from
   // the top of the document. Scanning from line 0 and taking the first hit
@@ -3011,11 +3009,10 @@ function reAnchorAnnotation(a: Annotation): AnnotationRange | null {
   // was never about — and a second such note landed on the same words,
   // stacking two marks on one span.
   // `home` is a remembered index, so it can point past the end after lines
-  // are deleted. Bound BOTH directions — pushing an out-of-range `home` made
-  // the loop below read lines[i].textContent off undefined and throw, which
-  // killed renderAnnotationOverlay mid-pipeline and took the undo recording
-  // and the autosave for that keystroke with it.
-  const home = a.range.start_line
+  // are deleted. Clamp it into the document first: an out-of-range `home`
+  // used to cut the search below short and orphan notes that were still in
+  // the document.
+  const home = Math.max(0, Math.min(a.range.start_line, lines.length - 1))
   const order: number[] = []
   for (let d = 0; d < lines.length; d++) {
     const back = home - d
@@ -3024,28 +3021,53 @@ function reAnchorAnnotation(a: Annotation): AnnotationRange | null {
     if (d > 0 && fwd >= 0 && fwd < lines.length) order.push(fwd)
   }
 
+  // One search for both shapes. Occurrences of the snippet in the joined
+  // document bucket by the line they start on, already left to right; the
+  // outward line order above then picks the nearest line, earliest on a
+  // tie. A single-line note finds the same occurrence as the old
+  // line-by-line search, and a multi-line one is re-found too.
+  const texts = lines.map((line) => line.textContent || '')
+  const starts: number[] = []
+  let acc = 0
+  for (const text of texts) { starts.push(acc); acc += text.length + 1 }
+  const locate = (abs: number): { line: number, offset: number } => {
+    let lo = 0
+    let hi = starts.length - 1
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1
+      if (starts[mid] <= abs) lo = mid
+      else hi = mid - 1
+    }
+    return { line: lo, offset: abs - starts[lo] }
+  }
+  const byLine = new Map<number, AnnotationRange[]>()
+  const doc = texts.join('\n')
+  for (let idx = doc.indexOf(a.snippet); idx >= 0; idx = doc.indexOf(a.snippet, idx + 1)) {
+    const s = locate(idx)
+    const e = locate(idx + a.snippet.length)
+    const candidate = {
+      start_line: s.line, start_offset: s.offset, end_line: e.line, end_offset: e.offset,
+    }
+    const bucket = byLine.get(s.line)
+    if (bucket) bucket.push(candidate)
+    else byLine.set(s.line, [candidate])
+  }
+
   // Never re-anchor on top of another annotation's span; prefer the next
   // free occurrence on that line, then keep searching outward.
   const taken = new Set(annotations
     .filter((x) => x.id !== a.id)
     .map((x) => `${x.range.start_line}:${x.range.start_offset}`))
 
-  let fallback: AnnotationRange | null = null
   for (const i of order) {
-    const text = lines[i].textContent || ''
-    for (let idx = text.indexOf(a.snippet); idx >= 0; idx = text.indexOf(a.snippet, idx + 1)) {
-      const candidate = {
-        start_line: i, start_offset: idx, end_line: i, end_offset: idx + a.snippet.length,
-      }
-      if (!taken.has(`${i}:${idx}`)) return candidate
-      if (!fallback) fallback = candidate
+    for (const candidate of byLine.get(i) ?? []) {
+      if (!taken.has(`${candidate.start_line}:${candidate.start_offset}`)) return candidate
     }
   }
-  // Every occurrence is already spoken for. Orphan the note rather than park
-  // it on top of another one: two marks over the same characters is how a
-  // note ends up labelling text it was never about, and the user cannot tell
-  // the two apart to remove either.
-  void fallback
+  // No free occurrence. Orphan the note rather than park it on top of
+  // another one: two marks over the same characters is how a note ends up
+  // labelling text it was never about, and the user cannot tell the two
+  // apart to remove either.
   return null
 }
 
@@ -3068,9 +3090,10 @@ function renderAnnotationOverlay(): void {
   // Re-anchor each annotation. Three outcomes per annotation:
   //   - found at recorded position: render as-is.
   //   - found at a new position: update + persist + render at new pos.
-  //   - not found at all: orphan — don't render (the row stays in
-  //     storage so the user's comment isn't silently lost; if the
-  //     snippet reappears on a later edit, the underline returns).
+  //   - not found at all: orphan — render an inert mark at the line it
+  //     was last seen on (the row stays in storage so the user's
+  //     comment isn't silently lost; if the snippet reappears on a
+  //     later edit, the underline returns).
   let anyChanged = false
   const orphans = new Set<string>()
   for (const a of annotations) {
@@ -3086,6 +3109,35 @@ function renderAnnotationOverlay(): void {
     }
   }
   if (anyChanged) scheduleAnnotationsSave()
+
+  // Orphaned notes draw first, as short inert ticks at the start of the
+  // line they were last seen on, so a live mark on the same line paints
+  // over them. Only the first characters of the line are covered, so the
+  // rest of the line can still be clicked into. Nothing about the orphan
+  // state is stored: if the snippet reappears, the note is re-found.
+  // Orphans sharing a clamped line cascade rightward from the line start,
+  // one tick per note: identical boxes would stack and leave all but the
+  // topmost unreachable.
+  const lineEls = Array.from(docEl.children) as HTMLElement[]
+  const orphansOnLine = new Map<number, number>()
+  for (const a of annotations) {
+    if (!orphans.has(a.id)) continue
+    const lineIdx = Math.max(0, Math.min(a.range.start_line, lineEls.length - 1))
+    const lineEl = lineEls[lineIdx]
+    if (!lineEl) continue
+    const slot = orphansOnLine.get(lineIdx) ?? 0
+    orphansOnLine.set(lineIdx, slot + 1)
+    const rect = lineEl.getBoundingClientRect()
+    const mark = document.createElement('div')
+    mark.className = 'annotation-mark annotation-orphan'
+    mark.dataset.annId = a.id
+    mark.style.left   = (rect.left - pageRect.left + slot * rect.height) + 'px'
+    mark.style.top    = (rect.top    - pageRect.top)  + 'px'
+    mark.style.width  = rect.height + 'px'
+    mark.style.height = rect.height + 'px'
+    mark.title = a.comment ? `Passage changed: ${a.comment.slice(0, 200)}` : 'Passage changed'
+    overlayEl.appendChild(mark)
+  }
 
   for (const a of annotations) {
     if (orphans.has(a.id)) continue
@@ -3963,7 +4015,9 @@ function openPanelForAnnotation(id: string): void {
   panelForId = id
   panelMessages = []
   panelReplies.clear()
+  const orphaned = !reAnchorAnnotation(a)
   panelEl.innerHTML = `
+    ${orphaned ? '<div class="editor-annotation-orphan">Passage changed: the text this note was on is no longer in the document.</div>' : ''}
     <div class="editor-annotation-row">
       <span class="editor-annotation-snippet" title="${escapeHtml(a.snippet)}">${escapeHtml(a.snippet.slice(0, 80))}${a.snippet.length > 80 ? '…' : ''}</span>
       <button type="button" class="editor-annotation-delete" aria-label="Delete">${ICON_TRASH}</button>
@@ -3996,11 +4050,15 @@ function openPanelForAnnotation(id: string): void {
 
   // Position the panel near the annotation. Use the annotation's first
   // rect for anchoring; if it would push off the bottom edge, flip
-  // above the annotation instead.
-  const range = rangeForAnnotation(a)
+  // above the annotation instead. An orphaned note has no live range,
+  // so its panel anchors to its mark instead.
+  const range = orphaned ? null : rangeForAnnotation(a)
+  const anchor = range?.getBoundingClientRect()
+    ?? overlayEl?.querySelector(`[data-ann-id="${CSS.escape(a.id)}"]`)?.getBoundingClientRect()
+    ?? null
   panelEl.hidden = false
-  if (range) {
-    const rect = range.getBoundingClientRect()
+  if (anchor) {
+    const rect = anchor
     const margin = 8
     const panelRect = panelEl.getBoundingClientRect()
     const wouldOverflowBottom = rect.bottom + margin + panelRect.height > window.innerHeight
