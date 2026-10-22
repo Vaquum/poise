@@ -16,6 +16,7 @@ import { config as loadDotenv } from 'dotenv'
 import { callerPython, setupCaller } from './caller-setup.mjs'
 import { installStopGate, stopGateManifest } from './stop-gate-runtime.mjs'
 import { servicePath } from './production-path.mjs'
+import { requireProductionDotenv } from './production-env.mjs'
 import { legacyDatastoreServices, resolveLegacyDatastore } from './legacy-datastore.mjs'
 import { prepareInstalledBundle } from './start-production.mjs'
 import { selectNodeRuntime } from './self-update/node-runtime.mjs'
@@ -228,10 +229,7 @@ async function main() {
   if (process.platform !== 'darwin') {
     throw new Error('The supervised production installer currently supports macOS launchd')
   }
-  const dotenvStat = await stat(dotenvPath)
-  if (!dotenvStat.isFile() || (dotenvStat.mode & 0o077) !== 0) {
-    throw new Error('.env must exist and be owner-readable only (chmod 600 .env)')
-  }
+  await requireProductionDotenv(dotenvPath)
   loadDotenv({ path: dotenvPath, quiet: true })
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/.test(
     process.env.REVIEW_AGENT_USERNAME || '',
