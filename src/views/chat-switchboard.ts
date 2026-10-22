@@ -1,6 +1,7 @@
 import type { SwitchboardItem, SwitchboardKind, SwitchboardState } from '../../server/chat/protocol'
 import { AGENT_LABELS } from '../../server/chat/protocol'
 import { chatClient } from '../chat-client'
+import { shortTime } from '../clock'
 import { effectiveTimezone } from '../config'
 import { patchContent } from '../dom-patch'
 import { escapeHtml } from '../markdown'
@@ -45,9 +46,8 @@ function stored(key: string): string | null { try { return localStorage.getItem(
 function remember(key: string, value: string): void { try { localStorage.setItem(key, value) } catch { /* layout still works */ } }
 
 function clock(iso: string | null): string {
-  if (!iso) return ''
-  const date = new Date(iso)
-  return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: effectiveTimezone() })
+  if (!iso || Number.isNaN(Date.parse(iso))) return ''
+  return shortTime(iso, effectiveTimezone(), Date.now())
 }
 function age(iso: string, now: number): string {
   const minutes = Math.floor((now - Date.parse(iso)) / 60_000)

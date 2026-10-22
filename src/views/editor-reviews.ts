@@ -1,4 +1,6 @@
 import { patchContent } from '../dom-patch'
+import { shortTime } from '../clock'
+import { effectiveTimezone } from '../config'
 import { reveal, watchPanel } from '../motion'
 import { locateReview, REVIEW_INTERVAL_MS, type ArticleReview, type ArticleReviews } from '../publishing-review'
 
@@ -187,7 +189,7 @@ export class EditorReviews {
     this.list.hidden = !this.data.checkedAt && !this.data.reviews.length && !this.data.problems.length && !this.error
     patchContent(this.list, `<details><summary>Review comments${count ? ` · ${count} unresolved` : ''}</summary>
       <div class="editor-review-status"><button type="button" data-action="refresh"${this.busy ? ' disabled' : ''}>Refresh reviews</button>
-      <span>${this.data.checkedAt ? `${this.data.stale ? 'Cached' : 'Checked'} ${escape(new Date(this.data.checkedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}` : 'Not synchronized'}</span></div>
+      <span>${this.data.checkedAt ? `${this.data.stale ? 'Cached' : 'Checked'} ${escape(shortTime(this.data.checkedAt, effectiveTimezone(), Date.now()))}` : 'Not synchronized'}</span></div>
       ${[...this.data.problems, ...(this.error ? [this.error] : [])].map((problem) => `<p role="alert">${escape(problem)}</p>`).join('')}
       ${!this.data.reviews.length ? '<p>No review comments yet.</p>' : ''}
       ${this.data.reviews.map((review) => `<button type="button" class="editor-review-item" data-key="${escape(review.id)}" data-review="${escape(review.id)}">
@@ -224,7 +226,7 @@ export class EditorReviews {
       <span class="editor-review-state">${review.resolved ? 'Resolved' : review.outdated ? 'Outdated · unresolved' : review.kind === 'thread' ? 'Unresolved' : 'Document feedback'}${this.data.stale ? ' · Cached' : ''}</span>
       ${review.anchor ? `<blockquote>${escape(review.anchor.quote)}</blockquote>` : ''}
       ${!located ? `<p class="editor-review-location">${escape(review.anchor ? 'Passage changed or ambiguous — comment retained here.' : review.location ?? 'Document feedback')}</p>` : ''}
-      <div class="editor-review-messages">${review.messages.map((message) => `<article data-key="${escape(message.id)}"><a href="${link(message.url)}" target="_blank" rel="noopener noreferrer">@${escape(message.author)}</a><time datetime="${escape(message.createdAt)}">${escape(new Date(message.createdAt).toLocaleString())}</time><p>${escape(message.body)}</p></article>`).join('')}</div>
+      <div class="editor-review-messages">${review.messages.map((message) => `<article data-key="${escape(message.id)}"><a href="${link(message.url)}" target="_blank" rel="noopener noreferrer">@${escape(message.author)}</a><time datetime="${escape(message.createdAt)}">${escape(shortTime(message.createdAt, effectiveTimezone(), Date.now()))}</time><p>${escape(message.body)}</p></article>`).join('')}</div>
       ${[...this.data.problems, ...(this.error ? [this.error] : [])].map((problem) => `<p role="alert">${escape(problem)}</p>`).join('')}
       ${review.canReply ? `<label>Reply on GitHub<textarea aria-label="Reply on GitHub" class="editor-annotation-text" maxlength="65536"${this.busy ? ' disabled' : ''}></textarea></label>` : ''}
       <div class="editor-review-actions">${review.canReply ? `<button type="button" data-action="reply"${this.busy ? ' disabled' : ''}>Reply on GitHub</button>` : ''}

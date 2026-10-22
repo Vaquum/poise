@@ -28,7 +28,8 @@ import type {
 } from '../../server/chat/protocol'
 import { AGENT_LABELS } from '../../server/chat/protocol'
 import { consoleModelLabel } from '../chat-catalog'
-import { clockDay, turnTime } from '../chat-turn-time'
+import { turnTime } from '../chat-turn-time'
+import { clockDay } from '../clock'
 import { effectiveTimezone } from '../config'
 import { renderMarkdown, escapeHtml } from '../markdown'
 

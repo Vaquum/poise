@@ -6,6 +6,7 @@ import { analyticsDay, analyticsDayProgress, analyticsHistoryBounds } from '../a
 import { analyticsSnapshotScope, hasNewAccountFailure, preparedAnalytics, readAnalyticsSnapshot, type AnalyticsSnapshot } from '../analytics-snapshot'
 import { HISTORY_BASELINE, historyChart, histogram, historySeries, periodLabel, type AnalyticsHistory, type HistorySeries } from '../analytics-history'
 import { mountOrganizationFilter, organizationUrl } from '../organizations'
+import { shortTime } from '../clock'
 import { effectiveTimezone, getRefreshRateMs, settingsReady } from '../config'
 import { noticeFeed, type ReadFailure } from '../notices'
 import { GITHUB_QUOTA_REFRESH_MS, quotaRiskTone, quotaHours, type GithubQuotaReport, type GithubQuotaBucket } from '../github-quota'
@@ -116,7 +117,7 @@ function histogramMarkup(series: Pick<HistorySeries, 'label' | 'values' | 'forma
 function quotaCharts(bucket: GithubQuotaBucket, now: number): string {
   const observations = (bucket.history ?? []).filter((sample) => Math.floor(sample.at / 3_600_000) >= Math.floor(now / 3_600_000) - 167 && sample.at <= now && sample.limit > 0)
   const hours = quotaHours(observations, now)
-  const time = (at: number) => new Intl.DateTimeFormat('en-GB', { timeZone: effectiveTimezone(), day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }).format(at)
+  const time = (at: number) => shortTime(at, effectiveTimezone(), now)
   const help = 'Used and remaining quota at the latest observation in each hour, past 24 hours including this hour. Empty columns have no observation. Heights show percentage of the quota limit.'
   return `<div class="quota-charts">
     <div class="analytics-chart-heading"><span>Past 24 hours</span><span class="quota-legend"><i class="quota-used"></i>Used <i class="quota-left"></i>Left</span></div>

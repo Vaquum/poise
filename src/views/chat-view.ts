@@ -25,6 +25,8 @@ import type {
 import { AGENT_LABELS } from '../../server/chat/protocol'
 import { chatClient, ChatCommandError, ChatHttpError, type AgentsResponse, type AgentInfo } from '../chat-client'
 import { escapeHtml } from '../markdown'
+import { listTime } from '../clock'
+import { effectiveTimezone } from '../config'
 import { recoverDraft } from '../chat-draft-recovery'
 import { parseChatCommandChain as parseChain, commandBody } from '../../server/chat/commands'
 import { commandDraftText } from '../chat-command-draft'
@@ -197,11 +199,8 @@ function isRunning(status: SessionStatus): boolean {
 }
 
 function dateLabel(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ''
-  const now = new Date()
-  const sameDay = d.toDateString() === now.toDateString()
-  return sameDay ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+  if (Number.isNaN(Date.parse(iso))) return ''
+  return listTime(iso, effectiveTimezone(), Date.now())
 }
 
 function agentFor(id: string): AgentInfo | undefined {

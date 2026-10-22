@@ -4,6 +4,7 @@ import { patchContent, patchInformation } from '../dom-patch'
 // The gateway does the work (src/gateway-client.ts); its apex /admin page has
 // the same controls for when the admin's own workspace cannot open.
 
+import { shortTime } from '../clock'
 import { effectiveTimezone } from '../config'
 import { changeAdmin, fetchAdmin, type AdminChange, type AdminOverview, type AdminUser, type GatewayAccount } from '../gateway-client'
 import './admin-settings.css'
@@ -21,7 +22,7 @@ function escapeHtml(value: string): string {
 }
 
 function moment(ms: number): string {
-  return new Date(ms).toLocaleString([], { timeZone: effectiveTimezone(), dateStyle: 'medium', timeStyle: 'short' })
+  return shortTime(ms, effectiveTimezone(), Date.now())
 }
 
 function action(user: AdminUser, change: AdminChange, label: string, danger = false): string {

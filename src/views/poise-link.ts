@@ -3,6 +3,7 @@ import { patchInformation } from '../dom-patch'
 // how to install it, approving the code it shows, and the computers paired
 // with this workspace. Pairing is the gateway's (src/gateway-client.ts).
 
+import { shortTime } from '../clock'
 import { effectiveTimezone } from '../config'
 import { decidePairing, fetchDevices, revokeDevice, type GatewayAccount, type PairedDevice } from '../gateway-client'
 import './poise-link.css'
@@ -38,7 +39,7 @@ function deviceName(device: PairedDevice): string {
 }
 
 function moment(ms: number): string {
-  return new Date(ms).toLocaleString([], { timeZone: effectiveTimezone(), dateStyle: 'medium', timeStyle: 'short' })
+  return shortTime(ms, effectiveTimezone(), Date.now())
 }
 
 // Paired is not running: an active device is Connected only while its Poise

@@ -237,7 +237,7 @@ test('ends each finished turn in one meta row: its recorded end time, how it sto
   const go = { text: 'go', attachments: [], mentions: [] }
   // History and live events carry the times the server would have stamped; the fixture's helpers stamp their own.
   const at = (seq: number, time: string, event: ChatEvent): ChatEnvelope => ({ seq, sessionId: 's1', at: time, event })
-  const state = makeState([session({ lastSeq: 15 })], { s1: [
+  const state = makeState([session({ lastSeq: 15, createdAt: '2026-10-21T16:19:00.000Z' })], { s1: [
     at(1, '2026-10-20T14:04:40.000Z', { type: 'turn.started', turnId: 't1', prompt: go }),
     at(2, '2026-10-20T14:05:02.000Z', { type: 'text.delta', turnId: 't1', messageId: 'a1', delta: 'Nothing is waiting for you.' }),
     at(3, '2026-10-20T14:05:12.000Z', { type: 'turn.finished', turnId: 't1', stopReason: 'end_turn', durationMs: 31_500, usage: { totalTokens: 18_432 } }),
@@ -273,6 +273,9 @@ test('ends each finished turn in one meta row: its recorded end time, how it sto
   const tokens = await page.evaluate(() => [(18_432).toLocaleString(), (9_214).toLocaleString()])
   await expect(turns).toHaveCount(5)
   await expect.poll(() => parts(4)).toEqual(['19:38', '·', '43s', '·', `${tokens[1]} tokens`, 'button: Copy message'])
+  // The session list's date is on the same clock, and relabels with the transcript.
+  const created = page.locator('.chat-session-item[data-id="s1"] .chat-session-date')
+  await expect(created).toHaveText('19:19')
   await expect(time(4)).toHaveAttribute('datetime', '2026-10-21T16:38:12.000Z')
   await expect(time(4)).toHaveAttribute('data-help', 'Finished Wednesday 21 October 2026 at 19:38:12 EEST')
   await expect(time(4)).toMatchAriaSnapshot('- time: Finished Wednesday 21 October 2026 at 19:38:12 EEST')
@@ -340,6 +343,7 @@ test('ends each finished turn in one meta row: its recorded end time, how it sto
   await expect(shown(4)).toHaveText('21 Oct 19:38', { timeout: 2_000 })
   await expect(shown(1)).toHaveText('21 Oct 19:20')
   await expect(shown(0)).toHaveText('20 Oct 17:05')
+  await expect(created).toHaveText('21 Oct')
   // Saving another time zone relabels the times in it. Chat has its own .st-save buttons.
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
   await page.locator('[data-settings="general"]').click()
@@ -352,6 +356,29 @@ test('ends each finished turn in one meta row: its recorded end time, how it sto
   await expect(time(4)).toHaveAttribute('data-help', 'Finished Wednesday 21 October 2026 at 17:38:12 BST')
   await expect(shown(1)).toHaveText('17:20')
   await expect(shown(0)).toHaveText('20 Oct 15:05')
+  await expect(created).toHaveText('17:19')
+})
+
+test.describe('in an en-US browser on UTC', () => {
+  test.use({ locale: 'en-US', timezoneId: 'UTC' })
+
+  test("dates the session list on Poise's clock in Settings' time zone", async ({ page }) => {
+    await page.clock.setFixedTime(new Date('2026-10-21T17:00:00Z'))
+    const state = makeState([
+      session({ id: 'today', title: 'Today', createdAt: '2026-10-21T16:38:00.000Z' }),
+      session({ id: 'yesterday', title: 'Yesterday', createdAt: '2026-10-20T14:05:00.000Z' }),
+      // 20 Oct in the browser's UTC, but 01:30 today in Helsinki.
+      session({ id: 'after-midnight', title: 'After midnight', createdAt: '2026-10-20T22:30:00.000Z' }),
+    ])
+    state.settings.timezone = 'Europe/Helsinki'
+    await installRoutes(page, state)
+    await installSocket(page)
+    await page.goto('/')
+    // Not the browser's "04:38 PM" or "Oct 20": Helsinki's time today, the date alone before.
+    await expect(page.locator('.chat-session-item[data-id="today"] .chat-session-date')).toHaveText('19:38')
+    await expect(page.locator('.chat-session-item[data-id="yesterday"] .chat-session-date')).toHaveText('20 Oct')
+    await expect(page.locator('.chat-session-item[data-id="after-midnight"] .chat-session-date')).toHaveText('01:30')
+  })
 })
 
 test('answers a permission with the keyboard and a question with its options', async ({ page }) => {
@@ -3118,13 +3145,15 @@ test('CLI refresh: a completed Settings check updates the fresh console without 
   await page.route('**/api/models/refresh', async route => {
     const claude = state.agents!.agents[0] as { models: Array<{ identity: string, selector: string, effort: string }> }
     claude.models = claude.models.map(model => ({ ...model, identity: model.identity.replace('opus-5-', 'opus-5.5-'), selector: 'claude-opus-5-5' }))
-    await route.fulfill({ json: { changed: true, families: { claude: { status: 'ok' } }, cli_updates: { claude: { status: 'updated', before: '2.1.274', after: '2.1.280' } } } })
+    await route.fulfill({ json: { changed: true, completed_at: '2026-10-21T16:38:00.000Z', families: { claude: { status: 'ok' } }, cli_updates: { claude: { status: 'updated', before: '2.1.274', after: '2.1.280' } } } })
   })
   await page.goto('/'); await expect(page.locator('.chat-default-model')).toHaveText('Opus 5 · High')
   await openModelSettings(page)
   await page.getByRole('button', { name: 'Check now', exact: true }).click()
   await expect(page.locator('.st-status')).toContainText('Catalog updated.')
   await expect(page.locator('.st-catalog-status')).toHaveAttribute('data-help', /2\.1\.280/)
+  await expect(page.locator('.st-catalog-status')).toHaveAttribute('data-help', /Last checked (21 Oct (2026 )?)?16:38\. /)
+  await expect(page.locator('.st-catalog-status')).toHaveText(/ · Checked (21 Oct (2026 )?)?16:38$/)
   await expect(page.locator('.st-catalog-status')).not.toContainText('Invalid Date')
   await page.keyboard.press('Escape')
   await expect(page.locator('.chat-default-model')).toHaveText('Opus 5.5 · High')

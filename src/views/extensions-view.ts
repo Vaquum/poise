@@ -6,6 +6,8 @@
 
 import './extensions.css'
 import { patchContent } from '../dom-patch'
+import { logTime, shortTime } from '../clock'
+import { effectiveTimezone } from '../config'
 import { watchPanel } from '../motion'
 import { escapeHtml as esc } from '../markdown'
 import {
@@ -228,7 +230,7 @@ function installedHtml(current: Data): string {
 
 function directoryHtml(): string {
   const status = results?.status ?? data?.directory
-  const synced = status?.completedAt ? `updated ${new Date(status.completedAt).toLocaleString()}` : 'not synced yet'
+  const synced = status?.completedAt ? `updated ${shortTime(status.completedAt, effectiveTimezone(), Date.now())}` : 'not synced yet'
   const head = `<div class="ext-directory-status"><span class="st-help st-help-info">From the official MCP Registry · ${(status?.count ?? 0).toLocaleString()} servers, ${status?.syncing ? 'syncing now…' : synced}.</span>
     <button type="button" class="ext-link" data-sync ${status?.syncing ? 'disabled' : ''}>Refresh</button></div>
     ${status?.error ? `<p class="st-help st-help-warn">The last sync stopped: ${esc(status.error)} It resumes from where it stopped.</p>` : ''}`
@@ -382,8 +384,8 @@ function serverPanelHtml(p: Extract<Panel, { kind: 'server' }>): string {
   const body = p.tab === 'tools'
     ? (tools.length ? `<div class="ext-tools">${tools.map((tool) => `<div><code>${esc(tool.name)}</code>${tool.description ? `<span>${esc(tool.description)}</span>` : ''}</div>`).join('')}</div>` : '<p class="st-help st-help-info">Tools appear after a successful check.</p>')
     : p.tab === 'activity'
-      ? (p.events ? (p.events.length ? `<div class="ext-log">${p.events.map((event) => `<div class="ext-log-${event.level}"><time>${esc(new Date(event.at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }))}</time><span>${esc(event.text)}</span></div>`).join('')}</div>` : '<p class="st-help st-help-info">Nothing yet.</p>') : '<div class="loader" role="status" aria-label="Loading activity"><span></span><span></span><span></span></div>')
-      : `<div class="ext-status"><span class="ext-state ext-state-${state.tone}">${esc(state.text)}</span>${server.status.checkedAt ? `<span class="st-help st-help-info">Checked ${esc(new Date(server.status.checkedAt).toLocaleString())}</span>` : ''}</div>
+      ? (p.events ? (p.events.length ? `<div class="ext-log">${p.events.map((event) => `<div class="ext-log-${event.level}"><time>${esc(logTime(event.at, effectiveTimezone(), Date.now()))}</time><span>${esc(event.text)}</span></div>`).join('')}</div>` : '<p class="st-help st-help-info">Nothing yet.</p>') : '<div class="loader" role="status" aria-label="Loading activity"><span></span><span></span><span></span></div>')
+      : `<div class="ext-status"><span class="ext-state ext-state-${state.tone}">${esc(state.text)}</span>${server.status.checkedAt ? `<span class="st-help st-help-info">Checked ${esc(shortTime(server.status.checkedAt, effectiveTimezone(), Date.now()))}</span>` : ''}</div>
         ${server.status.error ? `<p class="st-help st-help-error">${esc(server.status.error)}</p>` : ''}
         ${server.auth === 'oauth' || server.status.state === 'signin' ? `<div class="st-row st-row-tight">${server.signedIn ? '<button type="button" class="st-clear" data-sign-out>Sign out</button>' : ''}<button type="button" class="${server.signedIn ? 'st-clear' : 'st-save'}" data-sign-in="${server.id}">${server.signedIn ? 'Sign in again' : `Sign in to ${esc(server.title)}`}</button></div>` : ''}
         <div class="tp-group-label">Connection</div>

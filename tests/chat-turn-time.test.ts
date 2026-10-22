@@ -4,7 +4,8 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { StopReason } from '../server/chat/protocol'
-import { clockDay, shortTime, turnTime } from '../src/chat-turn-time'
+import { turnTime } from '../src/chat-turn-time'
+import { clockDay, shortTime } from '../src/clock'
 import { applyEvent, createModel } from '../src/views/chat-transcript'
 
 const NOW = Date.parse('2026-10-21T17:00:00Z')

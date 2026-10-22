@@ -1,4 +1,6 @@
 import { scrollToActor } from '../motion'
+import { clockDay, logTime } from '../clock'
+import { effectiveTimezone } from '../config'
 import { patchContent, patchInformation } from '../dom-patch'
 import { jevApi, JevHttpError } from '../jev-client'
 import { emptyJevDraft, exampleJevDraft, parseJevDraft, requestFromDraft, draftFromRequest, type JevDraft } from '../jev-draft'
@@ -150,13 +152,14 @@ export function createJevWorkspace(parent: HTMLElement, sidebar: HTMLElement, ha
   }
   let resultsFingerprint = ''
   function renderRuns() {
-    const fingerprint = JSON.stringify({ runs, selectedRun })
+    // The day and zone too: a run's time gains its date after midnight.
+    const fingerprint = JSON.stringify({ runs, selectedRun, day: clockDay(effectiveTimezone(), Date.now()) })
     if (fingerprint === resultsFingerprint) return
     resultsFingerprint = fingerprint
     const panel = el.querySelector<HTMLElement>('.jev-run-view')!
     panel.hidden = !runs.length
     const select = panel.querySelector<HTMLSelectElement>('.jev-run-select')!
-    select.innerHTML = runs.map(run => `<option value="${run.id}" ${run.id === selectedRun ? 'selected' : ''}>${esc(new Date(run.startedAt).toLocaleTimeString())} · ${Object.keys(run.request.questions).length} questions · ${run.status}</option>`).join('')
+    select.innerHTML = runs.map(run => `<option value="${run.id}" ${run.id === selectedRun ? 'selected' : ''}>${esc(logTime(run.startedAt, effectiveTimezone(), Date.now()))} · ${Object.keys(run.request.questions).length} questions · ${run.status}</option>`).join('')
     const run = runs.find(run => run.id === selectedRun)
     patchContent(panel.querySelector<HTMLElement>('.jev-result')!, run ? renderJevRun(run) : '')
     panel.querySelector<HTMLElement>('.jev-run-json pre')!.textContent = run ? JSON.stringify({ request: run.request, response: run.result || null }, null, 2) : ''

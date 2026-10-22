@@ -13,7 +13,9 @@ See [Chat orchestration](Chat-orchestration.md).
 ## Scope and migration
 
 Chat is a full view alongside Current, Swarm and Editor. Its sidebar stores
-named sessions; the transcript renders streamed prose, thinking when exposed,
+named sessions, each with when it was created on Poise's clock: the time today
+(`19:38`), the date alone on another day (`20 Oct`) and in another year
+(`31 Dec 2025`). The transcript renders streamed prose, thinking when exposed,
 tool activity, file diffs, questions and permission cards. The composer supports
 attachments, checkout-file mentions, advertised commands, draft preservation,
 steering during a turn and Stop. Capabilities belong to each native session:

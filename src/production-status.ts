@@ -1,6 +1,8 @@
 // The one line in Settings that says whether a merge reached production.
-// Kept free of imports so it can be tested under the node environment, like
-// the behaviors client state.
+// Kept free of imports beyond the clock, which has none, so it can be tested
+// under the node environment, like the behaviors client state.
+
+import { shortTime } from './clock'
 
 // The production updater's last run, as /api/health passes it through
 // (server/production-update.ts). `unknown` on a dev server, or before the
@@ -31,21 +33,17 @@ function short(commit: string | null): string {
   return commit ? commit.slice(0, 7) : '?'
 }
 
+// Reached only for a check younger than UPDATER_SILENT_AFTER_MS, so always minutes.
 function minutesAgo(iso: string, now: number): string {
   const minutes = Math.max(0, Math.floor((now - Date.parse(iso)) / 60_000))
-  if (minutes === 0) return 'just now'
-  if (minutes < 60) return `${minutes} min ago`
-  return new Date(iso).toLocaleString()
-}
-
-function clock(iso: string): string {
-  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  return minutes === 0 ? 'just now' : `${minutes} min ago`
 }
 
 // One line, in words: what production is running, what `main` is at, and
 // whether the updater is keeping the two together. Null when there is nothing
 // to say (no record), so the group hides instead of showing a placeholder.
-export function productionSummary(update: ProductionUpdate, now = Date.now()): { text: string, level: 'info' | 'error' } | null {
+export function productionSummary(update: ProductionUpdate, now: number, timeZone: string): { text: string, level: 'info' | 'error' } | null {
+  const clock = (iso: string) => shortTime(iso, timeZone, now)
   if (update.status === 'off') return { text: update.reason, level: 'info' }
   if (update.status === 'unknown' || !update.checkedAt) return null
   const deployed = `Deployed ${short(update.deployedCommit)}`

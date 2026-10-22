@@ -1,4 +1,6 @@
 import { viewDiagnostic, viewFeedback } from '../view-feedback'
+import { logTime } from '../clock'
+import { effectiveTimezone } from '../config'
 import { layout, retire, scrollToActor } from '../motion'
 import { patchContent, patchNode } from '../dom-patch'
 import { mountOrganizationFilter, organizationUrl, getSelectedOrganization, setSelectedOrganization } from '../organizations'
@@ -344,7 +346,7 @@ function progressDetail(e: LogEntry): string {
   }
   const facts = [heartbeat, provider, deadline].filter(Boolean).map(escapeHtml).join(' · ')
   const warning = `<p class="agent-response-error"${p.warning ? '' : ' hidden'}>${escapeHtml(p.warning || '')}</p>`
-  const events = p.events.map((event) => `<li><time datetime="${escapeHtml(event.at)}">${escapeHtml(new Date(event.at).toLocaleTimeString())}</time> ${escapeHtml(event.message)}</li>`).join('')
+  const events = p.events.map((event) => `<li><time datetime="${escapeHtml(event.at)}">${escapeHtml(logTime(event.at, effectiveTimezone(), Date.now()))}</time> ${escapeHtml(event.message)}</li>`).join('')
   return `<section class="agent-progress-detail" aria-label="Run activity"><p>${facts}</p>${warning}<ol>${events}</ol>${reasoningDetail(e)}</section>`
 }
 

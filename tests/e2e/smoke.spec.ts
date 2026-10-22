@@ -735,6 +735,29 @@ test('shows missing worker heartbeat, refreshes failures, and stops polling when
 })
 
 
+test.describe('in an en-US browser in New York', () => {
+  test.use({ locale: 'en-US', timezoneId: 'America/New_York' })
+
+  test("writes a run's activity on Poise's 24-hour clock, with seconds", async ({ page }) => {
+    await page.clock.setFixedTime(new Date('2026-10-21T17:00:05Z'))
+    const id = 'd'.repeat(32)
+    const at = '2026-10-21T16:59:58.000Z'
+    const row = { id, model: 'opus-5-high', behavior: 'pr_approve', repo: 'Vaquum/Origo', pr_id: '321',
+      status: 'running', started_at: at, started_at_precise: at, response: '', error: '',
+      progress: { version: 1, phase: 'reasoning', phase_started_at: at, heartbeat_at: at,
+        last_provider_event_at: at, deadline_at: null, warning: null, reasoning_available: true, reasoning_chars: 10,
+        events: [{ at, message: 'Past minute: new reasoning activity (3 events)' }] } }
+    await page.route(/\/api\/agent-logs(?:\?.*)?$/, (route) => route.fulfill({ json: { logs: [row] } }))
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+    await page.locator(`.agent-row[data-id="${id}"]`).getByRole('button', { name: 'Toggle detail' }).click()
+    // Settings' time zone here is UTC; the browser's language and zone must not make it "12:59:58 PM".
+    const time = page.locator('.agent-progress-detail time')
+    await expect(time).toHaveText('16:59:58')
+    await expect(time).toHaveAttribute('datetime', at)
+  })
+})
+
 test('updates activity without detaching rows or collapsing provider reasoning', async ({ page }) => {
   const id = 'c'.repeat(32)
   const now = new Date().toISOString()

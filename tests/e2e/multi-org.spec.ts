@@ -212,8 +212,7 @@ for (const status of ['initializing', 'ready'] as const) {
     await openSettings(page)
     const row = page.locator('.st-organization[data-org="beta"]')
     await expect(row).toContainText('Waiting for GitHub')
-    await expect(row).toContainText(`${status === 'ready' ? 'Sync' : 'Activation'} resumes automatically at`)
-    await expect(row).toContainText('08:30:00')
+    await expect(row).toContainText(`${status === 'ready' ? 'Sync' : 'Activation'} resumes automatically at 08:30:00.`)
     await expect(row.getByRole('button', { name: 'Retry' })).toBeDisabled()
     await expect(row.locator('.st-help-error')).toHaveCount(0)
     state.organizations = [organization('acme'), organization('beta')]

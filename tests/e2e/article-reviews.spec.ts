@@ -57,6 +57,8 @@ test('an inline review survives editing, updates the existing PR, and supports r
   await expect(panel).toContainText('Review · Site')
   await expect(panel).toContainText('@reviewer')
   await expect(panel).toContainText('Please clarify this passage.')
+  // The comment's time is on Poise's clock in Settings' time zone, UTC here.
+  await expect(panel.locator('.editor-review-messages time')).toHaveText(/^18 Oct (2026 )?08:00$/)
   await expect(panel.getByRole('link', { name: 'PR #7' })).toHaveAttribute('href', 'https://github.com/acme/site/pull/7')
   await expect(panel.locator('textarea')).toHaveCount(1)
   await expect.poll(() => panel.getAttribute('data-motion-running')).toBeNull()

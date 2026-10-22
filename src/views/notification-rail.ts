@@ -5,7 +5,7 @@ import { cancelMotion, disclosure, layout, retire, scrollToActor, spring, watchP
 import { patchContent } from '../dom-patch'
 import { BEHAVIORS, getBehaviorDiagnostics, refreshState } from '../behaviors'
 import { effectiveTimezone } from '../config'
-import { shortTime } from '../chat-turn-time'
+import { shortTime } from '../clock'
 import {
   GROUPS, behaviorCounts, countItems, headTone, notificationItems, openLabel,
   type ItemCounts, type ItemGroup, type ItemIcon, type NotificationItem,

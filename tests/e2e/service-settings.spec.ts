@@ -129,19 +129,20 @@ test('pairs Poise Link from Settings, where the gateway sends /link, and revokes
 test('says a paired computer whose Poise Link is not running is not connected, and follows it connecting', async ({ page }) => {
   const state = await setup(page, 'service')
   state.devices = [stopped('laptop')]
-  await page.clock.install()
+  // A later day than the pairing, so both times carry their date on Poise's clock.
+  await page.clock.install({ time: new Date('2026-10-21T12:00:00Z') })
   await page.goto('/?settings=link')
   const card = page.locator('.pl-device')
   await expect(card.locator('.pl-device-state')).toHaveText('Not connected')
   await expect(card.locator('.pl-device-state')).toHaveClass(/pl-device-state-disconnected/)
-  await expect(card.locator('.pl-device-times')).toHaveText(/^Paired Oct 9, 2026, 7:00\sAM · last seen Oct 9, 2026, 7:53\sAM$/)
+  await expect(card.locator('.pl-device-times')).toHaveText('Paired 9 Oct 07:00 · last seen 9 Oct 07:53')
   await expect(card.locator('.pl-device-state')).toHaveAttribute('data-help', 'Poise Link is not running on that computer, or it cannot reach Poise. Snippets and alerts reach it once it connects again.')
 
   // Poise Link starts on that computer while Settings stays open.
   state.devices = [device('laptop')]
   await page.clock.fastForward(10_000)
   await expect(card.locator('.pl-device-state')).toHaveText('Connected')
-  await expect(card.locator('.pl-device-times')).toHaveText('Paired Oct 9, 2026, 7:00 AM')
+  await expect(card.locator('.pl-device-times')).toHaveText('Paired 9 Oct 07:00')
   await expect(card.locator('.pl-device-state')).not.toHaveAttribute('data-help', /Poise Link is not running/)
 })
 
@@ -198,18 +199,20 @@ test('Escape closes the top-right menu, and Settings opened from it', async ({ p
 
 test('gives the gateway\'s admins an Admin tab that manages people and workspaces', async ({ page }) => {
   const state = await setup(page, 'service', true)
+  // A later day than the sign-ins, so their times carry the date on Poise's clock.
+  await page.clock.setFixedTime(new Date('2026-10-21T12:00:00Z'))
   await page.goto('/?settings=admin')
   await expect(page.locator('#settings-panel')).toHaveClass(/open/)
   await expect(page.locator('#settings-panel')).toHaveAttribute('data-section', 'admin')
   const alice = page.locator('.ad-user[data-user="alice"]')
   await expect(alice).toContainText('Alice')
-  await expect(alice).toContainText('allow list')
+  await expect(alice).toContainText('allow list · last sign-in 8 Oct 06:00')
   await expect(alice).toContainText('000000000000 (outdated)')
   await expect(alice).toContainText('the last start timed out')
   // Disk use, as the gateway last measured it.
   await expect(alice).toContainText('61 GB on disk, over its 50 GB budget')
   await expect(page.locator('.ad-user[data-user="octocat"]')).toContainText('2.4 GB on disk')
-  await expect(page.locator('.ad-disk')).toContainText('Server disk: 20 GB free of 290 GB')
+  await expect(page.locator('.ad-disk')).toContainText('Server disk: 20 GB free of 290 GB, measured 9 Oct 07:00.')
   await expect(page.locator('.ad-disk')).toContainText('Less than a tenth is free.')
   for (const theme of ['light', 'dark']) {
     await page.evaluate(value => document.documentElement.dataset.theme = value, theme)

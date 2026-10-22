@@ -35,7 +35,7 @@ Everything is listed by who acts:
 The filter above the list shows one group at a time. Each entry expands in
 place to its full words, what happened and what can be done. An expanded entry
 stays expanded through refreshes. Each line of what happened carries its time
-on Chat's clock: 24-hour in the time zone from Settings, whatever the browser's
+on Poise's clock: 24-hour in the time zone from Settings, whatever the browser's
 language, with the date for another day and the year for another year.
 
 ## What shows
