@@ -441,7 +441,10 @@ assertion may only resume, and anything else is refused with 403):
     stays truthful when this server restarts: once the switch has fired, the
     record is consumed and nothing is pending. Asking to switch to the
     release it runs calls a pending switch off; the gateway does so when the
-    target changes back.
+    target changes back. If the turn bound already cancelled work and the
+    restart is refused or withdrawn, that work gets one continuation on the
+    current server before waiting messages. A switch requested again while
+    an earlier cancellation settles keeps its own deadline and turn set.
   - `activeChatTurns` counts the Chat turns recorded open: reserved before
     their first write, closed once their outcome is recorded.
   - `runningCallerCalls` counts the Caller processes Poise launched for agent

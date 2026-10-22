@@ -279,6 +279,79 @@ describe('the switch bound', () => {
     }
   })
 
+  it('continues a turn cancelled at the bound before waited messages when restart is refused', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.c.calls.length === 1)
+    w.c.auto = true
+    const timer = new FakeTimer()
+    let now = 5_000_000
+    const restart = vi.fn(() => false)
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: () => {}, releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => now,
+    })
+    try {
+      service.switchRelease('r2')
+      expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+      now += 15 * 60_000
+      timer.fire()
+      await until(() => w.turns(w.s.id).length === 3)
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(w.c.calls.map(call => call.input.text)).toEqual([
+        'Original task', 'Poise stopped your turn for an update that did not restart. Continue where you left off.', 'Waited follow-up',
+      ])
+      expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
+    } finally { service.reset() }
+  })
+
+  it('does not restart a fresh switch when an earlier cancellation settles', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.c.calls.length === 1)
+    let release!: () => void
+    let cancelled!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const settled = new Promise<void>(resolve => { cancelled = resolve })
+    const cancel = w.runtime.cancel.bind(w.runtime)
+    const delayed = vi.spyOn(w.runtime, 'cancel').mockImplementation(async id => {
+      const result = await cancel(id)
+      cancelled()
+      await held
+      return result
+    })
+    const timer = new FakeTimer()
+    let now = 5_000_000
+    const logs: string[] = []
+    const restart = vi.fn(() => true)
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: line => logs.push(line), releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => now,
+    })
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await settled
+      service.switchRelease('r1')
+      const newTurn = w.runtime.prompt(w.s.id, input('Admitted during withdrawal'))
+      expect(newTurn).toHaveProperty('turnId')
+      await until(() => w.c.calls.length === 2)
+      service.switchRelease('r2')
+      release()
+      await until(() => logs.some(line => line.includes('superseded while cancellation settled')))
+      expect(restart).not.toHaveBeenCalled()
+      expect(storage.getOpenTurn(w.s.id)?.turnId).toBe('turnId' in newTurn ? newTurn.turnId : '')
+      expect(w.runtime.switchPending?.release).toBe('r2')
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+    } finally {
+      release()
+      delayed.mockRestore()
+      service.reset()
+    }
+  })
+
   it('cancels a turn still running past the bound and restarts; after the restart its session gets exactly one continue prompt on its resumed native session', async () => {
     const w = await world({ auto: false })
     w.runtime.prompt(w.s.id, input('Keep working'))

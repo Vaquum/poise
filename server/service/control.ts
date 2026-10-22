@@ -275,6 +275,7 @@ export class ServiceControl {
    *  were not interrupted — only turns still open or cancelled are resumed. */
   private expireSwitchBound(): void {
     const release = this.switchTo
+    const pending = this.runtime.switchPending
     if (release === null || this.switchPendingSince === null) return
     const waitedMinutes = Math.round((this.now() - this.switchPendingSince) / 60_000)
     this.log(`[service] release ${release} waited ${waitedMinutes} minutes for its turns; cancelling them and restarting`)
@@ -282,12 +283,18 @@ export class ServiceControl {
     void (async () => {
       await Promise.all(targets.map(({ sessionId }) => this.runtime.cancel(sessionId).catch((error: unknown) =>
         this.log(`[service] cancelling ${sessionId.slice(0, 8)} for the switch failed: ${error instanceof Error ? error.message : String(error)}`))))
-      if (this.switchTo === null) return
       this.runtime.recordSwitchInterrupted(targets.filter(({ sessionId, turnId }) => {
-        if (getOpenTurn(sessionId)) return true
+        if (getOpenTurn(sessionId)?.turnId === turnId) return true
         const terminal = findEvent(sessionId, (event) => event.type === 'turn.finished' && event.turnId === turnId)
         return terminal?.event.type === 'turn.finished' && terminal.event.stopReason === 'cancelled'
       }))
+      // Cancellation may outlive a withdrawal and a fresh request for the
+      // same release. That newer switch owns its own turn set and deadline.
+      if (this.runtime.switchPending !== pending) {
+        this.log(`[service] the switch to ${release} was superseded while cancellation settled`)
+        if (this.runtime.switchPending === null && !this.restarting) void this.runtime.releaseSwitchWait()
+        return
+      }
       this.restartForSwitch()
     })().catch((error: unknown) => this.log(`[service] the switch to ${release} failed: ${error instanceof Error ? error.message : String(error)}`))
   }

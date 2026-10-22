@@ -113,6 +113,7 @@ const AVAILABILITY_TTL_MS = 60_000
 /** What a session interrupted for a Poise update is asked after the restart,
  *  on its resumed native session. */
 export const SWITCH_CONTINUE_PROMPT = 'Poise restarted for an update while your turn was running. Continue where you left off.'
+const SWITCH_WITHDRAWN_CONTINUE_PROMPT = 'Poise stopped your turn for an update that did not restart. Continue where you left off.'
 /** Prompts that waited behind a switch (in arrival order) and sessions a
  *  switch bound interrupted. Consumed once, by the first recovery or
  *  withdrawal after they were written. */
@@ -687,13 +688,13 @@ export class ChatRuntime extends EventEmitter {
     if (!this.switchState || this.switchState.release !== release) this.switchState = { release, since: new Date().toISOString() }
   }
 
-  /** The pending switch went away without a restart: nothing was
-   *  interrupted, and the waiting prompts start now, in order. */
+  /** The pending switch went away without a restart. Resume any turns its
+   *  bound already interrupted, then release waiting prompts in order. */
   async releaseSwitchWait(): Promise<void> {
     this.switchState = null
+    if (this.stopped) return
     try {
-      this.writeInterruptedSessions([])
-      await this.startWaitingPrompts()
+      await this.resumeAfterUpdate(new Set(), SWITCH_WITHDRAWN_CONTINUE_PROMPT)
       for (const record of storage.listSessions(this.instance)) this.scheduleQueue(this.requireLive(record.id))
     } catch (error) {
       this.emit('log', `[chat] releasing prompts waited for an update failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -725,11 +726,11 @@ export class ChatRuntime extends EventEmitter {
    *  it is acted on, so a crash mid-resume loses only the entry in flight.
    *  Sessions another live server of this instance holds are left for a
    *  later recovery. */
-  private async resumeAfterUpdate(protectedSessions: ReadonlySet<string>): Promise<void> {
+  private async resumeAfterUpdate(protectedSessions: ReadonlySet<string>, continuation = SWITCH_CONTINUE_PROMPT): Promise<void> {
     for (const row of this.readInterruptedSessions()) {
       if (protectedSessions.has(row.sessionId)) continue
       if (!this.takeInterruptedSession(row.sessionId)) continue
-      await this.deliverWaitingPrompt(row.sessionId, { text: SWITCH_CONTINUE_PROMPT, attachments: [], mentions: [] }, 'interrupted')
+      await this.deliverWaitingPrompt(row.sessionId, { text: continuation, attachments: [], mentions: [] }, 'interrupted')
     }
     await this.startWaitingPrompts(protectedSessions)
   }
