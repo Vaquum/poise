@@ -16,6 +16,15 @@ describe('the cause a behavior failure shows', () => {
     expect(failureCause(error)).toBe('GitHub 500: Server Error: Sorry, this diff is temporarily unavailable due to heavy server load.')
   })
 
+  it('keeps the quota facts a rate-limit error carries', () => {
+    const error = 'error: GitHub 403 rate-limit: {\'x-ratelimit-resource\': \'core\', \'x-ratelimit-limit\': \'5000\', '
+      + '\'x-ratelimit-remaining\': \'0\', \'x-ratelimit-used\': \'5000\', \'x-ratelimit-reset\': \'1800000000\'} body={\n'
+      + '\t"message": "API rate limit exceeded for user ID 42.",\n\t"status": "403"\n}'
+    expect(failureCause(error)).toBe('GitHub 403 rate-limit '
+      + '{\'x-ratelimit-resource\': \'core\', \'x-ratelimit-remaining\': \'0\', \'x-ratelimit-reset\': \'1800000000\'}: '
+      + 'API rate limit exceeded for user ID 42.')
+  })
+
   it('keeps the last line naming an error otherwise, bounded', () => {
     expect(failureCause('Traceback (most recent call last):\n  File "x.py"\nValueError: bad verdict\n')).toBe('ValueError: bad verdict')
     expect(failureCause('just this')).toBe('just this')
@@ -46,6 +55,21 @@ describe('deterministic behavior severity', () => {
   it.each(['GitHub 404: Not Found', 'HTTP 401', 'invalid verdict', 'warning: an unknown problem',
     'Code Mode is unavailable because code-mode host is disabled.'])('keeps actionable or unknown evidence as needing attention: %s', (error) => {
     expect(classifyBehaviorDiagnostic(error).severity).toBe('warning')
+  })
+  it.each([
+    'GitHub 403 rate-limit: {\'x-ratelimit-resource\': \'core\', \'x-ratelimit-remaining\': \'0\'} body={"message": "API rate limit exceeded"}',
+    'Command failed (1): github-interface: GitHub 403 rate-limit {\'x-ratelimit-remaining\': \'0\', \'x-ratelimit-reset\': \'1800000000\'}: API rate limit exceeded for user ID 42.',
+    'GitHub 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.',
+    'HTTP 403 API rate limit exceeded',
+  ])('recognizes an evidenced quota exhaustion as a rate limit: %s', (error) => {
+    expect(classifyBehaviorDiagnostic(error)).toEqual({ severity: 'info', code: 'rate_limit' })
+  })
+  it.each([
+    'GitHub 403: Forbidden',
+    'GitHub 403 rate-limit: {\'x-ratelimit-resource\': \'core\', \'x-ratelimit-remaining\': \'12\'} body={"message": "Resource not accessible by integration"}',
+    'GitHub 403 rate-limit: {\'x-ratelimit-remaining\': \'12\'} body={"message": "Must have admin rights to Repository."}',
+  ])('keeps an access refusal without exhaustion evidence as repository access: %s', (error) => {
+    expect(classifyBehaviorDiagnostic(error)).toEqual({ severity: 'warning', code: 'github_access' })
   })
   it('never downgrades a held outcome or a structured account block based on transient text', () => {
     expect(classifyBehaviorDiagnostic(CAPACITY_STREAM, { held: true }).severity).toBe('warning')

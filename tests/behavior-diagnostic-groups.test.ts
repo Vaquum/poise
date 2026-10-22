@@ -32,6 +32,26 @@ describe('behavior diagnostic groups', () => {
       error: 'Selected model is at capacity.', createdAt: '' })
     expect(behaviorDiagnosticGroups(diagnostics)[0]?.severity).toBe('warning')
   })
+  it('keeps an evidenced quota failure automatic with its reset, never a repository-access warning', () => {
+    const diagnostics = snapshot()
+    diagnostics.failures.push({ behavior: 'approve-prs', target: 'acme/api#9:check', kind: 'operation',
+      consecutiveFailures: 3, lastFailureAt: '', nextRetryAt: '',
+      error: 'Command failed (1): github-interface: GitHub 403 rate-limit '
+        + '{\'x-ratelimit-resource\': \'core\', \'x-ratelimit-remaining\': \'0\', \'x-ratelimit-reset\': \'1800000000\'}: '
+        + 'API rate limit exceeded for user ID 42.' })
+    const [group] = behaviorDiagnosticGroups(diagnostics)
+    expect(group).toMatchObject({ severity: 'info', code: 'rate_limit', scope: 'acme/api#9',
+      message: 'The service is limiting requests. Poise will try again.' })
+    expect(group?.message).not.toContain('check repository access')
+    expect(group?.details[0]).toContain('API rate limit exceeded for user ID 42.')
+    expect(group?.details[0]).toContain('1800000000')
+  })
+  it('leaves a legacy brace-only summary unknown instead of inventing its cause', () => {
+    const diagnostics = snapshot()
+    diagnostics.failures.push({ behavior: 'approve-prs', target: 'acme/api#9:check', kind: 'operation',
+      consecutiveFailures: 3, lastFailureAt: '', nextRetryAt: '', error: 'Command failed (1): github-interface: }' })
+    expect(behaviorDiagnosticGroups(diagnostics)).toEqual([expect.objectContaining({ severity: 'warning', code: 'unknown', scope: 'acme/api#9' })])
+  })
   it('keeps an API outage separate from last-known repository errors', () => {
     const diagnostics = snapshot()
     diagnostics.apiError = { severity: 'warning', code: 'upstream_unavailable', message: 'HTTP 502' }

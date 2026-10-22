@@ -21,9 +21,15 @@ Unknown causes stay yellow until their cause is established; a process exit or
 retry count alone never proves Poise is broken. Each row expands to its full
 diagnostic details, retaining its expansion through refresh.
 
-The last terminal provider event is selected before redaction and the
-300-character display bound. Old summaries are refreshed only from an exact,
-validated Caller identity, without changing failure counts or retry clocks.
+The last terminal provider event is selected first; otherwise the message
+inside a JSON error — with a rate-limit error's resource, remaining and reset
+facts — else the last cause-bearing stderr line. Brace-only, link-only and
+empty tails leave the outer error alone, so unrecognized causes stay honest.
+Selection happens before canonical redaction and the 300-character display
+bound. A 403 with explicit quota-exhaustion evidence classifies as a rate
+limit; other 403s still mean repository access. Old summaries are refreshed
+only from an exact, validated Caller identity, without changing failure
+counts or retry clocks.
 A later authoritative completion removes transient warnings from the current
 view; uncertain held work and the audit history remain. Severity changes no
 launch, retry, ownership or publication rule.

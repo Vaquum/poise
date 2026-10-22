@@ -3,7 +3,7 @@
 // holds a brace: a Grok balance error showed as "Internal error: {" or "}".
 
 import { terminalProviderMessage } from '../gateway/src/diagnostics/material-cause'
-export { failureCause, terminalProviderMessage } from '../gateway/src/diagnostics/material-cause'
+export { failureCause, jsonMessageCause, lastCauseLine, terminalProviderMessage } from '../gateway/src/diagnostics/material-cause'
 
 export type DiagnosticSeverity = 'error' | 'warning' | 'info'
 export interface DiagnosticClassification { severity: DiagnosticSeverity; code: string }
@@ -39,6 +39,15 @@ export function isTimeoutCause(error: string): boolean {
 
 // Warning rules are an allowlist of observable transient outcomes. Neither a
 // retry count nor text saying "warning" can downgrade unknown or held evidence.
+// A 403 with explicit quota-exhaustion evidence is a rate limit, not a
+// repository-access failure: Caller's `rate-limit:` prefix alone also fires
+// for access refusals with remaining quota, so it proves nothing by itself.
+function quotaExhausted(cause: string): boolean {
+  return /\b(?:GitHub|HTTP)\s*403\b/.test(cause)
+    && (/x-ratelimit-remaining['"]?\s*[:=]\s*['"]?0\b/i.test(cause)
+      || /rate[ -]?limit exceeded|exceeded a secondary rate limit/i.test(cause))
+}
+
 export function classifyBehaviorDiagnostic(error: string, options: DiagnosticOptions = {}): DiagnosticClassification {
   const blockingCode = ['invalid_agent_result', 'review_provider_blocked', 'review_packet_too_large',
     'review_contract_violation', 'review_recovery_failed', 'review_budget_exhausted', 'model_output_limit']
@@ -56,7 +65,7 @@ export function classifyBehaviorDiagnostic(error: string, options: DiagnosticOpt
     return diagnosticClassification('head_changed')
   }
   if (/\b(?:GitHub|HTTP|http_status["']?\s*[:=]|unexpected status|status)\s*["']?\s*429\b/.test(cause)
-    || options.errorCode === 'rate_limit') return diagnosticClassification('rate_limit')
+    || options.errorCode === 'rate_limit' || quotaExhausted(cause)) return diagnosticClassification('rate_limit')
   if (/\b(?:GitHub|HTTP|http_status["']?\s*[:=]|unexpected status|status)\s*["']?\s*5\d\d\b/.test(cause)
     || options.errorCode === 'server_error') return diagnosticClassification('upstream_unavailable')
   if (/\b(?:httpx\.(?:ReadTimeout|ConnectTimeout|ConnectError)|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN)\b/.test(cause)) {
