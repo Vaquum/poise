@@ -409,6 +409,123 @@ describe('Poise-local session storage', () => {
       await capped.stop()
     }
   }, 60_000)
+
+  it('starts waiting turns in queue order when the agent slot cap is raised', async () => {
+    let cap = 1
+    const capped = new Runtime({ instance: randomUUID(), instanceLabel: 'test', callerTurns: null,
+      catalog: async () => CATALOG, resolveCheckout, localWorkspaceRoot: join(outer, '.poise-chat'),
+      idleTimeoutMinutes: () => 0, maxConcurrentLocalTurns: () => cap, adapters: { grok: fakeAdapter }, probeAgent: async () => ({ ok: true }) })
+    try {
+      const a = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title: 'A' })
+      await until(() => capped.get(a.id)?.status === 'idle')
+      capped.prompt(a.id, { text: 'hold this turn', attachments: [], mentions: [] })
+      await until(() => capped.get(a.id)?.status === 'running')
+      const waiters: string[] = []
+      for (const title of ['B', 'C', 'D']) {
+        const session = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title })
+        await until(() => capped.get(session.id)?.status === 'idle')
+        capped.prompt(session.id, { text: `work ${title}`, attachments: [], mentions: [] })
+        await until(() => capped.get(session.id)?.status === 'queued')
+        expect(capped.get(session.id)?.queuedBehind).toBe('waiting for a free agent slot')
+        waiters.push(session.id)
+      }
+      const [b, c, d] = waiters as [string, string, string]
+      // Raising the cap starts the earliest waiter; nothing else is prompted
+      // and no running turn ends.
+      cap = 2
+      capped.localTurnCapChanged()
+      await until(() => capped.get(b)?.status === 'running')
+      expect(capped.get(a.id)?.status).toBe('running')
+      expect(capped.get(c)?.status).toBe('queued')
+      expect(capped.get(c)?.queuedBehind).toBe('waiting for a free agent slot')
+      expect(capped.get(d)?.status).toBe('queued')
+      // Each release hands the next waiter in order.
+      await capped.cancel(a.id)
+      await until(() => capped.get(c)?.status === 'running')
+      expect(capped.get(d)?.status).toBe('queued')
+      await capped.cancel(c)
+      await until(() => capped.get(d)?.status === 'running')
+      await capped.cancel(b)
+      await capped.cancel(d)
+      await until(() => capped.get(d)?.status === 'idle')
+    } finally {
+      await capped.stop()
+    }
+  }, 60_000)
+
+  it('starts every waiter that fits when a release follows an unannounced raise', async () => {
+    let cap = 1
+    const capped = new Runtime({ instance: randomUUID(), instanceLabel: 'test', callerTurns: null,
+      catalog: async () => CATALOG, resolveCheckout, localWorkspaceRoot: join(outer, '.poise-chat'),
+      idleTimeoutMinutes: () => 0, maxConcurrentLocalTurns: () => cap, adapters: { grok: fakeAdapter }, probeAgent: async () => ({ ok: true }) })
+    try {
+      const a = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title: 'A' })
+      await until(() => capped.get(a.id)?.status === 'idle')
+      capped.prompt(a.id, { text: 'hold this turn', attachments: [], mentions: [] })
+      await until(() => capped.get(a.id)?.status === 'running')
+      const b = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title: 'B' })
+      await until(() => capped.get(b.id)?.status === 'idle')
+      capped.prompt(b.id, { text: 'work too', attachments: [], mentions: [] })
+      await until(() => capped.get(b.id)?.status === 'queued')
+      const c = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title: 'C' })
+      await until(() => capped.get(c.id)?.status === 'idle')
+      capped.prompt(c.id, { text: 'work three', attachments: [], mentions: [] })
+      await until(() => capped.get(c.id)?.status === 'queued')
+      // Another process saved a higher cap to the shared database: this
+      // runtime learns it only when it next reads the cap.
+      cap = 3
+      await capped.cancel(a.id)
+      await until(() => capped.get(b.id)?.status === 'running')
+      await until(() => capped.get(c.id)?.status === 'running')
+      await capped.cancel(b.id)
+      await capped.cancel(c.id)
+      await until(() => capped.get(c.id)?.status === 'idle')
+    } finally {
+      await capped.stop()
+    }
+  }, 60_000)
+
+  it('leaves running turns running when the agent slot cap is lowered', async () => {
+    let cap = 3
+    const capped = new Runtime({ instance: randomUUID(), instanceLabel: 'test', callerTurns: null,
+      catalog: async () => CATALOG, resolveCheckout, localWorkspaceRoot: join(outer, '.poise-chat'),
+      idleTimeoutMinutes: () => 0, maxConcurrentLocalTurns: () => cap, adapters: { grok: fakeAdapter }, probeAgent: async () => ({ ok: true }) })
+    try {
+      const running: string[] = []
+      for (const title of ['A', 'B', 'C']) {
+        const session = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title })
+        await until(() => capped.get(session.id)?.status === 'idle')
+        capped.prompt(session.id, { text: `work ${title}`, attachments: [], mentions: [] })
+        await until(() => capped.get(session.id)?.status === 'running')
+        running.push(session.id)
+      }
+      const [a, b, c] = running as [string, string, string]
+      // Lowering the cap stops nothing; the save hook is a no-op while full.
+      cap = 1
+      capped.localTurnCapChanged()
+      const d = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title: 'D' })
+      await until(() => capped.get(d.id)?.status === 'idle')
+      capped.prompt(d.id, { text: 'work D', attachments: [], mentions: [] })
+      await until(() => capped.get(d.id)?.status === 'queued')
+      expect(capped.get(d.id)?.queuedBehind).toBe('waiting for a free agent slot')
+      expect(capped.get(a)?.status).toBe('running')
+      expect(capped.get(b)?.status).toBe('running')
+      expect(capped.get(c)?.status).toBe('running')
+      // One waiter per release, only once the count is back within the cap.
+      await capped.cancel(a)
+      await until(() => capped.get(a)?.status === 'idle')
+      expect(capped.get(d.id)?.status).toBe('queued')
+      await capped.cancel(b)
+      await until(() => capped.get(b)?.status === 'idle')
+      expect(capped.get(d.id)?.status).toBe('queued')
+      await capped.cancel(c)
+      await until(() => capped.get(d.id)?.status === 'running')
+      await capped.cancel(d.id)
+      await until(() => capped.get(d.id)?.status === 'idle')
+    } finally {
+      await capped.stop()
+    }
+  }, 60_000)
 })
 
 it('retains the initialization lease when a bootstrap worker cannot be verified stopped', async () => {

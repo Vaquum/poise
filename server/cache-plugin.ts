@@ -489,6 +489,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               return json(res, 400, { error: 'Add GitHub accounts through account setup.' })
             }
             const settings = setSettings(body, catalog)
+            // A raised Chat cap starts turns waiting for a free agent slot now.
+            if (body && typeof body === 'object' && 'chat' in body) chatRuntime?.localTurnCapChanged()
             // Turned on, what needs attention is looked for now, not at the next pass.
             if (body && typeof body === 'object' && 'notifications' in body) void checkNotices()
             if (body && typeof body === 'object' && ['notifications', 'me', 'agentAccount'].some((key) => key in body)) checkGithubQuota()

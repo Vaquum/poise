@@ -461,6 +461,26 @@ describe('production server', () => {
     await fetch(url, { method: 'POST', headers, body: JSON.stringify({ agentAccount: 'bit-mis' }) })
   })
 
+  it('tells the chat runtime when saved settings include the chat cap', async () => {
+    const url = `${baseUrl}/api/settings`
+    const headers = { 'Content-Type': 'application/json' }
+    const { getChatRuntime } = await import('../server/cache-plugin')
+    const runtime = getChatRuntime()
+    const spy = vi.spyOn(runtime, 'localTurnCapChanged')
+    try {
+      const before = ((await (await fetch(url)).json()) as { chat: { maxConcurrentLocalTurns: number } }).chat.maxConcurrentLocalTurns
+      const saved = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ chat: { maxConcurrentLocalTurns: 2 } }) })
+      expect(saved.status).toBe(200)
+      expect(spy).toHaveBeenCalledTimes(1)
+      const untouched = await fetch(url, { method: 'POST', headers, body: JSON.stringify({}) })
+      expect(untouched.status).toBe(200)
+      expect(spy).toHaveBeenCalledTimes(1)
+      await fetch(url, { method: 'POST', headers, body: JSON.stringify({ chat: { maxConcurrentLocalTurns: before } }) })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   // Two Poise windows open on the same behavior used to mean the later save
   // silently discarded the earlier one — a memory is prose someone wrote, and
   // losing it leaves no trace that it existed.

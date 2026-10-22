@@ -2452,14 +2452,12 @@ export class ChatRuntime extends EventEmitter {
 
   /** Take one of the bounded Poise-local agent slots, FIFO. A turn that
    *  waits shows `queued` with the cap's own reason; cancelling the turn
-   *  wakes it. Lowering the cap converges as running turns release. */
+   *  wakes it. Lowering the cap converges as running turns release;
+   *  raising it starts waiters through localTurnCapChanged. */
   private async acquireLocalTurnSlot(session: LiveSession, turn: RunningTurn): Promise<void> {
     const cap = Math.max(1, this.maxConcurrentLocalTurns())
     // A raised cap frees earlier waiters first; the arrival never jumps them.
-    while (this.localTurnWaiters.length > 0 && this.localTurnSlots < cap) {
-      this.localTurnSlots += 1
-      this.localTurnWaiters.shift()!.resolve()
-    }
+    this.grantLocalTurnSlots()
     if (this.localTurnSlots < cap) {
       this.localTurnSlots += 1
       turn.localSlot = true
@@ -2487,9 +2485,22 @@ export class ChatRuntime extends EventEmitter {
   private releaseLocalTurnSlot(turn: RunningTurn): void {
     if (!turn.localSlot) return
     turn.localSlot = false
-    const next = this.localTurnSlots <= Math.max(1, this.maxConcurrentLocalTurns()) ? this.localTurnWaiters.shift() : undefined
-    if (next) next.resolve()
-    else this.localTurnSlots -= 1
+    this.localTurnSlots -= 1
+    this.grantLocalTurnSlots()
+  }
+
+  /** The cap setting changed: start every slot waiter that now fits, in order. */
+  localTurnCapChanged(): void {
+    this.grantLocalTurnSlots()
+  }
+
+  /** Hand free slots to parked waiters in FIFO order, up to the live cap. */
+  private grantLocalTurnSlots(): void {
+    const cap = Math.max(1, this.maxConcurrentLocalTurns())
+    while (this.localTurnWaiters.length > 0 && this.localTurnSlots < cap) {
+      this.localTurnSlots += 1
+      this.localTurnWaiters.shift()!.resolve()
+    }
   }
 
   /** Fresh session: cut/verify/check out its branch under the lease. */

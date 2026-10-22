@@ -159,7 +159,9 @@ kept, and the delete confirmation says which applies. Lock files are never
 deleted, and no server sweeps workspaces by its own session table: development
 and production share the chat root but keep separate session tables. A setting
 caps concurrently running Poise-local turns (default 4); a turn held by the
-cap shows `queued` with its own reason, "waiting for a free agent slot". The
+cap shows `queued` with its own reason, "waiting for a free agent slot".
+Raising the cap starts waiting turns at once, in queue order, up to the new
+cap; lowering it stops nothing, and new turns wait. The
 Switchboard's chat runs one turn at a time outside that cap, so it keeps
 reporting while every slot is busy, and the Manager's turns run outside it
 too, so supervision still runs when every slot is busy.
