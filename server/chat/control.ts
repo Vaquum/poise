@@ -172,6 +172,14 @@ function actionableOperations(operations: unknown): Array<Record<string, unknown
   return actionable
 }
 
+/** The watched slice of a settled CI observation: the failing set, plus the
+ *  head while red. A green settle on a new head carries nothing new, so the
+ *  head stays out while green; a failure always names the head it failed on,
+ *  so the same failure persisting onto a new head still wakes. */
+function ciWatched(ci: CiObservation): unknown {
+  return ci.failing.length > 0 ? { head: ci.head, failing: ci.failing } : { failing: ci.failing }
+}
+
 export class ChatControl {
   private readonly secret = randomBytes(32)
   private origin = ''
@@ -629,7 +637,7 @@ export class ChatControl {
       try {
         const ci = await (this.options.ci ?? readWorkCi)(target)
         const data = { kind: 'ci', target: target.url, head: ci.head, failing: ci.failing }
-        this.observe(binding, `ci:${target.url}`, data, now, ci.failing.length > 0, ci.pending === true)
+        this.observe(binding, `ci:${target.url}`, data, now, ci.failing.length > 0, ci.pending === true, ciWatched(ci))
       } catch (error) {
         this.observe(binding, `ci:${target.url}`, { kind: 'ci_unavailable', target: target.url, error: error instanceof Error ? error.message : String(error) }, now, true)
       }
@@ -663,11 +671,12 @@ export class ChatControl {
     const instance = this.runtime.instance
     const body = JSON.stringify(data)
     const bodyFingerprint = createHash('sha256').update(body).digest('hex')
-    // A behavior fingerprint pairs the actionable slice with the notice body.
-    // Only the actionable half drives change detection, so bookkeeping-only
-    // updates never wake; the body half keeps a notice identical to the last
-    // one from triggering another turn — including across this rollout, where
-    // the legacy fingerprint was the body hash alone.
+    // A composite fingerprint pairs the watched slice with the notice body.
+    // Only the watched half drives change detection, so updates outside the
+    // slice — behavior bookkeeping, a green CI settle on a new head — never
+    // wake; the body half keeps a notice identical to the last one from
+    // triggering another turn — including across this rollout, where the
+    // legacy fingerprint was the body hash alone.
     const watched = actionable === undefined ? bodyFingerprint : createHash('sha256').update(JSON.stringify(actionable)).digest('hex')
     const fingerprint = actionable === undefined ? watched : `${watched}:${bodyFingerprint}`
     db.transaction(() => {
@@ -682,14 +691,15 @@ export class ChatControl {
         return
       }
       const settled = previous?.fingerprint ? previous : undefined
-      // Stored fingerprints hold no ':' except the behavior composite's
-      // separator, so the first half is the watched slice on both paths.
+      // Stored fingerprints hold no ':' except a composite's separator,
+      // so the first half is the watched slice on both paths.
       const settledWatched = settled?.fingerprint.split(':')[0]
       const identical = settled !== undefined && (settled.fingerprint === bodyFingerprint || settled.fingerprint.endsWith(`:${bodyFingerprint}`))
       // A behavior observation wakes only while it holds actionable content:
       // entries that merely disappear — a cleared error, a launch recovered
-      // to pending or clean — need no turn.
-      const actionableNow = actionable === undefined || (Array.isArray(actionable) && actionable.length > 0)
+      // to pending or clean — need no turn. A CI observation wakes on any
+      // change to its watched slice, including a recovery to green.
+      const actionableNow = actionable === undefined || data.kind === 'ci' || (Array.isArray(actionable) && actionable.length > 0)
       if (settledWatched !== watched && !identical && actionableNow && (settled || initiallyActionable)) {
         store.message(instance, binding.session, 'Poise work monitor', boundedNotice(body, { kind: data.kind, target: binding.target,
           head: data.head, failingCount: Array.isArray(data.failing) ? data.failing.length : undefined,

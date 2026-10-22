@@ -274,6 +274,27 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(3)
   })
 
+  it('stays silent when CI settles green on a new head with no failures', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/93'
+    await command(parent.id, { operation: 'bind', target })
+    const h1 = 'a'.repeat(40), h2 = 'b'.repeat(40)
+    ci.mockResolvedValue({ head: h1, failing: [] })
+    await control.tick()
+    ci.mockResolvedValue({ head: h2, failing: [], pending: true })
+    clock += 5 * 60_000; await control.tick()
+    ci.mockResolvedValue({ head: h2, failing: [] })
+    clock += 5 * 60_000; await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+    ci.mockResolvedValue({ head: h2, failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
+    clock += 5 * 60_000; await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    ci.mockResolvedValue({ head: h2, failing: [] })
+    clock += 5 * 60_000; await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
+  })
+
   it('retains settled CI evidence during a rerun when another check remains failed', async () => {
     const parent = await manager()
     const target = 'https://github.com/acme/app/pull/91'
