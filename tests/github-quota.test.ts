@@ -219,6 +219,20 @@ describe('quota notifications', () => {
     expect(alerts.openAlerts()[0].id).not.toBe(old.id)
   })
 
+  it("says when the budget resets on Poise's clock in Settings' zone, naming the zone", () => {
+    const resets = () => alerts.openAlerts()[0].body.replace(/^.* Resets at /, 'Resets at ')
+    database.setMeta('timezone', 'Europe/Helsinki')
+    sustained(account(100, 50))
+    expect(resets()).toBe('Resets at 16:00 EEST.')
+    database.setMeta('timezone', '')
+    sample([account(110, 50)], T0 + 45_000)
+    expect(resets()).toBe('Resets at 13:00 UTC.')
+    // Settings refuses a zone it does not know; one stored before that reads in UTC, which the body names.
+    database.setMeta('timezone', 'Mars/Olympus')
+    sample([account(120, 50)], T0 + 60_000)
+    expect(resets()).toBe('Resets at 13:00 UTC.')
+  })
+
   it('requires 50 percent risk across distinct observations at least 30 seconds apart', () => {
     sample([account(100, 49)], T0)
     sample([account(200, 80)], T0 + 15_000)

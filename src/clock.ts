@@ -50,6 +50,13 @@ export function logTime(at: string | number, timeZone: string, now: number): str
   return `${date ? `${date} ` : ''}${time.hour}:${time.minute}:${time.second}`
 }
 
+/** As shortTime, followed by the zone's short name, for text read away from
+ *  Poise's page, such as a notice on the desktop: "22:00 EEST". */
+export function zonedTime(at: string | number, timeZone: string, now: number): string {
+  const { time, date } = dated(at, timeZone, now)
+  return `${date ? `${date} ` : ''}${time.hour}:${time.minute} ${time.timeZoneName}`
+}
+
 /** "19:38" on the day of `now`, otherwise the date alone, for compact lists. */
 export function listTime(at: string | number, timeZone: string, now: number): string {
   const { time, date } = dated(at, timeZone, now)

@@ -6,7 +6,8 @@ import { GH_STORED_ACCOUNTS_ENV } from './accounts/clis'
 import { openAlerts, raiseAlert, resolveAlert, updateAlertDetails } from './alerts/store'
 import { getMeta, setMeta } from './db'
 import { runFile } from './process'
-import { getNotificationSettings, getSettings } from './settings'
+import { getNotificationSettings, getSettings, knownTimeZone } from './settings'
+import { zonedTime } from '../src/clock'
 import { GITHUB_QUOTA_REFRESH_MS, type GithubQuotaAccount, type GithubQuotaBucket, type GithubQuotaReport, type GithubQuotaObservation } from '../src/github-quota'
 
 export const QUOTA_INTERVAL_MS = GITHUB_QUOTA_REFRESH_MS
@@ -180,8 +181,17 @@ export function observeQuotaConditions(accounts: GithubQuotaAccount[], now = Dat
   return sustained
 }
 
+// The notice is read on the desktop too, so its reset time names its zone:
+// Settings' zone, or UTC while none is saved or the saved one is not one this
+// server's Intl knows (Settings refuses those; the browser names them).
+function noticeZone(): string {
+  const { timezone } = getSettings()
+  return timezone && knownTimeZone(timezone) ? timezone : 'UTC'
+}
+
 export function syncQuotaAlerts(accounts: GithubQuotaAccount[], now = Date.now(), observed?: ReadonlySet<string>): void {
   const enabled = getNotificationSettings().enabled
+  const zone = noticeZone()
   const sustained = observed ?? observeQuotaConditions(accounts, now)
   const standing = new Set<string>()
   const existing = new Set(openAlerts({ now }).map((alert) => alert.dedupeKey))
@@ -196,7 +206,7 @@ export function syncQuotaAlerts(accounts: GithubQuotaAccount[], now = Date.now()
         || (!sustained.has(conditionKey(account.login, bucket)) && !existing.has(key)))) continue
       standing.add(key)
       const title = exhausted ? `GitHub ${bucket.label} quota exhausted for ${account.login}` : `GitHub ${bucket.label} quota may run out for ${account.login}`
-      const body = `${account.roles.join(' + ')} account · ${bucket.used.toLocaleString('en-US')} of ${bucket.limit.toLocaleString('en-US')} used. ${exhausted ? 'Requests are blocked.' : `${bucket.riskPercent}% estimated risk before reset at the observed usage rate.`} Resets ${bucket.resetAt}.`
+      const body = `${account.roles.join(' + ')} account · ${bucket.used.toLocaleString('en-US')} of ${bucket.limit.toLocaleString('en-US')} used. ${exhausted ? 'Requests are blocked.' : `${bucket.riskPercent}% estimated risk before reset at the observed usage rate.`} Resets at ${zonedTime(bucket.resetAt, zone, now)}.`
       if (!enabled) continue
       raiseAlert({
         kind: exhausted ? 'github_quota_exhausted' : 'github_quota_warning', dedupeKey: key,

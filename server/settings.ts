@@ -13,7 +13,7 @@ const GITHUB_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/
 // supportedValuesOf('timeZone') leaves out UTC and the aliases Intl accepts.
 // It is this server's Intl; a browser whose ICU differs reports a saved zone
 // it does not know itself (src/config.ts).
-function knownTimeZone(name: string): boolean {
+export function knownTimeZone(name: string): boolean {
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: name })
     return true

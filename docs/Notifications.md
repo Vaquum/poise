@@ -88,8 +88,10 @@ While notifications are enabled, a displayed [estimated exhaustion risk](Analyti
 of at least 50% sustained across distinct observations at least 30 seconds apart
 in the same reset window raises an amber `github_quota_warning`. Zero remaining raises a red
 `github_quota_exhausted` error, including after a dismissed warning. The notice
-names the account, API budget, usage and reset time. Errors appear in the rail's
-faults group and turn the bell red.
+names the account, API budget, usage and reset time. The reset time is on Poise's
+clock with its zone, as in `Resets at 16:00 EEST.`, in the time zone from
+Settings, or in UTC while none is set. Errors appear in the rail's faults group
+and turn the bell red.
 
 Each account/budget/reset condition alerts once. Continuing warnings update
 their numbers without undoing a dismissal or issuing another arrival. A

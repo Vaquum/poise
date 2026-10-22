@@ -3,7 +3,7 @@
 // not the day of `now`.
 
 import { describe, expect, it } from 'vitest'
-import { clockDay, fullTime, listTime, logTime, shortTime } from '../src/clock'
+import { clockDay, fullTime, listTime, logTime, shortTime, zonedTime } from '../src/clock'
 
 const NOW = Date.parse('2026-10-21T17:00:00Z')
 const ZONE = 'Europe/Helsinki'
@@ -49,6 +49,12 @@ describe("Poise's clock", () => {
     expect(shortTime('2026-10-22T05:00:00.000Z', ZONE, NOW)).toBe('22 Oct 08:00')
   })
 
+  it('names the zone after the short time, for text read away from the page', () => {
+    expect(zonedTime('2026-10-21T19:00:00.000Z', ZONE, NOW)).toBe('22:00 EEST')
+    expect(zonedTime('2026-10-22T04:00:00.000Z', ZONE, NOW)).toBe('22 Oct 07:00 EEST')
+    expect(zonedTime('2026-10-21T19:00:00.000Z', 'UTC', NOW)).toBe('19:00 UTC')
+  })
+
   it('writes the whole moment out in words', () => {
     expect(fullTime(TODAY, ZONE)).toBe('Wednesday 21 October 2026 at 19:38:12 EEST')
   })
@@ -63,6 +69,7 @@ describe("Poise's clock", () => {
     const reads = [
       (at: string, zone: string) => shortTime(at, zone, NOW), (at: string, zone: string) => logTime(at, zone, NOW),
       (at: string, zone: string) => listTime(at, zone, NOW), (at: string, zone: string) => fullTime(at, zone),
+      (at: string, zone: string) => zonedTime(at, zone, NOW),
     ]
     for (const read of reads) {
       expect(() => read('not a time', 'UTC')).toThrow(RangeError)
@@ -75,6 +82,7 @@ describe("Poise's clock", () => {
     expect(() => shortTime(TODAY, ZONE, NaN)).toThrow(RangeError)
     expect(() => logTime(TODAY, ZONE, NaN)).toThrow(RangeError)
     expect(() => listTime(TODAY, ZONE, NaN)).toThrow(RangeError)
+    expect(() => zonedTime(TODAY, ZONE, NaN)).toThrow(RangeError)
     expect(() => clockDay(ZONE, NaN)).toThrow(RangeError)
   })
 })
