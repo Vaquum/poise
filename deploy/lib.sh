@@ -111,7 +111,8 @@ require_env_file() {
 # The workspace image the gateway runs: POISE_RUNTIME_IMAGE as Compose resolves it.
 runtime_image() {
   local image
-  image=$(compose config --format json | sed -n 's/^ *"POISE_RUNTIME_IMAGE": "\(.*\)",\{0,1\}$/\1/p' | head -n 1)
+  image=$(env_value POISE_RUNTIME_IMAGE)
+  image=${image:-poise-runtime:latest}
   [ -n "$image" ] || die "Docker Compose resolved no POISE_RUNTIME_IMAGE from $deploy/compose.yaml"
   case $image in
     *@*) die "POISE_RUNTIME_IMAGE is $image, a digest; name a tag this server builds, such as poise-runtime:latest." ;;

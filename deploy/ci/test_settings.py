@@ -153,6 +153,48 @@ class RequireEnvFileTest(LibTest):
         self.assertIn('must be the one IP address and port your proxy reaches the gateway at', result.stderr)
 
 
+class RuntimeImageTest(LibTest):
+    def setUp(self):
+        super().setUp()
+        # runtime_image reads deploy/.env only; a docker here must never run.
+        self.bin = os.path.join(self.work.name, 'bin')
+        os.mkdir(self.bin)
+        docker = os.path.join(self.bin, 'docker')
+        with open(docker, 'w') as file:
+            file.write('#!/bin/sh\necho \"fake docker must not run\" >&2\nexit 1\n')
+        os.chmod(docker, 0o755)
+
+    def write_lines(self, *lines):
+        with open(self.env_file, 'w') as file:
+            file.writelines(f'{line}\n' for line in lines)
+        os.chmod(self.env_file, 0o600)
+
+    def runtime_image(self):
+        return self.lib('runtime_image', path=self.bin)
+
+    def test_returns_the_configured_image(self):
+        image = 'registry.example.com/poise/img:7'
+        for line in (f'POISE_RUNTIME_IMAGE={image}',
+                     f'POISE_RUNTIME_IMAGE=\"{image}\"',
+                     f"POISE_RUNTIME_IMAGE='{image}'",
+                     f'POISE_RUNTIME_IMAGE={image} # pinned'):
+            self.write_lines(line)
+            result = self.runtime_image()
+            self.assertEqual((result.returncode, result.stdout), (0, image), line)
+
+    def test_defaults_when_the_value_is_absent(self):
+        for lines in ((), ('POISE_RUNTIME_IMAGE=',), ('# POISE_RUNTIME_IMAGE=img:1',)):
+            self.write_lines(*lines)
+            result = self.runtime_image()
+            self.assertEqual((result.returncode, result.stdout), (0, 'poise-runtime:latest'), lines)
+
+    def test_rejects_a_digest(self):
+        self.write_lines('POISE_RUNTIME_IMAGE=img@sha256:deadbeef')
+        result = self.runtime_image()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('a digest; name a tag', result.stderr)
+
+
 class LintTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which('shellcheck'), 'shellcheck is not installed')
     def test_operator_scripts_pass_shellcheck(self):
