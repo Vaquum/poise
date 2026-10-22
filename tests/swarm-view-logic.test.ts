@@ -20,6 +20,8 @@ type Helpers = {
   progressDetail: (e: any, zone?: string, now?: number) => string
   quarantineDescription: (e: any) => string
   groupRuns: (entries: any[]) => Array<{ key: string, entries: any[] }>
+  statusLook: (e: any) => { icon: string, tone: string, word: string, detail: string, quiet?: boolean }
+  stopIcon: string
 }
 
 async function loadHelpers(): Promise<Helpers> {
@@ -28,7 +30,8 @@ async function loadHelpers(): Promise<Helpers> {
   // otherwise only reachable through a DOM input event.
   const patched = source + `
 export const __test = {
-  sessionLabel, targetText, matchesSearch, startedAtMs, elapsedText, hasDetail, progressText, progressDetail, quarantineDescription, groupRuns,
+  sessionLabel, targetText, matchesSearch, startedAtMs, elapsedText, hasDetail, progressText, progressDetail, quarantineDescription, groupRuns, statusLook,
+  stopIcon: ICON_STOPPED,
   setSearch: (q: string) => { searchQuery = q },
 }
 `
@@ -321,5 +324,29 @@ describe('unreadable records remain diagnostics rather than actionable runs', ()
     expect(markup).toContain('Reported session: content-session-123')
     expect(markup).toContain('<script>bad</script>')
     expect(markup).toContain('<img')
+  })
+})
+
+// `canceled` and `cancelled` are the same outcome with two spellings, and the
+// log layer accepts both — but only `cancelled` rendered as Stopped.
+describe('both canceled spellings render as Stopped', () => {
+  it('maps canceled to the stop icon, flat tone and Stopped word', () => {
+    const look = helpers.statusLook(entry({ status: 'canceled' }))
+    expect(look.icon).toBe(helpers.stopIcon)
+    expect(look.tone).toBe('flat')
+    expect(look.word).toBe('Stopped')
+    expect(look.icon).toBe(helpers.statusLook(entry({ status: 'cancelled' })).icon)
+  })
+
+  it('keeps cancelled, completed, failed and unknown looks unchanged', () => {
+    expect(helpers.statusLook(entry({ status: 'cancelled' })))
+      .toMatchObject({ icon: helpers.stopIcon, tone: 'flat', word: 'Stopped' })
+    expect(helpers.statusLook(entry({ status: 'completed' })))
+      .toMatchObject({ tone: 'ok', word: 'Completed', quiet: true })
+    expect(helpers.statusLook(entry({ status: 'failed' })))
+      .toMatchObject({ tone: 'bad', word: 'Failed' })
+    const unknown = helpers.statusLook(entry({ status: 'mystery' }))
+    expect(unknown).toMatchObject({ tone: 'flat', word: 'Mystery' })
+    expect(unknown.icon).not.toBe(helpers.stopIcon)
   })
 })

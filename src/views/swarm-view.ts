@@ -266,7 +266,7 @@ function statusLook(e: LogEntry): StatusLook {
   if (verdict) {
     return { ...verdict, detail: `${capitalise(status || 'finished')} · ${verdict.word.toLowerCase()}` }
   }
-  if (e.error_code === 'stopped' || status === 'cancelled') {
+  if (e.error_code === 'stopped' || status === 'cancelled' || status === 'canceled') {
     return { icon: ICON_STOPPED, tone: 'flat', word: 'Stopped', detail: `${capitalise(status)} · stopped` }
   }
   if (status === 'completed') return { icon: ICON_DONE, tone: 'ok', word: 'Completed', detail: 'Completed', quiet: true }
