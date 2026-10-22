@@ -27,7 +27,7 @@ from . import progress, review_budget, review_receipt
 MAX_INSPECTION_ROUNDS = 12
 CODEX_MAX_INPUT_CHARS = 1_048_576
 GROK_DISABLED_TOOLS = (
-    "run_terminal_cmd,run_terminal_command,read_file,write_file,write,search_replace,list_dir,grep,"
+    "run_terminal_cmd,run_terminal_command,read_file,write,search_replace,list_dir,grep,"
     "kill_command_or_subagent,todo_write,get_command_or_subagent_output,spawn_subagent,Agent,"
     "scheduler_create,scheduler_delete,scheduler_list,monitor,search_tool,use_tool,workflow,"
     "enter_plan_mode,exit_plan_mode,ask_user_question,send_feedback,image_gen,image_edit,"

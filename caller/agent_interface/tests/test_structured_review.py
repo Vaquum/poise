@@ -252,8 +252,9 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertIn("--verbatim", args)
         self.assertEqual(args[args.index("--system-prompt-override") + 1], "system")
         disabled = args[args.index("--disallowed-tools") + 1].split(",")
-        for tool in ("read_file", "run_terminal_cmd", "search_tool", "use_tool"):
+        for tool in ("read_file", "run_terminal_cmd", "search_tool", "use_tool", "write", "search_replace"):
             self.assertIn(tool, disabled)
+        self.assertNotIn("write_file", disabled)
         self.assertEqual(kwargs["env"]["GROK_CLAUDE_MCPS_ENABLED"], "0")
         self.assertEqual(kwargs["env"]["GROK_CLAUDE_HOOKS_ENABLED"], "0")
         self.assertEqual(args[args.index("--permission-mode") + 1], "dontAsk")
