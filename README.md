@@ -476,8 +476,10 @@ storage no longer needs a git checkout of Poise.
   included), scheduled behavior launches, and launches from the browser
   (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`, `/api/debate`,
   `/api/chat`, `/api/models/refresh`), which answer 503 with code `draining`.
-  Work already running continues. It returns the health body. The gateway
-  renews a drain by calling it again while it waits; one that is not renewed
+  Work already running continues. One Chat turn holds the drain at most 30
+  minutes: past that the drain stops it with a transcript notice naming the
+  update. It returns the health body. The gateway renews a drain by
+  calling it again while it waits; one that is not renewed
   lapses `POISE_DRAIN_TIMEOUT` seconds (default 5400; read from the
   workspace's environment and validated at startup) plus five minutes after
   the last drain call, so a gateway that stops renewing it cannot leave the

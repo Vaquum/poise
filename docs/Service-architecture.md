@@ -441,12 +441,18 @@ assertion may only resume, and anything else is refused with 403):
   launches, then returns the same fields. A drain lapses unless it is renewed:
   while the gateway polls health it re-POSTs `/api/service/drain` at least
   every 5 minutes. It recreates the container once `idle` is true or
-  `POISE_DRAIN_TIMEOUT` seconds (default 5400, 90 minutes: longer than an
-  issue review may run, so it should cut only a hung call) have passed.
+  `POISE_DRAIN_TIMEOUT` seconds (default 5400, 90 minutes) have passed.
   - New Chat turns include queued messages, and launches include the
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
     `/api/debate`, `/api/chat`, `/api/models/refresh`). Refused work answers
     503 with code `draining`; work already running continues.
+  - One Chat turn holds a refusing drain at most 30 minutes: past that the
+    drain stops it through the person's Stop path, with a transcript notice
+    naming the update, and the agent keeps its context for the next prompt.
+    `idle` still means nothing a restart would cut; it follows once the
+    stopped turn settles. Past the gateway's own timeout the container is
+    recreated anyway, cutting whatever would not settle — bounded Caller
+    work finishes inside it, so that lands only on hung work.
   - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
     5400) plus five minutes after the last drain call, so a gateway that
     stopped renewing it cannot leave the workspace refusing work.

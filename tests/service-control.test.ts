@@ -48,7 +48,7 @@ function fakeRuntime(instance = `poise-production:${randomUUID()}`) {
   return {
     instance, busyNow: 0, workingNow: 0,
     busy() { return this.busyNow }, working() { return this.workingNow },
-    startDrain: vi.fn(), endDrain: vi.fn(),
+    startDrain: vi.fn(), endDrain: vi.fn(), stopTurnsForDrain: vi.fn(async () => 0),
   }
 }
 
@@ -64,6 +64,12 @@ class FakeTimer {
     const [id, timer] = [...this.timers.entries()][0]
     this.timers.delete(id)
     timer.callback()
+  }
+  fireDelay(delayMs: number): void {
+    const entry = [...this.timers.entries()].find(([_, timer]) => timer.delayMs === delayMs)
+    if (!entry) throw new Error(`no timer with delay ${delayMs}`)
+    this.timers.delete(entry[0])
+    entry[1].callback()
   }
 }
 
@@ -168,15 +174,44 @@ describe('service drain', () => {
   it('lapses POISE_DRAIN_TIMEOUT plus five minutes after the last drain call', () => {
     const { runtime, timer, log, service } = serviceOf()
     service.drain()
-    expect([...timer.timers.values()].map((entry) => entry.delayMs)).toEqual([(1800 + 300) * 1000])
+    expect([...timer.timers.values()].map((entry) => entry.delayMs)).toEqual([(1800 + 300) * 1000, control.DRAIN_TURN_DEADLINE_MS])
     // The gateway renews the drain by calling it again while it waits.
     service.drain()
-    expect(timer.timers.size).toBe(1)
-    timer.fire()
+    expect(timer.timers.size).toBe(2)
+    timer.fireDelay((1800 + 300) * 1000)
     expect(service.draining).toBe(false)
     expect(runtime.endDrain).toHaveBeenCalledTimes(1)
     expect(background.releaseBackgroundPaused()).toBe(false)
     expect(log).toHaveBeenCalledWith('[service] the drain lapsed: no drain call renewed it within 2100 s, so new work is admitted again')
+  })
+
+  it('stops Chat turns that hold the drain past the turn deadline, once per drain', () => {
+    const { runtime, timer, log, service } = serviceOf()
+    service.drain()
+    // The gateway's renewals renew the lapse, never the turn deadline.
+    service.drain()
+    service.drain()
+    expect([...timer.timers.values()].filter((entry) => entry.delayMs === control.DRAIN_TURN_DEADLINE_MS)).toHaveLength(1)
+    timer.fireDelay(control.DRAIN_TURN_DEADLINE_MS)
+    expect(runtime.stopTurnsForDrain).toHaveBeenCalledTimes(1)
+    expect(runtime.stopTurnsForDrain).toHaveBeenCalledWith(control.DRAIN_TURN_STOPPED)
+    expect(log).toHaveBeenCalledWith('[service] the drain reached the Chat-turn deadline; turns still running are stopped for the update')
+    // The drain stays on: idle follows once the stopped turns settle.
+    expect(service.draining).toBe(true)
+  })
+
+  it('drops the turn deadline when the drain is lifted, lapses, or the runtime stops', () => {
+    const { runtime, timer, service } = serviceOf()
+    service.drain()
+    service.resume()
+    expect(timer.timers.size).toBe(0)
+    service.drain()
+    service.reset()
+    expect(timer.timers.size).toBe(0)
+    service.drain()
+    timer.fireDelay((1800 + 300) * 1000)
+    expect(timer.timers.size).toBe(0)
+    expect(runtime.stopTurnsForDrain).not.toHaveBeenCalled()
   })
 
   it('stops the lapse when the drain is lifted or the runtime stops', () => {
