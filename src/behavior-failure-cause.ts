@@ -37,6 +37,26 @@ export function isTimeoutCause(error: string): boolean {
   return /aborted due to timeout|timed out/i.test(error)
 }
 
+// GitHub states when a rate limit lifts, and Caller surfaces it in 403/429
+// errors: `x-ratelimit-reset` epoch seconds and `retry-after` delay seconds.
+// Retrying before then provably fails, so the retry clock honors the later of
+// the stated time and its own backoff. The reset binds only when the quota is
+// exhausted: Caller attaches these headers to every 403/429, including
+// permission errors and secondary throttles whose reset is far away while
+// `retry-after` is short. Anything without a sane stated time is not a schedule.
+export function rateLimitRetryAtMs(error: string, nowMs: number): number | null {
+  const remaining = /x-ratelimit-remaining['"]?\s*:\s*['"]?(\d+)['"]?/.exec(error)?.[1]
+  const exhausted = remaining !== undefined && Number(remaining) === 0
+  const reset = exhausted ? /x-ratelimit-reset['"]?\s*:\s*['"]?(\d+)['"]?/.exec(error)?.[1] : undefined
+  const retryAfter = /retry-after['"]?\s*:\s*['"]?(\d+)['"]?/.exec(error)?.[1]
+  const candidates = [
+    reset === undefined ? null : Number(reset) * 1000,
+    retryAfter === undefined ? null : nowMs + Number(retryAfter) * 1000,
+  ].filter((candidate): candidate is number => candidate !== null && Number.isSafeInteger(candidate)
+    && candidate > Date.parse('2020-01-01T00:00:00Z') && candidate <= nowMs + 24 * 3600_000)
+  return candidates.length ? Math.max(...candidates) : null
+}
+
 // Warning rules are an allowlist of observable transient outcomes. Neither a
 // retry count nor text saying "warning" can downgrade unknown or held evidence.
 // A 403 with explicit quota-exhaustion evidence is a rate limit, not a

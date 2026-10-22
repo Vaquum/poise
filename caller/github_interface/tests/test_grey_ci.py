@@ -59,7 +59,8 @@ class TestGreyDiscovery(IsolatedAsyncioTestCase):
 
     async def test_only_completed_grey_interruptions_are_candidates(self):
         for status, conclusion, expected in [('COMPLETED', 'CANCELLED', True), ('COMPLETED', 'STALE', True),
-                ('COMPLETED', 'FAILURE', False), ('COMPLETED', 'TIMED_OUT', False),
+                ('COMPLETED', 'TIMED_OUT', True),
+                ('COMPLETED', 'FAILURE', False),
                 ('COMPLETED', 'SUCCESS', False), ('COMPLETED', 'SKIPPED', False), ('COMPLETED', 'NEUTRAL', False),
                 ('COMPLETED', 'ACTION_REQUIRED', False), ('IN_PROGRESS', None, False), ('QUEUED', None, False)]:
             with self.subTest(status=status, conclusion=conclusion):
@@ -131,8 +132,8 @@ class TestGreyRerun(IsolatedAsyncioTestCase):
         self.assertEqual(self.client.get.await_count, 3)
         self.client.get.assert_any_await('/repos/acme/app/actions/runs/100/attempts/2/jobs', params={'per_page': 100, 'page': 1})
 
-    async def test_failed_green_active_intentionally_skipped_and_timed_out_runs_never_rerun(self):
-        for fields in [{'conclusion': 'failure'}, {'conclusion': 'success'}, {'conclusion': 'timed_out'},
+    async def test_failed_green_active_and_skipped_runs_never_rerun(self):
+        for fields in [{'conclusion': 'failure'}, {'conclusion': 'success'},
                        {'conclusion': 'skipped'}, {'conclusion': 'neutral'}, {'status': 'in_progress'},
                        {'status': 'queued'}, {'run_attempt': 3}, {'head_sha': 'b' * 40}, {'pull_requests': [{'number': 8}]}]:
             with self.subTest(fields=fields):
@@ -140,8 +141,31 @@ class TestGreyRerun(IsolatedAsyncioTestCase):
                 self.assertEqual((await self.rerun())['outcome'], 'not_ready')
                 self.client.post.assert_not_awaited()
 
-    async def test_a_failed_timed_out_active_or_unknown_job_blocks_whole_workflow_rerun(self):
-        for fields in [{'conclusion': 'failure'}, {'conclusion': 'timed_out'}, {'conclusion': None},
+    async def test_timed_out_run_with_an_interrupted_job_reruns(self):
+        self.workflow = {**deepcopy(WORKFLOW), 'conclusion': 'timed_out'}
+        self.assertEqual((await self.rerun())['outcome'], 'rerun_requested')
+        self.client.post.assert_awaited_once_with('/repos/acme/app/actions/runs/100/rerun')
+
+    async def test_failed_rollup_beside_a_cancelled_job_reruns_the_whole_workflow(self):
+        self.jobs = [{**JOB, 'conclusion': 'cancelled'}, {**JOB, 'conclusion': 'failure'},
+                   {**JOB, 'conclusion': 'success'}]
+        self.assertEqual((await self.rerun())['outcome'], 'rerun_requested')
+        self.client.post.assert_awaited_once_with('/repos/acme/app/actions/runs/100/rerun')
+
+    async def test_timed_out_job_beside_completed_jobs_reruns(self):
+        self.jobs = [{**JOB, 'conclusion': 'timed_out'}, {**JOB, 'conclusion': 'success'}]
+        self.assertEqual((await self.rerun())['outcome'], 'rerun_requested')
+        self.client.post.assert_awaited_once_with('/repos/acme/app/actions/runs/100/rerun')
+
+    async def test_jobs_without_an_interruption_never_rerun(self):
+        for conclusions in (['success', 'failure'], ['failure'], ['success'], ['skipped', 'neutral']):
+            with self.subTest(conclusions=conclusions):
+                self.jobs = [{**JOB, 'conclusion': conclusion} for conclusion in conclusions]
+                self.assertEqual((await self.rerun())['outcome'], 'not_ready')
+                self.client.post.assert_not_awaited()
+
+    async def test_an_active_unknown_or_mismatched_job_blocks_whole_workflow_rerun(self):
+        for fields in [{'conclusion': None}, {'conclusion': 'action_required'},
                        {'status': 'in_progress'}, {'run_id': 99}, {'run_attempt': 1}]:
             with self.subTest(fields=fields):
                 self.jobs = [deepcopy(JOB), {**JOB, **fields}]

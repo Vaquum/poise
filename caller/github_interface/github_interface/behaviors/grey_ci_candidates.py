@@ -4,7 +4,7 @@ from github_interface.atoms.pr_batch import read_pull_batch
 from github_interface.client import GitHubClient
 
 REQUIRE_TOKEN_USER = True
-GREY_CONCLUSIONS = {"cancelled", "stale"}
+GREY_CONCLUSIONS = {"cancelled", "stale", "timed_out"}
 SUITES = """
   pageInfo { hasNextPage endCursor }
   nodes { status conclusion workflowRun {
