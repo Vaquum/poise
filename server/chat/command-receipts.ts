@@ -20,6 +20,20 @@ db.exec(`CREATE TABLE IF NOT EXISTS chat_command_receipts (
   PRIMARY KEY (instance, request_id)
 )`)
 
+// The control operation each receipt recorded, and the time index the
+// Manager budget counts through. Receipts written before this slice read
+// the operation as NULL.
+try {
+  db.transaction(() => {
+    const cols = db.prepare('PRAGMA table_info(chat_command_receipts)').all() as Array<{ name: string }>
+    if (!cols.some((c) => c.name === 'operation')) db.exec('ALTER TABLE chat_command_receipts ADD COLUMN operation TEXT')
+    db.exec('CREATE INDEX IF NOT EXISTS chat_command_receipts_time ON chat_command_receipts(instance, created_at)')
+  }).immediate()
+} catch (error) {
+  // A concurrent process added the column first; anything else stops startup.
+  if (!(error instanceof Error) || !error.message.includes('duplicate column name')) throw error
+}
+
 function canonical(value: unknown, depth = 0): string {
   if (depth > 64) throw new Error('command nesting exceeds 64 levels')
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
@@ -36,10 +50,10 @@ function failure(id: string, code: string, error: string): Ack {
   return { kind: 'ack', id, ok: false, code, error }
 }
 
-const reserve = db.transaction((instance: string, id: string, fingerprint: string): { fresh: boolean, receipt: Receipt } => {
-  const result = db.prepare(`INSERT INTO chat_command_receipts (instance, request_id, fingerprint, ack, created_at)
-    VALUES (?, ?, ?, NULL, ?) ON CONFLICT(instance, request_id) DO NOTHING`)
-    .run(instance, id, fingerprint, new Date().toISOString())
+const reserve = db.transaction((instance: string, id: string, fingerprint: string, createdAt: string, operation: string | null): { fresh: boolean, receipt: Receipt } => {
+  const result = db.prepare(`INSERT INTO chat_command_receipts (instance, request_id, fingerprint, ack, created_at, operation)
+    VALUES (?, ?, ?, NULL, ?, ?) ON CONFLICT(instance, request_id) DO NOTHING`)
+    .run(instance, id, fingerprint, createdAt, operation)
   const receipt = db.prepare('SELECT fingerprint, ack FROM chat_command_receipts WHERE instance = ? AND request_id = ?')
     .get(instance, id) as Receipt
   return { fresh: result.changes === 1, receipt }
@@ -53,6 +67,7 @@ export function executeCommandOnce(
   id: string,
   command: unknown,
   execute: () => Promise<Ack>,
+  options?: { now?: () => number, operation?: string },
 ): Promise<Ack> {
   let fingerprint: string
   try { fingerprint = createHash('sha256').update(canonical(command)).digest('hex') }
@@ -65,7 +80,7 @@ export function executeCommandOnce(
   }
   if (active.size >= MAX_ACTIVE) return Promise.resolve(failure(id, 'overloaded', 'too many commands are in flight; nothing was executed'))
   let reserved: ReturnType<typeof reserve>
-  try { reserved = reserve.immediate(instance, id, fingerprint) }
+  try { reserved = reserve.immediate(instance, id, fingerprint, new Date((options?.now ?? Date.now)()).toISOString(), options?.operation ?? null) }
   catch { return Promise.resolve(failure(id, 'receipt_unavailable', 'could not reserve the command safely; nothing was executed')) }
   if (reserved.receipt.fingerprint !== fingerprint) {
     return Promise.resolve(failure(id, 'request_id_conflict', 'this request ID was already used for a different command'))
@@ -92,4 +107,18 @@ export function executeCommandOnce(
     .finally(() => active.delete(key))
   active.set(key, { fingerprint, promise })
   return promise
+}
+
+/** Receipts recorded in one scope since an ISO time, optionally only some operations, with the oldest counted one. Read-only; uses (instance, created_at). */
+export function countReceiptsSince(scope: string, sinceIso: string, operations?: { only?: string[], except?: string[] }): { count: number, oldest: string | null } {
+  if (operations?.only && operations.only.length === 0) return { count: 0, oldest: null }
+  let sql = 'SELECT COUNT(*) AS count, MIN(created_at) AS oldest FROM chat_command_receipts WHERE instance = ? AND created_at >= ?'
+  const args: string[] = [scope, sinceIso]
+  if (operations?.only?.length) { sql += ` AND operation IN (${operations.only.map(() => '?').join(',')})`; args.push(...operations.only) }
+  if (operations?.except?.length) { sql += ` AND (operation IS NULL OR operation NOT IN (${operations.except.map(() => '?').join(',')}))`; args.push(...operations.except) }
+  return db.prepare(sql).get(...args) as { count: number, oldest: string | null }
+}
+
+export function hasReceipt(scope: string, id: string): boolean {
+  return !!db.prepare('SELECT 1 FROM chat_command_receipts WHERE instance = ? AND request_id = ?').get(scope, id)
 }

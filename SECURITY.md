@@ -153,6 +153,20 @@ uses the enclosing source checkout for checkpoints. Symlinked storage roots
 and unowned non-empty workspace directories are refused. Existing sessions
 retain their original boundaries; no histories or documents are relocated.
 
+The workspace Manager's authority is cooperative. Only the Manager among chats
+can steer, answer and stop chats it did not create, and only the person's
+browser can stop, close, fork, hand off, rename or delete a chat through REST;
+the budgets (120 control actions and 20 new chats per hour) and the audit bind
+the control path only. They do not isolate agents running as the same
+operating-system user. A same-user agent can still read another chat's
+connection file and act as that chat, forge an `Origin` header and act as the
+person on any route, send origin-less commands over loopback `/ws/chat` that
+are recorded as the person, create unattributed chats through
+`POST /api/chat/sessions`, and change Settings and behaviors or drain and
+resume Poise through the loopback APIs. Ordinary chats keep no new limits,
+including on messages to the Manager. These are residual risks under the
+trusted-workspace model.
+
 ### Chat file previews
 
 Clicking a local Markdown link requests a bounded, read-only text preview.

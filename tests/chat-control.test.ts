@@ -328,11 +328,11 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(steered.find(e => e.type === 'steer.sent')).not.toHaveProperty('source.role')
     expect(steered.some(e => e.type === 'session.reset')).toBe(false)
     expect(runtime.get(child)?.status).toBe('running')
-    await expect(command(outsider.id, { ...input, requestId: randomUUID() })).rejects.toThrow('recorded manager')
+    await expect(command(outsider.id, { ...input, requestId: randomUUID() })).rejects.toThrow('only the workspace Manager or the chat that created this chat can steer it')
     const waiting = hosts.get(child)!.askQuestion({ questions: [{ id: 'target', question: 'Which target?', options: [], freeText: true, multiSelect: false }] })
     await until(() => runtime.get(child)?.status === 'waiting')
     const questionId = runtime.get(child)!.pendingRequests[0]
-    await expect(command(outsider.id, { operation: 'answer', sessionId: child, questionId, answers: { target: 'staging' } })).rejects.toThrow('recorded manager')
+    await expect(command(outsider.id, { operation: 'answer', sessionId: child, questionId, answers: { target: 'staging' } })).rejects.toThrow('only the workspace Manager or the chat that created this chat can answer its questions')
     await command(parent.id, { operation: 'answer', sessionId: child, questionId, answers: { target: 'staging' } })
     await expect(waiting).resolves.toEqual({ target: 'staging' })
     expect(runtime.events(child, 0).events.find(e => e.event.type === 'question.answered')?.event).toMatchObject(
@@ -868,7 +868,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       }
       expect(reported().find(a => (a.context as Record<string, unknown>).action === 'answer')?.context).toMatchObject({ questionId })
       expect(JSON.stringify(reported())).not.toContain('Release lead')
-      await expect(command(outsider.id, { operation: 'steer', sessionId: child, text: 'Intrude' })).rejects.toThrow('recorded manager')
+      await expect(command(outsider.id, { operation: 'steer', sessionId: child, text: 'Intrude' })).rejects.toThrow('only the workspace Manager or the chat that created this chat can steer it')
       logging.loggingRuntime()!.flush()
       expect(reported()).toHaveLength(5)
     } finally {

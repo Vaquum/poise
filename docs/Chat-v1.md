@@ -153,6 +153,17 @@ the Manager instead of deleting it, marks `retiredModel`, and refuses every
 turn until the person picks another model with `set_model`; retirement is
 detected at startup only. A closed Manager still holds the key.
 
+The person's REST actions on a chat answer only the person's browser: `cancel`,
+`close`, `fork` and `handoff`, renaming through `PATCH` and deleting through
+`DELETE /api/chat/sessions/<id>` refuse with 403 unless the request carries a
+browser `Origin` (in service mode, through the gateway's assertion), as does
+`POST /api/agent-stop` when its ID names a chat turn. The native control's `api`
+operation sends no `Origin`, so no chat can take these actions through it;
+chats steer, answer and stop through the control operations instead. Resume,
+reads and creation through `POST /api/chat/sessions` are unchanged. Like the
+Manager-creation rule above, this is cooperative: a loopback process can forge
+the header.
+
 Existing repository-bound sessions and their transcripts remain intact. They
 still use their original checkout and branch; this change does not move files
 or rewrite their history. Sessions already on the legacy shared workspace,

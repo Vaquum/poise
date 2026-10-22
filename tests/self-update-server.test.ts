@@ -261,7 +261,7 @@ describe('self-update routes', () => {
     expect(await refused.json()).toMatchObject({ code: 'draining' })
     expect((await post('/api/chat/sessions', { agent: 'grok', model: 'grok-4.6-xhigh' })).status).toBe(503)
     expect((await post('/api/settings', { org: 'x' })).status).toBe(503)
-    const cancel = await post(`/api/chat/sessions/${randomUUID()}/cancel`, {})
+    const cancel = await post(`/api/chat/sessions/${randomUUID()}/cancel`, {}, { Origin: base })
     expect(cancel.status).toBe(404) // reached the chat routes: not gated
     expect((await post('/api/self-update/revert', { sessionId: randomUUID(), changeId: randomUUID(), expectedReleaseId: 'r' })).status).toBe(404)
     // Drain again for another release replaces the intent; resume opens the gate.

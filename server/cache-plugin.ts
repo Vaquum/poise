@@ -1141,6 +1141,9 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // other Poise server is reported, never touched.
             const chatTurn = chatRuntime && /^[0-9a-f]{32}$/.test(id) ? chatRuntime.describeTurn(id) : null
             if (chatTurn) {
+              // Stopping a chat turn is the person's action, as on the chat
+              // routes. Stopping agent-interface jobs below is unchanged.
+              if (!speaksForPerson(req, !!service, authority)) return json(res, 403, { error: 'This is the person\'s action, taken in the browser. Chats use the control operations.', code: 'invalid' })
               const { settled } = await chatRuntime!.cancel(chatTurn.sessionId)
               return json(res, 200, { id, stopped: settled, status: settled ? 'cancelled' : 'stopping', error_code: 'stopped' })
             }

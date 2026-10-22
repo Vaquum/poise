@@ -22,15 +22,15 @@ between agents running as the same operating-system user.
 | `list` | — | Chats, creating-chat relationships, work bindings, supervision |
 | `read` | `sessionId`, optional `afterSeq` | Session and paged transcript; continue from the last sequence while `truncated` |
 | `create` | `title`, `task`, optional `model`, `effort` | One independent worker with the creating chat's model by default |
-| `send` | `sessionId`, `text` | Durable internal message; in this release any chat may send to any other chat |
-| `steer` | Managed worker `sessionId`, `text` | Native context delivery during its active turn; the transcript names the acting chat |
-| `answer` | Managed worker `sessionId`, `questionId`, `answers` | Supply known task data; the transcript names the acting chat |
+| `send` | `sessionId`, `text` | Durable internal message; any chat may send to any other chat, the Manager included |
+| `steer` | Your worker, or any chat if you are the workspace Manager: `sessionId`, `text` | Native context delivery during its active turn; the transcript names the acting chat |
+| `answer` | Your worker, or any chat if you are the workspace Manager: `sessionId`, `questionId`, `answers` | Supply known task data; the transcript names the acting chat |
 | `inbox` | Optional `afterSeq` | Up to 100 durable messages in sequence order, each with `sender_title` and `sender_role` |
 | `supervise` | `sessionIds`, `intervalMinutes`, `instruction` | Persistent supervision ID |
 | `unsupervise` | `watchId` | Disable the caller's supervision |
 | `bind` | Exact GitHub issue/PR `target` URL | Exclusive work ownership for the caller |
 | `unbind` | `target` | Release the caller's work |
-| `stop` | `sessionId` | Cancel its turn and pause automatic message dispatch; the transcript names the acting chat. In this release any chat may stop any other chat |
+| `stop` | Your worker, or any chat if you are the workspace Manager: `sessionId` | Cancel its turn and pause automatic message dispatch; the transcript names the acting chat. A closed chat refuses; stopping an idle chat reports `stopped: false` |
 | `api` (command only) | `path`, optional `method`, `body` | Normal local Poise API response |
 
 Mutating control requests use a UUID `requestId`. The command prints that ID
@@ -52,8 +52,11 @@ while disconnected; discovery never starts a native turn.
 
 Messages wait for an idle turn boundary. They do not steer a busy native turn,
 answer a question, or approve permissions. A creating chat receives notifications of
-its workers' completion, errors, questions and permission requests, with the
-transcript sequence needed to inspect the original event. An active creating
+its workers' completion, errors, questions, permission requests and closure, with the
+transcript sequence needed to inspect the original event. Each notice also carries
+`others`: steers, answers and stops by anyone but the creating chat — the person,
+the Manager, Poise or another chat — since its previous notice for that worker, at
+most 20, then `more`. Those ride along and start no turn of their own. An active creating
 chat can read its inbox directly. Admission records the new turn ID; it is not proof
 that the agent completed the task. Failed/stopped/interrupted work pauses
 automatic dispatch until explicit chat activity. Existing queued tasks take
@@ -66,6 +69,44 @@ question with known task data. Native answer validation still applies. The
 transcript names the acting chat, as described under Attribution; it never
 labels that answer as the person's decision. Questions needing a new human
 decision and all permission requests remain with the person/native Safe mode.
+Answering a question that someone else answered first names the first answerer
+relative to the caller ("by you", "by the person", "by the workspace Manager",
+or the answering chat); a cancelled question keeps "no longer pending".
+
+## Authority
+
+Who may act on a chat, through the control. Refusals are 403, before any receipt:
+
+| Operation on chat T | The workspace Manager | T's creating chat | Any other chat |
+| --- | --- | --- | --- |
+| `steer` | allowed, except on itself | allowed | refused |
+| `answer` | allowed, except on itself | allowed | refused |
+| `stop` | allowed, except on itself | allowed | refused |
+| `send`, `create`, `supervise`, `unsupervise`, `bind`, `unbind`, `read`, `list`, `inbox`, `help` | unchanged | unchanged | unchanged |
+
+No chat acts on itself, and none acts on the Switchboard except through its own
+operations. Any chat may `send` to the Manager, as to any chat; each message
+reaches it as source data from that chat, never as the person's request. A chat
+that keeps sending starts a Manager turn each time the Manager is idle, until the
+person stops the sending chat. The Manager's reach ends at the Poise instance:
+another instance's chat reads as unknown, without naming that instance.
+
+When the Manager answers in a chat it did not create, the target agent gets a
+provenance note naming the answered questions: the answer came from the Manager,
+not from the person, and the agent should ask the person before acting on any new
+decision. The note arrives as a Poise steer, or as an internal message when the
+turn cannot take a steer; either way it follows the answer, so the agent may act
+on the answer first. A creating chat answering its own worker sends no note.
+Issue and PR claims are unchanged: the Manager binds only work it implements
+itself and cannot take or release another chat's claim.
+
+Stopping, closing, renaming, deleting, forking or handing off a chat through REST,
+or stopping its turn through `POST /api/agent-stop`, answers only the person's
+browser; the control's `api` operation sends no `Origin` and never speaks for
+the person, so the narrowed `stop` holds on every documented path. Stopping,
+closing, deleting, renaming, forking or handing off chats, Memories, Settings,
+behaviors and draining or resuming Poise are the person's; every chat's guidance
+says so.
 
 ## Attribution
 
@@ -87,9 +128,12 @@ steers from other chats and Poise are excluded from console history recall.
 
 Each successful action also writes one `chat.control.action` diagnostic
 carrying chat IDs, the role and the operation — never a title or message text.
-Refused or failed actions write none. Diagnostics are best-effort and kept at
-most 30 days or 50,000 events; command receipts stay an anti-replay store, not
-an audit trail.
+Refused or failed actions write none. The Manager's reads are sampled: the first
+`read` of each chat, and the first `list`, in each hour writes one
+`chat.manager.read` record, so polling cannot flood the shared store; reads
+through the `api` operation carry no chat identity and are not audited.
+Diagnostics are best-effort and kept at most 30 days or 50,000 events; command
+receipts stay an anti-replay store, not an audit trail.
 
 Attribution lasts as long as the transcript: `/reset` deletes a chat's
 transcript events, labels included. The record shows which chat says it acted;
@@ -110,10 +154,23 @@ the owner must inspect complete evidence before acting on a truncated notice.
 ## Workspace Manager
 
 The workspace Manager (the `role: 'manager'` chat) supervises the chats in its
-Poise instance. Until cross-chat supervision ships, it has the same control
-reach as any chat: it lists and reads chats, creates workers, sends messages,
-and supervises them. This is a different "manager" from a chat's manager (the
-chat that created it), which the docs call the creating chat from here on.
+Poise instance. It alone among chats can steer, answer and stop chats it did not
+create, as if they were its own workers; each such action is attributed in the
+target's transcript and audited. This is a different "manager" from a chat's
+manager (the chat that created it), which the docs call the creating chat from
+here on.
+
+On its control path the Manager is limited to 120 mutating calls and 20 new
+chats per hour, counted from its command receipts. Retrying with the same
+`requestId` returns the stored result, and calls that only reduce activity
+(`stop`, `unsupervise`, `unbind`) are never counted or refused, so an exhausted
+Manager can still stop a runaway worker. Anything beyond the budget is refused
+with 429 and a retry time. The bound is approximate under concurrency, failed
+calls count, and deleting chats refunds nothing. Reads are neither counted nor
+limited, transcripts are not redacted, and ordinary chats get no new limits.
+The Manager's authority is cooperative, not a security boundary: it binds a
+Manager that uses the control, while the paths listed in SECURITY.md stay open
+to any same-user agent.
 
 **Manager charter.** The workspace Manager above — the `role: 'manager'`
 chat, not a creating chat — runs on standing instructions called its
@@ -213,4 +270,6 @@ It never obtains a gateway/admin identity or access to another workspace.
 `tests/chat-control.test.ts` covers the real command, HTTP control, runtime,
 SQLite, concurrent isolated workers, replay, ownership conflicts, supervision,
 Stop, targeted events, CI deduplication and credentials with scripted adapters.
-It makes no live model or GitHub requests. Run `npm run check`.
+`tests/chat-manager-control.test.ts` covers the Manager's cross-chat authority,
+provenance, worker notices, budgets, sampled reads and guidance the same way.
+They make no live model or GitHub requests. Run `npm run check`.

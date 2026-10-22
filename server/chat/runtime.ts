@@ -59,7 +59,7 @@ import {
 } from './git'
 import {
   AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
-  type PermissionOption, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
+  type PermissionOption, type PoiseActor, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
 // Only the sender label, used inside runTurn: a Switchboard relay is the
@@ -2334,7 +2334,7 @@ export class ChatRuntime extends EventEmitter {
     })
   }
 
-  async steer(id: string, text: string, context: Pick<PromptInput, 'attachments' | 'mentions'> = { attachments: [], mentions: [] }, actor?: ChatActor): Promise<void> {
+  async steer(id: string, text: string, context: Pick<PromptInput, 'attachments' | 'mentions'> = { attachments: [], mentions: [] }, actor?: ChatActor | PoiseActor): Promise<void> {
     this.assertAcceptingWork()
     const session = this.requireLive(id)
     const turn = session.turn
@@ -2356,9 +2356,11 @@ export class ChatRuntime extends EventEmitter {
       await this.serve(session, async () => {
         const resolved = await this.resolveInput(session, shown)
         if (session.turn !== turn || session.draining || turn.stopping || turn.abort.signal.aborted) throw new ChatError(409, 'the turn has ended', 'no_turn')
-        const composed = actor
-          ? steeringContext({ ...resolved, text: `${nativeSteerHeader(actor)}\n${shown.text}` })
-          : expandSwitches(steeringContext({ ...resolved, text: chain!.text }), chain!.switches)
+        // A Poise actor's text is sent verbatim, with no chat header,
+        // composed with origin 'source' below like any actor's.
+        const composed = !actor ? expandSwitches(steeringContext({ ...resolved, text: chain!.text }), chain!.switches)
+          : actor.kind === 'chat' ? steeringContext({ ...resolved, text: `${nativeSteerHeader(actor)}\n${shown.text}` })
+            : steeringContext({ ...resolved, text: shown.text })
         const input = withAutoMergeInstructions({ ...resolved, text: composed }, session.record.autoMerge, turn.implementsChange, actor ? 'source' : 'person')
         await session.adapter!.steer(appendMemories(input.text, readMemories().text))
         this.emit_(id, { type: 'steer.sent', turnId: turn.id, text: shown.text,
@@ -2453,20 +2455,35 @@ export class ChatRuntime extends EventEmitter {
     this.afterRequestAnswered(session)
   }
 
-  answerQuestion(id: string, requestId: string, answers: QuestionAnswers, actor?: ChatActor): void {
+  answerQuestion(id: string, requestId: string, answers: QuestionAnswers, actor?: ChatActor): { questions: Question[] } {
     const session = this.requireLive(id)
     const pending = session.pending.get(requestId)
     if (!pending || pending.kind !== 'question') {
       if (storage.listPendingRequests(id).some((p) => p.requestId === requestId)) {
         this.emit_(id, { type: 'question.answered', id: requestId, answers: {}, by: 'cancelled' })
       }
-      throw new ChatError(409, 'this question is no longer pending', 'no_turn')
+      throw new ChatError(409, this.firstAnswerMessage(id, requestId, actor), 'no_turn')
     }
     const validated = validateAnswers(pending.questions ?? [], answers)
     this.emit_(id, { type: 'question.answered', id: requestId, answers: validated, by: actor ? 'chat' : 'user', ...(actor ? { fromSession: actor.sessionId, source: actor } : {}) })
     session.pending.delete(requestId)
     pending.resolve(validated)
     this.afterRequestAnswered(session)
+    return { questions: pending.questions ?? [] }
+  }
+
+  /** Who answered first, named relative to the caller: the actor, or the
+   *  person when it is absent. A cancelled request, or one with no answer
+   *  event, keeps the old message. */
+  private firstAnswerMessage(id: string, requestId: string, actor?: ChatActor): string {
+    const found = storage.findEvent(id, (event) => event.type === 'question.answered' && event.id === requestId)
+    const event = found?.event
+    if (!event || event.type !== 'question.answered' || event.by === 'cancelled') return 'this question is no longer pending'
+    if (event.by === 'user') return actor ? 'this question was already answered by the person' : 'this question was already answered by you'
+    const from = event.source?.sessionId ?? event.fromSession
+    if (actor && from === actor.sessionId) return 'this question was already answered by you'
+    if (event.source?.role === 'manager') return 'this question was already answered by the workspace Manager'
+    return `this question was already answered by chat "${event.source?.title ?? event.fromSession ?? 'unknown'}"`
   }
 
   private afterRequestAnswered(session: LiveSession): void {

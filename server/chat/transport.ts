@@ -528,6 +528,12 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
       if (switchboard?.isSwitchboard(id) && (req.method === 'PATCH' || ['fork', 'handoff', 'close'].includes(action ?? ''))) {
         throw new ChatError(409, 'Poise runs the Switchboard chat; use the Switchboard pane', 'invalid')
       }
+      // The person's actions on a chat answer only the person's browser.
+      // Chats use the control operations; the control's api operation sends
+      // no Origin, so it never speaks for the person.
+      const personOnly = (!action && (req.method === 'PATCH' || req.method === 'DELETE'))
+        || (action && req.method === 'POST' && ['cancel', 'close', 'fork', 'handoff'].includes(action))
+      if (personOnly && !person) throw new ChatError(403, 'This is the person\'s action, taken in the browser. Chats use the control operations.', 'invalid')
       if (!action && req.method === 'GET') {
         const session = runtime.get(id)
         if (!session) throw new ChatError(404, 'unknown session', 'unknown_session')
