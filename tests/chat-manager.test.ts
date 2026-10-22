@@ -40,6 +40,7 @@ let forkCalls = 0
 let catalog: typeof CATALOG = CATALOG
 let servers: ResolvedServer[] = []
 let slots = 4
+let readinessDeadline = 0
 
 function scripted(host: AdapterHost, capabilities: Capabilities): Adapter {
   hosts.set(host.sessionId, host)
@@ -65,10 +66,29 @@ function scripted(host: AdapterHost, capabilities: Capabilities): Adapter {
 const adapter = (host: AdapterHost) => scripted(host, caps)
 const forkAdapter = (host: AdapterHost) => scripted(host, forkCaps)
 
-async function until(check: () => boolean) {
-  const deadline = Date.now() + 8000
-  while (Date.now() < deadline) { if (check()) return; await new Promise(done => setTimeout(done, 15)) }
-  throw new Error('manager fixture readiness deadline')
+async function until(check: () => boolean, ...sessionIds: string[]) {
+  // Startup and turn cleanup perform real Git work. Share the case's existing
+  // budget across every wait instead of imposing an unrelated eight seconds.
+  // Old expected errors (such as model retirement) are not new failures.
+  const cursors = new Map(sessionIds.map(id => [id, runtime.get(id)?.lastSeq ?? 0]))
+  for (;;) {
+    for (const id of sessionIds) {
+      const session = runtime.get(id)
+      if (!session || session.status === 'error' || session.status === 'closed' || session.status === 'interrupted') {
+        throw new Error(`manager fixture session ${id} became ${session?.status ?? 'missing'}`)
+      }
+      const cursor = cursors.get(id)!
+      if (session.lastSeq > cursor) {
+        const events = runtime.events(id, cursor).events
+        const failure = events.find(({ event }) => event.type === 'error')
+        if (failure?.event.type === 'error') throw new Error(`manager fixture session ${id} failed: ${failure.event.message}`)
+        cursors.set(id, session.lastSeq)
+      }
+    }
+    if (check()) return
+    if (Date.now() >= readinessDeadline) throw new Error('manager fixture readiness exhausted the case budget')
+    await new Promise(done => setTimeout(done, 15))
+  }
 }
 function makeRuntime() {
   return new Runtime({ instance, instanceLabel: 'test', callerTurns: null, catalog: async () => catalog,
@@ -116,7 +136,7 @@ beforeAll(async () => {
   database = await import('../server/db')
   transportModule = await import('../server/chat/transport')
 })
-beforeEach(async () => {
+beforeEach(async ({ task }) => {
   prompts.clear(); finishes.clear(); hosts.clear(); starts.clear()
   forkCalls = 0
   catalog = CATALOG
@@ -138,6 +158,9 @@ beforeEach(async () => {
   if (!address || typeof address === 'string') throw new Error('fixture needs TCP')
   origin = `http://127.0.0.1:${address.port}`
   control.start()
+  // Leave a short margin for a useful readiness error before Vitest's own
+  // unchanged case timeout. This deadline is shared, never reset per wait.
+  readinessDeadline = Date.now() + task.timeout - 250
 })
 afterEach(async () => {
   await socketServer?.close()
@@ -325,34 +348,34 @@ describe('one Manager chat per workspace', () => {
       runtime.prompt(child.id, { text: `Task ${i}`, attachments: [], mentions: [] })
     }
     for (const id of workers) {
-      await until(() => prompts.has(id))
+      await until(() => prompts.has(id), id)
       const asking = hosts.get(id)!.askQuestion({ questions: [{ id: 'q', question: 'Which target?', options: [], freeText: true, multiSelect: false }] })
       void asking.catch(() => undefined)
-      await until(() => runtime.get(id)?.status === 'waiting')
+      await until(() => runtime.get(id)?.status === 'waiting', id)
     }
     runtime.prompt(manager.id, { text: 'Unblock the workers', attachments: [], mentions: [] })
-    await until(() => (prompts.get(manager.id) ?? []).length === 1)
-    await until(() => runtime.get(manager.id)?.status === 'running')
+    await until(() => (prompts.get(manager.id) ?? []).length === 1, manager.id)
+    await until(() => runtime.get(manager.id)?.status === 'running', manager.id)
     expect(runtime.get(manager.id)?.queuedBehind).not.toBe('waiting for a free agent slot')
     const other = await runtime.create({ agent: 'grok', model: GROK_MODEL, title: 'Ordinary C', deferStart: true })
     runtime.prompt(other.id, { text: 'Ordinary work', attachments: [], mentions: [] })
-    await until(() => runtime.get(other.id)?.status === 'queued')
+    await until(() => runtime.get(other.id)?.status === 'queued', other.id)
     expect(runtime.get(other.id)?.queuedBehind).toBe('waiting for a free agent slot')
     finishes.get(manager.id)!({ stopReason: 'end_turn' })
-    await until(() => runtime.get(manager.id)?.status === 'idle')
+    await until(() => runtime.get(manager.id)?.status === 'idle', manager.id)
     for (const id of workers) {
       await runtime.cancel(id)
-      await until(() => runtime.get(id)?.status === 'idle')
+      await until(() => runtime.get(id)?.status === 'idle', id)
     }
     await runtime.cancel(other.id)
-    await until(() => runtime.get(other.id)?.status === 'idle')
+    await until(() => runtime.get(other.id)?.status === 'idle', other.id)
     const source = await runtime.create({ agent: 'muse', model: MUSE_MODEL, title: 'Source A', deferStart: true })
     await runtime.resume(source.id)
     const forked = await runtime.fork(source.id)
     runtime.prompt(source.id, { text: 'Source work', attachments: [], mentions: [] })
-    await until(() => prompts.has(source.id))
+    await until(() => prompts.has(source.id), source.id)
     runtime.prompt(forked.id, { text: 'Fork work', attachments: [], mentions: [] })
-    await until(() => runtime.get(forked.id)?.status === 'queued')
+    await until(() => runtime.get(forked.id)?.status === 'queued', forked.id)
     expect(runtime.get(forked.id)?.queuedBehind).not.toContain('Manager')
     expect(runtime.get(source.id)?.status).toBe('running')
   }, 60_000)
@@ -361,7 +384,7 @@ describe('one Manager chat per workspace', () => {
     servers = [{ id: 'github', name: 'github', title: 'GitHub', transport: 'stdio', command: 'github-mcp' }]
     const manager = await runtime.create({ agent: 'muse', model: MUSE_MODEL, role: 'manager' })
     const ordinary = await runtime.create({ agent: 'muse', model: MUSE_MODEL, title: 'Ordinary' })
-    await until(() => starts.has(manager.id) && starts.has(ordinary.id))
+    await until(() => starts.has(manager.id) && starts.has(ordinary.id), manager.id, ordinary.id)
     expect(starts.get(manager.id)![0]).toEqual(expect.objectContaining({ mcpServers: servers }))
     expect(starts.get(ordinary.id)![0]).toEqual(expect.objectContaining({ mcpServers: servers }))
     await runtime.reset(manager.id)
@@ -410,9 +433,9 @@ describe('one Manager chat per workspace', () => {
       .toThrow(`The Manager's model ${GROK_MODEL} was retired. Choose another model to continue.`)
     await runtime.setModel(manager.id, OPUS_MODEL)
     expect(runtime.get(manager.id)?.retiredModel).toBeUndefined()
-    await until(() => prompts.has(manager.id))
+    await until(() => prompts.has(manager.id), manager.id)
     finishes.get(manager.id)!({ stopReason: 'end_turn' })
-    await until(() => runtime.get(manager.id)?.status === 'idle')
+    await until(() => runtime.get(manager.id)?.status === 'idle', manager.id)
     expect(() => runtime.prompt(manager.id, { text: 'next', attachments: [], mentions: [] })).not.toThrow()
     expect(runtime.get(ordinary.id)).toBeNull()
     expect(storage.getSession(ordinary.id)).toBeNull()
@@ -421,7 +444,38 @@ describe('one Manager chat per workspace', () => {
   it('never auto-titles the Manager', async () => {
     const manager = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'manager', deferStart: true })
     runtime.prompt(manager.id, { text: 'Please check every chat', attachments: [], mentions: [] })
-    await until(() => prompts.has(manager.id))
+    await until(() => prompts.has(manager.id), manager.id)
     expect(runtime.get(manager.id)?.title).toBe('Manager')
+  }, 30_000)
+})
+
+describe('Manager fixture readiness', () => {
+  it('allows healthy readiness after eight seconds within the existing case budget', async () => {
+    vi.useFakeTimers()
+    let ready = false
+    let outcome: 'waiting' | 'ready' | Error = 'waiting'
+    const completed = until(() => ready).then(() => { outcome = 'ready' }, error => { outcome = error })
+    try {
+      await vi.advanceTimersByTimeAsync(9_000)
+      expect(outcome).toBe('waiting')
+      ready = true
+      await vi.advanceTimersByTimeAsync(15)
+      await completed
+      expect(outcome).toBe('ready')
+    } finally { vi.useRealTimers() }
+  }, 60_000)
+
+  it('fails readiness immediately when the watched session closes', async () => {
+    const manager = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'manager', deferStart: true })
+    await runtime.close(manager.id)
+    await expect(until(() => false, manager.id)).rejects.toThrow('became closed')
+  }, 30_000)
+
+  it('fails readiness on a new runtime error instead of waiting out the case', async () => {
+    const manager = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'manager' })
+    await until(() => hosts.has(manager.id), manager.id)
+    const failed = until(() => false, manager.id)
+    hosts.get(manager.id)!.emit({ type: 'error', message: 'fixture adapter failed', recoverable: false })
+    await expect(failed).rejects.toThrow('fixture adapter failed')
   }, 30_000)
 })
