@@ -298,7 +298,10 @@ A workspace takes a new image without a new container when the image's
 system base is the one its container runs, so the agents in it are never cut
 off. Agent calls (behavior runs, manual reviews, replays) are processes Poise
 starts detached; they keep running while Poise restarts, and the next Poise
-reconciles them as after any restart.
+reconciles them as after any restart. Chat turns survive the same way: each
+session's agent runs under a per-session relay that owns its stdio and
+spools the turn's output, so the next server reconnects and replays the turn
+instead of interrupting it.
 
 - **Releases.** The image carries one release, Poise (`/opt/poise`) and
   Caller's relocatable virtualenv (`/opt/caller/venv`), and labels it
@@ -323,9 +326,11 @@ reconciles them as after any restart.
   `{ release }` (`admin` scope or loopback; 202 `{ release, switching }`,
   409 for a release not installed for this base or a server started without
   the supervisor). Poise writes `next`, stops admitting new background ticks,
-  and restarts at the first moment no Chat turn and no work of its own runs;
-  it waits for no agent call. The gateway asks again on later passes until
-  health reports the release, which the request makes idempotent.
+  and restarts at the first moment no unheld Chat turn and no work of its
+  own runs; it waits for no agent call and no turn a healthy relay holds,
+  since the relay keeps the turn running and the next server adopts it. The
+  gateway asks again on later passes until health reports the release, which
+  the request makes idempotent.
 - **Meanwhile.** While the workspace restarts, the gateway answers for it
   with `x-poise-updating: 1`: "Updating to the latest version" for a page, 503
   `workspace_updating` for anything else. Poise dims the open page with the
