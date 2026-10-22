@@ -13,7 +13,7 @@ import type { Capabilities, ChatEvent, PromptInput, ServerFrame, SessionRecord }
 import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
 import type { ChatRuntime } from '../server/chat/runtime'
-import type { ChatControl, CiObservation } from '../server/chat/control'
+import type { ChatControl, CiObservation, WorkTargetStatus } from '../server/chat/control'
 
 vi.mock('../server/claude-auth', () => ({ claudeAuth: { snapshot: () => ({ status: 'authenticated' }), requireReady: async () => {} } }))
 const executeFile = promisify(execFile)
@@ -36,6 +36,7 @@ const finishes = new Map<string, (result: TurnResult) => void>()
 const hosts = new Map<string, AdapterHost>()
 const steers = new Map<string, string[]>()
 const ci = vi.fn<() => Promise<CiObservation>>()
+const targetStatus = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }) => Promise<WorkTargetStatus>>()
 
 function adapterWith(capabilities: Capabilities) {
   return function adapter(host: AdapterHost): Adapter {
@@ -100,7 +101,7 @@ async function restart() {
   const stopped = runtime.stop()
   await control.stop(stopped)
   runtime = makeRuntime()
-  control = new Control(runtime, { ci, now: () => clock })
+  control = new Control(runtime, { ci, now: () => clock, targetStatus })
   control.attach(server)
   await runtime.recover()
   control.start()
@@ -120,10 +121,11 @@ beforeEach(async () => {
   clock = Date.now()
   prompts.clear(); finishes.clear(); hosts.clear(); steers.clear()
   ci.mockReset().mockResolvedValue({ head: 'a'.repeat(40), failing: [] })
+  targetStatus.mockReset().mockResolvedValue('open')
   instance = `control:${randomUUID()}`
   workspaceRoot = join(root, randomUUID())
   runtime = makeRuntime()
-  control = new Control(runtime, { ci, now: () => clock })
+  control = new Control(runtime, { ci, now: () => clock, targetStatus })
   server = createServer((req, res) => {
     if (req.url === '/api/chat/control') { void control.handle(req, res); return }
     res.setHeader('Content-Type', 'application/json')
@@ -418,7 +420,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
     const old = await config(second.id)
     await control.stop()
-    control = new Control(runtime, { ci, now: () => clock }); control.attach(server); control.start()
+    control = new Control(runtime, { ci, now: () => clock, targetStatus }); control.attach(server); control.start()
     const response = await fetch(`${origin}/api/chat/control`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Poise-Chat': second.id, Authorization: `Bearer ${old.token}` }, body: '{"operation":"list"}' })
     expect(response.status).toBe(403)
   })
@@ -492,6 +494,60 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     expect(prompts.get(parent.id)).toHaveLength(1)
   })
+
+  it('starts no turn for a review-new-issues notice when its issue is closed', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/issues/100' })
+    targetStatus.mockResolvedValue('closed')
+    database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id,launch_error)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)`).run('review-new-issues', 'acme/app#100', new Date().toISOString(), 'acme/app', 100, 'issue_review', 'd'.repeat(32), 'Late review failed')
+    await control.tick()
+    await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+  })
+
+  it('starts no turn for a review-new-prs notice when its PR is merged', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/101' })
+    targetStatus.mockResolvedValue('merged')
+    database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id,launch_outcome,launch_action)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('review-new-prs', 'acme/app#101:check', new Date().toISOString(), 'acme/app', 101, 'pr_review', 'e'.repeat(32), 'changes_requested', 'requested_changes')
+    await control.tick()
+    await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+  })
+
+  it('starts no turn for a held grey-CI recovery error when its PR is merged', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/103' })
+    targetStatus.mockResolvedValue('merged')
+    database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_call_id,launch_error)
+      VALUES(?, ?, ?, ?, ?, ?, ?)`).run('grey-ci-recovery', 'acme/app#103:grey', new Date().toISOString(), 'acme/app', 103, 'g'.repeat(32), 'Rerun held: no confirmed receipt')
+    await control.tick()
+    await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+  })
+
+  it('wakes once for a human comment on a closed PR', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/102' })
+    targetStatus.mockResolvedValue('closed')
+    database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id,launch_outcome)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)`).run('human_comment', 'acme/app#102:human', new Date().toISOString(), 'acme/app', 102, 'pr_review', 'f'.repeat(32), 'human_comment')
+    await control.tick()
+    await until(() => prompts.has(parent.id))
+    expect(prompts.get(parent.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    finishes.get(parent.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(parent.id)?.status === 'idle')
+    await control.tick()
+    await control.tick()
+    expect(prompts.get(parent.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+  }, 30_000)
 
   it('wakes a session once when a check fails on its pull request', async () => {
     const parent = await manager()

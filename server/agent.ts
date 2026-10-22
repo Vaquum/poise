@@ -329,13 +329,15 @@ function settleAgentLogRead(read: AgentLogRead, outcome: { snapshot: AgentLogSna
 // child: sharing one object would attribute it to whichever waiter's
 // diagnostic context logged it last.
 function copyAgentLogError(error: unknown): unknown {
-  if (!(error instanceof Error)) return error
+  if (!(error instanceof Error)) {
+    return new Error(typeof error === 'string' ? error : 'agent-interface --logs failed without an Error', { cause: error })
+  }
   const copy = new Error(error.message, { cause: error })
   copy.name = error.name
   copy.stack = error.stack
   const source = error as unknown as Record<string, unknown>
   const target = copy as unknown as Record<string, unknown>
-  for (const field of ['code', 'killed', 'signal', 'stdout', 'stderr']) {
+  for (const field of ['code', 'errno', 'killed', 'signal', 'stdout', 'stderr']) {
     if (source[field] !== undefined) target[field] = source[field]
   }
   return copy
@@ -345,12 +347,13 @@ async function readAgentLogSnapshot(signal: AbortSignal): Promise<AgentLogSnapsh
   // The child serves every waiter, so it runs under the shared read's own
   // diagnostic identity — never the AsyncLocalStorage context of whoever
   // started the preceding read, whose correlationId would otherwise own
-  // this read's timeouts.
+  // this read's timeouts. Absent fields stay null: diagnostics persist ''
+  // as a distinct value, not as absence.
   const { stdout } = await withNoticeDiagnosticIdentity({
     correlationId: randomUUID(),
     behavior: 'agent-logs',
-    repository: '',
-    target: '',
+    repository: null,
+    target: null,
     account: null,
   }, () => runFile(CLI, ['--logs'], {
     cwd: agentCwd(),

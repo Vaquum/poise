@@ -125,7 +125,8 @@ mutation.
 Load timeouts — an expired sweep deadline, a slow CLI, lock contention — retry
 on a short clock of a few minutes, not the hour-long backoff of hard failures.
 A `review-new-prs` sweep cut short by its deadline still claims and launches
-the reviews it managed to prepare; the next sweep prepares the rest. Its git
+the reviews it managed to prepare, and an `approve-prs` sweep still fires the
+approvals it managed to prepare; the next sweep prepares the rest. Git
 verification uses the same 30-second CLI budget as other review reads, and the
 rail names a timed-out sweep as stalled instead of repeating the timeout text.
 
