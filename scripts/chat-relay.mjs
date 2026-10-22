@@ -464,7 +464,11 @@ server.on('error', (error) => {
   log(`socket failed: ${error.message}`)
   process.exit(65)
 })
-server.listen(socketPath)
+// The socket lives in the shared temp dir (see relaySocketFor): bind it
+// owner-only. The gate already runs, so this umask never reaches it or
+// the agent — only the socket and files the relay itself writes meanwhile.
+const prevUmask = process.umask(0o077)
+server.listen(socketPath, () => { process.umask(prevUmask) })
 log(`relay ${relayIdent} for session ${sessionId}: gate ${gate.pid}, socket ${socketPath}`)
 
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {

@@ -9,10 +9,11 @@
 // both sides together, so drift between the twins breaks tests, not turns.
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
 import { connect, type Socket } from 'node:net'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
 import { CLAUDE_SUBSCRIPTION_CLI, runFile } from '../process'
@@ -66,7 +67,8 @@ export interface RelayReady {
 
 export interface RelaySpawnOptions {
   sessionId: string
-  /** The session's relay directory; the socket, spool and log live under it. */
+  /** The session's relay directory; the spool and log live under it. The
+   *  socket defaults to relaySocketFor(dir) in the temp dir. */
   dir: string
   socketPath?: string
   command: string
@@ -488,7 +490,7 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
 export async function spawnRelay(options: RelaySpawnOptions): Promise<RelayConnection> {
   const ident = options.ident ?? randomUUID()
   const gateIdent = options.gateIdent ?? randomUUID()
-  const socketPath = options.socketPath ?? join(options.dir, 'r.sock')
+  const socketPath = options.socketPath ?? relaySocketFor(options.dir)
   const log = options.log ?? (() => {})
   const child = spawn(process.execPath, [
     RELAY_SCRIPT,
@@ -553,6 +555,18 @@ export async function attachRelay(options: RelayAttachOptions): Promise<{ connec
 
 export function relayDirFor(chatRoot: string, sessionId: string): string {
   return join(chatRoot, 'relays', sessionId)
+}
+
+/** Where a session's relay listens. Unix socket paths are capped at 108
+ *  bytes, which a nested relay dir exceeds — the bind then truncates
+ *  while unlink targets the full path, so a respawned relay meets its
+ *  own stale file as EADDRINUSE. The socket therefore lives in the
+ *  system temp dir under a hash of its relay dir: short, stable per
+ *  session (a replacement unlinks the same stale path), and unique per
+ *  dir. The spool and log stay under the relay dir; only the socket has
+ *  the length limit. */
+export function relaySocketFor(dir: string): string {
+  return join(tmpdir(), `poise-chat-relay-${createHash('sha256').update(dir).digest('hex').slice(0, 16)}.sock`)
 }
 
 export function relayLogTail(dir: string): string {

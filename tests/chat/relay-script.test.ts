@@ -3,7 +3,7 @@
 // output. These tests drive the real relay script with scripted agents.
 
 import { afterEach, describe, expect, it } from 'vitest'
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
 import { connect, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -129,10 +129,37 @@ describe('chat relay script', () => {
     }))
     await peer.go()
     peer.turnStart('turn-1')
+    const socketPath = peer.socketPath
     await peer.shutdown()
     expect(peer.healthy).toBe(false)
-    expect(existsSync(join(dir, 'r.sock'))).toBe(false)
+    expect(existsSync(socketPath)).toBe(false)
     expect(existsSync(join(dir, 'turn.spool'))).toBe(false)
+  })
+
+  it('respawns in a dir deeper than the socket path limit', async () => {
+    // Unix socket paths cap at 108 bytes, which a nested relay dir
+    // exceeds: the bind then truncates while unlink misses, so a
+    // replacement relay met its own stale file as EADDRINUSE. The socket
+    // lives under a short hash in the temp dir instead, owner-only.
+    const parent = join(tmpdir(), `poise-relay-deep-${'d'.repeat(80)}`)
+    mkdirSync(parent, { recursive: true })
+    const dir = mkdtempSync(join(parent, 'session-'))
+    expect(join(dir, 'r.sock').length).toBeGreaterThan(108)
+    const first = track(await spawnRelay({
+      sessionId: 'session-relay-deep', dir, command: process.execPath, args: ['-e', ECHO_AGENT], env: {}, cwd: dir,
+    }))
+    expect(Buffer.byteLength(first.socketPath)).toBeLessThan(108)
+    expect(statSync(first.socketPath).mode & 0o777).toBe(0o700)
+    await first.go()
+    first.turnStart('turn-1')
+    await first.shutdown()
+    const second = track(await spawnRelay({
+      sessionId: 'session-relay-deep', dir, command: process.execPath, args: ['-e', ECHO_AGENT], env: {}, cwd: dir,
+    }))
+    await second.go()
+    second.stdin!.write('after-respawn\n')
+    const text = await collectStdout(second, 'echo:after-respawn\n'.length)
+    expect(text).toContain('echo:after-respawn\n')
   })
 
   it('reports the agent exit and leaves once the agent is gone', async () => {
