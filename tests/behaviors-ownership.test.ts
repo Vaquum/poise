@@ -265,7 +265,10 @@ describe('launch ownership and resolution', () => {
         } else {
           expect(reply.status).toBe(503)
           expect(reply.body.health.status).toBe('unavailable')
-          expect(reply.body.health.dropped).toBeGreaterThan(0)
+          expect(reply.body.health.unavailableReason).toBe('store_unavailable')
+          // Failed captures wait for the store instead of spilling to loss.
+          expect(reply.body.health.pending).toBeGreaterThan(0)
+          expect(reply.body.health.dropped).toBe(0)
           expect(reply.body.records).toBeUndefined()
         }
       }

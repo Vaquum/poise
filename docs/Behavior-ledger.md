@@ -110,9 +110,16 @@ native settlement remains unknown. The ledger has no historical backfill.
 A separate worker owns `behavior-ledger.db` beside `POISE_DB` (by default
 `~/.poise`); it never migrates the behavior cache. `POISE_DB=:memory:` also makes
 the ledger ephemeral. Files use private permissions and SQLite rollback
-journaling. Capture is bounded to 1,000 queued observations or 2 MiB, dropping
-new arrivals explicitly on overflow. Reads allow 16 outstanding requests and a
-two-second budget. Each completed capture permits one waiting read before
+journaling. Capture queues arrivals past 1,000 queued observations or 2 MiB
+while the worker drains, and spills new arrivals explicitly with loss markers
+only once the oldest queued capture outwaits the ten-second stall budget or
+the worker is down. Captures the store rejects as storage failures wait at the
+head of the queue and retry; observations the store rejects as invalid are shed
+with loss accounting. A store that fails to open retries on later operations,
+and health names the cause in `unavailableReason` (`worker_unavailable`,
+`store_unavailable`, `journal_unavailable`) until reads observe recovery.
+Reads allow 16 outstanding requests and a two-second budget. Each completed
+capture permits one waiting read before
 ordinary FIFO resumes. Reads can return a committed prefix with pending
 captures reported in health. Startup yields after two seconds while the same
 worker may still initialize; reads remain unavailable until valid readiness
