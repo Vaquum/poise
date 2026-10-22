@@ -492,11 +492,12 @@ function fmtSeconds(ms: number): string {
   return s < 10 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`
 }
 
-function fmtDuration(ms: number): string {
-  if (ms < 60_000) return fmtSeconds(ms)
-  const m = Math.floor(ms / 60_000)
-  const s = Math.round((ms % 60_000) / 1000)
-  return `${m}m ${s}s`
+export function fmtDuration(ms: number): string {
+  // Round the whole duration before splitting it, so seconds can never
+  // carry past 59: 12m 59.6s is 13m 0s, never 12m 60s.
+  const totalSeconds = Math.round(ms / 1000)
+  if (totalSeconds < 60) return fmtSeconds(ms)
+  return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`
 }
 
 function preview(value: unknown, max = 1200): string {
