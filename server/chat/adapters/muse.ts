@@ -268,10 +268,12 @@ interface ActiveTurn {
   /** Item completions still reading file snapshots; the turn settles after them. */
   pending: Set<Promise<void>>
   finishing: boolean
-  /** Command ids of accepted steers: Muse (1.3.0) completes the running
-   *  turn and starts a new native turn under the steer's command id, so the
-   *  Poise turn stays open until each of those ran. */
-  steers: Set<string>
+  /** Accepted steers by command id, each with the runtime's correlation id
+   *  (if any): Muse either absorbs the steer into the running turn — seen
+   *  as a userMessage carrying the steer's command id — or completes the
+   *  running turn and starts a new native turn under the steer's command
+   *  id, so the Poise turn stays open until each of those ran. */
+  steers: Map<string, string | undefined>
   /** Native turn ids this Poise turn has owned, oldest first. */
   nativeIds: string[]
   endedNativeIds: Set<string>
@@ -477,8 +479,10 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
   }
 
   // A completed native turn with steers still to run is not the end of the
-  // Poise turn; if their turn does not start promptly the process is ended
-  // rather than the checkout released over an unknown queue.
+  // Poise turn; once nothing else is still running, steers that never
+  // started are reported back, so the runtime queues them as the next
+  // prompt instead of failing a turn whose work already finished. The
+  // process is kept: nothing observed is still running on it.
   let steerSettleTimer: ReturnType<typeof setTimeout> | null = null
   function clearSteerSettle() {
     if (steerSettleTimer) { clearTimeout(steerSettleTimer); steerSettleTimer = null }
@@ -488,17 +492,27 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     steerSettleTimer = setTimeout(() => {
       steerSettleTimer = null
       if (active !== turn || turn.done) return
-      void endForUnsettled(turn)
+      deferUnsettled(turn)
     }, steerSettleMs)
     steerSettleTimer.unref()
   }
-  async function endForUnsettled(turn: ActiveTurn) {
-    host.log(`${LABEL}: a steered message did not start its turn within the settle window; ending the process`)
-    // The turn settles with the request that the runtime terminate the
-    // worker group (verified) before the checkout goes; the close here is
-    // the cooperative first step of that.
-    finish(turn, { stopReason: 'error', error: `${LABEL} did not run a steered message of this turn within the settle window; the process was ended and resumes on the next prompt`, terminate: true })
-    try { await adapter.close() } catch { /* the runtime terminates the group */ }
+  function deferUnsettled(turn: ActiveTurn) {
+    // A successor that launched (it left the steer set at turn/started)
+    // may still be running the turn's work: look again once it lands
+    // instead of cutting its transcript off. An id still in the steer
+    // set never launched, even if its queued input was shown.
+    if (turn.nativeIds.some(id => !turn.endedNativeIds.has(id) && !turn.steers.has(id))) { armSteerSettle(turn); return }
+    const unrun = [...turn.steers.values()].filter((id): id is string => !!id)
+    turn.steers.clear()
+    if (turn.terminalError || turn.interruptRequested) {
+      // A failed or stopped turn drops its unrun steers and reports its
+      // real outcome; only a normally finished turn defers them.
+      host.log(`${LABEL}: a steered message never ran and the turn did not finish normally, so the steer was dropped`)
+      finish(turn, turn.terminalError ? { stopReason: 'error', error: turn.terminalError } : { stopReason: 'cancelled' })
+      return
+    }
+    host.log(`${LABEL}: a steered message did not run within the settle window; the turn completes and the steer is queued as the next prompt`)
+    finish(turn, { stopReason: 'end_turn', ...(unrun.length ? { unrunSteers: unrun } : {}) })
   }
 
   function emit(event: ChatEvent): void {
@@ -647,7 +661,20 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     closeTool(turn, item.itemId, itemToolStatus(item.status), content, item.durationMs)
   }
 
+  // A steer absorbed into the running turn (1.4.x) never gets its own
+  // turn/started: its userMessage carries the steer's command id while
+  // belonging to the running turn. That steer ran. An item whose turn is
+  // the steer id itself is the successor turn's own input; the
+  // turn/started path below attaches that turn instead.
+  function observeSteeredItem(turn: ActiveTurn, item: Item): void {
+    if (item.kind !== 'userMessage' || !item.commandId || item.commandId === item.turnId) return
+    if (!turn.steers.delete(item.commandId)) return
+    if (!turn.steers.size) clearSteerSettle()
+    finishIfQuiescent(turn)
+  }
+
   function handleItemStarted(turn: ActiveTurn, item: Item): void {
+    observeSteeredItem(turn, item)
     if (item.kind === 'reminderChild') { turn.internalItems.add(item.itemId); return }
     switch (item.kind) {
       case 'toolCall':
@@ -662,6 +689,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
   }
 
   function handleItemCompleted(turn: ActiveTurn, item: Item): void {
+    observeSteeredItem(turn, item)
     if (item.kind === 'reminderChild') { turn.internalItems.add(item.itemId); return }
     switch (item.kind) {
       case 'agentMessage':
@@ -729,6 +757,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       observeCompaction(item)
       const turn = turnFor(item.turnId)
       if (!turn) return
+      observeSteeredItem(turn, item)
       if (item.kind === 'reminderChild') { turn.internalItems.add(item.itemId); return }
       if (item.status !== 'inProgress' && turn.tools.has(item.itemId)) {
         completeTool(turn, item)
@@ -1083,7 +1112,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
 
   async function interrupt(turn: ActiveTurn): Promise<void> {
     if (!sessionId || turn.done) return
-    const targets = [...new Set([...turn.steers, ...turn.nativeIds, ...(turn.nativeId ? [turn.nativeId] : [])])]
+    const targets = [...new Set([...turn.steers.keys(), ...turn.nativeIds, ...(turn.nativeId ? [turn.nativeId] : [])])]
       .filter(id => !turn.endedNativeIds.has(id))
     await Promise.all(targets.map(nativeId => {
       const reclaim = turn.steers.has(nativeId) || (turn.queued && nativeId === turn.nativeId)
@@ -1216,7 +1245,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
         internalItems: new Set(),
         pending: new Set(),
         finishing: false,
-        steers: new Set(),
+        steers: new Map(),
         nativeIds: [],
         endedNativeIds: new Set(),
         cancellationRequests: new Map(),
@@ -1260,12 +1289,12 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       return current.wait.result.finally(() => { if (compaction === current) compaction = null })
     },
 
-    async steer(text) {
+    async steer(text, opts) {
       assertMuseContributor(modelId)
       const turn = active
       if (!turn || turn.done || turn.interruptRequested || !turn.nativeId) throw new AdapterError(AGENT, `${LABEL} has no running turn to steer`, 'protocol')
       const commandId = uuidv7()
-      turn.steers.add(commandId)
+      turn.steers.set(commandId, opts?.correlationId)
       try {
         await call('turn/steer', {
           commandId,

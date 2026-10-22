@@ -28,7 +28,7 @@ function git(cwd: string, ...args: string[]): string {
   if (r.status) throw new Error(r.stderr)
   return r.stdout.trim()
 }
-interface Controls { auto: boolean, failAgent?: AgentId, calls: { agent: AgentId, input: PromptInput, turnId: string }[], adapters: Fake[], active: number, maximum: number }
+interface Controls { auto: boolean, failAgent?: AgentId, dropSteers?: boolean, calls: { agent: AgentId, input: PromptInput, turnId: string }[], adapters: Fake[], active: number, maximum: number }
 class Fake implements Adapter {
   alive = false
   nativeSessionId: string | undefined
@@ -36,6 +36,7 @@ class Fake implements Adapter {
   options?: AdapterStartOptions
   finish?: (result: TurnResult) => void
   steered: string[] = []
+  unrun: string[] = []
   compactions: Array<{ turnId: string, memories: string }> = []
   modelChanges: string[] = []
   modeChanges: string[] = []
@@ -52,13 +53,13 @@ class Fake implements Adapter {
     try {
       if (this.c.auto) return { stopReason: 'end_turn' }
       return await new Promise<TurnResult>(resolve => {
-        this.finish = result => { this.finish = undefined; resolve(result) }
+        this.finish = result => { this.finish = undefined; resolve({ ...result, ...(this.unrun.length ? { unrunSteers: this.unrun.splice(0) } : {}) }) }
         signal.addEventListener('abort', () => this.finish?.({ stopReason: 'cancelled' }), { once: true })
       })
     } finally { this.c.active-- }
   }
   async compact(turnId: string, memories: string): Promise<TurnResult> { this.compactions.push({ turnId, memories }); return { stopReason: 'end_turn', compaction: { changed: true } } }
-  async steer(text: string) { this.steered.push(text) }
+  async steer(text: string, opts?: { correlationId?: string }) { this.steered.push(text); if (opts?.correlationId && this.c.dropSteers) this.unrun.push(opts.correlationId) }
   async cancel() { this.finish?.({ stopReason: 'cancelled' }) }
   async close() { this.alive = false; this.finish?.({ stopReason: 'cancelled' }) }
   async setModel(modelId: string, effort: string) { this.modelChanges.push(modelId); return { modelId, effort } }
@@ -113,6 +114,74 @@ describe('deferred message execution', () => {
     expect(w.c.maximum).toBe(1); expect(w.runtime.get(w.s.id)?.queue?.items).toEqual([])
     await w.add('A later idle task'); await pause(100)
     expect(w.c.calls).toHaveLength(6)
+  })
+
+  it('queues a Muse steer the agent never ran as the next prompt instead of failing the turn', async () => {
+    const w = await world({ auto: false })
+    w.c.dropSteers = true
+    const s = await w.runtime.create({ agent: 'muse', model: 'muse-spark-1.3-contributor-max', repo: 'test/queue-unrun', branch: { new: randomUUID() }, autoMerge: true })
+    await until(() => w.runtime.get(s.id)?.status === 'idle')
+    w.runtime.prompt(s.id, input('Long task'))
+    await until(() => w.c.calls.length === 1)
+    await w.runtime.steer(s.id, 'scope note')
+    w.finish()
+    await until(() => w.c.calls.length === 2)
+    w.finish()
+    const finished = () => w.runtime.events(s.id, 0).events.filter(e => e.event.type === 'turn.finished')
+    await until(() => finished().length === 2)
+    await until(() => w.runtime.get(s.id)?.status === 'idle')
+    expect(finished().map(e => e.event)).toMatchObject([{ stopReason: 'end_turn' }, { stopReason: 'end_turn' }])
+    expect(w.c.calls[1].input.text).toContain('scope note')
+    expect(w.c.calls[1].input.text).toContain('arrived after the previous turn')
+    expect(w.c.calls[1].input.text).toContain('[User request]')
+    expect(w.c.adapters.find(adapter => adapter.agent === 'muse')!.alive).toBe(true)
+    expect(w.runtime.get(s.id)?.queue?.items).toEqual([])
+    await pause(150)
+    expect(w.c.calls).toHaveLength(2)
+  })
+
+  it('dispatches a deferred chat steer as source data under its actor, not the person', async () => {
+    const w = await world({ auto: false })
+    w.c.dropSteers = true
+    const s = await w.runtime.create({ agent: 'muse', model: 'muse-spark-1.3-contributor-max', repo: 'test/queue-unrun-actor', branch: { new: randomUUID() }, autoMerge: true })
+    await until(() => w.runtime.get(s.id)?.status === 'idle')
+    w.runtime.prompt(s.id, input('Long task'))
+    await until(() => w.c.calls.length === 1)
+    await w.runtime.steer(s.id, 'scope note', { attachments: [], mentions: [] }, { kind: 'chat', sessionId: w.s.id, title: 'Manager' })
+    w.finish()
+    await until(() => w.c.calls.length === 2)
+    w.finish()
+    const finished = () => w.runtime.events(s.id, 0).events.filter(e => e.event.type === 'turn.finished')
+    await until(() => finished().length === 2)
+    await until(() => w.runtime.get(s.id)?.status === 'idle')
+    expect(w.c.calls[1].input.text).toContain('[Poise steer from')
+    expect(w.c.calls[1].input.text).not.toContain('[User request]')
+    const started = w.runtime.events(s.id, 0).events.filter(e => e.event.type === 'turn.started')
+    expect(started[1].event).toMatchObject({ source: { kind: 'chat', sessionId: w.s.id } })
+    await pause(150)
+    expect(w.c.calls).toHaveLength(2)
+  })
+
+  it('reports a visible error when an unrun steer cannot be queued', async () => {
+    const w = await world({ auto: false })
+    w.c.dropSteers = true
+    const s = w.s
+    // Fill the durable queue near its 2 MiB bound directly: eight ~240 KiB
+    // rows succeed, but the ~250 KiB deferred steer past them does not.
+    for (let i = 0; i < 8; i++) queues.enqueueMessage(s.id, { id: randomUUID(), sourceSessionId: s.id, prompt: input(`filler ${i} ${'x'.repeat(240_000)}`),
+      agent: 'grok', model: 'grok-4.6-high', effort: 'high', createdAt: new Date().toISOString(), state: 'waiting' })
+    w.runtime.prompt(s.id, input('Long task'))
+    await until(() => w.c.calls.length === 1)
+    await w.runtime.steer(s.id, `scope note ${'y'.repeat(250_000)}`)
+    w.finish()
+    const finished = () => w.runtime.events(s.id, 0).events.filter(e => e.event.type === 'turn.finished')
+    await until(() => finished().length === 1)
+    expect(finished()[0].event).toMatchObject({ stopReason: 'end_turn' })
+    const errors = w.runtime.events(s.id, 0).events.filter(e => e.event.type === 'error')
+    expect(errors.map(e => e.event)).toMatchObject([{ message: expect.stringContaining('could not be queued') }])
+    // The queue still advances normally past the failed deferral.
+    await until(() => w.c.calls.length === 2)
+    expect(w.runtime.get(s.id)?.queue?.items).toHaveLength(8)
   })
 
   it('enqueues during an active turn without steering it and waits through real pending questions', async () => {

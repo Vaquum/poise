@@ -27,6 +27,9 @@ function scripted() {
   let turn = null // { id, interrupted, steered: [], decided: [], answered: [] }
   const requireDialogs = process.argv.includes('--require-dialogs')
   const dropSteer = process.argv.includes('--drop-steer')
+  const abandonSteer = process.argv.includes('--abandon-steer')
+  const failSteerTurn = process.argv.includes('--fail-steer-turn')
+  const absorbSteer = process.argv.includes('--absorb-steer')
   const holdAfterSteer = process.argv.includes('--hold-after-steer')
   const reclaimRace = process.argv.includes('--reclaim-race')
   let dialogs = false
@@ -235,13 +238,32 @@ function scripted() {
         await sleep(20)
       }
       item('item/completed', { itemId, kind: 'agentMessage', revision: 2, status: 'completed', text: 'first' })
+      if (absorbSteer) {
+        // Muse 1.4.x (observed live): the steer is absorbed into the running
+        // turn — its userMessage carries the steer's command id, and no
+        // successor turn ever starts for it.
+        const steered = turn.steered[0]
+        if (steered && !turn.interrupted) {
+          item('item/completed', { itemId: uuid('user'), kind: 'userMessage', status: 'completed', text: steered.text, steered: true, commandId: steered.commandId })
+          await streamMessage(uuid('msg'), [`absorbed: ${steered.text}`])
+        }
+        await completeTurn(turn.interrupted ? 'cancelled' : 'completed')
+        return
+      }
       if (holdAfterSteer) await waitFor(() => turn.interrupted)
       const steered = turn.steered[0]
-      await completeTurn(turn.interrupted ? 'cancelled' : 'completed')
+      const failed = failSteerTurn && !turn.interrupted
+      await completeTurn(turn.interrupted ? 'cancelled' : failed ? 'failed' : 'completed',
+        failed ? { error: { kind: 'modelError', message: 'provider returned 503', retryable: true } } : {})
+      if (steered && abandonSteer) {
+        // The queued input is shown under the steer's id, but its turn
+        // never launches: no turn/started, no completion.
+        view('item/completed', { item: { itemId: uuid('user'), revision: 1, status: 'completed', turnId: steered.commandId, recordedAt: new Date().toISOString(), kind: 'userMessage', text: steered.text, steered: true, commandId: steered.commandId } })
+      }
       // Muse 1.3.0 (observed live): a steer is accepted against the running
       // turn, that turn completes, and the steered input runs as a NEW turn
       // whose id is the steer's command id. `--drop-steer` never starts it.
-      if (steered && !dropSteer) {
+      if (steered && !dropSteer && !abandonSteer && !failed) {
         turn = { id: steered.commandId, interrupted: false, steered: [], decided: [], answered: [], input: [{ type: 'text', text: steered.text }], effort: null }
         view('session/statusChanged', { status: 'running' })
         view('turn/started', { turnId: turn.id, commandId: turn.id })
