@@ -513,25 +513,28 @@ describe('agent log snapshot sharing', () => {
       seen.push(diagnosticIdentity() as { correlationId: string })
       releases.push(resolve)
     }))
-    const outer = { correlationId: 'outer', behavior: 'review-new-prs', repository: 'o/r', target: 'o/r#1', account: 'a' }
-    const first = withNoticeDiagnosticIdentity(outer, () => fetchAgentLogSnapshot())
-    const second = withNoticeDiagnosticIdentity(outer, () => fetchAgentLogSnapshot())
+    const firstSpawner = { correlationId: 'first', behavior: 'review-new-prs', repository: 'o/r', target: 'o/r#1', account: 'a' }
+    const queuedSpawner = { correlationId: 'queued', behavior: 'approve-prs', repository: 'o/r', target: 'o/r#2', account: 'a' }
+    const first = withNoticeDiagnosticIdentity(firstSpawner, () => fetchAgentLogSnapshot())
+    const second = withNoticeDiagnosticIdentity(queuedSpawner, () => fetchAgentLogSnapshot())
     releases[0]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
     await first
-    // The queued read starts inside the first read's settle callback.
+    // The queued read starts inside the first read's settle callback, whose
+    // async context is the first read's spawner — not the queued waiter's.
     expect(mocks.runFile).toHaveBeenCalledTimes(2)
     releases[1]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
     await second
     expect(seen).toHaveLength(2)
     for (const identity of seen) {
-      expect(identity).toMatchObject({ behavior: 'agent-logs', repository: '', target: '', account: null })
-      expect(identity.correlationId).not.toBe('outer')
+      expect(identity).toMatchObject({ behavior: 'agent-logs', repository: null, target: null, account: null })
+      expect(identity.correlationId).not.toBe('first')
+      expect(identity.correlationId).not.toBe('queued')
     }
     expect(seen[0]!.correlationId).not.toBe(seen[1]!.correlationId)
   })
 
   it('gives each waiter its own error object when a shared read fails', async () => {
-    const shared = Object.assign(new Error('Caller is down'), { code: 1, killed: false, signal: null, stdout: '', stderr: 'boom' })
+    const shared = Object.assign(new Error('Caller is down'), { code: 1, killed: false, signal: null, stdout: '', stderr: 'boom', errno: -2 })
     mocks.runFile.mockRejectedValue(shared)
     const first = fetchAgentLogSnapshot()
     const second = fetchAgentLogSnapshot()
@@ -551,8 +554,40 @@ describe('agent log snapshot sharing', () => {
       expect(failure.name).toBe('Error')
       expect(failure.code).toBe(1)
       expect(failure.stderr).toBe('boom')
+      expect(failure.errno).toBe(-2)
       expect(failure.cause).toBe(shared)
     }
+  })
+
+  it('wraps a non-Error rejection in a fresh error per waiter', async () => {
+    mocks.runFile.mockRejectedValue('Caller is down')
+    const failures = await Promise.all([
+      fetchAgentLogSnapshot().catch((error) => error),
+      fetchAgentLogSnapshot().catch((error) => error),
+    ])
+    expect(failures[0]).not.toBe(failures[1])
+    for (const failure of failures) {
+      expect(failure).toBeInstanceOf(Error)
+      expect(failure.message).toBe('Caller is down')
+      expect(failure.cause).toBe('Caller is down')
+    }
+  })
+
+  it('attributes each waiter copy under its own identity', async () => {
+    const { diagnosticIdentity, withNoticeDiagnosticIdentity } = await import('../server/logging-context')
+    mocks.runFile.mockRejectedValue({ message: 'Caller is down' })
+    const failures = await Promise.all([
+      fetchAgentLogSnapshot().catch((error) => error),
+      fetchAgentLogSnapshot().catch((error) => error),
+    ])
+    const firstIdentity = { correlationId: 'first', behavior: 'review-new-prs', repository: 'o/r', target: 'o/r#1', account: 'a' }
+    const secondIdentity = { correlationId: 'second', behavior: 'approve-prs', repository: 'o/r', target: 'o/r#2', account: 'a' }
+    await withNoticeDiagnosticIdentity(firstIdentity, async () => { throw failures[0] }).catch(() => undefined)
+    await withNoticeDiagnosticIdentity(secondIdentity, async () => { throw failures[1] }).catch(() => undefined)
+    // No ambient context: each copy kept the identity it was logged under.
+    // A shared object would carry only the last writer's identity.
+    expect(diagnosticIdentity(failures[0])).toMatchObject({ correlationId: 'first', behavior: 'review-new-prs' })
+    expect(diagnosticIdentity(failures[1])).toMatchObject({ correlationId: 'second', behavior: 'approve-prs' })
   })
 })
 
