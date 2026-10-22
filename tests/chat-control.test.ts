@@ -417,6 +417,76 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, unrelated.id)).toHaveLength(0)
   })
 
+  it('starts no turn while an issue review on its own issue only fills in outcomes', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/issues/77' })
+    database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id)
+      VALUES(?, ?, ?, ?, ?, ?, ?)`).run('review-new-issues', 'acme/app#77', new Date().toISOString(), 'acme/app', 77, 'issue_review', 'a'.repeat(32))
+    await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+    database.db.prepare(`UPDATE behavior_seen SET launch_outcome = 'commented', launch_action = 'commented'
+      WHERE key = ? AND target = ?`).run('review-new-issues', 'acme/app#77')
+    await control.tick()
+    await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+  })
+
+  it('wakes a session once when a review lands on its pull request', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/78' })
+    database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id)
+      VALUES(?, ?, ?, ?, ?, ?, ?)`).run('review-new-prs', 'acme/app#78:check', new Date().toISOString(), 'acme/app', 78, 'pr_review', 'b'.repeat(32))
+    await control.tick()
+    expect(prompts.has(parent.id)).toBe(false)
+    database.db.prepare(`UPDATE behavior_seen SET launch_outcome = 'changes_requested', launch_action = 'requested_changes'
+      WHERE key = ? AND target = ?`).run('review-new-prs', 'acme/app#78:check')
+    await control.tick()
+    await until(() => prompts.has(parent.id))
+    expect(prompts.get(parent.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)[0].body).toContain('changes_requested')
+    finishes.get(parent.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(parent.id)?.status === 'idle')
+    await control.tick()
+    await control.tick()
+    expect(prompts.get(parent.id)).toHaveLength(1)
+  })
+
+  it('starts no new turn when a failed launch recovers to clean', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/80' })
+    database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id,launch_error)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)`).run('review-new-prs', 'acme/app#80:check', new Date().toISOString(), 'acme/app', 80, 'pr_review', 'c'.repeat(32), 'Review failed')
+    await control.tick()
+    await until(() => prompts.has(parent.id))
+    expect(prompts.get(parent.id)).toHaveLength(1)
+    finishes.get(parent.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(parent.id)?.status === 'idle')
+    database.db.prepare(`UPDATE behavior_seen SET launch_error = NULL, launch_outcome = 'clean', launch_action = 'reviewed_clean'
+      WHERE key = ? AND target = ?`).run('review-new-prs', 'acme/app#80:check')
+    await control.tick()
+    await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    expect(prompts.get(parent.id)).toHaveLength(1)
+  })
+
+  it('wakes a session once when a check fails on its pull request', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/79' })
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
+    await control.tick()
+    await until(() => prompts.has(parent.id))
+    expect(prompts.get(parent.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    finishes.get(parent.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(parent.id)?.status === 'idle')
+    clock += 5 * 60_000
+    await control.tick()
+    expect(prompts.get(parent.id)).toHaveLength(1)
+  })
+
   it('keeps pending work while draining and releases ownership when its chat is deleted', async () => {
     const parent = await manager()
     await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/issues/88' })

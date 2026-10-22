@@ -100,6 +100,28 @@ function boundedNotice(body: string, summary: Record<string, unknown>): string {
   return bytes <= 32 * 1024 ? body : JSON.stringify({ ...summary, truncated: true, originalBytes: bytes })
 }
 
+/** Launch outcomes that only record a behavior finishing its own bookkeeping:
+ *  a clean review, or an issue review's triage comment on the bound issue. */
+const BOOKKEEPING_OUTCOMES = new Set(['clean', 'commented'])
+
+/** The actionable slice of a behavior observation: failures, held results and
+ *  outcomes the bound session can act on, keyed per launch. A pending launch
+ *  or a bookkeeping completion contributes nothing, so neither ever wakes a
+ *  session; anything unrecognized stays actionable so it fails loud. */
+function actionableOperations(operations: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(operations)) return []
+  const actionable: Array<Record<string, unknown>> = []
+  for (const operation of operations) {
+    if (!operation || typeof operation !== 'object') continue
+    const row = operation as Record<string, unknown>
+    const launch = { key: row.key ?? null, call: row.launch_call_id ?? null }
+    if (row.launch_error != null) actionable.push({ ...launch, error: row.launch_error })
+    if (row.launch_quarantine != null) actionable.push({ ...launch, quarantine: row.launch_quarantine })
+    if (row.launch_outcome != null && !BOOKKEEPING_OUTCOMES.has(String(row.launch_outcome))) actionable.push({ ...launch, outcome: row.launch_outcome })
+  }
+  return actionable
+}
+
 export class ChatControl {
   private readonly secret = randomBytes(32)
   private origin = ''
@@ -382,7 +404,8 @@ export class ChatControl {
       if (!this.runtime.ownsSession(binding.session)) { store.forgetSession(instance, binding.session); continue }
       const target = store.workTarget(binding.target)
       const local = this.workOperations(target)
-      this.observe(binding, `behavior:${target.url}`, { kind: 'behavior', target: target.url, ...local }, now, local.operations.length > 0)
+      const actionable = actionableOperations(local.operations)
+      this.observe(binding, `behavior:${target.url}`, { kind: 'behavior', target: target.url, ...local }, now, actionable.length > 0, false, actionable)
       if (target.kind !== 'pull') continue
       const previous = store.observation(instance, `ci:${target.url}`)
       if (previous && now - previous.checked_at < CI_INTERVAL) continue
@@ -419,10 +442,17 @@ export class ChatControl {
     }
   }
 
-  private observe(binding: store.Binding, key: string, data: Record<string, unknown>, now: number, initiallyActionable: boolean, pending = false): void {
+  private observe(binding: store.Binding, key: string, data: Record<string, unknown>, now: number, initiallyActionable: boolean, pending = false, actionable?: unknown): void {
     const instance = this.runtime.instance
     const body = JSON.stringify(data)
-    const fingerprint = createHash('sha256').update(body).digest('hex')
+    const bodyFingerprint = createHash('sha256').update(body).digest('hex')
+    // A behavior fingerprint pairs the actionable slice with the notice body.
+    // Only the actionable half drives change detection, so bookkeeping-only
+    // updates never wake; the body half keeps a notice identical to the last
+    // one from triggering another turn — including across this rollout, where
+    // the legacy fingerprint was the body hash alone.
+    const watched = actionable === undefined ? bodyFingerprint : createHash('sha256').update(JSON.stringify(actionable)).digest('hex')
+    const fingerprint = actionable === undefined ? watched : `${watched}:${bodyFingerprint}`
     db.transaction(() => {
       if (!store.bindingIsCurrent(instance, binding)) return
       const previous = store.observation(instance, key)
@@ -435,7 +465,15 @@ export class ChatControl {
         return
       }
       const settled = previous?.fingerprint ? previous : undefined
-      if (settled?.fingerprint !== fingerprint && (settled || initiallyActionable)) {
+      // Stored fingerprints hold no ':' except the behavior composite's
+      // separator, so the first half is the watched slice on both paths.
+      const settledWatched = settled?.fingerprint.split(':')[0]
+      const identical = settled !== undefined && (settled.fingerprint === bodyFingerprint || settled.fingerprint.endsWith(`:${bodyFingerprint}`))
+      // A behavior observation wakes only while it holds actionable content:
+      // entries that merely disappear — a cleared error, a launch recovered
+      // to pending or clean — need no turn.
+      const actionableNow = actionable === undefined || (Array.isArray(actionable) && actionable.length > 0)
+      if (settledWatched !== watched && !identical && actionableNow && (settled || initiallyActionable)) {
         store.message(instance, binding.session, 'Poise work monitor', boundedNotice(body, { kind: data.kind, target: binding.target,
           head: data.head, failingCount: Array.isArray(data.failing) ? data.failing.length : undefined,
           detail: 'Inspect the complete current work state through Poise APIs or Caller before acting.', inspect: { operation: 'api', path: '/api/logging' } }),
