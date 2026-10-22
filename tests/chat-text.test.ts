@@ -25,6 +25,7 @@ const session = (overrides: Partial<SessionRecord> & { id: string }): SessionRec
 describe('queued status text', () => {
   it('reads the agent-slot wait verbatim and checkout contention as queued behind', () => {
     expect(queuedStatusText('waiting for a free agent slot')).toBe('waiting for a free agent slot')
+    expect(queuedStatusText('waiting for the Poise update')).toBe('waiting for the Poise update')
     expect(queuedStatusText('chat "Work" on chat/abc (Poise production)')).toBe('queued behind chat "Work" on chat/abc (Poise production)')
     expect(queuedStatusText(undefined)).toBe('queued behind another session')
   })

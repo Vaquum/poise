@@ -217,7 +217,7 @@ describe('chat runtime', () => {
     expect(runtime.get(session.id)?.capabilities.steer).toBe(true)
     expect(runtime.get(session.id)?.branch.baseSha).toBe(git(['rev-parse', 'main']))
 
-    const { turnId } = await runtime.prompt(session.id, { text: 'hello there', attachments: [], mentions: [] })
+    const { turnId } = await runtime.prompt(session.id, { text: 'hello there', attachments: [], mentions: [] }) as { turnId: string }
     await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
     expect(git(['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('chat/alpha')
     const finished = ofType(events, session.id, 'turn.finished')[0]
@@ -359,7 +359,7 @@ describe('chat runtime', () => {
     const { runtime, controls, events } = makeRuntime()
     const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'chat/alpha' } })
     await waitFor(() => lastStatus(events, session.id) === 'idle')
-    const quick = await runtime.prompt(session.id, { text: 'a quick one', attachments: [], mentions: [] })
+    const quick = await runtime.prompt(session.id, { text: 'a quick one', attachments: [], mentions: [] }) as { turnId: string }
     await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
     expect(await alertRows('chat_turn_finished', `chat-turn-finished:${quick.turnId}`)).toEqual([])
 
@@ -370,7 +370,7 @@ describe('chat runtime', () => {
     const earlier = vi.spyOn(Date, 'now').mockImplementation(() => realNow() - 3 * 60_000)
     let long: { turnId: string }
     try {
-      long = runtime.prompt(session.id, { text: 'a long one', attachments: [], mentions: [] })
+      long = runtime.prompt(session.id, { text: 'a long one', attachments: [], mentions: [] }) as { turnId: string }
     } finally {
       earlier.mockRestore()
     }

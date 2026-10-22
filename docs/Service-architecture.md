@@ -324,8 +324,17 @@ reconciles them as after any restart.
   409 for a release not installed for this base or a server started without
   the supervisor). Poise writes `next`, stops admitting new background ticks,
   and restarts at the first moment no Chat turn and no work of its own runs;
-  it waits for no agent call. The gateway asks again on later passes until
-  health reports the release, which the request makes idempotent.
+  it waits for no agent call. While the switch is pending, new Chat turns
+  wait behind the update instead of starting — sent messages, queued
+  messages and work-monitor wakes alike, nothing refused or dropped —
+  while launches and behavior ticks run as usual. Running turns get the
+  update turn bound (a chat setting, default 15 minutes counted from when
+  the switch became pending); past it they are cancelled through the normal
+  cancel path, their sessions recorded, and the server restarted. After the
+  restart each interrupted session gets exactly one automatic continue
+  prompt on its resumed native session, then the waiting turns start in
+  order. The gateway asks again on later passes until health reports the
+  release, which the request makes idempotent.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace
   unreachable past the switch grace gets a new container, drained first.

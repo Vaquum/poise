@@ -642,7 +642,9 @@ export class ChatControl {
         this.observe(binding, `ci:${target.url}`, { kind: 'ci_unavailable', target: target.url, error: error instanceof Error ? error.message : String(error) }, now, true)
       }
     }
-    if (this.stopped || this.runtime.draining) return
+    // Observations are still recorded while a switch is pending; only the
+    // deliveries wait, staying pending in the inbox until the switch lands.
+    if (this.stopped || this.runtime.draining || this.runtime.switchPending) return
     const attempted = new Set<string>()
     for (const item of store.pending(instance, this.deliveryAfter)) {
       // Recipient identity keeps the rotation stable as new messages arrive;

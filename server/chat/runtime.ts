@@ -39,6 +39,7 @@ import type { ChildProcess } from 'node:child_process'
 import { mkdir, rm, rmdir, writeFile } from 'node:fs/promises'
 import { basename, dirname } from 'node:path'
 import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../models'
+import { getMeta, setMeta } from '../db'
 import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
 import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertContext } from '../alerts/producers'
@@ -58,8 +59,8 @@ import {
   inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
 } from './git'
 import {
-  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
-  type PermissionOption, type PoiseActor, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
+  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, SWITCH_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
+  type PermissionOption, type PoiseActor, type PromptInput, type PromptReceipt, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
 // Only the sender label, used inside runTurn: a Switchboard relay is the
@@ -106,6 +107,14 @@ const SERVICE_SETTLE_MS = 5_000
 const ATTACHMENT_LEASE_WAIT_MS = 15_000
 const TITLE_CHARS = 60
 const AVAILABILITY_TTL_MS = 60_000
+/** What a session interrupted for a Poise update is asked after the restart,
+ *  on its resumed native session. */
+export const SWITCH_CONTINUE_PROMPT = 'Poise restarted for an update while your turn was running. Continue where you left off.'
+/** Prompts that waited behind a switch (in arrival order) and sessions a
+ *  switch bound interrupted. Consumed once, by the first recovery or
+ *  withdrawal after they were written. */
+const SWITCH_WAITING_KEY = 'chat_switch_waiting'
+const SWITCH_INTERRUPTED_KEY = 'chat_switch_interrupted'
 
 export class ChatError extends HttpError {
   constructor(statusCode: number, message: string, readonly code: string, readonly detail?: { manager?: { id: string } }) {
@@ -230,6 +239,15 @@ export interface RuntimeExtensions {
 /** What the release controller sees before restarting this server. */
 export interface DrainState { releaseId: string, since: string }
 
+/** A release switch this server waits out: new Chat turns wait behind it. */
+export interface SwitchWait { release: string, since: string }
+
+/** One prompt admitted while a switch was pending, in arrival order. */
+interface WaitingPrompt { id: string, sessionId: string, prompt: PromptInput, createdAt: string }
+
+/** One session whose running turn a switch bound interrupted. */
+interface InterruptedSession { sessionId: string, turnId: string, at: string }
+
 export interface PoiseChangeResult { session: SessionRecord, change: SelfChange }
 
 const ACTIVE_STATUSES: readonly SessionStatus[] = ['starting', 'queued', 'running', 'waiting', 'stopping']
@@ -292,6 +310,7 @@ export class ChatRuntime extends EventEmitter {
   private readonly queueReleaseWait = new Set<string>()
   private stopped = false
   private drainState: DrainState | null = null
+  private switchState: SwitchWait | null = null
   /** Public operations in flight that are not (yet) a turn or a chain entry. */
   private inflightOps = 0
   private recovering = false
@@ -322,15 +341,19 @@ export class ChatRuntime extends EventEmitter {
    *  terminated only after their identity is verified and never while the
    *  lease they hold belongs to a live process (another server with the
    *  same instance name). Turns that were open are marked interrupted and
-   *  their prompts cancelled; nothing is replayed. */
+   *  their prompts cancelled; nothing is replayed — except a switch the
+   *  restart lands: sessions it interrupted get one automatic continue
+   *  prompt each, then prompts that waited behind it start in order. */
   async recover(): Promise<void> {
     this.recovering = true
+    let protectedSessions = new Set<string>()
     try {
-      const protectedSessions = await this.recoverState()
+      protectedSessions = await this.recoverState()
       await this.purgeRetiredModels(protectedSessions)
     } finally {
       this.recovering = false
     }
+    await this.resumeAfterUpdate(protectedSessions)
     for (const record of storage.listSessions(this.instance)) this.scheduleQueue(this.requireLive(record.id))
   }
 
@@ -583,7 +606,14 @@ export class ChatRuntime extends EventEmitter {
 
   endDrain(): void {
     this.drainState = null
-    for (const session of this.live.values()) this.scheduleQueue(session)
+    // Prompts that waited behind an update start first, in order — the
+    // synchronous reserves below land before the queue pump behind them —
+    // then the queues pump.
+    void this.startWaitingPrompts().then(() => {
+      for (const session of this.live.values()) this.scheduleQueue(session)
+    }, (error: unknown) => {
+      this.emit('log', `[chat] releasing prompts waited for an update failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
   }
 
   /** The drain outlasted its turns: stop every running one through the
@@ -615,6 +645,209 @@ export class ChatRuntime extends EventEmitter {
     if (session.idleTimer) { clearTimeout(session.idleTimer); session.idleTimer = null }
     await this.stopProcess(session)
     this.emit_(session.record.id, { type: 'status.changed', status: session.record.status, detail: 'agent process closed for the Poise update; it resumes on the next prompt' })
+  }
+
+  // ── Switch wait ────────────────────────────────────────────────────
+  //
+  // While a release switch is pending, an admissible prompt waits behind
+  // the update instead of starting: it is stored durably, in arrival
+  // order, and nothing about admission itself changes — the same
+  // validation, the same guards, the same errors. Queued messages wait
+  // unclaimed in their queue and internal deliveries stay pending in the
+  // control inbox, so both keep their provenance. Turns that are still
+  // running when the switch bound passes are cancelled through the
+  // normal cancel path and their sessions recorded; after the restart
+  // each recorded session gets exactly one automatic continue prompt on
+  // its resumed native session, then the waiting prompts start in order.
+  // A switch that is withdrawn instead starts the waiting prompts at
+  // once, with no interruption and no continue.
+
+  get switchPending(): SwitchWait | null {
+    return this.switchState
+  }
+
+  /** A release switch is pending from now on; null clears it silently, for
+   *  a server that is stopping anyway. Withdrawing a live switch releases
+   *  the wait instead, so the waiting prompts start. */
+  setSwitchPending(release: string | null): void {
+    if (release === null) { this.switchState = null; return }
+    if (!this.switchState || this.switchState.release !== release) this.switchState = { release, since: new Date().toISOString() }
+  }
+
+  /** The pending switch went away without a restart: nothing was
+   *  interrupted, and the waiting prompts start now, in order. */
+  async releaseSwitchWait(): Promise<void> {
+    this.switchState = null
+    try {
+      this.writeInterruptedSessions([])
+      await this.startWaitingPrompts()
+      for (const record of storage.listSessions(this.instance)) this.scheduleQueue(this.requireLive(record.id))
+    } catch (error) {
+      this.emit('log', `[chat] releasing prompts waited for an update failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /** Sessions with a turn running right now: what a switch bound interrupts. */
+  runningTurnSessions(): Array<{ sessionId: string, turnId: string }> {
+    const running: Array<{ sessionId: string, turnId: string }> = []
+    for (const session of this.live.values()) if (session.turn) running.push({ sessionId: session.record.id, turnId: session.turn.id })
+    return running
+  }
+
+  /** Record the sessions a switch bound interrupted, for their continue
+   *  prompt after the restart. A session is recorded at most once. */
+  recordSwitchInterrupted(sessions: Array<{ sessionId: string, turnId: string }>): void {
+    if (sessions.length === 0) return
+    const at = new Date().toISOString()
+    const fresh = new Set(sessions.map(session => session.sessionId))
+    this.writeInterruptedSessions([
+      ...this.readInterruptedSessions().filter(row => !fresh.has(row.sessionId)),
+      ...sessions.map(session => ({ sessionId: session.sessionId, turnId: session.turnId, at })),
+    ])
+  }
+
+  /** After any restart: each interrupted session gets exactly one automatic
+   *  continue prompt on its resumed native session, then the prompts that
+   *  waited behind the update start in order. Each entry is consumed before
+   *  it is acted on, so a crash mid-resume loses only the entry in flight.
+   *  Sessions another live server of this instance holds are left for a
+   *  later recovery. */
+  private async resumeAfterUpdate(protectedSessions: ReadonlySet<string>): Promise<void> {
+    for (const row of this.readInterruptedSessions()) {
+      if (protectedSessions.has(row.sessionId)) continue
+      if (!this.takeInterruptedSession(row.sessionId)) continue
+      await this.deliverWaitingPrompt(row.sessionId, { text: SWITCH_CONTINUE_PROMPT, attachments: [], mentions: [] }, 'interrupted')
+    }
+    await this.startWaitingPrompts(protectedSessions)
+  }
+
+  /** Start every prompt that waited behind an update, in arrival order. */
+  private async startWaitingPrompts(protectedSessions: ReadonlySet<string> = new Set()): Promise<void> {
+    for (const entry of this.readWaitingPrompts()) {
+      if (protectedSessions.has(entry.sessionId)) continue
+      if (!this.takeWaitingPrompt(entry.id)) continue
+      await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting')
+    }
+  }
+
+  /** Start one prompt that outlived a restart: at once when its session is
+   *  idle, or queued behind the turn running there. A prompt for a deleted
+   *  session is dropped; one that fails transiently waits for the next
+   *  restart; one that can never run says so on its session. Never throws:
+   *  one bad entry must not stop the entries behind it. */
+  private async deliverWaitingPrompt(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting'): Promise<void> {
+    try {
+      await this.deliverWaitingPromptInner(sessionId, prompt, kind)
+    } catch (error) {
+      this.emit('log', `[chat] ${kind} prompt for ${sessionId.slice(0, 8)} failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private async deliverWaitingPromptInner(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting'): Promise<void> {
+    const short = sessionId.slice(0, 8)
+    const drop = (message: string): void => {
+      this.emit('log', `[chat] ${kind} prompt for ${short} dropped: ${message}`)
+      this.resetWaitingStatus(sessionId)
+      if (this.ownsSession(sessionId)) {
+        try { this.emit_(sessionId, { type: 'error', message: `A message that waited for the Poise update could not start: ${message}`, recoverable: true }) } catch { /* mirror */ }
+      }
+    }
+    // A prompt for a deleted session is dropped without a notice: deleting
+    // the session deleted its future work with it.
+    const gone = (message: string): void => {
+      this.emit('log', `[chat] ${kind} prompt for ${short} dropped: ${message}`)
+    }
+    const defer = (message: string): void => {
+      this.writeWaitingPrompts([...this.readWaitingPrompts(), { id: randomUUID(), sessionId, prompt, createdAt: new Date().toISOString() }])
+      this.emit('log', `[chat] ${kind} prompt for ${short} still waiting: ${message}`)
+    }
+    try {
+      const receipt = this.prompt(sessionId, prompt)
+      // A switch already pending on the fresh server waits it again.
+      if (!('turnId' in receipt)) this.emit('log', `[chat] ${kind} prompt for ${short} waits behind a new update`)
+      return
+    } catch (error) {
+      if (error instanceof ChatError && error.statusCode === 404) { gone(error.message); return }
+      // A prompt its session cannot take now waits in its queue — or, when
+      // queuing is itself unavailable, for the next restart. A 503 (a drain
+      // in force) fails the enqueue the same way and defers the same way.
+      if (!(error instanceof ChatError) || error.statusCode === 409 || error.statusCode === 503) {
+        if (error instanceof ChatError) {
+          try {
+            await this.enqueue(sessionId, randomUUID(), prompt)
+            return
+          } catch (queued) {
+            if (queued instanceof ChatError && queued.statusCode === 404) { gone(queued.message); return }
+            if (queued instanceof ChatError && queued.statusCode === 400) { drop(queued.message); return }
+            defer(queued instanceof Error ? queued.message : String(queued))
+            return
+          }
+        }
+        defer(error instanceof Error ? error.message : String(error))
+        return
+      }
+      drop(error.message)
+    }
+  }
+
+  /** A waiting prompt that can never start leaves no stale `queued` behind. */
+  private resetWaitingStatus(sessionId: string): void {
+    const live = this.live.get(sessionId)
+    if (live) {
+      if (!live.turn && live.record.status === 'queued') this.setStatus(live, 'idle')
+      return
+    }
+    const record = storage.getSession(sessionId)
+    if (record && record.instance === this.instance && record.status === 'queued' && !storage.getOpenTurn(sessionId)) {
+      storage.saveSession({ ...record, status: 'idle', queuedBehind: undefined, updatedAt: new Date().toISOString() })
+    }
+  }
+
+  private readWaitingPrompts(): WaitingPrompt[] {
+    try {
+      const raw = getMeta(SWITCH_WAITING_KEY)
+      if (!raw) return []
+      const parsed = JSON.parse(raw) as WaitingPrompt[]
+      if (!Array.isArray(parsed)) return []
+      return parsed.filter(entry => entry && typeof entry.id === 'string' && typeof entry.sessionId === 'string'
+        && entry.prompt && typeof entry.prompt.text === 'string')
+    } catch {
+      return []
+    }
+  }
+
+  private writeWaitingPrompts(entries: WaitingPrompt[]): void {
+    setMeta(SWITCH_WAITING_KEY, JSON.stringify(entries))
+  }
+
+  private takeWaitingPrompt(id: string): WaitingPrompt | null {
+    const entries = this.readWaitingPrompts()
+    const entry = entries.find(candidate => candidate.id === id) ?? null
+    if (entry) this.writeWaitingPrompts(entries.filter(candidate => candidate.id !== id))
+    return entry
+  }
+
+  private readInterruptedSessions(): InterruptedSession[] {
+    try {
+      const raw = getMeta(SWITCH_INTERRUPTED_KEY)
+      if (!raw) return []
+      const parsed = JSON.parse(raw) as InterruptedSession[]
+      if (!Array.isArray(parsed)) return []
+      return parsed.filter(row => row && typeof row.sessionId === 'string' && typeof row.turnId === 'string')
+    } catch {
+      return []
+    }
+  }
+
+  private writeInterruptedSessions(rows: InterruptedSession[]): void {
+    setMeta(SWITCH_INTERRUPTED_KEY, JSON.stringify(rows))
+  }
+
+  private takeInterruptedSession(sessionId: string): InterruptedSession | null {
+    const rows = this.readInterruptedSessions()
+    const row = rows.find(candidate => candidate.sessionId === sessionId) ?? null
+    if (row) this.writeInterruptedSessions(rows.filter(candidate => candidate.sessionId !== sessionId))
+    return row
   }
 
   /** Work that a restart would cut: turns, startups, the agent's Poise-served
@@ -1599,9 +1832,9 @@ export class ChatRuntime extends EventEmitter {
 
   // ── Turns ──────────────────────────────────────────────────────────────
 
-  /** Reserve the turn synchronously — before any await — so a second prompt
-   *  in the same tick is refused, and persist it before acknowledging. */
-  private reserveTurn(session: LiveSession, queueItem?: QueuedMessage, internalMessageSeq?: number): RunningTurn {
+  /** The admission guards every new turn passes, started at once or waited
+   *  behind an update. */
+  private assertTurnAdmissible(session: LiveSession): void {
     if (session.record.role === 'manager' && session.record.retiredModel) {
       throw new ChatError(409, `The Manager's model ${session.record.retiredModel} was retired. Choose another model to continue.`, 'invalid')
     }
@@ -1609,6 +1842,12 @@ export class ChatRuntime extends EventEmitter {
     if (session.turn) throw new ChatError(409, 'a turn is already running; Enter steers it', 'turn_in_progress')
     if (session.record.status === 'closed') throw new ChatError(409, 'the session is closed; resume it first', 'no_turn')
     if (session.lifecycle.signal.aborted) throw new ChatError(409, 'the session is closing', 'no_turn')
+  }
+
+  /** Reserve the turn synchronously — before any await — so a second prompt
+   *  in the same tick is refused, and persist it before acknowledging. */
+  private reserveTurn(session: LiveSession, queueItem?: QueuedMessage, internalMessageSeq?: number): RunningTurn {
+    this.assertTurnAdmissible(session)
     let releasePrompt!: () => void
     const promptReady = new Promise<void>(resolve => { releasePrompt = resolve })
     const turn: RunningTurn = { id: randomUUID(), callId: null, startedAt: Date.now(), abort: new AbortController(), stopping: false, promptReady, releasePrompt }
@@ -1620,7 +1859,7 @@ export class ChatRuntime extends EventEmitter {
     return turn
   }
 
-  prompt(id: string, input: PromptInput, internal?: { seq: number, source: TurnSource, shown: string }): { turnId: string } {
+  prompt(id: string, input: PromptInput, internal?: { seq: number, source: TurnSource, shown: string }): PromptReceipt {
     this.assertAcceptingWork()
     const session = this.requireLive(id)
     if (session.record.role === 'manager' && session.record.retiredModel) {
@@ -1639,6 +1878,13 @@ export class ChatRuntime extends EventEmitter {
     const throughSeq = session.record.lastSeq
     const target = chain.review ? latestReviewTarget(id, throughSeq) : null
     if (chain.review && !target) throw new ChatError(400, 'There is no assistant reply to review yet.', 'invalid')
+    if (this.switchState) {
+      // Internal deliveries wait in the caller's hand: the control tick
+      // holds them pending until the switch lands, so their provenance
+      // survives. Anything else would admit them twice or unattributed.
+      if (internal) throw new ChatError(503, SWITCH_WAIT_REASON, 'switch_waiting')
+      return this.waitPromptForSwitch(session, prompt)
+    }
     const turn = this.reserveTurn(session, undefined, internal?.seq)
     turn.switches = chain.switches
     turn.commandModel = chain.model
@@ -1653,6 +1899,18 @@ export class ChatRuntime extends EventEmitter {
     }
     void this.serialized(session, () => this.runTurn(session, turn, { ...prompt, text: chain.text })).catch(() => undefined)
     return { turnId: turn.id }
+  }
+
+  /** While a switch is pending, an admissible prompt waits behind the update
+   *  instead of starting. Durable from this synchronous return: withdrawal,
+   *  restart and crash all start it later, in arrival order. */
+  private waitPromptForSwitch(session: LiveSession, prompt: PromptInput): PromptReceipt {
+    this.assertTurnAdmissible(session)
+    const entry: WaitingPrompt = { id: randomUUID(), sessionId: session.record.id, prompt, createdAt: new Date().toISOString() }
+    this.writeWaitingPrompts([...this.readWaitingPrompts(), entry])
+    session.record.queuedBehind = SWITCH_WAIT_REASON
+    this.setStatus(session, 'queued')
+    return { waitId: entry.id }
   }
 
   private validatePrompt(id: string, input: PromptInput): PromptInput {
@@ -1753,14 +2011,14 @@ export class ChatRuntime extends EventEmitter {
   private scheduleQueue(session: LiveSession): void {
     const id = session.record.id
     if (session.record.role === 'manager' && session.record.retiredModel) return
-    if (this.stopped || this.recovering || this.drainState || session.lifecycle.signal.aborted || session.record.status === 'closed'
+    if (this.stopped || this.recovering || this.drainState || this.switchState || session.lifecycle.signal.aborted || session.record.status === 'closed'
       || session.record.contextResetting || session.record.orphanNotice || session.turn || this.queuePumps.has(id) || this.queueTimers.has(id) || !this.messageQueue(id).ready) return
     const executor = this.messageQueue(id).executorSessionId
     if (executor && executor !== id) return
     this.queuePumps.add(id)
     let ran = false
     void this.serialized(session, async () => {
-      if (this.stopped || this.drainState || session.lifecycle.signal.aborted || session.turn || storage.getOpenTurn(id)) return
+      if (this.stopped || this.drainState || this.switchState || session.lifecycle.signal.aborted || session.turn || storage.getOpenTurn(id)) return
       // An isolated implementation hands its checkout to the release
       // controller after its turn. Never let a follow-up edit that checkout
       // while checks/build/deployment still own it. This is a wait, not an
@@ -1782,7 +2040,7 @@ export class ChatRuntime extends EventEmitter {
       }
       const queue = this.messageQueue(id)
       const item = queue.ready && queue.items.find(candidate => candidate.state === 'waiting')
-      if (!item || this.stopped || this.drainState || session.turn || session.lifecycle.signal.aborted) return
+      if (!item || this.stopped || this.drainState || this.switchState || session.turn || session.lifecycle.signal.aborted) return
       const turn = this.reserveTurn(session, item)
       ran = true
       await this.runTurn(session, turn, item.prompt)
