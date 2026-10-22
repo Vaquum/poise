@@ -98,7 +98,7 @@ describe('service health', () => {
     session(runtime.instance, false)
     session('poise-dev:another-database', true)
     const { service } = serviceOf(runtime)
-    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null })
+    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, eventLoop: { p50Ms: expect.any(Number), p99Ms: expect.any(Number), maxMs: expect.any(Number), meanMs: expect.any(Number), samples: expect.any(Number) } })
 
     let finish!: () => void
     const debate = callerCalls.countDebate(() => new Promise<void>((resolve) => { finish = resolve }))

@@ -17,6 +17,7 @@ import type { ChatRuntime } from '../chat/runtime'
 import { listOpenTurns } from '../chat/storage'
 import { HttpError, readJson, type RequestAuthority } from '../http'
 import { pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
+import { eventLoopDelayStats, type EventLoopDelayStats } from '../event-loop-delay'
 import { runningCallerCalls } from './caller-calls'
 import { canRestartForUpdate, requestUpdateRestart } from './restart'
 
@@ -35,6 +36,8 @@ export interface ServiceHealth {
   release: string | null
   /** The release a pending switch restarts this server onto; null when none is pending. */
   switching: string | null
+  /** Main-thread stall in the current minute window; spikes mark CLI fan-out. */
+  eventLoop: EventLoopDelayStats
 }
 
 /** What POST /api/service/switch answers. */
@@ -142,6 +145,7 @@ export class ServiceControl {
       draining: this.drainOn,
       release: this.release.name,
       switching: this.pendingSwitch(),
+      eventLoop: eventLoopDelayStats(),
     }
   }
 

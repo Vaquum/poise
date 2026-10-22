@@ -180,81 +180,102 @@ function arrangeCli(
         stderr: '',
       }
     }
-    if (command === 'github-interface' && args[0] === '--requested-changes-addressed') {
-      const cwdParts = String(options?.cwd || '').split('/')
-      const repository = cwdParts.length >= 2
-        ? `${cwdParts[cwdParts.length - 2]}/${cwdParts[cwdParts.length - 1]}`
-        : pr.repo
-      const pullNumber = Number(String(args[1] || '').replace(/^#/, ''))
+    const changesRecord = (repository: string, pullNumber: number, username: string) => ({
+      action: 'requested_changes_addressed',
+      repository,
+      pull_number: pullNumber,
+      username,
+      status: changesAddressed,
+      has_change_request: changesAddressed,
+      reviewer_latest_state: changesAddressed ? 'CHANGES_REQUESTED' : null,
+      reviewer_latest_commit: changesAddressed ? HEAD_SHA : null,
+      latest_request_at: changesAddressed ? '2026-07-10T10:00:00Z' : null,
+      head_sha: reviewActivity.headSha ?? HEAD_SHA,
+      commits_after_request: changesAddressed ? 1 : 0,
+      author_commits_after_request: changesAddressed ? 1 : 0,
+      author_inline_replies_after_request: 0,
+      response_count: changesAddressed ? 1 : 0,
+      ...changesEvidence,
+    })
+    const activityRecord = (repository: string, pullNumber: number, reviewer: string) => {
+      const requested = (reviewActivity.requestedReviewers || [])
+        .some((login) => login.toLowerCase() === reviewer.toLowerCase())
       return {
-        stdout: JSON.stringify({
-          action: 'requested_changes_addressed',
-          repository,
-          pull_number: pullNumber,
-          username: args[args.indexOf('--username') + 1],
-          status: changesAddressed,
-          has_change_request: changesAddressed,
-          reviewer_latest_state: changesAddressed ? 'CHANGES_REQUESTED' : null,
-          reviewer_latest_commit: changesAddressed ? HEAD_SHA : null,
-          latest_request_at: changesAddressed ? '2026-07-10T10:00:00Z' : null,
-          head_sha: reviewActivity.headSha ?? HEAD_SHA,
-          commits_after_request: changesAddressed ? 1 : 0,
-          author_commits_after_request: changesAddressed ? 1 : 0,
-          author_inline_replies_after_request: 0,
-          response_count: changesAddressed ? 1 : 0,
-          ...changesEvidence,
-        }),
-        stderr: '',
+        action: 'review_activity_since',
+        repository,
+        pull_number: pullNumber,
+        username: reviewer,
+        state: reviewActivity.state ?? 'OPEN',
+        draft: reviewActivity.draft ?? false,
+        head_sha: reviewActivity.headSha ?? HEAD_SHA,
+        reviewer_requested: requested,
+        active_change_request_authors: reviewActivity.activeChangeRequestAuthors ?? [],
+        unresolved_conversation_count: reviewActivity.unresolvedConversationCount ?? 0,
+        unresolved_outdated_conversation_count: Math.max(
+          0,
+          (reviewActivity.unresolvedConversationCount ?? 0)
+            - (reviewActivity.unresolvedLiveConversationCount
+              ?? reviewActivity.unresolvedConversationCount
+              ?? 0),
+        ),
+        unresolved_live_conversation_count: reviewActivity.unresolvedLiveConversationCount
+          ?? reviewActivity.unresolvedConversationCount
+          ?? 0,
+        unresolved_conversation_authors: reviewActivity.unresolvedConversationAuthors ?? [],
+        unresolved_live_conversation_authors: reviewActivity.unresolvedLiveConversationAuthors
+          ?? reviewActivity.unresolvedConversationAuthors
+          ?? [],
+        reviewer_latest_state: reviewActivity.reviewerLatestState ?? null,
+        reviewer_latest_commit: reviewActivity.reviewerLatestCommit ?? null,
+        reviewer_change_requests_since: 0,
+        reviewer_approvals_since: 0,
+        reviewer_reviews_since: reviewActivity.reviewerReviewIdsSince?.length ?? reviewActivity.reviewerReviewsSince ?? 0,
+        ...(reviewActivity.reviewerReviewIdsSince
+          ? { reviewer_reviews_since_items: reviewActivity.reviewerReviewIdsSince.map((id) => ({ id, node_id: `PRR_${id}`, state: 'COMMENTED', commit: HEAD_SHA, submitted_at: new Date().toISOString() })) }
+          : {}),
+        reviewer_pending_reviews: reviewActivity.reviewerPendingReviews ?? 0,
+        latest_activity_at: reviewActivity.latestActivityAt ?? null,
       }
     }
-    if (command === 'github-interface' && args[0] === '--review-activity-since') {
-      const reviewer = args[args.indexOf('--username') + 1].toLowerCase()
-      const requested = (reviewActivity.requestedReviewers || [])
-        .some((login) => login.toLowerCase() === reviewer)
+    if (command === 'github-interface' && args[0] === '--requested-changes-addressed') {
+      const username = args[args.indexOf('--username') + 1]
+      if (args.includes('--requests-json')) {
+        const requests = JSON.parse(args[args.indexOf('--requests-json') + 1]) as Array<{ repository: string, number: number }>
+        return {
+          stdout: JSON.stringify({
+            action: 'requested_changes_addressed_batch',
+            username,
+            records: requests.map((request) => ({ ...changesRecord(request.repository, request.number, username), error: null })),
+          }),
+          stderr: '',
+        }
+      }
       const cwdParts = String(options?.cwd || '').split('/')
       const repository = cwdParts.length >= 2
         ? `${cwdParts[cwdParts.length - 2]}/${cwdParts[cwdParts.length - 1]}`
         : pr.repo
       const pullNumber = Number(String(args[1] || '').replace(/^#/, ''))
-      return {
-        stdout: JSON.stringify({
-          action: 'review_activity_since',
-          repository,
-          pull_number: pullNumber,
-          username: reviewer,
-          state: reviewActivity.state ?? 'OPEN',
-          draft: reviewActivity.draft ?? false,
-          head_sha: reviewActivity.headSha ?? HEAD_SHA,
-          reviewer_requested: requested,
-          active_change_request_authors: reviewActivity.activeChangeRequestAuthors ?? [],
-          unresolved_conversation_count: reviewActivity.unresolvedConversationCount ?? 0,
-          unresolved_outdated_conversation_count: Math.max(
-            0,
-            (reviewActivity.unresolvedConversationCount ?? 0)
-              - (reviewActivity.unresolvedLiveConversationCount
-                ?? reviewActivity.unresolvedConversationCount
-                ?? 0),
-          ),
-          unresolved_live_conversation_count: reviewActivity.unresolvedLiveConversationCount
-            ?? reviewActivity.unresolvedConversationCount
-            ?? 0,
-          unresolved_conversation_authors: reviewActivity.unresolvedConversationAuthors ?? [],
-          unresolved_live_conversation_authors: reviewActivity.unresolvedLiveConversationAuthors
-            ?? reviewActivity.unresolvedConversationAuthors
-            ?? [],
-          reviewer_latest_state: reviewActivity.reviewerLatestState ?? null,
-          reviewer_latest_commit: reviewActivity.reviewerLatestCommit ?? null,
-          reviewer_change_requests_since: 0,
-          reviewer_approvals_since: 0,
-          reviewer_reviews_since: reviewActivity.reviewerReviewIdsSince?.length ?? reviewActivity.reviewerReviewsSince ?? 0,
-          ...(reviewActivity.reviewerReviewIdsSince
-            ? { reviewer_reviews_since_items: reviewActivity.reviewerReviewIdsSince.map((id) => ({ id, node_id: `PRR_${id}`, state: 'COMMENTED', commit: HEAD_SHA, submitted_at: new Date().toISOString() })) }
-            : {}),
-          reviewer_pending_reviews: reviewActivity.reviewerPendingReviews ?? 0,
-          latest_activity_at: reviewActivity.latestActivityAt ?? null,
-        }),
-        stderr: '',
+      return { stdout: JSON.stringify(changesRecord(repository, pullNumber, username)), stderr: '' }
+    }
+    if (command === 'github-interface' && args[0] === '--review-activity-since') {
+      const reviewer = args[args.indexOf('--username') + 1]
+      if (args.includes('--requests-json')) {
+        const requests = JSON.parse(args[args.indexOf('--requests-json') + 1]) as Array<{ repository: string, number: number }>
+        return {
+          stdout: JSON.stringify({
+            action: 'review_activity_since_batch',
+            username: reviewer,
+            records: requests.map((request) => ({ ...activityRecord(request.repository, request.number, reviewer), error: null })),
+          }),
+          stderr: '',
+        }
       }
+      const cwdParts = String(options?.cwd || '').split('/')
+      const repository = cwdParts.length >= 2
+        ? `${cwdParts[cwdParts.length - 2]}/${cwdParts[cwdParts.length - 1]}`
+        : pr.repo
+      const pullNumber = Number(String(args[1] || '').replace(/^#/, ''))
+      return { stdout: JSON.stringify(activityRecord(repository, pullNumber, reviewer.toLowerCase())), stderr: '' }
     }
     if (command === 'github-interface' && args[0] === '--resolve-nonblocking-conversations-if-ready') {
       if (reviewActivity.resolveError) throw new Error('resolution failed')

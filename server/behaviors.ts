@@ -69,8 +69,10 @@ import {
   setMeta as databaseSetMeta,
   type BehaviorAgentLaunch,
   type BehaviorLaunchClaim,
+  type CompletedApprovalBasisLaunch,
 } from './db'
 import { HttpError } from './http'
+import { eventLoopDelayStats, type EventLoopDelayStats } from './event-loop-delay'
 import { behaviorErrorMessage, behaviorIncidentDiagnostics } from './behavior-diagnostics'
 import { classifyBehaviorDiagnostic, diagnosticClassification, isTimeoutCause, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
@@ -94,6 +96,11 @@ const GITHUB_USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$
 // The account is captured for an entire asynchronous operation: datastore reads,
 // runtime state, process locks and callbacks must agree on the same owner.
 const behaviorOrganization = new AsyncLocalStorage<Organization | null>()
+
+// One shared open-PR listing per organization per tick: every PR behavior
+// reads the same health + view pair instead of listing the same PRs five
+// times. Dropped when the tick ends, so the 120 s freshness contract holds.
+const sharedPrListing = new AsyncLocalStorage<{ promise: Promise<DatastorePr[]> | null, author: string }>()
 
 function currentOrganization(): Organization | null {
   const scoped = behaviorOrganization.getStore()
@@ -906,6 +913,14 @@ function completeOwnedClaim(behavior: ActiveClaim['behavior'], target: string, c
 export const BEHAVIOR_REGISTRATION_GRACE_MS = 5 * 60_000
 const BEHAVIOR_CLAIM_RENEWAL_MS = 2 * 60 * 60_000
 const PR_OPERATION_EVALUATION_LEASE_MS = 65_000
+// One behavior tick's per-PR reads stay inside the CLI budget: evidence
+// batches of ten fit the 30 s CLI budget under load, and review preparation
+// runs a small pool instead of fanning out over every candidate at once.
+export const PR_READ_BATCH_SIZE = 10
+export const REVIEW_PREPARE_CONCURRENCY = 5
+// Organizations start their ticks apart so their CLI bursts don't serialize
+// on the main thread at the same minute boundary.
+export const BEHAVIOR_ORG_STAGGER_MS = 5_000
 const PR_OPERATION_WAIT_MS = 10_000
 const PR_OPERATION_RETRY_MS = 50
 const RUNNING_AGENT_STATUSES = new Set(['pending', 'queued', 'running', 'in_progress'])
@@ -1804,6 +1819,15 @@ function datastorePr(row: unknown, index: number): DatastorePr {
 
 async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
   if (!author) return []
+  const shared = sharedPrListing.getStore()
+  if (shared && (shared.promise === null || shared.author === author)) {
+    shared.author = author
+    return (shared.promise ??= readOpenPrsByAuthor(author))
+  }
+  return readOpenPrsByAuthor(author)
+}
+
+async function readOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
   await requireFreshDatastore()
   const { stdout } = await runFile(
     DATASTORE,
@@ -1838,6 +1862,30 @@ async function listEligiblePrs(behavior: SkippableBehavior, author: string): Pro
 // launch was being prepared stops it.
 function stillEligible(behavior: SkippableBehavior, pr: DatastorePr): boolean {
   return !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
+}
+
+// A scan cut short by its deadline resumes beyond the blocked batch or
+// candidate: the cursor advances before each batch read and each item, so a
+// timed-out batch can't keep hiding the ones after it.
+function orderByCursor(prs: DatastorePr[], cursorKey: string): DatastorePr[] {
+  const cursor = getMeta(cursorKey)
+  const start = (prs.findIndex((pr) => `${pr.repo}#${pr.number}` === cursor) + 1) % Math.max(prs.length, 1)
+  return [...prs.slice(start), ...prs.slice(0, start)]
+}
+
+// A fixed pool: queued items check the sweep deadline when they start, not
+// only when they are enqueued, so an ended sweep begins no new CLI work.
+async function forEachPool<T>(items: readonly T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      if (behaviorAborted()) return
+      const index = next++
+      if (index >= items.length) return
+      await task(items[index]!)
+    }
+  })
+  await Promise.all(workers)
 }
 
 // One pull request as the datastore has it, whatever its state; null when it
@@ -1948,16 +1996,16 @@ interface PreparedReviewTarget {
   catalog: Catalog
   modelCliEnv: NodeJS.ProcessEnv
   expectedHead: string
-  pwd: string
   changes: ChangesAddressedResult | null
   source: string
 }
 
 // Slow idempotent preparation: eligibility probes, model resolution, sign-in
-// gate, provider CLI updates, head and checkout reads. Runs without the
-// behavior lock and takes no ownership; null means this target must not
-// launch this tick. The PR-operation lease is released on every exit except
-// a returned bundle, which carries it into the claim phase.
+// gate, provider CLI updates and head reads. The checkout provisions in the
+// launch phase, outside the sweep deadline. Runs without the behavior lock
+// and takes no ownership; null means this target must not launch this tick.
+// The PR-operation lease is released on every exit except a returned bundle,
+// which carries it into the claim phase.
 async function prepareReviewTarget(
   pr: DatastorePr,
   key: string,
@@ -2004,7 +2052,6 @@ async function prepareReviewTarget(
         throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
       }
       const expectedHead = await currentHeadSha(pr.repo, pr.number, actor)
-      const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead)
       if (!isEnabled('review-new-prs') || behaviorAborted() || !stillEligible('review-new-prs', pr)) return null
       let changes: ChangesAddressedResult | null = null
       if (reviewer) {
@@ -2014,7 +2061,7 @@ async function prepareReviewTarget(
       prepared = {
         pr, num, key, slot, target, checkTarget, operationId,
         owner, repo, reviewer, actor, model, recovery, catalog,
-        modelCliEnv, expectedHead, pwd, changes, source: 'poise:review-new-prs',
+        modelCliEnv, expectedHead, changes, source: 'poise:review-new-prs',
       }
       return prepared
     })
@@ -2025,7 +2072,7 @@ async function prepareReviewTarget(
 
 // Fire-and-forget spawn for an already claimed target. Runs without the
 // behavior lock: the atomic claim plus launch intent is the ownership.
-async function spawnReviewLaunch(prepared: PreparedReviewTarget, claimId: string, setting: BehaviorSetting): Promise<void> {
+async function spawnReviewLaunch(prepared: PreparedReviewTarget, claimId: string, setting: BehaviorSetting, pwd: string): Promise<void> {
   const { pr, target: claimTarget } = prepared
   const args = [
     '--pr-review',
@@ -2043,7 +2090,7 @@ async function spawnReviewLaunch(prepared: PreparedReviewTarget, claimId: string
     '--correlation-id',
     claimId,
     '--pwd',
-    prepared.pwd,
+    pwd,
     '--p',
     setting,
     ...noteArgs('review-new-prs'),
@@ -2256,7 +2303,7 @@ async function tickReviewNewPrs(): Promise<void> {
     const prs = await listEligiblePrs('review-new-prs', author)
     await recoverSnapshotReviews(prs, reviewer)
     let failure: unknown
-    const candidates = prs.flatMap((pr) => {
+    const candidates = orderByCursor(prs, 'behavior_review_new_prs_prepare_cursor').flatMap((pr) => {
       const key = `${pr.repo}#${pr.number}`
       // Advisory only: the claim phase re-derives admission from fresh
       // reads. A fresh primary admits the current panel; already handled
@@ -2277,11 +2324,14 @@ async function tickReviewNewPrs(): Promise<void> {
       }).map((slot) => [pr, key, slot] as const)
     })
     // Phase 1 — prepare every candidate without the behavior lock. Slow
-    // idempotent work only; nothing here takes ownership.
+    // idempotent work only; nothing here takes ownership. A small pool, not
+    // one process per candidate at once, and the cursor rotates coverage so
+    // the next sweep prepares the rest.
     const prepared: PreparedReviewTarget[] = []
-    await Promise.all(candidates.map(async ([pr, key, slot]) => {
+    await forEachPool(candidates, REVIEW_PREPARE_CONCURRENCY, async ([pr, key, slot]) => {
       const target = reviewSlotTarget(key, slot)
       const checkTarget = `${target}:check`
+      setMeta('behavior_review_new_prs_prepare_cursor', key)
       try {
         const bundle = await prepareReviewTarget(pr, key, slot)
         if (bundle) prepared.push(bundle)
@@ -2291,7 +2341,7 @@ async function tickReviewNewPrs(): Promise<void> {
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
       }
-    }))
+    })
     // An expired operation deadline must not discard prepared reviews: a slow
     // sweep still claims and launches what it managed to prepare, and the next
     // sweep prepares the rest.
@@ -2410,12 +2460,23 @@ async function tickReviewNewPrs(): Promise<void> {
       releasePhase2Leases()
       throw err
     }
-    // Phase 3 — spawn every claimed target without the behavior lock: the
-    // atomic claim plus launch intent is the ownership.
+    // Phase 3 — provision the checkout and spawn every claimed target without
+    // the behavior lock: the atomic claim plus launch intent is the
+    // ownership. The checkout runs here, under the lifecycle signal, so a
+    // cold clone can't consume the sweep deadline.
     await underLifecycleSignal(() => Promise.all(claimed.map(async ({ prepared: bundle, claimId, setting }) => {
       const { pr, slot, target, checkTarget } = bundle
+      let checkoutReady = false
       try {
-        await spawnReviewLaunch(bundle, claimId, setting)
+        if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
+          throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
+        }
+        const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead)
+        if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
+          throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
+        }
+        checkoutReady = true
+        await spawnReviewLaunch(bundle, claimId, setting, pwd)
         if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
         console.log(`[behaviors] review-new-prs fired for ${pr.repo}#${pr.number} (p=${setting}, ${slot})`)
       } catch (err) {
@@ -2424,6 +2485,12 @@ async function tickReviewNewPrs(): Promise<void> {
         releaseOwnedClaim('review-new-prs', target, claimId)
         releasePrOperationOwned(bundle.operationId)
         if (behaviorAborted()) return
+        // A checkout failure leaves no worker behind its launch intent: the
+        // claim above is released and the ledger records the preflight end.
+        if (!checkoutReady) {
+          captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
+            outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+        }
         console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
@@ -2503,10 +2570,23 @@ async function checkReviewActivity(
     ],
     { cwd, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() },
   )
-  const data = objectValue(
-    parseJson(stdout, 'github-interface --review-activity-since'),
-    'github-interface --review-activity-since',
+  return parseReviewActivityResult(
+    objectValue(
+      parseJson(stdout, 'github-interface --review-activity-since'),
+      'github-interface --review-activity-since',
+    ),
+    repo,
+    number,
+    reviewer,
   )
+}
+
+function parseReviewActivityResult(
+  data: Record<string, unknown>,
+  repo: string,
+  number: number,
+  reviewer: string,
+): ReviewActivityResult {
   const unresolvedConversationCount = safeInteger(
     data.unresolved_conversation_count,
     'review-activity-since unresolved_conversation_count',
@@ -2840,10 +2920,23 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
     ],
     { cwd, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() },
   )
-  const data = objectValue(
-    parseJson(stdout, 'github-interface --requested-changes-addressed'),
-    'github-interface --requested-changes-addressed',
+  return parseChangesAddressedResult(
+    objectValue(
+      parseJson(stdout, 'github-interface --requested-changes-addressed'),
+      'github-interface --requested-changes-addressed',
+    ),
+    repo,
+    number,
+    reviewer,
   )
+}
+
+function parseChangesAddressedResult(
+  data: Record<string, unknown>,
+  repo: string,
+  number: number,
+  reviewer: string,
+): ChangesAddressedResult {
   const hasChangeRequest = data.has_change_request
   const status = data.status
   const headSha = String(data.head_sha || '').toLowerCase()
@@ -2904,6 +2997,83 @@ async function checkChangesAddressed(repo: string, number: number, reviewer: str
     resolvedRequestThreads,
     responseCount,
   }
+}
+
+interface BatchRead<T> {
+  pr: DatastorePr
+  result: T | null
+  error: string | null
+}
+
+// One process per batch, not one per pull request: the same evidence reads
+// the single-PR commands run, gathered on one client. One PR's error holds
+// only that target's check, never the whole sweep.
+async function readChangesAddressedBatch(
+  prs: DatastorePr[],
+  reviewer: string,
+): Promise<BatchRead<ChangesAddressedResult>[]> {
+  const { stdout } = await runFile(GH_INTERFACE, [
+    '--requested-changes-addressed', '--requests-json',
+    JSON.stringify(prs.map((pr) => ({ repository: pr.repo, number: pr.number }))),
+    '--username', reviewer, '--token-user', reviewer,
+  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+  const packet = objectValue(
+    parseJson(stdout, 'github-interface --requested-changes-addressed batch'),
+    'github-interface --requested-changes-addressed batch',
+  )
+  if (packet.action !== 'requested_changes_addressed_batch'
+    || String(packet.username || '').toLowerCase() !== reviewer.toLowerCase()
+    || !Array.isArray(packet.records) || packet.records.length !== prs.length) {
+    throw new Error('github-interface --requested-changes-addressed returned malformed batch evidence')
+  }
+  return packet.records.map((row: unknown, index: number) => {
+    const pr = prs[index]!
+    const record = objectValue(row, 'changes-addressed record')
+    if (record.repository !== pr.repo || record.pull_number !== pr.number) {
+      throw new Error('github-interface --requested-changes-addressed returned misaligned batch evidence')
+    }
+    if (record.error === null) {
+      return { pr, result: parseChangesAddressedResult(record, pr.repo, pr.number, reviewer), error: null }
+    }
+    if (typeof record.error !== 'string' || !record.error) {
+      throw new Error('github-interface --requested-changes-addressed returned malformed record evidence')
+    }
+    return { pr, result: null, error: record.error }
+  })
+}
+
+async function readReviewActivityBatch(
+  requests: { pr: DatastorePr, since: string }[],
+  reviewer: string,
+): Promise<BatchRead<ReviewActivityResult>[]> {
+  const { stdout } = await runFile(GH_INTERFACE, [
+    '--review-activity-since', '--requests-json',
+    JSON.stringify(requests.map(({ pr, since }) => ({ repository: pr.repo, number: pr.number, since }))),
+    '--username', reviewer, '--token-user', reviewer,
+  ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
+  const packet = objectValue(
+    parseJson(stdout, 'github-interface --review-activity-since batch'),
+    'github-interface --review-activity-since batch',
+  )
+  if (packet.action !== 'review_activity_since_batch'
+    || String(packet.username || '').toLowerCase() !== reviewer.toLowerCase()
+    || !Array.isArray(packet.records) || packet.records.length !== requests.length) {
+    throw new Error('github-interface --review-activity-since returned malformed batch evidence')
+  }
+  return packet.records.map((row: unknown, index: number) => {
+    const pr = requests[index]!.pr
+    const record = objectValue(row, 'review-activity record')
+    if (record.repository !== pr.repo || record.pull_number !== pr.number) {
+      throw new Error('github-interface --review-activity-since returned misaligned batch evidence')
+    }
+    if (record.error === null) {
+      return { pr, result: parseReviewActivityResult(record, pr.repo, pr.number, reviewer), error: null }
+    }
+    if (typeof record.error !== 'string' || !record.error) {
+      throw new Error('github-interface --review-activity-since returned malformed record evidence')
+    }
+    return { pr, result: null, error: record.error }
+  })
 }
 
 async function dismissedApprovalHeld(pr: DatastorePr, head: string, model: string): Promise<boolean> {
@@ -3037,6 +3207,23 @@ async function fireApprove(
   })
 }
 
+interface ApproveActivityCheck {
+  pr: DatastorePr
+  check: ChangesAddressedResult
+  since: string
+  clean: boolean
+  review: CompletedApprovalBasisLaunch | null
+  admittedReviewer: string | undefined
+}
+
+interface ApproveLaunch {
+  pr: DatastorePr
+  expectedHead: string
+  seenTarget: string
+  firedReason: string
+  admittedReviewer: string | undefined
+}
+
 async function tickApprovePrs(): Promise<void> {
   if (!isEnabled('approve-prs')) return
   const author = getMeta('me') || ''
@@ -3046,171 +3233,241 @@ async function tickApprovePrs(): Promise<void> {
   const reviewer = configuredReviewer()
   try {
     const prs = await listEligiblePrs('approve-prs', author)
+    // Backed-off PRs don't spend batch capacity, and the cursor rotates
+    // coverage so a sweep cut short by its deadline resumes beyond the
+    // blocked batch.
+    const stage1 = orderByCursor(prs, 'behavior_approve_prs_cursor').filter((pr) =>
+      !invalidPrResultHeld(pr.repo, pr.number)
+      && behaviorRetryDue('approve-prs', `${pr.repo}#${pr.number}:check`))
     let failure: unknown
-    await Promise.all(prs.map(async (pr) => {
+    const clearCheck = (checkTarget: string) => {
+      if (!behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget)
+    }
+    for (let offset = 0; offset < stage1.length; offset += PR_READ_BATCH_SIZE) {
       if (!isEnabled('approve-prs') || behaviorAborted()) return
-      const prTarget = `${pr.repo}#${pr.number}`
-      if (invalidPrResultHeld(pr.repo, pr.number)) return
-      const checkTarget = `${prTarget}:check`
-      if (!behaviorRetryDue('approve-prs', checkTarget)) return
-      let operationId: string | null = null
-      let launched = false
-      let checked = false
+      const batch = stage1.slice(offset, offset + PR_READ_BATCH_SIZE)
+      const last = batch[batch.length - 1]!
+      setMeta('behavior_approve_prs_cursor', `${last.repo}#${last.number}`)
+      let records: BatchRead<ChangesAddressedResult>[]
       try {
-        const check = await checkChangesAddressed(pr.repo, pr.number, reviewer)
-        if (await packetBlocked('approve-prs', pr.repo, pr.number, check.headSha)) {
-          checked = true
-          return
-        }
-        let dismissedReview: ReturnType<typeof latestCompletedChangeRequestLaunch> = null
-        if (!check.hasChangeRequest && !latestApprovalBasisLaunch(pr.repo, pr.number)) {
-          dismissedReview = check.reviewerLatestState === 'DISMISSED'
-            ? latestCompletedChangeRequestLaunch(pr.repo, pr.number, reviewer) : null
-          if (!dismissedReview) {
-            checked = true
-            return
-          }
-        }
-        if (hasActiveAgentLaunchForPr(pr.repo, pr.number)) return
-        operationId = await claimEligiblePrOperation('approve-prs', prTarget)
-        if (!operationId) {
-          console.log(`[behaviors] approve-prs deferred for ${prTarget}: PR operation busy`)
-          return
-        }
-        if (!isEnabled('approve-prs')) return
-        // Follow-up trigger: reviewer has at least one CHANGES_REQUESTED review
-        // on the PR, AND either its findings are all resolved or the author
-        // has engaged since — by pushing a commit, replying inline on a
-        // review thread, or posting a public PR comment. A refutation ("FTL is internal,
-        // everyone knows") is as much a "respond to this" signal as
-        // a code change; the agent run that follows decides whether
-        // it's convincing.
-        //
-        // Each subsequent author response (commit or reply) re-arms
-        // the trigger — the dedupe key sums all four counters, so every
-        // increment produces a fresh seen-key. If the reviewer posts
-        // another CHANGES_REQUESTED (latest_request_at advances),
-        // author response counters reset to 0. Caller matches resolution
-        // evidence to that request's findings, including reaffirmations.
-        let seenTarget = ''
-        let firedReason = ''
-        let expectedHead = ''
-        let admittedReviewer: string | undefined
-        if (check.hasChangeRequest) {
-          if (check.responseCount < 1 || check.latestRequestAt === null) {
-            checked = true
-            return
-          }
-          const activity = await checkReviewActivity(
-            pr.repo,
-            pr.number,
-            reviewer,
-            check.latestRequestAt,
-          )
-          // An outdated thread is evidence to inspect, not a current-head veto.
-          // The approval agent receives every thread in its immutable PR packet.
-          if (activity.state !== 'OPEN'
-            || activity.draft
-            || activity.headSha !== check.headSha
-            || activity.unresolvedLiveConversationAuthors.some(
-              (author) => author.toLowerCase() !== reviewer.toLowerCase(),
-            )) {
-            checked = true
-            return
-          }
-          expectedHead = check.headSha
-          seenTarget = `${pr.repo}#${pr.number}@req=${check.latestRequestAt}/r=${check.responseCount}/head=${check.headSha}`
-          firedReason = `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}inline+${check.authorPrCommentsAfterRequest}pr-comment+${check.resolvedRequestThreads}resolved, head=${check.headSha.slice(0, 8)}`
-        } else {
-          const cleanReview = latestApprovalBasisLaunch(pr.repo, pr.number)
-          const review = cleanReview ?? dismissedReview
-          if (!review) {
-            checked = true
-            return
-          }
-          const activity = await checkReviewActivity(
-            pr.repo,
-            pr.number,
-            reviewer,
-            review.completedAt,
-          )
-          if (!cleanReview && (activity.reviewerLatestState !== 'DISMISSED'
-            || activity.headSha !== check.headSha || activity.headSha === review.headSha)) {
-            checked = true
-            return
-          }
-          if (!cleanReview) admittedReviewer = reviewer
-          const reapprovalOwnsEveryUnresolvedConversation =
-            activity.reviewerLatestState === 'APPROVED'
-            && activity.reviewerLatestCommit !== null
-            && activity.reviewerLatestCommit !== activity.headSha
-            && activity.unresolvedConversationAuthors.length > 0
-            && activity.unresolvedConversationAuthors.every(
-              (author) => author.toLowerCase() === reviewer.toLowerCase(),
-            )
-          if (activity.state !== 'OPEN'
-            || activity.draft
-            || activity.activeChangeRequestAuthors.length > 0
-            || (activity.unresolvedLiveConversationCount > 0
-              && !reapprovalOwnsEveryUnresolvedConversation)
-            || (activity.reviewerLatestState === 'APPROVED'
-              && activity.reviewerLatestCommit === activity.headSha)) {
-            checked = true
-            return
-          }
-          if (activity.headSha !== review.headSha && activity.latestActivityAt === null) {
-            throw new Error(`head changed without an activity watermark for ${pr.repo}#${pr.number}`)
-          }
-          expectedHead = activity.headSha
-          seenTarget = `${pr.repo}#${pr.number}@head=${activity.headSha}`
-          firedReason = `${cleanReview ? 'clean' : 'dismissed'} review ${review.callId.slice(0, 8)}, head=${activity.headSha.slice(0, 8)}`
-        }
-        if (!behaviorRetryDue('approve-prs', seenTarget)) return
-        let claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
-        let replacesFailedCallId: string | undefined
-        if (!claimId) {
-          if (admittedReviewer) {
-            const held = getFailedBehaviorLaunch('approve-prs', seenTarget)
-            if (!held?.launchCallId || await dismissedApprovalHeld(
-              pr, expectedHead, (await reviewChoice('pr_approve')).model,
-            )) return
-            // Keep the held record until preparation admits a complete new intent.
-            replacesFailedCallId = held.launchCallId
-            claimId = operationId
-          } else {
-            const recovered = await releaseFailedBehaviorIfNoAction(
-              'approve-prs', pr.repo, pr.number, seenTarget,
-            )
-            if (!recovered) return
-            claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
-          }
-        }
-        if (!claimId) return
-        trackClaim('approve-prs', seenTarget, claimId)
-        try {
-          const accepted = await fireApprove(pr, seenTarget, claimId, expectedHead, admittedReviewer, replacesFailedCallId)
-          if (!accepted) {
-            releaseOwnedClaim('approve-prs', seenTarget, claimId)
-            return
-          }
-          launched = true
-          checked = true
-        } catch (err) {
-          releaseOwnedClaim('approve-prs', seenTarget, claimId)
-          throw err
-        }
-        console.log(`[behaviors] approve-prs fired for ${pr.repo}#${pr.number} (${firedReason})`)
+        records = await readChangesAddressedBatch(batch, reviewer)
       } catch (err) {
-        checked = false
         if (behaviorAborted()) return
-        console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
-        if (err instanceof BehaviorLogFeedError) failure ??= err
-        else recordBehaviorFailure('approve-prs', 'operation', err, checkTarget)
-      } finally {
-        if (checked && !behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget)
-        if (!launched && operationId) releasePrOperationOwned(operationId)
+        console.error('[behaviors] approve-prs batch check failed:', err)
+        for (const pr of batch) {
+          recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+        }
+        continue
       }
-    }))
+      const checks: ApproveActivityCheck[] = []
+      for (const { pr, result, error } of records) {
+        const checkTarget = `${pr.repo}#${pr.number}:check`
+        setMeta('behavior_approve_prs_cursor', `${pr.repo}#${pr.number}`)
+        if (error !== null) {
+          console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, error)
+          recordBehaviorFailure('approve-prs', 'operation', error, checkTarget)
+          continue
+        }
+        try {
+          const check = result!
+          if (await packetBlocked('approve-prs', pr.repo, pr.number, check.headSha)) {
+            clearCheck(checkTarget)
+            continue
+          }
+          const cleanReview = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number)
+          let dismissedReview: CompletedApprovalBasisLaunch | null = null
+          if (!check.hasChangeRequest && !cleanReview) {
+            dismissedReview = check.reviewerLatestState === 'DISMISSED'
+              ? latestCompletedChangeRequestLaunch(pr.repo, pr.number, reviewer) : null
+            if (!dismissedReview) {
+              clearCheck(checkTarget)
+              continue
+            }
+          }
+          // Follow-up trigger: reviewer has at least one CHANGES_REQUESTED review
+          // on the PR, AND either its findings are all resolved or the author
+          // has engaged since — by pushing a commit, replying inline on a
+          // review thread, or posting a public PR comment. A refutation ("FTL is internal,
+          // everyone knows") is as much a "respond to this" signal as
+          // a code change; the agent run that follows decides whether
+          // it's convincing.
+          //
+          // Each subsequent author response (commit or reply) re-arms
+          // the trigger — the dedupe key sums all four counters, so every
+          // increment produces a fresh seen-key. If the reviewer posts
+          // another CHANGES_REQUESTED (latest_request_at advances),
+          // author response counters reset to 0. Caller matches resolution
+          // evidence to that request's findings, including reaffirmations.
+          if (check.hasChangeRequest) {
+            if (check.responseCount < 1 || check.latestRequestAt === null) {
+              clearCheck(checkTarget)
+              continue
+            }
+            checks.push({ pr, check, since: check.latestRequestAt, clean: false, review: null, admittedReviewer: undefined })
+          } else {
+            const review = cleanReview ?? dismissedReview
+            if (!review) {
+              clearCheck(checkTarget)
+              continue
+            }
+            checks.push({ pr, check, since: review.completedAt, clean: cleanReview !== null, review,
+              admittedReviewer: cleanReview ? undefined : reviewer })
+          }
+        } catch (err) {
+          if (behaviorAborted()) return
+          console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
+          recordBehaviorFailure('approve-prs', 'operation', err, checkTarget)
+        }
+      }
+      // Each chunk runs the whole pipeline — activity read, claim and fire —
+      // so a sweep cut short by its deadline still fires the approvals it
+      // managed to prepare, and the next sweep prepares the rest.
+      const launches: ApproveLaunch[] = []
+      for (let sub = 0; sub < checks.length; sub += PR_READ_BATCH_SIZE) {
+        if (!isEnabled('approve-prs') || behaviorAborted()) return
+        const activityBatch = checks.slice(sub, sub + PR_READ_BATCH_SIZE)
+        let activityRecords: BatchRead<ReviewActivityResult>[]
+        try {
+          activityRecords = await readReviewActivityBatch(activityBatch, reviewer)
+        } catch (err) {
+          if (behaviorAborted()) return
+          console.error('[behaviors] approve-prs batch activity check failed:', err)
+          for (const { pr } of activityBatch) {
+            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+          }
+          continue
+        }
+        for (let index = 0; index < activityRecords.length; index++) {
+          const { pr, result, error } = activityRecords[index]!
+          const request = activityBatch[index]!
+          const checkTarget = `${pr.repo}#${pr.number}:check`
+          if (error !== null) {
+            console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, error)
+            recordBehaviorFailure('approve-prs', 'operation', error, checkTarget)
+            continue
+          }
+          try {
+            const activity = result!
+            const check = request.check
+            if (check.hasChangeRequest) {
+              // An outdated thread is evidence to inspect, not a current-head veto.
+              // The approval agent receives every thread in its immutable PR packet.
+              if (activity.state !== 'OPEN'
+                || activity.draft
+                || activity.headSha !== check.headSha
+                || activity.unresolvedLiveConversationAuthors.some(
+                  (author) => author.toLowerCase() !== reviewer.toLowerCase(),
+                )) {
+                clearCheck(checkTarget)
+                continue
+              }
+              launches.push({ pr, expectedHead: check.headSha,
+                seenTarget: `${pr.repo}#${pr.number}@req=${check.latestRequestAt}/r=${check.responseCount}/head=${check.headSha}`,
+                firedReason: `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}inline+${check.authorPrCommentsAfterRequest}pr-comment+${check.resolvedRequestThreads}resolved, head=${check.headSha.slice(0, 8)}`,
+                admittedReviewer: undefined })
+            } else {
+              const review = request.review!
+              if (!request.clean && (activity.reviewerLatestState !== 'DISMISSED'
+                || activity.headSha !== check.headSha || activity.headSha === review.headSha)) {
+                clearCheck(checkTarget)
+                continue
+              }
+              const reapprovalOwnsEveryUnresolvedConversation =
+                activity.reviewerLatestState === 'APPROVED'
+                && activity.reviewerLatestCommit !== null
+                && activity.reviewerLatestCommit !== activity.headSha
+                && activity.unresolvedConversationAuthors.length > 0
+                && activity.unresolvedConversationAuthors.every(
+                  (author) => author.toLowerCase() === reviewer.toLowerCase(),
+                )
+              if (activity.state !== 'OPEN'
+                || activity.draft
+                || activity.activeChangeRequestAuthors.length > 0
+                || (activity.unresolvedLiveConversationCount > 0
+                  && !reapprovalOwnsEveryUnresolvedConversation)
+                || (activity.reviewerLatestState === 'APPROVED'
+                  && activity.reviewerLatestCommit === activity.headSha)) {
+                clearCheck(checkTarget)
+                continue
+              }
+              if (activity.headSha !== review.headSha && activity.latestActivityAt === null) {
+                throw new Error(`head changed without an activity watermark for ${pr.repo}#${pr.number}`)
+              }
+              launches.push({ pr, expectedHead: activity.headSha,
+                seenTarget: `${pr.repo}#${pr.number}@head=${activity.headSha}`,
+                firedReason: `${request.clean ? 'clean' : 'dismissed'} review ${review.callId.slice(0, 8)}, head=${activity.headSha.slice(0, 8)}`,
+                admittedReviewer: request.admittedReviewer })
+            }
+          } catch (err) {
+            if (behaviorAborted()) return
+            console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
+            recordBehaviorFailure('approve-prs', 'operation', err, checkTarget)
+          }
+        }
+      }
+      for (const launch of launches) {
+        if (!isEnabled('approve-prs') || behaviorAborted()) return
+        const { pr, expectedHead, seenTarget, firedReason, admittedReviewer } = launch
+        const prTarget = `${pr.repo}#${pr.number}`
+        const checkTarget = `${prTarget}:check`
+        let operationId: string | null = null
+        let launched = false
+        let checked = false
+        try {
+          if (hasActiveAgentLaunchForPr(pr.repo, pr.number)) continue
+          operationId = await claimEligiblePrOperation('approve-prs', prTarget)
+          if (!operationId) {
+            console.log(`[behaviors] approve-prs deferred for ${prTarget}: PR operation busy`)
+            continue
+          }
+          if (!isEnabled('approve-prs')) continue
+          if (!behaviorRetryDue('approve-prs', seenTarget)) continue
+          let claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
+          let replacesFailedCallId: string | undefined
+          if (!claimId) {
+            if (admittedReviewer) {
+              const held = getFailedBehaviorLaunch('approve-prs', seenTarget)
+              if (!held?.launchCallId || await dismissedApprovalHeld(
+                pr, expectedHead, (await reviewChoice('pr_approve')).model,
+              )) continue
+              // Keep the held record until preparation admits a complete new intent.
+              replacesFailedCallId = held.launchCallId
+              claimId = operationId
+            } else {
+              const recovered = await releaseFailedBehaviorIfNoAction(
+                'approve-prs', pr.repo, pr.number, seenTarget,
+              )
+              if (!recovered) continue
+              claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
+            }
+          }
+          if (!claimId) continue
+          trackClaim('approve-prs', seenTarget, claimId)
+          try {
+            const accepted = await fireApprove(pr, seenTarget, claimId, expectedHead, admittedReviewer, replacesFailedCallId)
+            if (!accepted) {
+              releaseOwnedClaim('approve-prs', seenTarget, claimId)
+              continue
+            }
+            launched = true
+            checked = true
+          } catch (err) {
+            releaseOwnedClaim('approve-prs', seenTarget, claimId)
+            throw err
+          }
+          console.log(`[behaviors] approve-prs fired for ${pr.repo}#${pr.number} (${firedReason})`)
+        } catch (err) {
+          checked = false
+          if (behaviorAborted()) return
+          console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
+          if (err instanceof BehaviorLogFeedError) failure ??= err
+          else recordBehaviorFailure('approve-prs', 'operation', err, checkTarget)
+        } finally {
+          if (checked) clearCheck(checkTarget)
+          if (!launched && operationId) releasePrOperationOwned(operationId)
+        }
+      }
+    }
     if (failure) throw failure
   } catch (err) {
     console.error('[behaviors] approve-prs tick failed:', err)
@@ -3374,64 +3631,97 @@ async function tickResolveUnblocking(): Promise<void> {
   if (!author) return
   try {
     const prs = await listEligiblePrs('resolve-unblocking', author)
-    await Promise.all(prs.map(async (pr) => {
+    const ordered = orderByCursor(prs, 'behavior_resolve_unblocking_cursor').filter((pr) =>
+      behaviorRetryDue('resolve-unblocking', `${pr.repo}#${pr.number}:check`))
+    const reviewer = configuredReviewer()
+    // A read cannot resolve anything. One batched pre-check per chunk finds
+    // the PRs with unresolved conversations, so only those occupy the
+    // mutation lock — and each chunk resolves before the next is read, so a
+    // sweep cut short still resolves what it prepared.
+    for (let offset = 0; offset < ordered.length; offset += PR_READ_BATCH_SIZE) {
       if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
-      const key = `${pr.repo}#${pr.number}`
-      const checkTarget = `${key}:check`
-      if (!behaviorRetryDue('resolve-unblocking', checkTarget)) return
-      let checked = false
-      let operationId: string | null = null
-      let runId: string | null = null
+      const batch = ordered.slice(offset, offset + PR_READ_BATCH_SIZE)
+      const last = batch[batch.length - 1]!
+      setMeta('behavior_resolve_unblocking_cursor', `${last.repo}#${last.number}`)
+      let records: BatchRead<ReviewActivityResult>[]
       try {
-        // A read cannot resolve anything. Avoid occupying the mutation lock
-        // when the PR has no unresolved conversations to act on.
-        const activity = await checkReviewActivity(pr.repo, pr.number, configuredReviewer(), '1970-01-01T00:00:00Z')
-        if (activity.state !== 'OPEN' || activity.draft || activity.unresolvedConversationCount === 0) {
-          checked = true
-          return
-        }
-        if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
-        operationId = claimPrOperationOwned(key, PR_OPERATION_EVALUATION_LEASE_MS)
-        if (!operationId) return
-        // This CLI performs the mutation itself. The synchronous checks
-        // immediately before invocation prevent a disabled behavior, or one
-        // whose repository was just skipped, from starting another resolve.
-        if (!isEnabled('resolve-unblocking') || !stillEligible('resolve-unblocking', pr)) return
-        runId = startDirectBehaviorRun('resolve-unblocking')
-        const result = await resolveNonblockingIfReady(pr.repo, pr.number)
-        if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true)
-        else discardDirectBehaviorRun(runId)
-        runId = null
-        checked = true
-        if (result.superseded) {
-          console.log(`[behaviors] resolve-unblocking superseded on ${pr.repo}#${pr.number} by head ${result.headSha}`)
-        } else if (result.resolved_count > 0) {
-          console.log(`[behaviors] resolve-unblocking cleared ${result.resolved_count} convo(s) on ${key}`)
-          // github-interface doesn't write a log row for this call, so
-          // unlike pr_review / pr_approve there's no agent-interface
-          // surface to derive "last triggered" from. Persist it here:
-          // a meta row that setMeta overwrites, so the Behaviors view
-          // shows the most recent real resolve instead of a dash.
-          setMeta(RESOLVE_LAST_FIRED_KEY, JSON.stringify({
-            at: new Date().toISOString(),
-            target: key,
-          }))
-        } else if (result.unresolved_count > 0) {
-          console.log(
-            `[behaviors] resolve-unblocking waiting on ${key}: ${result.blockers.join(', ')}`,
-          )
-        }
+        records = await readReviewActivityBatch(
+          batch.map((pr) => ({ pr, since: '1970-01-01T00:00:00Z' })), reviewer)
       } catch (err) {
-        checked = false
         if (behaviorAborted()) return
-        console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, err)
-        recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget)
-      } finally {
-        if (runId) finishDirectBehaviorRun(runId, false)
-        if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
-        if (operationId) releasePrOperationOwned(operationId)
+        console.error('[behaviors] resolve-unblocking batch check failed:', err)
+        for (const pr of batch) {
+          recordBehaviorFailure('resolve-unblocking', 'operation', err, `${pr.repo}#${pr.number}:check`)
+        }
+        continue
       }
-    }))
+      const actionable: DatastorePr[] = []
+      for (const { pr, result, error } of records) {
+        const key = `${pr.repo}#${pr.number}`
+        const checkTarget = `${key}:check`
+        setMeta('behavior_resolve_unblocking_cursor', key)
+        if (error !== null) {
+          console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, error)
+          recordBehaviorFailure('resolve-unblocking', 'operation', error, checkTarget)
+          continue
+        }
+        const activity = result!
+        if (activity.state !== 'OPEN' || activity.draft || activity.unresolvedConversationCount === 0) {
+          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
+          continue
+        }
+        actionable.push(pr)
+      }
+      for (const pr of actionable) {
+        if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
+        const key = `${pr.repo}#${pr.number}`
+        const checkTarget = `${key}:check`
+        let checked = false
+        let operationId: string | null = null
+        let runId: string | null = null
+        try {
+          operationId = claimPrOperationOwned(key, PR_OPERATION_EVALUATION_LEASE_MS)
+          if (!operationId) continue
+          // This CLI performs the mutation itself. The synchronous checks
+          // immediately before invocation prevent a disabled behavior, or one
+          // whose repository was just skipped, from starting another resolve.
+          if (!isEnabled('resolve-unblocking') || !stillEligible('resolve-unblocking', pr)) continue
+          runId = startDirectBehaviorRun('resolve-unblocking')
+          const result = await resolveNonblockingIfReady(pr.repo, pr.number)
+          if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true)
+          else discardDirectBehaviorRun(runId)
+          runId = null
+          checked = true
+          if (result.superseded) {
+            console.log(`[behaviors] resolve-unblocking superseded on ${pr.repo}#${pr.number} by head ${result.headSha}`)
+          } else if (result.resolved_count > 0) {
+            console.log(`[behaviors] resolve-unblocking cleared ${result.resolved_count} convo(s) on ${key}`)
+            // github-interface doesn't write a log row for this call, so
+            // unlike pr_review / pr_approve there's no agent-interface
+            // surface to derive "last triggered" from. Persist it here:
+            // a meta row that setMeta overwrites, so the Behaviors view
+            // shows the most recent real resolve instead of a dash.
+            setMeta(RESOLVE_LAST_FIRED_KEY, JSON.stringify({
+              at: new Date().toISOString(),
+              target: key,
+            }))
+          } else if (result.unresolved_count > 0) {
+            console.log(
+              `[behaviors] resolve-unblocking waiting on ${key}: ${result.blockers.join(', ')}`,
+            )
+          }
+        } catch (err) {
+          checked = false
+          if (behaviorAborted()) return
+          console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, err)
+          recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget)
+        } finally {
+          if (runId) finishDirectBehaviorRun(runId, false)
+          if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
+          if (operationId) releasePrOperationOwned(operationId)
+        }
+      }
+    }
   } catch (err) {
     console.error('[behaviors] resolve-unblocking tick failed:', err)
     throw err
@@ -4906,6 +5196,8 @@ function serializeBehaviorOperation<T>(
 export interface RunEnabledBehaviorsOptions {
   /** Scheduled ticks coalesce instead of queuing behind a busy behavior. */
   skipBusy?: boolean
+  /** Scheduled ticks start each organization apart, spreading CLI bursts. */
+  stagger?: boolean
 }
 
 async function runBehaviorCycle(
@@ -4938,73 +5230,83 @@ export async function runEnabledBehaviorsOnce(
   if (releaseBackgroundPaused()) return
   prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
-    await Promise.allSettled(readyOrganizations().map((org) =>
-      behaviorOrganization.run(org, () => runEnabledBehaviorsOnce(options))))
+    const orgs = readyOrganizations()
+    await Promise.allSettled(orgs.map((org, index) => (async () => {
+      if (options.stagger && index > 0) {
+        await new Promise((resolve) => setTimeout(resolve, BEHAVIOR_ORG_STAGGER_MS * index))
+        if (!tickerStarted || releaseBackgroundPaused()) return
+      }
+      return behaviorOrganization.run(org, () => runEnabledBehaviorsOnce(options))
+    })()))
     return
   }
   const org = currentOrganization()
   if (!org || !readyOrganizations().some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
     && candidate.datastorePath === org.datastorePath)) return
-  const operations: Promise<void>[] = []
-  if (isEnabled('review-new-prs')
-    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('review-new-prs')))) {
-    // review-new-prs manages its own phased lock inside tickReviewNewPrs:
-    // reconcile, then prepare and spawn unlocked around a short claim
-    // critical section.
-    operations.push(runBehaviorCycle('review-new-prs', async () => {
-      await tickReviewNewPrs()
-      return listBehaviorLaunchClaims('review-new-prs').length === 0
-    }))
-  }
-  if (isEnabled('approve-prs')
-    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('approve-prs')))) {
-    operations.push(runBehaviorCycle('approve-prs', async () => {
-      return await withBehaviorProcessLock('approve-prs', async () => {
-        await reconcileBehaviorLaunchClaims('approve-prs')
-        if (await reviewHeldByClaudeAuth('pr_approve')) return false
-        await tickApprovePrs()
-        return listBehaviorLaunchClaims('approve-prs').length === 0
-      })
-    }))
-  }
-  if (isEnabled('review-new-issues')
-    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('review-new-issues')))) {
-    operations.push(runBehaviorCycle('review-new-issues', async () => {
-      return await withBehaviorProcessLock('review-new-issues', async () => {
-        await reconcileIssueReviewClaims()
-        await tickReviewNewIssues()
-        return listBehaviorLaunchClaims('review-new-issues').length === 0
-      })
-    }))
-  }
-  if (isEnabled('resolve-unblocking')
-    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('resolve-unblocking')))) {
-    operations.push(runBehaviorCycle('resolve-unblocking', async () => {
-      return await withBehaviorProcessLock('resolve-unblocking', async () => {
-        await tickResolveUnblocking()
-        return true
-      })
-    }))
-  }
-  if (isEnabled('merge-prs')
-    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('merge-prs')))) {
-    operations.push(runBehaviorCycle('merge-prs', async () => {
-      return await withBehaviorProcessLock('merge-prs', async () => {
-        await tickMergePrs()
-        return true
-      })
-    }))
-  }
-  if (isEnabled('rerun-grey-ci')
-    && (!options.skipBusy || !behaviorOperationTails.has(operationKey('rerun-grey-ci')))) {
-    operations.push(runBehaviorCycle('rerun-grey-ci', async () => {
-      return await withBehaviorProcessLock('rerun-grey-ci', async () => {
-        await tickRerunGreyCi()
-        return true
-      })
-    }))
-  }
-  await Promise.all(operations)
+  // This tick's PR behaviors share one open-PR listing, dropped when the
+  // tick ends.
+  return sharedPrListing.run({ promise: null, author: '' }, async () => {
+    const operations: Promise<void>[] = []
+    if (isEnabled('review-new-prs')
+      && (!options.skipBusy || !behaviorOperationTails.has(operationKey('review-new-prs')))) {
+      // review-new-prs manages its own phased lock inside tickReviewNewPrs:
+      // reconcile, then prepare and spawn unlocked around a short claim
+      // critical section.
+      operations.push(runBehaviorCycle('review-new-prs', async () => {
+        await tickReviewNewPrs()
+        return listBehaviorLaunchClaims('review-new-prs').length === 0
+      }))
+    }
+    if (isEnabled('approve-prs')
+      && (!options.skipBusy || !behaviorOperationTails.has(operationKey('approve-prs')))) {
+      operations.push(runBehaviorCycle('approve-prs', async () => {
+        return await withBehaviorProcessLock('approve-prs', async () => {
+          await reconcileBehaviorLaunchClaims('approve-prs')
+          if (await reviewHeldByClaudeAuth('pr_approve')) return false
+          await tickApprovePrs()
+          return listBehaviorLaunchClaims('approve-prs').length === 0
+        })
+      }))
+    }
+    if (isEnabled('review-new-issues')
+      && (!options.skipBusy || !behaviorOperationTails.has(operationKey('review-new-issues')))) {
+      operations.push(runBehaviorCycle('review-new-issues', async () => {
+        return await withBehaviorProcessLock('review-new-issues', async () => {
+          await reconcileIssueReviewClaims()
+          await tickReviewNewIssues()
+          return listBehaviorLaunchClaims('review-new-issues').length === 0
+        })
+      }))
+    }
+    if (isEnabled('resolve-unblocking')
+      && (!options.skipBusy || !behaviorOperationTails.has(operationKey('resolve-unblocking')))) {
+      operations.push(runBehaviorCycle('resolve-unblocking', async () => {
+        return await withBehaviorProcessLock('resolve-unblocking', async () => {
+          await tickResolveUnblocking()
+          return true
+        })
+      }))
+    }
+    if (isEnabled('merge-prs')
+      && (!options.skipBusy || !behaviorOperationTails.has(operationKey('merge-prs')))) {
+      operations.push(runBehaviorCycle('merge-prs', async () => {
+        return await withBehaviorProcessLock('merge-prs', async () => {
+          await tickMergePrs()
+          return true
+        })
+      }))
+    }
+    if (isEnabled('rerun-grey-ci')
+      && (!options.skipBusy || !behaviorOperationTails.has(operationKey('rerun-grey-ci')))) {
+      operations.push(runBehaviorCycle('rerun-grey-ci', async () => {
+        return await withBehaviorProcessLock('rerun-grey-ci', async () => {
+          await tickRerunGreyCi()
+          return true
+        })
+      }))
+    }
+    await Promise.all(operations)
+  })
 }
 
 function scheduleNextTick(generation: number) {
@@ -5020,7 +5322,7 @@ function scheduleNextTick(generation: number) {
     // Rearm before external work. One slow scan can no longer silence the
     // scheduler; the next tick skips only behaviors that are still busy.
     scheduleNextTick(generation)
-    void runEnabledBehaviorsOnce({ skipBusy: true }).then(
+    void runEnabledBehaviorsOnce({ skipBusy: true, stagger: true }).then(
       () => {
         if (tickerStarted && generation === runtimeGeneration) {
           lastTickCompletedAtMs = Date.now()
@@ -5065,6 +5367,8 @@ export interface BehaviorsRuntimeHealth {
     error: string | null
   }
   deadLetters: ReturnType<typeof listBehaviorIncidents>
+  /** Main-thread stall in the current minute window; spikes mark CLI fan-out. */
+  eventLoop: EventLoopDelayStats
 }
 
 function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
@@ -5177,6 +5481,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     datastore: { ...datastoreFreshness() },
     identity,
     deadLetters: listBehaviorIncidents(),
+    eventLoop: eventLoopDelayStats(),
   }
 }
 

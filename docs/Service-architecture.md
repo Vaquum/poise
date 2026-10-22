@@ -419,9 +419,12 @@ otherwise offer it):
 **Service endpoints** (loopback, or the `admin` scope; the owner's `browser`
 assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
-  runningCallerCalls, backgroundWork, idle, draining, release, switching }`. `idle` is true only
+  runningCallerCalls, backgroundWork, idle, draining, release, switching, eventLoop }`. `idle` is true only
   when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
   It backs the container health check and the gateway's readiness check.
+  - `eventLoop` is the current minute window of event-loop delay
+    (`{ p50Ms, p99Ms, maxMs, meanMs, samples }`): main-thread stall, where
+    CLI fan-out shows up first. The behavior diagnostics carry the same window.
   - `version` is the commit the running bundle was built from, `null` for a
     development build.
   - `release` is the installed release the supervisor started this server on

@@ -136,6 +136,20 @@ approvals it managed to prepare; the next sweep prepares the rest. Git
 verification uses the same 30-second CLI budget as other review reads, and the
 rail names a timed-out sweep as stalled instead of repeating the timeout text.
 
+Every behavior tick starts at most one open-PR listing per ready account,
+shared by the pull-request behaviors; each behavior then reads its per-PR
+evidence in batches of ten over one process per batch, and a per-account
+cursor rotates coverage so a sweep cut short by its deadline resumes beyond
+the blocked batch. One pull request's batch error holds only that target's
+check on the usual backoff; a failed batch holds each of its targets the
+same way. Review preparation runs a small pool, and its checkout provisions
+in the launch phase after the claim, outside the sweep deadline; a checkout
+failure there releases the claim and records a `preflight_failed` outcome.
+Scheduled ticks start each ready account a few seconds apart so their CLI
+bursts don't collide, and the service health and behavior diagnostics expose
+the current minute window of event-loop delay, where fan-out stalls show up
+first.
+
 `merge-prs` is disabled unless `behavior_merge_prs_enabled` is explicitly `1`.
 It uses Caller directly without a model launch: after fresh datastore eligibility,
 it discovers up to 50 eligible PRs per ready account with one fresh

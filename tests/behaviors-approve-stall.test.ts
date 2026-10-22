@@ -28,8 +28,18 @@ describe('approve-prs under load', () => {
     const { database: db, behaviors: runtime } = await startApproving([pr, secondPr])
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
-      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
-        throw new Error('Command timed out after 30000ms: github-interface')
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && args.includes('--requests-json')) {
+        const packet = JSON.parse((await original(command, args, options)).stdout)
+        return {
+          stdout: JSON.stringify({
+            ...packet,
+            records: (packet.records as Array<Record<string, unknown>>).map((record) =>
+              record.pull_number === 17
+                ? { repository: record.repository, pull_number: 17, error: 'Command timed out after 30000ms: github-interface' }
+                : record),
+          }),
+          stderr: '',
+        }
       }
       return original(command, args, options)
     })
@@ -57,8 +67,18 @@ describe('approve-prs under load', () => {
     const { database: db, behaviors: runtime } = await startApproving([pr, secondPr])
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
-      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
-        throw new Error('github-interface --requested-changes-addressed returned malformed state')
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && args.includes('--requests-json')) {
+        const packet = JSON.parse((await original(command, args, options)).stdout)
+        return {
+          stdout: JSON.stringify({
+            ...packet,
+            records: (packet.records as Array<Record<string, unknown>>).map((record) =>
+              record.pull_number === 17
+                ? { repository: record.repository, pull_number: 17, error: 'github-interface --requested-changes-addressed returned malformed state' }
+                : record),
+          }),
+          stderr: '',
+        }
       }
       return original(command, args, options)
     })
@@ -77,24 +97,16 @@ describe('approve-prs under load', () => {
   it('still fires prepared approvals when a slow check pushes the sweep past its deadline, and resumes the rest next pass', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
-    const { behaviors: runtime } = await startApproving([pr, secondPr])
+    const open = Array.from({ length: 12 }, (_, index) => ({
+      ...pr, number: 17 + index, url: `https://github.com/${pr.repo}/pull/${17 + index}`,
+    }))
+    const { behaviors: runtime } = await startApproving(open)
     const original = mocks.runFile.getMockImplementation()!
-    let slowEntered = false
     let fireEntered = false
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
-      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
-        slowEntered = true
-        const signal = (options as { signal?: AbortSignal } | undefined)?.signal
-        if (signal?.aborted) throw signal.reason
-        // A check that never answers until the sweep deadline aborts it, as a
-        // loaded machine does to a real CLI call.
-        await new Promise<never>((_resolve, reject) => {
-          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
-        })
-      }
-      if (command === 'github-interface' && args[0] === '--head-sha' && String(args[1]) === '#18') {
+      if (command === 'github-interface' && args[0] === '--head-sha' && String(args[1]) === '#26') {
         fireEntered = true
-        // The approval is prepared and its launch is in flight when the sweep
+        // The last prepared approval's launch is in flight when the sweep
         // deadline fires; the head lookup answers just after.
         await new Promise<void>((resolve) => setTimeout(resolve, 57_000))
       }
@@ -103,26 +115,27 @@ describe('approve-prs under load', () => {
 
     const run = runtime.runEnabledBehaviorsOnce()
     // Real I/O (checkout directories, lock files) drains while the fake clock
-    // stays put, so the fast PR is inside its launch before the deadline fires.
+    // stays put, so the first chunk is inside its last launch before the
+    // deadline fires.
     const pump = () => new Promise<void>((resolve) => setImmediate(resolve))
-    for (let i = 0; i < 1000 && !(slowEntered && fireEntered); i++) await pump()
-    expect(slowEntered && fireEntered).toBe(true)
+    for (let i = 0; i < 1000 && !fireEntered; i++) await pump()
+    expect(fireEntered).toBe(true)
     for (let i = 0; i < 20; i++) await pump()
     await vi.advanceTimersByTimeAsync(59_000)
-    for (let i = 0; i < 100 && mocks.spawnDetached.mock.calls.length === 0; i++) await pump()
+    for (let i = 0; i < 100 && mocks.spawnDetached.mock.calls.length < 10; i++) await pump()
     await run
 
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    expect(mocks.spawnDetached.mock.calls[0]?.[1]).toContain('#18')
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(10)
     const sweep = runtime.getBehaviorsRuntimeHealth().failures
       .find((failure) => failure.behavior === 'approve-prs' && !failure.target)
     expect(sweep?.error).toMatch(/aborted due to timeout/)
 
-    // The next sweep prepares the rest: the timed-out PR is approved next pass.
+    // The next sweep prepares the rest: the timed-out chunk is approved next pass.
     mocks.runFile.mockImplementation(original)
     await runtime.runEnabledBehaviorsOnce()
-    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
-    expect(mocks.spawnDetached.mock.calls[1]?.[1]).toContain('#17')
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(12)
+    expect(mocks.spawnDetached.mock.calls[10]?.[1]).toContain('#27')
+    expect(mocks.spawnDetached.mock.calls[11]?.[1]).toContain('#28')
   })
 
   it('records a launch failure instead of dropping it when the sweep deadline already expired', async () => {
@@ -130,17 +143,8 @@ describe('approve-prs under load', () => {
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
     const { database: db, behaviors: runtime } = await startApproving([pr, secondPr])
     const original = mocks.runFile.getMockImplementation()!
-    let slowEntered = false
     let fireEntered = false
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
-      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
-        slowEntered = true
-        const signal = (options as { signal?: AbortSignal } | undefined)?.signal
-        if (signal?.aborted) throw signal.reason
-        await new Promise<never>((_resolve, reject) => {
-          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
-        })
-      }
       if (command === 'github-interface' && args[0] === '--head-sha' && String(args[1]) === '#18') {
         fireEntered = true
         // The head lookup answers after the sweep deadline with a new head: a
@@ -156,13 +160,15 @@ describe('approve-prs under load', () => {
 
     const run = runtime.runEnabledBehaviorsOnce()
     const pump = () => new Promise<void>((resolve) => setImmediate(resolve))
-    for (let i = 0; i < 1000 && !(slowEntered && fireEntered); i++) await pump()
-    expect(slowEntered && fireEntered).toBe(true)
+    for (let i = 0; i < 1000 && !fireEntered; i++) await pump()
+    expect(fireEntered).toBe(true)
     for (let i = 0; i < 20; i++) await pump()
     await vi.advanceTimersByTimeAsync(59_000)
     await run
 
-    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    // #17's pipeline never stalls behind #18's slow launch.
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0]?.[1]).toContain('#17')
     const stored = JSON.parse(db.getMeta(`behavior_approve_prs_failure:${secondPr.repo}#18:check`)!)
     expect(stored.error).toMatch(/head changed/)
     expect(stored.consecutiveFailures).toBe(1)

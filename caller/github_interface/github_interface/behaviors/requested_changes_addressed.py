@@ -3,6 +3,7 @@ from typing import Any
 
 from github_interface.atoms.issues import issue_comments
 from github_interface.atoms.pulls import get_pull, list_commits, list_inline_comments, list_review_threads, list_reviews
+from github_interface.atoms.request_batch import read_requests, run_batch
 from github_interface.behaviors.request_changes import REAFFIRM_BODY
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
@@ -13,15 +14,29 @@ ACTIONABLE_STATES = {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
 
 
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
-    owner, repo = repository(payload)
-    pull_number = parse_pull_number(payload)
     username = str(payload.get("username", "")).strip()
     if not username:
         raise ValueError("username is required")
     actor = token_user(payload)
     if actor.lower() != username.lower():
         raise ValueError("username must match token-user")
+    if "requests" in payload:
+        requests = read_requests(payload)
+        records = await run_batch(client, requests, lambda request: read_one(client, request, username))
+        return {"action": "requested_changes_addressed_batch", "username": username, "records": records}
+    owner, repo = repository(payload)
+    pull_number = parse_pull_number(payload)
+    return await read_request(client, owner, repo, pull_number, username)
 
+
+async def read_one(client: GitHubClient, request: dict[str, Any], username: str) -> dict[str, Any]:
+    owner, repo = request["repository"].split("/")
+    return await read_request(client, owner, repo, request["number"], username)
+
+
+async def read_request(
+    client: GitHubClient, owner: str, repo: str, pull_number: int, username: str,
+) -> dict[str, Any]:
     pull = await get_pull(client, owner, repo, pull_number)
     reviews = await list_reviews(client, owner, repo, pull_number)
 
