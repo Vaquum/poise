@@ -3654,7 +3654,7 @@ export function getGreyCiLastFired(): { at: string, target: string, url: string 
   }
 }
 
-const GREY_CI_INTENT_KEY = 'grey-ci-recovery'
+export const GREY_CI_INTENT_KEY = 'grey-ci-recovery'
 
 async function tickRerunGreyCi(): Promise<void> {
   const behavior = 'rerun-grey-ci' as const
