@@ -606,6 +606,9 @@ export class ChatRuntime extends EventEmitter {
 
   endDrain(): void {
     this.drainState = null
+    // A server that is stopping leaves waited prompts durable for the next
+    // server: consuming them now would refuse each against a closing session.
+    if (this.stopped) return
     // Prompts that waited behind an update start first, in order — the
     // synchronous reserves below land before the queue pump behind them —
     // then the queues pump.
@@ -873,6 +876,10 @@ export class ChatRuntime extends EventEmitter {
     let count = this.inflightOps + (this.recovering ? 1 : 0)
     for (const session of this.live.values()) {
       const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
+      // A prompt waiting behind a Poise update holds nothing a restart would
+      // cut: it is durable, and the next server starts it. Counting it would
+      // hold the very switch it waits for.
+      if (own === 0 && session.record.status === 'queued' && session.record.queuedBehind === SWITCH_WAIT_REASON) continue
       count += own > 0 ? own : ACTIVE_STATUSES.includes(session.record.status) ? 1 : 0
     }
     return count

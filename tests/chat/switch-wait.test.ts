@@ -202,6 +202,23 @@ describe('waiting behind a pending switch', () => {
     await until(() => w.turns(w.s.id).length === 1)
     expect(w.c.calls.map(call => call.input.text)).toEqual(['Run at once'])
   })
+
+  it('leaves waited prompts durable when the server stops mid-drain, so the next server starts them', async () => {
+    const w = await world()
+    w.runtime.setSwitchPending('r2')
+    expect(w.runtime.prompt(w.s.id, input('First'))).toHaveProperty('waitId')
+    expect(w.runtime.prompt(w.s.id, input('Second'))).toHaveProperty('waitId')
+    w.runtime.startDrain('service')
+    await w.runtime.stop()
+    w.runtime.endDrain()
+    await pause(200)
+    const waiting = JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]') as Array<{ prompt: PromptInput }>
+    expect(waiting.map(entry => entry.prompt.text)).toEqual(['First', 'Second'])
+    const next = w.make()
+    await next.recover()
+    await until(() => w.c.calls.length === 2)
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['First', 'Second'])
+  })
 })
 
 describe('the switch bound', () => {
@@ -218,6 +235,25 @@ describe('the switch bound', () => {
     timer.fire()
     return { service, restart, timer }
   }
+
+  it('restarts at once when only waited prompts stand by: they hold no quiet check', async () => {
+    const w = await world()
+    const timer = new FakeTimer()
+    const restart = vi.fn(() => true)
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: () => {}, releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => 5_000_000,
+    })
+    try {
+      service.switchRelease('r2')
+      expect(w.runtime.prompt(w.s.id, input('Wait behind the update'))).toHaveProperty('waitId')
+      expect(w.runtime.working()).toBe(0)
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+    } finally {
+      service.reset()
+    }
+  })
 
   it('cancels a turn still running past the bound and restarts; after the restart its session gets exactly one continue prompt on its resumed native session', async () => {
     const w = await world({ auto: false })
