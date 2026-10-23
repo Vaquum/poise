@@ -3,7 +3,7 @@
 // output. These tests drive the real relay script with scripted agents.
 
 import { afterEach, describe, expect, it } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { connect, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -248,8 +248,14 @@ describe('chat relay script', () => {
   it('keeps a replacement replay exact when the stale client closes late', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'poise-relay-'))
     const socketPath = join(dir, 'r.sock')
+    const probeRelease = join(dir, 'probe.release')
+    // LIVE completes replay, not an agent response to input sent at READY.
+    // Force the probe after LIVE so the two boundaries cannot be confused.
+    const lateProbeAgent = ECHO_AGENT.replace("process.stdout.write('echo:'+l)",
+      "if(l.startsWith('probe')){const wait=setInterval(()=>{if(require('node:fs').existsSync(process.env.POISE_TEST_PROBE_RELEASE)){clearInterval(wait);process.stdout.write('echo:'+l)}},5)}else process.stdout.write('echo:'+l)")
     const first = track(await spawnRelay({
-      sessionId: 'session-relay-replace', dir, socketPath, command: process.execPath, args: ['-e', ECHO_AGENT], env: {}, cwd: dir,
+      sessionId: 'session-relay-replace', dir, socketPath, command: process.execPath, args: ['-e', lateProbeAgent],
+      env: { POISE_TEST_PROBE_RELEASE: probeRelease }, cwd: dir,
     }))
     await first.go()
     first.turnStart('turn-1')
@@ -301,11 +307,17 @@ describe('chat relay script', () => {
     // so the relay replaces A and streams the spool to B — and A's close
     // lands mid-replay. Only the new client's close may reset that replay.
     // (If B is refused instead, A had not ended yet; a fresh B retries.)
-    const attempt = async (socket: Socket, writeHello: () => void): Promise<{ stdout: string, spoolTurn: unknown }> => new Promise((resolve, reject) => {
+    const attempt = async (socket: Socket, writeHello: () => void): Promise<{ stdout: string, spoolTurn: unknown, replayed: string }> => new Promise((resolve, reject) => {
       let buffer: Buffer = Buffer.alloc(0)
       let text = ''
       let spoolTurn: unknown = null
-      const timer = setTimeout(() => reject(new Error(`B timed out waiting for LIVE after ${text.length} stdout bytes`)), 15_000)
+      let replayed: string | null = null
+      const timer = setTimeout(() => reject(new Error(`B timed out waiting for replay and probe after ${text.length} stdout bytes`)), 15_000)
+      const finish = () => {
+        if (replayed === null || !text.endsWith('echo:probe\n')) return
+        clearTimeout(timer)
+        resolve({ stdout: text, spoolTurn, replayed })
+      }
       socket.on('data', (chunk: Buffer) => {
         buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk
         while (buffer.length >= 5) {
@@ -317,8 +329,8 @@ describe('chat relay script', () => {
           if (kind === 101) {
             spoolTurn = (JSON.parse(payload.toString('utf8')) as { spoolTurn?: unknown }).spoolTurn
             socket.write(frame(3, Buffer.from('probe\n')))
-          } else if (kind === 103) text += payload.toString('utf8')
-          else if (kind === 106) { clearTimeout(timer); resolve({ stdout: text, spoolTurn }); return }
+          } else if (kind === 103) { text += payload.toString('utf8'); finish() }
+          else if (kind === 106) { replayed = text; writeFileSync(probeRelease, 'release'); finish() }
           else if (kind === 108) { clearTimeout(timer); reject(new Error(`relay refused B: ${payload.toString('utf8')}`)); return }
         }
       })
@@ -327,7 +339,7 @@ describe('chat relay script', () => {
     })
     const b = connect(socketPath)
     await connected(b)
-    let done: { stdout: string, spoolTurn: unknown } | null = null
+    let done: { stdout: string, spoolTurn: unknown, replayed: string } | null = null
     let lastRefusal = ''
     try {
       try {
@@ -351,6 +363,7 @@ describe('chat relay script', () => {
       }
       if (!done) throw new Error(`B never attached: ${lastRefusal}`)
       expect(done.spoolTurn).toBe('turn-1')
+      expect(done.replayed).toBe(`echo:${filler}`)
       expect(done.stdout).toBe(`echo:${filler}echo:probe\n`)
     } finally {
       a.destroy()
