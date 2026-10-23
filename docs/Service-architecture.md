@@ -353,10 +353,10 @@ instead of retaining an unanswerable request and checkout lease.
 - **Switching.** The gateway then sends `POST /api/service/switch` with
   `{ release }` (`admin` scope or loopback; 202 `{ release, switching }`,
   409 for a release not installed for this base or a server started without
-  the supervisor). Poise writes `next`, stops admitting new background ticks,
-  and restarts at the first moment no unheld Chat turn and no work of its own
+  the supervisor). Poise writes `next` and restarts at the first moment no unheld Chat turn and no work of its own
   runs; it waits for no agent call and no turn a healthy relay holds, since
-  the relay keeps the turn running and the next server adopts it. While the switch is pending, new Chat turns
+  the relay keeps the turn running and the next server adopts it. While the
+  switch is pending, new Chat turns
   wait behind the update instead of starting — sent messages, queued
   messages and work-monitor wakes alike, nothing refused or dropped —
   while launches and behavior ticks run as usual. A Poise implementation whose
