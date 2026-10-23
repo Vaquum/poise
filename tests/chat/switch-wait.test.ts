@@ -301,6 +301,34 @@ describe('the switch bound', () => {
     } finally { service.reset() }
   })
 
+  it('keeps interrupted work ahead of waited follow-ups when another switch is pending during recovery', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.c.calls.length === 1)
+    w.runtime.setSwitchPending('r2')
+    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+    const interrupted = w.runtime.runningTurnSessions()
+    await w.runtime.cancel(w.s.id)
+    w.runtime.recordSwitchInterrupted(interrupted)
+    await w.runtime.stop()
+    const waiting = database.getMeta('chat_switch_waiting')
+    const retained = database.getMeta('chat_switch_interrupted')
+    w.c.auto = true
+    const next = w.make()
+    next.setSwitchPending('r3')
+    await next.recover()
+    expect(database.getMeta('chat_switch_interrupted')).toBe(retained)
+    expect(database.getMeta('chat_switch_waiting')).toBe(waiting)
+    expect(w.c.calls).toHaveLength(1)
+    await next.releaseSwitchWait()
+    await until(() => w.c.calls.length === 3)
+    expect(w.c.calls.map(call => call.input.text)).toEqual([
+      'Original task', 'Poise stopped your turn for an update that did not restart. Continue where you left off.', 'Waited follow-up',
+    ])
+    expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
+    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([])
+  })
+
   it('retains shown input, switches and change completion when recovery queues behind a busy turn', async () => {
     const w = await world({ auto: false })
     const changeId = randomUUID()
