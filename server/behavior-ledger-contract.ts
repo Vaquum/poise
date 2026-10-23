@@ -95,7 +95,7 @@ export interface LedgerRecord {
   omittedAttempts: number
 }
 export interface LedgerGap { since: string; until: string | null; reason: 'capture_loss' | 'unclean_restart' | 'eviction' | 'unavailable' }
-export type LedgerUnavailableReason = 'worker_unavailable' | 'store_unavailable' | 'journal_unavailable'
+export type LedgerUnavailableReason = 'worker_unavailable' | 'store_unavailable' | 'journal_unavailable' | 'read_timeout'
 export interface LedgerHealth {
   status: 'ok' | 'incomplete' | 'stale' | 'unavailable' | 'stopped'
   unavailableReason: LedgerUnavailableReason | null
