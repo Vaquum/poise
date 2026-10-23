@@ -88,6 +88,33 @@ describe('worker failure classification and recovery', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
   })
 
+
+  it.each(['review_provider_exit', 'review_provider_error'])('releases a typed provider %s no-action failure for safe retry', async (code) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+    const launched = await launchReviewBeforeCrash()
+    const call = agentLog({
+      id: 'c'.repeat(32),
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      status: 'failed', error: 'codex review failed: provider exited',
+      expected_head: launched.expectedHead, actor: launched.actor,
+      source: launched.source, correlation_id: launched.correlationId,
+    })
+    fixture.agentLogs = [call]
+    let modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    arrangeCli(false, false, { reviewerReviewsSince: 3 })
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)?.launchCallId).toBe(call.id)
+    Object.assign(call, { action: 'not_started', outcome: 'preflight_failed', error_code: code, review_policy: 'bounded-v1' })
+    modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    arrangeCli(false, false, { reviewerReviewsSince: 3 })
+    vi.setSystemTime(Date.now() + modules.behaviors.BEHAVIOR_RETRY_BASE_MS)
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+  })
+
   it.each([
     ['httpx.ReadTimeout', 'network_interruption'],
     ['Selected model is at capacity. Please try a different model.', 'provider_capacity'],

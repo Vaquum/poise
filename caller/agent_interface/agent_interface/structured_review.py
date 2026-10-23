@@ -18,7 +18,7 @@ from uuid import UUID
 from pathlib import Path
 from time import monotonic
 
-from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, expected_head, pr_ref, provider_blocked
+from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, bounded_cause, expected_head, pr_ref, provider_blocked
 from .model_catalog import Model
 from .review_watch import ReviewWatch
 from . import progress, review_budget, review_receipt
@@ -39,10 +39,28 @@ class InvalidVerdict(ValueError):
     """A terminal contract failure, not a transient provider outage."""
 
 
-def provider_failure(message: str) -> None:
-    if provider_blocked(message):
-        raise AgentPreflightError(message, "review_provider_blocked")
-    raise ValueError(message)
+def _diagnostic(provider: str, phase: str, *, exit_code=None, signal=None, cause: str = "") -> dict:
+    return {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+            "phase": phase, "provider": provider, "exit_code": exit_code, "signal": signal,
+            "stderr": cause[:500], "submission": "none", "artifact": "none"}
+
+
+def provider_failure(message: str, *, provider: str = "provider", phase: str = "provider_execution",
+                     exit_code=None, signal=None) -> None:
+    cause = message.strip()
+    if provider_blocked(cause):
+        bounded = bounded_cause(cause or f"{provider} refused the review")
+        raise AgentPreflightError(bounded, "review_provider_blocked",
+                                  _diagnostic(provider, phase, exit_code=exit_code, signal=signal, cause=bounded))
+    bounded = bounded_cause(cause or f"{provider} exited {exit_code}")
+    raise AgentPreflightError(f"{provider} review failed: {bounded}", "review_provider_exit",
+                              _diagnostic(provider, phase, exit_code=exit_code, signal=signal, cause=bounded))
+
+
+def provider_error(provider: str, message: str, *, phase: str = "provider_execution") -> None:
+    bounded = bounded_cause(message)
+    raise AgentPreflightError(f"{provider} review failed: {bounded}", "review_provider_error",
+                              _diagnostic(provider, phase, cause=bounded))
 
 
 def verdict_schema(behavior: str, *, inspection: bool = False) -> dict:
@@ -84,8 +102,19 @@ def verdict_schema(behavior: str, *, inspection: bool = False) -> dict:
     return schema
 
 
+def _loads_no_duplicates(raw: str):
+    def hook(pairs):
+        seen = set()
+        for key, _ in pairs:
+            if key in seen:
+                raise InvalidVerdict(f"duplicate key in review output: {key!r}")
+            seen.add(key)
+        return dict(pairs)
+    return json.loads(raw, object_pairs_hook=hook)
+
+
 def validate_verdict(raw: str, behavior: str) -> dict:
-    verdict = json.loads(raw)
+    verdict = _loads_no_duplicates(raw)
     terminal = "reviewed_clean" if behavior == "pr_review" else "approve"
     if not isinstance(verdict, dict) or set(verdict) != {"action", "comments"}:
         raise InvalidVerdict("review verdict must contain only action and comments")
@@ -153,7 +182,19 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 if timeout <= 0:
                     raise review_budget.ReviewLimitError("Review reached its total time limit", "review_budget_exhausted")
                 if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
-                    raise AgentPreflightError("Repository inspection exceeds the review prompt limit", "review_packet_too_large")
+                    # Loop-driven growth, not #186's initial-packet overflow: keep
+                    # it out of the packet block so the head is not pinned.
+                    raise review_budget.ReviewLimitError(
+                        "Repository inspection exceeds the review prompt limit; needs attention",
+                        "review_budget_exhausted",
+                        {"version": 1, "source": "caller", "severity": "error",
+                         "operation": "provider.review", "phase": "inspection_context",
+                         "provider": model.provider})
+                # Last round decides on evidence already held: offer only the
+                # terminal verdict, never another inspection step.
+                if repository is not None and round_number == MAX_INSPECTION_ROUNDS:
+                    schema = verdict_schema(behavior, inspection=False)
+                    (root / "verdict.schema.json").write_text(json.dumps(schema))
                 remaining = (f"\n\nInspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
                              f"Analysis time remaining: {int(timeout)} seconds. "
                              "Batch independent inspection requests in one step. "
@@ -165,7 +206,13 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 if repository is None:
                     verdict = validate_verdict(raw, behavior)
                     break
-                step = json.loads(raw)
+                step = _loads_no_duplicates(raw)
+                if round_number == MAX_INSPECTION_ROUNDS and isinstance(step, dict) \
+                        and set(step) == {"action", "comments"}:
+                    # The final round offers the terminal-only verdict schema,
+                    # which has no requests property at all.
+                    verdict = validate_verdict(raw, behavior)
+                    break
                 if not isinstance(step, dict) or set(step) != {"action", "comments", "requests"}:
                     raise InvalidVerdict("review step must contain action, comments, and requests")
                 requests = step["requests"]
@@ -177,8 +224,13 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     verdict = validate_verdict(json.dumps({key: step[key] for key in ("action", "comments")}), behavior)
                     break
                 if round_number == MAX_INSPECTION_ROUNDS:
-                    raise review_budget.ReviewLimitError("Repository inspection limit reached; needs attention",
-                                                        "review_budget_exhausted")
+                    raise review_budget.ReviewLimitError(
+                        "Repository inspection limit reached; needs attention",
+                        "review_budget_exhausted",
+                        {"version": 1, "source": "caller", "severity": "error",
+                         "operation": "provider.review", "phase": "inspection_rounds",
+                         "provider": model.provider,
+                         "context": {"rounds": MAX_INSPECTION_ROUNDS}})
                 if not 1 <= len(requests) <= 8:
                     raise InvalidVerdict("invalid repository inspection request count")
                 # Validate provisional findings without submitting anything.
@@ -193,8 +245,12 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     except (ValueError, OSError) as error:
         code = ("review_packet_too_large" if "Input exceeds the maximum length" in str(error)
                 else "review_contract_violation" if isinstance(error, (InvalidVerdict, json.JSONDecodeError))
-                else None)
-        raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {error}", code) from error
+                else "review_provider_error")
+        cause = bounded_cause(str(error) or "invalid provider output")
+        diagnostic = {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+                      "phase": "validating", "provider": model.provider, "stderr": cause, "submission": "none"}
+        raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {cause}", code,
+                                  diagnostic) from error
 
     flag = {"request_changes": "--request-changes", "reviewed_clean": "--reviewed-clean",
             "approve": "--approve-pr"}[verdict["action"]]
@@ -203,11 +259,35 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         args.extend(["--comments-json", json.dumps(verdict["comments"])])
     limit = review_budget.timeout(600)
     progress.stage("submitting", "Submitting GitHub review", timeout=limit)
-    done = subprocess.run([*args, *fixed], cwd=pwd, text=True, capture_output=True, timeout=limit)
-    if done.returncode == 0:
-        review_receipt.record(done.stdout)
-    else:
-        review_receipt.record_failure(done.stderr or done.stdout)
+    try:
+        done = subprocess.run([*args, *fixed], cwd=pwd, text=True, capture_output=True, timeout=limit)
+    except subprocess.TimeoutExpired as error:
+        # The POST may have gone out before the timeout killed the child.
+        raise review_receipt.SubmissionError(
+            "review submission timed out; publication uncertain, reconcile before retry") from error
+    if done.returncode:
+        transient = review_receipt.record_failure(done.stderr or done.stdout)
+        if transient is not None:
+            raise review_receipt.SubmissionError(transient)
+        cause = bounded_cause((done.stderr or done.stdout).strip() or f"github-interface exited {done.returncode}")
+        raise review_budget.ReviewLimitError(
+            f"review submission rejected: {cause}", "review_contract_violation",
+            {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+             "phase": "submitting", "provider": model.provider, "stderr": cause, "submission": "rejected"})
+    receipt = review_receipt.record(done.stdout)
+    if receipt is None:
+        try:
+            reply = json.loads(done.stdout)
+        except ValueError:
+            reply = None
+        if isinstance(reply, dict) and reply.get("action") == "no_review":
+            cause = bounded_cause(json.dumps(reply.get("skipped", [])) or "no review submitted")
+            raise review_budget.ReviewLimitError(
+                f"review submission was a no-op: {cause}", "review_contract_violation",
+                {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+                 "phase": "submitting", "provider": model.provider, "stderr": cause, "submission": "noop"})
+        raise review_receipt.SubmissionError(
+            "review submission returned no receipt; publication uncertain, reconcile before retry")
     # The outer governed behavior reads authoritative review facts afterward,
     # including head supersession when GitHub correctly rejects a stale verdict.
     return raw.strip() + "\n" + (done.stdout or done.stderr).strip()
@@ -282,13 +362,20 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
             raise review_budget.ReviewLimitError("Review reached its total time limit", "review_budget_exhausted")
         done = watch.run(command, input=part, cwd=str(root), timeout=remaining, env=env, provider="codex")
         if done.returncode:
-            raise ValueError((done.stderr or done.stdout).strip() or f"codex exited {done.returncode}")
+            code, sig = (None, -done.returncode) if done.returncode < 0 else (done.returncode, None)
+            provider_failure(done.stderr.strip() or f"codex exited {done.returncode}",
+                             provider="codex", exit_code=code, signal=sig)
         # Startup item errors can be notices about disabled tools. Failed
         # turns and actual native tool executions still reject the verdict.
         observed_thread = None
+        completed_turns = 0
         for event in events(done.stdout):
             if event.get("type") in {"error", "turn.failed"}:
-                raise ValueError("Codex review did not complete successfully")
+                provider_error("codex", event.get("message") or "Codex review did not complete successfully")
+            if event.get("type") == "turn.completed":
+                completed_turns += 1
+                if completed_turns > 1:
+                    raise InvalidVerdict("Codex review returned duplicate completed turns")
             item = event.get("item") or {}
             if not isinstance(item, dict):
                 raise InvalidVerdict("invalid Codex review item")
@@ -349,7 +436,9 @@ def ask_grok(root: Path, model: Model, system: str, text: str, schema: dict, wat
         if "max turns reached" in (done.stderr + done.stdout).lower():
             raise review_budget.ReviewLimitError("Grok reached its model turn limit; needs attention",
                                                 "review_budget_exhausted")
-        provider_failure((done.stderr or done.stdout).strip() or f"agent exited {done.returncode}")
+        code, sig = (None, -done.returncode) if done.returncode < 0 else (done.returncode, None)
+        provider_failure(done.stderr.strip() or f"grok exited {done.returncode}",
+                         provider="grok", exit_code=code, signal=sig)
     reply = json.loads(done.stdout)
     if isinstance(reply, dict) and reply.get("stopReason") == "max_turns":
         raise review_budget.ReviewLimitError("Grok reached its model turn limit; needs attention",
@@ -376,11 +465,14 @@ def ask_antigravity(root: Path, model: Model, system: str, text: str, schema: di
     message = {"event": "user", "message": {"role": "user", "content": f"{system}\n\n{text}{instructions(schema)}"}}
     done = watch.run(args, input=json.dumps(message) + "\n", cwd=str(root), timeout=timeout, env=os.environ.copy(), provider="antigravity")
     if done.returncode:
-        raise ValueError((done.stderr or done.stdout).strip() or f"agy exited {done.returncode}")
+        code, sig = (None, -done.returncode) if done.returncode < 0 else (done.returncode, None)
+        provider_failure(done.stderr.strip() or f"agy exited {done.returncode}",
+                         provider="antigravity", exit_code=code, signal=sig)
     # With a schema the CLI adds a turn of its own to shape the answer, so
     # turns prove nothing; the steps do. A tool step, even one headless mode
     # auto-denied, is outside this adapter's contract.
     result = None
+    results = 0
     for event in events(done.stdout):
         kind = event.get("event")
         if kind == "step_update":
@@ -388,11 +480,14 @@ def ask_antigravity(root: Path, model: Model, system: str, text: str, schema: di
             if step not in {"user_input", "agent_response", "finish"}:
                 raise InvalidVerdict(f"Antigravity review used a tool: {step}")
         elif kind == "result":
+            results += 1
+            if results > 1:
+                raise InvalidVerdict("Antigravity review returned duplicate results")
             result = event.get("result")
     if not isinstance(result, dict):
         raise InvalidVerdict("Antigravity review returned no result")
     if result.get("status") != "SUCCESS":
-        raise ValueError(result.get("error") or f"Antigravity review ended with status {result.get('status')!r}")
+        provider_error("antigravity", result.get("error") or f"Antigravity review ended with status {result.get('status')!r}")
     if not isinstance(result.get("structured_output"), dict):
         raise InvalidVerdict("Antigravity review returned no structured verdict")
     return json.dumps(result["structured_output"])
@@ -437,8 +532,11 @@ def ask_muse(root: Path, model: Model, system: str, text: str, schema: dict, wat
     ]
     done = watch.run(args, input="", cwd=str(root), timeout=timeout, env=muse_environment(root), provider="muse")
     if done.returncode:
-        provider_failure((done.stderr or done.stdout).strip() or f"muse exited {done.returncode}")
+        code, sig = (None, -done.returncode) if done.returncode < 0 else (done.returncode, None)
+        provider_failure(done.stderr.strip() or f"muse exited {done.returncode}",
+                         provider="muse", exit_code=code, signal=sig)
     answer = None
+    terminals = 0
     for event in events(done.stdout):
         payload = event.get("payload") or {}
         kind = event.get("payload_type")
@@ -447,8 +545,11 @@ def ask_muse(root: Path, model: Model, system: str, text: str, schema: dict, wat
             if task.startswith("tool."):
                 raise InvalidVerdict(f"Muse review used a tool: {task}")
         elif isinstance(kind, str) and kind.startswith("run.terminal"):
+            terminals += 1
+            if terminals > 1:
+                raise InvalidVerdict("Muse review returned duplicate terminal events")
             if payload.get("terminal") != "completed":
-                raise ValueError(payload.get("reason") or f"Muse review ended with {payload.get('terminal')}")
+                provider_error("muse", payload.get("reason") or f"Muse review ended with {payload.get('terminal')}")
             answer = payload.get("text")
     if not isinstance(answer, str) or not answer.strip():
         raise InvalidVerdict("Muse review returned no answer")

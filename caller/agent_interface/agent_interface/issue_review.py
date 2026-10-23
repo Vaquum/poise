@@ -27,7 +27,7 @@ from time import monotonic, sleep, time
 from typing import Callable
 
 from . import progress, review_budget
-from .atoms import AgentPreflightError, provider_blocked
+from .atoms import AgentPreflightError, bounded_cause, provider_blocked
 from .model_catalog import Model
 from .provider_progress import ProviderStream, claude_error
 from .review_watch import _interrupted, _stop_process_group
@@ -54,6 +54,20 @@ logger = logging.getLogger(__name__)
 class InvalidReview(RuntimeError):
     code = "invalid_review_output"
 
+    def __init__(self, message: str, diagnostic: dict | None = None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+class ProviderFailure(RuntimeError):
+    """The issue-review provider ran and failed: an exit or signal, or an
+    error terminal despite a zero exit. Nothing was posted."""
+
+    def __init__(self, message: str, code: str, diagnostic: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.diagnostic = diagnostic
+
 
 def parse(issue: str) -> tuple[str, int]:
     raw = str(issue).strip()
@@ -70,12 +84,15 @@ def ref(repo: str, number: int) -> str:
 def interface(*args: str, seconds: float = 120) -> dict:
     # Its own process group: a timeout or a stop must also end the git it
     # started, which would otherwise keep working on a shared mirror.
+    # Check the budget before spawning so an exhausted budget never starts
+    # (and SIGKILLs) a fresh child.
+    limit = review_budget.timeout(seconds)
     process = subprocess.Popen(
         [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), *args],
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
     )
     try:
-        stdout, stderr = process.communicate(timeout=review_budget.timeout(seconds))
+        stdout, stderr = process.communicate(timeout=limit)
     except BaseException:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -168,7 +185,8 @@ def allowed(data: dict) -> list[str]:
             *(sub["issue"] for sub in data["sub_issues"] if "error" not in sub and "reviewed_by" not in sub)]
 
 
-def prompt(target: str, repo: str, checkout: dict, data: dict, output: Path, actor: str, note: str) -> str:
+def prompt(target: str, repo: str, checkout: dict, data: dict, output: Path, actor: str, note: str,
+           seconds: float | None = None) -> str:
     places = allowed(data)
     memories = f"Memories from the past:\n{note}\n\n" if note.strip() else ""
     readable = [sub["issue"] for sub in data["sub_issues"] if "error" not in sub]
@@ -176,6 +194,9 @@ def prompt(target: str, repo: str, checkout: dict, data: dict, output: Path, act
     already = (f"These already have an issue review: {', '.join(reviewed)}. Read them and that review for context, "
                f"but do not comment on them; put anything you would add in your comment on {target}.\n\n"
                if reviewed else "")
+    budget = (f"You have {int(seconds)} seconds from now to finish. Write {output.name} early "
+              "and keep it updated as you work; only what is in that file when time runs out can be used.\n\n"
+              if seconds else "")
     return (
         f"{memories}{INSTRUCTION.format(target=target)}\n\n"
         f"The issues directly linked to it are the sub-issues it makes part of itself: {', '.join(readable) or 'none'}. "
@@ -184,6 +205,7 @@ def prompt(target: str, repo: str, checkout: dict, data: dict, output: Path, act
         f"You run unattended with full access. The current directory is a fresh clone of {repo} "
         f"({checkout['branch']} at {checkout['head_sha']}): read anything, build, run the tests, "
         "use git history and GitHub as you see fit.\n\n"
+        f"{budget}"
         "Keep all throwaway files, dependency environments, downloads and test artifacts in "
         f"$TMPDIR ({output.parent.resolve() / 'tmp'}), not in shared /tmp. Caller removes this run's "
         "temporary directory after the review; repository access and tool permissions are unchanged.\n\n"
@@ -192,6 +214,34 @@ def prompt(target: str, repo: str, checkout: dict, data: dict, output: Path, act
         f"each under {MAX_COMMENT_CHARS} characters, only for {', '.join(places)}. Caller posts them as {actor}.\n\n"
         f"Packet:\n{json.dumps(data, indent=2)}"
     )
+
+
+MAX_ARTIFACT_BYTES = 5 * 1024 * 1024
+
+
+def artifact_status(path: Path) -> dict:
+    """What the provider left behind: presence, size, mtime and readability,
+    recorded before cleanup removes the evidence."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"present": False}
+    if not path.is_file() or path.is_symlink():
+        return {"present": True, "regular": False}
+    status = {"present": True, "regular": True, "bytes": stat.st_size, "mtime": stat.st_mtime}
+    if stat.st_size > MAX_ARTIFACT_BYTES:
+        return {**status, "readable": False, "error": "artifact exceeds its byte limit"}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        items = data.get("comments") if isinstance(data, dict) else None
+        status["readable"] = isinstance(items, list)
+        status["entries"] = len(items) if isinstance(items, list) else 0
+        if not isinstance(items, list):
+            status["error"] = "artifact is not {\"comments\": [...]}"
+    except (OSError, ValueError) as error:
+        status["readable"] = False
+        status["error"] = str(error)[:200]
+    return status
 
 
 def command(model: Model, text: str, checkout: Path, work: Path, seconds: float) -> tuple[list[str], str, dict]:
@@ -393,8 +443,14 @@ def comments(path: Path, places: list[str], repo: str) -> tuple[list[dict], list
     """The agent's comments, one per issue in `places` order; comments for
     any other issue are set aside and reported, never posted."""
     try:
-        data = json.loads(path.read_text())
+        if path.is_symlink() or not path.is_file():
+            raise InvalidReview(f"the agent left no regular review file at {path.name}")
+        if path.stat().st_size > MAX_ARTIFACT_BYTES:
+            raise InvalidReview(f"the agent review at {path.name} exceeds its byte limit")
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
+        if isinstance(error, InvalidReview):
+            raise
         raise InvalidReview(f"the agent left no readable review at {path.name}: {error}") from error
     items = data.get("comments") if isinstance(data, dict) else None
     if not isinstance(items, list):
@@ -440,33 +496,98 @@ def split(body: str, limit: int = MAX_COMMENT_CHARS) -> list[str]:
     return [*parts, body] if body else parts
 
 
+def _terminal_failure(provider: str, stdout: str) -> str | None:
+    """A provider-reported failure terminal, independent of process exit code.
+    A failed provider must not quietly become successful artifact output."""
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if provider == "codex" and event.get("type") in {"error", "turn.failed"}:
+            return str(event.get("message") or "Codex review did not complete successfully")
+        if provider == "claude" and event.get("type") == "result":
+            if event.get("is_error") or event.get("subtype") not in (None, "success"):
+                text = event.get("result")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+                errors = event.get("errors")
+                if isinstance(errors, list):
+                    joined = "\n".join(item for item in errors if isinstance(item, str))
+                    if joined.strip():
+                        return joined.strip()
+                return "Claude review reported an error"
+        if provider == "grok" and event.get("type") == "end" and event.get("stopReason") != "end_turn":
+            return f"Grok review ended with {event.get('stopReason')}"
+        if provider == "antigravity" and event.get("event") == "result":
+            result = event.get("result") or {}
+            if isinstance(result, dict) and result.get("status") != "SUCCESS":
+                return str(result.get("error") or f"Antigravity review ended with status {result.get('status')!r}")
+        if provider == "muse" and isinstance(event.get("payload_type"), str) \
+                and event["payload_type"].startswith("run.terminal"):
+            payload = event.get("payload") or {}
+            if payload.get("terminal") != "completed":
+                return str(payload.get("reason") or f"Muse review ended with {payload.get('terminal')}")
+    return None
+
+
 def review(model: Model, repo: str, number: int, data: dict, actor: str, note: str, work: Path) -> tuple[list[dict], list[str]]:
     """One full-power agent run in its own fresh checkout."""
     work.mkdir(parents=True)
     checkout = work / "repo"
     progress.stage("checking_out", f"Preparing a fresh checkout of {repo}", timeout=review_budget.timeout(1800))
-    info = interface("--checkout-repo", repo, "--path", str(checkout), "--token-user", actor, seconds=1800)
+    try:
+        info = interface("--checkout-repo", repo, "--path", str(checkout), "--token-user", actor, seconds=1800)
+    except subprocess.TimeoutExpired as error:
+        raise review_budget.ReviewLimitError(
+            "Issue review checkout reached its time limit; needs attention", "review_budget_exhausted",
+            {"version": 1, "source": "caller", "severity": "error", "operation": "issue.checkout",
+             "phase": "checking_out", "provider": model.provider}) from error
     output = work / "review.json"
-    text = prompt(ref(repo, number), repo, info, data, output, actor, note)
     seconds = review_budget.timeout(TIMEOUT_SECONDS, reserve=POST_RESERVE_SECONDS)
+    text = prompt(ref(repo, number), repo, info, data, output, actor, note, seconds)
     args, stdin, env = command(model, text, checkout, work, seconds)
     try:
         done = supervise(args, input=stdin, cwd=checkout, timeout=seconds, env=env, provider=model.provider, cleanup_root=work)
     except subprocess.TimeoutExpired as error:
-        raise review_budget.ReviewLimitError("Issue review reached its time limit; needs attention", "review_budget_exhausted") from error
-    if done.returncode:
+        status = artifact_status(output)
+        raise review_budget.ReviewLimitError(
+            "Issue review reached its time limit; needs attention", "review_budget_exhausted",
+            {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+             "phase": "provider_execution", "provider": model.provider,
+             "artifact": status, "submission": "none"}) from error
+    terminal = _terminal_failure(model.provider, done.stdout)
+    if done.returncode or terminal:
         # Claude's own result or stream diagnostics; a launch the subscription
         # wrapper refused says why on stderr.
-        error = claude_error(done.stdout) if model.provider == "claude" else provider_error(done.stdout, done.stderr)
-        error = error or done.stderr.strip()[-500:] or f"{model.provider} exited {done.returncode}"
+        raw = terminal or (claude_error(done.stdout) if model.provider == "claude"
+                           else provider_error(done.stdout, done.stderr))
+        raw = raw or done.stderr.strip()[-500:] or f"{model.provider} exited {done.returncode}"
+        error = bounded_cause(raw)
+        status = artifact_status(output)
+        diagnostic = {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+                      "phase": "provider_execution", "provider": model.provider,
+                      "exit_code": done.returncode if done.returncode > 0 else None,
+                      "signal": -done.returncode if done.returncode < 0 else None,
+                      "stderr": error, "artifact": status, "submission": "none"}
         if "output token maximum" in error or "context window limit" in error:
-            raise review_budget.ReviewLimitError(error)
+            raise review_budget.ReviewLimitError(error, diagnostic=diagnostic)
         # Held for a person, as a PR review is: relaunching cannot succeed until the account is fixed.
         if provider_blocked(error):
-            raise AgentPreflightError(error, "review_provider_blocked")
-        raise RuntimeError(error)
+            raise AgentPreflightError(error, "review_provider_blocked", diagnostic)
+        code = "review_provider_error" if terminal and not done.returncode else "review_provider_exit"
+        raise ProviderFailure(error, code, diagnostic)
     progress.stage("validating", "Validating review comments")
-    return comments(output, allowed(data), repo)
+    try:
+        return comments(output, allowed(data), repo)
+    except InvalidReview as error:
+        error.diagnostic = {"version": 1, "source": "caller", "severity": "error",
+                            "operation": "provider.review", "phase": "validating",
+                            "provider": model.provider, "artifact": artifact_status(output),
+                            "submission": "none"}
+        raise
 
 
 def provider_error(stdout: str, stderr: str) -> str:
@@ -488,6 +609,34 @@ def provider_error(stdout: str, stderr: str) -> str:
     return stderr.strip()[-500:]
 
 
+def _reconcile_post(repo: str, number: int, actor: str, call_id: str, seen: set[int]) -> dict | None:
+    """A comment lost to a timeout may still exist: match this call's marker
+    in the issue's comments rather than assuming failure. Already-receipted
+    comments are skipped, so a timed-out later part of a split body cannot
+    reconcile to an earlier part's comment."""
+    try:
+        comments = interface("--issue-comments", f"#{number}", "--repository", repo,
+                             "--token-user", actor).get("comments") or []
+    except Exception:
+        return None
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        match = MARKER_RE.search(str(comment.get("body") or ""))
+        if not match or match.group(1) != call_id:
+            continue
+        comment_id = comment.get("id")
+        if isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id in seen:
+            continue
+        author = comment.get("author")
+        if not isinstance(author, str):
+            user = comment.get("user") or {}
+            author = user.get("login") if isinstance(user, dict) else ""
+        return {"issue": ref(repo, number), "comment_id": comment_id,
+                "url": comment.get("html_url"), "author": str(author or "")}
+    return None
+
+
 def post(posts: list[dict], actor: str, call_id: str, model: str, record) -> list[dict]:
     """Post each comment as the actor. `record` is called with the receipts
     before the first comment and after every one, so a run that dies while
@@ -502,6 +651,19 @@ def post(posts: list[dict], actor: str, call_id: str, model: str, record) -> lis
                 f"<!-- agent-interface issue-review call={call_id} -->")
         try:
             reply = interface("--comment-issue", f"#{number}", "--repository", repo, "--token-user", actor, f"--body={body}")
+        except (subprocess.TimeoutExpired, review_budget.ReviewLimitError) as error:
+            # The comment may exist: reconcile through the call marker before
+            # calling it a failure. Unreconciled stays uncertain, never definite.
+            reconciled = _reconcile_post(repo, number, actor, call_id,
+                                           {receipt["comment_id"] for receipt in receipts})
+            if reconciled is not None:
+                receipts.append(reconciled)
+                record(receipts)
+                if str(reconciled.get("author") or "").lower() != actor.lower():
+                    raise RuntimeError(f"the comment on {item['issue']} was posted by {reconciled.get('author') or 'an unknown account'}, not {actor}")
+                continue
+            failures.append(f"{item['issue']}: uncertain publication ({type(error).__name__}); reconcile before retry")
+            continue
         except (RuntimeError, ValueError, subprocess.SubprocessError) as error:
             # A locked or deleted sub-issue must not cost the others their comment.
             failures.append(f"{item['issue']}: {str(error)[:300]}")
