@@ -556,7 +556,11 @@ export async function spawnRelay(options: RelaySpawnOptions): Promise<RelayConne
 export function livePromise(peer: RelayConnection): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const onError = (message: unknown) => { cleanup(); reject(new Error(`relay: ${String(message)}`)) }
-    const onExit = () => { cleanup(); reject(new Error('the relay went away during replay')) }
+    const onExit = () => {
+      // LIVE can resolve whenLive in the same decoder callback as EXITED.
+      // Let that already-queued boundary settle before treating exit as loss.
+      queueMicrotask(() => { cleanup(); reject(new Error('the relay went away during replay')) })
+    }
     const cleanup = () => {
       peer.off('relay-error', onError)
       peer.off('exit', onExit)

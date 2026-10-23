@@ -306,6 +306,9 @@ their persisted one-time answers without sending them again; completed filesyste
 requests never repeat their effects. The LIVE handoff waits until buffered spooled stdout reaches the adapter,
 including across an awaited outbound read. Relay termination follows gate stdio
 EOF, pending replay and final socket writes, so the last response precedes exit.
+A LIVE boundary decoded before exit retains its successful handoff even when
+both frames arrive in one socket callback. File-tool permission admission waits
+for replayed pre-image reads before allowing native writes.
 Historical request matching ends with
 the adopted turn. Each recorded RPC response is consumed once per occurrence,
 so the native agent can reuse its request ID after completing an earlier one.
