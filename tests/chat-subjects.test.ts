@@ -2,7 +2,7 @@
 // reset and delete. The earlier conversation is empty here; its import is
 // covered in tests/chat-legacy-import.test.ts.
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -109,6 +109,7 @@ beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-chat-subjects-test-'))
   vi.stubEnv('POISE_DB', join(root, 'chat.sqlite3'))
   vi.stubEnv('POISE_LOCK_DIR', join(root, 'locks'))
+  vi.stubEnv('POISE_EDITOR_DIR', join(root, 'editor'))
   ;({ ChatRuntime: Runtime } = await import('../server/chat/runtime'))
   ;({ ChatSocketServer: SocketServer, handleChatApi } = await import('../server/chat/transport'))
   storage = await import('../server/chat/storage')
@@ -160,6 +161,57 @@ describe('one session per subject', () => {
     expect((((await missing.json()) as any).session)).toBeNull()
   }, 60_000)
 
+  it('accepts the Editor surfaces and finds their legacy ids on the server', async () => {
+    const chat = await import('../server/chat')
+    const history = vi.mocked(chat.listChatHistory)
+    const editorDir = join(root, 'editor')
+    await mkdir(editorDir, { recursive: true })
+    const docId = 'editor-brief-1769500000000'
+    const forgedDocId = 'editor-other-1769500000000'
+    await writeFile(join(editorDir, 'brief.chat.json'), JSON.stringify({ session_id: docId, created_at: '2026-10-20T10:00:00.000Z' }))
+    await writeFile(join(editorDir, 'other.chat.json'), JSON.stringify({ session_id: forgedDocId, created_at: '2026-10-20T10:00:00.000Z' }))
+    const passageNew = 'editor-brief-1769500000000042'
+    const passageOld = 'ann-qncjuig3'
+    const annotation = (id: string, sessionId: string) => ({
+      id, session_id: sessionId,
+      range: { start_line: 0, start_offset: 0, end_line: 0, end_offset: 5 },
+      snippet: 'hello', comment: '', created_at: '2026-10-20T10:00:00.000Z', updated_at: '2026-10-20T10:00:00.000Z',
+    })
+    await writeFile(join(editorDir, 'brief.annotations.json'), JSON.stringify({
+      annotations: [annotation('ann-fresh', passageNew), annotation('ann-stale', passageOld)],
+    }))
+    const rows = (sessionId: string) => [{
+      id: 'a'.repeat(32), session_id: sessionId, prompt: `question for ${sessionId}`,
+      started_at: '2026-10-20T10:00:00.000Z', status: 'completed', response: 'abcd1234', behavior: 'chat' as const, error: '',
+    }]
+    history.mockImplementation(async (id: string) => [docId, forgedDocId, passageNew, passageOld].includes(id) ? rows(id) : [])
+    try {
+      const doc = await postSessions(createBody({ surface: 'editor-document', key: 'brief', label: 'Brief' }))
+      expect(doc.status).toBe(201)
+      expect(doc.json.session.importedFrom).toBe(docId)
+      const fresh = await postSessions(createBody({ surface: 'editor-passage', key: 'brief:ann-fresh', label: 'A passage' }))
+      expect(fresh.status).toBe(201)
+      expect(fresh.json.session.importedFrom).toBe(passageNew)
+      const stale = await postSessions(createBody({ surface: 'editor-passage', key: 'brief:ann-stale', label: 'A passage' }))
+      expect(stale.status).toBe(201)
+      expect(stale.json.session.importedFrom).toBe(passageOld)
+      expect(history).toHaveBeenCalledWith(docId)
+      expect(history).toHaveBeenCalledWith(passageNew)
+      expect(history).toHaveBeenCalledWith(passageOld)
+      // A review has no legacy id; an id sent by the client is ignored.
+      const review = await postSessions({ ...createBody({ surface: 'editor-review', key: 'brief:IC_review1', label: 'A review' }), legacyId: passageOld })
+      expect(review.status).toBe(201)
+      expect(review.json.session.importedFrom).toBeUndefined()
+      const forged = await postSessions({ ...createBody({ surface: 'editor-document', key: 'other', label: 'Other' }), legacyId: 'forged-id' })
+      expect(forged.status).toBe(201)
+      expect(forged.json.session.importedFrom).toBe(forgedDocId)
+      expect(history).not.toHaveBeenCalledWith('forged-id')
+    } finally {
+      history.mockReset()
+      history.mockResolvedValue([])
+    }
+  }, 120_000)
+
   it('creates exactly one session when two requests send the same subject at once', async () => {
     const socket = await connect()
     const rest = postSessions(createBody(issue()))
@@ -187,12 +239,20 @@ describe('one session per subject', () => {
 
   it('rejects an unknown surface, a malformed key and a non-GitHub url', async () => {
     const bad = [
-      { surface: 'editor-document', key: 'poise.card.1', label: 'x' },
+      { surface: 'archive', key: 'poise.card.1', label: 'x' },
       { surface: 'current', key: 'poise.card.abc', label: 'x' },
       { surface: 'current', key: 'poise.Card.1', label: 'x' },
       { surface: 'current', key: 'poise.issue.acme/app', label: 'x' },
       { surface: 'current', key: 'poise.card.1', label: 'x', url: 'https://example.com/x' },
       { surface: 'current', key: 'poise.card.1', label: '' },
+      { surface: 'editor-document', key: '../escape', label: 'x' },
+      { surface: 'editor-document', key: '', label: 'x' },
+      { surface: 'editor-passage', key: 'brief', label: 'x' },
+      { surface: 'editor-passage', key: 'brief:', label: 'x' },
+      { surface: 'editor-passage', key: 'brief:ann with space', label: 'x' },
+      { surface: 'editor-passage', key: 'brief:ann:extra', label: 'x' },
+      { surface: 'editor-review', key: 'brief', label: 'x' },
+      { surface: 'editor-review', key: 'brief:IC_some review', label: 'x' },
     ]
     for (const subject of bad) {
       const response = await postSessions({ agent: 'grok', model: 'grok-4.6-xhigh', subject })

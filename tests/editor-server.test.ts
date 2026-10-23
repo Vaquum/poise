@@ -361,13 +361,6 @@ describe('editor file integrity', () => {
     await expect(editor.readDoc('delete-race')).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('keeps one chat session under concurrent creation', async () => {
-    const sessions = await Promise.all(
-      Array.from({ length: 10 }, () => editor.getOrCreateChatSession('chat-race')),
-    )
-    expect(new Set(sessions.map((session) => session.session_id))).toHaveLength(1)
-  })
-
   it('rejects oversized UTF-8 documents without replacing existing data', async () => {
     await editor.writeDoc('size-limit', '# safe')
     const oversized = '€'.repeat(Math.floor(editor.MAX_DOC_BYTES / 3) + 1)

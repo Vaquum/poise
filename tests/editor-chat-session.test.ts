@@ -1,40 +1,40 @@
-import { describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { existsSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-import { slugFromEditorSession } from '../server/editor'
+type EditorModule = typeof import('../server/editor')
 
-// server/chat.ts attaches the voice guide, the document's current body and the
-// edit-proposal contract to a chat *only* when slugFromEditorSession matches.
-// Annotation chats used to carry their own `ann-xxxxxxxx` id, which never
-// matches, so "Ask the agent about this passage" reached the agent as nothing
-// but the snippet in quotes — asked what a passage said, it answered "The
-// working directory is empty."
-//
-// The editor now mints annotation sessions in this format, so these cases pin
-// the contract the client depends on.
-describe('editor chat session identity', () => {
-  it('accepts the format the editor mints, including the uniqueness digits', () => {
-    // `${Date.now()}${3 random digits}` — all digits, as the lookup requires.
-    expect(slugFromEditorSession('editor-untitled-20260722112438933-1769500000000042'))
-      .toBe('untitled-20260722112438933')
-  })
+let editor: EditorModule
+let editorDir: string
+let previousEditorDir: string | undefined
 
-  it('extracts slugs that themselves contain dashes', () => {
-    const slug = 'untitled-20260722112438933-7ad2fea8-8827-42db-8799-dae466b6e4ac'
-    expect(slugFromEditorSession(`editor-${slug}-1769500000000`)).toBe(slug)
-  })
+beforeAll(async () => {
+  editorDir = await mkdtemp(join(tmpdir(), 'poise-editor-chat-session-test-'))
+  previousEditorDir = process.env.POISE_EDITOR_DIR
+  process.env.POISE_EDITOR_DIR = editorDir
+  editor = await import('../server/editor')
+})
 
-  it('rejects the old annotation-scoped ids that carried no document', () => {
-    expect(slugFromEditorSession('ann-qncjuig3')).toBeNull()
-    expect(slugFromEditorSession('ann-4f2a9c1b')).toBeNull()
-  })
+afterAll(async () => {
+  if (previousEditorDir === undefined) delete process.env.POISE_EDITOR_DIR
+  else process.env.POISE_EDITOR_DIR = previousEditorDir
+  await rm(editorDir, { recursive: true, force: true })
+})
 
-  it('rejects ids whose tail is not purely numeric', () => {
-    expect(slugFromEditorSession('editor-some-slug-12a4')).toBeNull()
-    expect(slugFromEditorSession('editor-some-slug-')).toBeNull()
-  })
-
-  it('rejects unrelated session ids', () => {
-    expect(slugFromEditorSession('')).toBeNull()
-    expect(slugFromEditorSession('card-123')).toBeNull()
+// The legacy per-doc conversation id lives in a side-car the Editor used to
+// mint. Nothing mints one anymore; the lookup stays read-only so a doc's
+// first Chat session can import its earlier conversation.
+describe('editor legacy chat session', () => {
+  it("reads a document's legacy chat id without minting one", async () => {
+    expect(await editor.peekChatSession('untouched')).toBeNull()
+    expect(existsSync(join(editorDir, 'untouched.chat.json'))).toBe(false)
+    await writeFile(join(editorDir, 'brief.chat.json'), JSON.stringify({ session_id: 'editor-brief-1769500000000', created_at: '2026-10-20T10:00:00.000Z' }))
+    expect(await editor.peekChatSession('brief')).toBe('editor-brief-1769500000000')
+    await writeFile(join(editorDir, 'broken.chat.json'), '{oops')
+    expect(await editor.peekChatSession('broken')).toBeNull()
+    await writeFile(join(editorDir, 'empty.chat.json'), JSON.stringify({ session_id: '', created_at: '2026-10-20T10:00:00.000Z' }))
+    expect(await editor.peekChatSession('empty')).toBeNull()
   })
 })

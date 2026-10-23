@@ -36,6 +36,8 @@ import { autoMergeInstructions, withAutoMergeInstructions } from './auto-merge'
 import { steeringContext } from './steering-context'
 import { parseChatCommandChain, commandBody } from './commands'
 import { latestReviewTarget, prepareReview, type ReviewTarget } from './review'
+import { prepareEditorContext, removeEditorContext } from './editor-context'
+import { tryParseStructuredReply } from '../../src/edit-proposals'
 import type { AutoMergeAck, SafeModeAck } from './protocol'
 import type { ChildProcess } from 'node:child_process'
 import { mkdir, rm, rmdir, writeFile } from 'node:fs/promises'
@@ -60,7 +62,7 @@ import {
   inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
 } from './git'
 import {
-  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
+  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type EditDecision, type NewSessionRequest,
   type Mention, type PermissionOption, type PersonActor, type PoiseActor, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
@@ -872,6 +874,35 @@ export class ChatRuntime extends EventEmitter {
     if (!record) throw new ChatError(404, 'unknown session', 'unknown_session')
     if (record.instance !== this.instance) throw new ChatError(409, `this session belongs to another Poise server (${record.instance})`, 'foreign_session')
     this.emit_(id, event)
+  }
+
+  /** Record the person's decision on one proposed edit card. The stored
+   *  message is re-parsed with the same parser the transcript renders with,
+   *  so a card index means the same on both sides. An unfinished turn, an
+   *  unknown message or an index the parser does not produce is refused;
+   *  otherwise the decision is recorded and the last one for a card wins. */
+  async decideEdit(sessionId: string, request: { turnId: string, messageId: string, index: number, decision: EditDecision }): Promise<void> {
+    const record = storage.getSession(sessionId)
+    if (!record) throw new ChatError(404, 'unknown session', 'unknown_session')
+    if (record.instance !== this.instance) throw new ChatError(409, `this session belongs to another Poise server (${record.instance})`, 'foreign_session')
+    let finished = false
+    let text: string | null = null
+    let cursor = 0
+    for (;;) {
+      const page = storage.listEvents(sessionId, cursor)
+      for (const { event } of page.events) {
+        if (event.type === 'turn.finished' && event.turnId === request.turnId) finished = true
+        else if (event.type === 'text.delta' && event.turnId === request.turnId && event.messageId === request.messageId) {
+          text = (text ?? '') + event.delta
+        }
+      }
+      if (!page.truncated || !page.events.length) break
+      cursor = page.events[page.events.length - 1].seq
+    }
+    if (!finished || text === null) throw new ChatError(409, 'no such edit card', 'invalid')
+    const edits = tryParseStructuredReply(text)?.edits ?? []
+    if (request.index >= edits.length) throw new ChatError(409, 'no such edit card', 'invalid')
+    this.emit_(sessionId, { type: 'edit.decided', turnId: request.turnId, messageId: request.messageId, index: request.index, decision: request.decision })
   }
 
   private async createSession(request: NewSessionRequest, isolated = false, createdBy?: ChatActor): Promise<SessionRecord> {
@@ -2017,7 +2048,7 @@ export class ChatRuntime extends EventEmitter {
   }
 
   private async removeAttachments(session: LiveSession): Promise<void> {
-    for (const directory of [ATTACHMENT_DIR, '.poise-chat/reviews']) {
+    for (const directory of [ATTACHMENT_DIR, '.poise-chat/reviews', '.poise-chat/context']) {
       try {
         const { absolute } = await resolveInsideCheckout(session.record.checkout, `${directory}/${session.record.id}`)
         await rm(absolute, { recursive: true, force: true })
@@ -2078,6 +2109,7 @@ export class ChatRuntime extends EventEmitter {
     let agentInvoked = false
     let checkoutBefore: CheckoutSnapshot | null = null
     let started = false
+    let editorContext = false
     session.draining = false
     try {
       if (turn.abort.signal.aborted) throw new Error(turn.failure || 'cancelled before it started')
@@ -2177,6 +2209,14 @@ export class ChatRuntime extends EventEmitter {
       }
       let adapterInput = await this.resolveInput(session, nativeInput, turn.queueItem?.sourceSessionId)
       if (turn.review) adapterInput = await prepareReview(record.checkout, record.id, turn.id, turn.review.throughSeq, turn.review.target, { ...adapterInput, text: input.text }, turn.abort.signal)
+      // Every ordinary turn of an Editor session reads the voice guide, the
+      // saved document and the edit format from a read-only file written
+      // here, under the held lease. A /review, /compact or bare /reset turn
+      // is about the conversation and gets none.
+      if (!turn.review && turn.contextAction !== 'compact' && record.subject?.surface.startsWith('editor-')) {
+        adapterInput = await prepareEditorContext(record.checkout, record, turn.id, adapterInput, turn.abort.signal)
+        editorContext = true
+      }
       if (session.staged) {
         const report = await refreshDocument(record.checkout, session.staged)
         if (report.kind === 'refreshed' || report.kind === 'staged') this.saveRecord(session)
@@ -2277,6 +2317,7 @@ export class ChatRuntime extends EventEmitter {
     } finally {
       turn.releasePrompt()
       this.releaseLocalTurnSlot(turn)
+      if (editorContext) await removeEditorContext(record.checkout, record.id, turn.id)
       if (record.contextCompacting) {
         record.contextCompacting = false
         try { this.saveRecord(session); this.emit_(record.id, { type: 'session.updated', session: record }) }
