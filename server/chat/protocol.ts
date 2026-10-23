@@ -104,6 +104,8 @@ export interface SessionRecord {
   contextCompacting?: boolean
   /** Server-owned pending tasks; never copied when a session is forked. */
   queue?: MessageQueue
+  /** Live timer summaries; computed on a copy, never stored. */
+  timers?: TimerSummary[]
   /** A queued cross-agent handoff survives a startup failure or restart. */
   queuedHandoff?: string
   id: string
@@ -298,10 +300,46 @@ export interface PlanEntry {
 export interface ChatActor { kind: 'chat', sessionId: string, title: string, role?: 'manager' }
 /** Poise itself acting on a chat: supervision, the work monitor, or a relay. */
 export interface PoiseActor { kind: 'poise', name: string }
-/** What started a turn the person did not start: a chat or Poise, delivered
- *  through the control inbox. `seq` is the delivered inbox row, absent when
- *  the turn continues a deferred steer rather than an inbox delivery. */
-export type TurnSource = (ChatActor | PoiseActor) & { seq?: number }
+/** The person, acting from the browser: a Stop, a hold, or a timer they set. */
+export interface PersonActor { kind: 'person' }
+/** What started a turn the person did not start: a chat, Poise, or a timer.
+ *  `seq` is the delivered inbox row, absent for a deferred steer. Timer
+ *  sources retain the required delivered inbox row and firing metadata. */
+export type TurnSource = ((ChatActor | PoiseActor) & { seq?: number })
+  | { kind: 'timer', timerId: string, label: string, setBy: ChatActor | PersonActor, missed: number, dueAt: string, seq: number }
+
+/** One durable timer on a chat, as the Timers pane and session records show
+ *  it. Times are ISO strings; `nextAt` is null once nothing is scheduled. */
+export interface TimerSummary {
+  id: string
+  sessionId: string
+  label: string
+  /** The message's first 200 code points, then `…` when cut. */
+  preview: string
+  schedule: { kind: 'once', delayMinutes: number } | { kind: 'every', minutes: number }
+  nextAt: string | null
+  /** A failed timer waits until this time before its next turn, if set. */
+  notBefore: string | null
+  state: 'active' | 'held' | 'tripped' | 'done' | 'cancelled' | 'expired'
+  reason?: 'person_stopped' | 'person_held' | 'all_held' | 'failed_3_times' | 'completed' | 'turn_failed'
+    | 'target_deleted' | 'creator_deleted' | 'cancelled_by_person' | 'cancelled_by_manager' | 'skipped_while_held'
+  setBy: ChatActor | PersonActor
+  failures: number
+  skipped: number
+  /** Set while a firing is fired but not yet admitted. */
+  pending?: { since: string, missed: number, waitingFor?: 'starting' | 'queued' | 'running' | 'waiting' | 'stopping'
+    | 'maintenance' | 'queue' | 'reopening' | 'model' | 'person' | 'update' | 'backoff' }
+  createdAt: string
+}
+/** A timer with its full message: the control `timers` operation and the
+ *  person's Timers pane read these, never other chats' summaries. */
+export type TimerView = TimerSummary & { message: string }
+/** What creating a timer takes: exactly one of the two schedules. */
+export interface TimerInput { sessionId: string, label: string, message: string, delayMinutes?: number, everyMinutes?: number }
+/** One chat's hold: its timers skip their firings and turns other chats
+ *  would start in it wait. `stopped` clears on the person's next message or
+ *  Resume; `held` clears only on Resume. */
+export interface ChatHold { sessionId: string, cause: 'stopped' | 'held', since: string }
 
 export interface Attachment {
   /** Server-issued id; the record behind it is what a prompt is checked against. */
@@ -341,7 +379,8 @@ export type ChatEvent =
   | { type: 'status.changed', status: SessionStatus, queuedBehind?: string, detail?: string }
   | { type: 'turn.started', turnId: string, prompt: PromptInput, callId?: string, queueItemId?: string, agent?: AgentId, model?: string, source?: TurnSource }
   | { type: 'steer.sent', turnId: string, text: string, attachments?: Attachment[], mentions?: Mention[], source?: ChatActor | PoiseActor }
-  | { type: 'turn.finished', turnId: string, stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, stoppedBy?: ChatActor }
+  | { type: 'turn.finished', turnId: string, stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, stoppedBy?: ChatActor | PersonActor }
+  | { type: 'timer.changed', timer: TimerSummary, change: 'created' | 'cancelled' | 'held' | 'released' | 'tripped' | 'rearmed' | 'ended', by?: ChatActor | PersonActor | PoiseActor, error?: string }
   | { type: 'text.delta', turnId: string, messageId: string, delta: string }
   | { type: 'thought.delta', turnId: string, messageId: string, delta: string }
   | { type: 'tool.started', turnId: string, id: string, kind: ToolKind, title: string, locations?: ToolLocation[], input?: unknown }
@@ -423,6 +462,11 @@ export type ChatCommand =
   | { type: 'queue.remove', sessionId: string, itemId: string }
   | { type: 'steer', sessionId: string, text: string, attachments?: Attachment[], mentions?: Mention[] }
   | { type: 'cancel', sessionId: string }
+  | { type: 'timer.create', sessionId: string, label: string, message: string, delayMinutes?: number, everyMinutes?: number }
+  | { type: 'timer.cancel', timerId: string }
+  | { type: 'timer.rearm', timerId: string }
+  | { type: 'chat.hold', sessionId: string, held: boolean }
+  | { type: 'timers.holdAll', held: boolean }
   | { type: 'permission.respond', sessionId: string, id: string, optionId: string }
   | { type: 'question.answer', sessionId: string, id: string, answers: Record<string, string | string[]> }
   | { type: 'set_model', sessionId: string, model: string, effort?: string }

@@ -19,11 +19,13 @@ import type {
   ContentBlock,
   LegacyConversation,
   PermissionOption,
+  PersonActor,
   PlanEntry,
   PoiseActor,
   PromptInput,
   Question,
   StopReason,
+  TimerSummary,
   ToolKind,
   ToolLocation,
   ToolStatus,
@@ -105,7 +107,7 @@ export interface TurnModel extends Keyed {
   /** Set locally the moment a prompt is sent, cleared when turn.started lands. */
   optimistic?: boolean
   /** `at` is the server's time on the turn.finished envelope: when the turn ended. */
-  finished?: { stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, stoppedBy?: ChatActor, at: string }
+  finished?: { stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, stoppedBy?: ChatActor | PersonActor, at: string }
 }
 
 export type Block =
@@ -191,12 +193,37 @@ export function shortActorTitle(title: string): string {
 }
 
 /** Plain-text name of a chat or Poise actor for transcript labels. Pure, so
- *  unit tests prove the same mapping the transcript renders. */
-export function actorName(actor: ChatActor | PoiseActor | undefined): string {
+ *  unit tests prove the same mapping the transcript renders. A timer source
+ *  names the chat or person that set it. */
+export function actorName(actor: ChatActor | PoiseActor | PersonActor | TurnSource | undefined): string {
   if (!actor) return 'another chat'
   if (actor.kind === 'poise') return actor.name
+  if (actor.kind === 'person') return 'you'
+  if (actor.kind === 'timer') return timerSetterName(actor.setBy)
   if (actor.role === 'manager') return 'Manager'
   return actor.title ? `chat "${shortActorTitle(actor.title)}"` : 'another chat'
+}
+
+/** Who set a timer, in transcript and pane words. */
+export function timerSetterName(setBy: ChatActor | PersonActor): string {
+  if (setBy.kind === 'person') return 'you'
+  if (setBy.role === 'manager') return 'Manager'
+  return actorName(setBy)
+}
+
+/** One timer change as a transcript note. Pure; the note renderer escapes it. */
+export function timerChangedText(timer: TimerSummary, change: 'created' | 'cancelled' | 'held' | 'released' | 'tripped' | 'rearmed' | 'ended', error?: string): string {
+  const name = `Timer "${timer.label}"`
+  const schedule = timer.schedule.kind === 'every' ? `every ${timer.schedule.minutes} min` : `once in ${timer.schedule.delayMinutes} min`
+  switch (change) {
+    case 'created': return `${name} set by ${timerSetterName(timer.setBy)} · ${schedule}`
+    case 'cancelled': return `${name} cancelled`
+    case 'held': return `${name} put on hold`
+    case 'released': return `${name} resumed`
+    case 'tripped': return `${name} stopped after 3 failed turns: ${error || 'unknown error'}. Re-arm it from Timers.`
+    case 'rearmed': return `${name} re-armed`
+    case 'ended': return `${name} ended`
+  }
 }
 
 /** Tooltip for an actor label: the full frozen title and the short chat ID,
@@ -430,6 +457,12 @@ export function applyEvent(model: TranscriptModel, env: ChatEnvelope): void {
     }
     case 'session.closed': {
       const block: Block = { kind: 'note', key: `note:${env.seq}`, rev: 0, text: `Session closed${e.reason ? ` — ${e.reason}` : ''}` }
+      model.blocks.push(block)
+      bump(model, block)
+      return
+    }
+    case 'timer.changed': {
+      const block: Block = { kind: 'note', key: `timer:${env.seq}`, rev: 0, text: timerChangedText(e.timer, e.change, e.error) }
       model.blocks.push(block)
       bump(model, block)
       return
@@ -768,8 +801,8 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
 
   /** An actor's name in a label: a button selecting its chat while the chat
    *  exists, plain text with a deleted marker once it is gone. */
-  function actorHtml(actor: ChatActor | PoiseActor | undefined, ctx: RenderContext): string {
-    if (!actor || actor.kind === 'poise' || !actor.title) return `<span>${escapeHtml(actorName(actor))}</span>`
+  function actorHtml(actor: ChatActor | PoiseActor | PersonActor | undefined, ctx: RenderContext): string {
+    if (!actor || actor.kind === 'poise' || actor.kind === 'person' || !actor.title) return `<span>${escapeHtml(actorName(actor))}</span>`
     const label = escapeHtml(actorName(actor))
     const tip = escapeHtml(actorTitleAttr(actor))
     if ((ctx.chats || []).some((c) => c.id === actor.sessionId)) {
@@ -783,6 +816,11 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     const extrasHtml = contextExtras(p)
     const queued = turn.queueItemId ? `<div class="chat-turn-queued">From queue${turn.agent ? ` · ${escapeHtml(AGENT_LABELS[turn.agent])}` : ''}${turn.model ? ` · ${escapeHtml(consoleModelLabel(turn.model))}` : ''}</div>` : ''
     if (turn.source) {
+      if (turn.source.kind === 'timer') {
+        const collapsed = turn.source.missed ? ` · ${turn.source.missed} earlier firing${turn.source.missed === 1 ? '' : 's'} collapsed` : ''
+        const from = `Timer "${escapeHtml(turn.source.label)}" · set by ${escapeHtml(timerSetterName(turn.source.setBy))}${collapsed}`
+        return `${queued}<div class="chat-msg chat-msg-chat"><div class="chat-msg-body"><div class="chat-msg-source">${from}</div>${escapeHtml(p.text)}${extrasHtml}</div></div>`
+      }
       const from = turn.source.kind === 'poise'
         ? `From ${escapeHtml(turn.source.name)}`
         : `Message from ${actorHtml(turn.source, ctx)}`
