@@ -11,6 +11,7 @@ import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/t
 import type { CheckoutLeaseOptions } from '../server/chat/checkout-lock'
 import type { ResolvedServer } from '../server/extensions/types'
 import type { Capabilities, ChatEvent, PromptInput, SessionRecord, SwitchboardItem, SwitchboardState } from '../server/chat/protocol'
+import { SLOT_WAIT_REASON } from '../server/chat/protocol'
 import type { ChatRuntime } from '../server/chat/runtime'
 import type { ChatControl } from '../server/chat/control'
 import type { Switchboard } from '../server/chat/switchboard'
@@ -69,35 +70,80 @@ function adapter(host: AdapterHost): Adapter {
   }
 }
 /** Waits for a condition, running ChatControl's delivery now rather than on its one-second timer. */
-interface ReadinessBudget { deadline: number, sessions: string[] }
+interface ReadinessBudget {
+  deadline: number
+  signal: AbortSignal
+  cursors: Map<string, number>
+  session: (id: string) => Pick<SessionRecord, 'status' | 'lastSeq'> | undefined
+  events: (id: string, after: number) => ChatEvent[]
+  tick: () => Promise<void>
+  rejected?: () => string | undefined
+}
+function readinessBudget(deadline: number, signal: AbortSignal): ReadinessBudget {
+  const observed = runtime, delivery = control
+  return { deadline, signal, cursors: new Map(), session: id => observed.get(id),
+    events: (id, after) => observed.events(id, after).events.map(row => row.event), tick: () => delivery.tick() }
+}
+function slotFailure(phase: 'busy' | 'waiting' | 'board', session: Pick<SessionRecord, 'status' | 'queuedBehind'> | undefined, prompted: boolean): string | undefined {
+  if (phase === 'waiting' && (prompted || session?.status === 'running')) return 'the capped chat started'
+  if (phase !== 'waiting' && session?.queuedBehind === SLOT_WAIT_REASON) return 'the required turn is waiting for a free agent slot'
+}
+function boardFailure(state: Pick<SwitchboardState, 'status' | 'error'>, session: Pick<SessionRecord, 'status' | 'queuedBehind'> | undefined, prompted: boolean): string | undefined {
+  return state.status === 'stopped' && state.error ? state.error : slotFailure('board', session, prompted)
+}
+async function withinReadiness<T>(pending: Promise<T>, label: string, budget: ReadinessBudget): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let abort!: () => void
+  const stopped = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(budget.signal.reason)
+    budget.signal.addEventListener('abort', abort, { once: true })
+    timer = setTimeout(() => reject(new Error(`switchboard fixture deadline: ${label}`)), Math.max(0, budget.deadline - Date.now()))
+    if (budget.signal.aborted) abort()
+  })
+  try {
+    const result = await Promise.race([pending, stopped])
+    budget.signal.throwIfAborted()
+    if (Date.now() >= budget.deadline) throw new Error(`switchboard fixture deadline: ${label}`)
+    return result
+  }
+  finally { clearTimeout(timer); budget.signal.removeEventListener('abort', abort) }
+}
 async function until(check: () => boolean, label: string, budget?: ReadinessBudget) {
   const deadline = budget?.deadline ?? Date.now() + 8000
-  const cursors = new Map((budget?.sessions ?? []).map(id => [id, runtime.get(id)?.lastSeq ?? 0]))
   const healthy = (): void => {
-    for (const [id, cursor] of cursors) {
-      const session = runtime.get(id)
+    if (!budget) return
+    budget.signal.throwIfAborted()
+    for (const [id, cursor] of budget.cursors) {
+      const session = budget.session(id)
       if (session && session.lastSeq > cursor) {
-        for (const { event } of runtime.events(id, cursor).events) {
+        for (const event of budget.events(id, cursor)) {
           if (event.type === 'error') throw new Error(`switchboard fixture session ${id} failed: ${event.message}`)
           if (event.type === 'turn.finished' && event.stopReason === 'error') {
             throw new Error(`switchboard fixture session ${id} failed: ${event.error || 'turn failed'}`)
           }
         }
-        cursors.set(id, session.lastSeq)
+        budget.cursors.set(id, session.lastSeq)
       }
-      if (!session || ['error', 'closed', 'interrupted'].includes(session.status)) {
+      if (!session || ['error', 'closed', 'interrupted', 'stopping'].includes(session.status)) {
         throw new Error(`switchboard fixture session ${id} became ${session?.status ?? 'missing'}: ${label}`)
       }
     }
+    const rejection = budget?.rejected?.()
+    if (rejection) throw new Error(`switchboard fixture rejected ${label}: ${rejection}`)
+    if (budget && Date.now() >= deadline) throw new Error(`switchboard fixture deadline: ${label}`)
   }
   while (Date.now() < deadline) {
     healthy()
     if (check()) return
-    await control.tick()
+    if (budget) await withinReadiness(budget.tick(), label, budget)
+    else await control.tick()
     healthy()
     if (check()) return
-    await new Promise(done => setTimeout(done, 15))
+    const poll = new Promise<void>(done => setTimeout(done, 15))
+    if (budget) await withinReadiness(poll, label, budget)
+    else await poll
   }
+  healthy()
   throw new Error(`switchboard fixture deadline: ${label}`)
 }
 function makeRuntime(leaseProbes?: CheckoutLeaseOptions) {
@@ -195,8 +241,9 @@ function inboxRows(recipient: string) {
 function failures(): number {
   return (database.db.prepare('SELECT failures FROM chat_switchboard WHERE instance = ?').get(instance) as { failures: number }).failures
 }
-async function started(): Promise<string> {
+async function started(signal?: AbortSignal): Promise<string> {
   const { status, body } = await rest('/start')
+  signal?.throwIfAborted()
   expect(status).toBe(200)
   return (body as SwitchboardState).sessionId!
 }
@@ -235,10 +282,7 @@ beforeAll(async () => {
   producers = await import('../server/alerts/producers')
   database = await import('../server/db')
 })
-let broken = ''
-beforeEach(async ({ task, skip, onTestFailed }) => {
-  if (broken) skip(`Switchboard fixture stopped after: ${broken}`)
-  onTestFailed(() => { broken ||= task.name })
+beforeEach(async () => {
   catalog = CATALOG
   probe = async () => ({ ok: true })
   slots = 4
@@ -265,6 +309,88 @@ afterEach(async () => {
   await new Promise<void>(done => server.close(() => done()))
 })
 afterAll(async () => { database.closeDatabase(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }) })
+
+describe('budgeted fixture readiness', () => {
+  function probe(deadline = Date.now() + 1000, signal = new AbortController().signal): ReadinessBudget {
+    return { deadline, signal, cursors: new Map(), session: () => undefined, events: () => [], tick: vi.fn<() => Promise<void>>().mockResolvedValue(undefined) }
+  }
+
+  it.each<ChatEvent>([
+    { type: 'error', message: 'failure between waits', recoverable: true },
+    { type: 'turn.finished', turnId: 'fixture', stopReason: 'error', error: 'failure between waits' },
+  ])('retains the error cursor while provisioning between waits: $type', async (event) => {
+    const budget = probe()
+    const events: ChatEvent[] = []
+    budget.cursors.set('target', 0)
+    budget.session = () => ({ status: 'idle', lastSeq: events.length })
+    budget.events = (_id, after) => events.slice(after)
+    await until(() => true, 'before provisioning', budget)
+    events.push(event)
+    const injected = performance.now()
+    await expect(until(() => true, 'after provisioning', budget)).rejects.toThrow('failure between waits')
+    expect(performance.now() - injected).toBeLessThan(1000)
+  })
+
+  it.each(['error', 'closed', 'interrupted', 'stopping'] as const)('rejects a watched target becoming %s before readiness', async (status) => {
+    const budget = probe()
+    budget.cursors.set('target', 0)
+    budget.session = () => ({ status, lastSeq: 0 })
+    const injected = performance.now()
+    await expect(until(() => true, 'terminal target', budget)).rejects.toThrow(`became ${status}`)
+    expect(performance.now() - injected).toBeLessThan(1000)
+  })
+
+  it.each([
+    ['busy', 'queued', SLOT_WAIT_REASON, false],
+    ['waiting', 'running', undefined, false],
+    ['waiting', 'queued', undefined, true],
+    ['board', 'queued', SLOT_WAIT_REASON, false],
+  ] as const)('rejects the definitive %s admission failure', async (phase, status, queuedBehind, prompted) => {
+    const budget = probe()
+    budget.rejected = () => slotFailure(phase, { status, queuedBehind }, prompted)
+    const injected = performance.now()
+    await expect(until(() => true, phase, budget)).rejects.toThrow(`switchboard fixture rejected ${phase}`)
+    expect(performance.now() - injected).toBeLessThan(1000)
+    expect(budget.tick).not.toHaveBeenCalled()
+  })
+
+  it('rejects a stopped Switchboard even while its session remains idle', async () => {
+    const budget = probe()
+    budget.rejected = () => boardFailure({ status: 'stopped', error: 'Switchboard stopped explicitly' }, { status: 'idle' }, false)
+    await expect(until(() => true, 'the check despite the cap', budget)).rejects.toThrow('Switchboard stopped explicitly')
+  })
+
+  it('rejects readiness delivered after the shared deadline and bounds a held tick', async () => {
+    const budget = probe(Date.now() + 20)
+    let ready = false
+    let release!: () => void
+    const tick = new Promise<void>(done => { release = done })
+    budget.tick = () => tick
+    try { await expect(until(() => ready, 'late delivery', budget)).rejects.toThrow('switchboard fixture deadline: late delivery') }
+    finally { ready = true; release(); await tick }
+    await expect(until(() => ready, 'late readiness', budget)).rejects.toThrow('switchboard fixture deadline: late readiness')
+  })
+
+  it('stops an aborted wait before its held delivery can resume against another case', async () => {
+    const cancelled = new AbortController()
+    const budget = probe(Date.now() + 1000, cancelled.signal)
+    let release!: () => void
+    const tick = new Promise<void>(done => { release = done })
+    const read = vi.fn(() => ({ status: 'idle' as const, lastSeq: 0 }))
+    budget.cursors.set('target', 0)
+    budget.session = read
+    budget.tick = vi.fn(() => tick)
+    const readiness = until(() => false, 'cancelled delivery', budget)
+    cancelled.abort(new Error('fixture cancelled'))
+    await expect(readiness).rejects.toThrow('fixture cancelled')
+    const beforeRelease = read.mock.calls.length
+    release()
+    await tick
+    await Promise.resolve()
+    expect(read).toHaveBeenCalledTimes(beforeRelease)
+    expect(budget.tick).toHaveBeenCalledTimes(1)
+  })
+})
 
 describe('starting the Switchboard', () => {
   it('creates exactly one Muse chat in its own workspace, also under concurrent requests', async () => {
@@ -686,36 +812,37 @@ describe('checks', () => {
     expect(checks(board).map(check => check.reason)).toEqual(['start', 'interval'])
   })
 
-  it('runs its check while every Poise-local agent slot is busy', async ({ task }) => {
+  it('runs its check while every Poise-local agent slot is busy', async ({ task, signal }) => {
     // Three private workspaces each initialize through six guarded Node/Git
     // starts. Share this case's budget; admission is not a provisioning timer.
     const deadline = Date.now() + task.timeout - 250
+    const observed = runtime, boardState = switchboard
+    const budget = readinessBudget(deadline, signal)
     slots = 1
     // Two chats with workspaces of their own, so only the cap holds the second.
-    const busy = await chat('Busy')
-    const waiting = await runtime.create({ agent: 'grok', model: busy.model, title: 'Waiting', deferStart: true })
-    const sessions = [busy.id, waiting.id]
-    runtime.prompt(busy.id, { text: 'Work for an hour', attachments: [], mentions: [] })
-    await until(() => finishes.has(busy.id), 'the busy chat holding the only slot', { deadline, sessions })
-    runtime.prompt(waiting.id, { text: 'Me too', attachments: [], mentions: [] })
-    await until(() => runtime.get(waiting.id)!.queuedBehind === 'waiting for a free agent slot', 'the cap holding another chat', { deadline, sessions })
-    const board = await started()
-    await until(() => finishes.has(board), 'the check despite the cap', { deadline, sessions: [...sessions, board] })
+    const busy = await withinReadiness(observed.create({ agent: 'grok', model: CATALOG.models.find(m => m.provider === 'grok')!.identity, title: 'Busy', deferStart: true }), 'provisioning the busy chat', budget)
+    signal.throwIfAborted()
+    budget.cursors.set(busy.id, 0)
+    const waiting = await withinReadiness(observed.create({ agent: 'grok', model: busy.model, title: 'Waiting', deferStart: true }), 'provisioning the waiting chat', budget)
+    signal.throwIfAborted()
+    budget.cursors.set(waiting.id, 0)
+    observed.prompt(busy.id, { text: 'Work for an hour', attachments: [], mentions: [] })
+    await until(() => finishes.has(busy.id), 'the busy chat holding the only slot', {
+      ...budget, rejected: () => slotFailure('busy', observed.get(busy.id), finishes.has(busy.id)),
+    })
+    observed.prompt(waiting.id, { text: 'Me too', attachments: [], mentions: [] })
+    await until(() => observed.get(waiting.id)?.queuedBehind === SLOT_WAIT_REASON, 'the cap holding another chat', {
+      ...budget, rejected: () => slotFailure('waiting', observed.get(waiting.id), finishes.has(waiting.id)),
+    })
+    const board = await withinReadiness(started(signal), 'provisioning the Switchboard', budget)
+    signal.throwIfAborted()
+    // The ID is learned after creation; sequence zero includes failures during it.
+    budget.cursors.set(board, 0)
+    await until(() => finishes.has(board), 'the check despite the cap', {
+      ...budget, rejected: () => boardFailure(boardState.state(), observed.get(board), finishes.has(board)),
+    })
     expect(finishes.has(waiting.id)).toBe(false)
   }, 60_000)
-
-  it('fails budgeted readiness promptly when its target reports an error', async ({ task }) => {
-    const deadline = Date.now() + task.timeout - 250
-    const person = await chat('Failed target')
-    runtime.prompt(person.id, { text: 'Fail explicitly', attachments: [], mentions: [] })
-    await until(() => finishes.has(person.id), 'the target turn')
-    const readiness = until(() => false, 'an unreachable condition', {
-      deadline, sessions: [person.id],
-    })
-    const rejected = expect(readiness).rejects.toThrow('fixture target failure')
-    finishes.get(person.id)!({ stopReason: 'error', error: 'fixture target failure' })
-    await rejected
-  })
 
   it('gives the Switchboard no Extensions, unlike the chats it watches', async () => {
     servers = [{ id: 'github', name: 'github', title: 'GitHub', transport: 'stdio', command: 'github-mcp' }]
