@@ -31,7 +31,7 @@ interface Job {
   dispatchedAt?: number
 }
 const emptyHealth = (): LedgerHealth => ({
-  status: 'unavailable', unavailableReason: null, coverageStart: null, observedAt: null, callerObservedAt: null,
+  status: 'unavailable', unavailableReason: 'worker_unavailable', coverageStart: null, observedAt: null, callerObservedAt: null,
   pending: 0, dropped: 0, gaps: [], generation: null, retainedFrom: null,
   changeLowerBound: null, lastSequence: null, instances: null, changes: null,
 })
@@ -180,7 +180,12 @@ export class BehaviorLedgerObserver {
 
   private unavailable(request: LedgerRead, error = 'ledger_unavailable'): { status: number; body: LedgerReply } {
     const health = this.projectedHealth()
-    if (health.status !== 'stopped') health.status = 'unavailable'
+    if (health.status !== 'stopped') {
+      health.status = 'unavailable'
+      // A read that misses its budget with no deeper cause names the miss
+      // itself; unavailable never surfaces without a reason.
+      health.unavailableReason ??= 'read_timeout'
+    }
     return { status: request.operation === 'health' ? 200 : 503,
       body: { version: 1, health, ...(request.operation === 'health' ? {} : { error }) } }
   }
