@@ -719,14 +719,28 @@ describe('the switch bound', () => {
     }
   })
 
-  it.each(['unsent request', 'superseded continuation'] as const)('preserves pending recovery across a second update: %s', async earlier => {
+  it.each(['unsent request', 'superseded continuation', 'deferred continuation'] as const)('preserves pending recovery across a second update: %s', async earlier => {
     const w = await world({ auto: false })
     await tickControl(w.runtime)
     const earlierTurn = randomUUID()
     const earlierPrompt = earlier === 'unsent request' ? input('Earlier never-sent request') : undefined
     w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: earlierTurn, ...(earlierPrompt ? { prompt: earlierPrompt } : {}) }])
-    inbox.holdChat(w.instance, w.s.id, 'stopped', Date.now())
-    await w.runtime.releaseSwitchWait()
+    const deferred = earlier === 'deferred continuation'
+    let waited: string | null = null
+    if (deferred) {
+      const admission = vi.spyOn(w.runtime, 'prompt').mockImplementationOnce(() => { throw new Error('temporary continuation admission failure') })
+      try { await w.runtime.releaseSwitchWait() } finally { admission.mockRestore() }
+      expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([
+        expect.objectContaining({ sessionId: w.s.id, continuationTurnId: earlierTurn }),
+      ])
+      w.runtime.setSwitchPending('r2')
+      w.runtime.prompt(w.s.id, input('Literal waited follow-up'))
+      waited = database.getMeta('chat_switch_waiting')
+      w.runtime.setSwitchPending(null)
+    } else {
+      inbox.holdChat(w.instance, w.s.id, 'stopped', Date.now())
+      await w.runtime.releaseSwitchWait()
+    }
     const resumed = w.runtime.prompt(w.s.id, input('Person resumes'))
     if (!('turnId' in resumed)) throw new Error('fixture did not admit the person-resumed turn')
     await until(() => w.c.calls.length === 1)
@@ -750,7 +764,31 @@ describe('the switch bound', () => {
         timer.fire()
       }
       await until(() => restart.mock.calls.length === 1)
+      if (deferred) {
+        const interruptedBefore = database.getMeta('chat_switch_interrupted')
+        const waitingBefore = database.getMeta('chat_switch_waiting')
+        const setMeta = database.setMeta
+        const failedWrite = vi.spyOn(database, 'setMeta').mockImplementation((key, value) => {
+          if (key === 'chat_switch_waiting') throw new Error('waiting store unavailable')
+          return setMeta(key, value)
+        })
+        try {
+          expect(() => w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID(), prompt: input('Uncommitted recovery') }])).toThrow('waiting store unavailable')
+          expect(database.getMeta('chat_switch_interrupted')).toBe(interruptedBefore)
+          expect(database.getMeta('chat_switch_waiting')).toBe(waitingBefore)
+        } finally { failedWrite.mockRestore() }
+      }
       w.runtime.recordSwitchInterrupted(targets)
+      if (deferred) {
+        const before: unknown = JSON.parse(waited ?? '[]')
+        expect(before).toEqual([
+          expect.objectContaining({ continuationTurnId: earlierTurn }),
+          expect.objectContaining({ prompt: input('Literal waited follow-up') }),
+        ])
+        expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([
+          expect.objectContaining({ prompt: input('Literal waited follow-up') }),
+        ])
+      }
       expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([
         expect.objectContaining({ sessionId: w.s.id, turnId: resumed.turnId }),
         ...(earlierPrompt ? [expect.objectContaining({ sessionId: w.s.id, turnId: earlierTurn, prompt: earlierPrompt })] : []),
@@ -769,11 +807,12 @@ describe('the switch bound', () => {
       w.finish()
       const expected = [
         'Person resumes', 'Poise restarted for an update while your turn was running. Continue where you left off.',
-        ...(earlierPrompt ? [earlierPrompt.text] : []), 'Normal queued follow-up',
+        ...(earlierPrompt ? [earlierPrompt.text] : []), ...(deferred ? ['Literal waited follow-up'] : []), 'Normal queued follow-up',
       ]
       await until(() => next.get(w.s.id)?.status === 'idle' && w.c.calls.length === expected.length)
       expect(w.c.calls.map(call => call.input.text)).toEqual(expected)
       expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
+      expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([])
     } finally { service.reset() }
   })
 
