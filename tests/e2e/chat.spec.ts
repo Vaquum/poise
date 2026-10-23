@@ -214,7 +214,8 @@ test('streams text, sticks to the bottom only when there, and never runs agent H
   await expect(msg.locator('script')).toHaveCount(0)
   await expect(msg.locator('strong')).toHaveText('world')
   expect(await page.evaluate(() => (window as unknown as { pwned?: number }).pwned)).toBeUndefined()
-  await expect(page.locator('.chat-thinking')).toHaveCount(0)
+  // The working indicator stays for the whole turn, not just before the first token.
+  await expect(page.locator('.chat-thinking')).toBeVisible()
   for (let i = 0; i < 80; i++) sock.push('s1', { type: 'text.delta', turnId: 't1', messageId: 'm1', delta: `\n\nparagraph ${i}` })
   const scroll = page.locator('.chat-transcript-scroll')
   await expect(msg).toContainText('paragraph 79')
@@ -228,6 +229,10 @@ test('streams text, sticks to the bottom only when there, and never runs agent H
   await page.locator('.chat-item-text').hover()
   await page.locator('.chat-copy-btn').click()
   await expect(page.locator('.chat-copy-btn')).toHaveAttribute('aria-label', 'Copied')
+  // The indicator leaves with the turn.
+  sock.push('s1', { type: 'turn.finished', turnId: 't1', stopReason: 'end_turn', durationMs: 1000 })
+  sock.push('s1', { type: 'status.changed', status: 'idle' })
+  await expect(page.locator('.chat-thinking')).toHaveCount(0)
 })
 
 test('ends each finished turn in one meta row: its recorded end time, how it stopped, what it took, then its last message\'s copy icon', async ({ page, browserName }) => {
@@ -448,13 +453,13 @@ test('discovers native workers live and after reconnect without losing the manag
   const busyWorker = state.sessions.find(s => s.id === 'worker-0')!
   busyWorker.status = 'running'
   sock.ws!.send(JSON.stringify({ kind: 'session.updated', session: busyWorker }))
-  await expect(page.locator('.chat-session-item[data-id="worker-0"] .chat-session-running')).toBeVisible()
+  await expect(page.locator('.chat-session-item[data-id="worker-0"] .chat-session-dot[data-state="working"]')).toBeVisible()
   const staleResponse = page.waitForResponse(response => response.url().endsWith('/api/chat/sessions'))
   releaseList!()
   await (await staleResponse).finished()
   await page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))))
   await expect(page.locator('.chat-session-item')).toHaveCount(4)
-  await expect(page.locator('.chat-session-item[data-id="worker-0"] .chat-session-running')).toBeVisible()
+  await expect(page.locator('.chat-session-item[data-id="worker-0"] .chat-session-dot[data-state="working"]')).toBeVisible()
   const reconnected = sock.ws
   sock.ws!.close()
   const missed = session({ id: 'missed-worker', title: 'Created while disconnected' })
