@@ -901,15 +901,18 @@ function outboundHasUserFrame(outbound: Buffer): boolean {
   return false
 }
 
-/** The CLI-bound answers the previous Poise sent, by their request id. */
-function outboundControlResponses(outbound: Buffer): Set<string> {
-  const answered = new Set<string>()
+/** Each CLI-bound answer the previous Poise sent, counted by request id. */
+function outboundControlResponses(outbound: Buffer): Map<string, number> {
+  const answered = new Map<string, number>()
   for (const line of outbound.toString('utf8').split('\n')) {
     const trimmed = line.trim()
     if (!trimmed) continue
     try {
       const frame = JSON.parse(trimmed) as { type?: unknown, response?: { request_id?: unknown } }
-      if (frame?.type === 'control_response' && typeof frame.response?.request_id === 'string') answered.add(frame.response.request_id)
+      if (frame?.type === 'control_response' && typeof frame.response?.request_id === 'string') {
+        const id = frame.response.request_id
+        answered.set(id, (answered.get(id) ?? 0) + 1)
+      }
     } catch { /* not a frame */ }
   }
   return answered
@@ -930,7 +933,7 @@ class ReplayProcess {
   stderrTail = ''
   private readonly listeners = new Map<string, Array<(...args: any[]) => void>>()
   private readonly peer: AgentProcess
-  private readonly responded: Set<string>
+  private readonly responded: Map<string, number>
   private readonly synthesized: { modelId: string, efforts: string[], commands: CommandOption[] }
   private readonly log: (message: string) => void
   private readonly onStderr: (text: string) => void
@@ -940,7 +943,7 @@ class ReplayProcess {
   onProtocolError: (error: Error) => void = () => {}
 
   constructor(peer: AgentProcess, options: {
-    responded: Set<string>
+    responded: Map<string, number>
     session: { modelId: string, efforts: string[], commands: CommandOption[] }
     log: (message: string) => void
     onStderr: (text: string) => void
@@ -1014,10 +1017,14 @@ class ReplayProcess {
     if (!frame || typeof frame !== 'object') return this.unknown(line, 'is not JSON')
     if (frame.type === 'control_response') {
       const id = frame.response?.request_id
-      // SDK callbacks can finish after LIVE. Consume each recorded answer
-      // once, so its late reply stays suppressed and a later request may
-      // reuse the id after that callback has settled.
-      if (typeof id === 'string' && this.responded.delete(id)) return
+      // SDK callbacks can finish after LIVE. Suppress every recorded answer
+      // occurrence, including sequential reuse of the same request id.
+      const remaining = typeof id === 'string' ? this.responded.get(id) ?? 0 : 0
+      if (remaining > 0) {
+        if (remaining === 1) this.responded.delete(id)
+        else this.responded.set(id, remaining - 1)
+        return
+      }
       this.forward(line)
       return
     }

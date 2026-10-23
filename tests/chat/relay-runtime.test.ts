@@ -243,6 +243,9 @@ describe('relay handover between servers', () => {
       expect(contender.tryAcquire().acquired).toBe(false)
       process.kill(peer.gatePid, 'SIGCONT')
       await waitFor(() => !worker.pgidAlive(peer.gatePgid), 15_000)
+      // Relay exit arrived while the gate was stopped. Its later actual exit
+      // must retire the same worker's rows without requiring another close.
+      await waitFor(() => storage.getWorker(session.id) === null && storage.getRelay(session.id) === null)
       await owner.runtime.close(session.id)
       expect(storage.getWorker(session.id)).toBeNull()
       expect(storage.getRelay(session.id)).toBeNull()

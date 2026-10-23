@@ -3496,19 +3496,26 @@ export class ChatRuntime extends EventEmitter {
   }
 
   private trackRelayExit(session: LiveSession, peer: RelayConnection): void {
+    const worker = storage.getWorker(session.record.id)
     // A detach exit (no code, no signal) is the link dying, not the agent:
     // the rows stay for the server that adopts the relay.
     peer.once('exit', (code, signal) => {
-      if ((code === null && signal === null) || session.relay !== peer) return
-      // A broken link can force-kill the relay before its separate gate
-      // group has settled. Keep that worker owned until verified cleanup.
-      if (pgidAlive(peer.gatePgid) || pidAlive(peer.gatePid)) {
-        this.emit('log', `[chat ${session.record.id.slice(0, 8)}] relay exited while its worker remains alive; retaining the worker and checkout lease`)
-        return
+      if (code === null && signal === null) return
+      const settle = () => {
+        if (this.stopped || session.relayDetached || session.relay !== peer || this.live.get(session.record.id) !== session) return
+        // The separate gate can outlive the relay. Observe its eventual exit
+        // without giving up ownership, and never erase a successor's rows.
+        if (pgidAlive(peer.gatePgid) || pidAlive(peer.gatePid)) {
+          setTimeout(settle, 25).unref()
+          return
+        }
+        if (storage.getWorker(session.record.id)?.ident !== worker?.ident
+          || storage.getRelay(session.record.id)?.relayIdent !== peer.ident) return
+        session.relay = null
+        storage.forgetWorker(session.record.id)
+        storage.forgetRelay(session.record.id)
       }
-      session.relay = null
-      storage.forgetWorker(session.record.id)
-      storage.forgetRelay(session.record.id)
+      settle()
     })
   }
 
