@@ -848,7 +848,7 @@ export class ChatRuntime extends EventEmitter {
     let stopReason: StopReason = turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
     let error = result.error
     if (turn.failure && stopReason !== 'cancelled') { stopReason = 'error'; error = turn.failure }
-    if (result.terminate === true || (session.adapter && !session.adapter.alive) || (session.relay && !session.relay.healthy)) {
+    if (turn.stopping || result.terminate === true || (session.adapter && !session.adapter.alive) || (session.relay && !session.relay.healthy)) {
       try { await this.stopProcess(session) } catch { freed = false }
     }
     session.draining = true
@@ -2857,8 +2857,11 @@ export class ChatRuntime extends EventEmitter {
       // the checkout; a failure before it was asked leaves it alone.
       // An agent that ended its own process (Claude does after a stop) has
       // its worker group verified gone, or is terminated when it asked for
-      // that, before the lease can go.
-      if (terminate || (agentInvoked && session.adapter && (!agentSettled || !session.adapter.alive)) || (session.relay && !session.relay.healthy)) {
+      // that, before the lease can go. A stopped turn always terminates its
+      // worker group: the agent's acknowledgement ends the turn, but only a
+      // verified-dead group proves its shells, test runners and sleeps went
+      // with it. The next prompt resumes the native session in a fresh group.
+      if (turn.stopping || terminate || (agentInvoked && session.adapter && (!agentSettled || !session.adapter.alive)) || (session.relay && !session.relay.healthy)) {
         try { await this.stopProcess(session) } catch { freed = false }
       }
       session.draining = true
@@ -3128,10 +3131,12 @@ export class ChatRuntime extends EventEmitter {
     })
   }
 
-  /** Cancel the running turn. Resolves when the agent acknowledged or after
-   *  the stop target elapsed with the session in `stopping` — never by
-   *  pretending the turn ended. The person's Stop holds the chat, but only
-   *  when it actually stopped a running turn or startup. */
+  /** Cancel the running turn. Stop ends the native turn and its whole
+   *  process tree: when the agent does not settle within the stop target,
+   *  its worker group is terminated (SIGTERM, then SIGKILL) and the turn's
+   *  own cleanup runs with the adapter's rejection. Resolves with whether
+   *  the turn ended — never by pretending it did. The person's Stop holds
+   *  the chat, but only when it actually stopped a running turn or startup. */
   cancel(id: string, actor?: ChatActor | PersonActor): Promise<{ settled: boolean }> {
     return this.track(async () => {
       const session = this.requireLive(id)
@@ -3156,7 +3161,11 @@ export class ChatRuntime extends EventEmitter {
       this.settlePending(session, 'cancelled')
       turn.abort.abort()
       try { await session.adapter?.cancel() } catch { /* the abort signal also reaches prompt() */ }
-      const settled = await this.waitForTurnEnd(session, STOP_SETTLE_MS)
+      if (await this.waitForTurnEnd(session, STOP_SETTLE_MS)) return { settled: true }
+      // The agent did not acknowledge: the process tree goes, verifiably,
+      // and the turn's finally block then runs with the adapter's rejection.
+      await this.stopProcess(session).catch(() => undefined)
+      const settled = await this.waitForTurnEnd(session, CLOSE_GRACE_MS * 2)
       if (!settled) this.setStatus(session, 'stopping', 'the agent has not acknowledged the stop yet')
       return { settled }
     })

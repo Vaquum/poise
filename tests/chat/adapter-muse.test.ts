@@ -391,6 +391,16 @@ describe('Muse adapter', () => {
     expect(adapter.alive).toBe(false)
   })
 
+  it('handles session/closed by ending the turn with terminate', async () => {
+    const { host, adapter } = setup()
+    await adapter.start(MODEL)
+    const result = await adapter.prompt('turn-1', prompt('close-session'), new AbortController().signal)
+    expect(result).toMatchObject({ stopReason: 'error', terminate: true })
+    expect(result.error).toContain('closed the session')
+    expect(host.logs.some((line) => line.includes('no handler for session/closed'))).toBe(false)
+    expect(adapter.nativeSessionId).toBeUndefined()
+  })
+
   it('rejects unsupported effort before changing the native model', async () => {
     const { host, adapter } = setup()
     await adapter.start(MODEL)
@@ -499,7 +509,8 @@ describe('Muse adapter', () => {
     await adapter.prompt('turn-1', prompt('fail'), new AbortController().signal)
     await adapter.prompt('turn-2', prompt('fail'), new AbortController().signal)
     expect(host.logs.filter((line) => line.includes('ignoring session/branchChanged'))).toHaveLength(1)
-    expect(host.logs.filter((line) => line.includes('no handler for session/started'))).toHaveLength(1)
+    expect(host.logs.filter((line) => line.includes('ignoring session/started'))).toHaveLength(1)
+    expect(host.logs.some((line) => line.includes('no handler for'))).toBe(false)
     const exited = new Promise<void>((resolve) => adapter.onExit(() => resolve()))
     await adapter.close()
     await exited

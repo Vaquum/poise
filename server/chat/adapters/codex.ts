@@ -687,7 +687,7 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
 
     on('warning', ({ message }) => { host.log(`${LABEL} warning: ${message}`) })
     on('thread/closed', ({ threadId: closed }) => {
-      if (closed === threadId && active) finish(active, { stopReason: 'error', error: `${LABEL} closed the thread` })
+      if (closed === threadId && active) finish(active, { stopReason: 'error', error: `${LABEL} closed the thread`, terminate: true })
     })
 
     for (const method of IGNORED_NOTIFICATIONS) {

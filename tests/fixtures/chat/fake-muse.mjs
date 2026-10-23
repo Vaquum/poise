@@ -219,6 +219,11 @@ function scripted() {
       process.exit(2)
     }
 
+    if (prompt.startsWith('close-session')) {
+      peer.notify('session/closed', { sessionId })
+      return
+    }
+
     if (prompt.startsWith('slow')) {
       const itemId = uuid('msg')
       item('item/started', { itemId, kind: 'agentMessage', text: '' })
