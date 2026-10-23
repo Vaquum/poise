@@ -1084,7 +1084,7 @@ export class ChatControl {
     const page = store.pending(instance, this.deliveryAfter, now)
     let at = 0
     while (at < page.length) {
-      if (this.stopped || this.runtime.draining) return
+      if (this.stopped || this.runtime.draining || this.runtime.switchPending) return
       const recipient = page[at].recipient
       const rows: store.InternalMessage[] = []
       while (at < page.length && page[at].recipient === recipient) rows.push(page[at++])

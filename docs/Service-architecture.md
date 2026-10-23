@@ -353,12 +353,55 @@ instead of retaining an unanswerable request and checkout lease.
 - **Switching.** The gateway then sends `POST /api/service/switch` with
   `{ release }` (`admin` scope or loopback; 202 `{ release, switching }`,
   409 for a release not installed for this base or a server started without
-  the supervisor). Poise writes `next`, stops admitting new background ticks,
-  and restarts at the first moment no unheld Chat turn and no work of its
-  own runs; it waits for no agent call and no turn a healthy relay holds,
-  since the relay keeps the turn running and the next server adopts it. The
-  gateway asks again on later passes until health reports the release, which
-  the request makes idempotent.
+  the supervisor). Poise writes `next` and restarts at the first moment no unheld Chat turn and no work of its own
+  runs; it waits for no agent call and no turn a healthy relay holds, since
+  the relay keeps the turn running and the next server adopts it. While the
+  switch is pending, new Chat turns
+  wait behind the update instead of starting — sent messages, queued
+  messages and work-monitor wakes alike, nothing refused or dropped —
+  while launches and behavior ticks run as usual. A Poise implementation whose
+  controller binding completes during this pause also waits durably, retaining
+  its runbook, displayed request, switches and completion responsibility. It
+  remains ahead of discussion in that change chat, including messages sent to
+  the visible child before binding returns. Without a pending update, that
+  child refuses discussion until binding reserves its initial implementation;
+  ordinary starting chats retain their existing admission policy. A restart does not report an
+  implementation that never started as failed. Turns without a healthy relay get the
+  update turn bound (a chat setting, default 15 minutes counted from when
+  the switch became pending); past it they are cancelled through the normal
+  cancel path, their sessions recorded, and the server restarted. After the
+  restart each interrupted session gets exactly one automatic continue
+  prompt on its resumed native session; a request still waiting for a
+  checkout or startup is replayed with its original input and attribution.
+  Compaction does not count as delivering that request. If recovery must
+  wait, its durable recovery record retains its displayed request, switches and change
+  completion responsibility with the original source, including timer
+  provenance, and model. A busy session's continuation remains ahead of its
+  existing normal-queue follow-ups, ready when that busy turn finishes.
+  If a drain or another switch is pending during recovery, both interrupted and
+  waiting records stay durable until it clears; continuations keep priority
+  over their follow-ups. A new interruption supersedes older automatic
+  continuations even if transient admission deferred them into the waiting
+  store; literal waiting messages retain their order. Drain and withdrawal release paths also retain records
+  held by another live server. Waiting turns follow these recoveries in order.
+  In an isolated Poise change, recovered and waited follow-ups also wait for
+  the controller to release the checkout after checks, build and deployment.
+  A waited message retains its position between earlier and later normal queue
+  items when the preceding turn finishes naturally during the switch. New
+  waited messages record that queue boundary; older records use their stored
+  creation times. The person's Stop also holds these waited messages until the
+  person resumes the chat. A Stop that overlaps the update bound's native
+  cancellation also keeps its interrupted record durable; after the person's
+  resumed turn, that recovery still precedes normal queued follow-ups.
+  A later update preserves every earlier unsent request by interrupted turn
+  identity. It resumes the current turn first with one generic continuation,
+  then those older requests, consuming each durable row separately; that current
+  continuation supersedes an older generic continuation of the same session.
+  Withdrawal waits for any bound cancellation to record recovery before
+  releasing messages. A bound
+  cancellation never bypasses the quiet gate for server work, background
+  work or admitted launches. The gateway asks again on later passes until health reports the
+  release, which the request makes idempotent.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace
   unreachable past the switch grace gets a new container, drained first.
@@ -478,7 +521,10 @@ assertion may only resume, and anything else is refused with 403):
     stays truthful when this server restarts: once the switch has fired, the
     record is consumed and nothing is pending. Asking to switch to the
     release it runs calls a pending switch off; the gateway does so when the
-    target changes back.
+    target changes back. If the turn bound already cancelled work and the
+    restart is refused or withdrawn, that work gets one continuation on the
+    current server before waiting messages. A switch requested again while
+    an earlier cancellation settles keeps its own deadline and turn set.
   - `desiredRelease` is the release the workspace is asked to run: the
     pending switch's target, else the active release.
   - `installedRelease` is the desired release when an install of it for this

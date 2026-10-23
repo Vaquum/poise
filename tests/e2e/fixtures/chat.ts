@@ -51,7 +51,7 @@ const AGENTS: { agents: unknown[], defaults: { model: string, fallback: string, 
     { id: 'muse', label: 'Muse', available: true, models: [{ identity: 'muse-spark-1.3-contributor-max', selector: 'muse-spark-1.3-contributor', effort: 'max' }, { identity: 'muse-spark-1.3-contributor-xhigh', selector: 'muse-spark-1.3-contributor', effort: 'xhigh' }], efforts: ['max', 'xhigh'] },
   ],
   defaults: { model: 'opus-5-max', fallback: 'gpt-6-astra-ultra' },
-  settings: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 },
+  settings: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 },
 }
 
 /** The Switchboard as the server reports it; never started unless a test says so. */
@@ -404,7 +404,7 @@ function env(sessionId: string, seq: number, event: ChatEvent): ChatEnvelope {
 }
 
 function makeState(sessions: SessionRecord[], history: Record<string, ChatEnvelope[]> = {}): ServerState {
-  return { sessions, history, calls: [], settings: { org: 'acme', me: 'octocat', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 } } }
+  return { sessions, history, calls: [], settings: { org: 'acme', me: 'octocat', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 } } }
 }
 
 const input = (page: Page) => page.locator('.chat-v-composer .chat-input')

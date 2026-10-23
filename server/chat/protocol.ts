@@ -27,6 +27,10 @@ export const AGENT_LABELS: Record<AgentId, string> = {
  *  distinct from queueing behind another checkout holder. */
 export const SLOT_WAIT_REASON = 'waiting for a free agent slot'
 
+/** Why a session is `queued` while a release switch is pending: its next turn
+ *  waits behind the Poise update instead of starting. */
+export const SWITCH_WAIT_REASON = 'waiting for the Poise update'
+
 /** Which optional controls the view shows for a session. `permissions`,
  *  `questions`, `steer` and `resume` are required of every v1 adapter; the
  *  rest are honest flags — a control for a false flag is hidden, never faked. */
@@ -74,9 +78,11 @@ export interface BranchBinding {
 export interface QueuedMessage {
   /** Validated attachment/mention provenance across an isolated Poise handoff. */
   sourceSessionId?: string
-  /** Actor whose deferred steer this row continues; dispatched as source
-   *  data under that actor, never as the person's request. */
-  source?: ChatActor | PoiseActor
+  /** Original deferred turn provenance, including a recovered timer firing;
+   *  dispatched as that source, never as the person's request. */
+  source?: TurnSource
+  /** Server-owned request context retained when update recovery must queue. */
+  recovery?: { shown?: PromptInput, implementsChange?: boolean, switches?: string[] }
   id: string
   prompt: PromptInput
   agent: AgentId
@@ -369,6 +375,11 @@ export interface PromptInput {
   attachments: Attachment[]
   mentions: Mention[]
 }
+
+/** Admitting a prompt starts a turn at once — or, while a release switch is
+ *  pending, waits it behind the Poise update. A wait id names the waiting
+ *  prompt until it starts; it is never a turn id. */
+export type PromptReceipt = { turnId: string } | { waitId: string }
 
 // ── Events: runtime → view ────────────────────────────────────────────────
 

@@ -237,7 +237,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       if (preset === 'claude') void auth.check({ forceLive: true })
     })
     if (service) {
-      serviceControl = new ServiceControl(chatRuntime, { drainTimeoutSeconds: service.drainTimeoutSeconds })
+      serviceControl = new ServiceControl(chatRuntime, { drainTimeoutSeconds: service.drainTimeoutSeconds, switchTurnBoundMinutes: () => getChatSettings().updateTurnBoundMinutes })
       dailyModelRefresh = new DailyModelRefresh({
         timeZone: () => getSettings().timezone,
         refresh: refreshModelCatalog,

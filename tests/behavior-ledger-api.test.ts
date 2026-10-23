@@ -26,6 +26,7 @@ vi.mock('../server/chat/runtime', async (original) => {
     async recover() {}
     async stop() {}
     endDrain() {}
+    setSwitchPending() {}
   } }
 })
 vi.mock('../server/jev/api', () => ({ handleJevApi: vi.fn(async () => false), stopJev: vi.fn(async () => undefined) }))

@@ -220,6 +220,140 @@ describe('/poise change sessions', () => {
     await expect(unconfigured.runtime.startPoiseChange(src2.id, 'add a button', randomUUID())).rejects.toMatchObject({ code: 'self_update_unavailable' })
   }, 20_000)
 
+  it.each([
+    { mode: 'withdrawal', queued: true, beforeBind: false }, { mode: 'restart', queued: true, beforeBind: false },
+    { mode: 'withdrawal', queued: false, beforeBind: false }, { mode: 'restart', queued: false, beforeBind: false },
+    { mode: 'withdrawal', queued: false, beforeBind: true }, { mode: 'restart', queued: false, beforeBind: true },
+  ] as const)('waits a Poise implementation admitted during controller binding through $mode (queued: $queued, before bind: $beforeBind)', async ({ mode, queued, beforeBind }) => {
+    const bridge = fakeBridge('poise-test:db')
+    const initial = makeRuntime({ bridge })
+    const source = await sourceSession(initial.runtime, initial.events)
+    const switchName = `paused-${mode}`
+    await initial.runtime.createSwitch({ name: switchName, content: 'Keep the original implementation instructions.', revision: 0 })
+    let releaseBind!: () => void
+    const bindGate = new Promise<void>(done => { releaseBind = done })
+    let binding = false
+    const bind = bridge.bindSession.bind(bridge)
+    bridge.bindSession = async (changeId, input) => {
+      binding = true
+      await bindGate
+      return bind(changeId, input)
+    }
+    const changeId = randomUUID(), request = 'Improve the console after the update'
+    const context = { attachments: [], mentions: [], switches: [switchName] }
+    if (queued) await initial.runtime.enqueue(source.id, randomUUID(), { text: 'Existing queued follow-up', attachments: [], mentions: [] })
+    // A previously completed source turn armed its queue. The dedicated
+    // implementation still owns the first turn after delegation.
+    const previous = randomUUID()
+    storage.reserveQueueTurn(source.id, previous)
+    storage.finalizeTurn(source.id, { type: 'turn.finished', turnId: previous, stopReason: 'end_turn' })
+    expect(initial.runtime.get(source.id)?.queue?.ready ?? false).toBe(queued)
+    const starting = initial.runtime.startPoiseChange(source.id, request, changeId, context)
+    try {
+      await waitFor(() => binding)
+      initial.runtime.setSwitchPending('next-release')
+      if (beforeBind) {
+        const child = initial.runtime.list().find(session => session.selfChangeId === changeId)!
+        expect(child.status).toBe('starting')
+        expect(ofType(initial.events, child.id, 'session.created')).toHaveLength(1)
+        expect(initial.runtime.prompt(child.id, { text: 'Discuss before binding finishes', attachments: [], mentions: [] })).toHaveProperty('waitId')
+      }
+      releaseBind()
+      const result = await starting
+      expect(result.session).toMatchObject({ status: 'queued', queuedBehind: 'waiting for the Poise update' })
+      expect(initial.runtime.working()).toBe(0)
+      expect(storage.getOpenTurn(result.session.id)).toBeNull()
+      expect(ofType(initial.events, result.session.id, 'turn.started')).toHaveLength(0)
+      expect(initial.controls.adapters.some(adapter => adapter.host.sessionId === result.session.id)).toBe(false)
+      expect(outbox.getFinish(changeId)).toBeNull()
+      const retried = await initial.runtime.startPoiseChange(source.id, request, changeId, context)
+      expect(retried.session.id).toBe(result.session.id)
+      expect(bridge.calls.filter(call => call.op === 'prepare' && call.input.id === changeId)).toHaveLength(1)
+      expect(bridge.calls.filter(call => call.op === 'bind' && call.changeId === changeId)).toHaveLength(1)
+      let active = initial
+      if (mode === 'restart') {
+        await initial.runtime.stop()
+        active = makeRuntime({ bridge })
+        active.runtime.setSwitchPending('newer-release')
+        await active.runtime.recover()
+        expect(outbox.getFinish(changeId)).toBeNull()
+        expect(bridge.calls.filter(call => call.op === 'finish' && call.changeId === changeId)).toHaveLength(0)
+        expect(active.controls.startCount).toBe(0)
+      }
+      // Even after the switch clears, discussion cannot become the first
+      // turn while the durable implementation is waiting for recovery.
+      active.runtime.setSwitchPending(null)
+      expect(active.runtime.prompt(result.session.id, { text: 'Discuss after implementing', attachments: [], mentions: [] })).toHaveProperty('waitId')
+      expect(storage.getOpenTurn(result.session.id)).toBeNull()
+      const statusCalls = bridge.calls.filter(call => call.op === 'status').length
+      await active.runtime.releaseSwitchWait()
+      await waitFor(() => !!outbox.getFinish(changeId)?.deliveredAt)
+      expect(ofType(active.events, result.session.id, 'turn.finished')).toHaveLength(1)
+      // A waited follow-up must reach the release guard even with no older
+      // normal queue entry to block it. Observe the guard before release.
+      await waitFor(() => bridge.calls.filter(call => call.op === 'status').length > statusCalls)
+      if (queued) expect(active.runtime.get(result.session.id)?.queue?.waitingForRelease).toBe(true)
+      expect(bridge.changes.get(changeId)?.state).toBe('checking')
+      const agent = active.controls.adapters.find(adapter => adapter.host.sessionId === result.session.id)!
+      expect(agent.inputs).toHaveLength(1)
+      bridge.changes.get(changeId)!.state = 'live'
+      await waitFor(() => ofType(active.events, result.session.id, 'turn.finished').length === (queued || beforeBind ? 3 : 2))
+      expect(agent.inputs).toHaveLength(queued || beforeBind ? 3 : 2)
+      expect(agent.inputs[0].text).toContain(request)
+      expect(agent.inputs[0].text).toContain('Keep the original implementation instructions.')
+      if (queued) expect(agent.inputs[1].text).toContain('Existing queued follow-up')
+      if (beforeBind) expect(agent.inputs[1].text).toContain('Discuss before binding finishes')
+      expect(agent.inputs[queued || beforeBind ? 2 : 1].text).toContain('Discuss after implementing')
+      expect(ofType(active.events, result.session.id, 'turn.started')[0].prompt.text).toBe(`/${switchName} ${request}`)
+      expect(outbox.getFinish(changeId)).toMatchObject({ outcome: 'completed' })
+      expect(bridge.calls.filter(call => call.op === 'finish' && call.changeId === changeId)).toHaveLength(1)
+    } finally {
+      releaseBind()
+      await Promise.allSettled([starting])
+      const { setMeta } = await import('../../server/db')
+      setMeta('chat_switch_waiting', '[]')
+    }
+  }, 40_000)
+
+  it('keeps the first implementation reserved while its visible child is still binding without an update', async () => {
+    const bridge = fakeBridge('poise-test:db')
+    const { runtime, controls, events } = makeRuntime({ bridge })
+    const source = await sourceSession(runtime, events)
+    let releaseBind!: () => void
+    const bindGate = new Promise<void>(done => { releaseBind = done })
+    let binding = false
+    const bind = bridge.bindSession.bind(bridge)
+    bridge.bindSession = async (id, input) => {
+      binding = true
+      await bindGate
+      return bind(id, input)
+    }
+    const changeId = randomUUID(), request = 'Implement before discussion'
+    const starting = runtime.startPoiseChange(source.id, request, changeId)
+    try {
+      await waitFor(() => binding)
+      const child = runtime.list().find(session => session.selfChangeId === changeId)!
+      expect(ofType(events, child.id, 'session.created')).toHaveLength(1)
+      expect(() => runtime.prompt(child.id, { text: 'Discuss before binding finishes', attachments: [], mentions: [] }))
+        .toThrow(/implementation is still being prepared/)
+      expect(storage.getOpenTurn(child.id)).toBeNull()
+      expect(controls.adapters.some(adapter => adapter.host.sessionId === child.id)).toBe(false)
+      releaseBind()
+      const result = await starting
+      expect(result.session.id).toBe(child.id)
+      await waitFor(() => !!outbox.getFinish(changeId)?.deliveredAt)
+      const agent = controls.adapters.find(adapter => adapter.host.sessionId === child.id)!
+      expect(agent.inputs).toHaveLength(1)
+      expect(agent.inputs[0].text).toContain(request)
+      expect(ofType(events, child.id, 'turn.started')).toHaveLength(1)
+      expect(outbox.getFinish(changeId)).toMatchObject({ outcome: 'completed' })
+      expect(bridge.calls.filter(call => call.op === 'finish' && call.changeId === changeId)).toHaveLength(1)
+    } finally {
+      releaseBind()
+      await Promise.allSettled([starting])
+    }
+  }, 40_000)
+
   it('prepares, binds, runs one runbook turn in the controller checkout, and finishes only after cleanup', async () => {
     const bridge = fakeBridge('poise-test:db')
     const { runtime, controls, events } = makeRuntime({ bridge })
