@@ -6,7 +6,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from .interface import checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, grey_ci_candidates, rerun_grey_ci_if_ready, merge_candidates, merge_if_ready, update_branch_if_behind, mergeable, post_pr_comment, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
+from .interface import checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, grey_ci_candidates, rerun_grey_ci_if_ready, merge_candidates, merge_if_ready, update_branch_if_behind, mergeable, post_pr_comment, prune_mirrors, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
 
 TOP_HELP = """usage: github-interface BEHAVIOR ...
 
@@ -42,6 +42,7 @@ behaviors:
   --current-pr [--token-user USER]
   --pr-readiness PR --username USER --expected-head SHA [--token-user USER]
   --local-checkout-path ORG REPO
+  --prune-mirrors ROOT --cap-bytes N --now-ms N [--fresh-ms N] [--dry-run]
   --view-repos ORG
   --read-issue ISSUE [--repository OWNER/REPO]
   --issue-comments ISSUE [--repository OWNER/REPO]
@@ -68,7 +69,7 @@ def main() -> None:
     if argv in (["-h"], ["--help"]):
         print(TOP_HELP)
         return
-    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--update-branch-if-behind", "--merge-candidates", "--grey-ci-candidates", "--rerun-grey-ci-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context"}:
+    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--update-branch-if-behind", "--merge-candidates", "--grey-ci-candidates", "--rerun-grey-ci-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context", "--prune-mirrors"}:
         print("error: first argument must be a behavior switch\n", file=sys.stderr)
         print(TOP_HELP, file=sys.stderr)
         raise SystemExit(2)
@@ -84,7 +85,7 @@ def main() -> None:
         payload: dict[str, Any] = vars(args)
     else:
         args = _parser(argv[0]).parse_args(argv[2:])
-        key = "path" if argv[0] in {"--read-file", "--write-file"} else "issue" if argv[0] in {"--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues"} else "repository" if argv[0] == "--checkout-repo" else "log_id" if argv[0] == "--read-failing-ci-log" else "conversation" if argv[0] == "--resolve-conversation" else "pr"
+        key = "root" if argv[0] == "--prune-mirrors" else "path" if argv[0] in {"--read-file", "--write-file"} else "issue" if argv[0] in {"--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues"} else "repository" if argv[0] == "--checkout-repo" else "log_id" if argv[0] == "--read-failing-ci-log" else "conversation" if argv[0] == "--resolve-conversation" else "pr"
         payload = {key: argv[1], **vars(args)}
 
     if argv[0] in {"--merge-candidates", "--grey-ci-candidates"}:
@@ -133,6 +134,7 @@ def main() -> None:
         "--current-pr": current_pr,
         "--pr-readiness": pr_readiness,
         "--local-checkout-path": local_checkout_path,
+        "--prune-mirrors": prune_mirrors,
         "--view-repos": view_repos,
         "--read-issue": read_issue,
         "--assign-issue": assign_issue,
@@ -201,6 +203,14 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior == "--commit-work":
         parser = argparse.ArgumentParser(prog="github-interface --commit-work PR")
         parser.add_argument("--message", required=True)
+        return parser
+
+    if behavior == "--prune-mirrors":
+        parser = argparse.ArgumentParser(prog="github-interface --prune-mirrors ROOT")
+        parser.add_argument("--cap-bytes", required=True, type=int)
+        parser.add_argument("--now-ms", required=True, type=int)
+        parser.add_argument("--fresh-ms", default=300_000, type=int)
+        parser.add_argument("--dry-run", action="store_true")
         return parser
 
     if behavior == "--list-test-files":
