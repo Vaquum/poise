@@ -121,7 +121,7 @@ export function insertSession(record: SessionRecord): void {
     VALUES (@id, @record, @agent, @repo, @checkout, @branch, @status, @title, @native, @instance, @created, @updated, 0, @role)
   `).run({
     id: record.id,
-    record: JSON.stringify({ ...record, queue: undefined }),
+    record: JSON.stringify({ ...record, queue: undefined, timers: undefined }),
     agent: record.agent,
     repo: record.repo,
     checkout: record.checkout,
@@ -151,7 +151,7 @@ export function saveSession(record: SessionRecord): void {
     WHERE id = @id
   `).run({
     id: record.id,
-    record: JSON.stringify({ ...record, queue: undefined }),
+    record: JSON.stringify({ ...record, queue: undefined, timers: undefined }),
     agent: record.agent,
     repo: record.repo,
     checkout: record.checkout,
@@ -242,13 +242,13 @@ export const commitQueueMutation = db.transaction((sessionId: string, mutate: ()
 })
 
 /** Queue claim and open-turn reservation cannot be separated by a crash. */
-export const reserveQueueTurn = db.transaction((sessionId: string, turnId: string, itemId?: string, internalMessageSeq?: number): void => {
+export const reserveQueueTurn = db.transaction((sessionId: string, turnId: string, itemId?: string, internal?: { seq: number, at: number }): void => {
   if (getOpenTurn(sessionId)) throw new Error('A turn is already recorded for this session')
-  if (internalMessageSeq !== undefined) {
-    if (!Number.isSafeInteger(internalMessageSeq) || internalMessageSeq <= 0) throw new Error('Invalid internal message sequence')
-    const admitted = db.prepare(`UPDATE chat_control_inbox SET state = 'admitted', turn_id = ?
+  if (internal !== undefined) {
+    if (!Number.isSafeInteger(internal.seq) || internal.seq <= 0) throw new Error('Invalid internal message sequence')
+    const admitted = db.prepare(`UPDATE chat_control_inbox SET state = 'admitted', turn_id = ?, admitted_at = ?
       WHERE seq = ? AND recipient = ? AND instance = (SELECT instance FROM chat_sessions WHERE id = ?) AND state = 'pending'`)
-      .run(turnId, internalMessageSeq, sessionId, sessionId)
+      .run(turnId, internal.at, internal.seq, sessionId, sessionId)
     if (admitted.changes !== 1) throw new Error('The internal message is no longer pending for this session')
   }
   const owner = queueOwner(sessionId)
