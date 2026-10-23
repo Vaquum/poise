@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { once } from 'node:events'
+import { Worker } from 'node:worker_threads'
 import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -51,7 +53,13 @@ function blockedWorker(operation: 'capture' | 'read'): string {
     });`
 }
 afterEach(async () => {
-  await Promise.all(observers.splice(0).map((observer) => observer.stop()))
+  await Promise.all(observers.splice(0).map(async (observer) => {
+    // stop bounds its caller; fixture files belong to the worker until exit.
+    const worker: unknown = Reflect.get(observer, 'worker')
+    const exited = worker instanceof Worker ? once(worker, 'exit') : Promise.resolve()
+    await observer.stop()
+    await exited
+  }))
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
 })
 
