@@ -10,7 +10,7 @@ import {
   type LedgerRecord, type LedgerReference, type LedgerReply, type LedgerResult, type LedgerSlot, type LedgerState,
 } from './behavior-ledger-contract'
 
-interface Row { creation_seq: number; id: string; parent_id: string | null; native_id: string | null; payload: string; source_at: string | null; native_override: number }
+interface Row { creation_seq: number; id: string; parent_id: string | null; native_id: string | null; payload: string; source_at: string | null; native_override: number; bytes: number }
 interface Cursor { version: 1; generation: string; kind: 'list' | 'changes'; position: number; boundary: number; watermark: number; parent: string | null }
 interface Journal { version: 1; epoch: string; closed: boolean; health: LedgerHealth }
 const ID = /^[a-f0-9]{64}$/
@@ -45,6 +45,10 @@ export class BehaviorLedgerStore {
   private cursorKey = ''
   private initialized = false
   private budgetScanTime = 0
+  private instanceCount = 0
+  private instanceBytes = 0
+  private changeBytes = 0
+  private pendingRows = new Map<string, LedgerPending>()
 
   get budgetScanMs(): number { return this.budgetScanTime }
 
@@ -95,7 +99,13 @@ export class BehaviorLedgerStore {
           source_at TEXT,native_override INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL,
           terminal INTEGER NOT NULL DEFAULT 0,no_write INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS ledger_parent ON ledger_instances(parent_id,creation_seq);
+        CREATE INDEX IF NOT EXISTS ledger_updated ON ledger_instances(updated_at);
+        CREATE INDEX IF NOT EXISTS ledger_retention ON ledger_instances(parent_id,updated_at);
+        CREATE INDEX IF NOT EXISTS ledger_sourced ON ledger_instances(source_at);
+        CREATE INDEX IF NOT EXISTS ledger_pressure ON ledger_instances(no_write DESC,terminal DESC,creation_seq ASC) WHERE parent_id IS NULL;
         CREATE TABLE IF NOT EXISTS ledger_changes(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL,op TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL,bytes INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS ledger_change_created ON ledger_changes(created_at);
+        CREATE INDEX IF NOT EXISTS ledger_change_id ON ledger_changes(id);
         INSERT OR IGNORE INTO ledger_meta VALUES('version','1');`)
       const version = this.db.prepare("SELECT value FROM ledger_meta WHERE key='version'").get() as { value: string }
       if (version.value !== '1') throw new Error('Unsupported ledger schema')
@@ -110,14 +120,16 @@ export class BehaviorLedgerStore {
       }
       this.cursorKey = this.meta('cursor_key')
       this.initialized = true
+      this.refreshUsage()
       this.db.transaction(() => {
         // A detached direct command has no passive Caller row after its observer dies.
+        this.pendingRows.clear()
         for (const row of this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL')) {
           const record = recordOf(row)
           if (DIRECT.has(record.behavior) && !TERMINAL.has(record.state)) {
             this.put({ ...record, state: 'unknown', activity: 'unknown' }, row, true)
             if (record.parentId) this.aggregate(record.parentId)
-          }
+          } else this.trackPending(row.native_id, record)
         }
         this.prune()
       })()
@@ -181,13 +193,24 @@ export class BehaviorLedgerStore {
         if (!Number.isSafeInteger(observation.count) || observation.count < 1) throw new LedgerError(400, 'invalid_observation')
         this.loss(observation.count); return
       }
-      this.connection().transaction(() => {
-        if (observation.type === 'admit') this.admit(observation)
-        else if (observation.type === 'result') this.result(observation)
-        else if (observation.type === 'caller') this.caller(observation)
-        else if (observation.type === 'heartbeat') this.staleActivities()
-        this.prune()
-      })()
+      const usage = { instances: this.instanceCount, instanceBytes: this.instanceBytes, changeBytes: this.changeBytes }
+      try {
+        this.connection().transaction(() => {
+          if (observation.type === 'admit') this.admit(observation)
+          else if (observation.type === 'result') this.result(observation)
+          else if (observation.type === 'caller') this.caller(observation)
+          else if (observation.type === 'heartbeat') this.staleActivities()
+          this.prune()
+        })()
+      } catch (error) {
+        // The transaction rolled back; restore the incremental counters so
+        // a failed capture leaves usage and pending exactly as they were.
+        this.instanceCount = usage.instances
+        this.instanceBytes = usage.instanceBytes
+        this.changeBytes = usage.changeBytes
+        this.rebuildPending()
+        throw error
+      }
       this.data.observedAt = this.time()
     } finally { this.persistJournal(this.currentHealth()) }
   }
@@ -242,10 +265,34 @@ export class BehaviorLedgerStore {
     this.capAttempts(parent.id)
     this.aggregate(parent.id)
   }
+  private refreshUsage(): void {
+    // The only full-table scan: runs once per open, then every mutation
+    // maintains the counters incrementally so reads and captures stay flat.
+    const instances = this.connection().prepare('SELECT count(*) AS count,coalesce(sum(bytes),0) AS bytes FROM ledger_instances').get() as { count: number; bytes: number }
+    const changes = this.connection().prepare('SELECT coalesce(sum(bytes),0) AS bytes FROM ledger_changes').get() as { bytes: number }
+    this.instanceCount = instances.count
+    this.instanceBytes = instances.bytes
+    this.changeBytes = changes.bytes
+  }
+  private trackPending(nativeId: string | null, record: LedgerRecord, into: Map<string, LedgerPending> = this.pendingRows): void {
+    if (nativeId === null) return
+    if (!DIRECT.has(record.behavior) && (record.activity !== 'settled' || !TERMINAL.has(record.state))) {
+      into.set(nativeId, { nativeId, callId: record.refs.find((ref) => ref.kind === 'caller')?.identity ?? null })
+    } else into.delete(nativeId)
+  }
+  private rebuildPending(): void {
+    // Rebuild into a fresh map so a failed scan keeps the previous one.
+    const rebuilt = new Map<string, LedgerPending>()
+    for (const row of this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL')) this.trackPending(row.native_id, recordOf(row), rebuilt)
+    this.pendingRows = rebuilt
+  }
   private insert(record: LedgerRecord, admissionKey: string | null, nativeId: string | null): void {
     this.checkRecord(record)
+    const rowBytes = encodedBytes(record) + 512
     this.connection().prepare(`INSERT INTO ledger_instances(id,parent_id,admission_key,native_id,payload,updated_at,source_at,bytes)
-      VALUES(?,?,?,?,?,?,?,?)`).run(record.id, record.parentId, admissionKey, nativeId, JSON.stringify(record), this.time(), this.time(), encodedBytes(record) + 512)
+      VALUES(?,?,?,?,?,?,?,?)`).run(record.id, record.parentId, admissionKey, nativeId, JSON.stringify(record), this.time(), this.time(), rowBytes)
+    this.instanceCount++
+    this.instanceBytes += rowBytes
     this.put(record, this.byId(record.id)!, true)
   }
   private checkRecord(record: LedgerRecord): void {
@@ -266,11 +313,16 @@ export class BehaviorLedgerStore {
     this.checkRecord(record)
     const payload = JSON.stringify(record)
     const encoded = JSON.stringify({ sequence: record.revision, op: 'upsert', record })
-    this.connection().prepare('UPDATE ledger_changes SET payload=?,bytes=? WHERE seq=?').run(encoded, Buffer.byteLength(encoded) + 256, record.revision)
+    const changeRowBytes = Buffer.byteLength(encoded) + 256
+    this.connection().prepare('UPDATE ledger_changes SET payload=?,bytes=? WHERE seq=?').run(encoded, changeRowBytes, record.revision)
+    this.changeBytes += changeRowBytes
     const terminal = TERMINAL.has(record.state) ? 1 : 0
     const noWrite = directNoWrite(record) ? 1 : 0
+    const rowBytes = Buffer.byteLength(payload) + 512
     this.connection().prepare('UPDATE ledger_instances SET payload=?,updated_at=?,source_at=?,native_override=?,bytes=?,terminal=?,no_write=? WHERE id=?')
-      .run(payload, this.time(), sourceAt, nativeOverride, Buffer.byteLength(payload) + 512, terminal, noWrite, record.id)
+      .run(payload, this.time(), sourceAt, nativeOverride, rowBytes, terminal, noWrite, record.id)
+    this.instanceBytes += rowBytes - row.bytes
+    this.trackPending(row.native_id, record)
   }
 
   private validateRefs(refs: LedgerReference[]): void {
@@ -360,7 +412,7 @@ export class BehaviorLedgerStore {
   private staleActivities(): void {
     const cutoff = new Date(this.now() - LEDGER_STALE_MS).toISOString()
     const roots = new Set<string>()
-    for (const row of this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL AND source_at < ?', cutoff)) {
+    for (const row of this.budgetScan(() => this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL AND source_at < ?', cutoff))) {
       const record = recordOf(row)
       if (record.activity === 'unknown' || (TERMINAL.has(record.state) && record.activity === 'settled')) continue
       this.put({ ...record, activity: 'unknown' }, row)
@@ -374,10 +426,15 @@ export class BehaviorLedgerStore {
     if (!record.parentId) for (const child of this.rows('SELECT * FROM ledger_instances WHERE parent_id=?', row.id)) this.remove(child)
     if (!TERMINAL.has(record.state) || record.activity !== 'settled') this.gap('eviction')
     this.connection().prepare('DELETE FROM ledger_instances WHERE id=?').run(row.id)
+    if (row.native_id !== null) this.pendingRows.delete(row.native_id)
+    this.instanceCount--
+    this.instanceBytes -= row.bytes
     const change = this.connection().prepare("INSERT INTO ledger_changes(id,op,payload,created_at,bytes) VALUES(?,'remove','',?,0)").run(row.id, this.time())
     const sequence = Number(change.lastInsertRowid)
     const payload = JSON.stringify({ sequence, op: 'remove', id: row.id, revision: sequence })
-    this.connection().prepare('UPDATE ledger_changes SET payload=?,bytes=? WHERE seq=?').run(payload, Buffer.byteLength(payload) + 256, sequence)
+    const changeRowBytes = Buffer.byteLength(payload) + 256
+    this.connection().prepare('UPDATE ledger_changes SET payload=?,bytes=? WHERE seq=?').run(payload, changeRowBytes, sequence)
+    this.changeBytes += changeRowBytes
   }
   private capAttempts(id: string): void {
     const rows = this.rows('SELECT * FROM ledger_instances WHERE parent_id=? ORDER BY creation_seq DESC', id)
@@ -396,11 +453,10 @@ export class BehaviorLedgerStore {
     this.put({ ...record, omittedAttempts: record.omittedAttempts + Math.min(count, victims.length) }, root)
   }
   private usage(): { instances: number; changes: number; bytes: number } {
-    return this.budgetScan(() => {
-      const a = this.connection().prepare('SELECT count(*) AS count,coalesce(sum(bytes),0) AS bytes FROM ledger_instances').get() as { count: number; bytes: number }
-      const b = this.connection().prepare('SELECT count(*) AS count,coalesce(sum(bytes),0) AS bytes FROM ledger_changes').get() as { count: number; bytes: number }
-      return { instances: a.count, changes: b.count, bytes: a.bytes + b.bytes }
-    })
+    // Change sequences stay contiguous: inserts append and retention only
+    // drops a bottom prefix, so the count is last minus floor with no scan.
+    return { instances: this.instanceCount, changes: this.lastSequence() - Number(this.meta('change_floor')),
+      bytes: this.instanceBytes + this.changeBytes }
   }
   private budgetScan<T>(query: () => T): T {
     const startedAt = performance.now()
@@ -408,22 +464,32 @@ export class BehaviorLedgerStore {
   }
   private trimChanges(): void {
     const cutoff = new Date(this.now() - this.policy.retentionMs).toISOString()
-    const expired = this.budgetScan(() => this.connection().prepare('SELECT max(seq) AS seq FROM ledger_changes WHERE created_at < ? OR seq IN (SELECT seq FROM ledger_changes ORDER BY seq DESC LIMIT -1 OFFSET ?)')
-      .get(cutoff, this.policy.maxChanges)) as { seq: number | null }
-    if (expired.seq !== null) this.dropChangesThrough(expired.seq)
+    const floor = Number(this.meta('change_floor'))
+    const expired = this.budgetScan(() => this.connection().prepare('SELECT seq FROM ledger_changes INDEXED BY ledger_change_created WHERE created_at < ? ORDER BY seq DESC LIMIT 1')
+      .get(cutoff)) as { seq: number } | undefined
+    // The newest maxChanges sequences end at last, so anything at or below
+    // last minus maxChanges is over the cap without counting rows.
+    const target = Math.max(expired?.seq ?? floor, this.lastSequence() - this.policy.maxChanges, floor)
+    if (target > floor) this.dropChangesThrough(target)
   }
   private dropChangesThrough(sequence: number): void {
+    const floor = Number(this.meta('change_floor'))
+    if (sequence > floor) {
+      const removed = this.budgetScan(() => this.connection().prepare('SELECT coalesce(sum(bytes),0) AS bytes FROM ledger_changes WHERE seq>? AND seq<=?')
+        .get(floor, sequence)) as { bytes: number }
+      this.changeBytes -= removed.bytes
+    }
     this.connection().prepare('DELETE FROM ledger_changes WHERE seq<=?').run(sequence)
-    this.connection().prepare("UPDATE ledger_meta SET value=? WHERE key='change_floor'").run(String(Math.max(Number(this.meta('change_floor')), sequence)))
+    this.connection().prepare("UPDATE ledger_meta SET value=? WHERE key='change_floor'").run(String(Math.max(floor, sequence)))
   }
   private prune(): void {
     const cutoff = new Date(this.now() - this.policy.retentionMs).toISOString()
-    for (const row of this.rows('SELECT * FROM ledger_instances WHERE parent_id IS NULL AND updated_at < ?', cutoff)) this.remove(row)
+    for (const row of this.budgetScan(() => this.rows('SELECT * FROM ledger_instances WHERE parent_id IS NULL AND updated_at < ?', cutoff))) this.remove(row)
     this.trimChanges()
     let usage = this.usage()
     while (usage.instances > this.policy.maxInstances || usage.bytes > this.policy.maxBytes) {
       // Preserve panel work ahead of repetitive terminal direct no-write firings.
-      const victim = this.rows('SELECT * FROM ledger_instances WHERE parent_id IS NULL ORDER BY no_write DESC,terminal DESC,creation_seq ASC LIMIT 1')[0]
+      const victim = this.budgetScan(() => this.rows('SELECT * FROM ledger_instances INDEXED BY ledger_pressure WHERE parent_id IS NULL ORDER BY no_write DESC,terminal DESC,creation_seq ASC LIMIT 1'))[0]
       if (usage.instances > this.policy.maxInstances || !usage.changes || (victim && recordOf(victim).state === 'completed' && directNoWrite(recordOf(victim)))) {
         if (!victim) break
         this.remove(victim)
@@ -437,11 +503,7 @@ export class BehaviorLedgerStore {
 
   pending(): LedgerPending[] {
     if (!this.db || this.closed) return []
-    return this.rows('SELECT * FROM ledger_instances WHERE native_id IS NOT NULL').flatMap((row) => {
-      const record = recordOf(row)
-      return !DIRECT.has(record.behavior) && (record.activity !== 'settled' || !TERMINAL.has(record.state))
-        ? [{ nativeId: row.native_id!, callId: record.refs.find((ref) => ref.kind === 'caller')?.identity ?? null }] : []
-    })
+    return [...this.pendingRows.values()]
   }
   health(): LedgerHealth {
     this.ensureOpen()
