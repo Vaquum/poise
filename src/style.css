@@ -2295,6 +2295,25 @@ tr:hover .review-btn { opacity: 1; }
   margin-top: var(--sp-4);
 }
 
+.st-storage-breakdown {
+  margin: var(--sp-2) 0;
+}
+.st-storage-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: var(--sp-1) 0;
+  border-bottom: var(--b-hair);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+.st-storage-row:last-child {
+  border-bottom: none;
+}
+.st-storage-row span:last-child {
+  font-variant-numeric: tabular-nums;
+}
+
 .st-save,
 .st-clear {
   font-family: inherit;

@@ -77,9 +77,13 @@ export async function pruneReviewCheckouts(root: string, now = Date.now()): Prom
 }
 
 /** Where Poise keeps its state: beside POISE_DB, or in ~/.poise. */
-function poiseRoot(): string {
+export function poiseStateRoot(): string {
   return process.env.POISE_DB && process.env.POISE_DB !== ':memory:'
     ? dirname(resolve(process.env.POISE_DB)) : join(homedir(), '.poise')
+}
+
+function poiseRoot(): string {
+  return poiseStateRoot()
 }
 
 /**
