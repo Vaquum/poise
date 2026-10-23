@@ -90,19 +90,35 @@ async function until(check: () => boolean, ...sessionIds: string[]) {
     await new Promise(done => setTimeout(done, 15))
   }
 }
-// Capture the idle event before finishing: the live ticker may admit the
-// next inbox prompt before a polling reader sees that transient state.
+// Arm the competitor before finishing, independently of the readiness read.
+// Its macrotask runs after cleanup; hold that read until the next prompt runs.
 async function finishAndTick(id: string): Promise<void> {
+  const observed = runtime, delivery = control
+  const expected = (prompts.get(id)?.length ?? 0) + 1
   let becameIdle = false
+  let ticked = false
+  let failure: { error: unknown } | undefined
+  let immediate: ReturnType<typeof setImmediate> | undefined
   const onEvent = (envelope: ChatEnvelope) => {
-    if (envelope.sessionId === id && envelope.event.type === 'status.changed' && envelope.event.status === 'idle') becameIdle = true
+    if (envelope.sessionId !== id || envelope.event.type !== 'status.changed' || envelope.event.status !== 'idle' || becameIdle) return
+    becameIdle = true
+    immediate = setImmediate(() => {
+      void delivery.tick().then(() => { ticked = true }, error => { failure = { error }; ticked = true })
+    })
   }
-  runtime.on('event', onEvent)
+  observed.on('event', onEvent)
   try {
     finishes.get(id)!({ stopReason: 'end_turn' })
+    await until(() => {
+      if (failure) throw failure.error
+      return ticked && prompts.get(id)?.length === expected && observed.get(id)?.status === 'running'
+    }, id)
+    // Restoring a live status read here must miss idle: the competitor ran first.
     await until(() => becameIdle, id)
-    await control.tick()
-  } finally { runtime.off('event', onEvent) }
+  } finally {
+    if (immediate) clearImmediate(immediate)
+    observed.off('event', onEvent)
+  }
 }
 
 function makeRuntime() {
@@ -459,7 +475,9 @@ describe('one Manager chat per workspace', () => {
       .toEqual([expect.objectContaining({ state: 'admitted' })])
     finishes.get(manager.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(manager.id)?.status === 'idle', manager.id)
+    await control.tick()
     expect(prompts.get(manager.id)).toHaveLength(2)
+    expect(store.inbox(instance, manager.id)).toEqual([expect.objectContaining({ body: 'Hello Manager', state: 'admitted' })])
     expect(() => runtime.prompt(manager.id, { text: 'next', attachments: [], mentions: [] })).not.toThrow()
     await until(() => prompts.get(manager.id)?.length === 3, manager.id)
     expect(prompts.get(manager.id)![2].text.split('\n[Request]\n').at(-1)).toBe('next')
