@@ -226,6 +226,73 @@ describe('turn-level checkout change mirror', () => {
     expect(events[0].message).toContain('link: symlink target changed')
   })
 
+  it('stays quiet when a turn adds untouched binary files, while still recording added text files', async () => {
+    const before = await captureCheckoutSnapshot(repo)
+    await mkdir(join(repo, 'plain-tree', 'sub'), { recursive: true })
+    await writeFile(join(repo, 'plain-tree', 'image.png'), Buffer.from([137, 80, 78, 71, 0, 1, 2]))
+    await writeFile(join(repo, 'plain-tree', 'sub', 'data.bin'), Buffer.from([0, 1, 2, 3]))
+    await writeFile(join(repo, 'plain-tree', 'notes.txt'), 'new notes\n')
+    const { changes, warnings } = compareCheckoutSnapshots(before, await after(before))
+    expect(warnings).toEqual([])
+    expect(changes).toEqual([{ path: 'plain-tree/notes.txt', oldText: '', newText: 'new notes\n', oldExists: false, newExists: true }])
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events.some(event => event.type === 'error')).toBe(false)
+  })
+
+  it('never reports generated Python caches, even when a tracked cache changes during the turn', async () => {
+    await writeFile(join(repo, 'cached.pyc'), Buffer.from([0, 1, 2, 3]))
+    git('add', 'cached.pyc'); git('commit', '-q', '-m', 'tracked cache')
+    const before = await captureCheckoutSnapshot(repo)
+    expect(before.files.has('cached.pyc')).toBe(false)
+    await writeFile(join(repo, 'cached.pyc'), Buffer.from([0, 9, 9, 9]))
+    await mkdir(join(repo, 'pkg', '__pycache__'), { recursive: true })
+    await writeFile(join(repo, 'pkg', '__pycache__', 'new.pyc'), Buffer.from([0, 4, 5]))
+    await writeFile(join(repo, 'fresh.pyc'), Buffer.from([0, 6, 7]))
+    const { changes, warnings } = compareCheckoutSnapshots(before, await after(before))
+    expect(warnings).toEqual([])
+    expect(changes).toEqual([])
+  })
+
+  it('still warns when a binary file replaces a pre-existing directory', async () => {
+    await mkdir(join(repo, 'docs'))
+    await writeFile(join(repo, 'docs', 'notes.md'), 'existing notes\n')
+    const before = await captureCheckoutSnapshot(repo)
+    await rm(join(repo, 'docs'), { recursive: true })
+    await writeFile(join(repo, 'docs'), Buffer.from([0, 1, 2]))
+    const { changes, warnings } = compareCheckoutSnapshots(before, await after(before))
+    expect(warnings).toEqual(['docs: binary or non-UTF-8 file'])
+    expect(changes).toEqual([{ path: 'docs/notes.md', oldText: 'existing notes\n', newText: '', oldExists: true, newExists: false }])
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events.filter(event => event.type === 'error')).toEqual([
+      expect.objectContaining({ recoverable: true, message: expect.stringContaining('docs: binary or non-UTF-8 file') }),
+    ])
+  })
+
+  it('still reports a binary file changed or removed during the turn, once each', async () => {
+    await writeFile(join(repo, 'binary.dat'), Buffer.from([0, 1, 2]))
+    await writeFile(join(repo, 'gone.dat'), Buffer.from([0, 7, 8]))
+    const before = await captureCheckoutSnapshot(repo)
+    await writeFile(join(repo, 'binary.dat'), Buffer.from([0, 3, 4]))
+    await rm(join(repo, 'gone.dat'))
+    const { changes, warnings } = compareCheckoutSnapshots(before, await after(before))
+    expect(changes).toEqual([])
+    expect(warnings).toEqual(['binary.dat: binary or non-UTF-8 file', 'gone.dat: binary or non-UTF-8 file'])
+  })
+
+  it('reports nothing for a turn that leaves a nested clone containing binary files untouched', async () => {
+    const nested = await makeNestedRepo()
+    await writeFile(join(nested, 'asset.png'), Buffer.from([137, 80, 78, 71, 0]))
+    const before = await captureCheckoutSnapshot(repo)
+    const { changes, warnings } = compareCheckoutSnapshots(before, await after(before))
+    expect(warnings).toEqual([])
+    expect(changes).toEqual([])
+    const events: ChatEvent[] = []
+    await emitCheckoutChanges(repo, 'turn-id', before, event => events.push(event))
+    expect(events).toEqual([])
+  })
+
   it('emits a labelled whole-turn card rather than pretending shell changes came from a native edit tool', async () => {
     const before = await captureCheckoutSnapshot(repo)
     execFileSync('sh', ['-c', 'printf "shell edit\n" > base.txt'], { cwd: repo })
