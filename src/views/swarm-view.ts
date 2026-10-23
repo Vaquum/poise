@@ -424,19 +424,34 @@ function isChatTurn(e: LogEntry): boolean {
 // Swarm, readable by expanding the row.
 async function openImportedSession(button: HTMLButtonElement, session: string): Promise<void> {
   const requestId = ++importedSessionOpenRequestId
-  let reachable = false
+  let neverImported = false
   let found: { id: string } | null = null
   try {
     const res = await fetch(`/api/chat/sessions?legacy=${encodeURIComponent(session)}`, { cache: 'no-store' })
-    reachable = res.ok
-    if (res.ok) found = ((await res.json()) as { session: { id: string } | null }).session
-  } catch { /* unreachable Chat keeps the button below */ }
+    if (!res.ok) throw new Error(`Chat session lookup returned HTTP ${res.status}`)
+    const body: unknown = await res.json()
+    if (!body || typeof body !== 'object' || !('session' in body)) throw new Error('Chat session lookup returned no readable session')
+    const imported = body.session
+    if (imported === null) neverImported = true
+    else {
+      if (!imported || typeof imported !== 'object' || !('id' in imported) || typeof imported.id !== 'string' || !imported.id.trim()) {
+        throw new Error('Chat session lookup returned no readable session')
+      }
+      found = { id: imported.id }
+    }
+  } catch (error) {
+    if (requestId === importedSessionOpenRequestId && viewEl && !viewEl.hidden) {
+      viewFeedback(`swarm-chat:${session}`, 'Chat session lookup failed', (error as Error).message, 'read_failed')
+    }
+    return
+  }
   if (requestId !== importedSessionOpenRequestId || !viewEl || viewEl.hidden) return
+  viewFeedback(`swarm-chat:${session}`, 'Chat session lookup failed', '')
   if (found) {
     window.dispatchEvent(new CustomEvent('poise:open-chat-session', { detail: { id: found.id } }))
     return
   }
-  if (!reachable || !button.isConnected) return
+  if (!neverImported || !button.isConnected) return
   const message = document.createElement('span')
   message.className = 'agent-target agent-never-imported'
   message.textContent = 'This conversation was never opened in Chat — its replies stay in Swarm.'
