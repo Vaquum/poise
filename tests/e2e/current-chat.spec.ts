@@ -334,6 +334,41 @@ test('a legacy chat never opened in Chat says so on its Swarm row', async ({ pag
   await expect(page.locator('#view-chat')).not.toBeVisible()
 })
 
+for (const failure of ['invalid-json', 'body-read'] as const) {
+  test(`keeps a legacy session link retryable after ${failure} lookup failure`, async ({ page }) => {
+    await page.addInitScript((mode) => {
+      const json = Response.prototype.json
+      let reads = 0
+      Response.prototype.json = async function () {
+        if (!new URL(this.url).searchParams.has('legacy')) return json.call(this)
+        try {
+          if (mode === 'body-read' && reads === 0) await this.body?.cancel()
+          return await json.call(this)
+        } finally { Reflect.set(window, 'legacyLookupReads', ++reads) }
+      }
+    }, failure)
+    const imported = session({ id: 's-imported', title: 'Imported legacy chat', importedFrom: 'legacy-chat-1' })
+    await legacySwarm(page, [imported])
+    let requests = 0
+    await page.route('**/api/chat/sessions?legacy=legacy-chat-1', route => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: ++requests === 1 && failure === 'invalid-json' ? '{' : JSON.stringify({ session: imported }),
+    }))
+    const link = page.locator('.agent-session-link', { hasText: 'legacy-chat-1' })
+    await link.click()
+    await expect.poll(() => page.evaluate(() => Reflect.get(window, 'legacyLookupReads'))).toBe(1)
+    await expect(page.locator('.nr-toast-title', { hasText: 'Chat session lookup failed' })).toBeVisible()
+    await expect(link).toBeVisible()
+    await expect(page.locator('.agent-never-imported')).toHaveCount(0)
+    await expect(page.locator('#view-swarm')).toBeVisible()
+    await link.click()
+    await expect(page.locator('#view-chat')).toBeVisible()
+    await expect(page.locator('.chat-session-item.active')).toContainText('Imported legacy chat')
+    expect(requests).toBe(2)
+  })
+}
+
 for (const returnToSwarm of [false, true]) {
   test(`ignores a legacy lookup after leaving Swarm, return=${returnToSwarm}`, async ({ page }) => {
     await page.addInitScript(() => {
