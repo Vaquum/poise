@@ -331,6 +331,7 @@ export class ChatRuntime extends EventEmitter {
   private readonly queuePumps = new Set<string>()
   private readonly queueTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly queueReleaseWait = new Set<string>()
+  private readonly deferredWaitingSessions = new Set<string>()
   private stopped = false
   private drainState: DrainState | null = null
   private switchState: SwitchWait | null = null
@@ -748,13 +749,16 @@ export class ChatRuntime extends EventEmitter {
    *  Sessions another live server of this instance holds are left for a
    *  later recovery. */
   private async resumeAfterUpdate(protectedSessions: ReadonlySet<string>, continuation = SWITCH_CONTINUE_PROMPT): Promise<void> {
+    this.deferredWaitingSessions.clear()
+    const blocked = new Set(protectedSessions)
     for (const row of this.readInterruptedSessions()) {
       if (this.stopped || this.drainState || this.switchState) return
-      if (protectedSessions.has(row.sessionId) || this.recoveryOwnedElsewhere(row.sessionId)) continue
+      if (blocked.has(row.sessionId) || this.recoveryOwnedElsewhere(row.sessionId)) continue
       if (!this.takeInterruptedSession(row.sessionId)) continue
-      await this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
+      const outcome = await this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
+      if (outcome === 'deferred') blocked.add(row.sessionId)
     }
-    await this.startWaitingPrompts(protectedSessions)
+    await this.startWaitingPrompts(blocked)
   }
 
   /** Start every prompt that waited behind an update, in arrival order. */
@@ -766,7 +770,8 @@ export class ChatRuntime extends EventEmitter {
       if (protectedSessions.has(entry.sessionId) || this.recoveryOwnedElsewhere(entry.sessionId)) continue
       if (this.waitingPromptBlocked(entry)) { blocked.add(entry.sessionId); continue }
       if (!this.takeWaitingPrompt(entry.id)) continue
-      await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery, entry)
+      const outcome = await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery, entry)
+      if (outcome === 'deferred') blocked.add(entry.sessionId)
     }
   }
 
@@ -805,9 +810,12 @@ export class ChatRuntime extends EventEmitter {
    *  one bad entry must not stop the entries behind it. */
   private async deliverWaitingPrompt(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata, waiting?: WaitingPrompt): Promise<WaitingDelivery> {
     try {
-      return await this.deliverWaitingPromptInner(sessionId, prompt, kind, recovery, waiting)
+      const outcome = await this.deliverWaitingPromptInner(sessionId, prompt, kind, recovery, waiting)
+      if (outcome === 'deferred') this.deferredWaitingSessions.add(sessionId)
+      return outcome
     } catch (error) {
       this.emit('log', `[chat] ${kind} prompt for ${sessionId.slice(0, 8)} failed: ${error instanceof Error ? error.message : String(error)}`)
+      this.deferredWaitingSessions.add(sessionId)
       return 'deferred'
     }
   }
@@ -828,7 +836,10 @@ export class ChatRuntime extends EventEmitter {
     }
     const defer = (message: string): void => {
       const entry = waiting ?? { id: randomUUID(), sessionId, prompt, createdAt: new Date().toISOString(), queueBefore: [], ...(recovery ? { recovery } : {}) }
-      this.writeWaitingPrompts(kind === 'interrupted' ? [entry, ...this.readWaitingPrompts()] : [...this.readWaitingPrompts(), entry])
+      const rows = this.readWaitingPrompts()
+      const next = rows.findIndex(row => row.sessionId === sessionId)
+      rows.splice(kind === 'interrupted' ? 0 : next < 0 ? rows.length : next, 0, entry)
+      this.writeWaitingPrompts(rows)
       this.emit('log', `[chat] ${kind} prompt for ${short} still waiting: ${message}`)
     }
     try {
@@ -2240,7 +2251,7 @@ export class ChatRuntime extends EventEmitter {
     const id = session.record.id
     if (session.record.role === 'manager' && session.record.retiredModel) return
     if (this.stopped || this.recovering || this.drainState || this.switchState || session.lifecycle.signal.aborted || session.record.status === 'closed'
-      || session.record.contextResetting || session.record.orphanNotice || session.turn || this.queuePumps.has(id) || this.queueTimers.has(id)) return
+      || session.record.contextResetting || session.record.orphanNotice || session.turn || this.deferredWaitingSessions.has(id) || this.queuePumps.has(id) || this.queueTimers.has(id)) return
     const waiting = this.readWaitingPrompts().find(entry => entry.sessionId === id)
     if (waiting && !this.waitingPromptBlocked(waiting) && !this.recoveryOwnedElsewhere(id) && this.takeWaitingPrompt(waiting.id)) {
       void this.deliverWaitingPrompt(id, waiting.prompt, 'waiting', waiting.recovery, waiting).then(outcome => {

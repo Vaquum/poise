@@ -280,6 +280,25 @@ describe('waiting behind a pending switch', () => {
       'Original task', 'Older queued task', 'Switch-waited task', 'Newer queued task',
     ])
   })
+
+  it('retains two waited prompts in order when the first admission transiently fails', async () => {
+    const w = await world()
+    w.runtime.setSwitchPending('r2')
+    w.runtime.prompt(w.s.id, input('First waited task'))
+    w.runtime.prompt(w.s.id, input('Second waited task'))
+    const retained = database.getMeta('chat_switch_waiting')
+    const admission = vi.spyOn(w.runtime, 'prompt').mockImplementationOnce(() => { throw new Error('temporary admission failure') })
+    try {
+      await w.runtime.releaseSwitchWait()
+      expect(admission).toHaveBeenCalledTimes(1)
+      expect(database.getMeta('chat_switch_waiting')).toBe(retained)
+      expect(w.c.calls).toHaveLength(0)
+    } finally { admission.mockRestore() }
+    await w.runtime.stop()
+    await w.make().recover()
+    await until(() => w.turns(w.s.id).length === 2)
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['First waited task', 'Second waited task'])
+  })
 })
 
 describe('the switch bound', () => {
