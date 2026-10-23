@@ -37,7 +37,7 @@ let batchFailures = 0
 let batchGate: { reached: () => void, wait: Promise<void> } | null = null
 
 function pull(repo = REPO, number = 7, fields: Record<string, unknown> = {}) {
-  return { repo, number, url: `https://github.com/${repo}/pull/${number}`, status: 'open', draft: 0, author: 'octocat', ...fields }
+  return { repo, number, url: `https://github.com/${repo}/pull/${number}`, status: 'open', draft: 0, author: 'octocat', updated_at: '2026-07-15T12:00:00Z', ...fields }
 }
 function rerunCalls() {
   return mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-interface' && args[0] === '--rerun-grey-ci-if-ready')

@@ -173,6 +173,7 @@ describe('claim lifecycle and snapshots', () => {
       status: 'open',
       author: 'poise-user',
       draft: 0,
+      updated_at: '2026-07-15T12:00:00Z',
     }
     fixture.listedPrs = [pr, secondPr]
     arrangeCli(false)

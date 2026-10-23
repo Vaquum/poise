@@ -78,7 +78,14 @@ describe('scan health and dependency recovery', () => {
       vi.useFakeTimers({ toFake: ['Date'] })
       vi.setSystemTime(new Date('2026-10-02T12:00:00Z'))
       fixture.listedPrs = [pr, { ...pr, number: 18, url: `https://github.com/${pr.repo}/pull/18` }]
-      arrangeCli(behavior === 'approve-prs', false, { unresolvedConversationCount: behavior === 'resolve-unblocking' ? 1 : 0 })
+      arrangeCli(behavior === 'approve-prs', false, behavior === 'resolve-unblocking'
+        ? {
+            unresolvedConversationCount: 1,
+            reviewerLatestState: 'APPROVED',
+            reviewerLatestCommit: HEAD_SHA,
+            activeChangeRequestAuthors: [],
+          }
+        : { unresolvedConversationCount: 0 })
       const original = mocks.runFile.getMockImplementation()!
       const check = behavior === 'resolve-unblocking' ? '--review-activity-since' : '--requested-changes-addressed'
       mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
@@ -179,7 +186,14 @@ describe('scan health and dependency recovery', () => {
   it.each(['review-new-prs', 'approve-prs', 'resolve-unblocking'] as const)('preserves %s check history while another operation owns the PR', async (behavior) => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-10-02T12:00:00Z'))
-    arrangeCli(behavior === 'approve-prs', false, { unresolvedConversationCount: behavior === 'resolve-unblocking' ? 1 : 0 })
+    arrangeCli(behavior === 'approve-prs', false, behavior === 'resolve-unblocking'
+      ? {
+          unresolvedConversationCount: 1,
+          reviewerLatestState: 'APPROVED',
+          reviewerLatestCommit: HEAD_SHA,
+          activeChangeRequestAuthors: [],
+        }
+      : { unresolvedConversationCount: 0 })
     const { database: db, behaviors: runtime } = await loadModules()
     runtime.startBehaviorsRuntime()
     db.setMeta('me', 'poise-user')
@@ -227,7 +241,13 @@ describe('scan health and dependency recovery', () => {
   })
 
   it('treats a typed resolver head supersession as a safe no-op', async () => {
-    arrangeCli(false, false, { resolveSuperseded: true, unresolvedConversationCount: 1 })
+    arrangeCli(false, false, {
+      resolveSuperseded: true,
+      unresolvedConversationCount: 1,
+      reviewerLatestState: 'APPROVED',
+      reviewerLatestCommit: HEAD_SHA,
+      activeChangeRequestAuthors: [],
+    })
     const { database: db, behaviors: runtime } = await loadModules()
     db.setMeta('me', 'poise-user')
     db.setMeta('behavior_resolve_unblocking_enabled', '1')
@@ -246,7 +266,10 @@ describe('scan health and dependency recovery', () => {
     arrangeCli(false, false, {
       resolveUnresolvedCount: 1,
       unresolvedConversationCount: 1,
-      resolveBlockers: ['reviewer_not_approved_current_head'],
+      resolveBlockers: ['commit_status_failed'],
+      reviewerLatestState: 'APPROVED',
+      reviewerLatestCommit: HEAD_SHA,
+      activeChangeRequestAuthors: [],
     })
     const log = vi.spyOn(console, 'log').mockImplementation(() => {})
     const { database: db, behaviors: runtime } = await loadModules()
@@ -257,7 +280,7 @@ describe('scan health and dependency recovery', () => {
     await runtime.runEnabledBehaviorsOnce()
 
     expect(log).toHaveBeenCalledWith(
-      `[behaviors] resolve-unblocking waiting on ${pr.repo}#${pr.number}: reviewer_not_approved_current_head`,
+      `[behaviors] resolve-unblocking waiting on ${pr.repo}#${pr.number}: commit_status_failed`,
     )
   })
 
