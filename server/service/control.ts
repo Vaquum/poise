@@ -8,7 +8,7 @@ import { diagnosticPage } from '../logging'
 // lapses unless the gateway renews it, so a gateway that died mid-drain can
 // never leave the workspace refusing work for good.
 
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -32,10 +32,16 @@ export interface ServiceHealth {
   /** True only when nothing a restart would cut is running. */
   idle: boolean
   draining: boolean
-  /** The installed release the supervisor started this server on (POISE_RELEASE); null without one. */
+  /** The installed release the supervisor started this server on (POISE_RELEASE): the active SHA. Null without one. */
   release: string | null
   /** The release a pending switch restarts this server onto; null when none is pending. */
   switching: string | null
+  /** The release this workspace is asked to run: the pending switch's target, else the active release. */
+  desiredRelease: string | null
+  /** The desired release when an install of it for this base exists (the running release needs none); null when it is not installed. */
+  installedRelease: string | null
+  /** When the pending switch was first asked for, as ISO; null when none is pending. */
+  pendingSince: string | null
 }
 
 /** What POST /api/service/switch answers. */
@@ -139,6 +145,10 @@ export class ServiceControl {
     const activeChatTurns = listOpenTurns(this.runtime.instance).length
     const calls = runningCallerCalls()
     const backgroundWork = this.runtime.busy() + releaseBackgroundBusy() + this.launches
+    const pending = this.pendingSwitchRecord()
+    const release = this.release.name
+    const switching = pending?.release ?? null
+    const desiredRelease = switching ?? release
     return {
       ok: true,
       mode: 'service',
@@ -149,25 +159,54 @@ export class ServiceControl {
       // Never idle while Caller's records cannot be read: calls an earlier server started may still run.
       idle: calls.known && activeChatTurns + calls.count + backgroundWork === 0,
       draining: this.drainOn,
-      release: this.release.name,
-      switching: this.pendingSwitch(),
+      release,
+      switching,
+      desiredRelease,
+      installedRelease: desiredRelease !== null && this.releaseInstalled(desiredRelease) ? desiredRelease : null,
+      pendingSince: pending?.since ?? null,
     }
   }
 
   /** The pending switch as the supervisor will see it: the release queued in
-   *  `releases/next`, the record switchRelease writes. Health reads the
-   *  record rather than the in-memory poll, so what it reports is what a
-   *  restart switches onto — including after one, when the supervisor has
-   *  consumed the record and nothing is pending. A record naming no release
-   *  is none either: the supervisor falls back to the current release. */
-  private pendingSwitch(): string | null {
-    let next: string
+   *  `releases/next`, the record switchRelease writes, and when it was first
+   *  asked for (the record's mtime). Health reads the record rather than the
+   *  in-memory poll, so what it reports is what a restart switches onto —
+   *  including after one, when the supervisor has consumed the record and
+   *  nothing is pending. A record naming no release is none either: the
+   *  supervisor falls back to the current release. */
+  private pendingSwitchRecord(): { release: string, since: string } | null {
+    const path = join(this.releasesDir, 'next')
+    let release: string
+    let since: Date
     try {
-      next = readFileSync(join(this.releasesDir, 'next'), 'utf8').trim()
+      release = readFileSync(path, 'utf8').trim()
+      since = statSync(path).mtime
     } catch {
       return null
     }
-    return RELEASE_NAME.test(next) ? next : null
+    return RELEASE_NAME.test(release) ? { release, since: since.toISOString() } : null
+  }
+
+  /** Whether RELEASE could be switched to now: the running release needs no
+   *  install, its image's own included; any other needs its directory with an
+   *  installed marker for this base and no failed marker. */
+  private releaseInstalled(release: string): boolean {
+    return release === this.release.name || this.releaseInstallProblem(release) === null
+  }
+
+  /** Why RELEASE cannot be switched to, or null when it can. */
+  private releaseInstallProblem(release: string): string | null {
+    const dir = join(this.releasesDir, release)
+    let base: string
+    try {
+      if (!existsSync(join(dir, 'installed'))) throw new Error('not installed')
+      base = readFileSync(join(dir, 'base'), 'utf8').trim()
+    } catch {
+      return `release ${release} is not installed`
+    }
+    if (base !== this.release.base) return `release ${release} was built for another base; recreate the container to update it`
+    if (existsSync(join(dir, 'failed'))) return `release ${release} failed to start in this workspace; it stays on release ${this.release.name}`
+    return null
   }
 
   /**
@@ -192,20 +231,22 @@ export class ServiceControl {
       this.withdrawSwitch()
       return { release, switching: false }
     }
-    const dir = join(this.releasesDir, release)
-    let base: string
-    try {
-      if (!existsSync(join(dir, 'installed'))) throw new Error('not installed')
-      base = readFileSync(join(dir, 'base'), 'utf8').trim()
-    } catch {
-      throw new HttpError(409, `release ${release} is not installed`)
-    }
-    if (base !== this.release.base) throw new HttpError(409, `release ${release} was built for another base; recreate the container to update it`)
-    // The supervisor marks a release that failed to start, and never runs it again.
-    if (existsSync(join(dir, 'failed'))) throw new HttpError(409, `release ${release} failed to start in this workspace; it stays on release ${this.release.name}`)
+    const problem = this.releaseInstallProblem(release)
+    if (problem) throw new HttpError(409, problem)
     const next = join(this.releasesDir, 'next')
-    writeFileSync(`${next}.tmp`, `${release}\n`)
-    renameSync(`${next}.tmp`, next)
+    // Re-asking the queued release — the gateway asks on every pass until the
+    // switch lands — must not move the pending age: it counts from when the
+    // switch was first asked for.
+    let queued: string | null = null
+    try {
+      queued = readFileSync(next, 'utf8').trim()
+    } catch {
+      // Nothing queued yet.
+    }
+    if (queued !== release) {
+      writeFileSync(`${next}.tmp`, `${release}\n`)
+      renameSync(`${next}.tmp`, next)
+    }
     const first = this.switchTo === null
     const retargeted = this.switchTo !== release
     this.switchTo = release
