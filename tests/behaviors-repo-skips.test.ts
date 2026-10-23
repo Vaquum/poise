@@ -43,7 +43,7 @@ let healthFailure: Error | null = null
 let held: Record<string, { reached: () => void, release: () => void, released: Promise<void> }> = {}
 
 function pull(repo: string, number: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return { repo, number, url: `https://github.com/${repo}/pull/${number}`, status: 'open', author: ME, draft: 0, ...overrides }
+  return { repo, number, url: `https://github.com/${repo}/pull/${number}`, status: 'open', author: ME, draft: 0, updated_at: '2026-07-15T12:00:00Z', ...overrides }
 }
 
 function issue(repo: string, number: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -118,7 +118,7 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
         state: 'OPEN', draft: false, head_sha: HEAD, reviewer_requested: false, active_change_request_authors: [],
         unresolved_conversation_count: unresolvedConversations, unresolved_live_conversation_count: unresolvedConversations,
         unresolved_conversation_authors: [], unresolved_live_conversation_authors: [],
-        reviewer_latest_state: null, reviewer_latest_commit: null, reviewer_reviews_since: 0, reviewer_pending_reviews: 0,
+        reviewer_latest_state: 'APPROVED', reviewer_latest_commit: HEAD, reviewer_reviews_since: 0, reviewer_pending_reviews: 0,
         latest_activity_at: null,
       })
     }

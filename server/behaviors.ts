@@ -828,6 +828,7 @@ export interface PullRequestFacts {
   status: string
   draft: boolean
   author: string
+  updated_at: string
 }
 
 // Whose pull requests a PR behavior acts on and where it is skipped, read once
@@ -1796,15 +1797,17 @@ function datastorePr(row: unknown, index: number): DatastorePr {
   const author = String(value.author || '')
   const draft = safeInteger(value.draft, `github-datastore PR row ${index} draft`)
   const status = String(value.status || '')
+  const updatedAt = String(value.updated_at || '')
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)
     || number < 1
     || draft > 1
     || !['open', 'closed', 'merged'].includes(status)
     || !author
+    || !Number.isFinite(Date.parse(updatedAt))
     || url !== `https://github.com/${repo}/pull/${number}`) {
     throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
   }
-  return { repo, number, url, draft: draft === 1, author, status }
+  return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt }
 }
 
 async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
@@ -3042,6 +3045,55 @@ async function fireApprove(
   })
 }
 
+// The approve-prs change gate (#488): --requested-changes-addressed costs
+// 2-5 core REST calls per PR per tick, which exhausts the bot's hourly
+// quota. A push, review, reply or comment moves the datastore's updated_at,
+// so a terminal no-op decision stays valid while updated_at and the local
+// inputs it consumed are unchanged. The ceiling bounds inputs the gate
+// cannot see, such as a thread resolution that leaves updated_at alone.
+const APPROVE_CHECK_CEILING_MS = 20 * 60_000
+
+interface ApproveCheckSnapshot {
+  reviewer: string
+  basis: string | null
+  dismissed: string | null
+  packet: string | null
+}
+
+function approveCheckSnapshot(repo: string, number: number, reviewer: string): ApproveCheckSnapshot {
+  return {
+    reviewer,
+    basis: latestApprovalBasisLaunch(repo, number)?.callId ?? null,
+    dismissed: latestCompletedChangeRequestLaunch(repo, number, reviewer)?.callId ?? null,
+    packet: getMeta(packetBlockKey('approve-prs', repo, number)) || null,
+  }
+}
+
+function approveCheckGateKey(pr: DatastorePr): string {
+  return `${META_PREFIX}approve_prs_check:${pr.repo}#${pr.number}`
+}
+
+function approveCheckFresh(pr: DatastorePr, snapshot: ApproveCheckSnapshot): boolean {
+  const raw = getMeta(approveCheckGateKey(pr))
+  if (!raw) return false
+  try {
+    const watermark = JSON.parse(raw) as Partial<ApproveCheckSnapshot & { updated_at: unknown, at: unknown }>
+    return typeof watermark.updated_at === 'string' && watermark.updated_at === pr.updated_at
+      && typeof watermark.at === 'number' && Number.isFinite(watermark.at)
+      && Date.now() - watermark.at < APPROVE_CHECK_CEILING_MS
+      && watermark.reviewer === snapshot.reviewer
+      && (watermark.basis ?? null) === snapshot.basis
+      && (watermark.dismissed ?? null) === snapshot.dismissed
+      && (watermark.packet ?? null) === snapshot.packet
+  } catch {
+    return false
+  }
+}
+
+function recordApproveCheck(pr: DatastorePr, snapshot: ApproveCheckSnapshot): void {
+  setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() }))
+}
+
 async function tickApprovePrs(): Promise<void> {
   if (!isEnabled('approve-prs')) return
   const author = getMeta('me') || ''
@@ -3058,6 +3110,15 @@ async function tickApprovePrs(): Promise<void> {
       if (invalidPrResultHeld(pr.repo, pr.number)) return
       const checkTarget = `${prTarget}:check`
       if (!behaviorRetryDue('approve-prs', checkTarget)) return
+      // A held failure retries on its own clock even when nothing changed.
+      // An in-flight launch settles into the snapshot's local inputs, and
+      // review's reconciliation commits concurrently with this tick: only
+      // skip once nothing for this PR is still in flight, so a completing
+      // review can never be gated out by a snapshot taken a moment early.
+      const snapshot = approveCheckSnapshot(pr.repo, pr.number, reviewer)
+      if (readBehaviorFailure('approve-prs', checkTarget) === null
+        && !hasActiveAgentLaunchForPr(pr.repo, pr.number)
+        && approveCheckFresh(pr, snapshot)) return
       let operationId: string | null = null
       let launched = false
       let checked = false
@@ -3212,7 +3273,13 @@ async function tickApprovePrs(): Promise<void> {
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('approve-prs', 'operation', err, checkTarget)
       } finally {
-        if (checked && !behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget)
+        // The watermark records only a terminal no-op: a launch, a
+        // deferral (busy PR, active launch, held claim) or an error
+        // never parks the PR, so the next tick checks it again.
+        if (checked && !behaviorAborted()) {
+          clearBehaviorFailure('approve-prs', checkTarget)
+          if (!launched) recordApproveCheck(pr, snapshot)
+        }
         if (!launched && operationId) releasePrOperationOwned(operationId)
       }
     }))
@@ -3277,12 +3344,11 @@ export function getResolveUnblockingLastFired(): { at: string, target: string } 
   return null
 }
 
-async function resolveNonblockingIfReady(repo: string, number: number): Promise<ResolveResult> {
+async function resolveNonblockingIfReady(repo: string, number: number, expectedHead: string): Promise<ResolveResult> {
   const [owner, name] = repo.split('/', 2)
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
   const reviewer = configuredReviewer()
-  const expectedHead = await currentHeadSha(repo, number, reviewer)
   const nativeId = randomUUID()
   captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
     source: 'poise:resolve-unblocking', owner: currentOrganization()?.login ?? null,
@@ -3395,6 +3461,17 @@ async function tickResolveUnblocking(): Promise<void> {
           checked = true
           return
         }
+        // The resolve CLI re-verifies this gate itself and costs 3 core
+        // REST calls plus a head lookup per run: skip the doomed call when
+        // the approval blockers already fail on the activity in hand (#488).
+        // Its expected head is that same activity head, so no separate
+        // --head-sha lookup is needed; a raced push lands on superseded.
+        if (activity.reviewerLatestState !== 'APPROVED'
+          || activity.reviewerLatestCommit !== activity.headSha
+          || activity.activeChangeRequestAuthors.length > 0) {
+          checked = true
+          return
+        }
         if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
         operationId = claimPrOperationOwned(key, PR_OPERATION_EVALUATION_LEASE_MS)
         if (!operationId) return
@@ -3403,7 +3480,7 @@ async function tickResolveUnblocking(): Promise<void> {
         // whose repository was just skipped, from starting another resolve.
         if (!isEnabled('resolve-unblocking') || !stillEligible('resolve-unblocking', pr)) return
         runId = startDirectBehaviorRun('resolve-unblocking')
-        const result = await resolveNonblockingIfReady(pr.repo, pr.number)
+        const result = await resolveNonblockingIfReady(pr.repo, pr.number, activity.headSha)
         if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true)
         else discardDirectBehaviorRun(runId)
         runId = null

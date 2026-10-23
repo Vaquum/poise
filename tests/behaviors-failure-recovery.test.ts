@@ -304,6 +304,8 @@ describe('worker failure classification and recovery', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(mocks.spawnDetached.mock.calls[1][1]).toContain('#18')
     arrangeCli(behavior === 'approve-prs', false, { headSha: NEXT_HEAD_SHA })
+    // The push behind the new head moves the datastore rows too.
+    fixture.listedPrs = fixture.listedPrs.map((row) => ({ ...row, updated_at: '2026-07-15T12:00:01Z' }))
     await modules.behaviors.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
   })

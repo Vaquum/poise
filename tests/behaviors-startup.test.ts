@@ -31,6 +31,7 @@ describe('startup snapshots and recovery', () => {
       status: 'open',
       author: 'poise-user',
       draft: 0,
+      updated_at: '2026-07-15T12:00:00Z',
     }
     fixture.listedPrs = [pr, downtimePr]
     arrangeCli(false)
