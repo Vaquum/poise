@@ -1,14 +1,25 @@
+import { access } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
   diagnostic: vi.fn(),
   runFile: vi.fn(),
+  workerBuild: vi.fn<(outfile: string) => void>(),
   models: {} as Record<string, { default: string, fallback: string }>,
   agentAccount: 'bit-mis',
   // The scheduler's replay check; these tests admit everything unless told not to.
   admit: vi.fn(async () => undefined),
 }))
+
+vi.mock('esbuild', async importOriginal => {
+  const original = await importOriginal<typeof import('esbuild')>()
+  return { ...original, build: (options: import('esbuild').BuildOptions) => {
+    mocks.workerBuild(options.outfile ?? '')
+    return original.build(options)
+  } }
+})
 
 vi.mock('../server/settings', () => ({
   getModelSettings: () => mocks.models,
@@ -43,7 +54,7 @@ vi.mock('../server/gh', () => ({
   localCheckoutPath: vi.fn(),
 }))
 
-import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentReasoning, quarantinedLogMayMatch } from '../server/agent'
+import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchAgentLogsSince, fetchAgentLogWatermark, fetchRunningAgentLogs, fetchRunningAgentLogSnapshot, quarantinedLogMayMatch, resetAgentLogCache } from '../server/agent'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
 
 function logRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -76,6 +87,8 @@ function logRow(overrides: Record<string, unknown> = {}): Record<string, unknown
 beforeEach(() => {
   mocks.captureAdmission.mockClear(); mocks.captureOutcome.mockClear(); mocks.observeSnapshot.mockClear()
   mocks.diagnostic.mockClear()
+  mocks.workerBuild.mockClear()
+  resetAgentLogCache()
 })
 
 describe('agent log compatibility', () => {
@@ -385,30 +398,52 @@ describe('agent log snapshot sharing', () => {
   // a teardown, calling the mock once more after every test.
   beforeEach(() => { mocks.runFile.mockReset() })
 
-  it('queues overlapping readers onto one follow-up read that sees later rows', async () => {
+  it('shares one read across overlapping readers, and queues a fresh reader onto a follow-up', async () => {
     const releases: Array<(value: { stdout: string, stderr: string }) => void> = []
     mocks.runFile.mockImplementation(() => new Promise((resolve) => { releases.push(resolve) }))
     const first = fetchAgentLogSnapshot()
     const late = Array.from({ length: 10 }, () => fetchAgentLogSnapshot())
+    const fresh = fetchAgentLogSnapshot({ fresh: true })
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
     releases[0]!({ stdout: JSON.stringify([logRow({ id: 'a'.repeat(32) })]), stderr: '' })
     const firstSnapshot = await first
     expect(firstSnapshot.entries.map((row) => row.id)).toEqual(['a'.repeat(32)])
-    // The queued read starts when the running one settles.
+    const snapshots = await Promise.all(late)
+    for (const snapshot of snapshots) expect(snapshot).toBe(firstSnapshot)
+    // The fresh reader queued for the next read, which starts when the
+    // running one settles — and sees the row written after it arrived.
     expect(mocks.runFile).toHaveBeenCalledTimes(2)
     releases[1]!({ stdout: JSON.stringify([logRow({ id: 'a'.repeat(32) }), logRow({ id: 'b'.repeat(32) })]), stderr: '' })
-    const snapshots = await Promise.all(late)
-    for (const snapshot of snapshots) expect(snapshot).toBe(snapshots[0])
-    // Every late caller arrived after row B was written, and sees it.
-    expect(snapshots[0]?.entries.map((row) => row.id)).toEqual(['b'.repeat(32), 'a'.repeat(32)])
+    const freshSnapshot = await fresh
+    expect(freshSnapshot.entries.map((row) => row.id)).toEqual(['b'.repeat(32), 'a'.repeat(32)])
     expect(mocks.observeSnapshot).toHaveBeenCalledTimes(2)
   })
 
-  it('reads again once the shared read has settled', async () => {
+  it('reuses the shared snapshot within its TTL, then reads again', async () => {
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
-    await fetchAgentLogSnapshot()
-    await fetchAgentLogSnapshot()
+    const first = await fetchAgentLogSnapshot()
+    await expect(fetchAgentLogSnapshot()).resolves.toBe(first)
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    resetAgentLogCache()
+    await expect(fetchAgentLogSnapshot()).resolves.not.toBe(first)
     expect(mocks.runFile).toHaveBeenCalledTimes(2)
+  })
+
+  it('rereads once the shared snapshot TTL expires', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    const now = vi.spyOn(Date, 'now')
+    try {
+      now.mockReturnValue(1_000_000)
+      const first = await fetchAgentLogSnapshot()
+      now.mockReturnValue(1_000_000 + 4_999)
+      await expect(fetchAgentLogSnapshot()).resolves.toBe(first)
+      expect(mocks.runFile).toHaveBeenCalledTimes(1)
+      now.mockReturnValue(1_000_000 + 5_000)
+      await expect(fetchAgentLogSnapshot()).resolves.not.toBe(first)
+      expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    } finally {
+      now.mockRestore()
+    }
   })
 
   it('rejects one waiter’s abort without disturbing the other reader', async () => {
@@ -429,10 +464,10 @@ describe('agent log snapshot sharing', () => {
     expect((failure as Error).cause).toBe(reason)
     releases[0]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
     await expect(first).resolves.toBeDefined()
-    expect(mocks.runFile).toHaveBeenCalledTimes(2)
-    const childSignal = mocks.runFile.mock.calls[1][2].signal as AbortSignal
+    // Both remaining readers joined the one running read.
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    const childSignal = mocks.runFile.mock.calls[0][2].signal as AbortSignal
     expect(childSignal.aborted).toBe(false)
-    releases[1]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
     await expect(kept).resolves.toMatchObject({ entries: [{ id: 'a'.repeat(32) }] })
   })
 
@@ -441,14 +476,14 @@ describe('agent log snapshot sharing', () => {
     mocks.runFile.mockImplementation(() => new Promise((resolve) => { releases.push(resolve) }))
     const controller = new AbortController()
     const first = fetchAgentLogSnapshot()
-    const queued = fetchAgentLogSnapshot({ signal: controller.signal })
+    const queued = fetchAgentLogSnapshot({ signal: controller.signal, fresh: true })
     controller.abort()
     await expect(queued).rejects.toThrow('The operation was aborted')
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
     releases[0]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
     await expect(first).resolves.toBeDefined()
-    // Nothing was left queued: the next call spawns fresh.
-    const third = fetchAgentLogSnapshot()
+    // Nothing was left queued: a fresh call spawns its own read.
+    const third = fetchAgentLogSnapshot({ fresh: true })
     expect(mocks.runFile).toHaveBeenCalledTimes(2)
     releases[1]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
     await expect(third).resolves.toBeDefined()
@@ -462,16 +497,18 @@ describe('agent log snapshot sharing', () => {
       releases.push(resolve)
       options.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')), { once: true })
     }))
-    const running = fetchAgentLogSnapshot()
+    const gone = new AbortController()
     const first = new AbortController()
     const second = new AbortController()
+    const running = fetchAgentLogSnapshot({ signal: gone.signal })
     const one = fetchAgentLogSnapshot({ signal: first.signal })
     const two = fetchAgentLogSnapshot({ signal: second.signal })
-    releases[0]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
-    await expect(running).resolves.toBeDefined()
-    // Both waiters share the promoted second read.
-    expect(mocks.runFile).toHaveBeenCalledTimes(2)
-    const childSignal = mocks.runFile.mock.calls[1][2].signal as AbortSignal
+    // All three joined the one running read.
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    const childSignal = mocks.runFile.mock.calls[0][2].signal as AbortSignal
+    gone.abort()
+    await expect(running).rejects.toThrow('The operation was aborted')
+    expect(childSignal.aborted).toBe(false)
     first.abort()
     await expect(one).rejects.toThrow('The operation was aborted')
     expect(childSignal.aborted).toBe(false)
@@ -481,8 +518,8 @@ describe('agent log snapshot sharing', () => {
     // The slot cleared synchronously: a caller arriving during kill
     // teardown joins no dying child.
     const fresh = fetchAgentLogSnapshot()
-    expect(mocks.runFile).toHaveBeenCalledTimes(3)
-    releases[2]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    releases[1]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
     await expect(fresh).resolves.toBeDefined()
   })
 
@@ -493,17 +530,17 @@ describe('agent log snapshot sharing', () => {
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
 
-  it('fails a read’s waiters, still runs the queued read, then retries', async () => {
+  it('fails a shared read’s waiters, still runs the fresh waiter’s queued read, then shares', async () => {
     mocks.runFile.mockRejectedValueOnce(new Error('Caller is down'))
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
     const one = fetchAgentLogSnapshot()
-    const two = fetchAgentLogSnapshot()
+    const two = fetchAgentLogSnapshot({ fresh: true })
     await expect(one).rejects.toThrow('Caller is down')
     // The queued read is its own attempt, not the failure inherited.
     await expect(two).resolves.toBeDefined()
     expect(mocks.observeSnapshot).toHaveBeenCalledTimes(1)
     await expect(fetchAgentLogSnapshot()).resolves.toBeDefined()
-    expect(mocks.runFile).toHaveBeenCalledTimes(3)
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
   })
 
   it('freezes the shared snapshot so co-waiters cannot corrupt each other', async () => {
@@ -523,11 +560,11 @@ describe('agent log snapshot sharing', () => {
   it('ignores an abort that lands after the read has settled', async () => {
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
     const controller = new AbortController()
-    await expect(fetchAgentLogSnapshot({ signal: controller.signal })).resolves.toBeDefined()
+    const first = await fetchAgentLogSnapshot({ signal: controller.signal })
     controller.abort()
     expect(mocks.runFile).toHaveBeenCalledTimes(1)
-    await fetchAgentLogSnapshot()
-    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    await expect(fetchAgentLogSnapshot()).resolves.toBe(first)
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
   })
 
   it('spawns every shared read under its own diagnostic identity', async () => {
@@ -541,7 +578,7 @@ describe('agent log snapshot sharing', () => {
     const firstSpawner = { correlationId: 'first', behavior: 'review-new-prs', repository: 'o/r', target: 'o/r#1', account: 'a' }
     const queuedSpawner = { correlationId: 'queued', behavior: 'approve-prs', repository: 'o/r', target: 'o/r#2', account: 'a' }
     const first = withNoticeDiagnosticIdentity(firstSpawner, () => fetchAgentLogSnapshot())
-    const second = withNoticeDiagnosticIdentity(queuedSpawner, () => fetchAgentLogSnapshot())
+    const second = withNoticeDiagnosticIdentity(queuedSpawner, () => fetchAgentLogSnapshot({ fresh: true }))
     releases[0]!({ stdout: JSON.stringify([logRow()]), stderr: '' })
     await first
     // The queued read starts inside the first read's settle callback, whose
@@ -569,7 +606,7 @@ describe('agent log snapshot sharing', () => {
       second.catch((error) => error),
       third.catch((error) => error),
     ])
-    // Second and third co-wait on the queued read: distinct objects.
+    // All three joined the one running read: distinct objects.
     expect(failures[0]).not.toBe(failures[1])
     expect(failures[1]).not.toBe(failures[2])
     expect(failures[0]).not.toBe(shared)
@@ -860,6 +897,7 @@ describe('issue review rows', () => {
       stderr: '',
     })
     await expect(fetchAgentLogs()).rejects.toThrow(/violates the schema/)
+    resetAgentLogCache()
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([issueRow({ status: 'completed' })]), stderr: '' })
     await expect(fetchAgentLogs()).rejects.toThrow(/incomplete terminal outcome/)
   })
@@ -883,4 +921,204 @@ describe('issue review rows', () => {
     expect(gh.getHeadSha).not.toHaveBeenCalled()
     expect(gh.localCheckoutPath).not.toHaveBeenCalled()
   })
+})
+
+describe('running agent-log lane', () => {
+  beforeEach(() => { mocks.runFile.mockReset() })
+
+  it('reads the running set from its own indexed argv', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([
+      logRow({ id: 'a'.repeat(32), status: 'running', completed_at: null }),
+      logRow({ id: 'b'.repeat(32), status: 'running', completed_at: null }),
+    ]), stderr: '' })
+    const snapshot = await fetchRunningAgentLogSnapshot()
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--status', 'running'])
+    expect(snapshot.entries.map((row) => row.id)).toEqual(['b'.repeat(32), 'a'.repeat(32)])
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    // The ledger keeps its full-read cadence; the running lane only answers.
+    expect(mocks.observeSnapshot).not.toHaveBeenCalled()
+  })
+
+  it('keeps the running filter when Caller cannot pre-filter', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([
+      logRow({ id: 'a'.repeat(32), status: 'completed' }),
+      logRow({ id: 'b'.repeat(32), status: 'running', completed_at: null }),
+    ]), stderr: '' })
+    const rows = await fetchRunningAgentLogs()
+    expect(rows.map((row) => row.id)).toEqual(['b'.repeat(32)])
+  })
+
+  it('shares the running snapshot separately from the history snapshot', async () => {
+    mocks.runFile.mockImplementation(async (_command: string, args: readonly string[]) => ({
+      stdout: JSON.stringify([logRow({ status: args.includes('--status') ? 'running' : 'completed' })]),
+      stderr: '',
+    }))
+    const history = await fetchAgentLogSnapshot()
+    const running = await fetchRunningAgentLogSnapshot()
+    await expect(fetchAgentLogSnapshot()).resolves.toBe(history)
+    await expect(fetchRunningAgentLogSnapshot()).resolves.toBe(running)
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    resetAgentLogCache()
+    await fetchAgentLogSnapshot()
+    await fetchRunningAgentLogSnapshot()
+    expect(mocks.runFile).toHaveBeenCalledTimes(4)
+  })
+
+  it('answers a running read while a history read is still running', async () => {
+    let releaseHistory!: (value: { stdout: string, stderr: string }) => void
+    mocks.runFile.mockImplementation(async (_command: string, args: readonly string[]) => {
+      if (args.includes('--status')) return { stdout: JSON.stringify([logRow({ status: 'running', completed_at: null })]), stderr: '' }
+      return new Promise((resolve) => { releaseHistory = resolve })
+    })
+    const history = fetchAgentLogSnapshot()
+    const running = await fetchRunningAgentLogs()
+    expect(running.map((row) => row.status)).toEqual(['running'])
+    releaseHistory({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    await expect(history).resolves.toBeDefined()
+  })
+
+  it('names an older Caller instead of its usage text', async () => {
+    mocks.runFile.mockRejectedValue(Object.assign(new Error('Command failed (2): agent-interface'),
+      { code: 2, stdout: '', stderr: 'error: first argument must be a behavior switch\n\nusage: agent-interface BEHAVIOR ...\n' }))
+    await expect(fetchRunningAgentLogSnapshot()).rejects.toThrow('Update Caller: running-only log reads are unavailable')
+    const locked = Object.assign(new Error('Command failed (1): agent-interface'),
+      { code: 1, stdout: '', stderr: 'traceback: database is locked' })
+    mocks.runFile.mockRejectedValue(locked)
+    const failure = await fetchRunningAgentLogSnapshot().catch((error) => error)
+    expect(failure.message).toBe('Command failed (1): agent-interface')
+    expect(failure.message).not.toContain('Update Caller')
+  })
+})
+
+describe('selected agent-log reads', () => {
+  beforeEach(() => { mocks.runFile.mockReset() })
+  const selection = { latest: [
+    { behavior: 'pr_review', source: 'poise:review-new-prs', owner: 'owner' },
+    { behavior: 'issue_review', source: 'poise:review-new-issues', owner: 'owner' },
+  ], ids: ['a'.repeat(32)] }
+
+  it('shares and caches one bounded selection with a missing kind and an old incident', async () => {
+    let answer!: (value: { stdout: string, stderr: string }) => void
+    mocks.runFile.mockImplementation(() => new Promise(resolve => { answer = resolve }))
+    const first = fetchSelectedAgentLogSnapshot(selection)
+    const concurrent = fetchSelectedAgentLogSnapshot(selection)
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs', '--select', JSON.stringify(selection)])
+    answer({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    const snapshot = await first
+    expect(await concurrent).toBe(snapshot)
+    expect(await fetchSelectedAgentLogSnapshot(selection)).toBe(snapshot)
+    expect(snapshot.entries.map(row => row.id)).toEqual(['a'.repeat(32)])
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    expect(Object.isFrozen(snapshot)).toBe(true)
+  })
+
+  it('keeps large selections on the same off-thread decoder as history', async () => {
+    const rows = Array.from({ length: 1000 }, (_, index) => logRow({
+      id: index.toString(16).padStart(32, '0'), prompt: 'x'.repeat(4000),
+    }))
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify(rows), stderr: '' })
+    const selected = await fetchSelectedAgentLogSnapshot({ latest: [], ids: rows.map(row => String(row.id)) })
+    expect(selected.entries).toHaveLength(1000)
+    expect(selected.entries[0]!.id).toBe((999).toString(16).padStart(32, '0'))
+    expect(Object.isFrozen(selected.entries[0])).toBe(true)
+  }, 30_000)
+
+  it('includes terminal candidates after the exact pre-launch insertion boundary', async () => {
+    mocks.runFile.mockResolvedValueOnce({ stdout: JSON.stringify({ cursor: '42' }), stderr: '' })
+      .mockResolvedValueOnce({ stdout: JSON.stringify([logRow({ behavior: 'author_content', session_id: 'session', status: 'completed' })]), stderr: '' })
+    const before = await fetchAgentLogWatermark()
+    const snapshot = await fetchAgentLogsSince(before, { session: 'session', behavior: 'author_content', prompt: '--topic' }, { fresh: true })
+    expect(snapshot.entries[0]!.status).toBe('completed')
+    expect(mocks.runFile.mock.calls.map(([, args]) => args)).toEqual([
+      ['--logs', '--watermark'],
+      ['--logs', '--after', '42', '--session', 'session', '--behavior', 'author_content', '--prompt', '--topic'],
+    ])
+  })
+
+  it.each(['[]', '{"cursor":-1}', '{"cursor":"bad"}'])('rejects a malformed insertion boundary %s', async stdout => {
+    mocks.runFile.mockResolvedValue({ stdout, stderr: '' })
+    await expect(fetchAgentLogWatermark()).rejects.toThrow('invalid insertion boundary')
+  })
+
+  it('names unsupported Caller selection instead of reporting absent history', async () => {
+    mocks.runFile.mockRejectedValue(Object.assign(new Error('Command failed (2): agent-interface'),
+      { code: 2, stdout: '', stderr: 'usage: agent-interface BEHAVIOR ...\n' }))
+    await expect(fetchSelectedAgentLogSnapshot(selection)).rejects.toThrow('Update Caller: selected log reads are unavailable')
+    await expect(fetchAgentLogWatermark()).rejects.toThrow('Update Caller: selected log reads are unavailable')
+  })
+})
+
+describe('off-thread agent-log parse', () => {
+  beforeEach(() => { mocks.runFile.mockReset() })
+
+  it('decodes a small read inline without worker latency', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
+    const started = performance.now()
+    const snapshot = await fetchAgentLogSnapshot()
+    expect(performance.now() - started).toBeLessThan(100)
+    expect(snapshot.entries).toHaveLength(1)
+  })
+
+  it('shares one temporary build and removes it after concurrent parse workers finish', async () => {
+    const stdout = JSON.stringify([logRow({ prompt: 'x'.repeat(2 * 1024 * 1024) })])
+    mocks.runFile.mockResolvedValue({ stdout, stderr: '' })
+    const [first, second] = await Promise.all([
+      fetchSelectedAgentLogSnapshot({ latest: [], ids: ['a'.repeat(32)] }),
+      fetchSelectedAgentLogSnapshot({ latest: [], ids: ['b'.repeat(32)] }),
+    ])
+    expect(first.entries).toEqual(second.entries)
+    expect(mocks.workerBuild).toHaveBeenCalledTimes(1)
+    const output = mocks.workerBuild.mock.calls[0]![0]
+    expect(output).not.toContain('node_modules')
+    await expect(access(dirname(output))).rejects.toMatchObject({ code: 'ENOENT' })
+  }, 30_000)
+
+  it('removes its temporary asset after a worker reports invalid JSON', async () => {
+    mocks.runFile.mockResolvedValue({ stdout: '[' + ' '.repeat(2 * 1024 * 1024), stderr: '' })
+    await expect(fetchAgentLogSnapshot()).rejects.toThrow('returned invalid JSON')
+    expect(mocks.workerBuild).toHaveBeenCalledTimes(1)
+    const output = mocks.workerBuild.mock.calls[0]![0]
+    await expect(access(dirname(output))).rejects.toMatchObject({ code: 'ENOENT' })
+  }, 30_000)
+
+  it('parses the worker request and failure shapes', async () => {
+    const { executeAgentLogParse } = await import('../server/agent-log-worker')
+    const ok = executeAgentLogParse({ stdout: JSON.stringify([logRow({ id: 'a'.repeat(32) })]), source: 'agent-interface --logs' })
+    expect(ok.ok).toBe(true)
+    if (ok.ok) expect(ok.snapshot.entries.map((row) => row.id)).toEqual(['a'.repeat(32)])
+    const failed = executeAgentLogParse({ stdout: '[broken', source: 'agent-interface --logs' })
+    expect(failed).toEqual({ ok: false, error: {
+      name: 'Error', message: 'agent-interface --logs returned invalid JSON', causeMessage: expect.any(String),
+    } })
+  })
+
+  // A 25 MB read decodes off the event loop: the loop keeps turning while
+  // the worker parses, which an inline decode could never let happen.
+  it('decodes a large read off the event loop with identical results', async () => {
+    const rows = Array.from({ length: 6000 }, (_, index) => logRow({
+      id: index.toString(16).padStart(32, '0'), prompt: 'x'.repeat(4000),
+    }))
+    const stdout = JSON.stringify(rows)
+    expect(stdout.length).toBeGreaterThan(20 * 1024 * 1024)
+    mocks.runFile.mockResolvedValue({ stdout, stderr: '' })
+    let turns = 0
+    const timer = setInterval(() => { turns += 1 }, 5)
+    try {
+      const snapshot = await fetchAgentLogSnapshot()
+      expect(turns).toBeGreaterThanOrEqual(3)
+      expect(snapshot.entries).toHaveLength(6000)
+      expect(snapshot.entries[0]!.id).toBe((5999).toString(16).padStart(32, '0'))
+      expect(Object.isFrozen(snapshot)).toBe(true)
+      expect(Object.isFrozen(snapshot.entries[0])).toBe(true)
+      expect(mocks.observeSnapshot).toHaveBeenCalledExactlyOnceWith(snapshot)
+    } finally {
+      clearInterval(timer)
+    }
+    const { parseAgentLogStdout } = await import('../server/agent-log-parse')
+    expect(parseAgentLogStdout(stdout, 'agent-interface --logs')).toEqual({
+      entries: (await fetchAgentLogSnapshot()).entries,
+      quarantined: [],
+    })
+  }, 30_000)
 })
