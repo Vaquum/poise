@@ -3984,12 +3984,15 @@ async function tickMergePrs(): Promise<void> {
         const result = objectValue(parseJson(stdout, 'github-interface --merge-if-ready'), 'merge-if-ready')
         if (result.action !== 'merge_if_ready' || result.repository !== pr.repo
           || result.pull_number !== pr.number || result.head_sha !== expectedHead
-          || !['merged', 'already_merged', 'not_ready', 'superseded'].includes(String(result.outcome))
+          || !['merged', 'already_merged', 'not_ready', 'superseded', 'enqueued', 'in_queue'].includes(String(result.outcome))
+          || (['enqueued', 'in_queue'].includes(String(result.outcome))
+            && (typeof result.queue_entry_id !== 'string' || !result.queue_entry_id.trim()))
           || (result.outcome === 'merged' && (typeof result.merge_sha !== 'string' || !SHA_PATTERN.test(result.merge_sha)))) {
           throw new Error('github-interface --merge-if-ready returned malformed state')
         }
         captureBehaviorOutcome({ nativeId: runId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
-          activity: 'settled', stateSource: 'native', outcome: result.outcome as 'merged' | 'already_merged' | 'not_ready' | 'superseded',
+          activity: 'settled', stateSource: 'native', outcome: ['enqueued', 'in_queue'].includes(String(result.outcome))
+            ? 'waiting' : result.outcome as 'merged' | 'already_merged' | 'not_ready' | 'superseded',
           head: expectedHead, completedAt: new Date().toISOString() })
         finishDirectBehaviorRun(runId, true)
         runId = null

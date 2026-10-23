@@ -46,8 +46,9 @@ function session(instance: string, openTurn: boolean): string {
 
 function fakeRuntime(instance = `poise-production:${randomUUID()}`) {
   return {
-    instance, busyNow: 0, workingNow: 0,
+    instance, busyNow: 0, workingNow: 0, heldNow: new Set<string>(),
     busy() { return this.busyNow }, working() { return this.workingNow },
+    relayHeldSessions() { return this.heldNow },
     startDrain: vi.fn(), endDrain: vi.fn(), stopTurnsForDrain: vi.fn(async () => 0),
   }
 }
@@ -307,6 +308,28 @@ describe('switching to another release', () => {
       expect(background.releaseBackgroundPaused()).toBe(true)
       expect(service.health().draining).toBe(true)
       expect(timer.timers.size).toBe(0)
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('lands while relay-held turns are running, and waits for the rest', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { runtime, timer, restart, service } = switching(dir)
+    try {
+      expect(service.switchRelease('r2')).toEqual({ release: 'r2', switching: true })
+      const held = session(runtime.instance, true)
+      const unheld = session(runtime.instance, true)
+      expect(service.health().activeChatTurns).toBe(2)
+      runtime.heldNow = new Set([held])
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      runtime.heldNow = new Set([held, unheld])
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      // The switch landed with turns recorded open: health still counts them.
+      expect(service.health().activeChatTurns).toBe(2)
     } finally {
       service.reset()
       background.resumeReleaseBackground()
