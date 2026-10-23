@@ -71,7 +71,7 @@ import { actorOf, nativeName } from './actors'
 // person's own answer and keeps the person's composition.
 import { SWITCHBOARD_PERSON } from './switchboard'
 import * as storage from './storage'
-import { holdChat, internalTurn, timerSummaries } from './control-store'
+import { holdChat, holds, internalTurn, timerSummaries } from './control-store'
 import { pgidAlive, pidAlive, signalGroup, spawnWorker, workerIdentityMatches, type WorkerHandle } from './worker'
 import { createClaudeAdapter } from './adapters/claude'
 import { createCodexAdapter } from './adapters/codex'
@@ -776,6 +776,7 @@ export class ChatRuntime extends EventEmitter {
   }
 
   private waitingPromptBlocked(entry: WaitingPrompt): boolean {
+    if (holds(this.instance).some(hold => hold.sessionId === entry.sessionId)) return true
     if (this.live.get(entry.sessionId)?.turn || storage.getOpenTurn(entry.sessionId)) return true
     const queue = this.messageQueue(entry.sessionId)
     if (queue.executorSessionId && queue.executorSessionId !== entry.sessionId) return false

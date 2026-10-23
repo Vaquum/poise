@@ -787,6 +787,36 @@ describe('the switch bound', () => {
     expect(w.c.calls.map(call => call.input.text)).toEqual(['Original task', 'Poise restarted for an update while your turn was running. Continue where you left off.', 'Sent while waiting'])
   })
 
+  it('keeps a waited prompt held after the person stops its continuation until the person resumes', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.c.calls.length === 1)
+    const turnId = storage.getOpenTurn(w.s.id)!.turnId
+    await w.runtime.cancel(w.s.id)
+    await until(() => w.runtime.working() === 0)
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId }])
+    w.runtime.setSwitchPending('r2')
+    w.runtime.prompt(w.s.id, input('Sent while waiting'))
+    await w.runtime.stop()
+    const next = w.make()
+    await tickControl(next)
+    await next.recover()
+    await until(() => w.c.calls.length === 2)
+    await next.cancel(w.s.id, { kind: 'person' })
+    await until(() => next.working() === 0)
+    expect(inbox.holds(w.instance)).toEqual([expect.objectContaining({ sessionId: w.s.id, cause: 'stopped' })])
+    expect(w.c.calls).toHaveLength(2)
+    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toHaveLength(1)
+    next.prompt(w.s.id, input('Person resumes'))
+    await until(() => w.c.calls.length === 3)
+    w.finish()
+    await until(() => w.c.calls.length === 4)
+    expect(w.c.calls.map(call => call.input.text)).toEqual([
+      'Original task', 'Poise restarted for an update while your turn was running. Continue where you left off.',
+      'Person resumes', 'Sent while waiting',
+    ])
+  })
+
   it('starts waited prompts in order after the restart, refusing and losing none', async () => {
     const w = await world()
     w.runtime.setSwitchPending('r2')

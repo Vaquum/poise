@@ -345,7 +345,8 @@ reconciles them as after any restart.
   A waited message retains its position between earlier and later normal queue
   items when the preceding turn finishes naturally during the switch. New
   waited messages record that queue boundary; older records use their stored
-  creation times.
+  creation times. The person's Stop also holds these waited messages until the
+  person resumes the chat.
   Withdrawal waits for any bound cancellation to record recovery before
   releasing messages. A bound
   cancellation never bypasses the quiet gate for server work, background
