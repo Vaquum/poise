@@ -327,7 +327,11 @@ reconciles them as after any restart.
   it waits for no agent call. While the switch is pending, new Chat turns
   wait behind the update instead of starting — sent messages, queued
   messages and work-monitor wakes alike, nothing refused or dropped —
-  while launches and behavior ticks run as usual. Running turns get the
+  while launches and behavior ticks run as usual. A Poise implementation whose
+  controller binding completes during this pause also waits durably, retaining
+  its runbook, displayed request, switches and completion responsibility. It
+  remains ahead of discussion in that change chat; a restart does not report an
+  implementation that never started as failed. Running turns get the
   update turn bound (a chat setting, default 15 minutes counted from when
   the switch became pending); past it they are cancelled through the normal
   cancel path, their sessions recorded, and the server restarted. After the

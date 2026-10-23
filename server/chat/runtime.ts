@@ -520,7 +520,11 @@ export class ChatRuntime extends EventEmitter {
       // controller must hear "failed" rather than wait forever. A turn that
       // did finish before the outbox row was written keeps its own outcome.
       if (record.selfChangeId && !finishOutbox.getFinish(record.selfChangeId)) {
-        const terminal = implementingTurnOutcome(record.id).finished
+        const implementation = implementingTurnOutcome(record.id)
+        // A bound implementation still waiting for admission survived the
+        // restart; it has no failed native turn to report.
+        if (!implementation.started && this.waitingImplementation(record.id)) continue
+        const terminal = implementation.finished
         finishOutbox.queueFinish({
           changeId: record.selfChangeId, instance: this.instance, sessionId: record.id,
           outcome: terminal?.stopReason === 'end_turn' && !record.orphanNotice ? 'completed' : 'failed',
@@ -2003,16 +2007,19 @@ export class ChatRuntime extends EventEmitter {
     }
     delegateQueue(source.id, record.id)
     this.publishQueue(live)
-    // Reserved synchronously: the ack goes out with the turn already taken.
-    // The agent gets the runbook around the request; the transcript shows
-    // the request as the person typed it.
-    const turn = this.reserveTurn(live)
-    turn.switches = names
-    turn.implementsChange = true
-    turn.shown = names?.length ? { ...transferred, text: [...names.map(name => `/${name}`), transferred.text].join(' ') } : transferred
+    // Admission is synchronous: reserve now, or persist the implementation
+    // ahead of discussion while an update holds new Chat turns.
+    const shown = names?.length ? { ...transferred, text: [...names.map(name => `/${name}`), transferred.text].join(' ') } : transferred
     const prompt: PromptInput = { ...transferred, text: poiseChangePrompt({ request, branch: prepared.branch, baseSha: prepared.baseSha, workspace: checkout }) }
-    turn.input = prompt
-    void this.serialized(live, () => this.runTurn(live, turn, prompt)).catch(() => undefined)
+    if (this.switchState) this.waitPromptForSwitch(live, prompt, { shown, implementsChange: true, switches: names })
+    else {
+      const turn = this.reserveTurn(live)
+      turn.switches = names
+      turn.implementsChange = true
+      turn.shown = shown
+      turn.input = prompt
+      void this.serialized(live, () => this.runTurn(live, turn, prompt)).catch(() => undefined)
+    }
     return { session: this.withLive(live.record), change: bound }
   }
 
@@ -2175,7 +2182,7 @@ export class ChatRuntime extends EventEmitter {
     const throughSeq = session.record.lastSeq
     const target = chain.review ? latestReviewTarget(id, throughSeq) : null
     if (chain.review && !target) throw new ChatError(400, 'There is no assistant reply to review yet.', 'invalid')
-    if (this.switchState) {
+    if (this.switchState || this.waitingImplementation(id)) {
       // Internal deliveries wait in the caller's hand: the control tick
       // holds them pending until the switch lands, so their provenance
       // survives. Anything else would admit them twice or unattributed.
@@ -2199,13 +2206,18 @@ export class ChatRuntime extends EventEmitter {
     return { turnId: turn.id }
   }
 
+  private waitingImplementation(sessionId: string): boolean {
+    return this.readWaitingPrompts().some(entry => entry.sessionId === sessionId && entry.recovery?.implementsChange === true)
+  }
+
   /** While a switch is pending, an admissible prompt waits behind the update
    *  instead of starting. Durable from this synchronous return: withdrawal,
    *  restart and crash all start it later, in arrival order. */
-  private waitPromptForSwitch(session: LiveSession, prompt: PromptInput): PromptReceipt {
+  private waitPromptForSwitch(session: LiveSession, prompt: PromptInput, recovery?: SwitchPromptMetadata): PromptReceipt {
     this.assertTurnAdmissible(session)
     const entry: WaitingPrompt = { id: randomUUID(), sessionId: session.record.id, prompt, createdAt: new Date().toISOString(),
-      queueBefore: this.messageQueue(session.record.id).items.filter(item => item.state === 'waiting').map(item => item.id) }
+      queueBefore: this.messageQueue(session.record.id).items.filter(item => item.state === 'waiting').map(item => item.id),
+      ...(recovery ? { recovery } : {}) }
     this.writeWaitingPrompts([...this.readWaitingPrompts(), entry])
     session.record.queuedBehind = SWITCH_WAIT_REASON
     this.setStatus(session, 'queued')
