@@ -3513,6 +3513,9 @@ async function tickApprovePrs(): Promise<void> {
         if (!isEnabled('approve-prs') || behaviorAborted()) return
         const { pr, expectedHead, seenTarget, firedReason, admittedReviewer } = launch
         const prTarget = `${pr.repo}#${pr.number}`
+        // Pool starts are ordered; resume after the last attempted launch,
+        // even when its claim or preparation consumes the sweep deadline.
+        setMeta('behavior_approve_prs_cursor', prTarget)
         const checkTarget = `${prTarget}:check`
         let operationId: string | null = null
         let launched = false
