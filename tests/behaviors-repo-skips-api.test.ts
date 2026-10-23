@@ -15,6 +15,13 @@ vi.mock('../server/process', async (original) => ({
   runFile: mocks.runFile,
   spawnDetached: mocks.spawnDetached,
 }))
+// These assertions count request-side Caller reads. Background maintenance
+// owns separate integration coverage and must not add fstrim/cache work here.
+vi.mock('../server/storage-maintenance', async (original) => ({
+  ...(await original<typeof import('../server/storage-maintenance')>()),
+  startStorageMaintenanceRuntime: vi.fn(),
+  stopStorageMaintenanceRuntime: vi.fn(async () => undefined),
+}))
 vi.mock('../server/content-jobs', async (original) => ({
   ...(await original<typeof import('../server/content-jobs')>()),
   startContentFinalizer: vi.fn(),
