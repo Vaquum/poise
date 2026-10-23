@@ -344,6 +344,25 @@ describe('bounded behavior ledger transport', () => {
     expect(after.pending).toBeLessThan(held.pending)
   })
 
+  it('shuts storage down on the worker when a stop outlasts the drain budget', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-stop-drain-'))
+    directories.push(directory)
+    const path = join(directory, 'ledger.db')
+    const observer = new BehaviorLedgerObserver({ path })
+    observers.push(observer)
+    await observer.start()
+    for (let index = 0; index < 1050; index++) {
+      observer.capture({ ...admission, admissionKey: `burst-${index}`, nativeId: `burst-${index}` })
+    }
+    await observer.stop()
+    // The stop budget bounds the caller, not the worker: storage still shuts
+    // down on the worker instead of being terminated mid-transaction.
+    await vi.waitFor(async () => {
+      const journal = JSON.parse(await readFile(path + '.coverage.json', 'utf8')) as { closed: boolean }
+      expect(journal.closed).toBe(true)
+    }, { timeout: 5000, interval: 50 })
+  })
+
   it('holds captures through a storage outage and recovers to ok with the list answering', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-outage-'))
     directories.push(directory)
