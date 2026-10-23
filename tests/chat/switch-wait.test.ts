@@ -248,6 +248,38 @@ describe('waiting behind a pending switch', () => {
     ])
     expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([])
   })
+
+  it('retains the waited queue boundary after a transient admission failure', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.c.calls.length === 1)
+    await w.runtime.enqueue(w.s.id, randomUUID(), input('Older queued task'))
+    w.runtime.setSwitchPending('r2')
+    w.finish()
+    await until(() => w.turns(w.s.id).length === 1 && w.runtime.working() === 0)
+    w.runtime.prompt(w.s.id, input('Switch-waited task'))
+    const retained = database.getMeta('chat_switch_waiting')
+    await w.runtime.enqueue(w.s.id, randomUUID(), input('Newer queued task'))
+    const prompt = w.runtime.prompt.bind(w.runtime)
+    let refused = false
+    const admission = vi.spyOn(w.runtime, 'prompt').mockImplementation((id, request, internal) => {
+      if (request.text === 'Switch-waited task') { refused = true; throw new Error('temporary admission failure') }
+      return prompt(id, request, internal)
+    })
+    try {
+      w.c.auto = true
+      await w.runtime.releaseSwitchWait()
+      await until(() => refused && w.runtime.working() === 0)
+      expect(database.getMeta('chat_switch_waiting')).toBe(retained)
+      expect(w.c.calls.map(call => call.input.text)).toEqual(['Original task', 'Older queued task'])
+    } finally { admission.mockRestore() }
+    await w.runtime.stop()
+    await w.make().recover()
+    await until(() => w.turns(w.s.id).length === 4)
+    expect(w.c.calls.map(call => call.input.text)).toEqual([
+      'Original task', 'Older queued task', 'Switch-waited task', 'Newer queued task',
+    ])
+  })
 })
 
 describe('the switch bound', () => {
