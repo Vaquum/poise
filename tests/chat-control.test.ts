@@ -959,6 +959,72 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
   })
 
+  it('delivers one-page review, latest-reply and older-root edits exactly once', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/73'
+    await command(parent.id, { operation: 'bind', target })
+    store.pauseDelivery(runtime.instance, parent.id)
+    const review = { id: 'R_1', author: 'fixture-agent', state: 'CHANGES_REQUESTED', revision: 'review-original' }
+    const latest = { id: 'C_2', author: 'fixture-agent', revision: 'reply-original' }
+    const rootComment = { id: 'C_1', thread: 'T_1', resolved: false, revision: 'root-original' }
+    const read = () => ({ found: true, truncated: false, reviews: [review],
+      threads: [{ thread: 'T_1', resolved: false, outdated: false, comments: [latest] }],
+      comments: [rootComment, { id: latest.id, thread: 'T_1', resolved: false, revision: latest.revision }],
+      hasUnresolved: true, page: { reviewAfter: 0, commentAfter: 0 } })
+    reviews.mockImplementation(async () => read())
+    const notices = () => store.inbox(runtime.instance, parent.id).filter(message => JSON.parse(message.body).kind === 'reviews')
+    await observeReviews(target)
+    expect(notices()).toHaveLength(1)
+    for (const [edit, count] of [
+      [() => { review.revision = 'review-edited' }, 2],
+      [() => { latest.revision = 'reply-edited' }, 3],
+      [() => { rootComment.revision = 'root-edited-after-reply' }, 4],
+    ] as const) {
+      edit()
+      clock += 5 * 60_000
+      await observeReviews(target)
+      expect(notices()).toHaveLength(count)
+      clock += 5 * 60_000
+      await observeReviews(target)
+      expect(notices()).toHaveLength(count)
+    }
+    expect(JSON.parse(notices()[3].body).editedComments).toEqual([rootComment])
+    expect(JSON.parse(notices()[3].body).blockers).toContain('Address edited review comment C_1 in thread T_1')
+    expect(new Set(notices().map(message => JSON.parse(message.body).revision)).size).toBe(4)
+  })
+
+  it('does not replay first-seen old comments on later pages of the same thread', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/74'
+    await command(parent.id, { operation: 'bind', target })
+    store.pauseDelivery(runtime.instance, parent.id)
+    const thread = { thread: 'T_1', resolved: false, outdated: false,
+      comments: [{ id: 'C_3', author: 'fixture-agent', revision: 'latest' }] }
+    const read = (id: string, revision: string) => ({ found: true, truncated: true, reviews: [], threads: [thread],
+      comments: [{ id, thread: 'T_1', resolved: false, revision }],
+      hasUnresolved: true, page: { reviewAfter: 0, commentAfter: 1 } })
+    const notices = () => store.inbox(runtime.instance, parent.id).filter(message => JSON.parse(message.body).kind === 'reviews')
+    for (const id of ['C_1', 'C_2', 'C_3']) {
+      reviews.mockResolvedValue(read(id, id === 'C_3' ? 'latest' : 'old'))
+      await observeReviews(target)
+      clock += 5 * 60_000
+    }
+    expect(notices()).toHaveLength(1)
+    // C3 was observed as latest before its raw row was reached. When a new
+    // reply makes it older, its original revision still has a durable baseline.
+    thread.comments = [{ id: 'C_4', author: 'fixture-agent', revision: 'new reply' }]
+    reviews.mockResolvedValue(read('C_4', 'new reply'))
+    await observeReviews(target)
+    clock += 5 * 60_000
+    expect(notices()).toHaveLength(2)
+    reviews.mockResolvedValue(read('C_3', 'edited-after-new-reply'))
+    await observeReviews(target)
+    clock += 5 * 60_000
+    expect(notices()).toHaveLength(3)
+    await observeReviews(target)
+    expect(notices()).toHaveLength(3)
+  })
+
   it('advances beyond both old caps and revisits old changes without resetting unseen pages', async () => {
     database.setMeta('agentAccount', 'fixture-agent')
     const parent = await manager()
@@ -1038,7 +1104,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       expect(observed?.threads).toEqual([{ thread: 'T_1', resolved: false, outdated: false, comments: [{ id: 'C_1', author: 'reviewer' }] }])
       expect(run.mock.calls[0][1]).toContain('pr-reviews')
       expect(run.mock.calls[0][1]).toEqual(expect.arrayContaining(['--page-size', '200', '--review-after', '0', '--comment-after', '0']))
-      run.mockResolvedValue({ stdout: JSON.stringify({ found: true, truncated: true, reviews: [], threads: [], has_unresolved: true,
+      run.mockResolvedValue({ stdout: JSON.stringify({ found: true, truncated: true, reviews: [], threads: [], comments: [], has_unresolved: true,
         page: { review_after: 200, comment_after: 200, next_review_after: 400, next_comment_after: 400 } }), stderr: '' })
       expect(await readWorkReviews(target, { reviewAfter: 200, commentAfter: 200 })).toMatchObject({
         page: { reviewAfter: 400, commentAfter: 400 }, hasUnresolved: true, truncated: true })

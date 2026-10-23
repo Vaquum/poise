@@ -959,7 +959,9 @@ journeys are in `tests/e2e/google-publishing.spec.ts`. See
 
 The workspace's bound-chat monitor reads local Caller `pr-reviews` pages; it
 adds no GitHub requests. Each pass requests at most 200 reviews and 200 comment identities, returning
-only each represented thread's latest comment. It persists independent cursors
+each represented thread's latest comment plus bounded raw-comment revision
+summaries for edits to older comments. Content revisions participate in notice
+identity even when IDs and review state stay unchanged. It persists independent cursors
 and cycles back to observe
 older updates and reopens. Per-identity seen state survives partial or failed
 reads; page absence cannot establish resolution or completion. GitHub authors

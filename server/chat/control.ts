@@ -260,6 +260,7 @@ export async function readWorkTargetStatus(target: store.WorkTarget): Promise<Wo
 export interface ReviewsCursor { reviewAfter: number, commentAfter: number }
 export interface ReviewsObservation {
   page?: ReviewsCursor, hasUnresolved?: boolean,
+  comments?: Array<{ id: string, thread: string, resolved: boolean | null, revision: string }>,
   found: boolean, truncated: boolean,
   reviews: Array<{ id: string, author: string | null, state: string, revision?: string }>,
   threads: Array<{ thread: string | null, resolved: boolean | null, outdated: boolean | null,
@@ -284,7 +285,8 @@ export async function readWorkReviews(target: store.WorkTarget, cursor: ReviewsC
         || !('review_after' in raw) || raw.review_after !== cursor.reviewAfter
         || !('comment_after' in raw) || raw.comment_after !== cursor.commentAfter
         || !('has_unresolved' in value) || typeof value.has_unresolved !== 'boolean'
-        || value.reviews.length > 200 || value.threads.length > 200) return null
+        || value.reviews.length > 200 || value.threads.length > 200
+        || !('comments' in value) || !Array.isArray(value.comments) || value.comments.length > 200) return null
       page = { reviewAfter: raw.next_review_after, commentAfter: raw.next_comment_after }
     }
     const reviews: ReviewsObservation['reviews'] = []
@@ -313,8 +315,19 @@ export async function readWorkReviews(target: store.WorkTarget, cursor: ReviewsC
       }
       threads.push({ thread: thread.thread_node_id, resolved: thread.resolved, outdated: thread.outdated, comments })
     }
+    const comments: ReviewsObservation['comments'] = []
+    if ('comments' in value) {
+      if (!Array.isArray(value.comments) || value.comments.length > 200) return null
+      for (const comment of value.comments) {
+        if (!comment || typeof comment !== 'object' || !('id' in comment) || typeof comment.id !== 'string'
+          || !('thread' in comment) || typeof comment.thread !== 'string'
+          || !('revision' in comment) || typeof comment.revision !== 'string'
+          || !('resolved' in comment) || (comment.resolved !== null && typeof comment.resolved !== 'boolean')) return null
+        comments.push({ id: comment.id, thread: comment.thread, resolved: comment.resolved, revision: comment.revision })
+      }
+    }
     return { found: value.found, truncated: 'truncated' in value && value.truncated === true, reviews, threads,
-      ...(page ? { page, hasUnresolved: 'has_unresolved' in value && value.has_unresolved === true } : {}) }
+      ...(page ? { page, comments, hasUnresolved: 'has_unresolved' in value && value.has_unresolved === true } : {}) }
   } catch {
     return null
   }
@@ -1412,13 +1425,25 @@ export class ChatControl {
     const seenKey = `reviews-seen:${target.url}`
     const identity = (entry: Record<string, unknown>) => 'thread' in entry ? `thread:${String(entry.thread)}` : `review:${String(entry.review)}`
     const hasNew = fingerprinted.some(entry => store.observation(instance, `${seenKey}:${identity(entry)}`)?.fingerprint !== JSON.stringify(entry))
+    // Latest-comment edits are already carried by the thread fingerprint.
+    // Older/root edits need their own bounded revision evidence. First-seen
+    // historical comments establish a baseline without replaying old activity.
+    const editedComments = (reviews.comments ?? []).filter(comment => {
+      if (comment.resolved === true || reviews.threads.some(thread => thread.comments.at(-1)?.id === comment.id)) return false
+      const known = store.observation(instance, `${seenKey}:comment:${comment.id}`)
+      return known !== undefined && known.fingerprint !== comment.revision
+    })
+    const actionable = [...fingerprinted, ...editedComments.map(comment => ({ comment: comment.id, revision: comment.revision }))]
+    blockers.push(...editedComments.map(comment => `Address edited review comment ${comment.id} in thread ${comment.thread}`))
     const data = { kind: 'reviews', target: target.url,
+      revision: createHash('sha256').update(JSON.stringify(actionable)).digest('hex'),
+      ...(editedComments.length ? { editedComments } : {}),
       reviews: reviews.reviews.map(review => ({ id: review.id, author: review.author, state: review.state })),
       threads: reviews.threads.map(thread => ({ thread: thread.thread, resolved: thread.resolved, outdated: thread.outdated,
         comments: thread.comments.map(comment => comment.id),
         authors: [...new Set(thread.comments.map(comment => comment.author))] })),
       blockers, done: WORK_DONE }
-    this.observe(binding, key, data, now, blockers.length > 0, false, fingerprinted, hasNew)
+    this.observe(binding, key, data, now, blockers.length > 0, false, actionable, hasNew || editedComments.length > 0)
     // Update only identities actually present in this page. Absence from a
     // partial (or failed) read is never evidence of resolution or removal.
     const observed = [...reviews.reviews.map(review => ({ review: review.id })),
@@ -1430,6 +1455,11 @@ export class ChatControl {
       const watchedEntry = fingerprinted.find(candidate => identity(candidate) === identity(entry))
       store.saveObservation(instance, `${seenKey}:${identity(entry)}`, watchedEntry ? JSON.stringify(watchedEntry) : '', now)
     }
+    const commentBaselines = [...(reviews.comments ?? []), ...reviews.threads.flatMap(thread => {
+      const latest = thread.comments.at(-1)
+      return latest?.revision ? [{ id: latest.id, revision: latest.revision }] : []
+    })]
+    for (const comment of commentBaselines) store.saveObservation(instance, `${seenKey}:comment:${comment.id}`, comment.revision, now)
     if (reviews.page) store.saveObservation(instance, `reviews-cursor:${target.url}`, JSON.stringify([reviews.page]), now)
   }
 

@@ -34,7 +34,9 @@ github-datastore view pr-reviews --repo OWNER/REPO --number 123 --page-size 200 
 Pass back `page.next_review_after` and `page.next_comment_after`; a zero
 cursor restarts that lane to revisit updates and reopened older threads. For each thread represented in that comment page, its summary contains only
 its latest comment, with a content revision hash. Repeated thread summaries
-across pages deduplicate at the consumer. `has_unresolved` includes
+across pages deduplicate at the consumer. Bounded `comments` summaries carry
+raw-comment identity, thread resolution and body revision, so editing an older
+root comment remains visible after a newer reply. `has_unresolved` includes
 threads outside the page. `truncated` means more identities remain, not that
 returned feedback should be discarded; absence from a page proves nothing
 about an older identity. Without `--page-size`, the legacy capped read remains

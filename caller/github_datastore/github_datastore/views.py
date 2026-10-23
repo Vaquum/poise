@@ -192,7 +192,7 @@ def _pr_reviews_page(
     # even when a single thread has arbitrarily many comments; repeated thread
     # summaries across pages are deduplicated by the consumer's identity state.
     comments = conn.execute(
-        """SELECT comment_id, COALESCE(thread_node_id, node_id) AS identity
+        """SELECT comment_id, node_id, body, COALESCE(thread_node_id, node_id) AS identity
            FROM review_comments WHERE item_id = ? AND comment_id > ?
            ORDER BY comment_id LIMIT ?""", (item_id, comment_after, page_size + 1),
     ).fetchall()
@@ -202,6 +202,7 @@ def _pr_reviews_page(
            WHERE item_id = ? AND COALESCE(thread_node_id, node_id) = ?
            ORDER BY comment_id DESC LIMIT 1""", (item_id, identity),
     ).fetchone() for identity in dict.fromkeys(row["identity"] for row in comments[:page_size])]
+    latest_by_identity = {row["thread_node_id"] or row["node_id"]: row for row in threads}
     has_unresolved = conn.execute(
         """SELECT 1 FROM review_comments INDEXED BY idx_review_unresolved WHERE item_id = ? AND thread_resolved = 0
            UNION ALL SELECT 1 FROM review_comments INDEXED BY idx_review_unresolved WHERE item_id = ? AND thread_resolved IS NULL LIMIT 1""",
@@ -216,6 +217,10 @@ def _pr_reviews_page(
             "next_review_after": reviews[page_size - 1]["review_id"] if more_reviews else 0,
             "next_comment_after": comments[page_size - 1]["comment_id"] if more_comments else 0,
         },
+        "comments": [{"id": row["node_id"], "thread": row["identity"],
+                      "resolved": _flag(latest_by_identity[row["identity"]]["thread_resolved"]),
+                      "revision": hashlib.sha256((row["body"] or "").encode()).hexdigest()}
+                     for row in comments[:page_size]],
         "reviews": [{"node_id": row["node_id"], "author": row["author_login"],
                      "state": row["state"], "submitted_at": row["submitted_at"],
                      "revision": hashlib.sha256((row["body"] or "").encode()).hexdigest()}

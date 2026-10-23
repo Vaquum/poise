@@ -321,6 +321,14 @@ class ViewsTest(unittest.TestCase):
             self.assertNotEqual(revisited["reviews"][0]["revision"], page["reviews"][0]["revision"])
             self.assertFalse(revisited["threads"][0]["resolved"])
             self.assertEqual(revisited["threads"][0]["comments"][0]["node_id"], "C_3099")
+            root_before = revisited["comments"][0]["revision"]
+            latest_before = revisited["threads"][0]["comments"][0]["revision"]
+            with conn:
+                conn.execute("UPDATE review_comments SET body = 'edited root after a reply' WHERE comment_id = 1")
+            edited = json.loads(views.pr_reviews(db_path=db_path, repo="vaquum/test", number=2, page_size=200))
+            self.assertEqual(edited["comments"][0]["id"], "C_1")
+            self.assertNotEqual(edited["comments"][0]["revision"], root_before)
+            self.assertEqual(edited["threads"][0]["comments"][0]["revision"], latest_before)
             # A pre-migration database is unavailable, never a fallback to
             # scanning an unbounded thread history for every bounded row.
             with conn:

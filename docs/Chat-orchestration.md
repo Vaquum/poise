@@ -310,7 +310,9 @@ the last settled state, including when other checks have failed. Unchanged
 settled states deduplicate. A failed CI read keeps the settled baseline and
 queues at most one degraded notice per outage. Reviews use bounded local
 pages of at most 200 reviews and 200 comment identities, summarized by each
-represented thread's latest comment. Content revision hashes detect edits. Separate cursors
+represented thread's latest comment. Bounded raw-comment revisions also detect
+edits to older/root comments after a reply. Review and comment revision evidence
+travels in the notice fingerprint, so one-page body edits notify exactly once. Separate cursors
 cycle through both lanes, so long histories and changes to older threads keep
 progressing. Seen state is retained per identity: a missing identity in a
 partial page is never a resolution. Unknown, missing, failing or legacy
