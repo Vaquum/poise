@@ -28,3 +28,8 @@ await build({
   entryPoints: ['server/behavior-ledger-worker.ts'], bundle: true, platform: 'node',
   format: 'esm', packages: 'external', outfile: 'dist/behavior-ledger-worker.js', logLevel: 'info',
 })
+
+await build({
+  entryPoints: ['server/agent-log-worker.ts'], bundle: true, platform: 'node',
+  format: 'esm', packages: 'external', outfile: 'dist/agent-log-worker.js', logLevel: 'info',
+})
