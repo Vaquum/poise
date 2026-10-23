@@ -207,7 +207,7 @@ def claude_result(output: str) -> str:
 def claude_error(output: str) -> str:
     result = claude_result(output)
     if result:
-        return result
+        return result[:500]
     diagnostics = []
     for line in output.splitlines():
         try:

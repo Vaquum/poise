@@ -6,14 +6,23 @@ import fcntl
 @contextmanager
 def submission_gate(path: str | None):
     if not path:
-        yield
+        yield lambda: None
         return
     # Never recreate a missing gate: the owning review may have finished.
     with open(path, "r+") as gate:
         fcntl.flock(gate, fcntl.LOCK_EX)
-        if gate.read():
+        state = gate.read()
+        if state:
+            if "submitted" in state:
+                raise RuntimeError("review already submitted; duplicate submission blocked")
             raise RuntimeError("review was superseded; submission blocked")
-        yield
+
+        def seal():
+            gate.seek(0, 2)
+            gate.write("submitted\n")
+            gate.flush()
+
+        yield seal
 
 
 def cancel_when_idle(path: str) -> bool:
