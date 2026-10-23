@@ -78,6 +78,15 @@ describe('every test process', () => {
     }
   })
 
+  it('keeps production workspace discovery inside its fixture', async () => {
+    const fixture = realpathSync(resolve(process.env.HOME!, '../..'))
+    const { LOCAL_CHAT_ROOT } = await import('../server/chat/local-workspace')
+    const { poiseStateRoot } = await import('../server/review-checkout')
+    expect(realpathSync(LOCAL_CHAT_ROOT).startsWith(`${fixture}${sep}`)).toBe(true)
+    expect(resolve(poiseStateRoot()).startsWith(`${fixture}${sep}`)).toBe(true)
+    expect(LOCAL_CHAT_ROOT).not.toBe(resolve('.poise-chat'))
+  })
+
   it('finds a stand-in, never a real CLI, for every agent CLI name', () => {
     for (const name of AGENT_CLI_NAMES) {
       const found = resolveOnPath(name, process.env.PATH ?? '')
@@ -98,18 +107,25 @@ describe('every test process', () => {
     expect(git.status, git.stderr).toBe(0)
   })
 
-  it('does both when started from a parent like a Claude Code session', () => {
-    // The two tests above, in vitest started from such a parent.
+  it('does both when started from a parent like a Claude Code session', async () => {
+    // The same discovery checks in a fresh process with inherited host roots.
     const report = join(tmpdir(), `poise-cli-isolation-${process.pid}.json`)
+    const inherited = await mkdtemp(join(tmpdir(), 'poise-inherited-storage-'))
+    const sentinel = join(inherited, 'untouched')
+    await writeFile(sentinel, 'parent storage')
     try {
       const run = spawnSync(process.execPath, [resolve('node_modules/vitest/vitest.mjs'), 'run', 'tests/cli-isolation.test.ts',
-        '--testNamePattern', 'carries no variable|runs git', '--reporter=json', `--outputFile=${report}`], { encoding: 'utf8', env: { ...process.env, ...PARENT_ENVIRONMENT } })
+        '--testNamePattern', 'carries no variable|runs git|keeps production workspace discovery', '--reporter=json', `--outputFile=${report}`], {
+        encoding: 'utf8', env: { ...process.env, ...PARENT_ENVIRONMENT, POISE_CHAT_ROOT: inherited, ...inheritedCaches(inherited) },
+      })
       expect(existsSync(report), run.stderr).toBe(true)
       const result = JSON.parse(readFileSync(report, 'utf8')) as { numPassedTests: number, numFailedTests: number, testResults: { assertionResults: { failureMessages: string[] }[] }[] }
       const failures = result.testResults.flatMap((file) => file.assertionResults.flatMap((test) => test.failureMessages)).join('\n')
-      expect({ passed: result.numPassedTests, failed: result.numFailedTests }, failures).toEqual({ passed: 2, failed: 0 })
+      expect({ passed: result.numPassedTests, failed: result.numFailedTests }, failures).toEqual({ passed: 3, failed: 0 })
+      expect(readFileSync(sentinel, 'utf8')).toBe('parent storage')
     } finally {
       rmSync(report, { force: true })
+      await rm(inherited, { recursive: true, force: true })
     }
   }, 30_000)
 })
@@ -240,6 +256,7 @@ describe('the end-to-end server', () => {
     for (const [name, value] of Object.entries(PARENT_ENVIRONMENT)) vi.stubEnv(name, value)
     const inheritedRoot = await mkdtemp(join(tmpdir(), 'poise-e2e-inherited-caches-'))
     for (const [name, value] of Object.entries(inheritedCaches(inheritedRoot))) vi.stubEnv(name, value)
+    vi.stubEnv('POISE_CHAT_ROOT', inheritedRoot)
     const { webServer } = (await import('../playwright.config')).default
     if (!webServer || Array.isArray(webServer)) throw new Error('playwright.config.ts starts one web server')
     try {
@@ -253,6 +270,11 @@ describe('the end-to-end server', () => {
       for (const [name, path] of Object.entries(cacheDirs(server.HOME, server))) {
         expect(realpathSync(path).startsWith(`${isolationRoot}${sep}`), `${name} is ${path}`).toBe(true)
       }
+      vi.stubEnv('POISE_CHAT_ROOT', server.POISE_CHAT_ROOT)
+      vi.resetModules()
+      const { LOCAL_CHAT_ROOT } = await import('../server/chat/local-workspace')
+      expect(realpathSync(LOCAL_CHAT_ROOT).startsWith(`${isolationRoot}${sep}`)).toBe(true)
+      expect(LOCAL_CHAT_ROOT).not.toBe(inheritedRoot)
     } finally {
       rmSync(resolve(webServer.env!.HOME, '../..'), { recursive: true, force: true })
       await rm(inheritedRoot, { recursive: true, force: true })
