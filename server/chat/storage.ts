@@ -176,6 +176,20 @@ export function sessionInstance(id: string): string | null {
   return row?.instance ?? null
 }
 
+export interface CheckoutSession {
+  id: string
+  status: SessionStatus
+  updatedAt: string
+}
+
+/** Every session row claiming a checkout, across instances: a workspace
+ *  another server's session uses is claimed, never unclaimed. */
+export function sessionsForCheckout(checkout: string): CheckoutSession[] {
+  const rows = db.prepare('SELECT id, status, updated_at FROM chat_sessions WHERE checkout = ?')
+    .all(checkout) as Array<{ id: string, status: SessionStatus, updated_at: string }>
+  return rows.map((row) => ({ id: row.id, status: row.status, updatedAt: row.updated_at }))
+}
+
 export function listSessions(instance: string): SessionRecord[] {
   const rows = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
     .all(instance) as Array<{ record: string, last_seq: number, status: string, role: string | null }>

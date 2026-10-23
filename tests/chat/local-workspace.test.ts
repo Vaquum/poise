@@ -17,6 +17,16 @@ async function until(check: () => boolean) {
   const deadline = Date.now() + 10_000
   while (!check()) { if (Date.now() > deadline) throw new Error('local session deadline'); await new Promise(r => setTimeout(r, 25)) }
 }
+async function untilIdle(id: string) {
+  await until(() => {
+    const status = runtime.get(id)?.status
+    if (status === 'error') {
+      const errors = runtime.events(id, 0).events.map(entry => entry.event).filter(event => event.type === 'error')
+      throw new Error(`Local workspace startup failed: ${JSON.stringify(errors)}`)
+    }
+    return status === 'idle'
+  })
+}
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-local-chat-test-'))
   vi.stubEnv('POISE_DB', join(root, 'chat.db'))
@@ -53,6 +63,98 @@ beforeEach(async () => {
     idleTimeoutMinutes: () => 0, adapters: { grok: fakeAdapter }, probeAgent: async () => ({ ok: true }) })
 })
 describe('Poise-local session storage', () => {
+  it('resumes an already removed closed workspace under its canonical lease', async () => {
+    const record = await runtime.create({ agent: 'grok', model: 'grok-4.6-high' })
+    await untilIdle(record.id)
+    await runtime.close(record.id)
+    await rm(dirname(record.checkout), { recursive: true })
+    await runtime.resume(record.id)
+    expect(runtime.get(record.id)?.status).toBe('idle')
+    expect(await readFile(join(record.checkout, '.poise-workspace-owner'), 'utf8')).toBe('Poise local Chat workspace v1\n')
+    expect(execFileSync('git', ['branch', '--show-current'], { cwd: record.checkout, encoding: 'utf8' }).trim()).toBe(record.branch.name)
+  }, 30_000)
+
+  it('recreates a workspace deleted by the maintenance holder while resume waits for its lease', async () => {
+    const record = await runtime.create({ agent: 'grok', model: 'grok-4.6-high' })
+    await untilIdle(record.id)
+    await runtime.close(record.id)
+    const { CheckoutLease } = await import('../../server/chat/checkout-lock')
+    const maintenance = new CheckoutLease(record.checkout, { ownerKind: 'poise:chat', ownerId: 'maintenance', ownerLabel: 'Storage maintenance', instance: 'test' })
+    expect(maintenance.tryAcquire().acquired).toBe(true)
+    const resuming = runtime.resume(record.id)
+    try {
+      await until(() => runtime.get(record.id)?.queuedBehind?.includes('Storage maintenance') === true)
+      await rm(dirname(record.checkout), { recursive: true })
+    } finally { maintenance.release() }
+    await resuming
+    expect(runtime.get(record.id)?.status).toBe('idle')
+    expect(await readFile(join(record.checkout, '.poise-workspace-owner'), 'utf8')).toBe('Poise local Chat workspace v1\n')
+  }, 30_000)
+
+  it('keeps existing dirty work and refuses an invalid owner marker during resume', async () => {
+    const record = await runtime.create({ agent: 'grok', model: 'grok-4.6-high' })
+    await untilIdle(record.id)
+    await writeFile(join(record.checkout, 'draft.txt'), 'only copy\n')
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: record.checkout, encoding: 'utf8' })
+    await runtime.close(record.id)
+    await runtime.resume(record.id)
+    expect(await readFile(join(record.checkout, 'draft.txt'), 'utf8')).toBe('only copy\n')
+    expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: record.checkout, encoding: 'utf8' })).toBe(head)
+    await runtime.close(record.id)
+    await writeFile(join(record.checkout, '.poise-workspace-owner'), 'foreign owner\n')
+    await expect(runtime.resume(record.id)).rejects.toThrow(/ownership marker/)
+    expect(await readFile(join(record.checkout, 'draft.txt'), 'utf8')).toBe('only copy\n')
+    expect(await readFile(join(record.checkout, '.poise-workspace-owner'), 'utf8')).toBe('foreign owner\n')
+  }, 30_000)
+
+  it('retains a resumed initializer worker lease until the guarded bootstrap has settled', async () => {
+    const record = await runtime.create({ agent: 'grok', model: 'grok-4.6-high' })
+    await untilIdle(record.id)
+    await runtime.close(record.id)
+    await rm(dirname(record.checkout), { recursive: true })
+    const commands = await import('../../server/chat/git')
+    const workers = await import('../../server/chat/worker')
+    const { CheckoutLease } = await import('../../server/chat/checkout-lock')
+    const held: { lease?: InstanceType<typeof CheckoutLease> } = {}
+    const alive = vi.spyOn(workers, 'pgidAlive').mockReturnValue(true)
+    const guarded = vi.spyOn(commands, 'runGuarded').mockImplementation(async lease => {
+      held.lease = lease
+      lease.registerWorker({ pid: 999999, pgid: 999999, ident: 'unsettled-resume-fixture' })
+      throw new Error('bootstrap worker did not settle')
+    })
+    try {
+      await expect(runtime.resume(record.id)).rejects.toThrow('did not settle')
+      expect(held.lease?.held).toBe(true)
+      expect(held.lease?.read()?.worker_pgid).toBe(999999)
+      const contender = new CheckoutLease(record.checkout, { ownerKind: 'test', ownerId: 'contender', ownerLabel: 'contender', instance: 'test' })
+      expect(contender.tryAcquire().acquired).toBe(false)
+      await expect(runtime.close(record.id)).rejects.toThrow(/lease remains held/)
+    } finally {
+      guarded.mockRestore()
+      alive.mockRestore()
+    }
+    await runtime.resume(record.id)
+    expect(runtime.get(record.id)?.status).toBe('idle')
+  }, 30_000)
+
+  it('retries a removed workspace bootstrap that failed after git init', async () => {
+    const record = await runtime.create({ agent: 'grok', model: 'grok-4.6-high' })
+    await untilIdle(record.id)
+    await runtime.close(record.id)
+    await rm(dirname(record.checkout), { recursive: true })
+    const commands = await import('../../server/chat/git')
+    const original = commands.runGuarded
+    const guarded = vi.spyOn(commands, 'runGuarded').mockImplementation(async (...args) => {
+      await original(...args)
+      throw new Error('fixture failed after git init')
+    })
+    try { await expect(runtime.resume(record.id)).rejects.toThrow('after git init') }
+    finally { guarded.mockRestore() }
+    await runtime.resume(record.id)
+    expect(runtime.get(record.id)?.status).toBe('idle')
+    expect(execFileSync('git', ['branch', '--show-current'], { cwd: record.checkout, encoding: 'utf8' }).trim()).toBe(record.branch.name)
+  }, 30_000)
+
   it('does not look up a repository or touch the outer branch, index or dirty files', async () => {
     const head = git('rev-parse', 'HEAD'), status = git('status', '--porcelain'), index = git('diff', '--cached')
     const record = await runtime.create({ agent: 'grok', model: 'grok-4.6-high' })

@@ -347,6 +347,124 @@ async function loadProduction(): Promise<void> {
   }
 }
 
+// ── Storage ─────────────────────────────────────────────────────────────
+
+interface StorageCategoryJson { key: string, label: string, path: string, bytes: number }
+interface StorageStatusJson {
+  categories: StorageCategoryJson[]
+  disk: { path: string, totalBytes: number, freeBytes: number, usedPercent: number }
+  pressure: boolean
+  lastRun: { finishedAt: string, dryRun: boolean, reclaimedBytes: number, held: Array<{ path: string, reason: string }>, errors: unknown[] } | null
+}
+interface MaintenanceRunJson {
+  reclaimedBytes: number
+  removed: unknown[]
+  pruned: unknown[]
+  caches: unknown[]
+  held: Array<{ path: string, reason: string }>
+  errors: Array<{ message: string }>
+}
+
+let storageLoading: Promise<void> | null = null
+let storageRunning = false
+
+function storageSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '—'
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return unit === 0 ? `${value} bytes` : `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`
+}
+
+function renderStorageBreakdown(categories: StorageCategoryJson[]): void {
+  const breakdownEl = panelEl?.querySelector<HTMLElement>('.st-storage-breakdown')
+  if (!breakdownEl) return
+  breakdownEl.innerHTML = categories.map((category) =>
+    `<div class="st-storage-row"><span>${escapeHtml(category.label)}</span><span>${escapeHtml(storageSize(category.bytes))}</span></div>`).join('')
+}
+
+function renderStorage(data: StorageStatusJson): void {
+  const statusEl = panelEl?.querySelector<HTMLElement>('.st-storage-status')
+  if (!statusEl) return
+  const disk = data.disk
+  const lines = [`${storageSize(disk.freeBytes)} free of ${storageSize(disk.totalBytes)} (${disk.usedPercent.toFixed(0)}% used).`]
+  if (data.lastRun) {
+    const run = data.lastRun
+    lines.push(`Last maintenance ${run.dryRun ? '(dry run) ' : ''}${shortTime(run.finishedAt, effectiveTimezone(), Date.now())}:`
+      + ` reclaimed ${storageSize(run.reclaimedBytes)}, held ${run.held.length}.`)
+  } else {
+    lines.push('Maintenance has not run yet.')
+  }
+  statusEl.textContent = lines.join(' ')
+  statusEl.className = `st-help st-help-${data.pressure ? 'warn' : 'info'} st-storage-status`
+  renderStorageBreakdown(data.categories)
+}
+
+function storageError(message: string): void {
+  const statusEl = panelEl?.querySelector<HTMLElement>('.st-storage-status')
+  if (!statusEl) return
+  statusEl.textContent = message
+  statusEl.className = 'st-help st-help-error st-storage-status'
+}
+
+async function fetchStorage(): Promise<StorageStatusJson | null> {
+  try {
+    const res = await fetch('/api/storage')
+    const data = await res.json() as StorageStatusJson & { error?: string }
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    return data
+  } catch {
+    // Leave whatever was shown; the next open tries again.
+    return null
+  }
+}
+
+async function loadStorage(): Promise<void> {
+  if (!panelEl || storageRunning) return
+  storageLoading ??= (async () => {
+    try {
+      const data = await fetchStorage()
+      if (data) renderStorage(data)
+    } finally {
+      storageLoading = null
+    }
+  })()
+  await storageLoading
+}
+
+async function runStorageMaintenance(dryRun: boolean): Promise<void> {
+  if (!panelEl || storageRunning) return
+  storageRunning = true
+  for (const button of panelEl.querySelectorAll<HTMLButtonElement>('.st-storage-run, .st-storage-dry-run')) button.disabled = true
+  try {
+    const res = await fetch('/api/storage/maintenance', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dryRun }),
+    })
+    const data = await res.json() as MaintenanceRunJson & { error?: string }
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    const statusEl = panelEl.querySelector<HTMLElement>('.st-storage-status')
+    if (statusEl) {
+      const held = data.held.length ? ` Held: ${data.held.slice(0, 3).map((item) => `${item.path} (${item.reason})`).join('; ')}${data.held.length > 3 ? '…' : ''}` : ''
+      const errors = data.errors.length ? ` ${data.errors.length} error${data.errors.length === 1 ? '' : 's'}.` : ''
+      statusEl.textContent = `${dryRun ? 'Dry run' : 'Maintenance'} reclaimed ${storageSize(data.reclaimedBytes)}`
+        + ` (${data.removed.length} removed, ${data.pruned.length} pruned, ${data.caches.length} cache${data.caches.length === 1 ? '' : 's'} capped).${held}${errors}`
+      statusEl.className = `st-help st-help-${data.errors.length ? 'warn' : 'ok'} st-storage-status`
+    }
+    // Fresh sizes under the run's own result line.
+    const fresh = await fetchStorage()
+    if (fresh) renderStorageBreakdown(fresh.categories)
+  } catch (error) {
+    storageError((error as Error).message)
+  } finally {
+    storageRunning = false
+    for (const button of panelEl?.querySelectorAll<HTMLButtonElement>('.st-storage-run, .st-storage-dry-run') ?? []) button.disabled = false
+  }
+}
+
 // ── Connected accounts tab ──────────────────────────────────────────────
 
 // One login at a time from this panel; the server allows two terminals in
@@ -876,6 +994,7 @@ function selectSection(panel: HTMLElement, tab: SettingsSection) {
   if (panel.classList.contains('open')) {
     if (tab === 'accounts') void loadAccounts()
     if (tab === 'publishing') void publishing?.refresh()
+    if (tab === 'general') void loadStorage()
   }
   window.dispatchEvent(new CustomEvent('poise:settings-section-changed', { detail: { section: tab } }))
 }
@@ -975,6 +1094,18 @@ function buildPanel(): HTMLElement {
 
         </div>
 
+        <div class="tp-group-label">Storage</div>
+
+        <div class="tp-section">
+          <div class="st-help st-help-info st-storage-status" role="status">Loading storage…</div>
+          <div class="st-storage-breakdown" aria-live="polite"></div>
+          <div class="st-row st-row-tight">
+            <button type="button" class="st-clear st-storage-run">Run maintenance now</button>
+            <button type="button" class="st-clear st-storage-dry-run">Dry run</button>
+          </div>
+
+        </div>
+
         <div class="tp-group-label">Appearance</div>
 
         <div class="tp-section">
@@ -1066,6 +1197,8 @@ function buildPanel(): HTMLElement {
   productionEl = panel.querySelector('.st-production')
   refreshBtn = panel.querySelector('.st-refresh-models') as HTMLButtonElement
   refreshBtn.addEventListener('click', () => { void refreshModels() })
+  panel.querySelector('.st-storage-run')!.addEventListener('click', () => { void runStorageMaintenance(false) })
+  panel.querySelector('.st-storage-dry-run')!.addEventListener('click', () => { void runStorageMaintenance(true) })
   notificationsPicker = panel.querySelector('.st-notifications-picker')
   notificationsStatusEl = panel.querySelector('.st-notifications-status')
   notificationsPicker!.addEventListener('click', (event) => {
@@ -1178,6 +1311,7 @@ export function openSettingsPanel() {
   void refreshStatus()
   if (panelEl.dataset.section === 'models') void loadModels()
   if (panelEl.dataset.section === 'general') void loadProduction()
+  if (panelEl.dataset.section === 'general') void loadStorage()
   void pollOrganizations()
   if (accountsTabSelected()) void loadAccounts()
   if (panelEl.dataset.section === 'publishing') void publishing?.refresh()

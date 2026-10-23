@@ -40,6 +40,7 @@ import { validateGoogleEnvironment } from './google/accounts'
 import { getBehaviorDiagnosticIncidents } from './behaviors'
 import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
+import { maintenanceRunning, runStorageMaintenanceOnce, startStorageMaintenanceRuntime, stopStorageMaintenanceRuntime, storageStatus } from './storage-maintenance'
 import { ContentLaunchPendingError, contentLaunchIdForCall, getContentJobResponse, getContentLaunchResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
 import { retryFailedPrReviews } from './behaviors'
@@ -195,6 +196,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   startGithubQuotaRuntime()
   if (service) startTemporaryStorageRuntime()
   startReviewCheckoutPruning()
+  startStorageMaintenanceRuntime()
   startContentFinalizer()
   if (!chatRuntime) {
     const label = opts.instanceLabel ?? 'dev'
@@ -282,7 +284,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
   await stopBehaviorLedger()
   await stopLoggingApi()
   await stopLogging()
@@ -498,6 +500,29 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // The commit this Poise runs and since when, for the menu's first line.
         if (path === '/api/release' && req.method === 'GET') {
           return json(res, 200, runningRelease())
+        }
+
+        // ── Storage ──
+        // The workspace storage breakdown, disk pressure and the last
+        // maintenance run, plus on-demand runs from Settings.
+        if (path === '/api/storage' && req.method === 'GET') {
+          try {
+            return json(res, 200, await storageStatus())
+          } catch (err: any) {
+            return json(res, httpStatus(err, 500), { error: err.message || String(err) })
+          }
+        }
+        if (path === '/api/storage/maintenance' && req.method === 'POST') {
+          try {
+            const body = await readJson<any>(req)
+            if (body && typeof body === 'object' && 'dryRun' in body && typeof (body as { dryRun: unknown }).dryRun !== 'boolean') {
+              return json(res, 400, { error: 'dryRun must be a boolean' })
+            }
+            if (maintenanceRunning()) return json(res, 409, { error: 'a maintenance run is already in progress' })
+            return json(res, 200, await runStorageMaintenanceOnce({ dryRun: (body as { dryRun?: boolean })?.dryRun ?? false }))
+          } catch (err: any) {
+            return json(res, httpStatus(err, 500), { error: err.message || String(err) })
+          }
         }
 
         // ── Settings ──
