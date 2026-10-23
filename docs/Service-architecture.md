@@ -306,7 +306,11 @@ their persisted one-time answers without sending them again; completed filesyste
 requests never repeat their effects. The LIVE handoff waits until buffered spooled stdout reaches the adapter,
 including across an awaited outbound read. Historical request matching ends with
 the adopted turn. Recovery atomically claims the checkout lease before stopping
-a recorded worker; a competing live owner retains its turn and session.
+a recorded worker, including an idle worker whose completed turn released its
+lease; a competing live owner retains its turn and session. Cancelling an
+adopted Grok turn waits for its correlated native result or verified worker
+termination before releasing the checkout. A completed adopted turn drops its
+spool and outbound history without clearing another server's handed-over turn.
 A recorded failed Muse decision ends the turn with a visible error
 instead of retaining an unanswerable request and checkout lease.
 
