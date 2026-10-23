@@ -1,6 +1,6 @@
 // What keeps every test away from the developer's own agent CLIs and their
-// logins: a home folder and agent-CLI configuration of its own, and stand-ins
-// first on PATH for the six agent CLIs.
+// logins and caches: a home folder, agent-CLI configuration and cache roots
+// of its own, and stand-ins first on PATH for the six agent CLIs.
 //
 // HOME alone is not enough. On macOS Claude Code keeps its login in the login
 // Keychain under a name derived from CLAUDE_CONFIG_DIR, not from HOME, so a
@@ -16,9 +16,11 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import { environmentSecrets } from '../../gateway/src/diagnostics/contract'
 
-/** Where the agent CLIs keep their logins and settings. */
+/** Agent settings and the cache/workspace roots storage maintenance consumes. */
 export const CLI_HOME_VARIABLES = [
   'HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GH_CONFIG_DIR', 'GROK_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'AGENT_INTERFACE_DATA_DIR',
+  'XDG_CACHE_HOME', 'PIP_CACHE_DIR', 'UV_CACHE_DIR', 'npm_config_cache', 'AGENT_INTERFACE_WORK_DIR', 'GITHUB_INTERFACE_MIRROR_DIR',
+  'POISE_CHAT_ROOT',
 ] as const
 
 /** The agent CLIs' executables, as Poise runs them by name. */
@@ -57,7 +59,7 @@ export function removeCredentialVariables(env: NodeJS.ProcessEnv): void {
   for (const name of [...credentialVariables(env), 'GIT_CONFIG_COUNT']) delete env[name]
 }
 
-/** The environment of a process isolated under `root`: its own homes, and
+/** The environment of a process isolated under `root`: its own homes/caches, and
  *  the stand-ins ahead of `path`. */
 export function isolatedEnvironment(root: string, path: string): Record<string, string> {
   return { ...cliHomes(join(root, 'homes')), PATH: [agentCliStandIns(join(root, 'stand-ins')), path].filter(Boolean).join(delimiter) }
