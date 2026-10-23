@@ -381,15 +381,32 @@ def finish(
     error_code: str | None = None,
     diagnostic: dict | None = None,
 ) -> float:
+    # First terminal writer wins: a worker finishing after stop/reap must not
+    # overwrite stopped/interrupted. The loser keeps its response file out of
+    # the row and reports the existing state.
     path = str((RESPONSES / f"{id_}.txt").resolve()) if response else None
-    if response:
-        Path(path).write_text(response)
     ended_at = time()
     with db() as conn:
-        conn.execute(
-            "update calls set status=?, ended_at=?, response_path=?, error=?, outcome=?, head_sha=?, action=?, error_code=?, diagnostic=?, progress=coalesce(?, progress) where id=?",
+        changed = conn.execute(
+            "update calls set status=?, ended_at=?, response_path=?, error=?, outcome=?, head_sha=?, action=?, error_code=?, diagnostic=?, progress=coalesce(?, progress) where id=? and status='running'",
             (status, ended_at, path, error, outcome, head_sha, action, error_code, json.dumps({**diagnostic, "call_id": id_}) if diagnostic else None, progress.terminal(status), id_),
-        )
+        ).rowcount
+        if changed != 1:
+            row = conn.execute("select ended_at from calls where id=?", (id_,)).fetchone()
+            if row is not None and row["ended_at"] is not None:
+                print(f"call {id_} already finished; keeping its terminal state", file=sys.stderr)
+                return float(row["ended_at"])
+    if response and changed == 1:
+        try:
+            Path(path).write_text(response)
+        except OSError as persist_error:
+            # The row is terminal; a response persistence failure must not
+            # reopen it. Clear the dangling path and retain the cause.
+            with db() as conn:
+                conn.execute("update calls set response_path=null, diagnostic=coalesce(diagnostic, ?) where id=?",
+                             (json.dumps({"version": 1, "source": "caller", "severity": "error",
+                                          "operation": "call.finalize", "phase": "response_persist",
+                                          "stderr": str(persist_error)[:500], "call_id": id_}), id_))
     return ended_at
 
 
@@ -632,9 +649,15 @@ def run_issue_review(
     response = ""
 
     def fail(error: BaseException, code: str | None = None, preflight: bool = False):
-        finish(id_, "failed", response=response, error=str(error), error_code=code,
-               outcome="preflight_failed" if preflight else None, action="not_started" if preflight else None)
-        print(json.dumps({**stamp_, "model": name, "error": str(error), "error_code": code}, indent=2))
+        diagnostic = getattr(error, "diagnostic", None)
+        if isinstance(diagnostic, dict):
+            diagnostic = {**diagnostic, "call_id": id_, "correlation_id": correlation_id,
+                          "repository": repo, "issue": number, "reviewer": actor, "behavior": "issue_review"}
+        finish(id_, "failed", response=response, error=str(error)[:2000], error_code=code,
+               outcome="preflight_failed" if preflight else None, action="not_started" if preflight else None,
+               diagnostic=diagnostic)
+        print(json.dumps({**stamp_, "model": name, "error": str(error)[:2000],
+                          "error_code": code, "diagnostic": diagnostic}, indent=2))
         raise SystemExit(1)
 
     def record(receipts: list[dict]) -> None:
@@ -660,6 +683,10 @@ def run_issue_review(
                 issue_review.mark_reviewed(data, actor, _issue_review_targets, _running_issue_reviews(id_))
             except review_budget.ReviewLimitError as e:
                 fail(e, e.code)
+            except subprocess.TimeoutExpired as e:
+                fail(review_budget.ReviewLimitError(
+                    "Issue review preparation reached its time limit; needs attention",
+                    "review_budget_exhausted"), "review_budget_exhausted")
             except Exception as e:
                 fail(e, getattr(e, "code", None), preflight=True)
             try:
@@ -670,16 +697,45 @@ def run_issue_review(
                 fail(e, e.code, preflight=True)
             except issue_review.InvalidReview as e:
                 fail(e, e.code)
+            except issue_review.ProviderFailure as e:
+                fail(e, e.code)
+            except subprocess.TimeoutExpired as e:
+                fail(review_budget.ReviewLimitError(
+                    "Issue review reached its time limit; needs attention",
+                    "review_budget_exhausted"), "review_budget_exhausted")
             except Exception as e:
                 fail(e)
             try:
                 receipts = issue_review.post(posts, actor, id_, name, record)
+            except subprocess.TimeoutExpired as e:
+                fail(review_budget.ReviewLimitError(
+                    "Issue review posting reached its time limit; uncertain publication, reconcile before retry",
+                    "posting_failed"), "posting_failed")
             except Exception as e:
                 fail(e, "posting_failed")
             response = issue_review.summary(posts, receipts, ignored)
             ended_at = finish(id_, "completed", response=response, outcome="commented", action="commented")
             print(json.dumps({**stamp_, "model": name, "receipts": receipts, "completed_at": utc_stamp(ended_at),
                               "action": "commented", "outcome": "commented"}, indent=2))
+    except BaseException as terminal:
+        # A signal (or a finalization failure) must still leave one durable
+        # terminal state, never a row stuck running. fail() already finished;
+        # its SystemExit(1) passes through untouched.
+        if not (isinstance(terminal, SystemExit) and terminal.code == 1):
+            try:
+                with db() as conn:
+                    row = conn.execute("select status, error_code from calls where id=?", (id_,)).fetchone()
+                if row is not None and row["status"] == "running":
+                    stopping = row["error_code"] == "stopping"
+                    finish(id_, "failed", response=response,
+                           error="Stopped by user" if stopping else INTERRUPTED_ERROR,
+                           error_code="stopped" if stopping else "interrupted")
+                    print(json.dumps({**stamp_, "model": name,
+                                      "error": "Stopped by user" if stopping else INTERRUPTED_ERROR,
+                                      "error_code": "stopped" if stopping else "interrupted"}, indent=2))
+            except Exception:
+                pass
+        raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         issue_review.cleanup(run_dir)
@@ -1043,14 +1099,40 @@ def run_governed_behavior(
                 "error": str(e),
             }, indent=2))
             raise SystemExit(1)
+        except BaseException as terminal:
+            if not (isinstance(terminal, SystemExit) and terminal.code == 1):
+                try:
+                    with db() as conn:
+                        row = conn.execute("select status, error_code from calls where id=?", (id_,)).fetchone()
+                    if row is not None and row["status"] == "running":
+                        stopping = row["error_code"] == "stopping"
+                        finish(id_, "failed", response=response,
+                               error="Stopped by user" if stopping else INTERRUPTED_ERROR,
+                               error_code="stopped" if stopping else "interrupted")
+                        print(json.dumps({"id": id_,
+                                          "error": "Stopped by user" if stopping else INTERRUPTED_ERROR,
+                                          "error_code": "stopped" if stopping else "interrupted"}))
+                except Exception:
+                    pass
+            raise
 
 
 def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id):
     try:
         return mod.run(pwd, pr, actor, head, note, seconds, p, model=spec.identity), None
-    except (review_budget.ReviewLimitError, subprocess.TimeoutExpired) as error:
-        failure = error if isinstance(error, review_budget.ReviewLimitError) else review_budget.ReviewLimitError(
-            "Review reached its total time limit; needs attention", "review_budget_exhausted")
+    except (review_budget.ReviewLimitError, subprocess.TimeoutExpired, review_receipt.SubmissionError) as error:
+        if isinstance(error, review_budget.ReviewLimitError):
+            failure = error
+        elif isinstance(error, subprocess.TimeoutExpired):
+            failure = review_budget.ReviewLimitError(
+                "Review reached its total time limit; needs attention", "review_budget_exhausted")
+        else:
+            # An uncertain write: verify against GitHub below and adopt a
+            # landed review, but never auto-retry the write itself.
+            failure = review_budget.ReviewLimitError(
+                str(error), "review_submission_failed",
+                {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+                 "phase": "submitting", "submission": "uncertain"})
         progress.stage("verifying", "Checking GitHub after interrupted review")
         try:
             facts = review_facts(mod, pr, pwd, actor, head, 0)
@@ -1062,7 +1144,8 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             if own is None:
                 counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
                 if any(_count(facts, key) != _count(before, key) for key in counts):
-                    return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts)
+                    return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
+                                                          receipt=receipt, call_id=call_id)
             elif receipt is not None or own:
                 return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts, receipt=receipt, call_id=call_id)
             # Require positive no-action proof, including pending reviews.
@@ -1092,9 +1175,11 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             raise
         except Exception as recovery_error:
             # A submission may have succeeded before its response was lost.
-            # Adopt only a terminal outcome verified from GitHub, never text.
+            # Adopt only a terminal outcome verified from GitHub, never text,
+            # with exact ownership so a sibling's review cannot settle this run.
             try:
-                result = behavior_outcome(mod, behavior, pr, pwd, actor, head, before)
+                result = behavior_outcome(mod, behavior, pr, pwd, actor, head, before,
+                                          receipt=review_receipt.get(), call_id=call_id)
             except Exception:
                 pass
             else:
@@ -1123,7 +1208,9 @@ def _review_items(facts: dict) -> list[dict] | None:
 def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | None) -> list[dict] | None:
     """The reviews this run posted: the receipted one, or without a receipt the
     new ones no sibling run claims. None when github-interface predates
-    per-review ids; the activity counters decide then."""
+    per-review ids; the activity counters decide then. A second new review
+    that is neither receipted nor sibling-claimed is blamed on this run only
+    when no concurrent sibling could have written it invisibly."""
     after = _review_items(facts)
     earlier = _review_items(before)
     if after is None or earlier is None:
@@ -1131,7 +1218,22 @@ def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | 
     seen = {item["id"] for item in earlier}
     new = [item for item in after if item["id"] not in seen]
     if receipt is not None:
-        return [item for item in new if item["id"] == receipt["review_id"]]
+        own = [item for item in new if item["id"] == receipt["review_id"]]
+        if call_id and len(new) > len(own):
+            repo, number = str(facts.get("repository") or ""), str(facts.get("pull_number") or "")
+            extra = [item for item in new if item["id"] != receipt["review_id"]
+                     and item["id"] not in review_receipt.sibling_ids(DB, call_id, repo, number)]
+            if extra:
+                sleep(SIBLING_GRACE_SECONDS)
+                extra = [item for item in new if item["id"] != receipt["review_id"]
+                         and item["id"] not in review_receipt.sibling_ids(DB, call_id, repo, number)]
+            if extra and not review_receipt.concurrent_unclaimed_run_exists(DB, call_id, repo, number):
+                raise review_budget.ReviewLimitError(
+                    "review behavior produced duplicate GitHub reviews; needs attention"
+                    if len(own) == 1 else
+                    "review behavior must produce exactly one atomic clean or change-request review",
+                    "review_contract_violation")
+        return own
     if not new or not call_id:
         return new
     repo, number = str(facts.get("repository") or ""), str(facts.get("pull_number") or "")

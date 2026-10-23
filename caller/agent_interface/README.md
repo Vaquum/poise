@@ -81,12 +81,25 @@ lease never touches the row again.
 
 # PR review models
 
+Every attempt ends with one durable terminal state: a validated result with its
+authoritative `review_id` receipt, or a typed failure carrying provider, phase,
+bounded redacted cause and known (`none`, `rejected`, `noop`) or unknown
+submission state. Structured provider exits and signals are `review_provider_exit`,
+provider-reported error terminals are `review_provider_error`; both keep
+`not_started` / `preflight_failed` with no receipt, so Poise can safely retry
+after proving no reviewer action. Invalid, missing, duplicate or contradictory
+verdicts, submission rejections (including `no_review` no-ops) and duplicate
+GitHub reviews are `review_contract_violation` and held. A second terminal
+submission after an accepted one is blocked at the gate.
+
 A controller-observed transient GitHub submission failure is recorded as
 `review_submission_failed`, with action and outcome unknown until live review
 receipts establish what happened. It does not become a permanent model-contract
 hold. A verified accepted review wins over a lost response; Caller never retries
-the write automatically. Claude's pinned inspection root is also carried in its
-explicit settings so shell tools retain repository access.
+the write automatically. A submission timeout or a success without a receipt is
+uncertain and reconciled the same way before any retry. Claude's pinned
+inspection root is also carried in its explicit settings so shell tools retain
+repository access.
 
 An outer GitHub 403 submission error qualifies only when its validated quota
 headers identify `core` with string remaining `0`; authorization/validation
@@ -294,12 +307,17 @@ Failures are typed: `preflight_failed` when the packet could not be read
 when the agent left no usable review, `posting_failed` once posting began,
 `review_budget_exhausted` after the one-hour budget (wall-clock, so time
 asleep counts), `review_recovery_failed`,
-and `stopped`. A failed provider's error is its own message or stderr, never
-its output stream, which can hold whatever a full-access shell printed. A
-Claude output limit before posting recovers once with the recovery model in a
-new checkout. github-interface runs in its own process group, so a timeout
-also ends the git it started; a mirror left broken is cloned afresh once.
-`--models` lists `issue_review_providers`.
+and `stopped`. A failed provider's error is its own bounded redacted message
+or stderr, never its output stream, which can hold whatever a full-access
+shell printed; a provider-reported failure terminal rejects the run even when
+the process exits zero. The instruction names the provider deadline and asks
+for the artifact early; a timeout records the artifact's presence, size and
+readability in the diagnostic and never posts late work. A posting timeout is
+reconciled through the call marker before it counts as a failure, and stays
+uncertain until then. A Claude output limit before posting recovers once with
+the recovery model in a new checkout. github-interface runs in its own process
+group, so a timeout also ends the git it started; a mirror left broken is
+cloned afresh once. `--models` lists `issue_review_providers`.
 
 # PR stop gate
 
