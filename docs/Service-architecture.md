@@ -301,7 +301,11 @@ starts detached; they keep running while Poise restarts, and the next Poise
 reconciles them as after any restart. Chat turns survive the same way: each
 session's agent runs under a per-session relay that owns its stdio and
 spools the turn's output, so the next server reconnects and replays the turn
-instead of interrupting it.
+instead of interrupting it. Completed permission and question requests consume
+their persisted one-time answers without sending them again; completed filesystem
+requests never repeat their effects. Historical request matching ends with the
+adopted turn. A recorded failed Muse decision ends the turn with a visible error
+instead of retaining an unanswerable request and checkout lease.
 
 - **Releases.** The image carries one release, Poise (`/opt/poise`) and
   Caller's relocatable virtualenv (`/opt/caller/venv`), and labels it

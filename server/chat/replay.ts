@@ -103,7 +103,7 @@ export function recalledDiffs(events: ChatEvent[], turnId: string): Map<string, 
   return recalled
 }
 
-export function createReplayHost(options: ReplayHostOptions): AdapterHost {
+export function createReplayHost(options: ReplayHostOptions): AdapterHost & { releaseHistory(): void } {
   const { inner, turnId, persisted } = options
   // Multiset over the persisted turn events: each replayed emission consumes
   // the first unmatched persisted seq with the same key. Order-free on
@@ -114,10 +114,11 @@ export function createReplayHost(options: ReplayHostOptions): AdapterHost {
   const matched = new Array<boolean>(persisted.length).fill(false)
   const matchedKeys = persisted.map((envelope) => replayMatchKey(envelope.event))
   const matchedRequests = new Set<string>()
+  let released = false
 
   const emit = (event: ChatEvent): void => {
     const key = replayMatchKey(event)
-    if (key !== null) {
+    if (!released && key !== null) {
       for (let index = 0; index < persisted.length; index++) {
         if (!matched[index] && matchedKeys[index] === key) {
           matched[index] = true
@@ -130,6 +131,7 @@ export function createReplayHost(options: ReplayHostOptions): AdapterHost {
   }
 
   const findRequested = (key: string): Extract<ChatEvent, { type: 'permission.requested' | 'question.asked' }> | null => {
+    if (released) return null
     for (const envelope of persisted) {
       const event = envelope.event
       if ((event.type === 'permission.requested' || event.type === 'question.asked')
@@ -180,6 +182,7 @@ export function createReplayHost(options: ReplayHostOptions): AdapterHost {
   }
 
   return {
+    releaseHistory: () => { released = true },
     sessionId: inner.sessionId,
     checkout: inner.checkout,
     spawn: inner.spawn,

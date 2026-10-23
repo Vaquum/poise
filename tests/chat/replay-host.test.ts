@@ -116,4 +116,20 @@ describe('replay host', () => {
     await expect(host.requestPermission({ title: 'New', options: [...OPTIONS] })).resolves.toBe('inner-answer')
     expect(inner.permissions).toHaveLength(1)
   })
+
+  it('never reuses unused one-time answers after the adopted turn ends', async () => {
+    const inner = innerHost()
+    const questions = [{ id: '0', question: 'Which?', options: [], multiSelect: false, freeText: true }]
+    const host = createReplayHost({ inner, turnId: TURN, persisted: [
+      envelope(1, { type: 'permission.requested', id: 'p-old', turnId: TURN, title: 'Run rm', options: OPTIONS }),
+      envelope(2, { type: 'permission.resolved', id: 'p-old', optionId: 'allow', by: 'user' }),
+      envelope(3, { type: 'question.asked', id: 'q-old', turnId: TURN, questions }),
+      envelope(4, { type: 'question.answered', id: 'q-old', answers: { '0': 'old answer' }, by: 'user' }),
+    ], registerPending: () => { throw new Error('old request reattached') } })
+    host.releaseHistory()
+    await expect(host.requestPermission({ title: 'Run rm', options: [...OPTIONS] })).resolves.toBe('inner-answer')
+    await expect(host.askQuestion({ questions })).resolves.toEqual({ q: 'inner' })
+    expect(inner.permissions).toHaveLength(1)
+    expect(inner.questions).toHaveLength(1)
+  })
 })

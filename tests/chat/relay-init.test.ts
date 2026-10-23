@@ -5,13 +5,15 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createCodexAdapter } from '../../server/chat/adapters/codex'
 import { createGrokAdapter } from '../../server/chat/adapters/grok'
 import { createMuseAdapter } from '../../server/chat/adapters/muse'
-import type { Adapter, AgentProcess, ReplayInit } from '../../server/chat/adapters/types'
+import type { Adapter, AdapterHost, AgentProcess, ReplayInit } from '../../server/chat/adapters/types'
+import { createReplayHost, type ReplayPending } from '../../server/chat/replay'
+import type { ChatEnvelope } from '../../server/chat/protocol'
 import { createFakeHost } from './adapter-harness'
 
 const cleanups: Array<() => void> = []
 afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup() })
 
-function replay(agent: 'grok' | 'codex' | 'muse', extraOutbound = '') {
+function replay(agent: 'grok' | 'codex' | 'muse', extraOutbound = '', wrap: (host: AdapterHost) => AdapterHost = host => host) {
   const host = createFakeHost('unused.mjs')
   const events = new EventEmitter()
   const peer = Object.assign(events, {
@@ -26,7 +28,8 @@ function replay(agent: 'grok' | 'codex' | 'muse', extraOutbound = '') {
       return true
     },
   })
-  const adapter: Adapter = agent === 'grok' ? createGrokAdapter(host) : agent === 'codex' ? createCodexAdapter(host) : createMuseAdapter(host)
+  const adapterHost = wrap(host)
+  const adapter: Adapter = agent === 'grok' ? createGrokAdapter(adapterHost) : agent === 'codex' ? createCodexAdapter(adapterHost) : createMuseAdapter(adapterHost)
   let goLive!: () => void
   const live = new Promise<void>(resolve => { goLive = resolve })
   const method = agent === 'grok' ? 'session/prompt' : 'turn/start'
@@ -47,6 +50,34 @@ function replay(agent: 'grok' | 'codex' | 'muse', extraOutbound = '') {
 }
 
 describe('relay initiation failures', () => {
+  it('re-attaches the second identical Grok question instead of reusing the first answer', async () => {
+    const questions = [{ id: '0', question: 'Which?', options: [{ label: 'first' }, { label: 'second' }], multiSelect: false, freeText: false }]
+    const persisted: ChatEnvelope[] = [
+      { seq: 1, sessionId: 'session-test', at: '', event: { type: 'question.asked', id: 'question-first', turnId: 'turn-test', questions } },
+      { seq: 2, sessionId: 'session-test', at: '', event: { type: 'question.answered', id: 'question-first', answers: { '0': 'first' }, by: 'user' } },
+      { seq: 3, sessionId: 'session-test', at: '', event: { type: 'question.asked', id: 'question-second', turnId: 'turn-test', questions } },
+    ]
+    const pending = new Map<string, ReplayPending>()
+    let entered!: () => void
+    const attached = new Promise<void>(resolve => { entered = resolve })
+    const f = replay('grok', JSON.stringify({ jsonrpc: '2.0', id: 101, result: { outcome: 'accepted', answers: { 'Which?': 'first' } } }) + '\n',
+      inner => createReplayHost({ inner, turnId: 'turn-test', persisted, registerPending: (id, request) => { pending.set(id, request); entered() } }))
+    const result = f.adapter.replayTurn!(f.init)
+    const params = { sessionId: 'native-test', questions: [{ question: 'Which?', options: [{ label: 'first' }, { label: 'second' }] }] }
+    f.receive({ jsonrpc: '2.0', id: 101, method: '_x.ai/ask_user_question', params })
+    f.receive({ jsonrpc: '2.0', id: 102, method: '_x.ai/ask_user_question', params })
+    await attached
+    expect([...pending.keys()]).toEqual(['question-second'])
+    expect(f.peer.stdin.read()).toBeNull()
+    f.goLive()
+    pending.get('question-second')!.resolve({ '0': 'second' })
+    await new Promise(resolve => setImmediate(resolve))
+    const sent = f.peer.stdin.read().toString().trim().split('\n').map((line: string) => JSON.parse(line))
+    expect(sent).toEqual([{ jsonrpc: '2.0', id: 102, result: { outcome: 'accepted', answers: { 'Which?': 'second' } } }])
+    f.receive({ jsonrpc: '2.0', id: 7, result: { stopReason: 'end_turn' } })
+    await expect(result).resolves.toMatchObject({ stopReason: 'end_turn' })
+  })
+
   it.each(['grok', 'codex', 'muse'] as const)('settles %s when its recorded initiation response is an error', async agent => {
     const f = replay(agent)
     const result = f.adapter.replayTurn!(f.init)
@@ -77,8 +108,8 @@ describe('relay initiation failures', () => {
         const command = JSON.parse(line) as { id: number, method: string, params: { requirementId?: { sourceIndex: number } } }
         if (command.method === 'approval/decide') {
           decided(command.params.requirementId?.sourceIndex ?? -1)
-          f.receive({ jsonrpc: '2.0', id: command.id, result: { approvalId: 'approval-test', status: 'accepted', terminal: true } })
-        } else if (command.method === 'approval/listPending') f.receive({ jsonrpc: '2.0', id: command.id, result: { approvals: [] } })
+          queueMicrotask(() => f.receive({ jsonrpc: '2.0', id: command.id, result: { approvalId: 'approval-test', status: 'accepted', terminal: true } }))
+        } else if (command.method === 'approval/listPending') queueMicrotask(() => f.receive({ jsonrpc: '2.0', id: command.id, result: { approvals: [] } }))
       }
     })
     const result = f.adapter.replayTurn!(f.init)
@@ -95,5 +126,17 @@ describe('relay initiation failures', () => {
     await expect(stage).resolves.toBe(1)
     f.receive({ jsonrpc: '2.0', id: 7, error: { code: -32000, message: 'end fixture' } })
     await expect(result).resolves.toMatchObject({ stopReason: 'error' })
+  })
+
+  it('settles Muse when a recorded approval decision failed', async () => {
+    const prior = JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'approval/decide', params: {
+      approvalId: 'approval-test', requirementId: { approvalId: 'approval-test', sourceIndex: 0 },
+    } }) + '\n'
+    const f = replay('muse', prior)
+    const result = f.adapter.replayTurn!(f.init)
+    f.receive({ jsonrpc: '2.0', id: 7, result: { turnId: 'native-turn', disposition: 'started' } })
+    f.receive({ jsonrpc: '2.0', id: 8, error: { code: -32000, message: 'decision command was rejected' } })
+    await expect(result).resolves.toMatchObject({ stopReason: 'error', error: expect.stringContaining('decision command was rejected') })
+    expect(f.host.events).toContainEqual(expect.objectContaining({ type: 'error', message: expect.stringContaining('approval/decide') }))
   })
 })

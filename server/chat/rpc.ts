@@ -142,6 +142,7 @@ export class StdioRpc extends EventEmitter {
   private readonly deferred: Array<() => void> = []
   private readonly pending = new Map<number | string, Pending>()
   private readonly requestHandlers = new Map<string, RpcRequestHandler>()
+  private readonly replayCompletedHandlers = new Set<string>()
   private readonly notificationHandlers = new Map<string, RpcNotificationHandler>()
   private readonly inbound = new Set<string>()
   private readonly inboundAbort = new AbortController()
@@ -209,8 +210,12 @@ export class StdioRpc extends EventEmitter {
     for (const send of this.deferred.splice(0)) send()
   }
 
-  onRequest(method: string, handler: RpcRequestHandler): void {
+  onRequest(method: string, handler: RpcRequestHandler, options: { replayCompleted?: boolean } = {}): void {
     this.requestHandlers.set(method, handler)
+    // Permission/question handlers consume persisted one-time decisions.
+    // Filesystem handlers must never opt in: their effects already ran.
+    if (options.replayCompleted) this.replayCompletedHandlers.add(method)
+    else this.replayCompletedHandlers.delete(method)
   }
 
   onNotification(method: string, handler: RpcNotificationHandler): void {
@@ -417,9 +422,10 @@ export class StdioRpc extends EventEmitter {
     }
     const id = message.id
     const key = `${typeof id}:${String(id)}`
-    // A recorded response proves this request already ran. Suppress the
-    // handler itself, including filesystem writes and delayed responses.
-    if (this.replaying && this.respondedBeforeRestart.has(key)) return
+    const completed = this.replaying && this.respondedBeforeRestart.has(key)
+    // A completed authorization still consumes its historical request, so
+    // the next identical request cannot reuse that one-time answer.
+    if (completed && !this.replayCompletedHandlers.has(message.method)) return
     if (this.inbound.has(key)) {
       this.emit('duplicate-request', id)
       this.respondError(id, { code: -32600, message: `request id ${String(id)} is already in flight` })
@@ -441,11 +447,11 @@ export class StdioRpc extends EventEmitter {
       .then(
         (result) => {
           this.inbound.delete(key)
-          if (!this.closed) this.respond(id, result ?? {})
+          if (!this.closed && !completed) this.respond(id, result ?? {})
         },
         (error: unknown) => {
           this.inbound.delete(key)
-          if (this.closed) return
+          if (this.closed || completed) return
           const rpcError = error instanceof RpcError
             ? { code: error.code, message: error.message, data: error.data }
             : { code: -32000, message: error instanceof Error ? error.message : String(error) }

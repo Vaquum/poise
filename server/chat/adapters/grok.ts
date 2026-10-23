@@ -355,7 +355,7 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
       } catch {
         return { outcome: { outcome: 'cancelled' } }
       }
-    })
+    }, { replayCompleted: true })
     rpc.onRequest('_x.ai/ask_user_question', async (params: any, _id, signal) => {
       if (!params || params.sessionId !== sessionId) throw new RpcError(-32602, 'unknown session')
       const raw: any[] = Array.isArray(params.questions) ? params.questions : []
@@ -382,7 +382,7 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
       } catch {
         return { outcome: 'cancelled' }
       }
-    })
+    }, { replayCompleted: true })
     rpc.onRequest('fs/read_text_file', async (params: any) => {
       if (!params || params.sessionId !== sessionId || typeof params.path !== 'string') throw new RpcError(-32602, 'invalid params')
       const content = await host.readTextFile(params.path, {

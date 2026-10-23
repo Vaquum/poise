@@ -336,7 +336,7 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
   // The link aborts `signal` when it fails; a handler still waiting on the
   // user then has nobody to answer, and StdioRpc discards the late reply.
   function serve<M extends ServerMethod>(method: M, handler: (params: ServerParams<M>, signal: AbortSignal) => Promise<ServerResponses[M]> | ServerResponses[M]): void {
-    rpc!.onRequest(method, (params, _id, signal) => handler(params as ServerParams<M>, signal))
+    rpc!.onRequest(method, (params, _id, signal) => handler(params as ServerParams<M>, signal), { replayCompleted: true })
   }
 
   // Events belong to the turn whose prompt() is pending. Codex reports the

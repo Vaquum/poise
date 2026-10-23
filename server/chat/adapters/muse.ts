@@ -459,7 +459,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       // The request form is acknowledged with `{}`; the decision travels as
       // its own command, exactly like the notification form.
       return {}
-    })
+    }, { replayCompleted: true })
   }
 
   function session(): string {
@@ -1432,10 +1432,14 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
           finish(turn, { stopReason: 'error', error: `Muse could not start the turn: ${String(message.error.message || 'rpc error')}` })
           return
         }
+        const request = typeof id === 'string' || typeof id === 'number' ? requests.get(id) : undefined
+        if (message?.error && (request?.method === 'approval/decide' || request?.method === 'userInput/answer' || request?.method === 'userInput/cancel')) {
+          interactionFailed(request.method, new Error(String(message.error.message || 'recorded decision failed')), turn)
+          return
+        }
         const receipt = message?.result
         if (!receipt || typeof receipt !== 'object') return
         if (typeof receipt.approvalId === 'string') {
-          const request = typeof id === 'string' || typeof id === 'number' ? requests.get(id) : undefined
           const params = request?.params as Partial<ApprovalDecideParams> | undefined
           const sourceIndex = params?.requirementId?.sourceIndex
           if (request?.method === 'approval/decide' && params?.approvalId === receipt.approvalId

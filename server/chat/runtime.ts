@@ -688,6 +688,9 @@ export class ChatRuntime extends EventEmitter {
         })
       } finally {
         turn.relayHeld = false
+        // This adapter can serve later turns; their matching requests must
+        // never inherit unused one-time decisions from the adopted turn.
+        replayHost.releaseHistory()
       }
       // A second restart can hand this adopted turn to the next server
       // while replay is pending. Its result belongs to that server now.
