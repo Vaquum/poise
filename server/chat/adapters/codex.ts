@@ -1003,6 +1003,7 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
     },
 
     async replayTurn(init: ReplayInit): Promise<TurnResult> {
+      if (init.signal.aborted) return { stopReason: 'cancelled', terminate: true }
       // Without the turn's initiating request the agent never heard it: that
       // turn must be re-prompted, not replayed.
       if (init.outboundTruncated) throw new AdapterError(AGENT, 'the relay cannot prove what Codex heard; the turn is interrupted instead', 'protocol')
@@ -1052,6 +1053,7 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
       replayLink.on('orphan-response', orphan)
       const onAbort = () => { void adapter.cancel() }
       init.signal.addEventListener('abort', onAbort, { once: true })
+      if (init.signal.aborted) onAbort()
       void init.live.then(
         () => replayLink.endReplay(),
         (error) => replayLink.fail(error instanceof Error ? error : new Error(String(error))),

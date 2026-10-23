@@ -728,7 +728,9 @@ export class ChatRuntime extends EventEmitter {
       peer = attached.connection
       session.relay = peer
       this.trackRelayExit(session, peer)
+      turn.abort.signal.throwIfAborted()
       const outbound = await peer.getOutbound()
+      turn.abort.signal.throwIfAborted()
       const persisted = this.turnSlice(record.id, open.turnId)
       const replayHost = createReplayHost({ inner: this.hostFor(session), turnId: open.turnId, persisted,
         registerPending: (requestId, pending) => { session.pending.set(requestId, pending) } })

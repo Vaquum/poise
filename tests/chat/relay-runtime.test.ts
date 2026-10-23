@@ -187,6 +187,49 @@ describe('relay handover between servers', () => {
     return { first, session, peer, turnId }
   }
 
+  it('stops the actual worker when lease loss aborts recovery during its outbound read', async () => {
+    const instance = 'poise-relay-abort-during-outbound:db'
+    const { session, peer } = await heldTurn(instance)
+    const relay = await import('../../server/chat/relay')
+    const lock = await import('../../server/chat/checkout-lock')
+    const lost = vi.spyOn(lock.CheckoutLease.prototype, 'onLost')
+    const attach = relay.attachRelay
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    let reading = false
+    const attaching = vi.spyOn(relay, 'attachRelay').mockImplementation(async options => {
+      const attached = await attach(options)
+      const read = attached.connection.getOutbound.bind(attached.connection)
+      attached.connection.getOutbound = async () => {
+        const outbound = await read()
+        reading = true
+        await held
+        return outbound
+      }
+      return attached
+    })
+    const second = makeRuntime(instance)
+    try {
+      await second.runtime.recover()
+      await waitFor(() => reading)
+      const leaseLost = lost.mock.calls.at(-1)?.[0]
+      if (!leaseLost) throw new Error('the adopted checkout did not install its lease-loss handler')
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
+      leaseLost()
+      release()
+      await waitFor(() => ofType(second.events, session.id, 'turn.finished').some(event => event.stopReason === 'cancelled'), 15_000)
+      expect(second.controls.replayTurns).toHaveLength(0)
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(false)
+      expect(storage.getWorker(session.id)).toBeNull()
+      expect(storage.getRelay(session.id)).toBeNull()
+    } finally {
+      release()
+      attaching.mockRestore()
+      lost.mockRestore()
+      await second.runtime.stop({ handover: false })
+    }
+  }, 60_000)
+
   it.each(['local', 'adopted'] as const)('retains the %s worker and lease when the relay dies before its gate group', async (mode) => {
     const instance = `poise-relay-dies-before-worker-${mode}:db`
     const first = makeRuntime(instance)

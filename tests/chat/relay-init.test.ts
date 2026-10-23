@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events'
 import { rmSync } from 'node:fs'
 import { PassThrough } from 'node:stream'
 import { afterEach, describe, expect, it } from 'vitest'
+import { createClaudeAdapter } from '../../server/chat/adapters/claude'
 import { createCodexAdapter } from '../../server/chat/adapters/codex'
 import { createGrokAdapter } from '../../server/chat/adapters/grok'
 import { createMuseAdapter } from '../../server/chat/adapters/muse'
@@ -13,7 +14,7 @@ import { createFakeHost } from './adapter-harness'
 const cleanups: Array<() => void> = []
 afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup() })
 
-function replay(agent: 'grok' | 'codex' | 'muse', extraOutbound = '', wrap: (host: AdapterHost) => AdapterHost = host => host) {
+function replay(agent: 'grok' | 'codex' | 'muse' | 'claude', extraOutbound = '', wrap: (host: AdapterHost) => AdapterHost = host => host) {
   const host = createFakeHost('unused.mjs')
   const events = new EventEmitter()
   const peer = Object.assign(events, {
@@ -29,14 +30,14 @@ function replay(agent: 'grok' | 'codex' | 'muse', extraOutbound = '', wrap: (hos
     },
   })
   const adapterHost = wrap(host)
-  const adapter: Adapter = agent === 'grok' ? createGrokAdapter(adapterHost) : agent === 'codex' ? createCodexAdapter(adapterHost) : createMuseAdapter(adapterHost)
+  const adapter: Adapter = agent === 'grok' ? createGrokAdapter(adapterHost) : agent === 'codex' ? createCodexAdapter(adapterHost) : agent === 'claude' ? createClaudeAdapter(adapterHost) : createMuseAdapter(adapterHost)
   let goLive!: () => void
   const live = new Promise<void>(resolve => { goLive = resolve })
   const method = agent === 'grok' ? 'session/prompt' : 'turn/start'
   const init: ReplayInit = {
     turnId: 'turn-test', signal: new AbortController().signal, peer: peer as unknown as AgentProcess,
-    live, outbound: Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 7, method, params: {} }) + '\n' + extraOutbound), outboundTruncated: false,
-    session: { nativeSessionId: 'native-test', modelId: agent === 'muse' ? 'muse-spark-1.3-contributor' : 'test-model', effort: 'low', safeMode: false },
+    live, outbound: Buffer.from(JSON.stringify(agent === 'claude' ? { type: 'user', uuid: 'user-test', message: { role: 'user', content: 'continue' } } : { jsonrpc: '2.0', id: 7, method, params: {} }) + '\n' + extraOutbound), outboundTruncated: false,
+    session: { nativeSessionId: agent === 'claude' ? 'a1b2c3d4-0000-4000-8000-000000000001' : 'native-test', modelId: agent === 'muse' ? 'muse-spark-1.3-contributor' : 'test-model', effort: 'low', safeMode: false },
     recalledDiffs: new Map(),
   }
   const receive = (message: unknown) => peer.stdout.write(JSON.stringify(message) + '\n')
@@ -50,6 +51,17 @@ function replay(agent: 'grok' | 'codex' | 'muse', extraOutbound = '', wrap: (hos
 }
 
 describe('relay initiation failures', () => {
+  it.each(['codex', 'muse', 'claude'] as const)('requires verified termination for %s replay already aborted before admission', async agent => {
+    const f = replay(agent)
+    const abort = new AbortController()
+    abort.abort(new Error('fixture checkout lease lost during outbound read'))
+    await expect(f.adapter.replayTurn!({ ...f.init, signal: abort.signal })).resolves.toEqual({ stopReason: 'cancelled', terminate: true })
+    // LIVE never arrives: recovery must stop the worker instead of leaving
+    // an abort listener waiting for an event that already happened.
+    expect(f.peer.stdin.read()).toBeNull()
+    expect(f.host.spawns).toEqual([])
+  })
+
   it('re-attaches the second identical Grok question instead of reusing the first answer', async () => {
     const questions = [{ id: '0', question: 'Which?', options: [{ label: 'first' }, { label: 'second' }], multiSelect: false, freeText: false }]
     const persisted: ChatEnvelope[] = [

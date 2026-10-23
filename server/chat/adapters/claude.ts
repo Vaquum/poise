@@ -664,6 +664,7 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
     },
 
     async replayTurn(init: ReplayInit): Promise<TurnResult> {
+      if (init.signal.aborted) return { stopReason: 'cancelled', terminate: true }
       // Without the turn's user message the CLI never heard it: that turn
       // must be re-prompted, not replayed.
       if (init.outboundTruncated) throw new AdapterError('claude', 'the relay cannot prove what Claude Code heard; the turn is interrupted instead', 'protocol')
@@ -713,6 +714,7 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
         newMessageIds(current)
         const onAbort = () => { void adapter.cancel() }
         init.signal.addEventListener('abort', onAbort, { once: true })
+        if (init.signal.aborted) onAbort()
         current.resolve = (outcome: TurnResult) => { init.signal.removeEventListener('abort', onAbort); resolve(outcome) }
       })
       void init.live.then(

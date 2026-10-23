@@ -320,6 +320,9 @@ rollback or shutdown retains the worker records and checkout lease until that
 group is verified gone. While this server owns that relay, its exit observer
 retires matching worker records when the group subsequently exits; ownership
 transfer or server stop ends that observation.
+Recovery rechecks cancellation after relay attachment and outbound reads. A replay
+already aborted by lease loss requires verified native-worker termination before
+releasing its checkout.
 A recorded failed Muse decision ends the turn with a visible error
 instead of retaining an unanswerable request and checkout lease.
 
