@@ -156,7 +156,7 @@ export const MODEL_PLACES = [
   {
     key: 'chat',
     label: 'Chat',
-    why: 'Card chats opened from Current, Archive and Swarm.',
+    why: 'New chats in Chat and chats started from Current cards.',
     review: false,
     reviewers: false,
     seed: 'author_content',
@@ -164,7 +164,7 @@ export const MODEL_PLACES = [
   {
     key: 'editor',
     label: 'Editor chat',
-    why: 'Document and annotation chats in the Editor. /content and /consensus use the Caller defaults listed below.',
+    why: 'Document, passage and review chats in the Editor. /content and /consensus use the Caller defaults listed below.',
     review: false,
     reviewers: false,
     seed: 'author_content',

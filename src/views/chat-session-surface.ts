@@ -12,9 +12,11 @@ import type {
   AgentId,
   ChatEnvelope,
   ChatSubject,
+  EditDecision,
   NewSessionRequest,
   SessionRecord,
 } from '../../server/chat/protocol'
+import type { EditProposal } from '../edit-proposals'
 import { parseChatCommandChain } from '../../server/chat/commands'
 import { createComposer, emptyDraft, type Composer, type ComposerDraft } from './chat-composer'
 import { createModel, applyEvent, addOptimisticTurn, dropOptimisticTurns, createTranscriptView, renderImportedHtml, type TranscriptModel } from './chat-transcript'
@@ -24,6 +26,16 @@ export interface SurfaceOptions {
   subject: ChatSubject
   prefill?: string
   draft?: ComposerDraft
+  /** Runs before an Editor surface sends, so the saved body the agent reads
+   *  is what the person sees. A throw aborts the send with the draft kept. */
+  beforeSend?: () => Promise<void>
+  /** Edit-card wiring for Editor surfaces: hover highlights the target,
+   *  accept applies the edit and saves before the decision is recorded. */
+  edits?: {
+    hover(edit: EditProposal): void
+    leave(): void
+    accept(edit: EditProposal): Promise<'applied' | 'conflict' | 'failed'>
+  }
 }
 
 export interface SessionSurface {
@@ -31,6 +43,103 @@ export interface SessionSurface {
   focus(): void
   takeDraft(): ComposerDraft | null
   destroy(): void
+  setHighlight(text: string | null): void
+  /** Highest event seq applied, for resubscribing without a replay. */
+  lastSeq(): number
+  pendingRequests(): string[]
+}
+
+interface EditRetry {
+  turnId: string
+  messageId: string
+  index: number
+  decision: EditDecision
+  edit?: EditProposal
+  error: string
+}
+
+interface SavedEdit {
+  turnId: string
+  messageId: string
+  index: number
+  afterSeq: number
+  operationId: string
+}
+
+interface EditState {
+  deciding: Set<string>
+  applied: Set<string>
+  confirmed: Set<string>
+  baselines: Map<string, number>
+  saved: Map<string, SavedEdit>
+  storagePrefix: string | null
+  persisted: Map<string, SavedEdit>
+  storageError: string | null
+  retries: Map<string, EditRetry>
+  listeners: Set<(key?: string, decision?: EditDecision) => void>
+  revision: number
+}
+
+// A saved edit awaiting its decision acknowledgement must survive surface
+// teardown. Session + turn/message/index identify it until the server records it.
+const pendingEdits = new Map<string, EditState>()
+
+function newEditState(): EditState {
+  return { deciding: new Set(), applied: new Set(), confirmed: new Set(), baselines: new Map(), saved: new Map(),
+    storagePrefix: null, persisted: new Map(), storageError: null, retries: new Map(), listeners: new Set(), revision: 0 }
+}
+
+// localStorage is origin-scoped; the instance and session namespace prevents
+// another workspace from consuming the marker. Only card identity/cursor is
+// retained, never document text or the proposed edit.
+function restoreEditState(session: SessionRecord, state: EditState = pendingEdits.get(session.id) ?? newEditState()): EditState {
+  state.storagePrefix = `poise:editor-applied:v2:${encodeURIComponent(session.instance)}:${encodeURIComponent(session.id)}:`
+  for (const storageKey of Object.keys(localStorage)) {
+    if (!storageKey.startsWith(state.storagePrefix)) continue
+    const raw = localStorage.getItem(storageKey)
+    if (raw === null) continue // Another tab acknowledged this marker.
+    const identity: unknown = JSON.parse(decodeURIComponent(storageKey.slice(state.storagePrefix.length)))
+    const value: unknown = JSON.parse(raw)
+    if (!Array.isArray(identity) || identity.length !== 3 || typeof identity[0] !== 'string' || typeof identity[1] !== 'string'
+      || typeof identity[2] !== 'number' || !Number.isSafeInteger(identity[2]) || identity[2] < 0
+      || !value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Saved edit recovery identity is invalid')
+    const item = value as Record<string, unknown>
+    if (typeof item.afterSeq !== 'number' || !Number.isSafeInteger(item.afterSeq) || item.afterSeq < 0
+      || typeof item.operationId !== 'string' || !item.operationId) throw new Error('Saved edit recovery cursor is invalid')
+    const marker: SavedEdit = { turnId: identity[0], messageId: identity[1], index: identity[2], afterSeq: item.afterSeq, operationId: item.operationId }
+    const key = `${marker.turnId}:${marker.messageId}:${marker.index}`
+    if (state.deciding.has(key) || state.saved.has(key)) continue
+    state.applied.add(key)
+    state.baselines.set(key, marker.afterSeq)
+    state.saved.set(key, marker)
+    state.persisted.set(key, marker)
+    state.retries.set(key, { ...marker, decision: 'applied', error: 'The saved edit decision has not been acknowledged' })
+  }
+  return state
+}
+
+function persistEditState(state: EditState): void {
+  if (!state.storagePrefix) return
+  const storageKey = (marker: SavedEdit) => `${state.storagePrefix}${encodeURIComponent(JSON.stringify([marker.turnId, marker.messageId, marker.index]))}`
+  const value = (marker: SavedEdit) => JSON.stringify({ afterSeq: marker.afterSeq, operationId: marker.operationId })
+  try {
+    for (const [key, marker] of state.saved) {
+      if (state.persisted.get(key)?.operationId === marker.operationId) continue
+      const raw = value(marker)
+      localStorage.setItem(storageKey(marker), raw)
+      if (localStorage.getItem(storageKey(marker)) !== raw) throw new Error('Recovery marker write was not retained')
+      state.persisted.set(key, marker)
+    }
+    for (const [key, marker] of state.persisted) {
+      if (state.saved.has(key)) continue
+      // Never remove another tab's newer operation or a different card.
+      if (localStorage.getItem(storageKey(marker)) === value(marker)) localStorage.removeItem(storageKey(marker))
+      state.persisted.delete(key)
+    }
+    state.storageError = null
+  } catch (error) {
+    state.storageError = `Edit recovery could not be saved — ${(error as Error).message}. Keep this page open until the decision is recorded.`
+  }
 }
 
 interface ModelPlaceAnswer {
@@ -58,17 +167,22 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
   let destroyed = false
   let pendingModel: string | null = null
   let agents: AgentsResponse | null = null
+  /** Text highlighted in the document, sent as a quote with the next message. */
+  let highlight: string | null = null
+  let editState = newEditState()
 
   container.classList.add('chat-surface')
   container.innerHTML = '<div class="chat-surface-notice" hidden></div>'
     + '<div class="chat-surface-earlier" hidden></div>'
     + '<div class="chat-surface-transcript"></div>'
     + '<div class="chat-surface-queue"></div>'
+    + '<div class="chat-surface-highlight" hidden></div>'
     + '<div class="chat-surface-composer"></div>'
   const noticeEl = container.querySelector<HTMLElement>('.chat-surface-notice')!
   const earlierEl = container.querySelector<HTMLElement>('.chat-surface-earlier')!
   const transcriptEl = container.querySelector<HTMLElement>('.chat-surface-transcript')!
   const queueEl = container.querySelector<HTMLElement>('.chat-surface-queue')!
+  const highlightEl = container.querySelector<HTMLElement>('.chat-surface-highlight')!
   const composerEl = container.querySelector<HTMLElement>('.chat-surface-composer')!
 
   const transcript = createTranscriptView(transcriptEl, {
@@ -76,6 +190,12 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     onQuestion: (id, answers) => { if (record) void chatClient.send({ type: 'question.answer', sessionId: record.id, id, answers }).catch((err) => setNotice(`Answer failed — ${(err as Error).message}`)) },
     onRevert: () => { setNotice('Open in Chat to revert this diff.') },
     onFile: () => { setNotice('Open in Chat to preview files.') },
+    onEditDecide: (turnId, messageId, index, decision, edit) => { void decideEdit(turnId, messageId, index, decision, edit) },
+    onEditHover: (edit) => { options.edits?.hover(edit) },
+    onEditLeave: () => { options.edits?.leave() },
+    onSuggestedReply: (text) => {
+      container.dispatchEvent(new CustomEvent('chat:use-suggested-reply', { bubbles: true, detail: { subject, text } }))
+    },
   })
   transcriptEl.addEventListener('chat:rerender', render)
 
@@ -132,6 +252,124 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     container.dispatchEvent(new CustomEvent('chat:surface-state', { bubbles: true, detail: { sessionId: record?.id ?? null, status: record?.status ?? null } }))
   }
 
+  function renderHighlight(): void {
+    if (!highlight) { highlightEl.hidden = true; highlightEl.innerHTML = ''; return }
+    highlightEl.hidden = false
+    highlightEl.innerHTML = ''
+    const flat = highlight.replace(/\s+/g, ' ').trim()
+    const excerpt = flat.length > 80 ? `${flat.slice(0, 80)}…` : flat
+    const label = document.createElement('span')
+    label.textContent = `Highlighted · “${excerpt}”`
+    const remove = document.createElement('button')
+    remove.type = 'button'
+    remove.className = 'chat-surface-highlight-remove'
+    remove.setAttribute('aria-label', 'Remove highlight')
+    remove.textContent = '×'
+    remove.addEventListener('click', () => setHighlight(null))
+    highlightEl.append(label, remove)
+  }
+
+  function setHighlight(text: string | null): void {
+    highlight = text
+    renderHighlight()
+  }
+
+  /** The highlight travels as a quote at the start of the message text, so
+   *  prompts, steers and queued messages carry it unchanged, it shows in the
+   *  person's bubble in every surface, and it survives a reload. */
+  function withHighlight(text: string): string {
+    if (!highlight) return text
+    const quote = highlight.split('\n').map((line) => `> ${line}`).join('\n')
+    // The runtime only parses a command at the very start of the prompt,
+    // so a command keeps the head and the quote follows it.
+    if (text.startsWith('/')) return `${text}\n\n${quote}`
+    return `${quote}\n\n${text}`
+  }
+
+  function showEditRetry(): void {
+    const pending = [...editState.retries].find(([key]) => !editState.deciding.has(key))
+    if (pending) {
+      const [key, retry] = pending
+      setNotice(`Decision failed — ${retry.error}${editState.storageError ? `. ${editState.storageError}` : ''}`, [{ label: 'Retry', run: () => {
+        if (editState.retries.get(key) !== retry) return
+        void decideEdit(retry.turnId, retry.messageId, retry.index, retry.decision, retry.edit)
+      } }])
+    } else if (editState.storageError) setNotice(editState.storageError)
+  }
+
+  function editStateChanged(key?: string, decision?: EditDecision): void {
+    if (key && decision) { model.decisions.set(key, decision); setNotice(null) }
+    render()
+    showEditRetry()
+  }
+
+  function notifyEditState(state: EditState, sessionId: string, key?: string, decision?: EditDecision): void {
+    persistEditState(state)
+    state.revision++
+    for (const listener of state.listeners) listener(key, decision)
+    if (!state.deciding.size && !state.applied.size && !state.retries.size) pendingEdits.delete(sessionId)
+  }
+
+  async function decideEdit(turnId: string, messageId: string, index: number, decision: EditDecision, edit?: EditProposal): Promise<void> {
+    if (!record || !options.edits) return
+    const sessionId = record.id
+    const key = `${turnId}:${messageId}:${index}`
+    const state = editState
+    if (state.deciding.has(key)) return
+    try {
+      // Another tab can save after this surface mounts, before its decision.
+      restoreEditState(record, state)
+    } catch (error) {
+      setNotice(`Saved edit recovery could not be read — ${(error as Error).message}`)
+      return
+    }
+    state.deciding.add(key)
+    if (!state.applied.has(key)) state.baselines.set(key, seenSeq)
+    pendingEdits.set(sessionId, state)
+    notifyEditState(state, sessionId)
+    try {
+      // Saving and recording the decision are separate operations. Once the
+      // document was saved, a retry only records it, even for pure insertions.
+      if (state.applied.has(key)) decision = 'applied'
+      else if (decision === 'applied') {
+        if (!edit) { setNotice('The edit proposal is unavailable. Reopen this chat before accepting it.'); return }
+        let outcome: 'applied' | 'conflict' | 'failed'
+        try {
+          outcome = await options.edits.accept(edit)
+        } catch (err) {
+          setNotice(`Accept failed — ${(err as Error).message}`)
+          return
+        }
+        // A failed save records nothing; the Editor showed the save error.
+        if (outcome === 'failed') return
+        decision = outcome
+        if (outcome === 'applied') {
+          state.applied.add(key)
+          state.saved.set(key, { turnId, messageId, index, afterSeq: state.baselines.get(key)!, operationId: crypto.randomUUID() })
+          state.retries.set(key, { turnId, messageId, index, decision, edit, error: 'The saved edit decision has not been acknowledged' })
+          notifyEditState(state, sessionId)
+        }
+      }
+      try {
+        await chatClient.send({ type: 'edit.decide', sessionId, turnId, messageId, index, decision })
+        state.applied.delete(key)
+        state.saved.delete(key)
+        state.baselines.delete(key)
+        state.retries.delete(key)
+        notifyEditState(state, sessionId, key, decision)
+        setNotice(null)
+      } catch (err) {
+        // The decision event can arrive before a lost acknowledgement fails.
+        // Authoritative live or replayed history wins over that uncertainty.
+        if (!state.confirmed.has(key)) state.retries.set(key, { turnId, messageId, index, decision, edit, error: (err as Error).message })
+      }
+    } finally {
+      state.deciding.delete(key)
+      state.confirmed.delete(key)
+      notifyEditState(state, sessionId)
+    }
+  }
+
   function composerState(): void {
     const status = record?.status
     const closed = status === 'closed'
@@ -148,7 +386,11 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
 
   function render(): void {
     if (destroyed) return
-    transcript.render(model, { running: !!record && isRunning(record.status), sessionId: record?.id })
+    transcript.render(model, {
+      running: !!record && isRunning(record.status),
+      sessionId: record?.id,
+      ...(subject.surface === 'current' ? {} : { edits: { surface: subject.surface, readOnly: false, deciding: editState.deciding, applied: editState.applied, revision: editState.revision } }),
+    })
     composer.setCommands(record?.commands || [], { model: true, modes: false, fork: false, poise: false, create: false })
     queuePanel.render(record?.id ?? null, record?.queue, agents?.agents || [], !!record && isRunning(record.status), new Set())
     composerState()
@@ -162,8 +404,9 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
 
   async function placeDefault(): Promise<{ agent: AgentId, model: string }> {
     const answer = await (await fetch('/api/models', { cache: 'no-store' })).json() as ModelPlaceAnswer
-    const identity = answer.places.find((place) => place.key === 'chat')?.default
-    if (!identity) throw new Error('Chat has no default model. Choose one in the console.')
+    const place = subject.surface === 'current' ? 'chat' : 'editor'
+    const identity = answer.places.find((row) => row.key === place)?.default
+    if (!identity) throw new Error(`${place === 'chat' ? 'Chat' : 'Editor chat'} has no default model. Choose one in the console.`)
     const provider = answer.catalog.models.find((row) => row.identity === identity)?.provider
     return { agent: (provider || 'grok') as AgentId, model: identity }
   }
@@ -196,25 +439,44 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     }
   }
 
+  let seenSeq = 0
+  let adopting: ChatEnvelope[] | null = null
+  let subscribed: string | null = null
   async function adopt(session: SessionRecord): Promise<void> {
+    if (subscribed) { chatClient.unsubscribe(subscribed); subscribed = null }
+    const pending: ChatEnvelope[] = []
+    adopting = pending
     record = session
+    editState.listeners.delete(editStateChanged)
+    editState = restoreEditState(session)
+    editState.listeners.add(editStateChanged)
     earlierEl.hidden = true
     earlierEl.innerHTML = ''
     transcript.clear()
     model = createModel()
-    let after = 0
-    for (let guard = 0; guard < 100; guard++) {
-      const page = await chatClient.fetchSession(session.id, after)
-      record = page.session
-      for (const envelope of page.events) {
-        if (envelope.seq > after) { applyEvent(model, envelope); after = envelope.seq }
-      }
-      if (!page.truncated || !page.events.length) break
-    }
-    chatClient.subscribe(session.id, after)
-    setNotice(null)
+    seenSeq = 0
+    // Owners must retain the session even if they close while history loads.
     state()
-    render()
+    try {
+      for (let guard = 0; guard < 100; guard++) {
+        const page = await chatClient.fetchSession(session.id, seenSeq)
+        if (destroyed || adopting !== pending) return
+        record = page.session
+        for (const envelope of page.events) applyEnvelope(envelope)
+        if (!page.truncated || !page.events.length) break
+      }
+      // Another surface may still subscribe while history loads. Fold those
+      // live events after history so they cannot move its paging cursor.
+      for (const envelope of pending.sort((a, b) => a.seq - b.seq)) applyEnvelope(envelope)
+      chatClient.subscribe(session.id, seenSeq)
+      subscribed = session.id
+      setNotice(null)
+      state()
+      render()
+      showEditRetry()
+    } finally {
+      if (adopting === pending) adopting = null
+    }
   }
 
   async function ensureSession(draft?: ComposerDraft, skipLegacy = false): Promise<SessionRecord> {
@@ -255,6 +517,11 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     const text = commandDraftText({ ...draft, text: draft.text })
     const refused = refusedCommand(text)
     if (refused) { keepDraft(draft); setNotice(`Open in Chat to use /${refused}.`); return }
+    if (options.beforeSend) {
+      try {
+        await options.beforeSend()
+      } catch (err) { keepDraft(draft); setNotice((err as Error).message); return }
+    }
     const chain = parseChatCommandChain(text)
     if (chain.context === 'reset' && !chain.queue) { await resetThenSend(draft); return }
     if (!record) {
@@ -266,7 +533,7 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
       await ensureSession(first)
     } catch (err) { creationFailed(err, draft, () => sendPrompt(draft)); return }
     const session = record!
-    const prompt = { text, attachments: draft.attachments, mentions: draft.mentions }
+    const prompt = { text: withHighlight(text), attachments: draft.attachments, mentions: draft.mentions }
     dropOptimisticTurns(model)
     addOptimisticTurn(model, prompt)
     record = { ...session, ...(!session.title ? { title: text.slice(0, 200) } : {}), status: 'running' }
@@ -274,6 +541,7 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     render()
     try {
       await chatClient.send({ type: 'prompt', sessionId: session.id, ...prompt })
+      setHighlight(null)
     } catch (err) {
       dropOptimisticTurns(model)
       if (record?.status === 'running' && !model.running) record = { ...record, status: 'idle' }
@@ -330,6 +598,11 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
 
   async function queuePrompt(draft: ComposerDraft): Promise<void> {
     const chain = parseChatCommandChain(commandDraftText(draft))
+    if (options.beforeSend) {
+      try {
+        await options.beforeSend()
+      } catch (err) { keepDraft(draft); setNotice((err as Error).message); return }
+    }
     const first = { ...draft, model: draft.model || chain.model }
     try {
       await ensureSession(first)
@@ -337,9 +610,10 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     const session = record!
     try {
       const queue = await chatClient.queueCommand({ type: 'queue.add', sessionId: session.id, itemId: crypto.randomUUID(),
-        text: chain.text, attachments: draft.attachments, mentions: draft.mentions, model: first.model || session.model })
+        text: withHighlight(chain.text), attachments: draft.attachments, mentions: draft.mentions, model: first.model || session.model })
       record = { ...session, queue }
       setNotice(null)
+      setHighlight(null)
       render()
     } catch (err) {
       keepDraft(draft)
@@ -362,8 +636,9 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
   async function steer(draft: ComposerDraft): Promise<void> {
     if (!record) return
     try {
-      await chatClient.send({ type: 'steer', sessionId: record.id, text: draft.text,
+      await chatClient.send({ type: 'steer', sessionId: record.id, text: withHighlight(draft.text),
         ...(draft.attachments.length ? { attachments: draft.attachments } : {}), ...(draft.mentions.length ? { mentions: draft.mentions } : {}) })
+      setHighlight(null)
     } catch (err) {
       keepDraft(draft)
       setNotice(`Steer failed — ${(err as Error).message}`)
@@ -426,11 +701,31 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     }
   }
 
-  function onEvent(envelope: ChatEnvelope): void {
-    if (destroyed || !record || envelope.sessionId !== record.id) return
+  function applyEnvelope(envelope: ChatEnvelope): void {
+    if (!record || envelope.seq <= seenSeq) return
+    seenSeq = envelope.seq
     if (envelope.event.type === 'session.updated') record = envelope.event.session
     else if (envelope.event.type === 'session.closed') record = { ...record, status: 'closed' }
+    else if (envelope.event.type === 'edit.decided') {
+      const event = envelope.event
+      const key = `${event.turnId}:${event.messageId}:${event.index}`
+      const baseline = editState.baselines.get(key)
+      if (baseline !== undefined && envelope.seq > baseline && (!editState.applied.has(key) || event.decision === 'applied')) {
+        if (editState.deciding.has(key)) editState.confirmed.add(key)
+        editState.applied.delete(key)
+        editState.saved.delete(key)
+        editState.retries.delete(key)
+        if (!editState.deciding.has(key)) editState.baselines.delete(key)
+        notifyEditState(editState, record.id, key, event.decision)
+      }
+    }
     applyEvent(model, envelope)
+  }
+
+  function onEvent(envelope: ChatEnvelope): void {
+    if (destroyed || !record || envelope.sessionId !== record.id) return
+    if (adopting) { adopting.push(envelope); return }
+    applyEnvelope(envelope)
     state()
     render()
   }
@@ -440,17 +735,40 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
 
   return {
     session: () => record?.id ?? null,
+    lastSeq: () => seenSeq,
+    pendingRequests: () => {
+      const pending = new Set(record?.pendingRequests)
+      for (const [id, item] of model.permissions) {
+        if (item.resolved) pending.delete(id)
+        else pending.add(id)
+      }
+      for (const [id, item] of model.questions) {
+        if (item.answered) pending.delete(id)
+        else pending.add(id)
+      }
+      // A surface can close while history is loading and live requests are
+      // buffered for adoption. Those requests still need a margin marker.
+      for (const envelope of adopting || []) {
+        const event = envelope.event
+        if (event.type === 'permission.requested' || event.type === 'question.asked') pending.add(event.id)
+        else if (event.type === 'permission.resolved' || event.type === 'question.answered') pending.delete(event.id)
+        else if (event.type === 'session.reset') pending.clear()
+      }
+      return [...pending]
+    },
     focus: () => composer.focus(),
     takeDraft: () => {
       const draft = composer.getDraft()
       return draft.text || draft.attachments.length ? draft : null
     },
+    setHighlight,
     destroy: () => {
       if (destroyed) return
       destroyed = true
+      editState.listeners.delete(editStateChanged)
       clearInterval(tickTimer)
       offEvent()
-      if (record) chatClient.unsubscribe(record.id)
+      if (subscribed) chatClient.unsubscribe(subscribed)
       transcriptEl.removeEventListener('chat:rerender', render)
       queuePanel.el.remove()
       composer.destroy()

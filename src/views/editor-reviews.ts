@@ -1,8 +1,9 @@
 import { patchContent } from '../dom-patch'
 import { shortTime } from '../clock'
 import { effectiveTimezone } from '../config'
-import { reveal, watchPanel } from '../motion'
 import { locateReview, REVIEW_INTERVAL_MS, type ArticleReview, type ArticleReviews } from '../publishing-review'
+import { closeInlineThread, inlineThreadSubjectInView } from './editor-inline-thread'
+import type { ChatSubject } from '../../server/chat/protocol'
 
 interface Host {
   view: HTMLElement
@@ -10,7 +11,7 @@ interface Host {
   text(): string
   range(start: number, end: number): Range | null
   beforeOpen(): void
-  ask(review: ArticleReview): void
+  openThread(review: ArticleReview, render: (section: HTMLElement) => void): void
 }
 
 const escape = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
@@ -28,11 +29,12 @@ export class EditorReviews {
   private revision = 0
   private running = false
   private selected: string | null = null
+  /** The thread section the GitHub conversation renders into, while open. */
+  private section: HTMLElement | null = null
   private actions = new Set<string>()
   private error = ''
   private drafts = new Map<string, string>()
   private list: HTMLElement
-  private panel: HTMLElement
   private overlay: HTMLElement
 
   constructor(private host: Host) {
@@ -41,25 +43,22 @@ export class EditorReviews {
     this.list.setAttribute('aria-label', 'Article reviews')
     this.list.hidden = true
     host.view.querySelector('.editor-page')!.before(this.list)
-    this.panel = document.createElement('div')
-    this.panel.className = 'editor-annotation-panel editor-review-panel'
-    this.panel.hidden = true
-    this.panel.setAttribute('role', 'dialog')
-    this.panel.setAttribute('aria-label', 'Review comment')
-    host.view.appendChild(this.panel)
-    watchPanel(this.panel, () => !this.panel.hidden)
     this.overlay = document.createElement('div')
     this.overlay.className = 'editor-annotations editor-review-overlay'
     host.view.querySelector('.editor-page')!.appendChild(this.overlay)
     this.list.addEventListener('click', (event) => this.click(event))
-    this.panel.addEventListener('click', (event) => this.click(event))
-    this.panel.addEventListener('input', () => {
-      const input = this.panel.querySelector<HTMLTextAreaElement>('textarea')
-      if (this.selected && input) this.drafts.set(this.selected, input.value)
-    })
     this.overlay.addEventListener('click', (event) => {
       const id = (event.target as HTMLElement).closest<HTMLElement>('[data-review]')?.dataset.review
       if (id) this.open(id)
+    })
+    // A suggested reply fills the reply box; it posts nothing by itself. The
+    // textarea is restored from drafts, and act() posts it, so replacing the
+    // entry and re-rendering is the whole implementation.
+    window.addEventListener('chat:use-suggested-reply', (event) => {
+      const detail = (event as CustomEvent<{ subject: ChatSubject, text: string }>).detail
+      if (detail?.subject?.surface !== 'editor-review') return
+      this.drafts.set(detail.subject.key, detail.text)
+      if (this.slug && detail.subject.key.startsWith(`${this.slug}:`)) this.render()
     })
     document.addEventListener('visibilitychange', () => {
       clearTimeout(this.timer)
@@ -74,10 +73,19 @@ export class EditorReviews {
     }).observe(host.view, { attributes: true, attributeFilter: ['hidden'] })
     window.addEventListener('focus', () => { if (this.visible()) void this.synchronize() })
     window.addEventListener('resize', () => this.renderMarks())
-    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') this.close() })
+    // Escape and outside presses close the thread, but never from inside it:
+    // the thread owns its own Escape and buttons. Editing the document or
+    // working in the side pane (a moved thread, Use as reply) keeps it.
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return
+      const target = (event.target as HTMLElement).closest?.('.editor-inline-thread, #editor-doc, #chat-side-pane')
+      if (target) return
+      this.close()
+    })
     document.addEventListener('mousedown', (event) => {
       const target = event.target as HTMLElement
-      if (!this.panel.contains(target) && !this.list.contains(target) && !target.closest('[data-review]')) this.close()
+      if (target.closest('.editor-inline-thread, #editor-doc, #chat-side-pane')) return
+      if (!this.list.contains(target) && !target.closest('[data-review]')) this.close()
     }, true)
   }
 
@@ -180,8 +188,9 @@ export class EditorReviews {
         this.overlay.appendChild(mark)
       }
     }
-    // Editing can orphan a passage; update the open panel without losing its reply draft.
-    if (this.selected) this.renderPanel()
+    // Editing can orphan a passage; update the open section without losing
+    // its reply draft. The private surface lives outside this container.
+    if (this.selected) this.renderSection()
   }
 
   private render(): void {
@@ -198,42 +207,50 @@ export class EditorReviews {
     this.renderMarks()
   }
 
-  private open(id: string): void {
+  /** Open the review's thread, from its underline, its list item, or Back. */
+  open(id: string): void {
+    const review = this.data.reviews.find((item) => item.id === id)
+    if (!review) return
+    const key = `${this.slug}:${id}`
     this.host.beforeOpen()
     this.selected = id
     this.error = ''
-    this.panel.hidden = false
-    this.renderPanel()
-    const review = this.data.reviews.find((item) => item.id === id)
-    const at = review && this.location(review)
-    const rect = at ? this.host.range(at.start, at.end)?.getBoundingClientRect() : this.list.getBoundingClientRect()
-    const bounds = rect ?? this.list.getBoundingClientRect()
-    this.panel.style.left = `${Math.max(16, Math.min(bounds.left, window.innerWidth - this.panel.offsetWidth - 16))}px`
-    const top = bounds.bottom + 8
-    this.panel.style.top = `${Math.max(this.host.view.querySelector('.editor-bar')!.getBoundingClientRect().bottom + 8, Math.min(top, window.innerHeight - this.panel.offsetHeight - 16))}px`
-    reveal(this.panel, { distance: 8 })
-    this.panel.querySelector<HTMLElement>('[data-action="close"]')?.focus({ preventScroll: true })
+    this.host.openThread(review, (section) => {
+      section.classList.add('editor-review-thread')
+      section.addEventListener('click', (event) => this.click(event))
+      section.addEventListener('input', () => {
+        const input = section.querySelector<HTMLTextAreaElement>('.editor-review-reply')
+        this.drafts.set(key, input?.value ?? '')
+      })
+      this.section = section
+      this.renderSection()
+    })
   }
 
-  private close(): void { this.panel.hidden = true; this.selected = null }
+  private close(): void {
+    const subject = inlineThreadSubjectInView()
+    if (subject?.surface === 'editor-review' && this.selected && subject.key === `${this.slug}:${this.selected}`) closeInlineThread()
+    this.selected = null
+    this.section = null
+  }
 
-  private renderPanel(): void {
+  private renderSection(): void {
+    if (!this.section) return
     const review = this.data.reviews.find((item) => item.id === this.selected)
     if (!review) { this.close(); return }
     const located = this.location(review)
-    patchContent(this.panel, `<div class="editor-annotation-row"><strong>Review · ${escape(review.site)}</strong><button type="button" data-action="close" aria-label="Close review">×</button></div>
+    patchContent(this.section, `<div class="editor-annotation-row"><strong>Review · ${escape(review.site)}</strong></div>
       <a href="${link(review.prUrl)}" target="_blank" rel="noopener noreferrer">PR #${review.pr}</a>
       <span class="editor-review-state">${review.resolved ? 'Resolved' : review.outdated ? 'Outdated · unresolved' : review.kind === 'thread' ? 'Unresolved' : 'Document feedback'}${this.data.stale ? ' · Cached' : ''}</span>
       ${review.anchor ? `<blockquote>${escape(review.anchor.quote)}</blockquote>` : ''}
       ${!located ? `<p class="editor-review-location">${escape(review.anchor ? 'Passage changed or ambiguous — comment retained here.' : review.location ?? 'Document feedback')}</p>` : ''}
       <div class="editor-review-messages">${review.messages.map((message) => `<article data-key="${escape(message.id)}"><a href="${link(message.url)}" target="_blank" rel="noopener noreferrer">@${escape(message.author)}</a><time datetime="${escape(message.createdAt)}">${escape(shortTime(message.createdAt, effectiveTimezone(), Date.now()))}</time><p>${escape(message.body)}</p></article>`).join('')}</div>
       ${[...this.data.problems, ...(this.error ? [this.error] : [])].map((problem) => `<p role="alert">${escape(problem)}</p>`).join('')}
-      ${review.canReply ? `<label>Reply on GitHub<textarea aria-label="Reply on GitHub" class="editor-annotation-text" maxlength="65536"${this.busy ? ' disabled' : ''}></textarea></label>` : ''}
+      ${review.canReply ? `<label>Reply on GitHub<textarea aria-label="Reply on GitHub" class="editor-annotation-text editor-review-reply" maxlength="65536"${this.busy ? ' disabled' : ''}></textarea></label>` : ''}
       <div class="editor-review-actions">${review.canReply ? `<button type="button" data-action="reply"${this.busy ? ' disabled' : ''}>Reply on GitHub</button>` : ''}
-      ${review.canResolve && !review.resolved ? `<button type="button" data-action="resolve"${this.busy ? ' disabled' : ''}>Resolve thread</button>` : ''}
-      <button type="button" data-action="ask"${this.busy ? ' disabled' : ''}>Ask agent privately</button></div>`)
-    const input = this.panel.querySelector<HTMLTextAreaElement>('textarea')
-    const draft = this.drafts.get(review.id) ?? ''
+      ${review.canResolve && !review.resolved ? `<button type="button" data-action="resolve"${this.busy ? ' disabled' : ''}>Resolve thread</button>` : ''}</div>`)
+    const input = this.section.querySelector<HTMLTextAreaElement>('.editor-review-reply')
+    const draft = this.drafts.get(`${this.slug}:${review.id}`) ?? ''
     if (input && input.value !== draft) input.value = draft
   }
 
@@ -243,25 +260,24 @@ export class EditorReviews {
     if (target.dataset.review) { this.open(target.dataset.review); return }
     const action = target.dataset.action
     if (action === 'refresh') { void this.synchronize(true); return }
-    if (action === 'close') { this.close(); return }
     const review = this.data.reviews.find((item) => item.id === this.selected)
     if (!review || this.busy) return
-    if (action === 'ask') { this.host.ask(review); this.close(); return }
     if (action === 'reply' || action === 'resolve') void this.act(review, action)
   }
 
   private async act(review: ArticleReview, action: 'reply' | 'resolve'): Promise<void> {
     const slug = this.slug!
     const generation = this.generation
-    const body = this.drafts.get(review.id) ?? ''
-    if (action === 'reply' && !body.trim()) { this.error = 'Write a reply first.'; this.renderPanel(); return }
+    const key = `${slug}:${review.id}`
+    const body = this.drafts.get(key) ?? ''
+    if (action === 'reply' && !body.trim()) { this.error = 'Write a reply first.'; this.renderSection(); return }
     this.actions.add(slug)
     this.revision++
     this.error = ''
-    this.renderPanel()
+    this.renderSection()
     try {
       const data = await this.request(slug, '/action', { id: review.id, action, ...(action === 'reply' ? { body } : {}) })
-      if (action === 'reply') this.drafts.delete(review.id)
+      if (action === 'reply' && this.drafts.get(key) === body) this.drafts.delete(key)
       if (generation !== this.generation) return
       this.data = data
     } catch (error) { if (generation === this.generation) this.error = (error as Error).message }

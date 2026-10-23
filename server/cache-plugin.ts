@@ -26,8 +26,8 @@ import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
-import { listChatHistory, sendChat, saveAttachment, runDebate } from './chat'
-import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, getOrCreateChatSession, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
+import { runDebate } from './chat'
+import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
 import { handlePublishingApi } from './publishing-api'
 import { createExtensionsApi } from './extensions/http'
@@ -43,7 +43,7 @@ import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-
 import { ContentLaunchPendingError, contentLaunchIdForCall, getContentJobResponse, getContentLaunchResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
 import { retryFailedPrReviews } from './behaviors'
-import { ATTACHMENT_MAX_BYTES, enforceApiRequest, httpStatus, readBuffer, readJson, setApiHeaders, type RequestAuthority } from './http'
+import { enforceApiRequest, httpStatus, readJson, setApiHeaders, type RequestAuthority } from './http'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
 import { ChatSocketServer, handleChatApi, speaksForPerson } from './chat/transport'
@@ -956,64 +956,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         // ── /api/chat/* — Chat v1 sessions (server/chat) ──
-        // Handled before the legacy per-card chat below, whose matchers use
-        // the exact `/api/chat` path or the `/api/chat-…` prefixes.
         if (url.startsWith('/api/chat/') && chatRuntime) {
           if (await handleChatApi(req, res, url, chatRuntime, chatSwitchboard ?? undefined, speaksForPerson(req, !!service, authority), chatControl ?? undefined)) return
-        }
-
-        // ── /api/chat — per-card long-lived chats via agent-interface ──
-        // GET /api/chat?session=<id> returns the chat transcript for
-        // that session (oldest-first; each entry has the user prompt
-        // and a response hash for fetching the reply body).
-        // POST /api/chat { session, message } spawns
-        // `agent-interface --chat <message> --model gpt --session <id>`
-        // detached and returns immediately; the front-end polls GET
-        // for status updates.
-        // The path-only check (split on `?`) keeps this from greedily
-        // intercepting /api/chat-attachment, /api/chat-content, etc.
-        if (url?.split('?')[0] === '/api/chat' && req.method === 'GET') {
-          const qs = new URLSearchParams(url.split('?')[1] || '')
-          const session = qs.get('session') || ''
-          try {
-            const messages = await listChatHistory(session)
-            return json(res, 200, { messages })
-          } catch (err: any) {
-            return json(res, 502, { error: 'chat history failed: ' + (err.message || String(err)) })
-          }
-        }
-        if (url === '/api/chat' && req.method === 'POST') {
-          try {
-            const body = await readJson<any>(req)
-            const result = await sendChat(
-              String(body.session || ''),
-              String(body.message || ''),
-              body.model ? String(body.model) : undefined,
-              Array.isArray(body.attachments) ? body.attachments.map(String) : [],
-            )
-            return json(res, 200, result)
-          } catch (err: any) {
-            return json(res, httpStatus(err, 400), { error: err.message || String(err) })
-          }
-        }
-
-        // POST /api/chat-attachment?session=<id>&filename=<name>
-        // Raw request body is the file bytes. The server sanitizes the
-        // filename and writes it under chatPwd(session) so the agent
-        // sees the attachment in its cwd. Returns the sanitized name
-        // the front-end should reference when it sends the chat
-        // message that uses these files.
-        if (url?.startsWith('/api/chat-attachment') && req.method === 'POST') {
-          try {
-            const qs = new URLSearchParams(url.split('?')[1] || '')
-            const session = qs.get('session') || ''
-            const filename = qs.get('filename') || ''
-            const body = await readBuffer(req, ATTACHMENT_MAX_BYTES)
-            const result = await saveAttachment(session, filename, body)
-            return json(res, 200, result)
-          } catch (err: any) {
-            return json(res, httpStatus(err, 400), { error: err.message || String(err) })
-          }
         }
 
         // ── /api/chat-content — /content slash command bridge ──
@@ -1073,7 +1017,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         // ── /api/debate — wraps agent-interface --debate ──
-        // Routed here by the chat-pane's `/consensus` slash command.
+        // Routed here by Chat's `/consensus` slash command.
         // Synchronous: blocks until the local multi-model debate
         // completes, then returns the parsed JSON {synthesis, rounds}.
         // agent-interface logs the call so it appears in Swarm.
@@ -1285,23 +1229,6 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               error: err.message || String(err),
               ...(conflict ? { current_version: err.currentVersion } : {}),
             })
-          }
-        }
-
-        // ── /api/editor/doc/:slug/chat-session — per-doc long-lived chat ──
-        // GET returns the doc's chat session (minting on first call),
-        // so the editor can dispatch `poise:open-chat` against the
-        // existing chat-pane with a stable session_id. The transcript
-        // itself lives in agent-interface's DB — we only persist the
-        // session_id (in <slug>.chat.json) so we can resume the same
-        // conversation forever.
-        const editorChatMatch = url.match(/^\/api\/editor\/doc\/([A-Za-z0-9._-]+)\/chat-session$/)
-        if (editorChatMatch && req.method === 'GET') {
-          try {
-            const result = await getOrCreateChatSession(editorChatMatch[1])
-            return json(res, 200, result)
-          } catch (err: any) {
-            return json(res, 500, { error: err.message || String(err) })
           }
         }
 

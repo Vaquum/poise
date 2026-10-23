@@ -346,6 +346,20 @@ export class ChatSocketServer {
       case 'revert':
         await runtime.revert(String(command.sessionId || ''), String(command.diffId || ''))
         return {}
+      case 'edit.decide': {
+        const decision = command.decision
+        if (decision !== 'applied' && decision !== 'declined' && decision !== 'conflict') {
+          throw new ChatError(400, 'decision must be applied, declined or conflict', 'invalid')
+        }
+        if (!Number.isSafeInteger(command.index) || command.index < 0) {
+          throw new ChatError(400, 'index must be a non-negative integer', 'invalid')
+        }
+        await runtime.decideEdit(String(command.sessionId || ''), {
+          turnId: String(command.turnId || ''), messageId: String(command.messageId || ''),
+          index: command.index, decision,
+        })
+        return {}
+      }
       case 'poise.change': {
         if (this.policy.service) throw new ChatError(409, SELF_UPDATE_OFF, SERVICE_MODE_CODE)
         // Only these three fields exist: the browser never names a
@@ -517,6 +531,12 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
         const id = storage.sessionForSubject(runtime.instance, filter.surface, filter.key)
         return json(res, 200, { session: id ? runtime.get(id) : null, instance: runtime.instance }), true
       }
+      const legacyParam = query.get('legacy')
+      if (legacyParam !== null) {
+        if (!legacyParam) throw new ChatError(400, 'legacy must not be empty', 'invalid')
+        const found = runtime.list().find((record) => record.importedFrom === legacyParam) ?? null
+        return json(res, 200, { session: found, instance: runtime.instance }), true
+      }
       return json(res, 200, { sessions: runtime.list(), instance: runtime.instance }), true
     }
     if (path === '/api/chat/legacy' && req.method === 'GET') {
@@ -632,22 +652,42 @@ function localSessionRequest(body: any): import('./protocol').NewSessionRequest 
   }
 }
 
-/** `current` keys are the legacy chat ids the card builders make. Unlike
- *  `sanitizeContext`, which drops what it cannot use, an invalid subject
- *  is refused: it is never ignored. */
+/** An Editor slug: the same pattern `sanitizeContext` accepts. */
+const EDITOR_SLUG_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,119}$/
+/** An annotation or review id: 1–200 printable ASCII characters, none of
+ *  them a space or a colon. */
+const EDITOR_ID_PATTERN = /^[\x21-\x39\x3B-\x7E]{1,200}$/
+
+/** `current` keys are the legacy chat ids the card builders make. Editor
+ *  keys are `<slug>`, `<slug>:<annotationId>` and `<slug>:<reviewId>`; a
+ *  slug never contains a colon, so the first one separates it from the
+ *  id. Unlike `sanitizeContext`, which drops what it cannot use, an
+ *  invalid subject is refused: it is never ignored. */
 function sanitizeSubject(value: unknown): ChatSubject {
   if (!value || typeof value !== 'object') throw new ChatError(400, 'subject must be an object', 'invalid')
   const candidate = value as Record<string, unknown>
-  if (candidate.surface !== 'current') throw new ChatError(400, `unknown subject surface ${String(candidate.surface)}`, 'invalid')
+  const surface = candidate.surface
+  if (surface !== 'current' && surface !== 'editor-document' && surface !== 'editor-passage' && surface !== 'editor-review') {
+    throw new ChatError(400, `unknown subject surface ${String(surface)}`, 'invalid')
+  }
   const key = candidate.key
-  const valid = typeof key === 'string'
-    && (/^poise\.card\.\d+$/.test(key) || /^poise\.(issue|pr)\.[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\.\d+$/.test(key))
+  let valid = false
+  if (typeof key === 'string') {
+    if (surface === 'current') {
+      valid = /^poise\.card\.\d+$/.test(key) || /^poise\.(issue|pr)\.[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\.\d+$/.test(key)
+    } else if (surface === 'editor-document') {
+      valid = EDITOR_SLUG_PATTERN.test(key)
+    } else {
+      const at = key.indexOf(':')
+      valid = at > 0 && EDITOR_SLUG_PATTERN.test(key.slice(0, at)) && EDITOR_ID_PATTERN.test(key.slice(at + 1))
+    }
+  }
   if (!valid) throw new ChatError(400, 'invalid subject key', 'invalid')
   const label = typeof candidate.label === 'string' ? candidate.label.slice(0, 200) : ''
   if (!label) throw new ChatError(400, 'subject label is required', 'invalid')
   const url = candidate.url
   if (url !== undefined && (typeof url !== 'string' || !/^https:\/\/github\.com\//.test(url))) throw new ChatError(400, 'subject url must start with https://github.com/', 'invalid')
-  return { surface: 'current', key: key as string, label, ...(url !== undefined ? { url: (url as string).slice(0, 500) } : {}) }
+  return { surface, key: key as string, label, ...(url !== undefined ? { url: (url as string).slice(0, 500) } : {}) }
 }
 
 /** A `?subject=<surface>:<key>` filter carries no label or url; the key

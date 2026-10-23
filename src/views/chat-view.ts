@@ -365,6 +365,12 @@ function renderShell(): void {
     onRevert: (diffId) => { void revertDiff(diffId) },
     onLoadDiff: (diffId) => { void loadCompleteDiff(diffId) },
     onSelectSession: (id) => { void selectSession(id) },
+    onOpenInEditor: () => {
+      const id = activeId
+      const subject = id ? sessions.get(id)?.record.subject : undefined
+      const slug = subject && subject.surface !== 'current' ? editorSlugForSubject(subject) : null
+      if (id && slug) window.dispatchEvent(new CustomEvent('poise:open-editor-doc', { detail: { slug, session: id } }))
+    },
   })
   transcriptEl.addEventListener('chat:rerender', () => queueRender())
 
@@ -2400,8 +2406,10 @@ function render(): void {
   const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight
   const wasAtBottom = distance <= STICK_TO_BOTTOM_PX
   if (e) {
+    const subject = e.record.subject
     transcript.render(e.model, { showActivity, showReasoning, showTools, agent: e.record.agent, running: isRunning(e.record.status) || !!e.model.running, interruptedTurnId: e.record.interruptedTurnId, sessionId: e.record.id,
-      chats: [...sessions.values()].map((entry) => ({ id: entry.record.id, title: entry.record.title, role: entry.record.role })) })
+      chats: [...sessions.values()].map((entry) => ({ id: entry.record.id, title: entry.record.title, role: entry.record.role })),
+      ...(subject && subject.surface !== 'current' ? { edits: { surface: subject.surface, readOnly: true } } : {}) })
   } else {
     transcript.clear()
   }
@@ -2582,10 +2590,11 @@ export async function openChatForSubject(subject: ChatSubject, prefill?: string,
   composer.focus()
 }
 
-/** Open the New session dialog prefilled from a card or a document. */
-export async function openChatWithContext(prefill: NewSessionPrefill): Promise<void> {
-  await ensureInit()
-  await openNewSessionDialog(prefill)
+/** The Editor document a subject belongs to: the key itself for a document
+ *  chat, the part before the first colon for a passage or review chat. */
+function editorSlugForSubject(subject: ChatSubject): string {
+  if (subject.surface === 'editor-document') return subject.key
+  return subject.key.slice(0, Math.max(0, subject.key.indexOf(':')))
 }
 
 async function ensureInit(): Promise<void> {
