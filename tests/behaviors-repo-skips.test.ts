@@ -99,28 +99,40 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
     }
     const repository = githubRepository(args, options)
     const number = Number(String(args[1] || '').replace(/^#/, ''))
+    const changesEvidence = (repo: string, num: number) => ({
+      action: 'requested_changes_addressed', repository: repo, pull_number: num, username: flagValue(args, '--username'),
+      status: changeRequested, has_change_request: changeRequested,
+      reviewer_latest_state: changeRequested ? 'CHANGES_REQUESTED' : null,
+      reviewer_latest_commit: changeRequested ? HEAD : null,
+      latest_request_at: changeRequested ? '2026-07-10T10:00:00Z' : null, head_sha: HEAD,
+      commits_after_request: changeRequested ? 1 : 0, author_commits_after_request: changeRequested ? 1 : 0,
+      author_inline_replies_after_request: 0, response_count: changeRequested ? 1 : 0,
+    })
+    const activityEvidence = (repo: string, num: number) => ({
+      action: 'review_activity_since', repository: repo, pull_number: num, username: flagValue(args, '--username'),
+      state: 'OPEN', draft: false, head_sha: HEAD, reviewer_requested: false, active_change_request_authors: [],
+      unresolved_conversation_count: unresolvedConversations, unresolved_live_conversation_count: unresolvedConversations,
+      unresolved_conversation_authors: [], unresolved_live_conversation_authors: [],
+      reviewer_latest_state: 'APPROVED', reviewer_latest_commit: HEAD, reviewer_reviews_since: 0, reviewer_pending_reviews: 0,
+      latest_activity_at: null,
+    })
+    const batchRequests = (): Array<{ repository: string, number: number }> =>
+      JSON.parse(args[args.indexOf('--requests-json') + 1])
     if (args[0] === '--local-checkout-path') return json({ action: 'local_checkout_path', repository, path: tempRoot })
     if (args[0] === '--head-sha') return json({ action: 'head_sha', repository, pull_number: number, head_sha: HEAD })
+    if (args[0] === '--requested-changes-addressed' && args.includes('--requests-json')) {
+      return json({ action: 'requested_changes_addressed_batch', username: flagValue(args, '--username'),
+        records: batchRequests().map((request) => ({ ...changesEvidence(request.repository, request.number), error: null })) })
+    }
     if (args[0] === '--requested-changes-addressed') {
-      return json({
-        action: 'requested_changes_addressed', repository, pull_number: number, username: flagValue(args, '--username'),
-        status: changeRequested, has_change_request: changeRequested,
-        reviewer_latest_state: changeRequested ? 'CHANGES_REQUESTED' : null,
-        reviewer_latest_commit: changeRequested ? HEAD : null,
-        latest_request_at: changeRequested ? '2026-07-10T10:00:00Z' : null, head_sha: HEAD,
-        commits_after_request: changeRequested ? 1 : 0, author_commits_after_request: changeRequested ? 1 : 0,
-        author_inline_replies_after_request: 0, response_count: changeRequested ? 1 : 0,
-      })
+      return json(changesEvidence(repository, number))
+    }
+    if (args[0] === '--review-activity-since' && args.includes('--requests-json')) {
+      return json({ action: 'review_activity_since_batch', username: flagValue(args, '--username'),
+        records: batchRequests().map((request) => ({ ...activityEvidence(request.repository, request.number), error: null })) })
     }
     if (args[0] === '--review-activity-since') {
-      return json({
-        action: 'review_activity_since', repository, pull_number: number, username: flagValue(args, '--username'),
-        state: 'OPEN', draft: false, head_sha: HEAD, reviewer_requested: false, active_change_request_authors: [],
-        unresolved_conversation_count: unresolvedConversations, unresolved_live_conversation_count: unresolvedConversations,
-        unresolved_conversation_authors: [], unresolved_live_conversation_authors: [],
-        reviewer_latest_state: 'APPROVED', reviewer_latest_commit: HEAD, reviewer_reviews_since: 0, reviewer_pending_reviews: 0,
-        latest_activity_at: null,
-      })
+      return json(activityEvidence(repository, number))
     }
     if (args[0] === '--resolve-nonblocking-conversations-if-ready') {
       return json({
@@ -202,7 +214,15 @@ function ledgerRows(repo: string): unknown[] {
 }
 
 function githubCalls(repo: string): unknown[][] {
-  return mocks.runFile.mock.calls.filter(([command, args, options]) => command === 'github-interface' && githubRepository(args, options) === repo)
+  return mocks.runFile.mock.calls.filter(([command, args, options]) => {
+    if (command !== 'github-interface') return false
+    if ((args as string[]).includes('--requests-json')) {
+      const at = (args as string[]).indexOf('--requests-json') + 1
+      const requests = JSON.parse((args as string[])[at]) as Array<{ repository: string }>
+      return requests.some((request) => request.repository === repo)
+    }
+    return githubRepository(args as string[], options as { cwd?: string } | undefined) === repo
+  })
 }
 
 beforeEach(async () => {

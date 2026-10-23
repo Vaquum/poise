@@ -175,20 +175,14 @@ describe('approval eligibility and review activity', () => {
       expect.arrayContaining(['--pr-approve', `#${pr.number}`]),
       expect.any(Object),
     )
-    expect(mocks.runFile).toHaveBeenCalledWith(
-      'github-interface',
-      [
-        '--review-activity-since',
-        `#${pr.number}`,
-        '--username',
-        'review-bot',
-        '--since',
-        completedAt,
-        '--token-user',
-        'review-bot',
-      ],
-      expect.objectContaining({ cwd: expect.stringContaining('Vaquum/poise-test') }),
-    )
+    const activityCalls = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--review-activity-since')
+    expect(activityCalls).toHaveLength(1)
+    const [, activityArgs, activityOptions] = activityCalls[0]
+    expect(activityArgs.slice(0, 2)).toEqual(['--review-activity-since', '--requests-json'])
+    expect(JSON.parse(activityArgs[activityArgs.indexOf('--requests-json') + 1])).toEqual([
+      { repository: pr.repo, number: pr.number, since: completedAt },
+    ])
+    expect(activityOptions).not.toHaveProperty('cwd')
     expect(mocks.runFile.mock.calls.some(([command]) => command === 'gh')).toBe(false)
 
     const onExit = (mocks.spawnDetached.mock.calls[0][2] as {

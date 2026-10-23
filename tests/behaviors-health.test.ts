@@ -90,6 +90,19 @@ describe('scan health and dependency recovery', () => {
       const check = behavior === 'resolve-unblocking' ? '--review-activity-since' : '--requested-changes-addressed'
       mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
         if (command === 'github-interface' && args[0] === check && args[1] === '#17') throw new Error('GitHub 404: Not Found')
+        if (command === 'github-interface' && args[0] === check && args.includes('--requests-json')) {
+          const packet = JSON.parse((await original(command, args, options)).stdout)
+          return {
+            stdout: JSON.stringify({
+              ...packet,
+              records: (packet.records as Array<Record<string, unknown>>).map((record) =>
+                record.pull_number === 17
+                  ? { repository: record.repository, pull_number: 17, error: 'GitHub 404: Not Found' }
+                  : record),
+            }),
+            stderr: '',
+          }
+        }
         return original(command, args, options)
       })
       let modules = await loadModules()
@@ -112,7 +125,11 @@ describe('scan health and dependency recovery', () => {
       modules = await restartModules()
       modules.behaviors.startBehaviorsRuntime()
       await modules.behaviors.runEnabledBehaviorsOnce()
-      expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === check && args[1] === '#17')).toHaveLength(1)
+      const attempts = mocks.runFile.mock.calls.filter(([, args]) => args[0] === check
+        && (args[1] === '#17' || (args.includes('--requests-json')
+          && (JSON.parse(args[args.indexOf('--requests-json') + 1]) as Array<{ number: number }>)
+            .some((request) => request.number === 17))))
+      expect(attempts).toHaveLength(1)
       // Recovery may prove no action is needed; that still clears the check error.
       arrangeCli(behavior === 'review-new-prs')
       vi.setSystemTime(Date.now() + 60_000)

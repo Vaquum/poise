@@ -17,6 +17,7 @@ import type { ChatRuntime } from '../chat/runtime'
 import { findEvent, getOpenTurn, listOpenTurns } from '../chat/storage'
 import { HttpError, readJson, type RequestAuthority } from '../http'
 import { markReleaseSwitch, pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
+import { eventLoopDelayStats, type EventLoopDelayStats } from '../event-loop-delay'
 import { DEFAULT_CHAT_SETTINGS } from '../settings'
 import { runningCallerCalls } from './caller-calls'
 import { canRestartForUpdate, requestUpdateRestart } from './restart'
@@ -36,6 +37,8 @@ export interface ServiceHealth {
   release: string | null
   /** The release a pending switch restarts this server onto; null when none is pending. */
   switching: string | null
+  /** Main-thread stall in the current minute window; spikes mark CLI fan-out. */
+  eventLoop: EventLoopDelayStats
   /** The release this workspace is asked to run: the pending switch's target, else the active release. */
   desiredRelease: string | null
   /** The desired release when an install of it for this base exists (the running release needs none); null when it is not installed. */
@@ -163,6 +166,7 @@ export class ServiceControl {
       draining: this.drainOn,
       release,
       switching,
+      eventLoop: eventLoopDelayStats(),
       desiredRelease,
       installedRelease: desiredRelease !== null && this.releaseInstalled(desiredRelease) ? desiredRelease : null,
       pendingSince: pending?.since ?? null,
