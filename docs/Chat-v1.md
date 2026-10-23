@@ -64,6 +64,16 @@ The fresh console has a 640 px maximum width, a taller writing area and a
 slightly elevated position. Its border uses a low-opacity neutral hairline,
 with no resting or focus shadow, in both light and dark themes.
 
+The pane reads as a live work log. Every chat carries a status dot with a
+text label and tooltip, so the state never depends on colour alone: Working
+(pulsing green), Completed (solid green), Error or interruption (red),
+Waiting for you (amber), and Queued (grey). Chats order by their latest
+change — started, hit an error or a question, or completed — newest on top,
+with the Manager always first, and a reorder animates smoothly. Its position is fixed; dragging another chat pins it where it dropped,
+with a pin mark, and automatic ordering skips it; dragging it back into the
+list, or Unpin, returns it to automatic order. Alt+ArrowUp/Down moves the
+focused chat for keyboard users. Pins survive reloads in this browser.
+
 The Switchboard pane docks on the right, after Memories, and its button sits
 beside the sessions toggle with the mirrored icon. It opens at one third of the
 view, resizes from its left edge with snaps at one third and one half, and
@@ -103,6 +113,15 @@ and tracked Poise source in the running installation or the configured,
 identity-verified Poise development checkout. Private paths, unsafe schemes,
 symlink escapes, binary files and files over 512 KiB are refused. Long text
 previews stop at 5,000 lines. File text never executes as HTML.
+
+While a chat's turn runs, the three-dot indicator shows at the bottom of the
+transcript, including during long tool runs, and disappears when the turn
+ends. The Tools toggle beside the other display controls hides the tool
+calls and command blocks while keeping text messages, errors and outstanding
+requests; see [Chat permissions and display controls](Chat-controls.md). The
+top bar shows how long the current turn has run next to the status — "Running
+· since 12m", or "since 1h 5m" past an hour — updating live from the turn's
+start, and "Queued · since …" while the turn waits.
 
 ## Sessions and working context
 
@@ -152,6 +171,15 @@ singleton at once. When its model leaves the catalogue, the next startup keeps
 the Manager instead of deleting it, marks `retiredModel`, and refuses every
 turn until the person picks another model with `set_model`; retirement is
 detected at startup only. A closed Manager still holds the key.
+
+Other chats are named from the first message when the first turn starts. When
+the message references a GitHub issue or PR, the chat takes that item's title
+without its type prefix, plus the number — "#446 Let a pending Poise update
+land within a bounded pause" — resolved from the local GitHub datastore when
+it knows the item. Otherwise the first sentence names the chat with
+boilerplate removed: "Task:", "Could you take this task?", "Implement" or
+"continue", repository refs and URLs. A name the person set by hand is never
+overwritten.
 
 The person's REST actions on a chat answer only the person's browser: `cancel`,
 `close`, `fork` and `handoff`, renaming through `PATCH` and deleting through

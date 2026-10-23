@@ -25,6 +25,8 @@ import { prepareProviderCli } from '../provider-clis'
 import { readMemories } from './memories'
 import { expandSwitches, savedSwitchNames, saveSwitch } from './custom-switches'
 import { MANAGER_SWITCH } from '../../src/chat-switches'
+import { deriveSessionTitle, parseIssueReference, shouldAutoName } from '../../src/chat-title'
+import { resolveIssueTitle } from './issue-titles'
 import { appendMemories } from './memory-content'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -567,6 +569,7 @@ export class ChatRuntime extends EventEmitter {
     const interrupted = terminal.stopReason === 'interrupted'
     if (interrupted) record.interruptedTurnId = open.turnId
     record.status = interrupted || terminal.stopReason === 'error' ? 'interrupted' : 'idle'
+    record.lastStopReason = terminal.stopReason
     record.lastSeq = envelope.seq
     storage.saveSession(record)
     this.emit('event', envelope)
@@ -1543,6 +1546,7 @@ export class ChatRuntime extends EventEmitter {
     const next = String(title || '').trim().slice(0, CHAT_LIMITS.titleChars)
     if (!next) throw new ChatError(400, 'title is required', 'invalid')
     session.record.title = next
+    session.record.titleManual = true
     this.saveRecord(session)
     this.emit_(id, { type: 'session.updated', session: session.record })
     return session.record
@@ -2507,10 +2511,15 @@ export class ChatRuntime extends EventEmitter {
       let adapter = session.adapter!
       const isFirst = !storage.findEvent(record.id, (e) => e.type === 'turn.started')
       // A change session is titled by its request, not by the runbook's first line. The Manager keeps its title.
-      if ((record.title === 'New session' || (isFirst && !record.contextResetSeq)) && !record.selfChangeId && !internalTurn(turn.id) && record.role !== 'manager') {
-        record.title = (input.text.split('\n')[0] || record.title).slice(0, TITLE_CHARS) || record.title
-        this.saveRecord(session)
-        this.emit_(record.id, { type: 'session.updated', session: record })
+      if (shouldAutoName(record, isFirst, internalTurn(turn.id))) {
+        const ref = parseIssueReference(input.text.split('\n')[0] ?? '', record.repo)
+        const issueTitle = ref ? await resolveIssueTitle(ref).catch(() => null) : null
+        // A rename that landed during the lookup wins over the derived title.
+        if (shouldAutoName(record, isFirst, internalTurn(turn.id))) {
+          record.title = deriveSessionTitle(input.text, { repo: record.repo, issueTitle }).slice(0, TITLE_CHARS) || record.title
+          this.saveRecord(session)
+          this.emit_(record.id, { type: 'session.updated', session: record })
+        }
       }
       // The Caller row first, so its id is part of the durable turn record.
       if (this.caller) {
@@ -2756,6 +2765,8 @@ export class ChatRuntime extends EventEmitter {
         this.saveRecord(session)
       }
       await this.refreshWorkspace(session).catch(() => undefined)
+      // A failed turn shows an Error dot even though a live adapter idles the chat.
+      record.lastStopReason = stopReason
       if (record.status !== 'closed') {
         if (!freed) this.setStatus(session, 'error', record.orphanNotice || 'the agent process could not be stopped')
         else if (session.adapter?.alive) this.setStatus(session, 'idle')
