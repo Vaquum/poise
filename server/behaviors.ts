@@ -3207,11 +3207,12 @@ async function tickApprovePrs(): Promise<void> {
           }
           if (!cleanReview) admittedReviewer = reviewer
           const reapprovalOwnsEveryUnresolvedConversation =
-            activity.reviewerLatestState === 'APPROVED'
+            (activity.reviewerLatestState === 'APPROVED'
+              || activity.reviewerLatestState === 'DISMISSED')
             && activity.reviewerLatestCommit !== null
             && activity.reviewerLatestCommit !== activity.headSha
-            && activity.unresolvedConversationAuthors.length > 0
-            && activity.unresolvedConversationAuthors.every(
+            && activity.unresolvedLiveConversationAuthors.length > 0
+            && activity.unresolvedLiveConversationAuthors.every(
               (author) => author.toLowerCase() === reviewer.toLowerCase(),
             )
           if (activity.state !== 'OPEN'
