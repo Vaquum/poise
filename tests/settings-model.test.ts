@@ -25,7 +25,7 @@ beforeEach(() => {
 describe('what the settings model accepts', () => {
   it('stores a well-formed org, username and timezone', () => {
     const s = setSettings({ org: ' Vaquum ', me: ' mikkokotila ', timezone: 'Europe/Helsinki' })
-    expect(s).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'Europe/Helsinki', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 }, notifications: { enabled: true } })
+    expect(s).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'Europe/Helsinki', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }, notifications: { enabled: true } })
   })
 
   it('refuses a pasted URL rather than storing something no query can use', () => {
@@ -118,7 +118,7 @@ describe('a rejected save changes nothing at all', () => {
     setSettings({ org: 'Vaquum', me: 'mikkokotila', timezone: 'UTC' })
     expect(() => setSettings({ timezone: 'Europe/Berlin', org: 'not a valid org' })).toThrow()
     // The timezone in the same call must not have landed.
-    expect(getSettings()).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 }, notifications: { enabled: true } })
+    expect(getSettings()).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }, notifications: { enabled: true } })
   })
 
   it('does not keep the valid half when consecutive hyphens reject the other half', () => {
@@ -192,7 +192,7 @@ describe('changing the organization drops the org-scoped repo cache', () => {
 })
 
 describe('the concurrent local turns cap', () => {
-  const chat = (maxConcurrentLocalTurns: number) => ({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns })
+  const chat = (maxConcurrentLocalTurns: number) => ({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns, updateTurnBoundMinutes: 15 })
   it('defaults to 4 and accepts 1 through 64', () => {
     expect(getSettings().chat).toMatchObject({ maxConcurrentLocalTurns: 4 })
     expect(setSettings({ chat: chat(1) }).chat.maxConcurrentLocalTurns).toBe(1)
@@ -210,7 +210,30 @@ describe('the concurrent local turns cap', () => {
     mocks.store.set('chat_settings', JSON.stringify({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 0 }))
     expect(getSettings().chat.maxConcurrentLocalTurns).toBe(4)
     mocks.store.set('chat_settings', 'not json')
-    expect(getSettings().chat).toEqual({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 })
+    expect(getSettings().chat).toEqual({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 })
+  })
+})
+
+describe('the update turn bound', () => {
+  const chat = (updateTurnBoundMinutes: number) => ({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes })
+  it('defaults to 15 and accepts 1 through 10080', () => {
+    expect(getSettings().chat).toMatchObject({ updateTurnBoundMinutes: 15 })
+    expect(setSettings({ chat: chat(1) }).chat.updateTurnBoundMinutes).toBe(1)
+    expect(setSettings({ chat: chat(10080) }).chat.updateTurnBoundMinutes).toBe(10080)
+  })
+
+  it('refuses anything outside 1 through 10080 without saving it', () => {
+    for (const value of [0, 10081, 1.5, Number.NaN, 'fifteen']) {
+      expect(() => setSettings({ chat: chat(value as never) })).toThrow(/update turn bound/)
+    }
+    expect(getSettings().chat.updateTurnBoundMinutes).toBe(15)
+  })
+
+  it('falls back to 15 for a corrupt stored value', () => {
+    mocks.store.set('chat_settings', JSON.stringify({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 0 }))
+    expect(getSettings().chat.updateTurnBoundMinutes).toBe(15)
+    mocks.store.set('chat_settings', 'not json')
+    expect(getSettings().chat).toEqual({ branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 })
   })
 })
 
