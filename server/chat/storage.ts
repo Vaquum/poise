@@ -82,6 +82,15 @@ db.exec(`
     command TEXT NOT NULL,
     started_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS chat_relays (
+    session_id TEXT PRIMARY KEY,
+    relay_pid INTEGER NOT NULL,
+    relay_ident TEXT NOT NULL,
+    socket TEXT NOT NULL,
+    dir TEXT NOT NULL,
+    started_at TEXT NOT NULL
+  );
 `)
 
 // The Manager's role column and singleton index. The shape duplicates
@@ -221,6 +230,7 @@ export function deleteSession(id: string): void {
     db.prepare('DELETE FROM chat_events WHERE session_id = ?').run(id)
     db.prepare('DELETE FROM chat_pending WHERE session_id = ?').run(id)
     db.prepare('DELETE FROM chat_workers WHERE session_id = ?').run(id)
+    db.prepare('DELETE FROM chat_relays WHERE session_id = ?').run(id)
     db.prepare('DELETE FROM chat_attachments WHERE session_id = ?').run(id)
     db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(id)
   })()
@@ -357,8 +367,42 @@ export function setWorkerLeaseToken(sessionId: string, token: string | null): vo
   db.prepare('UPDATE chat_workers SET lease_token = ? WHERE session_id = ?').run(token, sessionId)
 }
 
+export function getWorker(sessionId: string): WorkerRow | null {
+  const row = db.prepare('SELECT * FROM chat_workers WHERE session_id = ?').get(sessionId) as {
+    session_id: string, gate_pid: number, gate_pgid: number, ident: string, checkout: string, lease_token: string | null, command: string, started_at: string
+  } | undefined
+  return row ? { sessionId: row.session_id, gatePid: row.gate_pid, gatePgid: row.gate_pgid, ident: row.ident, checkout: row.checkout, leaseToken: row.lease_token, command: row.command, startedAt: row.started_at } : null
+}
+
 export function forgetWorker(sessionId: string): void {
   db.prepare('DELETE FROM chat_workers WHERE session_id = ?').run(sessionId)
+}
+
+export interface RelayRow {
+  sessionId: string
+  relayPid: number
+  relayIdent: string
+  socket: string
+  dir: string
+  startedAt: string
+}
+
+export function recordRelay(row: RelayRow): void {
+  db.prepare(`
+    INSERT OR REPLACE INTO chat_relays (session_id, relay_pid, relay_ident, socket, dir, started_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(row.sessionId, row.relayPid, row.relayIdent, row.socket, row.dir, row.startedAt)
+}
+
+export function getRelay(sessionId: string): RelayRow | null {
+  const row = db.prepare('SELECT * FROM chat_relays WHERE session_id = ?').get(sessionId) as {
+    session_id: string, relay_pid: number, relay_ident: string, socket: string, dir: string, started_at: string
+  } | undefined
+  return row ? { sessionId: row.session_id, relayPid: row.relay_pid, relayIdent: row.relay_ident, socket: row.socket, dir: row.dir, startedAt: row.started_at } : null
+}
+
+export function forgetRelay(sessionId: string): void {
+  db.prepare('DELETE FROM chat_relays WHERE session_id = ?').run(sessionId)
 }
 
 export function listWorkers(): WorkerRow[] {

@@ -160,12 +160,23 @@ rechecks the pull request before a SHA-pinned merge request. Unknown readiness,
 pending/failed checks, unresolved live conversations, incomplete conversation
 reads, drafts, foreign authors and changed heads do not merge. GitHub enforces
 repository protections at mutation. Caller prefers allowed squash, merge, then
-rebase. It reports `merged`, `already_merged`, `not_ready`, or `superseded`.
+rebase on branches without a merge queue. A branch with a native merge queue
+instead uses a head-pinned enqueue mutation after successful head checks,
+platform approval and complete conversation checks. It reports `enqueued` or
+`in_queue` with the confirmed queue entry; neither is a completed merge.
+The direct path reports `merged`, `already_merged`, `not_ready`, or `superseded`.
 A confirmed `merged` receipt alone updates the per-account Last triggered event;
 operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
-After the merges, one scan updates at most one behind branch, oldest approval
+Queue-enabled branches are excluded from automatic base updates: GitHub tests
+the queued integration against current main. With Merge Pull Requests enabled,
+ready eligible PRs enter that queue automatically; no per-PR merge or confirmation
+click is needed. Chat Auto-merge instructions, the default Manager charter and
+work-monitor notices follow the repository's live merge policy instead of
+requiring every PR branch to contain the latest main. Existing edited Manager
+snippets retain their saved text. After the merges, one scan updates
+at most one other behind branch, oldest approval
 first, so updates don't churn CI: the oldest-approved behind candidate holds the
 shared per-PR operation lock for
 `--update-branch-if-behind PR --expected-head SHA --author USER --token-user AGENT`.

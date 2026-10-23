@@ -1,9 +1,8 @@
-import type { ChildProcess } from 'node:child_process'
-import type { TurnResult } from './types'
+import type { AgentProcess, TurnResult } from './types'
 
 /** Admission is not completion. Stop, disconnection and a missing terminal
  * notification all settle, and require worker termination before lease release. */
-export function compactionWaiter(child: ChildProcess, signal: AbortSignal, timeoutMs = 10 * 60_000) {
+export function compactionWaiter(child: AgentProcess, signal: AbortSignal, timeoutMs = 10 * 60_000) {
   let done = false
   let resolve!: (result: TurnResult) => void
   const result = new Promise<TurnResult>(settle => { resolve = settle })

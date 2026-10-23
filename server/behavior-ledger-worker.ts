@@ -50,5 +50,6 @@ if (parentPort) {
   port.postMessage({ ready: true, health: store.health(), pending: store.pending() })
   port.on('message', (request: LedgerWorkerRequest) => {
     port.postMessage(executeLedgerRequest(store, request))
+    if (request.operation === 'close') port.close()
   })
 }

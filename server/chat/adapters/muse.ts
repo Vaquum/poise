@@ -24,7 +24,6 @@ import { appendMemories } from '../memory-content'
 
 import { randomBytes } from 'node:crypto'
 import { basename, resolve, sep } from 'node:path'
-import type { ChildProcess } from 'node:child_process'
 import type {
   ApprovalChoice,
   ApprovalDecideParams,
@@ -88,9 +87,9 @@ import type {
 } from '../generated/muse/msp'
 import { CHAT_LIMITS } from '../protocol'
 import type { ChatEvent, ContentBlock, PermissionOption, PermissionOptionKind, PromptInput, Question, ToolKind, ToolLocation, ToolStatus, TurnUsage } from '../protocol'
-import { StdioRpc } from '../rpc'
+import { StdioRpc, outboundRequests } from '../rpc'
 import { AdapterError } from './types'
-import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, TurnResult } from './types'
+import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, AgentProcess, ReplayInit, TurnResult } from './types'
 import { forMuse, type Skipped } from '../../extensions/types'
 import { assertMuseContributor } from '../../models'
 import pkg from '../../../package.json'
@@ -281,6 +280,8 @@ interface ActiveTurn {
   terminalError?: string
   /** Muse admitted the turn behind another one; it has not launched. */
   queued: boolean
+  /** Transcript diffs to replay verbatim instead of re-reading the disk. */
+  recalled: Map<string, { oldText: string, newText: string, oldExists: boolean, newExists: boolean }>
   resolve: (result: TurnResult) => void
 }
 
@@ -383,7 +384,7 @@ function turnError(message: string): string {
 
 /** "Muse exited (code): last stderr lines" once the process is gone; the
  *  link's own reason when it is still running (a framing failure). */
-async function exitMessage(process: ChildProcess, link: StdioRpc, fallback: Error): Promise<string> {
+async function exitMessage(process: AgentProcess, link: StdioRpc, fallback: Error): Promise<string> {
   if (process.exitCode === null && process.signalCode === null) {
     const exited = new Promise<void>((resolveExit) => process.once('exit', () => resolveExit()))
     if (!(await withTimeout(exited, EXIT_GRACE_MS))) return fallback.message
@@ -396,7 +397,7 @@ async function exitMessage(process: ChildProcess, link: StdioRpc, fallback: Erro
 
 export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: number, compactTimeoutMs?: number } = {}): Adapter {
   const steerSettleMs = options.steerSettleMs ?? STEER_SETTLE_MS
-  let child: ChildProcess | null = null
+  let child: AgentProcess | null = null
   let rpc: StdioRpc | null = null
   let sessionId: string | undefined
   let modelId = ''
@@ -417,6 +418,14 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
   /** Pre-images taken for an approval whose tool item had not started yet. */
   const preApproved = new Map<string, Map<string, Promise<Snapshot>>>()
   const pendingUserInputs = new Set<string>()
+  /** Decisions replayed but not yet confirmed sent, confirmed at live. */
+  const pendingDecisions: Array<
+    | { kind: 'approval', approvalId: string, sourceIndex: number, choiceId: string, requirementId: ApprovalRequestParams['currentRequirementId'] }
+    | { kind: 'userInput', userInputId: string, answers: UserInputAnswer[] | null }
+  > = []
+  /** Decision receipts keyed `approval:<id>:<sourceIndex>` / `userInput:<id>`. */
+  const decisionReceipts = new Map<string, any>()
+  let replayOutbound: Buffer | null = null
 
   function logOnce(key: string, message: string): void {
     if (loggedOnce.has(key)) return
@@ -450,7 +459,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       // The request form is acknowledged with `{}`; the decision travels as
       // its own command, exactly like the notification form.
       return {}
-    })
+    }, { replayCompleted: true })
   }
 
   function session(): string {
@@ -645,6 +654,16 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
   // the card keeps the summary and the reason is logged.
   async function recordFileChanges(turn: ActiveTurn, tool: OpenTool, item: Item, content: ContentBlock[]): Promise<void> {
     for (const [path, pending] of tool.snapshots ?? []) {
+      const recalled = turn.recalled.get(`${item.itemId}\0${path}`)
+      if (recalled) {
+        // Replayed from the transcript: the disk moved on since this diff
+        // was recorded, so re-deriving it could only disagree.
+        emit({
+          type: 'diff', turnId: turn.id, toolId: item.itemId, diffId: uuidv7(), path,
+          oldText: recalled.oldText, newText: recalled.newText, oldExists: recalled.oldExists, newExists: recalled.newExists,
+        })
+        continue
+      }
       const before = await pending
       const after = before.ok ? await snapshot(path) : before
       if (!before.ok || !after.ok) {
@@ -900,7 +919,81 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     host.log(message)
     if (!active || active !== origin || active.done || closing || active.interruptRequested) return
     host.emit({ type: 'error', message, recoverable: true })
+    // Preserve the decision failure before process-exit reporting can win.
+    finish(origin, { stopReason: 'error', error: message, terminate: true })
     rpc?.fail(new AdapterError(AGENT, message, 'protocol'))
+  }
+
+  /** Whether the recorded outbound stream carries a decision command for
+   *  this approval stage or question. */
+  function outboundHasDecision(outbound: Buffer, decision: { kind: 'approval', approvalId: string, sourceIndex: number } | { kind: 'userInput', userInputId: string }): boolean {
+    for (const line of outbound.toString('utf8').split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      let message: any = null
+      try { message = JSON.parse(trimmed) } catch { continue }
+      if (!message || typeof message !== 'object' || message.id === undefined) continue
+      if (decision.kind === 'approval') {
+        if (message.method === 'approval/decide' && message.params?.approvalId === decision.approvalId
+          && message.params?.requirementId?.sourceIndex === decision.sourceIndex) return true
+      } else if ((message.method === 'userInput/answer' || message.method === 'userInput/cancel')
+        && message.params?.userInputId === decision.userInputId) return true
+    }
+    return false
+  }
+
+  function alreadySettled(error: unknown, code: number): boolean {
+    if ((error as { code?: unknown })?.code === code) return true
+    return /already (resolved|answered|settled|decided)/i.test(error instanceof Error ? error.message : String(error))
+  }
+
+  function listPendingRecovery(): void {
+    void call('approval/listPending', { sessionId: session() }, { timeoutMs: 30_000 })
+      .then((pending) => { for (const next of pending.approvals) receiveApproval(next) })
+      .catch((error) => interactionFailed('approval', error))
+  }
+
+  function applyApprovalReceipt(approvalId: string, receipt: { terminal?: unknown }): void {
+    if (receipt?.terminal === true) resolvedApprovals.add(approvalId)
+    else listPendingRecovery()
+  }
+
+  /** Confirm every decision replay made: receipts and the recorded outbound
+   *  stream prove what the agent heard; only a decision in neither is sent,
+   *  and the agent's already-settled answer then counts as accepted. */
+  async function confirmDecisions(): Promise<void> {
+    const outbound = replayOutbound
+    replayOutbound = null
+    const outstanding = pendingDecisions.splice(0)
+    const seen = new Set<string>()
+    for (const decision of outstanding) {
+      const dedupe = decision.kind === 'approval' ? `approval:${decision.approvalId}:${decision.sourceIndex}` : `userInput:${decision.userInputId}`
+      if (seen.has(dedupe)) continue
+      seen.add(dedupe)
+      if (decision.kind === 'approval') {
+        const receipt = decisionReceipts.get(`approval:${decision.approvalId}:${decision.sourceIndex}`)
+        if (receipt && receipt.status === 'accepted') { applyApprovalReceipt(decision.approvalId, receipt); continue }
+        if (outbound && outboundHasDecision(outbound, decision)) { listPendingRecovery(); continue }
+        try {
+          const result = await call('approval/decide', { commandId: uuidv7(), sessionId: session(), approvalId: decision.approvalId, choiceId: decision.choiceId, requirementId: decision.requirementId }, { timeoutMs: 30_000 })
+          if (result.status !== 'accepted') throw new Error('Muse did not accept the approval decision')
+          applyApprovalReceipt(decision.approvalId, result)
+        } catch (error) {
+          if (alreadySettled(error, -32054)) { resolvedApprovals.add(decision.approvalId); continue }
+          interactionFailed('approval', error)
+        }
+      } else {
+        if (decisionReceipts.has(`userInput:${decision.userInputId}`)) continue
+        if (outbound && outboundHasDecision(outbound, decision)) continue
+        try {
+          if (decision.answers) await call('userInput/answer', { commandId: uuidv7(), sessionId: session(), userInputId: decision.userInputId, answers: decision.answers }, { timeoutMs: 30_000 })
+          else await call('userInput/cancel', { commandId: uuidv7(), sessionId: session(), userInputId: decision.userInputId, reason: 'turn cancelled' }, { timeoutMs: 30_000 })
+        } catch (error) {
+          if (alreadySettled(error, -32056)) continue
+          interactionFailed(`userInput/${decision.answers ? 'answer' : 'cancel'}`, error)
+        }
+      }
+    }
   }
 
   async function handleApproval(params: ApprovalRequestParams): Promise<void> {
@@ -955,6 +1048,14 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       choice = rejectChoice(params) ?? choice
     }
     try {
+      if (link().isReplaying) {
+        // The agent already has this decision, or the live catch-up sends
+        // it: mark the stage decided now so the dual notification/request
+        // forms cannot ask twice, and confirm at live.
+        decidedApprovalStages.add(key)
+        pendingDecisions.push({ kind: 'approval', approvalId: params.approvalId, sourceIndex: params.currentRequirementId.sourceIndex, choiceId: choice.choiceId, requirementId: params.currentRequirementId })
+        return
+      }
       const result = await call('approval/decide', {
         commandId: uuidv7(),
         sessionId: session(),
@@ -1012,6 +1113,11 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     }
     try {
       if (active !== origin || origin.done) return
+      if (link().isReplaying) {
+        // Confirmed at live like an approval decision.
+        pendingDecisions.push({ kind: 'userInput', userInputId: params.userInputId, answers })
+        return
+      }
       if (answers) {
         await call('userInput/answer', { commandId: uuidv7(), sessionId: session(), userInputId: params.userInputId, answers }, { timeoutMs: 30_000 })
       } else {
@@ -1031,10 +1137,12 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
 
   // ── Process lifecycle ───────────────────────────────────────────────
 
-  async function launch(selector: string): Promise<void> {
-    const process = await host.spawn('muse', ['serve', '--model', selector, '--contributor-mode', 'on', '--disable-sandbox', '--trust-workspace'])
-    child = process
-    const link = new StdioRpc(process, { label: LABEL, onStderr: (text) => { if (text.trim()) host.log(`${LABEL} stderr: ${text.trimEnd()}`) } })
+  /** Wire a link — a fresh child or a replayed relay peer — to the
+   *  turn handlers. The handshake stays with the caller: replay never
+   *  re-runs it against the running agent. */
+  function attachLink(peer: AgentProcess): void {
+    child = peer
+    const link = new StdioRpc(peer, { label: LABEL, onStderr: (text) => { if (text.trim()) host.log(`${LABEL} stderr: ${text.trimEnd()}`) } })
     rpc = link
     link.on('malformed', (frame: string) => logOnce('malformed', `${LABEL} sent a frame that is not JSON-RPC (dropped): ${frame}`))
     link.on('unhandled-notification', (method: string) => logOnce(`unhandled:${method}`, `${LABEL}: no handler for ${method} notifications`))
@@ -1049,15 +1157,19 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       const turn = active
       if (!turn) return
       if (closing) { finish(turn, { stopReason: 'cancelled', terminate: true }); return }
-      void exitMessage(process, link, error).then((message) => finish(turn, { stopReason: 'error', error: message, terminate: true }))
+      void exitMessage(peer, link, error).then((message) => finish(turn, { stopReason: 'error', error: message, terminate: true }))
     })
-    process.once('exit', (code, signal) => {
+    peer.once('exit', (code, signal) => {
       for (const listener of exitListeners) {
         try { listener(code, signal) } catch (error) { host.log(`${LABEL} exit listener failed: ${error instanceof Error ? error.message : String(error)}`) }
       }
     })
     registerNotifications()
     registerServerRequests()
+  }
+
+  async function launch(selector: string): Promise<void> {
+    attachLink(await host.spawn('muse', ['serve', '--model', selector, '--contributor-mode', 'on', '--disable-sandbox', '--trust-workspace']))
   }
 
   async function validateModel(wanted: string): Promise<string> {
@@ -1250,6 +1362,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
         endedNativeIds: new Set(),
         cancellationRequests: new Map(),
         queued: false,
+        recalled: new Map(),
         resolve: () => {},
       }
       const result = new Promise<TurnResult>((resolveTurn) => { turn.resolve = resolveTurn })
@@ -1275,6 +1388,101 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       }
 
       return result.finally(() => signal.removeEventListener('abort', onAbort))
+    },
+
+    async replayTurn(init: ReplayInit): Promise<TurnResult> {
+      if (init.signal.aborted) return { stopReason: 'cancelled', terminate: true }
+      // Without the turn's initiating request the agent never heard it: that
+      // turn must be re-prompted, not replayed.
+      if (init.outboundTruncated) throw new AdapterError(AGENT, 'the relay cannot prove what Muse heard; the turn is interrupted instead', 'protocol')
+      const requests = outboundRequests(init.outbound)
+      const requestId = [...requests].reverse().find(([, request]) => request.method === 'turn/start')?.[0]
+      if (requestId === undefined) throw new AdapterError(AGENT, 'the turn never reached Muse; it is interrupted instead', 'protocol')
+      if (active) throw new AdapterError(AGENT, `${LABEL} is already running a turn`, 'protocol')
+      sessionId = init.session.nativeSessionId
+      modelId = init.session.modelId
+      effort = init.session.effort
+      replayOutbound = init.outbound
+      attachLink(init.peer)
+      const replayLink = link()
+      replayLink.beginReplay(init.outbound)
+      const turn: ActiveTurn = {
+        id: init.turnId,
+        nativeId: null,
+        done: false,
+        interruptRequested: false,
+        tools: new Map(),
+        streamed: new Set(),
+        internalItems: new Set(),
+        pending: new Set(),
+        finishing: false,
+        steers: new Map(),
+        nativeIds: [],
+        endedNativeIds: new Set(),
+        cancellationRequests: new Map(),
+        queued: false,
+        recalled: init.recalledDiffs,
+        resolve: () => {},
+      }
+      const result = new Promise<TurnResult>((resolveTurn) => { turn.resolve = resolveTurn })
+      active = turn
+      // The spool carries the turn/start answer and every decision receipt;
+      // the link never sent their requests, so each arrives as an orphan.
+      // Terminal receipts apply at once, so a late stage can never reopen a
+      // settled approval; the rest is confirmed at live.
+      const orphan = (id: unknown, message: any) => {
+        if (id === requestId && message?.error) {
+          finish(turn, { stopReason: 'error', error: `Muse could not start the turn: ${String(message.error.message || 'rpc error')}` })
+          return
+        }
+        const request = typeof id === 'string' || typeof id === 'number' ? requests.get(id) : undefined
+        if (message?.error && (request?.method === 'approval/decide' || request?.method === 'userInput/answer' || request?.method === 'userInput/cancel')) {
+          interactionFailed(request.method, new Error(String(message.error.message || 'recorded decision failed')), turn)
+          return
+        }
+        const receipt = message?.result
+        if (!receipt || typeof receipt !== 'object') return
+        if (typeof receipt.approvalId === 'string') {
+          const params = request?.params as Partial<ApprovalDecideParams> | undefined
+          const sourceIndex = params?.requirementId?.sourceIndex
+          if (request?.method === 'approval/decide' && params?.approvalId === receipt.approvalId
+            && typeof sourceIndex === 'number' && Number.isSafeInteger(sourceIndex)) {
+            decisionReceipts.set(`approval:${receipt.approvalId}:${sourceIndex}`, receipt)
+          }
+          if (receipt.terminal === true) resolvedApprovals.add(receipt.approvalId)
+          return
+        }
+        if (typeof receipt.userInputId === 'string') {
+          decisionReceipts.set(`userInput:${receipt.userInputId}`, receipt)
+          return
+        }
+        if (typeof receipt.turnId === 'string') {
+          if (turn.nativeId === null && receipt.turnId !== lastFinishedNativeId) {
+            turn.nativeId = receipt.turnId
+            if (!turn.nativeIds.includes(receipt.turnId)) turn.nativeIds.push(receipt.turnId)
+          }
+          if (receipt.disposition === 'queued') { turn.queued = true; host.log(`${LABEL} queued the turn behind another one`) }
+        }
+      }
+      replayLink.on('orphan-response', orphan)
+      const onAbort = () => { void adapter.cancel() }
+      init.signal.addEventListener('abort', onAbort, { once: true })
+      if (init.signal.aborted) onAbort()
+      void init.live.then(
+        async () => {
+          try {
+            replayLink.endReplay()
+            await confirmDecisions()
+          } catch (error) {
+            replayLink.fail(error instanceof Error ? error : new Error(String(error)))
+          }
+        },
+        (error) => replayLink.fail(error instanceof Error ? error : new Error(String(error))),
+      )
+      return result.finally(() => {
+        replayLink.off('orphan-response', orphan)
+        init.signal.removeEventListener('abort', onAbort)
+      })
     },
 
     async compact(_id, _memories, signal) {
