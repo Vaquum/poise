@@ -21,7 +21,7 @@ import { TerminalSocketServer } from '../server/terminal/server'
 import type { TerminalPreset } from '../server/terminal/protocol'
 import { COMMANDS, STATUS, fakeCalls, resolveOnPath, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 import { fakePresetCommand } from './fixtures/accounts/fake-presets'
-import { AGENT_CLI_NAMES, CLI_HOME_VARIABLES, credentialVariables, removeCredentialVariables } from './fixtures/cli-isolation'
+import { AGENT_CLI_NAMES, CLI_HOME_VARIABLES, credentialVariables, isolatedEnvironment, removeCredentialVariables } from './fixtures/cli-isolation'
 
 // A parent environment like a Claude Code session's, which exports
 // CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH=1, in some sessions
@@ -34,6 +34,12 @@ const PARENT_ENVIRONMENT = {
   GIT_CONFIG_COUNT: '1',
   GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
   GIT_CONFIG_VALUE_0: 'AUTHORIZATION: basic b3BhcXVlLWNyZWRlbnRpYWw=',
+}
+
+function inheritedCaches(root: string): Record<string, string> {
+  return Object.fromEntries([
+    'XDG_CACHE_HOME', 'PIP_CACHE_DIR', 'UV_CACHE_DIR', 'npm_config_cache', 'AGENT_INTERFACE_WORK_DIR', 'GITHUB_INTERFACE_MIRROR_DIR',
+  ].map((name) => [name, join(root, name)]))
 }
 
 describe('every test process', () => {
@@ -49,6 +55,36 @@ describe('every test process', () => {
       expect(real === developer || real.startsWith(`${developer}${sep}`), `${name} is ${value}`).toBe(false)
     }
     expect(homedir()).toBe(process.env.HOME)
+  })
+
+  it('keeps production cache discovery inside its fixture despite inherited cache overrides', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'poise-cache-isolation-'))
+    try {
+      const inherited = inheritedCaches(join(root, 'outside-fixture'))
+      for (const dir of Object.values(inherited)) await mkdir(dir, { recursive: true })
+      const parent: NodeJS.ProcessEnv = { ...process.env, ...inherited }
+      const fixture = join(root, 'fixture')
+      const env: NodeJS.ProcessEnv = { ...parent, ...isolatedEnvironment(fixture, parent.PATH ?? '') }
+      const { cacheDirs } = await import('../server/storage-maintenance')
+      for (const [name, path] of Object.entries(cacheDirs(env.HOME, env))) {
+        expect(realpathSync(path).startsWith(`${realpathSync(fixture)}${sep}`), `${name} is ${path}`).toBe(true)
+      }
+      for (const [name, path] of Object.entries(inherited)) {
+        expect(env[name], name).not.toBe(path)
+        expect(parent[name], name).toBe(path)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps production workspace discovery inside its fixture', async () => {
+    const fixture = realpathSync(resolve(process.env.HOME!, '../..'))
+    const { LOCAL_CHAT_ROOT } = await import('../server/chat/local-workspace')
+    const { poiseStateRoot } = await import('../server/review-checkout')
+    expect(realpathSync(LOCAL_CHAT_ROOT).startsWith(`${fixture}${sep}`)).toBe(true)
+    expect(realpathSync(poiseStateRoot()).startsWith(`${fixture}${sep}`)).toBe(true)
+    expect(LOCAL_CHAT_ROOT).not.toBe(resolve('.poise-chat'))
   })
 
   it('finds a stand-in, never a real CLI, for every agent CLI name', () => {
@@ -71,18 +107,25 @@ describe('every test process', () => {
     expect(git.status, git.stderr).toBe(0)
   })
 
-  it('does both when started from a parent like a Claude Code session', () => {
-    // The two tests above, in vitest started from such a parent.
+  it('does both when started from a parent like a Claude Code session', async () => {
+    // The same discovery checks in a fresh process with inherited host roots.
     const report = join(tmpdir(), `poise-cli-isolation-${process.pid}.json`)
+    const inherited = await mkdtemp(join(tmpdir(), 'poise-inherited-storage-'))
+    const sentinel = join(inherited, 'untouched')
+    await writeFile(sentinel, 'parent storage')
     try {
       const run = spawnSync(process.execPath, [resolve('node_modules/vitest/vitest.mjs'), 'run', 'tests/cli-isolation.test.ts',
-        '--testNamePattern', 'carries no variable|runs git', '--reporter=json', `--outputFile=${report}`], { encoding: 'utf8', env: { ...process.env, ...PARENT_ENVIRONMENT } })
+        '--testNamePattern', 'carries no variable|runs git|keeps production workspace discovery', '--reporter=json', `--outputFile=${report}`], {
+        encoding: 'utf8', env: { ...process.env, ...PARENT_ENVIRONMENT, POISE_CHAT_ROOT: inherited, ...inheritedCaches(inherited) },
+      })
       expect(existsSync(report), run.stderr).toBe(true)
       const result = JSON.parse(readFileSync(report, 'utf8')) as { numPassedTests: number, numFailedTests: number, testResults: { assertionResults: { failureMessages: string[] }[] }[] }
       const failures = result.testResults.flatMap((file) => file.assertionResults.flatMap((test) => test.failureMessages)).join('\n')
-      expect({ passed: result.numPassedTests, failed: result.numFailedTests }, failures).toEqual({ passed: 2, failed: 0 })
+      expect({ passed: result.numPassedTests, failed: result.numFailedTests }, failures).toEqual({ passed: 3, failed: 0 })
+      expect(readFileSync(sentinel, 'utf8')).toBe('parent storage')
     } finally {
       rmSync(report, { force: true })
+      await rm(inherited, { recursive: true, force: true })
     }
   }, 30_000)
 })
@@ -211,6 +254,9 @@ describe('the end-to-end server', () => {
 
   it('starts without them from a parent like a Claude Code session', async () => {
     for (const [name, value] of Object.entries(PARENT_ENVIRONMENT)) vi.stubEnv(name, value)
+    const inheritedRoot = await mkdtemp(join(tmpdir(), 'poise-e2e-inherited-caches-'))
+    for (const [name, value] of Object.entries(inheritedCaches(inheritedRoot))) vi.stubEnv(name, value)
+    vi.stubEnv('POISE_CHAT_ROOT', inheritedRoot)
     const { webServer } = (await import('../playwright.config')).default
     if (!webServer || Array.isArray(webServer)) throw new Error('playwright.config.ts starts one web server')
     try {
@@ -219,8 +265,19 @@ describe('the end-to-end server', () => {
       const server = { ...process.env, ...webServer.env }
       expect(credentialVariables(server)).toEqual([])
       expect(server.GIT_CONFIG_COUNT).toBeUndefined()
+      const { cacheDirs } = await import('../server/storage-maintenance')
+      const isolationRoot = realpathSync(resolve(server.HOME!, '../..'))
+      for (const [name, path] of Object.entries(cacheDirs(server.HOME, server))) {
+        expect(realpathSync(path).startsWith(`${isolationRoot}${sep}`), `${name} is ${path}`).toBe(true)
+      }
+      vi.stubEnv('POISE_CHAT_ROOT', server.POISE_CHAT_ROOT)
+      vi.resetModules()
+      const { LOCAL_CHAT_ROOT } = await import('../server/chat/local-workspace')
+      expect(realpathSync(LOCAL_CHAT_ROOT).startsWith(`${isolationRoot}${sep}`)).toBe(true)
+      expect(LOCAL_CHAT_ROOT).not.toBe(inheritedRoot)
     } finally {
       rmSync(resolve(webServer.env!.HOME, '../..'), { recursive: true, force: true })
+      await rm(inheritedRoot, { recursive: true, force: true })
     }
   })
 })

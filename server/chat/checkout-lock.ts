@@ -211,6 +211,37 @@ export class CheckoutLease {
     })
   }
 
+  /** Take over a row whose host is dead but whose worker is verified alive
+   *  and ours — a relay-held agent that outlived its Poise. The worker
+   *  registration stays (it still describes the running agent); the token,
+   *  host and heartbeat become ours. Refuses when the host lives, when the
+   *  row names another owner or instance, or when the worker is not the one
+   *  given. The caller proves the worker's identity (command line) first;
+   *  this only compares the row. */
+  adoptLiveWorker(expected: { workerPid: number, workerPgid: number, workerIdent: string, ownerId: string }): boolean {
+    const now = this.probes.now()
+    const nowIso = new Date(now).toISOString()
+    const adopted = withLock(this.path, (db) => {
+      const row = db.prepare('SELECT * FROM lease WHERE id = 1').get() as LeaseRow | undefined
+      if (!row) return false
+      if (row.owner_id !== expected.ownerId || row.instance !== this.owner.instance) return false
+      if (row.worker_pid !== expected.workerPid || row.worker_pgid !== expected.workerPgid || row.worker_ident !== expected.workerIdent) return false
+      if (row.host_pid === this.probes.hostPid) {
+        // Our own row (a retried adoption): renew it under a fresh token.
+      } else if (this.probes.pidAlive(row.host_pid)) {
+        return false
+      }
+      if (!this.probes.pgidAlive(expected.workerPgid) && !this.probes.pidAlive(expected.workerPid)) return false
+      const token = newToken()
+      const changed = db.prepare('UPDATE lease SET token = ?, host_pid = ?, heartbeat_at = ?, lease_until = ? WHERE id = 1 AND token = ?')
+        .run(token, this.probes.hostPid, nowIso, now + LEASE_MS, row.token).changes === 1
+      if (changed) this.token = token
+      return changed
+    })
+    if (adopted) this.startHeartbeat()
+    return adopted
+  }
+
   /** Wait until acquired or the signal aborts. `onBusy` is told who holds it. */
   async acquire(options: { signal?: AbortSignal, onBusy?: (result: Extract<AcquireResult, { acquired: false }>) => void } = {}): Promise<AcquireResult & { acquired: true }> {
     while (true) {
