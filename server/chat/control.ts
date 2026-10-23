@@ -342,10 +342,9 @@ function reviewWatched(reviews: ReviewsObservation): Array<Record<string, unknow
   return watched.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
 }
 
-/** The reviews facet's last-observed watched slice, stored as plain JSON.
- *  Missing or malformed reads as nothing seen, so the next pass wakes on
- *  whatever it finds — including once after this sidecar rolls out. */
-function parseReviewsSeen(fingerprint: string | undefined): Array<Record<string, unknown>> {
+/** Read the persisted bounded cursor sidecar. Malformed state restarts its
+ *  scan; per-identity delivery state remains intact. */
+function parseReviewsCursor(fingerprint: string | undefined): Array<Record<string, unknown>> {
   if (!fingerprint) return []
   try {
     const value: unknown = JSON.parse(fingerprint)
@@ -1383,7 +1382,7 @@ export class ChatControl {
     if (previous && now - previous.checked_at < CI_INTERVAL) return
     let reviews: ReviewsObservation | null
     try {
-      const saved = parseReviewsSeen(store.observation(instance, `reviews-cursor:${target.url}`)?.fingerprint)[0]
+      const saved = parseReviewsCursor(store.observation(instance, `reviews-cursor:${target.url}`)?.fingerprint)[0]
       const cursor = saved && typeof saved.reviewAfter === 'number' && Number.isSafeInteger(saved.reviewAfter) && saved.reviewAfter >= 0
         && typeof saved.commentAfter === 'number' && Number.isSafeInteger(saved.commentAfter) && saved.commentAfter >= 0 ? { reviewAfter: saved.reviewAfter, commentAfter: saved.commentAfter } : { reviewAfter: 0, commentAfter: 0 }
       reviews = await (this.options.reviews ?? readWorkReviews)(target, cursor)
