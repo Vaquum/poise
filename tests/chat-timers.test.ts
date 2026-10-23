@@ -826,8 +826,9 @@ describe('durable timers that wake chats', () => {
     await control.tick()
     await until(() => prompts.has(p.id))
     const turnId = starts(p.id).at(-1)!.turnId
-    // Own retention across the clock jump; a real second-tick must not
-    // consume the finished row before this fixture's exact removal count.
+    // Own retention across the clock jump: while paused the background
+    // second-ticks are no-ops, so none can consume the finished row
+    // before this fixture's exact removal count.
     pauseReleaseBackground()
     try {
       await until(() => releaseBackgroundBusy() === 0)
@@ -836,8 +837,6 @@ describe('durable timers that wake chats', () => {
       expect(store.timerForTurn(instance, turnId)?.id).toBe(created.id)
       finishes.get(p.id)!({ stopReason: kind === 'once' ? 'end_turn' : 'error', ...(kind === 'every' ? { error: 'Long turn failed' } : {}) })
       await until(() => runtime.get(p.id)?.status === 'idle')
-      // Attempt competing maintenance causally, without waiting for its interval.
-      await control.tick()
       expect(store.timerById(instance, created.id)).toMatchObject(kind === 'once' ? { state: 'done', reason: 'completed' } : { state: 'active', failures: 1 })
       if (kind === 'every') expect(store.retainTimers(instance, clock).rows).toBe(1)
     } finally { resumeReleaseBackground() }
