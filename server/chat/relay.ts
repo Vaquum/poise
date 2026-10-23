@@ -439,15 +439,24 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
   async getOutbound(): Promise<{ truncated: boolean, bytes: Buffer }> {
     if (!this.socket || this.exitedEmitted) throw new Error('the relay is gone')
     if (this.pendingOutbound) throw new Error('an outbound read is already in flight')
-    const read = new Promise<{ truncated: boolean, bytes: Buffer }>((resolve, reject) => { this.pendingOutbound = { resolve, reject } })
-    this.socket.write(encodeJson(GET_OUTBOUND, {}))
+    let waiter!: NonNullable<RelayConnection['pendingOutbound']>
+    const read = new Promise<{ truncated: boolean, bytes: Buffer }>((resolve, reject) => { this.pendingOutbound = waiter = { resolve, reject } })
+    let timer: ReturnType<typeof setTimeout> | undefined
     const timeout = new Promise<never>((_resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (this.pendingOutbound) { this.pendingOutbound = null; reject(new Error('the relay did not answer the outbound read')) }
+      timer = setTimeout(() => {
+        if (this.pendingOutbound !== waiter) return
+        this.pendingOutbound = null
+        reject(new Error('the relay did not answer the outbound read'))
       }, CONTROL_TIMEOUT_MS)
       timer.unref()
     })
-    return Promise.race([read, timeout])
+    try {
+      this.socket.write(encodeJson(GET_OUTBOUND, {}))
+      return await Promise.race([read, timeout])
+    } finally {
+      clearTimeout(timer)
+      if (this.pendingOutbound === waiter) this.pendingOutbound = null
+    }
   }
 
   async shutdown(): Promise<void> {
