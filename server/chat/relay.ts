@@ -101,7 +101,7 @@ export interface RelayControls {
   gatePgid: number
   /** True while the relay process has not been observed to exit. */
   readonly healthy: boolean
-  /** Resolves once the peer carries live bytes (after any replayed spool). */
+  /** Resolves after the adapter consumes every stdout byte before LIVE. */
   whenLive(): Promise<void>
   /** Let the relay start the agent. Fails when the relay is gone. */
   go(): Promise<void>
@@ -113,6 +113,18 @@ export interface RelayControls {
   shutdown(): Promise<void>
   /** Drop this client without stopping anything; the agent keeps running. */
   detach(): void
+}
+
+class RelayStdout extends PassThrough {
+  constructor(private readonly consumed: (bytes: number) => void) { super() }
+
+  override emit(event: string | symbol, ...args: unknown[]): boolean {
+    const emitted = super.emit(event, ...args)
+    // Observing with a data listener here would put the stream in flowing
+    // mode before an adapter exists, discarding its buffered spool.
+    if (event === 'data' && Buffer.isBuffer(args[0])) this.consumed(args[0].length)
+    return emitted
+  }
 }
 
 /** A relay as an agent process: stdio-compatible for adapters, controllable
@@ -139,6 +151,9 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
   private exitedEmitted = false
   private liveResolve: (() => void) | null = null
   private livePromise: Promise<void>
+  private stdoutBytes = 0
+  private consumedStdoutBytes = 0
+  private liveStdoutBoundary: number | null = null
   private pendingOutbound: { resolve: (value: { truncated: boolean, bytes: Buffer }) => void, reject: (error: Error) => void } | null = null
   private pendingStarted: { resolve: () => void, reject: (error: Error) => void } | null = null
 
@@ -162,7 +177,10 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
       },
     })
     this.stdin.on('error', () => { /* reported through the link, like a dead pipe */ })
-    this.stdout = new PassThrough()
+    this.stdout = new RelayStdout(bytes => {
+      this.consumedStdoutBytes += bytes
+      this.resolveLiveWhenConsumed()
+    })
     this.stderr = new PassThrough()
     this.livePromise = new Promise((resolve) => { this.liveResolve = resolve })
   }
@@ -179,6 +197,12 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
   }
 
   whenLive(): Promise<void> { return this.livePromise }
+
+  private resolveLiveWhenConsumed(): void {
+    if (this.liveStdoutBoundary === null || this.consumedStdoutBytes < this.liveStdoutBoundary) return
+    this.liveResolve?.()
+    this.liveResolve = null
+  }
 
   /** Connect and hello; resolves with the relay's ready. Rejects when the
    *  relay is unreachable, speaks another protocol, holds another session,
@@ -271,14 +295,15 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
   private onFrame(kind: number, payload: Buffer): void {
     switch (kind) {
       case STDOUT:
+        this.stdoutBytes += payload.length
         this.stdout.write(payload.length ? Buffer.from(payload) : Buffer.alloc(0))
         return
       case STDERR:
         this.stderr.write(payload.length ? Buffer.from(payload) : Buffer.alloc(0))
         return
       case LIVE:
-        this.liveResolve?.()
-        this.liveResolve = null
+        this.liveStdoutBoundary = this.stdoutBytes
+        this.resolveLiveWhenConsumed()
         return
       case EXITED: {
         const body = JSON.parse(payload.toString('utf8')) as { code?: number }
@@ -371,8 +396,8 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
     this.pendingStarted = null
     this.pendingOutbound?.reject(new Error('the relay is gone'))
     this.pendingOutbound = null
-    this.liveResolve?.()
-    this.liveResolve = null
+    this.liveStdoutBoundary ??= this.stdoutBytes
+    this.resolveLiveWhenConsumed()
     this.stdout.end()
     this.stderr.end()
     this.emit('exit', code, signal)

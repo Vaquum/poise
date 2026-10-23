@@ -303,8 +303,9 @@ session's agent runs under a per-session relay that owns its stdio and
 spools the turn's output, so the next server reconnects and replays the turn
 instead of interrupting it. Completed permission and question requests consume
 their persisted one-time answers without sending them again; completed filesystem
-requests never repeat their effects. Historical request matching ends with the
-adopted turn. A recorded failed Muse decision ends the turn with a visible error
+requests never repeat their effects. The LIVE handoff waits until buffered spooled stdout reaches the adapter,
+including across an awaited outbound read. Historical request matching ends with
+the adopted turn. A recorded failed Muse decision ends the turn with a visible error
 instead of retaining an unanswerable request and checkout lease.
 
 - **Releases.** The image carries one release, Poise (`/opt/poise`) and
