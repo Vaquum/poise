@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentId, ChatEnvelope, PromptInput } from '../../server/chat/protocol'
+import type { AgentId, ChatEnvelope, PromptInput, TurnSource } from '../../server/chat/protocol'
 import type { Adapter, AdapterHost, AdapterStartOptions, TurnResult } from '../../server/chat/adapters/types'
 import { CATALOG } from '../model-catalog-fixture'
 
@@ -353,6 +353,27 @@ describe('the switch bound', () => {
     expect(w.c.calls[1].input.text).toContain('Keep the original switch instructions')
     const started = next.events(w.s.id, 0).events.filter(({ event }) => event.type === 'turn.started').at(-1)
     expect(started?.event).toMatchObject({ prompt: input('Visible original request') })
+  })
+
+  it('retains timer provenance when recovery queues behind a busy turn', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Busy preceding task'))
+    await until(() => w.c.calls.length === 1)
+    const source: Extract<TurnSource, { kind: 'timer' }> = { kind: 'timer', timerId: randomUUID(), label: 'Reminder',
+      setBy: { kind: 'person' }, missed: 2, dueAt: new Date().toISOString(), seq: 123 }
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID(),
+      prompt: input('Recovered timer request'), shown: input('Visible reminder'), source }])
+    await w.runtime.releaseSwitchWait()
+    const queued = w.runtime.get(w.s.id)?.queue?.items[0]
+    expect(queued?.source).toEqual(source)
+    if (queued?.source?.kind !== 'timer') throw new Error('queued recovery lost its timer source')
+    expect(queued.source.timerId).toBe(source.timerId)
+    w.c.auto = true
+    w.finish()
+    await until(() => w.turns(w.s.id).length === 2)
+    const started = w.runtime.events(w.s.id, 0).events.filter(({ event }) => event.type === 'turn.started').at(-1)
+    expect(started?.event).toMatchObject({ source, prompt: input('Visible reminder') })
+    expect(w.c.calls[1].input.text).toBe('Recovered timer request')
   })
 
   it('restarts at once when only waited prompts stand by: they hold no quiet check', async () => {

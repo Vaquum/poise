@@ -78,9 +78,9 @@ export interface BranchBinding {
 export interface QueuedMessage {
   /** Validated attachment/mention provenance across an isolated Poise handoff. */
   sourceSessionId?: string
-  /** Actor whose deferred steer this row continues; dispatched as source
-   *  data under that actor, never as the person's request. */
-  source?: ChatActor | PoiseActor
+  /** Original deferred turn provenance, including a recovered timer firing;
+   *  dispatched as that source, never as the person's request. */
+  source?: TurnSource
   /** Server-owned request context retained when update recovery must queue. */
   recovery?: { shown?: PromptInput, implementsChange?: boolean, switches?: string[] }
   id: string

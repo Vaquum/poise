@@ -336,7 +336,8 @@ reconciles them as after any restart.
   checkout or startup is replayed with its original input and attribution.
   Compaction does not count as delivering that request. If recovery must
   queue, the queue retains its displayed request, switches and change
-  completion responsibility with the original actor and model.
+  completion responsibility with the original source, including timer
+  provenance, and model.
   If another switch is pending during recovery, both interrupted and
   waiting records stay durable until it clears; continuations keep priority
   over their follow-ups. Waiting turns follow these recoveries in order.
