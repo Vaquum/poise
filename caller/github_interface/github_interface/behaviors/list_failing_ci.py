@@ -21,12 +21,23 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
 
     failing_checks = [_check(check) for check in checks if _check_failing(check)]
     failing_statuses = [_status(item) for item in status.get("statuses", []) if item.get("state") != "success"]
+    # Merge state, author and draft flag ride the same get_pull response the
+    # head SHA already comes from: the work monitor's conflict/behind read
+    # costs zero additional GitHub requests. mergeable is None while GitHub
+    # is still computing it; the monitor treats that as no observation.
+    user = pull.get("user") or {}
+    base = pull.get("base") or {}
     return {
         "action": "list_failing_ci",
         "repository": f"{owner}/{repo}",
         "pull_number": pull_number,
         "head_sha": ref,
         "failing": failing_checks + failing_statuses,
+        "mergeable": pull.get("mergeable"),
+        "mergeable_state": pull.get("mergeable_state"),
+        "author": user.get("login"),
+        "draft": pull.get("draft"),
+        "base": base.get("ref"),
     }
 
 

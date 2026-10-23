@@ -205,6 +205,98 @@ class ViewsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             views.pr(updated_since_datetime="2026-01-01T00:00:00")
 
+    def test_pr_reviews_returns_reviews_and_threads_for_one_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = base_expanded("@mikkokotila", [])
+            pr["is_pr"] = True
+            pr["issue"] = dict(pr["issue"], id=101, node_id="I_101", number=2)
+            pr["pull"] = {
+                "id": 101,
+                "node_id": "I_101",
+                "graphql": {"isDraft": False},
+                "requested_reviewers": [],
+                "assignees": [],
+                "merged_by": None,
+                "updated_at": "2026-01-02T00:00:00Z",
+            }
+            pr["issue"]["pull_request"] = {"node_id": "I_101"}
+            pr["reviews"] = [
+                {"id": 11, "node_id": "R_11", "user": {"login": "reviewer"},
+                 "state": "CHANGES_REQUESTED", "body": "fix this", "commit_id": "a" * 40,
+                 "submitted_at": "2026-01-02T00:00:00Z"},
+            ]
+            pr["review_comments"] = [
+                {"id": 21, "node_id": "C_21", "user": {"login": "reviewer"}, "body": "here",
+                 "path": "a.ts", "position": None, "created_at": "2026-01-02T00:00:00Z",
+                 "updated_at": "2026-01-02T00:00:00Z", "thread_node_id": "T_1",
+                 "thread_resolved": False, "thread_outdated": False},
+                {"id": 22, "node_id": "C_22", "user": {"login": "fixture-agent"}, "body": "done",
+                 "path": "a.ts", "position": None, "created_at": "2026-01-03T00:00:00Z",
+                 "updated_at": "2026-01-03T00:00:00Z", "thread_node_id": "T_1",
+                 "thread_resolved": False, "thread_outdated": True},
+            ]
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            conn.close()
+
+            found = json.loads(views.pr_reviews(db_path=db_path, repo="vaquum/test", number=2))
+            self.assertTrue(found["found"])
+            self.assertFalse(found["truncated"])
+            self.assertEqual(
+                found["reviews"],
+                [{"node_id": "R_11", "author": "reviewer", "state": "CHANGES_REQUESTED",
+                  "submitted_at": "2026-01-02T00:00:00Z"}],
+            )
+            self.assertEqual(len(found["threads"]), 1)
+            self.assertEqual(found["threads"][0]["thread_node_id"], "T_1")
+            self.assertEqual(found["threads"][0]["resolved"], False)
+            self.assertEqual([comment["node_id"] for comment in found["threads"][0]["comments"]],
+                             ["C_21", "C_22"])
+
+            missing = json.loads(views.pr_reviews(db_path=db_path, repo="vaquum/test", number=9))
+            self.assertFalse(missing["found"])
+            self.assertEqual((missing["reviews"], missing["threads"]), ([], []))
+
+    def test_pr_view_matches_mixed_case_repos_case_insensitively(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            item = base_expanded("@mikkokotila", [])
+            with conn:
+                upsert_repo(conn, item["repo"])
+            store_expanded(conn, item)
+            conn.close()
+            # Stored as Vaquum/Test, queried normalized: the row must be found.
+            self.assertEqual(len(json.loads(views.issue(db_path=db_path, repo="vaquum/test"))), 1)
+
+    def test_pre_thread_rows_migrate_with_unknown_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            conn.execute(
+                """CREATE TABLE review_comments (
+                    comment_id INTEGER PRIMARY KEY, node_id TEXT NOT NULL UNIQUE,
+                    item_id INTEGER NOT NULL, author_login TEXT, body TEXT, path TEXT,
+                    position INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    raw_json TEXT NOT NULL)"""
+            )
+            conn.execute(
+                "INSERT INTO review_comments VALUES (21, 'C_21', 101, 'reviewer', 'here', 'a.ts', NULL, ?, ?, '{}')",
+                ("2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z"),
+            )
+            conn.commit()
+            init_db(conn)
+            names = {row["name"] for row in conn.execute("PRAGMA table_info(review_comments)")}
+            self.assertTrue({"thread_node_id", "thread_resolved", "thread_outdated"} <= names)
+            row = conn.execute("SELECT thread_node_id, thread_resolved FROM review_comments").fetchone()
+            self.assertEqual((row["thread_node_id"], row["thread_resolved"]), (None, None))
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
