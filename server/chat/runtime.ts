@@ -165,6 +165,8 @@ interface RunningTurn {
   inputSourceSessionId?: string
   /** True only once the native prompt was invoked, not while queued/startup. */
   agentInvoked?: boolean
+  /** Compaction can run before the original request reaches prompt(). */
+  requestInvoked?: boolean
   /** Settles at native prompt invocation, cancellation, or failed startup. */
   promptReady: Promise<void>
   releasePrompt(): void
@@ -716,7 +718,7 @@ export class ChatRuntime extends EventEmitter {
       const turn = session.turn
       if (!turn) continue
       running.push({ sessionId: session.record.id, turnId: turn.id, ...(turn.implementsChange ? { implementsChange: true } : {}),
-        ...(!turn.agentInvoked && turn.input ? { prompt: turn.input, shown: turn.shown, source: turn.source,
+        ...(!turn.requestInvoked && turn.input ? { prompt: turn.input, shown: turn.shown, source: turn.source,
           switches: turn.switches,
           sourceSessionId: turn.queueItem?.sourceSessionId ?? turn.inputSourceSessionId,
           model: turn.queueItem?.model ?? turn.commandModel, effort: turn.queueItem?.effort ?? turn.commandEffort } : {}) })
@@ -744,6 +746,7 @@ export class ChatRuntime extends EventEmitter {
    *  later recovery. */
   private async resumeAfterUpdate(protectedSessions: ReadonlySet<string>, continuation = SWITCH_CONTINUE_PROMPT): Promise<void> {
     for (const row of this.readInterruptedSessions()) {
+      if (this.switchState) return
       if (protectedSessions.has(row.sessionId)) continue
       if (!this.takeInterruptedSession(row.sessionId)) continue
       await this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
@@ -754,6 +757,7 @@ export class ChatRuntime extends EventEmitter {
   /** Start every prompt that waited behind an update, in arrival order. */
   private async startWaitingPrompts(protectedSessions: ReadonlySet<string> = new Set()): Promise<void> {
     for (const entry of this.readWaitingPrompts()) {
+      if (this.switchState) return
       if (protectedSessions.has(entry.sessionId)) continue
       if (!this.takeWaitingPrompt(entry.id)) continue
       await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery)
@@ -1989,7 +1993,13 @@ export class ChatRuntime extends EventEmitter {
     const turn: RunningTurn = { id: randomUUID(), callId: null, startedAt: Date.now(), abort: new AbortController(), stopping: false, promptReady, releasePrompt }
     turn.abort.signal.addEventListener('abort', releasePrompt, { once: true })
     storage.reserveQueueTurn(session.record.id, turn.id, queueItem?.id, internalMessageSeq)
-    if (queueItem) { turn.queueItem = queueItem; turn.input = queueItem.prompt }
+    if (queueItem) {
+      turn.queueItem = queueItem
+      turn.input = queueItem.prompt
+      turn.shown = queueItem.recovery?.shown
+      turn.implementsChange = queueItem.recovery?.implementsChange
+      turn.switches = queueItem.recovery?.switches
+    }
     if (queueItem?.source) turn.source = { ...queueItem.source }
     session.turn = turn
     if (session.idleTimer) { clearTimeout(session.idleTimer); session.idleTimer = null }
@@ -2087,7 +2097,8 @@ export class ChatRuntime extends EventEmitter {
       const prompt = this.validatePrompt(id, { ...submitted, text: commandBody(chain) })
       const target = await this.resolveModel(model || chain.model || session.record.model, effort)
       if (!this.ownsSession(id)) throw new ChatError(404, 'unknown session', 'unknown_session')
-      return this.mutateQueue(session, () => enqueueMessage(queueOwner(id), { id: itemId, sourceSessionId: recovery?.sourceSessionId ?? id, ...(recovery?.source ? { source: recovery.source } : {}), prompt, agent: target.agent, model: target.model.identity,
+      return this.mutateQueue(session, () => enqueueMessage(queueOwner(id), { id: itemId, sourceSessionId: recovery?.sourceSessionId ?? id, ...(recovery?.source ? { source: recovery.source } : {}),
+        ...(recovery ? { recovery: { shown: recovery.shown, implementsChange: recovery.implementsChange, switches: recovery.switches } } : {}), prompt, agent: target.agent, model: target.model.identity,
         effort: target.effort, createdAt: new Date().toISOString(), state: 'waiting' }))
     })
   }
@@ -2377,7 +2388,7 @@ export class ChatRuntime extends EventEmitter {
         const chain = parseCommands(input.text)
         if (chain.create) throw new ChatError(400, 'Switch definitions cannot be created by a queued provider task.', 'invalid')
         refuseManagerSwitch(chain.switches, record.role === 'manager')
-        turn.switches = chain.switches
+        turn.switches = chain.switches ?? turn.switches
         turn.contextAction = chain.context
         if (chain.context || chain.switches?.length) { turn.shown = input; input = { ...input, text: chain.text } }
         if (chain.review) {
@@ -2532,6 +2543,7 @@ export class ChatRuntime extends EventEmitter {
       const promptInput = withAutoMergeInstructions({ ...adapterInput, text: controlContext ? `${controlContext}\n\n[Request]\n${expanded}` : expanded, memories: readMemories().text }, record.autoMerge, turn.implementsChange, turn.source && !personRelay ? 'source' : 'person')
       agentInvoked = true
       turn.agentInvoked = true
+      turn.requestInvoked = true
       const response = adapter.prompt(turn.id, promptInput, turn.abort.signal)
       turn.releasePrompt()
       let result = await response

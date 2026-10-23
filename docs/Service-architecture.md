@@ -334,8 +334,14 @@ reconciles them as after any restart.
   restart each interrupted session gets exactly one automatic continue
   prompt on its resumed native session; a request still waiting for a
   checkout or startup is replayed with its original input and attribution.
-  Waiting turns follow these recoveries in order. Withdrawal waits for any
-  bound cancellation to record recovery before releasing messages. A bound
+  Compaction does not count as delivering that request. If recovery must
+  queue, the queue retains its displayed request, switches and change
+  completion responsibility with the original actor and model.
+  If another switch is pending during recovery, both interrupted and
+  waiting records stay durable until it clears; continuations keep priority
+  over their follow-ups. Waiting turns follow these recoveries in order.
+  Withdrawal waits for any bound cancellation to record recovery before
+  releasing messages. A bound
   cancellation never bypasses the quiet gate for server work, background
   work or admitted launches. The gateway asks again on later passes until health reports the
   release, which the request makes idempotent.
