@@ -362,7 +362,7 @@ export function mergePrsOwnsBehind(target: store.WorkTarget, ci: CiObservation, 
  *  notice's blockers are measured against. */
 const WORK_DONE = [
   'CI green on the current head',
-  'up to date with main and no conflicts',
+  'repository merge requirements satisfied and no conflicts',
   'every finding fixed or justified, replied to, and its thread resolved',
 ]
 
@@ -1354,7 +1354,7 @@ export class ChatControl {
     const behind = ci.mergeableState === 'behind' && !(this.options.ownsBehind ?? mergePrsOwnsBehind)(target, ci, status)
     const base = ci.base ?? 'its base'
     const blockers = [...(conflict ? [`Resolve the merge conflicts with ${base}`] : []),
-      ...(behind ? [`Bring the branch up to date with ${base}`] : [])]
+      ...(behind ? [`Check GitHub's merge requirements for ${base}: use the native merge queue when configured; update the branch only when protection requires it or a needed fix depends on it`] : [])]
     const data = { kind: 'merge', target: target.url, head: ci.head, mergeable: ci.mergeable,
       mergeableState: ci.mergeableState, conflict, behind, blockers, done: WORK_DONE }
     this.observe(binding, key, data, now, blockers.length > 0, false, blockers.length > 0 ? [{ conflict, behind }] : [])
