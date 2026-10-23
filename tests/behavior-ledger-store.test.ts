@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import { LedgerError, type LedgerAdmission, type LedgerCaller, type LedgerPolicy, type LedgerRecord } from '../server/behavior-ledger-contract'
 
@@ -51,17 +51,38 @@ afterEach(() => {
 })
 
 describe('behavior firing ledger store', () => {
-  it('measures the existing budget SELECT group without adding timing to the body', () => {
+  it('answers reads without scanning retained history or adding timing to the body', () => {
     const db = store()
+    db.capture(admission())
+    complete(db, 'claim-1')
     const before = db.budgetScanMs
-    const monotonic = vi.spyOn(performance, 'now').mockReturnValueOnce(10).mockReturnValueOnce(17)
-    try {
-      const reply = db.read({ operation: 'health' })
+    for (const request of [{ operation: 'health' }, { operation: 'list', limit: 50 }] as const) {
+      const reply = db.read(request)
       expect(reply.status).toBe(200)
       expect(reply.body).not.toHaveProperty('timing')
-      expect(db.budgetScanMs - before).toBeCloseTo(7, 6)
-      expect(monotonic).toHaveBeenCalledTimes(2)
-    } finally { monotonic.mockRestore() }
+    }
+    db.pending()
+    expect(db.budgetScanMs).toBe(before)
+  })
+
+  it('keeps usage and pending exact while trimming at the caps', () => {
+    const db = store({ maxInstances: 6, maxChanges: 20, maxBytes: 16384 })
+    for (let i = 0; i < 8; i++) { db.capture(admission('cap-' + i, { admissionKey: 'cap-' + i })); complete(db, 'cap-' + i) }
+    db.capture(admission('open-1', { admissionKey: 'open-1' }))
+    const check = new Database(db.path, { readonly: true })
+    try {
+      const instances = check.prepare('SELECT count(*) AS n FROM ledger_instances').get() as { n: number }
+      const changes = check.prepare('SELECT count(*) AS n FROM ledger_changes').get() as { n: number }
+      expect(db.health()).toMatchObject({ instances: instances.n, changes: changes.n })
+      const rows = check.prepare('SELECT native_id AS nativeId, payload FROM ledger_instances WHERE native_id IS NOT NULL').all() as { nativeId: string; payload: string }[]
+      const expected = rows.flatMap(({ nativeId, payload }) => {
+        const record = JSON.parse(payload) as LedgerRecord
+        return ['resolve-unblocking', 'merge-prs', 'rerun-grey-ci'].includes(record.behavior)
+          || (record.activity === 'settled' && ['completed', 'failed', 'superseded'].includes(record.state)) ? [] : [nativeId]
+      })
+      expect(db.pending().map((row) => row.nativeId).sort()).toEqual(expected.sort())
+    } finally { check.close() }
+    expect(db.health()).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
   })
 
   it('groups delayed siblings and retry attempts through the explicit admission, preserving the original plan', () => {
@@ -292,6 +313,13 @@ describe('behavior firing ledger store', () => {
     } finally { blocking.exec('ROLLBACK'); blocking.close() }
     expect(db.health().dropped).toBe(0)
     expect(records(db)).toHaveLength(2)
+    const check = new Database(db.path, { readonly: true })
+    try {
+      expect(db.health()).toMatchObject({
+        instances: (check.prepare('SELECT count(*) AS n FROM ledger_instances').get() as { n: number }).n,
+        changes: (check.prepare('SELECT count(*) AS n FROM ledger_changes').get() as { n: number }).n,
+      })
+    } finally { check.close() }
   })
 
   it('retains generation and identifiers on clean restart and exposes an unclean epoch', () => {
