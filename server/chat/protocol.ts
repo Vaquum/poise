@@ -81,6 +81,8 @@ export interface QueuedMessage {
   /** Actor whose deferred steer this row continues; dispatched as source
    *  data under that actor, never as the person's request. */
   source?: ChatActor | PoiseActor
+  /** Server-owned request context retained when update recovery must queue. */
+  recovery?: { shown?: PromptInput, implementsChange?: boolean, switches?: string[] }
   id: string
   prompt: PromptInput
   agent: AgentId

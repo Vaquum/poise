@@ -32,7 +32,7 @@ function git(cwd: string, ...args: string[]): string {
   if (r.status) throw new Error(r.stderr)
   return r.stdout.trim()
 }
-interface Controls { auto: boolean, calls: { agent: AgentId, input: PromptInput, turnId: string }[], adapters: Fake[] }
+interface Controls { auto: boolean, calls: { agent: AgentId, input: PromptInput, turnId: string }[], adapters: Fake[], compactGate?: Promise<void>, compactions: number }
 class Fake implements Adapter {
   alive = false
   nativeSessionId: string | undefined
@@ -54,6 +54,12 @@ class Fake implements Adapter {
     })
   }
   async cancel() { this.finish?.({ stopReason: 'cancelled' }) }
+  async compact(_turnId: string, _memories: string, signal: AbortSignal): Promise<TurnResult> {
+    this.c.compactions += 1
+    if (this.c.compactGate) await Promise.race([this.c.compactGate,
+      new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))])
+    return { stopReason: signal.aborted ? 'cancelled' : 'end_turn' }
+  }
   async steer(_text: string) {}
   async close() { this.alive = false; this.finish?.({ stopReason: 'cancelled' }) }
   async setModel(modelId: string, effort: string) { return { modelId, effort } }
@@ -81,7 +87,7 @@ async function world(options: { auto?: boolean, deferStart?: boolean } = {}) {
   git(repo, 'config', 'commit.gpgSign', 'false'); git(repo, 'config', 'core.hooksPath', '/dev/null')
   await writeFile(join(repo, 'README.md'), '# Switch fixture\n'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'fixture')
   const instance = `switch-test:${randomUUID()}`
-  const c: Controls = { auto: options.auto ?? true, calls: [], adapters: [] }
+  const c: Controls = { auto: options.auto ?? true, calls: [], adapters: [], compactions: 0 }
   function make() {
     const runtime = new Runtime({ instance, instanceLabel: 'switch-test', callerTurns: null, idleTimeoutMinutes: () => 0,
       catalog: async () => CATALOG, resolveCheckout: async () => repo, requireClaudeReady: async () => {},
@@ -273,6 +279,51 @@ describe('the switch bound', () => {
         expect(replayed?.event).toMatchObject({ source: metadata.source, prompt: input(metadata.shown) })
       }
     } finally { service.reset() }
+  })
+
+  it('replays the unsent request when the bound cancels native compaction first', async () => {
+    const w = await world()
+    w.runtime.prompt(w.s.id, input('Seed native context'))
+    await until(() => w.turns(w.s.id).length === 1 && w.runtime.working() === 0)
+    w.c.compactGate = new Promise<void>(() => {})
+    w.runtime.prompt(w.s.id, input('/compact Implement the task after compaction'))
+    await until(() => w.c.compactions === 1)
+    expect(w.c.calls).toHaveLength(1)
+    const { service, restart } = await expired(w)
+    try {
+      expect(restart).toHaveBeenCalledTimes(1)
+      w.c.compactGate = undefined
+      const next = w.make()
+      await next.recover()
+      await until(() => w.c.calls.length === 2)
+      expect(w.c.calls[1].input.text).toBe('Implement the task after compaction')
+      expect(w.c.compactions).toBe(2)
+    } finally { service.reset() }
+  })
+
+  it('retains shown input, switches and change completion when recovery queues behind a busy turn', async () => {
+    const w = await world({ auto: false })
+    const changeId = randomUUID()
+    storage.saveSession({ ...storage.getSession(w.s.id)!, selfChangeId: changeId })
+    const next = w.make()
+    await next.createSwitch({ name: 'recovery-hint', content: 'Keep the original switch instructions', revision: 0 })
+    next.prompt(w.s.id, input('Busy preceding task'))
+    await until(() => w.c.calls.length === 1)
+    next.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID(), prompt: input('Original implementation runbook'),
+      shown: input('Visible original request'), implementsChange: true, switches: ['recovery-hint'] }])
+    await next.releaseSwitchWait()
+    expect(next.get(w.s.id)?.queue?.items).toEqual([expect.objectContaining({ recovery: {
+      shown: input('Visible original request'), implementsChange: true, switches: ['recovery-hint'],
+    } })])
+    w.c.auto = true
+    w.finish()
+    const outbox = await import('../../server/self-update-outbox')
+    await until(() => outbox.getFinish(changeId)?.outcome === 'completed')
+    expect(w.c.calls).toHaveLength(2)
+    expect(w.c.calls[1].input.text).toContain('Original implementation runbook')
+    expect(w.c.calls[1].input.text).toContain('Keep the original switch instructions')
+    const started = next.events(w.s.id, 0).events.filter(({ event }) => event.type === 'turn.started').at(-1)
+    expect(started?.event).toMatchObject({ prompt: input('Visible original request') })
   })
 
   it('restarts at once when only waited prompts stand by: they hold no quiet check', async () => {

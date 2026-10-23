@@ -334,6 +334,9 @@ reconciles them as after any restart.
   restart each interrupted session gets exactly one automatic continue
   prompt on its resumed native session; a request still waiting for a
   checkout or startup is replayed with its original input and attribution.
+  Compaction does not count as delivering that request. If recovery must
+  queue, the queue retains its displayed request, switches and change
+  completion responsibility with the original actor and model.
   Waiting turns follow these recoveries in order. Withdrawal waits for any
   bound cancellation to record recovery before releasing messages. A bound
   cancellation never bypasses the quiet gate for server work, background
