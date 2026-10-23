@@ -404,6 +404,15 @@ computer.
 - Caller itself runs from the image: its CLIs from `CALLER_BIN_ROOT`,
   `agent-interface` in `AGENT_INTERFACE_ROOT`.
 
+Poise delegates GitHub-mirror cache eviction to Caller's local, account-free
+`github-interface --prune-mirrors` behavior. Caller retains each
+`owner/repo.lock` inode and owner directory, locks nonblockingly against
+refresh/snapshot, and removes only stale whole bare mirrors at
+`owner/repo.git`. Recent descendant writes and uncertain or symlinked
+identities are held; directory descriptors anchor removal. The JSON
+`removed`/`held` report and options are defined in
+[Caller's repository checkout contract](../caller/README.md#repository-checkouts).
+
 **Scheduling.** The daily model-catalogue refresh runs inside Poise at 07:00
 in the owner's configured timezone (UTC, logged, when none is set), replacing
 the launchd job; a drain skips it. Datastore sync already runs inside Poise.

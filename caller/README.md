@@ -48,6 +48,18 @@ filter therefore does not hold other snapshots behind it. Each checkout keeps
 its own objects and remains usable after the mirror is refreshed or removed.
 Credentials are passed per command and never stored in either repository.
 
+`github-interface --prune-mirrors ROOT --cap-bytes N --now-ms N
+[--fresh-ms N] [--dry-run]` is local maintenance and needs no GitHub account.
+It evicts whole bare mirrors only at `ROOT/owner/repo.git`, oldest first,
+under the same nonblocking `owner/repo.lock` flock as repository checkouts.
+Owner directories and lock files stay in place. Freshness includes every
+descendant write, rechecked under the lock; busy, recent, nonbare or
+symlinked entries are held. Open directory descriptors anchor inspection
+and removal so path replacement cannot redirect deletion outside the mirror.
+The JSON response contains `removed` (`path`, `bytes`), `held` (`path`,
+`reason`) and remaining `totalBytes`; dry-run returns the same classification
+without removing mirrors.
+
 ## Automatic merge primitive
 
 `github-interface --merge-if-ready '#7' --expected-head SHA --author USER
