@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
-import type { Capabilities, ChatEvent, PromptInput, ServerFrame, SessionRecord } from '../server/chat/protocol'
+import type { Capabilities, ChatEnvelope, ChatEvent, PromptInput, ServerFrame, SessionRecord } from '../server/chat/protocol'
 import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
 import type { ChatRuntime } from '../server/chat/runtime'
@@ -71,6 +71,21 @@ async function observeCi(target: string): Promise<void> {
   // result before changing the next mocked response or reading the inbox.
   await until(() => store.observation(runtime.instance, `ci:${target}`)?.checked_at === clock)
 }
+// Capture the idle event before finishing: the live ticker may admit the
+// next inbox prompt before a polling reader sees that transient state.
+async function finishAndTick(id: string): Promise<void> {
+  let becameIdle = false
+  const onEvent = (envelope: ChatEnvelope) => {
+    if (envelope.sessionId === id && envelope.event.type === 'status.changed' && envelope.event.status === 'idle') becameIdle = true
+  }
+  runtime.on('event', onEvent)
+  try {
+    finishes.get(id)!({ stopReason: 'end_turn' })
+    await until(() => becameIdle)
+    await control.tick()
+  } finally { runtime.off('event', onEvent) }
+}
+
 async function config(id: string) {
   const context = await control.context(id)
   const path = /"([^"\n]+\.json)"/.exec(context)?.[1]
@@ -657,12 +672,13 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     await control.tick()
     await until(() => prompts.has(recipient.id))
     expect(prompts.get(recipient.id)![0].text.endsWith('\nOrdered 0')).toBe(true)
-    finishes.get(recipient.id)!({ stopReason: 'end_turn' })
-    await until(() => runtime.get(recipient.id)?.status === 'idle')
-    await control.tick()
+    // The competing tick admits Ordered 1 before any transient-idle poll.
+    await finishAndTick(recipient.id)
     await until(() => prompts.get(recipient.id)?.length === 2)
-    expect(prompts.get(recipient.id)![1].text.endsWith('\nOrdered 1')).toBe(true)
-    expect(store.inbox(runtime.instance, recipient.id)[1].state).toBe('admitted')
+    expect(prompts.get(recipient.id)!.map(prompt => prompt.text.split('\n').at(-1))).toEqual(['Ordered 0', 'Ordered 1'])
+    expect(store.inbox(runtime.instance, recipient.id).slice(0, 2).map(message => message.state)).toEqual(['admitted', 'admitted'])
+    finishes.get(recipient.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.events(recipient.id, 0).events.filter(({ event }) => event.type === 'turn.finished').length === 2)
   })
 
   it('returns to an unblocked recipient while a later recipient keeps receiving new messages', async () => {

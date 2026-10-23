@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
-import type { Capabilities, PromptInput, ServerFrame } from '../server/chat/protocol'
+import type { Capabilities, ChatEnvelope, PromptInput, ServerFrame } from '../server/chat/protocol'
 import type { ChatRuntime } from '../server/chat/runtime'
 import type { ChatControl } from '../server/chat/control'
 import type { ResolvedServer } from '../server/extensions/types'
@@ -90,6 +90,21 @@ async function until(check: () => boolean, ...sessionIds: string[]) {
     await new Promise(done => setTimeout(done, 15))
   }
 }
+// Capture the idle event before finishing: the live ticker may admit the
+// next inbox prompt before a polling reader sees that transient state.
+async function finishAndTick(id: string): Promise<void> {
+  let becameIdle = false
+  const onEvent = (envelope: ChatEnvelope) => {
+    if (envelope.sessionId === id && envelope.event.type === 'status.changed' && envelope.event.status === 'idle') becameIdle = true
+  }
+  runtime.on('event', onEvent)
+  try {
+    finishes.get(id)!({ stopReason: 'end_turn' })
+    await until(() => becameIdle, id)
+    await control.tick()
+  } finally { runtime.off('event', onEvent) }
+}
+
 function makeRuntime() {
   return new Runtime({ instance, instanceLabel: 'test', callerTurns: null, catalog: async () => catalog,
     adapters: { grok: adapter, claude: adapter, codex: adapter, muse: forkAdapter },
@@ -434,9 +449,21 @@ describe('one Manager chat per workspace', () => {
     await runtime.setModel(manager.id, OPUS_MODEL)
     expect(runtime.get(manager.id)?.retiredModel).toBeUndefined()
     await until(() => prompts.has(manager.id), manager.id)
+    expect(prompts.get(manager.id)!.map(prompt => prompt.text)).toEqual(['Queued task'])
+    // Force a competing tick to admit the held inbox item before checking idle.
+    await finishAndTick(manager.id)
+    await until(() => prompts.get(manager.id)?.length === 2, manager.id)
+    expect(prompts.get(manager.id)![1].text.endsWith('\nHello Manager')).toBe(true)
+    expect(store.inbox(instance, manager.id).filter(message => message.body === 'Hello Manager'))
+      .toEqual([expect.objectContaining({ state: 'admitted' })])
     finishes.get(manager.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(manager.id)?.status === 'idle', manager.id)
+    expect(prompts.get(manager.id)).toHaveLength(2)
     expect(() => runtime.prompt(manager.id, { text: 'next', attachments: [], mentions: [] })).not.toThrow()
+    await until(() => prompts.get(manager.id)?.length === 3, manager.id)
+    expect(prompts.get(manager.id)![2].text).toBe('next')
+    finishes.get(manager.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(manager.id)?.status === 'idle', manager.id)
     expect(runtime.get(ordinary.id)).toBeNull()
     expect(storage.getSession(ordinary.id)).toBeNull()
   }, 60_000)
