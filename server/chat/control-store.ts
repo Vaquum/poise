@@ -98,13 +98,26 @@ export function bindingIsCurrent(instance: string, binding: Binding): boolean {
   return !!db.prepare('SELECT 1 FROM chat_work_bindings WHERE instance = ? AND target = ? AND session = ? AND created_at = ?')
     .get(instance, binding.target, binding.session, binding.created_at)
 }
+/** The sender every work-monitor notice carries. */
+export const WORK_MONITOR_SENDER = 'Poise work monitor'
+/** Event-key prefixes the work monitor's notices carry, one per watched facet. */
+const NOTICE_PREFIXES = ['ci:', 'behavior:', 'merge:', 'reviews:', 'ci-degraded:']
+/** One observation key per watched facet of a bound target, plus the
+ *  degraded-read marker and the reviews seen-set sidecar, which carries
+ *  no notices. A new owner starts from no baseline on all of them, so
+ *  current blockers wake it even when the old owner saw them. */
+const OBSERVATION_PREFIXES = [...NOTICE_PREFIXES, 'reviews-seen:']
+function resetTargetObservations(instance: string, url: string): void {
+  db.prepare(`DELETE FROM chat_control_observations WHERE instance = ? AND target IN (${OBSERVATION_PREFIXES.map(() => '?').join(', ')})`)
+    .run(instance, ...OBSERVATION_PREFIXES.map(prefix => `${prefix}${url}`))
+}
 export const bindWork = db.transaction((instance: string, session: string, target: string): Binding => {
   const canonical = workTarget(target).url
   const existing = db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? AND target = ?').get(instance, canonical) as Binding | undefined
   if (existing && existing.session !== session) throw new HttpError(409, `${canonical} is owned by chat ${existing.session}; its owner must release it first`)
   if (existing) return existing
   const result = { target: canonical, session, created_at: Date.now() }
-  db.prepare('DELETE FROM chat_control_observations WHERE instance = ? AND target IN (?, ?)').run(instance, `ci:${canonical}`, `behavior:${canonical}`)
+  resetTargetObservations(instance, canonical)
   db.prepare('INSERT INTO chat_work_bindings VALUES(?, ?, ?, ?)').run(instance, canonical, session, result.created_at)
   return result
 })
@@ -113,6 +126,33 @@ export function unbindWork(instance: string, session: string, target: string): v
   const owner = bindings(instance).find(b => b.target === canonical)
   if (owner && owner.session !== session) throw new HttpError(409, `only chat ${owner.session} can release this work`)
   db.prepare('DELETE FROM chat_work_bindings WHERE instance = ? AND target = ? AND session = ?').run(instance, canonical, session)
+}
+/** Move every work binding from one chat to another: a handoff's ownership
+ *  transfer. The new owner starts from no observation baseline; the old
+ *  owner's still-pending work-monitor notices for those targets are
+ *  dropped, so they never wake it stale after the transfer. */
+export const moveBindings = db.transaction((instance: string, from: string, to: string): Binding[] => {
+  const moved = db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? AND session = ?')
+    .all(instance, from) as Binding[]
+  for (const binding of moved) {
+    db.prepare('UPDATE chat_work_bindings SET session = ?, created_at = ? WHERE instance = ? AND target = ? AND session = ?')
+      .run(to, Date.now(), instance, binding.target, from)
+    resetTargetObservations(instance, binding.target)
+    // The colon after the URL keeps `…/pull/1` from matching `…/pull/12`;
+    // LIKE wildcards in the URL itself are escaped.
+    const escaped = binding.target.replace(/[\\%_]/g, ch => `\\${ch}`)
+    for (const prefix of NOTICE_PREFIXES) {
+      db.prepare(`DELETE FROM chat_control_inbox WHERE instance = ? AND recipient = ? AND sender = ? AND state = 'pending'
+        AND event_key LIKE ? ESCAPE '\\'`).run(instance, from, WORK_MONITOR_SENDER, `${prefix}${escaped}:%`)
+    }
+  }
+  return moved.map(binding => ({ ...binding, session: to }))
+})
+/** Release every work binding a chat holds. Closing settles work rather
+ *  than starting it, and a closed chat never receives monitor notices, so
+ *  its targets become claimable by the replacement chat. */
+export function releaseBindings(instance: string, session: string): void {
+  db.prepare('DELETE FROM chat_work_bindings WHERE instance = ? AND session = ?').run(instance, session)
 }
 
 export function addChild(instance: string, manager: string, child: string): void {
@@ -206,6 +246,9 @@ export function observation(instance: string, target: string): { fingerprint: st
 export function saveObservation(instance: string, target: string, fingerprint: string, now: number): void {
   db.prepare(`INSERT INTO chat_control_observations VALUES(?, ?, ?, ?) ON CONFLICT(instance, target)
     DO UPDATE SET fingerprint = excluded.fingerprint, checked_at = excluded.checked_at`).run(instance, target, fingerprint, now)
+}
+export function deleteObservation(instance: string, target: string): void {
+  db.prepare('DELETE FROM chat_control_observations WHERE instance = ? AND target = ?').run(instance, target)
 }
 export interface ForgottenTimers { /** Timers that targeted the deleted chat. */ targets: Array<{ id: string }>, /** Timers the deleted chat set, by surviving target. */ setters: Array<{ id: string, target: string }> }
 export const forgetSession = db.transaction((instance: string, session: string, now: number = Date.now()): ForgottenTimers => {
