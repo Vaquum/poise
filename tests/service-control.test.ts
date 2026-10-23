@@ -341,9 +341,10 @@ describe('switching to another release', () => {
     try {
       service.switchRelease('r2')
       expect(service.health().switching).toBe('r2')
-      const launches = ['/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/chat', '/api/models/refresh']
+      const launches = ['/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/models/refresh']
       const admitted = launches.map((path) => service.admitLaunch('POST', path))
       expect(admitted.every((launch) => typeof launch === 'function')).toBe(true)
+      expect(service.admitLaunch('POST', '/api/chat')).toBeNull()
       expect(background.releaseBackgroundPaused()).toBe(false)
       expect(service.health()).toMatchObject({ backgroundWork: launches.length, idle: false, draining: false })
       for (const release of admitted) (release as () => void)()
