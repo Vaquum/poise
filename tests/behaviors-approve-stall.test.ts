@@ -10,6 +10,25 @@ vi.mock('../server/provider-clis', () => ({
 
 const secondPr = { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18' }
 
+// Caller's GitHub client reports a 403/429 as `GitHub <status> rate-limit:
+// <headers> body=<text>` on stderr, and runFile rejects with that stderr
+// attached to a bare `Command failed` error.
+function cliFailure(stderr: string): Error {
+  return Object.assign(new Error('Command failed (1): github-interface'), { stderr })
+}
+
+function quotaExhaustedStderr(resetEpoch: number): string {
+  return `error: GitHub 403 rate-limit: {'x-ratelimit-resource': 'core', 'x-ratelimit-limit': '5000', `
+    + `'x-ratelimit-remaining': '0', 'x-ratelimit-used': '5000', 'x-ratelimit-reset': '${resetEpoch}'} body={\n`
+    + `\t"message": "API rate limit exceeded for user ID 265471408.",\n\t"status": "403"\n}`
+}
+
+function addressedCalls(): unknown[][] {
+  return mocks.runFile.mock.calls.filter(([command, args]: any[]) =>
+    command === 'github-interface' && (args as string[])[0] === '--requested-changes-addressed'
+    && String((args as string[])[1]) === '#17')
+}
+
 async function startApproving(open: typeof fixture.listedPrs) {
   fixture.listedPrs = open
   arrangeCli(true)
@@ -159,6 +178,143 @@ describe('approve-prs under load', () => {
     const stored = JSON.parse(db.getMeta(`behavior_approve_prs_failure:${secondPr.repo}#18:check`)!)
     expect(stored.error).toMatch(/head changed/)
     expect(stored.consecutiveFailures).toBe(1)
+    expect(stored.nextRetryAtMs - stored.lastFailureAtMs).toBe(60_000)
+  })
+
+  it('retries a quota-exhausted check at the reset instead of the hour-long backoff', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const { database: db, behaviors: runtime } = await startApproving([pr])
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
+        throw new Error('github-interface --requested-changes-addressed returned malformed state')
+      }
+      return original(command, args, options)
+    })
+
+    // Three hard failures build the count, so the quota failure below lands
+    // on an eight-minute backoff under the old clock.
+    const key = `behavior_approve_prs_failure:${pr.repo}#17:check`
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await runtime.runEnabledBehaviorsOnce()
+      const stored = JSON.parse(db.getMeta(key)!)
+      vi.setSystemTime(new Date(stored.nextRetryAtMs + 1))
+    }
+
+    let reset = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
+        reset = Math.floor(Date.now() / 1000) + 120
+        throw cliFailure(quotaExhaustedStderr(reset))
+      }
+      return original(command, args, options)
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const stored = JSON.parse(db.getMeta(key)!)
+    expect(stored.consecutiveFailures).toBe(4)
+    expect(stored.nextRetryAtMs).toBe(reset * 1000)
+
+    // No check runs before the reset; the first tick after it approves.
+    const calls = addressedCalls().length
+    vi.setSystemTime(new Date(reset * 1000 - 1000))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(addressedCalls()).toHaveLength(calls)
+    mocks.runFile.mockImplementation(original)
+    vi.setSystemTime(new Date(reset * 1000 + 1))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(addressedCalls()).toHaveLength(calls + 1)
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0]?.[1]).toContain('#17')
+  })
+
+  it('holds a quota-exhausted check until a distant reset instead of retrying inside the blocked window', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const { database: db, behaviors: runtime } = await startApproving([pr])
+    const original = mocks.runFile.getMockImplementation()!
+    let reset = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
+        reset = Math.floor(Date.now() / 1000) + 3000
+        throw cliFailure(quotaExhaustedStderr(reset))
+      }
+      return original(command, args, options)
+    })
+
+    await runtime.runEnabledBehaviorsOnce()
+    const key = `behavior_approve_prs_failure:${pr.repo}#17:check`
+    const stored = JSON.parse(db.getMeta(key)!)
+    expect(stored.consecutiveFailures).toBe(1)
+    expect(stored.nextRetryAtMs).toBe(reset * 1000)
+
+    const calls = addressedCalls().length
+    vi.setSystemTime(new Date(reset * 1000 - 60_000))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(addressedCalls()).toHaveLength(calls)
+    mocks.runFile.mockImplementation(original)
+    vi.setSystemTime(new Date(reset * 1000 + 1))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(addressedCalls()).toHaveLength(calls + 1)
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0]?.[1]).toContain('#17')
+  })
+
+  it('retries a non-exhausted 403 on backoff instead of its distant reset', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const { database: db, behaviors: runtime } = await startApproving([pr])
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
+        const reset = Math.floor(Date.now() / 1000) + 3600
+        throw cliFailure(`error: GitHub 403 rate-limit: {'x-ratelimit-resource': 'core', `
+          + `'x-ratelimit-remaining': '4999', 'x-ratelimit-reset': '${reset}'} body={\n`
+          + `\t"message": "Resource not accessible by integration.",\n\t"status": "403"\n}`)
+      }
+      return original(command, args, options)
+    })
+
+    await runtime.runEnabledBehaviorsOnce()
+    const key = `behavior_approve_prs_failure:${pr.repo}#17:check`
+    const stored = JSON.parse(db.getMeta(key)!)
+    expect(stored.consecutiveFailures).toBe(1)
+    expect(stored.nextRetryAtMs - stored.lastFailureAtMs).toBe(60_000)
+
+    mocks.runFile.mockImplementation(original)
+    vi.setSystemTime(new Date(stored.nextRetryAtMs + 1))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0]?.[1]).toContain('#17')
+  })
+
+  it('retries a quota error with a past reset no sooner than a minute', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const { database: db, behaviors: runtime } = await startApproving([pr])
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
+        throw new Error('github-interface --requested-changes-addressed returned malformed state')
+      }
+      return original(command, args, options)
+    })
+
+    const key = `behavior_approve_prs_failure:${pr.repo}#17:check`
+    await runtime.runEnabledBehaviorsOnce()
+    const first = JSON.parse(db.getMeta(key)!)
+    expect(first.nextRetryAtMs - first.lastFailureAtMs).toBe(60_000)
+    vi.setSystemTime(new Date(first.nextRetryAtMs + 1))
+
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
+        throw cliFailure(quotaExhaustedStderr(Math.floor(Date.now() / 1000) - 30))
+      }
+      return original(command, args, options)
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const stored = JSON.parse(db.getMeta(key)!)
+    expect(stored.consecutiveFailures).toBe(2)
     expect(stored.nextRetryAtMs - stored.lastFailureAtMs).toBe(60_000)
   })
 
