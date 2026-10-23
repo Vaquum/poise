@@ -187,7 +187,12 @@ operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
 Queue-enabled branches are excluded from automatic base updates: GitHub tests
-the queued integration against current main. After the merges, one scan updates
+the queued integration against current main. With Merge Pull Requests enabled,
+ready eligible PRs enter that queue automatically; no per-PR merge or confirmation
+click is needed. Chat Auto-merge instructions, the default Manager charter and
+work-monitor notices follow the repository's live merge policy instead of
+requiring every PR branch to contain the latest main. Existing edited Manager
+snippets retain their saved text. After the merges, one scan updates
 at most one other behind branch, oldest approval
 first, so updates don't churn CI: the oldest-approved behind candidate holds the
 shared per-PR operation lock for

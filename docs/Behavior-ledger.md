@@ -133,6 +133,18 @@ that deadline are discarded with durable loss accounting; an active capture
 finishes before the worker closes SQLite and exits naturally. The observer
 keeps that worker and its generated asset until its actual exit. A deadline
 never force-terminates an isolate that may be executing native SQLite work.
+`stop()` resolving means admission has stopped, not that the worker has exited.
+Code that removes ledger files must then await `observer.waitForExit()`; that
+promise also covers initialization still in progress. If native work never
+returns, the worker remains tracked and that promise remains pending. Health
+reports `stopped` with the outstanding capture in `pending` and discarded work
+in `dropped`; it does not claim the capture committed or that files are safe to
+remove. A protocol-failed worker can be terminated only after readiness and
+with no request in flight; active or uncertain native work closes cooperatively.
+The deterministic native-stop fixture extends SQLite's lock wait only in the
+test to hold an active native call across the deadline. Production retains its
+zero lock-wait timeout. The observed burst-test crash also involved teardown
+removing SQLite files before the abandoned worker exited.
 
 Retention targets 30 days from meaningful updates, bounded by 10,000 instances,
 30,000 changes, 32 MiB accounted metadata, a 64 MiB main database, at most
