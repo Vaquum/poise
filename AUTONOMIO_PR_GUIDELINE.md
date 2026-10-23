@@ -10,7 +10,7 @@ Specifics: repository-only details live in [POISE_REPO_SPECIFICS.md](POISE_REPO_
 | Tag family | Meaning |
 | --- | --- |
 | `authority:*` | instruction precedence, routed reads, escalation |
-| `scope:*` | task shape, slice boundaries, changed surfaces |
+| `scope:*` | task shape, issue requirements, changed surfaces |
 | `github:*` | branches, commits, issues, PRs, reviews, CI, merge |
 | `change:*` | implementation discipline and engineering constraints |
 | `evidence:*` | tests, gates, proof, terminal claims |
@@ -34,10 +34,10 @@ Specifics: repository-only details live in [POISE_REPO_SPECIFICS.md](POISE_REPO_
 ### Scope
 
 - `[scope:one-change]` Keep one PR to one coherent capability, fix, proof obligation, or documentation change.
-- `[scope:issue-contract]` If the repository uses slice or issue contracts, the PR must satisfy that contract exactly.
-- `[scope:surface-contract]` Keep the diff inside the declared surfaces and outside declared out-of-scope paths.
+- `[scope:issue-contract]` Every PR closes exactly one OPEN issue via `Closes #N`. A `feat` PR's issue must carry the `prd` label; any other type may close any OPEN issue — or a PRD when the author wants more eyes on it.
+- `[scope:surface-contract]` Keep the diff within the agreed outcome and scope; file-by-file declarations are not required.
 - `[scope:no-driveby]` Do not include drive-by cleanup, opportunistic refactors, unrelated formatting, or metadata churn.
-- `[scope:wrong-contract]` If the issue or slice is wrong, fix the issue or slice before implementation.
+- `[scope:wrong-contract]` Correct material errors in the linked issue as the work develops.
 - `[scope:runtime-touching]` Runtime-touching work adds proof obligations; it does not replace the primary task contract.
 - `[scope:planning]` Planning work publishes scope or backlog state only; it must not mutate runtime behavior.
 - `[scope:correctness]` Correctness work fixes existing behavior and must include regression protection.
@@ -46,13 +46,12 @@ Specifics: repository-only details live in [POISE_REPO_SPECIFICS.md](POISE_REPO_
 
 ### GitHub
 
-- `[github:branch]` Use the user-selected working branch, otherwise branch from the repository's protected base branch and keep the PR branch up to date before merge.
+- `[github:branch]` Use the user-selected working branch, otherwise branch from the repository's protected base branch. Where a native merge queue handles base integration, update the branch only to resolve conflicts or pick up a needed fix.
 - `[github:protected-base]` Never push directly to the protected base branch, force-push its history or delete it.
 - `[github:worktree]` Use the user-selected branch and an appropriate checkout. Local-only branches and isolated worktrees are valid for authorized local work; do not discard another contributor's changes.
 - `[github:commit]` Use Conventional Commits where required: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, or `revert`.
 - `[github:commit-scope]` Keep each commit to one logical change.
 - `[github:no-ai-attribution]` Do not name an AI, LLM, assistant, model, or model vendor in commit messages or PR titles where the repository bans assistant attribution.
-- `[github:pr-title]` If the repository binds PR title to issue title, make them byte-equal.
 - `[github:pr-body]` The PR body must identify what changed, why it changed, user or developer impact, and validation.
 - `[github:early-pr]` Open the PR as soon as the change is ready for CI when the repository requires early PR flow; continue local verification while CI runs.
 - `[github:review-request]` Request the required reviewer when the task authorizes review interaction; a local rule alone is not permission to message another person.

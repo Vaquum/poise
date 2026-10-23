@@ -115,7 +115,9 @@ function makeRuntime() {
 const docSubject = (key = 'brief'): ChatSubject => ({ surface: 'editor-document', key, label: 'Brief' })
 
 async function runTurn(sessionId: string, text: string): Promise<CapturedTurn> {
-  const { turnId } = runtime.prompt(sessionId, { text, attachments: [], mentions: [] })
+  const receipt = runtime.prompt(sessionId, { text, attachments: [], mentions: [] })
+  if (!('turnId' in receipt)) throw new Error('editor fixture unexpectedly waited for an update')
+  const { turnId } = receipt
   await until(() => finishes.has(sessionId), `adapter prompt for "${text}"`)
   const got = captured.find((c) => c.turnId === turnId)
   if (!got) throw new Error(`no capture for turn ${turnId}`)

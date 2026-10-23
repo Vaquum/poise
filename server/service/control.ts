@@ -14,9 +14,10 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { BUILD_SHA } from '../build-identity'
 import type { ChatRuntime } from '../chat/runtime'
-import { listOpenTurns } from '../chat/storage'
+import { findEvent, getOpenTurn, listOpenTurns } from '../chat/storage'
 import { HttpError, readJson, type RequestAuthority } from '../http'
 import { markReleaseSwitch, pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
+import { DEFAULT_CHAT_SETTINGS } from '../settings'
 import { runningCallerCalls } from './caller-calls'
 import { canRestartForUpdate, requestUpdateRestart } from './restart'
 
@@ -100,6 +101,10 @@ export interface ServiceControlOptions {
   /** Restarts this server onto the release named in releasesDir/next; false when it cannot. */
   restart?: () => boolean
   canRestart?: () => boolean
+  /** How long running Chat turns may hold up a switch, in minutes; the chat setting by default. */
+  switchTurnBoundMinutes?: () => number
+  /** Clock the switch bound is counted on; tests hold it still. */
+  now?: () => number
 }
 
 export class ServiceControl {
@@ -110,16 +115,22 @@ export class ServiceControl {
   // Drives the switch poll; health reports the persisted record, not this.
   private switchTo: string | null = null
   private switchPoll: unknown = null
+  private switchPendingSince: number | null = null
+  private switchEpoch = 0
+  private switchCancellation: Promise<void> | null = null
+  private restarting = false
   private readonly timer: DrainTimer
   private readonly log: (line: string) => void
   private readonly releasesDir: string
   private readonly release: { name: string | null, base: string | null }
+  private readonly now: () => number
 
   constructor(private readonly runtime: ChatRuntime, private readonly options: ServiceControlOptions) {
     this.timer = options.timer ?? systemTimer
     this.log = options.log ?? ((line) => console.log(line))
     this.releasesDir = options.releasesDir ?? join(homedir(), '.poise', 'releases')
     this.release = options.release ?? { name: process.env.POISE_RELEASE || null, base: process.env.POISE_BASE || null }
+    this.now = options.now ?? Date.now
   }
 
   get draining(): boolean {
@@ -202,11 +213,15 @@ export class ServiceControl {
 
   /**
    * Restarts this server onto an installed release of the same base, at the
-   * first moment no Chat turn and no work of this server's own runs. Agent
-   * calls are not waited for: they run detached, survive the restart, and the
-   * next server reconciles them as after any restart. Nothing is refused
-   * while it waits, behavior ticks included: they end within a minute, and
-   * the moment between two of them is quiet.
+   * first moment no unheld Chat turn and no work of this server's own runs.
+   * Detached agent calls survive the restart, and the next server reconciles
+   * them. Chat turns a healthy relay holds also keep running, and the next
+   * server adopts them. While the switch is pending, new Chat turns wait
+   * behind the update; launches and behavior ticks run as usual. Unheld
+   * turns get the update turn bound, then are cancelled through the normal
+   * cancel path and their sessions recorded. After the restart each
+   * interrupted session gets one automatic continue prompt on its resumed
+   * native session, then the waiting turns start in order.
    */
   switchRelease(release: unknown): SwitchAnswer {
     if (typeof release !== 'string' || !RELEASE_NAME.test(release)) throw new HttpError(400, 'release must name an installed release')
@@ -235,17 +250,24 @@ export class ServiceControl {
       renameSync(`${next}.tmp`, next)
     }
     const first = this.switchTo === null
+    const retargeted = this.switchTo !== release
+    if (first || retargeted) this.switchEpoch += 1
     this.switchTo = release
+    this.runtime.setSwitchPending(release)
     if (first) {
-      this.log(`[service] switching to release ${release} once no Chat turn and no work of this server runs`)
       markReleaseSwitch(true)
-      this.pollSwitch()
+      this.switchPendingSince = this.now()
+      this.log(`[service] switching to release ${release} once no unheld Chat turn and no work of this server runs; new turns wait behind the update`)
     }
+    if ((first || retargeted) && this.switchPoll === null && !this.restarting) this.pollSwitch()
     return { release, switching: true }
   }
 
   /** Asked for the release it runs: a switch asked for before, to a release since withdrawn, is called off. */
   private withdrawSwitch(): void {
+    // A restart already requested owns the shutdown: withdrawing now would
+    // take the supervisor's `next` away and start waited turns mid-shutdown.
+    if (this.restarting) return
     rmSync(join(this.releasesDir, 'next'), { force: true })
     if (this.switchTo === null) return
     if (this.switchPoll !== null) this.timer.clearTimeout(this.switchPoll)
@@ -253,27 +275,97 @@ export class ServiceControl {
     this.log(`[service] the switch to release ${this.switchTo} was withdrawn; staying on release ${this.release.name}`)
     this.switchTo = null
     markReleaseSwitch(false)
+    this.switchPendingSince = null
+    this.switchEpoch += 1
+    // An in-flight cancellation must record its continuation before any
+    // waited message is admitted, even when the switch is withdrawn.
+    if (!this.switchCancellation) void this.runtime.releaseSwitchWait()
+  }
+
+  private switchBoundMs(): number {
+    const minutes = this.options.switchTurnBoundMinutes?.() ?? DEFAULT_CHAT_SETTINGS.updateTurnBoundMinutes
+    const sane = Number.isFinite(minutes) && minutes >= 1 ? minutes : DEFAULT_CHAT_SETTINGS.updateTurnBoundMinutes
+    return sane * 60_000
   }
 
   private pollSwitch(): void {
     this.switchPoll = this.timer.setTimeout(() => {
       this.switchPoll = null
-      const quiet = listOpenTurns(this.runtime.instance).length === 0 && this.runtime.working() === 0
-        && releaseBackgroundBusy() === 0 && this.launches === 0
-      if (!quiet) return this.pollSwitch()
-      // Refused from here on; the gateway shows the person that Poise is updating.
-      pauseReleaseBackground()
-      this.runtime.startDrain('service')
-      // The drain governs from here: the switch is no longer waiting for quiet.
-      markReleaseSwitch(false)
-      this.drainOn = true
-      this.log(`[service] restarting on release ${this.switchTo}; running agent calls carry on`)
-      if (!(this.options.restart ?? requestUpdateRestart)()) {
-        this.log('[service] the restart was refused; staying on this release')
-        this.lift()
-        this.switchTo = null
+      if (this.switchTo === null) return
+      if (this.switchCancellation) return this.pollSwitch()
+      if (this.switchIsQuiet()) return this.restartForSwitch()
+      if (this.switchPendingSince !== null && this.now() - this.switchPendingSince >= this.switchBoundMs()) {
+        return this.expireSwitchBound()
       }
+      return this.pollSwitch()
     }, SWITCH_POLL_MS)
+  }
+
+  private switchIsQuiet(): boolean {
+    const held = this.runtime.relayHeldSessions()
+    return listOpenTurns(this.runtime.instance).every((turn) => held.has(turn.sessionId))
+      && this.runtime.working() === 0 && releaseBackgroundBusy() === 0 && this.launches === 0
+  }
+
+  private restartForSwitch(): void {
+    if (this.switchTo === null) return
+    // Cancellation settles Chat turns, not every operation or launch the
+    // server owns. Close admission only after the complete quiet gate holds.
+    if (!this.switchIsQuiet()) {
+      if (this.switchPoll === null) this.pollSwitch()
+      return
+    }
+    // Refused from here on; the gateway shows the person that Poise is updating.
+    pauseReleaseBackground()
+    this.runtime.startDrain('service')
+    markReleaseSwitch(false)
+    this.drainOn = true
+    this.log(`[service] restarting on release ${this.switchTo}; running agent calls and relay-held chat turns carry on`)
+    this.restarting = true
+    if (!(this.options.restart ?? requestUpdateRestart)()) {
+      this.restarting = false
+      this.log('[service] the restart was refused; staying on this release')
+      this.lift()
+      this.switchTo = null
+      this.switchPendingSince = null
+      if (!this.switchCancellation) void this.runtime.releaseSwitchWait()
+    }
+  }
+
+  /** The switch bound passed with unheld turns still running: cancel them
+   *  through the normal cancel path, record the sessions, and restart.
+   *  Turns that finished or failed on their own while the cancels landed
+   *  were not interrupted — only turns still open or cancelled are resumed. */
+  private expireSwitchBound(): void {
+    const release = this.switchTo
+    const epoch = this.switchEpoch
+    if (release === null || this.switchPendingSince === null) return
+    const waitedMinutes = Math.round((this.now() - this.switchPendingSince) / 60_000)
+    this.log(`[service] release ${release} waited ${waitedMinutes} minutes for its turns; cancelling them and restarting`)
+    const held = this.runtime.relayHeldSessions()
+    const targets = this.runtime.runningTurnSessions().filter(({ sessionId }) => !held.has(sessionId))
+    const cancellation = (async () => {
+      await Promise.all(targets.map(({ sessionId }) => this.runtime.cancel(sessionId).catch((error: unknown) =>
+        this.log(`[service] cancelling ${sessionId.slice(0, 8)} for the switch failed: ${error instanceof Error ? error.message : String(error)}`))))
+      this.runtime.recordSwitchInterrupted(targets.filter(({ sessionId, turnId }) => {
+        if (getOpenTurn(sessionId)?.turnId === turnId) return true
+        const terminal = findEvent(sessionId, (event) => event.type === 'turn.finished' && event.turnId === turnId)
+        return terminal?.event.type === 'turn.finished' && terminal.event.stopReason === 'cancelled'
+      }))
+      // Cancellation may outlive a withdrawal and a fresh request for the
+      // same release. That newer switch owns its own turn set and deadline.
+      if (this.switchEpoch !== epoch) {
+        this.log(`[service] the switch to ${release} was superseded while cancellation settled`)
+        return
+      }
+      this.restartForSwitch()
+    })().catch((error: unknown) => this.log(`[service] the switch to ${release} failed: ${error instanceof Error ? error.message : String(error)}`)).finally(() => {
+      if (this.switchCancellation !== cancellation) return
+      this.switchCancellation = null
+      if (this.switchTo === null && !this.restarting) void this.runtime.releaseSwitchWait()
+      else if (!this.restarting && this.switchPoll === null) this.pollSwitch()
+    })
+    this.switchCancellation = cancellation
   }
 
   /** Every call starts the lapse again: the gateway renews a drain by
@@ -318,6 +410,11 @@ export class ServiceControl {
     if (this.drainOn || this.switchTo !== null) this.lift()
     if (this.switchTo !== null) markReleaseSwitch(false)
     this.switchTo = null
+    this.switchPendingSince = null
+    this.switchEpoch += 1
+    this.switchCancellation = null
+    this.restarting = false
+    this.runtime.setSwitchPending(null)
   }
 
   private renewLapse(): void {

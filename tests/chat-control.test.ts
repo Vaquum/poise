@@ -744,6 +744,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(notice).toMatchObject({ kind: 'merge', conflict: true })
     expect(notice.blockers).toEqual(['Resolve the merge conflicts with main'])
     expect(notice.done).toHaveLength(3)
+    expect(notice.done).toContain('repository merge requirements satisfied and no conflicts')
     clock += 5 * 60_000
     await observeMerge(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
@@ -765,7 +766,8 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     clock += 5 * 60_000
     await observeMerge(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
-    expect(store.inbox(runtime.instance, parent.id)[0].body).toContain('Bring the branch up to date with main')
+    expect(store.inbox(runtime.instance, parent.id)[0].body).toContain('use the native merge queue when configured')
+    expect(store.inbox(runtime.instance, parent.id)[0].body).not.toContain('Bring the branch up to date')
   })
 
   it('leaves behind branches to merge-prs only when it is enabled, eligible and healthy', async () => {

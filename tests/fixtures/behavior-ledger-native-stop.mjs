@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
-import { once } from 'node:events'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import { Worker } from 'node:worker_threads'
 
 const require = createRequire(import.meta.url)
 const { root, observerBundle, workerBundle, sqliteModule } = JSON.parse(process.argv[2])
@@ -34,6 +34,12 @@ parentPort.on('message', request => {
 require(${JSON.stringify(workerBundle)});
 `)
 const observer = new BehaviorLedgerObserver({ path: databasePath, workerPath: instrumentedWorker })
+const originalTerminate = Worker.prototype.terminate
+let terminateCalls = 0
+Worker.prototype.terminate = function () {
+  terminateCalls++
+  return originalTerminate.call(this)
+}
 await observer.start()
 assert.equal((await observer.read({ operation: 'health' })).body.health.status, 'ok')
 const holder = new Database(databasePath)
@@ -59,12 +65,13 @@ try {
   observer.capture({ ...admission, admissionKey: 'queued', nativeId: 'queued' })
   const worker = observer.worker
   assert.ok(worker)
-  const exited = once(worker, 'exit')
+  const exited = observer.waitForExit()
   // Keep the lock through SQLite's error path, then allow health/close to finish.
   releaseTimer = setTimeout(unlock, 6500)
   const started = performance.now()
   await observer.stop()
   const callerMs = performance.now() - started
+  assert.equal(terminateCalls, 0, 'stop must not terminate an active native request')
   assert.ok(callerMs >= 1800 && callerMs < 3500, `stop budget: ${callerMs}`)
   assert.equal(observer.worker, worker, 'active worker must stay tracked after the caller deadline')
   assert.notEqual(worker.threadId, -1, 'the native request must remain alive')
@@ -73,6 +80,7 @@ try {
   assert.equal(pending.pending, 1)
   assert.equal(pending.dropped, 1, 'only undispatched capture is lost at the deadline')
   await exited
+  assert.equal(terminateCalls, 0, 'native work must settle without forced termination')
   assert.equal(observer.worker, null, 'worker is released only on actual exit')
   const journal = JSON.parse(readFileSync(databasePath + '.coverage.json', 'utf8'))
   assert.equal(journal.closed, true)
@@ -83,4 +91,6 @@ try {
   clearTimeout(releaseTimer)
   unlock()
   await observer.stop()
+  await observer.waitForExit()
+  Worker.prototype.terminate = originalTerminate
 }
