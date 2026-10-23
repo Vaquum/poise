@@ -74,7 +74,7 @@ interface ReadinessBudget {
   deadline: number
   signal: AbortSignal
   cursors: Map<string, number>
-  session: (id: string) => Pick<SessionRecord, 'status' | 'lastSeq'> | undefined
+  session: (id: string) => Pick<SessionRecord, 'status' | 'lastSeq'> | null | undefined
   events: (id: string, after: number) => ChatEvent[]
   tick: () => Promise<void>
   rejected?: () => string | undefined
@@ -84,11 +84,11 @@ function readinessBudget(deadline: number, signal: AbortSignal): ReadinessBudget
   return { deadline, signal, cursors: new Map(), session: id => observed.get(id),
     events: (id, after) => observed.events(id, after).events.map(row => row.event), tick: () => delivery.tick() }
 }
-function slotFailure(phase: 'busy' | 'waiting' | 'board', session: Pick<SessionRecord, 'status' | 'queuedBehind'> | undefined, prompted: boolean): string | undefined {
+function slotFailure(phase: 'busy' | 'waiting' | 'board', session: Pick<SessionRecord, 'status' | 'queuedBehind'> | null | undefined, prompted: boolean): string | undefined {
   if (phase === 'waiting' && (prompted || session?.status === 'running')) return 'the capped chat started'
   if (phase !== 'waiting' && session?.queuedBehind === SLOT_WAIT_REASON) return 'the required turn is waiting for a free agent slot'
 }
-function boardFailure(state: Pick<SwitchboardState, 'status' | 'error'>, session: Pick<SessionRecord, 'status' | 'queuedBehind'> | undefined, prompted: boolean): string | undefined {
+function boardFailure(state: Pick<SwitchboardState, 'status' | 'error'>, session: Pick<SessionRecord, 'status' | 'queuedBehind'> | null | undefined, prompted: boolean): string | undefined {
   return state.status === 'stopped' && state.error ? state.error : slotFailure('board', session, prompted)
 }
 async function withinReadiness<T>(pending: Promise<T>, label: string, budget: ReadinessBudget): Promise<T> {
