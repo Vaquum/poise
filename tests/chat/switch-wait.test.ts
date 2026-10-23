@@ -342,6 +342,9 @@ describe('the switch bound', () => {
       expect(timer.timers.size).toBe(1)
       release()
       await until(() => logs.some(line => line.includes('superseded while cancellation settled')))
+      // Cancellation can settle before the turn's workspace refresh and
+      // operation chain. Fire the new poll only once its quiet gate holds.
+      await until(() => storage.listOpenTurns(w.instance).length === 0 && w.runtime.working() === 0)
       timer.fire()
       expect(restart).toHaveBeenCalledTimes(1)
       expect(w.runtime.switchPending?.release).toBe('r3')
