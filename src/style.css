@@ -3747,19 +3747,18 @@ tr:hover .stop-btn { opacity: 1; }
    the conversation stays readable on narrower viewports.
    ───────────────────────────────────────────────────────────────────────── */
 
-#chat-panel,
 #chat-side-pane {
   position: fixed;
   /* Below the control bar, like the other fixed panels. The bar is a
      full-width opaque band at z-index 130, so a panel starting at y=0 has
      its own header — including .chat-close, which is the ONLY way to close
-     this pane (there is no Escape handler in chat-pane.ts) — painted over
-     and click-swallowed. Both lines are load-bearing: offsetting the top
-     without shortening the height pushes the composer off the bottom. */
+     this pane — painted over and click-swallowed. Both lines are
+     load-bearing: offsetting the top without shortening the height pushes
+     the composer off the bottom. */
   top: var(--app-bar-h, 96px);
   left: 0;
   /* Width is draggable — the handle on the trailing edge writes --chat-w, and
-     chat-pane.ts persists it. 25vw is only the starting point. */
+     chat-side-pane.ts persists it. 25vw is only the starting point. */
   width: var(--chat-w, 25vw);
   min-width: 360px;
   max-width: 90vw;
@@ -3775,12 +3774,10 @@ tr:hover .stop-btn { opacity: 1; }
   overflow: hidden;
 }
 
-#chat-panel.open,
 #chat-side-pane.open { transform: translateX(0); }
 
 /* A card's Chat session beside Current: header extras, the surface column,
-// the Earlier conversation block and the command cards. The pane frame
-// above is shared with the legacy pane until #370. */
+// the Earlier conversation block and the command cards. */
 .chat-pane-state {
   font-size: 0.75rem;
   color: var(--text-tertiary);
@@ -4193,10 +4190,8 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
   text-overflow: ellipsis;
 }
 
-/* Edit cards — rendered when the chat-pane is opened with
-   parseEdits: true (currently: the editor's toolbar chat) and the
-   agent reply parses cleanly into a StructuredReply with edits.
-   Inert in this slice — no accept/decline, no hover-to-doc coupling.
+/* Edit cards — rendered when an agent reply parses cleanly into a
+   StructuredReply with edits.
    The card sits below the agent's `chat` prose, indented a touch so
    it reads as "attached to" that turn rather than free-floating.
    Visual idiom: subtle tinted rows for old/new, with a leading -/+
@@ -4746,9 +4741,8 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
 }
 .editor-bar-right { gap: var(--sp-3); }
 
-/* + and × icon buttons — same ghost rhythm as the chat-pane / card
-   icons so the editor's chrome reads in the same vocabulary as the
-   rest of the app. */
+/* + and × icon buttons — same ghost rhythm as the card icons so the
+   editor's chrome reads in the same vocabulary as the rest of the app. */
 .editor-bar-btn {
   width: 26px;
   height: 26px;
@@ -5457,6 +5451,107 @@ body.editor-writer-mode .editor-focus-btn:hover { color: var(--text); }
   overflow: hidden;
 }
 .editor-annotation-panel[hidden] { display: none; }
+
+/* Inline threads live in a layer inside .editor-page, beside #editor-doc —
+   never as children of the doc, whose children are all source lines. The
+   layer itself takes no clicks; the thread and markers do. */
+.editor-inline-threads {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 5;
+}
+.editor-inline-thread {
+  position: absolute;
+  left: 0;
+  right: 0;
+  pointer-events: auto;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, rgba(0,0,0,0.12));
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+}
+.editor-inline-thread-flow {
+  position: static;
+  margin: var(--sp-2) 0 var(--sp-4);
+}
+.editor-inline-thread-flow .editor-inline-thread-notch { display: none; }
+.editor-inline-thread[hidden] { display: none; }
+.editor-inline-thread-notch {
+  position: absolute;
+  top: -6px;
+  width: 10px;
+  height: 10px;
+  margin-left: -5px;
+  background: var(--surface, #fff);
+  border-left: 1px solid var(--border, rgba(0,0,0,0.12));
+  border-top: 1px solid var(--border, rgba(0,0,0,0.12));
+  transform: rotate(45deg);
+}
+.editor-inline-thread-header {
+  display: flex;
+  gap: var(--sp-2);
+  justify-content: flex-end;
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border, rgba(0,0,0,0.08));
+}
+.editor-inline-thread-header button {
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim, #666);
+  cursor: pointer;
+  border-radius: 4px;
+}
+.editor-inline-thread-header button:hover {
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.05);
+}
+.editor-inline-thread-section { padding: var(--sp-2) var(--sp-3) 0; }
+.editor-inline-thread-note label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim, #666);
+}
+.editor-inline-thread-private {
+  padding: var(--sp-2) var(--sp-3) 0;
+  font-size: 12px;
+  color: var(--text-dim, #666);
+}
+.editor-inline-thread-surface {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 60vh;
+  padding: 0 var(--sp-1) var(--sp-1);
+}
+.editor-inline-thread-surface .chat-surface-transcript {
+  max-height: 32vh;
+  overflow-y: auto;
+}
+.editor-thread-marker {
+  position: absolute;
+  pointer-events: auto;
+  white-space: nowrap;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, rgba(0,0,0,0.12));
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--text-dim, #666);
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+.editor-thread-marker:hover { color: var(--text); }
+.editor-thread-marker[hidden] { display: none; }
 .editor-annotation-text {
   width: 100%;
   min-height: 60px;
