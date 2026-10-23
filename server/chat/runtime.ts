@@ -766,7 +766,7 @@ export class ChatRuntime extends EventEmitter {
       if (protectedSessions.has(entry.sessionId) || this.recoveryOwnedElsewhere(entry.sessionId)) continue
       if (this.waitingPromptBlocked(entry)) { blocked.add(entry.sessionId); continue }
       if (!this.takeWaitingPrompt(entry.id)) continue
-      await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery)
+      await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery, entry)
     }
   }
 
@@ -803,16 +803,16 @@ export class ChatRuntime extends EventEmitter {
    *  session is dropped; one that fails transiently waits for the next
    *  restart; one that can never run says so on its session. Never throws:
    *  one bad entry must not stop the entries behind it. */
-  private async deliverWaitingPrompt(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata): Promise<WaitingDelivery> {
+  private async deliverWaitingPrompt(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata, waiting?: WaitingPrompt): Promise<WaitingDelivery> {
     try {
-      return await this.deliverWaitingPromptInner(sessionId, prompt, kind, recovery)
+      return await this.deliverWaitingPromptInner(sessionId, prompt, kind, recovery, waiting)
     } catch (error) {
       this.emit('log', `[chat] ${kind} prompt for ${sessionId.slice(0, 8)} failed: ${error instanceof Error ? error.message : String(error)}`)
       return 'deferred'
     }
   }
 
-  private async deliverWaitingPromptInner(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata): Promise<WaitingDelivery> {
+  private async deliverWaitingPromptInner(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata, waiting?: WaitingPrompt): Promise<WaitingDelivery> {
     const short = sessionId.slice(0, 8)
     const drop = (message: string): void => {
       this.emit('log', `[chat] ${kind} prompt for ${short} dropped: ${message}`)
@@ -827,7 +827,8 @@ export class ChatRuntime extends EventEmitter {
       this.emit('log', `[chat] ${kind} prompt for ${short} dropped: ${message}`)
     }
     const defer = (message: string): void => {
-      this.writeWaitingPrompts([...this.readWaitingPrompts(), { id: randomUUID(), sessionId, prompt, createdAt: new Date().toISOString(), ...(recovery ? { recovery } : {}) }])
+      const entry = waiting ?? { id: randomUUID(), sessionId, prompt, createdAt: new Date().toISOString(), queueBefore: [], ...(recovery ? { recovery } : {}) }
+      this.writeWaitingPrompts(kind === 'interrupted' ? [entry, ...this.readWaitingPrompts()] : [...this.readWaitingPrompts(), entry])
       this.emit('log', `[chat] ${kind} prompt for ${short} still waiting: ${message}`)
     }
     try {
@@ -2242,7 +2243,7 @@ export class ChatRuntime extends EventEmitter {
       || session.record.contextResetting || session.record.orphanNotice || session.turn || this.queuePumps.has(id) || this.queueTimers.has(id)) return
     const waiting = this.readWaitingPrompts().find(entry => entry.sessionId === id)
     if (waiting && !this.waitingPromptBlocked(waiting) && !this.recoveryOwnedElsewhere(id) && this.takeWaitingPrompt(waiting.id)) {
-      void this.deliverWaitingPrompt(id, waiting.prompt, 'waiting', waiting.recovery).then(outcome => {
+      void this.deliverWaitingPrompt(id, waiting.prompt, 'waiting', waiting.recovery, waiting).then(outcome => {
         // A permanent refusal must not strand the normal queue. A transient
         // deferral remains for recovery instead of recursively retrying here.
         if (outcome === 'dropped') this.scheduleQueue(session)
