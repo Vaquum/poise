@@ -2494,7 +2494,7 @@ async function tickReviewNewPrs(): Promise<void> {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
           captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
-            outcome: 'not_required', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+            outcome: 'no_op', head: bundle.expectedHead, completedAt: new Date().toISOString() })
           return
         }
         if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {

@@ -185,7 +185,7 @@ describe('review checkout in the launch phase', () => {
     const competing = db.claimPrOperationOwned(`${pr.repo}#${pr.number}`, 65_000)
     expect(competing).not.toBeNull()
     if (competing) db.releasePrOperationOwned(competing)
-    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ state: 'completed', outcome: 'not_required' }))
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ state: 'completed', outcome: 'no_op' }))
   })
 
   it('starts no checkout when preparation fails before the claim', async () => {
