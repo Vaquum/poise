@@ -40,10 +40,12 @@ const CAPTURE_RETRY_MS = 250
 /** Capture never awaits or performs filesystem/SQLite work on the behavior thread. */
 export class BehaviorLedgerObserver {
   private worker: Worker | null = null
+  private workerExited: Promise<void> = Promise.resolve()
   private initializing: Promise<void> | null = null
   private ready = false
   private closed = false
   private stopping = false
+  private stopTimedOut = false
   private stopPromise: Promise<void> | null = null
   private failed = false
   private sequence = 0
@@ -86,7 +88,7 @@ export class BehaviorLedgerObserver {
 
   private async initialize(): Promise<void> {
     const asset = await this.asset()
-    if (this.closed) return
+    if (this.closed) { this.removeDevelopmentAsset(); return }
     const configured = process.env.POISE_DB
     const path = this.options.path ?? (configured === ':memory:' ? ':memory:'
       : join(configured ? dirname(resolve(configured)) : join(homedir(), '.poise'), 'behavior-ledger.db'))
@@ -95,6 +97,7 @@ export class BehaviorLedgerObserver {
       resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 8, stackSizeMb: 4 },
     })
     this.worker = worker
+    this.workerExited = new Promise(resolveExit => { worker.once('exit', () => resolveExit()) })
     await new Promise<void>((resolveReady, rejectReady) => {
       // The startup wait bounds its caller; elapsed time does not prove worker failure.
       const timer = setTimeout(resolveReady, 2_000)
@@ -122,7 +125,12 @@ export class BehaviorLedgerObserver {
       })
       const fail = () => { clearTimeout(timer); rejectReady(new Error('ledger_worker_stopped')); this.fail() }
       worker.on('error', fail)
-      worker.on('exit', fail)
+      worker.on('exit', () => {
+        if (this.worker === worker) this.worker = null
+        if (this.stopping) this.closed = true
+        fail()
+        this.removeDevelopmentAsset()
+      })
     })
   }
 
@@ -236,7 +244,7 @@ export class BehaviorLedgerObserver {
     this.health = message.body.health
     this.setPending(message.pending)
     if (job.operation === 'capture') {
-      if (message.status >= 500 && job.observation?.type !== 'loss') {
+      if (message.status >= 500 && job.observation?.type !== 'loss' && !this.stopTimedOut) {
         // Storage-side failure: hold the job at the head for retry instead
         // of consuming it, so an outage delays captures without losing them.
         job.dispatchedAt = undefined
@@ -254,6 +262,7 @@ export class BehaviorLedgerObserver {
       } else if (message.status >= 400) this.lose(1)
     }
     if (job.operation === 'read') this.reads--
+    if (job.operation === 'close') this.closed = true
     if (job.resolve) {
       clearTimeout(job.timer)
       job.resolve({ status: message.status, body: { ...message.body, health: this.projectedHealth() },
@@ -294,13 +303,14 @@ export class BehaviorLedgerObserver {
 
   private fail(): void {
     if (this.failed) return
+    // Readiness has completed native initialization, and no dispatched
+    // request means the worker is verifiably idle rather than in SQLite.
+    const idle = this.ready && this.active === null
     this.failed = true
     this.ready = false
     clearTimeout(this.retryTimer)
     this.retryTimer = undefined
     const worker = this.worker
-    this.worker = null
-    if (worker) void worker.terminate()
     const jobs = [...(this.active ? [this.active] : []), ...this.queue]
     this.active = null
     this.queue = []
@@ -315,6 +325,22 @@ export class BehaviorLedgerObserver {
       clearTimeout(job.timer)
       job.resolve(this.unavailable(job.request ?? { operation: 'health' }))
     }
+    if (worker && idle) {
+      void worker.terminate()
+    } else if (worker) {
+      // An active request or unfinished initialization may still be in
+      // native SQLite. Keep it tracked and close cooperatively.
+      worker.ref()
+      if (this.unreportedLoss) worker.postMessage({ id: ++this.sequence, operation: 'capture',
+        observation: { type: 'loss', count: this.unreportedLoss } } satisfies LedgerWorkerRequest)
+      worker.postMessage({ id: ++this.sequence, operation: 'close' } satisfies LedgerWorkerRequest)
+    } else this.removeDevelopmentAsset()
+  }
+
+  private removeDevelopmentAsset(): void {
+    if (!this.developmentDirectory) return
+    rmSync(this.developmentDirectory, { recursive: true, force: true })
+    this.developmentDirectory = null
   }
 
   private captureCaller(nativeId: string, observation: LedgerCaller): void {
@@ -390,7 +416,14 @@ export class BehaviorLedgerObserver {
     return this.stopPromise
   }
 
+  /** After stop(), wait for actual exit before removing the worker's files. */
+  async waitForExit(): Promise<void> {
+    await this.initializing
+    await this.workerExited
+  }
+
   private async finishStop(): Promise<void> {
+    if (!this.initializing && !this.worker) { this.closed = true; return }
     let timer: ReturnType<typeof setTimeout> | undefined
     if (!this.failed) await Promise.race([
       new Promise<void>((resolveClose) => {
@@ -403,9 +436,28 @@ export class BehaviorLedgerObserver {
       }),
     ])
     clearTimeout(timer)
-    this.closed = true
-    this.fail()
-    if (this.developmentDirectory) rmSync(this.developmentDirectory, { recursive: true, force: true })
+    if (this.closed || this.failed) return
+    // The caller's budget does not prove the native request ended. Keep
+    // that worker referenced until it replies and closes its own SQLite.
+    this.stopTimedOut = true
+    clearTimeout(this.retryTimer)
+    this.retryTimer = undefined
+    this.retryAt = 0
+    const queued = this.queue
+    this.queue = queued.filter((job) => job.operation === 'close')
+    for (const job of queued) {
+      if (job.operation === 'capture') {
+        this.captures--
+        this.captureBytes -= job.bytes
+        if (job.observation?.type !== 'loss') this.lose(1)
+        if (job.observation?.type === 'admit') this.admitted.delete(job.observation.nativeId)
+      }
+      if (job.operation !== 'read') continue
+      this.reads--
+      clearTimeout(job.timer)
+      job.resolve?.(this.unavailable(job.request ?? { operation: 'health' }))
+    }
+    this.pump()
   }
 }
 

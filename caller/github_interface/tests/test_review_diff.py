@@ -1,5 +1,7 @@
+import json
 import subprocess
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
@@ -140,3 +142,74 @@ class TestPacketBudget(IsolatedAsyncioTestCase):
         self.assertEqual(packet['excluded_files'][0]['path'], 'data.csv')
         self.assertNotIn(':(literal)data.csv', diff_calls[-1])
         self.assertEqual(len(packet['diff']), 1000)
+
+
+class TestBoundedCoverage(IsolatedAsyncioTestCase):
+    async def _packet(self, names, per_file, diff_limit, packet_limit=None, context=None):
+        base, head = 'a' * 40, 'b' * 40
+        oids = {name: f'{index + 1:040d}' for index, name in enumerate(names)}
+        raw = b''.join(
+            f':000000 100644 {"0" * 40} {oids[name]} A\0{name}\0'.encode()
+            for name in names
+        )
+
+        def git_result(cwd, env, *args, limit):
+            if '--raw' in args:
+                return raw
+            if '--find-renames' in args:
+                out = b'x' * sum(1 for arg in args if arg.startswith(':(literal)')) * per_file
+                if len(out) > limit:
+                    raise rd.ReviewPacketTooLarge(f'{rd.PACKET_LIMIT_CODE}: retained review diff exceeds {limit} bytes')
+                return out
+            return b''
+
+        client = AsyncMock()
+        client.token = 'test-token'
+        client.get.return_value = {'merge_base_commit': {'sha': base}}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(rd, '_git', side_effect=git_result))
+            stack.enter_context(patch.object(
+                rd, '_blob_sizes', AsyncMock(return_value={oid: 100 for oid in oids.values()})))
+            stack.enter_context(patch.object(rd, 'MAX_DIFF_BYTES', diff_limit))
+            if packet_limit is not None:
+                stack.enter_context(patch.object(rd, 'MAX_PACKET_BYTES', packet_limit))
+            return await rd.review_diff(client, 'o', 'r', {'base': {'sha': base}, 'head': {'sha': head}}, context)
+
+    async def test_oversized_diff_yields_bounded_packet_with_explicit_omitted_files(self):
+        packet = await self._packet(['a.py', 'b.py', 'c.py', 'd.py', 'e.py', 'data.csv'], 1000, 2500)
+        self.assertEqual(len(packet['diff']), 2000)
+        self.assertEqual([entry['filename'] for entry in packet['files']],
+                         ['a.py', 'b.py'])
+        self.assertEqual(packet['files'][0],
+                         {'filename': 'a.py', 'status': 'added', 'old_mode': '000000', 'new_mode': '100644'})
+        self.assertEqual([entry['path'] for entry in packet['omitted_files']],
+                         ['c.py', 'd.py', 'e.py'])
+        for entry in packet['omitted_files']:
+            self.assertIn('not reviewed', entry['reason'])
+        self.assertEqual([entry['path'] for entry in packet['excluded_files']], ['data.csv'])
+        self.assertEqual(packet['merge_base_sha'], 'a' * 40)
+        self.assertIn('partial', packet['review_scope'])
+        self.assertIn('3 of 5', packet['review_scope'])
+        self.assertIn('omitted_files', packet['review_scope'])
+        self.assertLessEqual(len(json.dumps(packet).encode('utf-8')), rd.MAX_PACKET_BYTES)
+
+    async def test_bounded_coverage_is_deterministic(self):
+        first = await self._packet(['a.py', 'b.py', 'c.py', 'd.py', 'e.py'], 1000, 2500)
+        second = await self._packet(['a.py', 'b.py', 'c.py', 'd.py', 'e.py'], 1000, 2500)
+        self.assertEqual(first, second)
+
+    async def test_packet_budget_shrinks_coverage_before_the_prompt_limit(self):
+        packet = await self._packet(['a.py', 'b.py', 'c.py'], 2000, 100_000,
+                                    packet_limit=7500, context={'body': 'x' * 4000})
+        self.assertEqual(len(packet['diff']), 2000)
+        self.assertEqual([entry['filename'] for entry in packet['files']], ['a.py'])
+        self.assertEqual([entry['path'] for entry in packet['omitted_files']], ['b.py', 'c.py'])
+
+    async def test_single_file_over_budget_stays_an_explicit_typed_failure(self):
+        with self.assertRaisesRegex(rd.ReviewPacketTooLarge, 'review_packet_too_large'):
+            await self._packet(['big.py'], 5000, 2500)
+
+    async def test_small_diff_carries_no_omitted_coverage_key(self):
+        packet = await self._packet(['a.py', 'b.py'], 1000, rd.MAX_DIFF_BYTES)
+        self.assertEqual(len(packet['diff']), 2000)
+        self.assertNotIn('omitted_files', packet)

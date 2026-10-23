@@ -27,6 +27,10 @@ export const AGENT_LABELS: Record<AgentId, string> = {
  *  distinct from queueing behind another checkout holder. */
 export const SLOT_WAIT_REASON = 'waiting for a free agent slot'
 
+/** Why a session is `queued` while a release switch is pending: its next turn
+ *  waits behind the Poise update instead of starting. */
+export const SWITCH_WAIT_REASON = 'waiting for the Poise update'
+
 /** Which optional controls the view shows for a session. `permissions`,
  *  `questions`, `steer` and `resume` are required of every v1 adapter; the
  *  rest are honest flags — a control for a false flag is hidden, never faked. */
@@ -74,9 +78,11 @@ export interface BranchBinding {
 export interface QueuedMessage {
   /** Validated attachment/mention provenance across an isolated Poise handoff. */
   sourceSessionId?: string
-  /** Actor whose deferred steer this row continues; dispatched as source
-   *  data under that actor, never as the person's request. */
-  source?: ChatActor | PoiseActor
+  /** Original deferred turn provenance, including a recovered timer firing;
+   *  dispatched as that source, never as the person's request. */
+  source?: TurnSource
+  /** Server-owned request context retained when update recovery must queue. */
+  recovery?: { shown?: PromptInput, implementsChange?: boolean, switches?: string[] }
   id: string
   prompt: PromptInput
   agent: AgentId
@@ -370,6 +376,11 @@ export interface PromptInput {
   mentions: Mention[]
 }
 
+/** Admitting a prompt starts a turn at once — or, while a release switch is
+ *  pending, waits it behind the Poise update. A wait id names the waiting
+ *  prompt until it starts; it is never a turn id. */
+export type PromptReceipt = { turnId: string } | { waitId: string }
+
 // ── Events: runtime → view ────────────────────────────────────────────────
 
 export type ChatEvent =
@@ -591,6 +602,15 @@ export interface SwitchboardState {
 }
 
 export const WS_PATH = '/ws/chat'
+
+/** Recursive canonical form: nested keys count, so two values that differ
+ *  below the top level never compare equal. Object key order is normalized;
+ *  array order is significant. */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined'
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  return `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as any)[key])}`).join(',')}}`
+}
 
 /** Hard bounds shared by the server and the client. */
 export const CHAT_LIMITS = {

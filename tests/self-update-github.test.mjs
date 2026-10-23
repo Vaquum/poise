@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   GitHubError, REQUIRED_CONTEXTS, assertPullRequestIdentity, assertRepositoryIdentity, createGitHubClient,
-  evaluateCi, isUncertain, verifyMergeCommit,
+  evaluateCi, isUncertain, verifyMergeCommit, verifyQueuedMergeCommit,
 } from '../scripts/self-update/github.mjs'
 import { REPOSITORY } from '../scripts/self-update/paths.mjs'
 
@@ -98,6 +98,33 @@ describe('merge commit verification', () => {
   })
 })
 
+describe('queued integration verification', () => {
+  const newerBase = '7'.repeat(40)
+  const commit = { sha: MERGE, parents: [{ sha: newerBase }, { sha: HEAD }], commit: { tree: { sha: '8'.repeat(40) } } }
+  const options = { commit, mergeSha: MERGE, expectedBase: MAIN, expectedHead: HEAD, mainSha: '9'.repeat(40) }
+
+  it('accepts a changed integration tree only with base and live-main ancestry', async () => {
+    const calls = []
+    await expect(verifyQueuedMergeCommit({ ...options, compare: async (base, head) => {
+      calls.push([base, head])
+      return { status: 'ahead', behind_by: 0 }
+    } })).resolves.toBe(MERGE)
+    expect(calls).toEqual([[MAIN, newerBase], [MERGE, options.mainSha]])
+  })
+
+  it('rejects a substituted head, missing base, and a merge outside live main', async () => {
+    const ahead = async () => ({ status: 'ahead', behind_by: 0 })
+    await expect(verifyQueuedMergeCommit({ ...options, commit: { ...commit, parents: [{ sha: newerBase }, { sha: MAIN }] }, compare: ahead })).rejects.toThrow(/pinned head/)
+    await expect(verifyQueuedMergeCommit({ ...options, compare: async () => ({ status: 'diverged', behind_by: 1 }) })).rejects.toThrow(/recorded base/)
+    await expect(verifyQueuedMergeCommit({ ...options, compare: async (base) => base === MAIN ? ahead() : { status: 'behind', behind_by: 1 } })).rejects.toThrow(/live main/)
+  })
+
+  it('requires the trusted merge_group workflow, not a pull-request run for that SHA', () => {
+    expect(evaluateCi({ headSha: HEAD, checkRuns: checkRuns(), workflowRuns: [workflowRun()], event: 'merge_group' }).status).toBe('pending')
+    expect(evaluateCi({ headSha: HEAD, checkRuns: checkRuns(), workflowRuns: [workflowRun({ event: 'merge_group' })], event: 'merge_group' }).status).toBe('success')
+  })
+})
+
 describe('GitHub client', () => {
   function client(handler, options = {}) {
     const calls = []
@@ -138,6 +165,28 @@ describe('GitHub client', () => {
     expect(calls[0].url).toBe(`https://api.github.com/repos/${REPOSITORY}/pulls/12/merge`)
     expect(JSON.parse(calls[0].init.body)).toEqual({ sha: HEAD, merge_method: 'merge' })
     await expect(api.mergePullRequest(12, { sha: 'abc' })).rejects.toThrow(/exact head SHA/)
+  })
+
+  it('reads native queue configuration and enqueues with an atomic expected head', async () => {
+    const { api, calls } = client((url, init) => {
+      const { query } = JSON.parse(init.body)
+      return response(200, { data: query.startsWith('query') ? { repository: { pullRequest: {
+        id: 'PR_12', headRefOid: HEAD, isMergeQueueEnabled: true, merged: false, state: 'OPEN',
+        mergeQueue: { configuration: { mergeMethod: 'MERGE' } }, mergeQueueEntry: null,
+      } } } : { enqueuePullRequest: { mergeQueueEntry: { id: 'QUEUE_12', state: 'QUEUED' } } } })
+    })
+    expect(await api.getMergeQueue(12)).toMatchObject({ enabled: true, headSha: HEAD, mergeMethod: 'MERGE', entry: null, merged: false, state: 'OPEN' })
+    expect(await api.enqueuePullRequest('PR_12', { sha: HEAD })).toEqual({ id: 'QUEUE_12', state: 'QUEUED' })
+    expect(calls[1].url).toBe('https://api.github.com/graphql')
+    expect(JSON.parse(calls[1].init.body).variables.input).toEqual({ pullRequestId: 'PR_12', expectedHeadOid: HEAD })
+    await expect(api.enqueuePullRequest('PR_12', { sha: 'abc' })).rejects.toThrow(/exact head/)
+  })
+
+  it('fails loudly on GraphQL errors and missing queue configuration', async () => {
+    const rejected = client(() => response(200, { errors: [{ message: 'Head changed' }] }))
+    await expect(rejected.api.enqueuePullRequest('PR_12', { sha: HEAD })).rejects.toThrow(/Head changed/)
+    const missing = client(() => response(200, { data: { repository: { pullRequest: null } } }))
+    await expect(missing.api.getMergeQueue(12)).rejects.toThrow(/configuration/)
   })
 
   it('finds a pull request by exact head branch and opens one without maintainer edits', async () => {

@@ -21,7 +21,6 @@ import { memorySuffix } from '../memory-content'
 
 import { randomUUID } from 'node:crypto'
 import { basename, resolve, sep } from 'node:path'
-import type { ChildProcess } from 'node:child_process'
 import type {
   ApplyPatchApprovalResponse,
   ClientNotification,
@@ -33,9 +32,9 @@ import type {
 } from '../generated/codex'
 import { CHAT_LIMITS } from '../protocol'
 import type { ChatEvent, ContentBlock, PlanEntry, PromptInput, StopReason, ToolKind, ToolLocation, ToolStatus, TurnUsage } from '../protocol'
-import { RpcError, StdioRpc } from '../rpc'
+import { RpcError, StdioRpc, outboundRequests } from '../rpc'
 import { AdapterError } from './types'
-import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, PermissionRequest, TurnResult } from './types'
+import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, AgentProcess, PermissionRequest, ReplayInit, TurnResult } from './types'
 import { forCodex, type Skipped } from '../../extensions/types'
 import pkg from '../../../package.json'
 
@@ -159,6 +158,8 @@ interface ActiveTurn {
   id: string
   /** Codex turn id, known from the `turn/start` response or first event. */
   nativeId: string | null
+  /** Transcript diffs to replay verbatim instead of re-reading the disk. */
+  recalled: Map<string, { oldText: string, newText: string, oldExists: boolean, newExists: boolean }>
   done: boolean
   interruptRequested: boolean
   tools: Map<string, OpenTool>
@@ -287,7 +288,7 @@ function withTimeout(promise: Promise<void>, ms: number): Promise<boolean> {
 
 /** "Codex exited (code): last stderr lines" once the process is gone; the
  *  link's own reason when it is still running (a framing failure). */
-async function exitMessage(process: ChildProcess, link: StdioRpc, fallback: Error): Promise<string> {
+async function exitMessage(process: AgentProcess, link: StdioRpc, fallback: Error): Promise<string> {
   if (process.exitCode === null && process.signalCode === null) {
     const exited = new Promise<void>((resolveExit) => process.once('exit', () => resolveExit()))
     if (!(await withTimeout(exited, EXIT_GRACE_MS))) return fallback.message
@@ -299,7 +300,7 @@ async function exitMessage(process: ChildProcess, link: StdioRpc, fallback: Erro
 // ── Adapter ─────────────────────────────────────────────────────────────
 
 export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutMs?: number } = {}): Adapter {
-  let child: ChildProcess | null = null
+  let child: AgentProcess | null = null
   let rpc: StdioRpc | null = null
   let safeMode = false
   let threadId: string | undefined
@@ -335,7 +336,7 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
   // The link aborts `signal` when it fails; a handler still waiting on the
   // user then has nobody to answer, and StdioRpc discards the late reply.
   function serve<M extends ServerMethod>(method: M, handler: (params: ServerParams<M>, signal: AbortSignal) => Promise<ServerResponses[M]> | ServerResponses[M]): void {
-    rpc!.onRequest(method, (params, _id, signal) => handler(params as ServerParams<M>, signal))
+    rpc!.onRequest(method, (params, _id, signal) => handler(params as ServerParams<M>, signal), { replayCompleted: true })
   }
 
   // Events belong to the turn whose prompt() is pending. Codex reports the
@@ -547,6 +548,16 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
       if (seen.has(change.path)) continue
       seen.add(change.path)
       if (item.status === 'declined') continue // nothing reached the disk
+      const recalled = turn.recalled.get(`${item.id}\0${change.path}`)
+      if (recalled) {
+        // Replayed from the transcript: the disk moved on since this diff
+        // was recorded, so re-deriving it could only disagree.
+        emit({
+          type: 'diff', turnId: turn.id, toolId: item.id, diffId: randomUUID(), path: change.path,
+          oldText: recalled.oldText, newText: recalled.newText, oldExists: recalled.oldExists, newExists: recalled.newExists,
+        })
+        continue
+      }
       const after = await snapshot(change.path)
       const oldExists = change.kind.type !== 'add'
       let before: Snapshot = { ok: false, reason: 'no pre-image could be established' }
@@ -792,10 +803,12 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
 
   // ── Process lifecycle ───────────────────────────────────────────────
 
-  async function launch(): Promise<void> {
-    const process = await host.spawn('codex', ['app-server', '--listen', 'stdio://'])
-    child = process
-    const link = new StdioRpc(process, { label: LABEL, onStderr: (text) => { if (text.trim()) host.log(`${LABEL} stderr: ${text.trimEnd()}`) } })
+  /** Wire a link — a fresh child or a replayed relay peer — to the
+   *  turn handlers. The handshake stays with the caller: replay never
+   *  re-runs it against the running agent. */
+  function attachLink(peer: AgentProcess): void {
+    child = peer
+    const link = new StdioRpc(peer, { label: LABEL, onStderr: (text) => { if (text.trim()) host.log(`${LABEL} stderr: ${text.trimEnd()}`) } })
     rpc = link
     link.on('malformed', (frame: string) => logOnce('malformed', `${LABEL} sent a frame that is not JSON-RPC (dropped): ${frame}`))
     link.on('unhandled-notification', (method: string) => logOnce(`unhandled:${method}`, `${LABEL}: no handler for ${method} notifications`))
@@ -811,15 +824,19 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
       const turn = active
       if (!turn) return
       if (closing) { finish(turn, { stopReason: 'cancelled' }); return }
-      void exitMessage(process, link, error).then((message) => finish(turn, { stopReason: 'error', error: message }))
+      void exitMessage(peer, link, error).then((message) => finish(turn, { stopReason: 'error', error: message }))
     })
-    process.once('exit', (code, signal) => {
+    peer.once('exit', (code, signal) => {
       for (const listener of exitListeners) {
         try { listener(code, signal) } catch (error) { host.log(`${LABEL} exit listener failed: ${error instanceof Error ? error.message : String(error)}`) }
       }
     })
     registerNotifications()
     registerServerRequests()
+  }
+
+  async function launch(): Promise<void> {
+    attachLink(await host.spawn('codex', ['app-server', '--listen', 'stdio://']))
   }
 
   async function loadModel(wanted: string): Promise<{ model: v2.Model, available: string[] }> {
@@ -948,6 +965,7 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
       const turn: ActiveTurn = {
         id: turnId,
         nativeId: null,
+        recalled: new Map(),
         done: false,
         interruptRequested: false,
         tools: new Map(),
@@ -982,6 +1000,68 @@ export function createCodexAdapter(host: AdapterHost, options: { compactTimeoutM
       }
 
       return result.finally(() => signal.removeEventListener('abort', onAbort))
+    },
+
+    async replayTurn(init: ReplayInit): Promise<TurnResult> {
+      if (init.signal.aborted) return { stopReason: 'cancelled', terminate: true }
+      // Without the turn's initiating request the agent never heard it: that
+      // turn must be re-prompted, not replayed.
+      if (init.outboundTruncated) throw new AdapterError(AGENT, 'the relay cannot prove what Codex heard; the turn is interrupted instead', 'protocol')
+      const requestId = [...outboundRequests(init.outbound)].reverse().find(([, request]) => request.method === 'turn/start')?.[0]
+      if (requestId === undefined) throw new AdapterError(AGENT, 'the turn never reached Codex; it is interrupted instead', 'protocol')
+      if (active) throw new AdapterError(AGENT, `${LABEL} is already running a turn`, 'protocol')
+      threadId = init.session.nativeSessionId
+      modelId = init.session.modelId
+      effort = init.session.effort
+      efforts = init.session.efforts ?? []
+      safeMode = init.session.safeMode
+      attachLink(init.peer)
+      const replayLink = link()
+      replayLink.beginReplay(init.outbound)
+      const turn: ActiveTurn = {
+        id: init.turnId,
+        nativeId: null,
+        recalled: init.recalledDiffs,
+        done: false,
+        interruptRequested: false,
+        tools: new Map(),
+        streamed: new Set(),
+        pending: new Set(),
+        finishing: false,
+        resolve: () => {},
+      }
+      const result = new Promise<TurnResult>((resolveTurn) => { turn.resolve = resolveTurn })
+      active = turn
+      // The spooled turn/start answer adopts the native id exactly as the
+      // prompt path would have; the stream binds it too when that answer
+      // never arrived.
+      const orphan = (id: unknown, message: any) => {
+        if (id !== requestId) return
+        if (message?.error) {
+          finish(turn, { stopReason: 'error', error: `Codex could not start the turn: ${String(message.error.message || 'rpc error')}` })
+          return
+        }
+        const native = message?.result?.turn
+        if (!native || typeof native.id !== 'string') return
+        replayLink.off('orphan-response', orphan)
+        if (turn.nativeId === null && native.id !== lastFinishedNativeId) turn.nativeId = native.id
+        if (native.status !== 'inProgress') {
+          const stopReason = turnStopReason(native.status)
+          finish(turn, stopReason === 'error' ? { stopReason, error: describeTurnError(native.error) } : { stopReason })
+        }
+      }
+      replayLink.on('orphan-response', orphan)
+      const onAbort = () => { void adapter.cancel() }
+      init.signal.addEventListener('abort', onAbort, { once: true })
+      if (init.signal.aborted) onAbort()
+      void init.live.then(
+        () => replayLink.endReplay(),
+        (error) => replayLink.fail(error instanceof Error ? error : new Error(String(error))),
+      )
+      return result.finally(() => {
+        replayLink.off('orphan-response', orphan)
+        init.signal.removeEventListener('abort', onAbort)
+      })
     },
 
     async compact(_id, _memories, signal) {
