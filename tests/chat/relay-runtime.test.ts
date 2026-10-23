@@ -4,6 +4,7 @@
 // interrupt-and-resume with the transcript saying so.
 
 import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -40,6 +41,7 @@ interface FakeControls {
   failReplayAfterGate?: string
   /** Manual turns resolve with terminate: true. */
   terminateTurns?: boolean
+  startWorker?: { command: string, args: string[] }
 }
 
 class FakeAdapter implements Adapter {
@@ -61,6 +63,7 @@ class FakeAdapter implements Adapter {
   }
   async start(options: AdapterStartOptions) {
     this.alive = true
+    if (this.controls.startWorker) await this.host.spawn(this.controls.startWorker.command, this.controls.startWorker.args)
     this.nativeSessionId = options.resume || `native-${this.controls.adapters.length}`
     return { nativeSessionId: this.nativeSessionId, capabilities: this.capabilities, modelId: options.modelId, effort: options.effort, efforts: ['high', 'xhigh'] }
   }
@@ -183,6 +186,124 @@ describe('relay handover between servers', () => {
     await first.runtime.stop()
     return { first, session, peer, turnId }
   }
+
+  it.each(['local', 'adopted'] as const)('retains the %s worker and lease when the relay dies before its gate group', async (mode) => {
+    const instance = `poise-relay-dies-before-worker-${mode}:db`
+    const first = makeRuntime(instance)
+    first.controls.auto = false
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    first.runtime.prompt(session.id, { text: 'Prime the relay', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    first.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    const { turnId } = first.runtime.prompt(session.id, { text: 'Keep the checkout owned', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    let releaseReplay = () => {}
+    let owner = first
+    let activePeer = peer
+    const lock = await import('../../server/chat/checkout-lock')
+    const lease = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance })
+    try {
+      if (mode === 'adopted') {
+        // Flush TURN_START before the intentional server handover.
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        await first.runtime.stop()
+        owner = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [],
+          replayGate: new Promise<void>((resolve) => { releaseReplay = resolve }) })
+        await owner.runtime.recover()
+        await waitFor(() => owner.controls.replayTurns.length === 1)
+        activePeer = owner.controls.replayTurns[0].peer as RelayConnection
+      }
+      const token = lease.read()?.token
+      expect(token).toBeTruthy()
+      // The relay is a separate process. Hold the gate alive across relay
+      // death, so neither its exit nor the adapter's ending proves safety.
+      process.kill(peer.gatePid, 'SIGSTOP')
+      process.kill(peer.relayPid, 'SIGKILL')
+      await waitFor(() => !activePeer.healthy && !worker.pidAlive(peer.relayPid))
+      releaseReplay()
+      await waitFor(() => owner.runtime.get(session.id)?.status === 'error')
+      expect(ofType(owner.events, session.id, 'turn.finished')).toContainEqual(expect.objectContaining({ turnId }))
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
+      expect(storage.getWorker(session.id)?.gatePgid).toBe(peer.gatePgid)
+      expect(storage.getRelay(session.id)?.relayPid).toBe(peer.relayPid)
+      expect(lease.read()?.token).toBe(token)
+      expect(owner.runtime.get(session.id)?.orphanNotice).toContain('still alive after shutdown')
+      await expect(owner.runtime.close(session.id)).rejects.toThrow('still alive after shutdown')
+      expect(lease.read()?.token).toBe(token)
+      const contender = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: 'different-session', ownerLabel: '', instance })
+      expect(contender.tryAcquire().acquired).toBe(false)
+      process.kill(peer.gatePid, 'SIGCONT')
+      await waitFor(() => !worker.pgidAlive(peer.gatePgid), 15_000)
+      await owner.runtime.close(session.id)
+      expect(storage.getWorker(session.id)).toBeNull()
+      expect(storage.getRelay(session.id)).toBeNull()
+      expect(lease.read()).toBeNull()
+      expect(contender.tryAcquire().acquired).toBe(true)
+      contender.release()
+    } finally {
+      releaseReplay()
+      if (worker.pidAlive(peer.gatePid)) process.kill(peer.gatePid, 'SIGCONT')
+      worker.signalGroup(peer.gatePgid, 'SIGKILL')
+      await waitFor(() => !worker.pgidAlive(peer.gatePgid), 10_000)
+      await owner.runtime.stop({ handover: false })
+    }
+  }, 60_000)
+
+  it('retains a started worker when GO confirmation and its shutdown both fail', async () => {
+    const instance = 'poise-relay-go-failed-shutdown:db'
+    const marker = join(root, 'go-started-native-agent')
+    const owner = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [], startWorker: {
+      command: process.execPath, args: ['-e', "require('node:fs').writeFileSync(process.argv[1], 'started'); setInterval(() => {}, 1000)", marker],
+    } })
+    const relay = await import('../../server/chat/relay')
+    const lock = await import('../../server/chat/checkout-lock')
+    const spawn = relay.spawnRelay
+    let peer!: RelayConnection
+    let refuseShutdown = true
+    const spawning = vi.spyOn(relay, 'spawnRelay').mockImplementation(async (options) => {
+      peer = await spawn(options)
+      const go = peer.go.bind(peer)
+      const shutdown = peer.shutdown.bind(peer)
+      peer.go = async () => {
+        await go()
+        await waitFor(() => existsSync(marker))
+        throw new Error('fixture GO confirmation failed after native startup')
+      }
+      peer.shutdown = async () => {
+        if (refuseShutdown) throw new Error('fixture shutdown could not verify termination')
+        await shutdown()
+      }
+      return peer
+    })
+    try {
+      const session = await owner.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+      await waitFor(() => !!owner.runtime.get(session.id)?.orphanNotice)
+      const lease = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance })
+      const token = lease.read()?.token
+      expect(token).toBeTruthy()
+      expect(existsSync(marker)).toBe(true)
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
+      expect(storage.getWorker(session.id)?.gatePgid).toBe(peer.gatePgid)
+      expect(storage.getRelay(session.id)?.relayPid).toBe(peer.relayPid)
+      await waitFor(() => owner.events.some((event) => event.sessionId === session.id && event.event.type === 'error'
+        && event.event.message.includes('GO confirmation failed after native startup; agent shutdown failed: fixture shutdown')))
+      await expect(owner.runtime.close(session.id)).rejects.toThrow('fixture shutdown could not verify termination')
+      expect(lease.read()?.token).toBe(token)
+      refuseShutdown = false
+      await owner.runtime.close(session.id)
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(false)
+      expect(storage.getWorker(session.id)).toBeNull()
+      expect(storage.getRelay(session.id)).toBeNull()
+      expect(lease.read()).toBeNull()
+    } finally {
+      refuseShutdown = false
+      spawning.mockRestore()
+      await owner.runtime.stop({ handover: false })
+    }
+  }, 30_000)
 
   it.each(['resolve', 'reject'] as const)('leaves a twice handed-over turn alone when old replay later %ss', async (outcome) => {
     const instance = `poise-relay-second-restart-${outcome}:db`

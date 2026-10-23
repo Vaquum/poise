@@ -727,14 +727,7 @@ export class ChatRuntime extends EventEmitter {
         log: (message) => this.emit('log', `[chat ${record.id.slice(0, 8)}] ${message}`) })
       peer = attached.connection
       session.relay = peer
-      peer.once('exit', (code, signal) => {
-        if (code === null && signal === null) return
-        if (session.relay === peer) {
-          session.relay = null
-          storage.forgetWorker(record.id)
-          storage.forgetRelay(record.id)
-        }
-      })
+      this.trackRelayExit(session, peer)
       const outbound = await peer.getOutbound()
       const persisted = this.turnSlice(record.id, open.turnId)
       const replayHost = createReplayHost({ inner: this.hostFor(session), turnId: open.turnId, persisted,
@@ -848,7 +841,7 @@ export class ChatRuntime extends EventEmitter {
     let stopReason: StopReason = turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
     let error = result.error
     if (turn.failure && stopReason !== 'cancelled') { stopReason = 'error'; error = turn.failure }
-    if (result.terminate === true || (session.adapter && !session.adapter.alive)) {
+    if (result.terminate === true || (session.adapter && !session.adapter.alive) || (session.relay && !session.relay.healthy)) {
       try { await this.stopProcess(session) } catch { freed = false }
     }
     session.draining = true
@@ -2775,7 +2768,7 @@ export class ChatRuntime extends EventEmitter {
       // An agent that ended its own process (Claude does after a stop) has
       // its worker group verified gone, or is terminated when it asked for
       // that, before the lease can go.
-      if (terminate || (agentInvoked && session.adapter && (!agentSettled || !session.adapter.alive))) {
+      if (terminate || (agentInvoked && session.adapter && (!agentSettled || !session.adapter.alive)) || (session.relay && !session.relay.healthy)) {
         try { await this.stopProcess(session) } catch { freed = false }
       }
       session.draining = true
@@ -3446,7 +3439,7 @@ export class ChatRuntime extends EventEmitter {
    *  hands the running turn to the next server instead of stopping it. */
   private async spawnAgent(session: LiveSession, command: string, args: readonly string[], env?: NodeJS.ProcessEnv): Promise<AgentProcess> {
     if (session.lifecycle.signal.aborted || session.startup?.signal.aborted || session.turn?.abort.signal.aborted) throw new Error('agent startup was cancelled')
-    if (session.relay?.healthy) throw new Error('the session already has a worker')
+    if (session.relay && (session.relay.healthy || pgidAlive(session.relay.gatePgid) || pidAlive(session.relay.gatePid))) throw new Error('the session already has a worker')
     const record = session.record
     const lease = session.lease
     if (!lease?.held) throw new Error('the checkout lease is not held; the agent cannot start')
@@ -3485,37 +3478,38 @@ export class ChatRuntime extends EventEmitter {
       dir,
       startedAt,
     })
-    const forget = () => {
-      if (session.relay === peer) session.relay = null
-      storage.forgetWorker(record.id)
-      storage.forgetRelay(record.id)
-    }
+    this.trackRelayExit(session, peer)
     // Registered before GO: nothing runs unregistered.
     if (!lease.registerWorker({ pid: peer.gatePid, pgid: peer.gatePgid, ident: gateIdent })) {
-      await peer.shutdown().catch(() => undefined)
-      forget()
+      await this.stopRelay(session, peer)
       throw new Error('the checkout lease was lost before the agent could start')
     }
     try {
       await peer.go()
     } catch (error) {
-      await peer.shutdown().catch(() => undefined)
-      forget()
+      try { await this.stopRelay(session, peer) } catch (shutdownError) {
+        throw new Error(`${error instanceof Error ? error.message : String(error)}; agent shutdown failed: ${shutdownError instanceof Error ? shutdownError.message : String(shutdownError)}`, { cause: error })
+      }
       throw error
     }
-    // The relay leaves only after its agent is gone, so an exit here means
-    // the group settled; until then the rows stay for recovery and the lease.
+    return peer
+  }
+
+  private trackRelayExit(session: LiveSession, peer: RelayConnection): void {
     // A detach exit (no code, no signal) is the link dying, not the agent:
     // the rows stay for the server that adopts the relay.
     peer.once('exit', (code, signal) => {
-      if (code === null && signal === null) return
-      if (session.relay === peer) {
-        session.relay = null
-        storage.forgetWorker(record.id)
-        storage.forgetRelay(record.id)
+      if ((code === null && signal === null) || session.relay !== peer) return
+      // A broken link can force-kill the relay before its separate gate
+      // group has settled. Keep that worker owned until verified cleanup.
+      if (pgidAlive(peer.gatePgid) || pidAlive(peer.gatePid)) {
+        this.emit('log', `[chat ${session.record.id.slice(0, 8)}] relay exited while its worker remains alive; retaining the worker and checkout lease`)
+        return
       }
+      session.relay = null
+      storage.forgetWorker(session.record.id)
+      storage.forgetRelay(session.record.id)
     })
-    return peer
   }
 
   private onAdapterExit(session: LiveSession, adapter: Adapter, code: number | null, signal: NodeJS.Signals | null): void {
@@ -3569,6 +3563,10 @@ export class ChatRuntime extends EventEmitter {
       }
       return
     }
+    await this.stopRelay(session, relay)
+  }
+
+  private async stopRelay(session: LiveSession, relay: RelayConnection): Promise<void> {
     try {
       await relay.shutdown()
       if (pgidAlive(relay.gatePgid) || pidAlive(relay.gatePid)) {
