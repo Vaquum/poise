@@ -323,9 +323,11 @@ reply can therefore notify once even if this chat posted it; unchanged replies,
 resolution-only changes, outdated-only pushes and approvals stay silent. An
 older Caller that lacks the page arguments yields unavailable evidence and
 retains prior state; it cannot establish completion. Every PR-state
-notice names its blockers and what done means: green CI, up to date with
-main and no conflicts, every finding fixed or justified, replied to, and its
-thread resolved. These observations confer no merge authority.
+notice names its blockers and what done means: required CI and reviews pass,
+no conflicts, every finding fixed or justified, replied to, and its thread
+resolved. A native merge queue handles latest-base integration; update the
+branch only for conflicts or a needed fix. These observations confer no merge
+authority.
 
 A target that reads closed or merged in the local GitHub datastore drops late
 automation bookkeeping without waking its chat; only human activity still

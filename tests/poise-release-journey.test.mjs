@@ -105,7 +105,7 @@ function nonceOf(page) {
 // ── Simulated GitHub over a real bare repository ─────────────────────────────
 
 /**
- * A GitHub REST transport for `createGitHubClient`. Refs, comparisons and
+ * A GitHub transport for `createGitHubClient`. Refs, comparisons and
  * commits are read from the bare origin; pull requests and CI are in-memory
  * records; a merge is a real `git merge --no-ff` pushed to the origin's main.
  */
@@ -144,6 +144,17 @@ function createFakeGitHub({ bare, hub, sh, rollbackPhase }) {
   }
 
   async function handle(method, path, query, body) {
+    if (method === 'POST' && path === '/graphql' && body?.query?.includes('isMergeQueueEnabled')) {
+      const [owner, name] = REPOSITORY.split('/')
+      if (body.variables?.owner !== owner || body.variables?.name !== name) return [200, { errors: [{ message: 'Repository identity mismatch' }] }]
+      const pull = state.pulls.get(body.variables.number)
+      const current = pull ? await view(pull) : null
+      return [200, { data: { repository: { pullRequest: current ? {
+        id: `PR_${pull.number}`, headRefOid: current.head.sha, isMergeQueueEnabled: false,
+        mergeQueue: null, mergeQueueEntry: null, merged: current.merged,
+        state: current.merged ? 'MERGED' : current.state.toUpperCase(),
+      } : null } } }]
+    }
     if (!path.startsWith(prefix)) return [404, { message: 'Not Found' }]
     const rest = path.slice(prefix.length)
     let match

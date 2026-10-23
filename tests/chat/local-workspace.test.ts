@@ -294,7 +294,7 @@ describe('Poise-local session storage', () => {
     await runtime.cancel(a.id)
     await until(() => runtime.get(a.id)?.status === 'idle')
     // A's turn cannot resolve B's file.
-    const { turnId } = runtime.prompt(a.id, { text: 'find it', attachments: [], mentions: [{ path: 'only-b.txt' }] })
+    const { turnId } = runtime.prompt(a.id, { text: 'find it', attachments: [], mentions: [{ path: 'only-b.txt' }] }) as { turnId: string }
     await until(() => runtime.events(a.id, 0).events.some((e) => e.event.type === 'turn.finished' && e.event.turnId === turnId && e.event.stopReason === 'error'))
     const finished = runtime.events(a.id, 0).events.map((e) => e.event)
       .find((e): e is Extract<ChatEvent, { type: 'turn.finished' }> => e.type === 'turn.finished' && e.turnId === turnId)

@@ -98,7 +98,9 @@ async function decide(socket: WebSocket, sessionId: string, turnId: string, mess
 
 async function runReplyTurn(sessionId: string, reply: string): Promise<{ turnId: string, messageId: string }> {
   replyText = reply
-  const { turnId } = runtime.prompt(sessionId, { text: 'propose something', attachments: [], mentions: [] })
+  const receipt = runtime.prompt(sessionId, { text: 'propose something', attachments: [], mentions: [] })
+  if (!('turnId' in receipt)) throw new Error('edit fixture unexpectedly waited for an update')
+  const { turnId } = receipt
   await until(() => finishes.has(sessionId), 'adapter prompt')
   const done = finishes.get(sessionId)
   finishes.delete(sessionId)
@@ -181,6 +183,7 @@ describe('edit decisions', () => {
     const socket = await connect()
     replyText = REPLY
     const pending = runtime.prompt(session.id, { text: 'propose something', attachments: [], mentions: [] })
+    if (!('turnId' in pending)) throw new Error('edit fixture unexpectedly waited for an update')
     await until(() => finishes.has(session.id), 'adapter prompt')
     const refused = await decide(socket, session.id, pending.turnId, `${pending.turnId}:m1`, 0, 'applied')
     expect(refused.ok).toBe(false)

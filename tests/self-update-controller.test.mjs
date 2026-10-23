@@ -280,6 +280,88 @@ describe('check, publish and pull request', () => {
 })
 
 describe('CI gate and merge', () => {
+  it('enqueues the pinned head despite base drift, waits through restart, and verifies the tested integration on main', async () => {
+    const h = await harness({ model: { queueEnabled: true } })
+    await runToAwaitingCi(h)
+    h.model.mainSha = MAIN2
+    h.model.compare = { status: 'diverged', ahead_by: 1, behind_by: 1 }
+    const originalEnqueue = h.github.enqueuePullRequest.bind(h.github)
+    h.github.enqueuePullRequest = async (...args) => {
+      expect(changeOf(h).merge).toMatchObject({ mode: 'queue', mainSha: MAIN2 })
+      return originalEnqueue(...args)
+    }
+    await tickUntil(h, () => changeOf(h).merge?.queued)
+    expect(changeOf(h).state).toBe('merging')
+    expect(h.github.log).toContainEqual(['enqueue', 'PR_100', HEAD])
+    expect(h.github.log.filter(entry => entry[0] === 'merge')).toEqual([])
+    const restarted = await h.restartController()
+    await restarted.tick()
+    expect(changeOf(h).state).toBe('merging')
+    expect(h.github.log.filter(entry => entry[0] === 'enqueue')).toHaveLength(1)
+
+    const newerBase = '7'.repeat(40)
+    const mergeSha = h.github.performMerge(100, HEAD, { parents: [newerBase, HEAD], tree: '8'.repeat(40) })
+    delete h.model.compare
+    h.model.ci = { [mergeSha]: 'pending' }
+    const workflowRuns = h.github.listWorkflowRuns.bind(h.github)
+    h.github.listWorkflowRuns = async sha => (await workflowRuns(sha)).map(run => ({ ...run, event: sha === mergeSha ? 'merge_group' : 'pull_request' }))
+    await h.controller.tick()
+    expect(changeOf(h).state).toBe('merging')
+    expect(h.releases.log).toHaveLength(1)
+    h.model.ci[mergeSha] = 'success'
+    await tickUntil(h, () => changeOf(h).state === 'live')
+    expect(changeOf(h).mergeSha).toBe(mergeSha)
+    expect(h.releases.log.at(-1)).toEqual(['stage', changeOf(h).releaseId, mergeSha])
+  })
+
+  it('re-observes uncertain enqueue without duplicating it and refuses an ejected queue entry', async () => {
+    const h = await harness({ model: { queueEnabled: true, enqueueUncertain: true } })
+    await runToAwaitingCi(h)
+    await tickUntil(h, () => changeOf(h).merge?.mode === 'queue')
+    await h.controller.tick()
+    expect(changeOf(h).state).toBe('merging')
+    expect(h.github.log.filter(entry => entry[0] === 'enqueue')).toHaveLength(1)
+    // A successfully acknowledged entry must never be blindly re-enqueued after rejection.
+    expect(changeOf(h).merge.queued).toBe(true)
+    delete h.model.queueEntries[100]
+    await h.controller.tick()
+    expect(changeOf(h)).toMatchObject({ state: 'failed', error: /removed from the merge queue/ })
+    expect(h.releases.log).toHaveLength(1)
+  })
+
+  it('refuses queue squash/rebase because source rollback requires a pinned-head merge parent', async () => {
+    const h = await harness({ model: { queueEnabled: true, queueMethod: 'SQUASH' } })
+    await runToAwaitingCi(h)
+    await h.controller.tick()
+    expect(changeOf(h)).toMatchObject({ state: 'failed', error: /MERGE method/ })
+    expect(h.github.log.filter(entry => entry[0] === 'enqueue')).toEqual([])
+  })
+
+  it.each(['merged', 'stale'])('re-observes a queue merge between REST reads when the queue packet is %s', async packet => {
+    const h = await harness({ model: { queueEnabled: true } })
+    await runToAwaitingCi(h)
+    await tickUntil(h, () => changeOf(h).merge?.queued)
+    const readQueue = h.github.getMergeQueue.bind(h.github)
+    let mergeSha
+    h.github.getMergeQueue = async number => {
+      mergeSha = h.github.performMerge(number, HEAD)
+      delete h.model.queueEntries[number]
+      h.github.getMergeQueue = readQueue
+      const queue = await readQueue(number)
+      return packet === 'stale' ? { ...queue, merged: false, state: 'OPEN' } : queue
+    }
+    await h.controller.tick()
+    expect(changeOf(h).state).toBe('merging')
+    expect(h.store.state.hold).toBeNull()
+    expect(h.releases.log).toHaveLength(1)
+    const workflowRuns = h.github.listWorkflowRuns.bind(h.github)
+    h.github.listWorkflowRuns = async sha => (await workflowRuns(sha)).map(run => ({ ...run, event: sha === mergeSha ? 'merge_group' : 'pull_request' }))
+    await tickUntil(h, () => changeOf(h).state === 'live')
+    expect(changeOf(h).mergeSha).toBe(mergeSha)
+    expect(h.store.state.hold).toBeNull()
+    expect(h.github.log.filter(entry => entry[0] === 'enqueue')).toHaveLength(1)
+  })
+
   it('waits for CI, fails on a red aggregate, and fails when main drifts under the branch', async () => {
     const pending = await harness({ model: { ci: { [HEAD]: 'pending' } } })
     await runToAwaitingCi(pending)
@@ -758,6 +840,23 @@ describe('source revert reconciliation', () => {
     await h.controller.tick()
     expect(h.git.log.filter((entry) => entry[0] === 'revert')).toHaveLength(1)
     expect(Object.keys(h.github.pulls)).toEqual(['100'])
+  })
+
+  it('keeps the rollback hold until a queued source revert has actually merged and passed integration CI', async () => {
+    const h = await harness()
+    await rolledBack(h)
+    h.model.queueEnabled = true
+    await tickUntil(h, () => changeOf(h).revert.attempt?.queued)
+    expect(changeOf(h).revert.phase).toBe('merging')
+    expect(h.store.state.hold).not.toBeNull()
+    await h.controller.tick()
+    expect(changeOf(h).revert.phase).toBe('merging')
+    const mergeSha = h.github.performMerge(101, changeOf(h).revert.headSha)
+    const workflowRuns = h.github.listWorkflowRuns.bind(h.github)
+    h.github.listWorkflowRuns = async sha => (await workflowRuns(sha)).map(run => ({ ...run, event: sha === mergeSha ? 'merge_group' : 'pull_request' }))
+    await tickUntil(h, () => changeOf(h).sourceRevert.state === 'merged')
+    expect(h.store.state.hold).toBeNull()
+    expect(await h.pointer()).toMatchObject({ id: 'baseline-release' })
   })
 
   it('reports failed revert checks and does not open a PR', async () => {

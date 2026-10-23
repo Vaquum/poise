@@ -1,5 +1,7 @@
 name: PRD
-description: Define a product requirement and proposed delivery shape.
+description: Define a standalone product requirement for a feature.
+labels:
+  - prd
 body:
   - type: textarea
     id: objective
@@ -126,13 +128,5 @@ body:
     attributes:
       label: Design
       description: Provide an end-to-end overview of the solution.
-    validations:
-      required: true
-
-  - type: textarea
-    id: work_slices
-    attributes:
-      label: Work Slices
-      description: Break down into one or more slices and link the underlying slice issues below.
     validations:
       required: true

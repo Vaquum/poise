@@ -46,9 +46,14 @@ function session(instance: string, openTurn: boolean): string {
 
 function fakeRuntime(instance = `poise-production:${randomUUID()}`) {
   return {
-    instance, busyNow: 0, workingNow: 0,
+    instance, busyNow: 0, workingNow: 0, heldNow: new Set<string>(),
     busy() { return this.busyNow }, working() { return this.workingNow },
+    relayHeldSessions() { return this.heldNow },
     startDrain: vi.fn(), endDrain: vi.fn(), stopTurnsForDrain: vi.fn(async () => 0),
+    setSwitchPending: vi.fn(), releaseSwitchWait: vi.fn(async () => {}),
+    runningTurnSessions: vi.fn((): Array<{ sessionId: string, turnId: string }> => []),
+    cancel: vi.fn(async (_sessionId: string) => ({ settled: true })),
+    recordSwitchInterrupted: vi.fn(),
   }
 }
 
@@ -269,13 +274,15 @@ describe('switching to another release', () => {
     return dir
   }
 
-  function switching(dir: string, options: { restart?: () => boolean, canRestart?: () => boolean, name?: string } = {}) {
+  function switching(dir: string, options: { restart?: () => boolean, canRestart?: () => boolean, name?: string, boundMinutes?: number, now?: () => number } = {}) {
     const runtime = fakeRuntime()
     const timer = new FakeTimer()
     const restart = vi.fn(options.restart ?? (() => true))
     const service = new control.ServiceControl(runtime as unknown as ChatRuntime, {
       drainTimeoutSeconds: 1800, timer, log: vi.fn(), releasesDir: dir,
       release: { name: options.name ?? 'r1', base: 'b1' }, restart, canRestart: options.canRestart ?? (() => true),
+      ...(options.boundMinutes !== undefined ? { switchTurnBoundMinutes: () => options.boundMinutes as number } : {}),
+      ...(options.now ? { now: options.now } : {}),
     })
     return { runtime, timer, restart, service }
   }
@@ -309,6 +316,230 @@ describe('switching to another release', () => {
       expect(timer.timers.size).toBe(0)
     } finally {
       service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('lands while relay-held turns are running, and waits for the rest', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { runtime, timer, restart, service } = switching(dir)
+    try {
+      expect(service.switchRelease('r2')).toEqual({ release: 'r2', switching: true })
+      const held = session(runtime.instance, true)
+      const unheld = session(runtime.instance, true)
+      expect(service.health().activeChatTurns).toBe(2)
+      runtime.heldNow = new Set([held])
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      runtime.heldNow = new Set([held, unheld])
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      // The switch landed with turns recorded open: health still counts them.
+      expect(service.health().activeChatTurns).toBe(2)
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('cancels only unheld turns at the bound and leaves relay-held turns for adoption', async () => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 1_000_000
+    const { runtime, timer, restart, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    try {
+      const held = session(runtime.instance, true)
+      const unheld = session(runtime.instance, true)
+      const heldTurnId = storage.getOpenTurn(held)!.turnId
+      const unheldTurnId = storage.getOpenTurn(unheld)!.turnId
+      runtime.heldNow = new Set([held])
+      runtime.runningTurnSessions.mockReturnValue([
+        { sessionId: held, turnId: heldTurnId },
+        { sessionId: unheld, turnId: unheldTurnId },
+      ])
+      runtime.workingNow = 1
+      runtime.cancel.mockImplementation(async (sessionId: string) => {
+        storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId: unheldTurnId, stopReason: 'cancelled' })
+        runtime.workingNow = 0
+        return { settled: true }
+      })
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(runtime.cancel.mock.calls).toEqual([[unheld]])
+      expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([{ sessionId: unheld, turnId: unheldTurnId }])
+      expect(storage.getOpenTurn(held)?.turnId).toBe(heldTurnId)
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(service.health()).toMatchObject({ activeChatTurns: 1, draining: true })
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('waits new Chat turns while a switch is pending and releases them when it is withdrawn', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { runtime, service } = switching(dir)
+    try {
+      service.switchRelease('r2')
+      expect(runtime.setSwitchPending).toHaveBeenCalledWith('r2')
+      expect(service.switchRelease('r1')).toEqual({ release: 'r1', switching: false })
+      expect(runtime.releaseSwitchWait).toHaveBeenCalledTimes(1)
+      service.reset()
+      expect(runtime.setSwitchPending).toHaveBeenCalledWith(null)
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('keeps admitting behavior launches while a switch is pending; only Chat turns wait', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { service } = switching(dir)
+    try {
+      service.switchRelease('r2')
+      expect(service.health().switching).toBe('r2')
+      const launches = ['/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/models/refresh']
+      const admitted = launches.map((path) => service.admitLaunch('POST', path))
+      expect(admitted.every((launch) => typeof launch === 'function')).toBe(true)
+      expect(service.admitLaunch('POST', '/api/chat')).toBeNull()
+      expect(background.releaseBackgroundPaused()).toBe(false)
+      expect(service.health()).toMatchObject({ backgroundWork: launches.length, idle: false, draining: false })
+      for (const release of admitted) (release as () => void)()
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('cancels turns still running past the bound, records them, and restarts', async () => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 1_000_000
+    const { runtime, timer, restart, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    try {
+      const sessionId = session(runtime.instance, true)
+      const turnId = storage.getOpenTurn(sessionId)!.turnId
+      runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
+      runtime.workingNow = 1
+      runtime.cancel.mockImplementation(async () => {
+        storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId, stopReason: 'cancelled' })
+        runtime.workingNow = 0
+        return { settled: true }
+      })
+      service.switchRelease('r2')
+      // Inside the bound the switch keeps waiting for a quiet moment.
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      expect(runtime.cancel).not.toHaveBeenCalled()
+      now += 15 * 60_000
+      timer.fire()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(runtime.cancel).toHaveBeenCalledWith(sessionId)
+      expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([{ sessionId, turnId }])
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(service.health().draining).toBe(true)
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('does not record a turn that finished on its own while the bound cancels landed', async () => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 2_000_000
+    const { runtime, timer, restart, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    try {
+      const sessionId = session(runtime.instance, false)
+      const turnId = randomUUID()
+      storage.appendEvent(sessionId, { type: 'turn.finished', turnId, stopReason: 'end_turn' })
+      runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
+      runtime.workingNow = 1
+      runtime.cancel.mockImplementation(async () => { runtime.workingNow = 0; return { settled: true } })
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(runtime.cancel).toHaveBeenCalledWith(sessionId)
+      expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([])
+      expect(restart).toHaveBeenCalledTimes(1)
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it.each(['runtime', 'background', 'launch'] as const)('keeps polling when %s work remains after bound cancellation', async work => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 2_000_000
+    const { runtime, timer, restart, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    const sessionId = session(runtime.instance, true)
+    const turnId = storage.getOpenTurn(sessionId)!.turnId
+    let releaseCancel!: () => void
+    const barrier = new Promise<void>(resolve => { releaseCancel = resolve })
+    runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
+    runtime.workingNow = 1
+    runtime.cancel.mockImplementation(async () => {
+      await barrier
+      storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId, stopReason: 'cancelled' })
+      runtime.workingNow = work === 'runtime' ? 1 : 0
+      return { settled: true }
+    })
+    let finishWork = () => { runtime.workingNow = 0 }
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      expect(runtime.cancel).toHaveBeenCalledTimes(1)
+      if (work === 'background') finishWork = background.trackReleaseBackground()
+      if (work === 'launch') {
+        const admitted = service.admitLaunch('POST', '/api/models/refresh')
+        if (typeof admitted !== 'function') throw new Error('the concurrent launch was not admitted')
+        finishWork = admitted
+      }
+      releaseCancel()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([{ sessionId, turnId }])
+      expect(restart).not.toHaveBeenCalled()
+      expect(service.draining).toBe(false)
+      expect(background.releaseBackgroundPaused()).toBe(false)
+      expect(timer.timers.size).toBe(1)
+      finishWork()
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(service.draining).toBe(true)
+    } finally {
+      releaseCancel()
+      finishWork()
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('releases waited turns when the restart is refused, and ignores a withdrawal mid-shutdown', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { runtime, timer, service } = switching(dir, { restart: () => false })
+    try {
+      service.switchRelease('r2')
+      timer.fire()
+      expect(service.health().draining).toBe(false)
+      expect(runtime.releaseSwitchWait).toHaveBeenCalledTimes(1)
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+    const quiet = await releases({ r2: 'b1' })
+    const started = switching(quiet)
+    try {
+      started.service.switchRelease('r2')
+      started.timer.fire()
+      expect(started.restart).toHaveBeenCalledTimes(1)
+      expect(existsSync(join(quiet, 'next'))).toBe(true)
+      // Withdrawing mid-shutdown changes nothing: the supervisor owns `next` now.
+      started.service.switchRelease('r1')
+      expect(existsSync(join(quiet, 'next'))).toBe(true)
+      expect(started.runtime.releaseSwitchWait).not.toHaveBeenCalled()
+    } finally {
+      started.service.reset()
       background.resumeReleaseBackground()
     }
   })
