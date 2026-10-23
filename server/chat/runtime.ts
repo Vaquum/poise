@@ -61,14 +61,14 @@ import {
 } from './git'
 import {
   AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type NewSessionRequest,
-  type Mention, type PermissionOption, type PoiseActor, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
+  type Mention, type PermissionOption, type PersonActor, type PoiseActor, type PromptInput, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
 // Only the sender label, used inside runTurn: a Switchboard relay is the
 // person's own answer and keeps the person's composition.
 import { SWITCHBOARD_PERSON } from './switchboard'
 import * as storage from './storage'
-import { internalTurn } from './control-store'
+import { holdChat, internalTurn, timerSummaries } from './control-store'
 import { pgidAlive, pidAlive, signalGroup, spawnWorker, workerIdentityMatches, type WorkerHandle } from './worker'
 import { createClaudeAdapter } from './adapters/claude'
 import { createCodexAdapter } from './adapters/codex'
@@ -139,9 +139,9 @@ interface RunningTurn {
   /** What started the turn, when the person did not: every turn.started of
    *  this turn carries it, and its text is composed as source data. */
   source?: TurnSource
-  /** The chat that stopped this turn: set only by a stop that arrives before
-   *  the turn is stopping, so a redundant cancel never relabels it. */
-  stoppedBy?: ChatActor
+  /** Who stopped this turn: set only by a stop that arrives before the turn
+   *  is stopping, so a redundant cancel never relabels it. */
+  stoppedBy?: ChatActor | PersonActor
   /** Set when the turn must end as an error (mirror failure, lost lease, forced stop). */
   failure?: string
   /** The one implementing turn of a `/poise` change: its settlement is the
@@ -734,7 +734,18 @@ export class ChatRuntime extends EventEmitter {
     const live = this.live.get(record.id)
     if (live) { live.record.pendingRequests = [...live.pending.keys()]; record = live.record }
     const queue = this.messageQueue(record.id)
-    return queue.revision ? { ...record, queue } : record
+    const timers = timerSummaries(this.instance, record.id)
+    // Live summaries are computed on a copy, never on `live.record`, and
+    // sessions without any read exactly as before.
+    if (!queue.revision && !timers.length) {
+      if (record.timers === undefined) return record
+      const clean = { ...record }
+      delete clean.timers
+      return clean
+    }
+    const clean = { ...record }
+    delete clean.timers
+    return { ...clean, ...(queue.revision ? { queue } : {}), ...(timers.length ? { timers } : {}) }
   }
 
   private requireLive(id: string): LiveSession {
@@ -856,7 +867,7 @@ export class ChatRuntime extends EventEmitter {
   /** Record a `/content` or `/consensus` step in a session's transcript.
    *  Neither command starts a native turn. Unknown and foreign sessions
    *  are refused before the caller launches anything. */
-  recordCommandEvent(id: string, event: Extract<ChatEvent, { type: 'content.started' | 'consensus.started' | 'consensus.finished' }>): void {
+  recordCommandEvent(id: string, event: Extract<ChatEvent, { type: 'content.started' | 'consensus.started' | 'consensus.finished' | 'timer.changed' }>): void {
     const record = storage.getSession(id)
     if (!record) throw new ChatError(404, 'unknown session', 'unknown_session')
     if (record.instance !== this.instance) throw new ChatError(409, `this session belongs to another Poise server (${record.instance})`, 'foreign_session')
@@ -1278,6 +1289,7 @@ export class ChatRuntime extends EventEmitter {
         orphanNotice: undefined,
         workspace: undefined,
         queue: undefined,
+        timers: undefined,
         queuedHandoff: undefined,
         subject: undefined, // a fork is a new conversation, not the card's session
         importedFrom: undefined,
@@ -1699,7 +1711,7 @@ export class ChatRuntime extends EventEmitter {
 
   /** Reserve the turn synchronously — before any await — so a second prompt
    *  in the same tick is refused, and persist it before acknowledging. */
-  private reserveTurn(session: LiveSession, queueItem?: QueuedMessage, internalMessageSeq?: number): RunningTurn {
+  private reserveTurn(session: LiveSession, queueItem?: QueuedMessage, internal?: { seq: number, at: number }): RunningTurn {
     if (session.record.role === 'manager' && session.record.retiredModel) {
       throw new ChatError(409, `The Manager's model ${session.record.retiredModel} was retired. Choose another model to continue.`, 'invalid')
     }
@@ -1711,7 +1723,7 @@ export class ChatRuntime extends EventEmitter {
     const promptReady = new Promise<void>(resolve => { releasePrompt = resolve })
     const turn: RunningTurn = { id: randomUUID(), callId: null, startedAt: Date.now(), abort: new AbortController(), stopping: false, promptReady, releasePrompt }
     turn.abort.signal.addEventListener('abort', releasePrompt, { once: true })
-    storage.reserveQueueTurn(session.record.id, turn.id, queueItem?.id, internalMessageSeq)
+    storage.reserveQueueTurn(session.record.id, turn.id, queueItem?.id, internal)
     if (queueItem) turn.queueItem = queueItem
     if (queueItem?.source) turn.source = { ...queueItem.source }
     session.turn = turn
@@ -1719,7 +1731,7 @@ export class ChatRuntime extends EventEmitter {
     return turn
   }
 
-  prompt(id: string, input: PromptInput, internal?: { seq: number, source: TurnSource, shown: string }): { turnId: string } {
+  prompt(id: string, input: PromptInput, internal?: { seq: number, source: TurnSource, shown: string, at: number }): { turnId: string } {
     this.assertAcceptingWork()
     const session = this.requireLive(id)
     if (session.record.role === 'manager' && session.record.retiredModel) {
@@ -1738,7 +1750,7 @@ export class ChatRuntime extends EventEmitter {
     const throughSeq = session.record.lastSeq
     const target = chain.review ? latestReviewTarget(id, throughSeq) : null
     if (chain.review && !target) throw new ChatError(400, 'There is no assistant reply to review yet.', 'invalid')
-    const turn = this.reserveTurn(session, undefined, internal?.seq)
+    const turn = this.reserveTurn(session, undefined, internal ? { seq: internal.seq, at: internal.at } : undefined)
     turn.switches = chain.switches
     turn.commandModel = chain.model
     turn.contextAction = chain.context
@@ -2328,7 +2340,8 @@ export class ChatRuntime extends EventEmitter {
         terminalRecorded = true
         record.lastSeq = envelope.seq
         this.emit('event', envelope)
-        chatTurnFinished(alertContext(record), { id: turn.id, stopReason, durationMs })
+        chatTurnFinished(alertContext(record), { id: turn.id, stopReason, durationMs,
+          ...(turn.source?.kind === 'timer' ? { timer: true as const } : {}) })
       } catch (failure) {
         // Preserve the open turn on storage failure; do not acknowledge a
         // ledger result whose recovery record was never made durable.
@@ -2551,8 +2564,9 @@ export class ChatRuntime extends EventEmitter {
 
   /** Cancel the running turn. Resolves when the agent acknowledged or after
    *  the stop target elapsed with the session in `stopping` — never by
-   *  pretending the turn ended. */
-  cancel(id: string, actor?: ChatActor): Promise<{ settled: boolean }> {
+   *  pretending the turn ended. The person's Stop holds the chat, but only
+   *  when it actually stopped a running turn or startup. */
+  cancel(id: string, actor?: ChatActor | PersonActor): Promise<{ settled: boolean }> {
     return this.track(async () => {
       const session = this.requireLive(id)
       pauseQueue(queueOwner(id))
@@ -2560,8 +2574,10 @@ export class ChatRuntime extends EventEmitter {
       if (timer) { clearTimeout(timer); this.queueTimers.delete(id) }
       this.queueReleaseWait.delete(id)
       this.publishQueue(session)
+      const stoppingStartup = !!session.startup
       session.startup?.abort()
       const turn = session.turn
+      if (actor?.kind === 'person' && (turn || stoppingStartup)) holdChat(this.instance, id, 'stopped', Date.now())
       if (!turn) {
         const deadline = Date.now() + STOP_SETTLE_MS
         while (session.startup && Date.now() < deadline) await delay(25)
