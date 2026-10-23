@@ -298,7 +298,38 @@ A workspace takes a new image without a new container when the image's
 system base is the one its container runs, so the agents in it are never cut
 off. Agent calls (behavior runs, manual reviews, replays) are processes Poise
 starts detached; they keep running while Poise restarts, and the next Poise
-reconciles them as after any restart.
+reconciles them as after any restart. Chat turns survive the same way: each
+session's agent runs under a per-session relay that owns its stdio and
+spools the turn's output, so the next server reconnects and replays the turn
+instead of interrupting it. Completed permission and question requests consume
+their persisted one-time answers without sending them again; completed filesystem
+requests never repeat their effects. The LIVE handoff waits until buffered spooled stdout reaches the adapter,
+including across an awaited outbound read. Relay termination follows gate stdio
+EOF, pending replay and final socket writes, so the last response precedes exit.
+A LIVE boundary decoded before exit retains its successful handoff even when
+both frames arrive in one socket callback. File-tool permission admission waits
+for replayed pre-image reads before allowing native writes.
+Historical request matching ends with
+the adopted turn. Each recorded RPC response is consumed once per occurrence,
+so the native agent can reuse its request ID after completing an earlier one.
+Historical callbacks cannot clear a later request's active slot. Claude control
+answers likewise retain each completed occurrence when a request ID is reused.
+Recovery atomically claims the checkout lease before stopping
+a recorded worker, including an idle worker whose completed turn released its
+lease; a competing live owner retains its turn and session. Cancelling an
+adopted Grok turn waits for its correlated native result or verified worker
+termination before releasing the checkout. A completed adopted turn drops its
+spool and outbound history without clearing another server's handed-over turn.
+Relay exit alone does not prove its separate worker group exited. Failed startup
+rollback or shutdown retains the worker records and checkout lease until that
+group is verified gone. While this server owns that relay, its exit observer
+retires matching worker records when the group subsequently exits; ownership
+transfer or server stop ends that observation.
+Recovery rechecks cancellation after relay attachment and outbound reads. A replay
+already aborted by lease loss requires verified native-worker termination before
+releasing its checkout.
+A recorded failed Muse decision ends the turn with a visible error
+instead of retaining an unanswerable request and checkout lease.
 
 - **Releases.** The image carries one release, Poise (`/opt/poise`) and
   Caller's relocatable virtualenv (`/opt/caller/venv`), and labels it
@@ -323,8 +354,9 @@ reconciles them as after any restart.
   `{ release }` (`admin` scope or loopback; 202 `{ release, switching }`,
   409 for a release not installed for this base or a server started without
   the supervisor). Poise writes `next`, stops admitting new background ticks,
-  and restarts at the first moment no Chat turn and no work of its own runs;
-  it waits for no agent call. While the switch is pending, new Chat turns
+  and restarts at the first moment no unheld Chat turn and no work of its own
+  runs; it waits for no agent call and no turn a healthy relay holds, since
+  the relay keeps the turn running and the next server adopts it. While the switch is pending, new Chat turns
   wait behind the update instead of starting — sent messages, queued
   messages and work-monitor wakes alike, nothing refused or dropped —
   while launches and behavior ticks run as usual. A Poise implementation whose
@@ -334,7 +366,7 @@ reconciles them as after any restart.
   the visible child before binding returns. Without a pending update, that
   child refuses discussion until binding reserves its initial implementation;
   ordinary starting chats retain their existing admission policy. A restart does not report an
-  implementation that never started as failed. Running turns get the
+  implementation that never started as failed. Turns without a healthy relay get the
   update turn bound (a chat setting, default 15 minutes counted from when
   the switch became pending); past it they are cancelled through the normal
   cancel path, their sessions recorded, and the server restarted. After the

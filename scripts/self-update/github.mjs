@@ -1,4 +1,4 @@
-// The GitHub gate. A thin REST client bound to one repository, plus the pure
+// The GitHub gate. A thin client bound to one repository, plus the
 // rules that decide whether a pull request has earned a merge: the repository
 // identity matches, its independently required CI checks pass, the
 // trusted CI workflow passed its aggregate gate on this exact head, and the
@@ -76,6 +76,14 @@ export function createGitHubClient({
     return parsed
   }
 
+  async function graphql(query, variables) {
+    const result = await request('POST', '/graphql', { query, variables })
+    if (result?.errors?.length) {
+      throw new GitHubError(`GitHub GraphQL: ${result.errors.map(error => error.message).join('; ')}`, { code: 'graphql', body: result })
+    }
+    return result?.data
+  }
+
   return {
     repository,
     request,
@@ -102,6 +110,33 @@ export function createGitHubClient({
     },
     async getPullRequest(number) {
       return request('GET', `${repo}/pulls/${number}`)
+    },
+    async getMergeQueue(number) {
+      const [owner, name] = repository.split('/')
+      const data = await graphql(`query($owner: String!, $name: String!, $number: Int!) {
+        repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+          id headRefOid isMergeQueueEnabled merged state
+          mergeQueue { configuration { mergeMethod } }
+          mergeQueueEntry { id state }
+        } }
+      }`, { owner, name, number })
+      const pull = data?.repository?.pullRequest
+      if (!pull?.id || typeof pull.isMergeQueueEnabled !== 'boolean') throw new GitHubError('GitHub did not report merge queue configuration')
+      return {
+        pullRequestId: pull.id, headSha: pull.headRefOid, enabled: pull.isMergeQueueEnabled,
+        merged: pull.merged, state: pull.state,
+        mergeMethod: pull.mergeQueue?.configuration?.mergeMethod ?? null,
+        entry: pull.mergeQueueEntry ?? null,
+      }
+    },
+    async enqueuePullRequest(pullRequestId, { sha }) {
+      if (!isSha(sha)) throw new GitHubError('enqueue requires the exact head SHA')
+      const data = await graphql(`mutation($input: EnqueuePullRequestInput!) {
+        enqueuePullRequest(input: $input) { mergeQueueEntry { id state } }
+      }`, { input: { pullRequestId, expectedHeadOid: sha } })
+      const entry = data?.enqueuePullRequest?.mergeQueueEntry
+      if (!entry?.id) throw new GitHubError('GitHub enqueue response did not confirm a queue entry')
+      return entry
     },
     async listCheckRuns(sha) {
       const page = await request('GET', `${repo}/commits/${sha}/check-runs?per_page=100`)
@@ -151,10 +186,10 @@ function latest(runs) {
  * Decide whether the trusted CI workflow has passed for `headSha`.
  * Returns { status: 'success' | 'pending' | 'failure', reason, runUrl? }.
  */
-export function evaluateCi({ headSha, checkRuns = [], workflowRuns = [] }) {
+export function evaluateCi({ headSha, checkRuns = [], workflowRuns = [], event = 'pull_request' }) {
   const candidates = workflowRuns.filter((run) => run?.path === CI_WORKFLOW_PATH
     && run?.head_sha === headSha
-    && run?.event === 'pull_request'
+    && run?.event === event
     && (run?.head_repository?.full_name === undefined || run.head_repository.full_name === REPOSITORY))
   const run = latest(candidates)
   if (!run) return { status: 'pending', reason: 'CI workflow has not started for this head' }
@@ -184,4 +219,20 @@ export function verifyMergeCommit({ commit, expectedBase, expectedHead, headTree
     throw new Error(`merge commit tree ${String(tree).slice(0, 12)} does not match the verified head tree ${String(headTree).slice(0, 12)}`)
   }
   return commit.sha
+}
+
+/** A queue may integrate newer main commits, but must preserve the pinned PR as its second parent. */
+export async function verifyQueuedMergeCommit({ commit, mergeSha, expectedBase, expectedHead, mainSha, compare }) {
+  const parents = commit?.parents?.map(parent => parent?.sha) ?? []
+  if (commit?.sha !== mergeSha || !isSha(mergeSha) || parents.length !== 2
+    || !isSha(parents[0]) || parents[1] !== expectedHead || !isSha(commit?.commit?.tree?.sha)) {
+    throw new Error('queued merge commit does not preserve the pinned head and a valid integration tree')
+  }
+  for (const [base, head, label] of [[expectedBase, parents[0], 'recorded base'], [mergeSha, mainSha, 'live main']]) {
+    const result = await compare(base, head)
+    if (!['ahead', 'identical'].includes(result?.status) || result?.behind_by !== 0) {
+      throw new Error(`queued merge commit ancestry does not match ${label}`)
+    }
+  }
+  return mergeSha
 }

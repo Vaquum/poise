@@ -16,10 +16,11 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import { environmentSecrets } from '../../gateway/src/diagnostics/contract'
 
-/** Agent settings and every cache override storage maintenance consumes. */
+/** Agent settings and the cache/workspace roots storage maintenance consumes. */
 export const CLI_HOME_VARIABLES = [
   'HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GH_CONFIG_DIR', 'GROK_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'AGENT_INTERFACE_DATA_DIR',
   'XDG_CACHE_HOME', 'PIP_CACHE_DIR', 'UV_CACHE_DIR', 'npm_config_cache', 'AGENT_INTERFACE_WORK_DIR', 'GITHUB_INTERFACE_MIRROR_DIR',
+  'POISE_CHAT_ROOT',
 ] as const
 
 /** The agent CLIs' executables, as Poise runs them by name. */

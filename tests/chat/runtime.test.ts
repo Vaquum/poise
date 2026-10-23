@@ -7,6 +7,8 @@ import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { AgentId, ChatEnvelope, ChatEvent, PromptInput, SessionRecord } from '../../server/chat/protocol'
 import type { Adapter, AdapterHost, AdapterStartOptions } from '../../server/chat/adapters/types'
+import type { RelayConnection } from '../../server/chat/relay'
+import { scrubbedChildEnvironment } from '../../server/process'
 import type { CallerTurns } from '../../server/chat/caller-turns'
 import { CATALOG } from '../model-catalog-fixture'
 
@@ -15,6 +17,7 @@ let repo = ''
 let runtimeModule: typeof import('../../server/chat/runtime')
 let storage: typeof import('../../server/chat/storage')
 let worker: typeof import('../../server/chat/worker')
+let relay: typeof import('../../server/chat/relay')
 let queueModule: typeof import('../../server/chat/message-queue')
 
 function git(args: string[], cwd = repo): string {
@@ -52,7 +55,16 @@ class FakeAdapter implements Adapter {
   auto = true
   private finishTurn: ((stop?: 'end_turn' | 'cancelled') => void) | null = null
   private exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = []
-  constructor(readonly host: AdapterHost, readonly controls: FakeControls) {}
+  constructor(readonly host: AdapterHost, readonly controls: FakeControls) {
+    // Like a real adapter, a dead link settles a pending prompt: the process
+    // is gone (or the turn was handed to a relay), so the turn ends here.
+    const spawn = host.spawn.bind(host)
+    host.spawn = (async (command, args, options) => {
+      const peer = await spawn(command, args, options)
+      peer.once('exit', () => this.finishTurn?.('cancelled'))
+      return peer
+    })
+  }
   async start(options: AdapterStartOptions) {
     this.controls.startCount += 1
     this.starts.push(options)
@@ -122,7 +134,7 @@ function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: F
 
 afterEach(async () => {
   // A failed assertion must not leave a held lease or a dirty tree for the next test.
-  for (const runtime of runtimes.splice(0)) await runtime.stop().catch(() => undefined)
+  for (const runtime of runtimes.splice(0)) await runtime.stop({ handover: false }).catch(() => undefined)
   spawnSync('git', ['checkout', '-q', '--', '.'], { cwd: repo })
   spawnSync('git', ['clean', '-fdq'], { cwd: repo })
   spawnSync('git', ['switch', '-q', 'main'], { cwd: repo })
@@ -159,7 +171,7 @@ it('launches native Codex through its verified snapshot and retains the Codex en
   await writeFile(launcher, `#!${process.execPath}\nsetInterval(() => {}, 1000);\n`, { mode: 0o700 })
   const { runtime, controls } = makeRuntime({ agent: 'codex', prepareCli: async provider => ({ provider,
     status: 'current', after: '0.161.0', launchVersion: '0.161.0', launchPath: launcher, checkedAt: new Date().toISOString() }) })
-  const spy = vi.spyOn(worker, 'spawnWorker')
+  const spy = vi.spyOn(relay, 'spawnRelay')
   try {
     const session = await runtime.create({ agent: 'codex', model: 'gpt-6-astra-ultra', repo: 'test/repo', branch: { new: 'codex/snapshot-cli' } })
     await waitFor(() => lastStatus(runtime.events(session.id, 0).events, session.id) === 'idle')
@@ -167,7 +179,8 @@ it('launches native Codex through its verified snapshot and retains the Codex en
     runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] })
     await waitFor(() => runtime.get(session.id)?.status === 'running')
     await controls.hosts[0].spawn('codex', ['app-server', '--listen', 'stdio://'])
-    expect(spy).toHaveBeenCalledWith(launcher, ['app-server', '--listen', 'stdio://'], expect.objectContaining({ envCommand: 'codex' }))
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ command: launcher, args: ['app-server', '--listen', 'stdio://'],
+      env: scrubbedChildEnvironment('codex', undefined, ['app-server', '--listen', 'stdio://']) }))
     await runtime.close(session.id)
   } finally { spy.mockRestore() }
 })
@@ -188,6 +201,7 @@ beforeAll(async () => {
   runtimeModule = await import('../../server/chat/runtime')
   storage = await import('../../server/chat/storage')
   worker = await import('../../server/chat/worker')
+  relay = await import('../../server/chat/relay')
   queueModule = await import('../../server/chat/message-queue')
   const { db } = await import('../../server/db')
   waitingAlerts = (sessionId) => db.prepare('SELECT resolved_at AS resolved FROM alerts WHERE dedupe_key = ? ORDER BY id').all(`chat-waiting:${sessionId}`) as Array<Record<string, unknown>>
@@ -568,7 +582,7 @@ describe('chat runtime', () => {
     runtime.prompt(session.id, { text: 'spawn', attachments: [], mentions: [] })
     await waitFor(() => lastStatus(events, session.id) === 'running')
     const child = await controls.hosts[0].spawn('sh', ['-c', 'sleep 60 & wait'])
-    const pgid = child.pid!
+    const pgid = (child as RelayConnection).gatePgid
     await waitFor(() => worker.pgidAlive(pgid))
     const workers = storage.listWorkers()
     expect(workers.map((w) => w.sessionId)).toContain(session.id)
@@ -927,11 +941,11 @@ it.each(['close', 'resume'])('QC2: a failed worker stop retains its lease until 
   const { runtime, controls, events } = makeRuntime()
   let release!: () => void; let refuseTermination = true
   controls.startWait = new Promise<void>(resolve => { release = resolve }); controls.spawnDuringStart = true
-  const actualSpawn = worker.spawnWorker
-  const spy = vi.spyOn(worker, 'spawnWorker').mockImplementation((command, args, options) => {
-    const handle = actualSpawn(command, args, options); const terminate = handle.terminate.bind(handle)
-    handle.terminate = async grace => { if (refuseTermination) throw new Error('fixture worker termination is not verified'); await terminate(grace) }
-    return handle
+  const actualSpawn = relay.spawnRelay
+  const spy = vi.spyOn(relay, 'spawnRelay').mockImplementation(async (options) => {
+    const peer = await actualSpawn(options); const shutdown = peer.shutdown.bind(peer)
+    peer.shutdown = async () => { if (refuseTermination) throw new Error('fixture worker termination is not verified'); await shutdown() }
+    return peer
   })
   try {
     const s = await runtime.create({ agent: 'grok', model: 'grok-4.6-high', deferStart: true, repo: 'fixture/repo', branch: { existing: 'main' } })

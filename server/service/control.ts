@@ -213,15 +213,15 @@ export class ServiceControl {
 
   /**
    * Restarts this server onto an installed release of the same base, at the
-   * first moment no Chat turn and no work of this server's own runs. Agent
-   * calls are not waited for: they run detached, survive the restart, and the
-   * next server reconciles them as after any restart. While the switch is
-   * pending, new Chat turns wait behind the update instead of starting;
-   * launches and behavior ticks run as usual. Running turns get the update
-   * turn bound, after which they are cancelled through the normal cancel
-   * path, their sessions recorded, and the server restarted: after the
-   * restart each interrupted session gets one automatic continue prompt on
-   * its resumed native session, then the waiting turns start in order.
+   * first moment no unheld Chat turn and no work of this server's own runs.
+   * Detached agent calls survive the restart, and the next server reconciles
+   * them. Chat turns a healthy relay holds also keep running, and the next
+   * server adopts them. While the switch is pending, new Chat turns wait
+   * behind the update; launches and behavior ticks run as usual. Unheld
+   * turns get the update turn bound, then are cancelled through the normal
+   * cancel path and their sessions recorded. After the restart each
+   * interrupted session gets one automatic continue prompt on its resumed
+   * native session, then the waiting turns start in order.
    */
   switchRelease(release: unknown): SwitchAnswer {
     if (typeof release !== 'string' || !RELEASE_NAME.test(release)) throw new HttpError(400, 'release must name an installed release')
@@ -257,7 +257,7 @@ export class ServiceControl {
     if (first) {
       markReleaseSwitch(true)
       this.switchPendingSince = this.now()
-      this.log(`[service] switching to release ${release} once no Chat turn and no work of this server runs; new turns wait behind the update`)
+      this.log(`[service] switching to release ${release} once no unheld Chat turn and no work of this server runs; new turns wait behind the update`)
     }
     if ((first || retargeted) && this.switchPoll === null && !this.restarting) this.pollSwitch()
     return { release, switching: true }
@@ -302,8 +302,9 @@ export class ServiceControl {
   }
 
   private switchIsQuiet(): boolean {
-    return listOpenTurns(this.runtime.instance).length === 0 && this.runtime.working() === 0
-      && releaseBackgroundBusy() === 0 && this.launches === 0
+    const held = this.runtime.relayHeldSessions()
+    return listOpenTurns(this.runtime.instance).every((turn) => held.has(turn.sessionId))
+      && this.runtime.working() === 0 && releaseBackgroundBusy() === 0 && this.launches === 0
   }
 
   private restartForSwitch(): void {
@@ -319,7 +320,7 @@ export class ServiceControl {
     this.runtime.startDrain('service')
     markReleaseSwitch(false)
     this.drainOn = true
-    this.log(`[service] restarting on release ${this.switchTo}; running agent calls carry on`)
+    this.log(`[service] restarting on release ${this.switchTo}; running agent calls and relay-held chat turns carry on`)
     this.restarting = true
     if (!(this.options.restart ?? requestUpdateRestart)()) {
       this.restarting = false
@@ -331,8 +332,8 @@ export class ServiceControl {
     }
   }
 
-  /** The switch bound passed with turns still running: cancel them through
-   *  the normal cancel path, record the sessions interrupted, and restart.
+  /** The switch bound passed with unheld turns still running: cancel them
+   *  through the normal cancel path, record the sessions, and restart.
    *  Turns that finished or failed on their own while the cancels landed
    *  were not interrupted — only turns still open or cancelled are resumed. */
   private expireSwitchBound(): void {
@@ -341,7 +342,8 @@ export class ServiceControl {
     if (release === null || this.switchPendingSince === null) return
     const waitedMinutes = Math.round((this.now() - this.switchPendingSince) / 60_000)
     this.log(`[service] release ${release} waited ${waitedMinutes} minutes for its turns; cancelling them and restarting`)
-    const targets = this.runtime.runningTurnSessions()
+    const held = this.runtime.relayHeldSessions()
+    const targets = this.runtime.runningTurnSessions().filter(({ sessionId }) => !held.has(sessionId))
     const cancellation = (async () => {
       await Promise.all(targets.map(({ sessionId }) => this.runtime.cancel(sessionId).catch((error: unknown) =>
         this.log(`[service] cancelling ${sessionId.slice(0, 8)} for the switch failed: ${error instanceof Error ? error.message : String(error)}`))))

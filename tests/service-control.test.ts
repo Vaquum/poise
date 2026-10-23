@@ -46,12 +46,13 @@ function session(instance: string, openTurn: boolean): string {
 
 function fakeRuntime(instance = `poise-production:${randomUUID()}`) {
   return {
-    instance, busyNow: 0, workingNow: 0,
+    instance, busyNow: 0, workingNow: 0, heldNow: new Set<string>(),
     busy() { return this.busyNow }, working() { return this.workingNow },
+    relayHeldSessions() { return this.heldNow },
     startDrain: vi.fn(), endDrain: vi.fn(), stopTurnsForDrain: vi.fn(async () => 0),
     setSwitchPending: vi.fn(), releaseSwitchWait: vi.fn(async () => {}),
     runningTurnSessions: vi.fn((): Array<{ sessionId: string, turnId: string }> => []),
-    cancel: vi.fn(async () => ({ settled: true })),
+    cancel: vi.fn(async (_sessionId: string) => ({ settled: true })),
     recordSwitchInterrupted: vi.fn(),
   }
 }
@@ -313,6 +314,63 @@ describe('switching to another release', () => {
       expect(background.releaseBackgroundPaused()).toBe(true)
       expect(service.health().draining).toBe(true)
       expect(timer.timers.size).toBe(0)
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('lands while relay-held turns are running, and waits for the rest', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { runtime, timer, restart, service } = switching(dir)
+    try {
+      expect(service.switchRelease('r2')).toEqual({ release: 'r2', switching: true })
+      const held = session(runtime.instance, true)
+      const unheld = session(runtime.instance, true)
+      expect(service.health().activeChatTurns).toBe(2)
+      runtime.heldNow = new Set([held])
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      runtime.heldNow = new Set([held, unheld])
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      // The switch landed with turns recorded open: health still counts them.
+      expect(service.health().activeChatTurns).toBe(2)
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('cancels only unheld turns at the bound and leaves relay-held turns for adoption', async () => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 1_000_000
+    const { runtime, timer, restart, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    try {
+      const held = session(runtime.instance, true)
+      const unheld = session(runtime.instance, true)
+      const heldTurnId = storage.getOpenTurn(held)!.turnId
+      const unheldTurnId = storage.getOpenTurn(unheld)!.turnId
+      runtime.heldNow = new Set([held])
+      runtime.runningTurnSessions.mockReturnValue([
+        { sessionId: held, turnId: heldTurnId },
+        { sessionId: unheld, turnId: unheldTurnId },
+      ])
+      runtime.workingNow = 1
+      runtime.cancel.mockImplementation(async (sessionId: string) => {
+        storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId: unheldTurnId, stopReason: 'cancelled' })
+        runtime.workingNow = 0
+        return { settled: true }
+      })
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(runtime.cancel.mock.calls).toEqual([[unheld]])
+      expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([{ sessionId: unheld, turnId: unheldTurnId }])
+      expect(storage.getOpenTurn(held)?.turnId).toBe(heldTurnId)
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(service.health()).toMatchObject({ activeChatTurns: 1, draining: true })
     } finally {
       service.reset()
       background.resumeReleaseBackground()

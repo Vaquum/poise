@@ -13,7 +13,7 @@ import { ensurePrivateDirectory } from './atomic.mjs'
 import { scrubEnvironment } from './environment.mjs'
 import {
   GitHubError, assertPullRequestIdentity, assertRepositoryIdentity, evaluateCi,
-  isUncertain as isNetworkUncertain, verifyMergeCommit,
+  isUncertain as isNetworkUncertain, verifyMergeCommit, verifyQueuedMergeCommit,
 } from './github.mjs'
 import { BASE_BRANCH, REPOSITORY, changeBranch, isReleaseId, isSha, isUuid, pullRequestUrl, revertBranch } from './paths.mjs'
 import { describeViolations, reviewPolicy } from './policy.mjs'
@@ -443,14 +443,19 @@ export function createController({
     if (pull.merged) return { status: 'merged', pull }
     if (pull.state !== 'open') return { status: 'failure', reason: `pull request #${prNumber} is ${pull.state}`, pull }
     assertPullRequestIdentity(pull, { branch, headSha })
+    const queue = await github.getMergeQueue(prNumber)
+    if (queue.headSha !== headSha) throw new Error(`PR head moved to ${String(queue.headSha).slice(0, 12)}`)
+    if (queue.enabled && queue.mergeMethod !== 'MERGE') throw new Error('self-update requires the merge queue MERGE method')
     const mainSha = await github.getBranchSha(BASE_BRANCH)
     const comparison = await github.compare(mainSha, headSha)
-    if (comparison?.behind_by > 0 || comparison?.status === 'diverged' || comparison?.status === 'behind') {
+    if (!queue.enabled && (comparison?.behind_by > 0 || comparison?.status === 'diverged' || comparison?.status === 'behind')) {
       return { status: 'failure', reason: `main moved to ${mainSha.slice(0, 12)}; the branch is ${comparison.behind_by} commit(s) behind and must be re-requested`, pull, mainSha }
     }
-    if (comparison?.status !== 'ahead') return { status: 'failure', reason: `branch is not ahead of main (${comparison?.status ?? 'unknown'})`, pull, mainSha }
+    if (comparison?.status !== 'ahead' && !(queue.enabled && comparison?.status === 'diverged' && comparison.ahead_by > 0)) {
+      return { status: 'failure', reason: `branch is not ahead of main (${comparison?.status ?? 'unknown'})`, pull, mainSha }
+    }
     const [checkRuns, workflowRuns] = await Promise.all([github.listCheckRuns(headSha), github.listWorkflowRuns(headSha)])
-    return { ...evaluateCi({ headSha, checkRuns, workflowRuns }), pull, mainSha }
+    return { ...evaluateCi({ headSha, checkRuns, workflowRuns }), pull, mainSha, queue }
   }
 
   /**
@@ -462,6 +467,7 @@ export function createController({
   async function mergeVerified({ prNumber, branch, headSha, cwd, attempt = null, recordAttempt }) {
     assertRepositoryIdentity(await github.getRepository())
     const pull = await github.getPullRequest(prNumber)
+    assertPullRequestIdentity(pull, { branch, headSha })
     const headTree = await git.treeSha(cwd, headSha)
     if (pull.merged) {
       // Only a merge this controller attempted counts; anything else is a
@@ -470,13 +476,58 @@ export function createController({
       const mergeSha = pull.merge_commit_sha
       if (!isSha(mergeSha)) throw new Error(`pull request #${prNumber} is merged without a merge commit`)
       const commit = await github.getCommit(mergeSha)
+      if (attempt.mode === 'queue') {
+        const mainSha = await github.getBranchSha(BASE_BRANCH)
+        await verifyQueuedMergeCommit({
+          commit, mergeSha, expectedBase: attempt.mainSha, expectedHead: headSha, mainSha,
+          compare: (base, head) => github.compare(base, head),
+        })
+        const [checkRuns, workflowRuns] = await Promise.all([github.listCheckRuns(mergeSha), github.listWorkflowRuns(mergeSha)])
+        const gate = evaluateCi({ headSha: mergeSha, checkRuns, workflowRuns, event: 'merge_group' })
+        if (gate.status === 'pending') return { pending: true }
+        if (gate.status !== 'success') throw new Error(`queued integration CI failed: ${gate.reason}`)
+        return { mergeSha, baseSha: attempt.mainSha }
+      }
       verifyMergeCommit({ commit, expectedBase: attempt.mainSha, expectedHead: headSha, headTree })
       return { mergeSha, baseSha: attempt.mainSha }
+    }
+    if (attempt?.mode === 'queue') {
+      const queue = await github.getMergeQueue(prNumber)
+      if (queue.headSha !== headSha) throw new Error('PR head moved while queued')
+      if (!queue.entry) {
+        // The merge can finish between the REST and GraphQL reads. Re-observe
+        // before treating a disappearing queue entry as rejection.
+        const current = await github.getPullRequest(prNumber)
+        assertPullRequestIdentity(current, { branch, headSha })
+        if (current.merged || queue.merged || queue.state === 'MERGED') return { pending: true }
+        if (queue.merged !== false || current.merged !== false) return { pending: true }
+        if (current.state === 'closed' && queue.state === 'CLOSED') throw new Error(`pull request #${prNumber} closed without merging`)
+        if (current.state !== 'open' || queue.state !== 'OPEN') return { pending: true }
+        if (attempt.queued) throw new Error(`pull request #${prNumber} was removed from the merge queue without merging`)
+      }
+      if (!queue.enabled || queue.mergeMethod !== 'MERGE') throw new Error('merge queue configuration changed while awaiting merge')
+      if (queue.entry) {
+        if (!attempt.queued) await recordAttempt({ ...attempt, queued: true })
+        return { pending: true }
+      }
     }
     const gate = await gateCi({ headSha, branch, prNumber })
     if (gate.status !== 'success') throw new Error(`refusing to merge: ${gate.reason}`)
     const mainSha = gate.mainSha
     if (pull.mergeable === false) throw new Error(`pull request #${prNumber} is not mergeable (${pull.mergeable_state})`)
+    if (gate.queue.enabled) {
+      if (gate.queue.entry && attempt?.mode !== 'queue') throw new Error(`pull request #${prNumber} was queued outside the controller`)
+      const intent = attempt?.mode === 'queue' ? attempt : { attemptedAt: iso(), mainSha, mode: 'queue' }
+      await recordAttempt(intent)
+      try {
+        await github.enqueuePullRequest(gate.queue.pullRequestId, { sha: headSha })
+      } catch (error) {
+        if (uncertain(error)) return { uncertain: true, mainSha: intent.mainSha }
+        throw error
+      }
+      await recordAttempt({ ...intent, queued: true })
+      return { pending: true }
+    }
     // A restart after GitHub accepts the merge must be able to re-observe it.
     // Commit the expected parents before the remote side effect, not only
     // after a network error.
@@ -596,9 +647,10 @@ export function createController({
       }, { changeId: record.id })
       return fail(record.id, `merge verification failed: ${trimError(error)}`)
     }
+    if (result.pending) return record
     if (result.uncertain) {
       return commitChange(record.id, 'change.merge_uncertain', (target) => {
-        target.merge = { attemptedAt: iso(), mainSha: result.mainSha }
+        target.merge = { ...(target.merge || {}), attemptedAt: iso(), mainSha: result.mainSha }
       })
     }
     return commitChange(record.id, 'change.merged', (target) => {
@@ -999,8 +1051,9 @@ export function createController({
             prNumber: revert.prNumber, branch: revert.branch, headSha: revert.headSha, cwd: revert.workspace, attempt: revert.attempt,
             recordAttempt: attempt => commitRevert(record.id, 'revert.merge_intent', target => { target.attempt = attempt }),
           })
+          if (result.pending) return record
           if (result.uncertain) {
-            return commitRevert(record.id, 'revert.merge_uncertain', (target) => { target.attempt = { attemptedAt: iso(), mainSha: result.mainSha } })
+            return commitRevert(record.id, 'revert.merge_uncertain', (target) => { target.attempt = { ...(target.attempt || {}), attemptedAt: iso(), mainSha: result.mainSha } })
           }
           return commitRevert(record.id, 'revert.merged', (target, changeRecord, draft) => {
             target.phase = 'merged'
