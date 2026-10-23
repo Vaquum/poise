@@ -592,6 +592,15 @@ export interface SwitchboardState {
 
 export const WS_PATH = '/ws/chat'
 
+/** Recursive canonical form: nested keys count, so two values that differ
+ *  below the top level never compare equal. Object key order is normalized;
+ *  array order is significant. */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined'
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  return `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as any)[key])}`).join(',')}}`
+}
+
 /** Hard bounds shared by the server and the client. */
 export const CHAT_LIMITS = {
   frameBytes: 1 * 1024 * 1024,
