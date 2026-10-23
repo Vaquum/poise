@@ -237,6 +237,13 @@ describe('/poise change sessions', () => {
     }
     const changeId = randomUUID(), request = 'Improve the console after the update'
     const context = { attachments: [], mentions: [], switches: [switchName] }
+    await initial.runtime.enqueue(source.id, randomUUID(), { text: 'Existing queued follow-up', attachments: [], mentions: [] })
+    // A previously completed source turn armed its queue. The dedicated
+    // implementation still owns the first turn after delegation.
+    const previous = randomUUID()
+    storage.reserveQueueTurn(source.id, previous)
+    storage.finalizeTurn(source.id, { type: 'turn.finished', turnId: previous, stopReason: 'end_turn' })
+    expect(initial.runtime.get(source.id)?.queue?.ready).toBe(true)
     const starting = initial.runtime.startPoiseChange(source.id, request, changeId, context)
     try {
       await waitFor(() => binding)
@@ -269,13 +276,17 @@ describe('/poise change sessions', () => {
       expect(active.runtime.prompt(result.session.id, { text: 'Discuss after implementing', attachments: [], mentions: [] })).toHaveProperty('waitId')
       expect(storage.getOpenTurn(result.session.id)).toBeNull()
       await active.runtime.releaseSwitchWait()
-      await waitFor(() => ofType(active.events, result.session.id, 'turn.finished').length === 2)
       await waitFor(() => !!outbox.getFinish(changeId)?.deliveredAt)
+      expect(ofType(active.events, result.session.id, 'turn.finished')).toHaveLength(1)
+      // Queued edits retain the existing controller-release barrier.
+      bridge.changes.get(changeId)!.state = 'live'
+      await waitFor(() => ofType(active.events, result.session.id, 'turn.finished').length === 3)
       const agent = active.controls.adapters.find(adapter => adapter.host.sessionId === result.session.id)!
-      expect(agent.inputs).toHaveLength(2)
+      expect(agent.inputs).toHaveLength(3)
       expect(agent.inputs[0].text).toContain(request)
       expect(agent.inputs[0].text).toContain('Keep the original implementation instructions.')
-      expect(agent.inputs[1].text).toContain('Discuss after implementing')
+      expect(agent.inputs[1].text).toContain('Existing queued follow-up')
+      expect(agent.inputs[2].text).toContain('Discuss after implementing')
       expect(ofType(active.events, result.session.id, 'turn.started')[0].prompt.text).toBe(`/${switchName} ${request}`)
       expect(outbox.getFinish(changeId)).toMatchObject({ outcome: 'completed' })
       expect(bridge.calls.filter(call => call.op === 'finish' && call.changeId === changeId)).toHaveLength(1)

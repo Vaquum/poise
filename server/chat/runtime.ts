@@ -2216,7 +2216,7 @@ export class ChatRuntime extends EventEmitter {
   private waitPromptForSwitch(session: LiveSession, prompt: PromptInput, recovery?: SwitchPromptMetadata): PromptReceipt {
     this.assertTurnAdmissible(session)
     const entry: WaitingPrompt = { id: randomUUID(), sessionId: session.record.id, prompt, createdAt: new Date().toISOString(),
-      queueBefore: this.messageQueue(session.record.id).items.filter(item => item.state === 'waiting').map(item => item.id),
+      queueBefore: recovery?.implementsChange ? [] : this.messageQueue(session.record.id).items.filter(item => item.state === 'waiting').map(item => item.id),
       ...(recovery ? { recovery } : {}) }
     this.writeWaitingPrompts([...this.readWaitingPrompts(), entry])
     session.record.queuedBehind = SWITCH_WAIT_REASON
