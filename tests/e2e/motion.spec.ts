@@ -172,7 +172,7 @@ for (const narrow of [false, true]) test(`session controls retain focus and draf
   const original = await button.elementHandle()
   await button.focus()
   socket.push(record.id, { type: 'session.updated', session: { ...record, status: 'running', lastSeq: 1 } })
-  await expect(page.locator('.chat-session-running')).toHaveCount(1)
+  await expect(page.locator('.chat-session-dot[data-state="working"]')).toHaveCount(1)
   expect(await original!.evaluate(element => element.isConnected && document.activeElement === element)).toBe(true)
   await expect(input(page)).toHaveValue('Unsent draft')
   await button.press('Enter')

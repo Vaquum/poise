@@ -22,7 +22,10 @@ native start/resume receives the saved setting. Stop remains independent.
 **Reasoning** is a separate, default-off display toggle. It reveals or hides
 provider-supplied reasoning without changing tools, model effort or prompts.
 **Activity** controls tool/plan details; messages, errors and outstanding
-questions or approvals remain visible. Neither display toggle deletes history.
+questions or approvals remain visible. **Tools**, on by default, shows or
+hides the individual tool calls and command blocks; text messages, errors
+and outstanding questions or approvals stay visible. The choice is remembered
+in this browser across chats and reloads. No display toggle deletes history.
 
 Icon-only buttons show short labels after one second of hovering. Keyboard
 focus works too; leaving, clicking, scrolling or Escape dismisses the tooltip.
