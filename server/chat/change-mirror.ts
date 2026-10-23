@@ -27,6 +27,13 @@ function allowedName(path: string): boolean {
   return path.length > 0 && !path.startsWith('/') && !path.split('/').some(part => part === '..' || part === '.' || part === '.git')
 }
 
+// Regenerable interpreter caches are never revert-relevant: a turn that runs
+// Python would otherwise report every rewritten cache as unrevertable.
+function isGeneratedCache(path: string): boolean {
+  const parts = path.split('/')
+  return parts.includes('__pycache__') || (parts[parts.length - 1]?.endsWith('.pyc') ?? false)
+}
+
 async function inventory(checkout: string, ignored: boolean): Promise<string[]> {
   const args = ignored
     ? ['ls-files', '-z', '--others', '--ignored', '--exclude-standard']
@@ -48,12 +55,12 @@ export async function captureCheckoutSnapshot(
   let names: string[] = []
   try {
     const [visible, ignored] = await Promise.all([inventory(checkout, false), inventory(checkout, true)])
-    names = [...new Set([...visible, ...extraPaths.filter(allowedName)])].sort()
+    names = [...new Set([...visible, ...extraPaths.filter(allowedName)])].filter(name => !isGeneratedCache(name)).sort()
     result.ignored = new Set(ignored)
   } catch (error) {
     result.inventoryComplete = false
     result.warnings.push(`checkout inventory failed: ${error instanceof Error ? error.message : String(error)}`)
-    names = [...new Set(extraPaths.filter(allowedName))].sort()
+    names = [...new Set(extraPaths.filter(allowedName))].filter(name => !isGeneratedCache(name)).sort()
   }
   if (names.length > limits.maxFiles) {
     result.inventoryComplete = false
@@ -99,7 +106,7 @@ export async function captureCheckoutSnapshot(
       const hash = createHash('sha256').update(bytes).digest('hex')
       const text = bytes.toString('utf8')
       if (bytes.includes(0) || !Buffer.from(text, 'utf8').equals(bytes)) {
-        result.files.set(path, { exists: true, signature: hash, reason: 'binary or non-UTF-8 file' })
+        result.files.set(path, { exists: true, signature: `binary:${hash}`, reason: 'binary or non-UTF-8 file' })
       } else result.files.set(path, { exists: true, signature: hash, text })
     } catch (error) {
       unknown(error instanceof Error ? error.message : String(error))
@@ -118,6 +125,7 @@ function version(snapshot: CheckoutSnapshot, path: string): Version {
 
 const isDirectoryVersion = (value: Version): boolean => value.exists && value.text === undefined && value.signature === 'directory'
 const isSymlinkVersion = (value: Version): boolean => value.exists && value.text === undefined && value.signature.startsWith('symlink:')
+const isBinaryVersion = (value: Version): boolean => value.exists && value.text === undefined && value.signature.startsWith('binary:')
 
 export function compareCheckoutSnapshots(before: CheckoutSnapshot, after: CheckoutSnapshot): { changes: ObservedChange[], warnings: string[] } {
   const changes: ObservedChange[] = []
@@ -136,6 +144,10 @@ export function compareCheckoutSnapshots(before: CheckoutSnapshot, after: Checko
     if (isSymlinkVersion(old) && !next.exists) { warnings.push(`${path}: symlink was removed`); continue }
     if (isSymlinkVersion(old) && isSymlinkVersion(next)) { warnings.push(`${path}: symlink target changed`); continue }
     if (old.exists && old.text !== undefined && isSymlinkVersion(next)) { warnings.push(`${path}: replaced by a symlink`); continue }
+    // A binary file created during the turn reverts by deletion, like any
+    // other new file, so its creation stays quiet; removal or modification
+    // still warns because the lost bytes cannot be restored.
+    if (!old.exists && isBinaryVersion(next) && ![...before.files.keys()].some(key => key.startsWith(`${path}/`))) continue
     if (old.text === undefined || next.text === undefined) {
       warnings.push(`${path}: ${old.reason || next.reason || 'a trustworthy before/after image is unavailable'}`)
       continue
