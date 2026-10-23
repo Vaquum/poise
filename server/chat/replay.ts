@@ -86,10 +86,16 @@ export function replayMatchKey(event: ChatEvent): string | null {
   }
 }
 
+// Persisted events cross JSON storage, which removes optional undefined
+// properties. Match the same wire value an adapter originally recorded.
+function requestMatchKey(value: unknown): string {
+  return canonicalJson(JSON.parse(JSON.stringify(value)))
+}
+
 function requestKey(turnId: string, event: Extract<ChatEvent, { type: 'permission.requested' | 'question.asked' }>): string {
   return event.type === 'permission.requested'
-    ? canonicalJson({ type: event.type, turnId, toolId: event.toolId, title: event.title, description: event.description, input: event.input, options: event.options })
-    : canonicalJson({ type: event.type, turnId, toolId: event.toolId, questions: event.questions })
+    ? requestMatchKey({ type: event.type, turnId, toolId: event.toolId, title: event.title, description: event.description, input: event.input, options: event.options })
+    : requestMatchKey({ type: event.type, turnId, toolId: event.toolId, questions: event.questions })
 }
 
 /** The turn's persisted diffs by `${toolId}\0${path}`: replay replays them
@@ -151,7 +157,7 @@ export function createReplayHost(options: ReplayHostOptions): AdapterHost & { re
   }
 
   const requestPermission = (request: PermissionRequest): Promise<string> => {
-    const key = canonicalJson({ type: 'permission.requested', turnId, toolId: request.toolId, title: request.title, description: request.description, input: request.input, options: request.options })
+    const key = requestMatchKey({ type: 'permission.requested', turnId, toolId: request.toolId, title: request.title, description: request.description, input: request.input, options: request.options })
     const requested = findRequested(key)
     if (!requested || requested.type !== 'permission.requested') return inner.requestPermission(request)
     matchedRequests.add(requested.id)
@@ -167,7 +173,7 @@ export function createReplayHost(options: ReplayHostOptions): AdapterHost & { re
   }
 
   const askQuestion = (request: QuestionRequest): Promise<QuestionAnswers> => {
-    const key = canonicalJson({ type: 'question.asked', turnId, toolId: request.toolId, questions: request.questions })
+    const key = requestMatchKey({ type: 'question.asked', turnId, toolId: request.toolId, questions: request.questions })
     const asked = findRequested(key)
     if (!asked || asked.type !== 'question.asked') return inner.askQuestion(request)
     matchedRequests.add(asked.id)

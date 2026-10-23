@@ -919,6 +919,8 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     host.log(message)
     if (!active || active !== origin || active.done || closing || active.interruptRequested) return
     host.emit({ type: 'error', message, recoverable: true })
+    // Preserve the decision failure before process-exit reporting can win.
+    finish(origin, { stopReason: 'error', error: message, terminate: true })
     rpc?.fail(new AdapterError(AGENT, message, 'protocol'))
   }
 
