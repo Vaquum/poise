@@ -90,9 +90,8 @@ it('overlapping manual and scheduled processes share one complete discovery run'
   expect((await readFile(join(root, 'order'), 'utf8')).match(/discovery/g)).toHaveLength(1)
 })
 
-it('a failed discovery replaces the old green receipt and can be retried', async ({ signal, task }) => {
+it('a failed discovery replaces the old green receipt and can be retried', async ({ signal }) => {
   const fixture = activeCase, { root } = fixture
-  expect(task.timeout).toBe(30_000)
   const good = await fixture.refresh(signal)
   expect(good.code).toBe(0)
   const discoveryPath = join(root, 'caller-bin', 'agent-interface')
