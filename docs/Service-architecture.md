@@ -340,7 +340,8 @@ reconciles them as after any restart.
   provenance, and model.
   If a drain or another switch is pending during recovery, both interrupted and
   waiting records stay durable until it clears; continuations keep priority
-  over their follow-ups. Waiting turns follow these recoveries in order.
+  over their follow-ups. Drain and withdrawal release paths also retain records
+  held by another live server. Waiting turns follow these recoveries in order.
   Withdrawal waits for any bound cancellation to record recovery before
   releasing messages. A bound
   cancellation never bypasses the quiet gate for server work, background

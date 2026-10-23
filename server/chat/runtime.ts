@@ -749,7 +749,7 @@ export class ChatRuntime extends EventEmitter {
   private async resumeAfterUpdate(protectedSessions: ReadonlySet<string>, continuation = SWITCH_CONTINUE_PROMPT): Promise<void> {
     for (const row of this.readInterruptedSessions()) {
       if (this.stopped || this.drainState || this.switchState) return
-      if (protectedSessions.has(row.sessionId)) continue
+      if (protectedSessions.has(row.sessionId) || this.recoveryOwnedElsewhere(row.sessionId)) continue
       if (!this.takeInterruptedSession(row.sessionId)) continue
       await this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
     }
@@ -760,9 +760,26 @@ export class ChatRuntime extends EventEmitter {
   private async startWaitingPrompts(protectedSessions: ReadonlySet<string> = new Set()): Promise<void> {
     for (const entry of this.readWaitingPrompts()) {
       if (this.stopped || this.drainState || this.switchState) return
-      if (protectedSessions.has(entry.sessionId)) continue
+      if (protectedSessions.has(entry.sessionId) || this.recoveryOwnedElsewhere(entry.sessionId)) continue
       if (!this.takeWaitingPrompt(entry.id)) continue
       await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery)
+    }
+  }
+
+  /** Release paths have no startup protection set. Recheck the live owner
+   *  before consuming durable work that another server must recover. */
+  private recoveryOwnedElsewhere(sessionId: string): boolean {
+    const record = storage.getSession(sessionId)
+    if (!record) return false
+    if (record.instance !== this.instance) return true
+    try {
+      const row = new CheckoutLease(record.checkout, { ownerKind: 'poise:chat', ownerId: sessionId,
+        ownerLabel: '', instance: this.instance }, this.leaseProbes).read()
+      return !!row && row.owner_kind === 'poise:chat' && row.owner_id === sessionId
+        && row.host_pid !== this.hostPid && (this.leaseProbes.pidAlive ?? pidAlive)(row.host_pid)
+    } catch (error) {
+      this.emit('log', `[chat] recovery ownership for ${sessionId.slice(0, 8)} is unreadable: ${error instanceof Error ? error.message : String(error)}`)
+      return true
     }
   }
 

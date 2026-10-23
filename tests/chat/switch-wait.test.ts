@@ -88,9 +88,9 @@ async function world(options: { auto?: boolean, deferStart?: boolean } = {}) {
   await writeFile(join(repo, 'README.md'), '# Switch fixture\n'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'fixture')
   const instance = `switch-test:${randomUUID()}`
   const c: Controls = { auto: options.auto ?? true, calls: [], adapters: [], compactions: 0 }
-  function make() {
+  function make(leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions) {
     const runtime = new Runtime({ instance, instanceLabel: 'switch-test', callerTurns: null, idleTimeoutMinutes: () => 0,
-      catalog: async () => CATALOG, resolveCheckout: async () => repo, requireClaudeReady: async () => {},
+      catalog: async () => CATALOG, resolveCheckout: async () => repo, requireClaudeReady: async () => {}, leaseProbes,
       adapters: Object.fromEntries((['grok', 'claude', 'codex', 'muse'] as AgentId[]).map(agent => [agent, (host: AdapterHost) => new Fake(agent, host, c)])),
     })
     runtimes.push(runtime); return runtime
@@ -357,6 +357,46 @@ describe('the switch bound', () => {
     ])
     expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
     expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([])
+  })
+
+  it.each(['drain', 'withdrawal'] as const)('retains another live server recovery rows when releasing %s', async release => {
+    const w = await world()
+    w.runtime.setSwitchPending('r2')
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID() }])
+    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+    await w.runtime.stop()
+    const { CheckoutLease } = await import('../../server/chat/checkout-lock')
+    const remotePid = process.pid + 1_000_000
+    const probes = { pidAlive: (pid: number) => pid === remotePid || pid === process.pid }
+    const lease = new CheckoutLease(w.repo, { ownerKind: 'poise:chat', ownerId: w.s.id,
+      ownerLabel: 'live recovery owner', instance: w.instance }, { ...probes, hostPid: remotePid })
+    expect(lease.tryAcquire().acquired).toBe(true)
+    storage.recordWorker({ sessionId: w.s.id, gatePid: remotePid, gatePgid: remotePid, ident: 'protected fixture',
+      checkout: w.repo, leaseToken: lease.currentToken, command: 'held owner', startedAt: new Date().toISOString() })
+    const waiting = database.getMeta('chat_switch_waiting')
+    const interrupted = database.getMeta('chat_switch_interrupted')
+    const next = w.make(probes)
+    try {
+      if (release === 'drain') next.startDrain('service')
+      else next.setSwitchPending('r3')
+      await next.recover()
+      if (release === 'drain') next.endDrain()
+      else await next.releaseSwitchWait()
+      expect(database.getMeta('chat_switch_interrupted')).toBe(interrupted)
+      expect(database.getMeta('chat_switch_waiting')).toBe(waiting)
+      expect(storage.getOpenTurn(w.s.id)).toBeNull()
+      expect(next.get(w.s.id)?.queue?.items ?? []).toEqual([])
+      expect(lease.read()?.token).toBe(lease.currentToken)
+      expect(w.c.calls).toHaveLength(0)
+    } finally {
+      storage.forgetWorker(w.s.id)
+      lease.release()
+    }
+    await next.recover()
+    await until(() => w.c.calls.length === 2)
+    expect(w.c.calls.map(call => call.input.text)).toEqual([
+      'Poise restarted for an update while your turn was running. Continue where you left off.', 'Waited follow-up',
+    ])
   })
 
   it('retains shown input, switches and change completion when recovery queues behind a busy turn', async () => {
