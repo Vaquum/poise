@@ -161,6 +161,8 @@ beforeEach(async () => {
 })
 afterEach(async () => {
   await control?.stop()
+  resumeReleaseBackground()
+  markReleaseSwitch(false)
   await runtime?.stop()
   await new Promise<void>(done => server.close(() => done()))
 })
@@ -831,6 +833,7 @@ describe('durable timers that wake chats', () => {
     // before this fixture's exact removal count.
     pauseReleaseBackground()
     try {
+      // A paused tick does not join an in-flight pass; drain its owner count.
       await until(() => releaseBackgroundBusy() === 0)
       clock += 8 * 86_400_000
       expect(store.retainTimers(instance, clock).rows).toBe(0)
@@ -838,7 +841,9 @@ describe('durable timers that wake chats', () => {
       finishes.get(p.id)!({ stopReason: kind === 'once' ? 'end_turn' : 'error', ...(kind === 'every' ? { error: 'Long turn failed' } : {}) })
       await until(() => runtime.get(p.id)?.status === 'idle')
       // Attempt competing maintenance causally, without waiting for its interval.
-      await control.tick()
+      const competing = control.tick()
+      expect(releaseBackgroundBusy()).toBe(0)
+      await competing
       expect(store.timerById(instance, created.id)).toMatchObject(kind === 'once' ? { state: 'done', reason: 'completed' } : { state: 'active', failures: 1 })
       if (kind === 'every') expect(store.retainTimers(instance, clock).rows).toBe(1)
     } finally { resumeReleaseBackground() }
