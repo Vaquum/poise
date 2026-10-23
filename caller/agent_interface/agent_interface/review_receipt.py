@@ -136,6 +136,31 @@ def record_file(path: str | Path) -> dict | None:
     return record(text) if text.strip() else None
 
 
+def concurrent_unclaimed_run_exists(database: Path, call_id: str, repo: str, pr_number: str) -> bool:
+    """A sibling PR run that may have submitted without recording its review id.
+
+    True when another pr_review/pr_approve run by the same actor on this target is still running,
+    or ended after this run started without a recorded review id and without
+    provable no-action preflight state. An unclaimed extra review is then
+    unattributed: this run cannot tell its own second write from the sibling's
+    invisible one, so it must not be blamed for a duplicate.
+    """
+    with sqlite3.connect(database, timeout=30) as conn:
+        mine = conn.execute("select started_at, actor from calls where id=?", (call_id,)).fetchone()
+        if mine is None or mine[0] is None:
+            return True
+        started, actor = mine
+        row = conn.execute(
+            "select 1 from calls where id != ? and repo = ? and pr_id = ? "
+            "and actor IS ? COLLATE NOCASE "
+            "and behavior in ('pr_review', 'pr_approve') and review_id is null "
+            "and (outcome is null or action is null "
+            "or outcome != 'preflight_failed' or action != 'not_started') "
+            "and (status = 'running' or ended_at > ?) limit 1",
+            (call_id, repo, pr_number, actor, started)).fetchone()
+    return row is not None
+
+
 def sibling_ids(database: Path, call_id: str, repo: str, pr_number: str) -> set[int]:
     """Review ids other runs recorded for this PR — theirs, never this run's."""
     with sqlite3.connect(database, timeout=30) as conn:

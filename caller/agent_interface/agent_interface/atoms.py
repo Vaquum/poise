@@ -50,6 +50,26 @@ def provider_blocked(message: str) -> bool:
     return any(block in message for block in PROVIDER_BLOCKS)
 
 
+# Bounded, redacted provider cause. Never persist raw event streams or tool
+# output: prefer the provider's own error line, redact credential shapes, and
+# truncate. Mirrors the github-interface redactor's patterns without its env.
+_CAUSE_LIMIT = 500
+
+
+def redact_cause(text: str) -> str:
+    redacted = re.sub(r"(?im)\b(?:proxy-authorization|authorization|set-cookie|cookie)\s*[:=][^\r\n]*",
+                      "[redacted header]", text)
+    redacted = re.sub(r"(?i)\b(?:basic|bearer|token)\s+[^\s,;\"']+", "[redacted credential]", redacted)
+    redacted = re.sub(r"(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "[redacted]", redacted)
+    redacted = re.sub(r"(?i)(https?://)[^\s/@]+@", r"\1[redacted]@", redacted)
+    return re.sub(r"(?i)([?&](?:token|key|secret|password|auth|signature)=)[^\s&#]+", r"\1[redacted]", redacted)
+
+
+def bounded_cause(text: str, limit: int = _CAUSE_LIMIT) -> str:
+    cleaned = redact_cause(" ".join(str(text or "").split()))
+    return cleaned[:limit] if len(cleaned) <= limit else cleaned[:limit] + "…"
+
+
 def pr_number(pr: str) -> str:
     raw = str(pr).strip().rstrip("/")
     if "/pull/" in raw:
