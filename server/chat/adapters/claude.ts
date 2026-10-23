@@ -185,7 +185,17 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
   // not exist; an unreadable file is not recorded at all, so a read error
   // can never masquerade as a newly created file that Revert would delete.
   const preImages = new Map<string, string | null>()
+  const preImageReads = new Map<string, Promise<void>>()
   async function capturePreImage(path: string): Promise<void> {
+    const pending = preImageReads.get(path)
+    if (pending) return pending
+    const reading = readPreImage(path)
+    preImageReads.set(path, reading)
+    try { await reading } finally {
+      if (preImageReads.get(path) === reading) preImageReads.delete(path)
+    }
+  }
+  async function readPreImage(path: string): Promise<void> {
     try {
       preImages.set(path, await host.readTextFile(path))
     } catch (error) {
@@ -290,6 +300,11 @@ export function createClaudeAdapter(host: AdapterHost, options: { exitGraceMs?: 
       }
     }
     try {
+      // Replay can deliver a pending permission while its already-answered
+      // PreToolUse callback is still reading. Native Write must not start
+      // until that shared pre-image read has finished.
+      const path = (input as { file_path?: unknown }).file_path
+      if (['Write', 'Edit', 'MultiEdit'].includes(toolName) && typeof path === 'string') await capturePreImage(path)
       const optionId = await host.requestPermission({
         toolId: options.toolUseID,
         title: options.title || toolTitle(toolName, input),
