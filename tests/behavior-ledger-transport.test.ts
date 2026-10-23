@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { randomBytes } from 'node:crypto'
+import { Worker } from 'node:worker_threads'
 import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,7 +24,7 @@ async function fixture(body: string, options: ConstructorParameters<typeof Behav
   const directory = await mkdtemp(join(tmpdir(), 'ledger-transport-'))
   directories.push(directory)
   const workerPath = join(directory, 'worker.mjs')
-  await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\n${body}`)
+  await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\n${body}\nport.on('message',request=>{if(request.operation==='close')port.close()});`)
   const observer = new BehaviorLedgerObserver({ workerPath, ...options })
   observers.push(observer)
   await observer.start()
@@ -54,11 +55,50 @@ function blockedWorker(operation: 'capture' | 'read'): string {
     });`
 }
 afterEach(async () => {
-  await Promise.all(observers.splice(0).map((observer) => observer.stop()))
+  await Promise.all(observers.splice(0).map(async (observer) => {
+    // stop bounds its caller; fixture files belong to the worker until exit.
+    await observer.stop()
+    await observer.waitForExit()
+  }))
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
 })
 
 describe('bounded behavior ledger transport', () => {
+  it('terminates a protocol-failed idle worker instead of leaking its live event loop', async () => {
+    const sent = vi.spyOn(Worker.prototype, 'postMessage')
+    const terminated = vi.spyOn(Worker.prototype, 'terminate')
+    let worker: Worker | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const observer = await fixture(`
+        port.postMessage({ready:true,health,pending:[]});
+        port.on('message',request=>{
+          if(request.operation!=='read') return;
+          port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});
+          setImmediate(()=>{
+            port.postMessage({pending:[],invalid:true});
+            while(true) {}
+          });
+        });`)
+      expect((await observer.read({ operation: 'health' })).status).toBe(200)
+      worker = sent.mock.contexts.find((value): value is Worker => value instanceof Worker)
+      expect(worker).toBeDefined()
+      const exited = await Promise.race([
+        observer.waitForExit().then(() => true),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 1000) }),
+      ])
+      expect(exited).toBe(true)
+      expect(terminated).toHaveBeenCalledExactlyOnceWith()
+      expect((await observer.read({ operation: 'health' })).body.health.status).toBe('unavailable')
+    } finally {
+      clearTimeout(timer)
+      // Only this fixture's pure-JS worker is forcibly settled on guard failure.
+      if (worker && worker.threadId !== -1) await worker.terminate()
+      sent.mockRestore()
+      terminated.mockRestore()
+    }
+  })
+
   it('queues newest overflow while the worker drains and never throws into work', async () => {
     const observer = await fixture(`
       port.postMessage({ready:true,health,pending:[]});
