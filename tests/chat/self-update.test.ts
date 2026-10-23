@@ -246,7 +246,7 @@ describe('/poise change sessions', () => {
     const previous = randomUUID()
     storage.reserveQueueTurn(source.id, previous)
     storage.finalizeTurn(source.id, { type: 'turn.finished', turnId: previous, stopReason: 'end_turn' })
-    expect(initial.runtime.get(source.id)?.queue?.ready).toBe(queued)
+    expect(initial.runtime.get(source.id)?.queue?.ready ?? false).toBe(queued)
     const starting = initial.runtime.startPoiseChange(source.id, request, changeId, context)
     try {
       await waitFor(() => binding)
@@ -278,12 +278,15 @@ describe('/poise change sessions', () => {
       active.runtime.setSwitchPending(null)
       expect(active.runtime.prompt(result.session.id, { text: 'Discuss after implementing', attachments: [], mentions: [] })).toHaveProperty('waitId')
       expect(storage.getOpenTurn(result.session.id)).toBeNull()
+      const statusCalls = bridge.calls.filter(call => call.op === 'status').length
       await active.runtime.releaseSwitchWait()
       await waitFor(() => !!outbox.getFinish(changeId)?.deliveredAt)
       expect(ofType(active.events, result.session.id, 'turn.finished')).toHaveLength(1)
       // A waited follow-up must reach the release guard even with no older
       // normal queue entry to block it. Observe the guard before release.
-      await waitFor(() => active.runtime.get(result.session.id)?.queue?.waitingForRelease === true)
+      await waitFor(() => bridge.calls.filter(call => call.op === 'status').length > statusCalls)
+      if (queued) expect(active.runtime.get(result.session.id)?.queue?.waitingForRelease).toBe(true)
+      expect(bridge.changes.get(changeId)?.state).toBe('checking')
       const agent = active.controls.adapters.find(adapter => adapter.host.sessionId === result.session.id)!
       expect(agent.inputs).toHaveLength(1)
       bridge.changes.get(changeId)!.state = 'live'
