@@ -97,6 +97,14 @@ async function restartModules() {
   return loadModules()
 }
 
+// The agent-log lanes share a short-TTL snapshot, so a phase that changes
+// the mocked log (or its mock) drops the cache first: the next read must
+// see the new world, not the previous phase's snapshot. Boundaries after a
+// loadModules/restartModules need no reset; those instances start empty.
+async function resetLogCache() {
+  (await import('../server/agent')).resetAgentLogCache()
+}
+
 interface ReviewActivityFixture {
   requestedReviewers?: string[]
   activeChangeRequestAuthors?: string[]
@@ -524,5 +532,5 @@ export const fixture = {
   set agentLogs(value: typeof agentLogs) { agentLogs = value },
 }
 
-export { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, externalCalls, loadModules, restartModules, arrangeCli, agentLog, datastoreHealthOutput, deferred, recordCompletedInitialReview, launchReviewBeforeCrash, launchApprovalBeforeCrash }
+export { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, externalCalls, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, datastoreHealthOutput, deferred, recordCompletedInitialReview, launchReviewBeforeCrash, launchApprovalBeforeCrash }
 export type { ReviewActivityFixture }

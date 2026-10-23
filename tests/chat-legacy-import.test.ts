@@ -150,6 +150,7 @@ beforeEach(async () => {
   mocks.logs = '[]'
   mocks.bodies = new Map()
   mocks.logsError = null
+  ;(await import('../server/agent')).resetAgentLogCache()
   instance = `legacy:${randomUUID()}`
   workspaceRoot = join(root, randomUUID())
   runtime = makeRuntime()

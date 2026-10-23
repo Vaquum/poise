@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
 describe('durable behavior quarantine', () => {
   it.each(['review-new-prs', 'approve-prs'] as const)('retains later corruption of an already failed %s launch after logs are revised', async (behavior) => {
@@ -13,12 +13,15 @@ describe('durable behavior quarantine', () => {
       correlation_id: launched.correlationId,
     })
     fixture.agentLogs = [failed]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.getFailedBehaviorLaunch(behavior, launched.target)).not.toBeNull()
     fixture.agentLogs = [{ ...failed, status: 'completed', completed_at: new Date().toISOString(), error: '' }]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.getFailedBehaviorLaunch(behavior, launched.target)?.launchQuarantine).toBe('invalid_result')
     fixture.agentLogs = [failed]
+    await resetLogCache()
     arrangeCli(behavior === 'approve-prs', false, { headSha: NEXT_HEAD_SHA })
     vi.setSystemTime(Date.now() + 60_000)
     const loaded = await restartModules()
@@ -26,6 +29,7 @@ describe('durable behavior quarantine', () => {
     fixture.listedPrs.push({ ...pr, number: 18, url: `https://github.com/${pr.repo}/pull/18` })
     await loaded.behaviors.runEnabledBehaviorsOnce()
     fixture.agentLogs = []
+    await resetLogCache()
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(mocks.spawnDetached.mock.calls[1][1]).toContain('#18')
@@ -58,6 +62,7 @@ describe('durable behavior quarantine', () => {
       id: 'c'.repeat(32), status: 'running', actor: secondary.launchActor, source: secondary.launchSource,
       correlation_id: secondary.launchCorrelationId, expected_head: secondary.launchExpectedHead,
     })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     const error = db.listBehaviorLaunchClaims('review-new-prs').find((claim) => claim.target === primary.target)!.launchError
     const launch = mocks.spawnDetached.mock.calls.find(([, args]) => !(args as string[]).includes('--reviewer-slot')
@@ -68,10 +73,13 @@ describe('durable behavior quarantine', () => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('shared log temporarily unavailable')
       return cli(command, args, ...rest)
     })
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     mocks.runFile.mockImplementation(cli)
+    await resetLogCache()
     vi.setSystemTime(Date.now() + 1_000)
     fixture.agentLogs[1] = { ...fixture.agentLogs[1], status: 'completed', action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA, completed_at: new Date().toISOString() }
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(db.listBehaviorLaunchClaims('review-new-prs')).toEqual([
       expect.objectContaining({ target: primary.target, launchQuarantine: 'invalid_result', launchError: error }),
@@ -100,6 +108,7 @@ describe('durable behavior quarantine', () => {
       correlation_id: launched.correlationId,
     })
     fixture.agentLogs = [invalid]
+    await resetLogCache()
     let loaded = await restartModules()
     loaded.behaviors.startBehaviorsRuntime()
     await loaded.behaviors.runEnabledBehaviorsOnce()
@@ -115,12 +124,15 @@ describe('durable behavior quarantine', () => {
       [behavior === 'review-new-prs' ? 'pr_review' : 'pr_approve']: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' },
     }))
     fixture.agentLogs = [{ ...invalid, status: 'completed', action, outcome, head_sha: HEAD_SHA, completed_at: new Date().toISOString() }]
+    await resetLogCache()
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(loaded.database.listBehaviorDeadLetters()).toEqual([expect.objectContaining({ target: launched.target })])
     fixture.agentLogs = [{ ...invalid, status: 'failed', action: null, outcome: null, head_sha: null, error: 'provider exited before reporting an action' }]
+    await resetLogCache()
     vi.setSystemTime(Date.now() + 60_000)
     await loaded.behaviors.runEnabledBehaviorsOnce()
     fixture.agentLogs = []
+    await resetLogCache()
     vi.setSystemTime(Date.now() + 6 * 60_000)
     loaded = await restartModules()
     loaded.behaviors.startBehaviorsRuntime()
@@ -137,9 +149,11 @@ describe('durable behavior quarantine', () => {
     vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
     const launched = behavior === 'review-new-prs' ? await launchReviewBeforeCrash() : await launchApprovalBeforeCrash()
     fixture.agentLogs = [{ corrupt: true }]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorLaunchClaims(behavior)[0].launchQuarantine).toBe('unreadable')
     fixture.agentLogs = []
+    await resetLogCache()
     vi.setSystemTime(Date.now() + 6 * 60_000)
     const loaded = await restartModules()
     loaded.behaviors.startBehaviorsRuntime()
@@ -150,6 +164,7 @@ describe('durable behavior quarantine', () => {
       status: 'failed', error: 'provider exited before reporting an action',
     })
     fixture.agentLogs = [actual]
+    await resetLogCache()
     vi.setSystemTime(Date.now() + 60_000)
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
@@ -157,6 +172,7 @@ describe('durable behavior quarantine', () => {
     expect(loaded.database.getFailedBehaviorLaunch(behavior, launched.target)?.launchQuarantine).toBeNull()
     expect(loaded.database.listBehaviorDeadLetters()).toMatchObject([{ error: 'provider exited before reporting an action' }])
     fixture.agentLogs = [{ ...actual, status: 'completed', action: behavior === 'review-new-prs' ? 'reviewed_clean' : 'approved', outcome: behavior === 'review-new-prs' ? 'clean' : 'approved', head_sha: HEAD_SHA, completed_at: new Date().toISOString() }]
+    await resetLogCache()
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(loaded.database.listBehaviorLaunchClaims(behavior)).toEqual([])
     expect(loaded.database.listBehaviorDeadLetters()).toEqual([])
@@ -171,14 +187,17 @@ describe('durable behavior quarantine', () => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, options)
     })
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorLaunchClaims(behavior)[0].launchQuarantine).toBe('unreadable')
     mocks.runFile.mockImplementation(original)
+    await resetLogCache()
     fixture.agentLogs = [agentLog({
       behavior: behavior === 'review-new-prs' ? 'pr_review' : 'pr_approve',
       actor: launched.actor, source: launched.source, expected_head: HEAD_SHA,
       correlation_id: launched.correlationId, status: 'running',
     })]
+    await resetLogCache()
     vi.setSystemTime(Date.now() + 2 * 60 * 60_000)
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorLaunchClaims(behavior)).toEqual([])
@@ -193,12 +212,14 @@ describe('durable behavior quarantine', () => {
   it.each(['unknown-status', 'duplicate-call', 'quarantined-duplicate'] as const)('does not clear unreadable evidence from a %s record', async (conflict) => {
     const launched = await launchReviewBeforeCrash()
     fixture.agentLogs = [{ corrupt: true }]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     const call = agentLog({ actor: launched.actor, source: launched.source, correlation_id: launched.correlationId,
       status: conflict === 'unknown-status' ? 'not-a-status' : 'running' })
     fixture.agentLogs = conflict === 'unknown-status' ? [call] : [call, {
       ...call, ...(conflict === 'quarantined-duplicate' ? { actor: 42 } : { id: 'a'.repeat(32) }),
     }]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorLaunchClaims('review-new-prs')[0].launchQuarantine).toBe('unreadable')
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
@@ -215,6 +236,7 @@ describe('durable behavior quarantine', () => {
         status: 'failed', error: 'provider exited without action' })
       if (state === 'closed') {
         fixture.agentLogs = [failed]
+        await resetLogCache()
         await launched.behaviors.runEnabledBehaviorsOnce()
       }
       const original = mocks.runFile.getMockImplementation()!
@@ -222,19 +244,23 @@ describe('durable behavior quarantine', () => {
         if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
         return original(command, args, options)
       })
+      await resetLogCache()
       await launched.behaviors.runEnabledBehaviorsOnce()
       mocks.runFile.mockImplementation(original)
+      await resetLogCache()
       const completed = { ...failed, id: identity === 'correlation' ? 'e'.repeat(32) : failed.id, status: 'completed', error: '',
         action: behavior === 'review-new-prs' ? 'reviewed_clean' : 'approved',
         outcome: behavior === 'review-new-prs' ? 'clean' : 'approved',
         head_sha: HEAD_SHA, completed_at: new Date().toISOString() }
       const duplicate = identity === 'quarantined-call-id' ? { ...failed, status: 'running', actor: 42 } : failed
       fixture.agentLogs = behavior === 'review-new-prs' ? [duplicate, completed] : [completed, duplicate]
+      await resetLogCache()
       await launched.behaviors.runEnabledBehaviorsOnce()
       const held = state === 'closed' ? launched.database.getFailedBehaviorLaunch(behavior, launched.target)
         : launched.database.listBehaviorLaunchClaims(behavior)[0]
       expect(held?.launchQuarantine).toBe('invalid_result')
       fixture.agentLogs = [failed]
+      await resetLogCache()
       vi.setSystemTime(Date.now() + 60_000)
       const loaded = await restartModules()
       loaded.behaviors.startBehaviorsRuntime()
@@ -250,21 +276,26 @@ describe('durable behavior quarantine', () => {
     const call = agentLog({ behavior: behavior === 'review-new-prs' ? 'pr_review' : 'pr_approve',
       actor: launched.actor, source: launched.source, correlation_id: launched.correlationId, status: 'running' })
     fixture.agentLogs = [call]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, options)
     })
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     mocks.runFile.mockImplementation(original)
+    await resetLogCache()
     fixture.agentLogs = [{ ...call, status: 'completed', error: '', completed_at: new Date().toISOString(), head_sha: HEAD_SHA,
       action: behavior === 'review-new-prs' ? 'reviewed_clean' : 'approved', outcome: behavior === 'review-new-prs' ? 'clean' : 'approved',
       ...(field === 'id' ? { id: 'e'.repeat(32) } : { correlation_id: 'different-correlation' }),
     }]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorLaunchClaims(behavior)[0]).toMatchObject({ launchCallId: call.id, launchQuarantine: 'invalid_result' })
     fixture.agentLogs = [{ ...call, status: 'failed', error: 'provider exited without action' }]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorLaunchClaims(behavior)[0].launchQuarantine).toBe('invalid_result')
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
@@ -275,14 +306,17 @@ describe('durable behavior quarantine', () => {
     const failed = agentLog({ actor: launched.actor, source: launched.source, correlation_id: launched.correlationId,
       status: 'failed', error: 'provider exited without action' })
     fixture.agentLogs = [failed]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, options)
     })
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     mocks.runFile.mockImplementation(original)
+    await resetLogCache()
     const completed = { ...failed, status: 'completed', error: '', action: 'reviewed_clean', outcome: 'clean',
       head_sha: HEAD_SHA, completed_at: new Date().toISOString(),
       ...(field === 'actor' ? { actor: 'another-bot' } : {}),
@@ -292,6 +326,7 @@ describe('durable behavior quarantine', () => {
       ...(field === 'head' ? { head_sha: NEXT_HEAD_SHA } : {}),
     }
     fixture.agentLogs = [completed]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.getFailedBehaviorLaunch('review-new-prs', launched.target)?.launchQuarantine).toBe('invalid_result')
     expect(launched.database.listBehaviorDeadLetters()).toHaveLength(1)
@@ -306,11 +341,13 @@ describe('durable behavior quarantine', () => {
       status: 'completed', actor: launched.actor, source: launched.source,
       expected_head: launched.expectedHead, correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
     let loaded = await restartModules()
     loaded.behaviors.startBehaviorsRuntime()
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     fixture.agentLogs = []
+    await resetLogCache()
     vi.setSystemTime(Date.now() + 6 * 60_000)
     loaded = await restartModules()
     loaded.behaviors.startBehaviorsRuntime()
@@ -327,6 +364,7 @@ describe('durable behavior quarantine', () => {
       actor: launched.actor, source: launched.source,
       expected_head: launched.expectedHead, correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
     let loaded = await restartModules()
     loaded.behaviors.startBehaviorsRuntime()
     await loaded.behaviors.runEnabledBehaviorsOnce()

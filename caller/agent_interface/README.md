@@ -319,6 +319,33 @@ the recovery model in a new checkout. github-interface runs in its own process
 group, so a timeout also ends the git it started; a mirror left broken is
 cloned afresh once. `--models` lists `issue_review_providers`.
 
+# Incremental log reads
+
+Bare `--logs` retains its complete oldest-first array. `--logs --status running`
+uses the running-call index; `--logs --limit N [--cursor C]` returns a bounded
+insertion-order page with an opaque `nextCursor`. Insertion order is not a
+call's start time.
+
+`--logs --select '{"latest":[{"behavior":"pr_review","source":"poise:review-new-prs","owner":"autonomio"}],"ids":["FULL_CALL_ID"]}'`
+returns an oldest-first array containing one indexed latest-started call per
+behavior/source/owner needle plus exact call-ID lookups. Missing kinds return
+no row without traversing history. There are at most 256 latest needles and
+1,000 IDs; invalid or larger requests fail. Poise shares identical selections
+in flight and for five seconds, and decodes large responses off its main thread.
+Development parses share one temporary build while workers are active, then
+remove that owned directory after the final worker stops, including failures.
+Production continues to use its packaged worker asset.
+An unsupported command or failed read marks dashboard history unavailable,
+rather than proving that a behavior has never run.
+
+Before launching content, `--logs --watermark` returns an insertion `cursor`.
+`--logs --after CURSOR --session SESSION --behavior author_content --prompt TEXT`
+then returns at most two exact candidates inserted after that boundary,
+including completed and failed calls. Two candidates preserve ambiguity;
+neither an early completion nor an old matching call is mistaken for absence
+or for the new launch. These arguments stay separate so a permitted topic
+does not expand into an oversized JSON command argument.
+
 # PR stop gate
 
 `--install-pr-stop-gate` registers `--pr-stop-gate` as a Stop and PostToolUse

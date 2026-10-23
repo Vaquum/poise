@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, arrangeCli, recordCompletedInitialReview, launchApprovalBeforeCrash, agentLog, fixture, type ReviewActivityFixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, recordCompletedInitialReview, launchApprovalBeforeCrash, agentLog, fixture, type ReviewActivityFixture } from './behaviors-runtime-fixture'
 
 describe('approval eligibility and review activity', () => {
 
@@ -552,6 +552,7 @@ describe('approval eligibility and review activity', () => {
       action: 'approved', outcome: 'approved', expected_head: NEXT_HEAD_SHA, head_sha: NEXT_HEAD_SHA,
       review_id: 92, correlation_id: args[args.indexOf('--correlation-id') + 1],
     }))
+    await resetLogCache()
     await modules.behaviors.runEnabledBehaviorsOnce()
     expect(modules.database.latestApprovalBasisLaunch(pr.repo, pr.number)?.headSha).toBe(NEXT_HEAD_SHA)
     modules = await restartModules()
@@ -751,6 +752,8 @@ describe('approval eligibility and review activity', () => {
     if (variant === 'retry-delay') modules.database.setMeta(`behavior_approve_prs_failure:${prior.target}`, JSON.stringify({
       kind: 'worker', consecutiveFailures: 1, lastFailureAtMs: Date.now(), nextRetryAtMs: Date.now() + 60_000,
     }))
+    // Variants above mutate the held call in place; the next read must see it.
+    await resetLogCache()
     const head = variant === 'new-head' ? 'e'.repeat(40) : HEAD_SHA
     arrangeCli(false, false, { headSha: head, reviewerLatestState: 'DISMISSED',
       latestActivityAt: new Date().toISOString() }, { reviewer_latest_state: 'DISMISSED' })

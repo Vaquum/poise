@@ -37,6 +37,7 @@ __version__ = "0.3.0"
 DATA_DIR = Path(os.getenv("AGENT_INTERFACE_DATA_DIR", Path(__file__).resolve().parent.parent / "data"))
 DB = DATA_DIR / "calls.sqlite3"
 RESPONSES = DATA_DIR / "responses"
+LOG_OWNER_SQL = "lower(substr(repo || '/',1,instr(repo || '/','/')-1))"
 
 
 def db():
@@ -122,6 +123,11 @@ def init_db():
             );
             create index if not exists calls_diagnostic_pending on calls(ended_at,id)
                 where status != 'running' and (coalesce(error,'') != '' or error_code is not null or diagnostic is not null);
+            create index if not exists calls_status_started on calls(status, started_at);
+            create index if not exists calls_behavior_owner_started on calls(
+                behavior, source, lower(substr(repo || '/',1,instr(repo || '/','/')-1)), started_at desc, id desc
+            ) where repo is not null and repo != '' and pr_id is not null and pr_id != '';
+            create index if not exists calls_session_behavior on calls(session_id, behavior);
             create trigger if not exists calls_diagnostic_insert after insert on calls
             when new.status != 'running' and (coalesce(new.error,'') != '' or new.error_code is not null or new.diagnostic is not null)
             begin insert or ignore into diagnostic_calls(call_id) values(new.id); end;
@@ -474,53 +480,155 @@ def reap_interrupted() -> int:
     return count
 
 
-def logs():
+LOG_ROW_COLUMNS = """id, model, prompt, started_at, ended_at, status,
+    response_path, error, pr_id, repo, actor, behavior,
+    session_id, outcome, head_sha, expected_head, source,
+    correlation_id, action, error_code, progress, review_policy, recovery_model,
+    review_id, runner, receipts, review_comments, diagnostic"""
+
+
+def _log_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "pr_id": r["pr_id"],
+        "repo": r["repo"],
+        "actor": r["actor"],
+        "behavior": r["behavior"],
+        "session_id": r["session_id"],
+        "model": r["model"],
+        "prompt": r["prompt"],
+        "started_at": stamp(r["started_at"]),
+        "started_at_precise": utc_stamp(r["started_at"]),
+        "completed_at": utc_stamp(r["ended_at"]) if r["ended_at"] else None,
+        "time_elapsed": elapsed(r["started_at"], r["ended_at"]),
+        "status": r["status"],
+        "outcome": r["outcome"],
+        "head_sha": r["head_sha"],
+        "expected_head": r["expected_head"],
+        "source": r["source"],
+        "correlation_id": r["correlation_id"],
+        "action": r["action"],
+        "error_code": r["error_code"],
+        "diagnostic": json.loads(r["diagnostic"]) if r["diagnostic"] else None,
+        "progress": progress.decode(r["progress"]),
+        "review_policy": r["review_policy"],
+        "recovery_model": r["recovery_model"],
+        "review_id": int(r["review_id"]) if r["review_id"] and str(r["review_id"]).isdigit() else None,
+        # The inline comments a change request posted, as GitHub's reply counted them.
+        "review_comments": int(r["review_comments"]) if r["review_comments"] and str(r["review_comments"]).isdigit() else None,
+        "response": Path(r["response_path"]).stem[:8] if r["response_path"] else None,
+        "error": r["error"],
+        "runner": r["runner"],
+        "receipts": _receipts(r["receipts"]),
+    }
+
+
+def logs(status: str | None = None):
+    """Every retained call, oldest first; with status, only the running ones.
+
+    The running-only read is indexed on (status, started_at), so retained
+    history does not raise its cost. Use logs_page for bounded history."""
+    if status is not None and status != "running":
+        raise ValueError("logs status filter must be running")
     reap_interrupted()
     with db() as conn:
         rows = conn.execute(
-            """select id, model, prompt, started_at, ended_at, status,
-                      response_path, error, pr_id, repo, actor, behavior,
-                      session_id, outcome, head_sha, expected_head, source,
-                      correlation_id, action, error_code, progress, review_policy, recovery_model,
-                      review_id, runner, receipts, review_comments, diagnostic
-               from calls order by started_at"""
+            f"select {LOG_ROW_COLUMNS} from calls"
+            + (" where status='running'" if status else "")
+            + " order by started_at"
         ).fetchall()
-    return [
-        {
-            "id": r["id"],
-            "pr_id": r["pr_id"],
-            "repo": r["repo"],
-            "actor": r["actor"],
-            "behavior": r["behavior"],
-            "session_id": r["session_id"],
-            "model": r["model"],
-            "prompt": r["prompt"],
-            "started_at": stamp(r["started_at"]),
-            "started_at_precise": utc_stamp(r["started_at"]),
-            "completed_at": utc_stamp(r["ended_at"]) if r["ended_at"] else None,
-            "time_elapsed": elapsed(r["started_at"], r["ended_at"]),
-            "status": r["status"],
-            "outcome": r["outcome"],
-            "head_sha": r["head_sha"],
-            "expected_head": r["expected_head"],
-            "source": r["source"],
-            "correlation_id": r["correlation_id"],
-            "action": r["action"],
-            "error_code": r["error_code"],
-            "diagnostic": json.loads(r["diagnostic"]) if r["diagnostic"] else None,
-            "progress": progress.decode(r["progress"]),
-            "review_policy": r["review_policy"],
-            "recovery_model": r["recovery_model"],
-            "review_id": int(r["review_id"]) if r["review_id"] and str(r["review_id"]).isdigit() else None,
-            # The inline comments a change request posted, as GitHub's reply counted them.
-            "review_comments": int(r["review_comments"]) if r["review_comments"] and str(r["review_comments"]).isdigit() else None,
-            "response": Path(r["response_path"]).stem[:8] if r["response_path"] else None,
-            "error": r["error"],
-            "runner": r["runner"],
-            "receipts": _receipts(r["receipts"]),
-        }
-        for r in rows
-    ]
+    return [_log_row(r) for r in rows]
+
+
+LOGS_PAGE_LIMIT_MAX = 1000
+LOGS_LATEST_QUERY = f"""select {LOG_ROW_COLUMNS} from calls
+    where behavior=? and source=? and {LOG_OWNER_SQL}=?
+      and repo is not null and repo != '' and pr_id is not null and pr_id != ''
+    order by started_at desc, id desc limit 1"""
+
+
+def logs_watermark() -> str:
+    """The insertion boundary before a launch, including an empty database."""
+    with db() as conn:
+        return str(conn.execute("select coalesce(max(rowid),0) from calls").fetchone()[0])
+
+
+def logs_selected(selection: object) -> list[dict]:
+    """Exact latest-trigger and call-id reads; absence is checked at the source.
+
+    Each latest needle seeks one indexed row; each id seeks the primary key.
+    Missing kinds and old incidents never require walking retained history.
+    """
+    if not isinstance(selection, dict) or set(selection) != {"latest", "ids"}:
+        raise ValueError("logs selection requires latest and ids")
+    latest, ids = selection["latest"], selection["ids"]
+    if not isinstance(latest, list) or len(latest) > 256 or not isinstance(ids, list) or len(ids) > 1000:
+        raise ValueError("logs selection permits at most 256 latest needles and 1000 ids")
+    for needle in latest:
+        if not isinstance(needle, dict) or set(needle) != {"behavior", "source", "owner"} \
+                or any(not isinstance(needle[key], str) or not needle[key] or len(needle[key]) > 128 for key in needle):
+            raise ValueError("logs latest needle requires behavior, source and owner")
+    if any(not isinstance(id_, str) or not re.fullmatch(r"[0-9a-f]{32}", id_) for id_ in ids):
+        raise ValueError("logs selection requires full call ids")
+    reap_interrupted()
+    found: dict[str, sqlite3.Row] = {}
+    with db() as conn:
+        # One read transaction keeps the selectors on the same database snapshot.
+        conn.execute("begin")
+        for needle in latest:
+            row = conn.execute(LOGS_LATEST_QUERY,
+                               (needle["behavior"], needle["source"], needle["owner"].lower())).fetchone()
+            if row is not None:
+                found[row["id"]] = row
+        for id_ in ids:
+            row = conn.execute(f"select {LOG_ROW_COLUMNS} from calls where id=?", (id_,)).fetchone()
+            if row is not None:
+                found[row["id"]] = row
+    rows = sorted(found.values(), key=lambda row: (row["started_at"], row["id"]))
+    return [_log_row(row) for row in rows]
+
+
+def logs_session_since(after: str, session: str, behavior: str, prompt: str) -> list[dict]:
+    """At most two exact launch candidates, including already terminal calls."""
+    if not re.fullmatch(r"0|[1-9][0-9]*", after) or int(after) > 2**63 - 1:
+        raise ValueError("logs insertion boundary is invalid")
+    if not session or not behavior:
+        raise ValueError("logs session and behavior are required")
+    reap_interrupted()
+    with db() as conn:
+        rows = conn.execute(f"""select {LOG_ROW_COLUMNS} from calls
+            where session_id=? and behavior=? and rowid>? and prompt=?
+            order by rowid limit 2""", (session, behavior, int(after), prompt)).fetchall()
+    return [_log_row(row) for row in rows]
+
+
+def logs_page(limit: int, cursor: str | None = None) -> dict:
+    """One bounded newest-first history page; rows stay oldest-first in it.
+
+    Pages walk back by insertion order (rowid), so concurrent appends never
+    shift them. The cursor is the next page's exclusive rowid bound, opaque
+    to callers. Each page costs its own rows, never the retained history."""
+    if type(limit) is not int or not 1 <= limit <= LOGS_PAGE_LIMIT_MAX:
+        raise ValueError(f"logs page limit must be 1..{LOGS_PAGE_LIMIT_MAX}")
+    bound: int | None = None
+    if cursor is not None:
+        if not re.fullmatch(r"[1-9][0-9]*", cursor):
+            raise ValueError("logs page cursor is invalid")
+        bound = int(cursor)
+    reap_interrupted()
+    with db() as conn:
+        rows = conn.execute(
+            f"select rowid, {LOG_ROW_COLUMNS} from calls"
+            + (" where rowid < ?" if bound is not None else "")
+            + " order by rowid desc limit ?",
+            ((bound, limit + 1) if bound is not None else (limit + 1,)),
+        ).fetchall()
+    page = rows[:limit]
+    oldest = page[-1]["rowid"] if page else None
+    return {
+        "rows": [_log_row(r) for r in reversed(page)],
+        "nextCursor": str(oldest) if len(rows) > limit and oldest is not None else None,
+    }
 
 
 def diagnostics(after: int = 0, limit: int = 3) -> dict:
@@ -1487,7 +1595,10 @@ HELP = """usage: agent-interface BEHAVIOR ...
 behaviors:
   --models
   --refresh-models
-  --logs
+  --logs [--status running] [--limit 1..1000] [--cursor CURSOR]
+  --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
+  --logs --watermark
+  --logs --after WATERMARK --session SESSION --behavior BEHAVIOR --prompt TEXT
   --diagnostics [after-sequence] [limit-1..10]
   --stop CALL_ID
   --read-response HASH
@@ -1574,8 +1685,56 @@ def main():
         limit = int(sys.argv[3]) if len(sys.argv) == 4 else 3
         print(json.dumps(diagnostics(after, limit), allow_nan=False))
         return
-    if sys.argv[1:] == ["--logs"]:
-        print(json.dumps(logs(), separators=(",", ":")))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--logs":
+        if sys.argv[2:] == ["--watermark"]:
+            print(json.dumps({"cursor": logs_watermark()}))
+            return
+        if len(sys.argv) == 4 and sys.argv[2] == "--select":
+            try:
+                selection = json.loads(sys.argv[3])
+                selected = logs_selected(selection)
+            except (ValueError, TypeError) as error:
+                usage(error=str(error))
+            print(json.dumps(selected, separators=(",", ":")))
+            return
+        seen: dict[str, str] = {}
+        rest = sys.argv[2:]
+        i = 0
+        while i < len(rest):
+            flag = rest[i]
+            if flag not in ("--status", "--limit", "--cursor", "--after", "--session", "--behavior", "--prompt") or flag in seen or i + 1 >= len(rest):
+                usage()
+            seen[flag] = rest[i + 1]
+            i += 2
+        session_flags = {"--after", "--session", "--behavior", "--prompt"}
+        if session_flags.intersection(seen):
+            if set(seen) != session_flags:
+                usage(error="session log reads require after, session, behavior and prompt only")
+            try:
+                selected = logs_session_since(seen["--after"], seen["--session"], seen["--behavior"], seen["--prompt"])
+            except ValueError as error:
+                usage(error=str(error))
+            print(json.dumps(selected, separators=(",", ":")))
+            return
+        if "--status" in seen and ("--limit" in seen or "--cursor" in seen):
+            usage(error="--status running cannot combine with --limit or --cursor")
+        if "--cursor" in seen and "--limit" not in seen:
+            usage(error="--cursor requires --limit")
+        if "--limit" in seen:
+            try:
+                limit = int(seen["--limit"])
+            except ValueError:
+                usage(error="--limit must be an integer")
+            try:
+                payload: object = logs_page(limit, seen.get("--cursor"))
+            except ValueError as error:
+                usage(error=str(error))
+        else:
+            status = seen.get("--status")
+            if status is not None and status != "running":
+                usage(error="--status must be running")
+            payload = logs(status=status)
+        print(json.dumps(payload, separators=(",", ":")))
         return
     if sys.argv[1:] == ["--pr-stop-gate"]:
         pr_stop_gate.run()

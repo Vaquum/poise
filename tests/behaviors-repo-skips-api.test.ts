@@ -52,6 +52,7 @@ const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
 async function cli(command: string, args: string[], options: RunFileOptions) {
   const json = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' })
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
+  if (command === 'agent-interface' && args[0] === '--logs' && args.includes('--limit')) return json({ rows: [], nextCursor: null })
   if (command === 'agent-interface' && args[0] === '--logs') return json([])
   if (command === 'github-datastore' && args[0] === 'health') {
     if (healthFailure) throw healthFailure
@@ -143,6 +144,61 @@ afterEach(async () => {
 })
 
 describe('Skip repositories API', () => {
+  it('shares a bounded latest-trigger selection when one kind has never run', async () => {
+    let release!: () => void
+    let started!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const selected = new Promise<void>(resolve => { started = resolve })
+    const rows = [{
+      id: 'a'.repeat(32), model: 'gpt-6-astra-ultra', prompt: '',
+      behavior: 'pr_review', source: 'poise:review-new-prs', repo: REPO, pr_id: '1',
+      actor: 'review-bot', expected_head: HEAD, head_sha: HEAD, correlation_id: 'selection-fixture',
+      started_at: '2026-10-23T12:00:00Z', started_at_precise: '2026-10-23T12:00:00.000Z',
+      completed_at: '2026-10-23T12:01:00Z', action: 'reviewed_clean', outcome: 'clean',
+      time_elapsed: '1s', status: 'completed', error: '',
+    }]
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: RunFileOptions) => {
+      if (command === 'agent-interface' && args[1] === '--select') {
+        started()
+        await held
+        return { stdout: JSON.stringify(rows), stderr: '' }
+      }
+      return cli(command, args, options)
+    })
+    try {
+      const first = behaviorState()
+      const concurrent = behaviorState()
+      await selected
+      // Both requests must reach the held read to share it. A joined
+      // request makes no mock call, so its arrival is only observable by
+      // waiting: the second HTTP dispatch lands well inside this window.
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      release()
+      const [one, two] = await Promise.all([first, concurrent])
+      expect(one['review-new-prs']!.lastTriggered).toEqual({ at: '2026-10-23T12:00:00.000Z', target: `${REPO}#1` })
+      expect(one['review-new-issues']!.lastTriggered).toBeNull()
+      expect(one.diagnostics!.agentLogsError).toBeNull()
+      expect(two).toEqual(one)
+      await behaviorState()
+      const reads = mocks.runFile.mock.calls.filter(([command, args]) => command === 'agent-interface' && args[0] === '--logs')
+      expect(reads).toHaveLength(1)
+      expect(reads[0]![1].slice(0, 2)).toEqual(['--logs', '--select'])
+      expect(JSON.parse(reads[0]![1][2]).latest).toContainEqual({ behavior: 'issue_review', source: 'poise:review-new-issues', owner: 'Legacy' })
+    } finally { release() }
+  })
+
+  it('reports unavailable selection as unknown history for an older Caller', async () => {
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: RunFileOptions) => {
+      if (command === 'agent-interface' && args[1] === '--select') {
+        throw Object.assign(new Error('unsupported Caller flags'), { stderr: 'usage: agent-interface BEHAVIOR ...' })
+      }
+      return cli(command, args, options)
+    })
+    const state = await behaviorState()
+    expect(state['review-new-prs']!.lastTriggered).toBeNull()
+    expect(state.diagnostics!.agentLogsError).toBe('Update Caller: selected log reads are unavailable')
+  })
+
   it('serves time-filtered metrics and rejects invalid period boundaries', async () => {
     database!.db.prepare('INSERT INTO behavior_runs(id, behavior, started_at, completed_at, status) VALUES (?, ?, ?, ?, ?)')
       .run('merge-run', 'merge-prs', '2026-10-17T10:00:00Z', '2026-10-17T10:02:00Z', 'completed')

@@ -7,6 +7,8 @@ import type { QuarantinedAgentLog } from '../server/agent'
 
 const mocks = vi.hoisted(() => ({
   fetchAgentLogs: vi.fn(),
+  fetchAgentLogWatermark: vi.fn(),
+  fetchAgentLogsSince: vi.fn(),
   quarantined: [] as QuarantinedAgentLog[],
   runFile: vi.fn(),
   spawnDetached: vi.fn(),
@@ -19,7 +21,11 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../server/agent', async (importOriginal) => ({
   ...await importOriginal<typeof import('../server/agent')>(),
   fetchAgentLogs: mocks.fetchAgentLogs,
+  fetchRunningAgentLogs: mocks.fetchAgentLogs,
+  fetchAgentLogWatermark: mocks.fetchAgentLogWatermark,
+  fetchAgentLogsSince: async (...args: unknown[]) => ({ entries: await mocks.fetchAgentLogsSince(...args), quarantined: mocks.quarantined }),
   fetchAgentLogSnapshot: async () => ({ entries: await mocks.fetchAgentLogs(), quarantined: mocks.quarantined }),
+  fetchRunningAgentLogSnapshot: async () => ({ entries: await mocks.fetchAgentLogs(), quarantined: mocks.quarantined }),
   fetchAgentResponse: vi.fn(),
 }))
 vi.mock('../server/process', () => ({
@@ -51,6 +57,8 @@ beforeEach(async () => {
   process.env.POISE_EDITOR_DIR = join(root, 'editor')
   process.env.AGENT_INTERFACE_ROOT = join(root, 'agent-interface')
   mocks.fetchAgentLogs.mockReset().mockResolvedValue([])
+  mocks.fetchAgentLogWatermark.mockReset().mockResolvedValue('42')
+  mocks.fetchAgentLogsSince.mockReset().mockResolvedValue([])
   mocks.quarantined = []
   mocks.catalogStdout = CATALOG_STDOUT
   mocks.runFile.mockReset().mockImplementation(async (command: string, args: string[]) => {
@@ -211,18 +219,19 @@ describe('chat runtime hardening', () => {
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
 
-  it.each(['direct', 'durable'])('launches %s non-Claude content while Claude is signed out', async (path) => {
+  it.each(['direct', 'durable'])('discovers %s non-Claude content completed before its first poll while Claude is signed out', async (path) => {
     const catalog = JSON.parse(CATALOG_STDOUT)
     catalog.behaviors.author_content = 'gpt-6-astra-ultra'
     mocks.catalogStdout = JSON.stringify(catalog)
     mocks.authStatus = 'reauth_required'
     const callId = 'a'.repeat(32)
-    mocks.fetchAgentLogs.mockResolvedValueOnce([]).mockResolvedValueOnce([{
+    mocks.fetchAgentLogsSince.mockResolvedValueOnce([{
       id: callId,
       behavior: 'author_content',
       session_id: 'content-session',
       prompt: 'Independent article',
       started_at: new Date().toISOString(),
+      status: 'completed',
     }])
     const chat = await import('../server/chat')
     database = await import('../server/db')
@@ -235,6 +244,8 @@ describe('chat runtime hardening', () => {
 
     expect(mocks.requireAuth).not.toHaveBeenCalled()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.fetchAgentLogWatermark).toHaveBeenCalledOnce()
+    expect(mocks.fetchAgentLogsSince).toHaveBeenCalledWith('42', { session: 'content-session', behavior: 'author_content', prompt: 'Independent article' }, { fresh: true })
     if (path === 'durable') expect(jobs.getContentJobResponse(callId)).toMatchObject({ status: 'pending' })
   })
 
@@ -255,11 +266,23 @@ describe('chat runtime hardening', () => {
     expect(database.db.prepare('SELECT count(*) AS count FROM content_launches').get()).toEqual({ count: 0 })
   })
 
+  it('retains ambiguous terminal launch candidates instead of choosing one', async () => {
+    mocks.fetchAgentLogsSince.mockResolvedValue(['a', 'b'].map(letter => ({
+      id: letter.repeat(32), behavior: 'author_content', session_id: 'ambiguous-session',
+      prompt: 'Same topic', started_at: new Date().toISOString(), status: 'completed',
+    })))
+    const chat = await import('../server/chat')
+    database = await import('../server/db')
+    await expect(chat.startAuthorContent('Same topic', 'ambiguous-session')).rejects.toMatchObject({
+      code: 'AUTHOR_CONTENT_DISCOVERY_TIMEOUT',
+      message: 'multiple matching author-content calls registered; correlation remains pending',
+    })
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+  })
+
   it('marks a post-spawn log lookup failure as recoverable discovery state', async () => {
     const lookupError = new Error('agent logs temporarily unavailable')
-    mocks.fetchAgentLogs
-      .mockResolvedValueOnce([])
-      .mockRejectedValueOnce(lookupError)
+    mocks.fetchAgentLogsSince.mockRejectedValueOnce(lookupError)
     const chat = await import('../server/chat')
     database = await import('../server/db')
 
@@ -270,13 +293,14 @@ describe('chat runtime hardening', () => {
         cause: lookupError,
       })
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    expect(mocks.fetchAgentLogs).toHaveBeenCalledTimes(2)
+    expect(mocks.fetchAgentLogWatermark).toHaveBeenCalledOnce()
+    expect(mocks.fetchAgentLogsSince).toHaveBeenCalledOnce()
     expect(mocks.requireAuth).toHaveBeenCalledTimes(2)
   })
 
   it('keeps a pre-spawn log lookup failure definite', async () => {
     const lookupError = new Error('initial agent logs unavailable')
-    mocks.fetchAgentLogs.mockRejectedValueOnce(lookupError)
+    mocks.fetchAgentLogWatermark.mockRejectedValueOnce(lookupError)
     const chat = await import('../server/chat')
     database = await import('../server/db')
 
@@ -293,6 +317,7 @@ describe('chat runtime hardening', () => {
 
     await expect(chat.startAuthorContent('Definite topic', 'definite-session'))
       .rejects.toBe(spawnError)
-    expect(mocks.fetchAgentLogs).toHaveBeenCalledOnce()
+    expect(mocks.fetchAgentLogWatermark).toHaveBeenCalledOnce()
+    expect(mocks.fetchAgentLogsSince).not.toHaveBeenCalled()
   })
 })

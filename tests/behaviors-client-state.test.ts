@@ -108,8 +108,8 @@ function respond(body: unknown): void {
   next.resolve(body)
 }
 
-// GET /api/behaviors blocks on an `agent-interface --logs` subprocess with a
-// 30-second timeout, so a refresh started before a click is routinely still
+// GET /api/behaviors walks recent Caller-log pages behind a 30-second
+// subprocess timeout, so a refresh started before a click is routinely still
 // unanswered when that click's POST has completed. Ordering reads against
 // other reads does not help: the slow read is the *newest* read, and it
 // carries a snapshot from before the change.
