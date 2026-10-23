@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
-import type { Capabilities, ChatEvent, PromptInput, ServerFrame, SessionRecord } from '../server/chat/protocol'
+import type { Capabilities, ChatEnvelope, ChatEvent, PromptInput, ServerFrame, SessionRecord } from '../server/chat/protocol'
 import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
 import type { ChatRuntime } from '../server/chat/runtime'
@@ -73,6 +73,37 @@ async function observeCi(target: string): Promise<void> {
   // result before changing the next mocked response or reading the inbox.
   await until(() => store.observation(runtime.instance, `ci:${target}`)?.checked_at === clock)
 }
+// Arm the competitor before finishing, independently of the readiness read.
+// Its macrotask runs after cleanup; hold that read until the next prompt runs.
+async function finishAndTick(id: string): Promise<void> {
+  const observed = runtime, delivery = control
+  const expected = (prompts.get(id)?.length ?? 0) + 1
+  let becameIdle = false
+  let ticked = false
+  let failure: { error: unknown } | undefined
+  let immediate: ReturnType<typeof setImmediate> | undefined
+  const onEvent = (envelope: ChatEnvelope) => {
+    if (envelope.sessionId !== id || envelope.event.type !== 'status.changed' || envelope.event.status !== 'idle' || becameIdle) return
+    becameIdle = true
+    immediate = setImmediate(() => {
+      void delivery.tick().then(() => { ticked = true }, error => { failure = { error }; ticked = true })
+    })
+  }
+  observed.on('event', onEvent)
+  try {
+    finishes.get(id)!({ stopReason: 'end_turn' })
+    await until(() => {
+      if (failure) throw failure.error
+      return ticked && prompts.get(id)?.length === expected && observed.get(id)?.status === 'running'
+    })
+    // Restoring a live status read here must miss idle: the competitor ran first.
+    await until(() => becameIdle)
+  } finally {
+    if (immediate) clearImmediate(immediate)
+    observed.off('event', onEvent)
+  }
+}
+
 async function observeMerge(target: string): Promise<void> {
   await control.tick()
   await until(() => store.observation(runtime.instance, `merge:${target}`)?.checked_at === clock)
@@ -183,11 +214,10 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     await until(() => runtime.get(workers[0])?.status === 'idle')
     expect(store.inbox(runtime.instance, parent.id).some(m => m.sender === workers[0] && m.body.includes('turn.finished'))).toBe(true)
     expect(prompts.get(parent.id)).toHaveLength(1)
-    finishes.get(parent.id)!({ stopReason: 'end_turn' })
-    await until(() => runtime.get(parent.id)?.status === 'idle')
-    await control.tick()
-    await until(() => prompts.get(parent.id)?.length === 2)
+    await finishAndTick(parent.id)
+    expect(prompts.get(parent.id)).toHaveLength(2)
     expect(prompts.get(parent.id)![1].text).toContain('worker_event')
+    expect(store.inbox(runtime.instance, parent.id)).toEqual([expect.objectContaining({ sender: workers[0], state: 'admitted' })])
   }, 30_000) // Four Git workspaces and several independently bounded readiness phases.
 
   it.each(['grok', 'claude', 'codex', 'muse'] as const)('injects discovery and live bindings through the shared %s prompt path', async agent => {
@@ -1128,12 +1158,26 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     await control.tick()
     await until(() => prompts.has(recipient.id))
     expect(prompts.get(recipient.id)![0].text.endsWith('\nOrdered 0')).toBe(true)
+    // The competing tick admits Ordered 1 before any transient-idle poll.
+    await finishAndTick(recipient.id)
+    await until(() => prompts.get(recipient.id)?.length === 2)
+    expect(runtime.get(recipient.id)?.status).toBe('running')
+    expect(prompts.get(recipient.id)!.map(prompt => prompt.text.split('\n').at(-1))).toEqual(['Ordered 0', 'Ordered 1'])
+    // Stop admission at this finite prefix; the other 99 messages stay pending.
+    await control.stop()
     finishes.get(recipient.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(recipient.id)?.status === 'idle')
-    await control.tick()
-    await until(() => prompts.get(recipient.id)?.length === 2)
-    expect(prompts.get(recipient.id)![1].text.endsWith('\nOrdered 1')).toBe(true)
-    expect(store.inbox(runtime.instance, recipient.id)[1].state).toBe('admitted')
+    expect(prompts.get(recipient.id)).toHaveLength(2)
+    const events = runtime.events(recipient.id, 0).events.map(({ event }) => event)
+    const turns = events.flatMap(event => event.type === 'turn.started' ? [event.turnId] : [])
+    expect(turns).toHaveLength(2)
+    expect(events.flatMap(event => event.type === 'turn.finished' ? [event.turnId] : [])).toEqual(turns)
+    const firstPage = store.inbox(runtime.instance, recipient.id)
+    expect(firstPage).toHaveLength(100)
+    const nextPage = store.inbox(runtime.instance, recipient.id, firstPage.at(-1)!.seq)
+    expect(nextPage).toHaveLength(1)
+    expect([...firstPage, ...nextPage].map(({ body, state, turn_id }) => ({ body, state, turn_id })))
+      .toEqual(Array.from({ length: 101 }, (_, i) => ({ body: `Ordered ${i}`, state: i < 2 ? 'admitted' : 'pending', turn_id: i < 2 ? turns[i] : null })))
   })
 
   it('returns to an unblocked recipient while a later recipient keeps receiving new messages', async () => {
