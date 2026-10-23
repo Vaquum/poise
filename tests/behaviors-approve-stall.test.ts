@@ -22,6 +22,85 @@ async function startApproving(open: typeof fixture.listedPrs) {
 }
 
 describe('approve-prs under load', () => {
+  it('rotates past three slow front claims before retrying the same full batch', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const open = Array.from({ length: 10 }, (_, index) => ({
+      ...pr, number: 17 + index, url: `https://github.com/${pr.repo}/pull/${17 + index}`,
+    }))
+    const { database: db, behaviors: runtime } = await startApproving(open)
+    expect(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS).toBe(55_000)
+    for (const number of [17, 18, 19]) {
+      expect(db.claimPrOperationOwned(`${pr.repo}#${number}`, 600_000)).not.toBeNull()
+    }
+    const claim = db.claimPrOperationOwned
+    let attempts: number[] = []
+    let firstThree = deferred<void>()
+    vi.spyOn(db, 'claimPrOperationOwned').mockImplementation((target, leaseMs) => {
+      const number = Number(target.slice(target.lastIndexOf('#') + 1))
+      if (!attempts.includes(number)) {
+        attempts.push(number)
+        if (attempts.length === 3) firstThree.resolve()
+      }
+      return claim(target, leaseMs)
+    })
+    const readGates = () => ({
+      changes: { entered: deferred<void>(), release: deferred<void>() },
+      activity: { entered: deferred<void>(), release: deferred<void>() },
+    })
+    let gates = readGates()
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args.includes('--requests-json')) {
+        const gate = args[0] === '--requested-changes-addressed' ? gates.changes
+          : args[0] === '--review-activity-since' ? gates.activity : null
+        if (gate) { gate.entered.resolve(); await gate.release.promise }
+      }
+      return original(command, args, options)
+    })
+    const lastFastLaunch = deferred<void>()
+    mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[1] === '#26') lastFastLaunch.resolve()
+    })
+    const spendReadBudget = async () => {
+      // Each read stays within its 30-second CLI limit, leaving five seconds
+      // of the real sweep budget for the unchanged ten-second claim waits.
+      await gates.changes.entered.promise
+      await vi.advanceTimersByTimeAsync(25_000)
+      gates.changes.release.resolve()
+      await gates.activity.entered.promise
+      await vi.advanceTimersByTimeAsync(25_000)
+      gates.activity.release.resolve()
+    }
+    try {
+      const first = runtime.runEnabledBehaviorsOnce()
+      await spendReadBudget()
+      await firstThree.promise
+      await vi.advanceTimersByTimeAsync(9_000)
+      await first
+      expect(attempts).toEqual([17, 18, 19])
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+      expect(db.getMeta('behavior_approve_prs_cursor')).toBe(`${pr.repo}#19`)
+
+      // The same peer claims remain held on the next sweep.
+      attempts = []
+      firstThree = deferred<void>()
+      gates = readGates()
+      const second = runtime.runEnabledBehaviorsOnce()
+      await spendReadBudget()
+      await firstThree.promise
+      expect(attempts.slice(0, 3)).toEqual([20, 21, 22])
+      await lastFastLaunch.promise
+      await vi.advanceTimersByTimeAsync(9_000)
+      await second
+      expect(mocks.spawnDetached.mock.calls.map(([, args]) => Number(args[1].slice(1))).sort((a, b) => a - b))
+        .toEqual([20, 21, 22, 23, 24, 25, 26])
+    } finally {
+      gates.changes.release.resolve()
+      gates.activity.release.resolve()
+    }
+  })
+
   it('approves the other PRs when one PR check times out, and retries the timed-out check within minutes', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
