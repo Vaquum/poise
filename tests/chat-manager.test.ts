@@ -453,6 +453,7 @@ describe('one Manager chat per workspace', () => {
     // Force a competing tick to admit the held inbox item before checking idle.
     await finishAndTick(manager.id)
     await until(() => prompts.get(manager.id)?.length === 2, manager.id)
+    expect(runtime.get(manager.id)?.status).toBe('running')
     expect(prompts.get(manager.id)![1].text.endsWith('\nHello Manager')).toBe(true)
     expect(store.inbox(instance, manager.id).filter(message => message.body === 'Hello Manager'))
       .toEqual([expect.objectContaining({ state: 'admitted' })])

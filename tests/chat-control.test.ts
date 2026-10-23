@@ -675,6 +675,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     // The competing tick admits Ordered 1 before any transient-idle poll.
     await finishAndTick(recipient.id)
     await until(() => prompts.get(recipient.id)?.length === 2)
+    expect(runtime.get(recipient.id)?.status).toBe('running')
     expect(prompts.get(recipient.id)!.map(prompt => prompt.text.split('\n').at(-1))).toEqual(['Ordered 0', 'Ordered 1'])
     expect(store.inbox(runtime.instance, recipient.id).slice(0, 2).map(message => message.state)).toEqual(['admitted', 'admitted'])
     finishes.get(recipient.id)!({ stopReason: 'end_turn' })
