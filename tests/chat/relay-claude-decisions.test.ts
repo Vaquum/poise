@@ -70,7 +70,7 @@ it.each(['permission', 'hook'] as const)('suppresses a recorded Claude %s respon
       '',
     ].join('\n')),
     outboundTruncated: false,
-    session: { nativeSessionId: 'a1b2c3d4-0000-4000-8000-000000000001', modelId: 'claude-opus-5', effort: 'high', safeMode: true },
+    session: { nativeSessionId: 'a1b2c3d4-0000-4000-8000-000000000001', modelId: 'claude-opus-5', effort: 'high', efforts: ['high'], safeMode: true },
     recalledDiffs: new Map(),
   }
   const ask = (id: string) => receive({
