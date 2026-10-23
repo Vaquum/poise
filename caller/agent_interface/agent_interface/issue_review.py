@@ -29,6 +29,7 @@ from typing import Callable
 from . import progress, review_budget
 from .atoms import AgentPreflightError, bounded_cause, provider_blocked
 from .model_catalog import Model
+from .process_diagnostic import diagnostic_envelope
 from .provider_progress import ProviderStream, claude_error
 from .review_watch import _interrupted, _stop_process_group
 
@@ -543,8 +544,8 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
     except subprocess.TimeoutExpired as error:
         raise review_budget.ReviewLimitError(
             "Issue review checkout reached its time limit; needs attention", "review_budget_exhausted",
-            {"version": 1, "source": "caller", "severity": "error", "operation": "issue.checkout",
-             "phase": "checking_out", "provider": model.provider}) from error
+            diagnostic_envelope(operation="issue.checkout", phase="checking_out",
+                                outcome="timed_out", provider=model.provider)) from error
     output = work / "review.json"
     seconds = review_budget.timeout(TIMEOUT_SECONDS, reserve=POST_RESERVE_SECONDS)
     text = prompt(ref(repo, number), repo, info, data, output, actor, note, seconds)
@@ -555,9 +556,9 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
         status = artifact_status(output)
         raise review_budget.ReviewLimitError(
             "Issue review reached its time limit; needs attention", "review_budget_exhausted",
-            {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
-             "phase": "provider_execution", "provider": model.provider,
-             "artifact": status, "submission": "none"}) from error
+            diagnostic_envelope(operation="provider.review", phase="provider_execution",
+                                outcome="timed_out", provider=model.provider,
+                                artifact=status, submission="none")) from error
     terminal = _terminal_failure(model.provider, done.stdout)
     if done.returncode or terminal:
         # Claude's own result or stream diagnostics; a launch the subscription
@@ -567,11 +568,12 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
         raw = raw or done.stderr.strip()[-500:] or f"{model.provider} exited {done.returncode}"
         error = bounded_cause(raw)
         status = artifact_status(output)
-        diagnostic = {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
-                      "phase": "provider_execution", "provider": model.provider,
-                      "exit_code": done.returncode if done.returncode > 0 else None,
-                      "signal": -done.returncode if done.returncode < 0 else None,
-                      "stderr": error, "artifact": status, "submission": "none"}
+        diagnostic = diagnostic_envelope(operation="provider.review", phase="provider_execution",
+                                               outcome="signal" if done.returncode < 0 else "exit",
+                                               stderr=error, provider=model.provider,
+                                               exit_code=done.returncode if done.returncode > 0 else None,
+                                               signal=-done.returncode if done.returncode < 0 else None,
+                                               artifact=status, submission="none")
         if "output token maximum" in error or "context window limit" in error:
             raise review_budget.ReviewLimitError(error, diagnostic=diagnostic)
         # Held for a person, as a PR review is: relaunching cannot succeed until the account is fixed.
@@ -583,10 +585,9 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
     try:
         return comments(output, allowed(data), repo)
     except InvalidReview as error:
-        error.diagnostic = {"version": 1, "source": "caller", "severity": "error",
-                            "operation": "provider.review", "phase": "validating",
-                            "provider": model.provider, "artifact": artifact_status(output),
-                            "submission": "none"}
+        error.diagnostic = diagnostic_envelope(operation="provider.review", phase="validating",
+                                                    outcome="invalid_output", provider=model.provider,
+                                                    artifact=artifact_status(output), submission="none")
         raise
 
 

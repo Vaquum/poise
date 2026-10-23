@@ -29,6 +29,7 @@ from . import (
     review_receipt,
 )
 from .model_catalog import CATALOG, ModelCatalogError
+from .process_diagnostic import diagnostic_envelope
 from .review_watch import ReviewSuperseded
 from .review_watch import _interrupted as review_watch_interrupted
 
@@ -410,9 +411,9 @@ def finish(
             # reopen it. Clear the dangling path and retain the cause.
             with db() as conn:
                 conn.execute("update calls set response_path=null, diagnostic=coalesce(diagnostic, ?) where id=?",
-                             (json.dumps({"version": 1, "source": "caller", "severity": "error",
-                                          "operation": "call.finalize", "phase": "response_persist",
-                                          "stderr": str(persist_error)[:500], "call_id": id_}), id_))
+                             (json.dumps(diagnostic_envelope(operation="call.finalize", phase="response_persist",
+                                                             outcome="persist_failed",
+                                                             stderr=str(persist_error)[:500], call_id=id_)), id_))
     return ended_at
 
 
@@ -1239,8 +1240,8 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             # landed review, but never auto-retry the write itself.
             failure = review_budget.ReviewLimitError(
                 str(error), "review_submission_failed",
-                {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
-                 "phase": "submitting", "submission": "uncertain"})
+                diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
+                                    stderr=str(error)[:500], submission="uncertain"))
         progress.stage("verifying", "Checking GitHub after interrupted review")
         try:
             facts = review_facts(mod, pr, pwd, actor, head, 0)
