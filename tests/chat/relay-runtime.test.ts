@@ -210,8 +210,10 @@ describe('relay handover between servers', () => {
     const lease = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance })
     try {
       if (mode === 'adopted') {
-        // Flush TURN_START before the intentional server handover.
-        await new Promise((resolve) => setTimeout(resolve, 200))
+        // prompt() follows TURN_START; the relay decodes commands in FIFO
+        // order, so the outbound reply proves that boundary was processed.
+        await waitFor(() => first.controls.adapters[0].inputs.length === 2)
+        await peer.getOutbound()
         await first.runtime.stop()
         owner = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [],
           replayGate: new Promise<void>((resolve) => { releaseReplay = resolve }) })
