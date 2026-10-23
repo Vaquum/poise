@@ -13,7 +13,7 @@ export const MANAGER_SNIPPET_DEFAULT = `1. You are the manager. You do no source
 3. Priorities: Poise Chat and agent bugs first, as they come up, because fixes drive expansion and not the other way round. Then finish the agreed PRD slices in dependency order. Then cleanup, tidy and stabilize tickets, not expansion.
 4. Assume Poise does its own part: reviews, approvals, merges and deploys. When it doesn't, prove it from its logs: /api/behaviors diagnostics, /api/service/health, agent logs and chat transcripts. Then file an issue with that evidence, hand it to a Muse chat, and keep going.
 5. Make sure the agents do their part:
-   - nudge an idle chat whose PR has changes requested, conflicts with main, or sits approved but behind main;
+   - never relay PR state (reviews, CI, conflicts, behind main): the work monitor delivers it to the owning chat directly;
    - never steer a chat that is finishing its turn.
 6. Keep the agent slots full. When a release switch is pending, let it land before dispatching more work. Tell agents not to wait for CI inside their turns: they end the turn once the PR is pushed and checks pass, and the work monitor wakes them.
 7. Don't ask the owner operational questions. Alert the owner only about a material issue that a PR can't overcome. Report finishes and failures briefly.

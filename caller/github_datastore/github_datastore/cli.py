@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> None:
         epilog=HELP.format(default_db=DEFAULT_DB),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    view_parser.add_argument("name", choices=("pr", "issue", "user"))
+    view_parser.add_argument("name", choices=("pr", "issue", "user", "pr-reviews"))
     view_parser.add_argument("--format", choices=("json", "csv"), default="json")
     view_parser.add_argument("--username")
     view_parser.add_argument("--item-type", choices=("issue", "pr"))
@@ -171,6 +171,8 @@ def run_view(db_path: Path, args: argparse.Namespace) -> str:
         return views.issue(**common)
     if args.name == "user":
         return views.user(username=args.username, item_type=args.item_type, **common)
+    if args.name == "pr-reviews":
+        return views.pr_reviews(db_path=db_path, output=args.format, repo=args.repo, number=args.number)
     raise AssertionError(args.name)
 
 
