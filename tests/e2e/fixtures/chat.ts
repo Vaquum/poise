@@ -179,6 +179,13 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
         await route.fulfill({ json: { session: found, instance: 'poise-dev:test' } })
         return
       }
+      const legacy = url.searchParams.get('legacy')
+      if (legacy !== null) {
+        if (!legacy) { await route.fulfill({ status: 400, json: { error: 'legacy must not be empty' } }); return }
+        const found = state.sessions.find((s) => s.importedFrom === legacy) || null
+        await route.fulfill({ json: { session: found, instance: 'poise-dev:test' } })
+        return
+      }
       await route.fulfill({ json: { sessions: state.sessions, instance: 'poise-dev:test' } })
       return
     }
@@ -331,6 +338,11 @@ async function installSocket(page: Page, state?: ServerState): Promise<Socket> {
         s.lastSeq = sock.seq + 1
         sock.push(s.id, { type: 'session.updated', session: { ...s } })
         sock.ack(frame, true, '', undefined, { session: { ...s }, applies: 'current_turn' })
+      } else if (sock.autoAck && frame.command.type === 'edit.decide') {
+        const cmd = frame.command
+        if (cmd.type !== 'edit.decide') throw new Error('Unexpected edit command')
+        sock.push(cmd.sessionId, { type: 'edit.decided', turnId: cmd.turnId, messageId: cmd.messageId, index: cmd.index, decision: cmd.decision })
+        sock.ack(frame)
       } else if (sock.autoAck && ['timer.create', 'timer.cancel', 'timer.rearm', 'chat.hold', 'timers.holdAll'].includes(frame.command.type) && state) {
         const command = frame.command
         if (command.type === 'timer.create') {

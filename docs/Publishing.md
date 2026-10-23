@@ -181,8 +181,9 @@ disambiguated by surrounding lines is highlighted in the current draft.
 Multi-line passages are supported. Removed-side comments stay in the list.
 
 Reply on GitHub and Resolve thread act as your publishing account. General
-feedback replies are posted to the PR discussion. Ask agent privately opens
-a separate document chat with the review as its draft; nothing is sent to
+feedback replies are posted to the PR discussion. Opening a review's thread
+shows the GitHub conversation with a private agent chat beside it — a Chat
+session of its own, inline at the review; nothing is sent to
 GitHub by asking the agent. Update continues to commit to an open PR, or to
 open a new update PR after merge.
 
