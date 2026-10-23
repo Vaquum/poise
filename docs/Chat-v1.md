@@ -23,11 +23,12 @@ unsupported optional controls are not simulated.
 
 Current cards, Swarm rows and Editor documents can hand off into Chat. A pending
 legacy-row lookup is cancelled by leaving Swarm or choosing another row. Failed
-or unreadable lookup responses retain the session link for retry and show a
-read failure; only a decoded `session: null` marks a conversation never opened
+lookups and unreadable responses retain the session link for retry and show a
+read failure. A successful lookup contains either a session with a nonempty ID
+or explicit `session: null`; only that null marks a conversation never opened
 in Chat. Changing the agent creates a new native session with a labelled context
-handoff, not a pretence that one vendor's session migrated to another. Each Current card has
-one Chat session of its own, opened from the card in the side pane or from
+handoff, not a pretence that one vendor's session migrated to another. Each
+Current card has one Chat session of its own, opened from the side pane or from
 Open in Chat in the Chat view; the pane shows the card's earlier conversation
 until the first message creates the session. `/content` and `/consensus` run
 as Chat composer commands with transcript cards. Every Editor chat — the

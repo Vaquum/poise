@@ -429,8 +429,16 @@ async function openImportedSession(button: HTMLButtonElement, session: string): 
   try {
     const res = await fetch(`/api/chat/sessions?legacy=${encodeURIComponent(session)}`, { cache: 'no-store' })
     if (!res.ok) throw new Error(`Chat session lookup returned HTTP ${res.status}`)
-    found = ((await res.json()) as { session: { id: string } | null }).session
-    neverImported = found === null
+    const body: unknown = await res.json()
+    if (!body || typeof body !== 'object' || !('session' in body)) throw new Error('Chat session lookup returned no readable session')
+    const imported = body.session
+    if (imported === null) neverImported = true
+    else {
+      if (!imported || typeof imported !== 'object' || !('id' in imported) || typeof imported.id !== 'string' || !imported.id.trim()) {
+        throw new Error('Chat session lookup returned no readable session')
+      }
+      found = { id: imported.id }
+    }
   } catch (error) {
     if (requestId === importedSessionOpenRequestId && viewEl && !viewEl.hidden) {
       viewFeedback(`swarm-chat:${session}`, 'Chat session lookup failed', (error as Error).message, 'read_failed')

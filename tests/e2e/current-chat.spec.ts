@@ -309,12 +309,12 @@ const LEGACY_ROW = {
   response: 'The old reply', error: '',
 }
 
-async function legacySwarm(page: Page, sessions: ReturnType<typeof session>[]): Promise<void> {
+async function legacySwarm(page: Page, sessions: ReturnType<typeof session>[], logs = [LEGACY_ROW]): Promise<void> {
   const state = makeState(sessions)
   await installRoutes(page, state)
   await installSocket(page, state)
   await currentRoutes(page)
-  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [LEGACY_ROW] } }))
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs } }))
   await page.goto('/')
   await page.getByRole('button', { name: 'Swarm', exact: true }).click()
   await expect(page.locator('#swarm-table')).toBeVisible()
@@ -334,13 +334,13 @@ test('a legacy chat never opened in Chat says so on its Swarm row', async ({ pag
   await expect(page.locator('#view-chat')).not.toBeVisible()
 })
 
-for (const failure of ['invalid-json', 'body-read'] as const) {
+for (const failure of ['invalid-json', 'body-read', 'missing-session', 'invalid-session', 'false-session', 'empty-session-id', 'null-body', 'http-error', 'network-error'] as const) {
   test(`keeps a legacy session link retryable after ${failure} lookup failure`, async ({ page }) => {
     await page.addInitScript((mode) => {
       const json = Response.prototype.json
       let reads = 0
       Response.prototype.json = async function () {
-        if (!new URL(this.url).searchParams.has('legacy')) return json.call(this)
+        if (!this.url || !new URL(this.url).searchParams.has('legacy')) return json.call(this)
         try {
           if (mode === 'body-read' && reads === 0) await this.body?.cancel()
           return await json.call(this)
@@ -350,14 +350,18 @@ for (const failure of ['invalid-json', 'body-read'] as const) {
     const imported = session({ id: 's-imported', title: 'Imported legacy chat', importedFrom: 'legacy-chat-1' })
     await legacySwarm(page, [imported])
     let requests = 0
-    await page.route('**/api/chat/sessions?legacy=legacy-chat-1', route => route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: ++requests === 1 && failure === 'invalid-json' ? '{' : JSON.stringify({ session: imported }),
-    }))
+    await page.route('**/api/chat/sessions?legacy=legacy-chat-1', route => {
+      if (++requests !== 1) return route.fulfill({ json: { session: imported } })
+      if (failure === 'network-error') return route.abort('failed')
+      if (failure === 'http-error') return route.fulfill({ status: 500, json: { error: 'Lookup unavailable' } })
+      const body = failure === 'invalid-json' ? '{' : JSON.stringify(
+        failure === 'missing-session' ? {} : failure === 'invalid-session' ? { session: {} }
+          : failure === 'false-session' ? { session: false } : failure === 'empty-session-id' ? { session: { id: '' } }
+            : failure === 'null-body' ? null : { session: imported })
+      return route.fulfill({ status: 200, contentType: 'application/json', body })
+    })
     const link = page.locator('.agent-session-link', { hasText: 'legacy-chat-1' })
     await link.click()
-    await expect.poll(() => page.evaluate(() => Reflect.get(window, 'legacyLookupReads'))).toBe(1)
     await page.locator('#notification-bell').click()
     await expect(page.locator('#notification-rail')).toContainText('Chat session lookup failed')
     await page.getByRole('button', { name: 'Close notifications', exact: true }).click()
@@ -368,6 +372,60 @@ for (const failure of ['invalid-json', 'body-read'] as const) {
     await expect(page.locator('#view-chat')).toBeVisible()
     await expect(page.locator('.chat-session-item.active')).toContainText('Imported legacy chat')
     expect(requests).toBe(2)
+    await page.locator('#notification-bell').click()
+    await expect(page.locator('#notification-rail')).toBeVisible()
+    await expect(page.locator('#notification-rail')).not.toContainText('Chat session lookup failed')
+  })
+}
+
+for (const navigation of ['current', 'return', 'other-row'] as const) {
+  test(`ignores a legacy lookup failure after leaving its row, navigation=${navigation}`, async ({ page }) => {
+    await page.addInitScript(() => {
+      const json = Response.prototype.json
+      Response.prototype.json = async function () {
+        try { return await json.call(this) }
+        finally {
+          if (this.url && new URL(this.url).searchParams.get('legacy') === 'legacy-chat-1') Reflect.set(window, 'legacyFailedLookupRead', true)
+        }
+      }
+      window.addEventListener('poise:open-chat-session', () => Reflect.set(window, 'legacyChatOpened', true))
+    })
+    await legacySwarm(page, [], [LEGACY_ROW, { ...LEGACY_ROW, id: 'legacy-row-2', session_id: 'legacy-chat-2' }])
+    let release!: () => void
+    let started!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const requested = new Promise<void>(resolve => { started = resolve })
+    await page.route('**/api/chat/sessions?legacy=legacy-chat-1', async route => {
+      started()
+      await held
+      await route.fulfill({ contentType: 'application/json', body: '{' })
+    })
+    const link = page.locator('.agent-session-link', { hasText: 'legacy-chat-1' })
+    try {
+      await link.click()
+      await requested
+      if (navigation === 'other-row') {
+        await page.locator('.agent-session-link', { hasText: 'legacy-chat-2' }).click()
+        await expect(page.locator('.agent-never-imported')).toHaveCount(1)
+      } else {
+        await page.getByRole('button', { name: 'Current', exact: true }).click()
+        await expect(page.locator('#view-swarm')).toBeHidden()
+        if (navigation === 'return') {
+          await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+          await expect(page.locator('#view-swarm')).toBeVisible()
+        }
+      }
+      release()
+      await expect.poll(() => page.evaluate(() => Reflect.get(window, 'legacyFailedLookupRead'))).toBe(true)
+      expect(await page.evaluate(() => Reflect.get(window, 'legacyChatOpened'))).not.toBe(true)
+      await expect(page.locator('#view-chat')).toBeHidden()
+      await page.locator('#notification-bell').click()
+      await expect(page.locator('#notification-rail')).not.toContainText('Chat session lookup failed')
+      await page.getByRole('button', { name: 'Close notifications', exact: true }).click()
+      if (navigation === 'current') await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+      await expect(link).toBeVisible()
+      await expect(link.locator('xpath=ancestor::tr').locator('.agent-never-imported')).toHaveCount(0)
+    } finally { release() }
   })
 }
 
