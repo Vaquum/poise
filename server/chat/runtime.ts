@@ -417,15 +417,11 @@ export class ChatRuntime extends EventEmitter {
     for (const worker of storage.listWorkers()) {
       if (storage.sessionInstance(worker.sessionId) !== this.instance) continue
       const record = storage.getSession(worker.sessionId)
-      let holderAlive = false
-      try {
-        const row = new CheckoutLease(worker.checkout, { ownerKind: 'poise:chat', ownerId: worker.sessionId, ownerLabel: '', instance: this.instance }, this.leaseProbes).read()
-        // Owner and host, not the token: an adoption by another server
-        // rotates the token, and that server owns the session now.
-        holderAlive = !!row && row.owner_id === worker.sessionId && row.instance === this.instance
-          && row.host_pid !== this.hostPid && (this.leaseProbes.pidAlive ?? pidAlive)(row.host_pid)
-      } catch { holderAlive = true } // the lock file is unreadable: do not touch anything
-      if (holderAlive) { protectedSessions.add(worker.sessionId); continue }
+      if (this.recoveryWorkerOwnedElsewhere(worker)) {
+        protectedSessions.add(worker.sessionId)
+        this.requireLive(worker.sessionId).relayDetached = true
+        continue
+      }
       const relayRow = storage.getRelay(worker.sessionId)
       const open = openTurns.get(worker.sessionId)
       const relayOk = relayRow ? await relayIdentityMatches(relayRow.relayPid, relayRow.relayIdent).catch(() => false) : false
@@ -445,11 +441,17 @@ export class ChatRuntime extends EventEmitter {
           continue
         }
         if (spoolTurn !== undefined) {
-          if (!(await this.terminateRecordedWorker(worker, record))) continue
+          const recovery = this.claimRecoveryWorker(worker)
+          if (!recovery) { protectedSessions.add(worker.sessionId); continue }
+          if (!(await this.terminateRecordedWorker(worker, record))) {
+            recovery.record = storage.getSession(worker.sessionId) ?? recovery.record
+            continue
+          }
           if (worker.leaseToken) { try { CheckoutLease.releaseByToken(worker.checkout, worker.leaseToken) } catch { /* the lock file may be gone */ } }
           storage.forgetWorker(worker.sessionId)
           storage.forgetRelay(worker.sessionId)
           await rm(relayRow.dir, { recursive: true, force: true }).catch(() => undefined)
+          this.releaseSettledLease(recovery)
           continue
         }
         fallbackNotes.set(worker.sessionId, 'the relay did not answer after the restart')
@@ -458,6 +460,13 @@ export class ChatRuntime extends EventEmitter {
         fallbackNotes.set(worker.sessionId, 'the relay was gone after the restart')
       } else if (relayRow && open && !verified && !groupAlive) {
         fallbackNotes.set(worker.sessionId, 'the agent was gone after the restart')
+      }
+      // Relay inspection awaited another process. Re-read ownership before
+      // mutating its rows or stopping a worker another server may now hold.
+      if (this.recoveryWorkerOwnedElsewhere(worker)) {
+        protectedSessions.add(worker.sessionId)
+        this.requireLive(worker.sessionId).relayDetached = true
+        continue
       }
       if (!verified && groupAlive) {
         if (record) {
@@ -469,8 +478,14 @@ export class ChatRuntime extends EventEmitter {
         if (relayRow && !relayOk) storage.forgetRelay(worker.sessionId)
         continue
       }
+      let recovery: LiveSession | null = null
       if (verified) {
-        if (!(await this.terminateRecordedWorker(worker, record))) continue
+        recovery = this.claimRecoveryWorker(worker)
+        if (!recovery) { protectedSessions.add(worker.sessionId); continue }
+        if (!(await this.terminateRecordedWorker(worker, record))) {
+          recovery.record = storage.getSession(worker.sessionId) ?? recovery.record
+          continue
+        }
       }
       if (worker.leaseToken) { try { CheckoutLease.releaseByToken(worker.checkout, worker.leaseToken) } catch { /* the lock file may be gone */ } }
       storage.forgetWorker(worker.sessionId)
@@ -479,6 +494,7 @@ export class ChatRuntime extends EventEmitter {
         storage.forgetRelay(worker.sessionId)
         await rm(relayRow.dir, { recursive: true, force: true }).catch(() => undefined)
       }
+      if (recovery) this.releaseSettledLease(recovery)
     }
     for (const open of storage.listOpenTurns(this.instance)) {
       if (protectedSessions.has(open.sessionId) || reattached.has(open.sessionId)) continue
@@ -524,8 +540,52 @@ export class ChatRuntime extends EventEmitter {
         })
       }
     }
+    // A fallback claim is a live session too; publish the reconciled record
+    // before its queue or later shutdown examines the retained worker.
+    for (const record of storage.listSessions(this.instance)) {
+      const live = this.live.get(record.id)
+      if (live && !protectedSessions.has(record.id) && !reattached.has(record.id)) live.record = record
+    }
     await this.flushSelfUpdateOutbox()
     return protectedSessions
+  }
+
+  /** Ownership uncertainty cannot authorize recovery to stop a worker. */
+  private recoveryWorkerOwnedElsewhere(worker: Pick<storage.WorkerRow, 'checkout' | 'sessionId'>): boolean {
+    try {
+      const row = new CheckoutLease(worker.checkout, { ownerKind: 'poise:chat', ownerId: worker.sessionId, ownerLabel: '', instance: this.instance }, this.leaseProbes).read()
+      // Another server's adoption rotates the token but retains this owner.
+      return !!row && row.owner_id === worker.sessionId && row.instance === this.instance
+        && row.host_pid !== this.hostPid && (this.leaseProbes.pidAlive ?? pidAlive)(row.host_pid)
+    } catch (error) {
+      this.emit('log', `[chat ${worker.sessionId.slice(0, 8)}] recovery ownership could not be verified; preserving its worker: ${error instanceof Error ? error.message : String(error)}`)
+      return true
+    }
+  }
+
+  /** Serialize fallback against another server's adoption, then retain the
+   *  exact claim on the session until its recorded worker is verified gone. */
+  private claimRecoveryWorker(worker: storage.WorkerRow): LiveSession | null {
+    const session = this.requireLive(worker.sessionId)
+    const lease = session.lease?.held ? session.lease : this.leaseFor(session)
+    try {
+      if (!lease.adoptLiveWorker({ workerPid: worker.gatePid, workerPgid: worker.gatePgid,
+        workerIdent: worker.ident, ownerId: worker.sessionId })) {
+        session.relayDetached = true
+        this.emit('log', `[chat ${worker.sessionId.slice(0, 8)}] recovery could not claim its worker; preserving its owner and turn`)
+        return null
+      }
+      session.lease = lease
+      session.relayDetached = false
+      storage.setWorkerLeaseToken(worker.sessionId, lease.currentToken)
+      return session
+    } catch (error) {
+      // A successful claim remains tracked even if updating its mirror failed.
+      if (lease.held) session.lease = lease
+      else session.relayDetached = true
+      this.emit('log', `[chat ${worker.sessionId.slice(0, 8)}] recovery ownership could not be claimed; preserving its worker: ${error instanceof Error ? error.message : String(error)}`)
+      return null
+    }
   }
 
   /** SIGTERM a verified recorded group, SIGKILL after the grace period.
@@ -631,6 +691,7 @@ export class ChatRuntime extends EventEmitter {
         throw new Error('the checkout lease could not be adopted')
       }
       session.lease = lease
+      session.relayDetached = false
       lease.onLost(() => {
         try { this.emit_(record.id, { type: 'error', message: 'the checkout lease was lost; stopping the turn', recoverable: true }) } catch { /* mirror */ }
         turn.failure = 'the checkout lease was lost'
@@ -918,7 +979,7 @@ export class ChatRuntime extends EventEmitter {
   }
 
   private async shutdownSession(session: LiveSession): Promise<void> {
-    if (session.relayDetached) return
+    if (session.relayDetached) throw new ChatError(409, 'the session belongs to another server', 'checkout_busy')
     if (session.idleTimer) clearTimeout(session.idleTimer)
     if (session.turn) return // still running after forceStop: leave it, the lease stays
     await this.stopProcess(session)
@@ -931,7 +992,8 @@ export class ChatRuntime extends EventEmitter {
   private releaseSettledLease(session: LiveSession): void {
     const lease = session.lease
     if (!lease?.held) return
-    if (session.startup || session.services || session.turn?.agentInvoked || session.relay?.healthy || session.adapter?.alive) {
+    if (session.startup || session.services || session.turn?.agentInvoked || session.relay?.healthy || session.adapter?.alive
+      || storage.getWorker(session.record.id)) {
       throw new ChatError(409, 'the checkout still has active work; its lease remains held', 'checkout_busy')
     }
     lease.clearWorker()
@@ -1380,6 +1442,7 @@ export class ChatRuntime extends EventEmitter {
       else if (!lease.held) throw new Error('the checkout lease was lost before native startup')
       signal.throwIfAborted()
       session.lease = lease
+      session.relayDetached = false
       const fresh = options.fresh || (!record.nativeSessionId && record.branch.provisional && !record.branch.baseSha)
       if (fresh) await this.prepareBranch(session, lease)
       await this.prepareCheckout(session, lease)
@@ -1556,6 +1619,7 @@ export class ChatRuntime extends EventEmitter {
   close(id: string): Promise<SessionRecord> {
     return this.track(async () => {
       const session = this.requireLive(id)
+      if (session.relayDetached) throw new ChatError(409, 'the session belongs to another server', 'checkout_busy')
       pauseQueue(queueOwner(id))
       this.publishQueue(session)
       session.lifecycle.abort()
@@ -1577,6 +1641,7 @@ export class ChatRuntime extends EventEmitter {
 
   private async deleteSession(id: string): Promise<{ workspaceRemoved: boolean }> {
     const session = this.requireLive(id)
+    if (session.relayDetached) throw new ChatError(409, 'the session belongs to another server', 'checkout_busy')
     session.lifecycle.abort()
     await this.forceStop(session, 'session deleted')
     return this.serialized(session, async () => {
@@ -2541,6 +2606,7 @@ export class ChatRuntime extends EventEmitter {
         await lease.acquire({ signal: turn.abort.signal, onBusy: (busy) => this.reportBusy(session, busy) })
       }
       session.lease = lease
+      session.relayDetached = false
       lease.onLost(() => {
         try { this.emit_(record.id, { type: 'error', message: 'the checkout lease was lost; stopping the turn', recoverable: true }) } catch { /* mirror */ }
         turn.failure = 'the checkout lease was lost'
@@ -3457,7 +3523,34 @@ export class ChatRuntime extends EventEmitter {
     session.adapter = null
     if (adapter) { try { await adapter.close() } catch { /* terminating below */ } }
     const relay = session.relay
-    if (!relay) return
+    if (!relay) {
+      // Recovery can own a verified worker after its relay probe failed.
+      // Close/resume/server-stop must settle that worker before releasing it.
+      const recorded = storage.getWorker(session.record.id)
+      if (!recorded) return
+      try {
+        if (!session.lease?.held || this.recoveryWorkerOwnedElsewhere(recorded)) {
+          throw new Error('the recorded worker is not owned by this server')
+        }
+        if (!(await workerIdentityMatches(recorded.gatePid, recorded.ident))) {
+          if (pgidAlive(recorded.gatePgid) || pidAlive(recorded.gatePid)) {
+            throw new Error('the recorded worker is still running but could not be verified')
+          }
+        } else if (!(await this.terminateRecordedWorker(recorded, session.record))) {
+          throw new Error(`worker group ${recorded.gatePgid} is still alive after shutdown`)
+        }
+        storage.forgetWorker(session.record.id)
+        const stale = storage.getRelay(session.record.id)
+        storage.forgetRelay(session.record.id)
+        if (stale) await rm(stale.dir, { recursive: true, force: true })
+      } catch (error) {
+        session.record.orphanNotice = error instanceof Error ? error.message : String(error)
+        this.saveRecord(session)
+        try { this.emit_(session.record.id, { type: 'error', message: session.record.orphanNotice, recoverable: false }) } catch { /* mirror */ }
+        throw error
+      }
+      return
+    }
     try {
       await relay.shutdown()
       if (pgidAlive(relay.gatePgid) || pidAlive(relay.gatePid)) {

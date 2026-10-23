@@ -269,6 +269,122 @@ describe('relay handover between servers', () => {
     }
   }, 60_000)
 
+  it.each(['probe', 'claim'] as const)('preserves a live owner that wins during recovery %s', async (race) => {
+    const instance = `poise-relay-probe-owner-race-${race}:db`
+    const { session, peer, turnId } = await heldTurn(instance)
+    const lock = await import('../../server/chat/checkout-lock')
+    const relay = await import('../../server/chat/relay')
+    const recorded = storage.getWorker(session.id)!
+    const queue = await import('../../server/chat/message-queue')
+    const beforeQueue = queue.readQueue(queue.queueOwner(session.id))
+    const beforeSession = storage.getSession(session.id)
+    const beforeTurn = storage.getOpenTurn(session.id)
+    const winner = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance },
+      { hostPid: peer.relayPid, pidAlive: (pid) => pid !== process.pid && worker.pidAlive(pid) })
+    const winningPeers: RelayConnection[] = []
+    let refusal = ''
+    const attach = relay.attachRelay
+    const adopt = lock.CheckoutLease.prototype.adoptLiveWorker
+    const adoption = race === 'claim' ? vi.spyOn(lock.CheckoutLease.prototype, 'adoptLiveWorker').mockImplementationOnce(function (this: InstanceType<typeof lock.CheckoutLease>, expected) {
+      // Even the last ownership read has passed. The CAS must lose to a
+      // winner that adopts immediately before recovery claims the row.
+      expect(adopt.call(winner, expected)).toBe(true)
+      return adopt.call(this, expected)
+    }) : null
+    const probe = vi.spyOn(relay, 'attachRelay').mockImplementationOnce(async (options) => {
+      if (race === 'claim') throw new Error('fixture probe unavailable')
+      // The initial holder check already passed. The live winner takes both
+      // the lease and relay before recovery's probe reaches the socket.
+      expect(winner.adoptLiveWorker({ workerPid: recorded.gatePid, workerPgid: recorded.gatePgid,
+        workerIdent: recorded.ident, ownerId: session.id })).toBe(true)
+      winningPeers.push((await attach(options)).connection)
+      try { return await attach(options) }
+      catch (error) { refusal = error instanceof Error ? error.message : String(error); throw error }
+    })
+    const signals = vi.spyOn(worker, 'signalGroup')
+    const second = makeRuntime(instance)
+    try {
+      await second.runtime.recover()
+      if (race === 'claim') {
+        expect(adoption).toHaveBeenCalledTimes(1)
+        const saved = storage.getRelay(session.id)!
+        winningPeers.push((await attach({ sessionId: session.id, dir: saved.dir, socketPath: saved.socket,
+          relayPid: saved.relayPid, relayIdent: saved.relayIdent })).connection)
+      } else expect(refusal).toContain('another Poise is already attached')
+      await expect(second.runtime.close(session.id)).rejects.toMatchObject({ code: 'checkout_busy' })
+      await expect(second.runtime.delete(session.id)).rejects.toMatchObject({ code: 'checkout_busy' })
+      expect(storage.getSession(session.id)).toEqual(beforeSession)
+      expect(storage.getOpenTurn(session.id)).toEqual(beforeTurn)
+      expect(queue.readQueue(queue.queueOwner(session.id))).toEqual(beforeQueue)
+      await second.runtime.stop({ handover: false })
+      expect(storage.getSession(session.id)).toEqual(beforeSession)
+      expect(storage.getOpenTurn(session.id)).toEqual(beforeTurn)
+      expect(queue.readQueue(queue.queueOwner(session.id))).toEqual(beforeQueue)
+      expect(probe).toHaveBeenCalledTimes(1)
+      expect(signals).not.toHaveBeenCalled()
+      expect(second.controls.replayTurns).toEqual([])
+      expect(second.finishes).toEqual([])
+      expect(ofType(second.events, session.id, 'turn.finished')).toEqual([])
+      expect(storage.getOpenTurn(session.id)?.turnId).toBe(turnId)
+      expect(storage.getSession(session.id)?.status).toBe('running')
+      expect(storage.getWorker(session.id)?.gatePgid).toBe(peer.gatePgid)
+      expect(storage.getRelay(session.id)).not.toBeNull()
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
+      expect(winner.read()).toMatchObject({ token: winner.currentToken, host_pid: peer.relayPid, worker_pgid: peer.gatePgid })
+    } finally {
+      probe.mockRestore()
+      adoption?.mockRestore()
+      signals.mockRestore()
+      for (const connection of winningPeers) connection.detach()
+      worker.signalGroup(peer.gatePgid, 'SIGKILL')
+      await waitFor(() => !worker.pgidAlive(peer.gatePgid), 10_000)
+      winner.release()
+      storage.forgetWorker(session.id)
+      storage.forgetRelay(session.id)
+      await rm(peer.dir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  it('retains a fallback claim through failed server shutdown and releases it only after verified close', async () => {
+    const instance = 'poise-relay-fallback-claim-lifetime:db'
+    const { session, peer, turnId } = await heldTurn(instance)
+    const lock = await import('../../server/chat/checkout-lock')
+    const relay = await import('../../server/chat/relay')
+    const probe = vi.spyOn(relay, 'attachRelay').mockRejectedValueOnce(new Error('fixture probe unavailable'))
+    const signals = vi.spyOn(worker, 'signalGroup').mockImplementation(() => {})
+    const second = makeRuntime(instance)
+    const lease = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance })
+    try {
+      await second.runtime.recover()
+      const token = lease.read()?.token
+      expect(token).toBeTruthy()
+      expect(lease.read()).toMatchObject({ host_pid: process.pid, worker_pgid: peer.gatePgid })
+      expect(storage.getWorker(session.id)?.leaseToken).toBe(token)
+      expect(ofType(second.events, session.id, 'turn.finished')[0]).toMatchObject({ turnId, stopReason: 'interrupted' })
+      await second.runtime.stop({ handover: false })
+      expect(lease.read()?.token).toBe(token)
+      expect(storage.getWorker(session.id)).not.toBeNull()
+      expect(storage.getRelay(session.id)).not.toBeNull()
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
+      signals.mockRestore()
+      await second.runtime.close(session.id)
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(false)
+      expect(storage.getWorker(session.id)).toBeNull()
+      expect(storage.getRelay(session.id)).toBeNull()
+      expect(lease.read()).toBeNull()
+    } finally {
+      probe.mockRestore()
+      signals.mockRestore()
+      worker.signalGroup(peer.gatePgid, 'SIGKILL')
+      await waitFor(() => !worker.pgidAlive(peer.gatePgid), 10_000)
+      const row = lease.read()
+      if (row) lock.CheckoutLease.releaseByToken(repo, row.token)
+      storage.forgetWorker(session.id)
+      storage.forgetRelay(session.id)
+      await rm(peer.dir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
   it('keeps a relay-held turn running through a restart', async () => {
     const instance = 'poise-relay-handover:db'
     const first = makeRuntime(instance)
