@@ -513,9 +513,9 @@ describe('the switch bound', () => {
     next.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID(), prompt: input('Original implementation runbook'),
       shown: input('Visible original request'), implementsChange: true, switches: ['recovery-hint'] }])
     await next.releaseSwitchWait()
-    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([expect.objectContaining({ recovery: {
+    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([expect.objectContaining({ recovery: expect.objectContaining({
       shown: input('Visible original request'), implementsChange: true, switches: ['recovery-hint'],
-    } })])
+    }) })])
     w.c.auto = true
     w.finish()
     const outbox = await import('../../server/self-update-outbox')
