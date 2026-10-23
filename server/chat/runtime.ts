@@ -2216,6 +2216,9 @@ export class ChatRuntime extends EventEmitter {
       if (internal) throw new ChatError(503, SWITCH_WAIT_REASON, 'switch_waiting')
       return this.waitPromptForSwitch(session, prompt)
     }
+    if (session.record.selfChangeId && this.changeStarts.has(session.record.selfChangeId)) {
+      throw new ChatError(409, 'the Poise implementation is still being prepared; wait for its first turn', 'turn_in_progress')
+    }
     const turn = this.reserveTurn(session, undefined, internal ? { seq: internal.seq, at: internal.at } : undefined)
     turn.input = prompt
     turn.switches = chain.switches
@@ -2245,7 +2248,12 @@ export class ChatRuntime extends EventEmitter {
     const entry: WaitingPrompt = { id: randomUUID(), sessionId: session.record.id, prompt, createdAt: new Date().toISOString(),
       queueBefore: recovery?.implementsChange ? [] : this.messageQueue(session.record.id).items.filter(item => item.state === 'waiting').map(item => item.id),
       ...(recovery ? { recovery } : {}) }
-    this.writeWaitingPrompts([...this.readWaitingPrompts(), entry])
+    const rows = this.readWaitingPrompts()
+    // The change child is visible before controller binding returns. Its
+    // first implementation still precedes discussion already waiting there.
+    const before = recovery?.implementsChange ? rows.findIndex(row => row.sessionId === session.record.id) : -1
+    rows.splice(before < 0 ? rows.length : before, 0, entry)
+    this.writeWaitingPrompts(rows)
     session.record.queuedBehind = SWITCH_WAIT_REASON
     this.setStatus(session, 'queued')
     return { waitId: entry.id }

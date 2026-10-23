@@ -221,9 +221,10 @@ describe('/poise change sessions', () => {
   }, 20_000)
 
   it.each([
-    { mode: 'withdrawal', queued: true }, { mode: 'restart', queued: true },
-    { mode: 'withdrawal', queued: false }, { mode: 'restart', queued: false },
-  ] as const)('waits a Poise implementation admitted during controller binding through $mode (queued: $queued)', async ({ mode, queued }) => {
+    { mode: 'withdrawal', queued: true, beforeBind: false }, { mode: 'restart', queued: true, beforeBind: false },
+    { mode: 'withdrawal', queued: false, beforeBind: false }, { mode: 'restart', queued: false, beforeBind: false },
+    { mode: 'withdrawal', queued: false, beforeBind: true }, { mode: 'restart', queued: false, beforeBind: true },
+  ] as const)('waits a Poise implementation admitted during controller binding through $mode (queued: $queued, before bind: $beforeBind)', async ({ mode, queued, beforeBind }) => {
     const bridge = fakeBridge('poise-test:db')
     const initial = makeRuntime({ bridge })
     const source = await sourceSession(initial.runtime, initial.events)
@@ -251,6 +252,12 @@ describe('/poise change sessions', () => {
     try {
       await waitFor(() => binding)
       initial.runtime.setSwitchPending('next-release')
+      if (beforeBind) {
+        const child = initial.runtime.list().find(session => session.selfChangeId === changeId)!
+        expect(child.status).toBe('starting')
+        expect(ofType(initial.events, child.id, 'session.created')).toHaveLength(1)
+        expect(initial.runtime.prompt(child.id, { text: 'Discuss before binding finishes', attachments: [], mentions: [] })).toHaveProperty('waitId')
+      }
       releaseBind()
       const result = await starting
       expect(result.session).toMatchObject({ status: 'queued', queuedBehind: 'waiting for the Poise update' })
@@ -290,12 +297,13 @@ describe('/poise change sessions', () => {
       const agent = active.controls.adapters.find(adapter => adapter.host.sessionId === result.session.id)!
       expect(agent.inputs).toHaveLength(1)
       bridge.changes.get(changeId)!.state = 'live'
-      await waitFor(() => ofType(active.events, result.session.id, 'turn.finished').length === (queued ? 3 : 2))
-      expect(agent.inputs).toHaveLength(queued ? 3 : 2)
+      await waitFor(() => ofType(active.events, result.session.id, 'turn.finished').length === (queued || beforeBind ? 3 : 2))
+      expect(agent.inputs).toHaveLength(queued || beforeBind ? 3 : 2)
       expect(agent.inputs[0].text).toContain(request)
       expect(agent.inputs[0].text).toContain('Keep the original implementation instructions.')
       if (queued) expect(agent.inputs[1].text).toContain('Existing queued follow-up')
-      expect(agent.inputs[queued ? 2 : 1].text).toContain('Discuss after implementing')
+      if (beforeBind) expect(agent.inputs[1].text).toContain('Discuss before binding finishes')
+      expect(agent.inputs[queued || beforeBind ? 2 : 1].text).toContain('Discuss after implementing')
       expect(ofType(active.events, result.session.id, 'turn.started')[0].prompt.text).toBe(`/${switchName} ${request}`)
       expect(outbox.getFinish(changeId)).toMatchObject({ outcome: 'completed' })
       expect(bridge.calls.filter(call => call.op === 'finish' && call.changeId === changeId)).toHaveLength(1)
@@ -304,6 +312,45 @@ describe('/poise change sessions', () => {
       await Promise.allSettled([starting])
       const { setMeta } = await import('../../server/db')
       setMeta('chat_switch_waiting', '[]')
+    }
+  }, 40_000)
+
+  it('keeps the first implementation reserved while its visible child is still binding without an update', async () => {
+    const bridge = fakeBridge('poise-test:db')
+    const { runtime, controls, events } = makeRuntime({ bridge })
+    const source = await sourceSession(runtime, events)
+    let releaseBind!: () => void
+    const bindGate = new Promise<void>(done => { releaseBind = done })
+    let binding = false
+    const bind = bridge.bindSession.bind(bridge)
+    bridge.bindSession = async (id, input) => {
+      binding = true
+      await bindGate
+      return bind(id, input)
+    }
+    const changeId = randomUUID(), request = 'Implement before discussion'
+    const starting = runtime.startPoiseChange(source.id, request, changeId)
+    try {
+      await waitFor(() => binding)
+      const child = runtime.list().find(session => session.selfChangeId === changeId)!
+      expect(ofType(events, child.id, 'session.created')).toHaveLength(1)
+      expect(() => runtime.prompt(child.id, { text: 'Discuss before binding finishes', attachments: [], mentions: [] }))
+        .toThrow(/implementation is still being prepared/)
+      expect(storage.getOpenTurn(child.id)).toBeNull()
+      expect(controls.adapters.some(adapter => adapter.host.sessionId === child.id)).toBe(false)
+      releaseBind()
+      const result = await starting
+      expect(result.session.id).toBe(child.id)
+      await waitFor(() => !!outbox.getFinish(changeId)?.deliveredAt)
+      const agent = controls.adapters.find(adapter => adapter.host.sessionId === child.id)!
+      expect(agent.inputs).toHaveLength(1)
+      expect(agent.inputs[0].text).toContain(request)
+      expect(ofType(events, child.id, 'turn.started')).toHaveLength(1)
+      expect(outbox.getFinish(changeId)).toMatchObject({ outcome: 'completed' })
+      expect(bridge.calls.filter(call => call.op === 'finish' && call.changeId === changeId)).toHaveLength(1)
+    } finally {
+      releaseBind()
+      await Promise.allSettled([starting])
     }
   }, 40_000)
 

@@ -330,7 +330,10 @@ reconciles them as after any restart.
   while launches and behavior ticks run as usual. A Poise implementation whose
   controller binding completes during this pause also waits durably, retaining
   its runbook, displayed request, switches and completion responsibility. It
-  remains ahead of discussion in that change chat; a restart does not report an
+  remains ahead of discussion in that change chat, including messages sent to
+  the visible child before binding returns. Without a pending update, that
+  child refuses discussion until binding reserves its initial implementation;
+  ordinary starting chats retain their existing admission policy. A restart does not report an
   implementation that never started as failed. Running turns get the
   update turn bound (a chat setting, default 15 minutes counted from when
   the switch became pending); past it they are cancelled through the normal
