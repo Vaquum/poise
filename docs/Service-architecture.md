@@ -347,7 +347,9 @@ reconciles them as after any restart.
   items when the preceding turn finishes naturally during the switch. New
   waited messages record that queue boundary; older records use their stored
   creation times. The person's Stop also holds these waited messages until the
-  person resumes the chat.
+  person resumes the chat. A Stop that overlaps the update bound's native
+  cancellation also keeps its interrupted record durable; after the person's
+  resumed turn, that recovery still precedes normal queued follow-ups.
   Withdrawal waits for any bound cancellation to record recovery before
   releasing messages. A bound
   cancellation never bypasses the quiet gate for server work, background

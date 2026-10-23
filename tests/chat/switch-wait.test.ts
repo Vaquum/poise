@@ -32,7 +32,7 @@ function git(cwd: string, ...args: string[]): string {
   if (r.status) throw new Error(r.stderr)
   return r.stdout.trim()
 }
-interface Controls { auto: boolean, calls: { agent: AgentId, input: PromptInput, turnId: string }[], adapters: Fake[], compactGate?: Promise<void>, compactions: number }
+interface Controls { auto: boolean, calls: { agent: AgentId, input: PromptInput, turnId: string }[], adapters: Fake[], compactGate?: Promise<void>, compactions: number, cancelGate?: Promise<void>, cancellationStarted?: () => void }
 class Fake implements Adapter {
   alive = false
   nativeSessionId: string | undefined
@@ -50,10 +50,14 @@ class Fake implements Adapter {
     if (this.c.auto) return { stopReason: 'end_turn' }
     return await new Promise<TurnResult>(resolve => {
       this.finish = result => { this.finish = undefined; resolve(result) }
-      signal.addEventListener('abort', () => this.finish?.({ stopReason: 'cancelled' }), { once: true })
+      signal.addEventListener('abort', () => {
+        this.c.cancellationStarted?.()
+        if (this.c.cancelGate) void this.c.cancelGate.then(() => this.finish?.({ stopReason: 'cancelled' }))
+        else this.finish?.({ stopReason: 'cancelled' })
+      }, { once: true })
     })
   }
-  async cancel() { this.finish?.({ stopReason: 'cancelled' }) }
+  async cancel() { if (this.c.cancelGate) await this.c.cancelGate; this.finish?.({ stopReason: 'cancelled' }) }
   async compact(_turnId: string, _memories: string, signal: AbortSignal): Promise<TurnResult> {
     this.c.compactions += 1
     if (this.c.compactGate) await Promise.race([this.c.compactGate,
@@ -657,6 +661,60 @@ describe('the switch bound', () => {
     } finally {
       release()
       delayed.mockRestore()
+      service.reset()
+    }
+  })
+
+  it('retains interrupted recovery when Person Stop overlaps native bound cancellation', async () => {
+    const w = await world({ auto: false })
+    await tickControl(w.runtime)
+    const original = w.runtime.prompt(w.s.id, input('Original task'))
+    if (!('turnId' in original)) throw new Error('fixture did not admit its original turn')
+    await until(() => w.c.calls.length === 1)
+    await w.runtime.enqueue(w.s.id, randomUUID(), input('Queued follow-up'))
+    let release!: () => void
+    let entered!: () => void
+    w.c.cancelGate = new Promise<void>(resolve => { release = resolve })
+    const cancelling = new Promise<void>(resolve => { entered = resolve })
+    w.c.cancellationStarted = entered
+    const timer = new FakeTimer()
+    let now = 5_000_000
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: () => {}, releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart: () => true, canRestart: () => true,
+      switchTurnBoundMinutes: () => 15, now: () => now,
+    })
+    let personStop: Promise<{ settled: boolean }> | undefined
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await cancelling
+      personStop = w.runtime.cancel(w.s.id, { kind: 'person' })
+      expect(inbox.holds(w.instance)).toEqual([expect.objectContaining({ sessionId: w.s.id, cause: 'stopped' })])
+      service.switchRelease('r1')
+      release()
+      await personStop
+      await until(() => w.runtime.switchPending === null)
+      await w.runtime.releaseSwitchWait()
+      expect(w.c.calls.map(call => call.input.text)).toEqual(['Original task'])
+      expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([
+        expect.objectContaining({ sessionId: w.s.id, turnId: original.turnId }),
+      ])
+      w.runtime.prompt(w.s.id, input('Person resumes'))
+      await until(() => w.c.calls.length === 2)
+      expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toHaveLength(1)
+      w.c.auto = true
+      w.finish()
+      await until(() => w.turns(w.s.id).length === 4 && w.runtime.get(w.s.id)?.status === 'idle')
+      expect(w.c.calls.map(call => call.input.text)).toEqual([
+        'Original task', 'Person resumes',
+        'Poise stopped your turn for an update that did not restart. Continue where you left off.', 'Queued follow-up',
+      ])
+      expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
+    } finally {
+      release()
+      await personStop
       service.reset()
     }
   })

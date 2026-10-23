@@ -268,7 +268,7 @@ interface WaitingPrompt { id: string, sessionId: string, prompt: PromptInput, cr
 type WaitingDelivery = 'admitted' | 'dropped' | 'deferred'
 
 /** One session whose running turn a switch bound interrupted. */
-interface InterruptedSession extends SwitchPromptMetadata { sessionId: string, turnId: string, at: string, prompt?: PromptInput }
+interface InterruptedSession extends SwitchPromptMetadata { sessionId: string, turnId: string, at: string, prompt?: PromptInput, continuation?: string }
 
 export interface PoiseChangeResult { session: SessionRecord, change: SelfChange }
 
@@ -766,12 +766,24 @@ export class ChatRuntime extends EventEmitter {
     const blocked = new Set(protectedSessions)
     for (const row of this.readInterruptedSessions()) {
       if (this.stopped || this.drainState || this.switchState) return
-      if (blocked.has(row.sessionId) || this.recoveryOwnedElsewhere(row.sessionId)) continue
-      if (!this.takeInterruptedSession(row.sessionId)) continue
-      const outcome = await this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
+      if (blocked.has(row.sessionId)) continue
+      const outcome = await this.resumeInterruptedSession(row, continuation)
       if (outcome === 'deferred') blocked.add(row.sessionId)
     }
     await this.startWaitingPrompts(blocked)
+  }
+
+  private async resumeInterruptedSession(row: InterruptedSession, continuation: string): Promise<WaitingDelivery> {
+    if (this.recoveryOwnedElsewhere(row.sessionId)) return 'deferred'
+    if (this.recoveryHeld(row.sessionId)) {
+      // Stop can overlap the bound's native cancellation. Keep its recovery
+      // row until a person resumes; preserve the withdrawal/restart reason.
+      if (row.continuation !== continuation) this.writeInterruptedSessions(this.readInterruptedSessions()
+        .map(entry => entry.sessionId === row.sessionId ? { ...entry, continuation } : entry))
+      return 'deferred'
+    }
+    if (!this.takeInterruptedSession(row.sessionId)) return 'admitted'
+    return this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
   }
 
   /** Start every prompt that waited behind an update, in arrival order. */
@@ -789,7 +801,7 @@ export class ChatRuntime extends EventEmitter {
   }
 
   private waitingPromptBlocked(entry: WaitingPrompt): boolean {
-    if (holds(this.instance).some(hold => hold.sessionId === entry.sessionId)) return true
+    if (this.recoveryHeld(entry.sessionId)) return true
     if (this.live.get(entry.sessionId)?.turn || storage.getOpenTurn(entry.sessionId)) return true
     const queue = this.messageQueue(entry.sessionId)
     if (queue.executorSessionId && queue.executorSessionId !== entry.sessionId) return false
@@ -798,6 +810,10 @@ export class ChatRuntime extends EventEmitter {
     // timestamp ordering; new entries record IDs so clock ties cannot reorder.
     const before = new Set(entry.queueBefore ?? queue.items.filter(item => item.createdAt <= entry.createdAt).map(item => item.id))
     return queue.items.some(item => item.state === 'waiting' && before.has(item.id))
+  }
+
+  private recoveryHeld(sessionId: string): boolean {
+    return holds(this.instance).some(hold => hold.sessionId === sessionId)
   }
 
   /** Release paths have no startup protection set. Recheck the live owner
@@ -2289,6 +2305,14 @@ export class ChatRuntime extends EventEmitter {
     if (session.record.role === 'manager' && session.record.retiredModel) return
     if (this.stopped || this.recovering || this.drainState || this.switchState || session.lifecycle.signal.aborted || session.record.status === 'closed'
       || session.record.contextResetting || session.record.orphanNotice || session.turn || this.deferredWaitingSessions.has(id) || this.queuePumps.has(id) || this.queueTimers.has(id)) return
+    const interrupted = this.readInterruptedSessions().find(row => row.sessionId === id)
+    if (interrupted) {
+      if (storage.getOpenTurn(id)) return
+      void this.resumeInterruptedSession(interrupted, interrupted.continuation ?? SWITCH_CONTINUE_PROMPT).then(outcome => {
+        if (outcome === 'dropped') this.scheduleQueue(session)
+      }).catch(error => this.emit('log', `[chat] interrupted recovery for ${id.slice(0, 8)} failed: ${error instanceof Error ? error.message : String(error)}`))
+      return
+    }
     const waiting = this.readWaitingPrompts().find(entry => entry.sessionId === id)
     if (waiting && !this.waitingPromptBlocked(waiting) && !this.recoveryOwnedElsewhere(id) && this.takeWaitingPrompt(waiting.id)) {
       void this.deliverWaitingPrompt(id, waiting.prompt, 'waiting', waiting.recovery, waiting).then(outcome => {
