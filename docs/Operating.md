@@ -719,6 +719,52 @@ history, the GitHub indexes Poise reads, and the repositories agents check
 out. Review checkouts are removed a day after their last use. Old images and
 build cache are removed after each deploy ([Upgrades](#upgrades)).
 
+### Storage maintenance
+
+Each workspace also cleans itself: every 6 hours, whenever its own disk
+passes 80% used, and on demand from Settings → Storage, which shows the
+storage breakdown and the last run. A run removes a closed session's scratch
+workspace after 24 hours when its tree is clean and nothing is unpushed,
+requiring a remote-tracking ref to contain every local branch tip and any
+detached HEAD; remote-less committed work stays held. Open idle sessions keep
+their artifacts: directory names and Git ignore rules do not prove that an
+entry can be regenerated. Artifact pruning requires recorded generator
+provenance, which existing workspaces do not have. Any legacy prune marker
+still restores dependencies on the next turn. Maintenance takes the checkout
+lease and rechecks turn claims before tidying its Git data. It expires
+incident snapshots after 30 days unless pinned with a
+`KEEP` file, and caps the pip, uv, npm and GitHub-mirror caches with
+least-recently-used eviction. Workspace content with uncommitted or unpushed
+work stays held, and a running or queued turn blocks all workspace maintenance;
+everything kept is listed
+as held with the reason, and every run is logged with the bytes it reclaimed.
+GitHub mirrors are evicted through Caller's local `--prune-mirrors` behavior,
+which shares checkout's per-repository lock and keeps owner directories and
+lock files. A recent descendant write, a busy lock or uncertain bare-mirror
+identity holds the mirror; symlinks are never followed for deletion.
+Resuming a removed managed workspace creates only its empty private path
+before constructing the canonical lease. Ownership/Git initialization and
+the post-wait existence check run under that same held lease. Foreign
+markers are refused; an unsettled initializer worker keeps its lease.
+
+### Giving space back on a VM host
+
+When Poise runs [in a virtual machine](#in-a-virtual-machine-on-a-shared-server),
+freed guest blocks only return to the host if the disk passes discards
+through. Without that, the image keeps growing while the guest reports free
+space. On the libvirt host, set `discard='unmap'` on the VM's disk (with the
+VM shut down, `virsh edit` the domain and find the `<driver>` line of its
+disk):
+
+```xml
+<driver name='qemu' type='qcow2' discard='unmap'/>
+```
+
+Then start the VM and compare the guest's `df` against the host's
+`virsh domblkinfo` allocation: after the guest trims, the two agree again.
+The guest side needs nothing from the operator: each maintenance run issues
+`fstrim` on the home volume when the tool is available.
+
 ## Logs
 
 From `deploy/`:

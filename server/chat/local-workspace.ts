@@ -51,7 +51,7 @@ export function needsIgnoreCheck(root: string): boolean {
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
 }
 
-export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'poise'): Promise<string> {
+export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'poise', heldLease?: CheckoutLease): Promise<string> {
   // Only the installation's own default storage must be ignored by its
   // checkout; any other root (service mode's, a release's) needs no checkout
   // of Poise at all.
@@ -63,9 +63,10 @@ export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'p
   const workspace = join(root, 'workspace')
   await privateDirectory(workspace)
   const checkout = canonicalCheckout(workspace)
+  if (heldLease && (!heldLease.held || heldLease.canonical !== checkout)) throw new Error('Initializing Chat storage requires its held checkout lease')
   if (await readyWorkspace(checkout)) return checkout
-  const lease = new CheckoutLease(checkout, { ownerKind: 'poise:chat', ownerId: 'local-workspace-init', ownerLabel: 'Preparing local Chat storage', instance })
-  await lease.acquire({ signal: AbortSignal.timeout(15_000) })
+  const lease = heldLease ?? new CheckoutLease(checkout, { ownerKind: 'poise:chat', ownerId: 'local-workspace-init', ownerLabel: 'Preparing local Chat storage', instance })
+  if (!heldLease) await lease.acquire({ signal: AbortSignal.timeout(15_000) })
   try {
     const marker = join(checkout, '.poise-workspace-owner')
     let owned = false
@@ -105,7 +106,7 @@ export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'p
     }
     return checkout
   } finally {
-    if (lease.held) {
+    if (!heldLease && lease.held) {
       const row = lease.read()
       // A bootstrap command that did not settle still owns the workspace.
       // Releasing here would defeat runGuarded's retained worker record.
@@ -114,13 +115,24 @@ export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'p
   }
 }
 
-/** Validate every managed parent before using the private workspace initializer. */
-export async function ensureWorkerWorkspace(root: string, id: string, instance: string): Promise<string> {
+/** Only plain private directories may precede canonical lease construction.
+ *  Ownership markers and Git initialization are written under that lease. */
+export async function ensureWorkerWorkspaceDirectory(root: string, id: string): Promise<string> {
   if (!WORKSPACE_ID.test(id)) throw new Error('Invalid worker workspace ID')
   await privateDirectory(root)
   const workers = join(root, 'workers')
   await privateDirectory(workers)
-  return ensureLocalWorkspace(join(workers, id), instance)
+  const home = join(workers, id)
+  await privateDirectory(home)
+  const workspace = join(home, 'workspace')
+  await privateDirectory(workspace)
+  return canonicalCheckout(workspace)
+}
+
+/** Validate every managed parent before using the private workspace initializer. */
+export async function ensureWorkerWorkspace(root: string, id: string, instance: string, heldLease?: CheckoutLease): Promise<string> {
+  await ensureWorkerWorkspaceDirectory(root, id)
+  return ensureLocalWorkspace(join(root, 'workers', id), instance, heldLease)
 }
 
 const WORKSPACE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
