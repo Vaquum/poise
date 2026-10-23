@@ -435,13 +435,15 @@ otherwise offer it):
 **Service endpoints** (loopback, or the `admin` scope; the owner's `browser`
 assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
-  runningCallerCalls, backgroundWork, idle, draining, release, switching }`. `idle` is true only
+  runningCallerCalls, backgroundWork, idle, draining, release, switching,
+  desiredRelease, installedRelease, pendingSince }`. `idle` is true only
   when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
   It backs the container health check and the gateway's readiness check.
   - `version` is the commit the running bundle was built from, `null` for a
     development build.
   - `release` is the installed release the supervisor started this server on
-    ([Updates in place](#updates-in-place)), `null` without one.
+    ([Updates in place](#updates-in-place)), `null` without one: the active
+    SHA. A deploy is done only once it equals the deployed commit.
   - `switching` is the release a pending switch restarts this server onto,
     `null` when none is pending. Health reads it from the `next` record in
     `~/.poise/releases`, the same record the supervisor switches on, so it
@@ -449,6 +451,16 @@ assertion may only resume, and anything else is refused with 403):
     record is consumed and nothing is pending. Asking to switch to the
     release it runs calls a pending switch off; the gateway does so when the
     target changes back.
+  - `desiredRelease` is the release the workspace is asked to run: the
+    pending switch's target, else the active release.
+  - `installedRelease` is the desired release when an install of it for this
+    base exists (the running release needs none), `null` when it is not
+    installed: desired without installed is an install failure, not a stuck
+    switch.
+  - `pendingSince` is when the pending switch was first asked for, as ISO,
+    `null` when none is pending. It is the `next` record's mtime, which
+    re-asking the queued release leaves alone, so asking again on later
+    passes never moves it.
   - `activeChatTurns` counts the Chat turns recorded open: reserved before
     their first write, closed once their outcome is recorded.
   - `runningCallerCalls` counts the Caller processes Poise launched for agent

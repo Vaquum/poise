@@ -108,6 +108,7 @@ require_env_file
 require_free_ports
 image=$(runtime_image)
 sha=$(source_sha)
+expected_workspaces=$(workspace_handles)
 build_runtime_image "$image" "$sha"
 if [ -n "$(proxy_listen)" ]; then
   say "Starting the gateway on $(proxy_listen), for your own proxy."
@@ -117,5 +118,6 @@ fi
 compose up --detach --build
 wait_for_gateway
 check_gateway_networks
+verify_workspaces "$sha" "$image" "$expected_workspaces"
 prune_docker_storage "$image"
 next_steps

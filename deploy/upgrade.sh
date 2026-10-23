@@ -70,11 +70,13 @@ require_docker
 require_env_file
 image=$(runtime_image)
 sha=$(source_sha)
+expected_workspaces=$(workspace_handles)
 build_runtime_image "$image" "$sha"
 plan=$(plan_workspaces "$image")
 say "Recreating what changed."
 compose up --detach --build
 wait_for_gateway
 check_gateway_networks
+verify_workspaces "$sha" "$image" "$expected_workspaces"
 prune_docker_storage "$image"
 say "$plan"
