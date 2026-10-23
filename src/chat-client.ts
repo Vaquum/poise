@@ -17,6 +17,7 @@ import type {
   MessageQueue,
   ChatCommand,
   ChatEnvelope,
+  ChatHold,
   ChatSubject,
   ClientFrame,
   NewSessionRequest,
@@ -28,6 +29,8 @@ import type {
   SafeModeAck,
   SwitchboardState,
   LegacyConversation,
+  TimerInput,
+  TimerView,
 } from '../server/chat/protocol'
 import type { SelfChange, SelfUpdateStatus } from './self-update-types'
 import { parseMessageQueue } from './chat-queue'
@@ -548,6 +551,40 @@ export class ChatClient {
     const result = await this.send({ type: 'set_safe_mode', sessionId, enabled }) as SafeModeAck | undefined
     if (result?.session?.id !== sessionId || typeof result.session.safeMode !== 'boolean') throw new Error('The server did not confirm Safe mode')
     return result
+  }
+
+  async createTimer(input: TimerInput): Promise<{ timer: TimerView }> {
+    const result = await this.send({ type: 'timer.create', ...input }) as { timer?: TimerView } | undefined
+    if (!result?.timer || typeof result.timer.id !== 'string') throw new Error('The server did not confirm the timer')
+    return { timer: result.timer }
+  }
+
+  async cancelTimer(timerId: string): Promise<{ timer: TimerView }> {
+    const result = await this.send({ type: 'timer.cancel', timerId }) as { timer?: TimerView } | undefined
+    if (!result?.timer || typeof result.timer.id !== 'string') throw new Error('The server did not confirm cancelling the timer')
+    return { timer: result.timer }
+  }
+
+  async rearmTimer(timerId: string): Promise<{ timer: TimerView }> {
+    const result = await this.send({ type: 'timer.rearm', timerId }) as { timer?: TimerView } | undefined
+    if (!result?.timer || typeof result.timer.id !== 'string') throw new Error('The server did not confirm re-arming the timer')
+    return { timer: result.timer }
+  }
+
+  async setHold(sessionId: string, held: boolean): Promise<{ session: SessionRecord }> {
+    const result = await this.send({ type: 'chat.hold', sessionId, held }) as { session?: SessionRecord } | undefined
+    if (result?.session?.id !== sessionId) throw new Error('The server did not confirm the hold')
+    return { session: result.session }
+  }
+
+  async setAllTimersHeld(held: boolean): Promise<{ held: boolean }> {
+    const result = await this.send({ type: 'timers.holdAll', held }) as { held?: boolean } | undefined
+    if (result?.held !== held) throw new Error('The server did not confirm holding all timers')
+    return { held: result.held }
+  }
+
+  timers(sessionId: string): Promise<{ timers: TimerView[], holds: ChatHold[], allHeld: { held: boolean, since: string | null }, scheduler: { running: boolean, lastTickAt: string | null, error?: string } }> {
+    return jsonFetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/timers`)
   }
 
   renameSession(id: string, title: string): Promise<{ session: SessionRecord }> {

@@ -48,7 +48,7 @@ const CATALOG = {
 }
 
 const PLACES = [
-  { key: 'chat', label: 'Chat', why: 'Card chats opened from Current, Archive and Swarm.', review: false, reviewers: false, providers: null, default: 'gpt-6-astra-ultra', fallback: 'opus-5-high', notes: [], stored: null },
+  { key: 'chat', label: 'Chat', why: 'New chats in Chat and chats started from Current cards.', review: false, reviewers: false, providers: null, default: 'gpt-6-astra-ultra', fallback: 'opus-5-high', notes: [], stored: null },
   { key: 'pr_review', label: 'PR review', why: 'Automatic and manual reviews, including replays.', review: true, reviewers: true, providers: ['claude', 'codex', 'grok', 'muse'], default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'muse-2-deep', tertiary: 'grok-5-heavy', notes: [], stored: null },
 ]
 

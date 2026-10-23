@@ -329,7 +329,6 @@ describe('Poise in service mode', () => {
       ['/api/agent-replay', { behavior: 'pr_review', repo: 'acme/app', pr_id: '1' }],
       ['/api/chat-content', { topic: 'Release notes', session: 'chat-1' }],
       ['/api/debate', { topic: 'Ship it?' }],
-      ['/api/chat', { session: 'card-1', message: 'hello' }],
       ['/api/models/refresh', {}],
     ] as const) {
       expect(await send('POST', path, fromGateway(), body), path).toMatchObject({ status: 503, json: { error: 'Poise is installing an update; try again after it restarts', code: 'draining' } })

@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentId, ChatEnvelope, PromptInput } from '../../server/chat/protocol'
+import type { AgentId, ChatEnvelope, PromptInput, TurnSource } from '../../server/chat/protocol'
 import type { Adapter, AdapterHost, AdapterStartOptions, TurnResult } from '../../server/chat/adapters/types'
 import { CATALOG } from '../model-catalog-fixture'
 
@@ -88,9 +88,9 @@ async function world(options: { auto?: boolean, deferStart?: boolean } = {}) {
   await writeFile(join(repo, 'README.md'), '# Switch fixture\n'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'fixture')
   const instance = `switch-test:${randomUUID()}`
   const c: Controls = { auto: options.auto ?? true, calls: [], adapters: [], compactions: 0 }
-  function make() {
+  function make(leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions) {
     const runtime = new Runtime({ instance, instanceLabel: 'switch-test', callerTurns: null, idleTimeoutMinutes: () => 0,
-      catalog: async () => CATALOG, resolveCheckout: async () => repo, requireClaudeReady: async () => {},
+      catalog: async () => CATALOG, resolveCheckout: async () => repo, requireClaudeReady: async () => {}, leaseProbes,
       adapters: Object.fromEntries((['grok', 'claude', 'codex', 'muse'] as AgentId[]).map(agent => [agent, (host: AdapterHost) => new Fake(agent, host, c)])),
     })
     runtimes.push(runtime); return runtime
@@ -254,10 +254,10 @@ describe('the switch bound', () => {
     w.runtime.prompt(w.s.id, input('Hold the shared checkout'))
     await until(() => w.c.calls.length === 1)
     const request = input('Implement the original waiting request')
-    let metadata: { seq: number, source: { kind: 'poise', name: string }, shown: string } | undefined
+    let metadata: { seq: number, source: { kind: 'poise', name: string }, shown: string, at: number } | undefined
     if (source === 'poise') {
       inbox.message(w.instance, waiting.id, 'Poise work monitor', request.text)
-      metadata = { seq: inbox.inbox(w.instance, waiting.id)[0].seq, source: { kind: 'poise', name: 'Poise work monitor' }, shown: 'Visible monitor request' }
+      metadata = { seq: inbox.inbox(w.instance, waiting.id)[0].seq, source: { kind: 'poise', name: 'Poise work monitor' }, shown: 'Visible monitor request', at: Date.now() }
     }
     const admitted = w.runtime.prompt(waiting.id, request, metadata)
     await until(() => w.runtime.events(waiting.id, 0).events.some(({ event }) => event.type === 'turn.started'))
@@ -305,13 +305,12 @@ describe('the switch bound', () => {
     const w = await world({ auto: false })
     w.runtime.prompt(w.s.id, input('Original task'))
     await until(() => w.c.calls.length === 1)
+    w.runtime.setSwitchPending('r2')
     const interrupted = w.runtime.runningTurnSessions()
     await w.runtime.cancel(w.s.id)
-    // The follow-up waits behind the switch once the original turn is gone;
-    // prompting a busy session throws by design (the browser steers instead).
-    w.runtime.setSwitchPending('r2')
-    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+    await until(() => w.runtime.runningTurnSessions().length === 0 && w.runtime.working() === 0)
     w.runtime.recordSwitchInterrupted(interrupted)
+    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
     await w.runtime.stop()
     const waiting = database.getMeta('chat_switch_waiting')
     const retained = database.getMeta('chat_switch_interrupted')
@@ -329,6 +328,75 @@ describe('the switch bound', () => {
     ])
     expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
     expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([])
+  })
+
+  it('keeps interrupted work ahead of waited follow-ups while recovery is draining', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.c.calls.length === 1)
+    w.runtime.setSwitchPending('r2')
+    const interrupted = w.runtime.runningTurnSessions()
+    await w.runtime.cancel(w.s.id)
+    await until(() => w.runtime.runningTurnSessions().length === 0 && w.runtime.working() === 0)
+    w.runtime.recordSwitchInterrupted(interrupted)
+    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+    await w.runtime.stop()
+    const waiting = database.getMeta('chat_switch_waiting')
+    const retained = database.getMeta('chat_switch_interrupted')
+    w.c.auto = true
+    const next = w.make()
+    next.startDrain('service')
+    await next.recover()
+    expect(database.getMeta('chat_switch_interrupted')).toBe(retained)
+    expect(database.getMeta('chat_switch_waiting')).toBe(waiting)
+    expect(w.c.calls).toHaveLength(1)
+    next.endDrain()
+    await until(() => w.c.calls.length === 3)
+    expect(w.c.calls.map(call => call.input.text)).toEqual([
+      'Original task', 'Poise restarted for an update while your turn was running. Continue where you left off.', 'Waited follow-up',
+    ])
+    expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
+    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([])
+  })
+
+  it.each(['drain', 'withdrawal'] as const)('retains another live server recovery rows when releasing %s', async release => {
+    const w = await world()
+    w.runtime.setSwitchPending('r2')
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID() }])
+    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+    await w.runtime.stop()
+    const { CheckoutLease } = await import('../../server/chat/checkout-lock')
+    const remotePid = process.pid + 1_000_000
+    const probes = { pidAlive: (pid: number) => pid === remotePid || pid === process.pid }
+    const lease = new CheckoutLease(w.repo, { ownerKind: 'poise:chat', ownerId: w.s.id,
+      ownerLabel: 'live recovery owner', instance: w.instance }, { ...probes, hostPid: remotePid })
+    expect(lease.tryAcquire().acquired).toBe(true)
+    storage.recordWorker({ sessionId: w.s.id, gatePid: remotePid, gatePgid: remotePid, ident: 'protected fixture',
+      checkout: w.repo, leaseToken: lease.currentToken, command: 'held owner', startedAt: new Date().toISOString() })
+    const waiting = database.getMeta('chat_switch_waiting')
+    const interrupted = database.getMeta('chat_switch_interrupted')
+    const next = w.make(probes)
+    try {
+      if (release === 'drain') next.startDrain('service')
+      else next.setSwitchPending('r3')
+      await next.recover()
+      if (release === 'drain') next.endDrain()
+      else await next.releaseSwitchWait()
+      expect(database.getMeta('chat_switch_interrupted')).toBe(interrupted)
+      expect(database.getMeta('chat_switch_waiting')).toBe(waiting)
+      expect(storage.getOpenTurn(w.s.id)).toBeNull()
+      expect(next.get(w.s.id)?.queue?.items ?? []).toEqual([])
+      expect(lease.read()?.token).toBe(lease.currentToken)
+      expect(w.c.calls).toHaveLength(0)
+    } finally {
+      storage.forgetWorker(w.s.id)
+      lease.release()
+    }
+    await next.recover()
+    await until(() => w.c.calls.length === 2)
+    expect(w.c.calls.map(call => call.input.text)).toEqual([
+      'Poise restarted for an update while your turn was running. Continue where you left off.', 'Waited follow-up',
+    ])
   })
 
   it('retains shown input, switches and change completion when recovery queues behind a busy turn', async () => {
@@ -354,6 +422,27 @@ describe('the switch bound', () => {
     expect(w.c.calls[1].input.text).toContain('Keep the original switch instructions')
     const started = next.events(w.s.id, 0).events.filter(({ event }) => event.type === 'turn.started').at(-1)
     expect(started?.event).toMatchObject({ prompt: input('Visible original request') })
+  })
+
+  it('retains timer provenance when recovery queues behind a busy turn', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Busy preceding task'))
+    await until(() => w.c.calls.length === 1)
+    const source: Extract<TurnSource, { kind: 'timer' }> = { kind: 'timer', timerId: randomUUID(), label: 'Reminder',
+      setBy: { kind: 'person' }, missed: 2, dueAt: new Date().toISOString(), seq: 123 }
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID(),
+      prompt: input('Recovered timer request'), shown: input('Visible reminder'), source }])
+    await w.runtime.releaseSwitchWait()
+    const queued = w.runtime.get(w.s.id)?.queue?.items[0]
+    expect(queued?.source).toEqual(source)
+    if (queued?.source?.kind !== 'timer') throw new Error('queued recovery lost its timer source')
+    expect(queued.source.timerId).toBe(source.timerId)
+    w.c.auto = true
+    w.finish()
+    await until(() => w.turns(w.s.id).length === 2)
+    const started = w.runtime.events(w.s.id, 0).events.filter(({ event }) => event.type === 'turn.started').at(-1)
+    expect(started?.event).toMatchObject({ source, prompt: input('Visible reminder') })
+    expect(w.c.calls[1].input.text).toBe('Recovered timer request')
   })
 
   it('restarts at once when only waited prompts stand by: they hold no quiet check', async () => {

@@ -3,6 +3,7 @@
 // comes from listChatHistory and each kept reply body from fetchAgentResponse.
 import { listChatHistory } from '../chat'
 import { fetchAgentResponse } from '../agent'
+import { peekChatSession, readAnnotations } from '../editor'
 import type { ChatSubject, LegacyConversation } from './protocol'
 
 export type { LegacyConversation }
@@ -14,11 +15,26 @@ const IMPORT_MAX_REPLIES = 50
 /** Quoted history given to the first native turn is bounded to 64 KiB. */
 const QUOTE_MAX_BYTES = 64 * 1024
 
-/** The legacy chat id for a subject. For `current` it is the key itself,
- *  which the client builds with the same functions as the legacy pane. */
+/** The legacy chat id for a subject, read on the server: nothing the client
+ *  sends is trusted for it. For `current` it is the key itself, which the
+ *  client builds with the same functions as the legacy pane. For
+ *  `editor-document` it is the document's side-car id, read without minting.
+ *  For `editor-passage` it is the annotation's `session_id`, in either shape
+ *  the Editor wrote. `editor-review` has none: review chats lived only in
+ *  browser memory. Keys are opaque after validation; this is the one place
+ *  that reads their parts. */
 export async function legacyIdFor(subject: ChatSubject): Promise<string | null> {
-  if (subject.surface !== 'current') return null
-  return subject.key
+  if (subject.surface === 'current') return subject.key
+  if (subject.surface === 'editor-document') return peekChatSession(subject.key)
+  if (subject.surface === 'editor-passage') {
+    const at = subject.key.indexOf(':')
+    if (at <= 0) return null
+    const id = subject.key.slice(at + 1)
+    if (!id) return null
+    const { annotations } = await readAnnotations(subject.key.slice(0, at))
+    return annotations.find((a) => a.id === id)?.session_id ?? null
+  }
+  return null
 }
 
 /** The subject's earlier conversation, oldest first. Newest turns are kept

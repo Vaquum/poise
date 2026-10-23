@@ -660,25 +660,16 @@ export async function deleteAnnotations(slug: string): Promise<{ ok: true }> {
   })
 }
 
-// ── Chat session ──────────────────────────────────────────────────────
+// ── Legacy chat session ───────────────────────────────────────────────
 //
-// Each editor doc can open a long-lived chat sidebar (the existing
-// `chat-pane.ts` view, opened via `poise:open-chat`). The chat itself
-// is held by agent-interface — the model session, the transcript, the
-// tokens — all keyed off a single session_id string. We just need to
-// remember which session_id belongs to which doc, so reopening the
-// chat for the same doc resumes the same conversation forever.
-//
-// Stored as a third side-car next to the .md and .annotations.json:
+// Before every Editor chat ran as a Chat session, each doc's conversation
+// lived in agent-interface under a single session_id string, remembered
+// here as a side-car next to the .md and .annotations.json:
 //   <slug>.chat.json  →  { session_id, created_at }
 //
-// session_id format: `editor-<canonical-slug>-<ms>`. The slug part
-// makes the id self-describing in `agent-interface --logs`; the ms
-// suffix is uniqueness insurance — if the side-car is deleted and a
-// fresh chat is started for the same slug later, the new session_id
-// won't collide with whatever orphaned history the old one left behind.
-// The file is small and stable: the schema can grow (e.g. tracking
-// which voice guide was active) without breaking older readers.
+// session_id format: `editor-<canonical-slug>-<ms>`. Nothing mints these
+// anymore; the side-car is read-only history so a doc's first Chat session
+// can import its earlier conversation. Deleting the doc still removes it.
 
 export interface ChatSessionFile {
   session_id: string
@@ -689,51 +680,25 @@ function chatSessionFileFor(slug: string): string {
   return join(EDITOR_DIR, canonicalSlug(slug) + '.chat.json')
 }
 
-// Return the chat session for `slug`, minting + persisting a new one
-// on first call. Idempotent: subsequent calls return the same row.
-// If the side-car exists but is corrupt or missing fields, we treat
-// it as absent and overwrite — losing a corrupt session_id loses
-// orphaned chat history but never corrupts a working doc.
-export async function getOrCreateChatSession(slug: string): Promise<ChatSessionFile> {
+// Read the legacy chat id for `slug` without minting one. A missing or
+// unusable side-car reads as no legacy conversation: the caller imports
+// nothing. Unexpected read errors still surface.
+export async function peekChatSession(slug: string): Promise<string | null> {
   await editorReady
   const path = chatSessionFileFor(slug)
-  return serializeMutation(path, async () => {
-    try {
-      const raw = (await readUtf8Limited(path, CHAT_SESSION_MAX_BYTES, 'chat session')).content
-      const parsed = JSON.parse(raw) as Partial<ChatSessionFile>
-      if (parsed && typeof parsed.session_id === 'string' && parsed.session_id) {
-        return {
-          session_id: parsed.session_id,
-          created_at: typeof parsed.created_at === 'string' ? parsed.created_at : new Date().toISOString(),
-        }
-      }
-      // Fall through to mint a fresh one — the file existed but its
-      // contents were unusable.
-    } catch (err: any) {
-      if (err.code !== 'ENOENT') {
-        // Surface unexpected read errors (perms, etc.) rather than
-        // silently minting a duplicate session.
-        throw err
-      }
-    }
-    const safe = canonicalSlug(slug)
-    const created_at = new Date().toISOString()
-    const session_id = `editor-${safe}-${Date.now()}`
-    const body: ChatSessionFile = { session_id, created_at }
-    await writeAtomic(path, JSON.stringify(body, null, 2))
-    return body
-  })
-}
-
-// Reverse-lookup: given a session_id minted by getOrCreateChatSession,
-// return the doc slug it belongs to. Returns null for session_ids that
-// aren't ours (card-chat sessions, /content sessions, anything bare).
-// Format: `editor-<canonical-slug>-<ms-digits>`. The regex anchors on
-// the trailing all-digit ms suffix so slugs containing internal `-`
-// chars (e.g. `untitled-20260512123456`) are extracted correctly.
-export function slugFromEditorSession(sessionId: string): string | null {
-  const m = String(sessionId || '').match(/^editor-(.+)-\d+$/)
-  return m && isCanonicalSlug(m[1]) ? m[1] : null
+  let raw: string
+  try {
+    raw = (await readUtf8Limited(path, CHAT_SESSION_MAX_BYTES, 'chat session')).content
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return null
+    throw err
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<ChatSessionFile>
+    return parsed && typeof parsed.session_id === 'string' && parsed.session_id ? parsed.session_id : null
+  } catch {
+    return null
+  }
 }
 
 // ── Publishing ────────────────────────────────────────────────────────

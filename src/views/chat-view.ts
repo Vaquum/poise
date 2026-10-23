@@ -22,11 +22,12 @@ import type {
   SessionStatus,
   AgentId,
   ChatSubject,
+  TimerInput,
 } from '../../server/chat/protocol'
 import { AGENT_LABELS } from '../../server/chat/protocol'
 import { chatClient, ChatCommandError, ChatHttpError, type AgentsResponse, type AgentInfo } from '../chat-client'
 import { escapeHtml } from '../markdown'
-import { listTime } from '../clock'
+import { listTime, shortTime } from '../clock'
 import { effectiveTimezone } from '../config'
 import { recoverDraft } from '../chat-draft-recovery'
 import { parseChatCommandChain as parseChain, commandBody } from '../../server/chat/commands'
@@ -36,6 +37,7 @@ import { reconcileSession } from '../chat-session-state'
 import { reserveQueuedMessage, releaseQueuedMessage } from '../chat-queue'
 import { createQueuePanel } from './chat-queue'
 import { createMemoriesPane } from './chat-memories'
+import { renderTimersPane } from './chat-timers'
 import { createSwitchboardPane, ICON_SWITCHBOARD } from './chat-switchboard'
 import { renderNewSessionDialog } from './chat-new-session'
 import {
@@ -86,6 +88,11 @@ let viewEl: HTMLElement
 let initialized = false
 let listEl: HTMLElement
 let headerEl: HTMLElement
+let timersPaneEl: HTMLElement
+let timersOpenFor: string | null = null
+let timersJson = ''
+let timersFetchGeneration = 0
+let timersRefresh: ReturnType<typeof setInterval> | null = null
 let mainEl: HTMLElement
 let scrollEl: HTMLElement
 let transcriptEl: HTMLElement
@@ -310,6 +317,7 @@ function renderShell(): void {
         </aside>
         <section class="chat-main">
           <div class="chat-session-header" hidden></div>
+          <div id="chat-timers-pane" hidden></div>
           <div class="chat-notice st-help st-help-error" role="status" hidden></div>
           <div class="chat-transcript-scroll">
             <div class="chat-empty chat-transcript-loading" hidden>Loading…</div>
@@ -323,6 +331,7 @@ function renderShell(): void {
   `
   listEl = viewEl.querySelector<HTMLElement>('.chat-session-list')!
   headerEl = viewEl.querySelector<HTMLElement>('.chat-session-header')!
+  timersPaneEl = viewEl.querySelector<HTMLElement>('#chat-timers-pane')!
   mainEl = viewEl.querySelector<HTMLElement>('.chat-main')!
   scrollEl = viewEl.querySelector<HTMLElement>('.chat-transcript-scroll')!
   transcriptEl = viewEl.querySelector<HTMLElement>('.chat-transcript')!
@@ -356,6 +365,12 @@ function renderShell(): void {
     onRevert: (diffId) => { void revertDiff(diffId) },
     onLoadDiff: (diffId) => { void loadCompleteDiff(diffId) },
     onSelectSession: (id) => { void selectSession(id) },
+    onOpenInEditor: () => {
+      const id = activeId
+      const subject = id ? sessions.get(id)?.record.subject : undefined
+      const slug = subject && subject.surface !== 'current' ? editorSlugForSubject(subject) : null
+      if (id && slug) window.dispatchEvent(new CustomEvent('poise:open-editor-doc', { detail: { slug, session: id } }))
+    },
   })
   transcriptEl.addEventListener('chat:rerender', () => queueRender())
 
@@ -931,6 +946,11 @@ async function selectSession(id: string, restoring = false): Promise<void> {
   }
   const switching = activeId !== id
   if (switching) filePreview.close()
+  if (switching && timersOpenFor !== null && timersOpenFor !== id) {
+    timersOpenFor = null
+    if (timersRefresh) { clearInterval(timersRefresh); timersRefresh = null }
+    timersPaneEl.hidden = true
+  }
   activeId = id
   freshSubject = null
   closeDialog()
@@ -1006,6 +1026,7 @@ function onEvent(env: ChatEnvelope): void {
   applyEvent(e.model, env)
   e.record = { ...e.record, lastSeq: Math.max(e.record.lastSeq || 0, env.seq) }
   sortOrder()
+  if (env.sessionId === timersOpenFor && (ev.type === 'timer.changed' || ev.type === 'session.updated')) void refreshTimersPane()
   queueRender()
 }
 
@@ -2040,6 +2061,78 @@ function memoriesButton(): string {
   return `<button type="button" class="chat-icon-btn chat-h-memories${error ? ' has-error' : ''}" aria-label="Memories" aria-controls="chat-memories-pane" aria-expanded="${open}" aria-pressed="${open}" data-tooltip="Memories">${ICON_MEMORIES}</button>`
 }
 
+// ── Timers ─────────────────────────────────────────────────────────────
+
+function timersButton(s: SessionRecord): string {
+  const open = timersOpenFor === s.id
+  const count = s.timers?.length ?? 0
+  const held = (s.timers || []).some(t => t.reason === 'person_stopped' || t.reason === 'person_held')
+  return `<button type="button" class="chat-h-btn chat-h-timers" aria-label="Timers" aria-controls="chat-timers-pane" aria-expanded="${open}" data-tooltip="Timers">Timers${count ? ` ${count}` : ''}${held ? ' · on hold' : ''}</button>`
+}
+
+function toggleTimers(): void {
+  const e = entry()
+  if (!e) return
+  if (timersOpenFor === e.record.id) {
+    timersOpenFor = null
+    if (timersRefresh) { clearInterval(timersRefresh); timersRefresh = null }
+    timersPaneEl.hidden = true
+    renderHeader()
+    queueRender()
+    return
+  }
+  timersOpenFor = e.record.id
+  timersJson = ''
+  if (timersPaneEl.dataset.timersSession !== e.record.id) {
+    timersPaneEl.dataset.timersSession = e.record.id
+    timersPaneEl.innerHTML = '<div class="chat-timers"><div class="st-help chat-timers-loading" role="status">Loading timers…</div></div>'
+  }
+  timersPaneEl.hidden = false
+  if (timersRefresh) clearInterval(timersRefresh)
+  timersRefresh = setInterval(() => { void refreshTimersPane() }, 30_000)
+  renderHeader()
+  queueRender()
+  void refreshTimersPane()
+}
+
+/** Refetch the open pane; re-render only when the data changed, so the add
+ *  form's draft survives unrelated frames. The scheduler's tick time moves
+ *  every second, so only its staleness counts toward the comparison. */
+async function refreshTimersPane(): Promise<void> {
+  const id = timersOpenFor
+  const e = entry()
+  if (!id || !e || e.record.id !== id) return
+  const generation = ++timersFetchGeneration
+  try {
+    const data = await chatClient.timers(id)
+    if (timersOpenFor !== id || generation !== timersFetchGeneration) return
+    const tick = data.scheduler.lastTickAt ? Date.parse(data.scheduler.lastTickAt) : NaN
+    const json = JSON.stringify({ ...data, scheduler: { running: data.scheduler.running, error: data.scheduler.error ?? null,
+      stale: !Number.isFinite(tick) || Date.now() - tick > 60_000 } })
+    if (json === timersJson) return
+    timersJson = json
+    renderTimersPane(timersPaneEl, e.record, data, {
+      add: async (input: TimerInput) => { await chatClient.createTimer(input); timersJson = ''; await refreshTimersPane() },
+      cancel: async (timerId: string) => { await chatClient.cancelTimer(timerId); timersJson = ''; await refreshTimersPane() },
+      rearm: async (timerId: string) => { await chatClient.rearmTimer(timerId); timersJson = ''; await refreshTimersPane() },
+      hold: async (held: boolean) => { await chatClient.setHold(id, held); timersJson = ''; await refreshTimersPane() },
+      holdAll: async (held: boolean) => { await chatClient.setAllTimersHeld(held); timersJson = ''; await refreshTimersPane() },
+    })
+  } catch (error) {
+    if (timersOpenFor !== id || generation !== timersFetchGeneration) return
+    timersJson = ''
+    timersPaneEl.querySelector('.chat-timers-loading')?.remove()
+    let alert = timersPaneEl.querySelector<HTMLElement>('.chat-timers-load-error')
+    if (!alert) {
+      alert = document.createElement('div')
+      alert.className = 'st-help st-help-error chat-timers-load-error'
+      alert.setAttribute('role', 'alert')
+      timersPaneEl.prepend(alert)
+    }
+    alert.textContent = `Timers could not be loaded — ${(error as Error).message}`
+  }
+}
+
 function headerHtml(): string {
   const e = entry()
   if (!e) return `<div class="chat-h-row chat-h-fresh"><span class="chat-controls-spacer"></span>${reasoningButton()}${autoMergeButton(freshAutoMerge, !!quickSessionPromise || firstPromptPending)}${safeModeButton(freshSafeMode, !!quickSessionPromise || firstPromptPending)}${memoriesButton()}</div>`
@@ -2086,6 +2179,7 @@ function headerHtml(): string {
       ${autoMergeButton(s.autoMerge === true, e.pending || autoMergeUpdates.has(s.id))}
       ${safeModeButton(s.safeMode === true, e.pending || safeModeUpdates.has(s.id) || s.status === 'closed', s.safeModePending === true)}
       ${memoriesButton()}
+      ${timersButton(s)}
     </div>
     ${s.safeModePending ? '<div id="chat-safe-mode-status" class="st-help chat-safe-mode-status" role="status">Permission change queued for the next turn; current native permissions are unchanged.</div>' : ''}
     ${s.retiredModel ? `<div class="st-help st-help-error chat-retired-model" role="status" data-model="${escapeHtml(s.retiredModel)}"></div>` : ''}
@@ -2126,6 +2220,7 @@ function attachHeader(): void {
     const t = e.target as HTMLElement
     if (t.closest('.chat-h-stop')) { void cancelTurn(); return }
     if (t.closest('.chat-h-memories')) { toggleMemories(); renderHeader(); return }
+    if (t.closest('.chat-h-timers')) { toggleTimers(); return }
     if (t.closest('.chat-h-safe-mode')) { void toggleSafeMode(); return }
     if (t.closest('.chat-h-reasoning')) {
       showReasoning = !showReasoning
@@ -2200,6 +2295,13 @@ function attachKeys(): void {
 
 // ── Composer state and layout ──────────────────────────────────────────────
 
+/** The earliest active timer's wake time, for the Resume note. */
+function wakeNote(s: SessionRecord): string {
+  const next = (s.timers || []).filter(t => t.state === 'active' && t.nextAt).sort((a, b) => Date.parse(a.nextAt!) - Date.parse(b.nextAt!))[0]
+  if (!next?.nextAt) return ''
+  return ` · Timer "${next.label}" wakes it at ${shortTime(next.nextAt, effectiveTimezone(), Date.now())}`
+}
+
 function composerStateFor(e: SessionEntry | null): void {
   if (!e) {
     composer.setCommands([], { model: true, modes: false, fork: false })
@@ -2215,8 +2317,8 @@ function composerStateFor(e: SessionEntry | null): void {
   if (e.pending) { disabled = true; placeholder = 'Starting the session…' }
   else if (s.status === 'closed') { disabled = true; placeholder = 'This session is closed' }
   else if (s.retiredModel) { disabled = true; placeholder = 'Choose another model to continue' }
-  else if (s.status === 'interrupted') { disabled = true; placeholder = 'Interrupted — Resume to continue, or /reset to start fresh' }
-  else if (s.status === 'error') { disabled = true; placeholder = 'The session failed — Resume to try again, or /reset to start fresh' }
+  else if (s.status === 'interrupted') { disabled = true; placeholder = `Interrupted — Resume to continue, or /reset to start fresh${wakeNote(s)}` }
+  else if (s.status === 'error') { disabled = true; placeholder = `The session failed — Resume to try again, or /reset to start fresh${wakeNote(s)}` }
   composer.setCommands(s.commands || [], { modes: !!s.capabilities?.modes, fork: !!s.capabilities?.fork })
   if (s.contextResetting) { disabled = true; placeholder = 'Resetting chat…' }
   composer.setState({ running, maintaining: s.contextCompacting, disabled, placeholder, modelIdentity: s.model, resume: !s.contextResetting && (s.status === 'interrupted' || s.status === 'error'), sessionId: e.pending ? null : s.id })
@@ -2251,9 +2353,10 @@ function render(): void {
   mainEl.classList.toggle('chat-observer', !!e && !listed(e.record.id))
   composerStateFor(e)
   renderQueue()
-  // A deploy card is content too: the console must not lift over it.
+  // A deploy card is content too: the console must not lift over it. An
+  // open Timers pane is content as well, for the same reason.
   const hasCard = !!e && (!!activeChange() || localChanges.has(e.record.id))
-  const empty = !e || (!e.model.blocks.length && !e.loading && !hasCard)
+  const empty = !e || (!e.model.blocks.length && !e.loading && !hasCard && timersOpenFor === null)
   const changedConsole = lastEmpty !== empty
   const presentedLift = new DOMMatrixReadOnly(getComputedStyle(dockEl).transform).m42
   const composerEl = composer.el
@@ -2303,8 +2406,10 @@ function render(): void {
   const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight
   const wasAtBottom = distance <= STICK_TO_BOTTOM_PX
   if (e) {
+    const subject = e.record.subject
     transcript.render(e.model, { showActivity, showReasoning, showTools, agent: e.record.agent, running: isRunning(e.record.status) || !!e.model.running, interruptedTurnId: e.record.interruptedTurnId, sessionId: e.record.id,
-      chats: [...sessions.values()].map((entry) => ({ id: entry.record.id, title: entry.record.title, role: entry.record.role })) })
+      chats: [...sessions.values()].map((entry) => ({ id: entry.record.id, title: entry.record.title, role: entry.record.role })),
+      ...(subject && subject.surface !== 'current' ? { edits: { surface: subject.surface, readOnly: true } } : {}) })
   } else {
     transcript.clear()
   }
@@ -2485,10 +2590,11 @@ export async function openChatForSubject(subject: ChatSubject, prefill?: string,
   composer.focus()
 }
 
-/** Open the New session dialog prefilled from a card or a document. */
-export async function openChatWithContext(prefill: NewSessionPrefill): Promise<void> {
-  await ensureInit()
-  await openNewSessionDialog(prefill)
+/** The Editor document a subject belongs to: the key itself for a document
+ *  chat, the part before the first colon for a passage or review chat. */
+function editorSlugForSubject(subject: ChatSubject): string {
+  if (subject.surface === 'editor-document') return subject.key
+  return subject.key.slice(0, Math.max(0, subject.key.indexOf(':')))
 }
 
 async function ensureInit(): Promise<void> {

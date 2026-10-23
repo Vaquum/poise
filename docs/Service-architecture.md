@@ -336,10 +336,12 @@ reconciles them as after any restart.
   checkout or startup is replayed with its original input and attribution.
   Compaction does not count as delivering that request. If recovery must
   queue, the queue retains its displayed request, switches and change
-  completion responsibility with the original actor and model.
-  If another switch is pending during recovery, both interrupted and
+  completion responsibility with the original source, including timer
+  provenance, and model.
+  If a drain or another switch is pending during recovery, both interrupted and
   waiting records stay durable until it clears; continuations keep priority
-  over their follow-ups. Waiting turns follow these recoveries in order.
+  over their follow-ups. Drain and withdrawal release paths also retain records
+  held by another live server. Waiting turns follow these recoveries in order.
   Withdrawal waits for any bound cancellation to record recovery before
   releasing messages. A bound
   cancellation never bypasses the quiet gate for server work, background
@@ -374,10 +376,12 @@ computer.
   process-scoped credential, a loopback peer and no browser Origin/fetch
   headers; even a valid gateway browser/admin assertion cannot call it.
   The native command can also use the normal loopback Poise APIs under their
-  existing policy. Creating-chat and worker relationships, the workspace Manager's role, inbox admission, supervision
-  and explicit issue/PR ownership persist in the workspace's SQLite store.
+  existing policy. Creating-chat and worker relationships, the workspace Manager's role, inbox admission, supervision,
+  explicit issue/PR ownership, durable timers and their holds persist in the
+  workspace's SQLite store.
   Dispatch pauses while draining; running monitor reads join the existing
-  background-work barrier. See [Chat orchestration](Chat-orchestration.md).
+  background-work barrier. A release switch waiting for quiet holds timer fire
+  and admission back so timer turns never keep it waiting. See [Chat orchestration](Chat-orchestration.md).
 - The Switchboard pane's actions (`POST /api/chat/switchboard/…`) act for the
   owner, so they also require an `Origin`, checked as below. A loopback
   request without one, such as a native chat's `api` operation, is refused
@@ -485,7 +489,7 @@ assertion may only resume, and anything else is refused with 403):
   `POISE_DRAIN_TIMEOUT` seconds (default 5400, 90 minutes) have passed.
   - New Chat turns include queued messages, and launches include the
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
-    `/api/debate`, `/api/chat`, `/api/models/refresh`). Refused work answers
+    `/api/debate`, `/api/models/refresh`). Refused work answers
     503 with code `draining`; work already running continues.
   - One Chat turn holds a refusing drain at most 30 minutes: past that the
     drain stops it through the person's Stop path, with a transcript notice

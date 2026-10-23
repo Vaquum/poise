@@ -17,13 +17,16 @@ import type {
   ChatEnvelope,
   AgentId,
   ContentBlock,
+  EditDecision,
   LegacyConversation,
   PermissionOption,
+  PersonActor,
   PlanEntry,
   PoiseActor,
   PromptInput,
   Question,
   StopReason,
+  TimerSummary,
   ToolKind,
   ToolLocation,
   ToolStatus,
@@ -31,6 +34,7 @@ import type {
   TurnUsage,
 } from '../../server/chat/protocol'
 import { AGENT_LABELS } from '../../server/chat/protocol'
+import { editFromCard, renderEditCards, tryParseStructuredReply, type EditProposal } from '../edit-proposals'
 import { consoleModelLabel } from '../chat-catalog'
 import { turnTime } from '../chat-turn-time'
 import { clockDay } from '../clock'
@@ -105,7 +109,7 @@ export interface TurnModel extends Keyed {
   /** Set locally the moment a prompt is sent, cleared when turn.started lands. */
   optimistic?: boolean
   /** `at` is the server's time on the turn.finished envelope: when the turn ended. */
-  finished?: { stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, stoppedBy?: ChatActor, at: string }
+  finished?: { stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, stoppedBy?: ChatActor | PersonActor, at: string }
 }
 
 export type Block =
@@ -125,6 +129,8 @@ export interface TranscriptModel {
   diffs: Map<string, { tool: ToolItem, diff: DiffModel }>
   permissions: Map<string, PermissionItem>
   questions: Map<string, QuestionItem>
+  /** Recorded edit decisions by `${turnId}:${messageId}:${index}`; the last one wins. */
+  decisions: Map<string, EditDecision>
   /** The turn that has started and not finished, if any. */
   running: TurnModel | null
   /** Whether any text has streamed for the running turn. */
@@ -134,7 +140,7 @@ export interface TranscriptModel {
 export function createModel(): TranscriptModel {
   return {
     blocks: [], turns: new Map(), tools: new Map(), diffs: new Map(),
-    permissions: new Map(), questions: new Map(), running: null, rev: 0,
+    permissions: new Map(), questions: new Map(), decisions: new Map(), running: null, rev: 0,
   }
 }
 
@@ -191,12 +197,37 @@ export function shortActorTitle(title: string): string {
 }
 
 /** Plain-text name of a chat or Poise actor for transcript labels. Pure, so
- *  unit tests prove the same mapping the transcript renders. */
-export function actorName(actor: ChatActor | PoiseActor | undefined): string {
+ *  unit tests prove the same mapping the transcript renders. A timer source
+ *  names the chat or person that set it. */
+export function actorName(actor: ChatActor | PoiseActor | PersonActor | TurnSource | undefined): string {
   if (!actor) return 'another chat'
   if (actor.kind === 'poise') return actor.name
+  if (actor.kind === 'person') return 'you'
+  if (actor.kind === 'timer') return timerSetterName(actor.setBy)
   if (actor.role === 'manager') return 'Manager'
   return actor.title ? `chat "${shortActorTitle(actor.title)}"` : 'another chat'
+}
+
+/** Who set a timer, in transcript and pane words. */
+export function timerSetterName(setBy: ChatActor | PersonActor): string {
+  if (setBy.kind === 'person') return 'you'
+  if (setBy.role === 'manager') return 'Manager'
+  return actorName(setBy)
+}
+
+/** One timer change as a transcript note. Pure; the note renderer escapes it. */
+export function timerChangedText(timer: TimerSummary, change: 'created' | 'cancelled' | 'held' | 'released' | 'tripped' | 'rearmed' | 'ended', error?: string): string {
+  const name = `Timer "${timer.label}"`
+  const schedule = timer.schedule.kind === 'every' ? `every ${timer.schedule.minutes} min` : `once in ${timer.schedule.delayMinutes} min`
+  switch (change) {
+    case 'created': return `${name} set by ${timerSetterName(timer.setBy)} · ${schedule}`
+    case 'cancelled': return `${name} cancelled`
+    case 'held': return `${name} put on hold`
+    case 'released': return `${name} resumed`
+    case 'tripped': return `${name} stopped after 3 failed turns: ${error || 'unknown error'}. Re-arm it from Timers.`
+    case 'rearmed': return `${name} re-armed`
+    case 'ended': return `${name} ended`
+  }
 }
 
 /** Tooltip for an actor label: the full frozen title and the short chat ID,
@@ -434,10 +465,24 @@ export function applyEvent(model: TranscriptModel, env: ChatEnvelope): void {
       bump(model, block)
       return
     }
+    case 'timer.changed': {
+      const block: Block = { kind: 'note', key: `timer:${env.seq}`, rev: 0, text: timerChangedText(e.timer, e.change, e.error) }
+      model.blocks.push(block)
+      bump(model, block)
+      return
+    }
     case 'history.imported': {
       const block: Block = { kind: 'imported', key: `imported:${env.seq}`, rev: 0, legacyId: e.legacyId, turns: e.turns, omitted: e.omitted }
       model.blocks.push(block)
       bump(model, block)
+      return
+    }
+    case 'edit.decided': {
+      const turn = model.turns.get(e.turnId)
+      if (!turn) return
+      model.decisions.set(`${e.turnId}:${e.messageId}:${e.index}`, e.decision)
+      const item = turn.items.find((it): it is TextItem => it.kind === 'text' && it.messageId === e.messageId)
+      bump(model, turn, ...(item ? [item] : []))
       return
     }
     case 'content.started': {
@@ -510,6 +555,11 @@ export interface TranscriptHandlers {
   onLoadDiff?(diffId: string): void
   onFile?(reference: string): void
   onSelectSession?(id: string): void
+  onEditDecide?(turnId: string, messageId: string, index: number, decision: EditDecision, edit: EditProposal): void
+  onEditHover?(edit: EditProposal): void
+  onEditLeave?(): void
+  onOpenInEditor?(): void
+  onSuggestedReply?(text: string): void
 }
 
 export interface RenderContext {
@@ -524,6 +574,15 @@ export interface RenderContext {
   running: boolean
   /** The rendered session; question drafts are kept per session. */
   sessionId?: string
+  /** Render a finished turn's last text message as edit cards when it parses
+   *  as the contract. Read-only cards show badges instead of buttons. */
+  edits?: {
+    surface: 'editor-document' | 'editor-passage' | 'editor-review'
+    readOnly: boolean
+    deciding?: ReadonlySet<string>
+    applied?: ReadonlySet<string>
+    revision?: number
+  }
   /** Live chats for actor labels: a listed source is a select button, a
    *  missing one renders with a deleted marker. */
   chats?: Array<{ id: string, title: string, role?: 'manager' }>
@@ -717,6 +776,8 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     draftSession = session
   }
   const texts = new Map<string, string>()
+  /** Rendered edit cards by opaque card key, for the delegated handlers. */
+  const cards = new Map<string, { turnId: string, messageId: string, index: number, edit: EditProposal }>()
   let lastCtxKey = ''
   let lastChatsKey = ''
   let renderedDay = ''
@@ -768,8 +829,8 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
 
   /** An actor's name in a label: a button selecting its chat while the chat
    *  exists, plain text with a deleted marker once it is gone. */
-  function actorHtml(actor: ChatActor | PoiseActor | undefined, ctx: RenderContext): string {
-    if (!actor || actor.kind === 'poise' || !actor.title) return `<span>${escapeHtml(actorName(actor))}</span>`
+  function actorHtml(actor: ChatActor | PoiseActor | PersonActor | undefined, ctx: RenderContext): string {
+    if (!actor || actor.kind === 'poise' || actor.kind === 'person' || !actor.title) return `<span>${escapeHtml(actorName(actor))}</span>`
     const label = escapeHtml(actorName(actor))
     const tip = escapeHtml(actorTitleAttr(actor))
     if ((ctx.chats || []).some((c) => c.id === actor.sessionId)) {
@@ -783,6 +844,11 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     const extrasHtml = contextExtras(p)
     const queued = turn.queueItemId ? `<div class="chat-turn-queued">From queue${turn.agent ? ` · ${escapeHtml(AGENT_LABELS[turn.agent])}` : ''}${turn.model ? ` · ${escapeHtml(consoleModelLabel(turn.model))}` : ''}</div>` : ''
     if (turn.source) {
+      if (turn.source.kind === 'timer') {
+        const collapsed = turn.source.missed ? ` · ${turn.source.missed} earlier firing${turn.source.missed === 1 ? '' : 's'} collapsed` : ''
+        const from = `Timer "${escapeHtml(turn.source.label)}" · set by ${escapeHtml(timerSetterName(turn.source.setBy))}${collapsed}`
+        return `${queued}<div class="chat-msg chat-msg-chat"><div class="chat-msg-body"><div class="chat-msg-source">${from}</div>${escapeHtml(p.text)}${extrasHtml}</div></div>`
+      }
       const from = turn.source.kind === 'poise'
         ? `From ${escapeHtml(turn.source.name)}`
         : `Message from ${actorHtml(turn.source, ctx)}`
@@ -796,8 +862,39 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
   }
 
   // A finished turn's last message has its copy button in the turn's meta row.
-  function textHtml(item: TextItem, final: boolean): string {
+  // In an Editor session, a finished turn's last text message renders as edit
+  // cards when it parses as the contract; earlier messages render as prose.
+  // While the last message streams and starts with `{"chat"`, it shows
+  // "Drafting edits…" instead of the partial JSON.
+  function textHtml(turn: TurnModel, item: TextItem, final: boolean, ctx: RenderContext, decisions: TranscriptModel['decisions']): string {
     texts.set(item.key, item.text)
+    if (ctx.edits && item === lastText(turn)) {
+      if (!turn.finished && item.text.trim().startsWith('{"chat"')) {
+        return `<div class="chat-msg chat-msg-agent"><div class="chat-msg-body">Drafting edits…</div>${copyButton(item.key)}</div>`
+      }
+      if (turn.finished) {
+        const parsed = tryParseStructuredReply(item.text)
+        const review = ctx.edits.surface === 'editor-review'
+        if (parsed && (parsed.edits || (review && parsed.reply))) {
+          const states = new Map<number, EditDecision>()
+          const deciding = new Set<number>()
+          const prefix = `${turn.turnId}:${item.messageId}:`
+          for (const [at, decision] of decisions) {
+            if (!at.startsWith(prefix)) continue
+            const index = Number(at.slice(prefix.length))
+            if (Number.isSafeInteger(index)) states.set(index, decision)
+          }
+          for (const [index, edit] of (parsed.edits || []).entries()) {
+            if (ctx.edits.applied?.has(`${prefix}${index}`)) states.set(index, 'applied')
+            if (ctx.edits.deciding?.has(`${prefix}${index}`)) deciding.add(index)
+            cards.set(`${item.key}:${index}`, { turnId: turn.turnId, messageId: item.messageId, index, edit })
+          }
+          const prose = parsed.chat ? `<div class="chat-msg-body chat-msg-md">${renderMarkdown(parsed.chat, { localFileLinks: !!handlers.onFile })}</div>` : ''
+          return `<div class="chat-msg chat-msg-agent chat-msg-final">${prose}`
+            + renderEditCards(parsed, item.key, states, { readOnly: ctx.edits.readOnly, review, deciding }) + '</div>'
+        }
+      }
+    }
     return `<div class="chat-msg chat-msg-agent${final ? ' chat-msg-final' : ''}"><div class="chat-msg-body chat-msg-md">${renderMarkdown(item.text, { localFileLinks: !!handlers.onFile })}</div>`
       + `${final ? '' : copyButton(item.key)}</div>`
   }
@@ -1006,7 +1103,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     }
   }
 
-  function renderTurn(el: HTMLElement, turn: TurnModel, ctx: RenderContext, clock: Clock, focused: PermissionItem | QuestionItem | null, isLast: boolean, repaintActors: boolean): void {
+  function renderTurn(el: HTMLElement, turn: TurnModel, ctx: RenderContext, clock: Clock, focused: PermissionItem | QuestionItem | null, isLast: boolean, repaintActors: boolean, repaintEdits: boolean, decisions: TranscriptModel['decisions']): void {
     let head = el.querySelector<HTMLElement>(':scope > .chat-turn-head')
     let items = el.querySelector<HTMLElement>(':scope > .chat-turn-items')
     let foot = el.querySelector<HTMLElement>(':scope > .chat-turn-foot')
@@ -1036,10 +1133,10 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       // repaints the items that carry one. Drafts survive: questions
       // remember and restore theirs around the repaint.
       const actorItem = (item.kind === 'steer' && !!item.source) || (item.kind === 'question' && item.answered?.by === 'chat')
-      if ((repaintActors && actorItem) || setRev(item.key, rev) || (item.kind === 'tool' && node.childElementCount === 0)) {
+      if ((repaintActors && actorItem) || (repaintEdits && item.kind === 'text') || setRev(item.key, rev) || (item.kind === 'tool' && node.childElementCount === 0)) {
         const paint = () => {
         switch (item.kind) {
-          case 'text': patchContent(node, textHtml(item, item === final)); break
+          case 'text': patchContent(node, textHtml(turn, item, item === final, ctx, decisions)); break
           case 'thought': patchContent(node, thoughtHtml(item, item.key)); break
           case 'tool': patchContent(node, toolHtml(item)); break
           case 'readgroup': patchContent(node, readGroupHtml(item.key, item.tools)); break
@@ -1100,7 +1197,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     // Actor labels follow the session list: a rename, delete or reload
     // re-renders them without any new transcript event.
     const chatsKey = (ctx.chats || []).map((c) => `${c.id}\n${c.role || ''}\n${c.title}`).join('\n')
-    const ctxKey = `${ctx.running ? 1 : 0}:${ctx.interruptedTurnId || ''}:${focused?.id || ''}:${ctx.showActivity !== false}:${ctx.showReasoning === true}:${ctx.showTools !== false}:${ctx.agent || ''}:${renderedDay}:${chatsKey}`
+    const ctxKey = `${ctx.running ? 1 : 0}:${ctx.interruptedTurnId || ''}:${focused?.id || ''}:${ctx.showActivity !== false}:${ctx.showReasoning === true}:${ctx.showTools !== false}:${ctx.agent || ''}:${renderedDay}:${chatsKey}:${ctx.edits ? `${ctx.edits.surface}:${ctx.edits.readOnly ? 'ro' : 'rw'}:${ctx.edits.revision ?? 0}` : ''}`
     const ctxChanged = ctxKey !== lastCtxKey
     lastCtxKey = ctxKey
     const chatsChanged = chatsKey !== lastChatsKey
@@ -1117,7 +1214,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
         // and the turn holding the request; both sit in the item revisions,
         // so a turn renders when its rev moved or the context did.
         const isLast = b.key === lastTurnKey
-        if (setRev(b.key, b.turn.rev) || ctxChanged || isLast) renderTurn(el, b.turn, b.turn.agent ? { ...ctx, agent: b.turn.agent } : ctx, clock, focused, isLast, chatsChanged)
+        if (setRev(b.key, b.turn.rev) || ctxChanged || isLast) renderTurn(el, b.turn, b.turn.agent ? { ...ctx, agent: b.turn.agent } : ctx, clock, focused, isLast, chatsChanged, ctxChanged && !!ctx.edits, model.decisions)
       } else if (setRev(b.key, b.rev)) {
         if (b.kind === 'error') {
           el.innerHTML = `<div class="chat-msg chat-msg-agent chat-msg-error"><div class="chat-msg-body">${escapeHtml(b.message)}</div></div>`
@@ -1144,6 +1241,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     container.innerHTML = ''
     nodes.clear()
     texts.clear()
+    cards.clear()
     lastCtxKey = ''
     lastChatsKey = ''
     renderedDay = ''
@@ -1257,6 +1355,40 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       handlers.onRevert(revert.dataset.revert!)
       return
     }
+    const accept = target.closest<HTMLButtonElement>('[data-edit-accept]')
+    const decline = target.closest<HTMLButtonElement>('[data-edit-decline]')
+    if (accept || decline) {
+      const key = (accept || decline)!.closest<HTMLElement>('.chat-edit-card')?.dataset.cardKey
+      const found = key ? cards.get(key) : undefined
+      if (found) handlers.onEditDecide?.(found.turnId, found.messageId, found.index, accept ? 'applied' : 'declined', found.edit)
+      return
+    }
+    const openEditor = target.closest<HTMLButtonElement>('[data-open-in-editor]')
+    if (openEditor) {
+      handlers.onOpenInEditor?.()
+      return
+    }
+    const useReply = target.closest<HTMLButtonElement>('[data-use-suggested-reply]')
+    if (useReply) {
+      handlers.onSuggestedReply?.(useReply.dataset.reply || '')
+      return
+    }
+  })
+
+  // Edit-card hover highlights the card's target in the document. Enter/leave
+  // semantics across the card's children, so a move between tracks does not
+  // flicker. Cards without an opaque key (the suggested reply) never hover.
+  container.addEventListener('mouseover', (e) => {
+    if (!handlers.onEditHover) return
+    const card = (e.target as HTMLElement).closest?.('.chat-edit-card') as HTMLElement | null
+    const from = (e.relatedTarget as HTMLElement | null)?.closest?.('.chat-edit-card')
+    if (card && card !== from && card.dataset.cardKey && cards.has(card.dataset.cardKey)) handlers.onEditHover(editFromCard(card))
+  })
+  container.addEventListener('mouseout', (e) => {
+    if (!handlers.onEditLeave) return
+    const card = (e.target as HTMLElement).closest?.('.chat-edit-card')
+    const to = (e.relatedTarget as HTMLElement | null)?.closest?.('.chat-edit-card')
+    if (card && card !== to) handlers.onEditLeave()
   })
 
   function collectAnswers(card: HTMLElement): Record<string, string | string[]> {

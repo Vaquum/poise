@@ -1,6 +1,26 @@
 import type { ChatSwitches } from '../../../src/chat-switches'
 import { expect, type Page, type WebSocketRoute } from '@playwright/test'
-import type { ChatEnvelope, ChatEvent, ClientFrame, SessionRecord, SwitchboardState } from '../../../server/chat/protocol'
+import type { ChatEnvelope, ChatEvent, ChatHold, ClientFrame, SessionRecord, SwitchboardState, TimerSummary, TimerView } from '../../../server/chat/protocol'
+
+export interface TimersData { timers: TimerView[], holds: ChatHold[], allHeld: { held: boolean, since: string | null }, scheduler: { running: boolean, lastTickAt: string | null, error?: string } }
+
+export function timersData(overrides: Partial<TimersData> = {}): TimersData {
+  return { timers: [], holds: [], allHeld: { held: false, since: null },
+    scheduler: { running: true, lastTickAt: new Date().toISOString() }, ...overrides }
+}
+
+let timerSeq = 0
+export function timerView(overrides: Partial<TimerView> = {}): TimerView {
+  timerSeq += 1
+  const message = overrides.message ?? 'Check the build'
+  const points = Array.from(message)
+  return {
+    id: `timer-${timerSeq}`, sessionId: 's1', label: 'Check CI', preview: points.length > 200 ? `${points.slice(0, 200).join('')}…` : message,
+    schedule: { kind: 'every', minutes: 30 }, nextAt: '2026-09-18T14:35:00.000Z', notBefore: null,
+    state: 'active', setBy: { kind: 'chat', sessionId: 'm1', title: 'Manager', role: 'manager' },
+    failures: 0, skipped: 0, createdAt: NOW, message, ...overrides,
+  }
+}
 
 // The Chat view against a scripted server: REST through page.route, the
 // socket through page.routeWebSocket. The mock says hello, acks every frame
@@ -75,6 +95,8 @@ interface ServerState {
   forbidLegacyChat?: boolean
   /** Answer for GET /api/models; the surface reads the chat default. */
   models?: unknown
+  /** Answer for GET /api/chat/sessions/<id>/timers, by session. */
+  timers?: Record<string, TimersData>
 }
 
 async function installRoutes(page: Page, state: ServerState): Promise<void> {
@@ -157,6 +179,13 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
         await route.fulfill({ json: { session: found, instance: 'poise-dev:test' } })
         return
       }
+      const legacy = url.searchParams.get('legacy')
+      if (legacy !== null) {
+        if (!legacy) { await route.fulfill({ status: 400, json: { error: 'legacy must not be empty' } }); return }
+        const found = state.sessions.find((s) => s.importedFrom === legacy) || null
+        await route.fulfill({ json: { session: found, instance: 'poise-dev:test' } })
+        return
+      }
       await route.fulfill({ json: { sessions: state.sessions, instance: 'poise-dev:test' } })
       return
     }
@@ -185,6 +214,11 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
       state.sessions.unshift(created)
       state.history[created.id] = []
       await route.fulfill({ status: 201, json: { session: created, ...(req2.subject ? { existing: false } : {}) } })
+      return
+    }
+    const t = /^\/api\/chat\/sessions\/([^/]+)\/timers$/.exec(path)
+    if (t && method === 'GET') {
+      await route.fulfill({ json: state.timers?.[decodeURIComponent(t[1])] || timersData() })
       return
     }
     const m = /^\/api\/chat\/sessions\/([^/]+)(?:\/(resume|fork|close|handoff))?$/.exec(path)
@@ -304,6 +338,60 @@ async function installSocket(page: Page, state?: ServerState): Promise<Socket> {
         s.lastSeq = sock.seq + 1
         sock.push(s.id, { type: 'session.updated', session: { ...s } })
         sock.ack(frame, true, '', undefined, { session: { ...s }, applies: 'current_turn' })
+      } else if (sock.autoAck && frame.command.type === 'edit.decide') {
+        const cmd = frame.command
+        if (cmd.type !== 'edit.decide') throw new Error('Unexpected edit command')
+        sock.push(cmd.sessionId, { type: 'edit.decided', turnId: cmd.turnId, messageId: cmd.messageId, index: cmd.index, decision: cmd.decision })
+        sock.ack(frame)
+      } else if (sock.autoAck && ['timer.create', 'timer.cancel', 'timer.rearm', 'chat.hold', 'timers.holdAll'].includes(frame.command.type) && state) {
+        const command = frame.command
+        if (command.type === 'timer.create') {
+          const created = timerView({ sessionId: command.sessionId, label: command.label, message: command.message,
+            schedule: command.everyMinutes !== undefined ? { kind: 'every', minutes: command.everyMinutes } : { kind: 'once', delayMinutes: command.delayMinutes! } })
+          const data = state.timers?.[command.sessionId]
+          if (data) data.timers.push(created)
+          sock.ack(frame, true, '', undefined, { timer: created })
+        } else if (command.type === 'timer.cancel' || command.type === 'timer.rearm') {
+          for (const data of Object.values(state.timers || {})) {
+            const timer = data.timers.find(t => t.id === (command as { timerId: string }).timerId)
+            if (timer) {
+              if (command.type === 'timer.cancel') { timer.state = 'cancelled'; timer.nextAt = null }
+              else { timer.state = 'active'; timer.failures = 0; timer.notBefore = null }
+              sock.ack(frame, true, '', undefined, { timer: { ...timer } })
+              return
+            }
+          }
+          sock.ack(frame)
+        } else if (command.type === 'chat.hold') {
+          const s = state.sessions.find(s => s.id === command.sessionId)!
+          const data = state.timers?.[command.sessionId]
+          if (command.held) {
+            if (data && !data.holds.some(h => h.sessionId === s.id)) data.holds.push({ sessionId: s.id, cause: 'held', since: NOW })
+            if (data) for (const timer of data.timers) if (timer.state === 'active') { timer.state = 'held'; timer.reason = 'person_held' }
+          } else {
+            if (data) data.holds = data.holds.filter(h => h.sessionId !== s.id)
+            if (data) for (const timer of data.timers) if (timer.state === 'held') { timer.state = 'active'; timer.reason = undefined }
+          }
+          if (data) {
+            const summaries: TimerSummary[] = data.timers.filter(t => t.state === 'active' || t.state === 'held' || t.state === 'tripped')
+              .map((t) => ({ id: t.id, sessionId: t.sessionId, label: t.label, preview: t.preview, schedule: t.schedule,
+                nextAt: t.nextAt, notBefore: t.notBefore, state: t.state, reason: t.reason, setBy: t.setBy,
+                failures: t.failures, skipped: t.skipped, pending: t.pending, createdAt: t.createdAt }))
+            s.timers = summaries
+            s.lastSeq = sock.seq + 1
+            sock.push(s.id, { type: 'session.updated', session: { ...s } })
+          }
+          sock.ack(frame, true, '', undefined, { session: { ...s } })
+        } else if (command.type === 'timers.holdAll') {
+          for (const data of Object.values(state.timers || {})) {
+            data.allHeld = { held: command.held, since: command.held ? NOW : null }
+            for (const timer of data.timers) {
+              if (command.held && timer.state === 'active') { timer.state = 'held'; timer.reason = 'all_held' }
+              if (!command.held && timer.state === 'held' && timer.reason === 'all_held') { timer.state = 'active'; timer.reason = undefined }
+            }
+          }
+          sock.ack(frame, true, '', undefined, { held: command.held })
+        }
       } else if (sock.autoAck) sock.ack(frame)
       else sock.held.push(frame)
     })
