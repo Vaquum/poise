@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { LogEntry } from '../server/agent'
-import { mocks, pr, HEAD_SHA, loadModules, arrangeCli, agentLog, fixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, loadModules, resetLogCache, arrangeCli, agentLog, fixture } from './behaviors-runtime-fixture'
 
 const BALANCE_ERROR = 'Internal error: {\n  "message": "API error (status 402 Payment Required): Grok Build usage balance exhausted",\n  "http_status": 402\n}'
 const SIGNIN_ERROR = 'Not signed in. To authenticate without a browser, run:\n  grok login --device-code\n\nAlternatively, set the XAI_API_KEY environment variable or run `grok login` on a machine with a browser.'
@@ -72,6 +72,7 @@ describe('reviewer account trips', () => {
 
     const key = `${pr.repo}#${pr.number}`
     fixture.agentLogs = [failedLog(db, key, 'grok-4.6-xhigh', { error, ...extras })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
 
     // One clear failure about the reviewer — not a dead letter for the target.
@@ -111,6 +112,7 @@ describe('reviewer account trips', () => {
       error: BALANCE_ERROR, error_code: 'review_provider_blocked',
       review_policy: 'bounded-v1', action: 'not_started', outcome: 'preflight_failed',
     })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
 
     // Tripped, released, and nothing to fall back to: the review waits.
@@ -148,6 +150,7 @@ describe('reviewer account trips', () => {
       source: probe.launchSource,
       correlation_id: probe.launchCorrelationId,
     })]
+    await resetLogCache()
     fixture.listedPrs = [pr, { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18' }]
     await runtime.runEnabledBehaviorsOnce()
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
@@ -166,6 +169,7 @@ describe('reviewer account trips', () => {
 
     const key = `${pr.repo}#${pr.number}`
     fixture.agentLogs = [failedLog(db, key, 'opus-5-xhigh', { error: 'max turns reached' })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
 
     expect(db.listBehaviorDeadLetters()).toEqual([
@@ -234,6 +238,7 @@ describe('reviewer account trips', () => {
       error: BALANCE_ERROR, error_code: 'review_provider_blocked',
       review_policy: 'bounded-v1', action: 'not_started', outcome: 'preflight_failed',
     })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
 
@@ -267,6 +272,7 @@ describe('reviewer account trips', () => {
       source: probe.launchSource,
       correlation_id: probe.launchCorrelationId,
     })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(db.listBehaviorDeadLetters()).toEqual([])
@@ -292,6 +298,7 @@ describe('reviewer account trips', () => {
       review_policy: 'bounded-v1',
       recovery_model: 'grok-4.6-xhigh',
     })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
 
     expect(db.listBehaviorDeadLetters()).toEqual([expect.objectContaining({ target: key })])
@@ -345,6 +352,7 @@ describe('reviewer account trips', () => {
       source: probe.launchSource,
       correlation_id: probe.launchCorrelationId,
     })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(runtime.getBehaviorsRuntimeHealth().failures.map((failure) => failure.target))
       .toEqual(['reviewer:opus-5-xhigh'])
@@ -362,6 +370,7 @@ describe('reviewer account trips', () => {
     fixture.agentLogs = [failedLog(db, key, 'grok-4.6-xhigh', {
       error: BALANCE_ERROR, head_sha: HEAD_SHA, review_id: 91,
     })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
 
     // Submitted work proves the account ran: the ordinary hold applies.

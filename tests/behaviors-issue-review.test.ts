@@ -47,6 +47,13 @@ let subIssueFailures: Record<string, string> = {}
 let catalogStdout = CATALOG_STDOUT
 let callCounter = 0
 
+// The agent-log lanes share a short-TTL snapshot: after changing the mocked
+// log (or its mock) mid-test, drop the cache so the next read sees the new
+// world instead of the previous phase's snapshot.
+async function resetLogCache() {
+  (await import('../server/agent')).resetAgentLogCache()
+}
+
 function ago(ms: number): string {
   return new Date(Date.now() - ms).toISOString()
 }
@@ -300,6 +307,7 @@ describe('Review New Issues', () => {
 
     // Running reviewers are not launched again.
     agentLogs = [callFor(`${REPO}#452`), callFor(`${REPO}#452:secondary`)]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(2)
   })
@@ -345,10 +353,12 @@ describe('Review New Issues', () => {
     expect(launches().map((args) => args[1])).toEqual([`${REPO}#452`, `${REPO}#452`, `${REPO}#452`])
 
     agentLogs = [callFor(`${REPO}#452`), callFor(`${REPO}#452:secondary`), callFor(`${REPO}#452:tertiary`)]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(3)
 
     agentLogs[0] = { ...agentLogs[0], status: 'completed', completed_at: new Date().toISOString(), action: 'commented', outcome: 'commented' }
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches().map((args) => args[1])).toEqual([`${REPO}#452`, `${REPO}#452`, `${REPO}#452`, `${REPO}#453`])
   })
@@ -358,6 +368,7 @@ describe('Review New Issues', () => {
     issues = [issue(452)]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(`${REPO}#452`, { status: 'completed', action: 'commented', outcome: 'commented', receipts: [] })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(1)
@@ -373,6 +384,7 @@ describe('Review New Issues', () => {
     issues = [issue(452)]
     await modules.behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(`${REPO}#452`, { status: 'failed', error: 'provider max turns reached' })]
+    await resetLogCache()
     issues.push(issue(453))
     await modules.behaviors.runEnabledBehaviorsOnce()
     expect(launches().map((args) => args[1])).toEqual([`${REPO}#452`, `${REPO}#453`])
@@ -399,6 +411,7 @@ describe('Review New Issues', () => {
     issues = [issue(452)]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(`${REPO}#452`, { status: 'failed', error: 'provider exited' })]
+    await resetLogCache()
     issues.push(issue(453, { repo: other, url: `https://github.com/${other}/issues/453` }))
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
@@ -464,6 +477,7 @@ describe('Review New Issues', () => {
         || (dependency === 'log feed' && command === 'agent-interface' && args[0] === '--logs')) throw new Error(`${dependency} unavailable`)
       return original(command, args)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     const health = behaviors.getBehaviorsRuntimeHealth()
     expect(health).toMatchObject({ status: 'degraded', failures: [{ behavior: KEY, kind: 'operation' }] })
@@ -480,6 +494,7 @@ describe('Review New Issues', () => {
     issues = [issue(452)]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(`${REPO}#452`, { status: 'failed', error: 'provider exited 1' })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(behaviors.getBehaviorsRuntimeHealth().failures[0]).toMatchObject({ behavior: KEY, kind: 'worker', error: 'provider exited 1' })
 
@@ -488,6 +503,7 @@ describe('Review New Issues', () => {
     expect(launches()).toHaveLength(2)
 
     agentLogs.push(finished(`${REPO}#452`, { status: 'failed', error: 'provider exited 1 again' }))
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     skipBackoff()
     await behaviors.runEnabledBehaviorsOnce()
@@ -507,6 +523,7 @@ describe('Review New Issues', () => {
       issues = [issue(452)]
       await behaviors.runEnabledBehaviorsOnce()
       agentLogs = [finished(`${REPO}#452`, { status: 'failed', error: 'GitHub 502', error_code: errorCode, receipts })]
+      await resetLogCache()
       await behaviors.runEnabledBehaviorsOnce()
       skipBackoff()
       await behaviors.runEnabledBehaviorsOnce()
@@ -524,6 +541,7 @@ describe('Review New Issues', () => {
       issues = [issue(452)]
       await behaviors.runEnabledBehaviorsOnce()
       agentLogs = [finished(`${REPO}#452`, { status: 'failed', error: 'held', error_code: errorCode })]
+      await resetLogCache()
       await behaviors.runEnabledBehaviorsOnce()
       // A hold is not an outage: nothing backs the behavior off.
       expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
@@ -574,6 +592,7 @@ describe('Review New Issues sub-issues', () => {
     subIssues = { [ref(500)]: [ref(501)] }
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(ref(500), { status: 'completed' })] // Missing action and outcome.
+    await resetLogCache()
     issues.push(issue(502))
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(Date.now() + 6 * MINUTE)
@@ -591,6 +610,7 @@ describe('Review New Issues sub-issues', () => {
     issues = [issue(500), issue(501)]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [reviewed(ref(500), ref(500)), { corrupt: true }]
+    await resetLogCache()
     issues.push(issue(502))
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(Date.now() + 6 * MINUTE)
@@ -611,6 +631,7 @@ describe('Review New Issues sub-issues', () => {
     await behaviors.runEnabledBehaviorsOnce()
     const completed = reviewed(ref(500), ref(500), ref(501))
     agentLogs = [completed, { id: completed.id, repo: 'other/unrelated', behavior: malformedBehavior }]
+    await resetLogCache()
     issues.push(issue(502))
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.listBehaviorLaunchClaims(KEY).find((claim) => claim.target === ref(500))?.launchError)
@@ -628,9 +649,11 @@ describe('Review New Issues sub-issues', () => {
     const targets = [ref(500), `${ref(500)}:secondary`, `${ref(500)}:tertiary`]
     const invalid = targets.map((target) => finished(target, { status: 'completed' }))
     agentLogs = invalid
+    await resetLogCache()
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(loaded.database.listBehaviorLaunchClaims(KEY).every((claim) => claim.launchQuarantine === 'invalid_result')).toBe(true)
     agentLogs = []
+    await resetLogCache()
     await loaded.behaviors.stopBehaviorsRuntime()
     loaded.database.closeDatabase()
     vi.useFakeTimers({ toFake: ['Date'] })
@@ -646,10 +669,12 @@ describe('Review New Issues sub-issues', () => {
       ...call, status: 'completed', action: 'commented', outcome: 'commented',
       receipts: commentedOn(ref(500), ref(501)),
     })), ...siblings.map((target) => reviewed(target, ref(502)))]
+    await resetLogCache()
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(loaded.database.listBehaviorLaunchClaims(KEY).map((claim) => claim.target).sort()).toEqual(targets.sort())
     expect(loaded.database.hasSeen(KEY, ref(501))).toBe(false)
     agentLogs = invalid.map((call) => ({ ...call, status: 'failed', error: 'provider exited before reporting a comment' }))
+    await resetLogCache()
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(6)
     expect(loaded.database.listBehaviorDeadLetters()).toHaveLength(3)
@@ -667,6 +692,7 @@ describe('Review New Issues sub-issues', () => {
       ...(conflict === 'valid-running' ? {} : { actor: 42 }),
     }))
     agentLogs = [...terminal, ...live]
+    await resetLogCache()
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(loaded.database.listBehaviorLaunchClaims(KEY)).toEqual(targets.map((target) => expect.objectContaining({
       target, launchQuarantine: 'invalid_result', launchQuarantineMayRun: true,
@@ -675,6 +701,7 @@ describe('Review New Issues sub-issues', () => {
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(3)
     agentLogs = terminal
+    await resetLogCache()
     await loaded.behaviors.stopBehaviorsRuntime()
     loaded.database.closeDatabase()
     loaded = await start({ reviewers: 3 })
@@ -694,9 +721,11 @@ describe('Review New Issues sub-issues', () => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('log feed unavailable')
       return cli(command, args, ...rest)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     mocks.runFile.mockImplementation(cli)
     agentLogs = running
+    await resetLogCache()
     issues.push(issue(501))
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.listBehaviorLaunchClaims(KEY).every((claim) => claim.launchQuarantine === null)).toBe(true)
@@ -704,6 +733,7 @@ describe('Review New Issues sub-issues', () => {
     expect(database.listBehaviorDeadLetters()).toHaveLength(0)
     expect(database.listBehaviorLaunchClaims(KEY).every((claim) => !!claim.launchCallId)).toBe(true)
     agentLogs = []
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(behaviors.getBehaviorsRuntimeHealth().deadLetters).toHaveLength(0)
     expect(launches()).toHaveLength(3)
@@ -724,10 +754,12 @@ describe('Review New Issues sub-issues', () => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, ...rest)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.listBehaviorLaunchClaims(KEY).every((claim) => claim.launchQuarantine === 'unreadable')).toBe(true)
     mocks.runFile.mockImplementation(original)
     agentLogs = failed
+    await resetLogCache()
     issues.push(issue(501))
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches().map((args) => args[1])).toEqual([ref(500), ref(500), ref(500), ref(501), ref(501), ref(501)])
@@ -739,6 +771,7 @@ describe('Review New Issues sub-issues', () => {
     expect(database.listBehaviorDeadLetters()).toHaveLength(3)
     expect(database.listBehaviorDeadLetters().every((letter) => letter.error === `${kind} worker failure`)).toBe(true)
     agentLogs.push(...[ref(501), `${ref(501)}:secondary`, `${ref(501)}:tertiary`].map((target) => reviewed(target, ref(501))))
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(6)
     skipBackoff()
@@ -747,6 +780,7 @@ describe('Review New Issues sub-issues', () => {
     if (kind === 'retryable') {
       // Exactly one safe retry remains; diagnostics from the outage are not attempts.
       agentLogs.push(...targets.map((target) => finished(target, { status: 'failed', error: 'second real failure' })))
+      await resetLogCache()
       await behaviors.runEnabledBehaviorsOnce()
       skipBackoff()
       await behaviors.runEnabledBehaviorsOnce()
@@ -760,12 +794,14 @@ describe('Review New Issues sub-issues', () => {
     issues = [issue(500)]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(ref(500), { status: 'failed', error: 'provider exited without action' })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, ...rest) => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, ...rest)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.getFailedBehaviorLaunch(KEY, ref(500))?.launchQuarantine).toBe('unreadable')
     mocks.runFile.mockImplementation(original)
@@ -785,6 +821,7 @@ describe('Review New Issues sub-issues', () => {
     await behaviors.runEnabledBehaviorsOnce()
     const targets = [ref(500), `${ref(500)}:secondary`, `${ref(500)}:tertiary`]
     agentLogs = targets.map((target) => finished(target, { status: 'failed', error: 'provider exited without action' }))
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.listBehaviorLaunchClaims(KEY)).toEqual([])
     const original = mocks.runFile.getMockImplementation()!
@@ -792,9 +829,11 @@ describe('Review New Issues sub-issues', () => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, ...rest)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     mocks.runFile.mockImplementation(original)
     agentLogs = []
+    await resetLogCache()
     issues.push(issue(501))
     skipBackoff()
     await behaviors.runEnabledBehaviorsOnce()
@@ -816,9 +855,11 @@ describe('Review New Issues sub-issues', () => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, ...rest)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     mocks.runFile.mockImplementation(original)
     agentLogs = running
+    await resetLogCache()
     vi.setSystemTime(Date.now() + 2 * 60 * MINUTE)
     issues.push(issue(501))
     await behaviors.runEnabledBehaviorsOnce()
@@ -836,6 +877,7 @@ describe('Review New Issues sub-issues', () => {
     const failed = finished(ref(500), { status: 'failed', error: 'provider exited without action' })
     if (state === 'closed') {
       agentLogs = [failed]
+      await resetLogCache()
       await behaviors.runEnabledBehaviorsOnce()
     }
     const original = mocks.runFile.getMockImplementation()!
@@ -843,15 +885,18 @@ describe('Review New Issues sub-issues', () => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, ...rest)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     mocks.runFile.mockImplementation(original)
     const completed = { ...failed, id: identity === 'correlation' ? 'e'.repeat(32) : failed.id, status: 'completed', error: '', action: 'commented', outcome: 'commented', receipts: commentedOn(ref(500)) }
     const duplicate = identity === 'quarantined-call-id' ? { ...failed, status: 'running', actor: 42 } : failed
     agentLogs = [duplicate, completed]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     const held = state === 'closed' ? database.getFailedBehaviorLaunch(KEY, ref(500)) : database.listBehaviorLaunchClaims(KEY)[0]
     expect(held?.launchQuarantine).toBe('invalid_result')
     agentLogs = [failed]
+    await resetLogCache()
     skipBackoff()
     await behaviors.stopBehaviorsRuntime()
     database.closeDatabase()
@@ -867,21 +912,25 @@ describe('Review New Issues sub-issues', () => {
     await behaviors.runEnabledBehaviorsOnce()
     const call = callFor(ref(500))
     agentLogs = [call]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, ...rest) => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, ...rest)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     mocks.runFile.mockImplementation(original)
     agentLogs = [{ ...call, status: 'completed', error: '', completed_at: new Date().toISOString(),
       action: 'commented', outcome: 'commented', receipts: commentedOn(ref(500)),
       ...(field === 'id' ? { id: 'e'.repeat(32) } : { correlation_id: 'different-correlation' }),
     }]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.listBehaviorLaunchClaims(KEY)[0]).toMatchObject({ launchCallId: call.id, launchQuarantine: 'invalid_result' })
     agentLogs = [{ ...call, status: 'failed', error: 'provider exited without action' }]
+    await resetLogCache()
     skipBackoff()
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.listBehaviorLaunchClaims(KEY)[0].launchQuarantine).toBe('invalid_result')
@@ -894,12 +943,14 @@ describe('Review New Issues sub-issues', () => {
     await behaviors.runEnabledBehaviorsOnce()
     const failed = finished(ref(500), { status: 'failed', error: 'provider exited without action' })
     agentLogs = [failed]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, ...rest) => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, ...rest)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     mocks.runFile.mockImplementation(original)
     agentLogs = [{ ...failed, status: 'completed', error: '', action: 'commented', outcome: 'commented', receipts: commentedOn(ref(500)),
@@ -908,6 +959,7 @@ describe('Review New Issues sub-issues', () => {
       ...(field === 'start' ? { started_at: '2020-01-01T00:00:00Z', started_at_precise: '2020-01-01T00:00:00Z' } : {}),
       ...(field === 'expected-head' ? { expected_head: 'a'.repeat(40) } : {}),
     }]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.getFailedBehaviorLaunch(KEY, ref(500))?.launchQuarantine).toBe('invalid_result')
     expect(database.listBehaviorDeadLetters()).toHaveLength(1)
@@ -918,10 +970,12 @@ describe('Review New Issues sub-issues', () => {
     issues = [issue(500)]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(ref(500), { status: 'failed', error: 'provider exited without action' })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     database.retireBehaviorDeadLettersForTarget(KEY, ref(500))
     issues = [issue(501)]
     agentLogs = []
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     const running = callFor(ref(501))
     const original = mocks.runFile.getMockImplementation()!
@@ -929,11 +983,13 @@ describe('Review New Issues sub-issues', () => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
       return original(command, args, ...rest)
     })
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.getFailedBehaviorLaunch(KEY, ref(500))?.launchQuarantine).toBeNull()
     expect(database.listBehaviorDeadLetters().some((letter) => letter.target === ref(500))).toBe(false)
     mocks.runFile.mockImplementation(original)
     agentLogs = [running]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.listBehaviorDeadLetters()).toEqual([])
     expect(launches().map((args) => args[1])).toEqual([ref(500), ref(501)])
@@ -946,16 +1002,20 @@ describe('Review New Issues sub-issues', () => {
     await behaviors.runEnabledBehaviorsOnce()
     const failed = finished(ref(500), { status: 'failed', error: 'provider unavailable' })
     agentLogs = [failed]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.getFailedBehaviorLaunch(KEY, ref(500))).not.toBeNull()
     agentLogs = [{ ...failed, status: 'completed', error: '' }]
+    await resetLogCache()
     settle(501)
     issues.push(issue(502))
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.getFailedBehaviorLaunch(KEY, ref(500))?.launchQuarantine).toBe('invalid_result')
     agentLogs = [failed]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = []
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches().map((args) => args[1])).toEqual([ref(500), ref(502)])
     expect(database.hasSeen(KEY, ref(501))).toBe(false)
@@ -973,13 +1033,16 @@ describe('Review New Issues sub-issues', () => {
     // The slices settle while the PRD's reviewers are still at work.
     settle(501, 502)
     agentLogs = [callFor(ref(500)), callFor(`${ref(500)}:secondary`)]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(2)
 
     // Once a reviewer has commented on them, they are done for good.
     agentLogs[0] = reviewed(ref(500), ref(500), ref(501), ref(502))
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs[1] = reviewed(`${ref(500)}:secondary`, ref(500), ref(501), ref(502))
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(2)
@@ -1007,6 +1070,7 @@ describe('Review New Issues sub-issues', () => {
     issues = [issue(500, { created_at: ago(30 * MINUTE) })]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [reviewed(ref(500), ref(500))]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
 
     issues.push(issue(503, { created_at: ago(12 * MINUTE) }))
@@ -1023,6 +1087,7 @@ describe('Review New Issues sub-issues', () => {
     expect(launches().map((args) => args[1])).toEqual([ref(500)])
 
     agentLogs = [reviewed(ref(500), ref(500))]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches().map((args) => args[1])).toEqual([ref(500), ref(501)])
   })
@@ -1033,6 +1098,7 @@ describe('Review New Issues sub-issues', () => {
     subIssues = { [ref(500)]: [ref(501)] }
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(ref(500), { status: 'failed', error: 'stopped', error_code: 'stopped' })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches().map((args) => args[1])).toEqual([ref(500), ref(501)])
   })
@@ -1043,6 +1109,7 @@ describe('Review New Issues sub-issues', () => {
     subIssues = { [ref(500)]: [ref(501)] }
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(ref(500), { status: 'failed', error: 'provider exited 1' })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     skipBackoff()
     await behaviors.runEnabledBehaviorsOnce()
@@ -1087,6 +1154,7 @@ describe('Review New Issues sub-issues', () => {
     issues = [issue(500, { created_at: ago(30 * MINUTE) })]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(ref(500), { status: 'failed', error: 'stopped', error_code: 'stopped' })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     // Another issue is still settling, so only the held one is due.
     issues.push(issue(501, { created_at: ago(5 * MINUTE) }))
@@ -1143,6 +1211,7 @@ describe('Review New Issues sub-issues', () => {
     issues = [issue(500, { created_at: ago(30 * MINUTE) })]
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [callFor(ref(500)), callFor(`${ref(500)}:secondary`), callFor(`${ref(500)}:tertiary`)]
+    await resetLogCache()
     issues.push(issue(501, { created_at: ago(20 * MINUTE) }))
     mocks.runFile.mockClear()
     await behaviors.runEnabledBehaviorsOnce()
@@ -1156,6 +1225,7 @@ describe('Review New Issues sub-issues', () => {
     // 501 was reviewed on its own and failed; 502's claim died before launching.
     await behaviors.runEnabledBehaviorsOnce()
     agentLogs = [finished(ref(501), { status: 'failed', error: 'provider exited 1' }), finished(ref(502), { status: 'failed', error: 'provider exited 1' })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     database.releaseSeen(KEY, ref(502))
     expect(database.claimSeenOwned(KEY, ref(502), 1)).toBeTruthy()
@@ -1174,6 +1244,7 @@ describe('Review New Issues sub-issues', () => {
       ...agentLogs[0], id: 'f'.repeat(32), pr_id: '500', correlation_id: 'replay-1', source: 'poise:replay',
       status: 'completed', action: 'commented', outcome: 'commented', error: '', receipts: commentedOn(ref(500), ref(501), ref(502)),
     })
+    await resetLogCache()
     skipBackoff()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(2)
@@ -1309,6 +1380,7 @@ describe('Review New Issues reviewer account trips', () => {
       status: 'failed', model: 'grok-4.6-xhigh', error,
       ...(errorCode ? { error_code: errorCode } : {}),
     })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
 
     // One clear failure about the reviewer — not a dead letter for the issue.
@@ -1351,6 +1423,7 @@ describe('Review New Issues reviewer account trips', () => {
       error: `grok-4.6-xhigh recovery failed; needs attention: ${BALANCE_ERROR}`,
       error_code: 'review_recovery_failed', recovery_model: 'grok-4.6-xhigh',
     })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
 
     expect(database.listBehaviorDeadLetters()).toHaveLength(1)
@@ -1378,6 +1451,7 @@ describe('Review New Issues reviewer account trips', () => {
       status: 'failed', model: 'grok-4.6-xhigh', error: SIGNIN_ERROR,
       receipts: [{ issue: target, comment_id: 7, url: `https://github.com/${target}`, author: 'bit-mis' }],
     })]
+    await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
 
     // Posted work proves the account ran: the ordinary hold applies.

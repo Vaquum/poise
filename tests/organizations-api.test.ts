@@ -63,6 +63,10 @@ function writeIndex(path: string, login: string) {
 
 async function cli(command: string, args: string[], options: RunFileOptions) {
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
+  // Paged reads speak the envelope; the small fixture log fits one final page.
+  if (command === 'agent-interface' && args[0] === '--logs' && args.includes('--limit')) {
+    return { stdout: JSON.stringify({ rows: behaviorLogs, nextCursor: null }), stderr: '' }
+  }
   if (command === 'agent-interface' && args[0] === '--logs') return { stdout: JSON.stringify(behaviorLogs), stderr: '' }
   if (command === 'github-interface' && args[0] === '--view-repos') {
     return { stdout: JSON.stringify({ repos: [{ full_name: `${args[1]}/same-repo` }] }), stderr: '' }
@@ -87,6 +91,13 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
       : '',
     stderr: '',
   }
+}
+
+// The server graph is re-imported per test, so the reset must come from the
+// test's own instance. Call it after re-pointing behaviorLogs mid-test: the
+// lanes would otherwise keep serving the previous phase's snapshot.
+async function resetLogCache() {
+  (await import('../server/agent')).resetAgentLogCache()
 }
 
 async function request(path: string, body?: unknown) {
@@ -366,6 +377,7 @@ describe('global behavior settings API', () => {
     const diagnostics = await state()
     expect(diagnostics['review-new-prs']!.lastTriggered).toMatchObject({ target: 'Legacy/same-repo#1' })
     behaviorLogs = [healthy, { ...healthy, repo: 'elsewhere/repo', outcome: null }]
+    await resetLogCache()
     const scoped = await (await fetch(`${base}/api/agent-logs?org=Legacy`)).json()
     expect(scoped.logs).toEqual([])
     expect(scoped.quarantined).toMatchObject([{
@@ -375,6 +387,7 @@ describe('global behavior settings API', () => {
     // A duplicate correlation has the same ambiguity even with a different
     // call ID and an apparently unrelated reported organization.
     behaviorLogs = [healthy, { ...healthy, id: '3'.repeat(32), repo: 'elsewhere/repo', outcome: null }]
+    await resetLogCache()
     const conflictingCorrelation = await (await fetch(`${base}/api/agent-logs?org=Legacy`)).json()
     expect(conflictingCorrelation.logs).toEqual([])
     expect(conflictingCorrelation.quarantined).toMatchObject([{
@@ -399,6 +412,7 @@ describe('global behavior settings API', () => {
     expect(full).not.toHaveProperty('total')
     const conflict = { ...row(80), actor: 42 }
     behaviorLogs.push(conflict)
+    await resetLogCache()
     const withheld = await (await fetch(`${base}/api/agent-logs?org=Legacy&limit=1`)).json()
     expect(withheld.logs[0].id).toBe(row(79).id)
     expect(withheld.total).toBe(79)
@@ -467,6 +481,7 @@ describe('global behavior settings API', () => {
     expect(response.diagnostics.deadLetters).toContainEqual(expect.objectContaining({ callId,
       diagnostic: { severity: 'info', code: 'head_changed' } }))
     behaviorLogs = []
+    await resetLogCache()
     const unread = await (await fetch(`${base}/api/behaviors`)).json()
     expect(unread.diagnostics.deadLetters).toContainEqual(expect.objectContaining({ callId,
       diagnostic: { severity: 'warning', code: 'held_result' } }))
@@ -483,6 +498,7 @@ describe('global behavior settings API', () => {
       correlation_id: secondId, started_at: '2026-10-13T14:09:00Z', completed_at: '2026-10-13T14:09:04Z',
       status: 'failed', action: 'not_started', outcome: 'preflight_failed', expected_head: 'b'.repeat(40),
       head_sha: null, review_id: null, receipts: null, error }]
+    await resetLogCache()
     const separate = await (await fetch(`${base}/api/behaviors`)).json()
     expect(separate.diagnostics.deadLetters).toEqual(expect.arrayContaining([
       expect.objectContaining({ callId, diagnostic: { severity: 'error', code: 'invalid_agent_result' } }),
@@ -505,5 +521,49 @@ describe('global behavior settings API', () => {
         at: '2026-10-01T12:01:00Z', target: 'beta/same-repo#1',
       })
     }
+  })
+
+  // A held whole-log read must not slow the dashboard or health: behaviors
+  // walks bounded recent pages on its own, and health reads no log at all.
+  it('keeps behaviors and health responsive while a history read runs', async () => {
+    behaviorLogs = [{
+      id: '1'.repeat(32), behavior: 'pr_review',
+      source: 'poise:review-new-prs', repo: 'Legacy/same-repo', pr_id: '1',
+      started_at: '2026-10-01T12:00:00Z', completed_at: '2026-10-01T12:00:01Z', status: 'completed',
+      actor: 'review-bot', expected_head: 'a'.repeat(40), head_sha: 'a'.repeat(40),
+      correlation_id: 'review-0', action: 'reviewed_clean', outcome: 'clean',
+      model: 'test', prompt: '', time_elapsed: '1s',
+    }]
+    let releaseHistory!: (value: { stdout: string, stderr: string }) => void
+    const held = new Promise<{ stdout: string, stderr: string }>((resolve) => { releaseHistory = resolve })
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: RunFileOptions) => {
+      if (command === 'agent-interface' && args[0] === '--logs' && args.length === 1) return held
+      return cli(command, args, options)
+    })
+    // Steady-state latencies: one unmeasured round warms the path first.
+    await fetch(`${base}/api/behaviors`)
+    await fetch(`${base}/api/health`)
+    const history = fetch(`${base}/api/agent-logs`)
+    try {
+      await vi.waitFor(() => expect(mocks.runFile.mock.calls.some(([, args]) => args.length === 1)).toBe(true))
+      const latencies: number[] = []
+      for (let index = 0; index < 20; index++) {
+        for (const path of ['/api/behaviors', '/api/health']) {
+          const started = performance.now()
+          const response = await fetch(`${base}${path}`)
+          latencies.push(performance.now() - started)
+          // Health answers degraded in the fixture; both must answer fast.
+          expect([200, 503]).toContain(response.status)
+        }
+      }
+      const sorted = [...latencies].sort((a, b) => a - b)
+      expect(sorted[Math.ceil(0.95 * sorted.length) - 1]).toBeLessThan(250)
+      expect((await state())['review-new-prs']!.lastTriggered).toEqual({
+        at: '2026-10-01T12:00:00Z', target: 'Legacy/same-repo#1',
+      })
+    } finally {
+      releaseHistory({ stdout: JSON.stringify(behaviorLogs), stderr: '' })
+    }
+    await expect(history.then((response) => response.status)).resolves.toBe(200)
   })
 })
