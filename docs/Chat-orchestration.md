@@ -308,8 +308,19 @@ per hour per bound PR; pagination/retries can add reads. Unbound work adds
 zero GitHub traffic. While any check is pending, notifications wait and retain
 the last settled state, including when other checks have failed. Unchanged
 settled states deduplicate. A failed CI read keeps the settled baseline and
-queues at most one degraded notice per outage. Unknown, missing or truncated
-review evidence never establishes completion and never wakes. Every PR-state
+queues at most one degraded notice per outage. Reviews use bounded local
+pages of at most 200 reviews and 200 comment identities, summarized by each
+represented thread's latest comment. Content revision hashes detect edits. Separate cursors
+cycle through both lanes, so long histories and changes to older threads keep
+progressing. Seen state is retained per identity: a missing identity in a
+partial page is never a resolution. Unknown, missing, failing or legacy
+truncated review evidence never establishes completion. Same-account feedback
+is retained because a GitHub login does not identify its originating chat;
+the datastore currently has no per-chat authorship receipt. A newly observed
+reply can therefore notify once even if this chat posted it; unchanged replies,
+resolution-only changes, outdated-only pushes and approvals stay silent. An
+older Caller that lacks the page arguments yields unavailable evidence and
+retains prior state; it cannot establish completion. Every PR-state
 notice names its blockers and what done means: green CI, up to date with
 main and no conflicts, every finding fixed or justified, replied to, and its
 thread resolved. These observations confer no merge authority.

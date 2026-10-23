@@ -27,7 +27,19 @@ github-datastore sync --loop --interval 60
 github-datastore view pr --status open --format json
 github-datastore view issue --author LOGIN --format csv
 github-datastore view user --username LOGIN --item-type pr --limit 20
+github-datastore view pr-reviews --repo OWNER/REPO --number 123 --page-size 200 --review-after 0 --comment-after 0
 ```
+
+`pr-reviews --page-size N` (1–200) bounds reviews and comment identities separately.
+Pass back `page.next_review_after` and `page.next_comment_after`; a zero
+cursor restarts that lane to revisit updates and reopened older threads. For each thread represented in that comment page, its summary contains only
+its latest comment, with a content revision hash. Repeated thread summaries
+across pages deduplicate at the consumer. `has_unresolved` includes
+threads outside the page. `truncated` means more identities remain, not that
+returned feedback should be discarded; absence from a page proves nothing
+about an older identity. Without `--page-size`, the legacy capped read remains
+available. All reads are local and preserve shared-account authors without
+claiming to know which chat posted them.
 
 `github-datastore` and `python3 -m github_datastore` work from any directory on this host.
 Every command takes `--db PATH`; without it the database is

@@ -261,6 +261,73 @@ class ViewsTest(unittest.TestCase):
             self.assertFalse(missing["found"])
             self.assertEqual((missing["reviews"], missing["threads"]), ([], []))
 
+    def test_pr_reviews_pages_beyond_caps_and_revisits_older_thread_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = base_expanded("@mikkokotila", [])
+            pr["is_pr"] = True
+            pr["issue"] = dict(pr["issue"], id=101, node_id="I_101", number=2)
+            pr["pull"] = {"id": 101, "node_id": "I_101", "graphql": {"isDraft": False},
+                          "requested_reviewers": [], "assignees": [], "merged_by": None,
+                          "updated_at": "2026-01-02T00:00:00Z"}
+            pr["issue"]["pull_request"] = {"node_id": "I_101"}
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            with conn:
+                conn.executemany(
+                    """INSERT INTO reviews(review_id, node_id, item_id, author_login, state, raw_json)
+                       VALUES (?, ?, 101, 'shared-account', ?, '{}')""",
+                    [(i, f"R_{i}", "CHANGES_REQUESTED" if i == 205 else "APPROVED") for i in range(1, 206)],
+                )
+                conn.executemany(
+                    """INSERT INTO review_comments(comment_id, node_id, item_id, author_login,
+                       thread_node_id, thread_resolved, thread_outdated, raw_json)
+                       VALUES (?, ?, 101, 'shared-account', ?, ?, 0, '{}')""",
+                    [(i, f"C_{i}", f"T_{i:04}", int(i != 1005)) for i in range(1, 1006)],
+                )
+                # A long single thread contributes one bounded latest summary,
+                # never 1000 comments that hide other thread identities.
+                conn.executemany(
+                    """INSERT INTO review_comments(comment_id, node_id, item_id, author_login,
+                       thread_node_id, thread_resolved, thread_outdated, raw_json)
+                       VALUES (?, ?, 101, 'shared-account', 'T_0001', 1, 0, '{}')""",
+                    [(i, f"C_{i}") for i in range(2000, 3100)],
+                )
+            review_after, comment_after = 0, 0
+            review_ids: list[str] = []
+            thread_ids: list[str] = []
+            for _ in range(11):
+                page = json.loads(views.pr_reviews(db_path=db_path, repo="vaquum/test", number=2,
+                                  review_after=review_after, comment_after=comment_after, page_size=200))
+                self.assertLessEqual(len(page["reviews"]), 200)
+                self.assertLessEqual(len(page["threads"]), 200)
+                self.assertTrue(page["has_unresolved"])
+                review_ids.extend(row["node_id"] for row in page["reviews"])
+                thread_ids.extend(row["thread_node_id"] for row in page["threads"])
+                self.assertTrue(all(len(row["comments"]) == 1 for row in page["threads"]))
+                review_after = page["page"]["next_review_after"]
+                comment_after = page["page"]["next_comment_after"]
+            self.assertIn("R_205", review_ids)
+            self.assertIn("T_1005", thread_ids)
+            self.assertEqual(comment_after, 0)
+            with conn:
+                conn.execute("UPDATE review_comments SET thread_resolved = 0 WHERE thread_node_id = 'T_0001'")
+                conn.execute("UPDATE reviews SET state = 'CHANGES_REQUESTED', body = 'edited' WHERE review_id = 1")
+            revisited = json.loads(views.pr_reviews(db_path=db_path, repo="vaquum/test", number=2, page_size=200))
+            self.assertEqual(revisited["reviews"][0]["state"], "CHANGES_REQUESTED")
+            self.assertNotEqual(revisited["reviews"][0]["revision"], page["reviews"][0]["revision"])
+            self.assertFalse(revisited["threads"][0]["resolved"])
+            self.assertEqual(revisited["threads"][0]["comments"][0]["node_id"], "C_3099")
+            conn.close()
+
+    def test_pr_reviews_rejects_unbounded_or_invalid_page_requests(self) -> None:
+        for kwargs in ({"page_size": 0}, {"page_size": 201}, {"review_after": -1}, {"comment_after": -1}):
+            with self.assertRaises(ValueError):
+                views.pr_reviews(repo="vaquum/test", number=2, **kwargs)
+
     def test_pr_view_matches_mixed_case_repos_case_insensitively(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "db.sqlite"

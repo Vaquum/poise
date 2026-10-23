@@ -95,6 +95,9 @@ def main(argv: list[str] | None = None) -> None:
     view_parser.add_argument("--created-since-datetime")
     view_parser.add_argument("--created-at-datetime")
     view_parser.add_argument("--limit", type=int)
+    view_parser.add_argument("--review-after", type=int, default=0)
+    view_parser.add_argument("--comment-after", type=int, default=0)
+    view_parser.add_argument("--page-size", type=int)
 
     args = parser.parse_args(argv)
     db_path = Path(args.db)
@@ -172,7 +175,8 @@ def run_view(db_path: Path, args: argparse.Namespace) -> str:
     if args.name == "user":
         return views.user(username=args.username, item_type=args.item_type, **common)
     if args.name == "pr-reviews":
-        return views.pr_reviews(db_path=db_path, output=args.format, repo=args.repo, number=args.number)
+        return views.pr_reviews(db_path=db_path, output=args.format, repo=args.repo, number=args.number,
+                                review_after=args.review_after, comment_after=args.comment_after, page_size=args.page_size)
     raise AssertionError(args.name)
 
 

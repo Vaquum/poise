@@ -13,7 +13,7 @@ import type { Capabilities, ChatEvent, PromptInput, ServerFrame, SessionRecord }
 import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
 import type { ChatRuntime } from '../server/chat/runtime'
-import type { ChatControl, CiObservation, ReviewsObservation, WorkTargetStatus } from '../server/chat/control'
+import type { ChatControl, CiObservation, ReviewsCursor, ReviewsObservation, WorkTargetStatus } from '../server/chat/control'
 
 vi.mock('../server/claude-auth', () => ({ claudeAuth: { snapshot: () => ({ status: 'authenticated' }), requireReady: async () => {} } }))
 const executeFile = promisify(execFile)
@@ -37,7 +37,7 @@ const hosts = new Map<string, AdapterHost>()
 const steers = new Map<string, string[]>()
 const ci = vi.fn<() => Promise<CiObservation>>()
 const targetStatus = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }) => Promise<WorkTargetStatus>>()
-const reviews = vi.fn<() => Promise<ReviewsObservation | null>>()
+const reviews = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }, cursor?: ReviewsCursor) => Promise<ReviewsObservation | null>>()
 const ownsBehind = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }, ci: CiObservation, status: WorkTargetStatus) => boolean>()
 
 function adapterWith(capabilities: Capabilities) {
@@ -809,7 +809,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(3)
   })
 
-  it('wakes once for review feedback and never for its own activity', async () => {
+  it('retains same-account feedback without chat origin and deduplicates unchanged activity', async () => {
     database.setMeta('agentAccount', 'fixture-agent')
     const parent = await manager()
     const target = 'https://github.com/acme/app/pull/66'
@@ -831,14 +831,17 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
         comments: [{ id: 'C_1', author: 'reviewer' }, { id: 'C_2', author: 'fixture-agent' }] }] })
     clock += 5 * 60_000
     await observeReviews(target)
-    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
     reviews.mockResolvedValue({ found: true, truncated: false, reviews: [review],
       threads: [{ thread: 'T_1', resolved: false, outdated: false,
         comments: [{ id: 'C_1', author: 'reviewer' }, { id: 'C_2', author: 'fixture-agent' }, { id: 'C_3', author: 'reviewer' }] }] })
     clock += 5 * 60_000
     await observeReviews(target)
-    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
-    expect(store.inbox(runtime.instance, parent.id)[1].body).toContain('C_3')
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(3)
+    expect(store.inbox(runtime.instance, parent.id)[2].body).toContain('C_3')
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(3)
   })
 
   it('wakes for a dismissed approval only while threads wait on the author', async () => {
@@ -956,6 +959,63 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
   })
 
+  it('advances beyond both old caps and revisits old changes without resetting unseen pages', async () => {
+    database.setMeta('agentAccount', 'fixture-agent')
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/72'
+    await command(parent.id, { operation: 'bind', target })
+    store.pauseDelivery(runtime.instance, parent.id)
+    const reviewRows = Array.from({ length: 205 }, (_, index) => ({ id: `R_${index + 1}`, author: 'fixture-agent',
+      state: index === 204 ? 'CHANGES_REQUESTED' : 'APPROVED', revision: 'original' }))
+    const threadRows = Array.from({ length: 1005 }, (_, index) => ({ thread: `T_${String(index + 1).padStart(4, '0')}`,
+      resolved: index !== 1004, outdated: false, comments: [{ id: `C_${index + 1}`, author: 'fixture-agent', revision: 'original' }] }))
+    reviews.mockImplementation(async (_target, cursor = { reviewAfter: 0, commentAfter: 0 }) => {
+      const nextReviews = reviewRows.slice(cursor.reviewAfter, cursor.reviewAfter + 200)
+      const nextThreads = threadRows.slice(cursor.commentAfter, cursor.commentAfter + 200)
+      const reviewAfter = cursor.reviewAfter + nextReviews.length < reviewRows.length ? cursor.reviewAfter + nextReviews.length : 0
+      const commentAfter = cursor.commentAfter + nextThreads.length < threadRows.length ? cursor.commentAfter + nextThreads.length : 0
+      return { found: true, truncated: !!(reviewAfter || commentAfter), hasUnresolved: true,
+        page: { reviewAfter, commentAfter }, reviews: nextReviews, threads: nextThreads }
+    })
+    for (let page = 0; page < 6; page++) {
+      await observeReviews(target)
+      clock += 5 * 60_000
+    }
+    const notices = () => store.inbox(runtime.instance, parent.id).filter(message => JSON.parse(message.body).kind === 'reviews')
+    expect(notices()).toHaveLength(2)
+    expect(notices()[0].body).toContain('R_205')
+    expect(notices()[1].body).toContain('C_1005')
+    // Reopening an older identity and editing an older review must be found
+    // after cursor wrap, while absent identities keep their existing baseline.
+    threadRows[0].resolved = false
+    reviewRows[0].state = 'CHANGES_REQUESTED'
+    await observeReviews(target)
+    expect(notices()).toHaveLength(3)
+    expect(notices()[2].body).toContain('T_0001')
+    expect(notices()[2].body).toContain('R_1')
+    clock += 5 * 60_000
+    reviews.mockResolvedValueOnce(null)
+    await observeReviews(target)
+    clock += 5 * 60_000
+    for (let page = 0; page < 6; page++) {
+      await observeReviews(target)
+      clock += 5 * 60_000
+    }
+    expect(notices()).toHaveLength(3)
+    // Observe the resolution, then revisit the same ID reopened with no new
+    // comment. Resolution alone is silent; the reopen is new actionable state.
+    threadRows[0].resolved = true
+    for (let page = 0; page < 6; page++) { await observeReviews(target); clock += 5 * 60_000 }
+    expect(notices()).toHaveLength(3)
+    threadRows[0].resolved = false
+    for (let page = 0; page < 6; page++) { await observeReviews(target); clock += 5 * 60_000 }
+    expect(notices()).toHaveLength(4)
+    reviewRows[0].revision = 'edited review body'
+    threadRows[0].comments[0].revision = 'edited comment body'
+    for (let page = 0; page < 6; page++) { await observeReviews(target); clock += 5 * 60_000 }
+    expect(notices()).toHaveLength(5)
+  })
+
   it('reads bound-PR reviews from the local datastore and never throws on malformed rows', async () => {
     const processModule = await import('../server/process')
     const { readWorkReviews } = await import('../server/chat/control')
@@ -973,6 +1033,15 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       expect(observed?.reviews).toEqual([{ id: 'R_1', author: 'reviewer', state: 'CHANGES_REQUESTED' }])
       expect(observed?.threads).toEqual([{ thread: 'T_1', resolved: false, outdated: false, comments: [{ id: 'C_1', author: 'reviewer' }] }])
       expect(run.mock.calls[0][1]).toContain('pr-reviews')
+      expect(run.mock.calls[0][1]).toEqual(expect.arrayContaining(['--page-size', '200', '--review-after', '0', '--comment-after', '0']))
+      run.mockResolvedValue({ stdout: JSON.stringify({ found: true, truncated: true, reviews: [], threads: [], has_unresolved: true,
+        page: { review_after: 200, comment_after: 200, next_review_after: 400, next_comment_after: 400 } }), stderr: '' })
+      expect(await readWorkReviews(target, { reviewAfter: 200, commentAfter: 200 })).toMatchObject({
+        page: { reviewAfter: 400, commentAfter: 400 }, hasUnresolved: true, truncated: true })
+      expect(run.mock.lastCall?.[1]).toEqual(expect.arrayContaining(['--review-after', '200', '--comment-after', '200']))
+      expect(await readWorkReviews(target)).toBeNull() // A stale/different page cannot advance this cursor.
+      run.mockRejectedValue(new Error('unrecognized arguments: --page-size'))
+      expect(await readWorkReviews(target)).toBeNull()
       run.mockResolvedValue({ stdout: '{"found":true}', stderr: '' })
       expect(await readWorkReviews(target)).toBeNull()
     } finally {

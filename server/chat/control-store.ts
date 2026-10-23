@@ -106,10 +106,13 @@ const NOTICE_PREFIXES = ['ci:', 'behavior:', 'merge:', 'reviews:', 'ci-degraded:
  *  degraded-read marker and the reviews seen-set sidecar, which carries
  *  no notices. A new owner starts from no baseline on all of them, so
  *  current blockers wake it even when the old owner saw them. */
-const OBSERVATION_PREFIXES = [...NOTICE_PREFIXES, 'reviews-seen:']
+const OBSERVATION_PREFIXES = [...NOTICE_PREFIXES, 'reviews-seen:', 'reviews-cursor:']
 function resetTargetObservations(instance: string, url: string): void {
   db.prepare(`DELETE FROM chat_control_observations WHERE instance = ? AND target IN (${OBSERVATION_PREFIXES.map(() => '?').join(', ')})`)
     .run(instance, ...OBSERVATION_PREFIXES.map(prefix => `${prefix}${url}`))
+  const seenPrefix = `reviews-seen:${url}:`
+  db.prepare('DELETE FROM chat_control_observations WHERE instance = ? AND substr(target, 1, length(?)) = ?')
+    .run(instance, seenPrefix, seenPrefix)
 }
 export const bindWork = db.transaction((instance: string, session: string, target: string): Binding => {
   const canonical = workTarget(target).url

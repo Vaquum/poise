@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import sqlite3
@@ -111,6 +112,9 @@ def pr_reviews(
     output: Output = "json",
     repo: str | None = None,
     number: int | None = None,
+    review_after: int = 0,
+    comment_after: int = 0,
+    page_size: int | None = None,
 ) -> str:
     """One pull request's reviews and review threads as the datastore has
     them: local rows only, the sync owns freshness. A PR the datastore has
@@ -120,8 +124,11 @@ def pr_reviews(
         raise ValueError("pr-reviews renders json only")
     if not repo or number is None:
         raise ValueError("pr-reviews needs a repo and a number")
+    if review_after < 0 or comment_after < 0 or (page_size is not None and not 1 <= page_size <= 200):
+        raise ValueError("pr-reviews needs a nonnegative review cursor and page-size between 1 and 200")
     conn = _read_connect(db_path)
     try:
+        conn.execute("BEGIN")
         item = conn.execute(
             "SELECT item_id FROM items WHERE repo_full_name = ? COLLATE NOCASE AND number = ? AND item_type = 'pr'",
             (repo, number),
@@ -129,6 +136,8 @@ def pr_reviews(
         if item is None:
             return json.dumps({"repo": repo, "number": number, "found": False, "reviews": [], "threads": []})
         item_id = item["item_id"]
+        if page_size is not None:
+            return _pr_reviews_page(conn, repo, number, item_id, review_after, comment_after, page_size)
         reviews = [
             {"node_id": row["node_id"], "author": row["author_login"], "state": row["state"],
              "submitted_at": row["submitted_at"]}
@@ -166,6 +175,56 @@ def pr_reviews(
         raise RuntimeError(f"view query failed: pr-reviews: {exc}") from exc
     finally:
         conn.close()
+
+
+def _pr_reviews_page(
+    conn: sqlite3.Connection, repo: str, number: int, item_id: int,
+    review_after: int, comment_after: int, page_size: int,
+) -> str:
+    # Each lane cycles independently: newly appended feedback cannot pin an
+    # older thread's resolution/reopen state behind a permanent prefix.
+    reviews = conn.execute(
+        """SELECT review_id, node_id, author_login, state, submitted_at, body FROM reviews
+           WHERE item_id = ? AND review_id > ? ORDER BY review_id LIMIT ?""",
+        (item_id, review_after, page_size + 1),
+    ).fetchall()
+    # Page raw IDs before looking up latest thread summaries. Work is bounded
+    # even when a single thread has arbitrarily many comments; repeated thread
+    # summaries across pages are deduplicated by the consumer's identity state.
+    comments = conn.execute(
+        """SELECT comment_id, COALESCE(thread_node_id, node_id) AS identity
+           FROM review_comments WHERE item_id = ? AND comment_id > ?
+           ORDER BY comment_id LIMIT ?""", (item_id, comment_after, page_size + 1),
+    ).fetchall()
+    threads = [conn.execute(
+        """SELECT node_id, author_login, updated_at, body, thread_node_id, thread_resolved, thread_outdated
+           FROM review_comments WHERE item_id = ? AND COALESCE(thread_node_id, node_id) = ?
+           ORDER BY comment_id DESC LIMIT 1""", (item_id, identity),
+    ).fetchone() for identity in dict.fromkeys(row["identity"] for row in comments[:page_size])]
+    has_unresolved = conn.execute(
+        """SELECT 1 FROM review_comments WHERE item_id = ? AND thread_resolved = 0
+           UNION ALL SELECT 1 FROM review_comments WHERE item_id = ? AND thread_resolved IS NULL LIMIT 1""",
+        (item_id, item_id),
+    ).fetchone() is not None
+    more_reviews, more_comments = len(reviews) > page_size, len(comments) > page_size
+    return json.dumps({
+        "repo": repo, "number": number, "found": True,
+        "truncated": more_reviews or more_comments, "has_unresolved": has_unresolved,
+        "page": {
+            "review_after": review_after, "comment_after": comment_after,
+            "next_review_after": reviews[page_size - 1]["review_id"] if more_reviews else 0,
+            "next_comment_after": comments[page_size - 1]["comment_id"] if more_comments else 0,
+        },
+        "reviews": [{"node_id": row["node_id"], "author": row["author_login"],
+                     "state": row["state"], "submitted_at": row["submitted_at"],
+                     "revision": hashlib.sha256((row["body"] or "").encode()).hexdigest()}
+                    for row in reviews[:page_size]],
+        "threads": [{"thread_node_id": row["thread_node_id"],
+                     "resolved": _flag(row["thread_resolved"]), "outdated": _flag(row["thread_outdated"]),
+                     "comments": [{"node_id": row["node_id"], "author": row["author_login"],
+                                   "updated_at": row["updated_at"],
+                                   "revision": hashlib.sha256((row["body"] or "").encode()).hexdigest()}]} for row in threads],
+    }, ensure_ascii=False)
 
 
 def _flag(value: Any) -> bool | None:
