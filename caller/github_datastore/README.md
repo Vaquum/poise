@@ -39,7 +39,9 @@ threads outside the page. `truncated` means more identities remain, not that
 returned feedback should be discarded; absence from a page proves nothing
 about an older identity. Without `--page-size`, the legacy capped read remains
 available. All reads are local and preserve shared-account authors without
-claiming to know which chat posted them.
+claiming to know which chat posted them. The paged read requires the indexes
+created by the normal datastore initialization/sync migration; an unmigrated
+database fails the read instead of scanning full histories without those indexes.
 
 `github-datastore` and `python3 -m github_datastore` work from any directory on this host.
 Every command takes `--db PATH`; without it the database is

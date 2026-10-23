@@ -198,12 +198,13 @@ def _pr_reviews_page(
     ).fetchall()
     threads = [conn.execute(
         """SELECT node_id, author_login, updated_at, body, thread_node_id, thread_resolved, thread_outdated
-           FROM review_comments WHERE item_id = ? AND COALESCE(thread_node_id, node_id) = ?
+           FROM review_comments INDEXED BY idx_review_threads_page
+           WHERE item_id = ? AND COALESCE(thread_node_id, node_id) = ?
            ORDER BY comment_id DESC LIMIT 1""", (item_id, identity),
     ).fetchone() for identity in dict.fromkeys(row["identity"] for row in comments[:page_size])]
     has_unresolved = conn.execute(
-        """SELECT 1 FROM review_comments WHERE item_id = ? AND thread_resolved = 0
-           UNION ALL SELECT 1 FROM review_comments WHERE item_id = ? AND thread_resolved IS NULL LIMIT 1""",
+        """SELECT 1 FROM review_comments INDEXED BY idx_review_unresolved WHERE item_id = ? AND thread_resolved = 0
+           UNION ALL SELECT 1 FROM review_comments INDEXED BY idx_review_unresolved WHERE item_id = ? AND thread_resolved IS NULL LIMIT 1""",
         (item_id, item_id),
     ).fetchone() is not None
     more_reviews, more_comments = len(reviews) > page_size, len(comments) > page_size

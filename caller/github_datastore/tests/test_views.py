@@ -321,6 +321,14 @@ class ViewsTest(unittest.TestCase):
             self.assertNotEqual(revisited["reviews"][0]["revision"], page["reviews"][0]["revision"])
             self.assertFalse(revisited["threads"][0]["resolved"])
             self.assertEqual(revisited["threads"][0]["comments"][0]["node_id"], "C_3099")
+            # A pre-migration database is unavailable, never a fallback to
+            # scanning an unbounded thread history for every bounded row.
+            with conn:
+                conn.execute("DROP INDEX idx_review_threads_page")
+            with self.assertRaisesRegex(RuntimeError, "idx_review_threads_page"):
+                views.pr_reviews(db_path=db_path, repo="vaquum/test", number=2, page_size=200)
+            init_db(conn)
+            self.assertTrue(json.loads(views.pr_reviews(db_path=db_path, repo="vaquum/test", number=2, page_size=200))["found"])
             conn.close()
 
     def test_pr_reviews_rejects_unbounded_or_invalid_page_requests(self) -> None:
