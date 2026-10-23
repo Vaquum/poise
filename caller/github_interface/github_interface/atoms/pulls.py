@@ -29,11 +29,15 @@ async def get_pr_readiness_state(
     query($owner: String!, $repo: String!, $number: Int!) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $number) {
+          id
           state
           isDraft
           mergeable
           mergeStateStatus
           headRefOid
+          reviewDecision
+          mergeQueue { id }
+          mergeQueueEntry { id }
           reviews(first: 100) {
             pageInfo { hasNextPage }
             nodes {
@@ -63,6 +67,20 @@ async def get_pr_readiness_state(
         {"owner": owner, "repo": repo, "number": pull_number},
     )
     return _required_pull(data, pull_number)
+
+
+async def enqueue_pull_request(client: GitHubClient, pull_id: str, head_sha: str) -> dict[str, Any]:
+    data = await client.graphql("""
+    mutation($pull: ID!, $head: GitObjectID!) {
+      enqueuePullRequest(input: {pullRequestId: $pull, expectedHeadOid: $head}) {
+        mergeQueueEntry { id pullRequest { headRefOid } }
+      }
+    }
+    """, {"pull": pull_id, "head": head_sha})
+    entry = (data.get("enqueuePullRequest") or {}).get("mergeQueueEntry")
+    if not isinstance(entry, dict) or not entry.get("id") or (entry.get("pullRequest") or {}).get("headRefOid") != head_sha:
+        raise RuntimeError("GitHub did not confirm a merge queue entry for the expected head")
+    return entry
 
 
 async def get_full_diff(client: GitHubClient, owner: str, repo: str, pull_number: int) -> str:
