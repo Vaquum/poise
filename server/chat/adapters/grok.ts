@@ -547,8 +547,10 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
         })
         return mapPromptResult(result)
       } catch (error) {
-        if (init.signal.aborted || cancelRequested) return { stopReason: 'cancelled' }
-        return { stopReason: 'error', error: `Grok Build: ${error instanceof Error ? error.message : String(error)}` }
+        // A failed replay proves neither prompt completion nor native exit.
+        // The runtime must stop the worker before releasing its checkout.
+        if (init.signal.aborted || cancelRequested) return { stopReason: 'cancelled', terminate: true }
+        return { stopReason: 'error', error: `Grok Build: ${error instanceof Error ? error.message : String(error)}`, terminate: true }
       } finally {
         stopWaiting()
         settlePrompt(init.turnId, admission, init.signal, onAbort)

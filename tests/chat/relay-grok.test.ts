@@ -22,6 +22,55 @@ async function answerRejectOnce(transcript: RelayTranscript): Promise<void> {
 }
 
 describe('Grok relay replay', () => {
+  it.each([
+    ['LIVE rejection', true], ['RPC close', true],
+    ['LIVE rejection', false], ['RPC close', false],
+  ] as const)('requires verified termination after %s (cancelled=%s)', async (failure, cancelled) => {
+    const host = createFakeHost('unused.mjs')
+    const events = new EventEmitter()
+    const peer = Object.assign(events, {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      killed: false, exitCode: null, signalCode: null,
+      // A signal request is not proof that the adopted native worker exited.
+      kill() { return true },
+    })
+    let goLive!: () => void
+    let rejectLive!: (error: Error) => void
+    const live = new Promise<void>((resolve, reject) => { goLive = resolve; rejectLive = reject })
+    const controller = new AbortController()
+    if (cancelled) controller.abort()
+    const adapter = createGrokAdapter(host)
+    const running = adapter.replayTurn!({
+      turnId: 'failed-recovery', signal: controller.signal, peer: peer as AgentProcess, live,
+      outbound: Buffer.from(`${JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'session/prompt', params: { sessionId: 'native-grok', prompt: [] } })}\n`),
+      outboundTruncated: false,
+      session: { nativeSessionId: 'native-grok', ...MODEL, safeMode: false }, recalledDiffs: new Map(),
+    })
+    try {
+      if (failure === 'LIVE rejection') rejectLive(new Error('replay could not reach LIVE'))
+      else {
+        goLive()
+        await live
+        peer.stdout.end()
+      }
+      const result = await running
+      expect(result).toMatchObject({ stopReason: cancelled ? 'cancelled' : 'error', terminate: true })
+      if (!cancelled) expect(result.error).toMatch(/Grok Build: .*?(LIVE|stdout)/)
+      expect(adapter.alive).toBe(true)
+      expect(host.spawns).toEqual([])
+    } finally {
+      goLive()
+      events.emit('exit', 0, null)
+      peer.stdout.end()
+      peer.stderr.end()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      await adapter.close()
+      peer.stdin.destroy(); peer.stdout.destroy(); peer.stderr.destroy()
+      host.dispose()
+      rmSync(host.checkout, { recursive: true, force: true })
+    }
+  })
+
   it.each(['before replay', 'during replay'] as const)('waits for native cancellation when stopped %s', async timing => {
     const host = createFakeHost('unused.mjs')
     const events = new EventEmitter()
