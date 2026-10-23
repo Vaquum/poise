@@ -232,8 +232,14 @@ existing SQLite store. Legacy session switching checkpoints owned dirty branches
 never stashes, commits, or switches the enclosing Poise source checkout.
 
 A fork or handoff stays in its source session's workspace, sharing that
-checkout and its lease with the source; while the source family's turn runs,
-the fork or handoff is visibly queued behind it. Deleting a session removes
+checkout and its lease with the source. A handoff waits for pending source
+startup before creating its target; a closing source, running turn, or absent
+source branch refuses the handoff without moving its subject or work bindings.
+A deferred chat prepares its branch under the checkout lease without starting
+its original provider. A provider error does not block handoff when the source
+branch exists. Source admission is checked again after target model/auth
+preparation, before any target is stored or ownership moves. Once created, the target queues behind any turn holding the shared checkout lease.
+Deleting a session removes
 its own scratch workspace only when no other session still uses it, its
 branch tip never moved, and its tree is clean; otherwise the workspace is
 kept, and the delete confirmation says which applies. Lock files are never

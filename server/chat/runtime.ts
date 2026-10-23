@@ -1757,7 +1757,7 @@ export class ChatRuntime extends EventEmitter {
     this.emit_(sessionId, { type: 'edit.decided', turnId: request.turnId, messageId: request.messageId, index: request.index, decision: request.decision })
   }
 
-  private async createSession(request: NewSessionRequest, isolated = false, createdBy?: ChatActor): Promise<SessionRecord> {
+  private async createSession(request: NewSessionRequest, isolated = false, createdBy?: ChatActor, beforeInsert?: () => void): Promise<SessionRecord> {
     if (this.stopped) throw new ChatError(503, 'the chat runtime is stopping', 'agent_error')
     if (request.deferStart !== undefined && typeof request.deferStart !== 'boolean') throw new ChatError(400, 'deferStart must be a boolean', 'invalid')
     if (request.safeMode !== undefined && typeof request.safeMode !== 'boolean') throw new ChatError(400, 'safeMode must be a boolean', 'invalid')
@@ -1810,6 +1810,9 @@ export class ChatRuntime extends EventEmitter {
       ...(request.role === 'manager' ? { role: 'manager' as const } : {}),
       ...(createdBy ? { createdBy } : {}),
     }
+    // Callers can guard admission after asynchronous model/auth preparation;
+    // no await may separate that guard from the durable insert.
+    beforeInsert?.()
     try {
       storage.insertSession(record)
     } catch (error) {
@@ -2222,46 +2225,76 @@ export class ChatRuntime extends EventEmitter {
     if (source.turn) throw new ChatError(409, 'a turn is running; hand off after it finishes', 'turn_in_progress')
     if (source.record.selfChangeId) throw new ChatError(409, 'a Poise change session cannot be handed off; its checkout belongs to the release controller', 'unsupported')
     if (source.record.role === 'manager') throw new ChatError(409, 'The Manager cannot be handed off; change its model instead.', 'unsupported')
-    const summary = this.handoffSummary(source.record)
-    const created = await this.create({
-      agent: target.agent,
-      model: target.model,
-      effort: target.effort,
-      repo: source.record.repo,
-      checkout: source.record.checkout,
-      branch: { existing: source.record.branch.name },
-      title: `${source.record.title} → ${AGENT_LABEL[target.agent]}`.slice(0, CHAT_LIMITS.titleChars),
-      autoMerge: source.record.autoMerge,
-      safeMode: source.record.safeMode === true,
-      context: { kind: 'handoff', title: source.record.title, body: summary, fromSession: source.record.id },
+    // Creation can return before branch setup; settle that source lifecycle
+    // before admitting a target on the same branch.
+    return this.serialized(source, async () => {
+      const assertSourceAvailable = () => {
+        this.assertAcceptingWork()
+        if (source.record.status === 'closed' || source.lifecycle.signal.aborted) throw new ChatError(409, 'the source chat is closing or closed; handoff was not started', 'agent_error')
+        if (source.turn) throw new ChatError(409, 'a turn is running; hand off after it finishes', 'turn_in_progress')
+      }
+      assertSourceAvailable()
+      let branchReady = await branchExists(source.record.checkout, source.record.branch.name)
+      // Deferred chats have never run a provider. Prepare only their branch,
+      // using the existing lease and branch path, before starting the target.
+      if (!branchReady && source.record.status === 'idle' && source.record.branch.origin === 'new'
+        && source.record.branch.provisional && !source.record.branch.baseSha && !source.record.nativeSessionId) {
+        const lease = await this.leaseForStartup(source, source.lifecycle.signal)
+        try {
+          await lease.acquire({ signal: source.lifecycle.signal, onBusy: busy => this.reportBusy(source, busy) })
+          assertSourceAvailable()
+          branchReady = await branchExists(source.record.checkout, source.record.branch.name)
+          if (!branchReady) { await this.prepareBranch(source, lease); branchReady = true }
+        } catch (error) { assertSourceAvailable(); throw error }
+        finally { if (lease.held) lease.release() }
+        assertSourceAvailable()
+        this.setStatus(source, 'idle')
+      }
+      if (!branchReady) {
+        throw new ChatError(409, `source branch ${source.record.branch.name} does not exist; finish or repair source startup before handing off`, 'agent_error')
+      }
+      assertSourceAvailable()
+      const summary = this.handoffSummary(source.record)
+      const created = await this.track(() => this.createSession({
+        agent: target.agent,
+        model: target.model,
+        effort: target.effort,
+        repo: source.record.repo,
+        checkout: source.record.checkout,
+        branch: { existing: source.record.branch.name },
+        title: `${source.record.title} → ${AGENT_LABEL[target.agent]}`.slice(0, CHAT_LIMITS.titleChars),
+        autoMerge: source.record.autoMerge,
+        safeMode: source.record.safeMode === true,
+        context: { kind: 'handoff', title: source.record.title, body: summary, fromSession: source.record.id },
+      }, false, undefined, assertSourceAvailable))
+      const live = this.requireLive(created.id)
+      // The conversation continues in the target: its work bindings move with
+      // it, so the next monitor tick wakes the target, never the source.
+      moveBindings(this.instance, source.record.id, live.record.id)
+      if (source.record.subject) {
+        // The subject moves once the target exists and before its summary
+        // turn is scheduled. Until now it still opened the source.
+        const subject = source.record.subject
+        storage.moveSubject(source.record, live.record)
+        delete source.record.subject
+        live.record.subject = subject
+        this.emit_(source.record.id, { type: 'session.updated', session: source.record })
+        this.emit_(live.record.id, { type: 'session.updated', session: live.record })
+      }
+      // The family's branch reference point travels with a local handoff, so
+      // the last session deleted from a shared workspace can still tell
+      // whether its branch never moved.
+      if (source.record.workspaceKind === 'poise-local' && source.record.branch.baseSha) {
+        live.record.branch.baseSha = source.record.branch.baseSha
+        this.saveRecord(live)
+      }
+      void this.serialized(live, async () => {
+        if (live.record.status === 'error' || live.lifecycle.signal.aborted) return
+        const turn = this.reserveTurn(live)
+        await this.runTurn(live, turn, { text: summary, attachments: [], mentions: [] })
+      }).catch(() => undefined)
+      return created
     })
-    const live = this.requireLive(created.id)
-    // The conversation continues in the target: its work bindings move with
-    // it, so the next monitor tick wakes the target, never the source.
-    moveBindings(this.instance, source.record.id, live.record.id)
-    if (source.record.subject) {
-      // The subject moves once the target exists and before its summary
-      // turn is scheduled. Until now it still opened the source.
-      const subject = source.record.subject
-      storage.moveSubject(source.record, live.record)
-      delete source.record.subject
-      live.record.subject = subject
-      this.emit_(source.record.id, { type: 'session.updated', session: source.record })
-      this.emit_(live.record.id, { type: 'session.updated', session: live.record })
-    }
-    // The family's branch reference point travels with a local handoff, so
-    // the last session deleted from a shared workspace can still tell
-    // whether its branch never moved.
-    if (source.record.workspaceKind === 'poise-local' && source.record.branch.baseSha) {
-      live.record.branch.baseSha = source.record.branch.baseSha
-      this.saveRecord(live)
-    }
-    void this.serialized(live, async () => {
-      if (live.record.status === 'error' || live.lifecycle.signal.aborted) return
-      const turn = this.reserveTurn(live)
-      await this.runTurn(live, turn, { text: summary, attachments: [], mentions: [] })
-    }).catch(() => undefined)
-    return created
   }
 
   private collectRecentTurns(record: SessionRecord): Array<{ prompt: string, text: string, files: Set<string> }> {
