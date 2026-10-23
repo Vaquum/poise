@@ -305,12 +305,18 @@ instead of interrupting it. Completed permission and question requests consume
 their persisted one-time answers without sending them again; completed filesystem
 requests never repeat their effects. The LIVE handoff waits until buffered spooled stdout reaches the adapter,
 including across an awaited outbound read. Historical request matching ends with
-the adopted turn. Recovery atomically claims the checkout lease before stopping
+the adopted turn. Each recorded RPC response is consumed once per occurrence,
+so the native agent can reuse its request ID after completing an earlier one.
+Historical callbacks cannot clear a later request's active slot.
+Recovery atomically claims the checkout lease before stopping
 a recorded worker, including an idle worker whose completed turn released its
 lease; a competing live owner retains its turn and session. Cancelling an
 adopted Grok turn waits for its correlated native result or verified worker
 termination before releasing the checkout. A completed adopted turn drops its
 spool and outbound history without clearing another server's handed-over turn.
+Relay exit alone does not prove its separate worker group exited. Failed startup
+rollback or shutdown retains the worker records and checkout lease until that
+group is verified gone.
 A recorded failed Muse decision ends the turn with a visible error
 instead of retaining an unanswerable request and checkout lease.
 
