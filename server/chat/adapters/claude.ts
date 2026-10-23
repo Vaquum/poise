@@ -1014,9 +1014,10 @@ class ReplayProcess {
     if (!frame || typeof frame !== 'object') return this.unknown(line, 'is not JSON')
     if (frame.type === 'control_response') {
       const id = frame.response?.request_id
-      // An answer the CLI heard stays answered; anything else may be an
-      // agent waiting on it, so it goes out at once.
-      if (!this.live && typeof id === 'string' && this.responded.has(id)) return
+      // SDK callbacks can finish after LIVE. Consume each recorded answer
+      // once, so its late reply stays suppressed and a later request may
+      // reuse the id after that callback has settled.
+      if (typeof id === 'string' && this.responded.delete(id)) return
       this.forward(line)
       return
     }
