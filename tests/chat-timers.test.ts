@@ -164,7 +164,13 @@ afterEach(async () => {
   await runtime?.stop()
   await new Promise<void>(done => server.close(() => done()))
 })
-afterAll(async () => { database.closeDatabase(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }) })
+afterAll(async () => {
+  await logging.stopLogging()
+  expect(logging.loggingRuntime()).toBeNull()
+  database.closeDatabase()
+  vi.unstubAllEnvs()
+  await rm(root, { recursive: true, force: true })
+})
 
 describe('durable timers that wake chats', () => {
   it('admits a due one-shot on an idle chat with the timer header, source and note', async () => {

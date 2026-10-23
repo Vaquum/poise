@@ -145,15 +145,23 @@ describe('Merge Pull Requests', () => {
     expect(runtime.getMergePrsLastFired()).toEqual(first)
     expect(db.db.prepare('SELECT status FROM behavior_runs').all()).toEqual([{ status: 'completed' }])
   })
-  it.each(['not_ready', 'superseded', 'already_merged'])('does not report a merge for %s', async (value) => {
+  it.each(['not_ready', 'superseded', 'already_merged', 'enqueued', 'in_queue'])('does not report a merge for %s', async (value) => {
     enable(); outcome = value
+    if (['enqueued', 'in_queue'].includes(value)) response = { queue_entry_id: 'MQE_test' }
     await runtime.runEnabledBehaviorsOnce()
     expect(mergeCalls()).toHaveLength(1)
     expect(runtime.getMergePrsLastFired()).toBeNull()
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
     expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      state: value === 'superseded' ? 'superseded' : 'completed', outcome: value,
+      state: value === 'superseded' ? 'superseded' : 'completed',
+      outcome: ['enqueued', 'in_queue'].includes(value) ? 'waiting' : value,
     }))
+  })
+  it('rejects a queued outcome without a confirmed queue entry', async () => {
+    enable(); outcome = 'enqueued'
+    await runtime.runEnabledBehaviorsOnce()
+    expect(runtime.getMergePrsLastFired()).toBeNull()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toHaveLength(1)
   })
   it('filters drafts, foreign authors and skipped repositories before reading or locking them', async () => {
     enable()
