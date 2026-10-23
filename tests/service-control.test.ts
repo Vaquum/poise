@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -102,7 +102,7 @@ describe('service health', () => {
     session(runtime.instance, false)
     session('poise-dev:another-database', true)
     const { service } = serviceOf(runtime)
-    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null })
+    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, desiredRelease: null, installedRelease: null, pendingSince: null })
 
     let finish!: () => void
     const debate = callerCalls.countDebate(() => new Promise<void>((resolve) => { finish = resolve }))
@@ -362,6 +362,11 @@ describe('switching to another release', () => {
       const turnId = storage.getOpenTurn(sessionId)!.turnId
       runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
       runtime.workingNow = 1
+      runtime.cancel.mockImplementation(async () => {
+        storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId, stopReason: 'cancelled' })
+        runtime.workingNow = 0
+        return { settled: true }
+      })
       service.switchRelease('r2')
       // Inside the bound the switch keeps waiting for a quiet moment.
       timer.fire()
@@ -390,6 +395,7 @@ describe('switching to another release', () => {
       storage.appendEvent(sessionId, { type: 'turn.finished', turnId, stopReason: 'end_turn' })
       runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
       runtime.workingNow = 1
+      runtime.cancel.mockImplementation(async () => { runtime.workingNow = 0; return { settled: true } })
       service.switchRelease('r2')
       now += 15 * 60_000
       timer.fire()
@@ -398,6 +404,53 @@ describe('switching to another release', () => {
       expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([])
       expect(restart).toHaveBeenCalledTimes(1)
     } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it.each(['runtime', 'background', 'launch'] as const)('keeps polling when %s work remains after bound cancellation', async work => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 2_000_000
+    const { runtime, timer, restart, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    const sessionId = session(runtime.instance, true)
+    const turnId = storage.getOpenTurn(sessionId)!.turnId
+    let releaseCancel!: () => void
+    const barrier = new Promise<void>(resolve => { releaseCancel = resolve })
+    runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
+    runtime.workingNow = 1
+    runtime.cancel.mockImplementation(async () => {
+      await barrier
+      storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId, stopReason: 'cancelled' })
+      runtime.workingNow = work === 'runtime' ? 1 : 0
+      return { settled: true }
+    })
+    let finishWork = () => { runtime.workingNow = 0 }
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      expect(runtime.cancel).toHaveBeenCalledTimes(1)
+      if (work === 'background') finishWork = background.trackReleaseBackground()
+      if (work === 'launch') {
+        const admitted = service.admitLaunch('POST', '/api/models/refresh')
+        if (typeof admitted !== 'function') throw new Error('the concurrent launch was not admitted')
+        finishWork = admitted
+      }
+      releaseCancel()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([{ sessionId, turnId }])
+      expect(restart).not.toHaveBeenCalled()
+      expect(service.draining).toBe(false)
+      expect(background.releaseBackgroundPaused()).toBe(false)
+      expect(timer.timers.size).toBe(1)
+      finishWork()
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(service.draining).toBe(true)
+    } finally {
+      releaseCancel()
+      finishWork()
       service.reset()
       background.resumeReleaseBackground()
     }
@@ -513,6 +566,68 @@ describe('switching to another release', () => {
       expect(service.health().switching).toBeNull()
     } finally {
       service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('reports the desired, installed and active release with how long a switch has been pending', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const { service } = switching(dir)
+    try {
+      // No switch pending: the desired release is the active one, and nothing has been pending.
+      expect(service.health()).toMatchObject({ release: 'r1', switching: null, desiredRelease: 'r1', installedRelease: 'r1', pendingSince: null })
+      // A switch stuck behind running turns: desired and installed are the target, active is still the old release.
+      await writeFile(join(dir, 'next'), 'r2\n')
+      const since = new Date('2026-10-22T18:00:00.000Z')
+      await utimes(join(dir, 'next'), since, since)
+      expect(service.health()).toMatchObject({ release: 'r1', switching: 'r2', desiredRelease: 'r2', installedRelease: 'r2', pendingSince: '2026-10-22T18:00:00.000Z' })
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('reports the desired release as not installed when it cannot be switched to', async () => {
+    const dir = await releases({ r2: 'b1', r3: 'b2', r4: 'b1' })
+    await writeFile(join(dir, 'r4', 'failed'), 'exited with 1 within a minute of starting\n')
+    const { service } = switching(dir)
+    try {
+      // Missing, built for another base, or failed to start: desired names it, installed does not.
+      for (const queued of ['r9', 'r3', 'r4']) {
+        await writeFile(join(dir, 'next'), `${queued}\n`)
+        expect(service.health(), queued).toMatchObject({ release: 'r1', switching: queued, desiredRelease: queued, installedRelease: null, pendingSince: expect.any(String) })
+      }
+    } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('keeps the pending age when the queued switch is asked for again', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const first = switching(dir)
+    try {
+      first.service.switchRelease('r2')
+      const since = new Date('2026-10-22T18:00:00.000Z')
+      await utimes(join(dir, 'next'), since, since)
+      expect(first.service.health().pendingSince).toBe('2026-10-22T18:00:00.000Z')
+      // The gateway asks on every pass until the switch lands; re-asking must not move the age.
+      first.service.switchRelease('r2')
+      expect(first.service.health().pendingSince).toBe('2026-10-22T18:00:00.000Z')
+      expect((await readFile(join(dir, 'next'), 'utf8')).trim()).toBe('r2')
+      expect(first.timer.timers.size).toBe(1)
+      // A restarted server re-arms its poll when asked again, without moving the age either.
+      const second = switching(dir)
+      try {
+        second.service.switchRelease('r2')
+        expect(second.timer.timers.size).toBe(1)
+        expect(second.service.health().pendingSince).toBe('2026-10-22T18:00:00.000Z')
+      } finally {
+        second.service.reset()
+        background.resumeReleaseBackground()
+      }
+    } finally {
+      first.service.reset()
       background.resumeReleaseBackground()
     }
   })

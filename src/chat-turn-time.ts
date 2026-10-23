@@ -30,3 +30,15 @@ const ENDED: Record<StopReason, string> = {
 export function turnTime(at: string, stopReason: StopReason, timeZone: string, now: number): TurnTime {
   return { text: shortTime(at, timeZone, now), label: `${ENDED[stopReason]} ${fullTime(at, timeZone)}` }
 }
+
+/** Elapsed time as "45s", "12m" or "1h 5m": the header's live "Running ·
+ *  since …" for the turn on screen. Floored, so it never overstates a turn
+ *  still running; a start that is not a time, or lies ahead, reads zero. */
+export function shortElapsed(from: string | number, now: number): string {
+  const ms = now - new Date(from).valueOf()
+  if (!Number.isFinite(ms) || ms < 0) return '0s'
+  const minutes = Math.floor(ms / 60_000)
+  if (minutes < 1) return `${Math.floor(ms / 1000)}s`
+  if (minutes < 60) return `${minutes}m`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}

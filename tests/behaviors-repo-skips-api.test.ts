@@ -96,7 +96,7 @@ beforeEach(async () => {
   process.env.AGENT_INTERFACE_ROOT = join(root, 'agent-interface')
   process.env.POISE_ESPANSO_MATCH_DIR = join(root, 'espanso')
   delete process.env.POISE_DATASTORE_DB
-  pulls = [{ repo: REPO, number: 1, url: `https://github.com/${REPO}/pull/1`, status: 'open', author: 'octocat', draft: 0 }]
+  pulls = [{ repo: REPO, number: 1, url: `https://github.com/${REPO}/pull/1`, status: 'open', author: 'octocat', draft: 0, updated_at: '2026-07-15T12:00:00Z' }]
   healthFailure = null
   mocks.runFile.mockReset().mockImplementation(cli)
   mocks.spawnDetached.mockReset().mockResolvedValue(undefined)

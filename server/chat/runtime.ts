@@ -25,6 +25,8 @@ import { prepareProviderCli } from '../provider-clis'
 import { readMemories } from './memories'
 import { expandSwitches, savedSwitchNames, saveSwitch } from './custom-switches'
 import { MANAGER_SWITCH } from '../../src/chat-switches'
+import { deriveSessionTitle, parseIssueReference, shouldAutoName } from '../../src/chat-title'
+import { resolveIssueTitle } from './issue-titles'
 import { appendMemories } from './memory-content'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -113,6 +115,7 @@ const AVAILABILITY_TTL_MS = 60_000
 /** What a session interrupted for a Poise update is asked after the restart,
  *  on its resumed native session. */
 export const SWITCH_CONTINUE_PROMPT = 'Poise restarted for an update while your turn was running. Continue where you left off.'
+const SWITCH_WITHDRAWN_CONTINUE_PROMPT = 'Poise stopped your turn for an update that did not restart. Continue where you left off.'
 /** Prompts that waited behind a switch (in arrival order) and sessions a
  *  switch bound interrupted. Consumed once, by the first recovery or
  *  withdrawal after they were written. */
@@ -157,6 +160,9 @@ interface RunningTurn {
   /** What the transcript shows as the prompt when the agent got more (a
    *  server-injected runbook around the person's request). */
   shown?: PromptInput
+  /** Original admitted request, retained until native invocation. */
+  input?: PromptInput
+  inputSourceSessionId?: string
   /** True only once the native prompt was invoked, not while queued/startup. */
   agentInvoked?: boolean
   /** Settles at native prompt invocation, cancellation, or failed startup. */
@@ -165,6 +171,7 @@ interface RunningTurn {
   queueItem?: QueuedMessage
   queueContext?: string
   commandModel?: string
+  commandEffort?: string
   contextAction?: 'compact' | 'reset'
   review?: { target: ReviewTarget, throughSeq: number }
   /** True while the turn holds one of the bounded Poise-local agent slots. */
@@ -248,11 +255,12 @@ export interface DrainState { releaseId: string, since: string }
 /** A release switch this server waits out: new Chat turns wait behind it. */
 export interface SwitchWait { release: string, since: string }
 
+interface SwitchPromptMetadata extends Pick<RunningTurn, 'implementsChange' | 'switches'> { source?: TurnSource, shown?: PromptInput, sourceSessionId?: string, model?: string, effort?: string }
 /** One prompt admitted while a switch was pending, in arrival order. */
-interface WaitingPrompt { id: string, sessionId: string, prompt: PromptInput, createdAt: string }
+interface WaitingPrompt { id: string, sessionId: string, prompt: PromptInput, createdAt: string, recovery?: SwitchPromptMetadata }
 
 /** One session whose running turn a switch bound interrupted. */
-interface InterruptedSession { sessionId: string, turnId: string, at: string }
+interface InterruptedSession extends SwitchPromptMetadata { sessionId: string, turnId: string, at: string, prompt?: PromptInput }
 
 export interface PoiseChangeResult { session: SessionRecord, change: SelfChange }
 
@@ -468,6 +476,7 @@ export class ChatRuntime extends EventEmitter {
       const interrupted = terminal.stopReason === 'interrupted'
       if (interrupted) record.interruptedTurnId = open.turnId
       record.status = interrupted || terminal.stopReason === 'error' ? 'interrupted' : 'idle'
+      record.lastStopReason = terminal.stopReason
       record.lastSeq = envelope.seq
       storage.saveSession(record)
       this.emit('event', envelope)
@@ -687,13 +696,13 @@ export class ChatRuntime extends EventEmitter {
     if (!this.switchState || this.switchState.release !== release) this.switchState = { release, since: new Date().toISOString() }
   }
 
-  /** The pending switch went away without a restart: nothing was
-   *  interrupted, and the waiting prompts start now, in order. */
+  /** The pending switch went away without a restart. Resume any turns its
+   *  bound already interrupted, then release waiting prompts in order. */
   async releaseSwitchWait(): Promise<void> {
     this.switchState = null
+    if (this.stopped) return
     try {
-      this.writeInterruptedSessions([])
-      await this.startWaitingPrompts()
+      await this.resumeAfterUpdate(new Set(), SWITCH_WITHDRAWN_CONTINUE_PROMPT)
       for (const record of storage.listSessions(this.instance)) this.scheduleQueue(this.requireLive(record.id))
     } catch (error) {
       this.emit('log', `[chat] releasing prompts waited for an update failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -701,21 +710,29 @@ export class ChatRuntime extends EventEmitter {
   }
 
   /** Sessions with a turn running right now: what a switch bound interrupts. */
-  runningTurnSessions(): Array<{ sessionId: string, turnId: string }> {
-    const running: Array<{ sessionId: string, turnId: string }> = []
-    for (const session of this.live.values()) if (session.turn) running.push({ sessionId: session.record.id, turnId: session.turn.id })
+  runningTurnSessions(): Array<Omit<InterruptedSession, 'at'>> {
+    const running: Array<Omit<InterruptedSession, 'at'>> = []
+    for (const session of this.live.values()) {
+      const turn = session.turn
+      if (!turn) continue
+      running.push({ sessionId: session.record.id, turnId: turn.id, ...(turn.implementsChange ? { implementsChange: true } : {}),
+        ...(!turn.agentInvoked && turn.input ? { prompt: turn.input, shown: turn.shown, source: turn.source,
+          switches: turn.switches,
+          sourceSessionId: turn.queueItem?.sourceSessionId ?? turn.inputSourceSessionId,
+          model: turn.queueItem?.model ?? turn.commandModel, effort: turn.queueItem?.effort ?? turn.commandEffort } : {}) })
+    }
     return running
   }
 
   /** Record the sessions a switch bound interrupted, for their continue
    *  prompt after the restart. A session is recorded at most once. */
-  recordSwitchInterrupted(sessions: Array<{ sessionId: string, turnId: string }>): void {
+  recordSwitchInterrupted(sessions: Array<Omit<InterruptedSession, 'at'>>): void {
     if (sessions.length === 0) return
     const at = new Date().toISOString()
     const fresh = new Set(sessions.map(session => session.sessionId))
     this.writeInterruptedSessions([
       ...this.readInterruptedSessions().filter(row => !fresh.has(row.sessionId)),
-      ...sessions.map(session => ({ sessionId: session.sessionId, turnId: session.turnId, at })),
+      ...sessions.map(session => ({ ...session, at })),
     ])
   }
 
@@ -725,11 +742,11 @@ export class ChatRuntime extends EventEmitter {
    *  it is acted on, so a crash mid-resume loses only the entry in flight.
    *  Sessions another live server of this instance holds are left for a
    *  later recovery. */
-  private async resumeAfterUpdate(protectedSessions: ReadonlySet<string>): Promise<void> {
+  private async resumeAfterUpdate(protectedSessions: ReadonlySet<string>, continuation = SWITCH_CONTINUE_PROMPT): Promise<void> {
     for (const row of this.readInterruptedSessions()) {
       if (protectedSessions.has(row.sessionId)) continue
       if (!this.takeInterruptedSession(row.sessionId)) continue
-      await this.deliverWaitingPrompt(row.sessionId, { text: SWITCH_CONTINUE_PROMPT, attachments: [], mentions: [] }, 'interrupted')
+      await this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
     }
     await this.startWaitingPrompts(protectedSessions)
   }
@@ -739,7 +756,7 @@ export class ChatRuntime extends EventEmitter {
     for (const entry of this.readWaitingPrompts()) {
       if (protectedSessions.has(entry.sessionId)) continue
       if (!this.takeWaitingPrompt(entry.id)) continue
-      await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting')
+      await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery)
     }
   }
 
@@ -748,15 +765,15 @@ export class ChatRuntime extends EventEmitter {
    *  session is dropped; one that fails transiently waits for the next
    *  restart; one that can never run says so on its session. Never throws:
    *  one bad entry must not stop the entries behind it. */
-  private async deliverWaitingPrompt(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting'): Promise<void> {
+  private async deliverWaitingPrompt(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata): Promise<void> {
     try {
-      await this.deliverWaitingPromptInner(sessionId, prompt, kind)
+      await this.deliverWaitingPromptInner(sessionId, prompt, kind, recovery)
     } catch (error) {
       this.emit('log', `[chat] ${kind} prompt for ${sessionId.slice(0, 8)} failed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
-  private async deliverWaitingPromptInner(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting'): Promise<void> {
+  private async deliverWaitingPromptInner(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata): Promise<void> {
     const short = sessionId.slice(0, 8)
     const drop = (message: string): void => {
       this.emit('log', `[chat] ${kind} prompt for ${short} dropped: ${message}`)
@@ -771,11 +788,27 @@ export class ChatRuntime extends EventEmitter {
       this.emit('log', `[chat] ${kind} prompt for ${short} dropped: ${message}`)
     }
     const defer = (message: string): void => {
-      this.writeWaitingPrompts([...this.readWaitingPrompts(), { id: randomUUID(), sessionId, prompt, createdAt: new Date().toISOString() }])
+      this.writeWaitingPrompts([...this.readWaitingPrompts(), { id: randomUUID(), sessionId, prompt, createdAt: new Date().toISOString(), ...(recovery ? { recovery } : {}) }])
       this.emit('log', `[chat] ${kind} prompt for ${short} still waiting: ${message}`)
     }
     try {
       const receipt = this.prompt(sessionId, prompt)
+      if (recovery) {
+        if ('turnId' in receipt) {
+          // prompt() reserved this turn synchronously; its serialized work
+          // starts after these original admission attributes are restored.
+          const turn = this.requireLive(sessionId).turn!
+          turn.source = recovery.source
+          turn.shown = recovery.shown ?? turn.shown
+          turn.inputSourceSessionId = recovery.sourceSessionId
+          turn.commandModel = recovery.model ?? turn.commandModel
+          turn.commandEffort = recovery.effort
+          turn.implementsChange = recovery.implementsChange
+          turn.switches = recovery.switches ?? turn.switches
+        } else {
+          this.writeWaitingPrompts(this.readWaitingPrompts().map(entry => entry.id === receipt.waitId ? { ...entry, recovery } : entry))
+        }
+      }
       // A switch already pending on the fresh server waits it again.
       if (!('turnId' in receipt)) this.emit('log', `[chat] ${kind} prompt for ${short} waits behind a new update`)
       return
@@ -787,7 +820,7 @@ export class ChatRuntime extends EventEmitter {
       if (!(error instanceof ChatError) || error.statusCode === 409 || error.statusCode === 503) {
         if (error instanceof ChatError) {
           try {
-            await this.enqueue(sessionId, randomUUID(), prompt)
+            await this.enqueue(sessionId, randomUUID(), prompt, recovery?.model, recovery?.effort, recovery)
             return
           } catch (queued) {
             if (queued instanceof ChatError && queued.statusCode === 404) { gone(queued.message); return }
@@ -1394,6 +1427,7 @@ export class ChatRuntime extends EventEmitter {
     const next = String(title || '').trim().slice(0, CHAT_LIMITS.titleChars)
     if (!next) throw new ChatError(400, 'title is required', 'invalid')
     session.record.title = next
+    session.record.titleManual = true
     this.saveRecord(session)
     this.emit_(id, { type: 'session.updated', session: session.record })
     return session.record
@@ -1823,6 +1857,7 @@ export class ChatRuntime extends EventEmitter {
     turn.implementsChange = true
     turn.shown = names?.length ? { ...transferred, text: [...names.map(name => `/${name}`), transferred.text].join(' ') } : transferred
     const prompt: PromptInput = { ...transferred, text: poiseChangePrompt({ request, branch: prepared.branch, baseSha: prepared.baseSha, workspace: checkout }) }
+    turn.input = prompt
     void this.serialized(live, () => this.runTurn(live, turn, prompt)).catch(() => undefined)
     return { session: this.withLive(live.record), change: bound }
   }
@@ -1954,7 +1989,7 @@ export class ChatRuntime extends EventEmitter {
     const turn: RunningTurn = { id: randomUUID(), callId: null, startedAt: Date.now(), abort: new AbortController(), stopping: false, promptReady, releasePrompt }
     turn.abort.signal.addEventListener('abort', releasePrompt, { once: true })
     storage.reserveQueueTurn(session.record.id, turn.id, queueItem?.id, internalMessageSeq)
-    if (queueItem) turn.queueItem = queueItem
+    if (queueItem) { turn.queueItem = queueItem; turn.input = queueItem.prompt }
     if (queueItem?.source) turn.source = { ...queueItem.source }
     session.turn = turn
     if (session.idleTimer) { clearTimeout(session.idleTimer); session.idleTimer = null }
@@ -1988,6 +2023,7 @@ export class ChatRuntime extends EventEmitter {
       return this.waitPromptForSwitch(session, prompt)
     }
     const turn = this.reserveTurn(session, undefined, internal?.seq)
+    turn.input = prompt
     turn.switches = chain.switches
     turn.commandModel = chain.model
     turn.contextAction = chain.context
@@ -2035,7 +2071,7 @@ export class ChatRuntime extends EventEmitter {
 
   // ── Deferred messages ───────────────────────────────────────────────────
 
-  async enqueue(id: string, itemId: string, input: PromptInput, model?: string, effort?: string): Promise<MessageQueue> {
+  async enqueue(id: string, itemId: string, input: PromptInput, model?: string, effort?: string, recovery?: SwitchPromptMetadata): Promise<MessageQueue> {
     this.assertAcceptingWork()
     const session = this.requireLive(id)
     if (!UUID_PATTERN.test(itemId)) throw new ChatError(400, 'itemId must be a UUID', 'invalid')
@@ -2051,7 +2087,7 @@ export class ChatRuntime extends EventEmitter {
       const prompt = this.validatePrompt(id, { ...submitted, text: commandBody(chain) })
       const target = await this.resolveModel(model || chain.model || session.record.model, effort)
       if (!this.ownsSession(id)) throw new ChatError(404, 'unknown session', 'unknown_session')
-      return this.mutateQueue(session, () => enqueueMessage(queueOwner(id), { id: itemId, sourceSessionId: id, prompt, agent: target.agent, model: target.model.identity,
+      return this.mutateQueue(session, () => enqueueMessage(queueOwner(id), { id: itemId, sourceSessionId: recovery?.sourceSessionId ?? id, ...(recovery?.source ? { source: recovery.source } : {}), prompt, agent: target.agent, model: target.model.identity,
         effort: target.effort, createdAt: new Date().toISOString(), state: 'waiting' }))
     })
   }
@@ -2316,6 +2352,7 @@ export class ChatRuntime extends EventEmitter {
   }
 
   private async runTurn(session: LiveSession, turn: RunningTurn, input: PromptInput): Promise<void> {
+    turn.input ??= input
     const record = session.record
     let lease: CheckoutLease | null = null
     let stopReason: StopReason = 'error'
@@ -2351,7 +2388,7 @@ export class ChatRuntime extends EventEmitter {
           input = { ...input, text: chain.text }
         }
         this.publishQueue(session); await this.prepareQueuedAgent(session, turn)
-      } else if (turn.commandModel) await this.selectSessionModel(session, turn.commandModel)
+      } else if (turn.commandModel) await this.selectSessionModel(session, turn.commandModel, turn.commandEffort)
       if (turn.contextAction === 'reset') {
         await this.stopProcess(session)
         this.releaseSettledLease(session)
@@ -2383,10 +2420,15 @@ export class ChatRuntime extends EventEmitter {
       let adapter = session.adapter!
       const isFirst = !storage.findEvent(record.id, (e) => e.type === 'turn.started')
       // A change session is titled by its request, not by the runbook's first line. The Manager keeps its title.
-      if ((record.title === 'New session' || (isFirst && !record.contextResetSeq)) && !record.selfChangeId && !internalTurn(turn.id) && record.role !== 'manager') {
-        record.title = (input.text.split('\n')[0] || record.title).slice(0, TITLE_CHARS) || record.title
-        this.saveRecord(session)
-        this.emit_(record.id, { type: 'session.updated', session: record })
+      if (shouldAutoName(record, isFirst, internalTurn(turn.id))) {
+        const ref = parseIssueReference(input.text.split('\n')[0] ?? '', record.repo)
+        const issueTitle = ref ? await resolveIssueTitle(ref).catch(() => null) : null
+        // A rename that landed during the lookup wins over the derived title.
+        if (shouldAutoName(record, isFirst, internalTurn(turn.id))) {
+          record.title = deriveSessionTitle(input.text, { repo: record.repo, issueTitle }).slice(0, TITLE_CHARS) || record.title
+          this.saveRecord(session)
+          this.emit_(record.id, { type: 'session.updated', session: record })
+        }
       }
       // The Caller row first, so its id is part of the durable turn record.
       if (this.caller) {
@@ -2419,7 +2461,7 @@ export class ChatRuntime extends EventEmitter {
         if (!lease.registerWorker({ pid: session.worker.pid, pgid: session.worker.pgid, ident: session.worker.ident })) throw new Error('the checkout lease was lost before the turn started')
         storage.setWorkerLeaseToken(record.id, lease.currentToken)
       }
-      let adapterInput = await this.resolveInput(session, nativeInput, turn.queueItem?.sourceSessionId)
+      let adapterInput = await this.resolveInput(session, nativeInput, turn.queueItem?.sourceSessionId ?? turn.inputSourceSessionId)
       if (turn.review) adapterInput = await prepareReview(record.checkout, record.id, turn.id, turn.review.throughSeq, turn.review.target, { ...adapterInput, text: input.text }, turn.abort.signal)
       if (session.staged) {
         const report = await refreshDocument(record.checkout, session.staged)
@@ -2448,13 +2490,13 @@ export class ChatRuntime extends EventEmitter {
       adapter = session.adapter!
       if (turn.abort.signal.aborted) throw new Error(turn.failure || 'cancelled before the agent prompt')
       this.setStatus(session, 'running')
-      agentInvoked = true
-      turn.agentInvoked = true
       if (record.queuedHandoff) adapterInput.text = `${record.queuedHandoff}\n\n[Current task]\n${adapterInput.text}`
       if (turn.contextAction === 'compact' && storage.findEvent(record.id, event => event.type === 'text.delta') && !record.queuedHandoff) {
         if (!adapter.compact) throw new ChatError(409, `${AGENT_LABEL[record.agent]} does not expose context compaction.`, 'unsupported')
         record.contextCompacting = true
         this.saveRecord(session); this.emit_(record.id, { type: 'session.updated', session: record })
+        agentInvoked = true
+        turn.agentInvoked = true
         const compacted = await adapter.compact(turn.id, readMemories().text, turn.abort.signal)
         if (compacted.stopReason !== 'end_turn') {
           agentSettled = true; terminate = compacted.terminate === true
@@ -2480,7 +2522,6 @@ export class ChatRuntime extends EventEmitter {
       }
       turn.abort.signal.throwIfAborted()
       turn.contextAction = undefined
-      turn.agentInvoked = true
       const controlContext = await this.options.controlContext?.(record.id)
       turn.abort.signal.throwIfAborted()
       const expanded = expandSwitches(adapterInput.text, turn.switches)
@@ -2489,6 +2530,8 @@ export class ChatRuntime extends EventEmitter {
       // own answer.
       const personRelay = turn.source?.kind === 'poise' && turn.source.name === SWITCHBOARD_PERSON
       const promptInput = withAutoMergeInstructions({ ...adapterInput, text: controlContext ? `${controlContext}\n\n[Request]\n${expanded}` : expanded, memories: readMemories().text }, record.autoMerge, turn.implementsChange, turn.source && !personRelay ? 'source' : 'person')
+      agentInvoked = true
+      turn.agentInvoked = true
       const response = adapter.prompt(turn.id, promptInput, turn.abort.signal)
       turn.releasePrompt()
       let result = await response
@@ -2611,6 +2654,8 @@ export class ChatRuntime extends EventEmitter {
         this.saveRecord(session)
       }
       await this.refreshWorkspace(session).catch(() => undefined)
+      // A failed turn shows an Error dot even though a live adapter idles the chat.
+      record.lastStopReason = stopReason
       if (record.status !== 'closed') {
         if (!freed) this.setStatus(session, 'error', record.orphanNotice || 'the agent process could not be stopped')
         else if (session.adapter?.alive) this.setStatus(session, 'idle')

@@ -8,12 +8,18 @@ from github_interface.behaviors import mergeable
 OPEN = {"state": "open", "draft": False, "mergeable": True, "mergeable_state": "clean"}
 
 
-def readiness(checks: str | None, threads: list[tuple[bool, bool]], more: bool = False) -> dict:
-    return {
+def readiness(checks: str | None, threads: list[tuple[bool, bool]], more: bool = False, **fields) -> dict:
+    packet = {
+        "state": "OPEN",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": checks} if checks else None}}]},
         "reviewThreads": {"pageInfo": {"hasNextPage": more},
                           "nodes": [{"isResolved": resolved, "isOutdated": outdated} for resolved, outdated in threads]},
     }
+    packet.update(fields)
+    return packet
 
 
 class TestStatus(IsolatedAsyncioTestCase):
@@ -34,19 +40,61 @@ class TestStatus(IsolatedAsyncioTestCase):
                 self.assertIsNone(mergeable.status(pull, "SUCCESS", 0))
 
     async def test_counts_only_live_unresolved_conversations(self):
-        client = object()
-        with patch.object(mergeable, "get_pull", AsyncMock(return_value=OPEN)), \
-                patch.object(mergeable, "get_pr_readiness_state",
-                             AsyncMock(return_value=readiness("SUCCESS", [(True, False), (False, True), (False, False)]))):
+        client = AsyncMock()
+        with patch.object(mergeable, "get_pr_readiness_state",
+                           AsyncMock(return_value=readiness("SUCCESS", [(True, False), (False, True), (False, False)]))):
             result = await mergeable.run(client, {"repository": "acme/app", "pull_number": "7"})
         self.assertEqual((result["mergeable"], result["checks_state"], result["unresolved_conversations"], result["status"]),
                          (True, "SUCCESS", 1, "yellow"))
+        client.get.assert_not_awaited()
 
     async def test_more_conversations_than_one_read_checks_cannot_show_green(self):
-        with patch.object(mergeable, "get_pull", AsyncMock(return_value=OPEN)), \
-                patch.object(mergeable, "get_pr_readiness_state", AsyncMock(return_value=readiness("SUCCESS", [(True, False)], more=True))):
-            result = await mergeable.run(object(), {"repository": "acme/app", "pull_number": "7"})
+        client = AsyncMock()
+        with patch.object(mergeable, "get_pr_readiness_state", AsyncMock(return_value=readiness("SUCCESS", [(True, False)], more=True))):
+            result = await mergeable.run(client, {"repository": "acme/app", "pull_number": "7"})
         self.assertEqual((result["unresolved_conversations"], result["status"]), (0, "yellow"))
+        client.get.assert_not_awaited()
+
+    async def test_colours_come_from_graphql_alone_with_no_rest_reads(self):
+        client = AsyncMock()
+        with patch.object(mergeable, "get_pr_readiness_state", AsyncMock(return_value=readiness("SUCCESS", []))):
+            result = await mergeable.run(client, {"repository": "acme/app", "pull_number": "7"})
+        self.assertEqual(result, {
+            "action": "mergeable",
+            "repository": "acme/app",
+            "pull_number": 7,
+            "mergeable": True,
+            "github_mergeable": True,
+            "github_mergeable_state": "clean",
+            "state": "open",
+            "draft": False,
+            "checks_state": "SUCCESS",
+            "unresolved_conversations": 0,
+            "status": "green",
+        })
+        client.get.assert_not_awaited()
+        client.paginate.assert_not_awaited()
+        client.post.assert_not_awaited()
+
+    async def test_computing_mergeability_reports_no_colour_like_rest_did(self):
+        with patch.object(mergeable, "get_pr_readiness_state",
+                           AsyncMock(return_value=readiness("SUCCESS", [], mergeable="UNKNOWN", mergeStateStatus="UNKNOWN"))):
+            result = await mergeable.run(AsyncMock(), {"repository": "acme/app", "pull_number": "7"})
+        self.assertEqual((result["mergeable"], result["github_mergeable"],
+                          result["github_mergeable_state"], result["status"]),
+                         (False, None, "unknown", None))
+
+    async def test_merged_pull_reports_the_closed_state_rest_used(self):
+        with patch.object(mergeable, "get_pr_readiness_state",
+                           AsyncMock(return_value=readiness("SUCCESS", [], state="MERGED"))):
+            result = await mergeable.run(AsyncMock(), {"repository": "acme/app", "pull_number": "7"})
+        self.assertEqual((result["state"], result["mergeable"], result["status"]), ("closed", False, None))
+
+    async def test_unknown_mergeable_value_fails_loud(self):
+        with patch.object(mergeable, "get_pr_readiness_state",
+                           AsyncMock(return_value=readiness("SUCCESS", [], mergeable="STUCK"))):
+            with self.assertRaisesRegex(RuntimeError, "unknown mergeable value"):
+                await mergeable.run(AsyncMock(), {"repository": "acme/app", "pull_number": "7"})
 
 
 BEHIND = {"state": "open", "draft": False, "mergeable": True, "mergeable_state": "behind"}

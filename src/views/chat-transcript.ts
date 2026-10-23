@@ -515,6 +515,8 @@ export interface TranscriptHandlers {
 export interface RenderContext {
   showReasoning?: boolean
   showActivity?: boolean
+  /** The tools toggle: false hides tool cards, keeping text, errors and requests. */
+  showTools?: boolean
   agent?: string
   /** A turn the runtime marked as cut by a crash or restart. */
   interruptedTurnId?: string
@@ -1067,14 +1069,16 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
         && item.input === undefined && !item.diffs.length && !item.locations?.length
       const activity = item.kind === 'tool' || item.kind === 'readgroup' || item.kind === 'plan'
         || (item.kind === 'permission' && !!item.resolved) || (item.kind === 'question' && !!item.answered)
+      const toolCall = item.kind === 'tool' || item.kind === 'readgroup'
       node.hidden = internalReminder || (item.kind === 'thought' ? ctx.showReasoning !== true : ctx.showActivity === false && activity)
+        || (ctx.showTools === false && toolCall)
       cursor = node.nextElementSibling as HTMLElement | null
     }
     prune(items, keep)
 
-    // Dots before the first token of the running turn, which is always the
-    // last one.
-    const dots = isLast && ctx.running && !turn.finished && !turn.items.some((it) => it.kind === 'text')
+    // Dots under the running turn, which is always the last one: at the
+    // bottom of the transcript for the whole turn, including long tool runs.
+    const dots = isLast && ctx.running && !turn.finished
     let dotsEl = el.querySelector<HTMLElement>(':scope > .chat-turn-dots')
     if (dots && !dotsEl) {
       dotsEl = document.createElement('div')
@@ -1096,7 +1100,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
     // Actor labels follow the session list: a rename, delete or reload
     // re-renders them without any new transcript event.
     const chatsKey = (ctx.chats || []).map((c) => `${c.id}\n${c.role || ''}\n${c.title}`).join('\n')
-    const ctxKey = `${ctx.running ? 1 : 0}:${ctx.interruptedTurnId || ''}:${focused?.id || ''}:${ctx.showActivity !== false}:${ctx.showReasoning === true}:${ctx.agent || ''}:${renderedDay}:${chatsKey}`
+    const ctxKey = `${ctx.running ? 1 : 0}:${ctx.interruptedTurnId || ''}:${focused?.id || ''}:${ctx.showActivity !== false}:${ctx.showReasoning === true}:${ctx.showTools !== false}:${ctx.agent || ''}:${renderedDay}:${chatsKey}`
     const ctxChanged = ctxKey !== lastCtxKey
     lastCtxKey = ctxKey
     const chatsChanged = chatsKey !== lastChatsKey

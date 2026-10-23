@@ -154,7 +154,10 @@ class TestStructuredVerdict(TestCase):
     def _run(self, verdict, behavior="pr_review", event=None, code=0):
         def process(args, **kwargs):
             if args[0] == "github-interface":
-                return SimpleNamespace(returncode=0, stdout="submitted", stderr="")
+                action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
+                          "--approve-pr": "approved_pr"}[args[1]]
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": action, "review_id": 91, "head_sha": "a" * 40}), stderr="")
             Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
             return SimpleNamespace(returncode=code, stdout=json.dumps(event) if event else "", stderr="provider failed" if code else "")
         with patch.object(structured_review.subprocess, "run", side_effect=process) as run, \
@@ -169,7 +172,7 @@ class TestStructuredVerdict(TestCase):
     def test_submits_exactly_one_atomic_review_with_fixed_target(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "CODEX_API_KEY": "test-key"}):
             result, run = self._run({"action": "request_changes", "comments": [FINDING]})
-        self.assertIn("submitted", result)
+        self.assertIn('"review_id": 91', result)
         self.assertEqual(run.call_count, 2)
         model_call, mutation = run.call_args_list
         args = model_call.args[0]
@@ -259,7 +262,10 @@ class TestOtherProviderVerdicts(TestCase):
 
         def github(args, **kwargs):
             calls.append((args, kwargs))
-            return SimpleNamespace(returncode=0, stdout="submitted", stderr="")
+            action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
+                      "--approve-pr": "approved_pr"}[args[1]]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                {"action": action, "review_id": 91, "head_sha": "a" * 40}), stderr="")
 
         with patch.object(structured_review.subprocess, "run", side_effect=github), \
                 patch.object(ReviewWatch, "run", side_effect=provider):
@@ -270,7 +276,7 @@ class TestOtherProviderVerdicts(TestCase):
     def test_grok_runs_one_tool_free_turn_from_a_prompt_file_and_submits(self):
         reply = {**GROK_REPLY, "structuredOutput": {"action": "request_changes", "comments": [FINDING]}}
         result, calls = self._run("grok-4.6-xhigh", json.dumps(reply))
-        self.assertIn("submitted", result)
+        self.assertIn('"review_id": 91', result)
         (args, kwargs), (mutation, _) = calls
         self.assertEqual(Path(args[0]).name, "grok")
         self.assertEqual(args[args.index("-m") + 1], "grok-4.6")
@@ -301,7 +307,8 @@ class TestOtherProviderVerdicts(TestCase):
             reply = {**GROK_REPLY, "structuredOutput": {"action": "reviewed_clean", "comments": []}}
             return SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr="")
 
-        with patch.object(structured_review.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="ok", stderr="")), \
+        receipt = json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40})
+        with patch.object(structured_review.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")), \
                 patch.object(ReviewWatch, "run", side_effect=provider):
             structured_review.run("/repo", "system", "packet", CATALOG.resolve("grok-4.6-high"), "pr_review",
                                   "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
@@ -323,12 +330,14 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(failure.exception.code, "review_budget_exhausted")
         with self.assertRaises(atoms.AgentPreflightError) as failure:
             self._run("grok-4.6-high", "", code=1)
-        self.assertIsNone(failure.exception.code)
+        self.assertEqual(failure.exception.code, "review_provider_exit")
+        self.assertEqual(failure.exception.diagnostic["provider"], "grok")
+        self.assertEqual(failure.exception.diagnostic["submission"], "none")
 
     def test_antigravity_streams_the_packet_in_plan_mode_and_submits(self):
         result_event = {**AGY_RESULT, "structured_output": {"action": "approve", "comments": []}}
         result, calls = self._run("gemini-3.8-flash-high", agy_stream(result_event), behavior="pr_approve")
-        self.assertIn("submitted", result)
+        self.assertIn('"review_id": 91', result)
         (args, kwargs), (mutation, _) = calls
         self.assertEqual(Path(args[0]).name, "agy")
         self.assertIn("--print=", args)
@@ -356,7 +365,7 @@ class TestOtherProviderVerdicts(TestCase):
 
     def test_muse_answers_from_a_prompt_file_with_tools_off_and_submits(self):
         result, calls = self._run("muse-spark-1.3-contributor-max", muse_stream('```json\n{"action": "reviewed_clean", "comments": []}\n```'))
-        self.assertIn("submitted", result)
+        self.assertIn('"review_id": 91', result)
         (args, kwargs), (mutation, _) = calls
         self.assertEqual(Path(args[0]).name, "muse")
         self.assertEqual(args[1], "exec")
@@ -402,8 +411,36 @@ class TestOtherProviderVerdicts(TestCase):
             with self.subTest(message=message), self.assertRaises(atoms.AgentPreflightError) as failure:
                 structured_review.provider_failure(message)
             self.assertEqual(failure.exception.code, "review_provider_blocked")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
             structured_review.provider_failure("temporary provider outage")
+        self.assertEqual(failure.exception.code, "review_provider_exit")
+        self.assertEqual(failure.exception.diagnostic["submission"], "none")
+
+    def test_blocked_provider_causes_are_redacted_and_bounded(self):
+        message = ("API error: Grok Build usage balance exhausted; "
+                   "proxy-authorization: Basic dGVzdA== token=secret-value ghp_abc123")
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            structured_review.provider_failure(message, provider="grok")
+        self.assertEqual(failure.exception.code, "review_provider_blocked")
+        self.assertIn("Grok Build usage balance exhausted", str(failure.exception))
+        for field in (str(failure.exception), failure.exception.diagnostic["stderr"]):
+            self.assertNotIn("dGVzdA==", field)
+            self.assertNotIn("secret-value", field)
+            self.assertNotIn("ghp_abc123", field)
+            self.assertLessEqual(len(field), 501)
+
+    def test_provider_cause_redacts_url_credentials_regardless_of_scheme_case(self):
+        for scheme in ("http", "HTTP", "https", "HTTPS", "hTtPs"):
+            with self.subTest(scheme=scheme):
+                message = ("API error: Grok Build usage balance exhausted via "
+                           f"{scheme}://test-user:private-password@proxy.example/failure")
+                with self.assertRaises(atoms.AgentPreflightError) as failure:
+                    structured_review.provider_failure(message, provider="grok")
+                self.assertEqual(failure.exception.code, "review_provider_blocked")
+                for field in (str(failure.exception), failure.exception.diagnostic["stderr"]):
+                    self.assertIn(f"{scheme}://[redacted]@proxy.example/failure", field)
+                    self.assertNotIn("test-user", field)
+                    self.assertNotIn("private-password", field)
 
     def test_muse_isolates_its_tool_roster_and_keeps_sign_in(self):
         with tempfile.TemporaryDirectory() as work:
@@ -436,3 +473,137 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(structured_review.unfenced('  {"a": 1} '), '{"a": 1}')
         self.assertEqual(structured_review.unfenced('```\n{"a": 1}\n```'), '{"a": 1}')
         self.assertEqual(structured_review.unfenced('Sure:\n```json\n{"a": 1}\n```'), 'Sure:\n```json\n{"a": 1}\n```')
+
+
+class TestVerifiedResultsOrExplicitFailures(TestCase):
+    """#236: every attempt ends with a validated receipt or a typed failure."""
+
+    def _codex_run(self, *, returncode=0, stderr="", stdout_events=(), verdict=None):
+        def process(args, **kwargs):
+            if args[0] == "github-interface":
+                action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
+                          "--approve-pr": "approved_pr"}[args[1]]
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": action, "review_id": 91, "head_sha": "a" * 40}), stderr="")
+            Path(args[args.index("--output-last-message") + 1]).write_text(
+                json.dumps(verdict or {"action": "reviewed_clean", "comments": []}))
+            return SimpleNamespace(returncode=returncode, stdout="\n".join(
+                json.dumps(event) for event in stdout_events), stderr=stderr)
+        with patch.object(structured_review.subprocess, "run", side_effect=process) as run, \
+                patch.object(ReviewWatch, "run", side_effect=run):
+            return structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                         "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60), run
+
+    def test_codex_exit_101_is_typed_bounded_and_submits_nothing(self):
+        stream = [{"type": "thread.started", "thread_id": "01234567-89ab-4cde-8123-456789abcdef"}] * 5
+        with patch.object(structured_review.subprocess, "run") as submit, \
+                patch.object(ReviewWatch, "run", return_value=SimpleNamespace(
+                    returncode=101, stdout="\n".join(json.dumps(e) for e in stream), stderr="")):
+            with self.assertRaises(atoms.AgentPreflightError) as failure:
+                structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+        self.assertEqual(failure.exception.code, "review_provider_exit")
+        self.assertEqual(failure.exception.diagnostic["provider"], "codex")
+        self.assertEqual(failure.exception.diagnostic["exit_code"], 101)
+        self.assertEqual(failure.exception.diagnostic["submission"], "none")
+        self.assertLessEqual(len(str(failure.exception)), 600)
+        self.assertNotIn("thread.started", str(failure.exception))
+        submit.assert_not_called()
+
+    def test_codex_signal_is_typed_with_signal_and_no_submission(self):
+        with patch.object(structured_review.subprocess, "run") as submit, \
+                patch.object(ReviewWatch, "run", return_value=SimpleNamespace(
+                    returncode=-9, stdout="", stderr="")):
+            with self.assertRaises(atoms.AgentPreflightError) as failure:
+                structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+        self.assertEqual(failure.exception.code, "review_provider_exit")
+        self.assertEqual(failure.exception.diagnostic["signal"], 9)
+        self.assertIsNone(failure.exception.diagnostic["exit_code"])
+        submit.assert_not_called()
+
+    def test_muse_server_error_is_typed_whether_exit_or_terminal(self):
+        from agent_interface import review_receipt as receipt_mod
+        # Exit with server_error on stderr.
+        with patch.object(structured_review.subprocess, "run") as submit, \
+                patch.object(ReviewWatch, "run", return_value=SimpleNamespace(
+                    returncode=1, stdout="", stderr="server_error")):
+            with self.assertRaises(atoms.AgentPreflightError) as failure:
+                structured_review.run("/repo", "system", "packet",
+                                      CATALOG.resolve("muse-spark-1.3-contributor-max"), "pr_review",
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+        self.assertEqual(failure.exception.code, "review_provider_exit")
+        submit.assert_not_called()
+        # Exit zero with a failed terminal.
+        stdout = muse_stream('{"action": "reviewed_clean", "comments": []}', terminal="failed")
+        with patch.object(structured_review.subprocess, "run") as submit, \
+                patch.object(ReviewWatch, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout=stdout, stderr="")):
+            with self.assertRaises(atoms.AgentPreflightError) as failure:
+                structured_review.run("/repo", "system", "packet",
+                                      CATALOG.resolve("muse-spark-1.3-contributor-max"), "pr_review",
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+        self.assertEqual(failure.exception.code, "review_provider_error")
+        self.assertEqual(failure.exception.diagnostic["provider"], "muse")
+        submit.assert_not_called()
+
+    def test_duplicate_verdict_keys_and_terminals_never_submit(self):
+        with self.assertRaises(structured_review.InvalidVerdict):
+            structured_review.validate_verdict(
+                '{"action": "request_changes", "action": "reviewed_clean", "comments": []}', "pr_review")
+        dup_turns = [{"type": "turn.completed"}, {"type": "turn.completed"}]
+        with self.assertRaises(atoms.AgentPreflightError):
+            self._codex_run(stdout_events=dup_turns)
+        first = {"payload_type": "run.terminal.completed",
+                 "payload": {"terminal": "completed", "text": '{"action": "reviewed_clean", "comments": []}'}}
+        second = {"payload_type": "run.terminal.completed",
+                  "payload": {"terminal": "completed", "text": '{"action": "request_changes", "comments": []}'}}
+        stdout = "\n".join(json.dumps(event) for event in [first, second])
+        with patch.object(ReviewWatch, "run", return_value=SimpleNamespace(returncode=0, stdout=stdout, stderr="")), \
+                patch.object(structured_review.subprocess, "run") as submit:
+            with self.assertRaises(atoms.AgentPreflightError):
+                structured_review.run("/repo", "system", "packet",
+                                      CATALOG.resolve("muse-spark-1.3-contributor-max"), "pr_review",
+                                      "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+            submit.assert_not_called()
+
+    def test_submission_rejection_noop_and_uncertainty_are_typed(self):
+        from agent_interface import review_receipt as receipt_mod
+        verdict = {"action": "request_changes", "comments": [FINDING]}
+
+        def run_with_github(reply):
+            def process(args, **kwargs):
+                if args[0] == "github-interface":
+                    return reply
+                Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                    patch.object(ReviewWatch, "run", side_effect=process):
+                return structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            run_with_github(SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 422: line not in diff"))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("line not in diff", str(failure.exception))
+        self.assertEqual(failure.exception.diagnostic["submission"], "rejected")
+
+        noop = json.dumps({"action": "no_review", "skipped": [{"reason": "duplicate"}]})
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            run_with_github(SimpleNamespace(returncode=0, stdout=noop, stderr=""))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertEqual(failure.exception.diagnostic["submission"], "noop")
+
+        with self.assertRaises(receipt_mod.SubmissionError):
+            run_with_github(SimpleNamespace(returncode=0, stdout="not json", stderr=""))
+
+        def provider(args, **kwargs):
+            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(
+                {"action": "reviewed_clean", "comments": []}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch.object(structured_review.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired("github-interface", 1)), \
+                patch.object(ReviewWatch, "run", side_effect=provider):
+            with self.assertRaises(receipt_mod.SubmissionError):
+                structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)

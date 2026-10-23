@@ -699,3 +699,246 @@ class TestProcessesAndErrors(TestCase):
                 time.sleep(0.1)
             os.kill(pid, 9)
             self.fail("git work started by github-interface outlived its timeout")
+
+
+class TestVerifiedResultsOrExplicitFailures(IssueReviewCase):
+    """#236: issue attempts end with validated comments or typed failures."""
+
+    def test_timeout_records_artifact_status_and_never_posts_late_work(self):
+        review = {"comments": [{"issue": f"{REPO}#452", "body": "late but valid"}]}
+
+        def hanging(args, *, input, cwd, timeout, env, provider, cleanup_root=None):
+            (Path(cwd).parent / "review.json").write_text(json.dumps(review))
+            raise subprocess.TimeoutExpired(args, timeout)
+
+        row, _ = self.run_review(FakeGitHub(), hanging, expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["status"], "failed")
+        self.assertEqual(exported["error_code"], "review_budget_exhausted")
+        self.assertIn("time limit", exported["error"])
+        diagnostic = exported["diagnostic"]
+        self.assertEqual(diagnostic["provider"], "claude")
+        self.assertEqual(diagnostic["phase"], "provider_execution")
+        self.assertEqual(diagnostic["submission"], "none")
+        self.assertTrue(diagnostic["artifact"]["present"])
+        self.assertTrue(diagnostic["artifact"]["readable"])
+        self.assertIsNone(exported["receipts"])
+        self.assertNotIn("--comment-issue", [call[0] for call in FakeGitHub().calls] if False else [])
+
+    def test_failed_provider_terminal_with_exit_zero_is_rejected(self):
+        review = {"comments": [{"issue": f"{REPO}#452", "body": "looks fine"}]}
+        cases = (
+            (json.dumps({"type": "turn.failed", "message": "boom"}) + "\n", "gpt-6-astra-max", "claim-1"),
+            (json.dumps({"payload_type": "run.terminal.failed",
+                         "payload": {"terminal": "failed", "reason": "server_error"}}) + "\n",
+             "muse-spark-1.3-contributor-max", "claim-2"),
+        )
+        for provider_stdout, model, claim in cases:
+            with self.subTest(model=model):
+                github = FakeGitHub()
+                supervise = agent_writes(review, code=0, stdout=provider_stdout)
+                with patch.object(issue_review, "interface", github), \
+                        patch.object(issue_review, "supervise", supervise), \
+                        redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", claim,
+                                                         model, None, note="")
+                with agent_interface.db() as conn:
+                    row = conn.execute("select * from calls where correlation_id=?", (claim,)).fetchone()
+                exported = self.exported(row)
+                self.assertEqual(exported["status"], "failed")
+                self.assertIn("boom" if "boom" in provider_stdout else "server_error", exported["error"])
+                self.assertIsNone(exported["receipts"])
+                self.assertNotIn("--comment-issue", [call[0] for call in github.calls])
+
+    def test_failed_provider_run_is_typed_with_provider_phase_and_artifact(self):
+        review = {"comments": [{"issue": f"{REPO}#452", "body": "looks fine"}]}
+        cases = (
+            (1, "", "review_provider_exit", "claim-1", "provider failed"),
+            (0, json.dumps({"type": "turn.failed", "message": "boom"}) + "\n", "review_provider_error",
+             "claim-2", "boom"),
+        )
+        for code, stdout, expected_code, claim, expected_error in cases:
+            with self.subTest(expected_code=expected_code):
+                github = FakeGitHub()
+                supervise = agent_writes(review, code=code, stdout=stdout)
+                with patch.object(issue_review, "interface", github), \
+                        patch.object(issue_review, "supervise", supervise), \
+                        redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", claim,
+                                                         "gpt-6-astra-max", None, note="")
+                with agent_interface.db() as conn:
+                    row = conn.execute("select * from calls where correlation_id=?", (claim,)).fetchone()
+                exported = self.exported(row)
+                self.assertEqual(exported["status"], "failed")
+                self.assertEqual(exported["error_code"], expected_code)
+                self.assertIn(expected_error, exported["error"])
+                diagnostic = exported["diagnostic"]
+                self.assertEqual(diagnostic["provider"], "codex")
+                self.assertEqual(diagnostic["phase"], "provider_execution")
+                self.assertEqual(diagnostic["submission"], "none")
+                self.assertTrue(diagnostic["artifact"]["present"])
+                self.assertIsNone(exported["receipts"])
+                self.assertNotIn("--comment-issue", [call[0] for call in github.calls])
+
+    def test_posting_timeout_reconciles_through_the_call_marker(self):
+        review = {"comments": [{"issue": f"{REPO}#452", "body": "hello"}]}
+        github = FakeGitHub()
+        calls = []
+
+        def flaky(*args: str, seconds: float = 120):
+            calls.append(args)
+            if args[0] == "--comment-issue":
+                raise subprocess.TimeoutExpired(list(args), seconds)
+            if args[0] == "--issue-comments":
+                call_id = github.last_call_id
+                return {"comments": [{"id": 777, "author": ACTOR,
+                                      "body": f"hello\n\n<!-- agent-interface issue-review call={call_id} -->",
+                                      "html_url": "https://example.test/c/777"}]}
+            return github(*args, seconds=seconds)
+
+        # Capture the call id the run uses so the reconciler can match it.
+        original_track = agent_interface.track
+
+        def tracking(*args, **kwargs):
+            call_id = original_track(*args, **kwargs)
+            github.last_call_id = call_id
+            return call_id
+
+        with patch.object(agent_interface, "track", side_effect=tracking):
+            row, printed = self.run_review(flaky, agent_writes(review))
+        exported = self.exported(row)
+        self.assertEqual(exported["status"], "completed")
+        self.assertEqual(exported["receipts"], [{"issue": f"{REPO}#452", "comment_id": 777,
+                                                 "url": "https://example.test/c/777", "author": ACTOR}])
+
+    def test_unreconciled_posting_timeout_stays_uncertain_with_receipts_held(self):
+        review = {"comments": [{"issue": f"{REPO}#452", "body": "hello"}]}
+
+        def flaky(*args: str, seconds: float = 120):
+            if args[0] == "--comment-issue":
+                raise subprocess.TimeoutExpired(list(args), seconds)
+            if args[0] == "--issue-comments":
+                return {"comments": []}
+            return FakeGitHub()(*args, seconds=seconds)
+
+        row, _ = self.run_review(flaky, agent_writes(review), expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["status"], "failed")
+        self.assertEqual(exported["error_code"], "posting_failed")
+        self.assertIn("uncertain publication", exported["error"])
+        self.assertEqual(exported["receipts"], [])
+
+    def test_non_regular_and_oversized_artifacts_are_rejected_before_posting(self):
+        github = FakeGitHub()
+
+        def symlink_agent(args, *, input, cwd, timeout, env, provider, cleanup_root=None):
+            target = Path(cwd).parent / "review.json"
+            if target.exists():
+                target.unlink()
+            target.symlink_to(Path(cwd) / "repo")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        row, _ = self.run_review(github, symlink_agent, expect_exit=True)
+        self.assertEqual(self.exported(row)["error_code"], "invalid_review_output")
+
+        def oversized(args, *, input, cwd, timeout, env, provider, cleanup_root=None):
+            (Path(cwd).parent / "review.json").write_text("x" * (issue_review.MAX_ARTIFACT_BYTES + 1))
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch.object(issue_review, "interface", FakeGitHub()), \
+                patch.object(issue_review, "supervise", oversized), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                agent_interface.run_issue_review(f"{REPO}#453", "bit-mis", "poise:review-new-issues", "claim-2",
+                                                 "opus-5-max", None, note="")
+        with agent_interface.db() as conn:
+            row = conn.execute("select * from calls where correlation_id='claim-2'").fetchone()
+        self.assertEqual(self.exported(row)["error_code"], "invalid_review_output")
+
+    def test_prompt_names_the_deadline_and_artifact_status_is_recorded(self):
+        text = issue_review.prompt(f"{REPO}#452", REPO, {"branch": "main", "head_sha": "a" * 40},
+                                   {"issue": {"issue": f"{REPO}#452"}, "sub_issues": []},
+                                   Path("/tmp/run/review.json"), ACTOR, "", 3480)
+        self.assertIn("3480 seconds", text)
+        self.assertIn("review.json early", text)
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "review.json"
+            self.assertEqual(issue_review.artifact_status(missing), {"present": False})
+            missing.write_text("not json")
+            status = issue_review.artifact_status(missing)
+            self.assertTrue(status["present"])
+            self.assertFalse(status["readable"])
+
+    def test_timed_out_later_part_never_reconciles_to_an_earlier_part(self):
+        paragraph = "p" * 40_000
+        review = {"comments": [{"issue": f"{REPO}#452", "body": f"{paragraph}\n\n{paragraph}"}]}
+        github = FakeGitHub()
+        comments = {"calls": 0}
+
+        def flaky(*args: str, seconds: float = 120):
+            if args[0] == "--comment-issue":
+                comments["calls"] += 1
+                if comments["calls"] > 1:
+                    raise subprocess.TimeoutExpired(list(args), seconds)
+                return github(*args, seconds=seconds)
+            if args[0] == "--issue-comments":
+                call_id = github.last_call_id
+                marker = f"<!-- agent-interface issue-review call={call_id} -->"
+                return {"comments": [
+                    {"id": 9000 + 452, "author": ACTOR, "body": f"Part 1\n\n{marker}",
+                     "html_url": "https://example.test/c/part1"},
+                    {"id": 777, "author": ACTOR, "body": f"Part 2\n\n{marker}",
+                     "html_url": "https://example.test/c/part2"},
+                ]}
+            return github(*args, seconds=seconds)
+
+        original_track = agent_interface.track
+
+        def tracking(*args, **kwargs):
+            call_id = original_track(*args, **kwargs)
+            github.last_call_id = call_id
+            return call_id
+
+        with patch.object(agent_interface, "track", side_effect=tracking):
+            row, _ = self.run_review(flaky, agent_writes(review))
+        exported = self.exported(row)
+        self.assertEqual(exported["status"], "completed")
+        self.assertEqual([receipt["comment_id"] for receipt in exported["receipts"]], [9000 + 452, 777])
+
+    def test_timed_out_part_missing_from_the_issue_stays_uncertain(self):
+        paragraph = "p" * 40_000
+        review = {"comments": [{"issue": f"{REPO}#452", "body": f"{paragraph}\n\n{paragraph}"}]}
+        github = FakeGitHub()
+        comments = {"calls": 0}
+
+        def flaky(*args: str, seconds: float = 120):
+            if args[0] == "--comment-issue":
+                comments["calls"] += 1
+                if comments["calls"] > 1:
+                    raise subprocess.TimeoutExpired(list(args), seconds)
+                return github(*args, seconds=seconds)
+            if args[0] == "--issue-comments":
+                call_id = github.last_call_id
+                return {"comments": [
+                    {"id": 9000 + 452, "author": ACTOR,
+                     "body": f"Part 1\n\n<!-- agent-interface issue-review call={call_id} -->",
+                     "html_url": "https://example.test/c/part1"},
+                ]}
+            return github(*args, seconds=seconds)
+
+        original_track = agent_interface.track
+
+        def tracking(*args, **kwargs):
+            call_id = original_track(*args, **kwargs)
+            github.last_call_id = call_id
+            return call_id
+
+        with patch.object(agent_interface, "track", side_effect=tracking):
+            row, _ = self.run_review(flaky, agent_writes(review), expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["status"], "failed")
+        self.assertEqual(exported["error_code"], "posting_failed")
+        self.assertIn("uncertain publication", exported["error"])
+        self.assertEqual([receipt["comment_id"] for receipt in exported["receipts"]], [9000 + 452])

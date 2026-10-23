@@ -124,7 +124,10 @@ Issue review · `opus-5.5-max`
 Reviewers work independently, so the same finding can appear twice, as with
 the PR review panel. When a reviewer finishes, anything still running in its
 checkout — a dev server, a watcher, a process that detached — is stopped
-before the checkout is deleted.
+before the checkout is deleted. The instruction names the provider deadline
+and asks for the review file early; a timeout records what the file held and
+never posts late work, and a posting timeout is reconciled through the
+call marker before it counts as a failure.
 
 Poise launches each reviewer with your agent account as `--actor` and in
 `GITHUB_INTERFACE_AGENT_USER`, and nothing launches while it is not set. Caller

@@ -121,6 +121,12 @@ Codex input overflow is staged within the existing total review budget, with
 every fragment acknowledged in one native conversation before a single final
 verdict can be submitted. Ordinary messages are unchanged. The bounds and
 failure rules are in [Caller PR review models](../caller/agent_interface/README.md#pr-review-models).
+A structured provider exit or error terminal keeps `not_started` /
+`preflight_failed` with a typed `review_provider_exit` / `review_provider_error`
+cause and no receipt; Poise retries it only after live GitHub evidence proves
+no reviewer action. Submission rejections, `no_review` no-ops, malformed or
+duplicate verdicts and duplicate GitHub reviews are contract violations and
+held. Uncertain submissions are reconciled from live receipts before any retry.
 After account recovery, a successful explicit replay on the same head, model,
 and reviewer reconciles the held no-action attempt. Its GitHub review receipt
 must be present in live evidence before it becomes durable approval evidence.

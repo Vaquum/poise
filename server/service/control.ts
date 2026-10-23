@@ -8,7 +8,7 @@ import { diagnosticPage } from '../logging'
 // lapses unless the gateway renews it, so a gateway that died mid-drain can
 // never leave the workspace refusing work for good.
 
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -32,10 +32,16 @@ export interface ServiceHealth {
   /** True only when nothing a restart would cut is running. */
   idle: boolean
   draining: boolean
-  /** The installed release the supervisor started this server on (POISE_RELEASE); null without one. */
+  /** The installed release the supervisor started this server on (POISE_RELEASE): the active SHA. Null without one. */
   release: string | null
   /** The release a pending switch restarts this server onto; null when none is pending. */
   switching: string | null
+  /** The release this workspace is asked to run: the pending switch's target, else the active release. */
+  desiredRelease: string | null
+  /** The desired release when an install of it for this base exists (the running release needs none); null when it is not installed. */
+  installedRelease: string | null
+  /** When the pending switch was first asked for, as ISO; null when none is pending. */
+  pendingSince: string | null
 }
 
 /** What POST /api/service/switch answers. */
@@ -110,6 +116,8 @@ export class ServiceControl {
   private switchTo: string | null = null
   private switchPoll: unknown = null
   private switchPendingSince: number | null = null
+  private switchEpoch = 0
+  private switchCancellation: Promise<void> | null = null
   private restarting = false
   private readonly timer: DrainTimer
   private readonly log: (line: string) => void
@@ -139,6 +147,10 @@ export class ServiceControl {
     const activeChatTurns = listOpenTurns(this.runtime.instance).length
     const calls = runningCallerCalls()
     const backgroundWork = this.runtime.busy() + releaseBackgroundBusy() + this.launches
+    const pending = this.pendingSwitchRecord()
+    const release = this.release.name
+    const switching = pending?.release ?? null
+    const desiredRelease = switching ?? release
     return {
       ok: true,
       mode: 'service',
@@ -149,25 +161,54 @@ export class ServiceControl {
       // Never idle while Caller's records cannot be read: calls an earlier server started may still run.
       idle: calls.known && activeChatTurns + calls.count + backgroundWork === 0,
       draining: this.drainOn,
-      release: this.release.name,
-      switching: this.pendingSwitch(),
+      release,
+      switching,
+      desiredRelease,
+      installedRelease: desiredRelease !== null && this.releaseInstalled(desiredRelease) ? desiredRelease : null,
+      pendingSince: pending?.since ?? null,
     }
   }
 
   /** The pending switch as the supervisor will see it: the release queued in
-   *  `releases/next`, the record switchRelease writes. Health reads the
-   *  record rather than the in-memory poll, so what it reports is what a
-   *  restart switches onto — including after one, when the supervisor has
-   *  consumed the record and nothing is pending. A record naming no release
-   *  is none either: the supervisor falls back to the current release. */
-  private pendingSwitch(): string | null {
-    let next: string
+   *  `releases/next`, the record switchRelease writes, and when it was first
+   *  asked for (the record's mtime). Health reads the record rather than the
+   *  in-memory poll, so what it reports is what a restart switches onto —
+   *  including after one, when the supervisor has consumed the record and
+   *  nothing is pending. A record naming no release is none either: the
+   *  supervisor falls back to the current release. */
+  private pendingSwitchRecord(): { release: string, since: string } | null {
+    const path = join(this.releasesDir, 'next')
+    let release: string
+    let since: Date
     try {
-      next = readFileSync(join(this.releasesDir, 'next'), 'utf8').trim()
+      release = readFileSync(path, 'utf8').trim()
+      since = statSync(path).mtime
     } catch {
       return null
     }
-    return RELEASE_NAME.test(next) ? next : null
+    return RELEASE_NAME.test(release) ? { release, since: since.toISOString() } : null
+  }
+
+  /** Whether RELEASE could be switched to now: the running release needs no
+   *  install, its image's own included; any other needs its directory with an
+   *  installed marker for this base and no failed marker. */
+  private releaseInstalled(release: string): boolean {
+    return release === this.release.name || this.releaseInstallProblem(release) === null
+  }
+
+  /** Why RELEASE cannot be switched to, or null when it can. */
+  private releaseInstallProblem(release: string): string | null {
+    const dir = join(this.releasesDir, release)
+    let base: string
+    try {
+      if (!existsSync(join(dir, 'installed'))) throw new Error('not installed')
+      base = readFileSync(join(dir, 'base'), 'utf8').trim()
+    } catch {
+      return `release ${release} is not installed`
+    }
+    if (base !== this.release.base) return `release ${release} was built for another base; recreate the container to update it`
+    if (existsSync(join(dir, 'failed'))) return `release ${release} failed to start in this workspace; it stays on release ${this.release.name}`
+    return null
   }
 
   /**
@@ -192,28 +233,32 @@ export class ServiceControl {
       this.withdrawSwitch()
       return { release, switching: false }
     }
-    const dir = join(this.releasesDir, release)
-    let base: string
-    try {
-      if (!existsSync(join(dir, 'installed'))) throw new Error('not installed')
-      base = readFileSync(join(dir, 'base'), 'utf8').trim()
-    } catch {
-      throw new HttpError(409, `release ${release} is not installed`)
-    }
-    if (base !== this.release.base) throw new HttpError(409, `release ${release} was built for another base; recreate the container to update it`)
-    // The supervisor marks a release that failed to start, and never runs it again.
-    if (existsSync(join(dir, 'failed'))) throw new HttpError(409, `release ${release} failed to start in this workspace; it stays on release ${this.release.name}`)
+    const problem = this.releaseInstallProblem(release)
+    if (problem) throw new HttpError(409, problem)
     const next = join(this.releasesDir, 'next')
-    writeFileSync(`${next}.tmp`, `${release}\n`)
-    renameSync(`${next}.tmp`, next)
+    // Re-asking the queued release — the gateway asks on every pass until the
+    // switch lands — must not move the pending age: it counts from when the
+    // switch was first asked for.
+    let queued: string | null = null
+    try {
+      queued = readFileSync(next, 'utf8').trim()
+    } catch {
+      // Nothing queued yet.
+    }
+    if (queued !== release) {
+      writeFileSync(`${next}.tmp`, `${release}\n`)
+      renameSync(`${next}.tmp`, next)
+    }
     const first = this.switchTo === null
+    const retargeted = this.switchTo !== release
+    if (first || retargeted) this.switchEpoch += 1
     this.switchTo = release
     this.runtime.setSwitchPending(release)
     if (first) {
       this.switchPendingSince = this.now()
       this.log(`[service] switching to release ${release} once no Chat turn and no work of this server runs; new turns wait behind the update`)
-      this.pollSwitch()
     }
+    if ((first || retargeted) && this.switchPoll === null && !this.restarting) this.pollSwitch()
     return { release, switching: true }
   }
 
@@ -229,7 +274,10 @@ export class ServiceControl {
     this.log(`[service] the switch to release ${this.switchTo} was withdrawn; staying on release ${this.release.name}`)
     this.switchTo = null
     this.switchPendingSince = null
-    void this.runtime.releaseSwitchWait()
+    this.switchEpoch += 1
+    // An in-flight cancellation must record its continuation before any
+    // waited message is admitted, even when the switch is withdrawn.
+    if (!this.switchCancellation) void this.runtime.releaseSwitchWait()
   }
 
   private switchBoundMs(): number {
@@ -242,9 +290,8 @@ export class ServiceControl {
     this.switchPoll = this.timer.setTimeout(() => {
       this.switchPoll = null
       if (this.switchTo === null) return
-      const quiet = listOpenTurns(this.runtime.instance).length === 0 && this.runtime.working() === 0
-        && releaseBackgroundBusy() === 0 && this.launches === 0
-      if (quiet) return this.restartForSwitch()
+      if (this.switchCancellation) return this.pollSwitch()
+      if (this.switchIsQuiet()) return this.restartForSwitch()
       if (this.switchPendingSince !== null && this.now() - this.switchPendingSince >= this.switchBoundMs()) {
         return this.expireSwitchBound()
       }
@@ -252,7 +299,19 @@ export class ServiceControl {
     }, SWITCH_POLL_MS)
   }
 
+  private switchIsQuiet(): boolean {
+    return listOpenTurns(this.runtime.instance).length === 0 && this.runtime.working() === 0
+      && releaseBackgroundBusy() === 0 && this.launches === 0
+  }
+
   private restartForSwitch(): void {
+    if (this.switchTo === null) return
+    // Cancellation settles Chat turns, not every operation or launch the
+    // server owns. Close admission only after the complete quiet gate holds.
+    if (!this.switchIsQuiet()) {
+      if (this.switchPoll === null) this.pollSwitch()
+      return
+    }
     // Refused from here on; the gateway shows the person that Poise is updating.
     pauseReleaseBackground()
     this.runtime.startDrain('service')
@@ -265,7 +324,7 @@ export class ServiceControl {
       this.lift()
       this.switchTo = null
       this.switchPendingSince = null
-      void this.runtime.releaseSwitchWait()
+      if (!this.switchCancellation) void this.runtime.releaseSwitchWait()
     }
   }
 
@@ -275,21 +334,33 @@ export class ServiceControl {
    *  were not interrupted — only turns still open or cancelled are resumed. */
   private expireSwitchBound(): void {
     const release = this.switchTo
+    const epoch = this.switchEpoch
     if (release === null || this.switchPendingSince === null) return
     const waitedMinutes = Math.round((this.now() - this.switchPendingSince) / 60_000)
     this.log(`[service] release ${release} waited ${waitedMinutes} minutes for its turns; cancelling them and restarting`)
     const targets = this.runtime.runningTurnSessions()
-    void (async () => {
+    const cancellation = (async () => {
       await Promise.all(targets.map(({ sessionId }) => this.runtime.cancel(sessionId).catch((error: unknown) =>
         this.log(`[service] cancelling ${sessionId.slice(0, 8)} for the switch failed: ${error instanceof Error ? error.message : String(error)}`))))
-      if (this.switchTo === null) return
       this.runtime.recordSwitchInterrupted(targets.filter(({ sessionId, turnId }) => {
-        if (getOpenTurn(sessionId)) return true
+        if (getOpenTurn(sessionId)?.turnId === turnId) return true
         const terminal = findEvent(sessionId, (event) => event.type === 'turn.finished' && event.turnId === turnId)
         return terminal?.event.type === 'turn.finished' && terminal.event.stopReason === 'cancelled'
       }))
+      // Cancellation may outlive a withdrawal and a fresh request for the
+      // same release. That newer switch owns its own turn set and deadline.
+      if (this.switchEpoch !== epoch) {
+        this.log(`[service] the switch to ${release} was superseded while cancellation settled`)
+        return
+      }
       this.restartForSwitch()
-    })().catch((error: unknown) => this.log(`[service] the switch to ${release} failed: ${error instanceof Error ? error.message : String(error)}`))
+    })().catch((error: unknown) => this.log(`[service] the switch to ${release} failed: ${error instanceof Error ? error.message : String(error)}`)).finally(() => {
+      if (this.switchCancellation !== cancellation) return
+      this.switchCancellation = null
+      if (this.switchTo === null && !this.restarting) void this.runtime.releaseSwitchWait()
+      else if (!this.restarting && this.switchPoll === null) this.pollSwitch()
+    })
+    this.switchCancellation = cancellation
   }
 
   /** Every call starts the lapse again: the gateway renews a drain by
@@ -334,6 +405,8 @@ export class ServiceControl {
     if (this.drainOn || this.switchTo !== null) this.lift()
     this.switchTo = null
     this.switchPendingSince = null
+    this.switchEpoch += 1
+    this.switchCancellation = null
     this.restarting = false
     this.runtime.setSwitchPending(null)
   }

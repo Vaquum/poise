@@ -332,8 +332,12 @@ reconciles them as after any restart.
   the switch became pending); past it they are cancelled through the normal
   cancel path, their sessions recorded, and the server restarted. After the
   restart each interrupted session gets exactly one automatic continue
-  prompt on its resumed native session, then the waiting turns start in
-  order. The gateway asks again on later passes until health reports the
+  prompt on its resumed native session; a request still waiting for a
+  checkout or startup is replayed with its original input and attribution.
+  Waiting turns follow these recoveries in order. Withdrawal waits for any
+  bound cancellation to record recovery before releasing messages. A bound
+  cancellation never bypasses the quiet gate for server work, background
+  work or admitted launches. The gateway asks again on later passes until health reports the
   release, which the request makes idempotent.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace
@@ -428,20 +432,35 @@ otherwise offer it):
 **Service endpoints** (loopback, or the `admin` scope; the owner's `browser`
 assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
-  runningCallerCalls, backgroundWork, idle, draining, release, switching }`. `idle` is true only
+  runningCallerCalls, backgroundWork, idle, draining, release, switching,
+  desiredRelease, installedRelease, pendingSince }`. `idle` is true only
   when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
   It backs the container health check and the gateway's readiness check.
   - `version` is the commit the running bundle was built from, `null` for a
     development build.
   - `release` is the installed release the supervisor started this server on
-    ([Updates in place](#updates-in-place)), `null` without one.
+    ([Updates in place](#updates-in-place)), `null` without one: the active
+    SHA. A deploy is done only once it equals the deployed commit.
   - `switching` is the release a pending switch restarts this server onto,
     `null` when none is pending. Health reads it from the `next` record in
     `~/.poise/releases`, the same record the supervisor switches on, so it
     stays truthful when this server restarts: once the switch has fired, the
     record is consumed and nothing is pending. Asking to switch to the
     release it runs calls a pending switch off; the gateway does so when the
-    target changes back.
+    target changes back. If the turn bound already cancelled work and the
+    restart is refused or withdrawn, that work gets one continuation on the
+    current server before waiting messages. A switch requested again while
+    an earlier cancellation settles keeps its own deadline and turn set.
+  - `desiredRelease` is the release the workspace is asked to run: the
+    pending switch's target, else the active release.
+  - `installedRelease` is the desired release when an install of it for this
+    base exists (the running release needs none), `null` when it is not
+    installed: desired without installed is an install failure, not a stuck
+    switch.
+  - `pendingSince` is when the pending switch was first asked for, as ISO,
+    `null` when none is pending. It is the `next` record's mtime, which
+    re-asking the queued release leaves alone, so asking again on later
+    passes never moves it.
   - `activeChatTurns` counts the Chat turns recorded open: reserved before
     their first write, closed once their outcome is recorded.
   - `runningCallerCalls` counts the Caller processes Poise launched for agent

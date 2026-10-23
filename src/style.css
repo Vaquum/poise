@@ -5959,16 +5959,57 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
   color: var(--text-primary);
 }
 
-/* A live session pulses teal; one waiting on the person pulses amber. */
-.chat-session-running {
+/* The work-log dot: every chat shows its state, with a text label beside it
+   so the state never depends on colour alone. Working pulses gently in
+   saturation; reduced-motion preferences still the pulse globally. */
+.chat-session-dot {
   flex: 0 0 auto;
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--a2);
-  animation: none;
+  background: var(--a3);
 }
-.chat-session-running.waiting { background: var(--a4); }
+.chat-session-dot[data-state="working"] { background: var(--a3); animation: chat-dot-pulse 3.2s ease-in-out infinite; }
+.chat-session-dot[data-state="completed"] { background: var(--a3); }
+.chat-session-dot[data-state="error"] { background: var(--a5); }
+.chat-session-dot[data-state="attention"] { background: var(--a4); }
+.chat-session-dot[data-state="queued"] { background: var(--text-tertiary); }
+@keyframes chat-dot-pulse {
+  0%, 100% { filter: saturate(1); }
+  50%      { filter: saturate(0.45); }
+}
+.chat-session-state {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+.chat-session-item.drop-before { box-shadow: 0 -2px 0 var(--a1); }
+.chat-session-item.drop-after { box-shadow: 0 2px 0 var(--a1); }
+.chat-session-item.dragging { opacity: 0.5; }
+
+.chat-session-item.pinned { padding-right: 50px; }
+.chat-session-pin {
+  position: absolute;
+  top: 6px;
+  right: 26px;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.75;
+}
+.chat-session-pin:hover { color: var(--text); background: var(--hover); opacity: 1; }
+.chat-session-pin svg { width: 12px; height: 12px; }
 
 .chat-session-delete {
   position: absolute;
@@ -6062,6 +6103,13 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 .chat-h-status[data-status="queued"],
 .chat-h-status[data-status="interrupted"] { color: var(--a4); }
 .chat-h-status[data-status="error"] { color: var(--a5); }
+/* How long the turn on screen has run; ticks live beside the status. */
+.chat-h-since {
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .chat-h-btn {
   display: inline-flex;
   align-items: center;
