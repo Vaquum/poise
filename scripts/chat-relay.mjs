@@ -128,6 +128,7 @@ class Decoder {
 let gate = null
 let gateControl = null
 let gateExited = null // { code } once the gate is gone
+let gateExitSent = false
 let goSent = false
 let client = null
 let clientGone = null // resolves when the active client disconnects
@@ -226,11 +227,21 @@ function onAgentStderr(chunk) {
 function onGateExit(code) {
   gateExited = { code: code ?? 1 }
   log(`gate exited (${gateExited.code})`)
-  if (client) send(client, encodeJson(EXITED, gateExited))
+  finishGateOutput()
+}
+
+function finishGateOutput() {
+  // A gate can close while its spool is still replaying. The final live
+  // bytes are queued behind that spool and must precede EXITED as well.
+  if (!gateExited || replaying || gateExitSent) return
+  gateExitSent = true
   // The relay holds an agent, not a session: with the agent gone it leaves.
   // The spool goes with it; a turn the agent outlived needs no replay.
   dropSpool()
-  setImmediate(() => finish(0))
+  if (!client || client.destroyed) { finish(0); return }
+  // end() flushes queued STDOUT and EXITED in order before the relay leaves.
+  client.once('close', () => finish(0))
+  client.end(encodeJson(EXITED, gateExited), () => finish(0))
 }
 
 function streamSpool(socket, onDone) {
@@ -294,6 +305,7 @@ function attach(socket, hello) {
     replayQueue = []
     replayQueueBytes = 0
     resolveGone()
+    if (gateExited) { finishGateOutput(); return }
     if (!goSent && !shuttingDown) {
       // Poise died before GO: nothing may ever have started.
       log('client gone before GO; leaving without spawning')
@@ -323,6 +335,7 @@ function attach(socket, hello) {
     replayQueueBytes = 0
     replaying = false
     send(socket, encode(LIVE, Buffer.alloc(0)))
+    finishGateOutput()
   })
 }
 
@@ -443,7 +456,8 @@ gateControl = gate.stdio[3]
 gateControl.on('error', () => { /* the gate is gone; its exit covers it */ })
 gate.stdout.on('data', onAgentOutput)
 gate.stderr.on('data', onAgentStderr)
-gate.once('exit', (code) => onGateExit(code))
+// exit can precede the final stdout chunks. close follows stdio EOF.
+gate.once('close', (code) => onGateExit(code))
 gate.once('error', (error) => log(`gate error: ${error.message}`))
 
 const server = createServer((socket) => {
