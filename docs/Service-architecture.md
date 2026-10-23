@@ -332,8 +332,12 @@ reconciles them as after any restart.
   the switch became pending); past it they are cancelled through the normal
   cancel path, their sessions recorded, and the server restarted. After the
   restart each interrupted session gets exactly one automatic continue
-  prompt on its resumed native session, then the waiting turns start in
-  order. The gateway asks again on later passes until health reports the
+  prompt on its resumed native session; a request still waiting for a
+  checkout or startup is replayed with its original input and attribution.
+  Waiting turns follow these recoveries in order. Withdrawal waits for any
+  bound cancellation to record recovery before releasing messages. A bound
+  cancellation never bypasses the quiet gate for server work, background
+  work or admitted launches. The gateway asks again on later passes until health reports the
   release, which the request makes idempotent.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace

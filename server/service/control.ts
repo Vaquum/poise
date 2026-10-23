@@ -116,6 +116,8 @@ export class ServiceControl {
   private switchTo: string | null = null
   private switchPoll: unknown = null
   private switchPendingSince: number | null = null
+  private switchEpoch = 0
+  private switchCancellation: Promise<void> | null = null
   private restarting = false
   private readonly timer: DrainTimer
   private readonly log: (line: string) => void
@@ -249,6 +251,7 @@ export class ServiceControl {
     }
     const first = this.switchTo === null
     const retargeted = this.switchTo !== release
+    if (first || retargeted) this.switchEpoch += 1
     this.switchTo = release
     this.runtime.setSwitchPending(release)
     if (first) {
@@ -271,7 +274,10 @@ export class ServiceControl {
     this.log(`[service] the switch to release ${this.switchTo} was withdrawn; staying on release ${this.release.name}`)
     this.switchTo = null
     this.switchPendingSince = null
-    void this.runtime.releaseSwitchWait()
+    this.switchEpoch += 1
+    // An in-flight cancellation must record its continuation before any
+    // waited message is admitted, even when the switch is withdrawn.
+    if (!this.switchCancellation) void this.runtime.releaseSwitchWait()
   }
 
   private switchBoundMs(): number {
@@ -284,9 +290,8 @@ export class ServiceControl {
     this.switchPoll = this.timer.setTimeout(() => {
       this.switchPoll = null
       if (this.switchTo === null) return
-      const quiet = listOpenTurns(this.runtime.instance).length === 0 && this.runtime.working() === 0
-        && releaseBackgroundBusy() === 0 && this.launches === 0
-      if (quiet) return this.restartForSwitch()
+      if (this.switchCancellation) return this.pollSwitch()
+      if (this.switchIsQuiet()) return this.restartForSwitch()
       if (this.switchPendingSince !== null && this.now() - this.switchPendingSince >= this.switchBoundMs()) {
         return this.expireSwitchBound()
       }
@@ -294,7 +299,19 @@ export class ServiceControl {
     }, SWITCH_POLL_MS)
   }
 
+  private switchIsQuiet(): boolean {
+    return listOpenTurns(this.runtime.instance).length === 0 && this.runtime.working() === 0
+      && releaseBackgroundBusy() === 0 && this.launches === 0
+  }
+
   private restartForSwitch(): void {
+    if (this.switchTo === null) return
+    // Cancellation settles Chat turns, not every operation or launch the
+    // server owns. Close admission only after the complete quiet gate holds.
+    if (!this.switchIsQuiet()) {
+      if (this.switchPoll === null) this.pollSwitch()
+      return
+    }
     // Refused from here on; the gateway shows the person that Poise is updating.
     pauseReleaseBackground()
     this.runtime.startDrain('service')
@@ -307,7 +324,7 @@ export class ServiceControl {
       this.lift()
       this.switchTo = null
       this.switchPendingSince = null
-      void this.runtime.releaseSwitchWait()
+      if (!this.switchCancellation) void this.runtime.releaseSwitchWait()
     }
   }
 
@@ -317,12 +334,12 @@ export class ServiceControl {
    *  were not interrupted — only turns still open or cancelled are resumed. */
   private expireSwitchBound(): void {
     const release = this.switchTo
-    const pending = this.runtime.switchPending
+    const epoch = this.switchEpoch
     if (release === null || this.switchPendingSince === null) return
     const waitedMinutes = Math.round((this.now() - this.switchPendingSince) / 60_000)
     this.log(`[service] release ${release} waited ${waitedMinutes} minutes for its turns; cancelling them and restarting`)
     const targets = this.runtime.runningTurnSessions()
-    void (async () => {
+    const cancellation = (async () => {
       await Promise.all(targets.map(({ sessionId }) => this.runtime.cancel(sessionId).catch((error: unknown) =>
         this.log(`[service] cancelling ${sessionId.slice(0, 8)} for the switch failed: ${error instanceof Error ? error.message : String(error)}`))))
       this.runtime.recordSwitchInterrupted(targets.filter(({ sessionId, turnId }) => {
@@ -332,13 +349,18 @@ export class ServiceControl {
       }))
       // Cancellation may outlive a withdrawal and a fresh request for the
       // same release. That newer switch owns its own turn set and deadline.
-      if (this.runtime.switchPending !== pending) {
+      if (this.switchEpoch !== epoch) {
         this.log(`[service] the switch to ${release} was superseded while cancellation settled`)
-        if (this.runtime.switchPending === null && !this.restarting) void this.runtime.releaseSwitchWait()
         return
       }
       this.restartForSwitch()
-    })().catch((error: unknown) => this.log(`[service] the switch to ${release} failed: ${error instanceof Error ? error.message : String(error)}`))
+    })().catch((error: unknown) => this.log(`[service] the switch to ${release} failed: ${error instanceof Error ? error.message : String(error)}`)).finally(() => {
+      if (this.switchCancellation !== cancellation) return
+      this.switchCancellation = null
+      if (this.switchTo === null && !this.restarting) void this.runtime.releaseSwitchWait()
+      else if (!this.restarting && this.switchPoll === null) this.pollSwitch()
+    })
+    this.switchCancellation = cancellation
   }
 
   /** Every call starts the lapse again: the gateway renews a drain by
@@ -383,6 +405,8 @@ export class ServiceControl {
     if (this.drainOn || this.switchTo !== null) this.lift()
     this.switchTo = null
     this.switchPendingSince = null
+    this.switchEpoch += 1
+    this.switchCancellation = null
     this.restarting = false
     this.runtime.setSwitchPending(null)
   }

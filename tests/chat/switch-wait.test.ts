@@ -233,8 +233,47 @@ describe('the switch bound', () => {
     service.switchRelease('r2')
     now += 15 * 60_000
     timer.fire()
+    await until(() => storage.listOpenTurns(w.instance).length === 0 && w.runtime.working() === 0)
+    if (!restart.mock.calls.length) {
+      await until(() => timer.timers.size > 0)
+      timer.fire()
+    }
     return { service, restart, timer }
   }
+
+  it.each(['person', 'poise'] as const)('replays the original %s request that never reached its checkout before the bound', async source => {
+    const w = await world({ auto: false })
+    const waiting = await w.session()
+    await until(() => w.runtime.get(waiting.id)?.status === 'idle')
+    w.runtime.prompt(w.s.id, input('Hold the shared checkout'))
+    await until(() => w.c.calls.length === 1)
+    const request = input('Implement the original waiting request')
+    let metadata: { seq: number, source: { kind: 'poise', name: string }, shown: string } | undefined
+    if (source === 'poise') {
+      inbox.message(w.instance, waiting.id, 'Poise work monitor', request.text)
+      metadata = { seq: inbox.inbox(w.instance, waiting.id)[0].seq, source: { kind: 'poise', name: 'Poise work monitor' }, shown: 'Visible monitor request' }
+    }
+    const admitted = w.runtime.prompt(waiting.id, request, metadata)
+    await until(() => w.runtime.events(waiting.id, 0).events.some(({ event }) => event.type === 'turn.started'))
+    expect(w.c.calls).toHaveLength(1)
+    const { service, restart } = await expired(w)
+    try {
+      expect(restart).toHaveBeenCalledTimes(1)
+      const retained = JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]') as Array<{ sessionId: string, prompt?: PromptInput }>
+      expect(retained.find(row => row.sessionId === waiting.id)?.prompt).toEqual(request)
+      w.c.auto = true
+      const next = w.make()
+      await next.recover()
+      await until(() => w.c.calls.length === 3)
+      expect(w.c.calls[1].input.text).toBe('Poise restarted for an update while your turn was running. Continue where you left off.')
+      expect(w.c.calls[2].input.text).toContain(request.text)
+      await until(() => next.get(waiting.id)?.status === 'idle')
+      if (metadata) {
+        const replayed = next.events(waiting.id, 0).events.find(({ event }) => event.type === 'turn.started' && event.turnId !== ('turnId' in admitted ? admitted.turnId : ''))
+        expect(replayed?.event).toMatchObject({ source: metadata.source, prompt: input(metadata.shown) })
+      }
+    } finally { service.reset() }
+  })
 
   it('restarts at once when only waited prompts stand by: they hold no quiet check', async () => {
     const w = await world()
@@ -296,6 +335,11 @@ describe('the switch bound', () => {
       await w.runtime.enqueue(w.s.id, randomUUID(), input('Waited follow-up'))
       now += 15 * 60_000
       timer.fire()
+      await until(() => storage.listOpenTurns(w.instance).length === 0 && w.runtime.working() === 0)
+      if (!restart.mock.calls.length) {
+        await until(() => timer.timers.size > 0)
+        timer.fire()
+      }
       await until(() => w.turns(w.s.id).length === 3)
       expect(restart).toHaveBeenCalledTimes(1)
       expect(w.c.calls.map(call => call.input.text)).toEqual([
@@ -303,6 +347,50 @@ describe('the switch bound', () => {
       ])
       expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
     } finally { service.reset() }
+  })
+
+  it('keeps waited messages behind continuation when withdrawal overlaps bound cancellation', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.c.calls.length === 1)
+    let release!: () => void
+    let cancelled!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const settled = new Promise<void>(resolve => { cancelled = resolve })
+    const cancel = w.runtime.cancel.bind(w.runtime)
+    const delayed = vi.spyOn(w.runtime, 'cancel').mockImplementation(async id => {
+      const result = await cancel(id)
+      cancelled()
+      await held
+      return result
+    })
+    const timer = new FakeTimer()
+    let now = 5_000_000
+    const restart = vi.fn(() => true)
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: () => {}, releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => now,
+    })
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await settled
+      service.switchRelease('r1')
+      expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+      expect(w.c.calls).toHaveLength(1)
+      w.c.auto = true
+      release()
+      await until(() => w.turns(w.s.id).length === 3)
+      expect(w.c.calls.map(call => call.input.text)).toEqual([
+        'Original task', 'Poise stopped your turn for an update that did not restart. Continue where you left off.', 'Waited follow-up',
+      ])
+      expect(restart).not.toHaveBeenCalled()
+    } finally {
+      release()
+      delayed.mockRestore()
+      service.reset()
+    }
   })
 
   it('keeps polling a retargeted switch after an earlier cancellation settles', async () => {
@@ -385,16 +473,18 @@ describe('the switch bound', () => {
       await settled
       service.switchRelease('r1')
       const newTurn = w.runtime.prompt(w.s.id, input('Admitted during withdrawal'))
-      expect(newTurn).toHaveProperty('turnId')
-      await until(() => w.c.calls.length === 2)
+      expect(newTurn).toHaveProperty('waitId')
+      expect(w.c.calls).toHaveLength(1)
       service.switchRelease('r2')
       release()
       await until(() => logs.some(line => line.includes('superseded while cancellation settled')))
       expect(restart).not.toHaveBeenCalled()
-      expect(storage.getOpenTurn(w.s.id)?.turnId).toBe('turnId' in newTurn ? newTurn.turnId : '')
+      expect(storage.getOpenTurn(w.s.id)).toBeNull()
       expect(w.runtime.switchPending?.release).toBe('r2')
+      await until(() => w.runtime.working() === 0)
+      await new Promise<void>(resolve => setImmediate(resolve))
       timer.fire()
-      expect(restart).not.toHaveBeenCalled()
+      expect(restart).toHaveBeenCalledTimes(1)
     } finally {
       release()
       delayed.mockRestore()
@@ -485,6 +575,7 @@ describe('the switch bound', () => {
     // Exercise cancellation after native work has started, not only while
     // every interrupted turn is still waiting for the shared checkout.
     await until(() => w.c.calls.length > agents.length)
+    const nativeAtBound = new Set(w.c.calls.slice(agents.length).map(call => call.agent))
     const { service, restart } = await expired(w)
     try {
       for (const agent of agents) await until(() => w.turns(ids.get(agent)!).length === 2)
@@ -497,12 +588,11 @@ describe('the switch bound', () => {
       const next = w.make()
       await next.recover()
       await until(() => w.c.calls.length === callsBeforeResume + agents.length, 100_000)
-      expect(w.c.calls.slice(callsBeforeResume).map(call => call.input.text)).toEqual([
-        'Poise restarted for an update while your turn was running. Continue where you left off.',
-        'Poise restarted for an update while your turn was running. Continue where you left off.',
-        'Poise restarted for an update while your turn was running. Continue where you left off.',
-        'Poise restarted for an update while your turn was running. Continue where you left off.',
-      ])
+      for (const agent of agents) {
+        expect(w.c.calls.slice(callsBeforeResume).find(call => call.agent === agent)?.input.text).toBe(nativeAtBound.has(agent)
+          ? 'Poise restarted for an update while your turn was running. Continue where you left off.'
+          : `Interrupted ${agent} work`)
+      }
       for (const agent of agents) {
         const fakes = w.c.adapters.filter(adapter => adapter.agent === agent)
         expect(fakes).toHaveLength(2)

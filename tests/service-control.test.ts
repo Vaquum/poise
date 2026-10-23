@@ -362,6 +362,11 @@ describe('switching to another release', () => {
       const turnId = storage.getOpenTurn(sessionId)!.turnId
       runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
       runtime.workingNow = 1
+      runtime.cancel.mockImplementation(async () => {
+        storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId, stopReason: 'cancelled' })
+        runtime.workingNow = 0
+        return { settled: true }
+      })
       service.switchRelease('r2')
       // Inside the bound the switch keeps waiting for a quiet moment.
       timer.fire()
@@ -390,6 +395,7 @@ describe('switching to another release', () => {
       storage.appendEvent(sessionId, { type: 'turn.finished', turnId, stopReason: 'end_turn' })
       runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
       runtime.workingNow = 1
+      runtime.cancel.mockImplementation(async () => { runtime.workingNow = 0; return { settled: true } })
       service.switchRelease('r2')
       now += 15 * 60_000
       timer.fire()
@@ -398,6 +404,53 @@ describe('switching to another release', () => {
       expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([])
       expect(restart).toHaveBeenCalledTimes(1)
     } finally {
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it.each(['runtime', 'background', 'launch'] as const)('keeps polling when %s work remains after bound cancellation', async work => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 2_000_000
+    const { runtime, timer, restart, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    const sessionId = session(runtime.instance, true)
+    const turnId = storage.getOpenTurn(sessionId)!.turnId
+    let releaseCancel!: () => void
+    const barrier = new Promise<void>(resolve => { releaseCancel = resolve })
+    runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
+    runtime.workingNow = 1
+    runtime.cancel.mockImplementation(async () => {
+      await barrier
+      storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId, stopReason: 'cancelled' })
+      runtime.workingNow = work === 'runtime' ? 1 : 0
+      return { settled: true }
+    })
+    let finishWork = () => { runtime.workingNow = 0 }
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      expect(runtime.cancel).toHaveBeenCalledTimes(1)
+      if (work === 'background') finishWork = background.trackReleaseBackground()
+      if (work === 'launch') {
+        const admitted = service.admitLaunch('POST', '/api/models/refresh')
+        if (typeof admitted !== 'function') throw new Error('the concurrent launch was not admitted')
+        finishWork = admitted
+      }
+      releaseCancel()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([{ sessionId, turnId }])
+      expect(restart).not.toHaveBeenCalled()
+      expect(service.draining).toBe(false)
+      expect(background.releaseBackgroundPaused()).toBe(false)
+      expect(timer.timers.size).toBe(1)
+      finishWork()
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(service.draining).toBe(true)
+    } finally {
+      releaseCancel()
+      finishWork()
       service.reset()
       background.resumeReleaseBackground()
     }
