@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import Database from 'better-sqlite3'
+import { randomBytes } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BehaviorLedgerObserver } from '../server/behavior-ledger'
+import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import type { LogEntry } from '../server/agent'
-import type { LedgerAdmission, LedgerHealth } from '../server/behavior-ledger-contract'
+import type { LedgerAdmission, LedgerHealth, LedgerRecord } from '../server/behavior-ledger-contract'
 
 const health: LedgerHealth = {
   status: 'ok', unavailableReason: null, coverageStart: '2026-10-19T00:00:00.000Z', observedAt: '2026-10-19T00:00:00.000Z',
@@ -159,7 +162,7 @@ describe('bounded behavior ledger transport', () => {
     observer.capture(admission)
     const first = observer.read({ operation: 'health' })
     expect((await observer.read({ operation: 'list' })).status).toBe(429)
-    expect(await first).toMatchObject({ status: 200, body: { health: { status: 'unavailable' } } })
+    expect(await first).toMatchObject({ status: 200, body: { health: { status: 'unavailable', unavailableReason: 'read_timeout' } } })
     expect(() => observer.capture(admission)).not.toThrow()
     await vi.waitFor(async () => {
       expect(await observer.read({ operation: 'health' })).toMatchObject({ status: 200, body: { health: { status: 'ok', pending: 0, dropped: 0 } } })
@@ -173,7 +176,7 @@ describe('bounded behavior ledger transport', () => {
     observer.capture(admission)
     try {
       const reply = await observer.read({ operation: 'list' })
-      expect(reply).toMatchObject({ status: 503, body: { error: 'ledger_read_timeout' } })
+      expect(reply).toMatchObject({ status: 503, body: { error: 'ledger_read_timeout', health: { status: 'unavailable', unavailableReason: 'read_timeout' } } })
       expect(reply.timing).toEqual({ queueMs: expect.any(Number), timeout: 'queued',
         blocking: { kind: 'admit', elapsedMs: expect.any(Number) } })
       expect(reply.timing!.queueMs).toBeGreaterThanOrEqual(0)
@@ -193,7 +196,7 @@ describe('bounded behavior ledger transport', () => {
     const settled = vi.fn()
     try {
       const reply = await observer.read({ operation: 'list' }).then((value) => { settled(value); return value })
-      expect(reply).toMatchObject({ status: 503, body: { error: 'ledger_read_timeout' } })
+      expect(reply).toMatchObject({ status: 503, body: { error: 'ledger_read_timeout', health: { status: 'unavailable', unavailableReason: 'read_timeout' } } })
       expect(reply.timing).toEqual({ queueMs: expect.any(Number), activeMs: expect.any(Number), timeout: 'active' })
       expect(reply.timing!.queueMs).toBeGreaterThanOrEqual(0)
       expect(reply.timing!.activeMs!).toBeGreaterThanOrEqual(0)
@@ -448,6 +451,63 @@ describe('bounded behavior ledger transport', () => {
     expect((await observer.read({ operation: 'health' })).body.health.status).toBe('unavailable')
   })
 
+  it('answers list reads within budget with settled data at the retention caps', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-caps-'))
+    directories.push(directory)
+    const path = join(directory, 'ledger.db')
+    // Bulk-load representative settled history at the default caps in one
+    // transaction; write-path seeding would take minutes in per-capture
+    // commits, while this acceptance is about reads. Row byte accounting
+    // mirrors the store; the store suite pins that formula.
+    const setup = new BehaviorLedgerStore(path)
+    setup.close()
+    const load = new Database(path)
+    try {
+      const now = new Date().toISOString()
+      const head = 'a'.repeat(40)
+      const insertInstance = load.prepare(`INSERT INTO ledger_instances
+        (creation_seq,id,parent_id,admission_key,native_id,payload,updated_at,source_at,bytes,terminal,no_write)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+      const insertChange = load.prepare('INSERT INTO ledger_changes(seq,id,op,payload,created_at,bytes) VALUES(?,?,?,?,?,?)')
+      load.transaction(() => {
+        for (let index = 0; index < 5000; index++) {
+          const root: LedgerRecord = { id: randomBytes(32).toString('hex'), kind: 'firing', parentId: null, behavior: 'review-new-prs',
+            source: 'poise:review-new-prs', owner: 'acme', actor: 'review-bot', target: { repository: 'acme/project', number: index + 1 },
+            head, slot: null, plannedSlots: ['primary'], state: 'completed', stateSource: 'native', activity: 'settled', outcome: 'clean',
+            createdAt: now, startedAt: now, completedAt: now, observedAt: now, revision: 1, refs: [], replayOf: null, omittedAttempts: 0 }
+          const attempt: LedgerRecord = { ...root, id: randomBytes(32).toString('hex'), kind: 'attempt', parentId: root.id,
+            slot: 'primary', plannedSlots: [], refs: [{ kind: 'correlation', identity: `caps-${index}`, availability: 'available' }] }
+          for (const [seq, record, admissionKey, nativeId] of [
+            [index * 2 + 1, root, `caps-key-${index}`, null],
+            [index * 2 + 2, attempt, null, `caps-${index}`],
+          ] as const) {
+            const payload = JSON.stringify(record)
+            insertInstance.run(seq, record.id, record.parentId, admissionKey, nativeId, payload, now, now, Buffer.byteLength(payload) + 512, 1, 0)
+          }
+        }
+        for (let seq = 1; seq <= 30000; seq++) {
+          const id = randomBytes(32).toString('hex')
+          const payload = JSON.stringify({ sequence: seq, op: 'remove', id, revision: seq })
+          insertChange.run(seq, id, 'remove', payload, now, Buffer.byteLength(payload) + 256)
+        }
+      })()
+    } finally { load.close() }
+    const observer = new BehaviorLedgerObserver({ path })
+    observers.push(observer)
+    await observer.start()
+    const health = (await observer.read({ operation: 'health' })).body.health
+    expect(health).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
+    expect(health.instances).toBeGreaterThan(9000)
+    expect(health.instances).toBeLessThanOrEqual(10000)
+    expect(health.changes).toBeGreaterThan(25000)
+    expect(health.changes).toBeLessThanOrEqual(30000)
+    const startedAt = performance.now()
+    const page = await observer.read({ operation: 'list', limit: 50 })
+    expect(performance.now() - startedAt).toBeLessThan(1000)
+    expect(page.status).toBe(200)
+    expect(page.body.records).toHaveLength(50)
+  }, 60000)
+
   it('accepts late readiness after the startup budget without losing queued capture', async () => {
     const observer = await fixture(`
       import { existsSync, watch } from 'node:fs';
@@ -466,7 +526,7 @@ describe('bounded behavior ledger transport', () => {
       check();`, { readTimeoutMs: 30 })
     observer.capture(admission)
     expect(await observer.read({ operation: 'health' })).toMatchObject({
-      status: 200, body: { health: { status: 'unavailable', pending: 1, dropped: 0 } },
+      status: 200, body: { health: { status: 'unavailable', unavailableReason: 'worker_unavailable', pending: 1, dropped: 0 } },
     })
     expect((await observer.read({ operation: 'list' })).status).toBe(503)
     await writeFile(join(directories.at(-1)!, 'release'), '')
