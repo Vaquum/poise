@@ -779,7 +779,9 @@ describe('the switch bound', () => {
     await next.recover()
     await until(() => w.c.calls.length === 2)
     expect(w.c.calls.map(call => call.input.text)).toEqual(['Original task', 'Poise restarted for an update while your turn was running. Continue where you left off.'])
-    expect(next.get(w.s.id)?.queue?.items.map(item => item.prompt.text)).toEqual(['Sent while waiting'])
+    const waiting = JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]') as Array<{ sessionId: string, prompt: PromptInput }>
+    expect(waiting.map(entry => ({ sessionId: entry.sessionId, text: entry.prompt.text })))
+      .toEqual([{ sessionId: w.s.id, text: 'Sent while waiting' }])
     w.finish()
     await until(() => w.c.calls.length === 3)
     expect(w.c.calls.map(call => call.input.text)).toEqual(['Original task', 'Poise restarted for an update while your turn was running. Continue where you left off.', 'Sent while waiting'])
