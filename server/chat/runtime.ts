@@ -40,14 +40,15 @@ import { prepareEditorContext, removeEditorContext } from './editor-context'
 import { tryParseStructuredReply } from '../../src/edit-proposals'
 import type { AutoMergeAck, SafeModeAck } from './protocol'
 import { homedir } from 'node:os'
-import { mkdir, rm, rmdir, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, rm, rmdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../models'
 import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
 import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertContext } from '../alerts/producers'
 import { localCheckoutPath } from '../gh'
-import { discardUnclaimedWorkspace, ensureLocalWorkspace, ensureWorkerWorkspace, LOCAL_CHAT_ROOT, workerWorkspaceRef, workspaceMarkerValid } from './local-workspace'
+import { discardUnclaimedWorkspace, ensureLocalWorkspace, ensureWorkerWorkspace, ensureWorkerWorkspaceDirectory, LOCAL_CHAT_ROOT, workerWorkspaceRef, workspaceMarkerValid } from './local-workspace'
+import { restorePrunedArtifacts } from '../storage-maintenance'
 import { catalogueAgents } from './catalog-agents'
 import { runFile, scrubbedChildEnvironment } from '../process'
 import { CheckoutLease, canonicalCheckout, describeHolder, type AcquireResult, type CheckoutLeaseOptions } from './checkout-lock'
@@ -195,6 +196,8 @@ interface LiveSession {
    *  next server: the turn settles without recording anything, and
    *  nothing here may stop the relay afterwards. */
   relayDetached: boolean
+  /** A failed workspace initializer may retain its own guarded Git worker. */
+  bootstrapUnsettled?: boolean
   lease: CheckoutLease | null
   turn: RunningTurn | null
   pending: Map<string, PendingRequest>
@@ -1008,7 +1011,7 @@ export class ChatRuntime extends EventEmitter {
     const lease = session.lease
     if (!lease?.held) return
     if (session.startup || session.services || session.turn?.agentInvoked || session.relay?.healthy || session.adapter?.alive
-      || storage.getWorker(session.record.id)) {
+      || storage.getWorker(session.record.id) || this.bootstrapStillRunning(session, lease)) {
       throw new ChatError(409, 'the checkout still has active work; its lease remains held', 'checkout_busy')
     }
     lease.clearWorker()
@@ -1016,6 +1019,16 @@ export class ChatRuntime extends EventEmitter {
     session.lease = null
     session.record.orphanNotice = undefined
     this.saveRecord(session)
+  }
+
+  private bootstrapStillRunning(session: LiveSession, lease: CheckoutLease): boolean {
+    if (!session.bootstrapUnsettled) return false
+    const row = lease.read()
+    const alive = row?.token === lease.currentToken && (
+      (row.worker_pgid && (this.leaseProbes.pgidAlive ?? pgidAlive)(row.worker_pgid))
+      || (row.worker_pid && (this.leaseProbes.pidAlive ?? pidAlive)(row.worker_pid)))
+    if (!alive) session.bootstrapUnsettled = false
+    return !!alive
   }
 
   // ── Drain and readiness ────────────────────────────────────────────────
@@ -1489,16 +1502,22 @@ export class ChatRuntime extends EventEmitter {
     session.startup = startup
     const signal = AbortSignal.any([session.lifecycle.signal, startup.signal, ...(session.turn ? [session.turn.abort.signal] : [])])
     this.setStatus(session, 'starting')
-    const lease = options.lease ?? this.leaseFor(session)
+    let lease = options.lease
     let freed = true
+    let initializingWorkspace = false
     try {
       const cli = await this.checkSessionCli(session, signal)
+      lease ??= await this.leaseForStartup(session, signal)
       if (!options.lease) await lease.acquire({ signal, onBusy: (busy) => this.reportBusy(session, busy) })
       else if (!lease.held) throw new Error('the checkout lease was lost before native startup')
       signal.throwIfAborted()
       session.lease = lease
       session.relayDetached = false
-      const fresh = options.fresh || (!record.nativeSessionId && record.branch.provisional && !record.branch.baseSha)
+      initializingWorkspace = true
+      const recreated = await this.recreateRemovedWorkspace(session, lease)
+      initializingWorkspace = false
+      signal.throwIfAborted()
+      const fresh = recreated || options.fresh || (!record.nativeSessionId && record.branch.provisional && !record.branch.baseSha)
       if (fresh) await this.prepareBranch(session, lease)
       await this.prepareCheckout(session, lease)
       if ((fresh || options.forkFrom) && record.context?.kind === 'document' && record.context.slug) {
@@ -1576,17 +1595,21 @@ export class ChatRuntime extends EventEmitter {
         try { this.emit_(record.id, { type: 'error', message, recoverable: true }) } catch { /* mirror */ }
         this.setStatus(session, 'error', message)
       } else if (!session.turn) this.setStatus(session, 'idle')
+      if (initializingWorkspace && lease?.held) {
+        session.bootstrapUnsettled = true
+        if (this.bootstrapStillRunning(session, lease)) freed = false
+      }
       try { await this.stopProcess(session) } catch { freed = false }
       throw error
     } finally {
       // The idle agent holds no lease; the next turn takes one. Release only
       // when nothing of this start can still write (a stopped orphan keeps it).
       // A turn-owned lease remains registered and held through its own cleanup.
-      if (!options.lease && lease.held) {
+      if (!options.lease && lease?.held) {
         if (freed) { lease.clearWorker(); lease.release() }
         else this.emit('log', `[chat ${record.id.slice(0, 8)}] checkout lease kept: worker not settled`)
       }
-      if (session.lease === lease && !lease.held) session.lease = null
+      if (lease && session.lease === lease && !lease.held) session.lease = null
       if (session.startup === startup) session.startup = null
     }
   }
@@ -1595,7 +1618,13 @@ export class ChatRuntime extends EventEmitter {
     this.assertAcceptingWork()
     const session = this.requireLive(id)
     await this.serialized(session, async () => {
-      if (session.record.status === 'closed' || session.lifecycle.signal.aborted) { session.lifecycle = new AbortController(); session.record.status = 'idle' }
+      if (session.record.status === 'closed' || session.lifecycle.signal.aborted) {
+        session.lifecycle = new AbortController()
+        session.record.status = 'idle'
+        // Persisted before the workspace is touched: from here the session
+        // is open, and storage maintenance holds its workspace.
+        this.saveRecord(session)
+      }
       if (!session.adapter?.alive) await this.startSession(session)
     })
     return session.record
@@ -2835,6 +2864,7 @@ export class ChatRuntime extends EventEmitter {
         try { await this.stopProcess(session) } catch { freed = false }
         await this.waitForServices(session, Number.POSITIVE_INFINITY)
       }
+      if (lease?.held && this.bootstrapStillRunning(session, lease)) freed = false
       if (checkoutBefore && agentInvoked && lease?.held && freed) {
         try { await emitCheckoutChanges(record.checkout, turn.id, checkoutBefore, event => this.emit_(record.id, event)) }
         catch (failure) {
@@ -3296,6 +3326,21 @@ export class ChatRuntime extends EventEmitter {
     }, this.leaseProbes)
   }
 
+  private async leaseForStartup(session: LiveSession, signal: AbortSignal): Promise<CheckoutLease> {
+    const root = this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT
+    const ref = session.record.workspaceKind === 'poise-local' ? workerWorkspaceRef(root, session.record.checkout) : null
+    while (true) {
+      signal.throwIfAborted()
+      if (ref) await ensureWorkerWorkspaceDirectory(root, ref.id)
+      try { return this.leaseFor(session) }
+      catch (error) {
+        // A maintenance holder can remove the placeholder before realpath.
+        // Only this validated managed path may be recreated and retried.
+        if (!ref || (error as { code?: unknown })?.code !== 'ENOENT') throw error
+      }
+    }
+  }
+
   private reportBusy(session: LiveSession, busy: Extract<AcquireResult, { acquired: false }>): void {
     const label = describeHolder(busy.holder) + (busy.orphan ? ' — its worker is still running' : '')
     if (session.record.queuedBehind !== label || session.record.status !== 'queued') {
@@ -3357,6 +3402,32 @@ export class ChatRuntime extends EventEmitter {
     }
   }
 
+  /** A closed session whose scratch workspace storage maintenance removed
+   *  resumes in a fresh one; the transcript survives in the database.
+   *  Anything but a missing workers/<id>/workspace still fails loud. The
+   *  initializer reuses the held checkout lease without a release gap. */
+  private async recreateRemovedWorkspace(session: LiveSession, lease: CheckoutLease): Promise<boolean> {
+    const record = session.record
+    if (record.workspaceKind !== 'poise-local') return false
+    const root = this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT
+    const ref = workerWorkspaceRef(root, record.checkout)
+    if (!ref) return false
+    let recreated = true
+    try {
+      const metadata = await lstat(join(record.checkout, '.git'))
+      if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+        // A failed bootstrap may have written HEAD without its first commit.
+        recreated = !(await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: record.checkout }).then(() => true, () => false))
+      }
+    }
+    catch (error) {
+      if ((error as { code?: unknown })?.code !== 'ENOENT') throw error
+    }
+    await ensureWorkerWorkspace(root, ref.id, this.instance, lease)
+    if (recreated) this.emit_(record.id, { type: 'status.changed', status: record.status, detail: 'storage maintenance had removed this workspace after the session closed; starting fresh' })
+    return recreated
+  }
+
   /** Fresh session: cut/verify/check out its branch under the lease. */
   private async prepareBranch(session: LiveSession, lease: CheckoutLease): Promise<void> {
     const record = session.record
@@ -3382,10 +3453,27 @@ export class ChatRuntime extends EventEmitter {
   private async prepareCheckout(session: LiveSession, lease: CheckoutLease): Promise<void> {
     const record = session.record
     const state = await inspectCheckout(record.checkout)
-    if (state.currentBranch === record.branch.name) { lease.setBranch(record.branch.name); return }
-    await this.makeCheckoutSwitchable(session, lease)
-    await switchBranch(lease, record.checkout, record.branch.name)
+    if (state.currentBranch !== record.branch.name) {
+      await this.makeCheckoutSwitchable(session, lease)
+      await switchBranch(lease, record.checkout, record.branch.name)
+    }
     lease.setBranch(record.branch.name)
+    await this.restorePrunedWorkspace(session)
+  }
+
+  /** Reinstall what storage maintenance pruned from an idle scratch
+   *  workspace. Best-effort: a failure never stops the turn, and the agent
+   *  reinstalls whatever is still missing. */
+  private async restorePrunedWorkspace(session: LiveSession): Promise<void> {
+    if (session.record.workspaceKind !== 'poise-local') return
+    try {
+      const restored = await restorePrunedArtifacts(session.record.checkout, this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT)
+      if (restored.length) {
+        this.emit_(session.record.id, { type: 'status.changed', status: session.record.status, detail: `storage maintenance had pruned ${restored.join(', ')} while idle; reinstalled` })
+      }
+    } catch (error) {
+      console.error(`[chat] reinstalling pruned artifacts failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   private async makeCheckoutSwitchable(session: LiveSession, lease: CheckoutLease): Promise<void> {
