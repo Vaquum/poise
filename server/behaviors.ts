@@ -2490,6 +2490,13 @@ async function tickReviewNewPrs(): Promise<void> {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
         const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead)
+        if (behaviorAborted() || !isEnabled('review-new-prs') || !stillEligible('review-new-prs', pr)) {
+          releaseOwnedClaim('review-new-prs', target, claimId)
+          releasePrOperationOwned(bundle.operationId)
+          captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
+            outcome: 'not_required', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+          return
+        }
         if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
@@ -3786,6 +3793,9 @@ async function tickResolveUnblocking(): Promise<void> {
       for (const { pr, headSha } of actionable) {
         if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
         const key = `${pr.repo}#${pr.number}`
+        // Reads finish before mutations start; resume beyond the last actual
+        // attempt when a slow resolve exhausts the remainder of this sweep.
+        setMeta('behavior_resolve_unblocking_cursor', key)
         const checkTarget = `${key}:check`
         let checked = false
         let operationId: string | null = null

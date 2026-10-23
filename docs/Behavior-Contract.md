@@ -354,3 +354,9 @@ observes the existing six Behaviors through nonblocking hooks and existing
 Caller snapshots. Its separate worker/store cannot change behavior decisions,
 claims, retries, metrics or launch arguments. Missing or stale evidence stays
 explicitly unknown; capture loss is visible in independent health metadata.
+
+Review launch eligibility is checked again after checkout provisioning: disabling
+Review New Pull Requests or skipping the repository settles the unused intent
+and releases its claim without spawning a worker. Resolution sweeps retain the
+last attempted mutation as their cursor, so slow attempts cannot hide later
+pull requests behind a batch that was already read.

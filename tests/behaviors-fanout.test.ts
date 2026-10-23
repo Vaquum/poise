@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, loadModules, arrangeCli, datastoreHealthOutput, fixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, loadModules, arrangeCli, datastoreHealthOutput, fixture, deferred } from './behaviors-runtime-fixture'
 
 function openPrs(count: number, repo = pr.repo, start = 17): typeof fixture.listedPrs {
   return Array.from({ length: count }, (_, index) => ({
@@ -159,6 +159,33 @@ describe('review checkout in the launch phase', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--pwd', fixture.tempRoot]))
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+
+  it.each(['disable', 'skip'] as const)('does not launch when the user chooses %s while checkout is pending', async choice => {
+    const { database: db, behaviors: runtime } = await startReviewing()
+    const entered = deferred<void>()
+    const release = deferred<void>()
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+        entered.resolve()
+        await release.promise
+      }
+      return original(command, args, options)
+    })
+    const cycle = runtime.runEnabledBehaviorsOnce()
+    await entered.promise
+    try {
+      if (choice === 'disable') db.setMeta('behavior_review_new_prs_enabled', '0')
+      else runtime.setRepositorySkips('review-new-prs', [pr.repo])
+    } finally { release.resolve() }
+    await cycle
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.listBehaviorLaunchClaims('review-new-prs')).toEqual([])
+    const competing = db.claimPrOperationOwned(`${pr.repo}#${pr.number}`, 65_000)
+    expect(competing).not.toBeNull()
+    if (competing) db.releasePrOperationOwned(competing)
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ state: 'completed', outcome: 'not_required' }))
   })
 
   it('starts no checkout when preparation fails before the claim', async () => {
@@ -320,5 +347,52 @@ describe('shared discovery failure', () => {
 
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+})
+
+
+describe('resolve-unblocking cursor rotation', () => {
+  it('resumes beyond slow attempted resolutions within a single full batch', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-23T12:00:00.000Z'))
+    fixture.listedPrs = openPrs(10)
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_resolve_unblocking_enabled', '1')
+    const original = mocks.runFile.getMockImplementation()!
+    let entered = deferred<void>()
+    const attempted: number[] = []
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--resolve-nonblocking-conversations-if-ready') {
+        const number = Number(args[1].replace('#', ''))
+        attempted.push(number)
+        entered.resolve()
+        if (number <= 18) {
+          const signal = (options as { signal?: AbortSignal }).signal
+          await new Promise<void>((resolve, reject) => {
+            if (signal?.aborted) { reject(signal.reason); return }
+            const abort = () => { clearTimeout(timer); reject(signal?.reason) }
+            const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, 30_000)
+            signal?.addEventListener('abort', abort, { once: true })
+          })
+        }
+      }
+      return original(command, args, options)
+    })
+    const first = runtime.runEnabledBehaviorsOnce()
+    await entered.promise
+    await vi.advanceTimersByTimeAsync(59_000)
+    await first
+    expect(attempted).toEqual([17, 18])
+    expect(db.getMeta('behavior_resolve_unblocking_cursor')).toBe(`${pr.repo}#18`)
+    attempted.length = 0
+    entered = deferred<void>()
+    const second = runtime.runEnabledBehaviorsOnce()
+    await entered.promise
+    await vi.advanceTimersByTimeAsync(59_000)
+    await second
+    expect(attempted.slice(0, 8)).toEqual([19, 20, 21, 22, 23, 24, 25, 26])
   })
 })
