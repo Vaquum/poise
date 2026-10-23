@@ -224,7 +224,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     chatControl = new ChatControl(chatRuntime, { switchboard: chatSwitchboard })
     addDiagnosticSecrets(secretValues)
     chatRuntime.on('log', (line: string) => console.log(redactSecrets(line)))
-    chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service }, chatSwitchboard)
+    chatSockets = new ChatSocketServer(chatRuntime, { allowedHosts: opts.allowedHosts, service }, chatSwitchboard, chatControl)
     terminalSockets = new TerminalSocketServer({ allowedHosts: opts.allowedHosts, service }, { command: opts.terminalCommand })
     // A login may have just changed an account. Claude's sign-in also gates
     // Claude-backed work, so it is verified now instead of at the next poll.
@@ -248,6 +248,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     }
     void chatRuntime.recover().then(() => { chatControl?.start(); chatSwitchboard?.start() }).catch((error: unknown) => {
       console.error('[chat] startup reconciliation failed:', error)
+      chatControl?.failStart(error)
     })
   }
   if (!linkApi) linkApi = new LinkApi({ service })
@@ -958,7 +959,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // Handled before the legacy per-card chat below, whose matchers use
         // the exact `/api/chat` path or the `/api/chat-…` prefixes.
         if (url.startsWith('/api/chat/') && chatRuntime) {
-          if (await handleChatApi(req, res, url, chatRuntime, chatSwitchboard ?? undefined, speaksForPerson(req, !!service, authority))) return
+          if (await handleChatApi(req, res, url, chatRuntime, chatSwitchboard ?? undefined, speaksForPerson(req, !!service, authority), chatControl ?? undefined)) return
         }
 
         // ── /api/chat — per-card long-lived chats via agent-interface ──
@@ -1156,7 +1157,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               // Stopping a chat turn is the person's action, as on the chat
               // routes. Stopping agent-interface jobs below is unchanged.
               if (!speaksForPerson(req, !!service, authority)) return json(res, 403, { error: 'This is the person\'s action, taken in the browser. Chats use the control operations.', code: 'invalid' })
-              const { settled } = await chatRuntime!.cancel(chatTurn.sessionId)
+              const { settled } = await chatRuntime!.cancel(chatTurn.sessionId, { kind: 'person' })
               return json(res, 200, { id, stopped: settled, status: settled ? 'cancelled' : 'stopping', error_code: 'stopped' })
             }
             if (/^[0-9a-f]{32}$/.test(id)) {

@@ -65,6 +65,12 @@ async function until(check: () => boolean) {
   while (Date.now() < deadline) { if (check()) return; await new Promise(done => setTimeout(done, 15)) }
   throw new Error('control fixture readiness deadline')
 }
+async function observeCi(target: string): Promise<void> {
+  await control.tick()
+  // The tick admits an independent background pass; wait for its persisted
+  // result before changing the next mocked response or reading the inbox.
+  await until(() => store.observation(runtime.instance, `ci:${target}`)?.checked_at === clock)
+}
 async function config(id: string) {
   const context = await control.context(id)
   const path = /"([^"\n]+\.json)"/.exec(context)?.[1]
@@ -256,83 +262,84 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   it('shares five-minute CI reads, records failures once, and delivers recovery and recurring failures', async () => {
     const parent = await manager()
     const target = 'https://github.com/acme/app/pull/9'
-    await command(parent.id, { operation: 'bind', target })
     const failed = { head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] }
     ci.mockResolvedValue(failed)
+    await command(parent.id, { operation: 'bind', target })
     await Promise.all([control.tick(), control.tick()])
+    await until(() => store.observation(runtime.instance, `ci:${target}`)?.checked_at === clock)
     expect(ci).toHaveBeenCalledTimes(1)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     clock += 5 * 60_000
-    await control.tick()
+    await observeCi(target)
     expect(ci).toHaveBeenCalledTimes(2)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [], pending: true })
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [] })
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     ci.mockResolvedValue(failed)
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(3)
   })
 
   it('stays silent when CI settles green on a new head with no failures', async () => {
     const parent = await manager()
     const target = 'https://github.com/acme/app/pull/93'
-    await command(parent.id, { operation: 'bind', target })
     const h1 = 'a'.repeat(40), h2 = 'b'.repeat(40)
     ci.mockResolvedValue({ head: h1, failing: [] })
-    await control.tick()
+    await command(parent.id, { operation: 'bind', target })
+    await observeCi(target)
     ci.mockResolvedValue({ head: h2, failing: [], pending: true })
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     ci.mockResolvedValue({ head: h2, failing: [] })
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
     expect(prompts.has(parent.id)).toBe(false)
     ci.mockResolvedValue({ head: h2, failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     ci.mockResolvedValue({ head: h2, failing: [] })
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
   })
 
   it('retains settled CI evidence during a rerun when another check remains failed', async () => {
     const parent = await manager()
     const target = 'https://github.com/acme/app/pull/91'
-    await command(parent.id, { operation: 'bind', target })
     const first = { name: 'First', state: 'completed', conclusion: 'failure' }
     const second = { name: 'Second', state: 'completed', conclusion: 'failure' }
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [first, second] })
-    await control.tick()
+    await command(parent.id, { operation: 'bind', target })
+    await observeCi(target)
     const settled = store.observation(runtime.instance, `ci:${target}`)!.fingerprint
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [second], pending: true })
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     expect(store.observation(runtime.instance, `ci:${target}`)!.fingerprint).toBe(settled)
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [second] })
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
     expect(JSON.parse(store.inbox(runtime.instance, parent.id)[1].body).failing).toEqual([second])
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
   })
 
   it.each([false, true])('waits for the first settled CI result across restart (failed=%s)', async failed => {
     const parent = await manager()
     const target = 'https://github.com/acme/app/pull/92'
-    await command(parent.id, { operation: 'bind', target })
     const failing = failed ? [{ name: 'First', state: 'completed', conclusion: 'failure' }] : []
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing, pending: true })
-    await control.tick()
+    await command(parent.id, { operation: 'bind', target })
+    await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
     await restart()
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing })
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(failed ? 1 : 0)
-    clock += 5 * 60_000; await control.tick()
+    clock += 5 * 60_000; await observeCi(target)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(failed ? 1 : 0)
   })
 
@@ -551,8 +558,8 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
 
   it('wakes a session once when a check fails on its pull request', async () => {
     const parent = await manager()
-    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/79' })
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/79' })
     await control.tick()
     await until(() => prompts.has(parent.id))
     expect(prompts.get(parent.id)).toHaveLength(1)
@@ -625,9 +632,9 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   it('does not notify a stale owner or restore its observations after a CI read crosses a handoff', async () => {
     const first = await manager(), second = await manager()
     const target = 'https://github.com/acme/app/pull/46'
-    await command(first.id, { operation: 'bind', target })
     let complete!: (value: CiObservation) => void
     ci.mockImplementationOnce(() => new Promise<CiObservation>(done => { complete = done }))
+    await command(first.id, { operation: 'bind', target })
     const reading = control.tick()
     await until(() => ci.mock.calls.length === 1)
     await command(first.id, { operation: 'unbind', target })
@@ -639,6 +646,8 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.observation(runtime.instance, `ci:${target}`)).toBeUndefined()
     ci.mockResolvedValue(failure)
     await control.tick()
+    // CI reads run in their own pass behind the tick; the new owner's read follows the crossed one.
+    await until(() => store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure')))
     expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
   })
 

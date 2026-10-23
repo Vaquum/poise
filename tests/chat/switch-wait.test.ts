@@ -254,10 +254,10 @@ describe('the switch bound', () => {
     w.runtime.prompt(w.s.id, input('Hold the shared checkout'))
     await until(() => w.c.calls.length === 1)
     const request = input('Implement the original waiting request')
-    let metadata: { seq: number, source: { kind: 'poise', name: string }, shown: string } | undefined
+    let metadata: { seq: number, source: { kind: 'poise', name: string }, shown: string, at: number } | undefined
     if (source === 'poise') {
       inbox.message(w.instance, waiting.id, 'Poise work monitor', request.text)
-      metadata = { seq: inbox.inbox(w.instance, waiting.id)[0].seq, source: { kind: 'poise', name: 'Poise work monitor' }, shown: 'Visible monitor request' }
+      metadata = { seq: inbox.inbox(w.instance, waiting.id)[0].seq, source: { kind: 'poise', name: 'Poise work monitor' }, shown: 'Visible monitor request', at: Date.now() }
     }
     const admitted = w.runtime.prompt(waiting.id, request, metadata)
     await until(() => w.runtime.events(waiting.id, 0).events.some(({ event }) => event.type === 'turn.started'))

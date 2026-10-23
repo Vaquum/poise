@@ -6057,6 +6057,36 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
   font-size: 0.75rem;
   color: var(--text-secondary);
 }
+
+/* Timers pane: one chat's timers under its header. */
+#chat-timers-pane {
+  flex: 0 0 auto;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: var(--b-hair);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+#chat-timers-pane[hidden] { display: none; }
+.chat-timers { display: flex; flex-direction: column; gap: var(--sp-2); }
+.chat-timers-controls { display: flex; gap: var(--sp-2); }
+.chat-timers-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+.chat-timer { display: flex; flex-direction: column; gap: 2px; padding: var(--sp-2) 0; border-top: var(--b-hair); }
+.chat-timer:first-child { border-top: none; padding-top: 0; }
+.chat-timer-label { font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.chat-timer-meta, .chat-timer-status { color: var(--text-secondary); }
+.chat-timer-preview { color: var(--text-tertiary); overflow-wrap: anywhere; }
+.chat-timer-actions { display: flex; gap: var(--sp-2); margin-top: 2px; }
+.chat-timers-empty { color: var(--text-tertiary); }
+.chat-timers-add { display: flex; flex-direction: column; gap: var(--sp-2); padding-top: var(--sp-2); border-top: var(--b-hair); }
+.chat-timers-add label { display: flex; flex-direction: column; gap: 2px; }
+.chat-timers-add input, .chat-timers-add textarea, .chat-timers-add select {
+  font-family: inherit; font-size: 0.75rem; color: var(--text);
+  background: var(--bg); border: var(--b-hair); border-radius: 4px; padding: 2px 6px;
+}
+.chat-timers-add .chat-timers-submit { align-self: flex-start; }
+.chat-timers-error:not([hidden]) { color: var(--a5); }
 .chat-h-row {
   display: flex;
   align-items: center;

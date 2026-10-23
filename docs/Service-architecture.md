@@ -374,10 +374,12 @@ computer.
   process-scoped credential, a loopback peer and no browser Origin/fetch
   headers; even a valid gateway browser/admin assertion cannot call it.
   The native command can also use the normal loopback Poise APIs under their
-  existing policy. Creating-chat and worker relationships, the workspace Manager's role, inbox admission, supervision
-  and explicit issue/PR ownership persist in the workspace's SQLite store.
+  existing policy. Creating-chat and worker relationships, the workspace Manager's role, inbox admission, supervision,
+  explicit issue/PR ownership, durable timers and their holds persist in the
+  workspace's SQLite store.
   Dispatch pauses while draining; running monitor reads join the existing
-  background-work barrier. See [Chat orchestration](Chat-orchestration.md).
+  background-work barrier. A release switch waiting for quiet holds timer fire
+  and admission back so timer turns never keep it waiting. See [Chat orchestration](Chat-orchestration.md).
 - The Switchboard pane's actions (`POST /api/chat/switchboard/…`) act for the
   owner, so they also require an `Origin`, checked as below. A loopback
   request without one, such as a native chat's `api` operation, is refused

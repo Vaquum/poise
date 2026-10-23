@@ -16,7 +16,7 @@ import { BUILD_SHA } from '../build-identity'
 import type { ChatRuntime } from '../chat/runtime'
 import { findEvent, getOpenTurn, listOpenTurns } from '../chat/storage'
 import { HttpError, readJson, type RequestAuthority } from '../http'
-import { pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
+import { markReleaseSwitch, pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
 import { DEFAULT_CHAT_SETTINGS } from '../settings'
 import { runningCallerCalls } from './caller-calls'
 import { canRestartForUpdate, requestUpdateRestart } from './restart'
@@ -255,6 +255,7 @@ export class ServiceControl {
     this.switchTo = release
     this.runtime.setSwitchPending(release)
     if (first) {
+      markReleaseSwitch(true)
       this.switchPendingSince = this.now()
       this.log(`[service] switching to release ${release} once no Chat turn and no work of this server runs; new turns wait behind the update`)
     }
@@ -273,6 +274,7 @@ export class ServiceControl {
     this.switchPoll = null
     this.log(`[service] the switch to release ${this.switchTo} was withdrawn; staying on release ${this.release.name}`)
     this.switchTo = null
+    markReleaseSwitch(false)
     this.switchPendingSince = null
     this.switchEpoch += 1
     // An in-flight cancellation must record its continuation before any
@@ -315,6 +317,7 @@ export class ServiceControl {
     // Refused from here on; the gateway shows the person that Poise is updating.
     pauseReleaseBackground()
     this.runtime.startDrain('service')
+    markReleaseSwitch(false)
     this.drainOn = true
     this.log(`[service] restarting on release ${this.switchTo}; running agent calls carry on`)
     this.restarting = true
@@ -403,6 +406,7 @@ export class ServiceControl {
     if (this.switchPoll !== null) this.timer.clearTimeout(this.switchPoll)
     this.switchPoll = null
     if (this.drainOn || this.switchTo !== null) this.lift()
+    if (this.switchTo !== null) markReleaseSwitch(false)
     this.switchTo = null
     this.switchPendingSince = null
     this.switchEpoch += 1
