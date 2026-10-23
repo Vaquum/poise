@@ -5,7 +5,7 @@ that Chat session. It is off by default. It is also available in the fresh
 console before the first message or attachment, without opening a session.
 
 When enabled, the selected agent owns the whole requested batch: implement
-all slices, run the appropriate checks, fix failures and conflicts, open or
+the requested changes, run the appropriate checks, fix failures and conflicts, open or
 update PRs, wait for mergeability and required checks/reviews, merge, and
 verify the merges. This applies to every repository involved in the request,
 not only Poise, and does not stop at the first PR or at “ready to merge”.
