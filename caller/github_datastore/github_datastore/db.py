@@ -119,6 +119,9 @@ CREATE TABLE IF NOT EXISTS review_comments (
     position INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    thread_node_id TEXT,
+    thread_resolved INTEGER,
+    thread_outdated INTEGER,
     raw_json TEXT NOT NULL
 );
 
@@ -319,6 +322,7 @@ JOIN items i ON i.item_id = a.item_id;
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     migrate_events_key(conn)
+    migrate_review_comment_threads(conn)
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     views = {
         str(row["name"])
@@ -362,6 +366,20 @@ def migrate_events_key(conn: sqlite3.Connection) -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_item ON events(item_id)")
+
+
+def migrate_review_comment_threads(conn: sqlite3.Connection) -> None:
+    # Thread identity arrived after the table: existing rows keep NULL thread
+    # columns until the pull request syncs again. NULL resolution reads as
+    # unknown, never as resolved.
+    names = {row["name"] for row in conn.execute("PRAGMA table_info(review_comments)")}
+    for column, ddl in (
+        ("thread_node_id", "ALTER TABLE review_comments ADD COLUMN thread_node_id TEXT"),
+        ("thread_resolved", "ALTER TABLE review_comments ADD COLUMN thread_resolved INTEGER"),
+        ("thread_outdated", "ALTER TABLE review_comments ADD COLUMN thread_outdated INTEGER"),
+    ):
+        if column not in names:
+            conn.execute(ddl)
 
 
 def set_state(conn: sqlite3.Connection, scope: str, key: str, value: str) -> None:
@@ -468,6 +486,12 @@ def login(value: dict[str, Any] | None) -> str | None:
         return None
     raw = value.get("login")
     return None if raw is None else str(raw)
+
+
+def _tri_state(value: Any) -> int | None:
+    if value is None:
+        return None
+    return 1 if value else 0
 
 
 def stable_key(kind: str, value: dict[str, Any]) -> str:
@@ -634,8 +658,9 @@ def replace_child_rows(conn: sqlite3.Connection, item_id: int, expanded: dict[st
         conn.execute(
             """
             INSERT INTO review_comments(comment_id, node_id, item_id, author_login, body,
-                                        path, position, created_at, updated_at, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        path, position, created_at, updated_at,
+                                        thread_node_id, thread_resolved, thread_outdated, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(require(comment.get("id"), "review_comment.id")),
@@ -647,6 +672,9 @@ def replace_child_rows(conn: sqlite3.Connection, item_id: int, expanded: dict[st
                 comment.get("position"),
                 require(comment.get("created_at"), "review_comment.created_at"),
                 require(comment.get("updated_at"), "review_comment.updated_at"),
+                comment.get("thread_node_id"),
+                _tri_state(comment.get("thread_resolved")),
+                _tri_state(comment.get("thread_outdated")),
                 dumps(comment),
             ),
         )

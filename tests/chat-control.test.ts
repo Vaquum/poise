@@ -13,7 +13,7 @@ import type { Capabilities, ChatEvent, PromptInput, ServerFrame, SessionRecord }
 import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
 import type { ChatRuntime } from '../server/chat/runtime'
-import type { ChatControl, CiObservation, WorkTargetStatus } from '../server/chat/control'
+import type { ChatControl, CiObservation, ReviewsObservation, WorkTargetStatus } from '../server/chat/control'
 
 vi.mock('../server/claude-auth', () => ({ claudeAuth: { snapshot: () => ({ status: 'authenticated' }), requireReady: async () => {} } }))
 const executeFile = promisify(execFile)
@@ -37,6 +37,8 @@ const hosts = new Map<string, AdapterHost>()
 const steers = new Map<string, string[]>()
 const ci = vi.fn<() => Promise<CiObservation>>()
 const targetStatus = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }) => Promise<WorkTargetStatus>>()
+const reviews = vi.fn<() => Promise<ReviewsObservation | null>>()
+const ownsBehind = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }, ci: CiObservation, status: WorkTargetStatus) => boolean>()
 
 function adapterWith(capabilities: Capabilities) {
   return function adapter(host: AdapterHost): Adapter {
@@ -70,6 +72,14 @@ async function observeCi(target: string): Promise<void> {
   // The tick admits an independent background pass; wait for its persisted
   // result before changing the next mocked response or reading the inbox.
   await until(() => store.observation(runtime.instance, `ci:${target}`)?.checked_at === clock)
+}
+async function observeMerge(target: string): Promise<void> {
+  await control.tick()
+  await until(() => store.observation(runtime.instance, `merge:${target}`)?.checked_at === clock)
+}
+async function observeReviews(target: string): Promise<void> {
+  await control.tick()
+  await until(() => store.observation(runtime.instance, `reviews:${target}`)?.checked_at === clock)
 }
 async function config(id: string) {
   const context = await control.context(id)
@@ -107,7 +117,7 @@ async function restart() {
   const stopped = runtime.stop()
   await control.stop(stopped)
   runtime = makeRuntime()
-  control = new Control(runtime, { ci, now: () => clock, targetStatus })
+  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind })
   control.attach(server)
   await runtime.recover()
   control.start()
@@ -128,10 +138,12 @@ beforeEach(async () => {
   prompts.clear(); finishes.clear(); hosts.clear(); steers.clear()
   ci.mockReset().mockResolvedValue({ head: 'a'.repeat(40), failing: [] })
   targetStatus.mockReset().mockResolvedValue('open')
+  reviews.mockReset().mockResolvedValue(null)
+  ownsBehind.mockReset().mockReturnValue(false)
   instance = `control:${randomUUID()}`
   workspaceRoot = join(root, randomUUID())
   runtime = makeRuntime()
-  control = new Control(runtime, { ci, now: () => clock, targetStatus })
+  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind })
   server = createServer((req, res) => {
     if (req.url === '/api/chat/control') { void control.handle(req, res); return }
     res.setHeader('Content-Type', 'application/json')
@@ -406,14 +418,21 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       { name: 'Queued', state: 'queued', conclusion: null }, { name: 'Running', state: 'in_progress', conclusion: null },
       { name: 'Failure', state: 'completed', conclusion: 'failure', url: 'https://github.com/acme/app/actions/runs/1' },
       { name: 'Legacy', state: 'error' },
-    ] }), stderr: '' })
+    ], mergeable: false, mergeable_state: 'dirty', author: 'other', draft: false, base: 'main' }), stderr: '' })
     const target = store.workTarget('https://github.com/acme/app/pull/9')
     const observed = await readWorkCi(target)
     expect(observed.failing.map(c => c.name)).toEqual(['Failure', 'Legacy'])
     expect(observed.pending).toBe(true)
     expect(run.mock.calls[0][1]).toContain('--repository')
+    expect(observed.mergeable).toBe(false)
+    expect(observed.mergeableState).toBe('dirty')
+    expect(observed.author).toBe('other')
+    expect(observed.draft).toBe(false)
+    expect(observed.base).toBe('main')
     run.mockResolvedValue({ stdout: JSON.stringify({ repository: 'acme/other', pull_number: 9, head_sha: 'b'.repeat(40), failing: [] }), stderr: '' })
     await expect(readWorkCi(target)).rejects.toThrow('invalid CI evidence')
+    run.mockResolvedValue({ stdout: JSON.stringify({ repository: 'acme/app', pull_number: 9, head_sha: 'b'.repeat(40), failing: [], mergeable: 'yes' }), stderr: '' })
+    await expect(readWorkCi(target)).rejects.toThrow('invalid merge evidence')
     run.mockRestore()
   })
 
@@ -427,7 +446,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
     const old = await config(second.id)
     await control.stop()
-    control = new Control(runtime, { ci, now: () => clock, targetStatus }); control.attach(server); control.start()
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind }); control.attach(server); control.start()
     const response = await fetch(`${origin}/api/chat/control`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Poise-Chat': second.id, Authorization: `Bearer ${old.token}` }, body: '{"operation":"list"}' })
     expect(response.status).toBe(403)
   })
@@ -649,6 +668,317 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     // CI reads run in their own pass behind the tick; the new owner's read follows the crossed one.
     await until(() => store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure')))
     expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
+  })
+
+  it('moves work bindings to the handoff target and wakes it, never the source', async () => {
+    const first = await manager()
+    const target = 'https://github.com/acme/app/pull/60'
+    await command(first.id, { operation: 'bind', target })
+    runtime.prompt(first.id, { text: 'Work on the bound PR', attachments: [], mentions: [] })
+    await until(() => prompts.has(first.id))
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
+    // The prompt startup above is slow enough for the 1s interval timer to
+    // tick first; the clock advance reopens the read cadence deterministically.
+    clock += 5 * 60_000
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, first.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, first.id)[0].state).toBe('pending')
+    // Paused delivery holds the notice pending while the source turns idle,
+    // so the handoff below cannot race a delivery starting a new turn.
+    store.pauseDelivery(runtime.instance, first.id)
+    finishes.get(first.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(first.id)?.status === 'idle')
+    const grok = CATALOG.models.find(m => m.provider === 'grok')
+    if (!grok) throw new Error('fixture lacks grok')
+    const second = await runtime.handoff(first.id, { agent: 'grok', model: grok.identity })
+    expect(store.bindings(runtime.instance).find(b => b.target === target)?.session).toBe(second.id)
+    expect(store.inbox(runtime.instance, first.id)).toHaveLength(0)
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
+    clock += 5 * 60_000
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, second.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, first.id)).toHaveLength(0)
+  }, 60_000)
+
+  it('releases work bindings when its chat is closed so a replacement can claim them', async () => {
+    const first = await manager(), second = await manager()
+    const target = 'https://github.com/acme/app/pull/61'
+    await command(first.id, { operation: 'bind', target })
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
+    await observeCi(target)
+    await runtime.close(first.id)
+    expect(store.bindings(runtime.instance)).toHaveLength(0)
+    await command(second.id, { operation: 'bind', target })
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
+    const closed = store.inbox(runtime.instance, first.id).length
+    clock += 5 * 60_000
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, first.id)).toHaveLength(closed)
+  }, 60_000)
+
+  it('wakes once for a conflict and stays silent when it clears or repeats', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/62'
+    await command(parent.id, { operation: 'bind', target })
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [], mergeable: false, mergeableState: 'dirty', author: 'other', draft: false, base: 'main' })
+    await observeMerge(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    const notice = JSON.parse(store.inbox(runtime.instance, parent.id)[0].body)
+    expect(notice).toMatchObject({ kind: 'merge', conflict: true })
+    expect(notice.blockers).toEqual(['Resolve the merge conflicts with main'])
+    expect(notice.done).toHaveLength(3)
+    clock += 5 * 60_000
+    await observeMerge(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [], mergeable: true, mergeableState: 'clean', author: 'other', draft: false, base: 'main' })
+    clock += 5 * 60_000
+    await observeMerge(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+  })
+
+  it('wakes for behind only when merge-prs will not update the branch', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/63'
+    await command(parent.id, { operation: 'bind', target })
+    ownsBehind.mockReturnValue(true)
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [], mergeable: true, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' })
+    await observeMerge(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    ownsBehind.mockReturnValue(false)
+    clock += 5 * 60_000
+    await observeMerge(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)[0].body).toContain('Bring the branch up to date with main')
+  })
+
+  it('leaves behind branches to merge-prs only when it is enabled, eligible and healthy', async () => {
+    const { mergePrsOwnsBehind } = await import('../server/chat/control')
+    const target = store.workTarget('https://github.com/acme/app/pull/64')
+    const ciState = { head: 'a'.repeat(40), failing: [], mergeable: true as const, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' }
+    expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(false)
+    database.setMeta('behavior_merge_prs_enabled', '1')
+    try {
+      expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(false)
+      database.setMeta('me', 'fixture-agent')
+      try {
+        expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(true)
+        expect(mergePrsOwnsBehind(target, { ...ciState, author: 'other' }, 'open')).toBe(false)
+        expect(mergePrsOwnsBehind(target, { ...ciState, draft: true }, 'open')).toBe(false)
+        expect(mergePrsOwnsBehind(target, { ...ciState, author: undefined }, 'open')).toBe(false)
+        database.setMeta('behavior_merge_prs_failure:Acme/App#64', JSON.stringify(
+          { kind: 'operation', consecutiveFailures: 1, lastFailureAtMs: 1, nextRetryAtMs: 2 }))
+        try {
+          expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(false)
+        } finally {
+          database.setMeta('behavior_merge_prs_failure:Acme/App#64', '')
+        }
+      } finally {
+        database.setMeta('me', '')
+      }
+    } finally {
+      database.setMeta('behavior_merge_prs_enabled', '0')
+    }
+  })
+
+  it('queues one degraded notice per CI outage and keeps the settled baseline', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/65'
+    await command(parent.id, { operation: 'bind', target })
+    const failed = { head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] }
+    ci.mockResolvedValue(failed)
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    ci.mockRejectedValue(new Error('GitHub access unavailable'))
+    clock += 5 * 60_000
+    await observeCi(target)
+    clock += 5 * 60_000
+    await observeCi(target)
+    clock += 5 * 60_000
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, parent.id).map(m => m.body).filter(b => b.includes('ci_unavailable'))).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
+    ci.mockResolvedValue(failed)
+    clock += 5 * 60_000
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
+    ci.mockRejectedValue(new Error('GitHub access unavailable'))
+    clock += 5 * 60_000
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(3)
+  })
+
+  it('wakes once for review feedback and never for its own activity', async () => {
+    database.setMeta('agentAccount', 'fixture-agent')
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/66'
+    await command(parent.id, { operation: 'bind', target })
+    const review = { id: 'R_1', author: 'reviewer', state: 'CHANGES_REQUESTED' }
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [review],
+      threads: [{ thread: 'T_1', resolved: false, outdated: false, comments: [{ id: 'C_1', author: 'reviewer' }] }] })
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    const notice = JSON.parse(store.inbox(runtime.instance, parent.id)[0].body)
+    expect(notice).toMatchObject({ kind: 'reviews' })
+    expect(notice.blockers).toHaveLength(2)
+    expect(notice.done).toHaveLength(3)
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [review],
+      threads: [{ thread: 'T_1', resolved: false, outdated: false,
+        comments: [{ id: 'C_1', author: 'reviewer' }, { id: 'C_2', author: 'fixture-agent' }] }] })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [review],
+      threads: [{ thread: 'T_1', resolved: false, outdated: false,
+        comments: [{ id: 'C_1', author: 'reviewer' }, { id: 'C_2', author: 'fixture-agent' }, { id: 'C_3', author: 'reviewer' }] }] })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
+    expect(store.inbox(runtime.instance, parent.id)[1].body).toContain('C_3')
+  })
+
+  it('wakes for a dismissed approval only while threads wait on the author', async () => {
+    database.setMeta('agentAccount', 'fixture-agent')
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/67'
+    await command(parent.id, { operation: 'bind', target })
+    reviews.mockResolvedValue({ found: true, truncated: false,
+      reviews: [{ id: 'R_1', author: 'reviewer', state: 'APPROVED' }], threads: [] })
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    reviews.mockResolvedValue({ found: true, truncated: false,
+      reviews: [{ id: 'R_1', author: 'reviewer', state: 'DISMISSED' }], threads: [] })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    reviews.mockResolvedValue({ found: true, truncated: false,
+      reviews: [{ id: 'R_1', author: 'reviewer', state: 'DISMISSED' }],
+      threads: [{ thread: 'T_1', resolved: false, outdated: false, comments: [{ id: 'C_1', author: 'reviewer' }] }] })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)[0].body).toContain('DISMISSED')
+  })
+
+  it('keeps the reviews baseline through unknown and truncated reads', async () => {
+    database.setMeta('agentAccount', 'fixture-agent')
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/68'
+    await command(parent.id, { operation: 'bind', target })
+    reviews.mockResolvedValue(null)
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    reviews.mockResolvedValue({ found: false, truncated: false, reviews: [], threads: [] })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    reviews.mockResolvedValue({ found: true, truncated: true, reviews: [], threads: [] })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    reviews.mockResolvedValue({ found: true, truncated: false,
+      reviews: [{ id: 'R_1', author: 'reviewer', state: 'CHANGES_REQUESTED' }], threads: [] })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+  })
+
+  it('notifies the new owner when a handoff crosses an unavailable reviews read', async () => {
+    database.setMeta('agentAccount', 'fixture-agent')
+    const first = await manager()
+    const target = 'https://github.com/acme/app/pull/69'
+    await command(first.id, { operation: 'bind', target })
+    store.pauseDelivery(runtime.instance, first.id)
+    const feedback = { found: true, truncated: false,
+      reviews: [{ id: 'R_1', author: 'reviewer', state: 'CHANGES_REQUESTED' }],
+      threads: [{ thread: 'T_1', resolved: false, outdated: false, comments: [{ id: 'C_1', author: 'reviewer' }] }] }
+    reviews.mockResolvedValue(feedback)
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, first.id)).toHaveLength(1)
+    let resolveRead!: (value: ReviewsObservation | null) => void
+    reviews.mockReturnValueOnce(new Promise<ReviewsObservation | null>(done => { resolveRead = done }))
+    const calls = reviews.mock.calls.length
+    clock += 5 * 60_000
+    const ticked = control.tick()
+    await until(() => reviews.mock.calls.length > calls)
+    const grok = CATALOG.models.find(m => m.provider === 'grok')
+    if (!grok) throw new Error('fixture lacks grok')
+    const second = await runtime.handoff(first.id, { agent: 'grok', model: grok.identity })
+    resolveRead(null)
+    await ticked
+    // The failed pass must not restore the old fingerprint: the same
+    // feedback notifies the new owner. Loop serialization runs the stale
+    // pass before this one, so the assertion is deterministic.
+    reviews.mockResolvedValue(feedback)
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, second.id).some(m => JSON.parse(m.body).kind === 'reviews')).toBe(true)
+  }, 60_000)
+
+  it('stays silent when a push marks an unresolved thread outdated', async () => {
+    database.setMeta('agentAccount', 'fixture-agent')
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/70'
+    await command(parent.id, { operation: 'bind', target })
+    const threads = (outdated: boolean) => [{ thread: 'T_1', resolved: false, outdated, comments: [{ id: 'C_1', author: 'reviewer' }] }]
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [], threads: threads(false) })
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [], threads: threads(true) })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+  })
+
+  it('stays silent when a resolution leaves other threads open, and wakes on the next new reply', async () => {
+    database.setMeta('agentAccount', 'fixture-agent')
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/71'
+    await command(parent.id, { operation: 'bind', target })
+    const threads = (resolved: boolean, extra: Array<{ id: string, author: string }> = []) => [
+      { thread: 'T_1', resolved, outdated: false, comments: [{ id: 'C_1', author: 'reviewer' }] },
+      { thread: 'T_2', resolved: false, outdated: false, comments: [{ id: 'C_2', author: 'reviewer' }, ...extra] },
+    ]
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [], threads: threads(false) })
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [], threads: threads(true) })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [], threads: threads(true, [{ id: 'C_3', author: 'reviewer' }]) })
+    clock += 5 * 60_000
+    await observeReviews(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(2)
+  })
+
+  it('reads bound-PR reviews from the local datastore and never throws on malformed rows', async () => {
+    const processModule = await import('../server/process')
+    const { readWorkReviews } = await import('../server/chat/control')
+    const target = store.workTarget('https://github.com/acme/app/pull/9')
+    expect(await readWorkReviews(target)).toBeNull()
+    database.setMeta('org', 'acme')
+    const run = vi.spyOn(processModule, 'runFile').mockResolvedValue({ stdout: JSON.stringify({ repo: 'acme/app', number: 9,
+      found: true, truncated: false,
+      reviews: [{ node_id: 'R_1', author: 'reviewer', state: 'CHANGES_REQUESTED', submitted_at: '2026-01-02T00:00:00Z' }],
+      threads: [{ thread_node_id: 'T_1', resolved: false, outdated: false,
+        comments: [{ node_id: 'C_1', author: 'reviewer', updated_at: '2026-01-02T00:00:00Z' }] }] }), stderr: '' })
+    try {
+      const observed = await readWorkReviews(target)
+      expect(observed).toMatchObject({ found: true, truncated: false })
+      expect(observed?.reviews).toEqual([{ id: 'R_1', author: 'reviewer', state: 'CHANGES_REQUESTED' }])
+      expect(observed?.threads).toEqual([{ thread: 'T_1', resolved: false, outdated: false, comments: [{ id: 'C_1', author: 'reviewer' }] }])
+      expect(run.mock.calls[0][1]).toContain('pr-reviews')
+      run.mockResolvedValue({ stdout: '{"found":true}', stderr: '' })
+      expect(await readWorkReviews(target)).toBeNull()
+    } finally {
+      database.setMeta('org', '')
+      run.mockRestore()
+    }
   })
 
   it('preserves each recipient message order across dispatch-page boundaries', async () => {
