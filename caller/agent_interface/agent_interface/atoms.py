@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from . import progress, review_budget
-from .process_diagnostic import command_failure, diagnostic_from_stderr, diagnostic_message
+from .process_diagnostic import command_failure, diagnostic_envelope, diagnostic_from_stderr, diagnostic_message
 from .provider_progress import claude_error, claude_result
 
 import os
@@ -228,9 +228,10 @@ def run_agent(
             f"{prompt_bytes} bytes exceeds {MAX_GOVERNED_PROMPT_BYTES} after data exclusions; "
             "reduce the remaining review input",
             "review_packet_too_large",
-            {"version": 1, "source": "caller", "severity": "error", "operation": "provider.input_admission",
-             "phase": "before_provider_launch", "stderr": "", "context": {"actual_input_bytes": prompt_bytes,
-             "input_limit_bytes": MAX_GOVERNED_PROMPT_BYTES, "provider_started": False}},
+            diagnostic_envelope(operation="provider.input_admission", phase="before_provider_launch",
+                                outcome="resource_failure",
+                                context={"actual_input_bytes": prompt_bytes,
+                                         "input_limit_bytes": MAX_GOVERNED_PROMPT_BYTES, "provider_started": False}),
         )
     spec = CATALOG.review_model(behavior, model)
     if spec.provider != "claude":
