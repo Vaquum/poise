@@ -117,7 +117,11 @@ the worker is down. Captures the store rejects as storage failures wait at the
 head of the queue and retry; observations the store rejects as invalid are shed
 with loss accounting. A store that fails to open retries on later operations,
 and health names the cause in `unavailableReason` (`worker_unavailable`,
-`store_unavailable`, `journal_unavailable`) until reads observe recovery.
+`store_unavailable`, `journal_unavailable`, `read_timeout`) until reads observe
+recovery. A read that misses its budget while the worker reports nothing wrong
+names `read_timeout`; `unavailable` never surfaces without a reason.
+The store keeps usage and pending counts incrementally and trims retained
+changes by sequence arithmetic, so reads never scan retained history.
 Reads allow 16 outstanding requests and a two-second budget. Each completed
 capture permits one waiting read before
 ordinary FIFO resumes. Reads can return a committed prefix with pending
