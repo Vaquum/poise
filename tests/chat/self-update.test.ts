@@ -220,7 +220,10 @@ describe('/poise change sessions', () => {
     await expect(unconfigured.runtime.startPoiseChange(src2.id, 'add a button', randomUUID())).rejects.toMatchObject({ code: 'self_update_unavailable' })
   }, 20_000)
 
-  it.each(['withdrawal', 'restart'] as const)('waits a Poise implementation admitted during controller binding through %s', async (mode) => {
+  it.each([
+    { mode: 'withdrawal', queued: true }, { mode: 'restart', queued: true },
+    { mode: 'withdrawal', queued: false }, { mode: 'restart', queued: false },
+  ] as const)('waits a Poise implementation admitted during controller binding through $mode (queued: $queued)', async ({ mode, queued }) => {
     const bridge = fakeBridge('poise-test:db')
     const initial = makeRuntime({ bridge })
     const source = await sourceSession(initial.runtime, initial.events)
@@ -237,13 +240,13 @@ describe('/poise change sessions', () => {
     }
     const changeId = randomUUID(), request = 'Improve the console after the update'
     const context = { attachments: [], mentions: [], switches: [switchName] }
-    await initial.runtime.enqueue(source.id, randomUUID(), { text: 'Existing queued follow-up', attachments: [], mentions: [] })
+    if (queued) await initial.runtime.enqueue(source.id, randomUUID(), { text: 'Existing queued follow-up', attachments: [], mentions: [] })
     // A previously completed source turn armed its queue. The dedicated
     // implementation still owns the first turn after delegation.
     const previous = randomUUID()
     storage.reserveQueueTurn(source.id, previous)
     storage.finalizeTurn(source.id, { type: 'turn.finished', turnId: previous, stopReason: 'end_turn' })
-    expect(initial.runtime.get(source.id)?.queue?.ready).toBe(true)
+    expect(initial.runtime.get(source.id)?.queue?.ready).toBe(queued)
     const starting = initial.runtime.startPoiseChange(source.id, request, changeId, context)
     try {
       await waitFor(() => binding)
@@ -278,15 +281,18 @@ describe('/poise change sessions', () => {
       await active.runtime.releaseSwitchWait()
       await waitFor(() => !!outbox.getFinish(changeId)?.deliveredAt)
       expect(ofType(active.events, result.session.id, 'turn.finished')).toHaveLength(1)
-      // Queued edits retain the existing controller-release barrier.
-      bridge.changes.get(changeId)!.state = 'live'
-      await waitFor(() => ofType(active.events, result.session.id, 'turn.finished').length === 3)
+      // A waited follow-up must reach the release guard even with no older
+      // normal queue entry to block it. Observe the guard before release.
+      await waitFor(() => active.runtime.get(result.session.id)?.queue?.waitingForRelease === true)
       const agent = active.controls.adapters.find(adapter => adapter.host.sessionId === result.session.id)!
-      expect(agent.inputs).toHaveLength(3)
+      expect(agent.inputs).toHaveLength(1)
+      bridge.changes.get(changeId)!.state = 'live'
+      await waitFor(() => ofType(active.events, result.session.id, 'turn.finished').length === (queued ? 3 : 2))
+      expect(agent.inputs).toHaveLength(queued ? 3 : 2)
       expect(agent.inputs[0].text).toContain(request)
       expect(agent.inputs[0].text).toContain('Keep the original implementation instructions.')
-      expect(agent.inputs[1].text).toContain('Existing queued follow-up')
-      expect(agent.inputs[2].text).toContain('Discuss after implementing')
+      if (queued) expect(agent.inputs[1].text).toContain('Existing queued follow-up')
+      expect(agent.inputs[queued ? 2 : 1].text).toContain('Discuss after implementing')
       expect(ofType(active.events, result.session.id, 'turn.started')[0].prompt.text).toBe(`/${switchName} ${request}`)
       expect(outbox.getFinish(changeId)).toMatchObject({ outcome: 'completed' })
       expect(bridge.calls.filter(call => call.op === 'finish' && call.changeId === changeId)).toHaveLength(1)

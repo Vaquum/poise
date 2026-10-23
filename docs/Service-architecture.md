@@ -349,6 +349,8 @@ reconciles them as after any restart.
   continuations even if transient admission deferred them into the waiting
   store; literal waiting messages retain their order. Drain and withdrawal release paths also retain records
   held by another live server. Waiting turns follow these recoveries in order.
+  In an isolated Poise change, recovered and waited follow-ups also wait for
+  the controller to release the checkout after checks, build and deployment.
   A waited message retains its position between earlier and later normal queue
   items when the preceding turn finishes naturally during the switch. New
   waited messages record that queue boundary; older records use their stored

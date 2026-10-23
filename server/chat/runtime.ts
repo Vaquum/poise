@@ -779,6 +779,12 @@ export class ChatRuntime extends EventEmitter {
     for (const row of this.readInterruptedSessions()) {
       if (this.stopped || this.drainState || this.switchState) return
       if (blocked.has(row.sessionId)) continue
+      if (this.deferChangeFollowUp(row.sessionId, row)) {
+        if (row.continuation !== continuation) this.writeInterruptedSessions(this.readInterruptedSessions()
+          .map(entry => entry.sessionId === row.sessionId && entry.turnId === row.turnId ? { ...entry, continuation } : entry))
+        blocked.add(row.sessionId)
+        continue
+      }
       const outcome = await this.resumeInterruptedSession(row, continuation)
       if (outcome === 'deferred') blocked.add(row.sessionId)
     }
@@ -812,10 +818,19 @@ export class ChatRuntime extends EventEmitter {
       if (blocked.has(entry.sessionId)) continue
       if (protectedSessions.has(entry.sessionId) || this.recoveryOwnedElsewhere(entry.sessionId)) continue
       if (this.waitingPromptBlocked(entry)) { blocked.add(entry.sessionId); continue }
+      if (this.deferChangeFollowUp(entry.sessionId, entry.recovery)) { blocked.add(entry.sessionId); continue }
       if (!this.takeWaitingPrompt(entry.id)) continue
       const outcome = await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery, entry)
       if (outcome === 'deferred') blocked.add(entry.sessionId)
     }
+  }
+
+  /** Follow-ups share the queue's controller-release gate, including after
+   *  restart. The never-started implementation itself still admits normally. */
+  private deferChangeFollowUp(sessionId: string, recovery?: SwitchPromptMetadata): boolean {
+    if (!storage.getSession(sessionId)?.selfChangeId || recovery?.implementsChange) return false
+    if (!this.recoveryOwnedElsewhere(sessionId)) this.scheduleQueue(this.requireLive(sessionId))
+    return true
   }
 
   private waitingPromptBlocked(entry: WaitingPrompt): boolean {
@@ -2337,26 +2352,8 @@ export class ChatRuntime extends EventEmitter {
     if (session.record.role === 'manager' && session.record.retiredModel) return
     if (this.stopped || this.recovering || this.drainState || this.switchState || session.lifecycle.signal.aborted || session.record.status === 'closed'
       || session.record.contextResetting || session.record.orphanNotice || session.turn || this.deferredWaitingSessions.has(id) || this.queuePumps.has(id) || this.queueTimers.has(id)) return
-    const interrupted = this.readInterruptedSessions().find(row => row.sessionId === id)
-    if (interrupted) {
-      if (storage.getOpenTurn(id)) return
-      void this.resumeInterruptedSession(interrupted, interrupted.continuation ?? SWITCH_CONTINUE_PROMPT).then(outcome => {
-        if (outcome === 'dropped') this.scheduleQueue(session)
-      }).catch(error => this.emit('log', `[chat] interrupted recovery for ${id.slice(0, 8)} failed: ${error instanceof Error ? error.message : String(error)}`))
-      return
-    }
-    const waiting = this.readWaitingPrompts().find(entry => entry.sessionId === id)
-    if (waiting && !this.waitingPromptBlocked(waiting) && !this.recoveryOwnedElsewhere(id) && this.takeWaitingPrompt(waiting.id)) {
-      void this.deliverWaitingPrompt(id, waiting.prompt, 'waiting', waiting.recovery, waiting).then(outcome => {
-        // A permanent refusal must not strand the normal queue. A transient
-        // deferral remains for recovery instead of recursively retrying here.
-        if (outcome === 'dropped') this.scheduleQueue(session)
-      })
-      return
-    }
-    if (!this.messageQueue(id).ready) return
-    const executor = this.messageQueue(id).executorSessionId
-    if (executor && executor !== id) return
+    if (!this.readInterruptedSessions().some(row => row.sessionId === id)
+      && !this.readWaitingPrompts().some(entry => entry.sessionId === id) && !this.messageQueue(id).ready) return
     this.queuePumps.add(id)
     let ran = false
     void this.serialized(session, async () => {
@@ -2365,7 +2362,10 @@ export class ChatRuntime extends EventEmitter {
       // controller after its turn. Never let a follow-up edit that checkout
       // while checks/build/deployment still own it. This is a wait, not an
       // extra confirmation; the durable queue continues after deployment.
-      if (session.record.selfChangeId && this.selfUpdate?.configured) {
+      const interrupted = this.readInterruptedSessions().find(row => row.sessionId === id)
+      const waiting = this.readWaitingPrompts().find(entry => entry.sessionId === id)
+      const implementing = interrupted?.implementsChange || waiting?.recovery?.implementsChange
+      if (session.record.selfChangeId && this.selfUpdate?.configured && !implementing) {
         let done = false
         try {
           const status = await this.selfUpdate.status()
@@ -2380,7 +2380,19 @@ export class ChatRuntime extends EventEmitter {
         }
         this.queueReleaseWait.delete(id)
       }
+      if (this.stopped || this.drainState || this.switchState || session.turn || session.lifecycle.signal.aborted || storage.getOpenTurn(id)) return
+      if (interrupted) {
+        const outcome = await this.resumeInterruptedSession(interrupted, interrupted.continuation ?? SWITCH_CONTINUE_PROMPT)
+        ran = outcome !== 'deferred'
+        return
+      }
+      if (waiting && !this.waitingPromptBlocked(waiting) && !this.recoveryOwnedElsewhere(id) && this.takeWaitingPrompt(waiting.id)) {
+        const outcome = await this.deliverWaitingPrompt(id, waiting.prompt, 'waiting', waiting.recovery, waiting)
+        ran = outcome !== 'deferred'
+        return
+      }
       const queue = this.messageQueue(id)
+      if (queue.executorSessionId && queue.executorSessionId !== id) return
       const item = queue.ready && queue.items.find(candidate => candidate.state === 'waiting')
       if (!item || this.stopped || this.drainState || this.switchState || session.turn || session.lifecycle.signal.aborted) return
       const turn = this.reserveTurn(session, item)
