@@ -261,7 +261,8 @@ export interface SwitchWait { release: string, since: string }
 
 interface SwitchPromptMetadata extends Pick<RunningTurn, 'implementsChange' | 'switches'> { source?: TurnSource, shown?: PromptInput, sourceSessionId?: string, model?: string, effort?: string }
 /** One prompt admitted while a switch was pending, in arrival order. */
-interface WaitingPrompt { id: string, sessionId: string, prompt: PromptInput, createdAt: string, recovery?: SwitchPromptMetadata }
+interface WaitingPrompt { id: string, sessionId: string, prompt: PromptInput, createdAt: string, queueBefore?: string[], recovery?: SwitchPromptMetadata }
+type WaitingDelivery = 'admitted' | 'dropped' | 'deferred'
 
 /** One session whose running turn a switch bound interrupted. */
 interface InterruptedSession extends SwitchPromptMetadata { sessionId: string, turnId: string, at: string, prompt?: PromptInput }
@@ -758,12 +759,26 @@ export class ChatRuntime extends EventEmitter {
 
   /** Start every prompt that waited behind an update, in arrival order. */
   private async startWaitingPrompts(protectedSessions: ReadonlySet<string> = new Set()): Promise<void> {
+    const blocked = new Set<string>()
     for (const entry of this.readWaitingPrompts()) {
       if (this.stopped || this.drainState || this.switchState) return
+      if (blocked.has(entry.sessionId)) continue
       if (protectedSessions.has(entry.sessionId) || this.recoveryOwnedElsewhere(entry.sessionId)) continue
+      if (this.waitingPromptBlocked(entry)) { blocked.add(entry.sessionId); continue }
       if (!this.takeWaitingPrompt(entry.id)) continue
       await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery)
     }
+  }
+
+  private waitingPromptBlocked(entry: WaitingPrompt): boolean {
+    if (this.live.get(entry.sessionId)?.turn || storage.getOpenTurn(entry.sessionId)) return true
+    const queue = this.messageQueue(entry.sessionId)
+    if (queue.executorSessionId && queue.executorSessionId !== entry.sessionId) return false
+    if (!queue.ready) return false
+    // Older persisted entries predate the queue boundary. Keep their stored
+    // timestamp ordering; new entries record IDs so clock ties cannot reorder.
+    const before = new Set(entry.queueBefore ?? queue.items.filter(item => item.createdAt <= entry.createdAt).map(item => item.id))
+    return queue.items.some(item => item.state === 'waiting' && before.has(item.id))
   }
 
   /** Release paths have no startup protection set. Recheck the live owner
@@ -788,15 +803,16 @@ export class ChatRuntime extends EventEmitter {
    *  session is dropped; one that fails transiently waits for the next
    *  restart; one that can never run says so on its session. Never throws:
    *  one bad entry must not stop the entries behind it. */
-  private async deliverWaitingPrompt(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata): Promise<void> {
+  private async deliverWaitingPrompt(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata): Promise<WaitingDelivery> {
     try {
-      await this.deliverWaitingPromptInner(sessionId, prompt, kind, recovery)
+      return await this.deliverWaitingPromptInner(sessionId, prompt, kind, recovery)
     } catch (error) {
       this.emit('log', `[chat] ${kind} prompt for ${sessionId.slice(0, 8)} failed: ${error instanceof Error ? error.message : String(error)}`)
+      return 'deferred'
     }
   }
 
-  private async deliverWaitingPromptInner(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata): Promise<void> {
+  private async deliverWaitingPromptInner(sessionId: string, prompt: PromptInput, kind: 'interrupted' | 'waiting', recovery?: SwitchPromptMetadata): Promise<WaitingDelivery> {
     const short = sessionId.slice(0, 8)
     const drop = (message: string): void => {
       this.emit('log', `[chat] ${kind} prompt for ${short} dropped: ${message}`)
@@ -834,9 +850,9 @@ export class ChatRuntime extends EventEmitter {
       }
       // A switch already pending on the fresh server waits it again.
       if (!('turnId' in receipt)) this.emit('log', `[chat] ${kind} prompt for ${short} waits behind a new update`)
-      return
+      return 'admitted'
     } catch (error) {
-      if (error instanceof ChatError && error.statusCode === 404) { gone(error.message); return }
+      if (error instanceof ChatError && error.statusCode === 404) { gone(error.message); return 'dropped' }
       // A prompt its session cannot take now waits in its queue — or, when
       // queuing is itself unavailable, for the next restart. A 503 (a drain
       // in force) fails the enqueue the same way and defers the same way.
@@ -844,18 +860,19 @@ export class ChatRuntime extends EventEmitter {
         if (error instanceof ChatError) {
           try {
             await this.enqueue(sessionId, randomUUID(), prompt, recovery?.model, recovery?.effort, recovery)
-            return
+            return 'admitted'
           } catch (queued) {
-            if (queued instanceof ChatError && queued.statusCode === 404) { gone(queued.message); return }
-            if (queued instanceof ChatError && queued.statusCode === 400) { drop(queued.message); return }
+            if (queued instanceof ChatError && queued.statusCode === 404) { gone(queued.message); return 'dropped' }
+            if (queued instanceof ChatError && queued.statusCode === 400) { drop(queued.message); return 'dropped' }
             defer(queued instanceof Error ? queued.message : String(queued))
-            return
+            return 'deferred'
           }
         }
         defer(error instanceof Error ? error.message : String(error))
-        return
+        return 'deferred'
       }
       drop(error.message)
+      return 'dropped'
     }
   }
 
@@ -2114,7 +2131,8 @@ export class ChatRuntime extends EventEmitter {
    *  restart and crash all start it later, in arrival order. */
   private waitPromptForSwitch(session: LiveSession, prompt: PromptInput): PromptReceipt {
     this.assertTurnAdmissible(session)
-    const entry: WaitingPrompt = { id: randomUUID(), sessionId: session.record.id, prompt, createdAt: new Date().toISOString() }
+    const entry: WaitingPrompt = { id: randomUUID(), sessionId: session.record.id, prompt, createdAt: new Date().toISOString(),
+      queueBefore: this.messageQueue(session.record.id).items.filter(item => item.state === 'waiting').map(item => item.id) }
     this.writeWaitingPrompts([...this.readWaitingPrompts(), entry])
     session.record.queuedBehind = SWITCH_WAIT_REASON
     this.setStatus(session, 'queued')
@@ -2221,7 +2239,17 @@ export class ChatRuntime extends EventEmitter {
     const id = session.record.id
     if (session.record.role === 'manager' && session.record.retiredModel) return
     if (this.stopped || this.recovering || this.drainState || this.switchState || session.lifecycle.signal.aborted || session.record.status === 'closed'
-      || session.record.contextResetting || session.record.orphanNotice || session.turn || this.queuePumps.has(id) || this.queueTimers.has(id) || !this.messageQueue(id).ready) return
+      || session.record.contextResetting || session.record.orphanNotice || session.turn || this.queuePumps.has(id) || this.queueTimers.has(id)) return
+    const waiting = this.readWaitingPrompts().find(entry => entry.sessionId === id)
+    if (waiting && !this.waitingPromptBlocked(waiting) && !this.recoveryOwnedElsewhere(id) && this.takeWaitingPrompt(waiting.id)) {
+      void this.deliverWaitingPrompt(id, waiting.prompt, 'waiting', waiting.recovery).then(outcome => {
+        // A permanent refusal must not strand the normal queue. A transient
+        // deferral remains for recovery instead of recursively retrying here.
+        if (outcome === 'dropped') this.scheduleQueue(session)
+      })
+      return
+    }
+    if (!this.messageQueue(id).ready) return
     const executor = this.messageQueue(id).executorSessionId
     if (executor && executor !== id) return
     this.queuePumps.add(id)

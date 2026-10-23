@@ -342,6 +342,10 @@ reconciles them as after any restart.
   waiting records stay durable until it clears; continuations keep priority
   over their follow-ups. Drain and withdrawal release paths also retain records
   held by another live server. Waiting turns follow these recoveries in order.
+  A waited message retains its position between earlier and later normal queue
+  items when the preceding turn finishes naturally during the switch. New
+  waited messages record that queue boundary; older records use their stored
+  creation times.
   Withdrawal waits for any bound cancellation to record recovery before
   releasing messages. A bound
   cancellation never bypasses the quiet gate for server work, background

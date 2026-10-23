@@ -225,6 +225,29 @@ describe('waiting behind a pending switch', () => {
     await until(() => w.c.calls.length === 2)
     expect(w.c.calls.map(call => call.input.text)).toEqual(['First', 'Second'])
   })
+
+  it.each(['withdrawal', 'restart'] as const)('preserves older queue, waited prompt and newer queue order after natural completion via %s', async release => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.c.calls.length === 1)
+    await w.runtime.enqueue(w.s.id, randomUUID(), input('Older queued task'))
+    w.runtime.setSwitchPending('r2')
+    w.finish()
+    await until(() => w.turns(w.s.id).length === 1 && w.runtime.working() === 0)
+    expect(w.runtime.get(w.s.id)?.queue?.ready).toBe(true)
+    expect(w.runtime.prompt(w.s.id, input('Switch-waited task'))).toHaveProperty('waitId')
+    await w.runtime.enqueue(w.s.id, randomUUID(), input('Newer queued task'))
+    w.c.auto = true
+    if (release === 'restart') {
+      await w.runtime.stop()
+      await w.make().recover()
+    } else await w.runtime.releaseSwitchWait()
+    await until(() => w.turns(w.s.id).length === 4)
+    expect(w.c.calls.map(call => call.input.text)).toEqual([
+      'Original task', 'Older queued task', 'Switch-waited task', 'Newer queued task',
+    ])
+    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([])
+  })
 })
 
 describe('the switch bound', () => {
