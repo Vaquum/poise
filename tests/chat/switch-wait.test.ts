@@ -486,8 +486,8 @@ describe('the switch bound', () => {
     w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID() }])
     await w.runtime.releaseSwitchWait()
     const continuation = 'Poise stopped your turn for an update that did not restart. Continue where you left off.'
-    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([
-      expect.objectContaining({ sessionId: w.s.id, prompt: input(continuation), queueBefore: [] }),
+    expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([
+      expect.objectContaining({ sessionId: w.s.id, continuation }),
     ])
     expect(w.runtime.get(w.s.id)?.queue?.items).toEqual([
       expect.objectContaining({ id: followupId, state: 'waiting' }),
@@ -513,9 +513,9 @@ describe('the switch bound', () => {
     next.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID(), prompt: input('Original implementation runbook'),
       shown: input('Visible original request'), implementsChange: true, switches: ['recovery-hint'] }])
     await next.releaseSwitchWait()
-    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([expect.objectContaining({ recovery: expect.objectContaining({
+    expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([expect.objectContaining({
       shown: input('Visible original request'), implementsChange: true, switches: ['recovery-hint'],
-    }) })])
+    })])
     w.c.auto = true
     w.finish()
     const outbox = await import('../../server/self-update-outbox')
@@ -536,8 +536,8 @@ describe('the switch bound', () => {
     w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID(),
       prompt: input('Recovered timer request'), shown: input('Visible reminder'), source }])
     await w.runtime.releaseSwitchWait()
-    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([
-      expect.objectContaining({ recovery: expect.objectContaining({ source }) }),
+    expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([
+      expect.objectContaining({ source }),
     ])
     w.c.auto = true
     w.finish()
@@ -717,6 +717,62 @@ describe('the switch bound', () => {
       await personStop
       service.reset()
     }
+  })
+
+  it('retains earlier unsent recovery when a second update interrupts the person-resumed turn', async () => {
+    const w = await world({ auto: false })
+    await tickControl(w.runtime)
+    const earlierTurn = randomUUID()
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: earlierTurn, prompt: input('Earlier never-sent request') }])
+    inbox.holdChat(w.instance, w.s.id, 'stopped', Date.now())
+    await w.runtime.releaseSwitchWait()
+    const resumed = w.runtime.prompt(w.s.id, input('Person resumes'))
+    if (!('turnId' in resumed)) throw new Error('fixture did not admit the person-resumed turn')
+    await until(() => w.c.calls.length === 1)
+    await w.runtime.enqueue(w.s.id, randomUUID(), input('Normal queued follow-up'))
+    const targets = w.runtime.runningTurnSessions()
+    const timer = new FakeTimer()
+    let now = 5_000_000
+    const restart = vi.fn(() => true)
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: () => {}, releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true,
+      switchTurnBoundMinutes: () => 15, now: () => now,
+    })
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await until(() => storage.listOpenTurns(w.instance).length === 0 && w.runtime.working() === 0)
+      if (!restart.mock.calls.length) {
+        await until(() => timer.timers.size > 0)
+        timer.fire()
+      }
+      await until(() => restart.mock.calls.length === 1)
+      w.runtime.recordSwitchInterrupted(targets)
+      expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([
+        expect.objectContaining({ sessionId: w.s.id, turnId: resumed.turnId }),
+        expect.objectContaining({ sessionId: w.s.id, turnId: earlierTurn, prompt: input('Earlier never-sent request') }),
+      ])
+      await w.runtime.stop()
+      const next = w.make()
+      await next.recover()
+      await until(() => w.c.calls.length === 2)
+      expect(w.c.calls.map(call => call.input.text)).toEqual([
+        'Person resumes', 'Poise restarted for an update while your turn was running. Continue where you left off.',
+      ])
+      expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([
+        expect.objectContaining({ turnId: earlierTurn, prompt: input('Earlier never-sent request') }),
+      ])
+      w.c.auto = true
+      w.finish()
+      await until(() => next.get(w.s.id)?.status === 'idle' && w.c.calls.length === 4)
+      expect(w.c.calls.map(call => call.input.text)).toEqual([
+        'Person resumes', 'Poise restarted for an update while your turn was running. Continue where you left off.',
+        'Earlier never-sent request', 'Normal queued follow-up',
+      ])
+      expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
+    } finally { service.reset() }
   })
 
   it('keeps polling a retargeted switch after an earlier cancellation settles', async () => {

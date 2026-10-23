@@ -743,15 +743,15 @@ export class ChatRuntime extends EventEmitter {
     return running
   }
 
-  /** Record the sessions a switch bound interrupted, for their continue
-   *  prompt after the restart. A session is recorded at most once. */
+  /** Keep each interrupted turn once. The current turn resumes before
+   *  earlier requests whose recovery the person had held with Stop. */
   recordSwitchInterrupted(sessions: Array<Omit<InterruptedSession, 'at'>>): void {
     if (sessions.length === 0) return
     const at = new Date().toISOString()
-    const fresh = new Set(sessions.map(session => session.sessionId))
+    const fresh = new Set(sessions.map(session => `${session.sessionId}:${session.turnId}`))
     this.writeInterruptedSessions([
-      ...this.readInterruptedSessions().filter(row => !fresh.has(row.sessionId)),
       ...sessions.map(session => ({ ...session, at })),
+      ...this.readInterruptedSessions().filter(row => !fresh.has(`${row.sessionId}:${row.turnId}`)),
     ])
   }
 
@@ -775,14 +775,14 @@ export class ChatRuntime extends EventEmitter {
 
   private async resumeInterruptedSession(row: InterruptedSession, continuation: string): Promise<WaitingDelivery> {
     if (this.recoveryOwnedElsewhere(row.sessionId)) return 'deferred'
-    if (this.recoveryHeld(row.sessionId)) {
-      // Stop can overlap the bound's native cancellation. Keep its recovery
-      // row until a person resumes; preserve the withdrawal/restart reason.
+    if (this.recoveryHeld(row.sessionId) || this.live.get(row.sessionId)?.turn || storage.getOpenTurn(row.sessionId)) {
+      // Keep this specific recovery while Stop or a current turn blocks it,
+      // preserving the withdrawal/restart reason until it can run.
       if (row.continuation !== continuation) this.writeInterruptedSessions(this.readInterruptedSessions()
-        .map(entry => entry.sessionId === row.sessionId ? { ...entry, continuation } : entry))
+        .map(entry => entry.sessionId === row.sessionId && entry.turnId === row.turnId ? { ...entry, continuation } : entry))
       return 'deferred'
     }
-    if (!this.takeInterruptedSession(row.sessionId)) return 'admitted'
+    if (!this.takeInterruptedSession(row.sessionId, row.turnId)) return 'admitted'
     return this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
   }
 
@@ -978,10 +978,10 @@ export class ChatRuntime extends EventEmitter {
     setMeta(SWITCH_INTERRUPTED_KEY, JSON.stringify(rows))
   }
 
-  private takeInterruptedSession(sessionId: string): InterruptedSession | null {
+  private takeInterruptedSession(sessionId: string, turnId: string): InterruptedSession | null {
     const rows = this.readInterruptedSessions()
-    const row = rows.find(candidate => candidate.sessionId === sessionId) ?? null
-    if (row) this.writeInterruptedSessions(rows.filter(candidate => candidate.sessionId !== sessionId))
+    const row = rows.find(candidate => candidate.sessionId === sessionId && candidate.turnId === turnId) ?? null
+    if (row) this.writeInterruptedSessions(rows.filter(candidate => candidate.sessionId !== sessionId || candidate.turnId !== turnId))
     return row
   }
 

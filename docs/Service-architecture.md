@@ -335,7 +335,7 @@ reconciles them as after any restart.
   prompt on its resumed native session; a request still waiting for a
   checkout or startup is replayed with its original input and attribution.
   Compaction does not count as delivering that request. If recovery must
-  wait, the durable waiting lane retains its displayed request, switches and change
+  wait, its durable recovery record retains its displayed request, switches and change
   completion responsibility with the original source, including timer
   provenance, and model. A busy session's continuation remains ahead of its
   existing normal-queue follow-ups, ready when that busy turn finishes.
@@ -350,6 +350,9 @@ reconciles them as after any restart.
   person resumes the chat. A Stop that overlaps the update bound's native
   cancellation also keeps its interrupted record durable; after the person's
   resumed turn, that recovery still precedes normal queued follow-ups.
+  A later update preserves every earlier undelivered recovery by interrupted
+  turn identity. It resumes the current turn first, then those older requests,
+  consuming each durable row separately.
   Withdrawal waits for any bound cancellation to record recovery before
   releasing messages. A bound
   cancellation never bypasses the quiet gate for server work, background
