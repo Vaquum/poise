@@ -189,6 +189,8 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
   get ident(): string { return this.identValue }
   get dir(): string { return this.dirValue }
   get socketPath(): string { return this.socketPathValue }
+  get liveReceived(): boolean { return this.liveStdoutBoundary !== null }
+  get exited(): boolean { return this.exitedEmitted }
 
   get healthy(): boolean {
     if (this.exitedEmitted) return false
@@ -396,8 +398,6 @@ export class RelayConnection extends EventEmitter implements AgentProcess, Relay
     this.pendingStarted = null
     this.pendingOutbound?.reject(new Error('the relay is gone'))
     this.pendingOutbound = null
-    this.liveStdoutBoundary ??= this.stdoutBytes
-    this.resolveLiveWhenConsumed()
     this.stdout.end()
     this.stderr.end()
     this.emit('exit', code, signal)
@@ -557,9 +557,11 @@ export function livePromise(peer: RelayConnection): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const onError = (message: unknown) => { cleanup(); reject(new Error(`relay: ${String(message)}`)) }
     const onExit = () => {
-      // LIVE can resolve whenLive in the same decoder callback as EXITED.
-      // Let that already-queued boundary settle before treating exit as loss.
-      queueMicrotask(() => { cleanup(); reject(new Error('the relay went away during replay')) })
+      // An actual LIVE frame can precede EXITED in the same decoder callback.
+      // Its buffered stdout must still reach the adapter before replay ends.
+      if (peer.liveReceived) return
+      cleanup()
+      reject(new Error('the relay went away during replay'))
     }
     const cleanup = () => {
       peer.off('relay-error', onError)
@@ -568,6 +570,7 @@ export function livePromise(peer: RelayConnection): Promise<void> {
     peer.once('relay-error', onError)
     peer.once('exit', onExit)
     void peer.whenLive().then(() => { cleanup(); resolve() })
+    if (peer.exited) onExit()
   })
 }
 

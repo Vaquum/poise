@@ -84,8 +84,12 @@ it('keeps buffered filesystem requests in replay after an awaited outbound read'
   }
 })
 
-
-it.each([true, false])('settles a coalesced final response and exit with LIVE=%s', async includeLive => {
+it.each([
+  { includeLive: true, late: false },
+  { includeLive: false, late: false },
+  { includeLive: true, late: true },
+  { includeLive: false, late: true },
+])('settles a coalesced final response and exit with LIVE=$includeLive, late=$late', async ({ includeLive, late }) => {
   const root = await mkdtemp(join(tmpdir(), 'relay-live-exit-'))
   const socketPath = join(tmpdir(), `pl-${randomUUID().slice(0, 12)}.sock`)
   let remote: Socket | undefined
@@ -122,8 +126,11 @@ it.each([true, false])('settles a coalesced final response and exit with LIVE=%s
   try {
     await peer.connect()
     rpc = new StdioRpc(peer)
-    const boundary = livePromise(peer).then(() => ({ live: true }), error => ({ error: String(error) }))
+    const observeBoundary = () => livePromise(peer).then(() => ({ live: true }), error => ({ error: String(error) }))
+    let boundary = late ? undefined : observeBoundary()
     await expect(rpc.request('test/final', {})).resolves.toEqual({ stopReason: 'end_turn' })
+    expect(peer.exitCode).toBe(0)
+    boundary ??= observeBoundary()
     if (includeLive) {
       expect(coalesced).toBe(true)
       expect(await boundary).toEqual({ live: true })
@@ -133,6 +140,50 @@ it.each([true, false])('settles a coalesced final response and exit with LIVE=%s
     expect(peer.exitCode).toBe(0)
   } finally {
     rpc?.fail(new RpcClosedError('test complete'))
+    peer.detach(); remote?.destroy()
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('keeps a decoded LIVE pending until buffered stdout is consumed after exit', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-live-buffer-'))
+  const socketPath = join(tmpdir(), `pl-${randomUUID().slice(0, 12)}.sock`)
+  let remote: Socket | undefined
+  const stdout = Buffer.from('buffered final output\n')
+  const header = Buffer.alloc(5)
+  header.writeUInt8(103, 0); header.writeUInt32BE(stdout.length, 1)
+  const server = createServer(socket => {
+    remote = socket
+    let buffer: Buffer = Buffer.alloc(0)
+    socket.on('data', chunk => {
+      buffer = Buffer.concat([buffer, chunk])
+      while (buffer.length >= 5 && buffer.length >= 5 + buffer.readUInt32BE(1)) {
+        const kind = buffer.readUInt8(0)
+        buffer = buffer.subarray(5 + buffer.readUInt32BE(1))
+        if (kind === 1) socket.write(frame(101, { version: 1, relayPid: 0, gatePid: 0, gatePgid: 0, spoolTurn: 'buffered' }))
+        if (kind === 6) socket.write(Buffer.concat([
+          header, stdout, frame(106, {}), frame(107, { bytes: '', truncated: false }), frame(105, { code: 0 }),
+        ]))
+      }
+    })
+  })
+  await new Promise<void>(resolve => server.listen(socketPath, resolve))
+  const peer = new RelayConnection({ sessionId: 'buffered-final', ident: 'test', dir: root, socketPath })
+  try {
+    await peer.connect()
+    await peer.getOutbound()
+    expect(peer.exited).toBe(true)
+    let settled = false
+    const boundary = livePromise(peer).then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    const consumed = new Promise<Buffer>(resolve => peer.stdout.once('data', resolve))
+    peer.stdout.resume()
+    expect(await consumed).toEqual(stdout)
+    await boundary
+    expect(settled).toBe(true)
+  } finally {
     peer.detach(); remote?.destroy()
     await new Promise<void>(resolve => server.close(() => resolve()))
     await rm(root, { recursive: true, force: true })
