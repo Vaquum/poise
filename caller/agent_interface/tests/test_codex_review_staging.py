@@ -43,16 +43,17 @@ class TestCodexReviewStaging(TestCase):
                                    stdout="\n".join(json.dumps(event) for event in events), stderr="failed")
 
         watch = SimpleNamespace(run=turn)
+        receipt = json.dumps({"action": "approved_pr", "review_id": 91, "head_sha": "a" * 40})
         with patch.object(structured_review, "CODEX_MAX_INPUT_CHARS", LIMIT), \
                 patch.object(structured_review, "ReviewWatch", return_value=nullcontext(watch)), \
                 patch.object(structured_review.subprocess, "run",
-                             return_value=SimpleNamespace(returncode=0, stdout="submitted", stderr="")) as submit:
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit:
             if failure:
                 with self.assertRaises(atoms.AgentPreflightError):
                     self.review(text)
                 submit.assert_not_called()
             else:
-                self.assertIn("submitted", self.review(text))
+                self.assertIn('"review_id": 91', self.review(text))
                 submit.assert_called_once()
                 self.assertEqual(submit.call_args.args[0], ["github-interface", "--approve-pr", "#12",
                     "--expected-head", "a" * 40, "--token-user", "bit-mis"])

@@ -54,25 +54,28 @@ def main():
         # submission lock or be mistaken for an ambiguous publication.
         raise SystemExit(subprocess.run(argv, text=True).returncode)
     receipt = os.environ.get("AGENT_INTERFACE_REVIEW_RECEIPT")
-    with submission_gate(os.environ.get("AGENT_INTERFACE_REVIEW_GATE")):
+    with submission_gate(os.environ.get("AGENT_INTERFACE_REVIEW_GATE")) as seal:
         if not receipt:
             done = subprocess.run(argv, text=True)
             raise SystemExit(done.returncode)
         done = subprocess.run(argv, text=True, capture_output=True)
+        # Hold the gate across the receipt write: a second terminal command
+        # after an accepted submission is blocked instead of overwriting it.
+        if done.returncode == 0 and '"review_id"' in done.stdout:
+            staged = receipt + ".tmp"
+            with open(staged, "w") as handle:
+                handle.write(done.stdout)
+            os.replace(staged, receipt)
+            seal()
+        elif done.returncode and (failure_message := record_failure(done.stderr or done.stdout)):
+            staged = receipt + ".failure.tmp"
+            with open(staged, "w") as handle:
+                handle.write(failure_message)
+            os.replace(staged, receipt + ".failure")
     # The reply reaches the model unchanged; a submitted review's id is also
     # left for the run, so it can tell its own review from a sibling's.
     sys.stdout.write(done.stdout)
     sys.stderr.write(done.stderr)
-    if done.returncode == 0 and '"review_id"' in done.stdout:
-        staged = receipt + ".tmp"
-        with open(staged, "w") as handle:
-            handle.write(done.stdout)
-        os.replace(staged, receipt)
-    elif done.returncode and (failure_message := record_failure(done.stderr or done.stdout)):
-        staged = receipt + ".failure.tmp"
-        with open(staged, "w") as handle:
-            handle.write(failure_message)
-        os.replace(staged, receipt + ".failure")
     raise SystemExit(done.returncode)
 
 
