@@ -454,7 +454,9 @@ describe('one session per subject', () => {
         .rejects.toMatchObject({ statusCode: 409, code: action === 'prompt' ? 'turn_in_progress' : 'agent_error' })
       await until(() => entered, 'the held target catalog')
       if (action === 'prompt') {
-        expect(handoffRuntime.prompt(source.id, { text: 'arrived during target lookup', attachments: [], mentions: [] }).turnId).toBeTruthy()
+        const receipt = handoffRuntime.prompt(source.id, { text: 'arrived during target lookup', attachments: [], mentions: [] })
+        if (!('turnId' in receipt)) throw new Error('the source prompt waited instead of taking a turn during target lookup')
+        expect(receipt.turnId).toBeTruthy()
       } else closing = handoffRuntime.close(source.id)
       held = false
       release()
