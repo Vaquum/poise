@@ -43,7 +43,7 @@ import type { ChildProcess } from 'node:child_process'
 import { lstat, mkdir, rm, rmdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../models'
-import { getMeta, setMeta } from '../db'
+import { db, getMeta, setMeta } from '../db'
 import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
 import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertContext } from '../alerts/producers'
@@ -264,7 +264,7 @@ export interface SwitchWait { release: string, since: string }
 
 interface SwitchPromptMetadata extends Pick<RunningTurn, 'implementsChange' | 'switches'> { source?: TurnSource, shown?: PromptInput, sourceSessionId?: string, model?: string, effort?: string }
 /** One prompt admitted while a switch was pending, in arrival order. */
-interface WaitingPrompt { id: string, sessionId: string, prompt: PromptInput, createdAt: string, queueBefore?: string[], recovery?: SwitchPromptMetadata }
+interface WaitingPrompt { id: string, sessionId: string, prompt: PromptInput, createdAt: string, queueBefore?: string[], recovery?: SwitchPromptMetadata, continuationTurnId?: string }
 type WaitingDelivery = 'admitted' | 'dropped' | 'deferred'
 
 /** One session whose running turn a switch bound interrupted. */
@@ -754,11 +754,17 @@ export class ChatRuntime extends EventEmitter {
     const at = new Date().toISOString()
     const fresh = new Set(sessions.map(session => `${session.sessionId}:${session.turnId}`))
     const current = new Set(sessions.map(session => session.sessionId))
-    this.writeInterruptedSessions([
-      ...sessions.map(session => ({ ...session, at })),
-      ...this.readInterruptedSessions().filter(row => !fresh.has(`${row.sessionId}:${row.turnId}`)
-        && (!current.has(row.sessionId) || row.prompt)),
-    ])
+    db.transaction(() => {
+      this.writeInterruptedSessions([
+        ...sessions.map(session => ({ ...session, at })),
+        ...this.readInterruptedSessions().filter(row => !fresh.has(`${row.sessionId}:${row.turnId}`)
+          && (!current.has(row.sessionId) || row.prompt)),
+      ])
+      // Deferral keeps a continuation's origin: only an older automatic
+      // continuation is superseded, never a literal message that waited.
+      this.writeWaitingPrompts(this.readWaitingPrompts().filter(entry =>
+        !entry.continuationTurnId || !current.has(entry.sessionId)))
+    })()
   }
 
   /** After any restart: each interrupted session gets exactly one automatic
@@ -789,7 +795,13 @@ export class ChatRuntime extends EventEmitter {
       return 'deferred'
     }
     if (!this.takeInterruptedSession(row.sessionId, row.turnId)) return 'admitted'
-    return this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
+    const prompt = row.prompt ?? { text: continuation, attachments: [], mentions: [] }
+    const recovery = row.prompt || row.implementsChange ? row : undefined
+    const waiting: WaitingPrompt | undefined = row.prompt ? undefined : {
+      id: randomUUID(), sessionId: row.sessionId, prompt, createdAt: row.at, queueBefore: [],
+      continuationTurnId: row.turnId, ...(recovery ? { recovery } : {}),
+    }
+    return this.deliverWaitingPrompt(row.sessionId, prompt, 'interrupted', recovery, waiting)
   }
 
   /** Start every prompt that waited behind an update, in arrival order. */

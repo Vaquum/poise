@@ -345,7 +345,9 @@ reconciles them as after any restart.
   existing normal-queue follow-ups, ready when that busy turn finishes.
   If a drain or another switch is pending during recovery, both interrupted and
   waiting records stay durable until it clears; continuations keep priority
-  over their follow-ups. Drain and withdrawal release paths also retain records
+  over their follow-ups. A new interruption supersedes older automatic
+  continuations even if transient admission deferred them into the waiting
+  store; literal waiting messages retain their order. Drain and withdrawal release paths also retain records
   held by another live server. Waiting turns follow these recoveries in order.
   A waited message retains its position between earlier and later normal queue
   items when the preceding turn finishes naturally during the switch. New
