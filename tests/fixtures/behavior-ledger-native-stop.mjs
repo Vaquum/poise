@@ -20,12 +20,14 @@ const {writeFileSync} = require('node:fs');
 const transaction = Database.prototype.transaction;
 let database;
 Database.prototype.transaction = function (...args) {
-  database = this;
+  if (!database) {
+    database = this;
+    database.pragma('busy_timeout=5000');
+  }
   return transaction.apply(this, args);
 };
 parentPort.on('message', request => {
   if(request.operation==='capture' && request.observation?.type==='admit') {
-    database.pragma('busy_timeout=5000');
     writeFileSync(${JSON.stringify(entered)}, 'active');
   }
 });
