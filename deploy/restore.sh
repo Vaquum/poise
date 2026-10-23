@@ -52,5 +52,6 @@ for volume in "${volumes[@]}"; do
     --entrypoint tar "$image" --extract --gzip --file "/backup/$volume.tar.gz" --directory /volume \
     --numeric-owner --same-owner --same-permissions
 done
+clear_workspace_proof
 created=()
 say "Restored ${#volumes[@]} volumes from $backup. Start Poise with deploy/install.sh."

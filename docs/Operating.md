@@ -547,6 +547,26 @@ gateway if they changed, and lists the workspaces that run an older image.
 A fork that deploys itself does this at every push to its main
 ([Run your own Poise from a fork](#run-your-own-poise-from-a-fork)).
 
+It then proves the deploy landed: for up to ten minutes it waits for every
+workspace to serve the new commit — a running one through its health check,
+a stopped one by its new image — and only then reports success. Past that it
+reports which workspaces are still pending, with the release each runs, the
+one it waits for and how long it has waited, and fails: a deploy run is
+green only once the workspaces run what it deployed. `deploy/install.sh`
+proves the same after it starts the gateway.
+Both scripts capture workspace handles before building or retagging the image,
+then retain that inventory and add any workspaces observed during verification.
+A removed container stays pending until its replacement is verified; another
+healthy workspace cannot hide a missing one.
+Each poll retains the workspace labels from its container listing before
+inspection. If a listed container vanishes before inspection, verification
+still requires that workspace across later polls and retries; it waits for
+a complete inventory instead of treating partial results as proof of success.
+The private `deploy/.env.workspace-proof` retains unfinished obligations across
+failed deploys and retries, and is cleared after successful verification.
+It proves handles captured by these scripts; a workspace already absent before
+the first captured inventory cannot be inferred from that inventory.
+
 The gateway upgrades those workspaces by itself, when it starts and every
 five minutes. Most upgrades change Poise but not the system it runs on, and
 those happen in place: the gateway installs the new release into each
@@ -658,6 +678,8 @@ checks the archives against `SHA256SUMS`, then creates each volume anew and
 fills it, keeping owners and permissions. It never overwrites a volume: if
 one already exists it stops before touching anything, and if it fails it
 removes the volumes it created.
+A successful restore also clears any unfinished host deployment proof: restored
+home volumes intentionally wait for their owner's next visit to create a container.
 
 **On a new server**, for example after losing the old one:
 
