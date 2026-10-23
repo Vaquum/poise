@@ -69,11 +69,32 @@ function adapter(host: AdapterHost): Adapter {
   }
 }
 /** Waits for a condition, running ChatControl's delivery now rather than on its one-second timer. */
-async function until(check: () => boolean, label: string) {
-  const deadline = Date.now() + 8000
+interface ReadinessBudget { deadline: number, sessions: string[] }
+async function until(check: () => boolean, label: string, budget?: ReadinessBudget) {
+  const deadline = budget?.deadline ?? Date.now() + 8000
+  const cursors = new Map((budget?.sessions ?? []).map(id => [id, runtime.get(id)?.lastSeq ?? 0]))
+  const healthy = (): void => {
+    for (const [id, cursor] of cursors) {
+      const session = runtime.get(id)
+      if (session && session.lastSeq > cursor) {
+        for (const { event } of runtime.events(id, cursor).events) {
+          if (event.type === 'error') throw new Error(`switchboard fixture session ${id} failed: ${event.message}`)
+          if (event.type === 'turn.finished' && event.stopReason === 'error') {
+            throw new Error(`switchboard fixture session ${id} failed: ${event.error || 'turn failed'}`)
+          }
+        }
+        cursors.set(id, session.lastSeq)
+      }
+      if (!session || ['error', 'closed', 'interrupted'].includes(session.status)) {
+        throw new Error(`switchboard fixture session ${id} became ${session?.status ?? 'missing'}: ${label}`)
+      }
+    }
+  }
   while (Date.now() < deadline) {
+    healthy()
     if (check()) return
     await control.tick()
+    healthy()
     if (check()) return
     await new Promise(done => setTimeout(done, 15))
   }
@@ -214,7 +235,10 @@ beforeAll(async () => {
   producers = await import('../server/alerts/producers')
   database = await import('../server/db')
 })
-beforeEach(async () => {
+let broken = ''
+beforeEach(async ({ task, skip, onTestFailed }) => {
+  if (broken) skip(`Switchboard fixture stopped after: ${broken}`)
+  onTestFailed(() => { broken ||= task.name })
   catalog = CATALOG
   probe = async () => ({ ok: true })
   slots = 4
@@ -662,18 +686,35 @@ describe('checks', () => {
     expect(checks(board).map(check => check.reason)).toEqual(['start', 'interval'])
   })
 
-  it('runs its check while every Poise-local agent slot is busy', async () => {
+  it('runs its check while every Poise-local agent slot is busy', async ({ task }) => {
+    // Three private workspaces each initialize through six guarded Node/Git
+    // starts. Share this case's budget; admission is not a provisioning timer.
+    const deadline = Date.now() + task.timeout - 250
     slots = 1
     // Two chats with workspaces of their own, so only the cap holds the second.
     const busy = await chat('Busy')
     const waiting = await runtime.create({ agent: 'grok', model: busy.model, title: 'Waiting', deferStart: true })
+    const sessions = [busy.id, waiting.id]
     runtime.prompt(busy.id, { text: 'Work for an hour', attachments: [], mentions: [] })
-    await until(() => finishes.has(busy.id), 'the busy chat holding the only slot')
+    await until(() => finishes.has(busy.id), 'the busy chat holding the only slot', { deadline, sessions })
     runtime.prompt(waiting.id, { text: 'Me too', attachments: [], mentions: [] })
-    await until(() => runtime.get(waiting.id)!.queuedBehind === 'waiting for a free agent slot', 'the cap holding another chat')
+    await until(() => runtime.get(waiting.id)!.queuedBehind === 'waiting for a free agent slot', 'the cap holding another chat', { deadline, sessions })
     const board = await started()
-    await until(() => finishes.has(board), 'the check despite the cap')
+    await until(() => finishes.has(board), 'the check despite the cap', { deadline, sessions: [...sessions, board] })
     expect(finishes.has(waiting.id)).toBe(false)
+  }, 60_000)
+
+  it('fails budgeted readiness promptly when its target reports an error', async ({ task }) => {
+    const deadline = Date.now() + task.timeout - 250
+    const person = await chat('Failed target')
+    runtime.prompt(person.id, { text: 'Fail explicitly', attachments: [], mentions: [] })
+    await until(() => finishes.has(person.id), 'the target turn')
+    const readiness = until(() => false, 'an unreachable condition', {
+      deadline, sessions: [person.id],
+    })
+    const rejected = expect(readiness).rejects.toThrow('fixture target failure')
+    finishes.get(person.id)!({ stopReason: 'error', error: 'fixture target failure' })
+    await rejected
   })
 
   it('gives the Switchboard no Extensions, unlike the chats it watches', async () => {
