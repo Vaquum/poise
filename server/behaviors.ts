@@ -417,10 +417,12 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
   const now = Date.now()
   const diagnostic = classifyBehaviorDiagnostic(error ?? '', { held: kind === 'worker', ...options })
   // A rate limit states its own reset: resume then, not on a backoff that
-  // lands inside the blocked window and doubles with every premature retry.
-  // Past the hourly ceiling the next attempt rereads a fresh reset instead.
-  const nextRetryAtMs = Math.min(Math.max(now + delayMs, rateLimitRetryAtMs(error ?? '', now) ?? 0),
-    now + BEHAVIOR_RETRY_MAX_MS)
+  // fires inside the blocked window or parks the check for an hour while
+  // quota sits available. The reset only moves the retry inside today's
+  // 1-minute to 1-hour range, never outside it.
+  const statedRetryAtMs = rateLimitRetryAtMs(error ?? '', now)
+  const nextRetryAtMs = statedRetryAtMs === null ? now + delayMs
+    : Math.min(Math.max(statedRetryAtMs, now + BEHAVIOR_RETRY_BASE_MS), now + BEHAVIOR_RETRY_MAX_MS)
   setMeta(failureKey(key, target), JSON.stringify({
     kind,
     consecutiveFailures,
