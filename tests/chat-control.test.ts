@@ -1013,7 +1013,11 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     reviewRows[0].revision = 'edited review body'
     threadRows[0].comments[0].revision = 'edited comment body'
     for (let page = 0; page < 6; page++) { await observeReviews(target); clock += 5 * 60_000 }
-    expect(notices()).toHaveLength(5)
+    // The lanes have different lengths; the edited review arrives before
+    // the edited old thread. Both changes must be delivered exactly once.
+    expect(notices()).toHaveLength(6)
+    expect(JSON.parse(notices()[4].body).blockers).toContain('Address review R_1 (CHANGES_REQUESTED)')
+    expect(JSON.parse(notices()[5].body).blockers).toContain('Reply to review thread T_0001 (latest comment C_1) and resolve it')
   })
 
   it('reads bound-PR reviews from the local datastore and never throws on malformed rows', async () => {
