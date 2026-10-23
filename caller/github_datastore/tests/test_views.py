@@ -284,16 +284,16 @@ class ViewsTest(unittest.TestCase):
                 )
                 conn.executemany(
                     """INSERT INTO review_comments(comment_id, node_id, item_id, author_login,
-                       thread_node_id, thread_resolved, thread_outdated, created_at, raw_json)
-                       VALUES (?, ?, 101, 'shared-account', ?, ?, 0, '2026-01-02T00:00:00Z', '{}')""",
+                       thread_node_id, thread_resolved, thread_outdated, created_at, updated_at, raw_json)
+                       VALUES (?, ?, 101, 'shared-account', ?, ?, 0, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '{}')""",
                     [(i, f"C_{i}", f"T_{i:04}", int(i != 1005)) for i in range(1, 1006)],
                 )
                 # A long single thread contributes one bounded latest summary,
                 # never 1000 comments that hide other thread identities.
                 conn.executemany(
                     """INSERT INTO review_comments(comment_id, node_id, item_id, author_login,
-                       thread_node_id, thread_resolved, thread_outdated, created_at, raw_json)
-                       VALUES (?, ?, 101, 'shared-account', 'T_0001', 1, 0, '2026-01-02T00:00:00Z', '{}')""",
+                       thread_node_id, thread_resolved, thread_outdated, created_at, updated_at, raw_json)
+                       VALUES (?, ?, 101, 'shared-account', 'T_0001', 1, 0, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '{}')""",
                     [(i, f"C_{i}") for i in range(2000, 3100)],
                 )
             review_after, comment_after = 0, 0
