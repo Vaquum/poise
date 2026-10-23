@@ -38,6 +38,13 @@ const { syncBuiltinESMExports } = require('node:module');
 const originalSpawn = cp.spawn;
 const originalRead = fs.createReadStream;
 function releaseRead(stream) {
+  // ChildProcess flushStdio resumes paused stdout at exit. Keep that real
+  // drain boundary held until the test releases it, including auto-resumes.
+  const resume = stream.resume;
+  stream.resume = function(...args) {
+    if (!fs.existsSync(process.env.TEST_RELEASE)) return this;
+    return resume.apply(this, args);
+  };
   const timer = setInterval(() => {
     if (!fs.existsSync(process.env.TEST_RELEASE)) return;
     clearInterval(timer); stream.resume();
