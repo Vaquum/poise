@@ -73,6 +73,22 @@ console.log(JSON.stringify({ checked_at: new Date().toISOString(), changed: true
 })
 afterEach(async () => { await activeCase.cleanup() })
 
+async function waitForUpdaterPid(marker: string) {
+  let pid: number | undefined
+  await expect.poll(async () => {
+    let text: string
+    try { text = await readFile(marker, 'utf8') }
+    catch (error) { if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false; throw error }
+    if (!/^[1-9][0-9]*$/.test(text)) return false
+    const candidate = Number(text)
+    if (!Number.isSafeInteger(candidate) || candidate <= 1) return false
+    pid = candidate
+    return true
+  }, { timeout: 5000 }).toBe(true)
+  if (pid === undefined) throw new Error('The updater did not publish a positive safe PID')
+  return pid
+}
+
 it('the actual scheduled/manual script updates all CLIs before model discovery and persists the report', async ({ signal }) => {
   const fixture = activeCase, { root } = fixture
   const result = await fixture.refresh(signal)
@@ -106,13 +122,11 @@ it('a failed discovery replaces the old green receipt and can be retried', async
 
 it('stopping the refresh runner also stops its in-flight native updater group', async ({ signal }) => {
   const fixture = activeCase, { root } = fixture
-  const { existsSync } = await import('node:fs')
   const marker = join(root, 'updater.pid')
-  await writeFile(join(root, 'bin', 'claude'), `#!${process.execPath}\nimport fs from 'node:fs';\nif(process.argv[2]==='--version') console.log('1.0.0');\nelse { fs.writeFileSync(${JSON.stringify(marker)},String(process.pid)); setInterval(()=>{},1000); }\n`, { mode: 0o700 })
+  await writeFile(join(root, 'bin', 'claude'), `#!${process.execPath}\nimport fs from 'node:fs';\nif(process.argv[2]==='--version') console.log('1.0.0');\nelse { const marker=${JSON.stringify(marker)}; fs.writeFileSync(marker+'.tmp',String(process.pid)); fs.renameSync(marker+'.tmp',marker); setInterval(()=>{},1000); }\n`, { mode: 0o700 })
   const { child, closed } = fixture.start(signal)
   try {
-    await expect.poll(() => existsSync(marker), { timeout: 5000 }).toBe(true)
-    const pid = Number(await readFile(marker, 'utf8'))
+    const pid = await waitForUpdaterPid(marker)
     child.kill('SIGTERM'); await closed
     await expect.poll(() => { try { process.kill(pid, 0); return true } catch { return false } }).toBe(false)
   } finally { child.kill('SIGTERM'); await closed }
@@ -122,19 +136,19 @@ it('a case abort stops its held updater and closes the runner before removing th
   const { existsSync } = await import('node:fs')
   const fixture = activeCase, { root } = fixture
   const marker = join(root, 'aborted-updater.pid')
-  await writeFile(join(root, 'bin', 'claude'), `#!${process.execPath}\nimport fs from 'node:fs';\nif(process.argv[2]==='--version') console.log('1.0.0');\nelse { fs.writeFileSync(${JSON.stringify(marker)},String(process.pid)); setInterval(()=>{},1000); }\n`, { mode: 0o700 })
+  await writeFile(join(root, 'bin', 'claude'), `#!${process.execPath}\nimport fs from 'node:fs';\nif(process.argv[2]==='--version') console.log('1.0.0');\nelse { const marker=${JSON.stringify(marker)}; fs.writeFileSync(marker+'.tmp',String(process.pid)); fs.renameSync(marker+'.tmp',marker); setInterval(()=>{},1000); }\n`, { mode: 0o700 })
   const controller = new AbortController()
   const run = fixture.start(controller.signal)
   let runnerClosed = false
   void run.closed.then(() => { runnerClosed = true })
   let pid: number | undefined
   const alive = (target: number) => {
+    if (!Number.isSafeInteger(target) || target <= 1) throw new Error('Refusing an invalid updater PID')
     try { process.kill(target, 0); return true }
     catch (error) { if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return false; throw error }
   }
   try {
-    await expect.poll(() => existsSync(marker), { timeout: 5000 }).toBe(true)
-    pid = Number(await readFile(marker, 'utf8'))
+    pid = await waitForUpdaterPid(marker)
     controller.abort()
     await fixture.cleanup()
     expect(runnerClosed).toBe(true)
@@ -146,6 +160,6 @@ it('a case abort stops its held updater and closes the runner before removing th
   } finally {
     controller.abort()
     await run.closed
-    if (pid !== undefined && alive(pid)) process.kill(pid, 'SIGKILL')
+    if (pid !== undefined && Number.isSafeInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, 'SIGKILL')
   }
 })
