@@ -83,7 +83,7 @@ describe('every test process', () => {
     const { LOCAL_CHAT_ROOT } = await import('../server/chat/local-workspace')
     const { poiseStateRoot } = await import('../server/review-checkout')
     expect(realpathSync(LOCAL_CHAT_ROOT).startsWith(`${fixture}${sep}`)).toBe(true)
-    expect(resolve(poiseStateRoot()).startsWith(`${fixture}${sep}`)).toBe(true)
+    expect(realpathSync(poiseStateRoot()).startsWith(`${fixture}${sep}`)).toBe(true)
     expect(LOCAL_CHAT_ROOT).not.toBe(resolve('.poise-chat'))
   })
 
