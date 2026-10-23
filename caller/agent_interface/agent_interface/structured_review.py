@@ -20,6 +20,7 @@ from time import monotonic
 
 from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, bounded_cause, expected_head, pr_ref, provider_blocked
 from .model_catalog import Model
+from .process_diagnostic import diagnostic_envelope
 from .review_watch import ReviewWatch
 from . import progress, review_budget, review_receipt
 
@@ -40,9 +41,10 @@ class InvalidVerdict(ValueError):
 
 
 def _diagnostic(provider: str, phase: str, *, exit_code=None, signal=None, cause: str = "") -> dict:
-    return {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
-            "phase": phase, "provider": provider, "exit_code": exit_code, "signal": signal,
-            "stderr": cause[:500], "submission": "none", "artifact": "none"}
+    return diagnostic_envelope(operation="provider.review", phase=phase,
+                               outcome="signal" if signal is not None else "exit",
+                               stderr=cause[:500], provider=provider, exit_code=exit_code,
+                               signal=signal, submission="none", artifact="none")
 
 
 def provider_failure(message: str, *, provider: str = "provider", phase: str = "provider_execution",
@@ -187,9 +189,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     raise review_budget.ReviewLimitError(
                         "Repository inspection exceeds the review prompt limit; needs attention",
                         "review_budget_exhausted",
-                        {"version": 1, "source": "caller", "severity": "error",
-                         "operation": "provider.review", "phase": "inspection_context",
-                         "provider": model.provider})
+                        diagnostic_envelope(operation="provider.review", phase="inspection_context",
+                                            outcome="resource_failure", provider=model.provider))
                 # Last round decides on evidence already held: offer only the
                 # terminal verdict, never another inspection step.
                 if repository is not None and round_number == MAX_INSPECTION_ROUNDS:
@@ -227,10 +228,9 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     raise review_budget.ReviewLimitError(
                         "Repository inspection limit reached; needs attention",
                         "review_budget_exhausted",
-                        {"version": 1, "source": "caller", "severity": "error",
-                         "operation": "provider.review", "phase": "inspection_rounds",
-                         "provider": model.provider,
-                         "context": {"rounds": MAX_INSPECTION_ROUNDS}})
+                        diagnostic_envelope(operation="provider.review", phase="inspection_rounds",
+                                            outcome="resource_failure", provider=model.provider,
+                                            context={"rounds": MAX_INSPECTION_ROUNDS}))
                 if not 1 <= len(requests) <= 8:
                     raise InvalidVerdict("invalid repository inspection request count")
                 # Validate provisional findings without submitting anything.
@@ -247,8 +247,9 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 else "review_contract_violation" if isinstance(error, (InvalidVerdict, json.JSONDecodeError))
                 else "review_provider_error")
         cause = bounded_cause(str(error) or "invalid provider output")
-        diagnostic = {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
-                      "phase": "validating", "provider": model.provider, "stderr": cause, "submission": "none"}
+        diagnostic = diagnostic_envelope(operation="provider.review", phase="validating",
+                                               outcome="invalid_output", stderr=cause,
+                                               provider=model.provider, submission="none")
         raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {cause}", code,
                                   diagnostic) from error
 
@@ -272,8 +273,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         cause = bounded_cause((done.stderr or done.stdout).strip() or f"github-interface exited {done.returncode}")
         raise review_budget.ReviewLimitError(
             f"review submission rejected: {cause}", "review_contract_violation",
-            {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
-             "phase": "submitting", "provider": model.provider, "stderr": cause, "submission": "rejected"})
+            diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
+                                stderr=cause, provider=model.provider, submission="rejected"))
     receipt = review_receipt.record(done.stdout)
     if receipt is None:
         try:
@@ -284,8 +285,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             cause = bounded_cause(json.dumps(reply.get("skipped", [])) or "no review submitted")
             raise review_budget.ReviewLimitError(
                 f"review submission was a no-op: {cause}", "review_contract_violation",
-                {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
-                 "phase": "submitting", "provider": model.provider, "stderr": cause, "submission": "noop"})
+                diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
+                                    stderr=cause, provider=model.provider, submission="noop"))
         raise review_receipt.SubmissionError(
             "review submission returned no receipt; publication uncertain, reconcile before retry")
     # The outer governed behavior reads authoritative review facts afterward,
