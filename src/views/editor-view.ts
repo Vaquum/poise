@@ -1,6 +1,6 @@
 import { isNotificationInteraction, viewDiagnostic, viewFeedback } from '../view-feedback'
 import { scrollToActor } from '../motion'
-import { retire, reveal, watchPanel } from '../motion'
+import { retire, reveal } from '../motion'
 import { patchContent } from '../dom-patch'
 import { registerReloadGuard, registerReloadSnapshot } from '../self-update-watch'
 import { editorHistoryKey, HISTORY_LIMIT, readEditorHistory, writeEditorHistory, type EditorHistoryEntry } from '../editor-history'
@@ -8,7 +8,13 @@ import { ICON_PUBLISH, closePublishPanel, togglePublishPanel } from './editor-pu
 import { setGoogleConnectionResult, setGoogleNavigationGuard, takeGoogleConnectionResult, takeGooglePublishReturn } from '../google'
 import { EditorReviews } from './editor-reviews'
 import { GoogleDocuments } from './google-documents'
-import type { ArticleReview } from '../publishing-review'
+import { chatClient } from '../chat-client'
+import { chatSidePane, registerEditorSurface } from './chat-side-pane'
+import { clearInlineThreads, closeInlineThread, dropThread, hasThreadDraft, inlineThreadSubjectInView, keepThreadDraft, openInlineThread, syncThreadMarker } from './editor-inline-thread'
+import type { SurfaceOptions } from './chat-session-surface'
+import { locateReview, type ArticleReview } from '../publishing-review'
+import type { ChatSubject } from '../../server/chat/protocol'
+import type { EditProposal } from '../edit-proposals'
 // Editor — minimalist markdown writing surface.
 //
 // Single horizontal control bar at the top, sharing the exact alignment
@@ -75,8 +81,8 @@ interface DocSummary {
 // mirrors server/editor.ts (Annotation). Ranges are line + char-offset
 // pairs; the snippet is the highlighted text at create time and
 // re-anchors the annotation if the user inserts/removes lines above
-// it. session_id is plumbing for Phase 2 (chat per annotation) and
-// equals the annotation id by default.
+// it. session_id survives only on annotations written before Chat
+// sessions, for the legacy import; new annotations omit it.
 interface AnnotationRange {
   start_line: number
   start_offset: number
@@ -85,7 +91,7 @@ interface AnnotationRange {
 }
 interface Annotation {
   id: string
-  session_id: string
+  session_id?: string
   range: AnnotationRange
   snippet: string
   comment: string
@@ -98,6 +104,7 @@ let initialized = false
 let docs: DocSummary[] = []
 let currentSlug: string | null = null
 let loadRequestId = 0
+let externalOpenRequestId = 0
 let deletingSlug: string | null = null
 let docEl: HTMLElement | null = null
 let triggerEl: HTMLButtonElement | null = null
@@ -111,13 +118,11 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null
 // rects per annotation, positioned with Range.getClientRects. The
 // floating Comment button appears when a non-collapsed selection
 // covers some text; clicking it creates a new annotation and opens
-// the panel for it. The panel is a single floating element shared
-// across annotations — only one is visible at a time.
+// an inline thread for it. One thread is open at a time.
 let annotations: Annotation[] = []
 let articleReviews: EditorReviews | undefined
 let googleImporting = false
 let googleDocuments: GoogleDocuments | null = null
-const reviewSessions = new Map<string, string>()
 let annotationsReadySlug: string | null = null
 const documentVersions = new Map<string, string>()
 const annotationsVersions = new Map<string, string>()
@@ -125,11 +130,9 @@ let overlayEl: HTMLElement | null = null
 let commentBtnEl: HTMLButtonElement | null = null
 let issueBtnEl: HTMLButtonElement | null = null
 let snippetBtnEl: HTMLButtonElement | null = null
-let panelEl: HTMLElement | null = null
-let panelForId: string | null = null
-// The annotation created by the Comment press that opened the current panel,
-// if any. Only this one may be auto-discarded when the panel closes empty.
-let panelCreatedId: string | null = null
+// The annotation created by the Comment press that opened the current thread,
+// if any. Only this one may be auto-discarded when the thread closes empty.
+let threadCreatedId: string | null = null
 let annotationsSaveTimer: ReturnType<typeof setTimeout> | null = null
 
 // Issue composer state. When the user clicks the floating Issue
@@ -395,10 +398,6 @@ function renderShell(): string {
       <button type="button" class="editor-comment-btn editor-snippet-btn" id="editor-snippet-btn" hidden aria-label="Save selection as snippet">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M8 1.5L3.5 8H6.5L6 12.5L10.5 6H7.5z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
       </button>
-      <!-- Comment panel: floating, anchored near the clicked
-           annotation. Shared across annotations — only one is open
-           at a time. -->
-      <div class="editor-annotation-panel" id="editor-annotation-panel" hidden role="dialog" aria-label="Annotation"></div>
     </main>
   `
 }
@@ -2299,8 +2298,9 @@ async function loadDoc(slug: string) {
   if (!docEl) return
   const requestId = ++loadRequestId
   if (!(await flushBeforeLeavingDocument('switch documents')) || requestId !== loadRequestId) return
-  closePanel()
+  clearInlineThreads()
   closePublishPanel()
+  chatSidePane.setHighlight(null)
   try {
     const res = await fetch(`/api/editor/doc/${encodeURIComponent(slug)}`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -2468,80 +2468,23 @@ async function deleteCurrent() {
   }
 }
 
-// Toolbar chat button: fetch (or mint) the long-lived chat session
-// bound to this doc, then hand off to the shared chat pane via
-// `poise:open-chat`. The session_id is stable per-doc — reopening
-// the chat for the same doc resumes the same conversation. The pane
-// itself is the modular `src/views/chat-pane.ts` already used by the
-// card-chats; we just bring it up with a doc-scoped session id and
-// the doc's current title as the header label.
-async function openChatForCurrentDoc(draft?: string, reviewSession?: string): Promise<void> {
-  if (!currentSlug) return
-  const slug = currentSlug
-  try {
-    let data: { session_id: string }
-    if (reviewSession) data = { session_id: reviewSession }
-    else {
-      const res = await fetch(`/api/editor/doc/${encodeURIComponent(slug)}/chat-session`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      data = await res.json() as { session_id: string }
-    }
-    if (!data.session_id) throw new Error('no session_id in response')
-    const d = currentDoc()
-    const label = d?.title || slug
-    // parseEdits: true asks the chat-pane to interpret JSON replies as
-    // edit-card proposals (matched against the response-format
-    // directive injected server-side for editor sessions). The four
-    // callbacks bind the cards to *this* doc: hover → highlight +
-    // smooth scroll-to-center; accept → mutate the doc + save;
-    // decline → no-op on the doc side.
-    window.dispatchEvent(new CustomEvent('poise:open-chat', {
-      detail: {
-        session: data.session_id,
-        label,
-        draft,
-        parseEdits: true,
-        onEditHover: (edit: EditCardData) => {
-          if (currentSlug !== slug) return
-          showEditHoverHighlight(edit)
-        },
-        onEditLeave: () => { clearEditHoverHighlight() },
-        onEditAccept: (edit: EditCardData) => applyEditToDoc(edit, slug),
-        onEditDecline: () => { /* no doc-side work; pane updates its own state */ },
-      },
-    }))
-  } catch (err) {
-    console.error('[editor] openChatForCurrentDoc failed:', err)
-  }
-}
-
 // ── Edit-card binding ────────────────────────────────────────────────
 //
-// The chat-pane fires hover / accept / decline events on edit cards
-// and passes back a plain-object EditCardData shape (mirrors the
-// EditProposal interface in chat-pane.ts — kept local here so the
-// editor doesn't import from a sibling view). The host's job is:
+// The session surface fires hover / accept / decline on edit cards and
+// passes back the shared EditProposal shape. The host's job is:
 //   - hover  → locate the `old` text in the doc and visually highlight
 //              it; smooth-scroll the highlight into vertical centre.
 //   - accept → apply the patch (replace `old` with `new`, or insert
 //              after `context_before` for a pure insertion), then
-//              save. Returns 'applied' or 'conflict' so the pane can
-//              update card state accordingly.
-//   - decline → nothing on the doc; pane handles its own visual.
+//              save. Returns 'applied', 'conflict' or 'failed' so the
+//              surface can record the decision accordingly.
+//   - decline → nothing on the doc; the surface records it.
 //
 // All locate operations work in the same character-offset space as
 // the existing annotation system (sum of textContent across lines,
 // joined by '\n'). Disambiguation when `old` appears more than once
 // uses context_before / context_after as anchors — the same model
 // the response-format directive promises.
-
-interface EditCardData {
-  description?: string
-  context_before?: string
-  old: string
-  new: string
-  context_after?: string
-}
 
 // Snapshot of the doc as a flat string + a line-prefix table for
 // converting global char offsets back into (line, lineOffset) pairs.
@@ -2569,7 +2512,7 @@ function docTextSnapshot(): { text: string, lineStarts: number[] } {
 // For pure insertions (old=""): the "range" is a zero-width slot
 // positioned right after context_before's occurrence; we never insert
 // blind into an ambiguous doc.
-function findCharRangeForEdit(text: string, edit: EditCardData): { start: number, end: number } | null {
+function findCharRangeForEdit(text: string, edit: EditProposal): { start: number, end: number } | null {
   const before = edit.context_before || ''
   const after  = edit.context_after  || ''
   if (edit.old === '') {
@@ -2663,7 +2606,7 @@ function locateLine(lineStarts: number[], charIdx: number): number {
 // rather than a persistent annotation underline. Replaced (not
 // appended to) on every hover so a fast move between cards doesn't
 // pile up stale marks.
-function showEditHoverHighlight(edit: EditCardData): void {
+function showEditHoverHighlight(edit: EditProposal): void {
   clearEditHoverHighlight()
   if (!docEl || !overlayEl) return
   const snap = docTextSnapshot()
@@ -2719,7 +2662,7 @@ function clearEditHoverHighlight(): void {
 // document switch, so without this an Accept landed on whatever happened to be
 // open — rewriting a document the agent never saw, and silently not applying
 // the edit to the one it was about.
-function applyEditToDoc(edit: EditCardData, slug: string): 'applied' | 'conflict' {
+function applyEditToDoc(edit: EditProposal, slug: string): 'applied' | 'conflict' {
   if (!docEl || googleImporting) return 'conflict'
   if (currentSlug !== slug) return 'conflict'
   const snap = docTextSnapshot()
@@ -2740,6 +2683,46 @@ function applyEditToDoc(edit: EditCardData, slug: string): 'applied' | 'conflict
   renderAnnotationOverlay()
   scheduleSave()
   return 'applied'
+}
+
+// Accept runs the existing apply, then saves before the decision is
+// recorded: 'applied' means the saved document changed. A failed save
+// withdraws the edit (best-effort revert) so Accept can be retried from a
+// clean document instead of conflicting with its own mutation; 'conflict'
+// can be retried.
+async function acceptEditForDoc(edit: EditProposal, slug: string): Promise<'applied' | 'conflict' | 'failed'> {
+  if (applyEditToDoc(edit, slug) === 'conflict') return 'conflict'
+  if (!await flushEditorSaves()) {
+    applyEditToDoc({ ...edit, old: edit.new, new: edit.old }, slug)
+    setMeta('The edit could not be saved, so it was withdrawn and the decision was not recorded. Resolve the save and Accept again.')
+    return 'failed'
+  }
+  return 'applied'
+}
+
+// The document a subject's chat belongs to: the key itself for a document
+// chat, the part before the first colon for a passage or review chat.
+function editorSlugForKey(subject: ChatSubject): string {
+  if (subject.surface === 'editor-document') return subject.key
+  const at = subject.key.indexOf(':')
+  return at < 0 ? subject.key : subject.key.slice(0, at)
+}
+
+// Session-surface wiring for Editor subjects: edit cards bind to the
+// mounted subject's document, and every send flushes pending saves first so
+// the saved body the agent reads is what the person sees.
+function editorSurfaceFor(subject: ChatSubject): Pick<SurfaceOptions, 'edits' | 'beforeSend'> {
+  const slug = editorSlugForKey(subject)
+  return {
+    edits: {
+      hover: (edit) => { if (currentSlug === slug) showEditHoverHighlight(edit) },
+      leave: () => { clearEditHoverHighlight() },
+      accept: (edit) => acceptEditForDoc(edit, slug),
+    },
+    beforeSend: async () => {
+      if (!await flushEditorSaves()) throw new Error('The document has unsaved changes that could not be saved. Resolve the save before sending.')
+    },
+  }
 }
 
 async function persistDocumentSnapshot(snapshot: DocumentSaveSnapshot): Promise<void> {
@@ -3157,6 +3140,23 @@ function renderAnnotationOverlay(): void {
       overlayEl.appendChild(mark)
     }
   }
+
+  // Move tracked thread markers with their passages. Subjects without a
+  // marker are ignored; an unlocatable passage marks its stored start line.
+  if (currentSlug) {
+    for (const a of annotations) {
+      const changed = orphans.has(a.id)
+      const firstIdx = Math.max(0, Math.min(a.range.start_line, lineEls.length - 1))
+      const lastIdx = changed ? firstIdx : Math.max(0, Math.min(a.range.end_line, lineEls.length - 1))
+      const first = lineEls[firstIdx]
+      const last = lineEls[lastIdx]
+      if (!first || !last) continue
+      syncThreadMarker(
+        { surface: 'editor-passage', key: `${currentSlug}:${a.id}`, label: a.snippet.slice(0, 80) || 'Passage' },
+        { first, last, changed },
+      )
+    }
+  }
 }
 
 // Compute (start_line, start_offset, end_line, end_offset) and the
@@ -3334,59 +3334,8 @@ function updateCommentButtonForSelection(): void {
 }
 
 // Create a new annotation from the current selection, append to the
-// list, persist, and immediately open the panel for it so the user
+// list, persist, and immediately open a thread for it so the user
 // can type a comment.
-// Mint a chat session id that the server recognises as belonging to this
-// document.
-//
-// This matters more than it looks. server/chat.ts only attaches the voice
-// guide, the document's current body and the edit-proposal contract when
-// slugFromEditorSession(sessionId) matches — that is, when the id has the
-// shape `editor-<slug>-<digits>` (server/editor.ts). Annotations used to
-// reuse their own `ann-xxxxxxxx` id as the session, which never matches, so
-// "Ask the agent about this passage" sent the agent nothing but the snippet
-// in quotes. Asked what a passage said, the agent answered "The working
-// directory is empty — there's no file or image here for me to read."
-//
-// The trailing group must stay all digits or the server's reverse lookup
-// rejects it, so uniqueness comes from extra digits rather than a suffix:
-// two annotations made in the same millisecond still get distinct sessions,
-// which keeps each passage's conversation separate.
-function editorChatSessionId(slug: string): string {
-  const unique = `${Date.now()}${String(Math.floor(Math.random() * 1000)).padStart(3, '0')}`
-  return `editor-${slug}-${unique}`
-}
-
-// Sessions written before the above are inert: the agent can never see the
-// document through them. Upgrade one when its transcript is still empty —
-// there is nothing to lose and everything to gain. An annotation that has
-// already been talked to keeps its id: the agent's own session memory holds
-// that conversation, and a silent re-mint would strand it.
-function upgradeAnnotationSessionIfInert(a: Annotation): boolean {
-  if (!currentSlug) return false
-  if (slugFromEditorSessionId(a.session_id) === currentSlug) return false
-  // An empty panelMessages is not proof of an empty conversation — the same
-  // trap that made closePanel delete notes. refreshPanelChat leaves it
-  // untouched when the transcript request is not ok and returns immediately
-  // when a poll is already in flight, so a failed or skipped load looked
-  // exactly like "never talked to". Re-minting then replaced the only record
-  // of the old session id and stranded a real conversation for good. Require
-  // proof that THIS session's transcript actually loaded, and was empty.
-  if (panelChatLoadedFor !== a.session_id) return false
-  if (panelMessages.length > 0) return false
-  a.session_id = editorChatSessionId(currentSlug)
-  a.updated_at = new Date().toISOString()
-  scheduleAnnotationsSave()
-  return true
-}
-
-// Mirror of server/editor.ts slugFromEditorSession. Anchored on the
-// all-digit tail so slugs containing `-` are extracted correctly.
-function slugFromEditorSessionId(sessionId: string): string | null {
-  const m = String(sessionId || '').match(/^editor-(.+)-\d+$/)
-  return m ? m[1] : null
-}
-
 function createAnnotationFromSelection(): void {
   if (!currentSlug || annotationsReadySlug !== currentSlug) {
     setMeta('Annotations unavailable')
@@ -3403,14 +3352,16 @@ function createAnnotationFromSelection(): void {
   if (existing) {
     hideSelectionActions()
     window.getSelection()?.removeAllRanges()
-    openPanelForAnnotation(existing.id)
+    openThreadForAnnotation(existing.id)
     return
   }
   const id = 'ann-' + Math.random().toString(36).slice(2, 10)
   const now = new Date().toISOString()
+  // New annotations get no session_id. A passage chat is its subject's Chat
+  // session, resolved on open and created on the first message; older
+  // annotations keep theirs for the legacy import.
   const a: Annotation = {
     id,
-    session_id: editorChatSessionId(currentSlug),
     range: got.range,
     snippet: got.snippet,
     comment: '',
@@ -3421,22 +3372,23 @@ function createAnnotationFromSelection(): void {
   // Collapse the selection so the floating buttons hide naturally and
   // the underline overlay can be drawn over the now-quiet selection.
   // Dismiss the cluster explicitly too: focus is about to move into the
-  // annotation panel, so the selectionchange that follows takes the
+  // thread, so the selectionchange that follows takes the
   // "not the editor" path and won't do it for us.
   window.getSelection()?.removeAllRanges()
   hideSelectionActions()
   scheduleAnnotationsSave()
   renderAnnotationOverlay()
-  openPanelForAnnotation(id)
+  openThreadForAnnotation(id)
   // Opened by its own creation, so closing it with nothing in it discards it.
-  panelCreatedId = id
+  threadCreatedId = id
 }
 
 function deleteAnnotation(id: string): void {
   annotations = annotations.filter((a) => a.id !== id)
   scheduleAnnotationsSave()
   renderAnnotationOverlay()
-  closePanel()
+  closeInlineThread()
+  if (currentSlug) dropThread({ surface: 'editor-passage', key: `${currentSlug}:${id}`, label: '' })
 }
 
 // ── Selection → "Create issue" composer ──────────────────────────────
@@ -3733,436 +3685,199 @@ function updateAnnotationComment(id: string, comment: string): void {
   scheduleAnnotationsSave()
 }
 
-// ── Annotation panel chat state ──
+// ── Inline threads ───────────────────────────────────────────────────
 //
-// Each annotation carries a session_id; opening the panel kicks off a
-// fetch + poll loop against /api/chat?session=<id>, mirroring what
-// chat-pane.ts does for the dedicated chat view but smaller and
-// scoped to the panel. The panel is single-instance — only one
-// annotation's chat is live at a time, so we don't need per-id state
-// dictionaries; the timer + caches reset on every open/close.
-interface PanelChatEntry {
-  id: string
-  session_id: string
-  prompt: string
-  started_at: string
-  status: string
-  response: string
-  error: string
-}
-let panelMessages: PanelChatEntry[] = []
-const panelReplies: Map<string, string> = new Map()
-let panelPollTimer: ReturnType<typeof setTimeout> | null = null
-let panelPollInflight = false
-// The session whose transcript last loaded successfully. Only that session may
-// be judged empty; see upgradeAnnotationSessionIfInert.
-let panelChatLoadedFor: string | null = null
+// Passage chats open under their passage. The thread holds the annotation's
+// note field and an inline surface for its subject's Chat session; the
+// passage reaches the agent through the context file on every turn, not
+// through the message.
 
-const PANEL_FAST_POLL_MS = 1500    // matches chat-pane's running cadence
-const PANEL_SLOW_POLL_MS = 8000    // idle cadence
-
-async function fetchPanelReply(callId: string): Promise<string> {
-  const res = await fetch(`/api/agent-response/${encodeURIComponent(callId)}`)
-  if (!res.ok) throw new Error(`agent-response ${res.status}`)
-  const data = await res.json()
-  return String(data.body || '')
+function passageSubjectFor(id: string): ChatSubject | null {
+  if (!currentSlug) return null
+  const a = annotations.find((x) => x.id === id)
+  if (!a) return null
+  return { surface: 'editor-passage', key: `${currentSlug}:${id}`, label: a.snippet.slice(0, 80) || 'Passage' }
 }
 
-function setPanelChatError(message: string | null): void {
-  if (!panelEl) return
-  let el = panelEl.querySelector<HTMLElement>('.ann-chat-error')
-  if (!message) { el?.remove(); return }
-  if (!el) {
-    el = document.createElement('div')
-    el.className = 'ann-chat-error st-help st-help-error'
-    el.setAttribute('role', 'status')
-    panelEl.appendChild(el)
-  }
-  el.textContent = message
-}
-
-async function refreshPanelChat(sessionId: string): Promise<void> {
-  if (panelPollInflight) return
-  panelPollInflight = true
-  try {
-    // The panel is shared: opening annotation B while A's transcript is still
-    // in flight used to let A's reply land in B's panel and keep re-landing
-    // there every poll, so the writer read a conversation belonging to a
-    // different passage with no way back. Bail unless this response is still
-    // for the annotation on screen.
-    const ownerAtStart = panelForId
-    const res = await fetch(`/api/chat?session=${encodeURIComponent(sessionId)}`)
-    if (!res.ok) {
-      // Silent before, so an unreachable agent-interface left the panel on
-      // "Loading…" with nothing to explain it.
-      if (panelForId === ownerAtStart) setPanelChatError(`Not updating — HTTP ${res.status}`)
-      return
-    }
-    setPanelChatError(null)
-    const data = await res.json()
-    if (panelForId !== ownerAtStart) return
-    const stillOpen = annotations.find((a) => a.id === panelForId)
-    if (!stillOpen || stillOpen.session_id !== sessionId) return
-    panelMessages = (data.messages || []) as PanelChatEntry[]
-    panelChatLoadedFor = sessionId
-    // Pull bodies for every newly-completed entry whose hash we
-    // haven't cached yet. Tiny payloads, fire in parallel.
-    const toFetch = panelMessages.filter((m) => m.status === 'completed' && m.response && !panelReplies.has(m.id))
-    await Promise.all(toFetch.map(async (m) => {
-      try { panelReplies.set(m.id, await fetchPanelReply(m.id)) } catch { /* leave missing */ }
-    }))
-    renderPanelChat()
-  } finally {
-    panelPollInflight = false
-  }
-}
-
-function schedulePanelPoll(sessionId: string): void {
-  if (panelPollTimer) clearTimeout(panelPollTimer)
-  if (!panelEl || panelEl.hidden || panelForId == null) return
-  const hasInflight = panelMessages.some((m) => m.status === 'running')
-  const delay = hasInflight ? PANEL_FAST_POLL_MS : PANEL_SLOW_POLL_MS
-  panelPollTimer = setTimeout(async () => {
-    // Same defect the chat pane had: with schedulePanelPoll after an unguarded
-    // await, one rejected read ended the chain permanently and the panel sat
-    // on a stale transcript that read as live. Chain the next tick regardless.
-    try {
-      await refreshPanelChat(sessionId)
-    } finally {
-      schedulePanelPoll(sessionId)
-    }
-  }, delay)
-}
-
-function stopPanelPoll(): void {
-  if (panelPollTimer) { clearTimeout(panelPollTimer); panelPollTimer = null }
-}
-
-// Now that these sessions are document-bound they also receive the editor's
-// response-format contract, so a reply that proposes edits arrives as a JSON
-// object rather than prose. This panel has no accept/decline affordance — that
-// lives in the document chat pane — so rendering the object raw would put a
-// wall of JSON in front of the writer. Show the message the agent wrote, and
-// name the changes it proposed.
-function panelReplyView(reply: string): { text: string, edits: string[] } {
-  const trimmed = reply.trim()
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-    try {
-      const parsed = JSON.parse(trimmed) as {
-        chat?: unknown, edits?: unknown, document?: unknown
-      }
-      const isContract = !!parsed && typeof parsed === 'object'
-        && (Array.isArray(parsed.edits) || typeof parsed.document === 'string')
-      if (isContract) {
-        const said = typeof parsed.chat === 'string' ? parsed.chat.trim() : ''
-        const edits = Array.isArray(parsed.edits)
-          ? parsed.edits
-            .map((e) => (e && typeof (e as { description?: unknown }).description === 'string'
-              ? String((e as { description: string }).description).trim()
-              : ''))
-            .filter(Boolean)
-          : typeof parsed.document === 'string' ? ['Rewrite the whole document'] : []
-        return { text: said || 'Proposed a change to the document.', edits }
-      }
-    } catch {
-      // Not the contract after all — show it exactly as the agent wrote it.
-    }
-  }
-  return { text: reply, edits: [] }
-}
-
-function renderPanelChat(): void {
-  if (!panelEl) return
-  const log = panelEl.querySelector<HTMLElement>('.editor-annotation-chat-log')
-  if (!log) return
-  if (panelMessages.length === 0) {
-    log.innerHTML = '<div class="editor-annotation-chat-empty">Ask the agent about this passage…</div>'
-    return
-  }
-  const parts: string[] = []
-  for (const m of panelMessages) {
-    parts.push(`
-      <div class="editor-annotation-chat-msg editor-annotation-chat-user">
-        <div class="editor-annotation-chat-body">${escapeHtml(m.prompt)}</div>
-      </div>
-    `)
-    const reply = panelReplies.get(m.id)
-    if (m.status === 'running') {
-      parts.push(`
-        <div class="editor-annotation-chat-msg editor-annotation-chat-agent">
-          <div class="chat-thinking"><span></span><span></span><span></span></div>
-        </div>
-      `)
-    } else if (m.status === 'failed') {
-      parts.push(`
-        <div class="editor-annotation-chat-msg editor-annotation-chat-agent editor-annotation-chat-error">
-          <div class="editor-annotation-chat-body">${escapeHtml(m.error || 'failed')}</div>
-        </div>
-      `)
-    } else if (reply !== undefined) {
-      const view = panelReplyView(reply)
-      const edits = view.edits.length
-        ? `<ul class="editor-annotation-chat-edits">${
-          view.edits.map((d) => `<li>${escapeHtml(d)}</li>`).join('')
-        }</ul><div class="editor-annotation-chat-hint">Open the document chat to apply these.</div>`
-        : ''
-      parts.push(`
-        <div class="editor-annotation-chat-msg editor-annotation-chat-agent">
-          <div class="editor-annotation-chat-body">${escapeHtml(view.text)}</div>
-          ${edits}
-        </div>
-      `)
-    } else if (m.response) {
-      parts.push(`
-        <div class="editor-annotation-chat-msg editor-annotation-chat-agent">
-          <div class="chat-thinking"><span></span><span></span><span></span></div>
-        </div>
-      `)
-    }
-  }
-  patchContent(log, parts.join(''))
-  log.scrollTop = log.scrollHeight
-}
-
-async function sendPanelChat(sessionId: string, snippet: string): Promise<void> {
-  if (!panelEl) return
-  const input = panelEl.querySelector<HTMLTextAreaElement>('.editor-annotation-chat-input')
-  const sendBtn = panelEl.querySelector<HTMLButtonElement>('.editor-annotation-chat-send')
-  if (!input || !sendBtn) return
-  const text = input.value.trim()
-  if (!text) return
-  sendBtn.disabled = true
-  input.disabled = true
-  // Prefix the message with the highlighted snippet so the agent has
-  // immediate context — the chat session might span weeks; the
-  // snippet is what the comment is "about". We only do this when
-  // there is no existing transcript for this session — once the
-  // conversation has started, the agent's session memory carries it.
-  const prefixed = panelMessages.length === 0
-    ? `(About: "${snippet.replace(/"/g, '\\"')}")\n\n${text}`
-    : text
-  try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: sessionId, message: prefixed }),
-    })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    input.value = ''
-    autoResizePanelInput()
-    // Optimistic placeholder so the user's bubble lands immediately
-    // — the next refresh reconciles against the real row.
-    panelMessages.push({
-      id: '__optimistic-' + Date.now(),
-      session_id: sessionId,
-      prompt: prefixed,
-      started_at: new Date().toISOString(),
-      status: 'running',
-      response: '',
-      error: '',
-    })
-    renderPanelChat()
-    // Pull soon — agent-interface needs a moment to insert the row.
-    window.setTimeout(() => { void refreshPanelChat(sessionId).then(() => schedulePanelPoll(sessionId)) }, 800)
-  } catch (err) {
-    console.error('[editor] sendPanelChat failed:', err)
-    // A console line is invisible to the writer: the message would just
-    // vanish from the box with nothing sent and nothing said. Put the text
-    // back so it isn't lost, and say so in the panel.
-    input.value = text
-    autoResizePanelInput()
-    const log = panelEl.querySelector<HTMLElement>('.editor-annotation-chat-log')
-    if (log) {
-      const failure = document.createElement('div')
-      failure.className = 'editor-annotation-chat-error'
-      failure.textContent = 'Could not send — the agent service did not accept the message.'
-      log.appendChild(failure)
-      log.scrollTop = log.scrollHeight
-    }
-  } finally {
-    sendBtn.disabled = false
-    input.disabled = false
-    input.focus()
-  }
-}
-
-function autoResizePanelInput(): void {
-  if (!panelEl) return
-  const input = panelEl.querySelector<HTMLTextAreaElement>('.editor-annotation-chat-input')
-  if (!input) return
-  input.style.height = 'auto'
-  input.style.height = Math.min(120, input.scrollHeight) + 'px'
-}
-
-// Show the comment panel for the given annotation. Anchored below the
-// annotation's first rectangle (or above if there's no room below).
-// Two stacked surfaces inside:
-//   - The user's editable comment (top): their thinking, autosaved.
-//   - A chat thread (bottom): a long-running session keyed on
-//     annotation.session_id, fetched + polled the same way as the
-//     dedicated chat pane. The first message gets the highlighted
-//     snippet prepended so the agent has context.
-function openPanelForAnnotation(id: string): void {
-  // Opening a different note ends the previous one's session. Without this the
-  // just-created empty note escaped discard-on-close — closePanel never ran,
-  // panelCreatedId still pointed at it, and it stayed on the page as an
-  // underline that reopens an empty panel forever.
-  if (panelForId != null && panelForId !== id) discardPanelAnnotationIfEmpty()
-  if (panelCreatedId !== id) panelCreatedId = null
-  if (!panelEl) return
+function openThreadForAnnotation(id: string): void {
+  if (!currentSlug || !docEl) return
   const a = annotations.find((x) => x.id === id)
   if (!a) return
-  panelForId = id
-  panelMessages = []
-  panelReplies.clear()
-  const orphaned = !reAnchorAnnotation(a)
-  panelEl.innerHTML = `
-    ${orphaned ? '<div class="editor-annotation-orphan">Passage changed: the text this note was on is no longer in the document.</div>' : ''}
-    <div class="editor-annotation-row">
-      <span class="editor-annotation-snippet" title="${escapeHtml(a.snippet)}">${escapeHtml(a.snippet.slice(0, 80))}${a.snippet.length > 80 ? '…' : ''}</span>
-      <button type="button" class="editor-annotation-delete" aria-label="Delete">${ICON_TRASH}</button>
-    </div>
-    <textarea class="editor-annotation-text" placeholder="Add a comment…" rows="3"></textarea>
-    <div class="editor-annotation-chat-log" aria-live="polite"></div>
-    <div class="editor-annotation-chat-compose">
-      <textarea class="editor-annotation-chat-input" placeholder="Ask…" rows="1"></textarea>
-      <button type="button" class="editor-annotation-chat-send" aria-label="Send">
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 7l10-4-4 10-2-4-4-2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
-      </button>
-    </div>
-  `
-  const ta = panelEl.querySelector<HTMLTextAreaElement>('.editor-annotation-text')!
-  ta.value = a.comment
-  ta.addEventListener('input', () => updateAnnotationComment(id, ta.value))
-  panelEl.querySelector<HTMLButtonElement>('.editor-annotation-delete')!
-    .addEventListener('click', () => deleteAnnotation(id))
-
-  const input = panelEl.querySelector<HTMLTextAreaElement>('.editor-annotation-chat-input')!
-  const sendBtn = panelEl.querySelector<HTMLButtonElement>('.editor-annotation-chat-send')!
-  input.addEventListener('input', autoResizePanelInput)
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      void sendPanelChat(a.session_id, a.snippet)
-    }
-  })
-  sendBtn.addEventListener('click', () => { void sendPanelChat(a.session_id, a.snippet) })
-
-  // Position the panel near the annotation. Use the annotation's first
-  // rect for anchoring; if it would push off the bottom edge, flip
-  // above the annotation instead. An orphaned note has no live range,
-  // so its panel anchors to its mark instead.
-  const range = orphaned ? null : rangeForAnnotation(a)
-  const anchor = range?.getBoundingClientRect()
-    ?? overlayEl?.querySelector(`[data-ann-id="${CSS.escape(a.id)}"]`)?.getBoundingClientRect()
-    ?? null
-  panelEl.hidden = false
-  if (anchor) {
-    const rect = anchor
-    const margin = 8
-    const panelRect = panelEl.getBoundingClientRect()
-    const wouldOverflowBottom = rect.bottom + margin + panelRect.height > window.innerHeight
-    const top = wouldOverflowBottom
-      ? Math.max(margin, rect.top - margin - panelRect.height)
-      : rect.bottom + margin
-    // Same contract as the buttons above: the panel is position:fixed and
-    // `rect` is viewport-relative, so the scroll must not be added. The
-    // overflow test two lines up is already viewport-relative, which is
-    // what made the mismatch visible.
-    panelEl.style.left = rect.left + 'px'
-    panelEl.style.top  = Math.max(top, controlBarBottom() + margin) + 'px'
+  const subject = passageSubjectFor(id)
+  if (!subject) return
+  // Already open for this annotation: leave it. Closing and reopening would
+  // run the discard rule on a note that is still being looked at.
+  const shown = inlineThreadSubjectInView()
+  if (shown && shown.surface === subject.surface && shown.key === subject.key) return
+  // A chat open in the side pane moves back like its Back button; anything
+  // else yields to the thread. The pane's draft is newer than the kept one.
+  const paneShown = chatSidePane.subjectInView()
+  if (paneShown && paneShown.surface === subject.surface && paneShown.key === subject.key) {
+    keepThreadDraft(subject, chatSidePane.takeDraft())
+    chatSidePane.close()
   }
-  ta.focus()
-
-  // Kick off chat fetch + polling for this session.
-  // Load the transcript first, then decide whether this annotation's session
-  // can be upgraded to a document-bound one (see
-  // upgradeAnnotationSessionIfInert — it needs to know whether anything has
-  // been said yet).
-  panelChatLoadedFor = null
-  void refreshPanelChat(a.session_id).then(() => {
-    upgradeAnnotationSessionIfInert(a)
-    schedulePanelPoll(a.session_id)
+  const page = docEl.closest('.editor-page') as HTMLElement | null
+  if (!page) return
+  const lines = Array.from(docEl.children) as HTMLElement[]
+  if (!lines.length) return
+  const located = reAnchorAnnotation(a)
+  // A passage that can no longer be located keeps its chat: the thread opens
+  // at the stored start line, clamped into the document.
+  const endLine = located ? located.end_line : Math.max(0, Math.min(a.range.start_line, lines.length - 1))
+  const line = lines[Math.max(0, Math.min(endLine, lines.length - 1))]!
+  const hooks = editorSurfaceFor(subject)
+  openInlineThread({
+    page, doc: docEl, line,
+    range: located && located.start_line === located.end_line
+      ? { start: located.start_offset, end: located.end_offset }
+      : { start: 0, end: 0 },
+    subject,
+    header: (section) => {
+      if (!located) {
+        const notice = document.createElement('div')
+        notice.className = 'editor-annotation-orphan'
+        notice.textContent = 'Passage changed: the text this note was on is no longer in the document.'
+        section.appendChild(notice)
+      }
+      const del = document.createElement('button')
+      del.type = 'button'
+      del.className = 'editor-annotation-delete'
+      del.setAttribute('aria-label', 'Delete')
+      del.innerHTML = ICON_TRASH
+      del.addEventListener('click', () => deleteAnnotation(id))
+      section.appendChild(del)
+    },
+    note: { value: a.comment, label: 'Note', onInput: (value) => updateAnnotationComment(id, value) },
+    edits: hooks.edits,
+    beforeSend: hooks.beforeSend!,
   })
+}
 
-  // Dismiss on a press outside the panel. This has to be a capture-phase
-  // *mousedown*, not a click.
-  //
-  // The panel is opened from the Comment button's mousedown, and the click
-  // that completes that same press is not dispatched until the user lifts the
-  // button. A bubbling click listener — armed here through setTimeout(…, 0),
-  // which runs about a millisecond later — was therefore live in time to
-  // receive the opening gesture's own click, and its target (the button, or
-  // the common ancestor of button and panel) is by definition outside the
-  // panel. So the panel was torn down on mouseup: it flashed and vanished for
-  // anyone who did not click infinitely fast, and the writer never got to type
-  // a comment or a question. Automated clicks send mousedown and mouseup with
-  // no dwell between them, which is why this survived testing.
-  //
-  // Listening on mousedown in the capture phase means the press that opened
-  // the panel is already past this point in its dispatch and cannot close it.
-  // The issue and snippet composers use the same contract.
-  document.addEventListener('mousedown', onPanelOutsidePress, true)
-  document.addEventListener('keydown', onPanelKeydown)
+// Open the thread for a subject from a marker or the side pane's Back
+// button. The pane's draft moves back with it.
+async function openThreadForSubject(subject: ChatSubject): Promise<void> {
+  const at = subject.key.indexOf(':')
+  if (at < 0) return
+  const slug = subject.key.slice(0, at)
+  if (slug !== currentSlug) {
+    await loadDoc(slug)
+    if (currentSlug !== slug || viewEl.hidden) return
+    // The review lookup must wait for this document's data, not the previous
+    // document's review ID or an independent in-flight discovery request.
+    if (subject.surface === 'editor-review') {
+      await articleReviews?.load(slug)
+      if (currentSlug !== slug || viewEl.hidden) return
+      await articleReviews?.synchronize()
+    }
+  }
+  if (currentSlug !== slug || viewEl.hidden) return
+  if (subject.surface === 'editor-passage') openThreadForAnnotation(subject.key.slice(at + 1))
+  else if (subject.surface === 'editor-review') articleReviews?.open(subject.key.slice(at + 1))
+}
+
+// A review's thread opens under its anchored paragraph when locateReview
+// finds it, with the GitHub conversation as its first section and a private
+// agent chat below. An unlocated review renders in flow under the review
+// list instead, with no room made in the text.
+function openThreadForReview(review: ArticleReview, render: (section: HTMLElement) => void): void {
+  if (!currentSlug || !docEl) return
+  const subject: ChatSubject = { surface: 'editor-review', key: `${currentSlug}:${review.id}`, label: `Review · ${review.site} #${review.pr}` }
+  const shown = inlineThreadSubjectInView()
+  if (shown && shown.surface === subject.surface && shown.key === subject.key) return
+  const paneShown = chatSidePane.subjectInView()
+  if (paneShown && paneShown.surface === subject.surface && paneShown.key === subject.key) {
+    keepThreadDraft(subject, chatSidePane.takeDraft())
+    chatSidePane.close()
+  }
+  const page = docEl.closest('.editor-page') as HTMLElement | null
+  if (!page) return
+  const lines = Array.from(docEl.children) as HTMLElement[]
+  if (!lines.length) return
+  const hooks = editorSurfaceFor(subject)
+  const at = review.anchor ? locateReview(serializeDoc(), review.anchor) : null
+  const snap = docTextSnapshot()
+  const endLineIdx = at ? locateLine(snap.lineStarts, at.end) : -1
+  const endLine = endLineIdx >= 0 ? lines[Math.min(endLineIdx, lines.length - 1)]! : null
+  const unlocated = !at || !endLine || !domRangeForCharRange(snap, at.start, at.end)
+  if (!unlocated && endLine) {
+    const startLineIdx = locateLine(snap.lineStarts, at!.start)
+    openInlineThread({
+      page, doc: docEl, line: endLine,
+      range: startLineIdx === endLineIdx
+        ? { start: at!.start - snap.lineStarts[startLineIdx]!, end: at!.end - snap.lineStarts[endLineIdx]! }
+        : { start: 0, end: 0 },
+      subject, header: render, edits: hooks.edits, beforeSend: hooks.beforeSend!,
+    })
+    return
+  }
+  const list = viewEl?.querySelector('.editor-review-list') as HTMLElement | null
+  openInlineThread({
+    page, doc: docEl, line: lines[0]!, range: { start: 0, end: 0 },
+    subject, header: render, edits: hooks.edits, beforeSend: hooks.beforeSend!,
+    ...(list ? { inFlowAfter: list } : {}),
+  })
 }
 
 // An annotation carries a comment, a conversation, or both. One that closes
 // with neither is not a note — it is the residue of a click, and keeping it
-// leaves an invisible trap: the text stays underlined and every later click on
-// it reopens an empty panel, which reads as the editor misbehaving rather than
-// as a note the user forgot they made. Discard it on close.
-function discardPanelAnnotationIfEmpty(): void {
-  if (panelForId == null) return
-  // Only ever discard the annotation this panel session just created. The
-  // first version of this tested `panelMessages.length === 0`, which is not
-  // evidence of an empty conversation: refreshPanelChat leaves panelMessages
-  // untouched when the transcript request is not ok, and returns immediately
-  // when a poll is already in flight. So opening an OLD annotation whose
-  // comment box happened to be empty — its content living entirely in the
-  // chat — and closing it while that request failed deleted it, along with
-  // the only record of its session id. Verified: a 502 on the transcript
-  // fetch was enough. A note the user did not create in this breath is now
-  // never removed without them asking.
-  if (panelForId !== panelCreatedId) return
-  const a = annotations.find((x) => x.id === panelForId)
+// leaves an invisible trap: the text stays underlined and every later click
+// on it reopens an empty thread, which reads as the editor misbehaving
+// rather than as a note the user forgot they made. Discard it on close — but
+// only the annotation this thread session just created. A note the user did
+// not create in this breath is never removed without them asking.
+function discardThreadAnnotationIfEmpty(id: string, sessionId: string | null): void {
+  if (id !== threadCreatedId) return
+  const a = annotations.find((x) => x.id === id)
   if (!a) return
-  if (a.comment.trim() !== '' || panelMessages.length > 0) return
+  if (a.comment.trim() !== '' || sessionId || (currentSlug && hasThreadDraft({ surface: 'editor-passage', key: `${currentSlug}:${id}`, label: a.snippet }))) return
   annotations = annotations.filter((x) => x.id !== a.id)
   scheduleAnnotationsSave()
   renderAnnotationOverlay()
 }
 
-function closePanel(): void {
-  if (!panelEl) return
-  if (panelEl.hidden && !panelForId) return
-  discardPanelAnnotationIfEmpty()
-  panelCreatedId = null
-  panelEl.hidden = true
-  panelForId = null
-  panelMessages = []
-  panelReplies.clear()
-  stopPanelPoll()
-  document.removeEventListener('mousedown', onPanelOutsidePress, true)
-  document.removeEventListener('keydown', onPanelKeydown)
+function returnCaretToPassageEnd(id: string): void {
+  if (!docEl) return
+  const a = annotations.find((x) => x.id === id)
+  if (!a) return
+  const range = reAnchorAnnotation(a) || a.range
+  const snap = docTextSnapshot()
+  const endLine = Math.max(0, Math.min(range.end_line, snap.lineStarts.length - 1))
+  const end = Math.min(snap.text.length, snap.lineStarts[endLine]! + range.end_offset)
+  const dom = domRangeForCharRange(snap, end, end)
+  if (!dom) return
+  const sel = window.getSelection()
+  sel?.removeAllRanges()
+  sel?.addRange(dom)
+  docEl.focus()
 }
 
-function onPanelOutsidePress(e: MouseEvent): void {
-  if (!panelEl) return
-  const t = e.target as Node
-  if (panelEl.contains(t)) return
-  // The control that opens the panel must never also close it.
-  if (commentBtnEl && commentBtnEl.contains(t)) return
-  // Allow presses on annotation marks to switch panels (the overlay click
-  // delegate opens the new one); other presses close the panel.
-  if ((t as HTMLElement).classList?.contains('annotation-mark')) return
-  closePanel()
+function onInlineThreadClosed(ev: Event): void {
+  const detail = (ev as CustomEvent<{ subject: ChatSubject, returnCaret: boolean, sessionId: string | null }>).detail
+  if (!detail || detail.subject.surface !== 'editor-passage') return
+  const at = detail.subject.key.indexOf(':')
+  if (at < 0) return
+  const id = detail.subject.key.slice(at + 1)
+  discardThreadAnnotationIfEmpty(id, detail.sessionId)
+  if (detail.returnCaret) returnCaretToPassageEnd(id)
+  threadCreatedId = null
 }
 
-function onPanelKeydown(e: KeyboardEvent): void {
-  if (e.key === 'Escape') {
-    e.preventDefault()
-    closePanel()
-  }
+
+// While the side pane shows the open document's session, a non-collapsed
+// selection inside #editor-doc sets the surface's highlight chip; a collapsed
+// one clears it. Selections elsewhere — including in the composer — are
+// ignored, so moving focus to the composer keeps the chip. This listener must
+// not inherit the selection-actions rule above that returns early unless the
+// editor has focus.
+function updateHighlightFromSelection(): void {
+  const shown = chatSidePane.subjectInView()
+  if (!currentSlug || !docEl || shown?.surface !== 'editor-document' || shown.key !== currentSlug) return
+  const sel = window.getSelection()
+  if (!sel || sel.rangeCount === 0) return
+  const range = sel.getRangeAt(0)
+  if (!docEl.contains(range.commonAncestorContainer) && range.commonAncestorContainer !== docEl) return
+  const text = sel.toString()
+  chatSidePane.setHighlight(!sel.isCollapsed && text ? text : null)
 }
 
 function attachHandlers() {
@@ -4190,15 +3905,18 @@ function attachHandlers() {
   copyBtnEl = viewEl.querySelector<HTMLButtonElement>('.editor-copy-btn')!
   copyBtnEl.addEventListener('click', () => { void copyDoc() })
   viewEl.querySelector<HTMLButtonElement>('.editor-chat-btn')!
-    .addEventListener('click', () => { void openChatForCurrentDoc() })
-  // Chat view handoff: the person picks the repository the session runs in;
-  // the runtime stages the document into that checkout.
+    .addEventListener('click', () => {
+      if (!currentSlug) return
+      const d = currentDoc()
+      chatSidePane.toggle({ subject: { surface: 'editor-document', key: currentSlug, label: d?.title || currentSlug } })
+    })
+  // Chat view handoff: opens the document's own chat in Chat.
   viewEl.querySelector<HTMLButtonElement>('.editor-chat-session-btn')!
     .addEventListener('click', () => {
       if (!currentSlug) return
       const d = currentDoc()
       window.dispatchEvent(new CustomEvent('poise:open-chat-session', {
-        detail: { context: { kind: 'document', slug: currentSlug, title: d?.title || currentSlug }, pickRepo: true },
+        detail: { subject: { surface: 'editor-document', key: currentSlug, label: d?.title || currentSlug } },
       }))
     })
 
@@ -4647,11 +4365,8 @@ function attachHandlers() {
     const id = target?.dataset?.annId
     if (!id) return
     e.stopPropagation()
-    openPanelForAnnotation(id)
+    openThreadForAnnotation(id)
   })
-
-  panelEl = viewEl.querySelector<HTMLElement>('#editor-annotation-panel')
-  if (panelEl) watchPanel(panelEl, () => !!panelEl && !panelEl.hidden)
 
   // Re-position annotation overlays on viewport changes. Resize and
   // scroll both invalidate the cached rects; they're cheap to redraw
@@ -4931,16 +4646,33 @@ function sendPendingEditorBeacons(): void {
 // in-memory `docs` array or an older discovery response yet).
 if (typeof window !== 'undefined') {
   window.addEventListener('poise:editor-load-doc', (ev) => {
-    const slug = (ev as CustomEvent<{ slug: string }>).detail?.slug
-    if (!slug) return
+    const detail = (ev as CustomEvent<{ slug: string, session?: string }>).detail
+    if (!detail?.slug) return
+    const requestId = ++externalOpenRequestId
     void (async () => {
       if (!initialized) {
         // initEditorView hasn't run yet — main.ts switchTo('editor')
         // triggers it. Wait one tick.
         await new Promise((r) => setTimeout(r, 100))
       }
+      if (requestId !== externalOpenRequestId || !viewEl || viewEl.hidden) return
       void fetchDocs({ fresh: true })
-      await loadDoc(slug)
+      const loadingDocument = loadDoc(detail.slug)
+      const documentRequestId = loadRequestId
+      await loadingDocument
+      // Chat's read-only edit cards carry their session: open the side pane
+      // on the session they came from (falling back to the document chat
+      // when it cannot be read).
+      if (detail.session && requestId === externalOpenRequestId && documentRequestId === loadRequestId && currentSlug === detail.slug && !viewEl.hidden) {
+        const d = currentDoc()
+        let subject: ChatSubject = { surface: 'editor-document', key: detail.slug, label: d?.title || detail.slug }
+        try {
+          const found = await chatClient.fetchSession(detail.session, 0)
+          if (found.session.subject) subject = found.session.subject
+        } catch { /* fall through to the document chat */ }
+        if (requestId !== externalOpenRequestId || documentRequestId !== loadRequestId || currentSlug !== detail.slug || viewEl.hidden) return
+        chatSidePane.toggle({ subject })
+      }
     })()
   })
 }
@@ -4971,17 +4703,23 @@ export async function initEditorView() {
         if (docEl) docEl.contentEditable = !frozen && currentSlug ? 'true' : 'false'
       },
     })
+    registerEditorSurface(editorSurfaceFor)
+    document.addEventListener('selectionchange', updateHighlightFromSelection)
+    window.addEventListener('editor:inline-thread-closed', onInlineThreadClosed)
+    window.addEventListener('editor:inline-thread-open', (ev) => {
+      const subject = (ev as CustomEvent<{ subject: ChatSubject }>).detail?.subject
+      if (subject) void openThreadForSubject(subject)
+    })
+    window.addEventListener('editor:inline-thread-back', (ev) => {
+      const subject = (ev as CustomEvent<{ subject: ChatSubject }>).detail?.subject
+      if (subject) void openThreadForSubject(subject)
+    })
+    window.addEventListener('editor:inline-thread-moved', () => renderAnnotationOverlay())
     articleReviews = new EditorReviews({
       view: viewEl, document: docEl!, text: serializeDoc,
       range: (start, end) => domRangeForCharRange(docTextSnapshot(), start, end),
-      beforeOpen: closePanel,
-      ask: (review: ArticleReview) => {
-        if (!currentSlug) return
-        const key = `${currentSlug}:${review.id}`
-        const session = reviewSessions.get(key) ?? editorChatSessionId(currentSlug)
-        reviewSessions.set(key, session)
-        void openChatForCurrentDoc(`Help me address this review from @${review.messages[0]?.author} on ${review.site} (${review.prUrl}).\n\n${review.messages.map((message) => `@${message.author}: ${message.body}`).join('\n\n')}\n\n${review.anchor?.quote ?? ''}`, session)
-      },
+      beforeOpen: closeInlineThread,
+      openThread: (review, render) => openThreadForReview(review, render),
     })
     attachHandlers()
     setGoogleNavigationGuard(prepareGoogleNavigation)
@@ -5032,6 +4770,7 @@ async function openInitialDocument(): Promise<void> {
 }
 
 export function stopEditorRefresh() {
+  externalOpenRequestId++
   if (!currentSlug) {
     loadRequestId++
     editorInitialization = null

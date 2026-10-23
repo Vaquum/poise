@@ -129,6 +129,7 @@ let viewEl: HTMLElement
 let bodyEl: HTMLElement
 let searchEl: HTMLInputElement | null = null
 let initialized = false
+let importedSessionOpenRequestId = 0
 let entries: LogEntry[] = []
 let quarantined: QuarantinedLog[] = []
 let searchQuery = ''
@@ -418,6 +419,30 @@ function isChatTurn(e: LogEntry): boolean {
   return e.behavior === 'chat' && e.source === 'poise:chat' && !!e.session_id
 }
 
+// Open the Chat session that imported a legacy chat row's conversation. A
+// row that was never opened in Chat says so in place; its replies stay in
+// Swarm, readable by expanding the row.
+async function openImportedSession(button: HTMLButtonElement, session: string): Promise<void> {
+  const requestId = ++importedSessionOpenRequestId
+  let reachable = false
+  let found: { id: string } | null = null
+  try {
+    const res = await fetch(`/api/chat/sessions?legacy=${encodeURIComponent(session)}`, { cache: 'no-store' })
+    reachable = res.ok
+    if (res.ok) found = ((await res.json()) as { session: { id: string } | null }).session
+  } catch { /* unreachable Chat keeps the button below */ }
+  if (requestId !== importedSessionOpenRequestId || !viewEl || viewEl.hidden) return
+  if (found) {
+    window.dispatchEvent(new CustomEvent('poise:open-chat-session', { detail: { id: found.id } }))
+    return
+  }
+  if (!reachable || !button.isConnected) return
+  const message = document.createElement('span')
+  message.className = 'agent-target agent-never-imported'
+  message.textContent = 'This conversation was never opened in Chat — its replies stay in Swarm.'
+  button.replaceWith(message)
+}
+
 // What the Target column reads as, so the filter can match the same text the
 // person is looking at. Empty when the row has no target at all.
 function targetText(e: LogEntry): string {
@@ -469,10 +494,10 @@ function repoCell(e: LogEntry): string {
     return `<span class="agent-repo-cell">${repoHtml}${prHtml}</span>`
   }
   const label = targetText(e)
-  // A session always resolves: listChatHistory reads the same agent log this
-  // row came from, filtered by session_id, so the conversation contains at
-  // least this run. Clicking opens it in the chat pane — or, for a Chat view
-  // turn, the Chat view on that session.
+  // A legacy chat row opens the Chat session that imported it, if any —
+  // resolved live when clicked, since the import happens on open. A row
+  // whose conversation was never opened in Chat says so in place. A Chat
+  // view turn opens the Chat view on that session directly.
   if (e.session_id) {
     const chat = isChatTurn(e)
     return `<button type="button" class="agent-target agent-session-link${chat ? ' agent-chat-session' : ''}" data-session="${escapeHtml(e.session_id)}"`
@@ -973,9 +998,7 @@ function attachClicks() {
         window.dispatchEvent(new CustomEvent('poise:open-chat-session', { detail: { id: session } }))
         return
       }
-      window.dispatchEvent(new CustomEvent('poise:open-chat', {
-        detail: { session, label: sessionLabel(session) },
-      }))
+      void openImportedSession(sessionBtn, session)
       return
     }
 
@@ -1296,6 +1319,7 @@ export async function initSwarmView() {
 }
 
 export function stopSwarmRefresh() {
+  importedSessionOpenRequestId++
   if (progressPoll) clearInterval(progressPoll)
   progressPoll = null
   if (swarmListening) {

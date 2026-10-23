@@ -1,5 +1,4 @@
-import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -50,9 +49,7 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-chat-runtime-'))
   process.env.POISE_DB = join(root, 'cache.db')
   process.env.POISE_EDITOR_DIR = join(root, 'editor')
-  process.env.POISE_CHAT_ATTACHMENTS_DIR = join(root, 'attachments')
   process.env.AGENT_INTERFACE_ROOT = join(root, 'agent-interface')
-  process.env.TMPDIR = join(root, 'tmp')
   mocks.fetchAgentLogs.mockReset().mockResolvedValue([])
   mocks.quarantined = []
   mocks.catalogStdout = CATALOG_STDOUT
@@ -75,29 +72,19 @@ afterEach(async () => {
   for (const key of [
     'POISE_DB',
     'POISE_EDITOR_DIR',
-    'POISE_CHAT_ATTACHMENTS_DIR',
     'AGENT_INTERFACE_ROOT',
-    'TMPDIR',
   ]) delete process.env[key]
   vi.restoreAllMocks()
   vi.resetModules()
   await rm(root, { recursive: true, force: true })
 })
 
-function worktreeName(session: string): string {
-  const readable = session.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_').slice(0, 120) || 'session'
-  return `${readable}-${createHash('sha256').update(session).digest('hex')}`
-}
-
 describe('chat runtime hardening', () => {
-  it('passes the admitted Codex launcher through legacy chat and debate workers', async () => {
+  it('passes the admitted Codex launcher through debate workers', async () => {
     const providers = await import('../server/provider-clis')
     vi.mocked(providers.prepareModelClis).mockResolvedValueOnce({ CODEX_CLI: '/verified/codex.js' })
-      .mockResolvedValueOnce({ CODEX_CLI: '/verified/codex.js' })
     const chat = await import('../server/chat')
     database = await import('../server/db')
-    await chat.sendChat('snapshot-session', 'hello', 'gpt-6-astra-ultra')
-    expect(mocks.spawnDetached.mock.calls[0][2].env).toMatchObject({ CODEX_CLI: '/verified/codex.js' })
     mocks.runFile.mockImplementation(async (_command, args) => ({ stdout: args[0] === '--models'
       ? mocks.catalogStdout : JSON.stringify({ response: JSON.stringify({ synthesis: 'Comparison', rounds: [] }) }), stderr: '' }))
     await chat.runDebate('Compare the providers')
@@ -142,52 +129,6 @@ describe('chat runtime hardening', () => {
       repo: 'owner/repo', prId: '12', behavior: 'pr_review', sessionId: null,
     }]
     await expect(chat.listChatHistory('session')).rejects.toThrow('duplicate corrupt result')
-  })
-
-  it('gates Claude models without blocking the others, and falls back off Claude when it is signed out', async () => {
-    const chat = await import('../server/chat')
-    database = await import('../server/db')
-    mocks.authStatus = 'reauth_required'
-
-    // Claude default, Claude fallback: nothing else to launch, so the gate holds.
-    database.setMeta('models', JSON.stringify({ chat: { default: 'opus-5-max', fallback: 'fable-5.1-max' } }))
-    await expect(chat.sendChat('claude-session', 'hello', 'opus-5-max'))
-      .rejects.toThrow(/Claude authentication required/)
-    expect(mocks.spawnDetached).not.toHaveBeenCalled()
-
-    await expect(chat.sendChat('codex-session', 'hello', 'gpt-6-astra-ultra')).resolves.toEqual({ ok: true, model: 'gpt-6-astra-ultra' })
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    expect(mocks.spawnDetached.mock.calls[0][2].env).toEqual({})
-
-    // A fallback on another provider launches instead of the signed-out default.
-    database.setMeta('models', JSON.stringify({ chat: { default: 'opus-5-max', fallback: 'grok-4.6-xhigh' } }))
-    await expect(chat.sendChat('claude-session', 'hello')).resolves.toEqual({ ok: true, model: 'grok-4.6-xhigh' })
-    expect(mocks.spawnDetached.mock.calls[1][1]).toEqual(expect.arrayContaining(['--model', 'grok-4.6-xhigh']))
-  })
-
-  it('rejects a model the catalog does not know instead of launching another', async () => {
-    const chat = await import('../server/chat')
-    database = await import('../server/db')
-    await expect(chat.sendChat('session', 'hello', 'opus')).rejects.toThrow(/unknown model opus/)
-    expect(mocks.spawnDetached).not.toHaveBeenCalled()
-  })
-
-  it('rechecks Opus immediately before launching the monitored Claude binary', async () => {
-    const chat = await import('../server/chat')
-    database = await import('../server/db')
-
-    await expect(chat.sendChat('claude-session', 'hello', 'opus-5-max')).resolves.toEqual({ ok: true, model: 'opus-5-max' })
-
-    expect(mocks.requireAuth).toHaveBeenCalledTimes(2)
-    expect(mocks.spawnDetached.mock.calls[0][2]).toMatchObject({
-      env: {
-        ANTHROPIC_API_KEY: undefined,
-        ANTHROPIC_AUTH_TOKEN: undefined,
-        ANTHROPIC_BASE_URL: undefined,
-        CLAUDE_CODE_OAUTH_TOKEN: undefined,
-        CLAUDE_CLI: '/poise/claude-subscription',
-      },
-    })
   })
 
   it('runs a debate with no Claude participants while Claude is signed out', async () => {
@@ -243,220 +184,30 @@ describe('chat runtime hardening', () => {
     expect(mocks.observeAuthFailure).not.toHaveBeenCalled()
   })
 
-  it('atomically migrates only uniquely attributable legacy attachment directories', async () => {
-    const attachments = join(root, 'attachments')
-    const legacyTmp = join(root, 'tmp', 'poise-chat')
-    await Promise.all([
-      mkdir(join(attachments, 'owner_repo'), { recursive: true }),
-      mkdir(join(attachments, 'collision_name'), { recursive: true }),
-      mkdir(join(attachments, 'orphan'), { recursive: true }),
-      mkdir(join(legacyTmp, 'temp_session'), { recursive: true }),
-    ])
-    await Promise.all([
-      writeFile(join(attachments, 'owner_repo', 'one.txt'), 'durable legacy'),
-      writeFile(join(attachments, 'collision_name', 'two.txt'), 'ambiguous'),
-      writeFile(join(attachments, 'orphan', 'three.txt'), 'unknown'),
-      writeFile(join(legacyTmp, 'temp_session', 'four.txt'), 'temporary legacy'),
-    ])
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+  it('strips the legacy context wrapper so the import quotes what the person wrote', async () => {
     const chat = await import('../server/chat')
     database = await import('../server/db')
-
-    const result = await chat.migrateLegacyChatAttachments(async () => [
-      { session_id: 'owner/repo' },
-      { session_id: 'temp/session' },
-      { session_id: 'collision/name' },
-      { session_id: 'collision?name' },
-    ])
-
-    expect(result).toEqual({ migrated: 2, quarantined: 2 })
-    await expect(readFile(join(attachments, worktreeName('owner/repo'), 'one.txt'), 'utf8'))
-      .resolves.toBe('durable legacy')
-    await expect(readFile(join(attachments, worktreeName('temp/session'), 'four.txt'), 'utf8'))
-      .resolves.toBe('temporary legacy')
-    await expect(readFile(join(attachments, 'collision_name', 'two.txt'), 'utf8'))
-      .resolves.toBe('ambiguous')
-    await expect(readFile(join(attachments, 'orphan', 'three.txt'), 'utf8'))
-      .resolves.toBe('unknown')
-    expect(warn).toHaveBeenCalledTimes(2)
-  })
-
-  it('fails closed on a transient log lookup and retries before creating a worktree', async () => {
-    const attachments = join(root, 'attachments')
-    await mkdir(join(attachments, 'owner_repo'), { recursive: true })
-    await writeFile(join(attachments, 'owner_repo', 'one.txt'), 'durable legacy')
-    mocks.fetchAgentLogs
-      .mockRejectedValueOnce(new Error('logs unavailable'))
-      .mockResolvedValue([{ session_id: 'owner/repo' }])
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
-    const chat = await import('../server/chat')
-    database = await import('../server/db')
-
-    await expect(chat.sendChat('owner/repo', 'hello'))
-      .rejects.toMatchObject({ statusCode: 503 })
-    await expect(readFile(join(attachments, 'owner_repo', 'one.txt'), 'utf8'))
-      .resolves.toBe('durable legacy')
-    await expect(readFile(join(attachments, worktreeName('owner/repo'), 'one.txt')))
-      .rejects.toMatchObject({ code: 'ENOENT' })
-    expect(mocks.spawnDetached).not.toHaveBeenCalled()
-
-    await expect(chat.sendChat('owner/repo', 'hello')).resolves.toEqual({ ok: true, model: 'opus-5-max' })
-    await expect(readFile(join(attachments, worktreeName('owner/repo'), 'one.txt'), 'utf8'))
-      .resolves.toBe('durable legacy')
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-  })
-
-  it('never reclassifies a current hash-format worktree as legacy', async () => {
-    const attachments = join(root, 'attachments')
-    const originalSession = 'original/session'
-    const currentName = worktreeName(originalSession)
-    const craftedTarget = worktreeName(currentName)
-    await mkdir(join(attachments, currentName), { recursive: true })
-    await writeFile(join(attachments, currentName, 'one.txt'), 'current attachment')
-    const chat = await import('../server/chat')
-    database = await import('../server/db')
-
-    await expect(chat.migrateLegacyChatAttachments(async () => [{ session_id: currentName }]))
-      .resolves.toEqual({ migrated: 0, quarantined: 0 })
-    await expect(readFile(join(attachments, currentName, 'one.txt'), 'utf8'))
-      .resolves.toBe('current attachment')
-    await expect(readFile(join(attachments, craftedTarget, 'one.txt')))
-      .rejects.toMatchObject({ code: 'ENOENT' })
-  })
-
-  it('moves editor context off argv, preserves the displayed prompt, and removes the context after exit', async () => {
-    const editor = join(root, 'editor')
-    await mkdir(editor, { recursive: true })
-    const document = `# Brief\n\n${'context '.repeat(12_000)}`
-    await writeFile(join(editor, 'brief.md'), document, 'utf8')
-    const chat = await import('../server/chat')
-    database = await import('../server/db')
-
-    await chat.sendChat('editor-brief-123', 'Review this draft.', 'gpt-6-astra-ultra')
-
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    const [, args, options] = mocks.spawnDetached.mock.calls[0] as [string, string[], {
-      onExit: () => Promise<void>
-    }]
-    const prompt = args[1]
-    expect(Buffer.byteLength(prompt, 'utf8')).toBeLessThan(64 * 1024)
-    expect(prompt).not.toContain('context context context')
-    expect(prompt).toContain('Review this draft.')
-    const contextRelative = prompt.match(/context file "([^"]+)"/)?.[1]
-    expect(contextRelative).toBeTruthy()
-    const contextPath = join(args[args.indexOf('--pwd') + 1], contextRelative!)
-    await expect(readFile(contextPath, 'utf8')).resolves.toContain(document)
-
-    mocks.fetchAgentLogs.mockResolvedValueOnce([{
+    mocks.fetchAgentLogs.mockResolvedValue([{
       id: 'a'.repeat(32),
-      pr_id: null,
-      repo: null,
-      actor: null,
-      model: 'gpt',
       behavior: 'chat',
       session_id: 'editor-brief-123',
-      prompt,
+      prompt: '[Poise context file v1]\nRead the complete UTF-8 context file ".poise-context/request-1.md" under your working directory before answering. Do not modify it.\n\n[User\'s message:]\nReview this draft.',
       started_at: '2026-07-14T10:00:00.000Z',
-      time_elapsed: '',
-      status: 'running',
-      response: null,
+      status: 'completed',
+      response: 'abcd1234',
       error: '',
     }])
     await expect(chat.listChatHistory('editor-brief-123')).resolves.toMatchObject([
       { prompt: 'Review this draft.' },
     ])
-
-    await options.onExit()
-    await expect(readFile(contextPath)).rejects.toMatchObject({ code: 'ENOENT' })
-  })
-
-  // The annotation panel ("Ask the agent about this passage") used to send the
-  // annotation's own `ann-xxxxxxxx` id as the chat session. That never matches
-  // slugFromEditorSession, so none of the above applied: the agent got the
-  // snippet in quotes and nothing else, and answered questions about a passage
-  // with "The working directory is empty". These two cases pin the difference.
-  it('sends no document context for a session id that is not document-bound', async () => {
-    const editor = join(root, 'editor')
-    await mkdir(editor, { recursive: true })
-    await writeFile(join(editor, 'passage.md'), '# Passage\n\nThe quick brown fox.', 'utf8')
-    const chat = await import('../server/chat')
-    database = await import('../server/db')
-
-    await chat.sendChat('ann-qncjuig3', 'What does this passage say?', 'gpt-6-astra-ultra')
-
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    const [, args] = mocks.spawnDetached.mock.calls[0] as [string, string[], unknown]
-    const prompt = args[1]
-    expect(prompt).toContain('What does this passage say?')
-    // No context file is created, so there is nothing for the agent to read.
-    expect(prompt).not.toContain('context file')
-    expect(prompt).not.toContain('The quick brown fox')
-  })
-
-  it('sends the document for a session id bound to that document', async () => {
-    const editor = join(root, 'editor')
-    await mkdir(editor, { recursive: true })
-    await writeFile(join(editor, 'passage.md'), '# Passage\n\nThe quick brown fox.', 'utf8')
-    const chat = await import('../server/chat')
-    database = await import('../server/db')
-
-    // The shape the editor now mints: `editor-<slug>-<digits>`.
-    await chat.sendChat('editor-passage-1769500000000042', 'What does this passage say?', 'gpt-6-astra-ultra')
-
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    const [, args] = mocks.spawnDetached.mock.calls[0] as [string, string[], unknown]
-    const prompt = args[1]
-    const contextRelative = prompt.match(/context file "([^"]+)"/)?.[1]
-    expect(contextRelative).toBeTruthy()
-    const contextPath = join(args[args.indexOf('--pwd') + 1], contextRelative!)
-    await expect(readFile(contextPath, 'utf8')).resolves.toContain('The quick brown fox')
-  })
-
-  it('fails closed before spawning when aggregate authored context exceeds its budget', async () => {
-    const editor = join(root, 'editor')
-    await mkdir(editor, { recursive: true })
-    await writeFile(join(editor, 'budget.md'), `# Current\n${'c'.repeat(5 * 1024 * 1024 - 10)}`)
-    const chat = await import('../server/chat')
-    database = await import('../server/db')
-    const now = '2026-07-14T10:00:00.000Z'
-    const rows = []
-    for (const letter of ['a', 'b', 'c']) {
-      const callId = letter.repeat(32)
-      const slug = chat.contentSlugForCallId(callId)
-      await writeFile(join(editor, `${slug}.md`), `# Article ${letter}\n${letter.repeat(4 * 1024 * 1024 - 16)}`)
-      database.db.prepare(`
-        INSERT INTO content_jobs (
-          call_id, session_id, topic, started_at, status, slug,
-          response_hash, error, article_created, lease_owner,
-          lease_expires_at, next_attempt_at, error_count, created_at,
-          updated_at, completed_at
-        ) VALUES (?, ?, ?, ?, 'completed', ?, 'response', NULL, 1, NULL, NULL, 0, 0, ?, ?, ?)
-      `).run(callId, 'editor-budget-1', `Article ${letter}`, now, slug, now, now, now)
-      rows.push({
-        id: callId,
-        behavior: 'author_content',
-        session_id: 'editor-budget-1',
-        status: 'completed',
-        prompt: `Article ${letter}`,
-        started_at: now,
-      })
-    }
-    mocks.fetchAgentLogs.mockResolvedValue(rows)
-
-    await expect(chat.sendChat('editor-budget-1', 'Continue.'))
-      .rejects.toMatchObject({ statusCode: 413 })
-    expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
   it('returns typed size failures before spawning oversized direct arguments', async () => {
     const chat = await import('../server/chat')
     database = await import('../server/db')
 
-    await expect(chat.sendChat('session', 'x'.repeat(64 * 1024 + 1)))
-      .rejects.toMatchObject({ statusCode: 413 })
     await expect(chat.runDebate('x'.repeat(64 * 1024 + 1)))
       .rejects.toMatchObject({ statusCode: 413 })
-    expect(mocks.spawnDetached).not.toHaveBeenCalled()
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
 

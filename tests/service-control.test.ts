@@ -155,14 +155,14 @@ describe('service drain', () => {
 
   it('refuses browser launches while draining and counts an admitted one until it is released', () => {
     const { service } = serviceOf()
-    const launches = ['/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/chat', '/api/models/refresh']
+    const launches = ['/api/pr-review', '/api/agent-replay', '/api/chat-content', '/api/debate', '/api/models/refresh']
     const admitted = launches.map((path) => service.admitLaunch('POST', path))
     expect(admitted.every((launch) => typeof launch === 'function')).toBe(true)
     // A launch that passed the gate before the drain still counts after it.
     const health = service.drain()
     expect(health).toMatchObject({ backgroundWork: launches.length, idle: false, draining: true })
     for (const path of launches) expect(service.admitLaunch('POST', path), path).toBe('draining')
-    for (const [method, path] of [['GET', '/api/chat'], ['POST', '/api/settings'], ['POST', '/api/agent-stop'], ['POST', '/api/chat-attachment'], ['PUT', '/api/editor/doc/x']]) {
+    for (const [method, path] of [['GET', '/api/chat'], ['POST', '/api/chat'], ['POST', '/api/settings'], ['POST', '/api/agent-stop'], ['POST', '/api/chat-attachment'], ['PUT', '/api/editor/doc/x']]) {
       expect(service.admitLaunch(method, path), `${method} ${path}`).toBeNull()
     }
     for (const release of admitted) (release as () => void)()
@@ -288,7 +288,7 @@ describe('switching to another release', () => {
       expect((await readFile(join(dir, 'next'), 'utf8')).trim()).toBe('r2')
       // Nothing is refused while it waits, behavior ticks included.
       expect(background.releaseBackgroundPaused()).toBe(false)
-      const launch = service.admitLaunch('POST', '/api/chat')
+      const launch = service.admitLaunch('POST', '/api/debate')
       expect(launch).toEqual(expect.any(Function))
       ;(launch as () => void)()
       runtime.workingNow = 1
