@@ -1033,3 +1033,18 @@ resolution state and local offsets reach the browser. The Google metadata
 round-trip and the API behavior are tested in `tests/google-*.test.ts`; browser
 journeys are in `tests/e2e/google-publishing.spec.ts`. See
 [Publishing](Publishing.md#google-docs) for setup and user behavior.
+
+### Bound PR review observations
+
+The workspace's bound-chat monitor reads local Caller `pr-reviews` pages; it
+adds no GitHub requests. Each pass requests at most 200 reviews and 200 comment identities, returning
+each represented thread's latest comment plus bounded raw-comment revision
+summaries for edits to older comments. Content revisions participate in notice
+identity even when IDs and review state stay unchanged. It persists independent cursors
+and cycles back to observe
+older updates and reopens. Per-identity seen state survives partial or failed
+reads; page absence cannot establish resolution or completion. GitHub authors
+identify accounts, not chats, so unproven same-account feedback remains
+eligible. The local datastore currently supplies no per-chat origin receipt.
+[Chat orchestration](Chat-orchestration.md#issue-and-pr-ownership) defines the
+notification and ownership behavior.

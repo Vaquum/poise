@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { db } from '../db'
 import { HttpError, httpStatus, readJson } from '../http'
 import { runFile } from '../process'
-import { agentAccount, requireAgentAccount } from '../settings'
+import { requireAgentAccount } from '../settings'
 import { diagnostic } from '../logging'
 import { releaseBackgroundPaused, releaseSwitchPending, trackReleaseBackground } from '../release-background'
 import { POISE_ROOT } from './local-workspace'
@@ -257,28 +257,46 @@ export async function readWorkTargetStatus(target: store.WorkTarget): Promise<Wo
 /** One bound PR's reviews and review threads as the local datastore has
  *  them; null when the datastore cannot be asked. Local rows only — the
  *  sync owns freshness, and this read adds zero GitHub traffic. */
+export interface ReviewsCursor { reviewAfter: number, commentAfter: number }
 export interface ReviewsObservation {
+  page?: ReviewsCursor, hasUnresolved?: boolean,
+  comments?: Array<{ id: string, thread: string, resolved: boolean | null, revision: string }>,
   found: boolean, truncated: boolean,
-  reviews: Array<{ id: string, author: string | null, state: string }>,
+  reviews: Array<{ id: string, author: string | null, state: string, revision?: string }>,
   threads: Array<{ thread: string | null, resolved: boolean | null, outdated: boolean | null,
-    comments: Array<{ id: string, author: string | null }> }>,
+    comments: Array<{ id: string, author: string | null, revision?: string }> }>,
 }
-export async function readWorkReviews(target: store.WorkTarget): Promise<ReviewsObservation | null> {
+export async function readWorkReviews(target: store.WorkTarget, cursor: ReviewsCursor = { reviewAfter: 0, commentAfter: 0 }): Promise<ReviewsObservation | null> {
   const org = organizationForRepository(target.repo)
   if (!org) return null
   try {
     const { stdout } = await runFile('github-datastore',
-      organizationArgs(org, ['view', 'pr-reviews', '--repo', target.repo, '--number', String(target.number), '--format', 'json']),
+      organizationArgs(org, ['view', 'pr-reviews', '--repo', target.repo, '--number', String(target.number), '--format', 'json',
+        '--page-size', '200', '--review-after', String(cursor.reviewAfter), '--comment-after', String(cursor.commentAfter)]),
       { timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 })
     const value: unknown = JSON.parse(stdout)
     if (!value || typeof value !== 'object' || !('found' in value) || typeof value.found !== 'boolean'
       || !('reviews' in value) || !Array.isArray(value.reviews) || !('threads' in value) || !Array.isArray(value.threads)) return null
+    let page: ReviewsCursor | undefined
+    if ('page' in value) {
+      const raw = value.page
+      if (!raw || typeof raw !== 'object' || !('next_review_after' in raw) || typeof raw.next_review_after !== 'number' || !Number.isSafeInteger(raw.next_review_after) || raw.next_review_after < 0
+        || !('next_comment_after' in raw) || typeof raw.next_comment_after !== 'number' || !Number.isSafeInteger(raw.next_comment_after) || raw.next_comment_after < 0
+        || !('review_after' in raw) || raw.review_after !== cursor.reviewAfter
+        || !('comment_after' in raw) || raw.comment_after !== cursor.commentAfter
+        || !('has_unresolved' in value) || typeof value.has_unresolved !== 'boolean'
+        || value.reviews.length > 200 || value.threads.length > 200
+        || !('comments' in value) || !Array.isArray(value.comments) || value.comments.length > 200) return null
+      page = { reviewAfter: raw.next_review_after, commentAfter: raw.next_comment_after }
+    }
     const reviews: ReviewsObservation['reviews'] = []
     for (const review of value.reviews) {
       if (!review || typeof review !== 'object' || !('node_id' in review) || typeof review.node_id !== 'string'
         || !('state' in review) || typeof review.state !== 'string'
-        || ('author' in review && review.author !== null && typeof review.author !== 'string')) return null
-      reviews.push({ id: review.node_id, author: 'author' in review ? review.author : null, state: review.state })
+        || ('author' in review && review.author !== null && typeof review.author !== 'string')
+        || ('revision' in review && typeof review.revision !== 'string')) return null
+      reviews.push({ id: review.node_id, author: 'author' in review ? review.author : null, state: review.state,
+        ...('revision' in review && typeof review.revision === 'string' ? { revision: review.revision } : {}) })
     }
     const threads: ReviewsObservation['threads'] = []
     for (const thread of value.threads) {
@@ -290,50 +308,56 @@ export async function readWorkReviews(target: store.WorkTarget): Promise<Reviews
       const comments: ReviewsObservation['threads'][number]['comments'] = []
       for (const comment of thread.comments) {
         if (!comment || typeof comment !== 'object' || !('node_id' in comment) || typeof comment.node_id !== 'string'
-          || ('author' in comment && comment.author !== null && typeof comment.author !== 'string')) return null
-        comments.push({ id: comment.node_id, author: 'author' in comment ? comment.author : null })
+          || ('author' in comment && comment.author !== null && typeof comment.author !== 'string')
+          || ('revision' in comment && typeof comment.revision !== 'string')) return null
+        comments.push({ id: comment.node_id, author: 'author' in comment ? comment.author : null,
+          ...('revision' in comment && typeof comment.revision === 'string' ? { revision: comment.revision } : {}) })
       }
       threads.push({ thread: thread.thread_node_id, resolved: thread.resolved, outdated: thread.outdated, comments })
     }
-    return { found: value.found, truncated: 'truncated' in value && value.truncated === true, reviews, threads }
+    const comments: ReviewsObservation['comments'] = []
+    if ('comments' in value) {
+      if (!Array.isArray(value.comments) || value.comments.length > 200) return null
+      for (const comment of value.comments) {
+        if (!comment || typeof comment !== 'object' || !('id' in comment) || typeof comment.id !== 'string'
+          || !('thread' in comment) || typeof comment.thread !== 'string'
+          || !('revision' in comment) || typeof comment.revision !== 'string'
+          || !('resolved' in comment) || (comment.resolved !== null && typeof comment.resolved !== 'boolean')) return null
+        comments.push({ id: comment.id, thread: comment.thread, resolved: comment.resolved, revision: comment.revision })
+      }
+    }
+    return { found: value.found, truncated: 'truncated' in value && value.truncated === true, reviews, threads,
+      ...(page ? { page, comments, hasUnresolved: 'has_unresolved' in value && value.has_unresolved === true } : {}) }
   } catch {
     return null
   }
 }
 
-/** The watched slice of a reviews observation: every unresolved thread
- *  with a comment by someone other than the bound chat's agent, keyed by
- *  its latest such comment so a new reply wakes, plus every non-self
- *  review that asks something of the author. Resolved threads contribute
- *  nothing; unknown resolution reads as unresolved, never silent.
- *  Approvals and unsubmitted reviews need no author action. A dismissal
- *  wakes only while unresolved threads give the author something to do —
- *  a bare stale-review dismissal waits on other reviewers, not the author. */
-function reviewWatched(reviews: ReviewsObservation, self: string): Array<Record<string, unknown>> {
-  const lower = self.toLowerCase()
-  const owned = (login: string | null): boolean => !!login && !!lower && login.toLowerCase() === lower
+/** GitHub login identifies an account, not a chat. Without per-chat origin
+ *  evidence, even same-account feedback remains actionable. Resolved threads,
+ *  approvals and unsubmitted reviews need no author action. */
+function reviewWatched(reviews: ReviewsObservation): Array<Record<string, unknown>> {
   const watched: Array<Record<string, unknown>> = []
-  let unresolved = 0
+  let unresolved = reviews.hasUnresolved ? 1 : 0
   for (const thread of reviews.threads) {
     if (thread.resolved === true) continue
-    const comments = thread.comments.filter(comment => !owned(comment.author))
+    const comments = thread.comments
     if (!comments.length) continue
     unresolved += 1
     const latest = comments[comments.length - 1]!
-    watched.push({ thread: thread.thread ?? latest.id, latest: latest.id, ...(thread.outdated === true ? { outdated: true } : {}) })
+    watched.push({ thread: thread.thread ?? latest.id, latest: latest.id, ...(latest.revision ? { revision: latest.revision } : {}), ...(thread.outdated === true ? { outdated: true } : {}) })
   }
   for (const review of reviews.reviews) {
-    if (owned(review.author) || review.state === 'APPROVED' || review.state === 'PENDING') continue
+    if (review.state === 'APPROVED' || review.state === 'PENDING') continue
     if (review.state === 'DISMISSED' && unresolved === 0) continue
-    watched.push({ review: review.id, state: review.state })
+    watched.push({ review: review.id, state: review.state, ...(review.revision ? { revision: review.revision } : {}) })
   }
   return watched.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
 }
 
-/** The reviews facet's last-observed watched slice, stored as plain JSON.
- *  Missing or malformed reads as nothing seen, so the next pass wakes on
- *  whatever it finds — including once after this sidecar rolls out. */
-function parseReviewsSeen(fingerprint: string | undefined): Array<Record<string, unknown>> {
+/** Read the persisted bounded cursor sidecar. Malformed state restarts its
+ *  scan; per-identity delivery state remains intact. */
+function parseReviewsCursor(fingerprint: string | undefined): Array<Record<string, unknown>> {
   if (!fingerprint) return []
   try {
     const value: unknown = JSON.parse(fingerprint)
@@ -1361,9 +1385,9 @@ export class ChatControl {
   }
 
   /** Reviews, threads and dismissed approvals from the local datastore:
-   *  zero new GitHub requests. Unknown, missing or truncated evidence
-   *  keeps the settled baseline like pending CI: it never establishes
-   *  completion and never wakes. */
+   *  zero new GitHub requests. Bounded pages advance independently and revisit
+   *  older identities. Unknown, missing or legacy truncated evidence keeps
+   *  the settled baseline; partial pages never establish completion. */
   private async observeReviews(binding: store.Binding, target: store.WorkTarget, now: number): Promise<void> {
     const instance = this.runtime.instance
     const key = `reviews:${target.url}`
@@ -1371,7 +1395,10 @@ export class ChatControl {
     if (previous && now - previous.checked_at < CI_INTERVAL) return
     let reviews: ReviewsObservation | null
     try {
-      reviews = await (this.options.reviews ?? readWorkReviews)(target)
+      const saved = parseReviewsCursor(store.observation(instance, `reviews-cursor:${target.url}`)?.fingerprint)[0]
+      const cursor = saved && typeof saved.reviewAfter === 'number' && Number.isSafeInteger(saved.reviewAfter) && saved.reviewAfter >= 0
+        && typeof saved.commentAfter === 'number' && Number.isSafeInteger(saved.commentAfter) && saved.commentAfter >= 0 ? { reviewAfter: saved.reviewAfter, commentAfter: saved.commentAfter } : { reviewAfter: 0, commentAfter: 0 }
+      reviews = await (this.options.reviews ?? readWorkReviews)(target, cursor)
     } catch (error) {
       this.runtime.emit('log', `[chat control] reviews read for ${target.url} failed: ${String(error)}`)
       reviews = null
@@ -1380,11 +1407,11 @@ export class ChatControl {
     // new owner starts from no baseline, so a stale write here must not
     // restore the old fingerprint and silence its first notice.
     if (!store.bindingIsCurrent(instance, binding)) return
-    if (!reviews || !reviews.found || reviews.truncated) {
+    if (!reviews || !reviews.found || (reviews.truncated && !reviews.page)) {
       store.saveObservation(instance, key, previous?.fingerprint ?? '', now)
       return
     }
-    const watched = reviewWatched(reviews, agentAccount())
+    const watched = reviewWatched(reviews)
     const blockers = watched.map(entry => 'thread' in entry
       ? `Reply to review thread ${String(entry.thread)} (latest comment ${String(entry.latest)}${entry.outdated === true ? ', outdated by a newer push' : ''}) and resolve it`
       : `Address review ${String(entry.review)} (${String(entry.state)})`)
@@ -1396,16 +1423,44 @@ export class ChatControl {
     // advances the baseline silently. New reviews, replies and reopened
     // threads still wake.
     const seenKey = `reviews-seen:${target.url}`
-    const seenBefore = parseReviewsSeen(store.observation(instance, seenKey)?.fingerprint)
-    const hasNew = fingerprinted.some(entry => !seenBefore.some(known => JSON.stringify(known) === JSON.stringify(entry)))
+    const identity = (entry: Record<string, unknown>) => 'thread' in entry ? `thread:${String(entry.thread)}` : `review:${String(entry.review)}`
+    const hasNew = fingerprinted.some(entry => store.observation(instance, `${seenKey}:${identity(entry)}`)?.fingerprint !== JSON.stringify(entry))
+    // Latest-comment edits are already carried by the thread fingerprint.
+    // Older/root edits need their own bounded revision evidence. First-seen
+    // historical comments establish a baseline without replaying old activity.
+    const editedComments = (reviews.comments ?? []).filter(comment => {
+      if (comment.resolved === true || reviews.threads.some(thread => thread.comments.at(-1)?.id === comment.id)) return false
+      const known = store.observation(instance, `${seenKey}:comment:${comment.id}`)
+      return known !== undefined && known.fingerprint !== comment.revision
+    })
+    const actionable = [...fingerprinted, ...editedComments.map(comment => ({ comment: comment.id, revision: comment.revision }))]
+    blockers.push(...editedComments.map(comment => `Address edited review comment ${comment.id} in thread ${comment.thread}`))
     const data = { kind: 'reviews', target: target.url,
+      revision: createHash('sha256').update(JSON.stringify(actionable)).digest('hex'),
+      ...(editedComments.length ? { editedComments } : {}),
       reviews: reviews.reviews.map(review => ({ id: review.id, author: review.author, state: review.state })),
       threads: reviews.threads.map(thread => ({ thread: thread.thread, resolved: thread.resolved, outdated: thread.outdated,
         comments: thread.comments.map(comment => comment.id),
         authors: [...new Set(thread.comments.map(comment => comment.author))] })),
       blockers, done: WORK_DONE }
-    this.observe(binding, key, data, now, blockers.length > 0, false, fingerprinted, hasNew)
-    store.saveObservation(instance, seenKey, JSON.stringify(fingerprinted), now)
+    this.observe(binding, key, data, now, blockers.length > 0, false, actionable, hasNew || editedComments.length > 0)
+    // Update only identities actually present in this page. Absence from a
+    // partial (or failed) read is never evidence of resolution or removal.
+    const observed = [...reviews.reviews.map(review => ({ review: review.id })),
+      ...reviews.threads.flatMap(thread => {
+        const latest = thread.comments.at(-1)
+        return latest ? [{ thread: thread.thread ?? latest.id }] : []
+      })]
+    for (const entry of observed) {
+      const watchedEntry = fingerprinted.find(candidate => identity(candidate) === identity(entry))
+      store.saveObservation(instance, `${seenKey}:${identity(entry)}`, watchedEntry ? JSON.stringify(watchedEntry) : '', now)
+    }
+    const commentBaselines = [...(reviews.comments ?? []), ...reviews.threads.flatMap(thread => {
+      const latest = thread.comments.at(-1)
+      return latest?.revision ? [{ id: latest.id, revision: latest.revision }] : []
+    })]
+    for (const comment of commentBaselines) store.saveObservation(instance, `${seenKey}:comment:${comment.id}`, comment.revision, now)
+    if (reviews.page) store.saveObservation(instance, `reviews-cursor:${target.url}`, JSON.stringify([reviews.page]), now)
   }
 
   private observe(binding: store.Binding, key: string, data: Record<string, unknown>, now: number, initiallyActionable: boolean, pending = false, actionable?: unknown, shouldWake = true): void {

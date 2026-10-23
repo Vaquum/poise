@@ -22,10 +22,13 @@ steering during a turn and Stop. Capabilities belong to each native session:
 unsupported optional controls are not simulated.
 
 Current cards, Swarm rows and Editor documents can hand off into Chat. A pending
-legacy-row lookup is cancelled by leaving Swarm or choosing another row. Changing
-the agent creates a new native session with a labelled context handoff, not a
-pretence that one vendor's session migrated to another. Each Current card has
-one Chat session of its own, opened from the card in the side pane or from
+legacy-row lookup is cancelled by leaving Swarm or choosing another row. Failed
+lookups and unreadable responses retain the session link for retry and show a
+read failure. A successful lookup contains either a session with a nonempty ID
+or explicit `session: null`; only that null marks a conversation never opened
+in Chat. Changing the agent creates a new native session with a labelled context
+handoff, not a pretence that one vendor's session migrated to another. Each
+Current card has one Chat session of its own, opened from the side pane or from
 Open in Chat in the Chat view; the pane shows the card's earlier conversation
 until the first message creates the session. `/content` and `/consensus` run
 as Chat composer commands with transcript cards. Every Editor chat — the
@@ -229,8 +232,14 @@ existing SQLite store. Legacy session switching checkpoints owned dirty branches
 never stashes, commits, or switches the enclosing Poise source checkout.
 
 A fork or handoff stays in its source session's workspace, sharing that
-checkout and its lease with the source; while the source family's turn runs,
-the fork or handoff is visibly queued behind it. Deleting a session removes
+checkout and its lease with the source. A handoff waits for pending source
+startup before creating its target; a closing source, running turn, or absent
+source branch refuses the handoff without moving its subject or work bindings.
+A deferred chat prepares its branch under the checkout lease without starting
+its original provider. A provider error does not block handoff when the source
+branch exists. Source admission is checked again after target model/auth
+preparation, before any target is stored or ownership moves. Once created, the target queues behind any turn holding the shared checkout lease.
+Deleting a session removes
 its own scratch workspace only when no other session still uses it, its
 branch tip never moved, and its tree is clean; otherwise the workspace is
 kept, and the delete confirmation says which applies. Lock files are never

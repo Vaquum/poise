@@ -380,6 +380,9 @@ def migrate_review_comment_threads(conn: sqlite3.Connection) -> None:
     ):
         if column not in names:
             conn.execute(ddl)
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_review_threads_page
+                    ON review_comments(item_id, COALESCE(thread_node_id, node_id), comment_id)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_review_unresolved ON review_comments(item_id, thread_resolved)")
 
 
 def set_state(conn: sqlite3.Connection, scope: str, key: str, value: str) -> None:
