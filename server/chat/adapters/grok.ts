@@ -519,12 +519,11 @@ export function createGrokAdapter(host: AdapterHost, options: { compactTimeoutMs
       const admission = { ready: new Promise<void>(resolve => { release = resolve }), release: () => release() }
       promptAdmission = admission
       admission.release()
-      if (init.signal.aborted || cancelRequested) {
-        settlePrompt(init.turnId, admission, init.signal, () => {})
-        return { stopReason: 'cancelled' }
-      }
       const onAbort = () => { void adapter.cancel() }
       init.signal.addEventListener('abort', onAbort, { once: true })
+      // Cancellation may precede attachment, but the native prompt already
+      // runs. Send its cancel and retain the turn until Grok acknowledges it.
+      if (init.signal.aborted) onAbort()
       let stopWaiting = () => {}
       try {
         const result = await new Promise<any>((resolve, reject) => {
