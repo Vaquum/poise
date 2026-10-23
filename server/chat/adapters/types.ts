@@ -7,7 +7,7 @@
 // protocol into `ChatEvent`s and asks the host to answer the agent's
 // requests; it never persists anything and never talks to the browser.
 
-import type { ChildProcess } from 'node:child_process'
+import type { Readable, Writable } from 'node:stream'
 import type { ResolvedServer, Skipped } from '../../extensions/types'
 import type {
   AgentId,
@@ -22,13 +22,32 @@ import type {
   TurnUsage,
 } from '../protocol'
 
+/** The agent's process as an adapter sees it: piped stdio plus exit and
+ *  signal. A ChildProcess satisfies this, and so does the relay peer
+ *  (server/chat/relay.ts), which is how an adapter talks to an agent that
+ *  outlives the Poise server. */
+export interface AgentProcess {
+  readonly stdin: Writable | null
+  readonly stdout: Readable | null
+  readonly stderr: Readable | null
+  readonly exitCode: number | null
+  readonly signalCode: NodeJS.Signals | null
+  readonly killed: boolean
+  kill(signal?: NodeJS.Signals): boolean
+  once(event: 'exit' | 'error', listener: (...args: any[]) => void): unknown
+  on(event: 'exit' | 'error', listener: (...args: any[]) => void): unknown
+  off(event: 'exit' | 'error', listener: (...args: any[]) => void): unknown
+  removeListener(event: 'exit' | 'error', listener: (...args: any[]) => void): unknown
+  removeAllListeners(event?: 'exit' | 'error'): unknown
+}
+
 /** Spawns the native agent through the registered worker gate (see
  *  server/chat/worker.ts). The returned process has piped stdio that is the
  *  agent's own stdin/stdout/stderr. */
 export type SpawnAgent = (command: string, args: readonly string[], options?: {
   /** Overlaid on the scrubbed environment for `command`. */
   env?: NodeJS.ProcessEnv
-}) => Promise<ChildProcess>
+}) => Promise<AgentProcess>
 
 export interface PermissionRequest {
   /** Native request superseded or resolved elsewhere; closes its old UI card. */
@@ -118,6 +137,33 @@ export interface TurnResult {
   unrunSteers?: string[]
 }
 
+/** Reconnecting to a turn that outlived its Poise: the relay peer carries
+ *  the spooled turn first, then live output. `live` resolves once the link
+ *  is live and rejects when the relay reports the replay cannot be exact.
+ *  `outbound` is the turn-scoped Poise-to-agent bytes the relay recorded.
+ *  `session` adopts what the start handshake established; replay never
+ *  re-runs it against the running agent. `recalledDiffs` replays file diffs
+ *  from the transcript instead of re-reading the disk, which the agent kept
+ *  writing through the restart; keys are `${toolId}\0${path}`. */
+export interface ReplayInit {
+  turnId: string
+  signal: AbortSignal
+  peer: AgentProcess
+  live: Promise<void>
+  outbound: Buffer
+  outboundTruncated: boolean
+  session: {
+    nativeSessionId: string
+    modelId: string
+    effort: string
+    mode?: string
+    safeMode: boolean
+    efforts?: string[]
+    commands?: CommandOption[]
+  }
+  recalledDiffs: Map<string, { oldText: string, newText: string, oldExists: boolean, newExists: boolean }>
+}
+
 export interface Adapter {
   readonly agent: AgentId
   /** Set once `start()` resolved. */
@@ -129,6 +175,11 @@ export interface Adapter {
   /** Run one turn. Resolves when the agent reports the turn finished; the
    *  `signal` aborts it (same as `cancel()`). */
   prompt(turnId: string, input: PromptInput, signal: AbortSignal): Promise<TurnResult>
+  /** Reconnect to a turn that is already running agent-side: rebuild parser
+   *  and pending-request state from the spooled bytes, then continue live.
+   *  Absent when the adapter cannot replay; the runtime falls back to
+   *  interrupt-and-resume instead. */
+  replayTurn?(init: ReplayInit): Promise<TurnResult>
   /** Interject into the running turn. Rejects with `unsupported` when the
    *  agent has no steering. The runtime passes a correlation id so an
    *  adapter that reports `unrunSteers` can name which steer never ran. */
