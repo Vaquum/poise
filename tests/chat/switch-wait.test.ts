@@ -305,10 +305,12 @@ describe('the switch bound', () => {
     const w = await world({ auto: false })
     w.runtime.prompt(w.s.id, input('Original task'))
     await until(() => w.c.calls.length === 1)
-    w.runtime.setSwitchPending('r2')
-    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
     const interrupted = w.runtime.runningTurnSessions()
     await w.runtime.cancel(w.s.id)
+    // The follow-up waits behind the switch once the original turn is gone;
+    // prompting a busy session throws by design (the browser steers instead).
+    w.runtime.setSwitchPending('r2')
+    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
     w.runtime.recordSwitchInterrupted(interrupted)
     await w.runtime.stop()
     const waiting = database.getMeta('chat_switch_waiting')
