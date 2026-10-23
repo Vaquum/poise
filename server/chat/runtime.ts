@@ -630,10 +630,10 @@ export class ChatRuntime extends EventEmitter {
     // A server that is stopping leaves waited prompts durable for the next
     // server: consuming them now would refuse each against a closing session.
     if (this.stopped || this.switchState) return
-    // Prompts that waited behind an update start first, in order — the
+    // Interrupted work resumes before prompts that waited behind an update; the
     // synchronous reserves below land before the queue pump behind them —
     // then the queues pump.
-    void this.startWaitingPrompts().then(() => {
+    void this.resumeAfterUpdate(new Set()).then(() => {
       for (const session of this.live.values()) this.scheduleQueue(session)
     }, (error: unknown) => {
       this.emit('log', `[chat] releasing prompts waited for an update failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -746,7 +746,7 @@ export class ChatRuntime extends EventEmitter {
    *  later recovery. */
   private async resumeAfterUpdate(protectedSessions: ReadonlySet<string>, continuation = SWITCH_CONTINUE_PROMPT): Promise<void> {
     for (const row of this.readInterruptedSessions()) {
-      if (this.switchState) return
+      if (this.stopped || this.drainState || this.switchState) return
       if (protectedSessions.has(row.sessionId)) continue
       if (!this.takeInterruptedSession(row.sessionId)) continue
       await this.deliverWaitingPrompt(row.sessionId, row.prompt ?? { text: continuation, attachments: [], mentions: [] }, 'interrupted', row.prompt || row.implementsChange ? row : undefined)
@@ -757,7 +757,7 @@ export class ChatRuntime extends EventEmitter {
   /** Start every prompt that waited behind an update, in arrival order. */
   private async startWaitingPrompts(protectedSessions: ReadonlySet<string> = new Set()): Promise<void> {
     for (const entry of this.readWaitingPrompts()) {
-      if (this.switchState) return
+      if (this.stopped || this.drainState || this.switchState) return
       if (protectedSessions.has(entry.sessionId)) continue
       if (!this.takeWaitingPrompt(entry.id)) continue
       await this.deliverWaitingPrompt(entry.sessionId, entry.prompt, 'waiting', entry.recovery)

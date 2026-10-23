@@ -338,7 +338,7 @@ reconciles them as after any restart.
   queue, the queue retains its displayed request, switches and change
   completion responsibility with the original source, including timer
   provenance, and model.
-  If another switch is pending during recovery, both interrupted and
+  If a drain or another switch is pending during recovery, both interrupted and
   waiting records stay durable until it clears; continuations keep priority
   over their follow-ups. Waiting turns follow these recoveries in order.
   Withdrawal waits for any bound cancellation to record recovery before
