@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
 describe('worker failure classification and recovery', () => {
 
@@ -18,6 +18,7 @@ describe('worker failure classification and recovery', () => {
       source: launched.source,
       correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
 
     const { database: db, behaviors: runtime } = await restartModules()
     runtime.startBehaviorsRuntime()
@@ -66,6 +67,7 @@ describe('worker failure classification and recovery', () => {
       source: launched.source, correlation_id: launched.correlationId,
     })
     fixture.agentLogs = [call]
+    await resetLogCache()
     let modules = await restartModules()
     modules.behaviors.startBehaviorsRuntime()
     arrangeCli(false, false, { reviewerReviewsSince: 3 })
@@ -138,6 +140,7 @@ describe('worker failure classification and recovery', () => {
       source: launched.source,
       correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
 
     const { database: db, behaviors: runtime } = await restartModules()
     runtime.startBehaviorsRuntime()
@@ -159,6 +162,7 @@ describe('worker failure classification and recovery', () => {
     ])
 
     fixture.agentLogs = []
+    await resetLogCache()
     vi.setSystemTime(new Date(Date.now() + runtime.BEHAVIOR_RETRY_BASE_MS))
     await runtime.runEnabledBehaviorsOnce()
 
@@ -176,6 +180,7 @@ describe('worker failure classification and recovery', () => {
       status: 'failed', action: 'not_started', outcome: 'preflight_failed', error,
       expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
     fixture.agentLogs = [call]
+    await resetLogCache()
     const { database: db, behaviors: runtime } = await restartModules()
     runtime.startBehaviorsRuntime()
     await runtime.runEnabledBehaviorsOnce()
@@ -185,9 +190,11 @@ describe('worker failure classification and recovery', () => {
     legacy.error = error.slice(0, 120)
     db.setMeta(key, JSON.stringify(legacy))
     call.correlation_id = 'unrelated-attempt'
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(JSON.parse(db.getMeta(key)!)).toEqual(legacy)
     call.correlation_id = launched.correlationId
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(JSON.parse(db.getMeta(key)!)).toEqual({ ...stored,
       diagnostic: { severity: 'info', code: 'provider_capacity' },
@@ -203,6 +210,7 @@ describe('worker failure classification and recovery', () => {
       status: 'failed', action: 'not_started', outcome: 'preflight_failed', error: 'Older invalid result',
       expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
     fixture.agentLogs = [old]
+    await resetLogCache()
     const { database: db, behaviors: runtime } = await restartModules()
     runtime.startBehaviorsRuntime()
     await runtime.runEnabledBehaviorsOnce()
@@ -216,6 +224,7 @@ describe('worker failure classification and recovery', () => {
       expected_head: current.launchExpectedHead, actor: current.launchActor, source: current.launchSource,
       correlation_id: current.launchCorrelationId })
     fixture.agentLogs = [latest, old]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     const key = `behavior_review_new_prs_failure:${launched.target}`
     const stored = JSON.parse(db.getMeta(key)!)
@@ -294,6 +303,7 @@ describe('worker failure classification and recovery', () => {
       actor: claim.launchActor, source: claim.launchSource, correlation_id: claim.launchCorrelationId,
       started_at: claim.launchRequestedAt, status: 'failed', action: null, outcome: null, expected_head: null,
       error: 'httpx.ReadTimeout', receipts: receipts ? [] : null })]
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(runtime.getBehaviorsRuntimeHealth().failures).toContainEqual(expect.objectContaining({
       behavior: 'review-new-issues', diagnostic: receipts ? { severity: 'warning', code: 'held_result' }
@@ -313,6 +323,7 @@ describe('worker failure classification and recovery', () => {
       expected_head: launched.expectedHead, actor: launched.actor,
       source: launched.source, correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
     let modules = await restartModules()
     modules.behaviors.startBehaviorsRuntime()
     await modules.behaviors.runEnabledBehaviorsOnce()
@@ -347,6 +358,7 @@ describe('worker failure classification and recovery', () => {
       expected_head: launched.expectedHead, actor: launched.actor,
       source: launched.source, correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
     const modules = await restartModules()
     modules.behaviors.startBehaviorsRuntime()
     await modules.behaviors.runEnabledBehaviorsOnce()
@@ -381,6 +393,7 @@ describe('worker failure classification and recovery', () => {
       model: claim.target.endsWith(':tertiary') ? 'grok-4.6-xhigh' : claim.target.endsWith(':secondary') ? 'gpt-6-astra-ultra' : 'opus-5-xhigh',
       error: 'review behavior must produce exactly one atomic clean or change-request review',
       error_code: 'review_contract_violation', review_policy: 'bounded-v1' }))
+    await resetLogCache()
     await loaded.behaviors.runEnabledBehaviorsOnce()
     expect(loaded.database.listBehaviorDeadLetters()).toHaveLength(3)
     arrangeCli(false, false, { reviewerReviewIdsSince: [] })

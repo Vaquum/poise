@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, HEAD_SHA, loadModules, restartModules, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
 describe('review panel scheduling and recovery', () => {
 
@@ -52,6 +52,7 @@ describe('review panel scheduling and recovery', () => {
       expected_head: launched.expectedHead, actor: launched.actor,
       source: launched.source, correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
     fixture.listedPrs = [pr, { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18' }]
     const { database: db, behaviors: runtime } = await restartModules()
     runtime.startBehaviorsRuntime()
@@ -129,6 +130,7 @@ describe('review panel scheduling and recovery', () => {
       source: claim.launchSource, correlation_id: claim.launchCorrelationId,
       ...(claim.target.endsWith(':tertiary') ? { status: 'failed', error: 'max turns reached' } : {}),
     }))
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(db.listBehaviorDeadLetters()).toEqual([
       expect.objectContaining({ target: `${key}:tertiary`, error: 'max turns reached' }),
@@ -139,6 +141,7 @@ describe('review panel scheduling and recovery', () => {
       status: 'completed', completed_at: new Date().toISOString(),
       action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA, review_id: 91,
     })
+    await resetLogCache()
     arrangeCli(false, false, { reviewerReviewIdsSince: [91] })
     await runtime.runEnabledBehaviorsOnce()
 
@@ -203,6 +206,7 @@ describe('review panel scheduling and recovery', () => {
       action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA,
     })
     fixture.agentLogs = [completed(primary, '1'.repeat(32), 'gpt-6-astra-ultra')]
+    await resetLogCache()
     await modules.behaviors.runEnabledBehaviorsOnce()
     expect(modules.database.listBehaviorLaunchClaims('review-new-prs')).toEqual([])
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
@@ -217,6 +221,7 @@ describe('review panel scheduling and recovery', () => {
     const secondary = modules.database.listBehaviorLaunchClaims('review-new-prs')[0]
     expect(secondary.target).toBe(`${pr.repo}#${pr.number}:secondary`)
     fixture.agentLogs.push(completed(secondary, '2'.repeat(32), 'opus-5-xhigh'))
+    await resetLogCache()
     await modules.behaviors.runEnabledBehaviorsOnce()
     modules.database.setMeta('behavior_review_new_prs_reviewers', '3')
     await modules.behaviors.runEnabledBehaviorsOnce()
@@ -288,6 +293,7 @@ describe('review panel scheduling and recovery', () => {
       row('2'.repeat(32), `${key}:secondary`, 'gpt-6-astra-ultra', { status: 'failed', error: 'provider unavailable' }),
       row('3'.repeat(32), `${key}:tertiary`, 'grok-4.6-xhigh', { status: 'completed', completed_at: new Date().toISOString(), action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA, review_id: 92 }),
     ]
+    await resetLogCache()
 
     // An unclaimed review since the launch could be the dead run's own: hold.
     const { database: db, behaviors: runtime } = await restartModules()
