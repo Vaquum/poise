@@ -307,6 +307,8 @@ PR_GRAPH_FIELDS = f"""
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
           id
+          isResolved
+          isOutdated
           comments(first: 100) {{
             pageInfo {{ hasNextPage endCursor }}
             nodes {{
@@ -1080,7 +1082,7 @@ class GitHubOrgReader:
         reviews = [graphql_review_to_row(node) for node in pull["reviews"]["nodes"]]
         review_requests = list(pull["reviewRequests"]["nodes"])
         review_comments = [
-            graphql_review_comment_to_row(comment)
+            graphql_review_comment_to_row(comment, thread)
             for thread in pull["reviewThreads"]["nodes"]
             for comment in thread["comments"]["nodes"]
         ]
@@ -1242,6 +1244,8 @@ class GitHubOrgReader:
                 pageInfo { hasNextPage endCursor }
                 nodes {
                   id
+                  isResolved
+                  isOutdated
                   comments(first: 100) {
                     pageInfo { hasNextPage endCursor }
                     nodes { fullDatabaseId id author { login } body path createdAt updatedAt }
@@ -1267,13 +1271,13 @@ class GitHubOrgReader:
         rows: list[dict[str, Any]] = []
         for thread in threads:
             if not only_extra_pages:
-                rows.extend(graphql_review_comment_to_row(node) for node in thread["comments"]["nodes"])
+                rows.extend(graphql_review_comment_to_row(node, thread) for node in thread["comments"]["nodes"])
             if thread["comments"]["pageInfo"]["hasNextPage"]:
-                rows.extend(self._page_review_thread_comments(thread["id"], thread["comments"]["pageInfo"]))
+                rows.extend(self._page_review_thread_comments(thread, thread["comments"]["pageInfo"]))
         return rows
 
     def _page_review_thread_comments(
-        self, thread_id: str, page_info: dict[str, Any]
+        self, thread: dict[str, Any], page_info: dict[str, Any]
     ) -> list[dict[str, Any]]:
         query = """
         query($id: ID!, $cursor: String) {
@@ -1287,6 +1291,7 @@ class GitHubOrgReader:
           }
         }
         """
+        thread_id = thread["id"]
         rows: list[dict[str, Any]] = []
         cursor = page_info["endCursor"]
         while page_info["hasNextPage"]:
@@ -1295,7 +1300,7 @@ class GitHubOrgReader:
             if node is None:
                 raise GitHubApiError(f"review thread not found: {thread_id}")
             conn = node["comments"]
-            rows.extend(graphql_review_comment_to_row(comment) for comment in conn["nodes"])
+            rows.extend(graphql_review_comment_to_row(comment, thread) for comment in conn["nodes"])
             page_info = conn["pageInfo"]
             cursor = page_info["endCursor"]
         return rows
@@ -1476,7 +1481,10 @@ def graphql_review_to_row(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def graphql_review_comment_to_row(node: dict[str, Any]) -> dict[str, Any]:
+def graphql_review_comment_to_row(
+    node: dict[str, Any], thread: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    thread = thread or {}
     return {
         "id": int(required_id(node, "reviewComment")),
         "node_id": node["id"],
@@ -1486,6 +1494,9 @@ def graphql_review_comment_to_row(node: dict[str, Any]) -> dict[str, Any]:
         "position": None,
         "created_at": node["createdAt"],
         "updated_at": node["updatedAt"],
+        "thread_node_id": thread.get("id"),
+        "thread_resolved": thread.get("isResolved"),
+        "thread_outdated": thread.get("isOutdated"),
         "graphql": node,
     }
 

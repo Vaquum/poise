@@ -105,6 +105,73 @@ def user(
     )
 
 
+def pr_reviews(
+    *,
+    db_path: str | Path = DEFAULT_DB,
+    output: Output = "json",
+    repo: str | None = None,
+    number: int | None = None,
+) -> str:
+    """One pull request's reviews and review threads as the datastore has
+    them: local rows only, the sync owns freshness. A PR the datastore has
+    never seen reads as found=false, never as an error. Truncated reads set
+    truncated=true and must not establish completion."""
+    if output != "json":
+        raise ValueError("pr-reviews renders json only")
+    if not repo or number is None:
+        raise ValueError("pr-reviews needs a repo and a number")
+    conn = _read_connect(db_path)
+    try:
+        item = conn.execute(
+            "SELECT item_id FROM items WHERE repo_full_name = ? COLLATE NOCASE AND number = ? AND item_type = 'pr'",
+            (repo, number),
+        ).fetchone()
+        if item is None:
+            return json.dumps({"repo": repo, "number": number, "found": False, "reviews": [], "threads": []})
+        item_id = item["item_id"]
+        reviews = [
+            {"node_id": row["node_id"], "author": row["author_login"], "state": row["state"],
+             "submitted_at": row["submitted_at"]}
+            for row in conn.execute(
+                "SELECT node_id, author_login, state, submitted_at FROM reviews WHERE item_id = ? ORDER BY review_id LIMIT 201",
+                (item_id,),
+            )
+        ]
+        comments = conn.execute(
+            """SELECT node_id, author_login, updated_at, thread_node_id, thread_resolved, thread_outdated
+               FROM review_comments WHERE item_id = ? ORDER BY comment_id LIMIT 1001""",
+            (item_id,),
+        ).fetchall()
+        truncated = len(reviews) > 200 or len(comments) > 1000
+        threads: list[dict[str, Any]] = []
+        by_thread: dict[str, dict[str, Any]] = {}
+        for row in comments[:1000]:
+            entry = {"node_id": row["node_id"], "author": row["author_login"], "updated_at": row["updated_at"]}
+            key = row["thread_node_id"]
+            if key is None:
+                # Pre-thread-identity rows: each comment stands alone with
+                # unknown resolution, which reads as unresolved, never silent.
+                threads.append({"thread_node_id": None, "resolved": None, "outdated": None, "comments": [entry]})
+                continue
+            thread = by_thread.get(key)
+            if thread is None:
+                thread = {"thread_node_id": key, "resolved": _flag(row["thread_resolved"]),
+                          "outdated": _flag(row["thread_outdated"]), "comments": []}
+                by_thread[key] = thread
+                threads.append(thread)
+            thread["comments"].append(entry)
+        return json.dumps({"repo": repo, "number": number, "found": True, "truncated": truncated,
+                           "reviews": reviews[:200], "threads": threads}, ensure_ascii=False)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"view query failed: pr-reviews: {exc}") from exc
+    finally:
+        conn.close()
+
+
+def _flag(value: Any) -> bool | None:
+    return None if value is None else bool(value)
+
+
 def _select(db_path: str | Path, view_name: str, output: Output, filters: dict[str, Any]) -> str:
     if view_name not in {"prs", "issues", "user_items"}:
         raise ValueError(f"unknown view: {view_name}")
@@ -144,7 +211,10 @@ def _where(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
     for column in ("username", "item_type", "repo", "status", "author", "number"):
         value = filters.get(column)
         if value is not None:
-            clauses.append(f"{column} = ?")
+            # Repository names keep GitHub's case in storage while callers
+            # pass them normalized: match case-insensitively so a mixed-case
+            # repo's rows are found, like pr-reviews already does.
+            clauses.append(f"{column} = ? COLLATE NOCASE" if column == "repo" else f"{column} = ?")
             params.append(value)
     updated_since = filters.get("updated_since_datetime")
     if updated_since is not None:
