@@ -10,6 +10,16 @@ IDENTITY = AGENT
 
 # The merge states GitHub shows a green merge button for.
 BUTTON_GREEN = {"clean", "unstable", "has_hooks"}
+QUEUE_ADMISSIBLE = {"CLEAN", "BEHIND", "BLOCKED", "UNSTABLE", "HAS_HOOKS"}
+
+
+def queue_enabled(readiness: dict[str, Any]) -> bool:
+    queue = readiness.get("mergeQueue")
+    if queue is None:
+        return False
+    if not isinstance(queue, dict) or not isinstance(queue.get("id"), str) or not queue["id"]:
+        raise RuntimeError("GitHub returned malformed merge queue evidence")
+    return True
 
 
 def status(pull: dict[str, Any], checks_state: str | None, unresolved: int, all_threads_read: bool = True) -> str | None:
@@ -33,6 +43,16 @@ def readiness_status(readiness: dict[str, Any]) -> str | None:
         return None
     threads = readiness["reviewThreads"]
     unresolved = sum(not thread["isResolved"] and not thread["isOutdated"] for thread in threads["nodes"])
+    if queue_enabled(readiness):
+        if (readiness["state"] != "OPEN" or readiness["isDraft"]
+                or readiness["mergeable"] != "MERGEABLE"
+                or readiness["mergeStateStatus"] not in QUEUE_ADMISSIBLE):
+            return None
+        return "green" if (
+            readiness.get("reviewDecision") == "APPROVED"
+            and (commit["statusCheckRollup"] or {}).get("state") == "SUCCESS"
+            and unresolved == 0 and not threads["pageInfo"]["hasNextPage"]
+        ) else "yellow"
     return status({
         "state": readiness["state"].lower(), "draft": readiness["isDraft"],
         "mergeable": readiness["mergeable"] == "MERGEABLE",
@@ -55,7 +75,7 @@ def behind_status(pull: dict[str, Any], checks_state: str | None, unresolved: in
 def readiness_behind(readiness: dict[str, Any]) -> str | None:
     """`behind` when GitHub reports the pull request mergeable but out of
     date with its base and the green predicate holds on everything else."""
-    if readiness.get("mergeStateStatus") != "BEHIND":
+    if queue_enabled(readiness) or readiness.get("mergeStateStatus") != "BEHIND":
         return None
     if readiness_status({**readiness, "mergeStateStatus": "CLEAN"}) != "green":
         return None
@@ -89,7 +109,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "mergeable_state": str(readiness.get("mergeStateStatus") or "").lower(),
     }
 
-    green = pull["state"] == "open" and not pull["draft"] and pull["mergeable"] is True and pull["mergeable_state"] == "clean"
+    green = (readiness_status(readiness) == "green" if queue_enabled(readiness) else
+             pull["state"] == "open" and not pull["draft"] and pull["mergeable"] is True and pull["mergeable_state"] == "clean")
     commit = (((readiness.get("commits") or {}).get("nodes") or [{}])[0].get("commit") or {})
     checks_state = (commit.get("statusCheckRollup") or {}).get("state")
     threads = readiness["reviewThreads"]
@@ -106,5 +127,5 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "draft": pull["draft"],
         "checks_state": checks_state,
         "unresolved_conversations": unresolved,
-        "status": status(pull, checks_state, unresolved, all_threads_read),
+        "status": readiness_status(readiness) if queue_enabled(readiness) else status(pull, checks_state, unresolved, all_threads_read),
     }
