@@ -281,13 +281,20 @@ Inspect the session before deliberately submitting a new action. Receipts and
 transcripts are local data and are retained rather than evicted in a way that
 would make an old command executable again.
 
-Server restart does not replay prompts. Open turns become interrupted and
-pending interactions are cancelled, while sessions owned by another live host
-are left alone. The terminal transcript event, immutable Caller outcome and
-clearing of the open-turn marker commit in one SQLite transaction. Caller
-finish failures remain in a durable outbox even if later turns run or the
-session is deleted; recovery retries the actual recorded outcome. A failed
-recording operation must not turn a completed turn into an invented failure.
+Server restart does not replay prompts, but a turn a live relay holds keeps
+running through it. Each session's agent runs under a per-session relay that
+owns its stdio and spools the turn's output; after a restart the new server
+reconnects to live relays, rebuilds each adapter over the spooled bytes, and
+continues the turn without repeating a persisted event or writing to the
+agent. Open turns with no live relay become interrupted and pending
+interactions are cancelled, while sessions owned by another live host are
+left alone, as does a turn whose relay or replay fails — its transcript
+says the handoff failed. The terminal transcript event, immutable Caller
+outcome and clearing of the open-turn marker commit in one SQLite
+transaction. Caller finish failures remain in a durable outbox even if
+later turns run or the session is deleted; recovery retries the actual
+recorded outcome. A failed recording operation must not turn a completed
+turn into an invented failure.
 
 Stop cancels the turn, not the session. Native cancellation is acknowledged
 only when the adapter can account for its work. Claude messages are UUID-tracked

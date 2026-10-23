@@ -68,6 +68,7 @@ let tzSelect: HTMLSelectElement | null = null
 let branchPrefixInput: HTMLInputElement | null = null
 let idleTimeoutInput: HTMLInputElement | null = null
 let maxConcurrentLocalTurnsInput: HTMLInputElement | null = null
+let updateTurnBoundInput: HTMLInputElement | null = null
 let saveBtn: HTMLButtonElement | null = null
 let helpEl: HTMLElement | null = null
 let modelsEl: HTMLElement | null = null
@@ -126,6 +127,7 @@ function syncFieldsFromCache() {
   if (branchPrefixInput && branchPrefixInput !== active && !dirtyFields.has(branchPrefixInput)) branchPrefixInput.value = s.chat?.branchPrefix ?? CHAT_DEFAULTS.branchPrefix
   if (idleTimeoutInput && idleTimeoutInput !== active && !dirtyFields.has(idleTimeoutInput)) idleTimeoutInput.value = String(s.chat?.idleTimeoutMinutes ?? CHAT_DEFAULTS.idleTimeoutMinutes)
   if (maxConcurrentLocalTurnsInput && maxConcurrentLocalTurnsInput !== active && !dirtyFields.has(maxConcurrentLocalTurnsInput)) maxConcurrentLocalTurnsInput.value = String(s.chat?.maxConcurrentLocalTurns ?? CHAT_DEFAULTS.maxConcurrentLocalTurns)
+  if (updateTurnBoundInput && updateTurnBoundInput !== active && !dirtyFields.has(updateTurnBoundInput)) updateTurnBoundInput.value = String(s.chat?.updateTurnBoundMinutes ?? CHAT_DEFAULTS.updateTurnBoundMinutes)
   showNotificationsChoice(s.notifications?.enabled !== false)
 }
 
@@ -169,7 +171,7 @@ function setNotifications(enabled: boolean): void {
 
 // What the server applies when nothing is stored; shown so an empty field
 // never reads as "no prefix" or "never times out".
-const CHAT_DEFAULTS = { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 }
+const CHAT_DEFAULTS = { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }
 
 // A <select> silently renders blank when told to show a value it has no option
 // for — and the engine's list is not guaranteed to contain the browser's own
@@ -878,6 +880,7 @@ async function saveAll() {
   const branchPrefix = (branchPrefixInput?.value ?? CHAT_DEFAULTS.branchPrefix).trim() || CHAT_DEFAULTS.branchPrefix
   const idleTimeoutMinutes = Number(idleTimeoutInput?.value ?? CHAT_DEFAULTS.idleTimeoutMinutes)
   const maxConcurrentLocalTurns = Number(maxConcurrentLocalTurnsInput?.value ?? CHAT_DEFAULTS.maxConcurrentLocalTurns)
+  const updateTurnBoundMinutes = Number(updateTurnBoundInput?.value ?? CHAT_DEFAULTS.updateTurnBoundMinutes)
 
   if (!me) {
     setHelp('Your GitHub account is required.', 'error')
@@ -913,6 +916,11 @@ async function saveAll() {
     maxConcurrentLocalTurnsInput?.focus()
     return
   }
+  if (!Number.isInteger(updateTurnBoundMinutes) || updateTurnBoundMinutes < 1 || updateTurnBoundMinutes > 10080) {
+    setHelp('Update turn bound must be a whole number of minutes between 1 and 10080.', 'error')
+    updateTurnBoundInput?.focus()
+    return
+  }
   for (const [key, choice] of Object.entries(models || {})) {
     if (choice.default === choice.fallback) {
       setHelp(`${key}: the fallback must differ from the default.`, 'error')
@@ -929,14 +937,14 @@ async function saveAll() {
   }
 
   saving = true
-  const savedValues = new Map([meInput, agentInput, tzSelect, branchPrefixInput, idleTimeoutInput, maxConcurrentLocalTurnsInput]
+  const savedValues = new Map([meInput, agentInput, tzSelect, branchPrefixInput, idleTimeoutInput, maxConcurrentLocalTurnsInput, updateTurnBoundInput]
     .filter((field) => field !== null).map((field) => [field, field.value] as const))
   saveBtn.disabled = true
   saveBtn.textContent = 'Saving…'
   try {
     const res = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ org, me, agentAccount, timezone: tz, chat: { branchPrefix, idleTimeoutMinutes, maxConcurrentLocalTurns }, ...(models ? { models } : {}) }),
+      body: JSON.stringify({ org, me, agentAccount, timezone: tz, chat: { branchPrefix, idleTimeoutMinutes, maxConcurrentLocalTurns, updateTurnBoundMinutes }, ...(models ? { models } : {}) }),
     })
     const data = await res.json()
     if (!res.ok) {
@@ -1080,6 +1088,12 @@ function buildPanel(): HTMLElement {
 
         </div>
 
+        <div class="tp-section">
+          <label class="tp-label" for="st-chat-update-turn-bound" ${helpAttributes("How long running turns may hold up a Poise update. Past the bound they are interrupted and resume after the update.")}>Update turn bound (minutes)</label>
+          <input type="number" id="st-chat-update-turn-bound" class="st-input st-input-update-turn-bound" min="1" max="10080" step="1" placeholder="15" />
+
+        </div>
+
         <div class="tp-group-label">Storage</div>
 
         <div class="tp-section">
@@ -1175,6 +1189,7 @@ function buildPanel(): HTMLElement {
   branchPrefixInput = panel.querySelector('.st-input-branch-prefix') as HTMLInputElement
   idleTimeoutInput = panel.querySelector('.st-input-idle-timeout') as HTMLInputElement
   maxConcurrentLocalTurnsInput = panel.querySelector('.st-input-max-concurrent-local-turns') as HTMLInputElement
+  updateTurnBoundInput = panel.querySelector('.st-input-update-turn-bound') as HTMLInputElement
   saveBtn = panel.querySelector('.st-save') as HTMLButtonElement
   modelsEl = panel.querySelector('.st-models')
   fixedEl = panel.querySelector('.st-models-fixed')

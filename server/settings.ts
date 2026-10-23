@@ -40,15 +40,17 @@ export interface Settings {
 }
 
 // Chat v1 (server/chat): the prefix of branches new sessions cut from the
-// default branch, how long an idle agent process is kept alive, and how many
-// Poise-local turns may run concurrently.
+// default branch, how long an idle agent process is kept alive, how many
+// Poise-local turns may run concurrently, and how long running turns may hold
+// up a Poise update before they are interrupted and resumed after it.
 export interface ChatSettings {
   branchPrefix: string
   idleTimeoutMinutes: number
   maxConcurrentLocalTurns: number
+  updateTurnBoundMinutes: number
 }
 
-export const DEFAULT_CHAT_SETTINGS: ChatSettings = { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4 }
+export const DEFAULT_CHAT_SETTINGS: ChatSettings = { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }
 const BRANCH_PREFIX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}\/$/
 
 export function getChatSettings(): ChatSettings {
@@ -60,6 +62,7 @@ export function getChatSettings(): ChatSettings {
       branchPrefix: typeof parsed.branchPrefix === 'string' && BRANCH_PREFIX.test(parsed.branchPrefix) ? parsed.branchPrefix : DEFAULT_CHAT_SETTINGS.branchPrefix,
       idleTimeoutMinutes: Number.isSafeInteger(parsed.idleTimeoutMinutes) && Number(parsed.idleTimeoutMinutes) >= 0 ? Number(parsed.idleTimeoutMinutes) : DEFAULT_CHAT_SETTINGS.idleTimeoutMinutes,
       maxConcurrentLocalTurns: Number.isSafeInteger(parsed.maxConcurrentLocalTurns) && Number(parsed.maxConcurrentLocalTurns) >= 1 && Number(parsed.maxConcurrentLocalTurns) <= 64 ? Number(parsed.maxConcurrentLocalTurns) : DEFAULT_CHAT_SETTINGS.maxConcurrentLocalTurns,
+      updateTurnBoundMinutes: Number.isSafeInteger(parsed.updateTurnBoundMinutes) && Number(parsed.updateTurnBoundMinutes) >= 1 && Number(parsed.updateTurnBoundMinutes) <= 10_080 ? Number(parsed.updateTurnBoundMinutes) : DEFAULT_CHAT_SETTINGS.updateTurnBoundMinutes,
     }
   } catch {
     return { ...DEFAULT_CHAT_SETTINGS }
@@ -85,6 +88,11 @@ function validateChatSettings(value: unknown): ChatSettings {
     const slots = Number(input.maxConcurrentLocalTurns)
     if (!Number.isSafeInteger(slots) || slots < 1 || slots > 64) throw new Error('concurrent local turns must be a whole number between 1 and 64')
     next.maxConcurrentLocalTurns = slots
+  }
+  if ('updateTurnBoundMinutes' in input) {
+    const minutes = Number(input.updateTurnBoundMinutes)
+    if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > 10_080) throw new Error('update turn bound must be a whole number of minutes between 1 and 10080')
+    next.updateTurnBoundMinutes = minutes
   }
   return next
 }

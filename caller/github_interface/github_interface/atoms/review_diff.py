@@ -24,6 +24,7 @@ MAX_PACKET_BYTES = 1_450_000  # Leave room for the governed agent policy.
 BULK_FILE_BYTES = 32_000
 BULK_SUFFIXES = {".json", ".jsonl", ".ndjson", ".csv", ".tsv"}
 OPAQUE_SUFFIXES = {".gz", ".zip", ".tar", ".bz2", ".xz", ".7z", ".pdf", ".parquet", ".arrow"}
+FILE_STATUS = {"A": "added", "D": "removed", "M": "modified", "T": "changed"}
 PACKET_LIMIT_CODE = "review_packet_too_large"
 
 
@@ -171,6 +172,66 @@ def _excluded(file: dict[str, Any], sizes: dict[str, int], compact: bool | None 
     return None
 
 
+async def _bounded_packet(git, files: list[dict[str, Any]], retained: list[str],
+                         excluded: list[dict[str, Any]], context: dict[str, Any] | None,
+                         merge_base: str, head: str) -> dict[str, Any]:
+    """The largest verified fitting sorted prefix of retained files, with the
+    rest listed explicitly as omitted. A rename-aware diff is not strictly
+    monotone in the file set, so the search keeps the largest prefix it
+    verified fits instead of assuming every smaller prefix fits."""
+    if not retained:
+        raise ReviewPacketTooLarge(f"{PACKET_LIMIT_CODE}: retained review packet exceeds {MAX_PACKET_BYTES} bytes")
+    ordered = sorted(set(retained))
+    meta = {item["filename"]: item for item in files}
+
+    async def probe(count: int) -> dict[str, Any] | None:
+        chosen = ordered[:count]
+        try:
+            diff = (await git(
+                "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv",
+                "--find-renames", merge_base, head, "--",
+                *(f":(literal){path}" for path in chosen),
+            )).decode("utf-8", errors="replace") if chosen else ""
+        except ReviewPacketTooLarge:
+            return None
+        omitted = [{"path": path, "reason": "omitted from the bounded review packet; not reviewed"}
+                   for path in ordered[count:]]
+        scope = (f"Review the retained diff below. Coverage is partial: {len(omitted)} of {len(ordered)} "
+                 f"retained files, listed in omitted_files, were not reviewed; "
+                 f"do not infer their correctness from this packet.")
+        if excluded:
+            scope += " Excluded file contents were not reviewed either; do not infer their correctness from this packet."
+        packet = {
+            "diff": diff,
+            "files": [{"filename": path, "status": FILE_STATUS[meta[path]["status"]],
+                       "old_mode": meta[path]["old_mode"], "new_mode": meta[path]["new_mode"]} for path in chosen],
+            "excluded_files": excluded,
+            "omitted_files": omitted,
+            "merge_base_sha": merge_base,
+            "review_scope": scope,
+        }
+        if len(json.dumps({**(context or {}), **packet}, indent=2).encode("utf-8")) > MAX_PACKET_BYTES:
+            return None
+        return packet
+
+    if await probe(0) is None:
+        raise ReviewPacketTooLarge(
+            f"{PACKET_LIMIT_CODE}: review context exceeds the {MAX_PACKET_BYTES} byte packet budget with no retained diff")
+    best, low, high = None, 0, len(ordered)
+    while low < high:
+        mid = (low + high + 1) // 2
+        packet = await probe(mid)
+        if packet is None:
+            high = mid - 1
+        else:
+            best, low = packet, mid
+    if low == 0:
+        raise ReviewPacketTooLarge(
+            f"{PACKET_LIMIT_CODE}: no single retained file fits within the {MAX_DIFF_BYTES} "
+            f"byte diff budget and {MAX_PACKET_BYTES} byte packet budget")
+    return best
+
+
 async def review_diff(
     client: GitHubClient, owner: str, repo: str, pull: dict[str, Any],
     context: dict[str, Any] | None = None,
@@ -228,7 +289,7 @@ async def review_diff(
                 packet = {
                     "diff": diff,
                     "files": [{"filename": f["filename"],
-                               "status": {"A": "added", "D": "removed", "M": "modified", "T": "changed"}[f["status"]],
+                               "status": FILE_STATUS[f["status"]],
                                "old_mode": f["old_mode"], "new_mode": f["new_mode"]} for f in files if f["filename"] in retained_paths],
                     "excluded_files": excluded,
                     "merge_base_sha": merge_base,
@@ -240,5 +301,5 @@ async def review_diff(
                 return packet
             except ReviewPacketTooLarge:
                 if compact:
-                    raise
+                    return await _bounded_packet(git, files, retained, excluded, context, merge_base, head)
         raise AssertionError("review packet compaction did not finish")

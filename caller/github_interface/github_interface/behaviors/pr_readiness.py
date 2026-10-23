@@ -1,6 +1,7 @@
 from typing import Any
 
 from github_interface.atoms.pulls import get_pr_readiness_state
+from github_interface.behaviors.mergeable import QUEUE_ADMISSIBLE, queue_enabled
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head
 from github_interface.context import pull_number as parse_pull_number
@@ -102,7 +103,7 @@ def _blockers(
         blockers.append("draft")
     if pull.get("mergeable") != "MERGEABLE":
         blockers.append("not_mergeable")
-    if pull.get("mergeStateStatus") != "CLEAN":
+    if pull.get("mergeStateStatus") not in (QUEUE_ADMISSIBLE if queue_enabled(pull) else {"CLEAN"}):
         blockers.append("merge_state_not_clean")
     if checks_state is None:
         blockers.append("checks_missing")
@@ -112,6 +113,8 @@ def _blockers(
         blockers.append("reviewer_not_approved_current_head")
     if approval["changes_requested"]:
         blockers.append("changes_requested")
+    if queue_enabled(pull) and pull.get("reviewDecision") != "APPROVED":
+        blockers.append("required_reviews_not_approved")
     if unresolved_live:
         blockers.append("unresolved_live_conversations")
     if pagination_incomplete:

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { randomBytes } from 'node:crypto'
+import { Worker } from 'node:worker_threads'
 import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,7 +24,7 @@ async function fixture(body: string, options: ConstructorParameters<typeof Behav
   const directory = await mkdtemp(join(tmpdir(), 'ledger-transport-'))
   directories.push(directory)
   const workerPath = join(directory, 'worker.mjs')
-  await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\n${body}`)
+  await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\n${body}\nport.on('message',request=>{if(request.operation==='close')port.close()});`)
   const observer = new BehaviorLedgerObserver({ workerPath, ...options })
   observers.push(observer)
   await observer.start()
@@ -54,11 +55,50 @@ function blockedWorker(operation: 'capture' | 'read'): string {
     });`
 }
 afterEach(async () => {
-  await Promise.all(observers.splice(0).map((observer) => observer.stop()))
+  await Promise.all(observers.splice(0).map(async (observer) => {
+    // stop bounds its caller; fixture files belong to the worker until exit.
+    await observer.stop()
+    await observer.waitForExit()
+  }))
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
 })
 
 describe('bounded behavior ledger transport', () => {
+  it('terminates a protocol-failed idle worker instead of leaking its live event loop', async () => {
+    const sent = vi.spyOn(Worker.prototype, 'postMessage')
+    const terminated = vi.spyOn(Worker.prototype, 'terminate')
+    let worker: Worker | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const observer = await fixture(`
+        port.postMessage({ready:true,health,pending:[]});
+        port.on('message',request=>{
+          if(request.operation!=='read') return;
+          port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});
+          setImmediate(()=>{
+            port.postMessage({pending:[],invalid:true});
+            while(true) {}
+          });
+        });`)
+      expect((await observer.read({ operation: 'health' })).status).toBe(200)
+      worker = sent.mock.contexts.find((value): value is Worker => value instanceof Worker)
+      expect(worker).toBeDefined()
+      const exited = await Promise.race([
+        observer.waitForExit().then(() => true),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 1000) }),
+      ])
+      expect(exited).toBe(true)
+      expect(terminated).toHaveBeenCalledExactlyOnceWith()
+      expect((await observer.read({ operation: 'health' })).body.health.status).toBe('unavailable')
+    } finally {
+      clearTimeout(timer)
+      // Only this fixture's pure-JS worker is forcibly settled on guard failure.
+      if (worker && worker.threadId !== -1) await worker.terminate()
+      sent.mockRestore()
+      terminated.mockRestore()
+    }
+  })
+
   it('queues newest overflow while the worker drains and never throws into work', async () => {
     const observer = await fixture(`
       port.postMessage({ready:true,health,pending:[]});
@@ -342,6 +382,32 @@ describe('bounded behavior ledger transport', () => {
     const after = (await observer.read({ operation: 'health' })).body.health
     expect(after.dropped).toBe(0)
     expect(after.pending).toBeLessThan(held.pending)
+  })
+
+  it('closes on the worker when a stop outlasts the drain budget', async () => {
+    // Ten captures at 400ms each can never drain inside the two-second stop
+    // budget, so close must be shed forward and dispatched instead of the
+    // worker being terminated with the queue still full.
+    const observer = await fixture(`
+      import { appendFileSync } from 'node:fs';
+      const order=new URL('./order',import.meta.url);
+      port.postMessage({ready:true,health,pending:[]});
+      port.on('message',request=>{
+        appendFileSync(order,(request.operation==='capture'?'capture':request.operation)+'\\n');
+        const reply=()=>port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});
+        if(request.operation==='capture') setTimeout(reply,400);
+        else reply();
+      });`)
+    for (let index = 0; index < 10; index++) {
+      observer.capture({ ...admission, admissionKey: `slow-${index}`, nativeId: `slow-${index}` })
+    }
+    await observer.stop()
+    // The stop budget bounds the caller, not the worker: close still lands
+    // on the worker after the active capture settles.
+    await vi.waitFor(async () => {
+      const order = (await readFile(join(directories.at(-1)!, 'order'), 'utf8')).trim().split('\n')
+      expect(order.at(-1)).toBe('close')
+    }, { timeout: 5000, interval: 50 })
   })
 
   it('holds captures through a storage outage and recovers to ok with the list answering', async () => {

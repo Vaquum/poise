@@ -5,6 +5,9 @@ describe('shared Auto-merge instructions', () => {
   it('covers the whole requested batch across repositories, including verified merges and final questions', () => {
     const policy = autoMergeInstructions(true)
     for (const text of ['every repository', 'one PR', 'existing PRs', 'verify that each intended PR actually merged', 'entire requested', 'non-blocking questions until the very end', 'continue independent PRs', 'Do not stop at', 'protection requirements']) expect(policy).toContain(text)
+    expect(policy).toContain('native merge queue')
+    expect(policy).toContain('do not repeatedly merge the base into a queued PR')
+    expect(policy).not.toContain('requested slices')
   })
   it('does not alter ordinary sessions that never opted in', () => {
     const input = { text: 'Discuss this idea', attachments: [], mentions: [] }
