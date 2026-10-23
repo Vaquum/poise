@@ -1,18 +1,24 @@
 import { prepareModelClis } from './provider-clis'
 import { captureBehaviorAdmission, captureBehaviorOutcome, observeAgentSnapshot } from './behavior-ledger'
-import { parseProcessDiagnostic, type ProcessDiagnostic } from './process-diagnostic'
 // Bridge to the local `agent-interface` CLI for Swarm's data source.
 //
-// Two operations:
-//   --logs                  → JSON array of completed agent calls
-//   --read-response <id>    → response body, looked up by the full call id
-//                             field
+// Log reads:
+//   --logs                        → JSON array of all calls, oldest first
+//   --logs --status running        → the running calls only, indexed
+//   --logs --limit N [--cursor C]  → one bounded newest-first page
+//   --read-response <id>          → response body, looked up by the full
+//                                   call id field
 //
 // Everything is hash-routed now — Poise never touches the filesystem
 // the agent-interface project owns.
 
-import { parseProgress, type ModelProgress } from '../src/agent-progress'
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { Worker } from 'node:worker_threads'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { getHeadSha, localCheckoutPath } from './gh'
 import { claudeAuth } from './claude-auth'
@@ -22,6 +28,14 @@ import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic } from './logging'
 import { requireAgentAccount } from './settings'
+import { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, parseAgentLogStdout, scopedAgentLogs } from './agent-log-parse'
+import type { AgentLogParseReply, AgentLogParseRequest } from './agent-log-worker'
+import type { AgentLogIdentity, AgentLogSnapshot, LogEntry } from './agent-log-parse'
+
+export { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, quarantinedLogMayMatch, scopedAgentLogs } from './agent-log-parse'
+export type {
+  AgentLogIdentity, AgentLogSnapshot, IssueCommentReceipt, LogEntry, QuarantinedAgentLog,
+} from './agent-log-parse'
 
 const CLI = 'agent-interface'
 
@@ -34,190 +48,21 @@ function agentCwd(): string {
   return agentInterfaceRoot()
 }
 
-export interface LogEntry {
-  id: string
-  pr_id: string | null
-  repo: string | null
-  actor: string | null
-  model: string
-  behavior: string | null   // agent-interface behavior name (pr-review, mergeable, etc.)
-  session_id: string | null
-  prompt: string
-  started_at: string
-  started_at_precise?: string | null
-  completed_at?: string | null
-  time_elapsed: string
-  status: string
-  progress?: ModelProgress | null
-  outcome: 'clean' | 'changes_requested' | 'approved' | 'superseded' | 'preflight_failed' | 'commented' | null
-  head_sha: string | null
-  expected_head: string | null
-  source: string | null
-  correlation_id: string | null
-  action: 'reviewed_clean' | 'requested_changes' | 'approved' | 'not_started' | 'commented' | null
-  response: string | null // upstream 8-char availability marker; read by full `id`
-  error: string
-  review_policy?: string | null
-  recovery_model?: string | null
-  diagnostic?: ProcessDiagnostic | null
-  error_code?: string | null
-  // The GitHub review this run submitted (Caller's receipt); tells a
-  // reviewer's review apart from a sibling's on the same pull request.
-  review_id?: number | null
-  // The inline comments a change request posted; null when unknown or not one.
-  review_comments?: number | null
-  // Issue review only: null until the run starts posting; from then on the
-  // comments it knows it posted. A failed run with receipts must never be
-  // relaunched on its own — it may already have commented.
-  receipts?: IssueCommentReceipt[] | null
-  // `external` for a Chat turn Poise recorded through `--record-turn`: no
-  // Caller process ran, so `--stop` refuses it and Poise routes it to its
-  // own runtime.
-  runner?: 'external' | null
-}
-
-export interface IssueCommentReceipt {
-  issue: string
-  comment_id: number
-  url: string | null
-  author: string
-}
-
-// An issue review runs against the issue, not a pull-request head, so its
-// rows carry no expected or terminal head.
-export const ISSUE_REVIEW_BEHAVIOR = 'issue_review'
-
-function parseReceipts(value: unknown): IssueCommentReceipt[] | null {
-  if (value === null || value === undefined) return null
-  // Anything else that is present means posting began; keep what can be read.
-  if (!Array.isArray(value)) return []
-  return value.flatMap((item) => {
-    const receipt = item as Record<string, unknown> | null
-    return receipt && typeof receipt.issue === 'string' && Number.isSafeInteger(receipt.comment_id)
-      && (receipt.url === null || receipt.url === undefined || typeof receipt.url === 'string')
-      && typeof receipt.author === 'string'
-      ? [{ issue: receipt.issue, comment_id: Number(receipt.comment_id), url: (receipt.url as string | undefined) ?? null, author: receipt.author }]
-      : []
-  })
-}
-
-export interface QuarantinedAgentLog {
-  // A readable lifecycle hint can retain running capacity; it never proves
-  // the rejected result's action or outcome.
-  status?: string | null
-  index: number
-  error: string
-  id: string | null
-  correlationId: string | null
-  repo: string | null
-  prId: string | null
-  behavior: string | null
-  sessionId: string | null
-}
-
-export interface AgentLogSnapshot {
-  entries: LogEntry[]
-  quarantined: QuarantinedAgentLog[]
-}
-
-export type AgentLogIdentity = Partial<Pick<QuarantinedAgentLog,
-  'id' | 'correlationId' | 'repo' | 'prId' | 'behavior' | 'sessionId'>>
-
-const LOG_CALL_ID = /^[0-9a-f]{32}$/
-const LOG_STATUS = /^(?:pending|queued|running|in_progress|completed|superseded|invalid|failed|error|cancelled|canceled|timed_out|timeout)$/
-const LOG_PR_ID = /^[1-9][0-9]*$/
-const LOG_REPO = /^[^/\s]+(?:\/[^/\s]+)?$/
-const LOG_CORRELATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
-
-function quarantineLogEntry(value: unknown, index: number, error: unknown): QuarantinedAgentLog {
-  const row = value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
-  const text = (key: string, pattern?: RegExp, lowercase = false): string | null => {
-    const raw = row[key]
-    if (typeof raw !== 'string' || !raw) return null
-    const result = lowercase ? raw.toLowerCase() : raw
-    return !pattern || pattern.test(result) ? result : null
-  }
-  return {
-    index,
-    status: text('status', LOG_STATUS, true),
-    error: error instanceof Error ? error.message : String(error),
-    id: text('id', LOG_CALL_ID, true),
-    correlationId: text('correlation_id', LOG_CORRELATION_ID),
-    repo: text('repo', LOG_REPO),
-    prId: text('pr_id', LOG_PR_ID),
-    behavior: text('behavior'),
-    sessionId: text('session_id'),
-  }
-}
-
-function sameLogIdentity(row: QuarantinedAgentLog, identity: AgentLogIdentity): boolean {
-  return !!((row.id && identity.id && row.id.toLowerCase() === identity.id.toLowerCase())
-    || (row.correlationId && identity.correlationId && row.correlationId === identity.correlationId))
-}
-
-/** Unreadable identity is uncertainty, never proof that a call is absent. */
-export function quarantinedLogMayMatch(row: QuarantinedAgentLog, identity: AgentLogIdentity): boolean {
-  // A duplicate call/correlation identity must remain suspect even when the
-  // malformed row contradicts other provenance on an otherwise valid call.
-  if (sameLogIdentity(row, identity)) return true
-  for (const key of ['id', 'correlationId', 'repo', 'prId', 'behavior', 'sessionId'] as const) {
-    const actual = row[key]
-    const expected = identity[key]
-    if (!actual || !expected) continue
-    if (key === 'repo') {
-      // Historical rows can name only the repository; its owner is unknown.
-      const qualified = actual.includes('/') && expected.includes('/')
-      const actualRepo = qualified ? actual : actual.split('/').at(-1)!
-      const expectedRepo = qualified ? expected : expected.split('/').at(-1)!
-      if (actualRepo.toLowerCase() !== expectedRepo.toLowerCase()) return false
-    } else if (key === 'id') {
-      if (actual.toLowerCase() !== expected.toLowerCase()) return false
-    } else if (actual !== expected) return false
-  }
-  return true
-}
-
 /** An unscoped read remains strict; scoped reads retain uncertainty in that scope. */
 export async function fetchAgentLogs(
-  options: { signal?: AbortSignal, identity?: AgentLogIdentity } = {},
+  options: { signal?: AbortSignal, identity?: AgentLogIdentity, fresh?: boolean } = {},
 ): Promise<LogEntry[]> {
   return scopedAgentLogs(await fetchAgentLogSnapshot(options), options.identity)
 }
 
-/** Apply one consumer's scope to a shared snapshot without rereading the CLI. */
-export function scopedAgentLogs(snapshot: AgentLogSnapshot, identity?: AgentLogIdentity): LogEntry[] {
-  const exact = identity?.id
-    ? snapshot.entries.find((row) => row.id === identity.id!.toLowerCase())
-    : undefined
-  const scoped = identity ? snapshot.entries.filter((entry) => {
-    const values: AgentLogIdentity = {
-      id: entry.id, correlationId: entry.correlation_id, repo: entry.repo,
-      prId: entry.pr_id, behavior: entry.behavior, sessionId: entry.session_id,
-    }
-    return Object.entries(identity).every(([field, expected]) => {
-      if (!expected) return true
-      const actual = values[field as keyof AgentLogIdentity]
-      if (!actual) return false
-      return field === 'id' || field === 'repo'
-        ? actual.toLowerCase() === expected.toLowerCase()
-        : actual === expected
-    })
-  }) : []
-  const rejected = snapshot.quarantined.find((row) => {
-    if (!identity) return true
-    if (exact) {
-      // A verified exact-ID result does not infer absence from the rest of
-      // the feed. Conflicting duplicates still invalidate that result.
-      return sameLogIdentity(row, identity)
-        || sameLogIdentity(row, { id: exact.id, correlationId: exact.correlation_id })
-    }
-    if (scoped.some((entry) => sameLogIdentity(row, { id: entry.id, correlationId: entry.correlation_id }))) return true
-    return quarantinedLogMayMatch(row, identity)
-  })
-  if (rejected) throw new Error(rejected.error)
-  return snapshot.entries
+// A running-only read: indexed at the source, so retained history does not
+// raise its cost. The status filter stays on this side too: Caller
+// pre-filters, and the read is still exactly the running set when it cannot.
+export async function fetchRunningAgentLogs(
+  options: { signal?: AbortSignal, identity?: AgentLogIdentity, fresh?: boolean } = {},
+): Promise<LogEntry[]> {
+  return scopedAgentLogs(await fetchRunningAgentLogSnapshot(options), options.identity)
+    .filter((entry) => entry.status === 'running')
 }
 
 // `--logs` still dumps the whole Caller log on every read, and runFile kills
@@ -229,13 +74,15 @@ const AGENT_LOG_CAP_WARN_BYTES = (AGENT_LOG_READ_CAP_BYTES * 3) / 4
 const AGENT_LOG_CAP_WARN_INTERVAL_MS = 60 * 60 * 1000
 let lastAgentLogCapWarningAt = 0
 
-// One `--logs` child runs at a time. The dump holds the whole Caller log
-// (thousands of rows), and a behavior tick plus open browser views used to
-// spawn a dozen of them at the same minute boundary, convoying on Caller's
-// database until each hit its 30 s timeout. A caller arriving mid-read
-// queues for the *next* read, which starts when the running one settles, so
-// every waiter gets data from a child spawned after it called: joining can
-// never serve pre-arrival data, and read-after-write callers stay correct.
+// Two lanes share nothing: a history read's seconds-long child never queues a
+// current read behind it. One child runs per lane: the whole-log dump used
+// to convoy a dozen children on Caller's database until each hit its 30 s
+// timeout. Concurrent readers join the in-flight read, and readers arriving
+// within the TTL reuse its snapshot, so a behavior tick plus open browser
+// views share one read instead of spawning at the same minute boundary. A
+// read-after-write caller passes fresh to queue the *next* read, which
+// starts when the running one settles, so it only sees data from a child
+// spawned after it called.
 interface AgentLogWaiter {
   signal: AbortSignal | undefined
   onAbort: () => void
@@ -250,8 +97,36 @@ interface AgentLogRead {
   settled: boolean
 }
 
-let runningAgentLogRead: AgentLogRead | null = null
-let queuedAgentLogRead: AgentLogRead | null = null
+interface AgentLogLane {
+  args: readonly string[]
+  source: string
+  running: AgentLogRead | null
+  queued: AgentLogRead | null
+  cached: { snapshot: AgentLogSnapshot, expiresAt: number } | null
+}
+
+const AGENT_LOG_SNAPSHOT_TTL_MS = 5_000
+
+const historyAgentLogLane: AgentLogLane = {
+  args: ['--logs'], source: 'agent-interface --logs', running: null, queued: null, cached: null,
+}
+
+const runningAgentLogLane: AgentLogLane = {
+  args: ['--logs', '--status', 'running'], source: 'agent-interface --logs --status running',
+  running: null, queued: null, cached: null,
+}
+const selectedAgentLogLanes = new Map<string, AgentLogLane>()
+
+// Test lifecycle: drop both lanes' cached snapshots so the next read spawns.
+// Production never calls it; in-flight reads are untouched.
+export function resetAgentLogCache(): void {
+  historyAgentLogLane.cached = null
+  runningAgentLogLane.cached = null
+  for (const [key, lane] of selectedAgentLogLanes) {
+    lane.cached = null
+    if (!lane.running && !lane.queued) selectedAgentLogLanes.delete(key)
+  }
+}
 
 // Shaped like runFile's own abort rejection, minus the child-kill fields:
 // the child may live on for the remaining waiters.
@@ -262,28 +137,45 @@ function agentLogAbortError(signal: AbortSignal): Error {
 }
 
 export async function fetchAgentLogSnapshot(
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal, fresh?: boolean } = {},
+): Promise<AgentLogSnapshot> {
+  return laneAgentLogSnapshot(historyAgentLogLane, options, readHistoryAgentLogSnapshot)
+}
+
+export async function fetchRunningAgentLogSnapshot(
+  options: { signal?: AbortSignal, fresh?: boolean } = {},
+): Promise<AgentLogSnapshot> {
+  return laneAgentLogSnapshot(runningAgentLogLane, options, readRunningAgentLogSnapshot)
+}
+
+async function laneAgentLogSnapshot(
+  lane: AgentLogLane,
+  options: { signal?: AbortSignal, fresh?: boolean },
+  read: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
 ): Promise<AgentLogSnapshot> {
   // A caller that is already gone never joins work it cannot use.
   options.signal?.throwIfAborted()
-  const read = runningAgentLogRead ? (queuedAgentLogRead ?? createAgentLogRead()) : startAgentLogRead(createAgentLogRead())
+  if (!options.fresh && lane.cached && Date.now() < lane.cached.expiresAt) return lane.cached.snapshot
+  const target = lane.running
+    ? (!options.fresh ? lane.running : (lane.queued ?? createLaneAgentLogRead(lane)))
+    : startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
   return new Promise<AgentLogSnapshot>((resolve, reject) => {
     const waiter: AgentLogWaiter = { signal: options.signal, onAbort: () => {}, resolve, reject }
     const signal = waiter.signal
     if (signal) {
       waiter.onAbort = () => {
-        read.waiters.delete(waiter)
-        if (read.waiters.size === 0 && !read.settled) {
-          if (!read.started) {
+        target.waiters.delete(waiter)
+        if (target.waiters.size === 0 && !target.settled) {
+          if (!target.started) {
             // Dropped before it ever spawned.
-            if (queuedAgentLogRead === read) queuedAgentLogRead = null
+            if (lane.queued === target) lane.queued = null
           } else {
             // Clear synchronously so a caller arriving during kill
             // teardown spawns fresh instead of joining a dying child.
-            read.controller.abort()
-            if (runningAgentLogRead === read) {
-              runningAgentLogRead = null
-              promoteQueuedAgentLogRead()
+            target.controller.abort()
+            if (lane.running === target) {
+              lane.running = null
+              promoteLaneAgentLogRead(lane, read)
             }
           }
         }
@@ -291,39 +183,54 @@ export async function fetchAgentLogSnapshot(
       }
       signal.addEventListener('abort', waiter.onAbort, { once: true })
     }
-    read.waiters.add(waiter)
+    target.waiters.add(waiter)
   })
 }
 
-function createAgentLogRead(): AgentLogRead {
+function createLaneAgentLogRead(lane: AgentLogLane): AgentLogRead {
   const read: AgentLogRead = { controller: new AbortController(), waiters: new Set(), started: false, settled: false }
-  if (runningAgentLogRead) queuedAgentLogRead = read
+  if (lane.running) lane.queued = read
   return read
 }
 
-function startAgentLogRead(read: AgentLogRead): AgentLogRead {
+function startLaneAgentLogRead(
+  lane: AgentLogLane,
+  read: AgentLogRead,
+  readSnapshot: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
+): AgentLogRead {
   read.started = true
-  runningAgentLogRead = read
-  readAgentLogSnapshot(read.controller.signal).then(
-    (snapshot) => settleAgentLogRead(read, { snapshot }),
-    (error) => settleAgentLogRead(read, { error }),
+  lane.running = read
+  readSnapshot(read.controller.signal).then(
+    (snapshot) => {
+      lane.cached = { snapshot, expiresAt: Date.now() + AGENT_LOG_SNAPSHOT_TTL_MS }
+      settleLaneAgentLogRead(lane, read, { snapshot }, readSnapshot)
+    },
+    (error) => settleLaneAgentLogRead(lane, read, { error }, readSnapshot),
   )
   return read
 }
 
-function promoteQueuedAgentLogRead(): void {
+function promoteLaneAgentLogRead(
+  lane: AgentLogLane,
+  readSnapshot: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
+): void {
   // A queued read starts even after a failure: its waiters arrived for
   // data, and the running read's failure is not theirs.
-  if (queuedAgentLogRead && !runningAgentLogRead) {
-    const next = queuedAgentLogRead
-    queuedAgentLogRead = null
-    startAgentLogRead(next)
+  if (lane.queued && !lane.running) {
+    const next = lane.queued
+    lane.queued = null
+    startLaneAgentLogRead(lane, next, readSnapshot)
   }
 }
 
-function settleAgentLogRead(read: AgentLogRead, outcome: { snapshot: AgentLogSnapshot } | { error: unknown }): void {
+function settleLaneAgentLogRead(
+  lane: AgentLogLane,
+  read: AgentLogRead,
+  outcome: { snapshot: AgentLogSnapshot } | { error: unknown },
+  readSnapshot: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
+): void {
   read.settled = true
-  if (runningAgentLogRead === read) runningAgentLogRead = null
+  if (lane.running === read) lane.running = null
   for (const waiter of read.waiters) {
     read.waiters.delete(waiter)
     // Completion wins over a racing abort once the read has settled,
@@ -332,7 +239,7 @@ function settleAgentLogRead(read: AgentLogRead, outcome: { snapshot: AgentLogSna
     if ('snapshot' in outcome) waiter.resolve(outcome.snapshot)
     else waiter.reject(copyAgentLogError(outcome.error))
   }
-  promoteQueuedAgentLogRead()
+  promoteLaneAgentLogRead(lane, readSnapshot)
 }
 
 // Each waiter gets its own error object, as if it had spawned its own
@@ -353,50 +260,208 @@ function copyAgentLogError(error: unknown): unknown {
   return copy
 }
 
-async function readAgentLogSnapshot(signal: AbortSignal): Promise<AgentLogSnapshot> {
+async function readHistoryAgentLogSnapshot(signal: AbortSignal): Promise<AgentLogSnapshot> {
+  const { stdout } = await spawnAgentLogRead(historyAgentLogLane.args, signal)
+  const snapshot = await decodeAgentLogSnapshot(stdout, historyAgentLogLane.source, signal)
+  observeAgentSnapshot(snapshot)
+  warnAgentLogCap(stdout, snapshot.entries.length + snapshot.quarantined.length)
+  return snapshot
+}
+
+async function readRunningAgentLogSnapshot(signal: AbortSignal): Promise<AgentLogSnapshot> {
+  let stdout: string
+  try {
+    ({ stdout } = await spawnAgentLogRead(runningAgentLogLane.args, signal))
+  } catch (error) {
+    throw callerUpdateError(runningAgentLogLane.args, error) ?? error
+  }
+  return decodeAgentLogSnapshot(stdout, runningAgentLogLane.source, signal)
+}
+
+function spawnAgentLogRead(args: readonly string[], signal: AbortSignal | undefined): Promise<{ stdout: string }> {
   // The child serves every waiter, so it runs under the shared read's own
   // diagnostic identity — never the AsyncLocalStorage context of whoever
   // started the preceding read, whose correlationId would otherwise own
   // this read's timeouts. Absent fields stay null: diagnostics persist ''
   // as a distinct value, not as absence.
-  const { stdout } = await withNoticeDiagnosticIdentity({
+  return withNoticeDiagnosticIdentity({
     correlationId: randomUUID(),
     behavior: 'agent-logs',
     repository: null,
     target: null,
     account: null,
-  }, () => runFile(CLI, ['--logs'], {
+  }, () => runFile(CLI, args, {
     cwd: agentCwd(),
     timeoutMs: 30_000,
     maxOutputBytes: AGENT_LOG_READ_CAP_BYTES,
     signal,
   }))
-  const trimmed = stdout.trim()
-  if (!trimmed) throw new Error('agent-interface --logs returned empty output')
-  // agent-interface returns oldest-first (`order by started_at`).
-  // Surface newest-first so the front-end doesn't carry the convention.
-  let list: unknown
-  try { list = JSON.parse(trimmed) }
-  catch (error) {
-    throw new Error('agent-interface --logs returned invalid JSON', { cause: error })
+}
+
+// An older Caller answers the new flags with its usage text. Name the fix;
+// anything else is a real failure and passes through untouched.
+function callerUpdateError(args: readonly string[], error: unknown): Error | null {
+  if (args.length < 2) return null
+  const stderr = (error as { stderr?: unknown } | null)?.stderr
+  if (typeof stderr !== 'string' || !stderr.includes('usage:')) return null
+  const feature = args.includes('--status') ? 'running-only'
+    : args.includes('--limit') ? 'paged' : 'selected'
+  return new Error(`Update Caller: ${feature} log reads are unavailable`, { cause: error })
+}
+
+// Decoding moves off the event loop past this size. Measured on this tree:
+// 6,276 rows (4 MB) decode inline in ~60 ms, a whole loop block; the worker
+// halves the main-thread cost to the two structured-clone trips, and below
+// 1 MB inline wins outright (~15 ms against the worker's ~150 ms boot).
+const AGENT_LOG_WORKER_PARSE_BYTES = 1024 * 1024
+const AGENT_LOG_PARSE_TIMEOUT_MS = 30_000
+
+async function decodeAgentLogSnapshot(stdout: string, source: string, signal?: AbortSignal): Promise<AgentLogSnapshot> {
+  if (Buffer.byteLength(stdout, 'utf8') < AGENT_LOG_WORKER_PARSE_BYTES) {
+    return freezeAgentLogSnapshot(parseAgentLogStdout(stdout, source))
   }
-  if (!Array.isArray(list)) throw new Error('agent-interface --logs returned non-array JSON')
-  const entries: LogEntry[] = []
-  const quarantined: QuarantinedAgentLog[] = []
-  list.forEach((value, index) => {
-    try { entries.push(validateLogEntry(value, index)) }
-    catch (error) { quarantined.push(quarantineLogEntry(value, index, error)) }
+  signal?.throwIfAborted()
+  const asset = await agentLogWorkerAssetUrl()
+  let worker: Worker | undefined
+  try {
+    signal?.throwIfAborted()
+    return await new Promise<AgentLogSnapshot>((resolve, reject) => {
+      worker = new Worker(asset.url)
+      worker.unref()
+      let settled = false
+      const timer = setTimeout(() => fail(new Error(`${source} parse timed out`)), AGENT_LOG_PARSE_TIMEOUT_MS)
+      const fail = (error: unknown) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        reject(error)
+      }
+      const onAbort = () => fail(agentLogAbortError(signal!))
+      signal?.addEventListener('abort', onAbort, { once: true })
+      worker.once('message', (reply: AgentLogParseReply) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        if (reply?.ok) {
+          try { resolve(freezeAgentLogSnapshot(reply.snapshot)) }
+          catch (error) { reject(error) }
+        } else {
+          reject(Object.assign(
+            new Error(reply?.error?.message ?? `${source} parse failed`,
+              { cause: reply?.error?.causeMessage ?? undefined }),
+            { name: reply?.error?.name ?? 'Error' }))
+        }
+      })
+      worker.once('error', fail)
+      worker.once('exit', (code) => fail(new Error(`${source} parse worker stopped (exit ${code})`)))
+      worker.postMessage({ stdout, source } satisfies AgentLogParseRequest)
+    })
+  } finally {
+    try { await worker?.terminate() } finally { await asset.release() }
+  }
+}
+
+let agentLogWorkerAsset: URL | null = null
+interface DevelopmentLogWorkerAsset { url: URL, dir: string, users: number }
+let agentLogWorkerBuild: Promise<DevelopmentLogWorkerAsset> | null = null
+
+async function agentLogWorkerAssetUrl(): Promise<{ url: URL, release: () => Promise<void> }> {
+  if (agentLogWorkerAsset) return { url: agentLogWorkerAsset, release: () => Promise.resolve() }
+  const built = new URL('./agent-log-worker.js', import.meta.url)
+  if (existsSync(built)) {
+    agentLogWorkerAsset = built
+    return { url: built, release: () => Promise.resolve() }
+  }
+  const source = new URL('./agent-log-worker.ts', import.meta.url)
+  if (process.env.NODE_ENV === 'production' || !existsSync(source)) {
+    throw new Error('The agent-log parse worker asset is missing')
+  }
+  const building = agentLogWorkerBuild ??= buildDevelopmentLogWorker(source)
+  let asset: DevelopmentLogWorkerAsset
+  try { asset = await building }
+  catch (error) { if (agentLogWorkerBuild === building) agentLogWorkerBuild = null; throw error }
+  asset.users += 1
+  let released = false
+  return { url: asset.url, release: async () => {
+    if (released) return
+    released = true
+    if (--asset.users === 0) {
+      if (agentLogWorkerBuild === building) agentLogWorkerBuild = null
+      await rm(asset.dir, { recursive: true, force: true })
+    }
+  } }
+}
+
+async function buildDevelopmentLogWorker(source: URL): Promise<DevelopmentLogWorkerAsset> {
+  const dir = await mkdtemp(join(tmpdir(), 'poise-agent-log-parse-'))
+  const output = join(dir, 'worker.mjs')
+  try {
+    // Only builtins remain external; the development asset needs no dependency-tree location.
+    const { build } = await import('esbuild')
+    await build({ entryPoints: [fileURLToPath(source)], outfile: output, bundle: true,
+      platform: 'node', format: 'esm', packages: 'external', logLevel: 'silent' })
+    return { url: pathToFileURL(output), dir, users: 0 }
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true })
+    throw error
+  }
+}
+
+export interface AgentLogSelection {
+  latest: Array<{ behavior: string, source: string, owner: string }>
+  ids: string[]
+}
+
+export async function fetchSelectedAgentLogSnapshot(
+  selection: AgentLogSelection,
+  options: { signal?: AbortSignal, fresh?: boolean } = {},
+): Promise<AgentLogSnapshot> {
+  return selectedAgentLogSnapshot(['--logs', '--select', JSON.stringify(selection)], options)
+}
+
+export async function fetchAgentLogsSince(
+  after: string,
+  selection: { session: string, behavior: string, prompt: string },
+  options: { signal?: AbortSignal, fresh?: boolean } = {},
+): Promise<AgentLogSnapshot> {
+  return selectedAgentLogSnapshot(['--logs', '--after', after, '--session', selection.session,
+    '--behavior', selection.behavior, '--prompt', selection.prompt], options)
+}
+
+export async function fetchAgentLogWatermark(): Promise<string> {
+  const args = ['--logs', '--watermark']
+  let stdout: string
+  try { ({ stdout } = await spawnAgentLogRead(args, undefined)) }
+  catch (error) { throw callerUpdateError(args, error) ?? error }
+  const value = JSON.parse(stdout) as { cursor?: unknown } | null
+  if (!value || typeof value.cursor !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(value.cursor)) {
+    throw new Error('agent-interface --logs --watermark returned an invalid insertion boundary')
+  }
+  return value.cursor
+}
+
+async function selectedAgentLogSnapshot(
+  args: readonly string[], options: { signal?: AbortSignal, fresh?: boolean },
+): Promise<AgentLogSnapshot> {
+  const key = JSON.stringify(args)
+  let lane = selectedAgentLogLanes.get(key)
+  if (!lane) {
+    for (const [oldKey, old] of selectedAgentLogLanes) {
+      if (!old.running && !old.queued && (!old.cached || Date.now() >= old.cached.expiresAt || selectedAgentLogLanes.size >= 32)) selectedAgentLogLanes.delete(oldKey)
+    }
+    if (selectedAgentLogLanes.size >= 32) throw new Error('agent log selection capacity is full; retry after current reads settle')
+    lane = { args, source: 'agent-interface --logs selected read', running: null, queued: null, cached: null }
+    selectedAgentLogLanes.set(key, lane)
+  }
+  const source = lane.source
+  return laneAgentLogSnapshot(lane, options, async signal => {
+    let stdout: string
+    try { ({ stdout } = await spawnAgentLogRead(args, signal)) }
+    catch (error) { throw callerUpdateError(args, error) ?? error }
+    return decodeAgentLogSnapshot(stdout, source, signal)
   })
-  const snapshot = { entries: entries.reverse(), quarantined }
-  // Co-waiters alias this snapshot; freezing makes misuse fail loud.
-  for (const row of snapshot.entries) Object.freeze(row)
-  for (const row of snapshot.quarantined) Object.freeze(row)
-  Object.freeze(snapshot.entries)
-  Object.freeze(snapshot.quarantined)
-  Object.freeze(snapshot)
-  observeAgentSnapshot(snapshot)
-  warnAgentLogCap(stdout, list.length)
-  return snapshot
 }
 
 function warnAgentLogCap(stdout: string, rows: number): void {
@@ -407,141 +472,6 @@ function warnAgentLogCap(stdout: string, rows: number): void {
   diagnostic({ level: 'warning', operation: 'agent.logs.cap', condition: 'agent_logs_read_cap',
     message: `agent-interface --logs is ${bytes} bytes (${rows} row${rows === 1 ? '' : 's'}), past 75% of the ${AGENT_LOG_READ_CAP_BYTES}-byte read cap`,
     resources: { bytes, rows, cap: AGENT_LOG_READ_CAP_BYTES } })
-}
-
-function validateLogEntry(value: unknown, index: number): LogEntry {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`agent-interface log row ${index} is not an object`)
-  }
-  const row = value as Record<string, unknown>
-  // An absent field and an explicit null both mean "this row does not have
-  // one". Only `null` was accepted, so a row written before agent-interface
-  // added a field — `expected_head`, `source`, `correlation_id`, `action` —
-  // omits the key entirely, `row[field]` is undefined, and validation threw.
-  // Previously one such row rejected the whole batch: with 1044 rows in the
-  // log and the oldest dating to May, Swarm served a 502 and rendered nothing.
-  // Absent is null; genuinely unreadable rows now retain a quarantine identity.
-  const optionalString = (field: string): string | null => {
-    const item = row[field]
-    if (item === null || item === undefined) return null
-    if (typeof item !== 'string') {
-      throw new Error(`agent-interface log row ${index} has invalid ${field}`)
-    }
-    return item
-  }
-  const requiredString = (field: string): string => {
-    const item = row[field]
-    if (typeof item !== 'string') {
-      throw new Error(`agent-interface log row ${index} has invalid ${field}`)
-    }
-    return item
-  }
-  const id = requiredString('id').toLowerCase()
-  const prId = optionalString('pr_id')
-  const repo = optionalString('repo')
-  const actor = optionalString('actor')
-  const behavior = optionalString('behavior')
-  const sessionId = optionalString('session_id')
-  const startedAt = requiredString('started_at')
-  const startedAtPrecise = optionalString('started_at_precise')
-  const completedAt = optionalString('completed_at')
-  const status = requiredString('status')
-  const outcome = optionalString('outcome')
-  const headSha = optionalString('head_sha')
-  const expectedHead = optionalString('expected_head')
-  const source = optionalString('source')
-  const correlationId = optionalString('correlation_id')
-  const action = optionalString('action')
-  const error = optionalString('error') || ''
-  const preflightFailed = status === 'failed'
-    && action === 'not_started'
-    && outcome === 'preflight_failed'
-    && headSha === null
-  const issueReview = behavior === ISSUE_REVIEW_BEHAVIOR
-  if (!LOG_CALL_ID.test(id)
-    || (prId !== null && !LOG_PR_ID.test(prId))
-    || (repo !== null && !LOG_REPO.test(repo))
-    || (actor !== null
-      && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/.test(actor))
-    || !Number.isFinite(Date.parse(startedAt))
-    || (startedAtPrecise !== null && !Number.isFinite(Date.parse(startedAtPrecise)))
-    || (completedAt !== null && !Number.isFinite(Date.parse(completedAt)))
-    || !['clean', 'changes_requested', 'approved', 'superseded', 'preflight_failed', 'commented', null].includes(outcome)
-    || (headSha !== null && !/^[0-9a-f]{40}$/.test(headSha))
-    || (expectedHead !== null && !/^[0-9a-f]{40}$/.test(expectedHead))
-    || !['reviewed_clean', 'requested_changes', 'approved', 'not_started', 'commented', null].includes(action)
-    || ((action === 'commented' || outcome === 'commented') && !issueReview)
-    || ((action === 'not_started' || outcome === 'preflight_failed') && !preflightFailed)
-    || (source !== null && !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(source))
-    || (correlationId !== null && !LOG_CORRELATION_ID.test(correlationId))) {
-    throw new Error(`agent-interface log row ${index} violates the schema`)
-  }
-  const runner = optionalString('runner')
-  if (runner !== null && runner !== 'external') {
-    throw new Error(`agent-interface log row ${index} has invalid runner`)
-  }
-  // A Chat turn is a Caller row without a Caller process: it is exempt from
-  // the review provenance rules only when it is exactly the well-formed
-  // externally recorded shape (runner, behavior and source all agree).
-  const externalChatTurn = runner === 'external' && behavior === 'chat' && source === 'poise:chat'
-  if (externalChatTurn) {
-    if (!sessionId || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionId)) {
-      throw new Error(`agent-interface log row ${index} is a chat turn without a session`)
-    }
-    if (status === 'failed' && !error) {
-      throw new Error(`agent-interface log row ${index} has no terminal error`)
-    }
-  } else if (runner === 'external') {
-    throw new Error(`agent-interface log row ${index} is externally recorded but not a chat turn`)
-  }
-  if (source?.startsWith('poise:') && !externalChatTurn) {
-    if (!actor || (!expectedHead && !issueReview) || !correlationId || !behavior
-      || !repo || !/^[^/\s]+\/[^/\s]+$/.test(repo) || !prId) {
-      throw new Error(`agent-interface log row ${index} has incomplete Poise provenance`)
-    }
-    if (status === 'completed' && (!completedAt || !action || !outcome || (!headSha && !issueReview))) {
-      throw new Error(`agent-interface log row ${index} has incomplete terminal outcome`)
-    }
-    if (status === 'failed' && !error) {
-      throw new Error(`agent-interface log row ${index} has no terminal error`)
-    }
-    if (status === 'superseded'
-      && (!completedAt || outcome !== 'superseded' || !headSha || action !== null)) {
-      throw new Error(`agent-interface log row ${index} has incomplete superseded outcome`)
-    }
-  }
-  return {
-    id,
-    pr_id: prId,
-    repo,
-    actor,
-    model: requiredString('model'),
-    behavior,
-    session_id: sessionId,
-    prompt: requiredString('prompt'),
-    started_at: startedAt,
-    started_at_precise: startedAtPrecise,
-    completed_at: completedAt,
-    time_elapsed: requiredString('time_elapsed'),
-    status,
-    progress: parseProgress(row.progress),
-    outcome: outcome as LogEntry['outcome'],
-    head_sha: headSha,
-    expected_head: expectedHead,
-    source,
-    correlation_id: correlationId,
-    action: action as LogEntry['action'],
-    response: optionalString('response'),
-    error,
-    error_code: optionalString('error_code'),
-    diagnostic: parseProcessDiagnostic(row.diagnostic),
-    review_policy: optionalString('review_policy'),
-    recovery_model: optionalString('recovery_model'),
-    review_id: Number.isSafeInteger(row.review_id) && Number(row.review_id) > 0 ? Number(row.review_id) : null,
-    review_comments: Number.isSafeInteger(row.review_comments) && Number(row.review_comments) >= 0 ? Number(row.review_comments) : null,
-    receipts: parseReceipts(row.receipts),
-    runner: runner as LogEntry['runner'],
-  }
 }
 
 // Fetch one response body by the full 32-hex call id. agent-interface also

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, restartModules, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
 describe('review outcome evidence and registration', () => {
 
@@ -10,6 +10,7 @@ describe('review outcome evidence and registration', () => {
       error_code: 'review_contract_violation', review_policy: 'bounded-v1', model: 'opus-5-xhigh',
       expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
     fixture.agentLogs = [failed]
+    await resetLogCache()
     const modules = await restartModules()
     modules.behaviors.startBehaviorsRuntime()
     await modules.behaviors.runEnabledBehaviorsOnce()
@@ -19,9 +20,12 @@ describe('review outcome evidence and registration', () => {
     if (variant === 'receipt') failed.review_id = 91
     if (variant === 'quarantine') modules.database.db.prepare("UPDATE behavior_seen SET launch_quarantine = 'unreadable' WHERE target = ?").run(launched.target)
     if (variant === 'ambiguous') fixture.agentLogs.push({ ...failed, id: 'e'.repeat(32) })
+    await resetLogCache()
     if (variant === 'running') fixture.agentLogs.push(agentLog({ id: 'e'.repeat(32), correlation_id: 'running-sibling' }))
+    await resetLogCache()
     if (variant === 'claimed-sibling') fixture.agentLogs.push(agentLog({ id: 'e'.repeat(32), correlation_id: 'completed-sibling',
       status: 'completed', action: 'reviewed_clean', outcome: 'clean', head_sha: HEAD_SHA, review_id: 91 }))
+    await resetLogCache()
     arrangeCli(false, false, { headSha: variant === 'head' ? NEXT_HEAD_SHA : HEAD_SHA,
       ...(variant === 'missing-inventory' ? {} : { reviewerReviewIdsSince: ['unclaimed', 'claimed-sibling'].includes(variant) ? [91] : [] }),
       reviewerPendingReviews: variant === 'pending' ? 1 : 0 })
@@ -61,6 +65,7 @@ describe('review outcome evidence and registration', () => {
     })
     if (variant === 'posted-original') Object.assign(failed, { action: null, outcome: null })
     fixture.agentLogs = [failed]
+    await resetLogCache()
     let modules = await restartModules()
     modules.behaviors.startBehaviorsRuntime()
     await modules.behaviors.runEnabledBehaviorsOnce()
@@ -77,12 +82,15 @@ describe('review outcome evidence and registration', () => {
     if (variant === 'model') replay.model = 'gpt-6-astra-ultra'
     if (variant === 'old') Object.assign(replay, { started_at: launched.requestedAt, started_at_precise: launched.requestedAt })
     fixture.agentLogs.push(replay)
+    await resetLogCache()
     if (variant === 'newest-claimed') {
       vi.setSystemTime(Date.now() + 1_000)
       fixture.agentLogs.push(agentLog({ ...replay, id: 'd'.repeat(32), correlation_id: 'newer-replay', review_id: 92,
         started_at: new Date().toISOString(), started_at_precise: new Date().toISOString(), completed_at: new Date().toISOString() }))
+      await resetLogCache()
     }
     if (variant === 'ambiguous') fixture.agentLogs.push({ ...replay, id: 'd'.repeat(32) })
+    await resetLogCache()
     arrangeCli(false, false, { reviewerReviewIdsSince: variant === 'receipt' ? [] : variant === 'newest-claimed' ? [91, 92] : [91] })
     modules = await restartModules()
     if (variant === 'claimed' || variant === 'newest-claimed') {
@@ -123,6 +131,7 @@ describe('review outcome evidence and registration', () => {
       expected_head: launched.expectedHead, actor: launched.actor,
       source: launched.source, correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
     let modules = await restartModules()
     modules.behaviors.startBehaviorsRuntime()
     await modules.behaviors.runEnabledBehaviorsOnce()
@@ -162,6 +171,7 @@ describe('review outcome evidence and registration', () => {
       source: launched.source,
       correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
 
     const { database: db, behaviors: runtime } = await restartModules()
     runtime.startBehaviorsRuntime()
@@ -193,6 +203,7 @@ describe('review outcome evidence and registration', () => {
       source: launched.source,
       correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
 
     const { database: db, behaviors: runtime } = await restartModules()
     runtime.startBehaviorsRuntime()
@@ -263,6 +274,7 @@ describe('review outcome evidence and registration', () => {
         correlation_id: launched.correlationId,
       }),
     ]
+    await resetLogCache()
 
     const { database: db, behaviors: runtime } = await restartModules()
     await runtime.runEnabledBehaviorsOnce()

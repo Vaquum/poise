@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, HEAD_SHA, restartModules, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, restartModules, resetLogCache, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
 describe('durable launch reconciliation', () => {
 
@@ -36,6 +36,7 @@ describe('durable launch reconciliation', () => {
     expect(leaseUntil).toBeGreaterThan(Date.now())
 
     fixture.agentLogs = []
+    await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     expect(db.db.prepare(`
@@ -155,6 +156,7 @@ describe('durable launch reconciliation', () => {
       actor: retry.launchActor, source: retry.launchSource, expected_head: retry.launchExpectedHead,
       correlation_id: retry.launchCorrelationId,
     }))
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorDeadLetters()).toHaveLength(2)
     expect(alerts()).toHaveLength(1)
@@ -169,6 +171,7 @@ describe('durable launch reconciliation', () => {
       actor: changed.launchActor, source: changed.launchSource, expected_head: changed.launchExpectedHead,
       correlation_id: changed.launchCorrelationId,
     }))
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(alerts()).toHaveLength(2)
     const fresh = launched.database.db.prepare('SELECT body, dismissed_at FROM alerts WHERE resolved_at IS NULL').get()
@@ -187,6 +190,7 @@ describe('durable launch reconciliation', () => {
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorDeadLetters()).toHaveLength(1)
     fixture.agentLogs.push({ id: fixture.agentLogs[0].id, corrupt: true })
+    await resetLogCache()
     vi.setSystemTime(Date.now() + launched.behaviors.BEHAVIOR_RETRY_BASE_MS)
     fixture.listedPrs.push({ ...pr, number: 18, url: `https://github.com/${pr.repo}/pull/18` })
     await launched.behaviors.runEnabledBehaviorsOnce()
