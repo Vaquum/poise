@@ -9,7 +9,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import type { AgentId, ChatEnvelope, ChatEvent, PromptInput } from '../../server/chat/protocol'
+import type { AgentId, ChatEnvelope, ChatEvent, PromptInput, PromptReceipt } from '../../server/chat/protocol'
 import type { Adapter, AdapterHost, AdapterStartOptions, ReplayInit } from '../../server/chat/adapters/types'
 import type { CallerTurns } from '../../server/chat/caller-turns'
 import type { RelayConnection } from '../../server/chat/relay'
@@ -165,6 +165,11 @@ async function waitFor(check: () => boolean, ms = 8_000): Promise<void> {
   }
 }
 
+function requireTurn(receipt: PromptReceipt): { turnId: string } {
+  if (!('turnId' in receipt)) throw new Error(`expected a reserved turn, got update wait ${receipt.waitId}`)
+  return receipt
+}
+
 const ofType = (events: ChatEnvelope[], id: string, type: ChatEvent['type']) => events.filter((e) => e.sessionId === id && e.event.type === type).map((e) => e.event as any)
 const lastStatus = (events: ChatEnvelope[], id: string) => ofType(events, id, 'status.changed').at(-1)?.status
 
@@ -180,7 +185,7 @@ describe('relay handover between servers', () => {
     await waitFor(() => worker.pgidAlive(peer.gatePgid))
     first.controls.adapters[0].finish()
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
-    const { turnId } = first.runtime.prompt(session.id, { text: 'Survive the restart', attachments: [], mentions: [] })
+    const { turnId } = requireTurn(first.runtime.prompt(session.id, { text: 'Survive the restart', attachments: [], mentions: [] }))
     await waitFor(() => first.runtime.get(session.id)?.status === 'running')
     await new Promise((resolve) => setTimeout(resolve, 200))
     await first.runtime.stop()
@@ -244,7 +249,7 @@ describe('relay handover between servers', () => {
     await waitFor(() => existsSync(marker))
     first.controls.adapters[0].finish()
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
-    const { turnId } = first.runtime.prompt(session.id, { text: 'Keep the checkout owned', attachments: [], mentions: [] })
+    const { turnId } = requireTurn(first.runtime.prompt(session.id, { text: 'Keep the checkout owned', attachments: [], mentions: [] }))
     await waitFor(() => first.runtime.get(session.id)?.status === 'running')
     let releaseReplay = () => {}
     let owner = first
@@ -646,7 +651,7 @@ describe('relay handover between servers', () => {
     // The full settle, not just the terminal event: the next prompt must
     // observe the idle edge, never the previous turn's running status.
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
-    const { turnId } = first.runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] })
+    const { turnId } = requireTurn(first.runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] }))
     await waitFor(() => first.runtime.get(session.id)?.status === 'running')
     // Let the turn-start frame flush to the relay before stopping: a real
     // restart lands seconds later, but this test stops within microseconds.
@@ -694,7 +699,7 @@ describe('relay handover between servers', () => {
     first.controls.exitAware = false
     const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
-    const { turnId } = first.runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] })
+    const { turnId } = requireTurn(first.runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] }))
     await waitFor(() => first.runtime.get(session.id)?.status === 'running')
     const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
     const pgid = peer.gatePgid
@@ -751,7 +756,7 @@ describe('relay handover between servers', () => {
 
     // The waiter's turn exists but is still before turnStart: no spool,
     // so a restart could not adopt it — the switch must wait for it.
-    const { turnId } = waiter.runtime.prompt(waiting.id, { text: 'Wait for the lease', attachments: [], mentions: [] })
+    const { turnId } = requireTurn(waiter.runtime.prompt(waiting.id, { text: 'Wait for the lease', attachments: [], mentions: [] }))
     await waitFor(() => waiter.events.some((e) => e.sessionId === waiting.id && e.event.type === 'turn.started' && (e.event as { turnId: string }).turnId === turnId))
     expect(waiter.runtime.get(waiting.id)?.status).toBe('queued')
     // Counted — the turn plus its chain entry — not skipped as held.
@@ -819,7 +824,7 @@ describe('relay handover between servers', () => {
     await waitFor(() => worker.pgidAlive(pgid))
     first.controls.adapters[0].finish()
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
-    const { turnId } = first.runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] })
+    const { turnId } = requireTurn(first.runtime.prompt(session.id, { text: 'Hold the checkout', attachments: [], mentions: [] }))
     await waitFor(() => first.runtime.get(session.id)?.status === 'running')
     await new Promise((r) => setTimeout(r, 200))
     await first.runtime.stop()
