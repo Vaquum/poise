@@ -109,6 +109,14 @@ process timeout now allows the gate to start before testing descendant cleanup;
 the attachment queue test waits separately for both turns, matching the existing
 FIFO and native-handoff tests. Both retain their original behavioral assertions.
 
+The provider refresh retry case runs three complete process refreshes and has a
+30-second case budget, three times the unchanged ten-second single-refresh
+budget. Its case-owned fixture forwards the case abort signal to the runner,
+awaits every owned runner's closure before removing its root, and refuses new
+work after cleanup. A held-updater regression verifies that abort also stops the
+native updater group. The global test deadline and production updater/discovery
+deadlines remain unchanged.
+
 `tests/chat/message-queue-runtime.test.ts` drives the real Chat runtime against
 real git repositories, and most of its cases run several turns. Under suite
 load one git or SQLite step can stall past eight seconds, so the file gives
