@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, NEXT_HEAD_SHA, loadModules, arrangeCli, fixture } from './behaviors-runtime-fixture'
+import { mocks, pr, NEXT_HEAD_SHA, loadModules, arrangeCli, fixture, deferred } from './behaviors-runtime-fixture'
 
 // Provider maintenance is unrelated to this regression: preparation resolves
 // immediately so the sweep's own deadline handling is what the tests observe.
@@ -79,11 +79,11 @@ describe('approve-prs under load', () => {
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
     const { behaviors: runtime } = await startApproving([pr, secondPr])
     const original = mocks.runFile.getMockImplementation()!
-    let slowEntered = false
-    let fireEntered = false
+    const slow = deferred<void>()
+    const fire = deferred<void>()
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
       if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
-        slowEntered = true
+        slow.resolve()
         const signal = (options as { signal?: AbortSignal } | undefined)?.signal
         if (signal?.aborted) throw signal.reason
         // A check that never answers until the sweep deadline aborts it, as a
@@ -93,7 +93,7 @@ describe('approve-prs under load', () => {
         })
       }
       if (command === 'github-interface' && args[0] === '--head-sha' && String(args[1]) === '#18') {
-        fireEntered = true
+        fire.resolve()
         // The approval is prepared and its launch is in flight when the sweep
         // deadline fires; the head lookup answers just after.
         await new Promise<void>((resolve) => setTimeout(resolve, 57_000))
@@ -102,14 +102,10 @@ describe('approve-prs under load', () => {
     })
 
     const run = runtime.runEnabledBehaviorsOnce()
-    // Real I/O (checkout directories, lock files) drains while the fake clock
-    // stays put, so the fast PR is inside its launch before the deadline fires.
-    const pump = () => new Promise<void>((resolve) => setImmediate(resolve))
-    for (let i = 0; i < 1000 && !(slowEntered && fireEntered); i++) await pump()
-    expect(slowEntered && fireEntered).toBe(true)
-    for (let i = 0; i < 20; i++) await pump()
+    // Observe both CLI entries after their real checkout/lock I/O finishes;
+    // event-loop iterations do not bound how long that I/O takes under load.
+    await Promise.all([slow.promise, fire.promise])
     await vi.advanceTimersByTimeAsync(59_000)
-    for (let i = 0; i < 100 && mocks.spawnDetached.mock.calls.length === 0; i++) await pump()
     await run
 
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
@@ -130,11 +126,11 @@ describe('approve-prs under load', () => {
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
     const { database: db, behaviors: runtime } = await startApproving([pr, secondPr])
     const original = mocks.runFile.getMockImplementation()!
-    let slowEntered = false
-    let fireEntered = false
+    const slow = deferred<void>()
+    const fire = deferred<void>()
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
       if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && String(args[1]) === '#17') {
-        slowEntered = true
+        slow.resolve()
         const signal = (options as { signal?: AbortSignal } | undefined)?.signal
         if (signal?.aborted) throw signal.reason
         await new Promise<never>((_resolve, reject) => {
@@ -142,7 +138,7 @@ describe('approve-prs under load', () => {
         })
       }
       if (command === 'github-interface' && args[0] === '--head-sha' && String(args[1]) === '#18') {
-        fireEntered = true
+        fire.resolve()
         // The head lookup answers after the sweep deadline with a new head: a
         // genuine launch failure, not an abort.
         await new Promise<void>((resolve) => setTimeout(resolve, 57_000))
@@ -155,10 +151,7 @@ describe('approve-prs under load', () => {
     })
 
     const run = runtime.runEnabledBehaviorsOnce()
-    const pump = () => new Promise<void>((resolve) => setImmediate(resolve))
-    for (let i = 0; i < 1000 && !(slowEntered && fireEntered); i++) await pump()
-    expect(slowEntered && fireEntered).toBe(true)
-    for (let i = 0; i < 20; i++) await pump()
+    await Promise.all([slow.promise, fire.promise])
     await vi.advanceTimersByTimeAsync(59_000)
     await run
 
