@@ -449,7 +449,7 @@ describe('one Manager chat per workspace', () => {
     await runtime.setModel(manager.id, OPUS_MODEL)
     expect(runtime.get(manager.id)?.retiredModel).toBeUndefined()
     await until(() => prompts.has(manager.id), manager.id)
-    expect(prompts.get(manager.id)!.map(prompt => prompt.text)).toEqual(['Queued task'])
+    expect(prompts.get(manager.id)!.map(prompt => prompt.text.split('\n[Request]\n').at(-1))).toEqual(['Queued task'])
     // Force a competing tick to admit the held inbox item before checking idle.
     await finishAndTick(manager.id)
     await until(() => prompts.get(manager.id)?.length === 2, manager.id)
@@ -462,7 +462,7 @@ describe('one Manager chat per workspace', () => {
     expect(prompts.get(manager.id)).toHaveLength(2)
     expect(() => runtime.prompt(manager.id, { text: 'next', attachments: [], mentions: [] })).not.toThrow()
     await until(() => prompts.get(manager.id)?.length === 3, manager.id)
-    expect(prompts.get(manager.id)![2].text).toBe('next')
+    expect(prompts.get(manager.id)![2].text.split('\n[Request]\n').at(-1)).toBe('next')
     finishes.get(manager.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(manager.id)?.status === 'idle', manager.id)
     expect(runtime.get(ordinary.id)).toBeNull()
