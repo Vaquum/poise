@@ -14,13 +14,13 @@ The needle is what people actually get from Poise: their own agents, data and au
 
 ## The laws
 
-1. **One pull request, one slice.** Every PR closes exactly one open slice issue, and its title equals that issue's title. The diff stays inside the slice's declared surfaces.
+1. **Every PR closes exactly one OPEN issue via `Closes #N`.** A `feat` PR's issue must carry the `prd` label; any other type may close any OPEN issue — or a PRD when the author wants more eyes on it.
 2. **Conventional Commits, no assistant attribution.** The PR title and every non-merge commit use Conventional Commits v1.0.0 (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`). No commit message or PR title names an AI or LLM assistant.
 3. **The gates pass on the exact candidate.** Run the gates [POISE_REPO_SPECIFICS.md](POISE_REPO_SPECIFICS.md) names for every surface you touched. CI is authoritative for merge.
 4. **Fail loud.** Never paper over missing or contradictory state with fallbacks, swallowed errors or silent defaults. Required configuration that is absent stops the process with a message naming it.
 5. **Every fix and capability carries its regression guard.** A test fails on the old behavior or on silent removal. User-facing changes carry end-to-end proof.
 6. **Documentation is current truth.** A PR that changes behavior updates the documentation describing it. Docs describe what runs, not what is planned.
-7. **No direct push to `main`.** Branch from `main`, keep the branch up to date, and merge only when CI is green and review threads are resolved.
+7. **No direct push to `main`.** Branch from `main` and merge through its native merge queue only when required CI and reviews pass and review threads are resolved. The queue tests integration with the latest base; update the branch only to resolve conflicts or pick up a needed fix.
 
 ## Workflow
 
@@ -30,4 +30,4 @@ When a gate fails, its output names the reason: fix the code, or fix the gate in
 
 ## Code stance
 
-Choose the smallest honest implementation that satisfies the requirement. Prefer the standard library and existing dependencies; a new dependency names the concern it solves. Comments explain non-obvious decisions, never narrate the line. Match the surrounding code's idiom. Validate against the stated expectation — "did it return what the slice promised", not "did it run".
+Choose the smallest honest implementation that satisfies the requirement. Prefer the standard library and existing dependencies; a new dependency names the concern it solves. Comments explain non-obvious decisions, never narrate the line. Match the surrounding code's idiom. Validate against the stated expectation — "did it return what the issue promised", not "did it run".
