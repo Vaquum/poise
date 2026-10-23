@@ -4,7 +4,7 @@
 // interrupt-and-resume with the transcript saying so.
 
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -166,14 +166,14 @@ const ofType = (events: ChatEnvelope[], id: string, type: ChatEvent['type']) => 
 const lastStatus = (events: ChatEnvelope[], id: string) => ofType(events, id, 'status.changed').at(-1)?.status
 
 describe('relay handover between servers', () => {
-  async function heldTurn(instance: string) {
+  async function heldTurn(instance: string, command = 'sleep 60') {
     const first = makeRuntime(instance)
     first.controls.auto = false
     const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
     first.runtime.prompt(session.id, { text: 'Prime the relay', attachments: [], mentions: [] })
     await waitFor(() => first.runtime.get(session.id)?.status === 'running')
-    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', command]) as RelayConnection
     await waitFor(() => worker.pgidAlive(peer.gatePgid))
     first.controls.adapters[0].finish()
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
@@ -216,6 +216,7 @@ describe('relay handover between servers', () => {
       expect(storage.getRelay(session.id)).not.toBeNull()
       expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
       expect(lease.read()?.token).toBe(ownerToken)
+      await expect(readFile(join(peer.dir, 'turn.spool'), 'utf8')).resolves.toBe('')
       releaseCurrent()
       await waitFor(() => ofType(third.events, session.id, 'turn.finished').length === 1)
       expect(ofType(third.events, session.id, 'turn.finished')[0]).toMatchObject({ turnId, stopReason: 'end_turn' })
@@ -382,6 +383,76 @@ describe('relay handover between servers', () => {
       storage.forgetWorker(session.id)
       storage.forgetRelay(session.id)
       await rm(peer.dir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  it('cleans up a live idle worker after its completed turn released the checkout lease', async () => {
+    const instance = 'poise-relay-idle-worker-no-lease:db'
+    const lock = await import('../../server/chat/checkout-lock')
+    const first = makeRuntime(instance)
+    first.controls.auto = false
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    first.runtime.prompt(session.id, { text: 'Complete before the crash', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    await waitFor(() => worker.pgidAlive(peer.gatePgid))
+    first.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    const lease = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance })
+    expect(storage.getOpenTurn(session.id)).toBeNull()
+    expect(lease.read()).toBeNull()
+    expect(storage.getWorker(session.id)?.gatePgid).toBe(peer.gatePgid)
+    // A crash drops the old link without running idle-session shutdown.
+    peer.detach()
+    runtimes.splice(runtimes.indexOf(first.runtime), 1)
+    const second = makeRuntime(instance)
+    try {
+      await second.runtime.recover()
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(false)
+      expect(storage.getWorker(session.id)).toBeNull()
+      expect(storage.getRelay(session.id)).toBeNull()
+      expect(lease.read()).toBeNull()
+      expect(second.controls.replayTurns).toEqual([])
+      expect(second.finishes).toEqual([])
+      expect(ofType(second.events, session.id, 'turn.finished')).toEqual([])
+      await expect(second.runtime.close(session.id)).resolves.toMatchObject({ status: 'closed' })
+      await expect(second.runtime.delete(session.id)).resolves.toMatchObject({ workspaceRemoved: false })
+      expect(storage.getSession(session.id)).toBeNull()
+    } finally {
+      worker.signalGroup(peer.gatePgid, 'SIGKILL')
+      await waitFor(() => !worker.pgidAlive(peer.gatePgid), 10_000)
+    }
+  }, 60_000)
+
+  it('drops the completed adopted turn spool and outbound log while its agent stays idle', async () => {
+    const instance = 'poise-relay-replay-finish-spool:db'
+    const { session, peer, turnId } = await heldTurn(instance, 'cat')
+    let releaseReplay = () => {}
+    const second = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [],
+      replayGate: new Promise<void>((resolve) => { releaseReplay = resolve }) })
+    try {
+      await second.runtime.recover()
+      await waitFor(() => second.controls.replayTurns.length === 1)
+      const adopted = second.controls.replayTurns[0].peer as RelayConnection
+      const marker = 'adopted-turn-output\n'
+      await new Promise<void>((resolve, reject) => adopted.stdin.write(marker, (error) => error ? reject(error) : resolve()))
+      const spool = join(peer.dir, 'turn.spool')
+      await vi.waitFor(async () => expect(await readFile(spool, 'utf8')).toContain(marker))
+      expect((await adopted.getOutbound()).bytes.toString()).toContain(marker)
+      releaseReplay()
+      await waitFor(() => lastStatus(second.events, session.id) === 'idle')
+      expect(ofType(second.events, session.id, 'turn.finished')).toEqual([expect.objectContaining({ turnId, stopReason: 'end_turn' })])
+      await vi.waitFor(async () => {
+        await expect(readFile(spool, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+      expect(await adopted.getOutbound()).toEqual({ truncated: false, bytes: Buffer.alloc(0) })
+      expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
+      expect(storage.getWorker(session.id)?.gatePgid).toBe(peer.gatePgid)
+      expect(storage.getRelay(session.id)).not.toBeNull()
+    } finally {
+      releaseReplay()
+      await second.runtime.stop({ handover: false })
     }
   }, 60_000)
 

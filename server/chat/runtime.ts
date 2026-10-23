@@ -568,9 +568,26 @@ export class ChatRuntime extends EventEmitter {
   private claimRecoveryWorker(worker: storage.WorkerRow): LiveSession | null {
     const session = this.requireLive(worker.sessionId)
     const lease = session.lease?.held ? session.lease : this.leaseFor(session)
+    const expected = { workerPid: worker.gatePid, workerPgid: worker.gatePgid,
+      workerIdent: worker.ident, ownerId: worker.sessionId }
     try {
-      if (!lease.adoptLiveWorker({ workerPid: worker.gatePid, workerPgid: worker.gatePgid,
-        workerIdent: worker.ident, ownerId: worker.sessionId })) {
+      let adopted = lease.adoptLiveWorker(expected)
+      if (!adopted) {
+        // A completed idle agent has released its turn's lease. Claim the
+        // available checkout atomically before registering and stopping it;
+        // a server that won meanwhile still makes tryAcquire refuse.
+        const acquired = lease.tryAcquire()
+        if (acquired.acquired) {
+          if (!lease.registerWorker({ pid: worker.gatePid, pgid: worker.gatePgid, ident: worker.ident })) {
+            throw new Error('the recovery lease was lost before worker registration')
+          }
+          // Renew the newly registered claim through the same heartbeat
+          // lifecycle used when adopting a surviving turn's lease.
+          if (!lease.adoptLiveWorker(expected)) throw new Error('the worker changed while recovery claimed its checkout')
+          adopted = true
+        }
+      }
+      if (!adopted) {
         session.relayDetached = true
         this.emit('log', `[chat ${worker.sessionId.slice(0, 8)}] recovery could not claim its worker; preserving its owner and turn`)
         return null
@@ -581,7 +598,7 @@ export class ChatRuntime extends EventEmitter {
       return session
     } catch (error) {
       // A successful claim remains tracked even if updating its mirror failed.
-      if (lease.held) session.lease = lease
+      if (lease.held) { session.lease = lease; session.relayDetached = false }
       else session.relayDetached = true
       this.emit('log', `[chat ${worker.sessionId.slice(0, 8)}] recovery ownership could not be claimed; preserving its worker: ${error instanceof Error ? error.message : String(error)}`)
       return null
@@ -751,6 +768,7 @@ export class ChatRuntime extends EventEmitter {
           recalledDiffs: recalledDiffs(persisted.map((envelope) => envelope.event), open.turnId),
         })
       } finally {
+        if (!session.relayDetached && session.relay === peer) peer.turnFinish()
         turn.relayHeld = false
         // This adapter can serve later turns; their matching requests must
         // never inherit unused one-time decisions from the adopted turn.
