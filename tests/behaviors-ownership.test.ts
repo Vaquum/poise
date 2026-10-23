@@ -148,6 +148,7 @@ describe('launch ownership and resolution', () => {
       status: 'open',
       author: 'poise-user',
       draft: 0,
+      updated_at: '2026-07-15T12:00:00Z',
     }
     fixture.listedPrs = [pr, secondPr]
     arrangeCli(false)
@@ -176,7 +177,12 @@ describe('launch ownership and resolution', () => {
   })
 
   it('keeps GitHub-only unblocking active during a Claude auth outage', async () => {
-    arrangeCli(false, false, { unresolvedConversationCount: 1 })
+    arrangeCli(false, false, {
+      unresolvedConversationCount: 1,
+      reviewerLatestState: 'APPROVED',
+      reviewerLatestCommit: HEAD_SHA,
+      activeChangeRequestAuthors: [],
+    })
     const { database: db, behaviors: runtime } = await loadModules()
     runtime.startBehaviorsRuntime()
     db.setMeta('me', 'poise-user')
@@ -203,7 +209,13 @@ describe('launch ownership and resolution', () => {
   })
 
   it('does not retain idle resolution polls as successful runs', async () => {
-    arrangeCli(false, false, { unresolvedConversationCount: 1, resolveUnresolvedCount: 1 })
+    arrangeCli(false, false, {
+      unresolvedConversationCount: 1,
+      resolveUnresolvedCount: 1,
+      reviewerLatestState: 'APPROVED',
+      reviewerLatestCommit: HEAD_SHA,
+      activeChangeRequestAuthors: [],
+    })
     const { database: db, behaviors: runtime } = await loadModules()
     runtime.startBehaviorsRuntime()
     db.setMeta('me', 'poise-user')
@@ -222,7 +234,13 @@ describe('launch ownership and resolution', () => {
   })
 
   it.each(['absent', 'healthy', 'failed'] as const)('preserves resolution execution with %s real ledger capture', async (mode) => {
-    arrangeCli(false, false, { unresolvedConversationCount: 1, resolveUnresolvedCount: 1 })
+    arrangeCli(false, false, {
+      unresolvedConversationCount: 1,
+      resolveUnresolvedCount: 1,
+      reviewerLatestState: 'APPROVED',
+      reviewerLatestCommit: HEAD_SHA,
+      activeChangeRequestAuthors: [],
+    })
     const { database: db, behaviors: runtime } = await loadModules()
     const { BehaviorLedgerObserver } = await vi.importActual<typeof import('../server/behavior-ledger')>('../server/behavior-ledger')
     const observer = mode === 'absent' ? null : new BehaviorLedgerObserver({ path: mode === 'failed'
@@ -281,7 +299,13 @@ describe('launch ownership and resolution', () => {
     { resolveResolvedCount: 1, status: 'completed' },
     { resolveError: true, status: 'failed' },
   ])('retains actual resolution results as $status runs', async ({ status, ...result }) => {
-    arrangeCli(false, false, { unresolvedConversationCount: 1, ...result })
+    arrangeCli(false, false, {
+      unresolvedConversationCount: 1,
+      reviewerLatestState: 'APPROVED',
+      reviewerLatestCommit: HEAD_SHA,
+      activeChangeRequestAuthors: [],
+      ...result,
+    })
     const { database: db, behaviors: runtime } = await loadModules()
     runtime.startBehaviorsRuntime()
     db.setMeta('me', 'poise-user')
