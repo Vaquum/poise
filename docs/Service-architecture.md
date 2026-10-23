@@ -350,9 +350,10 @@ reconciles them as after any restart.
   person resumes the chat. A Stop that overlaps the update bound's native
   cancellation also keeps its interrupted record durable; after the person's
   resumed turn, that recovery still precedes normal queued follow-ups.
-  A later update preserves every earlier undelivered recovery by interrupted
-  turn identity. It resumes the current turn first, then those older requests,
-  consuming each durable row separately.
+  A later update preserves every earlier unsent request by interrupted turn
+  identity. It resumes the current turn first with one generic continuation,
+  then those older requests, consuming each durable row separately; that current
+  continuation supersedes an older generic continuation of the same session.
   Withdrawal waits for any bound cancellation to record recovery before
   releasing messages. A bound
   cancellation never bypasses the quiet gate for server work, background

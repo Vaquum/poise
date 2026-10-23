@@ -743,15 +743,17 @@ export class ChatRuntime extends EventEmitter {
     return running
   }
 
-  /** Keep each interrupted turn once. The current turn resumes before
-   *  earlier requests whose recovery the person had held with Stop. */
+  /** Keep the current interruption and each earlier unsent request once.
+   *  A native session needs only its latest generic continuation. */
   recordSwitchInterrupted(sessions: Array<Omit<InterruptedSession, 'at'>>): void {
     if (sessions.length === 0) return
     const at = new Date().toISOString()
     const fresh = new Set(sessions.map(session => `${session.sessionId}:${session.turnId}`))
+    const current = new Set(sessions.map(session => session.sessionId))
     this.writeInterruptedSessions([
       ...sessions.map(session => ({ ...session, at })),
-      ...this.readInterruptedSessions().filter(row => !fresh.has(`${row.sessionId}:${row.turnId}`)),
+      ...this.readInterruptedSessions().filter(row => !fresh.has(`${row.sessionId}:${row.turnId}`)
+        && (!current.has(row.sessionId) || row.prompt)),
     ])
   }
 

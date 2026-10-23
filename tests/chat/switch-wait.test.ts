@@ -719,11 +719,12 @@ describe('the switch bound', () => {
     }
   })
 
-  it('retains earlier unsent recovery when a second update interrupts the person-resumed turn', async () => {
+  it.each(['unsent request', 'superseded continuation'] as const)('preserves pending recovery across a second update: %s', async earlier => {
     const w = await world({ auto: false })
     await tickControl(w.runtime)
     const earlierTurn = randomUUID()
-    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: earlierTurn, prompt: input('Earlier never-sent request') }])
+    const earlierPrompt = earlier === 'unsent request' ? input('Earlier never-sent request') : undefined
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: earlierTurn, ...(earlierPrompt ? { prompt: earlierPrompt } : {}) }])
     inbox.holdChat(w.instance, w.s.id, 'stopped', Date.now())
     await w.runtime.releaseSwitchWait()
     const resumed = w.runtime.prompt(w.s.id, input('Person resumes'))
@@ -752,7 +753,7 @@ describe('the switch bound', () => {
       w.runtime.recordSwitchInterrupted(targets)
       expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([
         expect.objectContaining({ sessionId: w.s.id, turnId: resumed.turnId }),
-        expect.objectContaining({ sessionId: w.s.id, turnId: earlierTurn, prompt: input('Earlier never-sent request') }),
+        ...(earlierPrompt ? [expect.objectContaining({ sessionId: w.s.id, turnId: earlierTurn, prompt: earlierPrompt })] : []),
       ])
       await w.runtime.stop()
       const next = w.make()
@@ -762,15 +763,16 @@ describe('the switch bound', () => {
         'Person resumes', 'Poise restarted for an update while your turn was running. Continue where you left off.',
       ])
       expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([
-        expect.objectContaining({ turnId: earlierTurn, prompt: input('Earlier never-sent request') }),
+        ...(earlierPrompt ? [expect.objectContaining({ turnId: earlierTurn, prompt: earlierPrompt })] : []),
       ])
       w.c.auto = true
       w.finish()
-      await until(() => next.get(w.s.id)?.status === 'idle' && w.c.calls.length === 4)
-      expect(w.c.calls.map(call => call.input.text)).toEqual([
+      const expected = [
         'Person resumes', 'Poise restarted for an update while your turn was running. Continue where you left off.',
-        'Earlier never-sent request', 'Normal queued follow-up',
-      ])
+        ...(earlierPrompt ? [earlierPrompt.text] : []), 'Normal queued follow-up',
+      ]
+      await until(() => next.get(w.s.id)?.status === 'idle' && w.c.calls.length === expected.length)
+      expect(w.c.calls.map(call => call.input.text)).toEqual(expected)
       expect(JSON.parse(database.getMeta('chat_switch_interrupted') ?? '[]')).toEqual([])
     } finally { service.reset() }
   })
