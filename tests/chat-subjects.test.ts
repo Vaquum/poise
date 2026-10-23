@@ -412,6 +412,68 @@ describe('one session per subject', () => {
     } finally { release(); await handoffRuntime.stop() }
   }, 180_000)
 
+  it('prepares a deferred source branch without starting its original provider', async () => {
+    let sourceStarts = 0
+    const store = await import('../server/chat/control-store')
+    const owned = 'https://github.com/acme/app/pull/540'
+    const handoffRuntime = makeRuntime({ adapters: {
+      grok: host => { sourceStarts += 1; return adapter(host) }, codex: adapter,
+    } })
+    try {
+      const source = await handoffRuntime.create({ agent: 'grok', model: 'grok-4.6-xhigh', deferStart: true })
+      expect(source.branch.baseSha).toBeUndefined()
+      store.bindWork(instance, source.id, owned)
+      const target = await handoffRuntime.handoff(source.id, { agent: 'codex', model: 'gpt-6-astra-ultra' })
+      await until(() => finishes.has(target.id), 'the deferred-source handoff summary')
+      expect(storage.getSession(source.id)?.branch.baseSha).toBeTruthy()
+      expect(sourceStarts).toBe(0)
+      expect(store.bindings(instance).find(binding => binding.target === owned)?.session).toBe(target.id)
+      finishes.get(target.id)?.({ stopReason: 'end_turn' })
+      await until(() => !storage.getOpenTurn(target.id), 'the deferred-source summary to settle')
+    } finally { await handoffRuntime.stop() }
+  }, 180_000)
+
+  it.each(['prompt', 'close'] as const)('refuses handoff if %s invalidates the source during target model lookup', async action => {
+    let release!: () => void
+    let held = false
+    let entered = false
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const store = await import('../server/chat/control-store')
+    const owned = 'https://github.com/acme/app/pull/541'
+    const handoffRuntime = makeRuntime({ catalog: async () => {
+      if (held) { entered = true; await gate }
+      return CATALOG
+    } })
+    let closing: Promise<unknown> | undefined
+    try {
+      const { session: source } = await handoffRuntime.createForSubject({ agent: 'grok', model: 'grok-4.6-xhigh', subject: card() })
+      await until(() => handoffRuntime.get(source.id)?.status === 'idle', 'the source before target lookup')
+      store.bindWork(instance, source.id, owned)
+      held = true
+      const refused = expect(handoffRuntime.handoff(source.id, { agent: 'codex', model: 'gpt-6-astra-ultra' }))
+        .rejects.toMatchObject({ statusCode: 409, code: action === 'prompt' ? 'turn_in_progress' : 'agent_error' })
+      await until(() => entered, 'the held target catalog')
+      if (action === 'prompt') {
+        expect(handoffRuntime.prompt(source.id, { text: 'arrived during target lookup', attachments: [], mentions: [] }).turnId).toBeTruthy()
+      } else closing = handoffRuntime.close(source.id)
+      held = false
+      release()
+      await refused
+      await closing
+      expect(storage.listSessions(instance).map(session => session.id)).toEqual([source.id])
+      expect(storage.sessionForSubject(instance, 'current', card().key)).toBe(source.id)
+      if (action === 'prompt') {
+        expect(store.bindings(instance).find(binding => binding.target === owned)?.session).toBe(source.id)
+        await until(() => finishes.has(source.id), 'the admitted source turn')
+        finishes.get(source.id)?.({ stopReason: 'end_turn' })
+        await until(() => !storage.getOpenTurn(source.id), 'the admitted source turn to settle')
+      } else {
+        expect(handoffRuntime.get(source.id)?.status).toBe('closed')
+        expect(store.bindings(instance)).toHaveLength(0)
+      }
+    } finally { held = false; release(); await handoffRuntime.stop() }
+  }, 180_000)
+
   it('frees the subject when its session is deleted', async () => {
     const first = await runtime.createForSubject({ agent: 'grok', model: 'grok-4.6-xhigh', subject: card() })
     expect(first.existing).toBe(false)

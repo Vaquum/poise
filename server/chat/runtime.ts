@@ -918,7 +918,7 @@ export class ChatRuntime extends EventEmitter {
     this.emit_(sessionId, { type: 'edit.decided', turnId: request.turnId, messageId: request.messageId, index: request.index, decision: request.decision })
   }
 
-  private async createSession(request: NewSessionRequest, isolated = false, createdBy?: ChatActor): Promise<SessionRecord> {
+  private async createSession(request: NewSessionRequest, isolated = false, createdBy?: ChatActor, beforeInsert?: () => void): Promise<SessionRecord> {
     if (this.stopped) throw new ChatError(503, 'the chat runtime is stopping', 'agent_error')
     if (request.deferStart !== undefined && typeof request.deferStart !== 'boolean') throw new ChatError(400, 'deferStart must be a boolean', 'invalid')
     if (request.safeMode !== undefined && typeof request.safeMode !== 'boolean') throw new ChatError(400, 'safeMode must be a boolean', 'invalid')
@@ -971,6 +971,9 @@ export class ChatRuntime extends EventEmitter {
       ...(request.role === 'manager' ? { role: 'manager' as const } : {}),
       ...(createdBy ? { createdBy } : {}),
     }
+    // Callers can guard admission after asynchronous model/auth preparation;
+    // no await may separate that guard from the durable insert.
+    beforeInsert?.()
     try {
       storage.insertSession(record)
     } catch (error) {
@@ -1389,12 +1392,28 @@ export class ChatRuntime extends EventEmitter {
         if (source.turn) throw new ChatError(409, 'a turn is running; hand off after it finishes', 'turn_in_progress')
       }
       assertSourceAvailable()
-      if (!(await branchExists(source.record.checkout, source.record.branch.name))) {
+      let branchReady = await branchExists(source.record.checkout, source.record.branch.name)
+      // Deferred chats have never run a provider. Prepare only their branch,
+      // using the existing lease and branch path, before starting the target.
+      if (!branchReady && source.record.status === 'idle' && source.record.branch.origin === 'new'
+        && source.record.branch.provisional && !source.record.branch.baseSha && !source.record.nativeSessionId) {
+        const lease = await this.leaseForStartup(source, source.lifecycle.signal)
+        try {
+          await lease.acquire({ signal: source.lifecycle.signal, onBusy: busy => this.reportBusy(source, busy) })
+          assertSourceAvailable()
+          branchReady = await branchExists(source.record.checkout, source.record.branch.name)
+          if (!branchReady) { await this.prepareBranch(source, lease); branchReady = true }
+        } catch (error) { assertSourceAvailable(); throw error }
+        finally { if (lease.held) lease.release() }
+        assertSourceAvailable()
+        this.setStatus(source, 'idle')
+      }
+      if (!branchReady) {
         throw new ChatError(409, `source branch ${source.record.branch.name} does not exist; finish or repair source startup before handing off`, 'agent_error')
       }
       assertSourceAvailable()
       const summary = this.handoffSummary(source.record)
-      const created = await this.create({
+      const created = await this.track(() => this.createSession({
         agent: target.agent,
         model: target.model,
         effort: target.effort,
@@ -1405,7 +1424,7 @@ export class ChatRuntime extends EventEmitter {
         autoMerge: source.record.autoMerge,
         safeMode: source.record.safeMode === true,
         context: { kind: 'handoff', title: source.record.title, body: summary, fromSession: source.record.id },
-      })
+      }, false, undefined, assertSourceAvailable))
       const live = this.requireLive(created.id)
       // The conversation continues in the target: its work bindings move with
       // it, so the next monitor tick wakes the target, never the source.
