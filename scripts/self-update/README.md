@@ -96,9 +96,18 @@ Merging: the controller verifies the repository identity, current PR head and
 base, and the successful `.github/workflows/ci.yml` aggregate `Verify (Node 22)` on
 that exact head. It does not require administrators to configure branch
 protection; any GitHub restrictions already in force remain effective and
-are never bypassed. The expected merge parents are journaled before the
-remote write. `PUT …/merge` pins the head and uses a merge commit; the returned
-commit must have exactly `[main, head]` as parents and the tested head's tree.
+are never bypassed. When GitHub enables a native merge queue, the controller
+journals the pinned head and current base before enqueueing with
+`expectedHeadOid`. It remains in `merging` until GitHub reports the PR actually
+merged; queue acceptance alone never permits deployment. The queue must use
+`MERGE`, preserving the source rollback contract. The integration commit must
+have the pinned head as its second parent, retain the recorded base through its
+first parent, be reachable from live main, and pass the trusted `merge_group`
+workflow aggregate on its exact SHA. This allows tested integration with newer
+main changes without requiring the PR's old tree or old base as a direct parent.
+An acknowledged entry removed without merging fails visibly.
+With the queue disabled, expected parents are journaled before `PUT …/merge`,
+which still requires exactly `[main, head]` and the tested head's tree.
 Uncertain outcomes are re-observed, not blindly repeated. A mismatch blocks
 promotion, and a human merge is not misrepresented as a controller merge.
 

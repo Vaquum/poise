@@ -165,6 +165,25 @@ export function fakeGitHub(model, git) {
       if (!pull) throw new GitHubError('Not Found', { status: 404, code: 'http' })
       return { ...pull, head: { ...pull.head, sha: model.prHeadOverride ?? pull.head.sha } }
     },
+    async getMergeQueue(number) {
+      return {
+        enabled: model.queueEnabled ?? false, mergeMethod: model.queueMethod ?? 'MERGE',
+        pullRequestId: `PR_${number}`, headSha: model.prHeadOverride ?? pulls[number].head.sha,
+        merged: pulls[number].merged, state: pulls[number].merged ? 'MERGED' : pulls[number].state.toUpperCase(),
+        entry: model.queueEntries?.[number] ?? null,
+      }
+    },
+    async enqueuePullRequest(id, { sha }) {
+      log.push(['enqueue', id, sha])
+      model.queueEntries ??= {}
+      const entry = { id: `QUEUE_${id}`, state: 'QUEUED' }
+      model.queueEntries[Number(id.slice(3))] = entry
+      if (model.enqueueUncertain) {
+        model.enqueueUncertain = false
+        throw network('timeout after enqueue')
+      }
+      return entry
+    },
     async listCheckRuns(sha) {
       const status = ciFor(sha)
       if (status === 'none') return []

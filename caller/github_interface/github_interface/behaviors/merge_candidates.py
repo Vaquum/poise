@@ -8,6 +8,7 @@ REQUIRE_TOKEN_USER = True
 MAX_CANDIDATES = 50
 FIELDS = """
   number state isDraft headRefOid mergeable mergeStateStatus
+  reviewDecision mergeQueue { id } mergeQueueEntry { id }
   author { login }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
   reviews(first: 100) {
