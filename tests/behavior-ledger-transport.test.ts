@@ -384,6 +384,32 @@ describe('bounded behavior ledger transport', () => {
     expect(after.pending).toBeLessThan(held.pending)
   })
 
+  it('closes on the worker when a stop outlasts the drain budget', async () => {
+    // Ten captures at 400ms each can never drain inside the two-second stop
+    // budget, so close must be shed forward and dispatched instead of the
+    // worker being terminated with the queue still full.
+    const observer = await fixture(`
+      import { appendFileSync } from 'node:fs';
+      const order=new URL('./order',import.meta.url);
+      port.postMessage({ready:true,health,pending:[]});
+      port.on('message',request=>{
+        appendFileSync(order,(request.operation==='capture'?'capture':request.operation)+'\\n');
+        const reply=()=>port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});
+        if(request.operation==='capture') setTimeout(reply,400);
+        else reply();
+      });`)
+    for (let index = 0; index < 10; index++) {
+      observer.capture({ ...admission, admissionKey: `slow-${index}`, nativeId: `slow-${index}` })
+    }
+    await observer.stop()
+    // The stop budget bounds the caller, not the worker: close still lands
+    // on the worker after the active capture settles.
+    await vi.waitFor(async () => {
+      const order = (await readFile(join(directories.at(-1)!, 'order'), 'utf8')).trim().split('\n')
+      expect(order.at(-1)).toBe('close')
+    }, { timeout: 5000, interval: 50 })
+  })
+
   it('holds captures through a storage outage and recovers to ok with the list answering', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-outage-'))
     directories.push(directory)

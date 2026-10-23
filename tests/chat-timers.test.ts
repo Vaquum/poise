@@ -837,6 +837,8 @@ describe('durable timers that wake chats', () => {
       expect(store.timerForTurn(instance, turnId)?.id).toBe(created.id)
       finishes.get(p.id)!({ stopReason: kind === 'once' ? 'end_turn' : 'error', ...(kind === 'every' ? { error: 'Long turn failed' } : {}) })
       await until(() => runtime.get(p.id)?.status === 'idle')
+      // A competing tick while paused must leave retention alone.
+      await control.tick()
       expect(store.timerById(instance, created.id)).toMatchObject(kind === 'once' ? { state: 'done', reason: 'completed' } : { state: 'active', failures: 1 })
       if (kind === 'every') expect(store.retainTimers(instance, clock).rows).toBe(1)
     } finally { resumeReleaseBackground() }

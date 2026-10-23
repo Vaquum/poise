@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import type { ChatRuntime } from '../server/chat/runtime'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, recordCompletedInitialReview, launchApprovalBeforeCrash, agentLog, fixture, type ReviewActivityFixture } from './behaviors-runtime-fixture'
 
 describe('approval eligibility and review activity', () => {
@@ -25,6 +28,42 @@ describe('approval eligibility and review activity', () => {
       `${pr.repo}#17@req=2026-07-10T10:00:00Z/r=1/head=${NEXT_HEAD_SHA}`)).toBe(true)
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
     expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--approve-pr')).toBe(false)
+  })
+
+  it('starts a behavior launch normally with a release switch pending', async () => {
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA }, {
+      commits_after_request: 0,
+      author_commits_after_request: 0,
+      author_pr_comments_after_request: 1,
+    })
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    // A pending Poise update waits Chat turns only; the scheduler keeps launching.
+    const { ServiceControl } = await import('../server/service/control')
+    const releasesDir = join(fixture.tempRoot, 'releases')
+    await mkdir(join(releasesDir, 'r2'), { recursive: true })
+    await writeFile(join(releasesDir, 'r2', 'base'), 'b1\n')
+    await writeFile(join(releasesDir, 'r2', 'installed'), '')
+    const chat = { instance: 'behavior-switch-test', setSwitchPending: () => {}, endDrain: () => {} } as unknown as ChatRuntime
+    const service = new ServiceControl(chat, {
+      drainTimeoutSeconds: 60, timer: { setTimeout: () => 0, clearTimeout: () => {} },
+      log: () => {}, releasesDir, release: { name: 'r1', base: 'b1' }, restart: () => true, canRestart: () => true,
+    })
+    service.switchRelease('r2')
+    try {
+      runtime.startBehaviorsRuntime()
+      db.setMeta('me', 'poise-user')
+      db.setMeta('behavior_approve_prs_enabled', '1')
+
+      await runtime.runEnabledBehaviorsOnce()
+
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining([
+        '--pr-approve', '#17', '--expected-head', NEXT_HEAD_SHA,
+      ]))
+    } finally {
+      service.reset()
+    }
   })
 
   it('waits for a response when the latest change request has no author engagement', async () => {
