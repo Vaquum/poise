@@ -3497,15 +3497,15 @@ export class ChatRuntime extends EventEmitter {
 
   private trackRelayExit(session: LiveSession, peer: RelayConnection): void {
     const worker = storage.getWorker(session.record.id)
-    // A detach exit (no code, no signal) is the link dying, not the agent:
-    // the rows stay for the server that adopts the relay.
+    // An adopted socket can close before the dying relay PID disappears,
+    // reporting null codes like a detach. Ownership, not codes, guards handoff.
     peer.once('exit', (code, signal) => {
-      if (code === null && signal === null) return
       const settle = () => {
         if (this.stopped || session.relayDetached || session.relay !== peer || this.live.get(session.record.id) !== session) return
         // The separate gate can outlive the relay. Observe its eventual exit
         // without giving up ownership, and never erase a successor's rows.
-        if (pgidAlive(peer.gatePgid) || pidAlive(peer.gatePid)) {
+        if ((code === null && signal === null && pidAlive(peer.relayPid))
+          || pgidAlive(peer.gatePgid) || pidAlive(peer.gatePid)) {
           setTimeout(settle, 25).unref()
           return
         }
