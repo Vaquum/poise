@@ -1,6 +1,6 @@
 import { parentPort, workerData } from 'node:worker_threads'
 import { BehaviorLedgerStore } from './behavior-ledger-store'
-import { LEDGER_RESPONSE_BYTES, type LedgerPending, type LedgerReply, type LedgerWorkerData, type LedgerWorkerReply, type LedgerWorkerRequest, type LedgerWorkerTiming } from './behavior-ledger-contract'
+import { LEDGER_RESPONSE_BYTES, LedgerError, type LedgerPending, type LedgerReply, type LedgerWorkerData, type LedgerWorkerReply, type LedgerWorkerRequest, type LedgerWorkerTiming } from './behavior-ledger-contract'
 
 export function executeLedgerRequest(store: BehaviorLedgerStore, request: LedgerWorkerRequest): LedgerWorkerReply {
   const startedAt = performance.now()
@@ -35,8 +35,11 @@ export function executeLedgerRequest(store: BehaviorLedgerStore, request: Ledger
     } else if (request.operation === 'close') store.close()
     else if (request.operation !== 'pending') throw new Error('Unknown ledger operation')
     return reply({ status: 200, body: { version: 1, health: store.health() } })
-  } catch {
-    return reply({ status: 503, body: { version: 1, health: store.health(), error: 'ledger_unavailable' } })
+  } catch (error) {
+    // Poison carries its 4xx rejection so the observer sheds it; anything
+    // else is storage-side and held for retry.
+    const failure = error instanceof LedgerError ? error : new LedgerError(503, 'ledger_unavailable')
+    return reply({ status: failure.status, body: { version: 1, health: store.health(), error: failure.code } })
   }
 }
 

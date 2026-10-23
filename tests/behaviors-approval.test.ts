@@ -342,6 +342,7 @@ describe('approval eligibility and review activity', () => {
       status: 'open',
       author: 'poise-user',
       draft: 0,
+      updated_at: '2026-07-15T12:00:00Z',
     }
     fixture.listedPrs = [pr, secondPr]
     arrangeCli(false)
@@ -445,6 +446,8 @@ describe('approval eligibility and review activity', () => {
 
     activity.activeChangeRequestAuthors = []
     activity.latestActivityAt = '2026-07-15T12:00:00.000Z'
+    // The dismissal is a new review, so the datastore row moves too.
+    fixture.listedPrs = [{ ...pr, updated_at: '2026-07-15T12:00:01Z' }]
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
   })
@@ -467,16 +470,20 @@ describe('approval eligibility and review activity', () => {
     db.clearSeen('approve-prs')
     db.clearSeen('pr-operation')
 
+    // Each transition below moves the datastore row, as on GitHub.
     activity.draft = true
+    fixture.listedPrs = [{ ...pr, updated_at: '2026-07-15T12:00:01Z' }]
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
 
     activity.draft = false
     activity.state = 'CLOSED'
+    fixture.listedPrs = [{ ...pr, updated_at: '2026-07-15T12:00:02Z' }]
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
 
     activity.state = 'OPEN'
+    fixture.listedPrs = [{ ...pr, updated_at: '2026-07-15T12:00:03Z' }]
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
   })
@@ -697,6 +704,8 @@ describe('approval eligibility and review activity', () => {
     const head = variant === 'new-head' ? 'e'.repeat(40) : HEAD_SHA
     arrangeCli(false, false, { headSha: head, reviewerLatestState: 'DISMISSED',
       latestActivityAt: new Date().toISOString() }, { reviewer_latest_state: 'DISMISSED' })
+    // The dismissal review (and the push behind a new head) moves the datastore row.
+    fixture.listedPrs = [{ ...pr, updated_at: '2026-07-15T12:00:01Z' }]
     const abortPreparation = ['head-model-rollback', 'head-reviewer-change', 'head-preparation-failure'].includes(variant)
     let interrupted = false
     if (abortPreparation) {

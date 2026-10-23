@@ -67,6 +67,7 @@ const pr = {
   status: 'open',
   author: 'poise-user',
   draft: 0,
+  updated_at: '2026-07-15T12:00:00Z',
 }
 const HEAD_SHA = 'a'.repeat(40)
 const NEXT_HEAD_SHA = 'd'.repeat(40)

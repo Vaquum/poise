@@ -14,7 +14,7 @@ behaviors:
   --pr-review PR [--p p2] --expected-head SHA --token-user USER
   --approve-pr PR --expected-head SHA --token-user USER
   --head-sha PR --token-user USER
-  --list-failing-ci PR
+  --list-failing-ci PR [--repository OWNER/REPO]
   --read-failing-ci-log LOG_ID
   --checkout-pr-head PR
   --commit-work PR --message MESSAGE
@@ -255,6 +255,11 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior == "--head-sha":
         parser = argparse.ArgumentParser(prog="github-interface --head-sha PR")
+        return parser
+
+    if behavior == "--list-failing-ci":
+        parser = argparse.ArgumentParser(prog="github-interface --list-failing-ci PR")
+        _add_repository(parser)
         return parser
 
     if behavior == "--current-pr":

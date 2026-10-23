@@ -1,7 +1,6 @@
-import asyncio
 from typing import Any
 
-from github_interface.atoms.pulls import get_pr_readiness_state, get_pull
+from github_interface.atoms.pulls import get_pr_readiness_state
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository
@@ -63,19 +62,34 @@ def readiness_behind(readiness: dict[str, Any]) -> str | None:
     return "behind"
 
 
+# GraphQL mergeable values mapped to the REST get_pull tri-state the response
+# shape keeps: True while mergeable, False on conflict, None while GitHub is
+# still computing (Poise shows that as no colour until the next refresh).
+_MERGEABLE = {"MERGEABLE": True, "CONFLICTING": False, "UNKNOWN": None}
+
+
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     owner, repo = repository(payload)
     pull_number = parse_pull_number(payload)
 
-    pull = {}
-    for _ in range(3):
-        pull = await get_pull(client, owner, repo, pull_number)
-        if pull.get("mergeable") is not None and pull.get("mergeable_state") != "unknown":
-            break
-        await asyncio.sleep(1)
-
-    green = pull.get("state") == "open" and not pull.get("draft") and pull.get("mergeable") is True and pull.get("mergeable_state") == "clean"
+    # No REST: the readiness packet already carries mergeability, so the
+    # get_pull loop only re-fetched it at 1-3 core calls per refresh (#488).
     readiness = await get_pr_readiness_state(client, owner, repo, pull_number)
+    try:
+        github_mergeable = _MERGEABLE[readiness["mergeable"]]
+    except KeyError as error:
+        raise RuntimeError(f"GitHub returned unknown mergeable value: {readiness.get('mergeable')!r}") from error
+    state = str(readiness.get("state") or "").lower()
+    if state == "merged":
+        state = "closed"
+    pull = {
+        "state": state,
+        "draft": bool(readiness.get("isDraft")),
+        "mergeable": github_mergeable,
+        "mergeable_state": str(readiness.get("mergeStateStatus") or "").lower(),
+    }
+
+    green = pull["state"] == "open" and not pull["draft"] and pull["mergeable"] is True and pull["mergeable_state"] == "clean"
     commit = (((readiness.get("commits") or {}).get("nodes") or [{}])[0].get("commit") or {})
     checks_state = (commit.get("statusCheckRollup") or {}).get("state")
     threads = readiness["reviewThreads"]
@@ -86,10 +100,10 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "repository": f"{owner}/{repo}",
         "pull_number": pull_number,
         "mergeable": green,
-        "github_mergeable": pull.get("mergeable"),
-        "github_mergeable_state": pull.get("mergeable_state"),
-        "state": pull.get("state"),
-        "draft": pull.get("draft"),
+        "github_mergeable": pull["mergeable"],
+        "github_mergeable_state": pull["mergeable_state"],
+        "state": pull["state"],
+        "draft": pull["draft"],
         "checks_state": checks_state,
         "unresolved_conversations": unresolved,
         "status": status(pull, checks_state, unresolved, all_threads_read),

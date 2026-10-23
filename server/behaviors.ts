@@ -835,6 +835,7 @@ export interface PullRequestFacts {
   status: string
   draft: boolean
   author: string
+  updated_at: string
 }
 
 // Whose pull requests a PR behavior acts on and where it is skipped, read once
@@ -1816,15 +1817,17 @@ function datastorePr(row: unknown, index: number): DatastorePr {
   const author = String(value.author || '')
   const draft = safeInteger(value.draft, `github-datastore PR row ${index} draft`)
   const status = String(value.status || '')
+  const updatedAt = String(value.updated_at || '')
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)
     || number < 1
     || draft > 1
     || !['open', 'closed', 'merged'].includes(status)
     || !author
+    || !Number.isFinite(Date.parse(updatedAt))
     || url !== `https://github.com/${repo}/pull/${number}`) {
     throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
   }
-  return { repo, number, url, draft: draft === 1, author, status }
+  return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt }
 }
 
 async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
@@ -3239,6 +3242,55 @@ interface ApproveLaunch {
   admittedReviewer: string | undefined
 }
 
+// The approve-prs change gate (#488): --requested-changes-addressed costs
+// 2-5 core REST calls per PR per tick, which exhausts the bot's hourly
+// quota. A push, review, reply or comment moves the datastore's updated_at,
+// so a terminal no-op decision stays valid while updated_at and the local
+// inputs it consumed are unchanged. The ceiling bounds inputs the gate
+// cannot see, such as a thread resolution that leaves updated_at alone.
+const APPROVE_CHECK_CEILING_MS = 20 * 60_000
+
+interface ApproveCheckSnapshot {
+  reviewer: string
+  basis: string | null
+  dismissed: string | null
+  packet: string | null
+}
+
+function approveCheckSnapshot(repo: string, number: number, reviewer: string): ApproveCheckSnapshot {
+  return {
+    reviewer,
+    basis: latestApprovalBasisLaunch(repo, number)?.callId ?? null,
+    dismissed: latestCompletedChangeRequestLaunch(repo, number, reviewer)?.callId ?? null,
+    packet: getMeta(packetBlockKey('approve-prs', repo, number)) || null,
+  }
+}
+
+function approveCheckGateKey(pr: DatastorePr): string {
+  return `${META_PREFIX}approve_prs_check:${pr.repo}#${pr.number}`
+}
+
+function approveCheckFresh(pr: DatastorePr, snapshot: ApproveCheckSnapshot): boolean {
+  const raw = getMeta(approveCheckGateKey(pr))
+  if (!raw) return false
+  try {
+    const watermark = JSON.parse(raw) as Partial<ApproveCheckSnapshot & { updated_at: unknown, at: unknown }>
+    return typeof watermark.updated_at === 'string' && watermark.updated_at === pr.updated_at
+      && typeof watermark.at === 'number' && Number.isFinite(watermark.at)
+      && Date.now() - watermark.at < APPROVE_CHECK_CEILING_MS
+      && watermark.reviewer === snapshot.reviewer
+      && (watermark.basis ?? null) === snapshot.basis
+      && (watermark.dismissed ?? null) === snapshot.dismissed
+      && (watermark.packet ?? null) === snapshot.packet
+  } catch {
+    return false
+  }
+}
+
+function recordApproveCheck(pr: DatastorePr, snapshot: ApproveCheckSnapshot): void {
+  setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() }))
+}
+
 async function tickApprovePrs(): Promise<void> {
   if (!isEnabled('approve-prs')) return
   const author = getMeta('me') || ''
@@ -3251,12 +3303,39 @@ async function tickApprovePrs(): Promise<void> {
     // Backed-off PRs don't spend batch capacity, and the cursor rotates
     // coverage so a sweep cut short by its deadline resumes beyond the
     // blocked batch.
-    const stage1 = orderByCursor(prs, 'behavior_approve_prs_cursor').filter((pr) =>
+    const candidates = orderByCursor(prs, 'behavior_approve_prs_cursor').filter((pr) =>
       !invalidPrResultHeld(pr.repo, pr.number)
       && behaviorRetryDue('approve-prs', `${pr.repo}#${pr.number}:check`))
+    // The change gate parks terminal no-ops while the datastore row and
+    // the local inputs are unchanged. Snapshots are taken up front so a
+    // review completing mid-sweep invalidates the watermark instead of
+    // being parked under inputs the check never saw.
+    const snapshots = new Map(candidates.map((pr) => [
+      `${pr.repo}#${pr.number}`,
+      approveCheckSnapshot(pr.repo, pr.number, reviewer),
+    ] as const))
+    // A held failure retries on its own clock even when nothing changed,
+    // and an in-flight launch settles into the snapshot's local inputs:
+    // only skip once nothing for the PR is still in flight, so a
+    // completing review can never be gated out by a snapshot taken a
+    // moment early.
+    const stage1 = candidates.filter((pr) => {
+      const key: `${string}#${number}` = `${pr.repo}#${pr.number}`
+      return readBehaviorFailure('approve-prs', `${key}:check`) !== null
+        || hasActiveAgentLaunchForPr(pr.repo, pr.number)
+        || !approveCheckFresh(pr, snapshots.get(key)!)
+    })
     let failure: unknown
     const clearCheck = (checkTarget: string) => {
       if (!behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget)
+    }
+    // A terminal no-op parks the PR: a launch, a deferral (busy PR,
+    // active launch, held claim) or an error never does, so the next
+    // tick checks it again.
+    const parkCheck = (pr: DatastorePr) => {
+      if (behaviorAborted()) return
+      clearBehaviorFailure('approve-prs', `${pr.repo}#${pr.number}:check`)
+      recordApproveCheck(pr, snapshots.get(`${pr.repo}#${pr.number}`)!)
     }
     for (let offset = 0; offset < stage1.length; offset += PR_READ_BATCH_SIZE) {
       if (!isEnabled('approve-prs') || behaviorAborted()) return
@@ -3286,7 +3365,7 @@ async function tickApprovePrs(): Promise<void> {
         try {
           const check = result!
           if (await packetBlocked('approve-prs', pr.repo, pr.number, check.headSha)) {
-            clearCheck(checkTarget)
+            parkCheck(pr)
             continue
           }
           const cleanReview = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number)
@@ -3295,7 +3374,7 @@ async function tickApprovePrs(): Promise<void> {
             dismissedReview = check.reviewerLatestState === 'DISMISSED'
               ? latestCompletedChangeRequestLaunch(pr.repo, pr.number, reviewer) : null
             if (!dismissedReview) {
-              clearCheck(checkTarget)
+              parkCheck(pr)
               continue
             }
           }
@@ -3315,14 +3394,14 @@ async function tickApprovePrs(): Promise<void> {
           // evidence to that request's findings, including reaffirmations.
           if (check.hasChangeRequest) {
             if (check.responseCount < 1 || check.latestRequestAt === null) {
-              clearCheck(checkTarget)
+              parkCheck(pr)
               continue
             }
             checks.push({ pr, check, since: check.latestRequestAt, clean: false, review: null, admittedReviewer: undefined })
           } else {
             const review = cleanReview ?? dismissedReview
             if (!review) {
-              clearCheck(checkTarget)
+              parkCheck(pr)
               continue
             }
             checks.push({ pr, check, since: review.completedAt, clean: cleanReview !== null, review,
@@ -3373,7 +3452,7 @@ async function tickApprovePrs(): Promise<void> {
                 || activity.unresolvedLiveConversationAuthors.some(
                   (author) => author.toLowerCase() !== reviewer.toLowerCase(),
                 )) {
-                clearCheck(checkTarget)
+                parkCheck(pr)
                 continue
               }
               launches.push({ pr, expectedHead: check.headSha,
@@ -3384,7 +3463,7 @@ async function tickApprovePrs(): Promise<void> {
               const review = request.review!
               if (!request.clean && (activity.reviewerLatestState !== 'DISMISSED'
                 || activity.headSha !== check.headSha || activity.headSha === review.headSha)) {
-                clearCheck(checkTarget)
+                parkCheck(pr)
                 continue
               }
               const reapprovalOwnsEveryUnresolvedConversation =
@@ -3402,7 +3481,7 @@ async function tickApprovePrs(): Promise<void> {
                   && !reapprovalOwnsEveryUnresolvedConversation)
                 || (activity.reviewerLatestState === 'APPROVED'
                   && activity.reviewerLatestCommit === activity.headSha)) {
-                clearCheck(checkTarget)
+                parkCheck(pr)
                 continue
               }
               if (activity.headSha !== review.headSha && activity.latestActivityAt === null) {
@@ -3689,6 +3768,15 @@ async function tickResolveUnblocking(): Promise<void> {
         }
         const activity = result!
         if (activity.state !== 'OPEN' || activity.draft || activity.unresolvedConversationCount === 0) {
+          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
+          continue
+        }
+        // The resolve CLI re-verifies this gate itself and costs 3 core
+        // REST calls plus a head lookup per run: skip the doomed call when
+        // the approval blockers already fail on the activity in hand (#488).
+        if (activity.reviewerLatestState !== 'APPROVED'
+          || activity.reviewerLatestCommit !== activity.headSha
+          || activity.activeChangeRequestAuthors.length > 0) {
           if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
           continue
         }

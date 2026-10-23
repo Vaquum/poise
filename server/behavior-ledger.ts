@@ -4,7 +4,6 @@ import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { AgentLogSnapshot, LogEntry } from './agent'
-import { LEDGER_STALE_MS } from './behavior-ledger-contract'
 import type {
   LedgerAdmission, LedgerCaller, LedgerHealth, LedgerObservation, LedgerPending, LedgerPolicy,
   LedgerRead, LedgerReadReply, LedgerReadTiming, LedgerReply, LedgerResult, LedgerWorkerReply, LedgerWorkerRequest,
@@ -18,7 +17,7 @@ interface Options {
   captureBytes?: number
   readLimit?: number
   readTimeoutMs?: number
-  callerRefreshMs?: number
+  stallTimeoutMs?: number
 }
 interface Job {
   id: number
@@ -32,10 +31,11 @@ interface Job {
   dispatchedAt?: number
 }
 const emptyHealth = (): LedgerHealth => ({
-  status: 'unavailable', coverageStart: null, observedAt: null, callerObservedAt: null,
+  status: 'unavailable', unavailableReason: null, coverageStart: null, observedAt: null, callerObservedAt: null,
   pending: 0, dropped: 0, gaps: [], generation: null, retainedFrom: null,
   changeLowerBound: null, lastSequence: null, instances: null, changes: null,
 })
+const CAPTURE_RETRY_MS = 250
 
 /** Capture never awaits or performs filesystem/SQLite work on the behavior thread. */
 export class BehaviorLedgerObserver {
@@ -53,10 +53,12 @@ export class BehaviorLedgerObserver {
   private captureBytes = 0
   private reads = 0
   private unreportedLoss = 0
+  private retryAt = 0
+  private retryTimer?: ReturnType<typeof setTimeout>
   private health = emptyHealth()
   private pending = new Map<string, string | null>()
   private admitted = new Map<string, string | null>()
-  private callerProjections = new Map<string, { projection: string; sentAt: number }>()
+  private callerProjections = new Map<string, string>()
   private developmentDirectory: string | null = null
 
   constructor(private readonly options: Options = {}) {}
@@ -129,28 +131,47 @@ export class BehaviorLedgerObserver {
       if (this.closed || this.stopping) return
       const serialized = JSON.stringify(observation)
       const bytes = Buffer.byteLength(serialized)
-      if (bytes > 4_096 || this.failed || this.captures >= (this.options.captureLimit ?? 1_000)
-        || this.captureBytes + bytes > (this.options.captureBytes ?? 2 * 1024 * 1024)) {
+      if (bytes > 4_096 || this.failed) { this.lose(1); return }
+      const captured = JSON.parse(serialized) as LedgerObservation
+      // Overflow waits for the drain while the worker makes progress and
+      // spills only once captures sit undrained past the stall budget.
+      if ((this.captures >= (this.options.captureLimit ?? 1_000)
+        || this.captureBytes + bytes > (this.options.captureBytes ?? 2 * 1024 * 1024))
+        && (!this.ready || this.stalled())) {
         this.lose(1)
         return
       }
-      const captured = JSON.parse(serialized) as LedgerObservation
       this.captures++
       this.captureBytes += bytes
       if (captured.type === 'admit' && ['review-new-prs', 'approve-prs', 'review-new-issues'].includes(captured.behavior)) {
         this.admitted.set(captured.nativeId, null)
       }
-      this.queue.push({ id: ++this.sequence, operation: 'capture', observation: captured, bytes })
+      this.queue.push({ id: ++this.sequence, operation: 'capture', observation: captured, bytes, enqueuedAt: Date.now() })
       this.pump()
     } catch { this.lose(1) }
+  }
+
+  private oldestCaptureAt(): number {
+    let oldest = Infinity
+    for (const job of [...(this.active ? [this.active] : []), ...this.queue]) {
+      if (job.operation === 'capture' && job.enqueuedAt !== undefined && job.enqueuedAt < oldest) oldest = job.enqueuedAt
+    }
+    return oldest
+  }
+
+  private stalled(): boolean {
+    // Idle is not stalled: a fresh burst is always accepted, and sustained
+    // overload or a wedged worker spills once the oldest capture outwaits the budget.
+    return this.captures > 0
+      && Date.now() - this.oldestCaptureAt() > (this.options.stallTimeoutMs ?? 10_000)
   }
 
   private lose(count: number): void { this.unreportedLoss += count }
 
   private projectedHealth(): LedgerHealth {
     const health = { ...this.health, pending: this.captures, dropped: this.health.dropped + this.unreportedLoss }
-    if (this.closed || this.stopping) health.status = 'stopped'
-    else if (this.failed) health.status = 'unavailable'
+    if (this.closed || this.stopping) { health.status = 'stopped'; health.unavailableReason = null }
+    else if (this.failed) { health.status = 'unavailable'; health.unavailableReason = 'worker_unavailable' }
     else if (health.pending || health.dropped || health.gaps.length) {
       if (health.status === 'ok') health.status = 'incomplete'
     }
@@ -210,13 +231,22 @@ export class BehaviorLedgerObserver {
     this.health = message.body.health
     this.setPending(message.pending)
     if (job.operation === 'capture') {
+      if (message.status >= 500 && job.observation?.type !== 'loss') {
+        // Storage-side failure: hold the job at the head for retry instead
+        // of consuming it, so an outage delays captures without losing them.
+        job.dispatchedAt = undefined
+        this.queue.unshift(job)
+        this.retryAt = Date.now() + CAPTURE_RETRY_MS
+        this.pump(true)
+        return
+      }
       this.captures--
       this.captureBytes -= job.bytes
       if (job.observation?.type === 'admit') this.admitted.delete(job.observation.nativeId)
-      if (job.observation?.type === 'loss' && message.status < 400) {
-        this.unreportedLoss = Math.max(0, this.unreportedLoss - job.observation.count)
-      }
-      if (message.status >= 400 && job.observation?.type === 'loss') { this.fail(); return }
+      if (job.observation?.type === 'loss') {
+        if (message.status < 400) this.unreportedLoss = Math.max(0, this.unreportedLoss - job.observation.count)
+        else { this.fail(); return }
+      } else if (message.status >= 400) this.lose(1)
     }
     if (job.operation === 'read') this.reads--
     if (job.resolve) {
@@ -231,14 +261,24 @@ export class BehaviorLedgerObserver {
     if (!this.ready || this.closed || this.failed || this.active || !this.worker) return
     // A loss marker has a reserved slot; dropping it would hide capture loss.
     if (this.unreportedLoss && !this.queue.some((job) => job.observation?.type === 'loss')) {
-      this.queue.unshift({ id: ++this.sequence, operation: 'capture', bytes: 0,
+      this.queue.unshift({ id: ++this.sequence, operation: 'capture', bytes: 0, enqueuedAt: Date.now(),
         observation: { type: 'loss', count: this.unreportedLoss } })
       this.captures++
     }
     // Read deadlines include queue wait; permit a turn without starving capture.
     const readIndex = preferRead ? this.queue.findIndex((job) => job.operation === 'read') : -1
-    const job = readIndex < 0 ? this.queue.shift() : this.queue.splice(readIndex, 1)[0]
+    const job = readIndex < 0 ? this.queue[0] : this.queue[readIndex]
     if (!job) { this.worker.unref(); return }
+    if (job.operation === 'capture' && Date.now() < this.retryAt) {
+      // A failing store backs capture dispatch off; reads still flow.
+      if (!this.retryTimer) {
+        this.retryTimer = setTimeout(() => { this.retryTimer = undefined; this.pump() }, this.retryAt - Date.now())
+        this.retryTimer.unref()
+      }
+      return
+    }
+    if (readIndex < 0) this.queue.shift()
+    else this.queue.splice(readIndex, 1)
     this.active = job
     job.dispatchedAt = performance.now()
     this.worker.ref()
@@ -251,6 +291,8 @@ export class BehaviorLedgerObserver {
     if (this.failed) return
     this.failed = true
     this.ready = false
+    clearTimeout(this.retryTimer)
+    this.retryTimer = undefined
     const worker = this.worker
     this.worker = null
     if (worker) void worker.terminate()
@@ -273,14 +315,11 @@ export class BehaviorLedgerObserver {
   private captureCaller(nativeId: string, observation: LedgerCaller): void {
     // Snapshots repeat unchanged Caller evidence while the store ignores
     // semantic duplicates, so only changed projections reach the worker queue.
-    // Running projections still refresh ahead of the staleness decay.
+    // Static running evidence then lapses under the documented staleness
+    // decay instead of re-emitting on a timer.
     const projection = JSON.stringify(observation)
-    const running = observation.mayRun === true
-      || observation.status === 'running' || observation.status === 'in_progress'
-    const prior = this.callerProjections.get(nativeId)
-    const refreshMs = this.options.callerRefreshMs ?? LEDGER_STALE_MS / 2
-    if (prior && prior.projection === projection && (!running || Date.now() - prior.sentAt < refreshMs)) return
-    this.callerProjections.set(nativeId, { projection, sentAt: Date.now() })
+    if (this.callerProjections.get(nativeId) === projection) return
+    this.callerProjections.set(nativeId, projection)
     this.capture(observation)
   }
 

@@ -4,7 +4,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { StopReason } from '../server/chat/protocol'
-import { turnTime } from '../src/chat-turn-time'
+import { shortElapsed, turnTime } from '../src/chat-turn-time'
 import { clockDay, shortTime } from '../src/clock'
 import { applyEvent, createModel } from '../src/views/chat-transcript'
 
@@ -63,6 +63,24 @@ describe("a turn's end time", () => {
   it('throws for a value that is not a time, and for a time zone Intl does not know', () => {
     for (const at of ['not a time', '', '2026-13-99']) expect(() => turnTime(at, 'end_turn', 'UTC', NOW), at).toThrow(RangeError)
     expect(() => turnTime('2026-10-21T16:38:12.000Z', 'end_turn', 'Mars/Olympus', NOW)).toThrow(RangeError)
+  })
+})
+
+describe("a running turn's elapsed time", () => {
+  it('reads minutes within the hour and hours past it, from fixed clocks', () => {
+    expect(shortElapsed('2026-10-21T16:48:00.000Z', NOW)).toBe('12m')
+    expect(shortElapsed('2026-10-21T15:55:00.000Z', NOW)).toBe('1h 5m')
+    expect(shortElapsed('2026-10-21T16:59:15.000Z', NOW)).toBe('45s')
+  })
+
+  it('floors, so a running turn never overstates', () => {
+    expect(shortElapsed('2026-10-21T16:47:01.000Z', NOW)).toBe('12m')
+    expect(shortElapsed('2026-10-21T15:54:59.000Z', NOW)).toBe('1h 5m')
+  })
+
+  it('reads zero for a start that is not a time, or lies ahead', () => {
+    expect(shortElapsed('not a time', NOW)).toBe('0s')
+    expect(shortElapsed('2026-10-21T17:00:01.000Z', NOW)).toBe('0s')
   })
 })
 
