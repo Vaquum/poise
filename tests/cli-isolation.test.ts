@@ -21,7 +21,7 @@ import { TerminalSocketServer } from '../server/terminal/server'
 import type { TerminalPreset } from '../server/terminal/protocol'
 import { COMMANDS, STATUS, fakeCalls, resolveOnPath, script, writeFakeClis } from './fixtures/accounts/fake-clis'
 import { fakePresetCommand } from './fixtures/accounts/fake-presets'
-import { AGENT_CLI_NAMES, CLI_HOME_VARIABLES, credentialVariables, removeCredentialVariables } from './fixtures/cli-isolation'
+import { AGENT_CLI_NAMES, CLI_HOME_VARIABLES, credentialVariables, isolatedEnvironment, removeCredentialVariables } from './fixtures/cli-isolation'
 
 // A parent environment like a Claude Code session's, which exports
 // CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH=1, in some sessions
@@ -34,6 +34,12 @@ const PARENT_ENVIRONMENT = {
   GIT_CONFIG_COUNT: '1',
   GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
   GIT_CONFIG_VALUE_0: 'AUTHORIZATION: basic b3BhcXVlLWNyZWRlbnRpYWw=',
+}
+
+function inheritedCaches(root: string): Record<string, string> {
+  return Object.fromEntries([
+    'XDG_CACHE_HOME', 'PIP_CACHE_DIR', 'UV_CACHE_DIR', 'npm_config_cache', 'AGENT_INTERFACE_WORK_DIR', 'GITHUB_INTERFACE_MIRROR_DIR',
+  ].map((name) => [name, join(root, name)]))
 }
 
 describe('every test process', () => {
@@ -49,6 +55,27 @@ describe('every test process', () => {
       expect(real === developer || real.startsWith(`${developer}${sep}`), `${name} is ${value}`).toBe(false)
     }
     expect(homedir()).toBe(process.env.HOME)
+  })
+
+  it('keeps production cache discovery inside its fixture despite inherited cache overrides', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'poise-cache-isolation-'))
+    try {
+      const inherited = inheritedCaches(join(root, 'outside-fixture'))
+      for (const dir of Object.values(inherited)) await mkdir(dir, { recursive: true })
+      const parent: NodeJS.ProcessEnv = { ...process.env, ...inherited }
+      const fixture = join(root, 'fixture')
+      const env: NodeJS.ProcessEnv = { ...parent, ...isolatedEnvironment(fixture, parent.PATH ?? '') }
+      const { cacheDirs } = await import('../server/storage-maintenance')
+      for (const [name, path] of Object.entries(cacheDirs(env.HOME, env))) {
+        expect(realpathSync(path).startsWith(`${realpathSync(fixture)}${sep}`), `${name} is ${path}`).toBe(true)
+      }
+      for (const [name, path] of Object.entries(inherited)) {
+        expect(env[name], name).not.toBe(path)
+        expect(parent[name], name).toBe(path)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('finds a stand-in, never a real CLI, for every agent CLI name', () => {
@@ -211,6 +238,8 @@ describe('the end-to-end server', () => {
 
   it('starts without them from a parent like a Claude Code session', async () => {
     for (const [name, value] of Object.entries(PARENT_ENVIRONMENT)) vi.stubEnv(name, value)
+    const inheritedRoot = await mkdtemp(join(tmpdir(), 'poise-e2e-inherited-caches-'))
+    for (const [name, value] of Object.entries(inheritedCaches(inheritedRoot))) vi.stubEnv(name, value)
     const { webServer } = (await import('../playwright.config')).default
     if (!webServer || Array.isArray(webServer)) throw new Error('playwright.config.ts starts one web server')
     try {
@@ -219,8 +248,14 @@ describe('the end-to-end server', () => {
       const server = { ...process.env, ...webServer.env }
       expect(credentialVariables(server)).toEqual([])
       expect(server.GIT_CONFIG_COUNT).toBeUndefined()
+      const { cacheDirs } = await import('../server/storage-maintenance')
+      const isolationRoot = realpathSync(resolve(server.HOME!, '../..'))
+      for (const [name, path] of Object.entries(cacheDirs(server.HOME, server))) {
+        expect(realpathSync(path).startsWith(`${isolationRoot}${sep}`), `${name} is ${path}`).toBe(true)
+      }
     } finally {
       rmSync(resolve(webServer.env!.HOME, '../..'), { recursive: true, force: true })
+      await rm(inheritedRoot, { recursive: true, force: true })
     }
   })
 })
