@@ -104,7 +104,7 @@ it.each([
         const payload = buffer.subarray(5, 5 + size)
         buffer = buffer.subarray(5 + size)
         if (kind === 1) socket.write(frame(101, { version: 1, relayPid: 0, gatePid: 0, gatePgid: 0, spoolTurn: 'turn-final' }))
-        if (kind === 2) {
+        if (kind === 3) {
           const request = JSON.parse(payload.toString('utf8')) as { id: number }
           const response = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'end_turn' } }) + '\n')
           const header = Buffer.alloc(5)
