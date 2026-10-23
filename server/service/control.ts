@@ -204,9 +204,11 @@ export class ServiceControl {
    * Restarts this server onto an installed release of the same base, at the
    * first moment no Chat turn and no work of this server's own runs. Agent
    * calls are not waited for: they run detached, survive the restart, and the
-   * next server reconciles them as after any restart. Nothing is refused
-   * while it waits, behavior ticks included: they end within a minute, and
-   * the moment between two of them is quiet.
+   * next server reconciles them as after any restart. Chat turns a healthy
+   * relay holds are not waited for either: the relay keeps them running and
+   * the next server adopts them. Nothing is refused while it waits, behavior
+   * ticks included: they end within a minute, and the moment between two of
+   * them is quiet.
    */
   switchRelease(release: unknown): SwitchAnswer {
     if (typeof release !== 'string' || !RELEASE_NAME.test(release)) throw new HttpError(400, 'release must name an installed release')
@@ -237,7 +239,7 @@ export class ServiceControl {
     const first = this.switchTo === null
     this.switchTo = release
     if (first) {
-      this.log(`[service] switching to release ${release} once no Chat turn and no work of this server runs`)
+      this.log(`[service] switching to release ${release} once no unheld Chat turn and no work of this server runs`)
       markReleaseSwitch(true)
       this.pollSwitch()
     }
@@ -258,8 +260,9 @@ export class ServiceControl {
   private pollSwitch(): void {
     this.switchPoll = this.timer.setTimeout(() => {
       this.switchPoll = null
-      const quiet = listOpenTurns(this.runtime.instance).length === 0 && this.runtime.working() === 0
-        && releaseBackgroundBusy() === 0 && this.launches === 0
+      const held = this.runtime.relayHeldSessions()
+      const quiet = listOpenTurns(this.runtime.instance).filter((turn) => !held.has(turn.sessionId)).length === 0
+        && this.runtime.working() === 0 && releaseBackgroundBusy() === 0 && this.launches === 0
       if (!quiet) return this.pollSwitch()
       // Refused from here on; the gateway shows the person that Poise is updating.
       pauseReleaseBackground()
@@ -267,7 +270,7 @@ export class ServiceControl {
       // The drain governs from here: the switch is no longer waiting for quiet.
       markReleaseSwitch(false)
       this.drainOn = true
-      this.log(`[service] restarting on release ${this.switchTo}; running agent calls carry on`)
+      this.log(`[service] restarting on release ${this.switchTo}; running agent calls and relay-held chat turns carry on`)
       if (!(this.options.restart ?? requestUpdateRestart)()) {
         this.log('[service] the restart was refused; staying on this release')
         this.lift()
