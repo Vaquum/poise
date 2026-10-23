@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 from github_datastore.github_api import (
     ENUMERATION_DRIFT_MAX_ATTEMPTS,
+    PR_BASE_QUERY,
     GitHubApiError,
     GitHubEnumerationDriftError,
     GitHubOrgReader,
@@ -790,6 +791,94 @@ class GitHubRepositoryBatchTest(unittest.TestCase):
         with self.assertRaisesRegex(GitHubApiError, "cyclic page cursor"):
             GitHubOrgReader(client).list_repos_changed_items(["owner/repo"], WATERMARK, {})
         client.assert_exhausted()
+
+
+def pull_with_threads(threads: list[dict]) -> dict:
+    empty = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
+    return {
+        "fullDatabaseId": 200,
+        "id": "P_200",
+        "number": 7,
+        "state": "OPEN",
+        "title": "Test",
+        "body": "",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "updatedAt": "2026-01-02T00:00:00Z",
+        "author": {"login": "other"},
+        "assignees": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        "comments": empty,
+        "timelineItems": empty,
+        "reviews": empty,
+        "reviewRequests": empty,
+        "commits": empty,
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": threads},
+    }
+
+
+def thread(thread_id: str, resolved: bool, outdated: bool, comments: list[dict],
+           comments_next: bool = False) -> dict:
+    return {
+        "id": thread_id,
+        "isResolved": resolved,
+        "isOutdated": outdated,
+        "comments": {
+            "pageInfo": {"hasNextPage": comments_next, "endCursor": "cursor" if comments_next else None},
+            "nodes": comments,
+        },
+    }
+
+
+def thread_comment(comment_id: int, node_id: str, author: str) -> dict:
+    return {
+        "fullDatabaseId": comment_id,
+        "id": node_id,
+        "author": {"login": author},
+        "body": "note",
+        "path": "a.ts",
+        "createdAt": "2026-01-02T00:00:00Z",
+        "updatedAt": "2026-01-02T00:00:00Z",
+    }
+
+
+class PullReviewThreadTest(unittest.TestCase):
+    def test_pr_query_carries_thread_resolution_without_new_requests(self) -> None:
+        # The fields ride the existing pull request query; the sync issues
+        # the same GraphQL calls with or without them.
+        self.assertIn("isResolved", PR_BASE_QUERY)
+        self.assertIn("isOutdated", PR_BASE_QUERY)
+
+    def test_first_page_comments_carry_their_thread_without_paging(self) -> None:
+        pull = pull_with_threads([
+            thread("T_open", False, False, [thread_comment(1, "C_1", "reviewer")]),
+            thread("T_done", True, False, [thread_comment(2, "C_2", "reviewer")]),
+        ])
+        client = ScriptedClient([])
+        expanded = GitHubOrgReader(client)._expand_pull_graph({}, "Vaquum", "Test", 7, pull)
+        client.assert_exhausted()
+        self.assertEqual(
+            [(row["node_id"], row["thread_node_id"], row["thread_resolved"], row["thread_outdated"])
+             for row in expanded["review_comments"]],
+            [("C_1", "T_open", False, False), ("C_2", "T_done", True, False)],
+        )
+
+    def test_paged_thread_comments_carry_their_thread(self) -> None:
+        pull = pull_with_threads([
+            thread("T_open", False, True, [thread_comment(1, "C_1", "reviewer")], comments_next=True),
+        ])
+        client = ScriptedClient([
+            {"node": {"comments": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [thread_comment(3, "C_3", "fixture-agent")],
+            }}},
+        ])
+        expanded = GitHubOrgReader(client)._expand_pull_graph({}, "Vaquum", "Test", 7, pull)
+        client.assert_exhausted()
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            [(row["node_id"], row["thread_node_id"], row["thread_resolved"], row["thread_outdated"])
+             for row in expanded["review_comments"]],
+            [("C_1", "T_open", False, True), ("C_3", "T_open", False, True)],
+        )
 
 
 if __name__ == "__main__":

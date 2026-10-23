@@ -285,20 +285,34 @@ operation never sends, so no chat can answer through Poise's API.
 Bind only work the chat is actually carrying out. Reading a URL or transcript
 does not claim it. An issue and its PR can both belong to the same chat, and
 several requested work items can coexist. Another chat cannot take a claimed
-target or release its owner. For a handoff, have the old owner release it,
-then claim it in the recipient. Release bindings after verified completion;
-deleting a chat releases its bindings and disables its own supervision.
+target or release its owner. A handoff moves the old chat's bindings to the
+new chat and drops the old chat's pending monitor notices for them, so the
+next observation wakes the new chat. Closing a chat releases its bindings,
+so a replacement chat can claim them; a closed chat never receives notices.
+Release bindings after verified completion; deleting a chat releases its
+bindings and disables its own supervision.
 
 Bound chats receive local behavior ledger changes for their exact repository,
 target number and issue/PR kind. PR owners also receive observed-head CI
-failures and recovery. The monitor calls Caller's existing `--list-failing-ci`
-primitive once per bound PR every five minutes, independent of browsers and
-supervision intervals. On the usual unpaginated path that is three GitHub
-reads per observation, at most 36 per hour per bound PR; pagination/retries
-can add reads. Unbound work adds zero GitHub traffic. While any check is pending,
-notifications wait and retain the last settled state, including when other
-checks have failed. Unchanged settled failures deduplicate; unavailable reads are visible
-as unknown evidence. These observations confer no merge authority.
+failures and recovery, merge conflicts, behind-main branches that merge-prs
+will not update itself, review feedback with unresolved threads, and
+dismissed approvals that leave author-actionable threads. Resolving a
+thread never wakes by itself; only new reviews, replies and reopened
+threads do. Conflict, behind
+and authorship ride the monitor's existing `--list-failing-ci` read; reviews
+and threads come from the local datastore sync. No facet adds a GitHub
+request: the monitor still calls the one existing primitive once per bound PR
+every five minutes, independent of browsers and supervision intervals. On the
+usual unpaginated path that is three GitHub reads per observation, at most 36
+per hour per bound PR; pagination/retries can add reads. Unbound work adds
+zero GitHub traffic. While any check is pending, notifications wait and retain
+the last settled state, including when other checks have failed. Unchanged
+settled states deduplicate. A failed CI read keeps the settled baseline and
+queues at most one degraded notice per outage. Unknown, missing or truncated
+review evidence never establishes completion and never wakes. Every PR-state
+notice names its blockers and what done means: green CI, up to date with
+main and no conflicts, every finding fixed or justified, replied to, and its
+thread resolved. These observations confer no merge authority.
 
 A target that reads closed or merged in the local GitHub datastore drops late
 automation bookkeeping without waking its chat; only human activity still
@@ -315,7 +329,9 @@ It never obtains a gateway/admin identity or access to another workspace.
 
 `tests/chat-control.test.ts` covers the real command, HTTP control, runtime,
 SQLite, concurrent isolated workers, replay, ownership conflicts, supervision,
-Stop, targeted events, CI deduplication and credentials with scripted adapters.
+Stop, targeted events, CI deduplication, binding transfer on handoff, release
+on close, merge and review observations, degraded reads and credentials with
+scripted adapters.
 `tests/chat-manager-control.test.ts` covers the Manager's cross-chat authority,
 provenance, worker notices, budgets, sampled reads and guidance the same way.
 They make no live model or GitHub requests. Run `npm run check`.
