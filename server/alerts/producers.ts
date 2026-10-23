@@ -223,9 +223,11 @@ export function chatWaitingEnded(sessionId: string): void {
 }
 
 /** A Chat turn finished. Only a turn that ran longer than two minutes alerts,
- *  and neither a turn the person stopped nor the Switchboard's finished checks do. */
-export function chatTurnFinished(session: ChatSessionAlertContext, turn: { id: string, stopReason: StopReason, durationMs: number }): void {
+ *  and neither a turn the person stopped, a timer turn that ended normally,
+ *  nor the Switchboard's finished checks do. */
+export function chatTurnFinished(session: ChatSessionAlertContext, turn: { id: string, stopReason: StopReason, durationMs: number, timer?: boolean }): void {
   if (turn.stopReason === 'cancelled' || turn.durationMs <= LONG_CHAT_TURN_MS) return
+  if (turn.timer === true && turn.stopReason === 'end_turn') return
   const finished = turn.stopReason === 'end_turn'
   // Inside record: a failed lookup is logged, never thrown at the turn.
   record(`the finished-turn alert for Chat turn ${turn.id}`, () => finished && isSwitchboardSession(session.sessionId) ? undefined : raiseAlert({

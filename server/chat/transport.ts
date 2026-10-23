@@ -29,6 +29,7 @@ import { getChatSettings } from '../settings'
 import { inspectCheckout } from './git'
 import { CHAT_LIMITS, WS_PATH, type Attachment, type ChatCommand, type ChatEnvelope, type ChatSubject, type ClientFrame, type ServerFrame } from './protocol'
 import { ChatError, type ChatRuntime } from './runtime'
+import type { ChatControl } from './control'
 import { legacyIdFor, readLegacyConversation } from './legacy-import'
 import * as storage from './storage'
 import { executeCommandOnce } from './command-receipts'
@@ -82,7 +83,7 @@ export class ChatSocketServer {
     for (const connection of this.connections) this.send(connection, { kind: 'switches.updated', catalogue })
   }
   private readonly onEvent = (envelope: ChatEnvelope) => {
-    if (['session.created', 'session.updated', 'session.resumed', 'status.changed', 'model.updated', 'mode.updated'].includes(envelope.event.type)) {
+    if (['session.created', 'session.updated', 'session.resumed', 'status.changed', 'model.updated', 'mode.updated', 'timer.changed'].includes(envelope.event.type)) {
       const session = this.runtime.get(envelope.sessionId)
       if (session) for (const connection of this.connections) this.send(connection, {
         kind: envelope.event.type === 'session.created' ? 'session.created' : 'session.updated', session: { ...session, lastSeq: envelope.seq },
@@ -101,7 +102,7 @@ export class ChatSocketServer {
     for (const connection of this.connections) this.send(connection, { kind: 'switchboard.updated', revision })
   }
 
-  constructor(private readonly runtime: ChatRuntime, private readonly policy: ApiRequestPolicy = {}, private readonly switchboard?: Switchboard) {
+  constructor(private readonly runtime: ChatRuntime, private readonly policy: ApiRequestPolicy = {}, private readonly switchboard?: Switchboard, private readonly control?: ChatControl) {
     this.wss = new WebSocketServer({ noServer: true, maxPayload: CHAT_LIMITS.frameBytes, perMessageDeflate: false })
     runtime.on('switches', this.onSwitches)
     snippetLibraryEvents.on('changed', this.onSwitches)
@@ -210,7 +211,9 @@ export class ChatSocketServer {
     const runtime = this.runtime
     const target = 'sessionId' in command ? command.sessionId : 'id' in command ? command.id : undefined
     // Poise runs the Switchboard chat; the person only follows it and answers what it asks.
-    if (typeof target === 'string' && this.switchboard?.isSwitchboard(target) && !SWITCHBOARD_CHAT_COMMANDS.has(command.type)) {
+    // A timer on it is refused with the timers' own error instead.
+    if (typeof target === 'string' && this.switchboard?.isSwitchboard(target) && !SWITCHBOARD_CHAT_COMMANDS.has(command.type)
+      && command.type !== 'timer.create') {
       throw new ChatError(409, 'Poise runs the Switchboard chat; use the Switchboard pane', 'invalid')
     }
     switch (command.type) {
@@ -296,7 +299,35 @@ export class ChatSocketServer {
         })
         return {}
       case 'cancel':
-        return await runtime.cancel(String(command.sessionId || ''))
+        return await runtime.cancel(String(command.sessionId || ''), { kind: 'person' })
+      case 'timer.create': {
+        if (!this.control) throw new ChatError(503, 'chat control is not started', 'invalid')
+        const timer = this.control.createTimer({ sessionId: String(command.sessionId || ''), label: String(command.label ?? ''),
+          message: String(command.message ?? ''),
+          ...(command.delayMinutes === undefined ? {} : { delayMinutes: command.delayMinutes }),
+          ...(command.everyMinutes === undefined ? {} : { everyMinutes: command.everyMinutes }) }, { kind: 'person' })
+        return { timer }
+      }
+      case 'timer.cancel': {
+        if (!this.control) throw new ChatError(503, 'chat control is not started', 'invalid')
+        return { timer: this.control.cancelTimer(String(command.timerId || ''), { kind: 'person' }) }
+      }
+      case 'timer.rearm': {
+        if (!this.control) throw new ChatError(503, 'chat control is not started', 'invalid')
+        return { timer: this.control.rearmTimer(String(command.timerId || ''), { kind: 'person' }) }
+      }
+      case 'chat.hold': {
+        if (!this.control) throw new ChatError(503, 'chat control is not started', 'invalid')
+        if (typeof command.held !== 'boolean') throw new ChatError(400, 'held must be a boolean', 'invalid')
+        this.control.setHold(String(command.sessionId || ''), command.held)
+        return { session: runtime.get(String(command.sessionId || '')) }
+      }
+      case 'timers.holdAll': {
+        if (!this.control) throw new ChatError(503, 'chat control is not started', 'invalid')
+        if (typeof command.held !== 'boolean') throw new ChatError(400, 'held must be a boolean', 'invalid')
+        this.control.setAllHeld(command.held)
+        return { held: command.held }
+      }
       case 'permission.respond':
         runtime.respondPermission(String(command.sessionId || ''), String(command.id || ''), String(command.optionId || ''))
         return {}
@@ -403,7 +434,7 @@ export function speaksForPerson(req: IncomingMessage, service: boolean, authorit
 
 /** Handle /api/chat/* routes; returns false when the url is not ours.
  *  `person`: the request has the person's authority (see Switchboard.handle). */
-export async function handleChatApi(req: IncomingMessage, res: ServerResponse, url: string, runtime: ChatRuntime, switchboard?: Switchboard, person = true): Promise<boolean> {
+export async function handleChatApi(req: IncomingMessage, res: ServerResponse, url: string, runtime: ChatRuntime, switchboard?: Switchboard, person = true, control?: ChatControl): Promise<boolean> {
   const path = url.split('?')[0]
   const query = new URLSearchParams(url.split('?')[1] || '')
   if (!path.startsWith('/api/chat/')) return false
@@ -525,6 +556,10 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
     const match = path.match(/^\/api\/chat\/sessions\/([0-9a-f-]{36})(?:\/([a-z]+))?$/)
     if (match) {
       const [, id, action] = match
+      if (action === 'timers' && req.method === 'GET') {
+        if (!control) throw new ChatError(503, 'chat control is not started', 'invalid')
+        return json(res, 200, { ...control.timersOf(id), scheduler: control.status() }), true
+      }
       if (switchboard?.isSwitchboard(id) && (req.method === 'PATCH' || ['fork', 'handoff', 'close'].includes(action ?? ''))) {
         throw new ChatError(409, 'Poise runs the Switchboard chat; use the Switchboard pane', 'invalid')
       }
@@ -553,7 +588,7 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
         if (action === 'resume') return json(res, 200, { session: await runtime.resume(id) }), true
         if (action === 'fork') return json(res, 200, { session: await runtime.fork(id) }), true
         if (action === 'close') return json(res, 200, { session: await runtime.close(id) }), true
-        if (action === 'cancel') return json(res, 200, await runtime.cancel(id)), true
+        if (action === 'cancel') return json(res, 200, await runtime.cancel(id, { kind: 'person' })), true
         if (action === 'handoff') {
           const body = await readJson<any>(req)
           return json(res, 200, { session: await runtime.handoff(id, { agent: body.agent, model: String(body.model || ''), effort: body.effort ? String(body.effort) : undefined }) }), true

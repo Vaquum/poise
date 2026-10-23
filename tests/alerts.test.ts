@@ -274,6 +274,16 @@ describe('the alert producers', () => {
     ])
   })
 
+  it('skips the finished alert for a timer turn that ended normally, but not for one that errored', () => {
+    const session = { sessionId: 's1', agent: 'Codex', title: 'Refactor the parser' }
+    producers.chatTurnFinished(session, { id: 't5', stopReason: 'end_turn', durationMs: 7 * 60_000, timer: true })
+    expect(rows()).toEqual([])
+    producers.chatTurnFinished(session, { id: 't6', stopReason: 'error', durationMs: 7 * 60_000, timer: true })
+    expect(rows()).toEqual([
+      { kind: 'chat_turn_finished', key: 'chat-turn-finished:t6', resolved: null, url: '/', title: 'Codex stopped early', body: '“Refactor the parser” ended (error) after 7 minutes.' },
+    ])
+  })
+
   it('logs an alert it cannot record instead of failing the work that raised it', () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     database.db.exec('ALTER TABLE alerts RENAME TO alerts_elsewhere')
