@@ -498,7 +498,7 @@ assertion may only resume, and anything else is refused with 403):
   `POISE_DRAIN_TIMEOUT` seconds (default 5400, 90 minutes) have passed.
   - New Chat turns include queued messages, and launches include the
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
-    `/api/debate`, `/api/chat`, `/api/models/refresh`). Refused work answers
+    `/api/debate`, `/api/models/refresh`). Refused work answers
     503 with code `draining`; work already running continues.
   - One Chat turn holds a refusing drain at most 30 minutes: past that the
     drain stops it through the person's Stop path, with a transcript notice

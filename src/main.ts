@@ -15,12 +15,12 @@ import { loggingCallId, loggingHref, type LoggingLink } from './logging'
 import { initMainView, refreshMainView, stopMainRefresh } from './views/main-view'
 import { initCurrentView, stopCurrentPolling } from './views/current-view'
 import { initSwarmView, stopSwarmRefresh, focusRow as focusSwarmRow, focusCall as focusSwarmCall } from './views/swarm-view'
-import { initChatView, stopChatRefresh, openChatSession, openChatWithContext, openChatForSubject, chatSessionInView, type NewSessionPrefill } from './views/chat-view'
+import { initChatView, stopChatRefresh, openChatSession, openChatForSubject, chatSessionInView } from './views/chat-view'
 import { initBehaviorsView, stopBehaviorsRefresh } from './views/behaviors-view'
 import { initSnippetsView } from './views/snippets-view'
 import { initEditorView, stopEditorRefresh } from './views/editor-view'
-import { toggle as toggleChat, close as closeChatPane } from './views/chat-pane'
 import { chatSidePane } from './views/chat-side-pane'
+import { inlineThreadSessionInView } from './views/editor-inline-thread'
 import { loadSettings, startRefreshTicker, applyTheme, getTheme, effectiveTimezone, unknownSavedTimezone } from './config'
 import { initClaudeAuth } from './claude-auth'
 import { getSelectedOrganization, setSelectedOrganization } from './organizations'
@@ -110,12 +110,8 @@ function showView(v: ViewSlug) {
   // Chat keeps its socket (a running turn keeps being mirrored) but stops
   // the per-second tick and parks the composer draft.
   if (v !== 'chat') stopChatRefresh()
-  // The chat pane is bound to whatever card or document opened it, so it does
-  // not belong to the next view. It had no leave-cleanup at all: it stayed
-  // open over whatever came next, kept polling for the rest of the session,
-  // and its composer stayed in the tab order — so a message could be sent
-  // into a conversation the person had navigated away from.
-  closeChatPane()
+  // The side pane is bound to whatever card or document opened it, so it
+  // does not belong to the next view.
   chatSidePane.close()
 
   // Initialize the target first so content exists before the animation starts
@@ -187,7 +183,7 @@ function openNotice(target: NoticeTarget): void {
   else window.open(target.pullRequest, '_blank', 'noopener,noreferrer')
 }
 // A Chat session on screen already shows what its notice would say.
-const notificationRail = mountNotificationRail(notices, { open: openNotice, inView: (target) => 'chat' in target && (chatSessionInView() === target.chat || chatSidePane.sessionInView() === target.chat) })
+const notificationRail = mountNotificationRail(notices, { open: openNotice, inView: (target) => 'chat' in target && (chatSessionInView() === target.chat || chatSidePane.sessionInView() === target.chat || inlineThreadSessionInView() === target.chat) })
 window.addEventListener('poise:notifications-changed', () => { void notices.refresh() })
 
 // A saved time zone this browser does not know would break every time Poise
@@ -281,46 +277,16 @@ window.addEventListener('poise:synced', () => {
 })
 
 // Card chat icon → toggle the chat pane bound to that card's session.
-// Clicking the same card's icon again closes the pane; switching to a
-// different card swaps the conversation in place. Hosts that want
-// JSON-edit-card rendering (currently: the editor's toolbar chat)
-// pass parseEdits=true in the event detail and may also supply hover
-// / accept / decline callbacks so the host can react to user gestures
-// on cards (highlight in surface, apply to surface, etc.); everyone
-// else leaves them unset and gets plain prose rendering.
-window.addEventListener('poise:open-chat', (ev) => {
-  const detail = (ev as CustomEvent<{
-    session: string,
-    label: string,
-    draft?: string,
-    parseEdits?: boolean,
-    onEditHover?: (edit: any) => void,
-    onEditLeave?: () => void,
-    onEditAccept?: (edit: any, key: string) => 'applied' | 'conflict',
-    onEditDecline?: (edit: any, key: string) => void,
-  }>).detail
-  if (!detail) return
-  toggleChat(detail.session, detail.label, detail.draft, {
-    parseEdits: detail.parseEdits,
-    onEditHover: detail.onEditHover,
-    onEditLeave: detail.onEditLeave,
-    onEditAccept: detail.onEditAccept,
-    onEditDecline: detail.onEditDecline,
-  })
-})
-
 // Chat handoffs. `{ id }` opens an existing session (Swarm's Target column);
-// `{ subject, prefill?, draft? }` opens a card's Chat session, or its
-// composer with the prefill when it has no session yet. `{ context, … }`
-// still opens the New session dialog, which the Editor uses until #370.
+// `{ subject, prefill?, draft? }` opens a subject's Chat session, or its
+// composer with the prefill when it has no session yet.
 window.addEventListener('poise:open-chat-session', (ev) => {
-  const detail = (ev as CustomEvent<{ id?: string, subject?: import('../server/chat/protocol').ChatSubject, prefill?: string, draft?: import('./views/chat-composer').ComposerDraft } & NewSessionPrefill>).detail
+  const detail = (ev as CustomEvent<{ id?: string, subject?: import('../server/chat/protocol').ChatSubject, prefill?: string, draft?: import('./views/chat-composer').ComposerDraft }>).detail
   if (!detail) return
   menu.switchTo('chat')
   window.requestAnimationFrame(() => {
     if (detail.id) void openChatSession(detail.id)
     else if (detail.subject) void openChatForSubject(detail.subject, detail.prefill, detail.draft)
-    else void openChatWithContext(detail)
   })
 })
 
@@ -361,12 +327,12 @@ window.addEventListener('popstate', () => {
   if (new URLSearchParams(location.search).get('view') === 'logging' || menu.currentView() === 'logging') menu.switchTo('logging')
 })
 
-// Chat /content → editor article. The chat pane dispatches
-// `poise:open-editor-doc` after agent-interface --author-content
-// completes; we switch to the editor view and re-dispatch a
-// `poise:editor-load-doc` event the editor view listens for.
+// Chat /content → editor article, and Chat's read-only edit cards → the
+// Editor. The sender dispatches `poise:open-editor-doc`; we switch to the
+// editor view and re-dispatch a `poise:editor-load-doc` event the editor
+// view listens for. `session` opens the side pane on that session.
 window.addEventListener('poise:open-editor-doc', (ev) => {
-  const detail = (ev as CustomEvent<{ slug: string }>).detail
+  const detail = (ev as CustomEvent<{ slug: string, session?: string }>).detail
   if (!detail?.slug) return
   menu.switchTo('editor')
   window.requestAnimationFrame(() => {

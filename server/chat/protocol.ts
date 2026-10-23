@@ -217,9 +217,13 @@ export interface WorkspaceState {
   checkedAt: string
 }
 
-/** Where a subject's chat starts. `current` is a Current card; later slices
- *  add the Editor surfaces. */
-export type SubjectSurface = 'current'
+/** Where a subject's chat starts. `current` is a Current card;
+ *  `editor-document`, `editor-passage` and `editor-review` are the Editor's
+ *  document chat, passage (annotation) chat and review thread. */
+export type SubjectSurface = 'current' | 'editor-document' | 'editor-passage' | 'editor-review'
+
+/** The person's decision on one proposed edit card. */
+export type EditDecision = 'applied' | 'declined' | 'conflict'
 
 /** What a session belongs to: at most one session per subject in an
  *  instance. The key is opaque after validation and compared exactly. */
@@ -397,6 +401,7 @@ export type ChatEvent =
   | { type: 'mode.updated', mode: string, modes: ModeOption[] }
   | { type: 'model.updated', model: string, modelId: string, effort: string, efforts?: string[] }
   | { type: 'history.imported', legacyId: string, turns: Array<{ prompt: string, reply: string, at: string, status: string }>, omitted: number }
+  | { type: 'edit.decided', turnId: string, messageId: string, index: number, decision: EditDecision }
   | { type: 'content.started', topic: string, launchId: string, callId?: string }
   | { type: 'consensus.started', id: string, topic: string }
   | { type: 'consensus.finished', id: string, synthesis?: string, truncated?: boolean, error?: string }
@@ -479,6 +484,7 @@ export type ChatCommand =
    *  request so a resend after an in-doubt answer never starts a second
    *  change. The ack is a `PoiseChangeAck`. */
   | { type: 'poise.change', sessionId: string, text: string, changeId: string, attachments?: Attachment[], mentions?: Mention[], switches?: string[] }
+  | { type: 'edit.decide', sessionId: string, turnId: string, messageId: string, index: number, decision: EditDecision }
 
 export interface SafeModeAck { session: SessionRecord, applies: 'current_turn' | 'next_turn', warning?: string }
 
