@@ -68,7 +68,8 @@ suppresses their popups. See
 5. A pull request of yours is ready to merge (below).
 6. A Chat turn that ran longer than two minutes has finished. This one shows
    for an hour. A [Switchboard](Switchboard.md) check that finishes is routine
-   and raises none; one that ends early does.
+   and raises none; one that ends early does. A timer turn that ends normally
+   is routine and raises none; one that ends early does.
 
 Within a kind, the one that most recently came due leads. A Chat session that
 is on screen already says what its notice would, so its notice is not listed.

@@ -621,6 +621,56 @@ describe('approval eligibility and review activity', () => {
     expect(db.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
   })
 
+  it('re-approves a dismissed approval when only the reviewer owns live conversations', async () => {
+    arrangeCli(false, false, {
+      headSha: NEXT_HEAD_SHA,
+      reviewerLatestState: 'DISMISSED',
+      reviewerLatestCommit: HEAD_SHA,
+      latestActivityAt: new Date().toISOString(),
+      unresolvedConversationCount: 2,
+      unresolvedLiveConversationCount: 2,
+      unresolvedConversationAuthors: ['review-bot'],
+      unresolvedLiveConversationAuthors: ['review-bot'],
+    }, { reviewer_latest_state: 'DISMISSED' })
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    recordCompletedInitialReview(db, { outcome: 'changes_requested' })
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--pr-approve', '#17', '--expected-head', NEXT_HEAD_SHA, '--actor', 'review-bot',
+    ]))
+    expect(db.hasSeen('approve-prs', `${pr.repo}#17@head=${NEXT_HEAD_SHA}`)).toBe(true)
+  })
+
+  it('does not re-approve a dismissed approval while another author owns a live conversation', async () => {
+    arrangeCli(false, false, {
+      headSha: NEXT_HEAD_SHA,
+      reviewerLatestState: 'DISMISSED',
+      reviewerLatestCommit: HEAD_SHA,
+      latestActivityAt: new Date().toISOString(),
+      unresolvedConversationCount: 3,
+      unresolvedLiveConversationCount: 3,
+      unresolvedConversationAuthors: ['review-bot', 'another-reviewer'],
+      unresolvedLiveConversationAuthors: ['review-bot', 'another-reviewer'],
+    }, { reviewer_latest_state: 'DISMISSED' })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    recordCompletedInitialReview(db, { outcome: 'changes_requested' })
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.hasSeen('approve-prs', `${pr.repo}#17@head=${NEXT_HEAD_SHA}`)).toBe(false)
+  })
+
   it.each(['--review-activity-since', '--local-checkout-path'])('abandons dismissed recovery when the reviewer changes during %s', async (stage) => {
     arrangeCli(false, false, { headSha: NEXT_HEAD_SHA, reviewerLatestState: 'DISMISSED',
       latestActivityAt: new Date().toISOString() }, { reviewer_latest_state: 'DISMISSED' })
