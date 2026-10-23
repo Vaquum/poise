@@ -310,9 +310,11 @@ the last settled state, including when other checks have failed. Unchanged
 settled states deduplicate. A failed CI read keeps the settled baseline and
 queues at most one degraded notice per outage. Unknown, missing or truncated
 review evidence never establishes completion and never wakes. Every PR-state
-notice names its blockers and what done means: green CI, up to date with
-main and no conflicts, every finding fixed or justified, replied to, and its
-thread resolved. These observations confer no merge authority.
+notice names its blockers and what done means: required CI and reviews pass,
+no conflicts, every finding fixed or justified, replied to, and its thread
+resolved. A native merge queue handles latest-base integration; update the
+branch only for conflicts or a needed fix. These observations confer no merge
+authority.
 
 A target that reads closed or merged in the local GitHub datastore drops late
 automation bookkeeping without waking its chat; only human activity still
