@@ -154,6 +154,10 @@ async def local_checkout_path(payload: dict[str, Any]) -> Any:
     return await run_behavior("local_checkout_path", payload)
 
 
+async def prune_mirrors(payload: dict[str, object]) -> object:
+    return await run_behavior("prune_mirrors", payload)
+
+
 async def view_repos(payload: dict[str, Any]) -> Any:
     return await run_behavior("view_repos", payload)
 
