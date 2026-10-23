@@ -37,9 +37,95 @@ describe('StdioRpc replay', () => {
   it('reads request numbering and answered ids from the recorded outbound stream', () => {
     const progress = outboundProgress(OUTBOUND)
     expect(progress.maxRequestId).toBe(2)
-    expect([...progress.responded]).toEqual(['number:7'])
+    expect([...progress.responded]).toEqual([['number:7', 1]])
     expect(outboundHasMethod(OUTBOUND, 'turn/start')).toBe(true)
     expect(outboundHasMethod(OUTBOUND, 'session/prompt')).toBe(false)
+  })
+
+  it('counts sequential response occurrences without conflating numeric and string ids', () => {
+    const progress = outboundProgress(Buffer.concat([OUTBOUND, Buffer.from(
+      '{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"recorded failure"}}\n'
+      + '{"jsonrpc":"2.0","id":"7","result":{}}\n',
+    )]))
+    expect([...progress.responded]).toEqual([['number:7', 2], ['string:7', 1]])
+  })
+
+  it('consumes only the recorded response occurrences before answering a reused id during replay', () => {
+    const { rpc, written } = fixture()
+    rpc.beginReplay(Buffer.concat([OUTBOUND, Buffer.from('{"jsonrpc":"2.0","id":7,"result":{}}\n')]))
+    rpc.respond(7, 'first historical answer')
+    rpc.respondError(7, { code: -32000, message: 'second historical answer' })
+    rpc.respond(7, 'new answer')
+    rpc.respond('7', 'different typed id')
+    expect(written.map(line => JSON.parse(line))).toEqual([
+      { jsonrpc: '2.0', id: 7, result: 'new answer' },
+      { jsonrpc: '2.0', id: '7', result: 'different typed id' },
+    ])
+    expect(rpc.isReplaying).toBe(true)
+    rpc.endReplay()
+  })
+
+  it('skips two completed writes but executes a later unanswered write reusing their id in the same spool', async () => {
+    const { rpc, receive, written } = fixture()
+    const writes: unknown[] = []
+    rpc.onRequest('fs/write_text_file', params => { writes.push(params); return {} })
+    rpc.beginReplay(Buffer.concat([OUTBOUND, Buffer.from('{"jsonrpc":"2.0","id":7,"result":{}}\n')]))
+    for (const content of ['first historical write', 'second historical write', 'new pending write']) {
+      receive({ jsonrpc: '2.0', id: 7, method: 'fs/write_text_file', params: { content } })
+    }
+    await new Promise(resolve => setImmediate(resolve))
+    expect(writes).toEqual([{ content: 'new pending write' }])
+    expect(written.map(line => JSON.parse(line))).toEqual([{ jsonrpc: '2.0', id: 7, result: {} }])
+    expect(rpc.isReplaying).toBe(true)
+    rpc.endReplay()
+  })
+
+  it.each([
+    ['resolve', false], ['reject', false], ['resolve', true], ['reject', true],
+  ] as const)('keeps a newer request slot when a historical callback completes by %s (after LIVE=%s)', async (outcome, afterLive) => {
+    const { rpc, receive, written } = fixture()
+    let releaseOld!: () => void
+    let releaseNew!: () => void
+    const oldHeld = new Promise<void>(resolve => { releaseOld = resolve })
+    const newHeld = new Promise<void>(resolve => { releaseNew = resolve })
+    const calls: unknown[] = []
+    const duplicates: unknown[] = []
+    rpc.on('duplicate-request', id => { duplicates.push(id) })
+    rpc.onRequest('ask', async params => {
+      calls.push(params)
+      if (params === 'historical') {
+        await oldHeld
+        if (outcome === 'reject') throw new Error('historical decision failed')
+        return 'old answer'
+      }
+      await newHeld
+      return 'new answer'
+    }, { replayCompleted: true })
+    rpc.beginReplay(OUTBOUND)
+    receive({ jsonrpc: '2.0', id: 7, method: 'ask', params: 'historical' })
+    receive({ jsonrpc: '2.0', id: 7, method: 'ask', params: 'new pending' })
+    try {
+      await new Promise(resolve => setImmediate(resolve))
+      expect(calls).toEqual(['historical', 'new pending'])
+      expect(duplicates).toEqual([])
+      if (afterLive) rpc.endReplay()
+      releaseOld()
+      await new Promise(resolve => setImmediate(resolve))
+      expect(written).toEqual([])
+      receive({ jsonrpc: '2.0', id: 7, method: 'ask', params: 'actual duplicate' })
+      await new Promise(resolve => setImmediate(resolve))
+      expect(duplicates).toEqual([7])
+      expect(calls).toEqual(['historical', 'new pending'])
+      releaseNew()
+      await new Promise(resolve => setImmediate(resolve))
+      const frames = written.map(line => JSON.parse(line))
+      expect(frames).toHaveLength(2)
+      expect(frames[0]).toMatchObject({ id: 7, error: { code: -32600 } })
+      expect(frames[1]).toEqual({ jsonrpc: '2.0', id: 7, result: 'new answer' })
+      if (!afterLive) rpc.endReplay()
+    } finally {
+      releaseOld(); releaseNew()
+    }
   })
 
   it('continues numbering past the previous Poise so fresh requests cannot collide', async () => {

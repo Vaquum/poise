@@ -83,13 +83,14 @@ function idKey(id: number | string): string {
   return `${typeof id}:${String(id)}`
 }
 
-/** Request ids this client used, and the agent requests it answered, as the
- *  relay recorded them. Replay continues the numbering past every id the
- *  previous Poise used, so a fresh request can never collide with one the
+/** Request ids this client used, and each response occurrence, as the relay
+ *  recorded them. The agent can reuse an id after its previous request ends.
+ *  Replay continues numbering past every id the previous Poise used, so a
+ *  fresh request can never collide with one the
  *  agent still has in flight. */
-export function outboundProgress(outbound: Buffer): { maxRequestId: number, responded: Set<string> } {
+export function outboundProgress(outbound: Buffer): { maxRequestId: number, responded: Map<string, number> } {
   let maxRequestId = 0
-  const responded = new Set<string>()
+  const responded = new Map<string, number>()
   for (const line of outbound.toString('utf8').split('\n')) {
     const trimmed = line.trim()
     if (!trimmed) continue
@@ -100,7 +101,10 @@ export function outboundProgress(outbound: Buffer): { maxRequestId: number, resp
       if (typeof message.id === 'number' && Number.isSafeInteger(message.id) && message.id > maxRequestId) maxRequestId = message.id
       continue
     }
-    if (validId(message.id)) responded.add(idKey(message.id))
+    if (validId(message.id)) {
+      const key = idKey(message.id)
+      responded.set(key, (responded.get(key) ?? 0) + 1)
+    }
   }
   return { maxRequestId, responded }
 }
@@ -138,7 +142,7 @@ export function outboundRequests(outbound: Buffer): Map<number | string, { metho
 export class StdioRpc extends EventEmitter {
   private nextId = 1
   private replaying = false
-  private respondedBeforeRestart = new Set<string>()
+  private respondedBeforeRestart = new Map<string, number>()
   private readonly deferred: Array<() => void> = []
   private readonly pending = new Map<number | string, Pending>()
   private readonly requestHandlers = new Map<string, RpcRequestHandler>()
@@ -283,13 +287,22 @@ export class StdioRpc extends EventEmitter {
   /** Answer a request the peer sent us. While replaying, an answer the
    *  previous Poise already sent is dropped; anything else goes out. */
   respond(id: number | string, result: unknown): void {
-    if (this.replaying && this.respondedBeforeRestart.has(idKey(id))) return
+    if (this.consumeRecordedResponse(id)) return
     this.write({ jsonrpc: '2.0', id, result })
   }
 
   respondError(id: number | string, error: JsonRpcError): void {
-    if (this.replaying && this.respondedBeforeRestart.has(idKey(id))) return
+    if (this.consumeRecordedResponse(id)) return
     this.write({ jsonrpc: '2.0', id, error })
+  }
+
+  private consumeRecordedResponse(id: number | string): boolean {
+    const key = idKey(id)
+    const remaining = this.replaying ? this.respondedBeforeRestart.get(key) ?? 0 : 0
+    if (!remaining) return false
+    if (remaining === 1) this.respondedBeforeRestart.delete(key)
+    else this.respondedBeforeRestart.set(key, remaining - 1)
+    return true
   }
 
   /** Returns the error instead of throwing so callers decide what to unwind. */
@@ -422,16 +435,16 @@ export class StdioRpc extends EventEmitter {
     }
     const id = message.id
     const key = `${typeof id}:${String(id)}`
-    const completed = this.replaying && this.respondedBeforeRestart.has(key)
+    const completed = this.consumeRecordedResponse(id)
     // A completed authorization still consumes its historical request, so
     // the next identical request cannot reuse that one-time answer.
     if (completed && !this.replayCompletedHandlers.has(message.method)) return
-    if (this.inbound.has(key)) {
+    if (!completed && this.inbound.has(key)) {
       this.emit('duplicate-request', id)
       this.respondError(id, { code: -32600, message: `request id ${String(id)} is already in flight` })
       return
     }
-    if (this.inbound.size >= this.options.maxInboundRequests) {
+    if (!completed && this.inbound.size >= this.options.maxInboundRequests) {
       this.respondError(id, { code: -32000, message: `too many outstanding requests (${this.options.maxInboundRequests})` })
       return
     }
@@ -441,16 +454,18 @@ export class StdioRpc extends EventEmitter {
       this.respondError(id, { code: -32601, message: `Method not found: ${message.method}` })
       return
     }
-    this.inbound.add(key)
+    // A historical callback only consumes its persisted decision. Its native
+    // request already ended and the same id can now belong to a later request.
+    if (!completed) this.inbound.add(key)
     Promise.resolve()
       .then(() => handler(message.params, id, this.inboundAbort.signal))
       .then(
         (result) => {
-          this.inbound.delete(key)
+          if (!completed) this.inbound.delete(key)
           if (!this.closed && !completed) this.respond(id, result ?? {})
         },
         (error: unknown) => {
-          this.inbound.delete(key)
+          if (!completed) this.inbound.delete(key)
           if (this.closed || completed) return
           const rpcError = error instanceof RpcError
             ? { code: error.code, message: error.message, data: error.data }
