@@ -195,7 +195,10 @@ describe('relay handover between servers', () => {
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
     first.runtime.prompt(session.id, { text: 'Prime the relay', attachments: [], mentions: [] })
     await waitFor(() => first.runtime.get(session.id)?.status === 'running')
-    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    const marker = join(root, `relay-before-worker-${mode}`)
+    const peer = await first.controls.hosts[0].spawn(process.execPath,
+      ['-e', "require('node:fs').writeFileSync(process.argv[1], 'started'); setInterval(() => {}, 1000)", marker]) as RelayConnection
+    await waitFor(() => existsSync(marker))
     first.controls.adapters[0].finish()
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
     const { turnId } = first.runtime.prompt(session.id, { text: 'Keep the checkout owned', attachments: [], mentions: [] })
@@ -214,6 +217,7 @@ describe('relay handover between servers', () => {
           replayGate: new Promise<void>((resolve) => { releaseReplay = resolve }) })
         await owner.runtime.recover()
         await waitFor(() => owner.controls.replayTurns.length === 1)
+        await owner.controls.replayTurns[0].live
         activePeer = owner.controls.replayTurns[0].peer as RelayConnection
       }
       const token = lease.read()?.token
