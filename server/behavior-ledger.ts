@@ -40,6 +40,7 @@ const CAPTURE_RETRY_MS = 250
 /** Capture never awaits or performs filesystem/SQLite work on the behavior thread. */
 export class BehaviorLedgerObserver {
   private worker: Worker | null = null
+  private workerExited: Promise<void> = Promise.resolve()
   private initializing: Promise<void> | null = null
   private ready = false
   private closed = false
@@ -96,6 +97,7 @@ export class BehaviorLedgerObserver {
       resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 8, stackSizeMb: 4 },
     })
     this.worker = worker
+    this.workerExited = new Promise(resolveExit => { worker.once('exit', () => resolveExit()) })
     await new Promise<void>((resolveReady, rejectReady) => {
       // The startup wait bounds its caller; elapsed time does not prove worker failure.
       const timer = setTimeout(resolveReady, 2_000)
@@ -301,6 +303,9 @@ export class BehaviorLedgerObserver {
 
   private fail(): void {
     if (this.failed) return
+    // Readiness has completed native initialization, and no dispatched
+    // request means the worker is verifiably idle rather than in SQLite.
+    const idle = this.ready && this.active === null
     this.failed = true
     this.ready = false
     clearTimeout(this.retryTimer)
@@ -320,9 +325,11 @@ export class BehaviorLedgerObserver {
       clearTimeout(job.timer)
       job.resolve(this.unavailable(job.request ?? { operation: 'health' }))
     }
-    // Forced isolate termination can abort the whole process inside a
-    // native SQLite error. Close cooperatively after its current request.
-    if (worker) {
+    if (worker && idle) {
+      void worker.terminate()
+    } else if (worker) {
+      // An active request or unfinished initialization may still be in
+      // native SQLite. Keep it tracked and close cooperatively.
       worker.ref()
       if (this.unreportedLoss) worker.postMessage({ id: ++this.sequence, operation: 'capture',
         observation: { type: 'loss', count: this.unreportedLoss } } satisfies LedgerWorkerRequest)
@@ -407,6 +414,12 @@ export class BehaviorLedgerObserver {
       this.stopPromise = this.finishStop()
     }
     return this.stopPromise
+  }
+
+  /** After stop(), wait for actual exit before removing the worker's files. */
+  async waitForExit(): Promise<void> {
+    await this.initializing
+    await this.workerExited
   }
 
   private async finishStop(): Promise<void> {
