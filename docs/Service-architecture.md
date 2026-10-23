@@ -335,9 +335,10 @@ reconciles them as after any restart.
   prompt on its resumed native session; a request still waiting for a
   checkout or startup is replayed with its original input and attribution.
   Compaction does not count as delivering that request. If recovery must
-  queue, the queue retains its displayed request, switches and change
+  wait, the durable waiting lane retains its displayed request, switches and change
   completion responsibility with the original source, including timer
-  provenance, and model.
+  provenance, and model. A busy session's continuation remains ahead of its
+  existing normal-queue follow-ups, ready when that busy turn finishes.
   If a drain or another switch is pending during recovery, both interrupted and
   waiting records stay durable until it clears; continuations keep priority
   over their follow-ups. Drain and withdrawal release paths also retain records

@@ -473,7 +473,32 @@ describe('the switch bound', () => {
     ])
   })
 
-  it('retains shown input, switches and change completion when recovery queues behind a busy turn', async () => {
+  it('resumes interrupted work before an existing normal follow-up after a busy turn', async () => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Busy preceding task'))
+    await until(() => w.c.calls.length === 1)
+    const followupId = randomUUID()
+    await w.runtime.enqueue(w.s.id, followupId, input('Normal queued follow-up'))
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID() }])
+    await w.runtime.releaseSwitchWait()
+    const continuation = 'Poise stopped your turn for an update that did not restart. Continue where you left off.'
+    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([
+      expect.objectContaining({ sessionId: w.s.id, prompt: input(continuation), queueBefore: [] }),
+    ])
+    expect(w.runtime.get(w.s.id)?.queue?.items).toEqual([
+      expect.objectContaining({ id: followupId, state: 'waiting' }),
+    ])
+    w.finish()
+    await until(() => w.c.calls.length === 2)
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['Busy preceding task', continuation])
+    expect(w.runtime.get(w.s.id)?.queue?.items[0]).toMatchObject({ id: followupId, state: 'waiting' })
+    w.c.auto = true
+    w.finish()
+    await until(() => w.turns(w.s.id).length === 3 && w.runtime.get(w.s.id)?.status === 'idle')
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['Busy preceding task', continuation, 'Normal queued follow-up'])
+  })
+
+  it('retains shown input, switches and change completion when recovery waits behind a busy turn', async () => {
     const w = await world({ auto: false })
     const changeId = randomUUID()
     storage.saveSession({ ...storage.getSession(w.s.id)!, selfChangeId: changeId })
@@ -484,7 +509,7 @@ describe('the switch bound', () => {
     next.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID(), prompt: input('Original implementation runbook'),
       shown: input('Visible original request'), implementsChange: true, switches: ['recovery-hint'] }])
     await next.releaseSwitchWait()
-    expect(next.get(w.s.id)?.queue?.items).toEqual([expect.objectContaining({ recovery: {
+    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([expect.objectContaining({ recovery: {
       shown: input('Visible original request'), implementsChange: true, switches: ['recovery-hint'],
     } })])
     w.c.auto = true
@@ -498,7 +523,7 @@ describe('the switch bound', () => {
     expect(started?.event).toMatchObject({ prompt: input('Visible original request') })
   })
 
-  it('retains timer provenance when recovery queues behind a busy turn', async () => {
+  it('retains timer provenance when recovery waits behind a busy turn', async () => {
     const w = await world({ auto: false })
     w.runtime.prompt(w.s.id, input('Busy preceding task'))
     await until(() => w.c.calls.length === 1)
@@ -507,10 +532,9 @@ describe('the switch bound', () => {
     w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID(),
       prompt: input('Recovered timer request'), shown: input('Visible reminder'), source }])
     await w.runtime.releaseSwitchWait()
-    const queued = w.runtime.get(w.s.id)?.queue?.items[0]
-    expect(queued?.source).toEqual(source)
-    if (queued?.source?.kind !== 'timer') throw new Error('queued recovery lost its timer source')
-    expect(queued.source.timerId).toBe(source.timerId)
+    expect(JSON.parse(database.getMeta('chat_switch_waiting') ?? '[]')).toEqual([
+      expect.objectContaining({ recovery: expect.objectContaining({ source }) }),
+    ])
     w.c.auto = true
     w.finish()
     await until(() => w.turns(w.s.id).length === 2)

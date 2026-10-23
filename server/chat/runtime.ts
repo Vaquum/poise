@@ -879,6 +879,13 @@ export class ChatRuntime extends EventEmitter {
       return 'admitted'
     } catch (error) {
       if (error instanceof ChatError && error.statusCode === 404) { gone(error.message); return 'dropped' }
+      if (kind === 'interrupted' && error instanceof ChatError && error.statusCode === 409 && this.live.get(sessionId)?.turn) {
+        // A continuation belongs before every follow-up. The durable waiting
+        // lane keeps that priority while the current turn finishes; appending
+        // it to the normal queue would put older follow-ups ahead of it.
+        defer(error.message)
+        return 'admitted'
+      }
       // A prompt its session cannot take now waits in its queue — or, when
       // queuing is itself unavailable, for the next restart. A 503 (a drain
       // in force) fails the enqueue the same way and defers the same way.
