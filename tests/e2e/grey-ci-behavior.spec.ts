@@ -27,7 +27,7 @@ test('grey CI recovery starts off, persists opt-in and skips, and links its last
         'merge-prs': behavior,
         'rerun-grey-ci': { ...behavior, enabled, skipRepos, lastTriggered: { at: new Date().toISOString(), target: 'acme/app#7', url: 'https://github.com/acme/app/actions/runs/100' } },
         'review-new-issues': { ...behavior, reviewers: 1, repos: [], authors: ['octocat'], scratchpad: '' },
-        diagnostics: { status: 'ok', agentLogsError: null, failures: [], deadLetters: [],
+        diagnostics: { status: 'ok', agentLogsError: null, failures: [], deadLetters: [], holds: [],
           datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null },
           identity: { status: 'valid', actor: 'review-bot', error: null } },
       } })

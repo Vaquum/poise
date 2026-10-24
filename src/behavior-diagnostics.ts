@@ -25,6 +25,10 @@ export interface BehaviorDiagnosticGroup extends DiagnosticClassification {
   entries: DiagnosticEntry[]
 }
 
+// The PR behaviors a repository hold gates, in Behaviors-view row order.
+// (src/behaviors.ts imports this module, so the list cannot come from there.)
+const HELD_PR_BEHAVIORS = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'rerun-grey-ci', 'merge-prs']
+
 export function targetRef(target: string): string {
   return target.match(/^[^#]+#\d+/)?.[0] ?? target
 }
@@ -84,6 +88,19 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
       : diagnosticMessage(classification.code, cause)
     const detail = `${failure.org ? `${failure.org}: ` : ''}${failure.behavior}${failure.target ? ` ${failure.target}` : ''}: ${failure.consecutiveFailures} consecutive ${failure.kind} failure(s) — ${cause}`
     add(classification, scope, message, detail, { behavior: failure.behavior, target: failure.target ?? null, at: failure.lastFailureAt || null, next: failure.nextRetryAt || null, callId: failure.callId, correlationId: failure.correlationId, ...evidenceAttachment(failure) })
+  }
+  // One held state per repository the agent account cannot read, however
+  // many behaviors it holds. No notice joins it: entries carry every held
+  // behavior so each behavior's row counts it, with no target to match a
+  // notice subject.
+  for (const hold of diagnostics.holds) {
+    const cause = failureCause(hold.error)
+    const message = `agent account has no access to ${hold.repo}`
+    const detail = `${hold.org ? `${hold.org}: ` : ''}PR behaviors held for ${hold.repo} — ${cause}`
+    for (const behavior of HELD_PR_BEHAVIORS) {
+      add({ severity: 'warning', code: 'github_access' }, hold.repo, message, detail,
+        { behavior, target: null, at: hold.heldAt || null, next: hold.nextRecheckAt || null })
+    }
   }
   for (const letter of diagnostics.deadLetters) {
     const ref = targetRef(letter.target)

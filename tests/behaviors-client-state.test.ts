@@ -61,7 +61,7 @@ describe('Behaviors availability diagnostics', () => {
   it('keeps a known degraded runtime visible through a 502 until a healthy read', async () => {
     const snapshot = { status: 'degraded', runtimeError: 'Behavior runtime is degraded.', agentLogsError: null,
       datastore: { status: 'healthy', error: null }, identity: { status: 'valid', actor: 'reviewer', error: null },
-      failures: [], deadLetters: [] }
+      failures: [], deadLetters: [], holds: [] }
     let outage = false
     vi.stubGlobal('fetch', async () => outage ? { ok: false, status: 502 }
       : { ok: true, json: async () => ({ ...payload(), diagnostics: snapshot }) })
@@ -82,7 +82,7 @@ describe('Behaviors availability diagnostics', () => {
   it('preserves real last-known errors during an outage and clears availability after recovery', async () => {
     const snapshot = { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', error: null },
       identity: { status: 'valid', actor: 'reviewer', error: null },
-      failures: [{ behavior: 'approve-prs', error: 'GitHub 404: Not Found' }], deadLetters: [] }
+      failures: [{ behavior: 'approve-prs', error: 'GitHub 404: Not Found' }], deadLetters: [], holds: [] }
     let outage = false
     vi.stubGlobal('fetch', async () => outage ? { ok: false, status: 502 }
       : { ok: true, json: async () => ({ ...payload(), diagnostics: snapshot }) })

@@ -46,6 +46,7 @@ describe('an entry', () => {
       datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
       identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [],
       deadLetters: [{ id: 'd', behavior: 'review-new-prs', target: 'acme/api#9', error: 'head changed <script>', createdAt: '', attemptCount: 2, diagnostic: { severity: 'info', code: 'head_changed' } }],
+      holds: [],
     }, T0)
     const html = itemHtml(diagnostic, true, T0)
     expect(html).toContain('<ol class="nr-history"><li><span>review-new-prs acme/api#9: head changed &lt;script&gt; (2 attempts)</span></li></ol>')
@@ -70,7 +71,7 @@ describe('where an entry comes from', () => {
     const [runtime] = notificationItems([], {
       status: 'degraded', runtimeError: 'The behavior scheduler is no longer responding.', agentLogsError: null,
       datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
-      identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [],
+      identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [], holds: [],
     }, T0)
     expect(itemHtml(runtime, false, T0)).toContain('<span class="nr-card-meta">Behaviors</span>')
     const held = item(notice('h', { kind: 'behavior_held', target: { swarm: 'call' }, subject: { behavior: 'review-new-prs', target: 'acme/api#9' } }))
@@ -99,6 +100,7 @@ describe('when its history happened', () => {
       datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
       identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [],
       deadLetters: [letter('today', '2026-10-17T16:38:00.000Z'), letter('yesterday', '2026-10-16T16:38:00.000Z')],
+      holds: [],
     }, now)
     const html = itemHtml(held, true, now)
     expect(html).toContain('<time datetime="2026-10-17T16:38:00.000Z">19:38</time>')
@@ -114,7 +116,7 @@ describe('when its history happened', () => {
       identity: { status: 'valid', actor: 'bit-mis', error: null },
       failures: [{ behavior: 'review-new-prs', target: 'acme/api#9', kind: 'operation', consecutiveFailures: 2,
         lastFailureAt: '2026-10-17T16:38:00.000Z', nextRetryAt: '2026-10-17T16:43:00.000Z', error: 'GitHub 404: Not Found' }],
-      deadLetters: [],
+      deadLetters: [], holds: [],
     }, now)
     const html = itemHtml(failing, true, now)
     expect(html).toContain('; next check 19:43</span>')
@@ -130,7 +132,7 @@ describe('when its history happened', () => {
       identity: { status: 'valid', actor: 'bit-mis', error: null },
       failures: [{ behavior: 'review-new-prs', target: 'acme/api#9', kind: 'operation', consecutiveFailures: 2,
         lastFailureAt: '2026-10-17T16:38:00.000Z', nextRetryAt: 'soon', error: 'GitHub 404: Not Found' }],
-      deadLetters: [],
+      deadLetters: [], holds: [],
     }, now)
     expect(itemHtml(failing, true, now)).not.toContain('next check')
   })
