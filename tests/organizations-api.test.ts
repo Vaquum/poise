@@ -1,13 +1,17 @@
 import Database from 'better-sqlite3'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Organization } from '../server/organizations'
 import type { RunFileOptions } from '../server/process'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
+
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
 vi.mock('../server/process', async (original) => ({
@@ -567,5 +571,180 @@ describe('global behavior settings API', () => {
       releaseHistory({ stdout: JSON.stringify(behaviorLogs), stderr: '' })
     }
     await expect(history.then((response) => response.status)).resolves.toBe(200)
+  })
+})
+
+describe('stopping following an organization', () => {
+  const runScript = promisify(execFile)
+
+  async function remove(login: string, person: boolean) {
+    const response = await fetch(`${base}/api/organizations/${encodeURIComponent(login)}`, {
+      method: 'DELETE', headers: person ? { Origin: base } : {},
+    })
+    return { status: response.status, body: await response.json() as { organizations: Organization[], error?: string } }
+  }
+
+  async function addReady(login: string) {
+    expect((await request('/api/organizations', { org: login })).status).toBe(202)
+    await orgStatus(login, 'ready')
+  }
+
+  function registered(login: string): boolean {
+    return !!database!.db.prepare('SELECT 1 FROM organizations WHERE login = ? COLLATE NOCASE').get(login)
+  }
+
+  function datastoreCalls(): unknown[][] {
+    return mocks.runFile.mock.calls.filter(([command]) => command === 'github-datastore' || command === 'gh')
+  }
+
+  it('removes a ready managed organization and refuses the legacy, the last, the unknown and the malformed', async () => {
+    await addReady('acme')
+    const removed = await remove('acme', true)
+    expect(removed.status).toBe(200)
+    expect(removed.body.organizations).toEqual([
+      { login: 'Legacy', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null, retryAt: null },
+    ])
+    expect(registered('acme')).toBe(false)
+
+    const legacy = await remove('Legacy', true)
+    expect(legacy.status).toBe(400)
+    expect(legacy.body.error).toContain('needs this account')
+    const missing = await remove('missing', true)
+    expect(missing.status).toBe(400)
+    expect(missing.body.error).toContain('not configured')
+    const malformed = await remove('../escape', true)
+    expect(malformed.status).toBe(400)
+    expect((await request('/api/organizations')).body.organizations).toHaveLength(1)
+
+    // The last account standing cannot go either.
+    await addReady('beta')
+    database!.db.prepare('DELETE FROM organizations WHERE login = ? COLLATE NOCASE').run('Legacy')
+    database!.setMeta('org', '')
+    expect((await request('/api/organizations')).body.organizations.map((org) => org.login)).toEqual(['beta'])
+    const last = await remove('beta', true)
+    expect(last.status).toBe(400)
+    expect(last.body.error).toContain('last GitHub account')
+    expect(registered('beta')).toBe(true)
+  })
+
+  it('aborts an activation in flight and publishes nothing after it', async () => {
+    pendingIndex = new Promise<void>((resolve) => { releaseIndex = resolve })
+    expect((await request('/api/organizations', { org: 'acme' })).status).toBe(202)
+    await vi.waitFor(() => expect(datastoreCalls().some(([, args]: any[]) => args[2] === 'init-org')).toBe(true))
+    const removed = await remove('ACME', true)
+    expect(removed.status).toBe(200)
+    expect(removed.body.organizations).toHaveLength(1)
+    expect(registered('acme')).toBe(false)
+    releaseIndex!()
+    pendingIndex = undefined
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect((await request('/api/organizations')).body.organizations).toHaveLength(1)
+    expect(database!.getMeta('organization_generation:acme')).toBe('1')
+  })
+
+  it('aborts a sync in flight and publishes nothing after it', async () => {
+    await addReady('acme')
+    const health = () => datastoreCalls().filter(([, args]: any[]) => (args as string[])[2] === 'health').length
+    const before = health()
+    pendingHealth = new Promise<void>((resolve) => { releaseHealth = resolve })
+    expect((await request('/api/organizations/acme/retry', {})).status).toBe(202)
+    await vi.waitFor(() => expect(health()).toBeGreaterThan(before))
+    const removed = await remove('acme', true)
+    expect(removed.status).toBe(200)
+    expect(registered('acme')).toBe(false)
+    releaseHealth!()
+    pendingHealth = undefined
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect((await request('/api/organizations')).body.organizations).toHaveLength(1)
+    expect(database!.getMeta('organization_generation:acme')).toBe('1')
+  })
+
+  it('activates a re-added organization cleanly while the old job stays fenced', async () => {
+    pendingIndex = new Promise<void>((resolve) => { releaseIndex = resolve })
+    expect((await request('/api/organizations', { org: 'acme' })).status).toBe(202)
+    await vi.waitFor(() => expect(datastoreCalls().some(([, args]: any[]) => args[2] === 'init-org')).toBe(true))
+    expect((await remove('acme', true)).status).toBe(200)
+    expect((await request('/api/organizations', { org: 'acme' })).status).toBe(202)
+    releaseIndex!()
+    pendingIndex = undefined
+    await orgStatus('acme', 'ready')
+    const rows = database!.db.prepare('SELECT login, status, error FROM organizations WHERE login = ? COLLATE NOCASE').all('acme')
+    expect(rows).toEqual([{ login: 'acme', status: 'ready', error: null }])
+    expect(database!.getMeta('organization_generation:acme')).toBe('1')
+  })
+
+  it('resolves its notices and drops its repositories from selections and scope', async () => {
+    await addReady('acme')
+    const { raiseAlert, openAlerts, silenceAlert, silencedKeys } = await import('../server/alerts/store')
+    const alert = (kind: any, dedupeKey: string) => raiseAlert({ kind, dedupeKey, title: dedupeKey, body: dedupeKey, path: '/' })
+    alert('datastore_sync_failing', 'datastore-sync:acme')
+    alert('pr_ready', 'pr-ready:acme/repo#1')
+    const silenced = alert('review_requested', 'review-requested:acme/repo#2')
+    silenceAlert(silenced!.seq)
+    alert('behavior_held', 'behavior-held:merge-prs:acme/repo#3:check')
+    alert('datastore_sync_failing', 'datastore-sync:legacy')
+    alert('pr_ready', 'pr-ready:legacy/repo#1')
+    alert('storage_low', 'storage:low')
+    expect((await request('/api/behaviors/review-new-issues', { repos: ['acme/same-repo', 'Legacy/same-repo'] })).status).toBe(200)
+    const scoped = await fetch(`${base}/api/settings`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Origin: base },
+      body: JSON.stringify({ manager: { scope: ['acme/repo', 'Legacy/repo'] } }),
+    })
+    expect(scoped.status).toBe(200)
+
+    expect((await remove('acme', true)).status).toBe(200)
+    expect(openAlerts().map((entry) => entry.dedupeKey).sort()).toEqual(
+      ['datastore-sync:legacy', 'pr-ready:legacy/repo#1', 'storage:low'])
+    expect(silencedKeys('review-requested:')).toEqual([])
+
+    const behaviors = await (await fetch(`${base}/api/behaviors`)).json() as Record<string, Record<string, unknown>>
+    expect(behaviors['review-new-issues']!.repos).toEqual(['Legacy/same-repo'])
+    const settings = await (await fetch(`${base}/api/settings`)).json() as Record<string, any>
+    expect(settings.manager.scope).toEqual(['Legacy/repo'])
+    expect(settings.manager.version).toBe(2)
+  })
+
+  it('keeps the datastore files and touches nothing on GitHub', async () => {
+    await addReady('acme')
+    const external = join(root, 'external.sqlite')
+    await writeFile(external, 'externally managed')
+    process.env.POISE_DATASTORE_DB = external
+    const calls = datastoreCalls().length
+    expect((await remove('acme', true)).status).toBe(200)
+    expect(datastoreCalls()).toHaveLength(calls)
+    const { existsSync } = await import('node:fs')
+    expect(existsSync(join(root, 'datastores/acme/github.sqlite'))).toBe(true)
+    expect(existsSync(external)).toBe(true)
+  })
+
+  it('refuses without the person, through fetch and through the native control api', async () => {
+    await addReady('acme')
+    const refused = await remove('acme', false)
+    expect(refused.status).toBe(403)
+    expect(registered('acme')).toBe(true)
+
+    const config = join(root, 'control.json')
+    await writeFile(config, JSON.stringify({ origin: base, sessionId: 's', token: 't' }))
+    const script = join(process.cwd(), 'scripts', 'poise-chat-control.mjs')
+    const stderr = await runScript(process.execPath,
+      [script, config, JSON.stringify({ operation: 'api', path: '/api/organizations/acme', method: 'DELETE' })])
+      .then(() => null, (error: any) => String(error?.stderr ?? error))
+    expect(stderr).toMatch(/"status":\s*403/)
+    expect(registered('acme')).toBe(true)
+    expect((await request('/api/organizations')).body.organizations).toHaveLength(2)
+  })
+
+  it('stays removed across a restart of the organizations runtime', async () => {
+    await addReady('acme')
+    expect((await remove('acme', true)).status).toBe(200)
+    const { startOrganizationsRuntime, stopOrganizationsRuntime } = await import('../server/organizations')
+    await stopOrganizationsRuntime()
+    const calls = datastoreCalls().length
+    startOrganizationsRuntime()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(registered('acme')).toBe(false)
+    expect((await request('/api/organizations')).body.organizations).toHaveLength(1)
+    expect(datastoreCalls()).toHaveLength(calls)
+    await stopOrganizationsRuntime()
   })
 })

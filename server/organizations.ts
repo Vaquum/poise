@@ -3,7 +3,8 @@ import Database from 'better-sqlite3'
 import { chmodSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { db, getMeta } from './db'
+import { db, getMeta, setMeta } from './db'
+import { forgetSilence, openAlerts, resolveAlert, silencedKeys } from './alerts/store'
 import { ProcessLockError, withProcessLock } from './process-lock'
 import { runFile } from './process'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
@@ -216,6 +217,33 @@ export function addOrganization(value: unknown): Organization {
   return fromRow(rowFor(login)!)
 }
 
+// The account's notices resolve with it: its datastore alert, its
+// pull-request notices, and behavior incidents on its repositories.
+// Silences go too, so a re-added account starts clean. Quota, chat,
+// sign-in, storage and ledger alerts belong to identities or the
+// workspace, not to the account, and stay.
+function resolveOrganizationAlerts(login: string): void {
+  const lower = login.toLowerCase()
+  const owned = (key: string): boolean => {
+    if (key === `datastore-sync:${lower}`) return true
+    for (const prefix of ['pr-ready:', 'review-requested:', 'pr-conflict:', 'behavior-held:']) {
+      if (!key.startsWith(prefix)) continue
+      const rest = key.slice(prefix.length)
+      const owner = (prefix === 'behavior-held:' ? rest.split(':').slice(1).join(':') : rest).split('/')[0].toLowerCase()
+      if (owner === lower) return true
+    }
+    return false
+  }
+  for (const alert of openAlerts()) {
+    if (owned(alert.dedupeKey)) resolveAlert(alert.dedupeKey)
+  }
+  for (const prefix of ['pr-ready:', 'review-requested:', 'pr-conflict:', 'behavior-held:', 'datastore-sync:']) {
+    for (const key of silencedKeys(prefix)) {
+      if (owned(key)) forgetSilence(key)
+    }
+  }
+}
+
 export function retryOrganization(value: string): Organization {
   const login = normalizeOrganizationLogin(value)
   const row = rowFor(login)
@@ -230,8 +258,68 @@ export function retryOrganization(value: string): Organization {
   return fromRow(rowFor(login)!)
 }
 
-function stage(login: string, value: string): void {
+// Stop following a managed organization. Nothing changes on GitHub. The
+// registration row goes; its datastore file stays — whether Poise-owned
+// data is kept awaits the owner's decision — and an externally managed
+// datastore is never touched. Work bindings stay as history.
+export async function removeOrganization(value: unknown): Promise<void> {
+  const login = normalizeOrganizationLogin(value)
+  const row = rowFor(login)
+  if (!row && login !== getMeta('org')?.trim().toLowerCase()) throw new Error('GitHub account is not configured.')
+  if (!row?.managed) {
+    throw new Error(`Cannot stop following ${row?.login ?? login}: the workspace needs this account.`)
+  }
+  if (getOrganizations().length <= 1) {
+    throw new Error(`Cannot stop following ${row.login}: it is the last GitHub account.`)
+  }
+  // Abort the in-flight activation or sync and wait for it to settle,
+  // then move the generation so a straggler can never publish into a
+  // new registration of this login after a quick re-add.
+  const job = jobs.get(login.toLowerCase())
+  if (job) {
+    job.controller.abort()
+    await Promise.allSettled([job.promise])
+  }
+  setMeta(generationKey(login), String(organizationGeneration(login) + 1))
+  db.prepare('DELETE FROM organizations WHERE login = ?').run(login)
+  resolveOrganizationAlerts(login)
+  // Its repositories leave the issue review selection and the Manager's
+  // scope. Skips stay: they are designed to outlive listing changes.
+  // Dynamic imports: behaviors and settings both depend on this module.
+  const lower = login.toLowerCase()
+  const { getIssueRepositories, setIssueRepositories } = await import('./behaviors')
+  const selected = getIssueRepositories().map((entry) => entry.repo)
+  const kept = selected.filter((repo) => repo.split('/')[0].toLowerCase() !== lower)
+  if (kept.length !== selected.length) setIssueRepositories(kept)
+  const { getSettings, setSettings } = await import('./settings')
+  const manager = getSettings().manager
+  if (Array.isArray(manager.scope)) {
+    const scope = manager.scope.filter((repo) => repo.split('/')[0].toLowerCase() !== lower)
+    if (scope.length !== manager.scope.length) setSettings({ manager: { ...manager, scope } })
+  }
+}
+
+function stage(login: string, value: string, generation?: number): void {
+  if (generation !== undefined && !publishAdmitted(login, generation)) return
   db.prepare('UPDATE organizations SET stage = ? WHERE login = ?').run(value, login)
+}
+
+// The activation generation fences a login's job against a quick remove
+// and re-add: the job captures the generation when it starts, and every
+// publish point below checks it, so an older job can never publish into
+// a new registration of the same login. It lives in meta, not in the
+// registration row, so it survives the row's deletion.
+function generationKey(login: string): string {
+  return `organization_generation:${login.toLowerCase()}`
+}
+
+function organizationGeneration(login: string): number {
+  const value = Number(getMeta(generationKey(login)))
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0
+}
+
+function publishAdmitted(login: string, generation: number): boolean {
+  return !!rowFor(login) && organizationGeneration(login) === generation
 }
 
 async function githubEnvironment(me: string | undefined, signal: AbortSignal): Promise<NodeJS.ProcessEnv> {
@@ -323,7 +411,7 @@ function publishDatabase(tempPath: string, targetPath: string): void {
   renameSync(tempPath, targetPath)
 }
 
-async function activate(row: OrganizationRow, me: string, signal: AbortSignal, env: NodeJS.ProcessEnv): Promise<void> {
+async function activate(row: OrganizationRow, me: string, signal: AbortSignal, env: NodeJS.ProcessEnv, generation: number): Promise<void> {
   const path = row.datastore_path!
   const tempPath = `${path}.initializing`
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
@@ -348,7 +436,7 @@ async function activate(row: OrganizationRow, me: string, signal: AbortSignal, e
       reused = state.complete
     }
     if (!reused) {
-      stage(row.login, 'indexing')
+      stage(row.login, 'indexing', generation)
       await caller(tempPath, ['init-org', row.login, '--resume'], me, env, signal)
       assertOrganization(tempPath, row.login)
     }
@@ -357,17 +445,18 @@ async function activate(row: OrganizationRow, me: string, signal: AbortSignal, e
   // Refresh retained data before rebuilding the user so Retry can discover
   // issues created remotely since that attempt, without reinitializing it.
   if (reused) {
-    stage(row.login, 'syncing')
+    stage(row.login, 'syncing', generation)
     await caller(sourcePath, ['sync'], me, env, signal)
   }
-  stage(row.login, 'building-user')
+  stage(row.login, 'building-user', generation)
   await caller(sourcePath, ['build-user', me], me, env, signal)
-  stage(row.login, 'syncing')
+  stage(row.login, 'syncing', generation)
   await caller(sourcePath, ['sync'], me, env, signal)
-  stage(row.login, 'checking')
+  stage(row.login, 'checking', generation)
   await checkHealth(sourcePath, me, env, signal)
   signal.throwIfAborted()
   if (sourcePath === tempPath) publishDatabase(tempPath, path)
+  if (!publishAdmitted(row.login, generation)) return
   db.prepare(`
     UPDATE organizations SET status = 'ready', stage = 'ready', error = NULL,
       activated_at = COALESCE(activated_at, ?), last_sync_at = ?, last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0,
@@ -385,34 +474,37 @@ async function reconcileChunk(path: string, me: string, env: NodeJS.ProcessEnv, 
   return result.reconcile_complete
 }
 
-async function synchronize(row: OrganizationRow, me: string, signal: AbortSignal, env: NodeJS.ProcessEnv): Promise<void> {
+async function synchronize(row: OrganizationRow, me: string, signal: AbortSignal, env: NodeJS.ProcessEnv, generation: number): Promise<void> {
   const path = row.datastore_path!
   const recoveringFullBuild = assertOrganization(path, row.login)
   if (row.indexed_user !== me) {
-    stage(row.login, 'building-user')
+    stage(row.login, 'building-user', generation)
     await caller(path, ['build-user', me], me, env, signal)
   }
   let reconcileComplete = false
   // Older releases invalidated every repository before a full reconciliation.
   // Repair those markers in resumable chunks before requesting a delta sync.
   if (recoveringFullBuild) {
-    stage(row.login, 'reconciling')
+    stage(row.login, 'reconciling', generation)
     reconcileComplete = await reconcileChunk(path, me, env, signal)
     if (!reconcileComplete) {
-      db.prepare('UPDATE organizations SET next_sync_at = 0 WHERE login = ?').run(row.login)
+      if (publishAdmitted(row.login, generation)) {
+        db.prepare('UPDATE organizations SET next_sync_at = 0 WHERE login = ?').run(row.login)
+      }
       return
     }
   }
-  stage(row.login, 'syncing')
+  stage(row.login, 'syncing', generation)
   await caller(path, ['sync'], me, env, signal)
   const reconcile = Date.now() - row.last_reconcile_at >= RECONCILE_INTERVAL_MS
   if (reconcile && !reconcileComplete) {
-    stage(row.login, 'reconciling')
+    stage(row.login, 'reconciling', generation)
     reconcileComplete = await reconcileChunk(path, me, env, signal)
     // Reconciliation does not advance Caller's last_sync_at freshness marker.
     await caller(path, ['sync'], me, env, signal)
   }
   await checkHealth(path, me, env, signal)
+  if (!publishAdmitted(row.login, generation)) return
   db.prepare(`
     UPDATE organizations SET stage = 'ready', error = NULL, last_sync_at = ?,
       last_reconcile_at = ?, indexed_user = ?, next_sync_at = 0, sync_failures = 0, sync_failing_since = 0 WHERE login = ?
@@ -425,6 +517,7 @@ function launch(login: string): void {
   if (stopping || jobs.has(key) || releaseBackgroundPaused() || cooldownUntil(getMeta('me')?.trim())) return
   const releaseOperation = trackReleaseBackground()
   const controller = new AbortController()
+  const generation = organizationGeneration(login)
   const promise = Promise.resolve().then(async () => {
     const initial = rowFor(login)
     if (!initial?.managed || !initial.datastore_path) return
@@ -434,23 +527,27 @@ function launch(login: string): void {
       mkdirSync(directory, { recursive: true, mode: 0o700 })
       chmodSync(directory, 0o700)
       await withProcessLock({ path: `${initial.datastore_path}.lock`, timeoutMs: 50 }, async () => {
-        const row = rowFor(login)!
+        const row = rowFor(login)
         controller.signal.throwIfAborted()
         // Recheck under the process lock: another Poise instance may have
-        // completed this work while we waited for ownership.
+        // completed this work while we waited for ownership, or the
+        // account may have been removed and re-added since this job
+        // started — a straggler publishes nothing into the new row.
+        if (!row || !publishAdmitted(login, generation)) return
         if (row.status === 'error') return
         const me = getMeta('me')?.trim()
         if (me) requireQuota(me)
         if (row.status === 'ready' && row.next_sync_at > Date.now()) return
         if (row.status === 'ready' && row.indexed_user === me && Date.now() - row.last_sync_at < SYNC_INTERVAL_MS) return
-        if (row.status === 'initializing') stage(login, 'authenticating')
+        if (row.status === 'initializing') stage(login, 'authenticating', generation)
         env = await githubEnvironment(me, controller.signal)
-        if (row.status === 'ready') await synchronize(row, me!, controller.signal, env)
-        else await activate(row, me!, controller.signal, env)
+        if (row.status === 'ready') await synchronize(row, me!, controller.signal, env, generation)
+        else await activate(row, me!, controller.signal, env, generation)
       })
     } catch (error) {
       if (controller.signal.aborted || error instanceof ProcessLockError) return
-      const failed = rowFor(login)!
+      const failed = rowFor(login)
+      if (!failed || !publishAdmitted(login, generation)) return
       const failures = error instanceof GitHubRateLimitError ? failed.sync_failures : failed.activated_at ? failed.sync_failures + 1 : 0
       const retryAt = error instanceof GitHubRateLimitError ? error.resetAt : failures ? Date.now() + Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(failures - 1, 6), MAX_SYNC_RETRY_MS) : 0
       const failingSince = failures ? failed.sync_failing_since || Date.now() : 0

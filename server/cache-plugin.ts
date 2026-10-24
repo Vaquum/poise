@@ -25,7 +25,7 @@ import { checkGithubQuota, readGithubQuota, startGithubQuotaRuntime, stopGithubQ
 import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
-import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
+import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
 import { runDebate } from './chat'
@@ -40,7 +40,7 @@ import { listSessions } from './chat/storage'
 import { handleGoogleApi } from './google/api'
 import { validateGoogleEnvironment } from './google/accounts'
 import { getBehaviorDiagnosticIncidents } from './behaviors'
-import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
+import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, setPaused as setBehaviorPaused, getPausedUntil as getBehaviorPausedUntil, getPausedBy as getBehaviorPausedBy, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
 import { maintenanceRunning, runStorageMaintenanceOnce, startStorageMaintenanceRuntime, stopStorageMaintenanceRuntime, storageStatus } from './storage-maintenance'
 import { ContentLaunchPendingError, contentLaunchIdForCall, getContentJobResponse, getContentLaunchResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
@@ -513,6 +513,21 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             return json(res, httpStatus(error, 400), { error: (error as Error).message })
           }
         }
+        // Person-only: stopping following an account answers 403 without
+        // the person's authority, and removes nothing. Nothing changes on
+        // GitHub; the legacy account and the last one are refused.
+        const organizationRemove = path.match(/^\/api\/organizations\/([^/]+)$/)
+        if (organizationRemove && req.method === 'DELETE') {
+          if (!speaksForPerson(req, !!service, authority)) {
+            return json(res, 403, { error: 'Stopping following an account is the person\'s action, taken in the browser.', code: 'invalid' })
+          }
+          try {
+            await removeOrganization(decodeURIComponent(organizationRemove[1]))
+            return json(res, 200, { organizations: getOrganizations() })
+          } catch (error) {
+            return json(res, httpStatus(error, 400), { error: (error as Error).message })
+          }
+        }
 
         // ── The running release ──
         // The commit this Poise runs and since when, for the menu's first line.
@@ -755,6 +770,9 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const enabled = getEnabledMap()
           const settings = getSettingMap()
           const scratch = getScratchpadMap()
+          // A pause holds new launches until its time; `enabled` stays the
+          // saved on/off, and expiry needs no write.
+          const pauseState = (key: BehaviorKey) => ({ pausedUntil: getBehaviorPausedUntil(key), pausedBy: getBehaviorPausedBy(key) })
           // Indexed latest-trigger and exact incident lookups also prove
           // absence: a never-run kind cannot cause a whole-history walk.
           const accounts = getOrganizations()
@@ -800,6 +818,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const owner = agentAccount() || null
           return json(res, 200, {
             'review-new-prs': {
+              ...pauseState('review-new-prs'),
               owner,
               enabled: enabled['review-new-prs'],
               setting: settings['review-new-prs'],
@@ -815,6 +834,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // the Behaviors view can render an em dash instead of a
             // dropdown for that row.
             'approve-prs': {
+              ...pauseState('approve-prs'),
               owner,
               enabled: enabled['approve-prs'],
               setting: null,
@@ -831,6 +851,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // `scratchpad: null` because there's no agent prompt to
             // inject memory into — the view renders no memory control.
             'resolve-unblocking': {
+              ...pauseState('resolve-unblocking'),
               owner,
               enabled: enabled['resolve-unblocking'],
               setting: null,
@@ -840,12 +861,14 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               lastTriggered: getResolveUnblockingLastFired(),
             },
             'rerun-grey-ci': {
+              ...pauseState('rerun-grey-ci'),
               owner, enabled: enabled['rerun-grey-ci'], setting: null, reviewers: null,
               skipRepos: getRepositorySkips('rerun-grey-ci'), scratchpad: null,
               lastTriggered: getGreyCiLastFired(),
               lastSucceeded: getGreyCiLastSucceeded(),
             },
             'merge-prs': {
+              ...pauseState('merge-prs'),
               owner,
               enabled: enabled['merge-prs'],
               setting: null,
@@ -858,6 +881,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // until `repos` names one. `authors` are the trusted accounts
             // whose issues it reviews.
             'review-new-issues': {
+              ...pauseState('review-new-issues'),
               owner,
               enabled: enabled['review-new-issues'],
               setting: null,
@@ -880,7 +904,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           })
         }
 
-        // POST /api/behaviors/<key> { enabled?, setting?, reviewers?: 1|2|3, repos?: string[], authors?: string[], skipRepos?: string[], scratchpad? }
+        // POST /api/behaviors/<key> { enabled?, pausedUntil?, setting?, reviewers?: 1|2|3, repos?: string[], authors?: string[], skipRepos?: string[], scratchpad? }
         // — every field optional; several can be sent in one call.
         const behaviorMatch = url.match(/^\/api\/behaviors\/([a-z0-9-]+)(?:\?|$)/)
         if (behaviorMatch && req.method === 'POST') {
@@ -898,6 +922,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // side effect, and string values are not booleans.
             if ('enabled' in body && typeof body.enabled !== 'boolean') {
               return json(res, 400, { error: 'enabled must be a boolean' })
+            }
+            // A pause holds new launches until its time, apart from the
+            // saved on/off; null clears it at once. An already past time
+            // simply holds nothing.
+            if ('pausedUntil' in body && body.pausedUntil !== null
+              && (typeof body.pausedUntil !== 'string' || !Number.isFinite(Date.parse(body.pausedUntil)))) {
+              return json(res, 400, { error: 'pausedUntil must be an ISO time or null' })
             }
             if ('setting' in body) {
               if (!isValidSetting(body.setting)) {
@@ -981,9 +1012,18 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             if ('skipRepos' in body && isSkippableBehavior(key)) setRepositorySkips(key, body.skipRepos)
             if ('scratchpad' in body) setBehaviorScratchpad(key, body.scratchpad)
             if ('enabled' in body) await setBehaviorEnabled(key, body.enabled)
+            // The pause records who asked: the person, or `api` for a
+            // write that does not speak for them — the server cannot name
+            // the chat behind one.
+            if ('pausedUntil' in body) {
+              await setBehaviorPaused(key, body.pausedUntil,
+                speaksForPerson(req, !!service, authority) ? 'person' : 'api')
+            }
             return json(res, 200, {
               ok: true,
               enabled: getEnabledMap()[key],
+              pausedUntil: getBehaviorPausedUntil(key),
+              pausedBy: getBehaviorPausedBy(key),
               setting: getSettingMap()[key],
               reviewers: isPanelBehavior(key) ? getReviewers(key) : null,
               ...(key === 'review-new-issues' ? {

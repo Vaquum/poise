@@ -645,6 +645,15 @@ variables, and Caller fails loudly when an account is needed and missing.
 `grok`, `muse` and `antigravity`. Each shows whether the CLI is installed, its
 version, whether it is signed in and as whom.
 
+**Followed accounts.** Settings → General → GitHub accounts follows GitHub
+organizations and users, each with its own synced datastore. `DELETE
+/api/organizations/<login>` stops following one; it is the person's action in
+the browser. The account from setup and the last one cannot be removed.
+Removal aborts the account's activation or sync job, resolves its notices,
+and drops its repositories from the issue review selection and the Manager's
+scope. Nothing changes on GitHub, datastores are kept, and work bindings stay
+as history.
+
 `GET /api/github-quota` reads the configured user and automation accounts'
 stored credentials explicitly and returns their API budgets without secrets.
 Its response and forecast model are defined in [Analytics](Analytics.md#github-api-quota).
@@ -827,6 +836,14 @@ scheduler applies, or it is refused with HTTP 409 and the failed check named:
 The facts are read fresh from the datastore the scheduler reads; when they
 cannot be read the replay answers 502 and launches nothing. Swarm shows a
 refusal under the row whose Replay was pressed.
+
+**Pausing.** A behavior can be paused until a time (`pausedUntil` on `POST
+/api/behaviors/<key>`, `null` clears). The pause is stored apart from the
+saved on/off and attributed to the person or the api; it clears no claims,
+seen state or backoff. While it holds, reconciliation and already launched
+agents run on, but nothing new launches: every launch path rechecks at its
+final admission, and replays and explicit runs stay available. Expiry needs
+no write and never flips the saved on/off.
 
 ## Snippets and Poise Link
 
