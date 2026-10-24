@@ -3,10 +3,10 @@
 // flag the chat as stalled, and the monitor cycle wakes it once per episode.
 
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { AgentId, ChatEnvelope, ChatEvent, PromptInput } from '../../server/chat/protocol'
 import type { Adapter, AdapterHost, AdapterStartOptions, TurnResult } from '../../server/chat/adapters/types'
@@ -575,6 +575,56 @@ describe('turn stall detection and waking', () => {
     spawnSync('rm', ['-f', fifo1, fifo2])
     await runtime.stop({ handover: false })
   }, 60_000)
+
+  it('retries a failed first baseline instead of freezing the turn jobs as pre-existing', async () => {
+    // A one-shot ps shim: the first process listing fails, every later one
+    // delegates to the real ps. Installed after idle, before the first
+    // prompt, the failure lands exactly on the first baseline snapshot.
+    const realPs = spawnSync('sh', ['-c', 'command -v ps'], { encoding: 'utf8' })
+    if (realPs.status !== 0) throw new Error('no ps on PATH')
+    const binDir = await mkdtemp(join(root, 'ps-shim-'))
+    const marker = join(binDir, 'failed')
+    await writeFile(join(binDir, 'ps'), `#!/bin/sh\nif [ ! -e ${marker} ]; then touch ${marker}; exit 1; fi\nexec ${realPs.stdout.trim()} "$@"\n`)
+    await chmod(join(binDir, 'ps'), 0o755)
+    const fifoPath = join(root, 'bg-retry-trigger.fifo')
+    spawnSync('rm', ['-f', fifoPath])
+    const fifo = spawnSync('mkfifo', [fifoPath])
+    if (fifo.status !== 0) throw new Error(`mkfifo: ${fifo.stderr}`)
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true,
+      startWorker: { command: 'sh', args: ['-c', `read line < ${fifoPath}; sleep 30 & wait`] } }
+    const { runtime, events } = makeRuntime('poise-turn-stall-retry:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-retry' } })
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const savedPath = process.env.PATH
+    process.env.PATH = `${binDir}${delimiter}${savedPath}`
+    try {
+      runtime.prompt(session.id, { text: 'run the suite', attachments: [], mentions: [] })
+      await waitFor(() => owned.prompts.length === 1)
+      await writeFile(fifoPath, 'run\n')
+      const row = storage.getWorker(session.id)
+      if (!row) throw new Error('no worker row for the session')
+      await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.some((m) => m.command === 'sleep 30') ?? false)
+      spawnSync('rm', ['-f', fifoPath])
+      finishManual(owned)
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+      // The shim fired, and the retry recovered the baseline: the sleep
+      // tracks instead of going blind, and the frozen group excludes it.
+      await expect(readFile(marker)).resolves.toBeDefined()
+      const jobs = runtime.get(session.id)?.stall?.backgroundJobs ?? []
+      expect(jobs).toHaveLength(1)
+      expect(jobs[0].command).toBe('sleep 30')
+      expect(runtime.get(session.id)?.stallJobBaseline?.pids).not.toContain(jobs[0].pid)
+
+      process.kill(jobs[0].pid, 'SIGTERM')
+      await waitFor(() => !worker.pidAlive(jobs[0].pid))
+    } finally {
+      process.env.PATH = savedPath
+    }
+    await runtime.stop({ handover: false })
+  }, 40_000)
 
   it('clears the stall once the leftover is pushed and committed', async () => {
     const owned: FakeControls = { hosts: [], adapters: [], prompts: [],

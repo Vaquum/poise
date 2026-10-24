@@ -75,7 +75,7 @@ import { actorOf, nativeName } from './actors'
 import { SWITCHBOARD_PERSON } from './switchboard'
 import * as storage from './storage'
 import { WORK_MONITOR_SENDER, bindings, holdChat, holds, internalTurn, message as controlMessage, moveBindings, releaseBindings, timerSummaries } from './control-store'
-import { groupMembers, pgidAlive, pidAlive, signalGroup, workerGateStatus, workerIdentityMatches, type WorkerGateStatus } from './worker'
+import { groupMembers, pgidAlive, pidAlive, signalGroup, workerGateStatus, workerIdentityMatches, type GroupMember, type WorkerGateStatus } from './worker'
 import { ADOPTION_LIVE_TIMEOUT_MS, attachRelay, livePromise, relayDirFor, relayIdentityMatches, spawnRelay, type RelayConnection } from './relay'
 import { createReplayHost, recalledDiffs } from './replay'
 import { createClaudeAdapter } from './adapters/claude'
@@ -4382,15 +4382,25 @@ export class ChatRuntime extends EventEmitter {
 
   /** Snapshot the turn's worker group before its native prompt runs, so
    *  turn-end detection tracks only what the turn itself started. Never
-   *  throws: without a baseline nothing new is tracked. */
+   *  throws: without a baseline nothing new is tracked. The listing is
+   *  retried — a missed baseline is permanent, since the next successful
+   *  turn would freeze the turn's jobs as pre-existing — and an exhausted
+   *  failure warns instead of degrading silently. Detection and the reap
+   *  need no retry: their misses heal on the next pass. */
   private async snapshotJobBaseline(session: LiveSession, turn: RunningTurn): Promise<void> {
     turn.jobBaseline = undefined
     try {
       const worker = storage.getWorker(session.record.id)
       const pgid = session.relay?.gatePgid ?? worker?.gatePgid
       if (!pgid) return
-      const members = await groupMembers(pgid)
-      if (!members) return
+      let members: GroupMember[] | null = null
+      for (let attempt = 0; attempt < 3 && !members; attempt++) members = await groupMembers(pgid)
+      if (!members) {
+        diagnostic({ level: 'warning', operation: 'chat.work.baseline_failed',
+          message: 'The turn started without a job baseline; its background jobs cannot be tracked',
+          context: { sessionId: session.record.id } })
+        return
+      }
       turn.jobBaseline = { pgid, members: new Map(members.map((member) => [member.pid, this.stallCommand(member.command)])) }
     } catch (error) {
       turn.jobBaseline = undefined
