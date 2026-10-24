@@ -482,6 +482,100 @@ describe('turn stall detection and waking', () => {
     await runtime.stop({ handover: false })
   }, 40_000)
 
+  it('adopts a tracked job\'s orphaned child instead of letting a later baseline absorb it', async () => {
+    // Two trigger fifos outside every checkout. The agent parks a keeper
+    // sleep first — baselined, never tracked — so its wait survives the
+    // parent below exiting; the parent blocks on the second fifo, then
+    // spawns its sleep child and exits, orphaning it into the group.
+    const fifo1 = join(root, 'bg-orphan-1.fifo')
+    const fifo2 = join(root, 'bg-orphan-2.fifo')
+    spawnSync('rm', ['-f', fifo1, fifo2])
+    for (const fifo of [fifo1, fifo2]) {
+      const made = spawnSync('mkfifo', [fifo])
+      if (made.status !== 0) throw new Error(`mkfifo: ${made.stderr}`)
+    }
+    const agentScript = `sleep 120 & read line < ${fifo1}; (read line < ${fifo2}; sleep 45 &) & wait`
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true,
+      startWorker: { command: 'sh', args: ['-c', agentScript] } }
+    const { runtime, events } = makeRuntime('poise-turn-stall-orphan:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-orphan' } })
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.prompt(session.id, { text: 'run the suite', attachments: [], mentions: [] })
+    await waitFor(() => owned.prompts.length === 1)
+    await writeFile(fifo1, 'run\n')
+    const row = storage.getWorker(session.id)
+    if (!row) throw new Error('no worker row for the session')
+    const shCmd = `sh -c ${agentScript}`
+    // The agent plus its blocked subshell share the forked command line.
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.filter((m) => m.command === shCmd).length === 2)
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // Turn 1 ends with the parent tracked and the group frozen without it.
+    const first = runtime.get(session.id)?.stall?.backgroundJobs ?? []
+    expect(first).toHaveLength(1)
+    expect(first[0].command).toBe(shCmd)
+    const parentPid = first[0].pid
+    const frozen = runtime.get(session.id)?.stallJobBaseline
+    expect(frozen?.pgid).toBe(row.gatePgid)
+    expect(frozen?.pids).not.toContain(parentPid)
+
+    // After the turn the parent spawns its sleep child and exits; the
+    // orphan stays in the worker group under init.
+    await writeFile(fifo2, 'run\n')
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.some((m) => m.command === 'sleep 45') ?? false)
+    await waitFor(() => !worker.pidAlive(parentPid))
+
+    // The monitor cycle reaps the parent and wakes the chat; turn 2's
+    // prompt-start baseline absorbs the orphan as pre-existing.
+    const control = await makeControl(runtime)
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 2)
+    expect(owned.prompts[1].text).toContain('still running')
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // Turn 2's end adopts the orphan against the frozen group instead of
+    // letting the absorbing baseline clear the stall silently.
+    const second = runtime.get(session.id)?.stall?.backgroundJobs ?? []
+    expect(second.map((job) => job.command)).toEqual(['sleep 45'])
+
+    // Each queued notice drains in order: the parent's completion, the
+    // re-created stall notice, then the orphan's completion.
+    const orphan = second[0]
+    process.kill(orphan.pid, 'SIGTERM')
+    await waitFor(() => !worker.pidAlive(orphan.pid))
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 3)
+    expect(owned.prompts[2].text).toContain('finished')
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 3)
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 4)
+    expect(owned.prompts[3].text).toContain('still running')
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 4)
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 5)
+    expect(owned.prompts[4].text).toContain('finished')
+    expect(owned.prompts[4].text).toContain('sleep 45')
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 5)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toBeUndefined()
+
+    // Each notice fires once: no completion replay, no nag loop.
+    await control.tick()
+    await new Promise((r) => setTimeout(r, 1_500))
+    await control.tick()
+    expect(owned.prompts.length).toBe(5)
+    spawnSync('rm', ['-f', fifo1, fifo2])
+    await runtime.stop({ handover: false })
+  }, 60_000)
+
   it('clears the stall once the leftover is pushed and committed', async () => {
     const owned: FakeControls = { hosts: [], adapters: [], prompts: [],
       commitFirst: { file: 'work.txt', content: 'done\n', dirty: 'draft.txt' } }

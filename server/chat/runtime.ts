@@ -4242,8 +4242,9 @@ export class ChatRuntime extends EventEmitter {
       const record = session.record
       if (stopReason !== 'end_turn' || record.status === 'closed') return
       if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
-        if (record.stall) {
+        if (record.stall || record.stallJobBaseline) {
           delete record.stall
+          delete record.stallJobBaseline
           this.saveRecord(session)
           this.emit_(record.id, { type: 'session.updated', session: record })
         }
@@ -4266,8 +4267,9 @@ export class ChatRuntime extends EventEmitter {
       // source stays silent. This check runs synchronously with the queues
       // below, so no handoff can interleave between them.
       if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
-        if (record.stall) {
+        if (record.stall || record.stallJobBaseline) {
           delete record.stall
+          delete record.stallJobBaseline
           this.saveRecord(session)
           this.emit_(record.id, { type: 'session.updated', session: record })
         }
@@ -4283,6 +4285,16 @@ export class ChatRuntime extends EventEmitter {
       if (members !== null && gatePgid && baseline) {
         const seen = new Map(jobs.map((job) => [job.pid, job]))
         const now = new Date().toISOString()
+        // The session's frozen group: the first listing stores the turn's
+        // prompt-start set; a replaced group (stale/safe-mode recovery runs
+        // a new gate) refreshes it, since old pids name another group. It is
+        // written back at once, independent of the marker — the poll may
+        // delete the marker before the next turn end ever runs.
+        if (record.stallJobBaseline?.pgid !== gatePgid) {
+          record.stallJobBaseline = { pgid: gatePgid, pids: [...baseline.members.keys()] }
+          this.saveRecord(session)
+        }
+        const frozen = new Set(record.stallJobBaseline.pids)
         const keptJobs: StalledJob[] = []
         const freshJobs: StalledJob[] = []
         for (const member of members.filter((candidate) => candidate.pid !== gatePid).sort((a, b) => a.pid - b.pid)) {
@@ -4293,6 +4305,13 @@ export class ChatRuntime extends EventEmitter {
           // gate group needs a full pid-space wraparound.
           if (kept) keptJobs.push(kept.command === command ? kept : { ...kept, command })
           else if (baseline.members.get(member.pid) !== command) freshJobs.push({ pid: member.pid, pgid: gatePgid, command, startedAt: now })
+          // A member the turn absorbed as pre-existing but the frozen group
+          // never saw start: a tracked job's child, spawned after a turn end
+          // and orphaned when its parent exited. Chasing parentage would miss
+          // it — the exit reparented it away — but group membership cannot
+          // lie, so detection adopts it instead of letting a later baseline
+          // absorb it ever after.
+          else if (!frozen.has(member.pid)) freshJobs.push({ pid: member.pid, pgid: gatePgid, command, startedAt: now })
         }
         // Every live turn-started job is tracked, however many: dropping one
         // would let a later baseline absorb it as pre-existing, so its
@@ -4484,6 +4503,7 @@ export class ChatRuntime extends EventEmitter {
     // promptly instead of waking unbound.
     if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
       delete record.stall
+      delete record.stallJobBaseline
       this.saveRecord(session)
       this.emit_(record.id, { type: 'session.updated', session: record })
       return
@@ -4503,6 +4523,7 @@ export class ChatRuntime extends EventEmitter {
     // the work. Synchronous with the writeback and queues below.
     if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
       delete record.stall
+      delete record.stallJobBaseline
       this.saveRecord(session)
       this.emit_(record.id, { type: 'session.updated', session: record })
       return
