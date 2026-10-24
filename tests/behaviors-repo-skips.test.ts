@@ -512,6 +512,9 @@ describe('the scheduler and a replay apply the same check', () => {
       runtime.setRepositorySkips(behavior, skipped)
       enable(db, behavior)
       const admissionBefore = await admitted(replay, API, 1)
+      // Admission reserves its target, and the reservation's fence has its
+      // own test; clear it so this test stays about eligibility parity.
+      db.db.prepare('DELETE FROM behavior_replay_reservations').run()
       runtime.startBehaviorsRuntime()
       await runtime.runEnabledBehaviorsOnce()
       const launched = actedOn(behavior).length === 1
