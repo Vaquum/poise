@@ -374,17 +374,22 @@ export class ServiceControl {
    *  Turns that finished or failed on their own while the cancels landed
    *  were not interrupted — only turns still open or cancelled are resumed.
    *  The bound expires once per switch target: past it the switch waits on
-   *  any remaining non-chat work, named once, instead of cancelling again
-   *  every poll. */
+   *  any remaining non-chat work, named once, instead of expiring again
+   *  every poll. A turn still running after a failed cancel is the
+   *  exception: it is retried silently until it settles, so one transient
+   *  stop failure cannot stall the switch. */
   private expireSwitchBound(): void {
     const release = this.switchTo
     const epoch = this.switchEpoch
     if (release === null || this.switchPendingSince === null) return
-    if (this.boundExpiredEpoch === epoch) return this.pollSwitch()
-    this.boundExpiredEpoch = epoch
-    const waitedMinutes = Math.round((this.now() - this.switchPendingSince) / 60_000)
     const held = this.runtime.relayHeldSessions()
     const targets = this.runtime.runningTurnSessions().filter(({ sessionId }) => !held.has(sessionId))
+    if (this.boundExpiredEpoch === epoch) {
+      if (targets.length === 0) return this.pollSwitch()
+      return this.cancelSwitchTurns(release, epoch, targets, true)
+    }
+    this.boundExpiredEpoch = epoch
+    const waitedMinutes = Math.round((this.now() - this.switchPendingSince) / 60_000)
     if (targets.length === 0) {
       // No turn to cancel: only non-chat work holds the switch. Name it
       // once and keep waiting; the poll re-enters silently from here on.
@@ -393,9 +398,18 @@ export class ServiceControl {
       return this.pollSwitch()
     }
     this.log(`[service] release ${release} waited ${waitedMinutes} minutes for its turns; cancelling them and restarting`)
+    return this.cancelSwitchTurns(release, epoch, targets, false)
+  }
+
+  /** Cancel the switch's unheld turns, record the sessions, and restart.
+   *  A retry past the bound runs silently: the bound already logged, and
+   *  health names the turns still open. One wave runs at a time — the poll
+   *  holds while one settles — so retries never pile onto each other. */
+  private cancelSwitchTurns(release: string, epoch: number, targets: Parameters<ChatRuntime['recordSwitchInterrupted']>[0], silent: boolean): void {
     const cancellation = (async () => {
-      await Promise.all(targets.map(({ sessionId }) => this.runtime.cancel(sessionId).catch((error: unknown) =>
-        this.log(`[service] cancelling ${sessionId.slice(0, 8)} for the switch failed: ${error instanceof Error ? error.message : String(error)}`))))
+      await Promise.all(targets.map(({ sessionId }) => this.runtime.cancel(sessionId).catch((error: unknown) => {
+        if (!silent) this.log(`[service] cancelling ${sessionId.slice(0, 8)} for the switch failed: ${error instanceof Error ? error.message : String(error)}`)
+      })))
       this.runtime.recordSwitchInterrupted(targets.filter(({ sessionId, turnId }) => {
         if (getOpenTurn(sessionId)?.turnId === turnId) return true
         const terminal = findEvent(sessionId, (event) => event.type === 'turn.finished' && event.turnId === turnId)

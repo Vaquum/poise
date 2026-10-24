@@ -565,6 +565,8 @@ describe('switching to another release', () => {
     runtime.cancel.mockImplementation(async () => {
       storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId, stopReason: 'cancelled' })
       runtime.workingNow = 0
+      // The settled turn leaves the running set, as the runtime reports it.
+      runtime.runningTurnSessions.mockReturnValue([])
       return { settled: true }
     })
     try {
@@ -605,6 +607,48 @@ describe('switching to another release', () => {
     } finally {
       finish()
       await debate
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('retries a failed bound cancellation silently until the turn settles', async () => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 7_000_000
+    const { runtime, timer, restart, log, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    const sessionId = session(runtime.instance, true)
+    const turnId = storage.getOpenTurn(sessionId)!.turnId
+    runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
+    runtime.workingNow = 1
+    let attempts = 0
+    runtime.cancel.mockImplementation(async () => {
+      attempts += 1
+      if (attempts < 3) throw new Error('transient stop failure')
+      storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId, stopReason: 'cancelled' })
+      runtime.workingNow = 0
+      // The settled turn leaves the running set, as the runtime reports it.
+      runtime.runningTurnSessions.mockReturnValue([])
+      return { settled: true }
+    })
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(restart).not.toHaveBeenCalled()
+      timer.fire()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(restart).not.toHaveBeenCalled()
+      timer.fire()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(runtime.recordSwitchInterrupted).toHaveBeenCalledWith([{ sessionId, turnId }])
+      // One expiry, one wait line, one loud failure; the retries stay silent.
+      expect(runtime.cancel).toHaveBeenCalledTimes(3)
+      expect(log.mock.calls.filter(([line]) => String(line).includes('cancelling them and restarting'))).toHaveLength(1)
+      expect(log.mock.calls.filter(([line]) => String(line).includes('still waiting on'))).toHaveLength(1)
+      expect(log.mock.calls.filter(([line]) => String(line).includes('for the switch failed'))).toHaveLength(1)
+    } finally {
       service.reset()
       background.resumeReleaseBackground()
     }
