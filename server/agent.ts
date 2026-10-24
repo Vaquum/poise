@@ -541,8 +541,9 @@ export async function triggerPrReview(
   const correlationId = randomUUID()
 
   if (claude) await claudeAuth.requireReady()
+  const selectedModel = (await reviewChoice('pr_review')).model
   if (prReviewer(author, true) !== actor) throw new Error('GitHub accounts changed; retry the review')
-  if ((await reviewChoice('pr_review')).model !== model) throw new Error('Review model changed; retry the request')
+  if (selectedModel !== model) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: 'review-new-prs', source, owner, actor, repository: repoFullName,
     number: Number(num), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
@@ -624,8 +625,9 @@ export async function replayAgentJob(input: {
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
+  const selectedModel = (await reviewChoice(place)).model
   if (prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
-  if ((await reviewChoice(place)).model !== model) throw new Error('Review model changed; retry the request')
+  if (selectedModel !== model) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
     repository: repo, number: Number(prId), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })

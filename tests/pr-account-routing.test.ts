@@ -212,7 +212,7 @@ describe('PR account routing', () => {
     await expect(behaviors.admitReplay(behavior, pr.repo, pr.number)).resolves.toMatchObject({ actor: 'poise-user' })
   })
 
-  it.each(['disable', 'skip'] as const)('stops approval when %s is saved during its final receipt lookup', async (change) => {
+  it.each(['disable', 'skip', 'model'] as const)('stops approval when %s is saved during its final receipt lookup', async (change) => {
     const { db, behaviors } = await initial()
     db.setMeta('behavior_review_new_prs_enabled', '0')
     db.setMeta('behavior_approve_prs_enabled', '1')
@@ -230,7 +230,8 @@ describe('PR account routing', () => {
         const read = agent.fetchAgentLogSnapshot
         vi.spyOn(agent, 'fetchAgentLogSnapshot').mockImplementationOnce(async (options) => {
           const snapshot = await read(options)
-          db.setMeta(change === 'disable' ? 'behavior_approve_prs_enabled' : 'behavior_approve_prs_skip_repos', change === 'disable' ? '0' : JSON.stringify([pr.repo]))
+          if (change === 'model') db.setMeta('models', JSON.stringify({ pr_approve: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' } }))
+          else db.setMeta(change === 'disable' ? 'behavior_approve_prs_enabled' : 'behavior_approve_prs_skip_repos', change === 'disable' ? '0' : JSON.stringify([pr.repo]))
           changed = true
           return snapshot
         })
@@ -296,5 +297,31 @@ describe('PR account routing', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     expect(db.getMeta(key)).not.toBe('')
     expect(behaviors.getBehaviorsRuntimeHealth().holds).toEqual([expect.objectContaining({ actor: 'review-bot' })])
+  })
+
+  it.each(['manual', 'replay'] as const)('refuses %s launch when accounts change during the final model lookup', async (mode) => {
+    const { db } = await initial()
+    db.setMeta('behavior_review_new_prs_enabled', '0')
+    const models = await import('../server/models')
+    const original = mocks.runFile.getMockImplementation()!
+    let checkoutReady = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await original(command, args, options)
+      if (command === 'github-interface' && args[0] === '--head-sha') {
+        return { ...result, stdout: JSON.stringify({ ...JSON.parse(result.stdout), author: 'review-bot' }) }
+      }
+      if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+        checkoutReady = true
+        models.invalidateCatalog()
+      }
+      if (checkoutReady && command === 'agent-interface' && args[0] === '--models') db.setMeta('me', 'replacement-user')
+      return result
+    })
+    const agent = await import('../server/agent')
+    const launch = mode === 'manual' ? agent.triggerPrReview(pr.url)
+      : agent.replayAgentJob({ behavior: 'pr_review', repo: pr.repo, pr_id: pr.number }, async () => ({ author: 'review-bot', actor: 'poise-user' }))
+    await expect(launch).rejects.toThrow('GitHub accounts changed')
+    expect(checkoutReady).toBe(true)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 })

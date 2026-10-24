@@ -3495,8 +3495,8 @@ async function fireApprove(
   }
   attachCheckSlotToClaim(claimId, checkSlot)
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead, actor)
-  const selectedModel = (await reviewChoice('pr_approve')).model
   const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor)
+  const selectedModel = (await reviewChoice('pr_approve')).model
   if (!isEnabled('approve-prs') || behaviorAborted() || !stillEligible('approve-prs', pr, actor)) return false
   if (selectedModel !== model) return false
   if (admittedReviewer && configuredReviewer(pr.author).toLowerCase() !== admittedReviewer.toLowerCase()) return false
