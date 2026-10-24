@@ -1,0 +1,74 @@
+# Audits main once a day so a new npm advisory files one issue before it can
+# block PRs. PRs without dependency changes skip the audit gate in ci.yml.
+name: Scheduled npm audit
+
+on:
+  schedule:
+    # Off the top of the hour, when GitHub's scheduler is busiest.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: npm-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Audit main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - name: Run audit
+        id: audit
+        run: |
+          set +e
+          npm audit --audit-level=high 2>&1 | tee /tmp/npm-audit.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: File or update the audit issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUDIT_EXIT: ${{ steps.audit.outputs.exit_code }}
+        run: |
+          TITLE='[npm audit] new advisories on main'
+          existing=$(gh issue list --state open --search "new advisories on main in:title" --json number,title --jq "[.[] | select(.title == \"$TITLE\")] | first | .number // empty")
+          if [ "$AUDIT_EXIT" != "0" ]; then
+            {
+              echo "The scheduled \`npm audit --audit-level=high\` on \`main\` reports new advisories."
+              echo
+              echo "Update the flagged dependencies so the audit is clean again. PRs that change \`package.json\` or \`package-lock.json\` are still audited in CI; this issue tracks the fix on \`main\`."
+              echo
+              echo "Latest run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              echo
+              echo '```'
+              head -c 50000 /tmp/npm-audit.txt
+              echo
+              echo '```'
+            } > /tmp/issue-body.md
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --body-file /tmp/issue-body.md
+              echo "Updated issue #$existing."
+            else
+              gh issue create --title "$TITLE" --label security --body-file /tmp/issue-body.md
+            fi
+          else
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "The scheduled audit is clean again. Closing."
+              gh issue close "$existing"
+              echo "Closed issue #$existing."
+            else
+              echo "Audit clean, no issue to close."
+            fi
+          fi

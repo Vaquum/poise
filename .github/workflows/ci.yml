@@ -27,7 +27,21 @@ jobs:
           node-version-file: .node-version
           cache: npm
       - run: npm ci
+      # Audit only when the change touches dependencies; a new advisory must
+      # not fail PRs that did not touch them. The scheduled audit covers main.
+      - name: Check whether dependencies changed
+        id: deps
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE"
+          if git diff --quiet FETCH_HEAD HEAD -- package.json package-lock.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Audit dependencies
+        if: steps.deps.outputs.changed == 'true'
         run: npm audit --audit-level=high
       - name: Lint
         run: npm run lint
