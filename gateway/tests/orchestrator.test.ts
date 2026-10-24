@@ -558,6 +558,58 @@ describe('image upgrades', () => {
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 
+  it('aborts when answers deny health instead of cutting busy work on unconfirmed evidence', async () => {
+    await start({ env: { POISE_DRAIN_TIMEOUT: '1' } })
+    const aliceId = h.docker.containers.get('poise-ws-alice')?.id
+    // Busy and draining, but never ok: no flag a forced stop could rest on may latch.
+    h.workspace.health.ok = false
+    h.workspace.health.activeChatTurns = 1
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
+    expect(h.logs.find((entry) => entry.event === 'workspace.drain.timeout')).toMatchObject({
+      activeChatTurns: null, runningCallerCalls: null, backgroundWork: null,
+    })
+    // Authoritative answers recover on the next pass.
+    h.workspace.health.ok = true
+    h.workspace.health.activeChatTurns = 0
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('aborts when answers resume unadmitted after a transient failure instead of cutting on stale down', async () => {
+    await start({ env: { POISE_DRAIN_TIMEOUT: '1' } })
+    const aliceId = h.docker.containers.get('poise-ws-alice')?.id
+    h.workspace.reachable = false
+    const upgrade = h.orchestrator.upgradePass()
+    await waitFor(() => events(h.logs, 'workspace.drain.request.failed').length > 0, 'the failed drain request')
+    // Reachable again, but the drain never admits: the earlier failure authorizes nothing.
+    h.workspace.reachable = true
+    h.workspace.drainApplies = false
+    await upgrade
+    expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
+  })
+
+  it('records the bound miss when the replacement answers late, and still reports when it answered', async () => {
+    await start({ idleToReadyMs: 60 })
+    h.docker.onStart = () => {
+      h.workspace.answerDelayMs = 200
+    }
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+    const missed = h.logs.find((entry) => entry.event === 'workspace.upgrade.ready.missed')
+    expect(missed).toMatchObject({ handle: 'alice', level: 'warn', boundMs: 60 })
+    expect(typeof missed?.elapsedMs).toBe('number')
+    const finished = h.logs.find((entry) => entry.event === 'workspace.upgrade.finished')
+    expect(typeof finished?.readyAfterMs).toBe('number')
+    expect(finished?.readyAfterMs as number).toBeGreaterThan(60)
+  })
+
   it('holds a busy workspace through the drain, then recreates it ready within the idle-to-ready bound', async () => {
     await start()
     const aliceId = h.docker.containers.get('poise-ws-alice')?.id
@@ -786,6 +838,27 @@ describe('updates in place', () => {
     expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate'], ['--activate']])
     const docker = dockerCalls(h)
     expect(docker.lastIndexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(docker.indexOf('POST /containers/poise-ws-alice/stop'))
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('aborts when the final recheck answers idle without the drain on, instead of stopping blind', async () => {
+    await start({ oldBase: 'base-0' })
+    const before = containerId()
+    h.docker.onTask = () => {
+      // Activation restarts Poise, and the new Poise answers the recheck without holding a drain.
+      h.workspace.drainApplies = false
+      h.workspace.health.draining = false
+      h.docker.onTask = undefined
+    }
+    await h.orchestrator.upgradePass()
+    expect(events(h.logs, 'workspace.drain.unconfirmed').length).toBeGreaterThanOrEqual(1)
+    expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
+    expect(containerId()).toBe(before)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    // The next pass admits and upgrades.
+    h.workspace.drainApplies = true
+    await h.orchestrator.upgradePass()
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 
@@ -1154,7 +1227,12 @@ describe('a recreated gateway container', () => {
     const page = await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
     expect(page.status).toBe(200)
     expect(events(h.logs, 'workspace.network.connected')).toHaveLength(1)
+    // The drain was never admitted — its only POST reached nothing — so the pass aborts instead of
+    // cutting on the stale failure, and the next pass admits over the rejoined network and upgrades.
     await pass
+    expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
+    await h.orchestrator.upgradePass()
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 

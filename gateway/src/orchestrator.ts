@@ -703,7 +703,8 @@ export class Orchestrator {
             this.upgradingPhase = 'upgrade'
             if (!recheck.idle) {
               if (recheck.unknown) {
-                if (recheck.down) sawDown = true
+                // A down recheck latches nothing: the next drain round decides on fresh evidence, so a
+                // workspace that answers again is never cut for a failure it recovered from.
                 if (this.deps.now() >= deadline) {
                   if (!recheck.down) return 'abort-unknown'
                   drainedIdle = false
@@ -793,9 +794,15 @@ export class Orchestrator {
   private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; down: boolean }> {
     try {
       const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
-      // The recheck guards the stop: only an authoritative idle answer lets it proceed. Whether the
-      // drain still shows is irrelevant to safety — stopping an idle workspace cuts nothing.
-      return { idle: health.ok && health.idle, unknown: false, down: false }
+      // The recheck is the last gate before the stop: only an idle answer behind an applied drain lets
+      // it proceed. Without the drain on, new work stays unblocked and could arrive between this reply
+      // and the stop, so a missing ack reads as unknown, never idle.
+      if (!health.ok || !health.draining) {
+        this.deps.log.warn('workspace.drain.unconfirmed', { handle, ok: health.ok, draining: health.draining,
+          activeChatTurns: health.activeChatTurns, runningCallerCalls: health.runningCallerCalls, backgroundWork: health.backgroundWork })
+        return { idle: false, unknown: true, down: false }
+      }
+      return { idle: health.idle, unknown: false, down: false }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       this.deps.log.warn('workspace.drain.recheck.failed', { handle, error: errorMessage(error) })
@@ -808,7 +815,8 @@ export class Orchestrator {
    * container serves, not just that Docker started it. Returns stop-to-ready milliseconds, or null
    * past the idle-to-ready bound; a miss warns with the last answer and finishes anyway, since
    * demand-driven readiness still recovers. A refusal is the new container answering broken, not
-   * starting, and fails the wait at once; silence is waited out.
+   * starting, and fails the wait at once; silence is waited out. The bound is checked on success
+   * too: a probe in flight may overrun it by one service call, retries included, but never silently.
    */
   private async awaitReplacementReady(handle: string, login: string, stoppedAt: number): Promise<number | null> {
     const miss = (error: string | null): null => {
@@ -819,8 +827,11 @@ export class Orchestrator {
     for (;;) {
       try {
         const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
-        if (health.ok) return this.deps.now() - stoppedAt
-        return miss('the replacement answered health with ok: false')
+        const elapsedMs = this.deps.now() - stoppedAt
+        if (!health.ok) return miss('the replacement answered health with ok: false')
+        // Late but answering: the replacement is ready, and the bound miss is recorded alongside.
+        if (elapsedMs > this.idleToReadyMs) miss(null)
+        return elapsedMs
       } catch (error) {
         if (error instanceof WorkspaceNetworkError) throw error
         if (error instanceof WorkspaceAnswerError) return miss(errorMessage(error))
@@ -879,6 +890,11 @@ export class Orchestrator {
       backgroundWork: health.backgroundWork,
     })
     const note = (health: ServiceHealth): void => {
+      // Anything that answers is not down: a transient failure stops authorizing a cut the moment
+      // answers resume. Only an ok answer is evidence beyond that: a non-ok answer proves nothing
+      // about admission, work or idleness, so it latches no flag a forced stop could rest on.
+      sawDown = false
+      if (!health.ok) return
       // A drain the gateway saw on is gone while the workspace still isn't idle: the owner or admin
       // resumed, the drain lapsed, or Poise restarted. An answer that never showed a drain is not a lift.
       if (health.draining) {

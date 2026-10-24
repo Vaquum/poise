@@ -579,9 +579,10 @@ assertion may only resume, and anything else is refused with 403):
   workspace still isn't idle, and `workspace.drain.timeout` with the last known
   counters. After starting the replacement the gateway waits for its health before
   declaring the upgrade finished, within the two-minute idle-to-ready bound
-  (`readyAfterMs` on `workspace.upgrade.finished` measures stop to ready); past it
-  the upgrade finishes anyway with `workspace.upgrade.ready.missed`, and the next
-  visit brings the workspace up through demand-driven readiness. A pass skipped
+  (`readyAfterMs` on `workspace.upgrade.finished` measures stop to ready). Past it
+  the miss is recorded as `workspace.upgrade.ready.missed`: a replacement that answers
+  late still reports its measured `readyAfterMs`, and one that never answers is left
+  for the next visit to bring up through demand-driven readiness. A pass skipped
   behind a running one names its handle and phase.
   - New Chat turns include queued messages, and launches include the
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,

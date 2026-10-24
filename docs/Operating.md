@@ -592,8 +592,9 @@ longer reach, cutting only work that would not settle, and releases one whose
 drain was never admitted or whose answers only timed out or were refused for
 the next pass (`workspace.upgrade.aborted`). After starting the replacement it
 waits for its health before declaring the upgrade finished, within the two-minute
-idle-to-ready bound; a miss warns (`workspace.upgrade.ready.missed`) and the next
-visit still brings the workspace up. A stopped workspace
+idle-to-ready bound; past it the miss is recorded (`workspace.upgrade.ready.missed`),
+a late answer still reports its measured `readyAfterMs`, and one that never answers
+is left for the next visit to bring up. A stopped workspace
 is recreated without being started. Follow it all in the gateway's log:
 
 ```bash
@@ -849,9 +850,9 @@ also alert through Poise Link and the page's notices.
   `workspace.update.stuck` (an in-place switch waiting or stuck), and
   `workspace.upgrade` and `workspace.network` events in its log.
   `readyAfterMs` on `workspace.upgrade.finished` says how long the replacement
-  took to answer health; past the two-minute idle-to-ready bound the upgrade
-  finishes with `workspace.upgrade.ready.missed` instead, and the next visit
-  brings the workspace up.
+  took to answer health; past the two-minute idle-to-ready bound the miss is
+  recorded as `workspace.upgrade.ready.missed` alongside it, and a replacement
+  that never answers is left for the next visit to bring up.
 - **`install.sh` or `upgrade.sh` says the gateway is not on a workspace's
   network.** The gateway joins every workspace's network as it starts, and
   `docker logs poise-gateway 2>&1 | grep workspace.network` says why it could
