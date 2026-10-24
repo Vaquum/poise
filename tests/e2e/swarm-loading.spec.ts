@@ -52,7 +52,7 @@ test('Swarm paints recent calls before the complete history arrives and retains 
 test('Swarm completes a large history without blocking the preview controls', async ({ page, browserName }) => {
   test.skip(browserName !== 'chromium', 'Chromium exposes the long-task observer used by this regression.')
   await ready(page)
-  const older = deferred(), logs = history('acme', 1300)
+  const older = deferred(), logs = history('acme', 6280)
   await page.route('**/api/agent-logs**', async route => {
     if (new URL(route.request().url()).searchParams.has('limit')) return route.fulfill({ json: { logs: logs.slice(0, 50), total: logs.length } })
     await older.promise
@@ -74,19 +74,20 @@ test('Swarm completes a large history without blocking the preview controls', as
       return { durations, observer, counts, mutations }
     })
     older.release()
-    await expect(page.locator(rows)).toHaveCount(1300)
+    await expect(page.locator(rows)).toHaveCount(200)
     const worstTask = await tasks.evaluate(({ durations, observer }) => {
       durations.push(...observer.takeRecords().map(entry => entry.duration)); observer.disconnect()
       return Math.max(0, ...durations)
     })
-    console.log(`Swarm preview to 1300 calls: longest main-thread task ${worstTask}ms`)
+    console.log(`Swarm preview to 6280 calls: longest main-thread task ${worstTask}ms`)
     expect(worstTask).toBeLessThan(350)
     const counts = await tasks.evaluate(({ counts, mutations }) => { mutations.disconnect(); return counts })
-    expect(counts.some(count => count > 50 && count < 1300)).toBe(true)
+    expect(Math.max(...counts)).toBeLessThanOrEqual(200)
+    await expect(page.locator('#swarm-count')).toHaveText('6280')
     expect(await control!.evaluate(element => element.isConnected && document.activeElement === element)).toBe(true)
-    await page.locator('#swarm-search').fill('acme run 1300')
+    await page.locator('#swarm-search').fill('acme run 6280')
     await expect(page.locator(rows)).toHaveCount(1)
-    await expect(page.locator(rows)).toContainText('#1300')
+    await expect(page.locator(rows)).toContainText('#6280')
   } finally { older.release() }
 })
 
@@ -113,10 +114,10 @@ test('a failed complete-history read keeps recent calls, reports incompleteness 
 
 test('returning to Swarm paints history received while hidden before its new refresh', async ({ page }) => {
   await ready(page)
-  const first = deferred(), refresh = deferred(), logs = history()
+  const first = deferred(), refresh = deferred(), logs = history('acme', 6280)
   let completeReads = 0
   await page.route('**/api/agent-logs**', async route => {
-    if (new URL(route.request().url()).searchParams.has('limit')) return route.fulfill({ json: { logs: logs.slice(0, 50), total: 60 } })
+    if (new URL(route.request().url()).searchParams.has('limit')) return route.fulfill({ json: { logs: logs.slice(0, 50), total: logs.length } })
     await (++completeReads === 1 ? first.promise : refresh.promise)
     await route.fulfill({ json: { logs } })
   })
@@ -124,12 +125,27 @@ test('returning to Swarm paints history received while hidden before its new ref
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
     await expect(page.locator(rows)).toHaveCount(50)
     await page.getByRole('button', { name: 'Archive', exact: true }).click()
+    const hiddenRows = await page.evaluateHandle(() => {
+      let created = 0
+      const original = document.createElement.bind(document)
+      document.createElement = ((...args: Parameters<typeof document.createElement>) => {
+        if (args[0].toLowerCase() === 'tr') created++
+        return original(...args)
+      }) as typeof document.createElement
+      return { count: () => created }
+    })
     const received = page.waitForResponse(response => new URL(response.url()).pathname === '/api/agent-logs' && !new URL(response.url()).searchParams.has('limit'))
     first.release()
     await (await received).finished()
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    expect(await hiddenRows.evaluate(value => value.count())).toBe(0)
+    await expect(page.locator(rows)).toHaveCount(0)
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
-    await expect(page.locator(rows)).toHaveCount(60, { timeout: 1000 })
+    await expect(page.locator(rows)).toHaveCount(200, { timeout: 1000 })
+    await expect(page.locator('#swarm-count')).toHaveText('6280')
+    await page.locator('#swarm-search').fill('acme run 6280')
+    await expect(page.locator(rows)).toHaveCount(1)
+    await expect(page.locator(rows)).toContainText('#6280')
     await expect.poll(() => completeReads).toBe(2)
   } finally { first.release(); refresh.release() }
 })

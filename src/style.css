@@ -3362,6 +3362,7 @@ tr:hover .stop-btn { opacity: 1; }
   #view-logging tr.agent-expand-row > td > * { position: sticky; left: var(--sp-4); width: calc(100vw - 72px); max-width: calc(100vw - 72px); }
 }
 .logging-pagination { display: flex; align-items: center; gap: var(--sp-3); margin-block: var(--sp-4); }
+#swarm-pagination[hidden] { display: none; }
 .logging-new { margin-block: var(--sp-3); }
 .logging-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-3); margin-block: var(--sp-4); font-size: 0.8125rem; }
 .logging-facts dt { color: var(--text-tertiary); }

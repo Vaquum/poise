@@ -1,7 +1,7 @@
 import { viewDiagnostic, viewFeedback } from '../view-feedback'
 import { logTime } from '../clock'
 import { effectiveTimezone } from '../config'
-import { layout, retire, scrollToActor } from '../motion'
+import { finishMotion, layout, retire, scrollToActor } from '../motion'
 import { patchContent, patchNode } from '../dom-patch'
 import { mountOrganizationFilter, organizationUrl, getSelectedOrganization, setSelectedOrganization } from '../organizations'
 // Swarm — log of agent calls. Identical finished calls share a row: model, prompt
@@ -133,6 +133,8 @@ let importedSessionOpenRequestId = 0
 let entries: LogEntry[] = []
 let quarantined: QuarantinedLog[] = []
 let searchQuery = ''
+const PAGE_SIZE = 200
+let pageIndex = 0
 let searchDebounce: ReturnType<typeof setTimeout> | null = null
 // Tick listener — installed on view init, removed on view leave.
 // The shared refresh clock still refreshes history; active runs poll every 15s.
@@ -352,12 +354,13 @@ function progressDetail(e: LogEntry, zone: string = effectiveTimezone(), now: nu
 }
 
 const reasoning = new Map<string, { chars: number, body: string, loading: boolean }>()
+const openReasoning = new Set<string>()
 
 function reasoningDetail(e: LogEntry): string {
   if (e.progress?.reasoning_available === undefined) return ''
   const saved = reasoning.get(e.id)
   const body = saved?.body || ''
-  return `<details class="agent-reasoning" data-reasoning-id="${escapeHtml(e.id)}"><summary>Provider reasoning</summary><pre class="agent-reasoning-body">${escapeHtml(body)}</pre></details>`
+  return `<details class="agent-reasoning" data-reasoning-id="${escapeHtml(e.id)}"${openReasoning.has(e.id) ? ' open' : ''}><summary>Provider reasoning</summary><pre class="agent-reasoning-body">${escapeHtml(body)}</pre></details>`
 }
 
 async function loadReasoning(id: string): Promise<void> {
@@ -602,6 +605,11 @@ function visible(): LogEntry[] {
   return entries.filter(matchesSearch)
 }
 
+function clearRows(): void {
+  finishMotion(bodyEl, true)
+  bodyEl.replaceChildren()
+}
+
 // Every column in the header row; the expanded detail row spans all of them.
 const COLUMN_COUNT = 11
 
@@ -612,6 +620,13 @@ function renderShell() {
         <div class="search-cluster">
           <input class="search-input" id="swarm-search" type="search" placeholder="Filter…" autocomplete="off" spellcheck="false" />
           <span class="filter-count" id="swarm-count"></span>
+        </div>
+        <div class="logging-pagination" id="swarm-pagination" hidden>
+          <div class="range-picker" role="group" aria-label="Swarm pages">
+            <button type="button" data-page="previous">Previous</button>
+            <button type="button" data-page="next">Next</button>
+          </div>
+          <span class="filter-count" id="swarm-page"></span>
         </div>
       </div>
     </header>
@@ -640,13 +655,23 @@ function renderShell() {
   mountOrganizationFilter(viewEl.querySelector<HTMLElement>('#swarm-filters')!)
   bodyEl = viewEl.querySelector<HTMLElement>('#swarm-tbody')!
   searchEl = viewEl.querySelector<HTMLInputElement>('#swarm-search')!
+  viewEl.querySelector('#swarm-pagination')!.addEventListener('click', event => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-page]')
+    if (!button || button.disabled) return
+    pageIndex += button.dataset.page === 'next' ? 1 : -1
+    clearRows()
+    render(false)
+    if (button.disabled) viewEl.querySelector<HTMLButtonElement>('#swarm-pagination button:not(:disabled)')?.focus()
+  })
   searchEl.addEventListener('input', () => {
     if (searchDebounce) clearTimeout(searchDebounce)
     searchDebounce = setTimeout(() => {
       const next = (searchEl!.value || '').trim()
       if (next === searchQuery) return
       searchQuery = next
-      render()
+      pageIndex = 0
+      clearRows()
+      render(false)
     }, 90)
   })
 }
@@ -697,7 +722,6 @@ function mainRowInnerHTML(e: LogEntry, state: MainRowState): string {
 }
 
 const mainRowMarkup = new WeakMap<HTMLTableRowElement, string>()
-const preparedRows = new WeakMap<LogEntry, { row: HTMLTableRowElement, state: MainRowState }>()
 
 function buildMainRow(e: LogEntry, markup: string): HTMLTableRowElement {
   const tr = document.createElement('tr')
@@ -707,26 +731,6 @@ function buildMainRow(e: LogEntry, markup: string): HTMLTableRowElement {
   tr.innerHTML = markup
   mainRowMarkup.set(tr, markup)
   return tr
-}
-
-async function prepareRows(list: LogEntry[], current: () => boolean, progress: (ready: LogEntry[]) => void): Promise<void> {
-  const retained = new Set([...bodyEl.children].map(row => (row as HTMLElement).dataset.id))
-  const missing = list.filter(entry => !retained.has(entry.id))
-  if (missing.length <= 100) return
-  // Parsing a full history's cells in the layout mutation made its first
-  // mount one long task. Prepare detached rows while the preview stays usable.
-  for (let start = 0; start < missing.length; start += 50) {
-    if (!current()) return
-    for (const entry of missing.slice(start, start + 50)) {
-      const state = mainRowState(entry)
-      preparedRows.set(entry, { row: buildMainRow(entry, mainRowInnerHTML(entry, state)), state })
-      retained.add(entry.id)
-    }
-    // Inserting the complete detached history still makes style and table
-    // layout one long task. Reconcile bounded additions before yielding.
-    if ((start + 50) % 200 === 0 && start + 50 < missing.length) progress(list.filter(entry => retained.has(entry.id)))
-    await new Promise<void>(resolve => setTimeout(resolve, 0))
-  }
 }
 
 function setExpandContent(tr: HTMLTableRowElement, id: string) {
@@ -777,51 +781,50 @@ function buildExpandRow(e: LogEntry): HTMLTableRowElement {
 }
 
 // Stable keyed rows: unchanged rows are never detached or animated on refresh.
-function reconcileRows(nextRows: RunRow[]): void {
-  layout(bodyEl, () => {
-  const main = new Map<string, HTMLTableRowElement>()
-  const detail = new Map<string, HTMLTableRowElement>()
-  for (const row of [...bodyEl.children] as HTMLTableRowElement[]) {
-    if (row.dataset.id) main.set(row.dataset.id, row)
-    if (row.dataset.expandFor) detail.set(row.dataset.expandFor, row)
-  }
-  const ids = new Set(nextRows.map(({ entry }) => entry.id))
-  for (const [id, row] of main) if (!ids.has(id)) retire(row)
-  for (const [id, row] of detail) if (!ids.has(id) || !expanded.has(id)) retire(row)
-  let cursor: ChildNode | null = bodyEl.firstChild
-  const place = (row: HTMLTableRowElement) => {
-    if (cursor !== row) bodyEl.insertBefore(row, cursor)
-    cursor = row.nextSibling
-  }
-  for (const { entry, group, repeat } of nextRows) {
-    const state = mainRowState(entry, group)
-    const prepared = preparedRows.get(entry)
-    // Detached rows already have their static cells. Rebuild only if grouping,
-    // disclosure, action buttons or the clock changed, then consume the cache.
-    const reusable = prepared && prepared.state.open === state.open && prepared.state.group === state.group
-      && prepared.state.status === state.status
-      && prepared.state.started === state.started && prepared.state.elapsed === state.elapsed
-      && prepared.state.replay === state.replay && prepared.state.stop === state.stop
-    const markup = reusable ? mainRowMarkup.get(prepared.row)! : mainRowInnerHTML(entry, state)
-    const row = main.get(entry.id) || prepared?.row || buildMainRow(entry, markup)
-    preparedRows.delete(entry)
-    row.classList.toggle('agent-repeat-row', !!repeat)
-    row.dataset.callId = entry.response ? entry.id : ''
-    if (mainRowMarkup.get(row) !== markup) {
-      patchContent(row, markup)
-      mainRowMarkup.set(row, markup)
+function reconcileRows(nextRows: RunRow[], animate: boolean): void {
+  const change = () => {
+    const main = new Map<string, HTMLTableRowElement>()
+    const detail = new Map<string, HTMLTableRowElement>()
+    for (const row of [...bodyEl.children] as HTMLTableRowElement[]) {
+      if (row.dataset.id) main.set(row.dataset.id, row)
+      if (row.dataset.expandFor) detail.set(row.dataset.expandFor, row)
     }
-    place(row)
-    if (expanded.has(entry.id)) {
-      const expandedRow = detail.get(entry.id) || buildExpandRow(entry)
-      refreshRunDetail(expandedRow, entry)
-      place(expandedRow)
+    const ids = new Set(nextRows.map(({ entry }) => entry.id))
+    const remove = (row: HTMLTableRowElement) => { if (animate) retire(row); else row.remove() }
+    for (const [id, row] of main) if (!ids.has(id)) remove(row)
+    for (const [id, row] of detail) if (!ids.has(id) || !expanded.has(id)) remove(row)
+    let cursor: ChildNode | null = bodyEl.firstChild
+    const place = (row: HTMLTableRowElement) => {
+      if (cursor !== row) bodyEl.insertBefore(row, cursor)
+      cursor = row.nextSibling
+    }
+    for (const { entry, group, repeat } of nextRows) {
+      const state = mainRowState(entry, group)
+      const markup = mainRowInnerHTML(entry, state)
+      const row = main.get(entry.id) || buildMainRow(entry, markup)
+      row.classList.toggle('agent-repeat-row', !!repeat)
+      row.dataset.callId = entry.response ? entry.id : ''
+      if (mainRowMarkup.get(row) !== markup) {
+        patchContent(row, markup)
+        mainRowMarkup.set(row, markup)
+      }
+      place(row)
+      if (expanded.has(entry.id)) {
+        const expandedRow = detail.get(entry.id) || buildExpandRow(entry)
+        refreshRunDetail(expandedRow, entry)
+        place(expandedRow)
+      }
     }
   }
-  })
+  if (animate) layout(bodyEl, change)
+  else {
+    const active = document.activeElement
+    change()
+    if (active instanceof HTMLElement && active.isConnected && bodyEl.contains(active)) active.focus({ preventScroll: true })
+  }
 }
 
-function render() {
+function render(animate = true) {
   // Nothing to paint into while the view is hidden. Swarm kept rebuilding all
   // ~1000 rows on every tick for the rest of the session after one visit —
   // a fetch, a parse and a full table rebuild every minute, on the main thread,
@@ -829,14 +832,29 @@ function render() {
   if (!viewEl || viewEl.hidden) return
   const list = visible()
   const groups = groupRuns(list)
+  const rows = groupRows(groups)
+  const previousPage = pageIndex
+  const focused = document.activeElement?.closest<HTMLElement>('#swarm-tbody > tr')
+  const focusedId = focused?.dataset.id ?? focused?.dataset.expandFor
+  const focusedIndex = focusedId ? rows.findIndex(row => row.entry.id === focusedId) : -1
+  // Fixed pages retain complete coverage as new runs arrive. Follow a focused
+  // run over a boundary, retaining its keyed control rather than dropping focus.
+  if (animate && focusedIndex >= 0) pageIndex = Math.floor(focusedIndex / PAGE_SIZE)
+  pageIndex = Math.min(pageIndex, Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1))
+  const start = pageIndex * PAGE_SIZE
+  const pager = viewEl.querySelector<HTMLElement>('#swarm-pagination')!
+  pager.hidden = rows.length <= PAGE_SIZE
+  pager.querySelector<HTMLButtonElement>('[data-page="previous"]')!.disabled = pageIndex === 0
+  pager.querySelector<HTMLButtonElement>('[data-page="next"]')!.disabled = start + PAGE_SIZE >= rows.length
+  viewEl.querySelector<HTMLElement>('#swarm-page')!.textContent = rows.length ? `${start + 1}–${Math.min(start + PAGE_SIZE, rows.length)} / ${rows.length}` : ''
   displayedGroups = new Map(groups.map((group) => [group.entries[0].id, group]))
   const table = viewEl.querySelector<HTMLElement>('#swarm-table')!
   const countEl = viewEl.querySelector<HTMLElement>('#swarm-count')!
   const runCount = list.length === entries.length ? `${entries.length}` : `${list.length} / ${entries.length}`
   countEl.textContent = entries.length ? runCount : ''
   table.hidden = list.length === 0
-  if (!list.length) { bodyEl.replaceChildren(); return }
-  reconcileRows(groupRows(groups))
+  if (!list.length) { clearRows(); return }
+  reconcileRows(rows.slice(start, start + PAGE_SIZE), animate && previousPage === pageIndex)
 }
 
 async function loadResponse(id: string, refresh = false) {
@@ -885,7 +903,10 @@ async function loadResponse(id: string, refresh = false) {
 function attachClicks() {
   bodyEl.addEventListener('toggle', (event) => {
     const details = event.target
-    if (details instanceof HTMLDetailsElement && details.dataset.reasoningId && details.open) void loadReasoning(details.dataset.reasoningId)
+    if (details instanceof HTMLDetailsElement && details.dataset.reasoningId && bodyEl.contains(details)) {
+      if (details.open) { openReasoning.add(details.dataset.reasoningId); void loadReasoning(details.dataset.reasoningId) }
+      else openReasoning.delete(details.dataset.reasoningId)
+    }
   }, true)
   bodyEl.addEventListener('click', async (ev) => {
     const target = ev.target as HTMLElement
@@ -896,7 +917,8 @@ function attachClicks() {
       if (!group) return
       if (expandedGroups.has(group.key)) expandedGroups.delete(group.key)
       else expandedGroups.add(group.key)
-      render()
+      // Disclosure can replace the whole page; use the pager's direct commit.
+      render(false)
       return
     }
 
@@ -1052,6 +1074,7 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
   if (!viewEl || !bodyEl) return
   // Pull fresh logs so behaviors that just fired show up immediately.
   await pollOnce()
+  if (viewEl.hidden) return
   // entries are newest-first per the proxy, so the first match is the most
   // recent run against this pull request. This used to require
   // `behavior === 'pr_review'`, so the "Last triggered" links for approve-prs
@@ -1070,8 +1093,8 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
   if (!matchesSearch(match)) {
     searchQuery = ''
     if (searchEl) searchEl.value = ''
-    render()
   }
+  showRun(match)
   const row = bodyEl.querySelector<HTMLTableRowElement>(`tr.agent-row[data-id="${match.id}"]`)
   if (!row) {
     notFocusable(`The run for ${repo}#${pr_id} is not in the current list.`)
@@ -1106,6 +1129,17 @@ function highlightRow(row: HTMLTableRowElement): void {
 
 let callFocusSequence = 0
 
+function showRun(match: LogEntry): void {
+  const groups = groupRuns(visible())
+  const group = groups.find(candidate => candidate.entries.some(entry => entry.id === match.id))
+  if (group && group.entries[0].id !== match.id) expandedGroups.add(group.key)
+  const index = groupRows(groups).findIndex(row => row.entry.id === match.id)
+  const nextPage = Math.max(0, Math.floor(index / PAGE_SIZE))
+  if (nextPage !== pageIndex) clearRows()
+  pageIndex = nextPage
+  render(false)
+}
+
 /** Open the exact run a notification names, including an earlier grouped
  *  failure. The caller makes Swarm visible before asking for it. */
 export async function focusCall(callId: string): Promise<void> {
@@ -1130,9 +1164,7 @@ export async function focusCall(callId: string): Promise<void> {
   }
   searchQuery = ''
   if (searchEl) searchEl.value = ''
-  const group = groupRuns(entries).find((candidate) => candidate.entries.some((entry) => entry.id === callId))
-  if (group && group.entries[0].id !== callId) expandedGroups.add(group.key)
-  render()
+  showRun(match)
   const row = bodyEl.querySelector<HTMLTableRowElement>(`tr.agent-row[data-id="${CSS.escape(callId)}"]`)
   if (!row) {
     notFocusable(`The run for call ${callId} is not in the current list.`)
@@ -1180,20 +1212,15 @@ async function readLogFeed(org: string, recent = false): Promise<LogFeed> {
 }
 
 async function applyLogFeed(data: LogFeed, current: () => boolean): Promise<void> {
-  const logs = data.logs || []
-  const apply = (ready: LogEntry[], total = data.total) => {
-    entries = ready
-    incompleteTotal = typeof total === 'number' && total > entries.length ? total : null
-    loadingHistory = incompleteTotal !== null
-    lastLoadError = null
-    quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
-    lastLoadedAt = Date.now()
-    render()
-    renderStaleBanner()
-  }
-  await prepareRows(logs, current, ready => apply(ready, Math.max(data.total ?? 0, logs.length)))
   if (!current()) return
-  apply(logs)
+  entries = data.logs || []
+  incompleteTotal = typeof data.total === 'number' && data.total > entries.length ? data.total : null
+  loadingHistory = incompleteTotal !== null
+  lastLoadError = null
+  quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
+  lastLoadedAt = Date.now()
+  render()
+  renderStaleBanner()
   for (const entry of entries) {
     const state = expanded.get(entry.id)
     if (state) void loadReasoning(entry.id)
@@ -1316,18 +1343,20 @@ export async function initSwarmView() {
       lastLoadedAt = 0
       incompleteTotal = null
       loadingHistory = false
-      bodyEl.replaceChildren()
+      pageIndex = 0
+      clearRows()
       viewEl.querySelector<HTMLElement>('#swarm-table')!.hidden = true
       viewEl.querySelector<HTMLElement>('#swarm-count')!.textContent = ''
       expanded.clear()
       expandedGroups.clear()
+      openReasoning.clear()
       displayedGroups.clear()
       render()
       renderStaleBanner()
       if (!viewEl.hidden) void pollOnce()
     })
   }
-  if (lastLoadedAt) queueMicrotask(() => { render(); renderStaleBanner() })
+  if (lastLoadedAt) queueMicrotask(() => { render(false); renderStaleBanner() })
   startSwarmPolling()
   if (!startedTickTimer) startedTickTimer = setInterval(refreshStartedCells, STARTED_TICK_MS)
   await pollOnce()
@@ -1335,6 +1364,7 @@ export async function initSwarmView() {
 
 export function stopSwarmRefresh() {
   importedSessionOpenRequestId++
+  if (initialized) clearRows()
   if (progressPoll) clearInterval(progressPoll)
   progressPoll = null
   if (swarmListening) {
