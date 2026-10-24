@@ -229,7 +229,11 @@ function stallSummary(stall: StallState): string {
     if (repo.unpushedCommits) parts.push(`${repo.unpushedCommits} unpushed commit${repo.unpushedCommits === 1 ? '' : 's'} ${where}`)
     if (repo.dirtyFiles) parts.push(`${repo.dirtyFiles} uncommitted change${repo.dirtyFiles === 1 ? '' : 's'} ${where}`)
   }
-  for (const job of stall.backgroundJobs) parts.push(`background job "${job.command}" (pid ${job.pid}) still running`)
+  // Mirrors the server's notice cap: the list stays readable no matter how
+  // many jobs the marker tracks.
+  for (const job of stall.backgroundJobs.slice(0, 20)) parts.push(`background job "${job.command}" (pid ${job.pid}) still running`)
+  const hiddenJobs = stall.backgroundJobs.length - Math.min(stall.backgroundJobs.length, 20)
+  if (hiddenJobs) parts.push(`${hiddenJobs} more background job${hiddenJobs === 1 ? '' : 's'} still running`)
   if (stall.truncatedRepos) parts.push(`${stall.truncatedRepos} more task repo${stall.truncatedRepos === 1 ? '' : 's'} with leftover work`)
   if (!parts.length) return 'Stalled — the last turn left work behind.'
   return `Stalled — the last turn left ${parts.join(', ')}.`

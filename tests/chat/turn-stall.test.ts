@@ -298,6 +298,119 @@ describe('turn stall detection and waking', () => {
     await runtime.stop({ handover: false })
   }, 40_000)
 
+  it('tracks every background job past twenty and wakes each completion', async () => {
+    const fifoPath = join(root, 'bg-many-trigger.fifo')
+    spawnSync('rm', ['-f', fifoPath])
+    const fifo = spawnSync('mkfifo', [fifoPath])
+    if (fifo.status !== 0) throw new Error(`mkfifo: ${fifo.stderr}`)
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true,
+      startWorker: { command: 'sh', args: ['-c', `read line < ${fifoPath}; i=0; while [ $i -lt 21 ]; do sleep 30 & i=$((i + 1)); done; wait`] } }
+    const { runtime, events } = makeRuntime('poise-turn-stall-many:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-many' } })
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.prompt(session.id, { text: 'run the suite', attachments: [], mentions: [] })
+    await waitFor(() => owned.prompts.length === 1)
+    await writeFile(fifoPath, 'run\n')
+    const row = storage.getWorker(session.id)
+    if (!row) throw new Error('no worker row for the session')
+    await waitFor(async () => ((await worker.groupMembers(row.gatePgid))?.filter((m) => m.command === 'sleep 30').length ?? 0) === 21)
+    spawnSync('rm', ['-f', fifoPath])
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // All 21 are tracked: only the notice rendering is capped, never the
+    // tracking — a dropped pid would read as pre-existing ever after.
+    const jobs = runtime.get(session.id)?.stall?.backgroundJobs ?? []
+    expect(jobs).toHaveLength(21)
+    const overflow = jobs[20]
+
+    // The wake notice lists 20 and counts the rest.
+    const control = await makeControl(runtime)
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 2)
+    expect(owned.prompts[1].text).toContain('1 more background job')
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // The overflow job's completion wakes with its identity.
+    process.kill(overflow.pid, 'SIGTERM')
+    await waitFor(() => !worker.pidAlive(overflow.pid))
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 3)
+    expect(owned.prompts[2].text).toContain('finished')
+    expect(owned.prompts[2].text).toContain(String(overflow.pid))
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 3)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // The rest finish; the stall clears with nothing left.
+    for (const job of jobs) {
+      if (job.pid !== overflow.pid && worker.pidAlive(job.pid)) process.kill(job.pid, 'SIGTERM')
+    }
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.every((m) => m.command !== 'sleep 30') ?? false)
+    await control.tick()
+    await waitFor(() => runtime.get(session.id)?.stall === undefined)
+    await runtime.stop({ handover: false })
+  }, 60_000)
+
+  it('tracks and wakes a job whose command exceeds the label length', async () => {
+    const fifoPath = join(root, 'bg-long-trigger.fifo')
+    spawnSync('rm', ['-f', fifoPath])
+    const fifo = spawnSync('mkfifo', [fifoPath])
+    if (fifo.status !== 0) throw new Error(`mkfifo: ${fifo.stderr}`)
+    const pad = 'x'.repeat(250)
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true,
+      startWorker: { command: 'sh', args: ['-c', `read line < ${fifoPath}; sh -c 'sleep 30' ${pad} & wait`] } }
+    const { runtime, events } = makeRuntime('poise-turn-stall-long:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-long' } })
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.prompt(session.id, { text: 'run the suite', attachments: [], mentions: [] })
+    await waitFor(() => owned.prompts.length === 1)
+    await writeFile(fifoPath, 'run\n')
+    const row = storage.getWorker(session.id)
+    if (!row) throw new Error('no worker row for the session')
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.some((m) => m.command.startsWith('sh -c sleep 30')) ?? false)
+    spawnSync('rm', ['-f', fifoPath])
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // Clipped consistently on both sides of every comparison: the long
+    // shell tracks under its clipped label next to its short sleep child.
+    const jobs = runtime.get(session.id)?.stall?.backgroundJobs ?? []
+    expect(jobs).toHaveLength(2)
+    const long = jobs.find((job) => job.command.length > 200)
+    const short = jobs.find((job) => job.command === 'sleep 30')
+    if (!long || !short) throw new Error('expected the long shell and its sleep child')
+    expect(long.command).toHaveLength(201)
+    expect(long.command.endsWith('…')).toBe(true)
+
+    process.kill(long.pid, 'SIGTERM')
+    await waitFor(() => !worker.pidAlive(long.pid))
+    const control = await makeControl(runtime)
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 2)
+    finishManual(owned)
+    await waitFor(() => owned.prompts.length === 3)
+    expect(owned.prompts[2].text).toContain('finished')
+    expect(owned.prompts[2].text).toContain('…')
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 3)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // The orphaned sleep outlives its parent under the same group; once it
+    // goes too, the stall clears.
+    if (worker.pidAlive(short.pid)) process.kill(short.pid, 'SIGTERM')
+    await waitFor(() => !worker.pidAlive(short.pid))
+    await control.tick()
+    await waitFor(() => runtime.get(session.id)?.stall === undefined)
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
   it('keeps tracking a job that execs into another program instead of announcing it', async () => {
     // Two trigger fifos outside every checkout. The agent spawns a subshell
     // that blocks opening the second fifo; writing it makes the same pid

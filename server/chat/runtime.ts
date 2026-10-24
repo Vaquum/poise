@@ -114,11 +114,13 @@ const STALL_DONE = [
   'every commit pushed to the remote',
   'no background job left running from the turn',
 ]
-/** Tracked background jobs per stall marker: a runaway group never bloats
- *  the session record or the wake notice past the inbox bound. */
+/** Background jobs listed per stall wake notice and status line. Tracking
+ *  itself is uncapped — dropping a live pid would lose its completion —
+ *  only the rendering is, with the remainder counted. */
 const MAX_STALL_JOBS = 20
 /** Task repos kept per stall marker; the rest count as truncated. Together
- *  with the job cap this keeps every stall notice under the inbox bound. */
+ *  with the capped job listing this keeps every stall notice under the
+ *  inbox bound. */
 const MAX_STALL_REPOS = 20
 /** Stored command labels are redacted display text, truncated past this. */
 const STALL_COMMAND_CHARS = 200
@@ -4292,8 +4294,10 @@ export class ChatRuntime extends EventEmitter {
           if (kept) keptJobs.push(kept.command === command ? kept : { ...kept, command })
           else if (baseline.members.get(member.pid) !== command) freshJobs.push({ pid: member.pid, pgid: gatePgid, command, startedAt: now })
         }
-        // Still-running tracked jobs survive the cap; only fresh ones drop.
-        jobs = [...keptJobs, ...freshJobs].slice(0, MAX_STALL_JOBS)
+        // Every live turn-started job is tracked, however many: dropping one
+        // would let a later baseline absorb it as pre-existing, so its
+        // completion would never wake. Only the notice rendering is capped.
+        jobs = [...keptJobs, ...freshJobs]
         const current = new Map(jobs.map((job) => [job.pid, job]))
         for (const job of seen.values()) {
           // Only a gone pid finishes a job; one that exec'd into another
@@ -5121,11 +5125,15 @@ function stallNotice(sessionId: string, stall: StallState): Record<string, unkno
     if (repo.unpushedCommits) blockers.push(`Push ${repo.unpushedCommits} unpushed commit${repo.unpushedCommits === 1 ? '' : 's'} ${where}`)
   }
   if (stall.truncatedRepos) blockers.push(`${stall.truncatedRepos} more task repo${stall.truncatedRepos === 1 ? '' : 's'} with leftover work; inspect the workspace`)
-  for (const job of stall.backgroundJobs) {
+  const shownJobs = stall.backgroundJobs.slice(0, MAX_STALL_JOBS)
+  for (const job of shownJobs) {
     blockers.push(`Background job "${job.command}" (pid ${job.pid}) is still running; finish what you can now and end your turn — Poise wakes you when it finishes`)
   }
+  const hiddenJobs = stall.backgroundJobs.length - shownJobs.length
+  if (hiddenJobs) blockers.push(`${hiddenJobs} more background job${hiddenJobs === 1 ? '' : 's'} still running; Poise wakes you as each finishes`)
   return { kind: 'stall', session: sessionId, repos: stall.repos, ...(stall.truncatedRepos ? { truncatedRepos: stall.truncatedRepos } : {}),
-    backgroundJobs: stall.backgroundJobs.map((job) => ({ pid: job.pid, command: job.command, startedAt: job.startedAt })),
+    backgroundJobs: shownJobs.map((job) => ({ pid: job.pid, command: job.command, startedAt: job.startedAt })),
+    ...(hiddenJobs ? { truncatedJobs: hiddenJobs } : {}),
     blockers, done: STALL_DONE }
 }
 
