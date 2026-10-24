@@ -507,7 +507,7 @@ otherwise offer it):
 assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
   runningCallerCalls, backgroundWork, idle, draining, release, switching,
-  eventLoop, desiredRelease, installedRelease, pendingSince }`. `idle` is true only
+  eventLoop, desiredRelease, installedRelease, pendingSince, switchWaitingOn }`. `idle` is true only
   when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
   It backs the container health check and the gateway's readiness check.
   - `eventLoop` is the current minute window of event-loop delay
@@ -540,6 +540,10 @@ assertion may only resume, and anything else is refused with 403):
     `null` when none is pending. It is the `next` record's mtime, which
     re-asking the queued release leaves alone, so asking again on later
     passes never moves it.
+  - `switchWaitingOn` names what the pending switch still waits for, one
+    phrase per failing quiet-gate clause (unheld chat turns, runtime
+    operations, background operations, browser launches); `null` when none
+    is pending or nothing blocks it.
   - `activeChatTurns` counts the Chat turns recorded open: reserved before
     their first write, closed once their outcome is recorded.
   - `runningCallerCalls` counts the Caller processes Poise launched for agent

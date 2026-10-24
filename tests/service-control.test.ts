@@ -103,7 +103,7 @@ describe('service health', () => {
     session(runtime.instance, false)
     session('poise-dev:another-database', true)
     const { service } = serviceOf(runtime)
-    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, eventLoop: { p50Ms: expect.any(Number), p99Ms: expect.any(Number), maxMs: expect.any(Number), meanMs: expect.any(Number), samples: expect.any(Number), windowStartedAt: expect.any(String) }, desiredRelease: null, installedRelease: null, pendingSince: null })
+    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, eventLoop: { p50Ms: expect.any(Number), p99Ms: expect.any(Number), maxMs: expect.any(Number), meanMs: expect.any(Number), samples: expect.any(Number), windowStartedAt: expect.any(String) }, desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null })
 
     let finish!: () => void
     const debate = callerCalls.countDebate(() => new Promise<void>((resolve) => { finish = resolve }))
@@ -278,13 +278,14 @@ describe('switching to another release', () => {
     const runtime = fakeRuntime()
     const timer = new FakeTimer()
     const restart = vi.fn(options.restart ?? (() => true))
+    const log = vi.fn()
     const service = new control.ServiceControl(runtime as unknown as ChatRuntime, {
-      drainTimeoutSeconds: 1800, timer, log: vi.fn(), releasesDir: dir,
+      drainTimeoutSeconds: 1800, timer, log, releasesDir: dir,
       release: { name: options.name ?? 'r1', base: 'b1' }, restart, canRestart: options.canRestart ?? (() => true),
       ...(options.boundMinutes !== undefined ? { switchTurnBoundMinutes: () => options.boundMinutes as number } : {}),
       ...(options.now ? { now: options.now } : {}),
     })
-    return { runtime, timer, restart, service }
+    return { runtime, timer, restart, log, service }
   }
 
   it('restarts onto an installed release of its base once no Chat turn or work of its own runs', async () => {
@@ -510,6 +511,124 @@ describe('switching to another release', () => {
     } finally {
       releaseCancel()
       finishWork()
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it.each([['runtime', '2 runtime operations'], ['background', '1 background operation'], ['launch', '1 browser launch']] as const)(
+    'names %s work once past the bound and restarts when it settles', async (work, waitingOn) => {
+      const dir = await releases({ r2: 'b1' })
+      let now = 3_000_000
+      const { runtime, timer, restart, log, service } = switching(dir, { boundMinutes: 15, now: () => now })
+      let finishWork = () => { runtime.workingNow = 0 }
+      try {
+        if (work === 'runtime') runtime.workingNow = 2
+        if (work === 'background') finishWork = background.trackReleaseBackground()
+        if (work === 'launch') {
+          const admitted = service.admitLaunch('POST', '/api/models/refresh')
+          if (typeof admitted !== 'function') throw new Error('the concurrent launch was not admitted')
+          finishWork = admitted
+        }
+        service.switchRelease('r2')
+        expect(service.health().switchWaitingOn).toBe(waitingOn)
+        now += 15 * 60_000
+        timer.fire()
+        timer.fire()
+        timer.fire()
+        // The bound expired once: one wait line, nothing cancelled, still polling.
+        expect(log.mock.calls.filter(([line]) => String(line).includes('still waiting on'))).toHaveLength(1)
+        expect(runtime.cancel).not.toHaveBeenCalled()
+        expect(runtime.recordSwitchInterrupted).not.toHaveBeenCalled()
+        expect(restart).not.toHaveBeenCalled()
+        expect(timer.timers.size).toBe(1)
+        finishWork()
+        expect(service.health().switchWaitingOn).toBeNull()
+        timer.fire()
+        expect(restart).toHaveBeenCalledTimes(1)
+      } finally {
+        finishWork()
+        service.reset()
+        background.resumeReleaseBackground()
+      }
+    })
+
+  it('logs the remaining work once when non-chat work outlives bound cancellation', async () => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 5_000_000
+    const { runtime, timer, restart, log, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    const sessionId = session(runtime.instance, true)
+    const turnId = storage.getOpenTurn(sessionId)!.turnId
+    runtime.runningTurnSessions.mockReturnValue([{ sessionId, turnId }])
+    runtime.workingNow = 1
+    const finishTick = background.trackReleaseBackground()
+    runtime.cancel.mockImplementation(async () => {
+      storage.finalizeTurn(sessionId, { type: 'turn.finished', turnId, stopReason: 'cancelled' })
+      runtime.workingNow = 0
+      return { settled: true }
+    })
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      // Cancellation settled; the background tick still holds the switch.
+      expect(restart).not.toHaveBeenCalled()
+      timer.fire()
+      timer.fire()
+      const waits = log.mock.calls.filter(([line]) => String(line).includes('still waiting on'))
+      expect(waits).toHaveLength(1)
+      expect(String(waits[0][0])).toContain('1 background operation')
+      expect(service.health().switchWaitingOn).toBe('1 background operation')
+      finishTick()
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+    } finally {
+      finishTick()
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('restarts past the bound while only a Caller call runs', async () => {
+    const dir = await releases({ r2: 'b1' })
+    let now = 4_000_000
+    const { timer, restart, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    let finish!: () => void
+    const debate = callerCalls.countDebate(() => new Promise<void>((resolve) => { finish = resolve }))
+    try {
+      service.switchRelease('r2')
+      expect(service.health()).toMatchObject({ runningCallerCalls: 1, switchWaitingOn: null })
+      now += 15 * 60_000
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+    } finally {
+      finish()
+      await debate
+      service.reset()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('expires the bound afresh when the switch is retargeted', async () => {
+    const dir = await releases({ r2: 'b1', r3: 'b1' })
+    let now = 6_000_000
+    const { timer, log, service } = switching(dir, { boundMinutes: 15, now: () => now })
+    const finishTick = background.trackReleaseBackground()
+    try {
+      service.switchRelease('r2')
+      now += 15 * 60_000
+      timer.fire()
+      timer.fire()
+      service.switchRelease('r3')
+      timer.fire()
+      timer.fire()
+      expect(log.mock.calls.filter(([line]) => String(line).includes('still waiting on')).map(([line]) => line)).toEqual([
+        expect.stringContaining('release r2 waited 15 minutes'),
+        expect.stringContaining('release r3 waited 15 minutes'),
+      ])
+    } finally {
+      finishTick()
       service.reset()
       background.resumeReleaseBackground()
     }

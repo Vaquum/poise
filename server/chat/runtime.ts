@@ -1491,11 +1491,14 @@ export class ChatRuntime extends EventEmitter {
     let count = this.inflightOps + (this.recovering ? 1 : 0)
     for (const session of this.live.values()) {
       if (session.turn?.relayHeld && session.relay?.healthy) continue
-      const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
       // A prompt waiting behind a Poise update holds nothing a restart would
-      // cut: it is durable, and the next server starts it. Counting it would
-      // hold the very switch it waits for.
-      if (own === 0 && session.record.status === 'queued' && session.record.queuedBehind === SWITCH_WAIT_REASON) continue
+      // cut: it is durable, and the next server starts it. Whatever the
+      // session keeps from before it queued — a live process, unsettled
+      // operations, even a turn past its recorded outcome — must never hold
+      // the very switch it waits for. A turn still recorded open holds the
+      // switch through the open-turn gate instead, and the bound cancels it.
+      if (session.record.status === 'queued' && session.record.queuedBehind === SWITCH_WAIT_REASON) continue
+      const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
       count += own > 0 ? own : ACTIVE_STATUSES.includes(session.record.status) ? 1 : 0
     }
     return count
