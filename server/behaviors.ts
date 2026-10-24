@@ -1716,6 +1716,49 @@ function datastoreFreshness(): DatastoreFreshness {
   return datastoreFreshnessByOrganization.get(operationKey('review-new-prs')) ?? initialDatastoreFreshness
 }
 
+/** A freshness observation older than this no longer describes the
+ *  datastore: the sampler refreshes at most every behavior tick, so five
+ *  missed samples mean it has stopped (behavior off or tick stuck). */
+export const DATASTORE_OBSERVATION_STALE_MS = 5 * 60_000
+
+export interface DatastoreFreshnessEntry {
+  /** The organization's login, or null before any organization exists. */
+  org: string | null
+  status: 'unchecked' | 'healthy' | 'unavailable'
+  checkedAt: string
+  /** How old the observation itself is. */
+  observationAgeMs: number
+  /** Last successful sync the observation reported, when it named one. */
+  lastSuccessAt: string | null
+  /** Sync age recomputed at read time; null when never successfully observed. */
+  ageSeconds: number | null
+  error: string | null
+}
+
+/** One freshness observation per configured organization, with the sync age
+ *  recomputed at read time instead of frozen at the check. An organization
+ *  that never sampled reads unknown; none is hidden. Read-only: sampling
+ *  stays with the behaviors that gate on it. */
+export function datastoreFreshnessEntries(now = Date.now()): DatastoreFreshnessEntry[] {
+  const organizations = getOrganizations()
+  const entries = (organizations.length ? organizations.map((org) => org.login) : [null]).map((org) => {
+    const key = `${org?.toLowerCase() ?? 'legacy'}:review-new-prs`
+    const observed = datastoreFreshnessByOrganization.get(key) ?? initialDatastoreFreshness
+    const checkedAtMs = Date.parse(observed.checkedAt)
+    const lastSuccessMs = observed.lastSuccessAt === null ? NaN : Date.parse(observed.lastSuccessAt)
+    return {
+      org,
+      status: observed.status,
+      checkedAt: observed.checkedAt,
+      observationAgeMs: Number.isFinite(checkedAtMs) ? Math.max(0, now - checkedAtMs) : Number.MAX_SAFE_INTEGER,
+      lastSuccessAt: observed.lastSuccessAt,
+      ageSeconds: Number.isFinite(lastSuccessMs) ? Math.max(0, Math.round((now - lastSuccessMs) / 1000)) : null,
+      error: observed.error,
+    }
+  })
+  return entries
+}
+
 function configuredReviewer(): string {
   return requireAgentAccount()
 }

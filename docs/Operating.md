@@ -789,6 +789,26 @@ in `/etc/docker/daemon.json` and restart Docker:
 { "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "5" } }
 ```
 
+## Health
+
+Each workspace answers three levels of health:
+
+- `GET /api/health/live` is liveness: 200 whenever the process answers. It
+  performs no I/O, so no dependency can slow it down.
+- `GET /api/health` adds readiness: `readiness` says whether interactive
+  work can trust its dependencies, `dependencies` names each one (ledger,
+  datastore per organization, GitHub quota per account, local collection),
+  and `history` keeps cumulative ledger loss. These fields are additive:
+  the response's status code and `status` keep the meaning existing
+  monitors read.
+- `GET /api/service/health` is the gateway's contract: startup readiness,
+  release switching and drain polling. The container health check probes it.
+
+A degraded dependency never changes a status code. Alert on
+`readiness.status` and the `dependencies` entries rather than on the
+process existing. Ledger queue stalls, worker failures and capture loss
+also alert through Poise Link and the page's notices.
+
 ## Troubleshooting
 
 - **`install.sh` says a port is in use.** Another web server holds port 80

@@ -345,3 +345,64 @@ it('retains exactly 168 hourly slots including this hour after a full week', () 
   expect(bucket.history?.[0].at).toBe(now - 167 * 3_600_000)
   expect(bucket.history?.at(-1)?.used).toBe(200)
 })
+
+describe('cached snapshots for health', () => {
+  it('reads unobserved accounts as null without running any subprocess', () => {
+    expect(quota.githubQuotaSnapshots()).toEqual([])
+    database.setMeta('me', 'Octocat')
+    database.setMeta('agentAccount', 'octo-agent')
+    expect(quota.githubQuotaSnapshots()).toEqual([
+      { login: 'Octocat', roles: ['user'], checkedAt: null, observationAgeMs: null, exhausted: [], error: null },
+      { login: 'octo-agent', roles: ['automation'], checkedAt: null, observationAgeMs: null, exhausted: [], error: null },
+    ])
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('projects the monitor cache, flagging only live exhausted budgets', async () => {
+    database.setMeta('me', 'octocat')
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[0] === 'auth') return { stdout: 'test-token' }
+      return { stdout: JSON.stringify({ resources: {
+        core: { used: 5000, remaining: 0, limit: 5000, reset },
+        graphql: { used: 0, remaining: 0, limit: 0, reset },
+        search: { used: 30, remaining: 0, limit: 30, reset: T0 / 1000 - 60 },
+      } }) }
+    })
+    await quota.readGithubQuota()
+    const calls = mocks.runFile.mock.calls.length
+    expect(quota.githubQuotaSnapshots()).toEqual([{
+      login: 'octocat', roles: ['user'], checkedAt: new Date(T0).toISOString(),
+      observationAgeMs: 0, exhausted: ['core'], error: null,
+    }])
+    expect(mocks.runFile.mock.calls.length).toBe(calls)
+  })
+
+  it('reports the monitor failure and clears it on the next success', async () => {
+    database.setMeta('me', 'octocat')
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      // Identities changed mid-read: the whole pass fails instead of
+      // publishing a mixed result, and health carries the failure.
+      mocks.runFile.mockImplementation(async () => {
+        database.setMeta('me', 'other')
+        return { stdout: JSON.stringify(payload()) }
+      })
+      quota.checkGithubQuota()
+      await quota.stopGithubQuotaRuntime()
+      expect(quota.githubQuotaSnapshots()).toEqual([{
+        login: 'other', roles: ['user'], checkedAt: null, observationAgeMs: null,
+        exhausted: [], error: 'GitHub accounts changed while reading quota; retry.',
+      }])
+      mocks.runFile.mockImplementation(async (_command: string, args: string[]) => (
+        { stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload()) }))
+      quota.checkGithubQuota()
+      await quota.stopGithubQuotaRuntime()
+      expect(quota.githubQuotaSnapshots()).toEqual([{
+        login: 'other', roles: ['user'], checkedAt: new Date(T0).toISOString(),
+        observationAgeMs: 0, exhausted: [], error: null,
+      }])
+    } finally {
+      error.mockRestore()
+    }
+  })
+})

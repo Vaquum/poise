@@ -29,6 +29,10 @@ const stderrFailure = (error: Error & { code?: unknown }) => {
 
 export function loggingRuntime(): DiagnosticRuntime | null { return active }
 export function loggingWorkspace(): string { return workspace }
+/** Local collection state for health, or null before logging starts. */
+export function loggingCollectionSnapshot(): ReturnType<DiagnosticRuntime['localSnapshot']> | null {
+  return active?.localSnapshot() ?? null
+}
 export function loggingPath(): string | null { return active ? path : null }
 
 const secretSources: Array<() => readonly string[]> = []

@@ -71,6 +71,24 @@ second deadline and 512 KiB response bound. Exit 0 means a successful reply with
 complete health; 1 means HTTP/transport failure or incomplete/stale coverage;
 2 means invalid arguments. The command emits server JSON unchanged.
 
+## Health split
+
+`/api/health` carries the ledger twice: `dependencies.ledger` for whether
+capture is draining now, and `history.ledger` for cumulative completeness.
+Both come from a synchronous in-memory snapshot, never from the worker queue,
+so a wedged worker cannot slow health down (a worker round trip has a
+two-second budget; health never queues one).
+
+`dependencies.ledger` reads `degraded` while the oldest queued capture
+outwaits the ten-second stall budget or capture loss is still unreported,
+and `unavailable` once the worker has failed; anything else reads `ok`.
+Cumulative `dropped` counts and retained gaps stay in `history.ledger` and
+never affect readiness: a ledger that once lost a capture must not read
+degraded forever. A queue age past the budget on two minute-checks in a row,
+a dead worker, and any lost-capture increase alert through the durable alert
+path. Loss is baselined per store generation, so history alone never
+re-alerts.
+
 ## Meaning and evidence
 
 A firing groups explicitly admitted work. PR review panels retain their native
