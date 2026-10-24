@@ -381,5 +381,175 @@ class ViewsTest(unittest.TestCase):
             conn.close()
 
 
+def dependent_fixture(number, item_id, body, state="open", blocked_by=(), title=None):
+    item = base_expanded(body, [])
+    item["issue"] = dict(item["issue"], id=item_id, node_id=f"I_{item_id}", number=number,
+                         state=state, title=title or f"Issue {number}")
+    if blocked_by is not None:
+        item["issue"]["graphql"] = {"blockedBy": {"pageInfo": {"hasNextPage": False}, "nodes": [
+            {"number": n, "repository": {"nameWithOwner": "Vaquum/Test"}} for n in blocked_by]}}
+    return item
+
+
+def closing_pr_fixture(number, item_id, body, closing=(), state="merged", title=None):
+    pr = base_expanded(body, [])
+    pr["is_pr"] = True
+    pr["issue"] = dict(pr["issue"], id=item_id, node_id=f"I_{item_id}", number=number, state=state,
+                       title=title or f"PR {number}")
+    graphql = {} if closing is None else {
+        "closingIssuesReferences": {"pageInfo": {"hasNextPage": False}, "nodes": [
+            {"number": n, "title": f"Issue {n}", "repository": {"nameWithOwner": "Vaquum/Test"}}
+            for n in closing]}}
+    pr["pull"] = {"id": item_id, "node_id": f"I_{item_id}", "graphql": graphql,
+                  "requested_reviewers": [], "assignees": [], "merged_by": None,
+                  "updated_at": "2026-01-02T00:00:00Z"}
+    pr["issue"]["pull_request"] = {"node_id": f"I_{item_id}"}
+    return pr
+
+
+class PrDependentsTest(unittest.TestCase):
+    def test_pr_dependents_returns_closed_and_dependents_listed_either_way(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            items = [
+                closing_pr_fixture(12, 112, "Closes #7", closing=(7,)),
+                dependent_fixture(7, 107, "the fix", state="closed"),
+                dependent_fixture(9, 109, "waiting on the fix", blocked_by=(7,)),
+                dependent_fixture(10, 110, "Depends on:\n- #7\nUnlocks:\n- none"),
+                dependent_fixture(11, 111, "Depends on: #7", blocked_by=(7,)),
+                dependent_fixture(13, 113, "Depends on:\n- #999"),
+                dependent_fixture(14, 114, "Depends on: #7", state="closed"),
+                dependent_fixture(15, 115, "Depends on:\n- Vaquum/Test#7"),
+                dependent_fixture(16, 116, "nothing to do with it", blocked_by=None),
+            ]
+            with conn:
+                upsert_repo(conn, items[0]["repo"])
+            for item in items:
+                store_expanded(conn, item)
+            conn.close()
+
+            found = json.loads(views.pr_dependents(db_path=db_path, repo="vaquum/test", number=12))
+            self.assertTrue(found["found"])
+            self.assertEqual(found["title"], "PR 12")
+            self.assertEqual(found["closes_via"], "closing-references")
+            self.assertFalse(found["truncated"])
+            self.assertEqual(found["closed"], [{
+                "repo": "Vaquum/Test", "number": 7, "title": "Issue 7",
+                "url": "https://github.com/Vaquum/Test/issues/7", "state": "closed"}])
+            self.assertEqual(
+                [(entry["number"], entry["via"]) for entry in found["dependents"]],
+                [(9, ["blocked-by"]), (10, ["depends-on"]), (11, ["blocked-by", "depends-on"]),
+                 (15, ["depends-on"])],
+            )
+            self.assertEqual(found["dependents"][0]["url"], "https://github.com/Vaquum/Test/issues/9")
+
+            missing = json.loads(views.pr_dependents(db_path=db_path, repo="vaquum/test", number=99))
+            self.assertFalse(missing["found"])
+            self.assertEqual((missing["closed"], missing["dependents"]), ([], []))
+
+    def test_pr_dependents_falls_back_to_closing_keywords_without_tracked_references(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = closing_pr_fixture(12, 112, "Fixes #7", closing=None)
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            store_expanded(conn, dependent_fixture(7, 107, "the fix", state="closed"))
+            store_expanded(conn, dependent_fixture(9, 109, "waiting on the fix", blocked_by=(7,)))
+            conn.close()
+
+            found = json.loads(views.pr_dependents(db_path=db_path, repo="vaquum/test", number=12))
+            self.assertTrue(found["found"])
+            self.assertEqual(found["closes_via"], "body-keywords")
+            self.assertFalse(found["truncated"])
+            self.assertEqual([entry["number"] for entry in found["closed"]], [7])
+            self.assertEqual([entry["number"] for entry in found["dependents"]], [9])
+
+    def test_pr_dependents_marks_truncated_lists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = closing_pr_fixture(12, 5000, "Closes #7", closing=(7,))
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            store_expanded(conn, dependent_fixture(7, 5001, "the fix", state="closed"))
+            for offset in range(51):
+                store_expanded(conn, dependent_fixture(100 + offset, 5100 + offset, "Depends on: #7"))
+            conn.close()
+
+            found = json.loads(views.pr_dependents(db_path=db_path, repo="vaquum/test", number=12))
+            self.assertTrue(found["truncated"])
+            self.assertEqual(len(found["dependents"]), 50)
+            self.assertEqual(found["dependents"][0]["number"], 100)
+
+    def test_pr_dependents_rejects_non_json_or_unscoped_reads(self) -> None:
+        with self.assertRaises(ValueError):
+            views.pr_dependents(repo="vaquum/test", number=2, output="csv")
+        with self.assertRaises(ValueError):
+            views.pr_dependents(number=2)
+        with self.assertRaises(ValueError):
+            views.pr_dependents(repo="vaquum/test")
+
+    def test_pr_dependents_serves_through_the_view_command(self) -> None:
+        from contextlib import redirect_stdout
+
+        from github_datastore import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = closing_pr_fixture(12, 112, "Closes #7", closing=(7,))
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            conn.close()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli.main(["--db", str(db_path), "view", "pr-dependents",
+                          "--repo", "vaquum/test", "--number", "12"])
+            found = json.loads(output.getvalue())
+            self.assertTrue(found["found"])
+            self.assertEqual([entry["number"] for entry in found["closed"]], [7])
+
+
+class DependsOnParserTest(unittest.TestCase):
+    def test_depends_on_formats(self) -> None:
+        self.assertEqual(views.parse_depends_on("Depends on:\n- #354\n- #355", "acme/app"),
+                         {("acme/app", 354), ("acme/app", 355)})
+        self.assertEqual(views.parse_depends_on("Depends on: #354, #355", "acme/app"),
+                         {("acme/app", 354), ("acme/app", 355)})
+        self.assertEqual(views.parse_depends_on("depends on:\n1. #354\n2) acme/app#355", "other/repo"),
+                         {("other/repo", 354), ("acme/app", 355)})
+        self.assertEqual(views.parse_depends_on(
+            "Depends on:\n- https://github.com/acme/app/issues/354", "other/repo"),
+            {("acme/app", 354)})
+        self.assertEqual(views.parse_depends_on("Depends on:\n- none", "acme/app"), set())
+        self.assertEqual(views.parse_depends_on(None, "acme/app"), set())
+        self.assertEqual(views.parse_depends_on("", "acme/app"), set())
+
+    def test_depends_on_stops_at_the_next_section(self) -> None:
+        self.assertEqual(
+            views.parse_depends_on("Depends on:\n- #354\nUnlocks:\n- #999", "acme/app"),
+            {("acme/app", 354)})
+        # A bare list without a header claims nothing.
+        self.assertEqual(views.parse_depends_on("- #354\n- #355", "acme/app"), set())
+
+    def test_closes_keywords(self) -> None:
+        self.assertEqual(views.parse_closes("Closes #7", "acme/app"), {("acme/app", 7)})
+        self.assertEqual(views.parse_closes("Fixes acme/app#7 and resolves #8", "other/repo"),
+                         {("acme/app", 7), ("other/repo", 8)})
+        self.assertEqual(views.parse_closes(
+            "Closed https://github.com/acme/app/issues/7", "other/repo"), {("acme/app", 7)})
+        self.assertEqual(views.parse_closes("no keywords here #7", "acme/app"), set())
+        self.assertEqual(views.parse_closes(None, "acme/app"), set())
+
+
 if __name__ == "__main__":
     unittest.main()

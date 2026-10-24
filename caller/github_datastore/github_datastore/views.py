@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -231,6 +232,246 @@ def _pr_reviews_page(
                                    "updated_at": row["updated_at"],
                                    "revision": hashlib.sha256((row["body"] or "").encode()).hexdigest()}]} for row in threads],
     }, ensure_ascii=False)
+
+
+DEPENDS_ON_HEADER = re.compile(r"^\s*depends\s+on\s*:(.*)$", re.IGNORECASE)
+DEPENDS_ON_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+GITHUB_URL_REF = re.compile(
+    r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/([1-9][0-9]*)\b",
+    re.IGNORECASE,
+)
+REPO_NUM_REF = re.compile(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)\b")
+BARE_NUM_REF = re.compile(r"(?<![\w/#])#([1-9][0-9]*)\b")
+CLOSES_REF = re.compile(
+    r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
+    r"\s+(?:"
+    r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/([1-9][0-9]*)\b"
+    r"|([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)\b"
+    r"|#([1-9][0-9]*)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+DEPENDENTS_SCAN_LIMIT = 1000
+DEPENDENTS_MATCH_LIMIT = 50
+
+
+def _extract_refs(text: str, default_repo: str) -> list[tuple[str, int]]:
+    """(lowercase repo, number) refs in `text`: URLs, then repo#num, then bare #num."""
+    refs: list[tuple[str, int]] = []
+    for match in GITHUB_URL_REF.finditer(text):
+        refs.append((match.group(1).lower(), int(match.group(2))))
+    scrubbed = GITHUB_URL_REF.sub(" ", text)
+    for match in REPO_NUM_REF.finditer(scrubbed):
+        refs.append((match.group(1).lower(), int(match.group(2))))
+    scrubbed = REPO_NUM_REF.sub(" ", scrubbed)
+    for match in BARE_NUM_REF.finditer(scrubbed):
+        refs.append((default_repo.lower(), int(match.group(1))))
+    return refs
+
+
+def parse_depends_on(body: str | None, default_repo: str) -> set[tuple[str, int]]:
+    """Refs a body lists under Depends on: headers, inline or as list items.
+
+    Each header consumes the rest of its line plus following list items; the
+    first non-item line ends it, so a later Unlocks: list never leaks in."""
+    refs: set[tuple[str, int]] = set()
+    if not body:
+        return refs
+    lines = body.splitlines()
+    index = 0
+    while index < len(lines):
+        header = DEPENDS_ON_HEADER.match(lines[index])
+        if not header:
+            index += 1
+            continue
+        refs.update(_extract_refs(header.group(1), default_repo))
+        index += 1
+        while index < len(lines):
+            item = DEPENDS_ON_ITEM.match(lines[index])
+            if not item:
+                break
+            refs.update(_extract_refs(item.group(1), default_repo))
+            index += 1
+    return refs
+
+
+def parse_closes(body: str | None, default_repo: str) -> set[tuple[str, int]]:
+    """Refs one closing keyword directly introduces: the fallback for pull
+    requests last synced before closing references were tracked."""
+    refs: set[tuple[str, int]] = set()
+    if not body:
+        return refs
+    for match in CLOSES_REF.finditer(body):
+        if match.group(1):
+            refs.add((match.group(1).lower(), int(match.group(2))))
+        elif match.group(3):
+            refs.add((match.group(3).lower(), int(match.group(4))))
+        else:
+            refs.add((default_repo.lower(), int(match.group(5))))
+    return refs
+
+
+def _connection_nodes(value: Any) -> tuple[list[dict[str, Any]] | None, bool]:
+    """(nodes, truncated) for a stored blockedBy/closingIssuesReferences
+    connection. Absent reads as no edges: the sync owns freshness."""
+    if value is None:
+        return [], False
+    if not isinstance(value, dict) or not isinstance(value.get("nodes"), list):
+        return None, True
+    page = value.get("pageInfo")
+    truncated = isinstance(page, dict) and page.get("hasNextPage") is True
+    nodes: list[dict[str, Any]] = []
+    for node in value["nodes"]:
+        if not isinstance(node, dict):
+            return None, True
+        nodes.append(node)
+    return nodes, truncated
+
+
+def _node_ref(node: dict[str, Any]) -> tuple[str, int] | None:
+    number = node.get("number")
+    repository = node.get("repository")
+    repo = repository.get("nameWithOwner") if isinstance(repository, dict) else None
+    if type(number) is not int or number <= 0 or not isinstance(repo, str) or not repo:
+        return None
+    return (repo.lower(), number)
+
+
+def _closing_refs(graphql: Any, body: str | None, repo: str) -> tuple[list[tuple[str, int, str | None]], str, bool]:
+    """((repo, number, title) refs, provenance, truncated) for a pull request.
+
+    GitHub's closing references when the stored read tracked them, else the
+    body's closing keywords. A malformed stored connection falls back to the
+    body and marks the read truncated."""
+    stored = graphql.get("closingIssuesReferences") if isinstance(graphql, dict) else None
+    if stored is None:
+        return [(r, n, None) for r, n in sorted(parse_closes(body, repo))], "body-keywords", False
+    nodes, truncated = _connection_nodes(stored)
+    if nodes is None:
+        return [(r, n, None) for r, n in sorted(parse_closes(body, repo))], "body-keywords", True
+    refs: list[tuple[str, int, str | None]] = []
+    for node in nodes:
+        ref = _node_ref(node)
+        if ref is None:
+            return [(r, n, None) for r, n in sorted(parse_closes(body, repo))], "body-keywords", True
+        title = node.get("title")
+        refs.append((ref[0], ref[1], title if isinstance(title, str) and title else None))
+    return sorted(refs), "closing-references", truncated
+
+
+def pr_dependents(
+    *,
+    db_path: str | Path = DEFAULT_DB,
+    output: Output = "json",
+    repo: str | None = None,
+    number: int | None = None,
+) -> str:
+    """A pull request's closed issues and their open dependents as the
+    datastore has them: local rows only, the sync owns freshness. A PR the
+    datastore has never seen reads as found=false, never as an error. An
+    open issue counts as dependent when GitHub lists the closed issue in its
+    blockedBy, or its body lists it under Depends on:. `truncated` means a
+    cap or a malformed stored connection hid entries; absence from the lists
+    then proves nothing."""
+    if output != "json":
+        raise ValueError("pr-dependents renders json only")
+    if not repo or number is None:
+        raise ValueError("pr-dependents needs a repo and a number")
+    conn = _read_connect(db_path)
+    try:
+        conn.execute("BEGIN")
+        row = conn.execute(
+            """SELECT title, body, expanded_json FROM items
+               WHERE repo_full_name = ? COLLATE NOCASE AND number = ? AND item_type = 'pr'""",
+            (repo, number),
+        ).fetchone()
+        if row is None:
+            return json.dumps({"repo": repo, "number": number, "found": False, "title": None,
+                               "closed": [], "closes_via": None, "dependents": [], "truncated": False})
+        try:
+            expanded = json.loads(row["expanded_json"])
+        except ValueError:
+            expanded = None
+        pull = expanded.get("pull") if isinstance(expanded, dict) else None
+        graphql = pull.get("graphql") if isinstance(pull, dict) else None
+        closing, closes_via, truncated = _closing_refs(graphql, row["body"], repo)
+        closed: list[dict[str, Any]] = []
+        for ref_repo, ref_number, ref_title in closing:
+            issue = conn.execute(
+                """SELECT repo_full_name, title, state FROM items
+                   WHERE repo_full_name = ? COLLATE NOCASE AND number = ? AND item_type = 'issue'""",
+                (ref_repo, ref_number),
+            ).fetchone()
+            display_repo = issue["repo_full_name"] if issue else ref_repo
+            closed.append({
+                "repo": display_repo,
+                "number": ref_number,
+                "title": issue["title"] if issue else (ref_title or f"{display_repo}#{ref_number}"),
+                "url": f"https://github.com/{display_repo}/issues/{ref_number}",
+                "state": issue["state"] if issue else None,
+            })
+        dependents: list[dict[str, Any]] = []
+        if closing:
+            targets = {(ref_repo, ref_number) for ref_repo, ref_number, _ in closing}
+            scanned = conn.execute(
+                """SELECT repo_full_name, number, title, body,
+                          json_extract(expanded_json, '$.issue.graphql.blockedBy') AS blocked_by
+                   FROM items
+                   WHERE repo_full_name = ? COLLATE NOCASE AND item_type = 'issue' AND state = 'open'
+                   ORDER BY number LIMIT ?""",
+                (repo, DEPENDENTS_SCAN_LIMIT + 1),
+            ).fetchall()
+            if len(scanned) > DEPENDENTS_SCAN_LIMIT:
+                truncated = True
+                scanned = scanned[:DEPENDENTS_SCAN_LIMIT]
+            for candidate in scanned:
+                raw_blocked_by = candidate["blocked_by"]
+                if raw_blocked_by is None:
+                    blocked_by = None
+                elif not isinstance(raw_blocked_by, str):
+                    blocked_by = False
+                else:
+                    try:
+                        blocked_by = json.loads(raw_blocked_by)
+                    except ValueError:
+                        blocked_by = False
+                nodes, connections_truncated = _connection_nodes(blocked_by)
+                if nodes is None:
+                    truncated = True
+                    blocked: set[tuple[str, int]] = set()
+                else:
+                    if connections_truncated:
+                        truncated = True
+                    blocked = set()
+                    for node in nodes:
+                        ref = _node_ref(node)
+                        if ref is None:
+                            truncated = True
+                            blocked = set()
+                            break
+                        blocked.add(ref)
+                depends = parse_depends_on(candidate["body"], candidate["repo_full_name"])
+                via = [name for name, hits in (("blocked-by", blocked), ("depends-on", depends)) if hits & targets]
+                if not via:
+                    continue
+                dependents.append({
+                    "repo": candidate["repo_full_name"],
+                    "number": candidate["number"],
+                    "title": candidate["title"],
+                    "url": f"https://github.com/{candidate['repo_full_name']}/issues/{candidate['number']}",
+                    "via": via,
+                })
+            if len(dependents) > DEPENDENTS_MATCH_LIMIT:
+                truncated = True
+                dependents = dependents[:DEPENDENTS_MATCH_LIMIT]
+        return json.dumps({"repo": repo, "number": number, "found": True, "title": row["title"],
+                           "closed": closed, "closes_via": closes_via,
+                           "dependents": dependents, "truncated": truncated}, ensure_ascii=False)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"view query failed: pr-dependents: {exc}") from exc
+    finally:
+        conn.close()
 
 
 def _flag(value: Any) -> bool | None:

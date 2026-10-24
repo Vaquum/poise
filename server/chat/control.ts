@@ -333,6 +333,55 @@ export async function readWorkReviews(target: store.WorkTarget, cursor: ReviewsC
   }
 }
 
+/** One merged PR's closed issues and their open dependents as the local
+ *  datastore has them; null when the datastore cannot be asked. Local rows
+ *  only — the sync owns freshness, and this read adds zero GitHub traffic. */
+export interface MergeWakeClosedIssue { repo: string, number: number, title: string, url: string, state: string | null }
+export interface MergeWakeDependent { repo: string, number: number, title: string, url: string, via: Array<'blocked-by' | 'depends-on'> }
+export interface MergeWakeObservation {
+  found: boolean, title: string | null, closed: MergeWakeClosedIssue[],
+  closesVia: 'closing-references' | 'body-keywords' | null, dependents: MergeWakeDependent[], truncated: boolean,
+}
+export async function readWorkMergeWake(target: store.WorkTarget): Promise<MergeWakeObservation | null> {
+  const org = organizationForRepository(target.repo)
+  if (!org) return null
+  try {
+    const { stdout } = await runFile('github-datastore',
+      organizationArgs(org, ['view', 'pr-dependents', '--repo', target.repo, '--number', String(target.number), '--format', 'json']),
+      { timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 })
+    const value: unknown = JSON.parse(stdout)
+    if (!value || typeof value !== 'object') return null
+    const row = value as Record<string, unknown>
+    if (typeof row.found !== 'boolean' || (row.title !== null && typeof row.title !== 'string')
+      || !Array.isArray(row.closed) || row.closed.length > 100 || !Array.isArray(row.dependents) || row.dependents.length > 50
+      || typeof row.truncated !== 'boolean'
+      || (row.closes_via !== null && row.closes_via !== 'closing-references' && row.closes_via !== 'body-keywords')) return null
+    const closed: MergeWakeClosedIssue[] = []
+    for (const entry of row.closed) {
+      if (!entry || typeof entry !== 'object') return null
+      const issue = entry as Record<string, unknown>
+      if (typeof issue.repo !== 'string' || !issue.repo || typeof issue.number !== 'number' || !Number.isSafeInteger(issue.number) || issue.number <= 0
+        || typeof issue.title !== 'string' || !issue.title || typeof issue.url !== 'string' || !issue.url
+        || (issue.state !== null && typeof issue.state !== 'string')) return null
+      closed.push({ repo: issue.repo, number: issue.number, title: issue.title, url: issue.url, state: issue.state })
+    }
+    const dependents: MergeWakeDependent[] = []
+    for (const entry of row.dependents) {
+      if (!entry || typeof entry !== 'object') return null
+      const issue = entry as Record<string, unknown>
+      if (typeof issue.repo !== 'string' || !issue.repo || typeof issue.number !== 'number' || !Number.isSafeInteger(issue.number) || issue.number <= 0
+        || typeof issue.title !== 'string' || !issue.title || typeof issue.url !== 'string' || !issue.url
+        || !Array.isArray(issue.via) || issue.via.length < 1 || issue.via.length > 2 || new Set(issue.via).size !== issue.via.length
+        || !issue.via.every(via => via === 'blocked-by' || via === 'depends-on')) return null
+      dependents.push({ repo: issue.repo, number: issue.number, title: issue.title, url: issue.url, via: issue.via as MergeWakeDependent['via'] })
+    }
+    return { found: row.found, title: row.title, closed, closesVia: row.closes_via as MergeWakeObservation['closesVia'],
+      dependents, truncated: row.truncated }
+  } catch {
+    return null
+  }
+}
+
 /** GitHub login identifies an account, not a chat. Without per-chat origin
  *  evidence, even same-account feedback remains actionable. Resolved threads,
  *  approvals and unsubmitted reviews need no author action. */
@@ -574,7 +623,7 @@ export class ChatControl {
         ...(timer.reason ? { reason: timer.reason } : {}), ...(error ? { error } : {}) } })
   }
 
-  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, now?: () => number, switchboard?: SwitchboardControl } = {}) {
+  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, mergeWake?: typeof readWorkMergeWake, now?: () => number, switchboard?: SwitchboardControl } = {}) {
     runtime.on('event', this.onEvent)
     runtime.on('deleted', this.onDeleted)
   }
@@ -1068,7 +1117,13 @@ export class ChatControl {
       } catch (error) { this.itemFailed('binding', binding.target, error) }
       if (target.kind !== 'pull') continue
       const prStatus = await this.workTargetStatus(target, now)
-      if (prStatus === 'closed' || prStatus === 'merged') continue
+      if (prStatus === 'merged') {
+        try {
+          await this.observeMergeWake(binding, target, now)
+        } catch (error) { this.itemFailed('ci', binding.target, error) }
+        continue
+      }
+      if (prStatus === 'closed') continue
       try {
         await this.observeCi(binding, target, prStatus, now)
         await this.observeReviews(binding, target, now)
@@ -1468,6 +1523,56 @@ export class ChatControl {
     })]
     for (const comment of commentBaselines) store.saveObservation(instance, `${seenKey}:comment:${comment.id}`, comment.revision, now)
     if (reviews.page) store.saveObservation(instance, `reviews-cursor:${target.url}`, JSON.stringify([reviews.page]), now)
+  }
+
+  /** A merged worker-bound PR wakes its creating chat once with the closed
+   *  issues and their open dependents, from the merge the target-status read
+   *  already saw: zero new GitHub requests. Unknown or missing evidence
+   *  keeps the unsettled baseline like pending CI; with no creating chat,
+   *  nothing changes. */
+  private async observeMergeWake(binding: store.Binding, target: store.WorkTarget, now: number): Promise<void> {
+    const instance = this.runtime.instance
+    const key = `merge-wake:${target.url}`
+    const previous = store.observation(instance, key)
+    if (previous && now - previous.checked_at < CI_INTERVAL) return
+    if (previous?.fingerprint) return
+    let wake: MergeWakeObservation | null
+    try {
+      wake = await (this.options.mergeWake ?? readWorkMergeWake)(target)
+    } catch (error) {
+      this.runtime.emit('log', `[chat control] merge-wake read for ${target.url} failed: ${String(error)}`)
+      wake = null
+    }
+    // An ownership transfer mid-read must not announce the merge to the old
+    // owner's Manager; the new owner starts from the unsettled baseline.
+    if (!store.bindingIsCurrent(instance, binding)) return
+    const manager = store.children(instance).find(child => child.child === binding.session)?.manager
+    if (!manager || !this.runtime.ownsSession(manager) || !wake || !wake.found) {
+      store.saveObservation(instance, key, previous?.fingerprint ?? '', now)
+      return
+    }
+    const worker = this.runtime.get(binding.session)
+    const data = { kind: 'worker_pr_merged', target: target.url, worker: binding.session,
+      ...(worker?.title ? { workerTitle: worker.title } : {}), ...(wake.title ? { title: wake.title } : {}),
+      closedIssues: wake.closed, closesVia: wake.closesVia, dependentIssues: wake.dependents,
+      truncated: wake.truncated,
+      detail: wake.truncated
+        ? 'The closed and dependent lists may be incomplete; inspect the complete current work state through Poise APIs or Caller before acting.'
+        : 'Start dependent work at once; inspect the complete current work state through Poise APIs or Caller before acting.' }
+    const body = JSON.stringify(data)
+    const fingerprint = createHash('sha256').update(body).digest('hex')
+    db.transaction(() => {
+      if (!store.bindingIsCurrent(instance, binding)) return
+      store.message(instance, manager, store.WORK_MONITOR_SENDER,
+        boundedNotice(body, { kind: data.kind, target: binding.target, worker: binding.session,
+          closedCount: wake.closed.length, dependentsCount: wake.dependents.length, truncated: wake.truncated,
+          detail: 'Inspect the complete current work state through Poise APIs or Caller before acting.' }),
+        key)
+      store.saveObservation(instance, key, fingerprint, now)
+      diagnostic({ level: 'info', operation: 'chat.work.merge_wake', target: binding.target,
+        repository: target.repo, message: 'Worker PR merged; its Manager was woken',
+        context: { sessionId: manager, worker: binding.session, closed: wake.closed.length, dependents: wake.dependents.length } })
+    })()
   }
 
   private observe(binding: store.Binding, key: string, data: Record<string, unknown>, now: number, initiallyActionable: boolean, pending = false, actionable?: unknown, shouldWake = true): void {
