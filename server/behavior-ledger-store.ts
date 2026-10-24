@@ -21,7 +21,7 @@ const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,1
 const SHA = /^[a-f0-9]{40}$/
 const SLOTS: readonly LedgerSlot[] = ['primary', 'secondary', 'tertiary']
 const PRECEDENCE: readonly LedgerState[] = ['running', 'held', 'unknown', 'pending', 'failed', 'superseded', 'completed']
-const OUTCOMES = new Set(['clean', 'changes_requested', 'approved', 'commented', 'preflight_failed', 'resolved', 'waiting', 'no_op', 'merged', 'already_merged', 'updated', 'not_ready', 'superseded', 'rerun_requested', 'read_failed', 'spawn_failed', 'adopted'])
+const OUTCOMES = new Set(['clean', 'changes_requested', 'approved', 'commented', 'preflight_failed', 'resolved', 'waiting', 'no_op', 'merged', 'already_merged', 'updated', 'not_ready', 'superseded', 'rerun_requested', 'read_failed', 'spawn_failed', 'adopted', 'enqueued'])
 const TERMINAL = new Set<LedgerState>(['completed', 'failed', 'superseded'])
 const DIRECT = new Set(['resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
 const cliBehavior = { 'review-new-prs': 'pr_review', 'approve-prs': 'pr_approve', 'review-new-issues': 'issue_review' } as const
@@ -326,7 +326,7 @@ export class BehaviorLedgerStore {
   }
 
   private validateRefs(refs: LedgerReference[]): void {
-    if (refs.length > 8 || refs.some((ref) => !['caller', 'correlation', 'review', 'comment', 'workflow', 'intent', 'logging'].includes(ref.kind)
+    if (refs.length > 8 || refs.some((ref) => !['caller', 'correlation', 'review', 'comment', 'workflow', 'intent', 'logging', 'queue'].includes(ref.kind)
       || !['available', 'unavailable', 'unknown'].includes(ref.availability) || typeof ref.identity !== 'string'
       || !/^[A-Za-z0-9][A-Za-z0-9._:#/-]{0,159}$/.test(ref.identity) || encodedBytes(ref) > 256
       || (ref.kind === 'caller' && !CALL.test(ref.identity)))) throw new LedgerError(400, 'invalid_observation')

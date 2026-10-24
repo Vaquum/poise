@@ -189,8 +189,14 @@ instead uses a head-pinned enqueue mutation after successful head checks,
 platform approval and complete conversation checks. It reports `enqueued` or
 `in_queue` with the confirmed queue entry; neither is a completed merge.
 The direct path reports `merged`, `already_merged`, `not_ready`, or `superseded`.
-A confirmed `merged` receipt alone updates the per-account Last triggered event;
-operation failures use existing diagnostics and retry backoff. A retry after a
+A confirmed `merged` or `enqueued` receipt updates the per-account Last triggered
+event; `enqueued` is recorded as a write with the queue entry reference, while
+`in_queue` stays an observation. The server remembers the last entry seen per PR
+head: a queued PR is skipped from the batch evidence without further calls, and
+a vanished entry for an unchanged green head is retained as a rejection with
+backoff instead of being resubmitted. A new head, a manual requeue, or the merge
+itself releases the admission.
+Operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
 Queue-enabled branches are excluded from automatic base updates: GitHub tests

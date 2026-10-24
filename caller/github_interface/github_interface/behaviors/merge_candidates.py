@@ -33,6 +33,16 @@ def latest_approval(pull: dict[str, Any]) -> str | None:
     return max(stamps) if stamps else None
 
 
+def queue_entry_id(pull: dict[str, Any]) -> str | None:
+    """Current merge queue entry id, or None when the PR is not queued."""
+    entry = pull.get("mergeQueueEntry")
+    if entry is None:
+        return None
+    if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+        raise TypeError("GitHub returned malformed merge queue entry evidence")
+    return entry["id"]
+
+
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     result = await read_pull_batch(client, payload, FIELDS)
     result["action"] = "merge_candidates"
@@ -41,11 +51,13 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         record["ready"] = False
         record["behind"] = False
         record["approved_at"] = None
+        record["queue_entry_id"] = None
         if pull is not None:
             try:
                 record["ready"] = bool(record["author"]) and readiness_status(pull) == "green"
                 record["behind"] = bool(record["author"]) and readiness_behind(pull) == "behind"
                 record["approved_at"] = latest_approval(pull)
+                record["queue_entry_id"] = queue_entry_id(pull)
             except (KeyError, TypeError, AttributeError) as error:
                 record["error"] = f"GitHub returned malformed pull request readiness evidence: {error}"
     return result

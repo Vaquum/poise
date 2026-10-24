@@ -315,8 +315,12 @@ already open. It follows Current's green status: the merge button is available,
 checks have passed (or none exist), and no live conversation remains unresolved.
 Yellow or unknown pull requests wait. Caller rereads readiness and pins the head
 SHA when merging; GitHub still enforces repository protections. It prefers squash
-when allowed, then a merge commit, then rebase. Skip repositories applies here too.
-Last triggered links to the confirmed merged pull request. Merge failures appear
+when allowed, then a merge commit, then rebase. On a branch with a native merge
+queue it instead enqueues the pinned head for GitHub to integrate, and never
+resubmits an entry the queue ejected: a new head or a manual requeue releases
+the rejection. Skip repositories applies here too.
+Last triggered links to the last merge action: the confirmed merged pull request,
+or the queued pull request on a queue branch. Merge failures appear
 in Behaviors diagnostics and retry with backoff. It runs without an agent model or
 an open browser tab. Turning it off stops subsequent merge launches.
 
@@ -328,7 +332,9 @@ are reevaluated even when the head has not changed. Separate accounts and batche
 add queries; the query returns GitHub's actual `graphql_cost` in points.
 Only a green candidate invokes the merge primitive: three REST reads, one fresh
 GraphQL readiness query and one REST merge write, in addition to its shared
-batch read. These are normal-path counts; transient retries can add requests.
+batch read. On a queue branch the write is a head-pinned enqueue instead, and
+already-queued PRs are skipped from the batch evidence without per-PR calls.
+These are normal-path counts; transient retries can add requests.
 Skipped, draft and foreign-author candidates are excluded from discovery locally.
 A partial target-read failure is visible without holding other readable targets.
 The scan deadline and resume cursor may defer some evaluations to the next tick.

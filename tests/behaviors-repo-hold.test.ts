@@ -167,9 +167,9 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
       const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
       return json({ action: 'merge_candidates', actor: AGENT, graphql_cost: 1,
         records: requests.map((request) => deniedRepos.has(request.repository)
-          ? { ...request, head_sha: null, author: null, ready: false, behind: false, approved_at: null,
+          ? { ...request, head_sha: null, author: null, ready: false, behind: false, approved_at: null, queue_entry_id: null,
             error: `Could not resolve to a Repository with the name '${request.repository}'.` }
-          : { ...request, head_sha: HEAD, author: ME, ready: true, behind: false, approved_at: null, error: null }) })
+          : { ...request, head_sha: HEAD, author: ME, ready: true, behind: false, approved_at: null, queue_entry_id: null, error: null }) })
     }
     if (args[0] === '--merge-if-ready') {
       if (deniedRepos.has(repository)) throw new Error('GitHub 404: Not Found')
@@ -422,9 +422,9 @@ describe('Repository hold', () => {
         const requests = JSON.parse((all as string[])[2]!) as Array<{ repository: string, number: number }>
         return { stdout: JSON.stringify({ action: 'merge_candidates', actor: AGENT, graphql_cost: 1,
           records: requests.map((request) => request.repository === WEB
-            ? { ...request, head_sha: null, author: null, ready: false, behind: false, approved_at: null,
+            ? { ...request, head_sha: null, author: null, ready: false, behind: false, approved_at: null, queue_entry_id: null,
               error: 'request timed out after 10 seconds' }
-            : { ...request, head_sha: HEAD, author: ME, ready: true, behind: false, approved_at: null, error: null }) }), stderr: '' }
+            : { ...request, head_sha: HEAD, author: ME, ready: true, behind: false, approved_at: null, queue_entry_id: null, error: null }) }), stderr: '' }
       }
       return cli(command, all, options)
     })
@@ -444,9 +444,9 @@ describe('Repository hold', () => {
         const requests = JSON.parse((all as string[])[2]!) as Array<{ repository: string, number: number }>
         return { stdout: JSON.stringify({ action: 'merge_candidates', actor: AGENT, graphql_cost: 1,
           records: requests.map((request) => request.repository === WEB
-            ? { ...request, head_sha: HEAD, author: ME, ready: false, behind: false, approved_at: null,
+            ? { ...request, head_sha: HEAD, author: ME, ready: false, behind: false, approved_at: null, queue_entry_id: null,
               error: 'GitHub 403: Must have admin rights to Repository.' }
-            : { ...request, head_sha: HEAD, author: ME, ready: true, behind: false, approved_at: null, error: null }) }), stderr: '' }
+            : { ...request, head_sha: HEAD, author: ME, ready: true, behind: false, approved_at: null, queue_entry_id: null, error: null }) }), stderr: '' }
       }
       return cli(command, all, options)
     })

@@ -60,7 +60,19 @@ class TestMergeCandidates(IsolatedAsyncioTestCase):
         result = await self.read()
         self.assertEqual(result['records'][0], {'repository': 'acme/app', 'number': 1,
                          'ready': True, 'behind': False, 'head_sha': HEAD, 'author': 'octocat',
-                         'approved_at': APPROVED_AT, 'error': None})
+                         'approved_at': APPROVED_AT, 'queue_entry_id': None, 'error': None})
+
+    async def test_queued_packets_carry_the_current_queue_entry_id(self):
+        self.client.request.return_value = response(fields={'mergeQueueEntry': {'id': 'MQE_1'}})
+        record = (await self.read())['records'][0]
+        self.assertEqual(record['queue_entry_id'], 'MQE_1')
+        self.assertIsNone(record['error'])
+
+    async def test_malformed_queue_entry_holds_only_its_target(self):
+        self.client.request.return_value = response(fields={'mergeQueueEntry': {'id': ''}})
+        record = (await self.read())['records'][0]
+        self.assertIsNone(record['queue_entry_id'])
+        self.assertIn('malformed', record['error'])
 
     async def test_discovery_preserves_the_existing_readiness_predicate(self):
         cases = [({}, True), ({'state': 'CLOSED'}, False), ({'isDraft': True}, False),

@@ -69,6 +69,11 @@ conversation completeness and merge state without Poise's display cache, and
 sends the expected SHA to GitHub's merge endpoint. GitHub enforces protections.
 The method is the first allowed of squash, merge and rebase. The JSON outcome
 is `merged` with `merge_sha`, `not_ready`, `superseded`, or `already_merged`.
+On a branch with a native merge queue it instead sends a head-pinned enqueue
+mutation after successful head checks, platform approval and complete
+conversation checks, and reports `enqueued` or `in_queue` with the confirmed
+queue entry id; neither is a completed merge. The queue admission contract is
+in `docs/Behavior-Contract.md`.
 API errors fail visibly; a lost merge response can be reconciled by the next
 read without merging twice. This operation requires an explicit acting account.
 
