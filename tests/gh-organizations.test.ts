@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
     { login: 'beta', datastorePath: '/beta.sqlite', status: 'ready', error: null as string | null },
   ],
 }))
-vi.mock('../server/db', () => ({ getMeta: (key: string) => mocks.meta[key] ?? null, setMeta: vi.fn() }))
+vi.mock('../server/db', () => ({ getMeta: (key: string) => mocks.meta[key] ?? null, setMeta: vi.fn(), db: { transaction: (fn: (...args: never[]) => unknown) => fn } }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, MAX_PROCESS_ARG_BYTES: 64 * 1024 }))
 vi.mock('../server/organizations', () => ({
   getOrganizations: () => mocks.orgs,

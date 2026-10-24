@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({ store: new Map<string, string>() }))
 vi.mock('../server/db', () => ({
   getMeta: (k: string) => mocks.store.get(k) ?? null,
   setMeta: (k: string, v: string) => { mocks.store.set(k, v) },
+  db: { transaction: (fn: (...args: never[]) => unknown) => fn },
 }))
 vi.mock('../server/gh', () => ({ invalidateRepoListCache: vi.fn() }))
 
