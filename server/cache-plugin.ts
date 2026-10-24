@@ -30,10 +30,12 @@ import { getOrganizations, readyOrganizations, addOrganization, retryOrganizatio
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
 import { readBehaviorEstimates } from './behavior-estimates'
+import { listCapabilities } from './capabilities'
 import { runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
 import { handlePublishingApi } from './publishing-api'
+import { startPublicationReviewsRuntime, stopPublicationReviewsRuntime } from './publishing-reviews'
 import { createExtensionsApi } from './extensions/http'
 import { runtimeExtensions } from './extensions/delivery'
 import { redactSecrets, secretValues } from './extensions/store'
@@ -198,6 +200,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   startOrganizationsRuntime()
   startBehaviorsRuntime()
   startNoticesRuntime()
+  startPublicationReviewsRuntime()
   startGithubQuotaRuntime()
   startLedgerHealthRuntime()
   if (service) startTemporaryStorageRuntime()
@@ -291,7 +294,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopPublicationReviewsRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
   await stopBehaviorLedger()
   await stopLoggingApi()
   await stopLogging()
@@ -772,6 +775,12 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           } catch (err: any) {
             return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })
           }
+        }
+
+        // ── /api/capabilities — which redesigned-interface capabilities exist ──
+        // #556's interface reads this once at mount. See server/capabilities.ts.
+        if (path === '/api/capabilities' && req.method === 'GET') {
+          return json(res, 200, { capabilities: listCapabilities() })
         }
 
         // ── /api/behaviors — state + metadata for behavior automations ──

@@ -985,6 +985,38 @@ the current head; `merged` carries the merge SHA and method; `enqueued` and
 `in_queue` carry the queue entry; `already_merged` names who merged;
 `superseded` carries both heads; `refused` carries GitHub's own words.
 
+## Redesigned-interface reads
+
+`GET /api/capabilities` lists the capabilities this server has, by name
+(`server/capabilities.ts`). #556's interface reads it once at mount and uses
+each capability once it ships, keeping its Open fallback otherwise. Only
+delivered capabilities appear; the Manager's controls, plan and escalation
+stay absent until their enforcement lands.
+
+The supporting reads behind those names:
+
+- `GET /api/behavior-estimates`: each running behavior run with its remaining
+  time from similar runs (same behavior and model, last 30 days, at least
+  five); an overrun reads `overrun`, never below zero.
+- `GET /api/chat/requests`: every open chat request with a revision, kept
+  current by the `chatRequests.updated` frame.
+- `GET /api/notices/handled?since=<ISO>`: the append-only handling log, kept
+  30 days from each entry's time.
+- `GET /api/editor/reviews`: every publication with its `checkedAt`, `stale`,
+  `problems` and `retryAt`, including ones with no open thread; a cold or
+  failed one stays listed, never looking as if it had no feedback. The
+  response also states the sweep's longest delay in minutes.
+- Settings saves may carry `expect: { <field>: <value the tab read> }`; a
+  save that would overwrite another tab's edit is refused with 409 and the
+  current values, changing nothing.
+
+A background sweep reads every GitHub publication as your GitHub account,
+oldest checked first, one publication a minute and each at most every 15
+minutes; closed or merged ones are re-read once a day, so a reopened pull
+request or late feedback is seen within a day. It pauses on release drain
+and on the account's deferred budget, keeps the Editor's backoff, and skips
+Google publications, whose reads need live browser delegation.
+
 ## Deployment
 
 `deploy/` holds:
