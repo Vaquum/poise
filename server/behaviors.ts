@@ -415,8 +415,8 @@ function readBehaviorFailure(key: BehaviorKey, target?: string): PersistedBehavi
 }
 
 function recordBehaviorFailure(key: BehaviorKey, kind: 'worker', cause: unknown, target: string, options?: DiagnosticOptions & { callId?: string }): void
-function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string, hold?: boolean }): void
-function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string, hold?: boolean } = {}): void {
+function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string, hold?: boolean, noBackoff?: boolean }): void
+function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string, hold?: boolean, noBackoff?: boolean } = {}): void {
   if (!isEnabled(key)) return
   const error = cause === undefined ? undefined : behaviorErrorMessage(cause)
   if (kind === 'operation' && target !== undefined && options.hold !== false && error !== undefined
@@ -434,7 +434,10 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
     }
   }
   const previous = readBehaviorFailure(key, target)
-  const consecutiveFailures = Math.min((previous?.consecutiveFailures ?? 0) + 1, 31)
+  // A shed launch is a deferral, not a failure: the reason stays visible,
+  // but the count owes no growth and the retry owes no delay.
+  const consecutiveFailures = options.noBackoff ? (previous?.consecutiveFailures ?? 1)
+    : Math.min((previous?.consecutiveFailures ?? 0) + 1, 31)
   const transient = kind === 'operation' && isTimeoutCause(error ?? '')
   const delayMs = Math.min(
     BEHAVIOR_RETRY_BASE_MS * (2 ** Math.min(consecutiveFailures - 1, 20)),
@@ -447,7 +450,8 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
   // quota sits available. The reset only moves the retry inside today's
   // 1-minute to 1-hour range, never outside it.
   const statedRetryAtMs = rateLimitRetryAtMs(error ?? '', now)
-  const nextRetryAtMs = statedRetryAtMs === null ? now + delayMs
+  const nextRetryAtMs = options.noBackoff ? now
+    : statedRetryAtMs === null ? now + delayMs
     : Math.min(Math.max(statedRetryAtMs, now + BEHAVIOR_RETRY_BASE_MS), now + BEHAVIOR_RETRY_MAX_MS)
   setMeta(failureKey(key, target), JSON.stringify({
     kind,
@@ -1024,8 +1028,41 @@ const activeClaims = new Map<string, ActiveClaim>()
 // pool with the same cap.
 let behaviorCheckSlots = new CheckSemaphore(() => DEFAULT_CHECK_SLOT_CAP)
 
+/** A shed launch retries this soon after a slot frees, instead of waiting
+ *  for the next minute tick. */
+export const CHECK_SLOT_RETRY_DELAY_MS = 1_000
+let checkSlotRetryPending = false
+let checkSlotRetryTimer: ReturnType<typeof setTimeout> | null = null
+let releaseCheckSlotListener = behaviorCheckSlots.onRelease(onCheckSlotReleased)
+
+function onCheckSlotReleased(): void {
+  if (!checkSlotRetryPending || checkSlotRetryTimer || !tickerStarted) return
+  if (!behaviorCheckSlots.available('behavior')) return
+  // One armed timer covers the burst; a sweep that sheds again re-arms it.
+  checkSlotRetryPending = false
+  checkSlotRetryTimer = setTimeout(() => {
+    checkSlotRetryTimer = null
+    if (!tickerStarted || releaseBackgroundPaused()) return
+    void runEnabledBehaviorsOnce({ skipBusy: true, stagger: true }).then(
+      () => undefined,
+      (error) => console.error('[behaviors] check-slot retry sweep failed:', error),
+    )
+  }, CHECK_SLOT_RETRY_DELAY_MS)
+}
+
+// A launch shed for a full budget defers without backoff and retries when
+// a slot frees; the busy reason stays visible in health meanwhile.
+function recordCheckSlotBusy(key: BehaviorKey, display: string, checkTarget: string): void {
+  const busy = checkSlotsBusyError(behaviorCheckSlots.stats().cap)
+  console.log(`[behaviors] ${key} deferred for ${display}: ${busy.message}`)
+  recordBehaviorFailure(key, 'operation', busy, checkTarget, { noBackoff: true })
+  checkSlotRetryPending = true
+}
+
 export function setBehaviorCheckSlots(slots: CheckSemaphore): void {
+  releaseCheckSlotListener()
   behaviorCheckSlots = slots
+  releaseCheckSlotListener = slots.onRelease(onCheckSlotReleased)
 }
 
 export function getBehaviorCheckSlots(): CheckSemaphore {
@@ -2644,7 +2681,7 @@ async function tickReviewNewPrs(): Promise<void> {
             // A full shared budget stops here, before the probe and the
             // claim: the candidate retries on the next tick instead of
             // consuming a recovery probe for a launch that cannot run.
-            if (!behaviorCheckSlots.available('background')) { releaseLeases(null); continue }
+            if (!behaviorCheckSlots.available('behavior')) { releaseLeases(null); continue }
             // At most one probe per backoff window: a sibling that already
             // claimed it makes this target wait for the verdict.
             if (!claimReviewerTripProbe(bundle.model)) { releaseLeases(null); continue }
@@ -2708,19 +2745,17 @@ async function tickReviewNewPrs(): Promise<void> {
       let checkoutReady = false
       try {
         // Shed load before provisioning a checkout: a launch past the
-        // shared budget waits for the retry clock, not for a slot.
-        const checkSlot = behaviorCheckSlots.tryAcquire('background')
+        // shared budget defers without backoff and retries when a slot frees.
+        const checkSlot = behaviorCheckSlots.tryAcquire('behavior')
         if (!checkSlot) {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
           if (!behaviorAborted()) {
-            const busy = checkSlotsBusyError(behaviorCheckSlots.stats().cap)
-            console.log(`[behaviors] review-new-prs deferred for ${pr.repo}#${pr.number}: ${busy.message}`)
+            recordCheckSlotBusy('review-new-prs', `${pr.repo}#${pr.number}`, checkTarget)
             // The phase-2 launch intent already admitted this claim: close
             // the ledger attempt so a later retry inherits no unknown activity.
             captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
               outcome: 'no_op', head: bundle.expectedHead, completedAt: new Date().toISOString() })
-            recordBehaviorFailure('review-new-prs', 'operation', busy, checkTarget)
           }
           return
         }
@@ -3420,12 +3455,10 @@ async function fireApprove(
     )
   }
   // Shed load before provisioning a checkout: a launch past the shared
-  // budget waits for the retry clock, not for a slot.
-  const checkSlot = behaviorCheckSlots.tryAcquire('background')
+  // budget defers without backoff and retries when a slot frees.
+  const checkSlot = behaviorCheckSlots.tryAcquire('behavior')
   if (!checkSlot) {
-    const busy = checkSlotsBusyError(behaviorCheckSlots.stats().cap)
-    console.log(`[behaviors] approve-prs deferred for ${pr.repo}#${pr.number}: ${busy.message}`)
-    recordBehaviorFailure('approve-prs', 'operation', busy, `${pr.repo}#${pr.number}:check`)
+    recordCheckSlotBusy('approve-prs', `${pr.repo}#${pr.number}`, `${pr.repo}#${pr.number}:check`)
     return false
   }
   attachCheckSlotToClaim(claimId, checkSlot)
@@ -5080,12 +5113,10 @@ async function fireIssueReview(
   if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return false
   if (issueReviewRefusal(issueReviewPolicy(), issue.repo, issue.number, issue)) return false
   // Shed load before claiming a recovery probe: a launch past the shared
-  // budget waits for the retry clock without consuming the probe.
-  const checkSlot = behaviorCheckSlots.tryAcquire('background')
+  // budget defers without backoff and retries when a slot frees.
+  const checkSlot = behaviorCheckSlots.tryAcquire('behavior')
   if (!checkSlot) {
-    const busy = checkSlotsBusyError(behaviorCheckSlots.stats().cap)
-    console.log(`[behaviors] review-new-issues deferred for ${issue.repo}#${issue.number}: ${busy.message}`)
-    recordBehaviorFailure(ISSUES_KEY, 'operation', busy, `${target}:check`)
+    recordCheckSlotBusy(ISSUES_KEY, `${issue.repo}#${issue.number}`, `${target}:check`)
     return false
   }
   attachCheckSlotToClaim(claimId, checkSlot)
@@ -5305,7 +5336,7 @@ async function tickReviewNewIssues(): Promise<void> {
     if (!covers) continue
     // A full shared budget also stops the scan: later candidates wait for
     // the next tick instead of each recording a busy failure.
-    if (runningIssueReviewCount() >= MAX_ISSUE_REVIEW_RUNS || !behaviorCheckSlots.available('background')) break
+    if (runningIssueReviewCount() >= MAX_ISSUE_REVIEW_RUNS || !behaviorCheckSlots.available('behavior')) break
     const checkTarget = `${target}:check`
     if (!behaviorRetryDue(ISSUES_KEY, checkTarget)) continue
     try {
@@ -5844,6 +5875,9 @@ export async function runEnabledBehaviorsOnce(
   options: RunEnabledBehaviorsOptions = {},
 ): Promise<void> {
   if (releaseBackgroundPaused()) return
+  // This sweep is the retry a shed launch waits for; a shed inside it
+  // re-arms the wake below.
+  checkSlotRetryPending = false
   prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
     // The run ledger is global, not per organization: reap once before the
@@ -6207,6 +6241,9 @@ export async function stopBehaviorsRuntime(): Promise<void> {
   runtimeGeneration += 1
   if (tickTimer) clearTimeout(tickTimer)
   tickTimer = null
+  if (checkSlotRetryTimer) clearTimeout(checkSlotRetryTimer)
+  checkSlotRetryTimer = null
+  checkSlotRetryPending = false
   behaviorAbortController?.abort()
   behaviorAbortController = null
   await Promise.allSettled([...behaviorOperationTails.values()])

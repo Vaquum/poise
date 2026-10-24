@@ -3981,8 +3981,9 @@ export class ChatRuntime extends EventEmitter {
   /** Take one of the shared check slots, FIFO per lane. A turn that waits
    *  shows `queued` with the cap's own reason; cancelling the turn wakes it.
    *  A turn the person sent takes the person lane, which background work
-   *  cannot fill; delegated, supervised and timer turns share the background
-   *  lane with behavior runs. Lowering the cap converges as running turns
+   *  cannot fill; delegated, supervised and timer turns take the background
+   *  lane, which leaves one slot for behavior runs while the background
+   *  budget holds two. Lowering the cap converges as running turns
    *  release; raising it starts waiters through localTurnCapChanged. */
   private async acquireLocalTurnSlot(session: LiveSession, turn: RunningTurn): Promise<void> {
     const person = !turn.source || (turn.source.kind === 'poise' && turn.source.name === SWITCHBOARD_PERSON)

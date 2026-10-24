@@ -253,12 +253,15 @@ caps concurrently running heavy work (default 4): Poise-local turns and the
 agent runs background behaviors launch draw from the one pool, so builds and
 test suites cannot pile past the cap no matter which surface started them. A
 turn held by the cap shows `queued` with its own reason, "waiting for a free
-agent slot"; a behavior launch past it waits for its retry clock instead, and
-names the busy budget in its failure. Raising the cap starts waiting turns at
-once, in queue order, up to the new cap; lowering it stops nothing, and new
-turns wait. While the cap holds at least two, delegated, supervised and timer
-turns together with behavior runs leave one slot free, so a turn you send
-starts without queueing behind background work. The
+agent slot"; a behavior launch past it defers without backoff instead, names
+the busy budget in its failure, and retries when a slot frees. Raising the
+cap starts waiting turns at once, in queue order, up to the new cap;
+lowering it stops nothing, and new turns wait. While the cap holds at least
+two, delegated, supervised and timer turns together with behavior runs leave
+one slot free, so a turn you send starts without queueing behind background
+work; while the background budget holds two, those turns leave one more
+slot for behavior runs, so worker load cannot stall the reviews and
+approvals that finish the workers' own work. The
 Switchboard's chat runs one turn at a time outside that cap, so it keeps
 reporting while every slot is busy, and the Manager's turns run outside it
 too, so supervision still runs when every slot is busy. The health endpoint
