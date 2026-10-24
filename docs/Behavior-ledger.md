@@ -13,12 +13,20 @@ machine token or gateway scope. All routes accept GET only:
 
 | Route | Result |
 | --- | --- |
-| `/api/behavior-ledger?limit=50&cursor=...&parent=...` | Page of roots and attempts; optional parent restricts children |
+| `/api/behavior-ledger?limit=50&cursor=...&parent=...&repository=...&number=...` | Page of roots and attempts; optional parent restricts children, optional repository plus number selects that GitHub target |
 | `/api/behavior-ledger/ID` | One retained instance |
 | `/api/behavior-ledger/changes?cursor=...&limit=50` | Ordered upserts and removals |
 | `/api/behavior-ledger/health` | Capture health, including unavailable storage |
 
 Responses contain `version: 1` and `health`. Limits are integers from 1 to 100.
+A target lookup passes both `repository` (`OWNER/REPO`, at most 140
+characters) and `number` (positive integer) together; either alone returns
+400. Repository matching is case-insensitive, matching GitHub identity.
+It selects retained roots and attempts for that target from captured
+data, under the same authority, limits and freshness contract, with no
+additional Caller or GitHub collection. An empty or stale filtered result
+must not establish that no work is running; check `health` for pending,
+dropped, gaps and stale coverage.
 Start with a list request without a cursor. Its `watermark` is a changes cursor;
 follow `nextCursor` until null, then consume changes from that watermark.
 List pages freeze their creation boundary. Apply upserts by increasing record
@@ -60,6 +68,7 @@ The shipped command uses the same fixed GET routes and emits JSON only:
 
 ```sh
 node dist/behavior-ledger.js list --limit 50
+node dist/behavior-ledger.js list --repository OWNER/REPO --number 123
 node dist/behavior-ledger.js get HASH
 node dist/behavior-ledger.js changes CURSOR
 node dist/behavior-ledger.js health
@@ -70,6 +79,26 @@ node dist/behavior-ledger.js health
 second deadline and 512 KiB response bound. Exit 0 means a successful reply with
 complete health; 1 means HTTP/transport failure or incomplete/stale coverage;
 2 means invalid arguments. The command emits server JSON unchanged.
+
+## Health split
+
+`/api/health` carries the ledger twice: `dependencies.ledger` for whether
+capture is draining now, and `history.ledger` for cumulative completeness.
+Both come from a synchronous in-memory snapshot, never from the worker queue,
+so a wedged worker cannot slow health down (a worker round trip has a
+two-second budget; health never queues one).
+
+`dependencies.ledger` reads `degraded` while the oldest queued capture
+outwaits the ten-second stall budget or capture loss is still unreported,
+and `unavailable` once the worker has failed or the store reports itself
+unavailable (an unopenable database, an unwritable journal), even with the
+queue drained; anything else reads `ok`.
+Cumulative `dropped` counts and retained gaps stay in `history.ledger` and
+never affect readiness: a ledger that once lost a capture must not read
+degraded forever. A queue age past the budget on two minute-checks in a row,
+a dead worker, and any lost-capture increase alert through the durable alert
+path. Loss is baselined per store generation, so history alone never
+re-alerts.
 
 ## Meaning and evidence
 

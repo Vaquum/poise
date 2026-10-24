@@ -3362,6 +3362,7 @@ tr:hover .stop-btn { opacity: 1; }
   #view-logging tr.agent-expand-row > td > * { position: sticky; left: var(--sp-4); width: calc(100vw - 72px); max-width: calc(100vw - 72px); }
 }
 .logging-pagination { display: flex; align-items: center; gap: var(--sp-3); margin-block: var(--sp-4); }
+#swarm-pagination[hidden] { display: none; }
 .logging-new { margin-block: var(--sp-3); }
 .logging-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-3); margin-block: var(--sp-4); font-size: 0.8125rem; }
 .logging-facts dt { color: var(--text-tertiary); }
@@ -4779,14 +4780,6 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
 .editor-bar-btn:hover { color: var(--text); background: var(--hover); }
 .editor-bar-btn.editor-delete-btn:hover { color: var(--a5); }
 .editor-bar-btn svg { display: block; }
-
-/* Save / word-count cell on the right, kept quiet. */
-.editor-meta {
-  font-size: 0.6875rem;
-  letter-spacing: 0.04em;
-  color: var(--text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
 
 /* The trigger + popover share a wrapper so the popover anchors to
    the trigger's right edge, not the bar's. */

@@ -9,6 +9,8 @@ export const NOTIFICATION_PLACEMENT = {
   storage_low: { actor: 'user-operator', logging: 'exact-crossing', lifecycle: 'five-gib-downward-rearm-six' },
   github_quota_warning: { actor: 'user-operator', logging: 'sustained-forecast', lifecycle: 'fifty-percent-thirty-seconds-reset-keyed' },
   github_quota_exhausted: { actor: 'account-operator', logging: 'observed-exhaustion', lifecycle: 'zero-until-confirmed-capacity' },
+  ledger_queue_stalled: { actor: 'poise', logging: 'sustained-queue-age', lifecycle: 'stall-budget-two-checks-until-drained' },
+  ledger_capture_loss: { actor: 'poise', logging: 'dropped-increase', lifecycle: 'increase-per-generation-until-dismissed' },
   pr_ready: { actor: 'user', logging: 'none', lifecycle: 'ready-two-minute-check-fifteen-minute-reminder' },
   action_failed: { actor: 'poise', logging: 'known-source-only', lifecycle: 'tab-dedupe-until-action-recovery' },
   action_needed: { actor: 'user', logging: 'none', lifecycle: 'tab-dedupe-until-action-recovery' },

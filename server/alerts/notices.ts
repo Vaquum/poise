@@ -36,7 +36,7 @@ const INCIDENT_READ_LIMIT = 500
 
 // The most pressing first: someone is blocked on the person, then work that
 // cannot run, then work that failed, then what waits for them.
-const ORDER: readonly AlertKind[] = ['chat_waiting', 'sign_in_needed', 'github_quota_exhausted', 'storage_low', 'github_quota_warning', 'behavior_held', 'datastore_sync_failing', 'pr_ready', 'chat_turn_finished']
+const ORDER: readonly AlertKind[] = ['chat_waiting', 'sign_in_needed', 'github_quota_exhausted', 'storage_low', 'github_quota_warning', 'behavior_held', 'ledger_queue_stalled', 'ledger_capture_loss', 'datastore_sync_failing', 'pr_ready', 'chat_turn_finished']
 const SILENCEABLE: ReadonlySet<AlertKind> = new Set(['pr_ready'])
 
 export interface Notice extends EvidenceAttachment {

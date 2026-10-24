@@ -135,6 +135,8 @@ async function readAccount(login: string): Promise<Snapshot> {
 
 export const QUOTA_WARNING_RISK_PERCENT = 50
 export const QUOTA_WARNING_SUSTAIN_MS = 30_000
+/** A quota observation older than this means the monitor has stopped refreshing it. */
+export const QUOTA_OBSERVATION_STALE_MS = 5 * 60_000
 interface RiskWindow { resetAt: string; since: number | null; lastAt: number; warned: boolean; exhaustedSince?: number | null }
 const riskKey = (login: string, resource: string) => `${PREFIX}risk:${login.toLowerCase()}:${resource}`
 const conditionKey = (login: string, bucket: GithubQuotaBucket) => `${PREFIX}${login.toLowerCase()}:${bucket.resource}:${Date.parse(bucket.resetAt)}`
@@ -243,11 +245,49 @@ export async function readGithubQuota(): Promise<GithubQuotaReport> {
 
 let timer: ReturnType<typeof setInterval> | undefined
 let pass: Promise<void> | undefined
+/** The monitor's last failure, so health can report it instead of only logging it. */
+let monitorError: string | null = null
 export function checkGithubQuota(): void {
   if (pass) return
-  pass = readGithubQuota().then(() => undefined).catch((error: unknown) => {
+  pass = readGithubQuota().then(() => {
+    monitorError = null
+  }).catch((error: unknown) => {
+    monitorError = error instanceof Error ? error.message : String(error)
     console.error('[github-quota] monitor failed:', error)
   }).finally(() => { pass = undefined })
+}
+
+export interface GithubQuotaSnapshot {
+  login: string
+  roles: string[]
+  /** ISO time of the cached observation, or null when never observed. */
+  checkedAt: string | null
+  /** How old the cached observation is; null when never observed. */
+  observationAgeMs: number | null
+  /** Resources with no budget left until reset; valid zero-limit buckets excluded. */
+  exhausted: string[]
+  /** Why the account has no usable observation, when it has none. */
+  error: string | null
+}
+
+/** Cached quota observations only: health projects them without running
+ *  any `gh` subprocess. An account reads stale only when the monitor that
+ *  refreshes it has stopped. */
+export function githubQuotaSnapshots(now = Date.now()): GithubQuotaSnapshot[] {
+  return configuredAccounts().map((account) => {
+    const cached = cache.get(account.login.toLowerCase())
+    if (!cached) return { ...account, checkedAt: null, observationAgeMs: null, exhausted: [], error: monitorError }
+    const exhausted = cached.snapshot.error ? [] : cached.snapshot.buckets
+      .filter((bucket) => bucket.limit > 0 && bucket.remaining === 0 && Date.parse(bucket.resetAt) > now)
+      .map((bucket) => bucket.resource)
+    return {
+      ...account,
+      checkedAt: new Date(cached.snapshot.checkedAt).toISOString(),
+      observationAgeMs: Math.max(0, now - cached.snapshot.checkedAt),
+      exhausted,
+      error: cached.snapshot.error,
+    }
+  })
 }
 
 export function startGithubQuotaRuntime(): void {

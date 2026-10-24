@@ -245,6 +245,22 @@ export class DiagnosticRuntime {
       sources, policy: this.policy }
   }
 
+  /** In-memory collection state only: unlike health(), this never reads the
+   *  coverage store, so health endpoints can call it on every request. */
+  localSnapshot(): {
+    sinkError: string | null; sinkSince: string | null; lossActive: boolean
+    queued: number; queuedBytes: number; dropped: number; droppedSince: string | null
+    coverageError: string | null; journalError: string | null; reportError: string | null
+    lastSuccessfulWriteAt: string | null
+  } {
+    return {
+      sinkError: this.sinkError, sinkSince: this.sinkSince, lossActive: this.lossActive,
+      queued: this.queue.length, queuedBytes: this.queuedBytes, dropped: this.dropped, droppedSince: this.droppedSince,
+      coverageError: this.coverageError, journalError: this.journalError, reportError: this.reportError,
+      lastSuccessfulWriteAt: this.lastSuccess,
+    }
+  }
+
   /** Hand an operator integration to the single store authority before collectors start. */
   ownCoverage(id: string, configured: boolean): void {
     const store = this.connection()

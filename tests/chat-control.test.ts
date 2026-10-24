@@ -5,7 +5,7 @@ import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
@@ -62,8 +62,14 @@ function adapterWith(capabilities: Capabilities) {
 const adapter = adapterWith(caps)
 // Fork-capable scripted adapter for the fork case; muse sessions run it.
 const forkAdapter = adapterWith({ ...caps, fork: true })
+// Every case drives the real Chat runtime through real git and SQLite
+// lifecycles, and under suite load one of their steps can stall past eight
+// seconds: each readiness wait gets 20 s, and each case and hook at least
+// 25 s, instead of vitest's global 10 s. Cases with several independently
+// bounded readiness phases keep their larger ceilings.
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
 async function until(check: () => boolean) {
-  const deadline = Date.now() + 8000
+  const deadline = Date.now() + 20_000
   while (Date.now() < deadline) { if (check()) return; await new Promise(done => setTimeout(done, 15)) }
   throw new Error('control fixture readiness deadline')
 }
@@ -1505,4 +1511,9 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       stderr.mockRestore()
     }
   }, 60_000)
+})
+
+it('gives every case at least 25 s instead of the global 10 s', ({ task }) => {
+  const cases = (tasks: RunnerTask[]): RunnerTestCase[] => tasks.flatMap(t => t.type === 'test' ? [t] : cases(t.tasks))
+  expect(cases(task.file.tasks).filter(t => t.timeout < 25_000).map(t => t.fullTestName)).toEqual([])
 })

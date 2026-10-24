@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -22,10 +22,13 @@ const capabilities: Capabilities = { steer: true, fork: false, thought: false, p
 const input: PromptInput = { text: 'fixture task', attachments: [], mentions: [] }
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 function git(...args: string[]) { return execFileSync('git', args, { cwd: checkout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() }
+// Fixture startup runs git and SQLite alongside the rest of the suite, and
+// under suite load one of their steps can stall past eight seconds: each
+// readiness wait gets 20 s, and each case and hook 25 s, instead of vitest's
+// global 10 s. This is a readiness deadline, not a streaming-latency budget.
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
 async function until(check: () => boolean) {
-  // Fixture startup runs git and SQLite alongside the rest of the suite;
-  // this is a readiness deadline, not the separate streaming-latency budget.
-  const deadline = Date.now() + 8_000
+  const deadline = Date.now() + 20_000
   while (Date.now() < deadline) { if (check()) return; await pause(20) }
   throw new Error('fixture state deadline')
 }
@@ -206,7 +209,7 @@ it('keeps the checkout locked while a Poise filesystem write outlives the servic
     await pending
     write.mockRestore()
   }
-}, 15_000)
+})
 
 
 it('does not replace an already recorded terminal outcome with an interruption on recovery', async () => {
@@ -388,4 +391,9 @@ it.each((['permission', 'question'] as const).flatMap(kind => ['request', 'waiti
   expect(storage.listPendingRequests(id)).toEqual([])
   const terminal = events.find(event => event.event.type === 'turn.finished')?.event
   expect(terminal).toMatchObject({ stopReason: 'error', error: expect.stringContaining('request receipt unavailable') })
+})
+
+it('gives every case 25 s instead of the global 10 s', ({ task }) => {
+  const cases = (tasks: RunnerTask[]): RunnerTestCase[] => tasks.flatMap(t => t.type === 'test' ? [t] : cases(t.tasks))
+  expect(cases(task.file.tasks).filter(t => t.timeout !== 25_000).map(t => t.fullTestName)).toEqual([])
 })

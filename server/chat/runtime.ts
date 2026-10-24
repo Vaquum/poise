@@ -4021,7 +4021,7 @@ export class ChatRuntime extends EventEmitter {
       const metadata = await lstat(join(record.checkout, '.git'))
       if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
         // A failed bootstrap may have written HEAD without its first commit.
-        recreated = !(await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: record.checkout }).then(() => true, () => false))
+        recreated = !(await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: record.checkout, expected: { codes: [128], stderr: /Needed a single revision/ } }).then(() => true, () => false))
       }
     }
     catch (error) {
@@ -4180,7 +4180,7 @@ export class ChatRuntime extends EventEmitter {
     // Admission, including its branch check, is part of the service lifetime.
     session.services += 1
     try {
-      const head = await runFile('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: session.record.checkout, timeoutMs: 10_000 }).then((r) => r.stdout.trim()).catch(() => '')
+      const head = await runFile('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: session.record.checkout, timeoutMs: 10_000, expected: { codes: [1] } }).then((r) => r.stdout.trim()).catch(() => '')
       if (head !== session.record.branch.name) throw new Error(`the checkout is on ${head || 'a detached HEAD'}, not ${session.record.branch.name}; file services are closed`)
       if (session.turn !== turn || turn.stopping || turn.abort.signal.aborted || session.draining || !session.lease?.held) throw new Error('the turn is settling; file services are closed')
       return await operation()

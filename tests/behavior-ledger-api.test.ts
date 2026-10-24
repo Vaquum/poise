@@ -216,10 +216,35 @@ it('rejects mutation methods and ambiguous or unsupported selectors', async () =
   const denied = await call(PREFIX, 'POST')
   expect(denied.status).toBe(405)
   expect(denied.allow).toBe('GET')
-  for (const path of ['?limit=0', '?limit=101', '?limit=1.5', '?limit=1&limit=2', '?org=other', '?parent=wrong', '/changes', '/changes?cursor=', '/health?limit=1', '/wrong', '?cursor=bad']) {
+  for (const path of ['?limit=0', '?limit=101', '?limit=1.5', '?limit=1&limit=2', '?org=other', '?parent=wrong', '/changes', '/changes?cursor=', '/health?limit=1', '/wrong', '?cursor=bad',
+    '?repository=example/project', '?number=7', '?repository=not%20a%20repo&number=7', '?repository=example/project&number=0',
+    '?repository=example/project&number=1.5', '?repository=example/project&number=7&number=8']) {
     expect((await call(PREFIX + path)).status, path).toBe(400)
   }
   expect((await call(`${PREFIX}/${'f'.repeat(64)}`)).status).toBe(404)
+})
+
+it('selects retained work by GitHub target through guarded HTTP and the built CLI', async () => {
+  const nativeId = randomUUID()
+  ledger.captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'merge-prs', source: 'poise:merge-prs',
+    owner: 'octocat', actor: 'octobot', repository: 'example/target-lookup', number: 4242, head: 'e'.repeat(40) })
+  await flushCaptures()
+  const filtered = await call(`${PREFIX}?repository=${encodeURIComponent('example/target-lookup')}&number=4242&limit=100`)
+  expect(filtered.status).toBe(200)
+  expect(filtered.body.records!.length).toBeGreaterThanOrEqual(2)
+  expect(filtered.body.records!.every((record) => record.target.repository === 'example/target-lookup' && record.target.number === 4242)).toBe(true)
+  expect(new Set(filtered.body.records!.map((record) => record.kind))).toEqual(new Set(['firing', 'attempt']))
+  const missing = await call(`${PREFIX}?repository=${encodeURIComponent('example/target-lookup')}&number=4243&limit=100`)
+  expect(missing.status).toBe(200)
+  expect(missing.body.records).toEqual([])
+  expect(missing.body.health).toMatchObject({ status: expect.any(String) })
+  const listing = await cli(['list', '--repository', 'example/target-lookup', '--number', '4242', '--base-url', base])
+  expect(listing.code, listing.stderr).toBe(0)
+  const listed = JSON.parse(listing.stdout) as LedgerReply
+  expect(listed.version).toBe(1)
+  expect(listed.records).toHaveLength(2)
+  expect(listed.records!.every((record) => record.target.repository === 'example/target-lookup' && record.target.number === 4242)).toBe(true)
+  expect((await cli(['list', '--repository', 'example/target-lookup', '--base-url', base])).code).toBe(2)
 })
 
 it('keeps the existing owner, assertion, Host, Origin and cross-site boundary', async () => {
@@ -252,9 +277,13 @@ it('confines CLI arguments to fixed loopback reads', () => {
   for (const value of ['https://127.0.0.1', 'http://localhost', 'http://example.com', 'file:///tmp/private', 'http://user:secret@127.0.0.1', 'http://127.0.0.1/private', 'http://127.0.0.1?private', 'http://127.0.0.1#private', 'http://127.0.0.1?']) {
     expect(() => parseBehaviorLedgerArguments(['health', '--base-url', value]), value).toThrow()
   }
-  for (const args of [['stop'], ['get', '../private'], ['list', 'extra'], ['health', '--limit', '1'], ['list', '--limit', '101'], ['list', '--limit', '1', '--limit', '2'], ['changes'], ['list', '--url', base]]) {
+  for (const args of [['stop'], ['get', '../private'], ['list', 'extra'], ['health', '--limit', '1'], ['list', '--limit', '101'], ['list', '--limit', '1', '--limit', '2'], ['changes'], ['list', '--url', base],
+    ['list', '--repository', 'example/project'], ['list', '--number', '7'], ['list', '--repository', 'not a repo', '--number', '7'],
+    ['list', '--repository', 'example/project', '--number', '0'], ['list', '--repository', 'example/project', '--number', '1.5'],
+    ['get', 'f'.repeat(64), '--repository', 'example/project', '--number', '7']]) {
     expect(() => parseBehaviorLedgerArguments(args)).toThrow()
   }
+  expect(parseBehaviorLedgerArguments(['list', '--repository', 'example/project', '--number', '7']).search).toBe('?repository=example%2Fproject&number=7')
   expect(parseBehaviorLedgerArguments(['health', '--base-url', 'http://[::1]:5555']).href).toBe('http://[::1]:5555/api/behavior-ledger/health')
 })
 

@@ -4,6 +4,7 @@ import { LEDGER_RESPONSE_BYTES, type LedgerRead, type LedgerReadTiming, type Led
 
 const PREFIX = '/api/behavior-ledger'
 const ID = /^[a-f0-9]{64}$/
+const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,100}$/
 const MAX_CURSOR_LENGTH = 2048
 
 class InvalidRead extends Error {
@@ -31,7 +32,7 @@ export function parseBehaviorLedgerRead(target: string): LedgerRead {
   if (operation === 'get' && (!path.startsWith(`${PREFIX}/`) || path.slice(PREFIX.length + 1).includes('/'))) {
     throw new InvalidRead(404, 'not_found')
   }
-  const permitted = operation === 'list' ? ['limit', 'cursor', 'parent']
+  const permitted = operation === 'list' ? ['limit', 'cursor', 'parent', 'repository', 'number']
     : operation === 'changes' ? ['limit', 'cursor'] : []
   for (const key of url.searchParams.keys()) {
     if (!permitted.includes(key) || url.searchParams.getAll(key).length !== 1) throw new InvalidRead(400, 'invalid_query')
@@ -50,8 +51,16 @@ export function parseBehaviorLedgerRead(target: string): LedgerRead {
     return { operation, cursor: continuation, ...(limit === undefined ? {} : { limit }) }
   }
   const parent = url.searchParams.get('parent')
+  const repository = url.searchParams.get('repository')
+  const rawNumber = url.searchParams.get('number')
+  if ((repository === null) !== (rawNumber === null)) throw new InvalidRead(400, 'invalid_query')
+  if (repository !== null && (!REPO.test(repository) || repository.length > 140)) throw new InvalidRead(400, 'invalid_query')
+  if (rawNumber !== null && (!/^[1-9]\d{0,9}$/.test(rawNumber) || !Number.isSafeInteger(Number(rawNumber)))) {
+    throw new InvalidRead(400, 'invalid_query')
+  }
   return { operation, ...(limit === undefined ? {} : { limit }), ...(continuation === undefined ? {} : { cursor: continuation }),
-    ...(parent === null ? {} : { parent: identifier(parent) }) }
+    ...(parent === null ? {} : { parent: identifier(parent) }),
+    ...(repository === null || rawNumber === null ? {} : { repository, number: Number(rawNumber) }) }
 }
 
 function serverTiming(startedAt: number, timing?: LedgerReadTiming): string {
