@@ -482,6 +482,54 @@ describe('turn stall detection and waking', () => {
     await runtime.stop({ handover: false })
   }, 40_000)
 
+  it('treats a baselined process that execs mid-turn as pre-existing, not a new job', async () => {
+    // The agent parks a subshell that blocks opening a trigger fifo outside
+    // every checkout; the same pid execs into sleep mid-turn. It predates
+    // the prompt-start baseline, so the command change must not read as a
+    // job the turn started — no stall marker, no wake.
+    const fifo = join(root, 'bg-baseline-exec.fifo')
+    spawnSync('rm', ['-f', fifo])
+    const made = spawnSync('mkfifo', [fifo])
+    if (made.status !== 0) throw new Error(`mkfifo: ${made.stderr}`)
+    const agentScript = `(read line < ${fifo}; exec sleep 60) & wait`
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true,
+      startWorker: { command: 'sh', args: ['-c', agentScript] } }
+    const { runtime, events } = makeRuntime('poise-turn-stall-baseline-exec:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-baseline-exec' } })
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const row = storage.getWorker(session.id)
+    if (!row) throw new Error('no worker row for the session')
+    const shCmd = `sh -c ${agentScript}`
+    // The subshell exists before the prompt, so the baseline holds it.
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.filter((m) => m.command === shCmd).length === 2)
+    runtime.prompt(session.id, { text: 'run the suite', attachments: [], mentions: [] })
+    await waitFor(() => owned.prompts.length === 1)
+    await writeFile(fifo, 'run\n')
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.some((m) => m.command === 'sleep 60') ?? false)
+    spawnSync('rm', ['-f', fifo])
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // The exec'd pid is alive in the group, but the turn started nothing.
+    const slept = (await worker.groupMembers(row.gatePgid))?.find((m) => m.command === 'sleep 60')
+    if (!slept) throw new Error('expected the re-executed sleep to outlive the turn')
+    expect(worker.pidAlive(slept.pid)).toBe(true)
+    expect(runtime.get(session.id)?.stall).toBeUndefined()
+
+    // No wake follows: the monitor cycle finds nothing to report.
+    const control = await makeControl(runtime)
+    await control.tick()
+    await new Promise((r) => setTimeout(r, 1_500))
+    await control.tick()
+    expect(owned.prompts.length).toBe(1)
+
+    process.kill(slept.pid, 'SIGTERM')
+    await waitFor(() => !worker.pidAlive(slept.pid))
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
   it('adopts a tracked job\'s orphaned child instead of letting a later baseline absorb it', async () => {
     // Two trigger fifos outside every checkout. The agent parks a keeper
     // sleep first — baselined, never tracked — so its wait survives the

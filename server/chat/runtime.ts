@@ -4333,7 +4333,11 @@ export class ChatRuntime extends EventEmitter {
           // exec replaces the image in place, while pid reuse inside a live
           // gate group needs a full pid-space wraparound.
           if (kept) keptJobs.push(kept.command === command ? kept : { ...kept, command })
-          else if (baseline.members.get(member.pid) !== command) freshJobs.push({ pid: member.pid, pgid: gatePgid, command, startedAt: now })
+          // Baseline membership is by pid, not command: a baseline member
+          // that exec'd mid-turn is pre-existing, not a job the turn
+          // started. Comparing commands would stall and wake a chat that
+          // started no background process at all.
+          else if (!baseline.members.has(member.pid)) freshJobs.push({ pid: member.pid, pgid: gatePgid, command, startedAt: now })
           // A member the turn absorbed as pre-existing but the frozen group
           // never saw start: a tracked job's child, spawned after a turn end
           // and orphaned when its parent exited. Chasing parentage would miss
