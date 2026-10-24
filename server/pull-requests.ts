@@ -49,8 +49,29 @@ const reserveAction = db.transaction((id: string, fingerprint: string, createdAt
   return { fresh: result.changes === 1, receipt }
 })
 
-function recordOutcome(id: string, result: ActionResult): void {
-  db.prepare('UPDATE pull_request_action_receipts SET outcome = ? WHERE action_id = ?').run(JSON.stringify(result), id)
+function isUnknownResult(result: ActionResult): boolean {
+  return (result.body as { outcome?: unknown } | null)?.outcome === 'unknown'
+}
+
+/** Persists the outcome, returning whether this write won. An unknown
+ *  outcome never overwrites a receipt another request already persisted:
+ *  a concurrent retry that read the pending receipt must not clobber the
+ *  original request's refused or not-ready result with unknown. */
+function recordOutcome(id: string, result: ActionResult): boolean {
+  const info = isUnknownResult(result)
+    ? db.prepare('UPDATE pull_request_action_receipts SET outcome = ? WHERE action_id = ? AND outcome IS NULL').run(JSON.stringify(result), id)
+    : db.prepare('UPDATE pull_request_action_receipts SET outcome = ? WHERE action_id = ?').run(JSON.stringify(result), id)
+  return info.changes > 0
+}
+
+function readReceiptOutcome(id: string): ActionResult | null {
+  const row = db.prepare('SELECT outcome FROM pull_request_action_receipts WHERE action_id = ?').get(id) as { outcome: string | null } | undefined
+  if (!row?.outcome) return null
+  try {
+    return JSON.parse(row.outcome) as ActionResult
+  } catch {
+    return null
+  }
 }
 
 async function callInterface(args: string[]): Promise<unknown> {
@@ -212,7 +233,7 @@ async function runAction(kind: 'approve' | 'merge', action: ValidAction, actor: 
       // Only a determined outcome replays. An unknown one re-reads GitHub
       // below, so a delayed approval or merge is seen once it lands; the
       // reservation is not fresh, so nothing acts twice.
-      if ((stored.body as { outcome?: unknown } | null)?.outcome !== 'unknown') return stored
+      if (!isUnknownResult(stored)) return stored
     } catch {
       // A corrupted receipt never acts again; it reconciles like a pending one.
     }
@@ -237,13 +258,20 @@ async function runAction(kind: 'approve' | 'merge', action: ValidAction, actor: 
 
 function finalize(id: string, result: ActionResult): ActionResult {
   try {
-    recordOutcome(id, result)
+    if (recordOutcome(id, result)) return result
+    // Lost a race: another request persisted first. An unknown outcome
+    // yields to the winner's determined one, so this caller also replays
+    // the known outcome instead of answering 503.
+    if (isUnknownResult(result)) {
+      const winner = readReceiptOutcome(id)
+      if (winner && !isUnknownResult(winner)) return winner
+    }
+    return result
   } catch {
     // The receipt is the record: when it cannot be written the outcome is
     // unknown, even one just determined.
     return { status: 503, body: { ...(typeof result.body === 'object' && result.body ? result.body : {}), outcome: 'unknown' } }
   }
-  return result
 }
 
 function reconcileApproval(action: ValidAction, actor: string, state: ActionState): ActionResult | null {

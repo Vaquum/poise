@@ -51,6 +51,21 @@ class TestPullActionState(IsolatedAsyncioTestCase):
         self.assertEqual((result['merged'], result['merged_by'], result['queue_entry_id']), (True, 'hubot', None))
         self.readiness.assert_not_awaited()
 
+    async def test_rereads_when_the_head_moves_between_the_pull_and_readiness_reads(self):
+        other = 'b' * 40
+        self.readiness.return_value = {'mergeQueueEntry': {'id': 'entry-1'}, 'headRefOid': other, 'state': 'OPEN'}
+        pulls = [dict(self.pull, head={'sha': HEAD}), dict(self.pull, head={'sha': other})]
+        calls = {'n': 0}
+
+        async def pull_then(*_args):
+            calls['n'] += 1
+            return deepcopy(pulls[0] if calls['n'] == 1 else pulls[1])
+
+        with patch.object(pull_action_state, 'get_pull', AsyncMock(side_effect=pull_then)):
+            result = await pull_action_state.run(self.client, PAYLOAD)
+        self.assertEqual((result['head_sha'], result['queue_entry_id']), (other, 'entry-1'))
+        self.assertEqual(calls['n'], 2)
+
     async def test_malformed_queue_entry_fails_loud(self):
         self.readiness.return_value = {'mergeQueueEntry': {'id': 7}}
         with self.assertRaisesRegex(RuntimeError, 'malformed merge queue entry'):

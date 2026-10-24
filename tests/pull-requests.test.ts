@@ -414,6 +414,50 @@ describe('action receipts', () => {
     expect(interfaceCalls('--approve-pr')).toHaveLength(1)
   })
 
+  it('keeps a refused outcome when a concurrent retry finalizes unknown', async () => {
+    let releaseAct!: () => void
+    let releaseRead!: () => void
+    const actGate = new Promise<void>((resolve) => { releaseAct = resolve })
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve })
+    let acts = 0
+    let stateReads = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') {
+        return { stdout: JSON.stringify({ version: 1, streamId: 'f'.repeat(32), events: [], cursor: Number(args[1]), hasMore: false, backfillPending: false }), stderr: '' }
+      }
+      if (command !== 'github-interface') throw new Error('Unexpected test command')
+      if (args[0] === '--pull-action-state') {
+        stateReads += 1
+        // The retry's read: held until the original persisted its refusal.
+        if (stateReads === 2) await readGate
+        return { stdout: JSON.stringify(stateResponse()), stderr: '' }
+      }
+      if (args[0] === '--approve-pr') {
+        acts += 1
+        await actGate
+        throw cliError('RuntimeError: pull request is not open and ready for review\n')
+      }
+      throw new Error('Unexpected test command')
+    })
+    // The original acts while the retry reads the pending receipt, then
+    // waits inside its own state read.
+    const first = call('POST', '/api/pull-requests/approve', body())
+    await vi.waitFor(() => expect(acts).toBe(1))
+    const second = call('POST', '/api/pull-requests/approve', body())
+    await vi.waitFor(() => expect(stateReads).toBe(2))
+    releaseAct()
+    expect((await first).status).toBe(409)
+    // The retry's unknown yields to the persisted refusal, and so does
+    // every later retry.
+    releaseRead()
+    const secondResult = await second
+    expect(secondResult.status).toBe(409)
+    expect(secondResult.body).toMatchObject({ outcome: 'refused' })
+    expect(acts).toBe(1)
+    const retry = await call('POST', '/api/pull-requests/approve', body())
+    expect(retry.body).toMatchObject({ outcome: 'refused' })
+  })
+
   it('recovers a crash before the receipt was saved', async () => {
     // Reserved, sent, then the server died before recording: the pending
     // receipt carries the action's own fingerprint and no outcome.

@@ -25,22 +25,43 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     number = parse_pull_number(payload)
     actor = token_user(payload)
 
-    pull = await get_pull(client, owner, repo, number)
-    reviews = await list_reviews(client, owner, repo, number)
-    mine = []
-    for review in reviews:
-        login = _login(review.get("user"))
-        if login is not None and login.lower() == actor.lower():
-            mine.append({"id": review.get("id"), "state": review.get("state"),
-                         "commit_id": review.get("commit_id"), "submitted_at": review.get("submitted_at")})
+    # The pull, its reviews and its readiness are separate reads; a push or
+    # merge between them would pair one head's pull with another head's
+    # queue entry. The readiness packet carries the head it saw: while it
+    # disagrees with the pull read, the sequence runs again, so H's pull
+    # is never answered with H2's queue entry.
+    pull: dict[str, Any] = {}
+    mine: list[dict[str, Any]] = []
+    queue_entry_id: str | None = None
+    for _ in range(3):
+        pull = await get_pull(client, owner, repo, number)
+        reviews = await list_reviews(client, owner, repo, number)
+        mine = []
+        for review in reviews:
+            login = _login(review.get("user"))
+            if login is not None and login.lower() == actor.lower():
+                mine.append({"id": review.get("id"), "state": review.get("state"),
+                             "commit_id": review.get("commit_id"), "submitted_at": review.get("submitted_at")})
 
-    queue_entry_id = None
-    if pull.get("state") == "open" and pull.get("merged") is not True:
-        entry = (await get_pr_readiness_state(client, owner, repo, number)).get("mergeQueueEntry")
-        if entry is not None:
-            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
-                raise RuntimeError("GitHub returned malformed merge queue entry evidence")
-            queue_entry_id = entry["id"]
+        queue_entry_id = None
+        steady = True
+        if pull.get("state") == "open" and pull.get("merged") is not True:
+            readiness = await get_pr_readiness_state(client, owner, repo, number)
+            entry = readiness.get("mergeQueueEntry")
+            if entry is not None:
+                if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+                    raise RuntimeError("GitHub returned malformed merge queue entry evidence")
+                queue_entry_id = entry["id"]
+            ready_head = readiness.get("headRefOid")
+            rest_head = (pull.get("head") or {}).get("sha")
+            if isinstance(ready_head, str) and isinstance(rest_head, str) \
+                    and ready_head.lower() != rest_head.lower():
+                steady = False
+            ready_state = readiness.get("state")
+            if isinstance(ready_state, str) and ready_state != "OPEN":
+                steady = False
+        if steady:
+            break
 
     return {
         "action": "pull_action_state",

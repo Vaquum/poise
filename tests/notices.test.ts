@@ -159,6 +159,15 @@ describe('the notices', () => {
     expect(handling.listHandling().map((row) => row.title)).toEqual(['Recent dismissal', 'Old run'])
   })
 
+  it('compares since cutoffs carrying timezone offsets in UTC', () => {
+    handling.recordHandling({ kind: 'notice', source: 'pr_ready', title: 'Eleven oclock',
+      startedAt: '2026-10-09T11:00:00.000Z', finishedAt: '2026-10-09T11:00:00.000Z',
+      outcome: 'dismissed', actor: 'person', ref: 'alert:9:dismissed' }, '2026-10-09T11:00:00.000Z')
+    // Noon at +02:00 is 10:00Z: the 11:00Z handling is at and after it.
+    expect(handling.listHandling(200, Date.now(), '2026-10-09T12:00:00+02:00').map((row) => row.title))
+      .toEqual(['Eleven oclock'])
+  })
+
   it('puts other notices away for good, until their condition clears and returns', () => {
     const first = store.raiseAlert(waiting, at(0))!
     notices.dismissNotice(first.id, at(1))

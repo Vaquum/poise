@@ -61,10 +61,17 @@ export function recordHandling(input: HandlingInput, at = new Date().toISOString
  *  handled at or after `since`. */
 export function listHandling(limit = HANDLED_READ_LIMIT, now = Date.now(), since?: string): HandlingRow[] {
   const cutoff = new Date(now - HANDLING_RETENTION_MS).toISOString()
+  // Compared lexicographically against UTC timestamps, so a cutoff with a
+  // timezone offset is normalized to UTC first; otherwise +02:00 noon
+  // would wrongly exclude handlings between 10:00Z and 12:00Z.
+  const sinceUtc = since === undefined ? null : new Date(since).toISOString()
+  // Compared lexicographically against UTC timestamps, so a cutoff with a
+  // timezone offset is normalized to UTC first; otherwise +02:00 noon
+  // would wrongly exclude handlings between 10:00Z and 12:00Z.
   const rows = db.prepare(`
     SELECT id, kind, source, title, started_at, finished_at, outcome, error, actor, at
     FROM handling_log WHERE at >= ? AND (? IS NULL OR at >= ?) ORDER BY at DESC, id DESC LIMIT ?
-  `).all(cutoff, since ?? null, since ?? null, limit) as Array<{ id: number, kind: HandlingKind, source: string, title: string, started_at: string,
+  `).all(cutoff, sinceUtc, sinceUtc, limit) as Array<{ id: number, kind: HandlingKind, source: string, title: string, started_at: string,
     finished_at: string, outcome: string, error: string | null, actor: HandlingActor, at: string }>
   return rows.map((row) => ({ id: row.id, kind: row.kind, source: row.source, title: row.title,
     startedAt: row.started_at, finishedAt: row.finished_at, outcome: row.outcome,
