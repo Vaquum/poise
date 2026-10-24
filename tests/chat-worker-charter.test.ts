@@ -355,6 +355,23 @@ it('places /worker between the control context and the request in worker turns o
   expect(prompts.get(worker.id)!.at(-1)!.text).toContain('[Worker charter] The /worker snippet is empty. Ask the person to write it in Snippets.')
 }, 60_000)
 
+it('carries the effective policy on the turns of workers the Manager created', async () => {
+  const manager = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'manager' })
+  const owned = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'worker' })
+  const lone = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'worker' })
+  store.addChild(instance, manager.id, owned.id)
+
+  await runPrompt(owned.id, 'Do the thing')
+  const carried = prompts.get(owned.id)!.at(-1)!.text
+  const policy = carried.indexOf('[Manager controls — policy version 0.]')
+  const charter = carried.indexOf('[Worker charter —')
+  expect(policy).toBeGreaterThan(carried.indexOf('[Poise native control]'))
+  expect(charter).toBeGreaterThan(policy)
+
+  await runPrompt(lone.id, 'Do the thing')
+  expect(prompts.get(lone.id)!.at(-1)!.text).not.toContain('[Manager controls —')
+}, 60_000)
+
 it('applies a /worker edit from the next turn and says it supersedes earlier revisions', async () => {
   const worker = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'worker' })
   runtime.prompt(worker.id, { text: 'Long task', attachments: [], mentions: [] })

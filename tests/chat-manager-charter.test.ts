@@ -222,6 +222,7 @@ it('creates /manager from the default file while a Manager exists and never repl
   expect(listed.json.snippets).toContainEqual({ trigger: ';manager', replace: MANAGER_SNIPPET_DEFAULT })
   expect(MANAGER_SNIPPET_DEFAULT).toContain('standalone PRD labelled prd')
   expect(MANAGER_SNIPPET_DEFAULT).toContain('live work table')
+  expect(MANAGER_SNIPPET_DEFAULT).toContain('take precedence over this charter')
   expect(MANAGER_SNIPPET_DEFAULT).not.toContain('native merge queue')
   expect(MANAGER_SNIPPET_DEFAULT).not.toContain('muse-spark')
   expect(listed.json.skills.switches).toContainEqual(expect.objectContaining({ name: 'manager', content: MANAGER_SNIPPET_DEFAULT }))
@@ -422,6 +423,25 @@ it('places /manager between the control context and the request in Manager turns
   await writeFile(matchFile, 'matches:\n  - trigger: ;manager\n    replace: \'   \'\n')
   await runPrompt(manager.id, 'After a hand edit')
   expect(prompts.get(manager.id)!.at(-1)!.text).toContain('[Manager charter] The /manager snippet is empty. Ask the person to write it in Snippets.')
+}, 60_000)
+
+it('carries the effective policy above the charter on every Manager turn', async () => {
+  const { setSettings } = await import('../server/settings')
+  const manager = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'manager' })
+  const text = async () => prompts.get(manager.id)!.at(-1)!.text
+  await runPrompt(manager.id, 'Do the thing')
+  const control = (await text()).indexOf('[Poise native control]')
+  const policy = (await text()).indexOf('[Manager controls — policy version 0.]')
+  const charter = (await text()).indexOf('[Manager charter —')
+  expect(policy).toBeGreaterThan(control)
+  expect(charter).toBeGreaterThan(policy)
+  expect(await text()).toContain('Rhythm: 5 Manager slots.')
+  expect(await text()).toContain('Precedence: a direct request from the person in this chat first, then these controls, then the charter, then Memories.')
+
+  setSettings({ manager: { rhythm: 2 } as never })
+  await runPrompt(manager.id, 'Do the next thing')
+  expect(await text()).toContain('[Manager controls — policy version 1.]')
+  expect(await text()).toContain('Rhythm: 2 Manager slots.')
 }, 60_000)
 
 it('applies a /manager edit from the next turn and says it supersedes earlier revisions', async () => {

@@ -161,7 +161,7 @@ export async function listActionRuns(body: Record<string, unknown>): Promise<{ s
   const orgs = selectOrganizations(body.org)
   if (!orgs.length) return { status: 200, body: body.count_only ? { count: 0, errors: [], warnings: [] } : { records: [], errors: [], warnings: [] } }
   const me = getMeta('me') || ''
-  if (!me) throw new HttpError(400, 'Set your GitHub account in Settings → GitHub to read Actions')
+  if (!me) throw new HttpError(400, 'Set your GitHub account in Settings → General to read Actions')
   const failed = body.record_state !== 'all'
   const entries = orgs.map((org) => {
     const key = `${me.toLowerCase()}:${org.login.toLowerCase()}:${failed}`

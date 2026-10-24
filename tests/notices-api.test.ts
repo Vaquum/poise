@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createAuthenticatedClaudeAuth } from './claude-auth-fixture'
 
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
+
 // The notices through the HTTP API the page's notification island uses, and
 // the Notifications setting that turns them off.
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn() }))
@@ -46,10 +48,11 @@ let cache: typeof import('../server/cache-plugin') | undefined
 const envKeys = ['POISE_DB', 'POISE_EDITOR_DIR', 'POISE_CHAT_ATTACHMENTS_DIR', 'POISE_LOCK_DIR', 'AGENT_INTERFACE_ROOT', 'POISE_ESPANSO_MATCH_DIR', 'POISE_DATASTORE_DB']
 const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
 
-async function call(method: 'GET' | 'POST', path: string, body?: unknown): Promise<{ status: number, body: any }> {
+async function call(method: 'GET' | 'POST', path: string, body?: unknown, person = false): Promise<{ status: number, body: any }> {
   const response = await fetch(`${base}${path}`, {
     method,
-    ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+    headers: { ...(person ? { Origin: base } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
   return { status: response.status, body: await response.json() }
 }
@@ -138,7 +141,7 @@ describe('the notices API', () => {
     expect(JSON.stringify(quota.body)).not.toContain('test-stored-credential')
     const state = await call('GET', '/api/notices')
     expect(state.body.notices[0]).toMatchObject({ kind: 'github_quota_exhausted', title: 'GitHub REST API quota exhausted for octocat', silenceable: false })
-    expect((await call('POST', `/api/notices/${state.body.notices[0].id}/dismiss`)).body.notices).toEqual([])
+    expect((await call('POST', `/api/notices/${state.body.notices[0].id}/dismiss`, undefined, true)).body.notices).toEqual([])
     await call('GET', '/api/github-quota')
     expect((await call('GET', '/api/notices')).body.notices).toEqual([])
     expect(mocks.runFile.mock.calls.filter(([command]) => command === 'gh')).toHaveLength(2)
@@ -157,7 +160,7 @@ describe('the notices API', () => {
     const answer = await call('GET', '/api/notices')
     expect(answer.status).toBe(200)
     expect(answer.body.notices).toEqual([expect.objectContaining({
-      id: failed.id, target: { swarm: 'failed-call' }, body: 'Open Swarm in Poise to see what happened.',
+      id: failed.id, target: { swarm: 'failed-call' }, body: 'Open it in Poise to see what happened.',
       subject: { behavior: 'approve-prs', target: 'acme/api#9' },
     })])
   })
@@ -179,33 +182,37 @@ describe('the notices API', () => {
   it('puts a notice away and answers with what is left', async () => {
     const chat = store!.raiseAlert(waiting)!
     store!.raiseAlert(ready)
-    const dismissed = await call('POST', `/api/notices/${encodeURIComponent(chat.id)}/dismiss`)
+    const dismissed = await call('POST', `/api/notices/${encodeURIComponent(chat.id)}/dismiss`, undefined, true)
     expect(dismissed.status).toBe(200)
     expect(dismissed.body.notices.map((notice: any) => notice.kind)).toEqual(['pr_ready'])
     // Every page reads the same: it stays away.
     expect((await call('GET', '/api/notices')).body.notices.map((notice: any) => notice.kind)).toEqual(['pr_ready'])
   })
 
-  it('silences a pull request ready to merge, and refuses to silence anything else', async () => {
+  it('silences a pull request ready to merge or asking for review, and refuses to silence anything else', async () => {
     const chat = store!.raiseAlert(waiting)!
     const pr = store!.raiseAlert(ready)!
+    const review = store!.raiseAlert({ kind: 'review_requested', dedupeKey: 'review-requested:acme/api#4', title: 'acme/api#4 requests your review', body: 'Change 4', path: '/', target: { pullRequest: 'https://github.com/acme/api/pull/4' } })!
     const refused = await call('POST', `/api/notices/${encodeURIComponent(chat.id)}/silence`)
     expect(refused.status).toBe(400)
-    expect(refused.body.error).toMatch(/Only a pull request ready to merge can be silenced/)
+    expect(refused.body.error).toMatch(/Only a pull request ready to merge or asking for your review can be silenced/)
     const silenced = await call('POST', `/api/notices/${encodeURIComponent(pr.id)}/silence`)
     expect(silenced.status).toBe(200)
-    expect(silenced.body.notices.map((notice: any) => notice.kind)).toEqual(['chat_waiting'])
+    expect(silenced.body.notices.map((notice: any) => notice.kind).sort()).toEqual(['chat_waiting', 'review_requested'])
+    const quiet = await call('POST', `/api/notices/${encodeURIComponent(review.id)}/silence`)
+    expect(quiet.status).toBe(200)
+    expect(quiet.body.notices.map((notice: any) => notice.kind)).toEqual(['chat_waiting'])
   })
 
   it('answers 404 for a notice it did not issue or that has cleared, and 400 for an unreadable id', async () => {
     const chat = store!.raiseAlert(waiting)!
     store!.resolveAlert(waiting.dedupeKey)
     for (const id of [chat.id, '000000000000-1', 'nope']) {
-      const answer = await call('POST', `/api/notices/${encodeURIComponent(id)}/dismiss`)
+      const answer = await call('POST', `/api/notices/${encodeURIComponent(id)}/dismiss`, undefined, true)
       expect(answer.status, id).toBe(404)
       expect(answer.body.error, id).toMatch(/notification/)
     }
-    expect((await call('POST', '/api/notices/%E0%A4%A/dismiss')).status).toBe(400)
+    expect((await call('POST', '/api/notices/%E0%A4%A/dismiss', undefined, true)).status).toBe(400)
   })
 
   it('turns notifications off and on from Settings', async () => {
@@ -225,5 +232,180 @@ describe('the notices API', () => {
     expect((await call('GET', '/api/notices')).body.notices.map((notice: any) => notice.kind)).toEqual(['chat_waiting'])
     // Turned on, the check ran at once; with no GitHub account set it asked GitHub nothing.
     expect(mocks.runFile.mock.calls.filter(([command]) => command === 'github-datastore' || command === 'github-interface')).toEqual([])
+  })
+})
+
+describe('the handling log', () => {
+  async function handled(): Promise<{ status: number, body: { handled: Array<Record<string, unknown>> } }> {
+    return await call('GET', '/api/notices/handled') as { status: number, body: { handled: Array<Record<string, unknown>> } }
+  }
+
+  it('records a dismissal while the notice stays active, then its clearing', async () => {
+    const raised = store!.raiseAlert(waiting)!
+    const dismissed = await call('POST', `/api/notices/${encodeURIComponent(raised.id)}/dismiss`, undefined, true)
+    expect(dismissed.status).toBe(200)
+    let state = await handled()
+    expect(state.status).toBe(200)
+    expect(state.body.handled).toHaveLength(1)
+    expect(state.body.handled[0]).toMatchObject({ kind: 'notice', source: 'chat_waiting',
+      title: waiting.title, outcome: 'dismissed', actor: 'person' })
+    expect(Date.parse(state.body.handled[0]!.finishedAt as string))
+      .toBeGreaterThanOrEqual(Date.parse(state.body.handled[0]!.startedAt as string))
+
+    // Dismissed, not cleared: the earlier dismissal is preserved when the
+    // condition later clears.
+    store!.resolveAlert(waiting.dedupeKey)
+    state = await handled()
+    expect(state.body.handled.map((row) => row.outcome)).toEqual(['resolved', 'dismissed'])
+    expect(state.body.handled[0]).toMatchObject({ actor: 'notices-service' })
+    expect((await call('GET', '/api/notices')).body.notices).toEqual([])
+  })
+
+  it('refuses a dismissal without the person, through fetch and the native control api', async () => {
+    const raised = store!.raiseAlert(waiting)!
+    const refused = await call('POST', `/api/notices/${encodeURIComponent(raised.id)}/dismiss`)
+    expect(refused.status).toBe(403)
+    expect((await handled()).body.handled).toEqual([])
+
+    const { execFile } = await import('node:child_process')
+    const { writeFile } = await import('node:fs/promises')
+    const { promisify } = await import('node:util')
+    const config = join(root, 'control.json')
+    await writeFile(config, JSON.stringify({ origin: base, sessionId: 's', token: 't' }))
+    const stderr = await promisify(execFile)(process.execPath,
+      [join(process.cwd(), 'scripts', 'poise-chat-control.mjs'), config,
+        JSON.stringify({ operation: 'api', path: `/api/notices/${raised.id}/dismiss`, method: 'POST' })])
+      .then(() => null, (error: any) => String(error?.stderr ?? error))
+    expect(stderr).toMatch(/"status":\s*403/)
+    expect((await handled()).body.handled).toEqual([])
+  })
+
+  it('attributes a silence from outside the browser to the api', async () => {
+    const raised = store!.raiseAlert(ready)!
+    const silenced = await call('POST', `/api/notices/${encodeURIComponent(raised.id)}/silence`)
+    expect(silenced.status).toBe(200)
+    const state = await handled()
+    // The read's own check resolved the silence's alert first: with no
+    // GitHub account set, nothing is followed, so nothing stays active.
+    expect(state.body.handled.map((row) => row.outcome).sort()).toEqual(['resolved', 'silenced'])
+    expect(state.body.handled.find((row) => row.outcome === 'silenced')).toMatchObject({ actor: 'api' })
+  })
+
+  it('logs behavior firings and Caller-reported runs with their outcomes', async () => {
+    const metrics = await import('../server/behavior-metrics')
+    const run = metrics.startDirectBehaviorRun('merge-prs')
+    metrics.finishDirectBehaviorRun(run, false)
+    const completed = metrics.startDirectBehaviorRun('resolve-unblocking')
+    metrics.finishDirectBehaviorRun(completed, true)
+
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'agent-interface' && args[0] === '--logs') {
+        const now = new Date().toISOString()
+        return { stdout: JSON.stringify([{ id: 'a'.repeat(32), pr_id: '9', repo: 'acme/api', actor: 'review-bot',
+          model: 'opus-5-xhigh', behavior: 'pr_review', session_id: null, prompt: '', started_at: now,
+          started_at_precise: now, completed_at: now, time_elapsed: '1m', status: 'completed', outcome: 'clean',
+          head_sha: 'b'.repeat(40), expected_head: 'b'.repeat(40), source: 'poise:review-new-prs',
+          correlation_id: 'correlation-fixture', action: 'reviewed_clean', response: null, error: '' }]), stderr: '' }
+      }
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return { stdout: JSON.stringify({ version: 1, streamId: 'f'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }) }
+      throw new Error(`Unexpected test command: ${command} ${args.join(' ')}`)
+    })
+    expect((await call('GET', '/api/agent-logs')).status).toBe(200)
+
+    const state = await handled()
+    expect(state.body.handled).toHaveLength(3)
+    const firing = state.body.handled.find((row) => row.source === 'merge-prs')
+    expect(firing).toMatchObject({ kind: 'behavior-firing', outcome: 'failed', actor: 'behaviors', error: null })
+    const update = state.body.handled.find((row) => row.kind === 'caller-update')
+    expect(update).toMatchObject({ source: 'pr_review', title: 'acme/api#9 pr_review',
+      outcome: 'clean', actor: 'caller' })
+
+    // A second sighting of the same run records nothing new.
+    expect((await call('GET', '/api/agent-logs')).status).toBe(200)
+    expect((await handled()).body.handled).toHaveLength(3)
+  })
+
+  it('caps the read at the newest 200 rows', async () => {
+    const { recordHandling } = await import('../server/alerts/handling')
+    for (let n = 0; n < 205; n++) {
+      recordHandling({ kind: 'notice', source: 'pr_ready', title: `Row ${n}`, startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(), outcome: 'resolved', actor: 'notices-service', ref: `test-row:${n}` })
+    }
+    const state = await handled()
+    expect(state.body.handled).toHaveLength(200)
+    expect(state.body.handled[0]!.title).toBe('Row 204')
+    expect(state.body.handled.at(-1)!.title).toBe('Row 5')
+  })
+
+  it('keeps a row handled within 30 days however old its notice, and drops older handlings', async () => {
+    const { recordHandling } = await import('../server/alerts/handling')
+    const old = new Date(Date.now() - 60 * 24 * 60 * 60_000).toISOString()
+    recordHandling({ kind: 'notice', source: 'pr_ready', title: 'Old notice, fresh handling',
+      startedAt: old, finishedAt: new Date().toISOString(), outcome: 'dismissed', actor: 'person', ref: 'test-row:old-notice' })
+    recordHandling({ kind: 'notice', source: 'pr_ready', title: 'Stale handling',
+      startedAt: old, finishedAt: old, outcome: 'resolved', actor: 'notices-service', ref: 'test-row:stale' },
+      new Date(Date.now() - 31 * 24 * 60 * 60_000).toISOString())
+    const state = await handled()
+    expect(state.body.handled.map((row) => row.title)).toEqual(['Old notice, fresh handling'])
+  })
+
+  it('answers stored rows when unreadiness or a failing datastore stops the checks', async () => {
+    store!.raiseAlert(ready)!
+    const dismissed = await call('POST', `/api/notices/${encodeURIComponent((await call('GET', '/api/notices')).body.notices[0].id)}/dismiss`, undefined, true)
+    expect(dismissed.status).toBe(200)
+    // No GitHub account is set: the read's check has nothing to read, and
+    // the stored dismissal still answers.
+    let state = await handled()
+    expect(state.status).toBe(200)
+    expect(state.body.handled.map((row) => row.outcome).sort()).toEqual(['dismissed', 'resolved'])
+
+    // A failing datastore keeps prior state instead of failing the read.
+    database!.setMeta('me', 'octocat')
+    database!.setMeta('agentAccount', 'octo-agent')
+    database!.setMeta('org', 'Legacy')
+    mocks.runFile.mockImplementation(async () => { throw new Error('datastore unavailable') })
+    state = await handled()
+    expect(state.status).toBe(200)
+    expect(state.body.handled.map((row) => row.outcome).sort()).toEqual(['dismissed', 'resolved'])
+  })
+
+  it('filters by since and refuses a malformed one', async () => {
+    const { recordHandling } = await import('../server/alerts/handling')
+    const first = new Date(Date.now() - 60_000).toISOString()
+    recordHandling({ kind: 'notice', source: 'pr_ready', title: 'Older', startedAt: first,
+      finishedAt: first, outcome: 'resolved', actor: 'notices-service', ref: 'test-row:older' }, first)
+    recordHandling({ kind: 'notice', source: 'pr_ready', title: 'Newer', startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(), outcome: 'resolved', actor: 'notices-service', ref: 'test-row:newer' })
+    const filtered = await call('GET', `/api/notices/handled?since=${encodeURIComponent(first)}`)
+    expect(filtered.status).toBe(200)
+    expect(filtered.body.handled.map((row: any) => row.title)).toEqual(['Newer', 'Older'])
+    expect(filtered.body.handled[0].id).toBeGreaterThan(0)
+    const future = await call('GET', `/api/notices/handled?since=${encodeURIComponent(new Date(Date.now() + 60_000).toISOString())}`)
+    expect(future.body.handled).toEqual([])
+    expect((await call('GET', '/api/notices/handled?since=soon')).status).toBe(400)
+  })
+
+  it('notices nothing when notifications turn off while a check is in flight', async () => {
+    database!.setMeta('me', 'octocat')
+    database!.setMeta('agentAccount', 'octo-agent')
+    database!.setMeta('org', 'Legacy')
+    store!.raiseAlert(ready)!
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'github-datastore') {
+        await gate
+        return { stdout: '[]', stderr: '' }
+      }
+      throw new Error(`Unexpected test command: ${command} ${args.join(' ')}`)
+    })
+    const reading = handled()
+    await vi.waitFor(() => expect(mocks.runFile.mock.calls.some(([command]) => command === 'github-datastore')).toBe(true))
+    expect((await call('POST', '/api/settings', { notifications: { enabled: false } })).status).toBe(200)
+    release()
+    expect((await reading).status).toBe(200)
+    // The pass noticed nothing: the alert stays open and unhandled.
+    expect(store!.openAlerts().map((alert) => alert.dedupeKey)).toContain('pr-ready:acme/api#1')
+    expect((await handled()).body.handled).toEqual([])
   })
 })

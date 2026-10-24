@@ -130,6 +130,14 @@ async def merge_if_ready(payload: dict[str, Any]) -> Any:
     return await run_behavior("merge_if_ready", payload)
 
 
+async def merge_pr(payload: dict[str, Any]) -> Any:
+    return await run_behavior("merge_pr", payload)
+
+
+async def pull_action_state(payload: dict[str, Any]) -> Any:
+    return await run_behavior("pull_action_state", payload)
+
+
 async def update_branch_if_behind(payload: dict[str, Any]) -> Any:
     return await run_behavior("update_branch_if_behind", payload)
 

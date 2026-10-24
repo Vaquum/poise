@@ -151,7 +151,7 @@ describe('the Link API in a workspace', () => {
       const data = JSON.parse(alert.data)
       expect(data).toEqual({
         id: alert.id, kind: 'sign_in_needed', title: 'Claude needs you to sign in again',
-        body: 'Claude-backed work is paused. Connect Claude in Settings → Connected accounts.',
+        body: 'Claude-backed work is paused. Connect Claude in Settings → Accounts.',
         url: `${PUBLIC_ORIGIN}/`, created_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/),
       })
       // support/mod.rs alert_frame(): `id: …\nevent: alert\ndata: {"id":…,"kind":…,"title":…,"body":…,"url":…,"created_at":…}\n\n`.

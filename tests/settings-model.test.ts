@@ -12,10 +12,11 @@ vi.mock('../server/db', () => ({
   // As the database answers: null for a key never written.
   getMeta: (k: string) => mocks.store.get(k) ?? null,
   setMeta: (k: string, v: string) => { mocks.store.set(k, v) },
+  db: { transaction: (fn: (...args: never[]) => unknown) => fn },
 }))
 vi.mock('../server/gh', () => ({ invalidateRepoListCache: mocks.invalidateRepoListCache }))
 
-const { agentAccount, callerAccounts, getSettings, isReady, requireAgentAccount, seedAgentAccount, setSettings } = await import('../server/settings')
+const { agentAccount, callerAccounts, getSettings, isReady, requireAgentAccount, seedAgentAccount, setSettings, SettingsConflictError } = await import('../server/settings')
 
 beforeEach(() => {
   mocks.store.clear()
@@ -25,7 +26,7 @@ beforeEach(() => {
 describe('what the settings model accepts', () => {
   it('stores a well-formed org, username and timezone', () => {
     const s = setSettings({ org: ' Vaquum ', me: ' mikkokotila ', timezone: 'Europe/Helsinki' })
-    expect(s).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'Europe/Helsinki', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }, notifications: { enabled: true } })
+    expect(s).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'Europe/Helsinki', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }, notifications: { enabled: true }, manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
   })
 
   it('refuses a pasted URL rather than storing something no query can use', () => {
@@ -118,7 +119,7 @@ describe('a rejected save changes nothing at all', () => {
     setSettings({ org: 'Vaquum', me: 'mikkokotila', timezone: 'UTC' })
     expect(() => setSettings({ timezone: 'Europe/Berlin', org: 'not a valid org' })).toThrow()
     // The timezone in the same call must not have landed.
-    expect(getSettings()).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }, notifications: { enabled: true } })
+    expect(getSettings()).toEqual({ org: 'Vaquum', me: 'mikkokotila', agentAccount: '', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }, notifications: { enabled: true }, manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
   })
 
   it('does not keep the valid half when consecutive hyphens reject the other half', () => {
@@ -138,7 +139,7 @@ describe('the agent account', () => {
   })
 
   it('is required, with where to set it, by anything that posts as it', () => {
-    expect(() => requireAgentAccount()).toThrow('No agent account is set. Set it in Settings → GitHub')
+    expect(() => requireAgentAccount()).toThrow('No agent account is set. Set it in Settings → General')
     setSettings({ agentAccount: 'review-bot' })
     expect(requireAgentAccount()).toBe('review-bot')
     // A hand-edited database is not trusted either.
@@ -284,5 +285,89 @@ describe('model choices per place', () => {
       expect(getSettings().models).toEqual({})
     }
     expect(() => setSettings({ models: { chat: { default: 'opus-5-max', fallback: 'grok-4.6-high' } } })).toThrow(/catalog is unavailable/)
+  })
+})
+
+describe('the Manager controls', () => {
+  const manager = (overrides: Record<string, unknown> = {}) => ({
+    rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, ...overrides,
+  })
+
+  it('starts unconfigured with the defaults and no policy version', () => {
+    expect(getSettings().manager).toEqual({ rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 0 })
+  })
+
+  it('stores changed controls and reads them back with a bumped version', () => {
+    const first = setSettings({ manager: manager({ rhythm: 1, paused: true }) as never })
+    expect(first.manager).toEqual({ rhythm: 1, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: true, version: 1 })
+    expect(getSettings().manager).toEqual(first.manager)
+    // Every save advances the counter, even one that changes nothing.
+    const second = setSettings({ manager: manager({ rhythm: 1, paused: true }) as never })
+    expect(second.manager.version).toBe(2)
+    const third = setSettings({ manager: { autonomy: 'Ask first' } as never })
+    expect(third.manager).toMatchObject({ autonomy: 'Ask first', rhythm: 1, paused: true, version: 3 })
+  })
+
+  it('advances the same counter for a save that touches no control', () => {
+    expect(setSettings({ timezone: 'UTC' }).manager.version).toBe(1)
+    expect(setSettings({ notifications: { enabled: false } }).manager.version).toBe(2)
+    expect(getSettings().manager).toMatchObject({ rhythm: 5, paused: false, version: 2 })
+  })
+
+  it('keeps the scope it is given, null or listed', () => {
+    expect(setSettings({ manager: manager({ scope: ['acme/api'] }) as never }).manager.scope).toEqual(['acme/api'])
+    expect(setSettings({ manager: { scope: null } as never }).manager.scope).toBeNull()
+  })
+
+  it('rejects bad values without storing anything', () => {
+    const cases: Array<[unknown, RegExp]> = [
+      ['rhythm', /manager settings must be an object/],
+      [{ rhythm: 0 }, /between 1 and 10/],
+      [{ rhythm: 11 }, /between 1 and 10/],
+      [{ rhythm: 2.5 }, /between 1 and 10/],
+      [{ stability: 'Reckless' }, /one of/],
+      [{ autonomy: 'YOLO' }, /one of/],
+      [{ scope: ['nope'] }, /owner\/name/],
+      [{ scope: 'acme/api' }, /owner\/name/],
+      [{ paused: 'yes' }, /true or false/],
+    ]
+    for (const [value, message] of cases) {
+      expect(() => setSettings({ manager: value as never })).toThrow(message)
+      expect(getSettings().manager).toEqual({ rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 0 })
+    }
+  })
+
+  it('ignores a version the caller sends: the server owns it', () => {
+    const saved = setSettings({ manager: { rhythm: 2, version: 99 } as never })
+    expect(saved.manager).toMatchObject({ rhythm: 2, version: 1 })
+  })
+})
+
+describe('saves that refuse to overwrite', () => {
+  it('saves when every expected value still holds, across nested partials', () => {
+    const first = setSettings({ timezone: 'UTC', manager: { rhythm: 2 } as never })
+    expect(first.manager.version).toBe(1)
+    const second = setSettings({ timezone: 'Europe/Berlin', manager: { paused: true } as never },
+      undefined, { expect: { timezone: 'UTC', manager: first.manager } })
+    expect(second).toMatchObject({ timezone: 'Europe/Berlin', manager: { rhythm: 2, paused: true, version: 2 } })
+  })
+
+  it('refuses with the current values when another save landed first, changing nothing', () => {
+    setSettings({ timezone: 'UTC' })
+    setSettings({ timezone: 'Europe/Berlin', manager: { rhythm: 2 } as never })
+    const before = getSettings()
+    try {
+      setSettings({ timezone: 'Asia/Tokyo' }, undefined, { expect: { timezone: 'UTC' } })
+      expect.unreachable('a stale save must be refused')
+    } catch (error) {
+      expect(error).toBeInstanceOf(SettingsConflictError)
+      expect((error as InstanceType<typeof SettingsConflictError>).current).toEqual({ timezone: 'Europe/Berlin' })
+    }
+    expect(getSettings()).toEqual(before)
+  })
+
+  it('refuses an expectation it cannot check', () => {
+    expect(() => setSettings({ timezone: 'UTC' }, undefined, { expect: { nope: 1 } })).toThrow(/no settings field/)
+    expect(() => setSettings({ timezone: 'UTC' }, undefined, { expect: 'UTC' as never })).toThrow(/must be an object/)
   })
 })

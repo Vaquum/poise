@@ -203,6 +203,25 @@ db.exec(`
     dedupe_key TEXT PRIMARY KEY,
     silenced_at TEXT NOT NULL
   );
+
+  -- The handling log (server/alerts/handling.ts): append-only. Every row is
+  -- one handled action — a notice dismissed, silenced or resolved, a
+  -- behavior firing finished, a Caller-reported run completed — with its
+  -- authoritative actor and timestamp, independent of any continuing alert.
+  CREATE TABLE IF NOT EXISTS handling_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('notice', 'behavior-firing', 'caller-update')),
+    source TEXT NOT NULL,
+    title TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    error TEXT,
+    actor TEXT NOT NULL,
+    ref TEXT NOT NULL UNIQUE
+  );
+  CREATE INDEX IF NOT EXISTS handling_log_at ON handling_log(at);
 `)
 
 // One-time migrations: the kanban table has been renamed twice.

@@ -17,7 +17,7 @@ def default_db() -> str:
 
 
 DEFAULT_DB = default_db()
-VIEW_SCHEMA_VERSION = 3
+VIEW_SCHEMA_VERSION = 4
 VIEW_NAMES = frozenset({"user_associations", "prs", "issues", "user_items"})
 
 
@@ -237,7 +237,15 @@ SELECT
     -- NULL until the pull request is read again after these fields were added
     -- to the query: a size nobody fetched is unknown, not zero.
     CAST(json_extract(i.expanded_json, '$.pull.graphql.additions') AS INTEGER) AS additions,
-    CAST(json_extract(i.expanded_json, '$.pull.graphql.deletions') AS INTEGER) AS deletions
+    CAST(json_extract(i.expanded_json, '$.pull.graphql.deletions') AS INTEGER) AS deletions,
+    -- The pull request's current requested reviewers as of the last sync, a
+    -- JSON array of logins: NULL for a row from before reviewers were read,
+    -- never the timeline's historical request events.
+    CASE WHEN json_extract(i.expanded_json, '$.pull.requested_reviewers') IS NULL THEN NULL
+    ELSE (SELECT json_group_array(json_extract(value, '$.login'))
+          FROM json_each(i.expanded_json, '$.pull.requested_reviewers')
+          WHERE json_extract(value, '$.login') IS NOT NULL)
+    END AS requested_reviewers
 FROM items i
 WHERE i.item_type = 'pr';
 
@@ -303,7 +311,14 @@ SELECT
     END AS url,
     a.reasons,
     a.evidence_count,
-    CAST((julianday('now') - julianday(i.updated_at)) * 24 * 60 AS INTEGER) AS updated_minutes_ago
+    CAST((julianday('now') - julianday(i.updated_at)) * 24 * 60 AS INTEGER) AS updated_minutes_ago,
+    -- As in prs: the current requested reviewers, NULL for issues and for
+    -- rows from before reviewers were read.
+    CASE WHEN json_extract(i.expanded_json, '$.pull.requested_reviewers') IS NULL THEN NULL
+    ELSE (SELECT json_group_array(json_extract(value, '$.login'))
+          FROM json_each(i.expanded_json, '$.pull.requested_reviewers')
+          WHERE json_extract(value, '$.login') IS NOT NULL)
+    END AS requested_reviewers
 -- Evidence is grouped before items are joined: grouping the joined rows sorted
 -- every evidence row with its item's whole payload, gigabytes for a busy user.
 FROM (

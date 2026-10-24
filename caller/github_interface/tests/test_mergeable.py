@@ -1,6 +1,7 @@
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
+from github_interface.atoms import pulls
 from github_interface.behaviors import mergeable
 
 # The colour Current shows a pull request by (behaviors/mergeable.py).
@@ -71,6 +72,13 @@ class TestStatus(IsolatedAsyncioTestCase):
             "checks_state": "SUCCESS",
             "unresolved_conversations": 0,
             "status": "green",
+            "head_sha": None,
+            "review_decision": None,
+            "threads_checked": True,
+            "queue_enabled": False,
+            "has_rollup": True,
+            "check_contexts": [],
+            "contexts_partial": False,
         })
         client.get.assert_not_awaited()
         client.paginate.assert_not_awaited()
@@ -138,3 +146,97 @@ class TestBehindStatus(TestCase):
                        behind_packet(mergeStateStatus="CLEAN"), behind_packet(mergeStateStatus="UNSTABLE")):
             with self.subTest(packet=packet):
                 self.assertIsNone(mergeable.readiness_behind(packet))
+
+
+def evidence_packet(**fields):
+    packet = readiness("FAILURE", [(False, False)], more=True,
+                       headRefOid="a" * 40, reviewDecision="REVIEW_REQUIRED",
+                       mergeQueue={"id": "queue-1"})
+    packet["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"] = {
+        "pageInfo": {"hasNextPage": False},
+        "nodes": [
+            {"__typename": "CheckRun", "name": "browser shard 3", "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"__typename": "StatusContext", "context": "deploy", "state": "PENDING"},
+        ],
+    }
+    packet.update(fields)
+    return packet
+
+
+class TestHeldEvidence(IsolatedAsyncioTestCase):
+    async def test_evidence_fields_ride_the_same_read(self):
+        with patch.object(mergeable, "get_pr_readiness_state", AsyncMock(return_value=evidence_packet())):
+            result = await mergeable.run(AsyncMock(), {"repository": "acme/app", "pull_number": "7"})
+        self.assertEqual(
+            (result["head_sha"], result["review_decision"], result["threads_checked"],
+             result["queue_enabled"], result["has_rollup"]),
+            ("a" * 40, "REVIEW_REQUIRED", False, True, True))
+        self.assertEqual(result["check_contexts"], [
+            {"name": "browser shard 3", "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "deploy", "status": None, "conclusion": "PENDING"},
+        ])
+        self.assertFalse(result["contexts_partial"])
+
+    async def test_full_read_is_the_default(self):
+        fetch = AsyncMock(return_value=evidence_packet())
+        with patch.object(mergeable, "get_pr_readiness_state", fetch):
+            await mergeable.run(AsyncMock(), {"repository": "acme/app", "pull_number": "7"})
+        self.assertTrue(fetch.call_args[0][4])
+
+    async def test_slim_read_omits_contexts_but_keeps_the_aggregate(self):
+        fetch = AsyncMock(return_value=evidence_packet())
+        with patch.object(mergeable, "get_pr_readiness_state", fetch):
+            result = await mergeable.run(AsyncMock(), {"repository": "acme/app", "pull_number": "7", "no_check_contexts": True})
+        self.assertFalse(fetch.call_args[0][4])
+        self.assertIsNone(result["check_contexts"])
+        self.assertFalse(result["contexts_partial"])
+        self.assertEqual(result["checks_state"], "FAILURE")
+
+    async def test_contexts_beyond_one_read_are_partial(self):
+        packet = evidence_packet()
+        packet["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["pageInfo"]["hasNextPage"] = True
+        with patch.object(mergeable, "get_pr_readiness_state", AsyncMock(return_value=packet)):
+            result = await mergeable.run(AsyncMock(), {"repository": "acme/app", "pull_number": "7"})
+        self.assertTrue(result["contexts_partial"])
+        self.assertEqual(len(result["check_contexts"]), 3)
+
+    async def test_missing_rollup_is_reported(self):
+        with patch.object(mergeable, "get_pr_readiness_state", AsyncMock(return_value=readiness(None, []))):
+            result = await mergeable.run(AsyncMock(), {"repository": "acme/app", "pull_number": "7"})
+        self.assertEqual((result["has_rollup"], result["checks_state"], result["check_contexts"]),
+                         (False, None, []))
+
+
+class TestNormalizeCheckContexts(TestCase):
+    def test_check_run_and_legacy_status_share_one_shape(self):
+        self.assertEqual(mergeable.normalize_check_contexts({"nodes": [
+            {"__typename": "CheckRun", "name": "test", "status": "IN_PROGRESS", "conclusion": None},
+            {"__typename": "StatusContext", "context": "docs", "state": "SUCCESS"},
+        ]}), [
+            {"name": "test", "status": "IN_PROGRESS", "conclusion": None},
+            {"name": "docs", "status": None, "conclusion": "SUCCESS"},
+        ])
+
+    def test_malformed_context_fails_loud(self):
+        with self.assertRaisesRegex(RuntimeError, "malformed check context"):
+            mergeable.normalize_check_contexts({"nodes": ["test"]})
+        with self.assertRaisesRegex(RuntimeError, "without a name"):
+            mergeable.normalize_check_contexts({"nodes": [{"__typename": "CheckRun", "status": "COMPLETED"}]})
+
+
+class TestReadinessQuery(IsolatedAsyncioTestCase):
+    def test_contexts_selected_only_when_asked(self):
+        self.assertIn("contexts(first: 100)", pulls.readiness_query(True))
+        self.assertIn("StatusContext", pulls.readiness_query(True))
+        self.assertNotIn("contexts(", pulls.readiness_query(False))
+        self.assertEqual(pulls.readiness_query(False), pulls.readiness_query())
+
+    async def test_slim_flag_reaches_the_query(self):
+        client = AsyncMock()
+        client.graphql = AsyncMock(return_value={"repository": {"pullRequest": {"id": "1"}}})
+        await pulls.get_pr_readiness_state(client, "acme", "app", 7, include_contexts=False)
+        self.assertNotIn("contexts(", client.graphql.call_args[0][0])
+        await pulls.get_pr_readiness_state(client, "acme", "app", 7, include_contexts=True)
+        self.assertIn("contexts(first: 100)", client.graphql.call_args[0][0])

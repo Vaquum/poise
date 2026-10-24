@@ -24,6 +24,7 @@ import { getMeta } from './db'
 import { HttpError } from './http'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { MAX_PROCESS_ARG_BYTES, runFile } from './process'
+import { isRiskPressured, quotaRiskKey } from './quota-risk'
 import { agentAccount, requireAgentAccount } from './settings'
 import { invalidateActionRunCache, listActionRuns } from './action-runs'
 
@@ -52,8 +53,15 @@ const GREEN_CONCURRENCY = 5
 type PrColour = 'green' | 'yellow'
 // Null: neither colour. Undefined: GitHub could not be asked, so nothing is known.
 type PrStatus = PrColour | null | undefined
-const greenCache = new Map<string, { status: PrStatus, expiry: number }>()
-const greenReads = new Map<string, Promise<PrStatus>>()
+// Why an open pull request is held, in display order. A green pull request
+// carries no reasons; `unknown` means the evidence was incomplete.
+export type HeldReason = 'draft' | 'conflict' | 'checks_failing' | 'changes_requested' | 'review_required' | 'conversation_open' | 'checks_running' | 'behind' | 'blocked' | 'unknown'
+export interface HeldChecks { failing: string[], failingCount: number, runningCount: number, partial: boolean }
+export interface HeldInfo { reasons: HeldReason[], checks: HeldChecks, threadsChecked: boolean }
+export interface HeldEntry { repo: string, number: number, head: string | null, held: HeldInfo }
+interface PrCheck { status: PrStatus, held: HeldInfo, head: string | null }
+const greenCache = new Map<string, { check: PrCheck, expiry: number }>()
+const greenReads = new Map<string, Promise<PrCheck>>()
 
 // Subset of fields the datastore returns. Pr-only and issue-only fields
 // are optional; the user-footprint view adds `item_type` and `reasons`.
@@ -92,6 +100,9 @@ export interface DatastoreRecord {
   item_type?: 'pr' | 'issue'
   reasons?: string
   evidence_count?: number
+  // The pull request's current requested reviewers as of the last sync, a
+  // JSON array of logins: null for a row from before reviewers were read.
+  requested_reviewers?: string | string[] | null
 }
 
 // What Poise's views consume. Kept identical to the old /github shape so
@@ -119,6 +130,22 @@ interface GhRecord {
   labels: string[]
   owner_login: string | null
   owner_avatar: string | null
+  /** Whether your GitHub account is currently asked to review this pull
+   *  request: null when unknown, and for issues. */
+  reviewRequested: boolean | null
+}
+
+/** Parses the projection's reviewer list: null when the row predates it. */
+function parseRequestedReviewers(value: unknown): string[] | null {
+  if (value === null || value === undefined) return null
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string')
+  if (typeof value !== 'string') return null
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === 'string') : null
+  } catch {
+    return null
+  }
 }
 
 export async function runCli(org: Organization, args: string[]): Promise<DatastoreRecord[]> {
@@ -136,7 +163,8 @@ export async function runCli(org: Organization, args: string[]): Promise<Datasto
   return records
 }
 
-function toLegacy(r: DatastoreRecord, kind: 'pr' | 'issue'): GhRecord {
+function toLegacy(r: DatastoreRecord, kind: 'pr' | 'issue', me: string): GhRecord {
+  const reviewers = kind === 'pr' ? parseRequestedReviewers(r.requested_reviewers) : null
   return {
     kind,
     repo: r.repo,
@@ -156,6 +184,7 @@ function toLegacy(r: DatastoreRecord, kind: 'pr' | 'issue'): GhRecord {
     labels: [],
     owner_login: r.owner_login ?? null,
     owner_avatar: r.owner_avatar ?? null,
+    reviewRequested: reviewers === null || !me ? null : reviewers.some((login) => login.toLowerCase() === me.toLowerCase()),
   }
 }
 
@@ -197,7 +226,7 @@ const REPO_LIST_TTL_MS = 5 * 60 * 1000
 
 async function discoverOrgRepos(org: Organization): Promise<string[]> {
   const me = getMeta('me') || ''
-  if (!me) throw new Error('Set your GitHub account in Settings → GitHub to list repositories')
+  if (!me) throw new Error('Set your GitHub account in Settings → General to list repositories')
   const key = `${me.toLowerCase()}:${org.login.toLowerCase()}`
   const now = Date.now()
   const cached = repoListCache.get(key)
@@ -306,6 +335,83 @@ export async function getPrAuthor(repo: string, number: number, actor: string): 
   return data.author
 }
 
+// The --mergeable evidence the held reasons read. Absent fields predate the
+// evidence and stay benign: only explicit negative evidence claims a reason.
+interface MergeableEvidence {
+  state?: unknown
+  draft?: unknown
+  github_mergeable?: unknown
+  github_mergeable_state?: unknown
+  checks_state?: unknown
+  unresolved_conversations?: unknown
+  head_sha?: unknown
+  review_decision?: unknown
+  threads_checked?: unknown
+  queue_enabled?: unknown
+  has_rollup?: unknown
+  check_contexts?: unknown
+  contexts_partial?: unknown
+}
+
+const AGGREGATE_FAILING = new Set(['FAILURE', 'ERROR'])
+const AGGREGATE_RUNNING = new Set(['PENDING', 'EXPECTED'])
+const CHECK_FAILING = new Set(['FAILURE', 'ERROR', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'])
+const CHECK_RUNNING = new Set(['QUEUED', 'IN_PROGRESS', 'WAITING', 'REQUESTED', 'PENDING'])
+const LEGACY_RUNNING = new Set(['PENDING', 'EXPECTED'])
+const MAX_FAILING_NAMES = 5
+
+function summarizeCheckContexts(contexts: unknown, partial: unknown): HeldChecks {
+  if (!Array.isArray(contexts)) return { failing: [], failingCount: 0, runningCount: 0, partial: true }
+  const failing: string[] = []
+  let failingCount = 0
+  let runningCount = 0
+  for (const entry of contexts) {
+    const context = entry && typeof entry === 'object' ? entry as { name?: unknown, status?: unknown, conclusion?: unknown } : null
+    if (!context || typeof context.name !== 'string') continue
+    const status = typeof context.status === 'string' ? context.status : null
+    const conclusion = typeof context.conclusion === 'string' ? context.conclusion : null
+    if (conclusion && CHECK_FAILING.has(conclusion)) {
+      failingCount += 1
+      if (failing.length < MAX_FAILING_NAMES) failing.push(context.name)
+    } else if ((status && CHECK_RUNNING.has(status)) || (!status && !!conclusion && LEGACY_RUNNING.has(conclusion))) {
+      runningCount += 1
+    }
+  }
+  return { failing, failingCount, runningCount, partial: partial === true }
+}
+
+function heldFromEvidence(evidence: MergeableEvidence): { held: HeldInfo, head: string | null } {
+  const mergeState = typeof evidence.github_mergeable_state === 'string' ? evidence.github_mergeable_state : ''
+  const aggregate = typeof evidence.checks_state === 'string' ? evidence.checks_state : null
+  const decision = typeof evidence.review_decision === 'string' ? evidence.review_decision : null
+  const unresolved = typeof evidence.unresolved_conversations === 'number' ? evidence.unresolved_conversations : 0
+  const reasons: HeldReason[] = []
+  if (evidence.draft === true || mergeState === 'draft') reasons.push('draft')
+  if (evidence.github_mergeable === false || mergeState === 'dirty') reasons.push('conflict')
+  if (aggregate && AGGREGATE_FAILING.has(aggregate)) reasons.push('checks_failing')
+  if (decision === 'CHANGES_REQUESTED') reasons.push('changes_requested')
+  if (decision === 'REVIEW_REQUIRED' || (evidence.queue_enabled === true && decision !== 'APPROVED')) reasons.push('review_required')
+  if (unresolved > 0) reasons.push('conversation_open')
+  if (aggregate && AGGREGATE_RUNNING.has(aggregate)) reasons.push('checks_running')
+  if (mergeState === 'behind') reasons.push('behind')
+  if (mergeState === 'blocked' && reasons.length === 0) reasons.push('blocked')
+  const computing = evidence.state === 'open' && (evidence.github_mergeable === null || mergeState === 'unknown')
+  if (evidence.has_rollup === false || computing) reasons.push('unknown')
+  const head = typeof evidence.head_sha === 'string' && /^[0-9a-f]{40}$/i.test(evidence.head_sha) ? evidence.head_sha.toLowerCase() : null
+  return {
+    held: {
+      reasons,
+      checks: summarizeCheckContexts(evidence.check_contexts, evidence.contexts_partial),
+      threadsChecked: evidence.threads_checked !== false,
+    },
+    head,
+  }
+}
+
+function unknownHeld(): HeldInfo {
+  return { reasons: ['unknown'], checks: { failing: [], failingCount: 0, runningCount: 0, partial: false }, threadsChecked: false }
+}
+
 // Ask github-interface whether a single PR is "green" (mergeable, open,
 // not draft, mergeable_state == clean). Cached per PR for ~60s so the
 // once-a-minute frontend poll doesn't refire the whole fanout every tick.
@@ -313,21 +419,26 @@ export async function getPrAuthor(repo: string, number: number, actor: string): 
 // github-interface infers the repo from cwd when no `--repository` flag
 // or git remote is available. We just point cwd at a tmp directory whose
 // last two parts are `<owner>/<repo>` and the CLI picks it up.
-async function checkPrStatus(owner: string, repo: string, number: number, agent: string): Promise<PrStatus> {
+async function checkPrStatus(owner: string, repo: string, number: number, agent: string): Promise<PrCheck> {
   const key = `${agent.toLowerCase()}:${owner}/${repo}#${number}`
   const now = Date.now()
   const cached = greenCache.get(key)
-  if (cached && cached.expiry > now) return cached.status
+  if (cached && cached.expiry > now) return cached.check
   const pending = greenReads.get(key)
   if (pending) return pending
 
   // Current and ready-PR notifications can miss the cache together. Share
   // their read only when it uses the same authenticated account.
-  const read = (async (): Promise<PrStatus> => {
+  const read = (async (): Promise<PrCheck> => {
     const cwd = join(GH_INTERFACE_CWD_ROOT, owner, repo)
     try {
       await mkdir(cwd, { recursive: true })
-      const { stdout } = await runFile(GH_INTERFACE, ['--mergeable', `#${number}`, '--token-user', agent], {
+      // Under GraphQL pressure on the agent account the check names are left
+      // out; the rollup aggregate the same query returns still decides.
+      const slim = isRiskPressured(getMeta(quotaRiskKey(agent, 'graphql')))
+      const { stdout } = await runFile(GH_INTERFACE, slim
+        ? ['--mergeable', `#${number}`, '--token-user', agent, '--no-check-contexts']
+        : ['--mergeable', `#${number}`, '--token-user', agent], {
         cwd,
         timeoutMs: 30_000,
         maxOutputBytes: 1 * 1024 * 1024,
@@ -342,14 +453,17 @@ async function checkPrStatus(owner: string, repo: string, number: number, agent:
         : result.status === 'green' || result.status === 'yellow'
           ? result.status
           : result.status === undefined && result.mergeable ? 'green' : null
-      greenCache.set(key, { status, expiry: now + GREEN_TTL_MS })
-      return status
+      const { held, head } = heldFromEvidence(result && typeof result === 'object' ? result : {})
+      const check = { status, held, head }
+      greenCache.set(key, { check, expiry: now + GREEN_TTL_MS })
+      return check
     } catch {
       // Network blip / API error / parse failure — cache it so we don't hammer
       // on every retry. Current shows such a PR uncoloured: better to
       // under-show green than to over-show it.
-      greenCache.set(key, { status: undefined, expiry: now + GREEN_TTL_MS })
-      return undefined
+      const check: PrCheck = { status: undefined, held: unknownHeld(), head: null }
+      greenCache.set(key, { check, expiry: now + GREEN_TTL_MS })
+      return check
     }
   })().finally(() => { greenReads.delete(key) })
   greenReads.set(key, read)
@@ -364,6 +478,8 @@ export interface OwnPullRequest {
   title: string
   /** Current's colour; null when it has neither, undefined when GitHub could not say. */
   status: PrStatus
+  /** Why the pull request is held, from the same check that coloured it. */
+  held: HeldInfo
 }
 
 /** The person's own open pull requests with Current's colour for each. `read`
@@ -383,9 +499,37 @@ export async function readOwnPullRequests(): Promise<{ pullRequests: OwnPullRequ
     const chunk = own.slice(i, i + GREEN_CONCURRENCY)
     pullRequests.push(...await Promise.all(chunk.map(async (pr) => {
       const [owner, name] = pr.repo.split('/', 2)
-      return { repo: pr.repo, number: pr.number, title: pr.title, status: await checkPrStatus(owner, name, pr.number, agent) }
+      const check = await checkPrStatus(owner, name, pr.number, agent)
+      return { repo: pr.repo, number: pr.number, title: pr.title, status: check.status, held: check.held }
     })))
   }
+  const failed = new Set(read.errors.map((error) => error.org.toLowerCase()))
+  return { pullRequests, read: orgs.map((org) => org.login).filter((login) => !failed.has(login.toLowerCase())), tracked }
+}
+
+/** An involved open pull request: the person's footprint plus what the agent
+ *  account authored, whoever wrote each one. */
+export interface InvolvedPullRequest {
+  repo: string
+  number: number
+  title: string
+  /** Whether the person's GitHub account is currently asked to review it:
+   *  null when the last sync did not say. */
+  reviewRequested: boolean | null
+}
+
+/** Every involved open pull request with its review request state, from the
+ *  datastore sync alone: no GitHub reads. `read` and `tracked` carry the
+ *  same completeness contract as the own pull requests. */
+export async function readInvolvedPullRequests(): Promise<{ pullRequests: InvolvedPullRequest[], read: string[], tracked: string[] }> {
+  const me = getMeta('me') || ''
+  if (!me) return { pullRequests: [], read: [], tracked: [] }
+  const tracked = getOrganizations().map((org) => org.login)
+  const orgs = readyOrganizations()
+  const read = await fetchKind('pr', { record_state: 'open', count_only: true }, me, orgs)
+  const pullRequests = read.records
+    .filter((pr) => pr.state === 'open' && pr.repo.includes('/'))
+    .map((pr) => ({ repo: pr.repo, number: pr.number, title: pr.title, reviewRequested: pr.reviewRequested ?? null }))
   const failed = new Set(read.errors.map((error) => error.org.toLowerCase()))
   return { pullRequests, read: orgs.map((org) => org.login).filter((login) => !failed.has(login.toLowerCase())), tracked }
 }
@@ -393,7 +537,7 @@ export async function readOwnPullRequests(): Promise<{ pullRequests: OwnPullRequ
 // Resolve mergeable-true PRs across the user's open-PR set. Concurrency
 // capped to be polite to GitHub's REST endpoint — typical involvement
 // only has a handful of open PRs at once.
-async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promise<{ records: { repo: string, number: number, status: PrColour }[], errors: OrganizationReadError[] }> {
+async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promise<{ records: { repo: string, number: number, status: PrColour }[], held: HeldEntry[], errors: OrganizationReadError[] }> {
   // Checked up front: each check below fails quietly to "not green", which
   // would hide a missing agent account behind an empty result.
   const agent = requireAgentAccount()
@@ -401,19 +545,21 @@ async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promi
   const openPrs = read.records
 
   const results: { repo: string, number: number, status: PrColour }[] = []
+  const held: HeldEntry[] = []
   for (let i = 0; i < openPrs.length; i += GREEN_CONCURRENCY) {
     const chunk = openPrs.slice(i, i + GREEN_CONCURRENCY)
     const checks = await Promise.all(chunk.map(async (pr) => {
-      if (!pr.repo.includes('/')) return { pr, status: null }
+      if (!pr.repo.includes('/')) return null
       const [owner, repoName] = pr.repo.split('/', 2)
-      const status = await checkPrStatus(owner, repoName, pr.number, agent)
-      return { pr, status }
+      return { pr, check: await checkPrStatus(owner, repoName, pr.number, agent) }
     }))
-    for (const { pr, status } of checks) {
-      if (status) results.push({ repo: pr.repo, number: pr.number, status })
+    for (const entry of checks) {
+      if (!entry) continue
+      if (entry.check.status) results.push({ repo: entry.pr.repo, number: entry.pr.number, status: entry.check.status })
+      held.push({ repo: entry.pr.repo, number: entry.pr.number, head: entry.check.head, held: entry.check.held })
     }
   }
-  return { records: results, errors: read.errors }
+  return { records: results, held, errors: read.errors }
 }
 
 /** The datastore queries that select what Current shows: what `me` is
@@ -494,7 +640,7 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: 
       const key = `${r.repo}#${r.number}`
       if (seen.has(key)) continue
       seen.add(key)
-      out.push(toLegacy(r, itemType))
+      out.push(toLegacy(r, itemType, me))
     }
   }
   out.sort((a, b) => b.updated_at.localeCompare(a.updated_at))
@@ -582,7 +728,7 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
     }
     try { requireConfiguredRepository(repoFull) }
     catch (error) { return { status: 400, body: { error: (error as Error).message } } }
-    if (!me) return { status: 400, body: { error: 'Set your GitHub account in Settings → GitHub before creating issues' } }
+    if (!me) return { status: 400, body: { error: 'Set your GitHub account in Settings → General before creating issues' } }
     const [owner, repo] = repoFull.split('/', 2)
 
     // Resolve `me`'s gh credential.
@@ -655,6 +801,7 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
         labels: [],
         owner_login: null,
         owner_avatar: null,
+        reviewRequested: null,
       }
       return { status: 200, body: { record } }
     } catch (err: any) {

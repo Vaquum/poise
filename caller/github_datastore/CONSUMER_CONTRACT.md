@@ -72,11 +72,18 @@ review_comments_count
 commits_count
 additions
 deletions
+requested_reviewers
 ```
 
 `additions` and `deletions` are the pull request's line counts as GitHub
 reports them. They are `null` for a pull request not read since they were
 added; the next full reconcile reads every pull request again.
+
+`requested_reviewers` is the pull request's current requested reviewers as of
+the last sync, a JSON array of logins. It is `null` for a pull request not
+read since reviewers were added, and `[]` when none is requested. It never
+carries the timeline's historical request events: a removed request disappears
+from it on the next sync.
 
 ### `views.issue(...)`
 
@@ -127,7 +134,11 @@ url
 reasons
 evidence_count
 updated_minutes_ago
+requested_reviewers
 ```
+
+`requested_reviewers` is as in `views.pr`: the current requested reviewers,
+`null` for issues and for rows from before reviewers were read.
 
 ## Filters
 

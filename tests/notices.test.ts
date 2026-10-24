@@ -13,6 +13,7 @@ let database: typeof import('../server/db')
 let store: typeof import('../server/alerts/store')
 let notices: typeof import('../server/alerts/notices')
 let settings: typeof import('../server/settings')
+let handling: typeof import('../server/alerts/handling')
 
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-notices-'))
@@ -22,12 +23,14 @@ beforeAll(async () => {
   store = await import('../server/alerts/store')
   notices = await import('../server/alerts/notices')
   settings = await import('../server/settings')
+  handling = await import('../server/alerts/handling')
 })
 
 beforeEach(() => {
   database.db.prepare('DELETE FROM alerts').run()
   database.db.prepare('DELETE FROM alert_silences').run()
   database.db.prepare('DELETE FROM behavior_dead_letters').run()
+  database.db.prepare('DELETE FROM handling_log').run()
   database.db.prepare("DELETE FROM meta WHERE key = 'notification_settings'").run()
 })
 
@@ -103,6 +106,19 @@ describe('the notices', () => {
     })
   })
 
+  it('shows review requests and conflicts with what needs you, before ready pull requests', () => {
+    store.raiseAlert(ready(1), at(0))
+    store.raiseAlert({ kind: 'pr_conflict', dedupeKey: 'pr-conflict:acme/api#5', title: 'acme/api#5 has a merge conflict', body: 'Change 5', path: '/', target: { pullRequest: 'https://github.com/acme/api/pull/5' } }, at(1))
+    store.raiseAlert({ kind: 'review_requested', dedupeKey: 'review-requested:acme/api#4', title: 'acme/api#4 requests your review', body: 'Change 4', path: '/', target: { pullRequest: 'https://github.com/acme/api/pull/4' } }, at(2))
+    store.raiseAlert(held, at(3))
+    expect(titles(at(4))).toEqual([
+      'Review New Pull Requests failed on acme/api#9',
+      'acme/api#4 requests your review',
+      'acme/api#5 has a merge conflict',
+      'acme/api#1 is ready to merge',
+    ])
+  })
+
   it('reminds of a ready pull request every 15 minutes from when it became ready', () => {
     const alert = store.raiseAlert(ready(1), at(0))!
     expect(shown(at(14)).map((notice) => notice.due)).toEqual([new Date(at(0)).toISOString()])
@@ -116,6 +132,40 @@ describe('the notices', () => {
     expect(shown(at(29))).toEqual([])
     expect(shown(at(31)).map((notice) => [notice.since, notice.due])).toEqual([[new Date(at(0)).toISOString(), new Date(at(30)).toISOString()]])
     expect(shown(at(31))[0].silenceable).toBe(true)
+  })
+
+  it('logs each dismissal while reminders reuse the alert, and the clearing after', () => {
+    const alert = store.raiseAlert(ready(1), at(0))!
+    expect(handling.listHandling(200, at(14))).toEqual([])
+    notices.dismissNotice(alert.id, at(14))
+    notices.dismissNotice(alert.id, at(16))
+    // The same alert dismissed twice: one row per dismissal, newest first.
+    expect(handling.listHandling(200, at(17)).map((row) => [row.outcome, row.at])).toEqual([
+      ['dismissed', new Date(at(16)).toISOString()],
+      ['dismissed', new Date(at(14)).toISOString()],
+    ])
+    store.resolveAlert(`pr-ready:acme/api#1`, at(18))
+    expect(handling.listHandling(200, at(19)).map((row) => row.outcome)).toEqual(['resolved', 'dismissed', 'dismissed'])
+  })
+
+  it('lists backfilled completions by handling time, not insertion order', () => {
+    handling.recordHandling({ kind: 'notice', source: 'pr_ready', title: 'Recent dismissal',
+      startedAt: new Date(at(0)).toISOString(), finishedAt: new Date(at(10)).toISOString(),
+      outcome: 'dismissed', actor: 'person', ref: 'alert:9:dismissed' }, new Date(at(10)).toISOString())
+    // A Caller completion backfilled afterwards with its original time.
+    handling.recordHandling({ kind: 'caller-update', source: 'pr_review', title: 'Old run',
+      startedAt: new Date(at(0)).toISOString(), finishedAt: new Date(at(1)).toISOString(),
+      outcome: 'completed', actor: 'caller', ref: 'caller:abc123' }, new Date(at(1)).toISOString())
+    expect(handling.listHandling().map((row) => row.title)).toEqual(['Recent dismissal', 'Old run'])
+  })
+
+  it('compares since cutoffs carrying timezone offsets in UTC', () => {
+    handling.recordHandling({ kind: 'notice', source: 'pr_ready', title: 'Eleven oclock',
+      startedAt: '2026-10-09T11:00:00.000Z', finishedAt: '2026-10-09T11:00:00.000Z',
+      outcome: 'dismissed', actor: 'person', ref: 'alert:9:dismissed' }, '2026-10-09T11:00:00.000Z')
+    // Noon at +02:00 is 10:00Z: the 11:00Z handling is at and after it.
+    expect(handling.listHandling(200, Date.now(), '2026-10-09T12:00:00+02:00').map((row) => row.title))
+      .toEqual(['Eleven oclock'])
   })
 
   it('puts other notices away for good, until their condition clears and returns', () => {
@@ -173,7 +223,7 @@ describe('an alert target', () => {
     insert.run('first', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-1', 'Review failed', new Date(at(0)).toISOString())
     // Another behavior on the same PR must never become this notice's target.
     insert.run('unrelated', 'approve-prs', 'acme/api#9', 'acme/api', 9, 'approval-call', 'Approval failed', new Date(at(1)).toISOString())
-    expect(shown(at(2))[0]).toMatchObject({ target: { swarm: 'failed-call-1' }, body: 'Open Swarm in Poise to see what happened.' })
+    expect(shown(at(2))[0]).toMatchObject({ target: { swarm: 'failed-call-1' }, body: 'Open it in Poise to see what happened.' })
     insert.run('second', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-2', 'Review failed again', new Date(at(3)).toISOString())
     expect(shown(at(4))[0].target).toEqual({ swarm: 'failed-call-2' })
   })
@@ -237,8 +287,14 @@ describe('an alert target', () => {
 })
 
 describe('the check for pull requests ready to merge', () => {
+  // The checks raise only for accounts followed right now.
+  beforeEach(() => {
+    database.setMeta('org', 'acme')
+    database.db.prepare("INSERT OR IGNORE INTO organizations (login, managed, status, stage) VALUES ('other', 1, 'ready', 'ready')").run()
+  })
   type Read = Awaited<ReturnType<typeof import('../server/gh').readOwnPullRequests>>
-  const pr = (number: number, status: OwnPullRequest['status'], repo = 'acme/api'): OwnPullRequest => ({ repo, number, title: `Change ${number}`, status })
+  const noHeld = (): OwnPullRequest['held'] => ({ reasons: [], checks: { failing: [], failingCount: 0, runningCount: 0, partial: false }, threadsChecked: true })
+  const pr = (number: number, status: OwnPullRequest['status'], repo = 'acme/api', held = noHeld()): OwnPullRequest => ({ repo, number, title: `Change ${number}`, status, held })
   const reading = (value: Read) => async () => value
   const check = (value: Read, now: number) => notices.checkReadyPullRequests(reading(value), () => now)
   const all = (pullRequests: OwnPullRequest[]): Read => ({ pullRequests, read: ['acme'], tracked: ['acme'] })
@@ -255,6 +311,17 @@ describe('the check for pull requests ready to merge', () => {
       target: { pullRequest: 'https://github.com/acme/api/pull/1' },
     })])
     expect(database.db.prepare("SELECT url FROM alerts WHERE kind = 'pr_ready'").all()).toEqual([{ url: '/' }])
+  })
+
+  it('raises nothing for an account unfollowed after the pass read its lists', async () => {
+    await notices.checkReadyPullRequests(async () => {
+      const value = all([pr(1, 'green')])
+      // The unfollow lands mid-pass: the row goes and the removal resolves
+      // what stood, before this pass raises from its stale read.
+      database.db.prepare("DELETE FROM meta WHERE key = 'org'").run()
+      return value
+    }, () => at(0))
+    expect(open()).toEqual([])
   })
 
   it('resolves it when the pull request stops being ready, and notices it anew when it is ready again', async () => {
@@ -332,6 +399,135 @@ describe('the check for pull requests ready to merge', () => {
   })
 })
 
+describe('the check for requested reviews', () => {
+  // The checks raise only for accounts followed right now.
+  beforeEach(() => {
+    database.setMeta('org', 'acme')
+    database.db.prepare("INSERT OR IGNORE INTO organizations (login, managed, status, stage) VALUES ('other', 1, 'ready', 'ready')").run()
+  })
+  type Involved = import('../server/gh').InvolvedPullRequest
+  type Read = Awaited<ReturnType<typeof import('../server/gh').readInvolvedPullRequests>>
+  const pr = (number: number, reviewRequested: boolean | null, repo = 'acme/api'): Involved => ({ repo, number, title: `Change ${number}`, reviewRequested })
+  const reading = (value: Read) => async () => value
+  const check = (value: Read, now: number) => notices.checkReviewRequests(reading(value), () => now)
+  const all = (pullRequests: Involved[]): Read => ({ pullRequests, read: ['acme'], tracked: ['acme'] })
+  const open = () => store.openAlerts({ kind: 'review_requested' }).map((alert) => alert.dedupeKey).sort()
+
+  it('raises an alert once for a pull request that asks for your review, with its own words and link', async () => {
+    await check(all([pr(1, true), pr(2, false), pr(3, null)]), at(0))
+    await check(all([pr(1, true), pr(2, false), pr(3, null)]), at(2))
+    expect(shown(at(3))).toEqual([expect.objectContaining({
+      kind: 'review_requested',
+      title: 'acme/api#1 requests your review',
+      body: 'Change 1',
+      since: new Date(at(0)).toISOString(),
+      silenceable: true,
+      target: { pullRequest: 'https://github.com/acme/api/pull/1' },
+    })])
+  })
+
+  it('resolves it when the request is removed, and notices it anew when asked again', async () => {
+    await check(all([pr(1, true)]), at(0))
+    await check(all([pr(1, false)]), at(2))
+    expect(open()).toEqual([])
+    await check(all([pr(1, true)]), at(4))
+    expect(shown(at(5)).map((notice) => notice.since)).toEqual([new Date(at(4)).toISOString()])
+  })
+
+  it('keeps what it had when the last sync did not say', async () => {
+    await check(all([pr(1, true)]), at(0))
+    await check(all([pr(1, null)]), at(2))
+    expect(shown(at(3)).map((notice) => notice.since)).toEqual([new Date(at(0)).toISOString()])
+  })
+
+  it('resolves it once the pull request is no longer open', async () => {
+    await check(all([pr(1, true), pr(2, true)]), at(0))
+    await check(all([pr(2, true)]), at(2))
+    expect(open()).toEqual(['review-requested:acme/api#2'])
+  })
+
+  it('keeps it while the account it belongs to could not be read, and resolves it once Poise no longer follows that account', async () => {
+    await check({ pullRequests: [pr(1, true), pr(5, true, 'other/web')], read: ['acme', 'other'], tracked: ['acme', 'other'] }, at(0))
+    await check({ pullRequests: [], read: ['acme'], tracked: ['acme', 'other'] }, at(2))
+    expect(open()).toEqual(['review-requested:other/web#5'])
+    await check({ pullRequests: [], read: ['acme'], tracked: ['acme'] }, at(4))
+    expect(open()).toEqual([])
+  })
+
+  it('silence lasts until the request is removed, and a renewed request notices anew', async () => {
+    await check(all([pr(1, true)]), at(0))
+    notices.silenceNotice(shown(at(1))[0].id, at(1))
+    await check(all([pr(1, true)]), at(2))
+    expect(shown(at(3))).toEqual([])
+    expect(store.silenced('review-requested:acme/api#1')).toBe(true)
+    await check(all([pr(1, false)]), at(4))
+    expect(store.silenced('review-requested:acme/api#1')).toBe(false)
+    await check(all([pr(1, true)]), at(6))
+    expect(shown(at(7)).map((notice) => notice.since)).toEqual([new Date(at(6)).toISOString()])
+  })
+
+  it('notices nothing more once notifications are turned off while reading', async () => {
+    await notices.checkReviewRequests(async () => {
+      settings.setSettings({ notifications: { enabled: false } })
+      return all([pr(1, true)])
+    }, () => at(0))
+    expect(store.openAlerts()).toEqual([])
+  })
+})
+
+describe('the check for conflicting pull requests of yours', () => {
+  // The checks raise only for accounts followed right now.
+  beforeEach(() => {
+    database.setMeta('org', 'acme')
+    database.db.prepare("INSERT OR IGNORE INTO organizations (login, managed, status, stage) VALUES ('other', 1, 'ready', 'ready')").run()
+  })
+  type Read = Awaited<ReturnType<typeof import('../server/gh').readOwnPullRequests>>
+  const held = (reasons: OwnPullRequest['held']['reasons']): OwnPullRequest['held'] => ({ reasons, checks: { failing: [], failingCount: 0, runningCount: 0, partial: false }, threadsChecked: true })
+  const pr = (number: number, status: OwnPullRequest['status'], reasons: OwnPullRequest['held']['reasons'] = []): OwnPullRequest => ({ repo: 'acme/api', number, title: `Change ${number}`, status, held: held(reasons) })
+  const reading = (value: Read) => async () => value
+  const check = (value: Read, now: number) => notices.checkConflictPullRequests(reading(value), () => now)
+  const all = (pullRequests: OwnPullRequest[]): Read => ({ pullRequests, read: ['acme'], tracked: ['acme'] })
+  const open = () => store.openAlerts({ kind: 'pr_conflict' }).map((alert) => alert.dedupeKey).sort()
+
+  it('raises an alert once for your own pull request with a conflict, with its own words and link', async () => {
+    await check(all([pr(1, null, ['conflict']), pr(2, 'yellow', []), pr(3, 'green', [])]), at(0))
+    await check(all([pr(1, null, ['conflict']), pr(2, 'yellow', []), pr(3, 'green', [])]), at(2))
+    expect(shown(at(3))).toEqual([expect.objectContaining({
+      kind: 'pr_conflict',
+      title: 'acme/api#1 has a merge conflict',
+      body: 'Change 1',
+      since: new Date(at(0)).toISOString(),
+      silenceable: false,
+      target: { pullRequest: 'https://github.com/acme/api/pull/1' },
+    })])
+  })
+
+  it('resolves it when the conflict is gone, and notices it anew when it conflicts again', async () => {
+    await check(all([pr(1, null, ['conflict'])]), at(0))
+    await check(all([pr(1, 'yellow', [])]), at(2))
+    expect(open()).toEqual([])
+    await check(all([pr(1, null, ['conflict'])]), at(4))
+    expect(shown(at(5)).map((notice) => notice.since)).toEqual([new Date(at(4)).toISOString()])
+  })
+
+  it('keeps what it had for a pull request GitHub could not be asked about', async () => {
+    await check(all([pr(1, null, ['conflict'])]), at(0))
+    await check(all([pr(1, undefined, ['unknown'])]), at(2))
+    expect(shown(at(3)).map((notice) => notice.since)).toEqual([new Date(at(0)).toISOString()])
+  })
+
+  it('resolves it once the pull request is no longer open', async () => {
+    await check(all([pr(1, null, ['conflict']), pr(2, null, ['conflict'])]), at(0))
+    await check(all([pr(2, null, ['conflict'])]), at(2))
+    expect(open()).toEqual(['pr-conflict:acme/api#2'])
+  })
+
+  it('cannot be silenced', async () => {
+    await check(all([pr(1, null, ['conflict'])]), at(0))
+    expect(() => notices.silenceNotice(shown(at(1))[0].id, at(1))).toThrow(/asking for your review/)
+  })
+})
+
 describe('failed-behavior alerts', () => {
   function incident(behavior: string, repo: string, number: number): void {
     database.db.prepare(`
@@ -378,11 +574,11 @@ describe('the notifications setting', () => {
     expect(logged).toHaveBeenCalledWith('[notices] could not check what needs attention:', expect.any(Error))
     expect(read).not.toHaveBeenCalled()
     await notices.checkNotices(read)
-    expect(read).toHaveBeenCalledTimes(1)
+    expect(read).toHaveBeenCalledTimes(2)
   })
 
   it('stops the check of pull requests while off', async () => {
-    const read = vi.fn(async () => ({ pullRequests: [{ repo: 'acme/api', number: 1, title: 'Change 1', status: 'green' as const }], read: ['acme'], tracked: ['acme'] }))
+    const read = vi.fn(async () => ({ pullRequests: [{ repo: 'acme/api', number: 1, title: 'Change 1', status: 'green' as const, held: { reasons: [], checks: { failing: [], failingCount: 0, runningCount: 0, partial: false }, threadsChecked: true } }], read: ['acme'], tracked: ['acme'] }))
     settings.setSettings({ notifications: { enabled: false } })
     await notices.checkNotices(read)
     expect(read).not.toHaveBeenCalled()
@@ -390,7 +586,7 @@ describe('the notifications setting', () => {
 
     settings.setSettings({ notifications: { enabled: true } })
     await notices.checkNotices(read)
-    expect(read).toHaveBeenCalledTimes(1)
+    expect(read).toHaveBeenCalledTimes(2)
     expect(store.openAlerts().map((alert) => alert.title)).toEqual(['acme/api#1 is ready to merge'])
   })
 })

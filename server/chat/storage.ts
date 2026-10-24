@@ -51,6 +51,11 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_chat_pending_session ON chat_pending(session_id);
 
+  CREATE TABLE IF NOT EXISTS chat_request_revision (
+    instance TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL DEFAULT 0
+  );
+
   CREATE TABLE IF NOT EXISTS chat_attachments (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -226,13 +231,15 @@ export const moveSubject: (from: SessionRecord, to: SessionRecord) => void = db.
 
 export function deleteSession(id: string): void {
   db.transaction(() => {
+    const session = db.prepare('SELECT instance FROM chat_sessions WHERE id = ?').get(id) as { instance: string } | undefined
     deleteMessageQueue(id)
     db.prepare('DELETE FROM chat_events WHERE session_id = ?').run(id)
-    db.prepare('DELETE FROM chat_pending WHERE session_id = ?').run(id)
+    const pending = db.prepare('DELETE FROM chat_pending WHERE session_id = ?').run(id)
     db.prepare('DELETE FROM chat_workers WHERE session_id = ?').run(id)
     db.prepare('DELETE FROM chat_relays WHERE session_id = ?').run(id)
     db.prepare('DELETE FROM chat_attachments WHERE session_id = ?').run(id)
     db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(id)
+    if (session && pending.changes) bumpRequestRevision(session.instance)
   })()
 }
 
@@ -294,7 +301,7 @@ export const appendEvent = db.transaction((sessionId: string, event: ChatEvent, 
   if (Buffer.byteLength(encoded, 'utf8') > EVENT_MAX_BYTES) {
     throw new Error(`chat event exceeds ${EVENT_MAX_BYTES} bytes`)
   }
-  const row = db.prepare('SELECT last_seq FROM chat_sessions WHERE id = ?').get(sessionId) as { last_seq: number } | undefined
+  const row = db.prepare('SELECT last_seq, instance FROM chat_sessions WHERE id = ?').get(sessionId) as { last_seq: number, instance: string } | undefined
   if (!row) throw new Error(`unknown chat session ${sessionId}`)
   const seq = row.last_seq + 1
   db.prepare('INSERT INTO chat_events (session_id, seq, at, event) VALUES (?, ?, ?, ?)').run(sessionId, seq, at, encoded)
@@ -302,11 +309,14 @@ export const appendEvent = db.transaction((sessionId: string, event: ChatEvent, 
   if (event.type === 'permission.requested') {
     db.prepare('INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at) VALUES (?, ?, ?, ?, ?)')
       .run(event.id, sessionId, 'permission', seq, at)
+    bumpRequestRevision(row.instance)
   } else if (event.type === 'question.asked') {
     db.prepare('INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at) VALUES (?, ?, ?, ?, ?)')
       .run(event.id, sessionId, 'question', seq, at)
+    bumpRequestRevision(row.instance)
   } else if (event.type === 'permission.resolved' || event.type === 'question.answered') {
-    db.prepare('DELETE FROM chat_pending WHERE request_id = ? AND session_id = ?').run(event.id, sessionId)
+    const removed = db.prepare('DELETE FROM chat_pending WHERE request_id = ? AND session_id = ?').run(event.id, sessionId)
+    if (removed.changes) bumpRequestRevision(row.instance)
   }
   return { seq, sessionId, at, event }
 })
@@ -340,10 +350,98 @@ export function findEvent(sessionId: string, predicate: (event: ChatEvent) => bo
 
 export interface PendingRequest { requestId: string, sessionId: string, kind: 'permission' | 'question', seq: number }
 
+/** One open request with its stored title and ask time, for the handling
+ *  log. Read before the answering event deletes the pending row. */
+export function pendingRequestDetail(sessionId: string, requestId: string): { kind: 'permission' | 'question', title: string, createdAt: string } | null {
+  const row = db.prepare(`
+    SELECT p.kind AS kind, p.created_at AS createdAt, e.event AS event
+    FROM chat_pending p JOIN chat_events e ON e.session_id = p.session_id AND e.seq = p.seq
+    WHERE p.session_id = ? AND p.request_id = ?
+  `).get(sessionId, requestId) as { kind: 'permission' | 'question', createdAt: string, event: string } | undefined
+  if (!row) return null
+  try {
+    const event = JSON.parse(row.event) as ChatEvent
+    if (event.type === 'permission.requested' && row.kind === 'permission' && event.id === requestId) {
+      return { kind: row.kind, title: event.title, createdAt: row.createdAt }
+    }
+    if (event.type === 'question.asked' && row.kind === 'question' && event.id === requestId) {
+      return { kind: row.kind, title: event.questions[0]?.question ?? 'A question', createdAt: row.createdAt }
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
 export function listPendingRequests(sessionId: string): PendingRequest[] {
   return (db.prepare('SELECT request_id, session_id, kind, seq FROM chat_pending WHERE session_id = ? ORDER BY seq').all(sessionId) as Array<{ request_id: string, session_id: string, kind: 'permission' | 'question', seq: number }>)
     .map((row) => ({ requestId: row.request_id, sessionId: row.session_id, kind: row.kind, seq: row.seq }))
 }
+
+// The open-request revision: every change the Overview must see bumps it,
+// inside the same transaction as the pending rows, so the counter and the
+// rows never disagree. The row is never deleted, so the revision only ever
+// grows, across restarts. Callers outside a transaction bump through this;
+// appendEvent, resetConversation and deleteSession bump inside their own.
+export function requestRevision(instance: string): number {
+  db.prepare('INSERT OR IGNORE INTO chat_request_revision(instance) VALUES(?)').run(instance)
+  return (db.prepare('SELECT revision FROM chat_request_revision WHERE instance = ?').get(instance) as { revision: number }).revision
+}
+
+export function bumpRequestRevision(instance: string): number {
+  requestRevision(instance)
+  return (db.prepare('UPDATE chat_request_revision SET revision = revision + 1 WHERE instance = ? RETURNING revision').get(instance) as { revision: number }).revision
+}
+
+export const OPEN_CHAT_REQUEST_LIMIT = 200
+
+export interface OpenChatRequest {
+  id: string
+  kind: 'permission' | 'question'
+  sessionId: string
+  sessionTitle: string
+  createdAt: string
+  content: unknown
+  /** The escalation reason, once the Manager escalates requests. */
+  escalation: string | null
+}
+
+/** Every open request of this instance with its stored content: one
+ *  consistent snapshot carrying its revision, newest first. Each pending
+ *  row joins by seq to its exact stored request event, never a transcript
+ *  scan. Foreign instances' rows stay out. */
+export const listOpenChatRequests = db.transaction((instance: string): { revision: number, complete: boolean, requests: OpenChatRequest[] } => {
+  const revision = requestRevision(instance)
+  const rows = db.prepare(`
+    SELECT p.request_id AS requestId, p.session_id AS sessionId, p.kind AS kind, p.created_at AS createdAt,
+      e.event AS event, s.title AS sessionTitle
+    FROM chat_pending p
+    JOIN chat_events e ON e.session_id = p.session_id AND e.seq = p.seq
+    JOIN chat_sessions s ON s.id = p.session_id
+    WHERE s.instance = ?
+    ORDER BY p.created_at DESC, p.request_id DESC
+    LIMIT ?
+  `).all(instance, OPEN_CHAT_REQUEST_LIMIT + 1) as Array<{ requestId: string, sessionId: string, kind: 'permission' | 'question', createdAt: string, event: string, sessionTitle: string }>
+  const requests: OpenChatRequest[] = []
+  for (const row of rows.slice(0, OPEN_CHAT_REQUEST_LIMIT)) {
+    let content: unknown = null
+    try {
+      const event = JSON.parse(row.event) as ChatEvent
+      if (event.type === 'permission.requested' && row.kind === 'permission' && event.id === row.requestId) {
+        content = { title: event.title, description: event.description ?? null, input: event.input ?? null, options: event.options }
+      } else if (event.type === 'question.asked' && row.kind === 'question' && event.id === row.requestId) {
+        content = { questions: event.questions }
+      } else {
+        continue
+      }
+    } catch {
+      continue
+    }
+    requests.push({ id: row.requestId, kind: row.kind, sessionId: row.sessionId,
+      sessionTitle: row.sessionTitle, createdAt: row.createdAt, content, escalation: null })
+  }
+  return { revision, complete: rows.length <= OPEN_CHAT_REQUEST_LIMIT, requests }
+})
 
 export interface WorkerRow {
   sessionId: string
@@ -506,7 +604,8 @@ export const resetConversation = db.transaction((current: SessionRecord): { sess
     forkedFrom: undefined, staged: undefined, interruptedTurnId: undefined,
     orphanNotice: undefined, safeModePending: false, queuedBehind: undefined }
   db.prepare('DELETE FROM chat_events WHERE session_id = ?').run(session.id)
-  db.prepare('DELETE FROM chat_pending WHERE session_id = ?').run(session.id)
+  const pending = db.prepare('DELETE FROM chat_pending WHERE session_id = ?').run(session.id)
+  if (pending.changes) bumpRequestRevision(current.instance)
   const envelope = appendEvent(session.id, { type: 'session.reset', session })
   saveSession(session)
   return { session, envelope }

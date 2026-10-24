@@ -14,7 +14,7 @@ describe('the agent account the behaviors act as', () => {
     runtime.startBehaviorsRuntime()
     expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({
       status: 'degraded',
-      identity: { status: 'invalid', actor: null, error: expect.stringContaining('No agent account is set. Set it in Settings → GitHub') },
+      identity: { status: 'invalid', actor: null, error: expect.stringContaining('No agent account is set. Set it in Settings → General') },
     })
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).not.toHaveBeenCalled()

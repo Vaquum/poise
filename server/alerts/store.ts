@@ -10,8 +10,9 @@
 
 import { EventEmitter } from 'node:events'
 import { ALERT_ID_EPOCH_KEY, db, getMeta } from '../db'
+import { recordHandling, type HandlingActor } from './handling'
 
-export const ALERT_KINDS = ['sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'chat_waiting', 'chat_turn_finished', 'pr_ready', 'github_quota_warning', 'github_quota_exhausted', 'storage_low', 'ledger_queue_stalled', 'ledger_capture_loss'] as const
+export const ALERT_KINDS = ['sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'chat_waiting', 'chat_turn_finished', 'pr_ready', 'review_requested', 'pr_conflict', 'github_quota_warning', 'github_quota_exhausted', 'storage_low', 'ledger_queue_stalled', 'ledger_capture_loss'] as const
 export type AlertKind = typeof ALERT_KINDS[number]
 
 /** Where the alert's notice in the page takes the person: a view, a Settings
@@ -140,9 +141,17 @@ export function raiseAlert(input: AlertInput, now = Date.now()): Alert | null {
 }
 
 /** The condition behind `dedupeKey` has cleared: the next raise alerts again. */
-export function resolveAlert(dedupeKey: string, now = Date.now()): boolean {
-  return db.prepare('UPDATE alerts SET resolved_at = ? WHERE dedupe_key = ? AND resolved_at IS NULL')
-    .run(new Date(now).toISOString(), dedupeKey).changes === 1
+export function resolveAlert(dedupeKey: string, now = Date.now(), actor: HandlingActor = 'notices-service'): boolean {
+  const at = new Date(now).toISOString()
+  const resolved = db.prepare('UPDATE alerts SET resolved_at = ? WHERE dedupe_key = ? AND resolved_at IS NULL')
+    .run(at, dedupeKey).changes === 1
+  if (!resolved) return false
+  const row = db.prepare('SELECT id, kind, title, created_at, cause FROM alerts WHERE dedupe_key = ?').get(dedupeKey) as { id: number, kind: string, title: string, created_at: string, cause: string | null } | undefined
+  if (row) {
+    recordHandling({ kind: 'notice', source: row.kind, title: row.title, startedAt: row.created_at,
+      finishedAt: at, outcome: 'resolved', error: row.cause, actor, ref: `alert:${row.id}:resolved` }, at)
+  }
+  return true
 }
 
 /** Keep a continuing condition current without issuing another arrival or
@@ -276,4 +285,10 @@ export function forgetSilence(dedupeKey: string): void {
 export function alertKind(seq: number): AlertKind | null {
   const row = db.prepare('SELECT kind FROM alerts WHERE id = ?').get(seq) as { kind: AlertKind } | undefined
   return row?.kind ?? null
+}
+
+/** The alert behind a notice id, resolved or not, for the handling log. */
+export function alertRow(seq: number): { kind: string, title: string, createdAt: string } | null {
+  const row = db.prepare('SELECT kind, title, created_at FROM alerts WHERE id = ?').get(seq) as { kind: string, title: string, created_at: string } | undefined
+  return row ? { kind: row.kind, title: row.title, createdAt: row.created_at } : null
 }
