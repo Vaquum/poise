@@ -52,7 +52,7 @@ test('marks /worker as built in, edits it without a Delete, and refuses it in no
   await installRoutes(page, state)
   const sock = await installSocket(page, state)
   await page.goto('/')
-  await sock.subscribed('s1')
+  await sock.subscribed('m1')
 
   await expect(page.locator('.chat-session-item[data-id="w1"] .chat-pill-worker')).toHaveText('Worker')
 
