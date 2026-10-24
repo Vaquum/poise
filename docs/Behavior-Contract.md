@@ -138,6 +138,13 @@ Load timeouts — an expired sweep deadline, a slow CLI, lock contention — ret
 on a short clock of a few minutes, not the hour-long backoff of hard failures.
 A failure carrying an explicit quota reset retries at the reset instead of that
 backoff: no sooner than a minute out, never later than an hour.
+When the agent account cannot read a repository at all — GitHub 404 or
+NOT_FOUND for the repository — the first such failure records one held state
+for the repository instead of a per-target failure, and the pull-request
+behaviors skip the repository until access comes back. One recheck an hour
+later either clears the hold or renews it; a successful check against the
+repository clears it sooner. A batch failure shared by several repositories
+is unattributable and never holds any of them.
 A `review-new-prs` sweep cut short by its deadline still claims and launches
 the reviews it managed to prepare, and an `approve-prs` sweep still fires the
 approvals it managed to prepare; the next sweep prepares the rest. Git

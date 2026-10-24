@@ -74,7 +74,7 @@ import {
 import { HttpError } from './http'
 import { eventLoopDelayStats, type EventLoopDelayStats } from './event-loop-delay'
 import { behaviorErrorMessage, behaviorIncidentDiagnostics } from './behavior-diagnostics'
-import { classifyBehaviorDiagnostic, diagnosticClassification, isTimeoutCause, rateLimitRetryAtMs, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
+import { classifyBehaviorDiagnostic, diagnosticClassification, isRepoAccessDenied, isTimeoutCause, rateLimitRetryAtMs, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { resolveReviewCheckout } from './review-checkout'
 import { claudeSubscriptionEnvironment, runFile, runningCallerLaunches, spawnDetached } from './process'
@@ -90,7 +90,8 @@ const GH_INTERFACE = 'github-interface'
 const AGENT_INTERFACE = 'agent-interface'
 const LEGACY_REVIEW_SNAPSHOT_TARGET = '__snapshot_v2__'
 const REVIEW_SNAPSHOT_TARGET = '__snapshot_v3__'
-const DATASTORE_MAX_AGE_SECONDS = 120
+/** Sync age past this fails the datastore freshness gate. */
+export const DATASTORE_MAX_AGE_SECONDS = 120
 const SHA_PATTERN = /^[0-9a-f]{40}$/
 const GITHUB_USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
 
@@ -411,12 +412,26 @@ function readBehaviorFailure(key: BehaviorKey, target?: string): PersistedBehavi
 }
 
 function recordBehaviorFailure(key: BehaviorKey, kind: 'worker', cause: unknown, target: string, options?: DiagnosticOptions & { callId?: string }): void
-function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string }): void
-function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string } = {}): void {
+function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string, hold?: boolean }): void
+function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string, hold?: boolean } = {}): void {
   if (!isEnabled(key)) return
+  const error = cause === undefined ? undefined : behaviorErrorMessage(cause)
+  if (kind === 'operation' && target !== undefined && options.hold !== false && error !== undefined
+    && isSkippableBehavior(key)) {
+    const repo = repoOfFailureTarget(target)
+    if (repo && isRepoAccessDenied(error)) {
+      // The agent account cannot read this repository at all: one held state
+      // for the repository replaces this sweep's per-target failure, and the
+      // PR behaviors skip the repository until the hourly recheck succeeds.
+      // Callers that fan one error out to a whole batch pass hold: false:
+      // their error is unattributable to any one repository.
+      setMeta(failureKey(key, target), '')
+      recordRepoAccessHold(repo, error)
+      return
+    }
+  }
   const previous = readBehaviorFailure(key, target)
   const consecutiveFailures = Math.min((previous?.consecutiveFailures ?? 0) + 1, 31)
-  const error = cause === undefined ? undefined : behaviorErrorMessage(cause)
   const transient = kind === 'operation' && isTimeoutCause(error ?? '')
   const delayMs = Math.min(
     BEHAVIOR_RETRY_BASE_MS * (2 ** Math.min(consecutiveFailures - 1, 20)),
@@ -462,6 +477,101 @@ function refreshFailureDiagnostic(behavior: BehaviorKey, target: string, call: L
 
 function clearBehaviorFailure(key: BehaviorKey, target?: string): void {
   setMeta(failureKey(key, target), '')
+  // A cleared PR check proved the agent account can reach the repository, so
+  // an access hold for it is over. Only PR behaviors record holds.
+  if (target !== undefined && isSkippableBehavior(key)) {
+    const repo = repoOfFailureTarget(target)
+    if (repo) clearRepoAccessHold(repo)
+  }
+}
+
+// Clearing without proof — quarantine, retirement — retires only the
+// failure row. A repository hold is released solely by proven access.
+function clearBehaviorFailureKeepHold(key: BehaviorKey, target: string): void {
+  setMeta(failureKey(key, target), '')
+}
+
+// ── Repository access holds ──────────────────────────────────────────
+// When the agent account cannot read a repository at all (GitHub 404 or
+// NOT_FOUND for it), every PR behavior would fail on it every sweep,
+// spending calls and burying real failures. Instead the first such failure
+// records one held state per repository, the PR behaviors skip the
+// repository until access comes back, and one recheck an hour later either
+// clears the hold or renews it. A successful check against the repository
+// clears it sooner.
+const REPO_ACCESS_HOLD_PREFIX = `${META_PREFIX}repo_hold:`
+const REPO_ACCESS_HOLD_RECHECK_MS = 60 * 60_000
+
+interface RepoAccessHold {
+  repo: string
+  error: string
+  heldAtMs: number
+  nextRecheckAtMs: number
+}
+
+function repoHoldKey(repo: string): string {
+  return `${REPO_ACCESS_HOLD_PREFIX}${repo.toLowerCase()}`
+}
+
+// The repository a per-PR failure target names, or null for behavior-wide,
+// reviewer and scan targets. Requires a PR number so `reviewer:…` and
+// `:scan` targets never attribute their errors to a repository.
+function repoOfFailureTarget(target: string): string | null {
+  const match = /^([^/#\s]+\/[^/#\s]+)#\d+/.exec(target)
+  return match ? match[1]! : null
+}
+
+function readRepoAccessHold(repo: string): RepoAccessHold | null {
+  const raw = getMeta(repoHoldKey(repo))
+  if (!raw) return null
+  try {
+    const value = JSON.parse(raw) as Partial<RepoAccessHold>
+    if (typeof value.repo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(value.repo)
+      || typeof value.error !== 'string' || !value.error
+      || !Number.isFinite(value.heldAtMs) || Number(value.heldAtMs) < 0
+      || Number(value.heldAtMs) > 8.64e15
+      || !Number.isFinite(value.nextRecheckAtMs) || Number(value.nextRecheckAtMs) < 0
+      || Number(value.nextRecheckAtMs) > 8.64e15) return null
+    const hold = { repo: value.repo, error: value.error.slice(0, 300),
+      heldAtMs: Number(value.heldAtMs), nextRecheckAtMs: Number(value.nextRecheckAtMs) }
+    // An expired hold is no hold: the next sweep rechecks, and the recheck
+    // renews or clears. Purge the row so stale holds never display.
+    if (Date.now() >= hold.nextRecheckAtMs) {
+      setMeta(repoHoldKey(repo), '')
+      return null
+    }
+    return hold
+  } catch {
+    return null
+  }
+}
+
+// Records the hold unless one is already active. A failure observed while
+// the hold stands (a race in the recording sweep, a path that ran anyway)
+// must not extend it, or the hourly recheck would never come due.
+function recordRepoAccessHold(repo: string, error: string): void {
+  if (readRepoAccessHold(repo)) return
+  const now = Date.now()
+  setMeta(repoHoldKey(repo), JSON.stringify({
+    repo, error: error.slice(0, 300), heldAtMs: now, nextRecheckAtMs: now + REPO_ACCESS_HOLD_RECHECK_MS,
+  } satisfies RepoAccessHold))
+}
+
+function clearRepoAccessHold(repo: string): void {
+  setMeta(repoHoldKey(repo), '')
+}
+
+function listRepoAccessHolds(): RepoAccessHold[] {
+  const prefix = scopedMetaKey(REPO_ACCESS_HOLD_PREFIX)
+  const rows = db.prepare(
+    "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
+  ).all(prefix.length, prefix) as Array<{ key: string }>
+  const holds: RepoAccessHold[] = []
+  for (const row of rows) {
+    const hold = readRepoAccessHold(row.key.slice(prefix.length))
+    if (hold) holds.push(hold)
+  }
+  return holds.sort((a, b) => a.repo.localeCompare(b.repo))
 }
 
 // A lost lock race is not a failure: another process owns this behavior's
@@ -534,7 +644,8 @@ function retireClosedTargetFailures(open: ReadonlySet<string>, behaviors: readon
     for (const target of behaviorFailureTargets(behavior)) {
       const ref = target.match(/^[^#]+#\d+/)?.[0]
       if (ref && !unreadRepositories?.has(ref.split('#')[0]) && !open.has(ref)) {
-        clearBehaviorFailure(behavior, target)
+        // A closed PR proves nothing about repository access.
+        clearBehaviorFailureKeepHold(behavior, target)
       }
     }
   }
@@ -872,6 +983,14 @@ function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | n
 export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, number: number, pr: PullRequestFacts | null): string | null {
   return ownPullRequestRefusal(policy.me, `${repo}#${number}`, pr)
     ?? (policy.skipped.has(repo.toLowerCase()) ? `${repo} is in the Skip repositories list of ${SKIPPABLE_LABELS[policy.behavior]}` : null)
+    ?? repoHoldRefusal(repo)
+}
+
+// A repository the agent account cannot read holds every PR behavior until
+// access comes back, rechecked hourly. An expired hold reads as no hold.
+function repoHoldRefusal(repo: string): string | null {
+  const hold = readRepoAccessHold(repo)
+  return hold ? `agent account has no access to ${hold.repo}; PR behaviors are held for this repository` : null
 }
 
 // Last-fired info is intentionally NOT persisted here — agent-interface
@@ -1106,7 +1225,8 @@ function quarantineClaim(
       linkBehaviorLaunchCallOwned(claim.key, claim.target, claim.claimId, callId)
     }
     recordQuarantineIncident(claim, error, callId)
-    clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
+    // Uncertainty, not success: a quarantine must not release a hold.
+    clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
     return true
   })()
   if (changed) captureBehaviorOutcome({ nativeId: claim.launchCorrelationId,
@@ -1124,15 +1244,19 @@ function quarantineBlocksLogCorrection(behavior: string, target: string): boolea
 
 // Approval keys change with commits and author responses. A durable hold
 // belongs to the PR, even if an earlier runtime closed its owned claim.
-function invalidPrResultHeld(repo: string, pr: number): boolean {
-  return !!db.prepare(`
-    SELECT 1 FROM behavior_seen
+function invalidPrResultHoldDetail(repo: string, pr: number): {
+  callId: string | null, head: string, error: string | null,
+} | null {
+  const row = db.prepare(`
+    SELECT launch_call_id AS callId, launch_expected_head AS head, launch_error AS error
+    FROM behavior_seen
     WHERE key IN ('review-new-prs', 'approve-prs') AND (
       (launch_repo = ? AND launch_pr = ? AND launch_quarantine = 'invalid_result')
       OR (target = ? AND launch_requested_at IS NULL AND launch_quarantine IS NOT NULL)
     )
     LIMIT 1
-  `).get(repo, pr, `${repo}#${pr}`)
+  `).get(repo, pr, `${repo}#${pr}`) as { callId: string | null, head: string, error: string | null } | undefined
+  return row ?? null
 }
 
 // Invalid terminal results keep ownership and coverage without using a
@@ -1215,7 +1339,8 @@ function quarantineFailedClaim(
     `).run(Number(mayRun), Number(mayRun), kind, error, claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
     if (changed.changes) {
       recordQuarantineIncident(claim, error, claim.launchCallId)
-      clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
+      // Uncertainty, not success: a quarantine must not release a hold.
+      clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
     }
     return changed.changes !== 0
   })()
@@ -1749,6 +1874,49 @@ const datastoreFreshnessByOrganization = new Map<string, DatastoreFreshness>()
 
 function datastoreFreshness(): DatastoreFreshness {
   return datastoreFreshnessByOrganization.get(operationKey('review-new-prs')) ?? initialDatastoreFreshness
+}
+
+/** A freshness observation older than this no longer describes the
+ *  datastore: the sampler refreshes at most every behavior tick, so five
+ *  missed samples mean it has stopped (behavior off or tick stuck). */
+export const DATASTORE_OBSERVATION_STALE_MS = 5 * 60_000
+
+export interface DatastoreFreshnessEntry {
+  /** The organization's login, or null before any organization exists. */
+  org: string | null
+  status: 'unchecked' | 'healthy' | 'unavailable'
+  checkedAt: string
+  /** How old the observation itself is. */
+  observationAgeMs: number
+  /** Last successful sync the observation reported, when it named one. */
+  lastSuccessAt: string | null
+  /** Sync age recomputed at read time; null when never successfully observed. */
+  ageSeconds: number | null
+  error: string | null
+}
+
+/** One freshness observation per configured organization, with the sync age
+ *  recomputed at read time instead of frozen at the check. An organization
+ *  that never sampled reads unknown; none is hidden. Read-only: sampling
+ *  stays with the behaviors that gate on it. */
+export function datastoreFreshnessEntries(now = Date.now()): DatastoreFreshnessEntry[] {
+  const organizations = getOrganizations()
+  const entries = (organizations.length ? organizations.map((org) => org.login) : [null]).map((org) => {
+    const key = `${org?.toLowerCase() ?? 'legacy'}:review-new-prs`
+    const observed = datastoreFreshnessByOrganization.get(key) ?? initialDatastoreFreshness
+    const checkedAtMs = Date.parse(observed.checkedAt)
+    const lastSuccessMs = observed.lastSuccessAt === null ? NaN : Date.parse(observed.lastSuccessAt)
+    return {
+      org,
+      status: observed.status,
+      checkedAt: observed.checkedAt,
+      observationAgeMs: Number.isFinite(checkedAtMs) ? Math.max(0, now - checkedAtMs) : Number.MAX_SAFE_INTEGER,
+      lastSuccessAt: observed.lastSuccessAt,
+      ageSeconds: Number.isFinite(lastSuccessMs) ? Math.max(0, Math.round((now - lastSuccessMs) / 1000)) : null,
+      error: observed.error,
+    }
+  })
+  return entries
 }
 
 function configuredReviewer(): string {
@@ -3359,6 +3527,24 @@ function recordApproveCheck(pr: DatastorePr, snapshot: ApproveCheckSnapshot): vo
   setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() }))
 }
 
+// A dismissed approval that never gets re-selected is invisible without a
+// skip reason (#559). Log once per reason so a permanently parked PR does
+// not emit a line every minute.
+function approveSkipKey(pr: DatastorePr): string {
+  return `${META_PREFIX}approve_prs_skip:${pr.repo}#${pr.number}`
+}
+
+function logApproveSkip(pr: DatastorePr, reason: string): void {
+  const key = approveSkipKey(pr)
+  if (getMeta(key) === reason) return
+  setMeta(key, reason)
+  console.log(`[behaviors] approve-prs skipped ${pr.repo}#${pr.number}: ${reason}`)
+}
+
+function clearApproveSkip(pr: DatastorePr): void {
+  setMeta(approveSkipKey(pr), '')
+}
+
 async function tickApprovePrs(): Promise<void> {
   if (!isEnabled('approve-prs')) return
   const author = getMeta('me') || ''
@@ -3370,10 +3556,25 @@ async function tickApprovePrs(): Promise<void> {
     const prs = await listEligiblePrs('approve-prs', author)
     // Backed-off PRs don't spend batch capacity, and the cursor rotates
     // coverage so a sweep cut short by its deadline resumes beyond the
-    // blocked batch.
-    const candidates = orderByCursor(prs, 'behavior_approve_prs_cursor').filter((pr) =>
-      !invalidPrResultHeld(pr.repo, pr.number)
-      && behaviorRetryDue('approve-prs', `${pr.repo}#${pr.number}:check`))
+    // blocked batch. Every filter logs its reason once (#559), so a
+    // dismissed approval that never gets re-selected is visible.
+    const candidates: DatastorePr[] = []
+    for (const pr of orderByCursor(prs, 'behavior_approve_prs_cursor')) {
+      const hold = invalidPrResultHoldDetail(pr.repo, pr.number)
+      if (hold) {
+        const call = hold.callId ? ` launch ${hold.callId.slice(0, 8)}` : ''
+        const head = hold.head ? ` (head ${String(hold.head).slice(0, 8)})` : ''
+        logApproveSkip(pr, `held by invalid_result${call}${head}`)
+        continue
+      }
+      const checkTarget = `${pr.repo}#${pr.number}:check`
+      const failure = readBehaviorFailure('approve-prs', checkTarget)
+      if (failure && Date.now() < failure.nextRetryAtMs) {
+        logApproveSkip(pr, `check backoff until ${new Date(failure.nextRetryAtMs).toISOString()}: ${failure.error ?? 'check failed'}`)
+        continue
+      }
+      candidates.push(pr)
+    }
     // The change gate parks terminal no-ops while the datastore row and
     // the local inputs are unchanged. Snapshots are taken up front so a
     // review completing mid-sweep invalidates the watermark instead of
@@ -3387,12 +3588,18 @@ async function tickApprovePrs(): Promise<void> {
     // only skip once nothing for the PR is still in flight, so a
     // completing review can never be gated out by a snapshot taken a
     // moment early.
-    const stage1 = candidates.filter((pr) => {
+    const stage1: DatastorePr[] = []
+    for (const pr of candidates) {
       const key: `${string}#${number}` = `${pr.repo}#${pr.number}`
-      return readBehaviorFailure('approve-prs', `${key}:check`) !== null
+      if (readBehaviorFailure('approve-prs', `${key}:check`) !== null
         || hasActiveAgentLaunchForPr(pr.repo, pr.number)
-        || !approveCheckFresh(pr, snapshots.get(key)!)
-    })
+        || !approveCheckFresh(pr, snapshots.get(key)!)) {
+        clearApproveSkip(pr)
+        stage1.push(pr)
+      } else {
+        logApproveSkip(pr, `no change since last check (datastore updated_at ${pr.updated_at})`)
+      }
+    }
     let failure: unknown
     const clearCheck = (checkTarget: string) => {
       if (!behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget)
@@ -3400,10 +3607,11 @@ async function tickApprovePrs(): Promise<void> {
     // A terminal no-op parks the PR: a launch, a deferral (busy PR,
     // active launch, held claim) or an error never does, so the next
     // tick checks it again.
-    const parkCheck = (pr: DatastorePr) => {
+    const parkCheck = (pr: DatastorePr, reason: string) => {
       if (behaviorAborted()) return
       clearBehaviorFailure('approve-prs', `${pr.repo}#${pr.number}:check`)
       recordApproveCheck(pr, snapshots.get(`${pr.repo}#${pr.number}`)!)
+      logApproveSkip(pr, `parked: ${reason}`)
     }
     for (let offset = 0; offset < stage1.length; offset += PR_READ_BATCH_SIZE) {
       if (!isEnabled('approve-prs') || behaviorAborted()) return
@@ -3417,7 +3625,8 @@ async function tickApprovePrs(): Promise<void> {
         if (behaviorAborted()) return
         console.error('[behaviors] approve-prs batch check failed:', err)
         for (const pr of batch) {
-          recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+          // One error for the whole batch: unattributable to any repository.
+          recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
         }
         continue
       }
@@ -3433,7 +3642,7 @@ async function tickApprovePrs(): Promise<void> {
         try {
           const check = result!
           if (await packetBlocked('approve-prs', pr.repo, pr.number, check.headSha)) {
-            parkCheck(pr)
+            parkCheck(pr, `review packet too large for head ${check.headSha.slice(0, 8)}`)
             continue
           }
           const cleanReview = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number)
@@ -3442,7 +3651,7 @@ async function tickApprovePrs(): Promise<void> {
             dismissedReview = check.reviewerLatestState === 'DISMISSED'
               ? latestCompletedChangeRequestLaunch(pr.repo, pr.number, reviewer) : null
             if (!dismissedReview) {
-              parkCheck(pr)
+              parkCheck(pr, 'dismissed approval without a recorded approval or change-request basis')
               continue
             }
           }
@@ -3462,14 +3671,14 @@ async function tickApprovePrs(): Promise<void> {
           // evidence to that request's findings, including reaffirmations.
           if (check.hasChangeRequest) {
             if (check.responseCount < 1 || check.latestRequestAt === null) {
-              parkCheck(pr)
+              parkCheck(pr, 'waiting for author response to change request')
               continue
             }
             checks.push({ pr, check, since: check.latestRequestAt, clean: false, review: null, admittedReviewer: undefined })
           } else {
             const review = cleanReview ?? dismissedReview
             if (!review) {
-              parkCheck(pr)
+              parkCheck(pr, 'no review basis')
               continue
             }
             checks.push({ pr, check, since: review.completedAt, clean: cleanReview !== null, review,
@@ -3495,7 +3704,8 @@ async function tickApprovePrs(): Promise<void> {
           if (behaviorAborted()) return
           console.error('[behaviors] approve-prs batch activity check failed:', err)
           for (const { pr } of activityBatch) {
-            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+            // One error for the whole batch: unattributable to any repository.
+            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
           }
           continue
         }
@@ -3520,7 +3730,12 @@ async function tickApprovePrs(): Promise<void> {
                 || activity.unresolvedLiveConversationAuthors.some(
                   (author) => author.toLowerCase() !== reviewer.toLowerCase(),
                 )) {
-                parkCheck(pr)
+                const reason = activity.state !== 'OPEN' ? `PR is ${activity.state.toLowerCase()}`
+                  : activity.draft ? 'PR is draft'
+                    : activity.headSha !== check.headSha
+                      ? `head race (activity ${activity.headSha.slice(0, 8)} vs check ${check.headSha.slice(0, 8)})`
+                      : 'live conversations owned by another author'
+                parkCheck(pr, reason)
                 continue
               }
               launches.push({ pr, expectedHead: check.headSha,
@@ -3531,7 +3746,7 @@ async function tickApprovePrs(): Promise<void> {
               const review = request.review!
               if (!request.clean && (activity.reviewerLatestState !== 'DISMISSED'
                 || activity.headSha !== check.headSha || activity.headSha === review.headSha)) {
-                parkCheck(pr)
+                parkCheck(pr, `dismissal race (reviewer ${activity.reviewerLatestState ?? 'none'}, activity ${activity.headSha.slice(0, 8)} vs check ${check.headSha.slice(0, 8)})`)
                 continue
               }
               const reapprovalOwnsEveryUnresolvedConversation =
@@ -3550,7 +3765,14 @@ async function tickApprovePrs(): Promise<void> {
                   && !reapprovalOwnsEveryUnresolvedConversation)
                 || (activity.reviewerLatestState === 'APPROVED'
                   && activity.reviewerLatestCommit === activity.headSha)) {
-                parkCheck(pr)
+                const reason = activity.state !== 'OPEN' ? `PR is ${activity.state.toLowerCase()}`
+                  : activity.draft ? 'PR is draft'
+                    : activity.activeChangeRequestAuthors.length > 0
+                      ? `active change requests by ${activity.activeChangeRequestAuthors.join(', ')}`
+                      : activity.unresolvedLiveConversationCount > 0
+                        ? 'live conversations owned by another author'
+                        : `already approved on head ${activity.headSha.slice(0, 8)}`
+                parkCheck(pr, reason)
                 continue
               }
               if (activity.headSha !== review.headSha && activity.latestActivityAt === null) {
@@ -3624,6 +3846,7 @@ async function tickApprovePrs(): Promise<void> {
             throw err
           }
           console.log(`[behaviors] approve-prs fired for ${pr.repo}#${pr.number} (${firedReason})`)
+          clearApproveSkip(pr)
         } catch (err) {
           checked = false
           if (behaviorAborted()) return
@@ -3824,7 +4047,8 @@ async function tickResolveUnblocking(): Promise<void> {
         if (behaviorAborted()) return
         console.error('[behaviors] resolve-unblocking batch check failed:', err)
         for (const pr of batch) {
-          recordBehaviorFailure('resolve-unblocking', 'operation', err, `${pr.repo}#${pr.number}:check`)
+          // One error for the whole batch: unattributable to any repository.
+          recordBehaviorFailure('resolve-unblocking', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
         }
         continue
       }
@@ -4195,7 +4419,8 @@ async function tickRerunGreyCi(): Promise<void> {
       // keeps a visible failure and the scan continues. An aborted tick ends.
       if (behaviorAborted()) throw error
       if (!isEnabled(behavior)) return
-      for (const pr of batch) recordBehaviorFailure(behavior, 'operation', error, `${pr.repo}#${pr.number}`)
+      // One error for the whole batch: unattributable to any repository.
+      for (const pr of batch) recordBehaviorFailure(behavior, 'operation', error, `${pr.repo}#${pr.number}`, { hold: false })
       continue
     }
     for (let index = 0; index < batch.length; index++) {
@@ -4302,7 +4527,10 @@ async function tickRerunGreyCi(): Promise<void> {
               url: `https://github.com/${pr.repo}/actions/runs/${runId}` }))
           } else if (!releaseSeenOwned(claimKey, claimTarget, claimId)) throw new Error('grey CI intent ownership changed before no-write receipt')
           if (result.outcome === 'read_failed') {
-            recordBehaviorFailure(behavior, 'operation', result.error, failureTarget)
+            // The rerun preflight reads the pull request before its workflow
+            // runs and jobs: a 404 here can name a deleted run on a readable
+            // repository, so it never holds the repository.
+            recordBehaviorFailure(behavior, 'operation', result.error, failureTarget, { hold: false })
           } else clearBehaviorFailure(behavior, failureTarget)
         } catch (error) {
           // A missing receipt may follow an accepted write. Retain the durable
@@ -5611,6 +5839,13 @@ export interface BehaviorsRuntimeHealth {
     correlationId?: string
     recovered?: boolean
   }>
+  holds: Array<{
+    org?: string
+    repo: string
+    error: string
+    heldAt: string
+    nextRecheckAt: string
+  }>
   datastore: DatastoreFreshness
   identity: {
     status: 'valid' | 'invalid'
@@ -5733,6 +5968,12 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
       : new Date(lastTickCompletedAtMs).toISOString(),
     busy,
     failures,
+    holds: listRepoAccessHolds().map((hold) => ({
+      repo: hold.repo,
+      error: hold.error,
+      heldAt: new Date(hold.heldAtMs).toISOString(),
+      nextRecheckAt: new Date(hold.nextRecheckAtMs).toISOString(),
+    })),
     datastore: { ...datastoreFreshness() },
     identity,
     deadLetters: listBehaviorIncidents(),
@@ -5764,6 +6005,7 @@ export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     status: health.some((entry) => entry.health.status === 'degraded') ? 'degraded' : 'ok',
     busy: health.flatMap((entry) => entry.health.busy.map((item) => ({ ...item, org: entry.org }))),
     failures: health.flatMap((entry) => entry.health.failures.map((item) => ({ ...item, org: entry.org }))),
+    holds: health.flatMap((entry) => entry.health.holds.map((item) => ({ ...item, org: entry.org }))),
     deadLetters: health.flatMap((entry) => entry.health.deadLetters),
     datastore: health.find((entry) => entry.health.datastore.status === 'unavailable')?.health.datastore ?? first.datastore,
     identity: health.find((entry) => entry.health.identity.status === 'invalid')?.health.identity ?? first.identity,

@@ -554,8 +554,15 @@ assertion may only resume, and anything else is refused with 403):
 - `POST /api/service/drain` stops admitting new Chat turns and behavior
   launches, then returns the same fields. A drain lapses unless it is renewed:
   while the gateway polls health it re-POSTs `/api/service/drain` at least
-  every 5 minutes. It recreates the container once `idle` is true or
-  `POISE_DRAIN_TIMEOUT` seconds (default 5400, 90 minutes) have passed.
+  every 5 minutes. One `POISE_DRAIN_TIMEOUT` budget (default 5400, 90 minutes)
+  covers the whole workspace operation: every drain, recheck and re-drain.
+  Once `idle` is true the gateway recreates the container; past the budget it
+  recreates a workspace that confirmed busy work or refused answers, and aborts
+  a workspace whose answers only timed out, releasing its drain for the next
+  pass. While it waits it logs `workspace.drain.waiting` at each renew with
+  the counters and the time left, and `workspace.drain.lifted` when a drain it
+  saw on is gone while the workspace still isn't idle. A pass skipped behind a
+  running one names its handle and phase.
   - New Chat turns include queued messages, and launches include the
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
     `/api/debate`, `/api/models/refresh`). Refused work answers
@@ -564,14 +571,18 @@ assertion may only resume, and anything else is refused with 403):
     drain stops it through the person's Stop path, with a transcript notice
     naming the update, and the agent keeps its context for the next prompt.
     `idle` still means nothing a restart would cut; it follows once the
-    stopped turn settles. Past the gateway's own timeout the container is
-    recreated anyway, cutting whatever would not settle — bounded Caller
-    work finishes inside it, so that lands only on hung work.
+    stopped turn settles. Past the gateway's own timeout a confirmed busy
+    container is recreated anyway, cutting whatever would not settle —
+    bounded Caller work finishes inside it, so that lands only on hung work.
   - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
     5400) plus five minutes after the last drain call, so a gateway that
     stopped renewing it cannot leave the workspace refusing work.
-- `POST /api/service/resume` lifts a drain. The owner's browser may call it
-  too, to lift a drain a gateway left behind.
+  - One service call waits 5 seconds for an answer and retries a timeout twice
+    with backoff; a refused connection is not retried.
+- `POST /api/service/resume` lifts a drain. The gateway calls it whenever it
+  abandons an upgrade after attempting a drain without recreating the
+  workspace; the owner's browser may call it too, to lift a drain a gateway
+  left behind.
 
 ## Accounts, identities and the terminal
 

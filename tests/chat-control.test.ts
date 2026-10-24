@@ -5,7 +5,7 @@ import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
@@ -62,8 +62,14 @@ function adapterWith(capabilities: Capabilities) {
 const adapter = adapterWith(caps)
 // Fork-capable scripted adapter for the fork case; muse sessions run it.
 const forkAdapter = adapterWith({ ...caps, fork: true })
+// Every case drives the real Chat runtime through real git and SQLite
+// lifecycles, and under suite load one of their steps can stall past eight
+// seconds: each readiness wait gets 20 s, and each case and hook at least
+// 25 s, instead of vitest's global 10 s. Cases with several independently
+// bounded readiness phases keep their larger ceilings.
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
 async function until(check: () => boolean) {
-  const deadline = Date.now() + 8000
+  const deadline = Date.now() + 20_000
   while (Date.now() < deadline) { if (check()) return; await new Promise(done => setTimeout(done, 15)) }
   throw new Error('control fixture readiness deadline')
 }
@@ -814,6 +820,34 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     }
   })
 
+  it('wakes for behind when a managed account holds the repository', async () => {
+    const { mergePrsOwnsBehind } = await import('../server/chat/control')
+    const target = store.workTarget('https://github.com/beta/app/pull/64')
+    const ciState = { head: 'a'.repeat(40), failing: [], mergeable: true as const, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' }
+    database.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES ('beta', ?, 1, 'ready', 'ready', ?)`).run(join(root, 'beta.sqlite'), 'fixture-agent')
+    // An unmanaged default account alongside: unscoped metadata reads fall
+    // back to it and miss the managed account's hold.
+    database.setMeta('org', 'acme')
+    database.setMeta('behavior_merge_prs_enabled', '1')
+    database.setMeta('me', 'fixture-agent')
+    try {
+      expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(true)
+      database.setMeta('org:beta:behavior_repo_hold:beta/app', JSON.stringify({ repo: 'beta/app',
+        error: 'GitHub 404: Not Found', heldAtMs: Date.now(), nextRecheckAtMs: Date.now() + 3_600_000 }))
+      try {
+        expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(false)
+      } finally {
+        database.setMeta('org:beta:behavior_repo_hold:beta/app', '')
+      }
+    } finally {
+      database.db.prepare('DELETE FROM organizations WHERE login = ?').run('beta')
+      database.setMeta('org', '')
+      database.setMeta('behavior_merge_prs_enabled', '0')
+      database.setMeta('me', '')
+    }
+  })
+
   it('queues one degraded notice per CI outage and keeps the settled baseline', async () => {
     const parent = await manager()
     const target = 'https://github.com/acme/app/pull/65'
@@ -1477,4 +1511,9 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       stderr.mockRestore()
     }
   }, 60_000)
+})
+
+it('gives every case at least 25 s instead of the global 10 s', ({ task }) => {
+  const cases = (tasks: RunnerTask[]): RunnerTestCase[] => tasks.flatMap(t => t.type === 'test' ? [t] : cases(t.tasks))
+  expect(cases(task.file.tasks).filter(t => t.timeout < 25_000).map(t => t.fullTestName)).toEqual([])
 })

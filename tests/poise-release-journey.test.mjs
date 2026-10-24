@@ -664,9 +664,11 @@ async function reconcileSource(j, { daemon, client }, shipped) {
 
 describe('Poise release journey on real artifacts', () => {
   const journeys = []
+  // Teardown stops real daemons and waits out in-flight git/npm workers (up
+  // to 30 s by itself), so it cannot run under the 10 s hook default.
   afterEach(async () => {
     while (journeys.length) await journeys.pop().teardown()
-  })
+  }, 60_000)
 
   it('ships a change through checks, CI, a verified merge and a health-checked switch, then rolls it back from the card with GitHub offline', async () => {
     const j = await createJourney()

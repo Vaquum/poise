@@ -365,7 +365,7 @@ test('reports failures across accounts in global behavior diagnostics', async ({
     failures: [
       { org: 'acme', behavior: 'review-new-prs', target: 'acme/same-repo#7', kind: 'review', consecutiveFailures: 1, lastFailureAt: '', nextRetryAt: '', error: 'First account error' },
       { org: 'mikkokotila', behavior: 'review-new-issues', kind: 'review', consecutiveFailures: 2, lastFailureAt: '', nextRetryAt: '', error: 'Personal account error' },
-    ], deadLetters: [],
+    ], deadLetters: [], holds: [],
   }
   await page.goto('/')
   await page.locator('#main-filters').getByLabel('Organization filter').selectOption('mikkokotila')
@@ -380,7 +380,7 @@ test('groups conditions needing attention and folds automatic recovery in the no
   const state = await setup(page)
   state.diagnostics = { status: 'ok', agentLogsError: null,
     datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
-    identity: { status: 'valid', actor: 'bit-mis', error: null }, deadLetters: [],
+    identity: { status: 'valid', actor: 'bit-mis', error: null }, deadLetters: [], holds: [],
     failures: [
       ...['', ':secondary', ':tertiary'].map((slot) => ({ behavior: 'review-new-prs' as const,
         target: `acme/private#21${slot}:check`, kind: 'operation', consecutiveFailures: 19,
@@ -442,7 +442,7 @@ test('keeps the last-known runtime error visible alongside a later API outage', 
   const state = await setup(page)
   state.diagnostics = { status: 'degraded', runtimeError: 'Behavior runtime is degraded.', agentLogsError: null,
     datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
-    identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [] }
+    identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [], holds: [] }
   let unavailable = false
   await page.route(/\/api\/behaviors(?:\?.*)?$/, async (route) => unavailable
     ? route.fulfill({ status: 502, body: 'Bad Gateway' }) : route.fallback())
@@ -477,6 +477,7 @@ for (const theme of ['light', 'dark']) {
       deadLetters: [{ id: 'audit', behavior: 'review-new-prs', target: 'velocinbio/portal-velocin-fi#18',
         error: `pull-request head changed: expected ${'a'.repeat(40)}, got ${'b'.repeat(40)}`, createdAt: '', attemptCount: 3,
         diagnostic: { severity: 'info', code: 'head_changed' } }],
+      holds: [],
     }
     await page.addInitScript((value) => localStorage.setItem('poise-theme', value), theme)
     await page.goto('/')

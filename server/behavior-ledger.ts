@@ -36,6 +36,22 @@ const emptyHealth = (): LedgerHealth => ({
   changeLowerBound: null, lastSequence: null, instances: null, changes: null,
 })
 const CAPTURE_RETRY_MS = 250
+/** A capture queued past this long means the worker is no longer draining. */
+export const LEDGER_STALL_TIMEOUT_MS = 10_000
+
+/** What health and its alerts read: memory only, never the worker queue. */
+export interface BehaviorLedgerSnapshot {
+  /** The worker answered readiness; before that, `health` is still the initial placeholder. */
+  ready: boolean
+  failed: boolean
+  stopping: boolean
+  /** Age of the oldest queued or in-flight capture; null when none. */
+  queueAgeMs: number | null
+  pending: number
+  unreportedLoss: number
+  stallBudgetMs: number
+  health: LedgerHealth
+}
 
 /** Capture never awaits or performs filesystem/SQLite work on the behavior thread. */
 export class BehaviorLedgerObserver {
@@ -171,7 +187,23 @@ export class BehaviorLedgerObserver {
     // Idle is not stalled: a fresh burst is always accepted, and sustained
     // overload or a wedged worker spills once the oldest capture outwaits the budget.
     return this.captures > 0
-      && Date.now() - this.oldestCaptureAt() > (this.options.stallTimeoutMs ?? 10_000)
+      && Date.now() - this.oldestCaptureAt() > (this.options.stallTimeoutMs ?? LEDGER_STALL_TIMEOUT_MS)
+  }
+
+  /** Synchronous observer state for health: no worker round trip, so a
+   *  wedged worker cannot slow the reader down. */
+  snapshot(): BehaviorLedgerSnapshot {
+    const oldest = this.oldestCaptureAt()
+    return {
+      ready: this.ready,
+      failed: this.failed,
+      stopping: this.stopping || this.closed,
+      queueAgeMs: oldest === Infinity ? null : Math.max(0, Date.now() - oldest),
+      pending: this.captures,
+      unreportedLoss: this.unreportedLoss,
+      stallBudgetMs: this.options.stallTimeoutMs ?? LEDGER_STALL_TIMEOUT_MS,
+      health: this.projectedHealth(),
+    }
   }
 
   private lose(count: number): void { this.unreportedLoss += count }
@@ -482,4 +514,9 @@ export function behaviorLedgerHeartbeat(): void { observer?.capture({ type: 'hea
 export function readBehaviorLedger(request: LedgerRead): Promise<LedgerReadReply> {
   return observer ? observer.read(request) : Promise.resolve({ status: request.operation === 'health' ? 200 : 503,
     body: { version: 1, health: emptyHealth(), ...(request.operation === 'health' ? {} : { error: 'ledger_unavailable' }) } })
+}
+
+/** Synchronous observer state, or null before the ledger has started. */
+export function behaviorLedgerSnapshot(): BehaviorLedgerSnapshot | null {
+  return observer?.snapshot() ?? null
 }

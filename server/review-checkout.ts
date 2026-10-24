@@ -117,8 +117,13 @@ export async function resolveReviewCheckout(
     || !/^[A-Za-z0-9-]+$/.test(actor) || !Number.isSafeInteger(number) || number < 1
     || !/^[0-9a-f]{40}$/.test(head)) throw new Error('Invalid review repository, actor or head')
   try {
+    // A missing managed checkout is the expected miss this probe falls back
+    // from; anything else with the same code still reports. Mirrors the guard
+    // below, which keeps failing closed on it.
+    const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const { stdout } = await runFile('github-interface', ['--local-checkout-path', owner, repo], {
       signal, timeoutMs: 30_000, maxOutputBytes: 1024 * 1024,
+      expected: { codes: [1], stderr: new RegExp(`^error: checkout not found under .*: ${escaped(owner)}/${escaped(repo)}\\s*$`) },
     })
     const result = JSON.parse(stdout) as { action?: unknown, repository?: unknown, path?: unknown }
     if (result?.action !== 'local_checkout_path' || result.repository !== `${owner}/${repo}`

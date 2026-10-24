@@ -5,7 +5,7 @@ import type { BehaviorDiagnostics, BehaviorKey } from '../src/behaviors'
 function snapshot(): BehaviorDiagnostics {
   return { status: 'ok', agentLogsError: null,
     datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
-    identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [] }
+    identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [], holds: [] }
 }
 
 describe('behavior diagnostic groups', () => {
@@ -143,6 +143,21 @@ describe('behavior diagnostic groups', () => {
     expect(behaviorDiagnosticGroups(diagnostics)).toEqual([expect.objectContaining({ severity: 'warning', code: 'held_result' })])
   })
 
+  it('shows one held diagnostic for a repository the agent account cannot read', () => {
+    const diagnostics = snapshot()
+    diagnostics.holds.push({ repo: 'Vaquum/field-data-api', error: 'GitHub 404: Not Found',
+      heldAt: '2026-10-23T09:17:00.000Z', nextRecheckAt: '2026-10-23T10:17:00.000Z' })
+    const groups = behaviorDiagnosticGroups(diagnostics)
+    expect(groups).toEqual([{
+      severity: 'warning', code: 'github_access', scope: 'Vaquum/field-data-api',
+      message: 'agent account has no access to Vaquum/field-data-api',
+      details: ['PR behaviors held for Vaquum/field-data-api — GitHub 404: Not Found'],
+      entries: ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'rerun-grey-ci', 'merge-prs'].map((behavior) => ({
+        behavior, target: null, at: '2026-10-23T09:17:00.000Z', next: '2026-10-23T10:17:00.000Z',
+        detail: 'PR behaviors held for Vaquum/field-data-api — GitHub 404: Not Found',
+      })),
+    }])
+  })
   it('records what each detail is about, so the notification rail can join and count it', () => {
     const diagnostics = snapshot()
     diagnostics.agentLogsError = 'agent-interface --logs exited with status 1'

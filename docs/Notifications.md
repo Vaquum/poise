@@ -112,6 +112,20 @@ those resets. There is no fixed per-minute command ceiling.
 An exhaustion error clears as soon as GitHub confirms positive remaining
 capacity, even while a new consumption rate is being collected.
 
+## Behavior ledger
+
+A background check reads the ledger's drain state every minute. A queue whose
+oldest capture outwaits the ten-second stall budget on two checks in a row
+raises a red `ledger_queue_stalled` error, as does a dead worker at once; both
+clear once the queue drains or the worker runs again. Any increase in lost
+captures raises a red `ledger_capture_loss` error. Loss is baselined per store
+generation, so history alone never re-alerts on a poll or a restart, and a new
+store resolves the previous store's loss alert. A standing loss alert refreshes
+its totals without issuing another arrival. Like quota alerts, these raise only
+while notifications are enabled. Resolution continues while off, and unraised
+loss accumulates instead of being consumed, so re-enabling surfaces what was
+lost. They open the Behaviors view.
+
 ## Pull requests ready to merge
 
 Every two minutes Poise checks your own open pull requests, the ones your

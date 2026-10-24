@@ -51,7 +51,7 @@ function diagnostics(overrides: Partial<BehaviorDiagnostics> = {}): BehaviorDiag
   return {
     status: 'ok', agentLogsError: null,
     datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
-    identity: { status: 'valid', actor: 'octo-agent', error: null }, failures: [], deadLetters: [], ...overrides,
+    identity: { status: 'valid', actor: 'octo-agent', error: null }, failures: [], deadLetters: [], holds: [], ...overrides,
   }
 }
 

@@ -11,7 +11,7 @@
 import { EventEmitter } from 'node:events'
 import { ALERT_ID_EPOCH_KEY, db, getMeta } from '../db'
 
-export const ALERT_KINDS = ['sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'chat_waiting', 'chat_turn_finished', 'pr_ready', 'github_quota_warning', 'github_quota_exhausted', 'storage_low'] as const
+export const ALERT_KINDS = ['sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'chat_waiting', 'chat_turn_finished', 'pr_ready', 'github_quota_warning', 'github_quota_exhausted', 'storage_low', 'ledger_queue_stalled', 'ledger_capture_loss'] as const
 export type AlertKind = typeof ALERT_KINDS[number]
 
 /** Where the alert's notice in the page takes the person: a view, a Settings

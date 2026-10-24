@@ -11,7 +11,7 @@ import { MODEL_PLACES, canaryClaudeModel, loadCatalog, placeProviders, readCatal
 import { refreshModelCatalog } from './models-refresh'
 import { deleteModelPreset, listModelPresets, saveModelPreset } from './model-presets'
 import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
-import { accountsChecked, claudeAuthStatusChanged } from './alerts/producers'
+import { accountsChecked, claudeAuthStatusChanged, startLedgerHealthRuntime, stopLedgerHealthRuntime } from './alerts/producers'
 import { pruneAlerts } from './alerts/store'
 import { checkNotices, dismissNotice, noticesState, silenceNotice, startNoticesRuntime, stopNoticesRuntime } from './alerts/notices'
 import { startTemporaryStorageRuntime, stopTemporaryStorageRuntime } from './temporary-storage'
@@ -22,6 +22,7 @@ import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
 import { parseBounds, parseWindow, readAnalytics, readAnalyticsHistory } from './analytics'
 import { checkGithubQuota, readGithubQuota, startGithubQuotaRuntime, stopGithubQuotaRuntime } from './github-quota'
+import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
@@ -194,6 +195,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   startBehaviorsRuntime()
   startNoticesRuntime()
   startGithubQuotaRuntime()
+  startLedgerHealthRuntime()
   if (service) startTemporaryStorageRuntime()
   startReviewCheckoutPruning()
   startStorageMaintenanceRuntime()
@@ -285,7 +287,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
   await stopBehaviorLedger()
   await stopLoggingApi()
   await stopLogging()
@@ -345,6 +347,11 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
         if (req.method === 'OPTIONS') {
           return json(res, 405, { error: 'cross-origin preflight is not supported' })
+        }
+        // Liveness answers 200 whenever the process does, in both modes and
+        // while draining: it performs no I/O, so no dependency can slow it.
+        if (url === '/api/health/live' && req.method === 'GET') {
+          return json(res, 200, livenessSnapshot())
         }
         if (path === CHAT_CONTROL_PATH) {
           if (!chatControl) return json(res, 503, { error: 'native chat control is not started' })
@@ -408,6 +415,11 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           // `build` is what the release controller verifies after a switch
           // and what the browser compares its own bundle against; both come
           // from the compiled bundle, never from a checkout on disk.
+          // `liveness`, `readiness`, `dependencies` and `history` are
+          // additive: nothing in them changes this response's status code,
+          // `status`, or `scheduler.status`, which the release judge, the
+          // browser watcher and the health monitor read as before.
+          const split = dependencySnapshot()
           return json(res, healthy ? 200 : 503, {
             status: healthy ? 'ok' : 'degraded',
             scheduler,
@@ -417,6 +429,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             production,
             build: buildIdentity(),
             selfUpdate: selfUpdate?.summary() ?? { configured: false, draining: false },
+            liveness: { status: 'ok' },
+            readiness: split.readiness,
+            dependencies: split.dependencies,
+            history: split.history,
           })
         }
 
@@ -832,6 +848,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               identity: runtime.identity,
               failures: evidence.failures,
               deadLetters: evidence.deadLetters,
+              holds: runtime.holds,
             },
           })
         }

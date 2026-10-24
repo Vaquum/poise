@@ -23,7 +23,7 @@ function caller(id: string, error = cause, owner = 'alice') {
     correlation_id: correlationId, completed_at: new Date().toISOString(), error }, owner)!)!
 }
 const diagnostics = (): BehaviorDiagnostics => ({ status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: '', ageSeconds: 0, lastSuccessAt: null, error: null },
-  identity: { status: 'valid', actor: 'review-bot', error: null }, failures: [], deadLetters: [] })
+  identity: { status: 'valid', actor: 'review-bot', error: null }, failures: [], deadLetters: [], holds: [] })
 let directory = ''
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); if (directory) rmSync(directory, { recursive: true, force: true }) })
 

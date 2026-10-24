@@ -885,7 +885,7 @@ export class ChatRuntime extends EventEmitter {
     let stopReason: StopReason = turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
     let error = result.error
     if (turn.failure && stopReason !== 'cancelled') { stopReason = 'error'; error = turn.failure }
-    if (result.terminate === true || (session.adapter && !session.adapter.alive) || (session.relay && !session.relay.healthy)) {
+    if (turn.stopping || result.terminate === true || (session.adapter && !session.adapter.alive) || (session.relay && !session.relay.healthy)) {
       try { await this.stopProcess(session) } catch { freed = false }
     }
     session.draining = true
@@ -1017,7 +1017,7 @@ export class ChatRuntime extends EventEmitter {
       turn.stopping = true
       const relay = session.relay
       relay.detach()
-      if (await this.waitForTurnEnd(session, STOP_SETTLE_MS)) return
+      if (await this.waitForTurnEnd(session, turn, STOP_SETTLE_MS)) return
       this.emit('log', `[chat ${session.record.id.slice(0, 8)}] turn did not settle after detach; leaving it for adoption`)
       return
     }
@@ -1026,11 +1026,11 @@ export class ChatRuntime extends EventEmitter {
     this.settlePending(session, 'cancelled')
     turn.abort.abort()
     try { await session.adapter?.cancel() } catch { /* terminating below */ }
-    if (await this.waitForTurnEnd(session, STOP_SETTLE_MS)) return
+    if (await this.waitForTurnEnd(session, turn, STOP_SETTLE_MS)) return
     // The agent did not acknowledge: the process goes, verifiably, and the
     // turn's finally block then runs with the adapter's rejection.
     await this.stopProcess(session).catch(() => undefined)
-    await this.waitForTurnEnd(session, CLOSE_GRACE_MS * 2)
+    await this.waitForTurnEnd(session, turn, CLOSE_GRACE_MS * 2)
   }
 
   private async shutdownSession(session: LiveSession): Promise<void> {
@@ -3337,8 +3337,11 @@ export class ChatRuntime extends EventEmitter {
       // the checkout; a failure before it was asked leaves it alone.
       // An agent that ended its own process (Claude does after a stop) has
       // its worker group verified gone, or is terminated when it asked for
-      // that, before the lease can go.
-      if (terminate || (agentInvoked && session.adapter && (!agentSettled || !session.adapter.alive)) || (session.relay && !session.relay.healthy)) {
+      // that, before the lease can go. A stopped turn always terminates its
+      // worker group: the agent's acknowledgement ends the turn, but only a
+      // verified-dead group proves its shells, test runners and sleeps went
+      // with it. The next prompt resumes the native session in a fresh group.
+      if (turn.stopping || terminate || (agentInvoked && session.adapter && (!agentSettled || !session.adapter.alive)) || (session.relay && !session.relay.healthy)) {
         try { await this.stopProcess(session) } catch { freed = false }
       }
       session.draining = true
@@ -3608,10 +3611,12 @@ export class ChatRuntime extends EventEmitter {
     })
   }
 
-  /** Cancel the running turn. Resolves when the agent acknowledged or after
-   *  the stop target elapsed with the session in `stopping` — never by
-   *  pretending the turn ended. The person's Stop holds the chat, but only
-   *  when it actually stopped a running turn or startup. */
+  /** Cancel the running turn. Stop ends the native turn and its whole
+   *  process tree: when the agent does not settle within the stop target,
+   *  its worker group is terminated (SIGTERM, then SIGKILL) and the turn's
+   *  own cleanup runs with the adapter's rejection. Resolves with whether
+   *  the turn ended — never by pretending it did. The person's Stop holds
+   *  the chat, but only when it actually stopped a running turn or startup. */
   cancel(id: string, actor?: ChatActor | PersonActor): Promise<{ settled: boolean }> {
     return this.track(async () => {
       const session = this.requireLive(id)
@@ -3636,17 +3641,24 @@ export class ChatRuntime extends EventEmitter {
       this.settlePending(session, 'cancelled')
       turn.abort.abort()
       try { await session.adapter?.cancel() } catch { /* the abort signal also reaches prompt() */ }
-      const settled = await this.waitForTurnEnd(session, STOP_SETTLE_MS)
+      if (await this.waitForTurnEnd(session, turn, STOP_SETTLE_MS)) return { settled: true }
+      // The agent did not acknowledge: the process tree goes, verifiably,
+      // and the turn's finally block then runs with the adapter's rejection.
+      await this.stopProcess(session).catch(() => undefined)
+      const settled = await this.waitForTurnEnd(session, turn, CLOSE_GRACE_MS * 2)
       if (!settled) this.setStatus(session, 'stopping', 'the agent has not acknowledged the stop yet')
       return { settled }
     })
   }
 
-  private waitForTurnEnd(session: LiveSession, ms: number): Promise<boolean> {
+  /** Resolve once `turn` itself is gone from the session — finished, or
+   *  replaced by a newer turn. Never follows the replacement: killing the
+   *  worker of a turn that was never stopped would end innocent work. */
+  private waitForTurnEnd(session: LiveSession, turn: RunningTurn, ms: number): Promise<boolean> {
     const deadline = Date.now() + ms
     return new Promise((resolve) => {
       const check = () => {
-        if (!session.turn) resolve(true)
+        if (session.turn !== turn) resolve(true)
         else if (Date.now() >= deadline) resolve(false)
         else setTimeout(check, 25)
       }
@@ -3878,7 +3890,7 @@ export class ChatRuntime extends EventEmitter {
       const metadata = await lstat(join(record.checkout, '.git'))
       if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
         // A failed bootstrap may have written HEAD without its first commit.
-        recreated = !(await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: record.checkout }).then(() => true, () => false))
+        recreated = !(await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: record.checkout, expected: { codes: [128], stderr: /Needed a single revision/ } }).then(() => true, () => false))
       }
     }
     catch (error) {
@@ -4025,7 +4037,7 @@ export class ChatRuntime extends EventEmitter {
     // Admission, including its branch check, is part of the service lifetime.
     session.services += 1
     try {
-      const head = await runFile('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: session.record.checkout, timeoutMs: 10_000 }).then((r) => r.stdout.trim()).catch(() => '')
+      const head = await runFile('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: session.record.checkout, timeoutMs: 10_000, expected: { codes: [1] } }).then((r) => r.stdout.trim()).catch(() => '')
       if (head !== session.record.branch.name) throw new Error(`the checkout is on ${head || 'a detached HEAD'}, not ${session.record.branch.name}; file services are closed`)
       if (session.turn !== turn || turn.stopping || turn.abort.signal.aborted || session.draining || !session.lease?.held) throw new Error('the turn is settling; file services are closed')
       return await operation()

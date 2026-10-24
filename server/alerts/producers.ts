@@ -11,11 +11,14 @@
 import { createHash } from 'node:crypto'
 import { materialFailureCause } from '../../gateway/src/diagnostics/material-cause'
 import { CONNECTED_ACCOUNTS_PATH, GITHUB_AUTOMATION_SIGN_IN_TITLE, type AccountId, type ConnectedAccount } from '../accounts/types'
+import { behaviorLedgerSnapshot, type BehaviorLedgerSnapshot } from '../behavior-ledger'
 import type { ClaudeAuthStatus } from '../claude-auth'
 import type { StopReason } from '../chat/protocol'
 import { isSwitchboardSession } from '../chat/switchboard-store'
+import { getMeta, setMeta } from '../db'
 import { isServiceMode } from '../service/config'
-import { openAlerts, raiseAlert, resolveAlert, type AlertTarget } from './store'
+import { getNotificationSettings } from '../settings'
+import { openAlerts, raiseAlert, resolveAlert, updateAlertDetails, type AlertTarget } from './store'
 
 const FRONT_PAGE = '/'
 /** Datastore sync alerts once it has been failing this long. */
@@ -30,11 +33,12 @@ const BEHAVIOR_LABELS: Record<string, string> = {
   'review-new-issues': 'Review New Issues',
 }
 
-function record(what: string, action: () => void): void {
+function record<T>(what: string, action: () => T): T | undefined {
   try {
-    action()
+    return action()
   } catch (error) {
     console.error(`[alerts] could not record ${what}:`, error)
+    return undefined
   }
 }
 
@@ -220,6 +224,142 @@ export function chatWaiting(session: ChatSessionAlertContext, request: ChatReque
 
 export function chatWaitingEnded(sessionId: string): void {
   record(`the end of the waiting alert for Chat session ${sessionId}`, () => resolveAlert(chatWaitingKey(sessionId)))
+}
+
+/** How often the ledger's drain state is checked: the behavior tick's own
+ *  cadence, as a local constant — this module cannot import the behaviors
+ *  runtime that imports it. */
+export const LEDGER_HEALTH_CHECK_MS = 60_000
+/** Queue age past the stall budget alerts only after this many checks in a
+ *  row, so one slow store write does not page the owner. */
+export const LEDGER_STALL_ALERT_CHECKS = 2
+
+const LEDGER_QUEUE_KEY = 'ledger:queue'
+const LEDGER_WORKER_KEY = 'ledger:queue:worker'
+const BEHAVIORS_VIEW: AlertTarget = { view: 'behaviors' }
+const lossKey = (generation: string) => `ledger:loss:${generation}`
+const baselineKey = (generation: string) => `ledger-loss-baseline:${generation}`
+
+let stalledChecks = 0
+let ledgerTimer: ReturnType<typeof setInterval> | undefined
+
+/** Raises (or refreshes) a standing ledger alert. True once the condition
+ *  is surfaced: a failed raise must not consume what it was meant to report. */
+function ledgerStanding(what: string, input: Parameters<typeof raiseAlert>[0]): boolean {
+  try {
+    raiseAlert(input)
+  } catch (error) {
+    console.error(`[alerts] could not record ${what}:`, error)
+    return false
+  }
+  record(`${what} details`, () => updateAlertDetails(input.dedupeKey, input.title, input.body))
+  return true
+}
+
+function ledgerCleared(what: string, dedupeKey: string, nowMs?: number): void {
+  record(`the end of ${what}`, () => resolveAlert(dedupeKey, nowMs))
+}
+
+/** The ledger's drain state as this check saw it: a stalled queue, a dead
+ *  worker, and lost-capture deltas alert through the durable alert path
+ *  (Poise Link, and the page's notices while it is open). Raising honors
+ *  the Notifications setting; resolution does not, so a condition that
+ *  cleared while notifications were off cannot alert stale.
+ *
+ *  Loss is baselined per store generation in meta: an unchanged historical
+ *  `dropped` never re-alerts on a poll or a restart, a later increase
+ *  alerts (and refreshes the standing alert's details) even while the
+ *  ledger is already degraded, and counters are never subtracted across
+ *  different stores. The baseline advances only once a delta is surfaced,
+ *  so neither a failed alert write nor notifications being off can consume
+ *  an increase unreported. */
+export function ledgerHealthObserved(snapshot: BehaviorLedgerSnapshot | null, nowMs = Date.now()): void {
+  const enabled = getNotificationSettings().enabled
+  if (snapshot?.failed) {
+    stalledChecks = 0
+    ledgerCleared('the ledger queue alert', LEDGER_QUEUE_KEY, nowMs)
+    if (enabled) {
+      ledgerStanding('the ledger worker alert', {
+        kind: 'ledger_queue_stalled',
+        dedupeKey: LEDGER_WORKER_KEY,
+        title: 'Behavior ledger worker stopped',
+        body: 'Behavior history is not being recorded. It resumes when Poise restarts.',
+        path: FRONT_PAGE,
+        target: BEHAVIORS_VIEW,
+      })
+    }
+  } else {
+    ledgerCleared('the ledger worker alert', LEDGER_WORKER_KEY, nowMs)
+    const queueAgeMs = snapshot && !snapshot.stopping ? snapshot.queueAgeMs : null
+    const stallBudgetMs = snapshot && !snapshot.stopping ? snapshot.stallBudgetMs : null
+    const stalled = queueAgeMs !== null && stallBudgetMs !== null && queueAgeMs > stallBudgetMs
+    stalledChecks = stalled ? stalledChecks + 1 : 0
+    if (stalled && queueAgeMs !== null && stalledChecks >= LEDGER_STALL_ALERT_CHECKS && enabled) {
+      ledgerStanding('the ledger queue alert', {
+        kind: 'ledger_queue_stalled',
+        dedupeKey: LEDGER_QUEUE_KEY,
+        title: 'Behavior ledger is not draining',
+        body: `Its oldest queued capture is ${minutes(queueAgeMs)} old; history is delayed until the queue drains.`,
+        path: FRONT_PAGE,
+        target: BEHAVIORS_VIEW,
+      })
+    } else if (!stalled) {
+      ledgerCleared('the ledger queue alert', LEDGER_QUEUE_KEY, nowMs)
+    }
+  }
+  const generation = snapshot?.health.generation ?? null
+  for (const alert of openAlerts({ kind: 'ledger_capture_loss', now: nowMs })) {
+    if (alert.dedupeKey !== (generation === null ? '' : lossKey(generation))) {
+      ledgerCleared('a superseded ledger loss alert', alert.dedupeKey, nowMs)
+    }
+  }
+  if (generation === null || !snapshot) return
+  const dropped = snapshot.health.dropped
+  const raw = record('the ledger loss baseline', () => getMeta(baselineKey(generation)))
+  const baseline = typeof raw === 'string' && /^\d{1,15}$/.test(raw) && Number.isSafeInteger(Number(raw)) ? Number(raw) : null
+  if (baseline === null || dropped < baseline) {
+    // First sight of this store, or counters that do not continue it:
+    // baseline silently, never alert on history alone.
+    record('the ledger loss baseline', () => setMeta(baselineKey(generation), String(dropped)))
+    return
+  }
+  if (dropped === baseline) return
+  const delta = dropped - baseline
+  const lost = delta === 1 ? '1 capture was lost' : `${delta} captures were lost`
+  // The baseline advances only once the delta is surfaced. An alert write
+  // that throws leaves the baseline behind so the next check retries, and
+  // while notifications are off the delta accumulates instead of being
+  // consumed, so re-enabling surfaces what was lost.
+  if (enabled && ledgerStanding('the ledger loss alert', {
+    kind: 'ledger_capture_loss',
+    dedupeKey: lossKey(generation),
+    title: 'Behavior ledger lost captures',
+    body: `${lost}; ${dropped} total in this store. The gaps stay in history.`,
+    path: FRONT_PAGE,
+    target: BEHAVIORS_VIEW,
+  })) {
+    record('the ledger loss baseline', () => setMeta(baselineKey(generation), String(dropped)))
+  }
+}
+
+/** One ledger health check, from the timer below. */
+export function checkLedgerHealth(nowMs = Date.now()): void {
+  try {
+    ledgerHealthObserved(behaviorLedgerSnapshot(), nowMs)
+  } catch (error) {
+    console.error('[alerts] could not check ledger health:', error)
+  }
+}
+
+export function startLedgerHealthRuntime(): void {
+  if (ledgerTimer) return
+  ledgerTimer = setInterval(checkLedgerHealth, LEDGER_HEALTH_CHECK_MS)
+  ledgerTimer.unref?.()
+}
+
+export function stopLedgerHealthRuntime(): void {
+  clearInterval(ledgerTimer)
+  ledgerTimer = undefined
 }
 
 /** A Chat turn finished. Only a turn that ran longer than two minutes alerts,

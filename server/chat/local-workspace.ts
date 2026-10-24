@@ -38,7 +38,7 @@ async function readyWorkspace(checkout: string): Promise<boolean> {
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error('Local Chat Git metadata must not be a link or worktree')
     const top = (await runFile('git', ['rev-parse', '--show-toplevel'], { cwd: checkout })).stdout.trim()
     if (canonicalCheckout(top) !== checkout) throw new Error('Local Chat storage must not use the enclosing Poise repository')
-    return await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: checkout }).then(() => true, () => false)
+    return await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: checkout, expected: { codes: [128], stderr: /Needed a single revision/ } }).then(() => true, () => false)
   } catch (error: any) { if (error?.code === 'ENOENT') return false; throw error }
 }
 
@@ -94,7 +94,7 @@ export async function ensureLocalWorkspace(root = LOCAL_CHAT_ROOT, instance = 'p
     if (!initialized) await git(['init', '--quiet', '--initial-branch=main', '--template=', checkout])
     const top = (await runFile('git', ['rev-parse', '--show-toplevel'], { cwd: checkout })).stdout.trim()
     if (canonicalCheckout(top) !== checkout) throw new Error('Local Chat storage must not use the enclosing Poise repository')
-    const hasHead = await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: checkout }).then(() => true, () => false)
+    const hasHead = await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: checkout, expected: { codes: [128], stderr: /Needed a single revision/ } }).then(() => true, () => false)
     if (!hasHead) {
       await git(['config', 'user.name', 'Poise local Chat'])
       await git(['config', 'user.email', 'poise-chat@example.invalid'])

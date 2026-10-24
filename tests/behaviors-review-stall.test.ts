@@ -150,7 +150,7 @@ describe('review-new-prs under load', () => {
       failures: [{ org: 'autonomio', behavior: 'review-new-prs', kind: 'operation', consecutiveFailures: 31,
         lastFailureAt: '2026-10-21T22:40:35.257Z', nextRetryAt: '2026-10-21T22:43:35.257Z',
         error: 'The operation was aborted due to timeout' }],
-      deadLetters: [] }
+      deadLetters: [], holds: [] }
     const groups = behaviorDiagnosticGroups(diagnostics)
     expect(groups).toHaveLength(1)
     expect(groups[0]?.message).toMatch(/stalled/)

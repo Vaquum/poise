@@ -584,11 +584,12 @@ the workspace refuses new Chat turns and agent launches, which then answer
 that Poise is installing an update, and lets running work finish. One Chat
 turn holds the drain at most 30 minutes: past that the workspace stops it
 with a notice in its transcript, naming the update, and the agent keeps its
-context for the next prompt. Once the workspace is idle, or after
-`POISE_DRAIN_TIMEOUT` seconds (90 minutes by default), the gateway recreates
-the container on the new image with the same home volume, cutting only work
-that would not settle. A stopped workspace is recreated without being
-started. Follow it all in the gateway's log:
+context for the next prompt. Once the workspace is idle the gateway recreates
+the container on the new image with the same home volume; past
+`POISE_DRAIN_TIMEOUT` seconds (90 minutes by default) it recreates a busy or
+down workspace, cutting only work that would not settle, and releases a
+workspace whose answers only timed out for the next pass. A stopped workspace
+is recreated without being started. Follow it all in the gateway's log:
 
 ```bash
 docker logs --follow poise-gateway 2>&1 | grep workspace.
@@ -789,6 +790,26 @@ in `/etc/docker/daemon.json` and restart Docker:
 { "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "5" } }
 ```
 
+## Health
+
+Each workspace answers three levels of health:
+
+- `GET /api/health/live` is liveness: 200 whenever the process answers. It
+  performs no I/O, so no dependency can slow it down.
+- `GET /api/health` adds readiness: `readiness` says whether interactive
+  work can trust its dependencies, `dependencies` names each one (ledger,
+  datastore per organization, GitHub quota per account, local collection),
+  and `history` keeps cumulative ledger loss. These fields are additive:
+  the response's status code and `status` keep the meaning existing
+  monitors read.
+- `GET /api/service/health` is the gateway's contract: startup readiness,
+  release switching and drain polling. The container health check probes it.
+
+A degraded dependency never changes a status code. Alert on
+`readiness.status` and the `dependencies` entries rather than on the
+process existing. Ledger queue stalls, worker failures and capture loss
+also alert through Poise Link and the page's notices.
+
 ## Troubleshooting
 
 - **`install.sh` says a port is in use.** Another web server holds port 80
@@ -816,8 +837,10 @@ in `/etc/docker/daemon.json` and restart Docker:
   If the workspace image is missing, run `deploy/install.sh`.
 - **A workspace still runs the old image after an upgrade.** The gateway
   waits up to `POISE_DRAIN_TIMEOUT` for a busy workspace. Look for
-  `workspace.drain`, `workspace.upgrade` and `workspace.network` events in its
-  log.
+  `workspace.drain.waiting` (what it waits on and the time left),
+  `workspace.upgrade.aborted` and `workspace.drain.released` (a slow workspace
+  freed for the next pass), and `workspace.upgrade` and `workspace.network`
+  events in its log.
 - **`install.sh` or `upgrade.sh` says the gateway is not on a workspace's
   network.** The gateway joins every workspace's network as it starts, and
   `docker logs poise-gateway 2>&1 | grep workspace.network` says why it could

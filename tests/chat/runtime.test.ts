@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import type { AgentId, ChatEnvelope, ChatEvent, PromptInput, SessionRecord } from '../../server/chat/protocol'
 import type { Adapter, AdapterHost, AdapterStartOptions } from '../../server/chat/adapters/types'
 import type { RelayConnection } from '../../server/chat/relay'
@@ -140,7 +140,12 @@ afterEach(async () => {
   spawnSync('git', ['switch', '-q', 'main'], { cwd: repo })
 })
 
-async function waitFor(check: () => boolean, ms = 8_000): Promise<void> {
+// Every case drives the real Chat runtime against a real git checkout, and
+// under suite load one git or SQLite step can stall past eight seconds: each
+// readiness wait gets 20 s, and each case and hook at least 25 s, instead of
+// vitest's global 10 s. Multi-turn cases keep their larger ceilings.
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
+async function waitFor(check: () => boolean, ms = 20_000): Promise<void> {
   const deadline = Date.now() + ms
   while (!check()) {
     if (Date.now() > deadline) throw new Error('condition not met in time')
@@ -263,6 +268,49 @@ describe('chat runtime', () => {
     expect(ofType(events, session.id, 'turn.finished').at(-1).stopReason).toBe('cancelled')
     await waitFor(() => lastStatus(events, session.id) === 'idle')
     expect(caller.finishes.at(-1).status).toBe('cancelled')
+    await runtime.stop()
+  }, 40_000)
+
+  it('never kills the worker of a replacement turn that reserved during a stop', async () => {
+    ensureBranch('chat/alpha')
+    const caller = fakeCaller()
+    // The stopped turn already left session.turn (it is cleared before the
+    // Caller finish), while the stop's settle poll has not run again yet:
+    // the replacement reserves deterministically inside that window.
+    let sessionId = ''
+    let replacementSent = false
+    const runtimeHolder: { runtime?: import('../../server/chat/runtime').ChatRuntime } = {}
+    const innerFinish = caller.finish.bind(caller)
+    caller.finish = (async (...args: Parameters<typeof innerFinish>) => {
+      if (!replacementSent) {
+        replacementSent = true
+        runtimeHolder.runtime!.prompt(sessionId, { text: 'replacement', attachments: [], mentions: [] })
+      }
+      return innerFinish(...args)
+    }) as typeof caller.finish
+    const { runtime, controls, events } = makeRuntime({ caller })
+    runtimeHolder.runtime = runtime
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'chat/alpha' } })
+    sessionId = session.id
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    controls.adapters[0].auto = false
+    await runtime.prompt(session.id, { text: 'first', attachments: [], mentions: [] })
+    await waitFor(() => lastStatus(events, session.id) === 'running')
+    const stopping = runtime.cancel(session.id)
+    // The replacement's adapter is created when its turn starts; hold its
+    // turn open before the agent is asked.
+    await waitFor(() => controls.adapters.length === 2)
+    controls.adapters[1].auto = false
+    expect((await stopping).settled).toBe(true)
+    await waitFor(() => lastStatus(events, session.id) === 'running')
+    // The stopped turn ended cancelled; the replacement was never stopped,
+    // so its worker is untouched.
+    expect(ofType(events, session.id, 'turn.finished')[0]).toMatchObject({ stopReason: 'cancelled' })
+    expect(controls.adapters[1].closed).toBe(0)
+    expect(controls.adapters[1].alive).toBe(true)
+    controls.adapters[1].finish()
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(ofType(events, session.id, 'turn.finished').at(-1)).toMatchObject({ stopReason: 'end_turn' })
     await runtime.stop()
   }, 40_000)
 
@@ -1164,4 +1212,9 @@ describe('Extensions in the runtime', () => {
     expect(stored).not.toContain('sk-live-0123456789')
     expect(stored).toContain('echo: print [redacted]')
   })
+})
+
+it('gives every case at least 25 s instead of the global 10 s', ({ task }) => {
+  const cases = (tasks: RunnerTask[]): RunnerTestCase[] => tasks.flatMap(t => t.type === 'test' ? [t] : cases(t.tasks))
+  expect(cases(task.file.tasks).filter(t => t.timeout < 25_000).map(t => t.fullTestName)).toEqual([])
 })
