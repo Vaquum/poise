@@ -25,7 +25,7 @@ function diagnostics(overrides: Partial<BehaviorDiagnostics> = {}): BehaviorDiag
 }
 
 const HELD_SUBJECT = { behavior: 'review-new-prs', target: 'acme/api#9' }
-const held = notice('held', { kind: 'behavior_held', title: 'Review New Pull Requests failed on acme/api#9', body: 'Open Swarm in Poise to see what happened.', target: { swarm: 'failed-call' }, subject: HELD_SUBJECT })
+const held = notice('held', { kind: 'behavior_held', title: 'Review New Pull Requests failed on acme/api#9', body: 'Open it in Poise to see what happened.', target: { swarm: 'failed-call' }, subject: HELD_SUBJECT })
 const letter = (target: string, overrides: Partial<BehaviorDiagnostics['deadLetters'][number]> = {}) => ({
   id: `letter-${target}`, behavior: 'review-new-prs', target, error: 'The reviewer stopped before posting.', createdAt: iso(5), attemptCount: 3, ...overrides,
 })
@@ -43,6 +43,17 @@ describe('the list', () => {
       { id: 'error', group: 'faults', tone: 'red', source: 'GitHub API' },
     ])
     expect(headTone(countItems(items))).toBe('red')
+  })
+
+  it('needs you for a requested review and for a conflict on your pull request', () => {
+    const items = notificationItems([
+      notice('review', { kind: 'review_requested', title: 'acme/api#4 requests your review', target: { pullRequest: 'https://github.com/acme/api/pull/4' } }),
+      notice('conflict', { kind: 'pr_conflict', title: 'acme/api#5 has a merge conflict', target: { pullRequest: 'https://github.com/acme/api/pull/5' } }),
+    ], null, NOW)
+    expect(items).toMatchObject([
+      { id: 'review', group: 'needs', tone: 'amber', source: 'GitHub' },
+      { id: 'conflict', group: 'needs', tone: 'amber', source: 'GitHub' },
+    ])
   })
 
   it('groups notices by who acts, in the order the server gave them', () => {

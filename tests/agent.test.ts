@@ -24,7 +24,7 @@ vi.mock('esbuild', async importOriginal => {
 vi.mock('../server/settings', () => ({
   getModelSettings: () => mocks.models,
   requireAgentAccount: () => {
-    if (!mocks.agentAccount) throw new Error('No agent account is set. Set it in Settings → GitHub: it is the GitHub user your reviews and comments are posted as.')
+    if (!mocks.agentAccount) throw new Error('No agent account is set. Set it in Settings → General: it is the GitHub user your reviews and comments are posted as.')
     return mocks.agentAccount
   },
 }))
@@ -776,8 +776,8 @@ describe('manual review model selection', () => {
     const { setMeta } = await import('../server/db'); setMeta('agentAccount', '')
     const { triggerPrReview, replayAgentJob } = await import('../server/agent')
     const { spawnDetached } = await import('../server/process')
-    await expect(triggerPrReview('https://github.com/o/r/pull/12')).rejects.toThrow('Set it in Settings → GitHub')
-    await expect(replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 }, mocks.admit)).rejects.toThrow('Set it in Settings → GitHub')
+    await expect(triggerPrReview('https://github.com/o/r/pull/12')).rejects.toThrow('Set it in Settings → General')
+    await expect(replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 }, mocks.admit)).rejects.toThrow('Set it in Settings → General')
     await expect(replayAgentJob({ behavior: 'issue_review', repo: 'o/r', pr_id: '4' }, mocks.admit)).rejects.toThrow('No agent account is set')
     expect(spawnDetached).not.toHaveBeenCalled()
   })

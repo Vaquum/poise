@@ -395,7 +395,7 @@ test('chooses how many reviewers each new pull request gets from Behaviors', asy
 
 test('shows the agent account as the Behaviors owner and follows it when it changes', async ({ page }) => {
   let owner: string | null = 'review-bot'
-  const missing = 'No agent account is set. Set it in Settings → GitHub: it is the GitHub user your reviews and comments are posted as.'
+  const missing = 'No agent account is set. Set it in Settings → General: it is the GitHub user your reviews and comments are posted as.'
   const behavior = (extra: Record<string, unknown>) => ({
     owner, enabled: false, setting: null, reviewers: null, scratchpad: '', lastTriggered: null, ...extra,
   })

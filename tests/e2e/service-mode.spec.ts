@@ -4,7 +4,7 @@ import { expect, test, type Page } from '@playwright/test'
 // is turned off: the server's answers as service mode gives them, each shown
 // where the feature would otherwise be offered.
 
-const LOGIN_OFF = 'Claude sign-in through a local browser is not available in service mode. Connect Claude in Settings → Connected accounts.'
+const LOGIN_OFF = 'Claude sign-in through a local browser is not available in service mode. Connect Claude in Settings → Accounts.'
 const UPDATER_OFF = 'No production updater runs in service mode: the server upgrades this workspace with its image, so there is no update record here and no desktop notification.'
 
 async function serviceModeApi(page: Page, calls: string[]): Promise<void> {
@@ -74,7 +74,7 @@ test('signs in to Claude from the banner in a Connected accounts terminal, not a
   const alert = page.getByRole('alert')
   await expect(alert).toContainText('Claude subscription sign-in required')
   await expect(alert).toContainText('Claude-backed work is paused.')
-  await expect(alert).toContainText('Connect Claude in Settings → Connected accounts.')
+  await expect(alert).toContainText('Connect Claude in Settings → Accounts.')
   await expect(alert).not.toContainText('connected to this computer')
 
   await alert.getByRole('button', { name: 'Sign in with Claude' }).click()

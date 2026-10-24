@@ -48,6 +48,7 @@ import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
 import { diagnostic } from '../logging'
 import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertContext } from '../alerts/producers'
+import { recordHandling, type HandlingActor } from '../alerts/handling'
 import { localCheckoutPath } from '../gh'
 import { discardUnclaimedWorkspace, ensureLocalWorkspace, ensureWorkerWorkspace, ensureWorkerWorkspaceDirectory, LOCAL_CHAT_ROOT, workerWorkspaceRef, workspaceMarkerValid } from './local-workspace'
 import { restorePrunedArtifacts } from '../storage-maintenance'
@@ -723,9 +724,11 @@ export class ChatRuntime extends EventEmitter {
     const record = storage.getSession(open.sessionId)
     if (!record) return
     for (const pending of storage.listPendingRequests(open.sessionId)) {
+      const detail = storage.pendingRequestDetail(open.sessionId, pending.requestId)
       this.emit_(open.sessionId, pending.kind === 'permission'
         ? { type: 'permission.resolved', id: pending.requestId, optionId: '', by: 'cancelled' }
         : { type: 'question.answered', id: pending.requestId, answers: {}, by: 'cancelled' })
+      this.recordAnsweredRequest(open.sessionId, pending.requestId, detail, 'cancelled', 'recovery')
     }
     // No request outlives the process that asked it.
     if (record.status === 'waiting') chatWaitingEnded(record.id)
@@ -2193,6 +2196,7 @@ export class ChatRuntime extends EventEmitter {
       throw new ChatError(409, 'The previous agent has not settled; history has not been reset.', 'checkout_busy')
     }
     const committed = storage.resetConversation(session.record)
+    this.emit('chatRequests', storage.requestRevision(this.instance))
     Object.assign(session.record, committed.session)
     session.grants.clear()
     session.staged = null
@@ -2266,6 +2270,7 @@ export class ChatRuntime extends EventEmitter {
           message: 'Post-delete cleanup failed; the chat was deleted',
           context: { sessionId: id, error: error instanceof Error ? error.message : String(error) } })
       }
+      this.emit('chatRequests', storage.requestRevision(this.instance))
       return { workspaceRemoved }
     })
   }
@@ -3801,7 +3806,7 @@ export class ChatRuntime extends EventEmitter {
       session.record.stopRequestedTurnId = turn.id
       this.saveRecord(session)
       turn.stopping = true
-      this.settlePending(session, 'cancelled')
+      this.settlePending(session, 'cancelled', !actor ? 'poise' : actor.kind === 'person' ? 'person' : 'api')
       turn.abort.abort()
       try { await session.adapter?.cancel() } catch { /* the abort signal also reaches prompt() */ }
       if (await this.waitForTurnEnd(session, turn, STOP_SETTLE_MS)) return { settled: true }
@@ -3847,18 +3852,23 @@ export class ChatRuntime extends EventEmitter {
   private resolvePermission(session: LiveSession, requestId: string, optionId: string, by: 'user' | 'auto_merge' | 'unrestricted'): void {
     const id = session.record.id
     const pending = session.pending.get(requestId)
+    const answeredBy = by === 'user' ? 'person' : 'poise'
     if (!pending || pending.kind !== 'permission') {
       // A request that outlived its process (crash, restart) is closed out
       // rather than left hanging in the transcript.
       if (storage.listPendingRequests(id).some((p) => p.requestId === requestId)) {
+        const detail = storage.pendingRequestDetail(id, requestId)
         this.emit_(id, { type: 'permission.resolved', id: requestId, optionId: '', by: 'cancelled' })
+        this.recordAnsweredRequest(id, requestId, detail, 'cancelled', answeredBy)
       }
       throw new ChatError(409, 'this permission request is no longer pending', 'no_turn')
     }
     const option = pending.options!.find((o) => o.id === optionId)
     if (!option) throw new ChatError(400, 'unknown option', 'invalid')
+    const detail = storage.pendingRequestDetail(id, requestId)
     // Keep the native waiter reachable until its decision is durable.
     this.emit_(id, { type: 'permission.resolved', id: requestId, optionId, by })
+    this.recordAnsweredRequest(id, requestId, detail, option.kind.startsWith('reject') ? 'denied' : 'answered', answeredBy)
     session.pending.delete(requestId)
     // "Always" means this session, in Poise's memory — never the agent's own
     // persistence, which outlives the session. The agent is told "once".
@@ -3872,17 +3882,34 @@ export class ChatRuntime extends EventEmitter {
     this.afterRequestAnswered(session)
   }
 
+  /** One request answered, denied or cancelled, for the handling log.
+   *  Callers read the stored title and ask time before the answering event
+   *  deletes the pending row, and record after the event is durable. */
+  private recordAnsweredRequest(sessionId: string, requestId: string,
+    detail: { title: string, createdAt: string } | null,
+    outcome: 'answered' | 'denied' | 'cancelled', actor: HandlingActor): void {
+    if (!detail) return
+    const at = new Date().toISOString()
+    recordHandling({ kind: 'notice', source: `chat/${sessionId}`, title: detail.title,
+      startedAt: detail.createdAt, finishedAt: at, outcome, actor, ref: `chat-request:${requestId}:${outcome}` }, at)
+  }
+
   answerQuestion(id: string, requestId: string, answers: QuestionAnswers, actor?: ChatActor): { questions: Question[] } {
     const session = this.requireLive(id)
     const pending = session.pending.get(requestId)
+    const answeredBy = actor ? 'api' : 'person'
     if (!pending || pending.kind !== 'question') {
       if (storage.listPendingRequests(id).some((p) => p.requestId === requestId)) {
+        const detail = storage.pendingRequestDetail(id, requestId)
         this.emit_(id, { type: 'question.answered', id: requestId, answers: {}, by: 'cancelled' })
+        this.recordAnsweredRequest(id, requestId, detail, 'cancelled', answeredBy)
       }
       throw new ChatError(409, this.firstAnswerMessage(id, requestId, actor), 'no_turn')
     }
     const validated = validateAnswers(pending.questions ?? [], answers)
+    const detail = storage.pendingRequestDetail(id, requestId)
     this.emit_(id, { type: 'question.answered', id: requestId, answers: validated, by: actor ? 'chat' : 'user', ...(actor ? { fromSession: actor.sessionId, source: actor } : {}) })
+    this.recordAnsweredRequest(id, requestId, detail, 'answered', answeredBy)
     session.pending.delete(requestId)
     pending.resolve(validated)
     this.afterRequestAnswered(session)
@@ -3907,13 +3934,15 @@ export class ChatRuntime extends EventEmitter {
     if (session.turn && !session.turn.stopping && session.pending.size === 0 && session.record.status === 'waiting') this.setStatus(session, 'running')
   }
 
-  private settlePending(session: LiveSession, by: 'cancelled'): void {
+  private settlePending(session: LiveSession, by: 'cancelled', actor: HandlingActor = 'poise'): void {
     for (const [requestId, pending] of session.pending) {
       session.pending.delete(requestId)
+      const detail = storage.pendingRequestDetail(session.record.id, requestId)
       try {
         this.emit_(session.record.id, pending.kind === 'permission'
           ? { type: 'permission.resolved', id: requestId, optionId: '', by }
           : { type: 'question.answered', id: requestId, answers: {}, by })
+        this.recordAnsweredRequest(session.record.id, requestId, detail, 'cancelled', actor)
       } catch { /* mirror failure is handled by the turn */ }
       pending.reject(new Error('cancelled'))
     }
@@ -4631,6 +4660,12 @@ export class ChatRuntime extends EventEmitter {
     const live = this.live.get(sessionId)
     if (live) live.record.lastSeq = envelope.seq
     this.emit('event', envelope)
+    // The open-request revision moved with the pending rows, inside the
+    // same transaction; every open Chat view hears the new revision.
+    if (event.type === 'permission.requested' || event.type === 'question.asked'
+      || event.type === 'permission.resolved' || event.type === 'question.answered') {
+      this.emit('chatRequests', storage.requestRevision(this.instance))
+    }
     this.noOpGuard(sessionId, event)
     return envelope
   }

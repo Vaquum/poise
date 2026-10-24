@@ -6,13 +6,14 @@ import { handleBehaviorLedger } from './behavior-ledger-http'
 import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
 import type { ServerResponse } from 'node:http'
-import { agentAccount, callerAccounts, getModelSettings, getSettings, seedAgentAccount, setSettings } from './settings'
+import { agentAccount, callerAccounts, getModelSettings, getSettings, seedAgentAccount, setSettings, SettingsConflictError } from './settings'
 import { MODEL_PLACES, canaryClaudeModel, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
 import { refreshModelCatalog } from './models-refresh'
 import { deleteModelPreset, listModelPresets, saveModelPreset } from './model-presets'
 import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
 import { accountsChecked, claudeAuthStatusChanged, startLedgerHealthRuntime, stopLedgerHealthRuntime } from './alerts/producers'
 import { pruneAlerts } from './alerts/store'
+import { HANDLED_READ_LIMIT, listHandling, pruneHandling } from './alerts/handling'
 import { checkNotices, dismissNotice, noticesState, silenceNotice, startNoticesRuntime, stopNoticesRuntime } from './alerts/notices'
 import { startTemporaryStorageRuntime, stopTemporaryStorageRuntime } from './temporary-storage'
 import { recordRunningRelease, runningRelease } from './running-release'
@@ -24,13 +25,17 @@ import { parseBounds, parseWindow, readAnalytics, readAnalyticsHistory } from '.
 import { checkGithubQuota, readGithubQuota, startGithubQuotaRuntime, stopGithubQuotaRuntime } from './github-quota'
 import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
-import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
+import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
+import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
+import { readBehaviorEstimates } from './behavior-estimates'
+import { listCapabilities } from './capabilities'
 import { runDebate } from './chat'
 import { listDocs, readDoc, writeDoc, deleteDoc, newSlug, readAnnotations, writeAnnotations, MAX_DOC_BYTES, MAX_ANNOTATIONS_BYTES, EditorConflictError } from './editor'
 import { handleSnippetApi } from './snippet-api'
 import { handlePublishingApi } from './publishing-api'
+import { startPublicationReviewsRuntime, stopPublicationReviewsRuntime } from './publishing-reviews'
 import { createExtensionsApi } from './extensions/http'
 import { runtimeExtensions } from './extensions/delivery'
 import { redactSecrets, secretValues } from './extensions/store'
@@ -39,7 +44,7 @@ import { listSessions } from './chat/storage'
 import { handleGoogleApi } from './google/api'
 import { validateGoogleEnvironment } from './google/accounts'
 import { getBehaviorDiagnosticIncidents } from './behaviors'
-import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
+import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, setPaused as setBehaviorPaused, getPausedUntil as getBehaviorPausedUntil, getPausedBy as getBehaviorPausedBy, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
 import { maintenanceRunning, runStorageMaintenanceOnce, startStorageMaintenanceRuntime, stopStorageMaintenanceRuntime, storageStatus } from './storage-maintenance'
 import { ContentLaunchPendingError, contentLaunchIdForCall, getContentJobResponse, getContentLaunchResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
@@ -189,11 +194,13 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   if (!activeClaudeAuthRuntimes.has(auth)) activeClaudeAuthRuntimes.set(auth, auth.onStatus(claudeAuthStatusChanged))
   auth.start()
   pruneAlerts()
+  pruneHandling()
   recordRunningRelease()
   setCallerAccounts(callerAccounts)
   startOrganizationsRuntime()
   startBehaviorsRuntime()
   startNoticesRuntime()
+  startPublicationReviewsRuntime()
   startGithubQuotaRuntime()
   startLedgerHealthRuntime()
   if (service) startTemporaryStorageRuntime()
@@ -287,7 +294,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopPublicationReviewsRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
   await stopBehaviorLedger()
   await stopLoggingApi()
   await stopLogging()
@@ -512,6 +519,21 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             return json(res, httpStatus(error, 400), { error: (error as Error).message })
           }
         }
+        // Person-only: stopping following an account answers 403 without
+        // the person's authority, and removes nothing. Nothing changes on
+        // GitHub; the legacy account and the last one are refused.
+        const organizationRemove = path.match(/^\/api\/organizations\/([^/]+)$/)
+        if (organizationRemove && req.method === 'DELETE') {
+          if (!speaksForPerson(req, !!service, authority)) {
+            return json(res, 403, { error: 'Stopping following an account is the person\'s action, taken in the browser.', code: 'invalid' })
+          }
+          try {
+            await removeOrganization(decodeURIComponent(organizationRemove[1]))
+            return json(res, 200, { organizations: getOrganizations() })
+          } catch (error) {
+            return json(res, httpStatus(error, 400), { error: (error as Error).message })
+          }
+        }
 
         // ── The running release ──
         // The commit this Poise runs and since when, for the menu's first line.
@@ -551,11 +573,22 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (url.startsWith('/api/settings') && req.method === 'POST') {
           try {
             const body = await readJson<any>(req)
+            // Person-only, checked before any state changes: the Manager
+            // controls and the local turn limit. Saves of other fields keep
+            // working for every caller.
+            const touchesManagerControls = body !== null && typeof body === 'object' && !Array.isArray(body)
+              && ('manager' in body || (typeof body.chat === 'object' && body.chat !== null && 'maxConcurrentLocalTurns' in body.chat))
+            if (touchesManagerControls && !speaksForPerson(req, !!service, authority)) {
+              return json(res, 403, { error: 'The Manager controls and the local turn limit are the person\'s: change them in the browser.', code: 'invalid' })
+            }
             const catalog = body && typeof body === 'object' && 'models' in body ? await loadCatalog() : undefined
             if (typeof body?.org === 'string' && body.org.trim() !== getSettings().org) {
               return json(res, 400, { error: 'Add GitHub accounts through account setup.' })
             }
-            const settings = setSettings(body, catalog)
+            // A save may carry the values its tab read: changed since, it is
+            // refused with 409 and the current values, changing nothing.
+            const settings = setSettings(body, catalog,
+              body && typeof body === 'object' && 'expect' in body ? { expect: (body as { expect?: Record<string, unknown> }).expect } : undefined)
             // A raised Chat cap starts turns waiting for a free agent slot now.
             if (body && typeof body === 'object' && 'chat' in body) chatRuntime?.localTurnCapChanged()
             // Turned on, what needs attention is looked for now, not at the next pass.
@@ -563,7 +596,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             if (body && typeof body === 'object' && ['notifications', 'me', 'agentAccount'].some((key) => key in body)) checkGithubQuota()
             return json(res, 200, { ...settings, organizations: getOrganizations() })
           } catch (err: any) {
-            return json(res, httpStatus(err, 400), { error: err.message || String(err) })
+            const conflict = err instanceof SettingsConflictError ? { current: err.current } : {}
+            return json(res, httpStatus(err, 400), { error: err.message || String(err), ...conflict })
           }
         }
 
@@ -574,14 +608,33 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
         const noticeAction = path.match(/^\/api\/notices\/([^/]+)\/(dismiss|silence)$/)
         if (noticeAction && req.method === 'POST') {
+          // Dismissing is the person's action in the browser. A silence
+          // from anyone else is recorded as the api's.
+          const person = speaksForPerson(req, !!service, authority)
+          if (noticeAction[2] === 'dismiss' && !person) {
+            return json(res, 403, { error: 'Dismissing a notification is the person\'s action, taken in the browser.', code: 'invalid' })
+          }
           try {
             const id = decodeURIComponent(noticeAction[1])
             if (noticeAction[2] === 'dismiss') dismissNotice(id)
-            else silenceNotice(id)
+            else silenceNotice(id, Date.now(), person ? 'person' : 'api')
             return json(res, 200, await noticeEvidence(noticesState()))
           } catch (error) {
             return json(res, httpStatus(error, 400), { error: (error as Error).message })
           }
+        }
+        // The handling log: the newest handled notices, behavior firings
+        // and Caller-reported runs. The checks settle first, so a handled
+        // row never stays active; failures keep prior state, as they do
+        // for the active notices, and the stored rows still answer.
+        // `?since=<ISO>` keeps rows handled at or after that time.
+        if (path === '/api/notices/handled' && req.method === 'GET') {
+          const since = new URLSearchParams(url.split('?')[1] || '').get('since')
+          if (since !== null && !Number.isFinite(Date.parse(since))) {
+            return json(res, 400, { error: 'since must be an ISO time' })
+          }
+          await checkNotices()
+          return json(res, 200, { handled: listHandling(HANDLED_READ_LIMIT, Date.now(), since ?? undefined) })
         }
 
         // ── Models ──
@@ -652,6 +705,24 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           }
         }
 
+        // ── /api/pull-requests/approve and /merge — the person's buttons ──
+        // Body: { repo, number, expectedHeadSha, actionId }. Acts with the
+        // person's GitHub account; the actionId receipt makes retries safe.
+        // Person-only: without the person's authority this answers 403 and
+        // acts on nothing. See server/pull-requests.ts.
+        if ((url === '/api/pull-requests/approve' || url === '/api/pull-requests/merge') && req.method === 'POST') {
+          try {
+            const body = await readJson<any>(req)
+            const person = speaksForPerson(req, !!service, authority)
+            const { status, body: respBody } = url === '/api/pull-requests/approve'
+              ? await handlePullRequestApprove(body, person)
+              : await handlePullRequestMerge(body, person)
+            return json(res, status, respBody)
+          } catch (err: any) {
+            return json(res, httpStatus(err, 502), { error: 'pull request action failed: ' + (err.message || String(err)) })
+          }
+        }
+
         // ── /api/agent-logs — Swarm's data source ──
         // Wraps `agent-interface --logs`. Returns the JSON array as-is
         // under a `logs` envelope so the front-end can extend it later
@@ -693,6 +764,25 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           }
         }
 
+        // ── /api/behavior-estimates — how long running behavior runs have left ──
+        // Each running agent behavior run with its estimate from similar
+        // runs: the same behavior and model, completed in the last 30 days.
+        // See server/behavior-estimates.ts.
+        if (path === '/api/behavior-estimates' && req.method === 'GET') {
+          try {
+            const [running, history] = await Promise.all([fetchRunningAgentLogSnapshot(), fetchAgentLogSnapshot()])
+            return json(res, 200, { estimates: readBehaviorEstimates(history.entries, running.entries) })
+          } catch (err: any) {
+            return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })
+          }
+        }
+
+        // ── /api/capabilities — which redesigned-interface capabilities exist ──
+        // #556's interface reads this once at mount. See server/capabilities.ts.
+        if (path === '/api/capabilities' && req.method === 'GET') {
+          return json(res, 200, { capabilities: listCapabilities() })
+        }
+
         // ── /api/behaviors — state + metadata for behavior automations ──
         if (path === '/api/behaviors/retry-pr-reviews' && req.method === 'POST') {
           const body = await readJson<{ callIds?: unknown }>(req)
@@ -728,6 +818,9 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const enabled = getEnabledMap()
           const settings = getSettingMap()
           const scratch = getScratchpadMap()
+          // A pause holds new launches until its time; `enabled` stays the
+          // saved on/off, and expiry needs no write.
+          const pauseState = (key: BehaviorKey) => ({ pausedUntil: getBehaviorPausedUntil(key), pausedBy: getBehaviorPausedBy(key) })
           // Indexed latest-trigger and exact incident lookups also prove
           // absence: a never-run kind cannot cause a whole-history walk.
           const accounts = getOrganizations()
@@ -772,6 +865,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const owner = [getSettings().me, agentAccount()].filter(Boolean).join(' / ') || null
           return json(res, 200, {
             'review-new-prs': {
+              ...pauseState('review-new-prs'),
               owner,
               enabled: enabled['review-new-prs'],
               setting: settings['review-new-prs'],
@@ -787,6 +881,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // the Behaviors view can render an em dash instead of a
             // dropdown for that row.
             'approve-prs': {
+              ...pauseState('approve-prs'),
               owner,
               enabled: enabled['approve-prs'],
               setting: null,
@@ -803,6 +898,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // `scratchpad: null` because there's no agent prompt to
             // inject memory into — the view renders no memory control.
             'resolve-unblocking': {
+              ...pauseState('resolve-unblocking'),
               owner,
               enabled: enabled['resolve-unblocking'],
               setting: null,
@@ -812,12 +908,14 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               lastTriggered: getResolveUnblockingLastFired(),
             },
             'rerun-grey-ci': {
+              ...pauseState('rerun-grey-ci'),
               owner, enabled: enabled['rerun-grey-ci'], setting: null, reviewers: null,
               skipRepos: getRepositorySkips('rerun-grey-ci'), scratchpad: null,
               lastTriggered: getGreyCiLastFired(),
               lastSucceeded: getGreyCiLastSucceeded(),
             },
             'merge-prs': {
+              ...pauseState('merge-prs'),
               owner,
               enabled: enabled['merge-prs'],
               setting: null,
@@ -830,7 +928,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // until `repos` names one. `authors` are the trusted accounts
             // whose issues it reviews.
             'review-new-issues': {
-              owner: agentAccount() || null,
+              ...pauseState('review-new-issues'),
+              owner,
               enabled: enabled['review-new-issues'],
               setting: null,
               reviewers: getReviewers('review-new-issues'),
@@ -852,7 +951,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           })
         }
 
-        // POST /api/behaviors/<key> { enabled?, setting?, reviewers?: 1|2|3, repos?: string[], authors?: string[], skipRepos?: string[], scratchpad? }
+        // POST /api/behaviors/<key> { enabled?, pausedUntil?, setting?, reviewers?: 1|2|3, repos?: string[], authors?: string[], skipRepos?: string[], scratchpad? }
         // — every field optional; several can be sent in one call.
         const behaviorMatch = url.match(/^\/api\/behaviors\/([a-z0-9-]+)(?:\?|$)/)
         if (behaviorMatch && req.method === 'POST') {
@@ -870,6 +969,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // side effect, and string values are not booleans.
             if ('enabled' in body && typeof body.enabled !== 'boolean') {
               return json(res, 400, { error: 'enabled must be a boolean' })
+            }
+            // A pause holds new launches until its time, apart from the
+            // saved on/off; null clears it at once. An already past time
+            // simply holds nothing.
+            if ('pausedUntil' in body && body.pausedUntil !== null
+              && (typeof body.pausedUntil !== 'string' || !Number.isFinite(Date.parse(body.pausedUntil)))) {
+              return json(res, 400, { error: 'pausedUntil must be an ISO time or null' })
             }
             if ('setting' in body) {
               if (!isValidSetting(body.setting)) {
@@ -953,9 +1059,18 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             if ('skipRepos' in body && isSkippableBehavior(key)) setRepositorySkips(key, body.skipRepos)
             if ('scratchpad' in body) setBehaviorScratchpad(key, body.scratchpad)
             if ('enabled' in body) await setBehaviorEnabled(key, body.enabled)
+            // The pause records who asked: the person, or `api` for a
+            // write that does not speak for them — the server cannot name
+            // the chat behind one.
+            if ('pausedUntil' in body) {
+              await setBehaviorPaused(key, body.pausedUntil,
+                speaksForPerson(req, !!service, authority) ? 'person' : 'api')
+            }
             return json(res, 200, {
               ok: true,
               enabled: getEnabledMap()[key],
+              pausedUntil: getBehaviorPausedUntil(key),
+              pausedBy: getBehaviorPausedBy(key),
               setting: getSettingMap()[key],
               reviewers: isPanelBehavior(key) ? getReviewers(key) : null,
               ...(key === 'review-new-issues' ? {

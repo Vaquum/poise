@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { BEHAVIOR_KEYS, type BehaviorKey } from '../src/behavior-types'
 import type { BehaviorMetrics, BehaviorMetricsReport } from '../src/behavior-metrics'
 import type { LogEntry } from './agent'
+import { recordHandling } from './alerts/handling'
 import type { AnalyticsWindow } from './analytics'
 import { db } from './db'
 
@@ -23,9 +24,16 @@ export function startDirectBehaviorRun(behavior: DirectBehavior): string {
 }
 
 export function finishDirectBehaviorRun(id: string, success: boolean): void {
+  const at = new Date().toISOString()
+  const row = db.prepare('SELECT behavior, started_at FROM behavior_runs WHERE id = ?').get(id) as { behavior: string, started_at: string } | undefined
   db.prepare('UPDATE behavior_runs SET completed_at = ?, status = ? WHERE id = ?')
-    .run(new Date().toISOString(), success ? 'completed' : 'failed', id)
+    .run(at, success ? 'completed' : 'failed', id)
   activeDirectRuns.delete(id)
+  if (row) {
+    recordHandling({ kind: 'behavior-firing', source: row.behavior, title: row.behavior,
+      startedAt: row.started_at, finishedAt: at, outcome: success ? 'completed' : 'failed',
+      actor: 'behaviors', ref: `direct-run:${id}` }, at)
+  }
 }
 
 export function discardDirectBehaviorRun(id: string): void {

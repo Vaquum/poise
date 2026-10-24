@@ -19,13 +19,7 @@ async def list_open_pulls_for_branch(
     )
 
 
-async def get_pr_readiness_state(
-    client: GitHubClient,
-    owner: str,
-    repo: str,
-    pull_number: int,
-) -> dict[str, Any]:
-    query = """
+_READINESS_QUERY = """
     query($owner: String!, $repo: String!, $number: Int!) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $number) {
@@ -62,8 +56,42 @@ async def get_pr_readiness_state(
       }
     }
     """
+
+# Check names for the held reasons, read with the same query and the same
+# head commit so they always describe the head the reasons describe. Both
+# node kinds: CheckRun carries name/status/conclusion, the legacy commit
+# StatusContext carries context/state.
+_CHECK_CONTEXTS_SELECTION = """
+              contexts(first: 100) {
+                pageInfo { hasNextPage }
+                nodes {
+                  __typename
+                  ... on CheckRun { name status conclusion }
+                  ... on StatusContext { context state }
+                }
+              }"""
+
+
+def readiness_query(include_contexts: bool = False) -> str:
+    """The pull-request readiness query, with check names only for readers
+    that report them: the contexts add GraphQL cost to every call."""
+    if not include_contexts:
+        return _READINESS_QUERY
+    anchor = "statusCheckRollup { state }"
+    if _READINESS_QUERY.count(anchor) != 1:
+        raise RuntimeError("readiness query no longer carries the rollup anchor for check contexts")
+    return _READINESS_QUERY.replace(anchor, "statusCheckRollup { state" + _CHECK_CONTEXTS_SELECTION + " }")
+
+
+async def get_pr_readiness_state(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    include_contexts: bool = False,
+) -> dict[str, Any]:
     data = await client.graphql(
-        query,
+        readiness_query(include_contexts),
         {"owner": owner, "repo": repo, "number": pull_number},
     )
     return _required_pull(data, pull_number)

@@ -357,6 +357,39 @@ export function isEnabled(key: BehaviorKey): boolean {
   return getMeta(enabledKey(key)) === '1'
 }
 
+function pausedUntilKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_paused_until' }
+function pausedByKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_paused_by' }
+
+export type PausedBy = 'person' | 'api'
+
+// The stored pause, while it still holds: an ISO time in the future. An
+// expired or unreadable value counts as no pause, so expiry needs no
+// write and survives a restart by the wall clock alone.
+export function getPausedUntil(key: BehaviorKey): string | null {
+  const raw = getMeta(pausedUntilKey(key))
+  if (!raw) return null
+  const at = Date.parse(raw)
+  if (!Number.isFinite(at) || at <= Date.now()) return null
+  return new Date(at).toISOString()
+}
+
+export function getPausedBy(key: BehaviorKey): PausedBy | null {
+  if (!getPausedUntil(key)) return null
+  return getMeta(pausedByKey(key)) === 'person' ? 'person' : 'api'
+}
+
+// A pause holds back new launches only. It keeps `enabled` as saved,
+// clears no claims, seen state or backoff, and lets agents already
+// launched run to completion. Replays and explicit runs check neither
+// this nor `enabled`: they are the person's own actions.
+export function isPaused(key: BehaviorKey): boolean {
+  return getPausedUntil(key) !== null
+}
+
+export function isRunnable(key: BehaviorKey): boolean {
+  return isEnabled(key) && !isPaused(key)
+}
+
 function setPersistedEnabled(key: BehaviorKey, enabled: boolean) {
   setMeta(enabledKey(key), enabled ? '1' : '0')
 }
@@ -786,7 +819,7 @@ function reviewerTripTarget(identity: string): string {
 function tripReviewerAccount(behavior: PanelBehavior, identity: string, kind: ReviewAccountFailureKind, callId: string): void {
   const message = kind === 'balance'
     ? `${identity} cannot review: its account is out of balance (402). Top up its credit; Poise retries automatically.`
-    : `${identity} cannot review: it is not signed in. Sign it in from Settings → Connected accounts; Poise retries automatically.`
+    : `${identity} cannot review: it is not signed in. Sign it in from Settings → Accounts; Poise retries automatically.`
   recordBehaviorFailure(behavior, 'operation', message, reviewerTripTarget(identity), { callId })
 }
 
@@ -991,8 +1024,8 @@ export function pullRequestPolicy(behavior: SkippableBehavior): PullRequestPolic
 function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | null, agent = agentAccount()): string | null {
   if (pr?.status !== 'open') return `${ref} is not an open pull request`
   if (pr.draft) return `${ref} is a draft`
-  if (!me) return `${ref} cannot be matched to your GitHub account: none is set in Settings → GitHub`
-  if (!agent) return `${ref} needs an agent account in Settings → GitHub`
+  if (!me) return `${ref} cannot be matched to your GitHub account: none is set in Settings → General`
+  if (!agent) return `${ref} needs an agent account in Settings → General`
   if (agent.toLowerCase() === me.toLowerCase()) return `${ref} needs different GitHub user and agent accounts`
   if (![me.toLowerCase(), agent.toLowerCase()].includes(pr.author.toLowerCase())) return `${ref} is authored by ${pr.author}, outside your configured GitHub account pair`
   return null
@@ -2623,6 +2656,9 @@ async function tickReviewNewPrs(): Promise<void> {
   await withBehaviorProcessLock('review-new-prs', async () => {
     await reconcileBehaviorLaunchClaims('review-new-prs')
   })
+  // A pause holds new launches; the reconciliation above still settled
+  // what already launched, and the ledger keeps new work for the resume.
+  if (isPaused('review-new-prs')) return
 
   // keyver=3 restores one initial review per PR. Convert a complete v2 ledger
   // in place so a PR opened during downtime is not absorbed by a deploy-time
@@ -2684,7 +2720,7 @@ async function tickReviewNewPrs(): Promise<void> {
     // An expired operation deadline must not discard prepared reviews: a slow
     // sweep still claims and launches what it managed to prepare, and the next
     // sweep prepares the rest.
-    if (behaviorLifecycleAborted() || !isEnabled('review-new-prs')) {
+    if (behaviorLifecycleAborted() || !isRunnable('review-new-prs')) {
       for (const bundle of prepared) releasePrOperationOwned(bundle.operationId)
       return
     }
@@ -2723,7 +2759,7 @@ async function tickReviewNewPrs(): Promise<void> {
           let ownedClaimId: string | null = null
           try {
             if (behaviorAborted()) { releasePhase2Leases(); return }
-            if (!isEnabled('review-new-prs')) { releaseLeases(null); continue }
+            if (!isRunnable('review-new-prs')) { releaseLeases(null); continue }
             if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) { releaseLeases(null); continue }
             if (!prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) { releaseLeases(null); continue }
             const primaryFresh = !hasSeen('review-new-prs', key) || !!getFailedBehaviorLaunch('review-new-prs', key)
@@ -2831,7 +2867,7 @@ async function tickReviewNewPrs(): Promise<void> {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
         const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor)
-        if (behaviorAborted() || !isEnabled('review-new-prs') || !prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) {
+        if (behaviorAborted() || !isRunnable('review-new-prs') || !prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
           captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
@@ -3498,7 +3534,7 @@ async function fireApprove(
   replacesFailedCallId?: string,
 ): Promise<boolean> {
   return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author) }, async () => {
-  if (!isEnabled('approve-prs')) return false
+  if (!isRunnable('approve-prs')) return false
   const accounts = prAccounts()
   const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url: ' + pr.url)
@@ -3541,7 +3577,7 @@ async function fireApprove(
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead, actor)
   const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor, accounts)
   const selectedModel = (await reviewChoice('pr_approve')).model
-  if (!isEnabled('approve-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('approve-prs', pr, actor)) return false
+  if (!isRunnable('approve-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('approve-prs', pr, actor)) return false
   if (selectedModel !== model) return false
   if (admittedReviewer && configuredReviewer(pr.author).toLowerCase() !== admittedReviewer.toLowerCase()) return false
   if (replacesFailedCallId && !renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
@@ -3567,6 +3603,9 @@ async function fireApprove(
     pwd,
     ...noteArgs('approve-prs'),
   ]
+  // The model read above awaits: a pause landing in that window must
+  // still hold this launch, so this is the last check before it.
+  if (!isRunnable('approve-prs') || behaviorAborted()) return false
   if (!markLaunchIntent(
     'approve-prs',
     pr,
@@ -3696,6 +3735,9 @@ async function tickApprovePrs(): Promise<void> {
   const author = getMeta('me') || ''
   // Each PR uses the configured account opposite its author.
   if (!author) return
+  // Reconciliation already ran before this tick; a pause holds the new
+  // launches below, and the ledger keeps them for the resume.
+  if (isPaused('approve-prs')) return
   try {
     const prs = await listEligiblePrs('approve-prs', author)
     // Backed-off PRs don't spend batch capacity, and the cursor rotates
@@ -3942,7 +3984,7 @@ async function tickApprovePrs(): Promise<void> {
       // Launches run in a small pool: preparations overlap the way the
       // provider layer expects, while the sweep stays bounded.
       await forEachPool(launches, APPROVE_FIRE_CONCURRENCY, async (launch) => {
-        if (!isEnabled('approve-prs') || behaviorAborted()) return
+        if (!isRunnable('approve-prs') || behaviorAborted()) return
         const { pr, expectedHead, seenTarget, firedReason, admittedReviewer, dismissedRecovery } = launch
         const prTarget = `${pr.repo}#${pr.number}`
         // Pool starts are ordered; resume after the last attempted launch,
@@ -3959,7 +4001,7 @@ async function tickApprovePrs(): Promise<void> {
             console.log(`[behaviors] approve-prs deferred for ${prTarget}: PR operation busy`)
             return
           }
-          if (!isEnabled('approve-prs')) return
+          if (!isRunnable('approve-prs')) return
           if (!behaviorRetryDue('approve-prs', seenTarget)) return
           let claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
           let replacesFailedCallId: string | undefined
@@ -4082,7 +4124,9 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
   const reviewEnvironment = await automatedReviewEnvironment(repo, number, reviewer, accounts)
-  if (!isEnabled('resolve-unblocking') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('resolve-unblocking', pr, reviewer)) return null
+  // Final admission before the mutation: a pause landing during the awaits
+  // above must still hold this resolve.
+  if (!isRunnable('resolve-unblocking') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('resolve-unblocking', pr, reviewer)) return null
   const nativeId = randomUUID()
   captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
     source: 'poise:resolve-unblocking', owner: currentOrganization()?.login ?? null,
@@ -4178,6 +4222,7 @@ async function tickResolveUnblocking(): Promise<void> {
   if (!isEnabled('resolve-unblocking')) return
   const author = getMeta('me') || ''
   if (!author) return
+  if (isPaused('resolve-unblocking')) return
   try {
     const prs = await listEligiblePrs('resolve-unblocking', author)
     const ordered = orderByCursor(prs, 'behavior_resolve_unblocking_cursor').filter((pr) =>
@@ -4245,9 +4290,10 @@ async function tickResolveUnblocking(): Promise<void> {
           operationId = claimPrOperationOwned(key, PR_OPERATION_EVALUATION_LEASE_MS)
           if (!operationId) continue
           // This CLI performs the mutation itself. The synchronous checks
-          // immediately before invocation prevent a disabled behavior, or one
-          // whose repository was just skipped, from starting another resolve.
-          if (!isEnabled('resolve-unblocking') || !stillEligible('resolve-unblocking', pr, reviewer)) continue
+          // immediately before invocation prevent a disabled or paused
+          // behavior, or one whose repository was just skipped, from
+          // starting another resolve.
+          if (!isRunnable('resolve-unblocking') || !stillEligible('resolve-unblocking', pr, reviewer)) continue
           runId = startDirectBehaviorRun('resolve-unblocking')
           const result = await resolveNonblockingIfReady(pr, headSha, reviewer)
           if (!result) { discardDirectBehaviorRun(runId); runId = null; continue }
@@ -4418,6 +4464,7 @@ async function tickMergePrs(): Promise<void> {
   if (!isEnabled('merge-prs')) return
   const author = getMeta('me') || ''
   if (!author) return
+  if (isPaused('merge-prs')) return
   const prs = await listEligiblePrs('merge-prs', author)
   const cursor = getMeta('behavior_merge_prs_cursor')
   const start = (prs.findIndex((pr) => `${pr.repo}#${pr.number}` === cursor) + 1) % Math.max(prs.length, 1)
@@ -4496,7 +4543,7 @@ async function tickMergePrs(): Promise<void> {
         const [owner, name] = pr.repo.split('/', 2)
         const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
         await mkdir(cwd, { recursive: true })
-        if (!isEnabled('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', pr)
+        if (!isRunnable('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', pr)
           || configuredReviewer(pr.author) !== actor) continue
         runId = startDirectBehaviorRun('merge-prs')
         captureBehaviorAdmission({ admissionKey: runId, nativeId: runId, behavior: 'merge-prs',
@@ -4566,7 +4613,7 @@ async function tickMergePrs(): Promise<void> {
     const [owner, name] = updatePr.repo.split('/', 2)
     const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
     await mkdir(cwd, { recursive: true })
-    if (!isEnabled('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', updatePr)
+    if (!isRunnable('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', updatePr)
       || configuredReviewer(updatePr.author) !== actor) return
     updateRunId = startDirectBehaviorRun('merge-prs')
     captureBehaviorAdmission({ admissionKey: updateRunId, nativeId: updateRunId, behavior: 'merge-prs',
@@ -4648,6 +4695,7 @@ async function tickRerunGreyCi(): Promise<void> {
   if (!isEnabled(behavior)) return
   const author = getMeta('me') || ''
   if (!author) return
+  if (isPaused(behavior)) return
   const prs = await listEligiblePrs(behavior, author)
   const cursor = getMeta('behavior_rerun_grey_ci_cursor')
   const start = (prs.findIndex((pr) => `${pr.repo}#${pr.number}` === cursor) + 1) % Math.max(prs.length, 1)
@@ -4747,7 +4795,7 @@ async function tickRerunGreyCi(): Promise<void> {
           const [owner, name] = pr.repo.split('/', 2)
           const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
           await mkdir(cwd, { recursive: true })
-          if (!isEnabled(behavior) || behaviorAborted() || !stillEligible(behavior, pr)
+          if (!isRunnable(behavior) || behaviorAborted() || !stillEligible(behavior, pr)
             || configuredReviewer(pr.author) !== actor) continue
           const claimed = db.transaction(() => {
             if (!claimSeenOwnedAs(claimKey, claimTarget, claimId, PR_OPERATION_EVALUATION_LEASE_MS)) return false
@@ -5299,7 +5347,7 @@ async function fireIssueReview(
   // changing the panel meanwhile must stop this launch, so these are the last
   // checks before it.
   if ((await waitForBehavior(issueSlotModel(slot)))?.model !== model) return false
-  if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return false
+  if (!isRunnable(ISSUES_KEY) || behaviorAborted()) return false
   if (issueReviewRefusal(issueReviewPolicy(), issue.repo, issue.number, issue)) return false
   // Shed load before claiming a recovery probe: a launch past the shared
   // budget defers without backoff and retries when a slot frees.
@@ -5438,6 +5486,9 @@ async function tickReviewNewIssues(): Promise<void> {
   if (!isEnabled(ISSUES_KEY)) return
   const repositories = getIssueRepositories().filter((entry) => organizationOwns(entry.repo))
   if (repositories.length === 0) return
+  // Reconciliation already ran before this tick; a pause holds the new
+  // launches below, and the ledger keeps them for the resume.
+  if (isPaused(ISSUES_KEY)) return
   const policy = issueReviewPolicy()
   const panel = await reviewPanel(getReviewers(ISSUES_KEY), 'issue_review')
   await retireStaleReviewerTrips()
@@ -5520,7 +5571,7 @@ async function tickReviewNewIssues(): Promise<void> {
     if (settled) console.log(`[behaviors] review-new-issues: ${settled} was reviewed as a sub-issue of ${by}`)
   }
   for (const { issue, slot, target, admissionKey, plannedSlots } of candidates) {
-    if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return
+    if (!isRunnable(ISSUES_KEY) || behaviorAborted()) return
     const covers = plan.launch.get(issueRef(`${issue.repo}#${issue.number}`))
     if (!covers) continue
     // A full shared budget also stops the scan: later candidates wait for
@@ -5984,6 +6035,32 @@ export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<vo
 
 export function setSetting(key: BehaviorKey, setting: BehaviorSetting): void {
   setPersistedSetting(key, setting)
+}
+
+const pauseChanges = new Map<BehaviorKey, number>()
+
+// Pause the behavior until an ISO time, or clear the pause with null.
+// The decision publishes first and this answers after operations that
+// started under the old state have settled, like disabling — but with
+// none of setEnabled's side effects: claims, seen state and backoff are
+// kept, so work that arrives during the pause is handled on resume, and
+// expiry never flips the saved on/off.
+export async function setPaused(key: BehaviorKey, pausedUntil: string | null, by: PausedBy): Promise<void> {
+  const change = (pauseChanges.get(key) ?? 0) + 1
+  pauseChanges.set(key, change)
+  if (pausedUntil === null) {
+    setMeta(pausedUntilKey(key), '')
+    setMeta(pausedByKey(key), '')
+  } else {
+    const at = Date.parse(pausedUntil)
+    if (!Number.isFinite(at)) throw new Error('pausedUntil must be an ISO time or null')
+    setMeta(pausedUntilKey(key), new Date(at).toISOString())
+    setMeta(pausedByKey(key), by)
+  }
+  if (pauseChanges.get(key) !== change) return
+  const pending = [...behaviorOperationTails.entries()]
+    .filter(([scope]) => scope.endsWith(`:${key}`)).map(([, tail]) => tail)
+  await Promise.allSettled(pending)
 }
 
 // Wall-clock-aligned ticker — mirrors src/config.ts startRefreshTicker.

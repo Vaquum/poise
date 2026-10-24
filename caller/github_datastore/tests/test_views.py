@@ -569,5 +569,121 @@ class DependsOnParserTest(unittest.TestCase):
         self.assertEqual(views.parse_closes(None, "acme/app"), set())
 
 
+def pr_with_reviewers(number: int, item_id: int, reviewers: list[dict] | None) -> dict:
+    pr = base_expanded("@mikkokotila", [])
+    pr["is_pr"] = True
+    pr["issue"] = dict(pr["issue"], id=item_id, node_id=f"I_{item_id}", number=number)
+    pull: dict = {
+        "id": item_id,
+        "node_id": f"I_{item_id}",
+        "graphql": {"isDraft": False},
+        "assignees": [],
+        "merged_by": None,
+        "updated_at": "2026-01-02T00:00:00Z",
+    }
+    if reviewers is not None:
+        pull["requested_reviewers"] = reviewers
+    pr["pull"] = pull
+    pr["issue"]["pull_request"] = {"node_id": f"I_{item_id}"}
+    return pr
+
+
+class RequestedReviewersTest(unittest.TestCase):
+    def test_prs_view_returns_the_current_requested_reviewers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            current = pr_with_reviewers(2, 101, [{"login": "mikkokotila"}, {"login": "hubot"}])
+            empty = pr_with_reviewers(3, 102, [])
+            legacy = pr_with_reviewers(4, 103, None)
+            with conn:
+                upsert_repo(conn, current["repo"])
+            store_expanded(conn, current)
+            store_expanded(conn, empty)
+            store_expanded(conn, legacy)
+            conn.close()
+
+            rows = {row["number"]: row for row in json.loads(views.pr(db_path=db_path))}
+            self.assertEqual(json.loads(rows[2]["requested_reviewers"]), ["mikkokotila", "hubot"])
+            self.assertEqual(json.loads(rows[3]["requested_reviewers"]), [])
+            self.assertIsNone(rows[4]["requested_reviewers"])
+
+    def test_user_view_carries_reviewers_and_null_for_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = pr_with_reviewers(2, 101, [{"login": "mikkokotila"}])
+            issue = base_expanded("@mikkokotila", [])
+            with conn:
+                upsert_repo(conn, pr["repo"])
+                add_user(conn, "mikkokotila")
+            store_expanded(conn, pr)
+            store_expanded(conn, issue)
+            conn.close()
+
+            rows = {(row["item_type"], row["number"]): row
+                    for row in json.loads(views.user(db_path=db_path, username="mikkokotila"))}
+            self.assertEqual(json.loads(rows[("pr", 2)]["requested_reviewers"]), ["mikkokotila"])
+            self.assertIsNone(rows[("issue", 1)]["requested_reviewers"])
+
+    def test_a_review_request_alone_is_an_involvement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = pr_with_reviewers(2, 101, [{"login": "mikkokotila"}])
+            pr["issue"] = dict(pr["issue"], title="Someone else's work", body="no mention here")
+            with conn:
+                upsert_repo(conn, pr["repo"])
+                add_user(conn, "mikkokotila")
+            store_expanded(conn, pr)
+            conn.close()
+
+            rows = json.loads(views.user(db_path=db_path, username="mikkokotila", item_type="pr"))
+            self.assertEqual(len(rows), 1)
+            self.assertIn("review_requested", rows[0]["reasons"].split(","))
+            self.assertEqual(json.loads(rows[0]["requested_reviewers"]), ["mikkokotila"])
+
+    def test_a_removed_request_leaves_only_its_timeline_trace_outside_the_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = pr_with_reviewers(2, 101, [])
+            pr["timeline"] = [{
+                "id": 400, "node_id": "E_400", "event": "review_requested",
+                "actor": {"login": "other"}, "requested_reviewer": {"login": "mikkokotila"},
+                "created_at": "2026-01-04T00:00:00Z",
+            }]
+            with conn:
+                upsert_repo(conn, pr["repo"])
+                add_user(conn, "mikkokotila")
+            store_expanded(conn, pr)
+            conn.close()
+
+            rows = json.loads(views.user(db_path=db_path, username="mikkokotila", item_type="pr"))
+            self.assertEqual(len(rows), 1)
+            self.assertIn("event_requested_reviewer:review_requested", rows[0]["reasons"].split(","))
+            self.assertEqual(json.loads(rows[0]["requested_reviewers"]), [])
+
+    def test_a_version_3_database_gets_requested_reviewers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            conn.execute("DROP VIEW prs")
+            conn.execute("CREATE VIEW prs AS SELECT item_id AS pr_ref FROM items WHERE item_type = 'pr'")
+            conn.execute("PRAGMA user_version = 3")
+            conn.commit()
+            init_db(conn)
+            columns = [column[0] for column in conn.execute("SELECT * FROM prs LIMIT 0").description]
+            user_columns = [column[0] for column in conn.execute("SELECT * FROM user_items LIMIT 0").description]
+            conn.close()
+            self.assertIn("requested_reviewers", columns)
+            self.assertIn("requested_reviewers", user_columns)
+
+
 if __name__ == "__main__":
     unittest.main()

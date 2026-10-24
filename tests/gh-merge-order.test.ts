@@ -15,6 +15,7 @@ vi.mock('../server/organizations', () => ({
 vi.mock('../server/db', () => ({
   getMeta: mocks.getMeta,
   setMeta: vi.fn(),
+  db: { transaction: (fn: (...args: never[]) => unknown) => fn },
 }))
 
 const { handleGhBody } = await import('../server/gh')

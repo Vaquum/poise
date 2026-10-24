@@ -525,6 +525,8 @@ export type ServerFrame =
   | { kind: 'switches.updated', catalogue: ChatSwitches }
   /** The Switchboard's state changed; read it again from `/api/chat/switchboard`. */
   | { kind: 'switchboard.updated', revision: number }
+  /** The open requests changed; read them again from `/api/chat/requests`. */
+  | { kind: 'chatRequests.updated', revision: number }
   | { kind: 'ack', id: string, ok: true, result?: unknown }
   | { kind: 'ack', id: string, ok: false, error: string, code?: string }
   | { kind: 'event', envelope: ChatEnvelope }

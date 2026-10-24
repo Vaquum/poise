@@ -648,6 +648,15 @@ variables, and Caller fails loudly when an account is needed and missing.
 `grok`, `muse` and `antigravity`. Each shows whether the CLI is installed, its
 version, whether it is signed in and as whom.
 
+**Followed accounts.** Settings → General → GitHub accounts follows GitHub
+organizations and users, each with its own synced datastore. `DELETE
+/api/organizations/<login>` stops following one; it is the person's action in
+the browser. The account from setup and the last one cannot be removed.
+Removal aborts the account's activation or sync job, resolves its notices,
+and drops its repositories from the issue review selection and the Manager's
+scope. Nothing changes on GitHub, datastores are kept, and work bindings stay
+as history.
+
 `GET /api/github-quota` reads the configured user and automation accounts'
 stored credentials explicitly and returns their API budgets without secrets.
 Its response and forecast model are defined in [Analytics](Analytics.md#github-api-quota).
@@ -838,6 +847,14 @@ The facts are read fresh from the datastore the scheduler reads; when they
 cannot be read the replay answers 502 and launches nothing. Swarm shows a
 refusal under the row whose Replay was pressed.
 
+**Pausing.** A behavior can be paused until a time (`pausedUntil` on `POST
+/api/behaviors/<key>`, `null` clears). The pause is stored apart from the
+saved on/off and attributed to the person or the api; it clears no claims,
+seen state or backoff. While it holds, reconciliation and already launched
+agents run on, but nothing new launches: every launch path rechecks at its
+final admission, and replays and explicit runs stay available. Expiry needs
+no write and never flips the saved on/off.
+
 ## Snippets and Poise Link
 
 **Snippets are edited only in Poise:** the Snippets view, Chat's `/create`, and
@@ -948,6 +965,57 @@ at its top.
 - **Alerts** become native notifications; clicking one opens its URL.
 - **Tray menu:** status, Open Poise, Sync now, Notifications on/off,
   Start at login on/off, Sign out, Quit.
+
+## Pull-request actions
+
+The person's Approve and Merge buttons (workspace, the person's browser
+only): `POST /api/pull-requests/approve` and `POST /api/pull-requests/merge`.
+Both take `{ repo, number, expectedHeadSha, actionId }`, act with the person's
+GitHub account, and pin the action to the expected head. Anything without the
+person's authority answers 403 and acts on nothing.
+
+Each `actionId` is a receipt: the server reserves it with a fingerprint of the
+action before anything is sent. Repeating a call returns the stored outcome
+without acting again; the same ID for a different action is refused with 409.
+A lost response or a crash reconciles against GitHub instead of acting twice:
+a recorded result becomes the outcome, anything else answers unknown with the
+GitHub state, and a retry with the same ID reconciles again. Outcomes name
+what happened: `approved` and `already_approved` carry the approval's head and
+the current head; `merged` carries the merge SHA and method; `enqueued` and
+`in_queue` carry the queue entry; `already_merged` names who merged;
+`superseded` carries both heads; `refused` carries GitHub's own words.
+
+## Redesigned-interface reads
+
+`GET /api/capabilities` lists the capabilities this server has, by name
+(`server/capabilities.ts`). #556's interface reads it once at mount and uses
+each capability once it ships, keeping its Open fallback otherwise. Only
+delivered capabilities appear; the Manager's controls, plan and escalation
+stay absent until their enforcement lands.
+
+The supporting reads behind those names:
+
+- `GET /api/behavior-estimates`: each running behavior run with its remaining
+  time from similar runs (same behavior and model, last 30 days, at least
+  five); an overrun reads `overrun`, never below zero.
+- `GET /api/chat/requests`: every open chat request with a revision, kept
+  current by the `chatRequests.updated` frame.
+- `GET /api/notices/handled?since=<ISO>`: the append-only handling log, kept
+  30 days from each entry's time.
+- `GET /api/editor/reviews`: every publication with its `checkedAt`, `stale`,
+  `problems` and `retryAt`, including ones with no open thread; a cold or
+  failed one stays listed, never looking as if it had no feedback. The
+  response also states the sweep's longest delay in minutes.
+- Settings saves may carry `expect: { <field>: <value the tab read> }`; a
+  save that would overwrite another tab's edit is refused with 409 and the
+  current values, changing nothing.
+
+A background sweep reads every GitHub publication as your GitHub account,
+oldest checked first, one publication a minute and each at most every 15
+minutes; closed or merged ones are re-read once a day, so a reopened pull
+request or late feedback is seen within a day. It pauses on release drain
+and on the account's deferred budget, keeps the Editor's backoff, and skips
+Google publications, whose reads need live browser delegation.
 
 ## Deployment
 

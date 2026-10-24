@@ -24,6 +24,7 @@ vi.mock('../server/db', () => ({
   getMeta: (key: string) => mocks.meta[key] ?? null,
   setMeta: vi.fn(),
   listCompletedBehaviorActions: () => mocks.behaviors,
+  db: { transaction: (fn: (...args: never[]) => unknown) => fn },
 }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, MAX_PROCESS_ARG_BYTES: 64 * 1024 }))
 vi.mock('../server/organizations', () => ({

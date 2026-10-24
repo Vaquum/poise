@@ -65,8 +65,10 @@ suppresses their popups. See
    with the same cause retain their dismissal; changing counts and attempt IDs
    do not count as a new cause. This persists across restarts.
 4. A GitHub account's datastore has not synced for 15 minutes.
-5. A pull request of yours is ready to merge (below).
-6. A Chat turn that ran longer than two minutes has finished. This one shows
+5. A pull request asks for your review (below).
+6. One of your pull requests has a merge conflict (below).
+7. A pull request of yours is ready to merge (below).
+8. A Chat turn that ran longer than two minutes has finished. This one shows
    for an hour. A [Switchboard](Switchboard.md) check that finishes is routine
    and raises none; one that ends early does. A timer turn that ends normally
    is routine and raises none; one that ends early does.
@@ -151,6 +153,25 @@ authoritative resolution, including beyond thirty days. Resolved history and
 native alert replay keep their thirty-day window. Finished-turn notices still
 expire after one hour; ready-PR reminders follow their existing lifecycle.
 
+## Requested reviews and conflicts
+
+Every two minutes, on the same pass as the ready check, Poise looks at every
+involved open pull request, whoever authored it, and at your own open pull
+requests:
+
+- A pull request that currently asks your GitHub account to review it is
+  noticed once. The request is as fresh as the organization's datastore sync:
+  it resolves when a sync shows the request gone — GitHub drops it when you
+  submit a review — or when the pull request closes. A failed or incomplete
+  read keeps the notice. A request made again after removal is noticed anew.
+  Silencing it lasts until the request is removed.
+- One of your own open pull requests whose held reasons include a conflict is
+  noticed once. It resolves when the conflict is gone or the pull request
+  closes. It cannot be silenced.
+
+Neither repeats while it stands: each shows until you put it away or it
+resolves.
+
 ## Acting on a notice
 
 - **Open** goes to what the notice is about and puts the notice away. That is
@@ -165,8 +186,9 @@ expire after one hour; ready-PR reminders follow their existing lifecycle.
   - A floating rail closes when it opens something; a docked rail stays open.
 - **Dismiss** puts it away: for good, or for a ready pull request until its
   next reminder.
-- **Silence reminders**, on a ready pull request only, silences it: no more
-  reminders while it stays open.
+- **Silence reminders**, on a ready pull request or a requested review,
+  silences it: no more reminders while a ready pull request stays open, and
+  nothing more about a review request until the request is removed.
 
 Behaviors' conditions cannot be put away. They leave the rail when the
 condition clears.
@@ -221,7 +243,8 @@ other alerts go on as before.
 - `POST /api/notices/:id/dismiss` and `POST /api/notices/:id/silence` answer
   the same shape.
   - Either answers 404 for a notice that has cleared or was never issued.
-  - Silencing answers 400 for anything but a ready pull request.
+  - Silencing answers 400 for anything but a ready pull request or a
+    requested review.
 - `POST /api/settings` with `{ "notifications": { "enabled": false } }` turns
   them off; `true` turns them on.
 

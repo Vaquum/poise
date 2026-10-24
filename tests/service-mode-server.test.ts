@@ -501,7 +501,7 @@ describe('Poise in service mode', () => {
     try {
       const login = await send('POST', '/api/claude-auth/login', fromGateway())
       expect(login).toMatchObject({ status: 409, json: { code: 'service_mode' } })
-      expect(login.json.error).toContain('Settings → Connected accounts')
+      expect(login.json.error).toContain('Settings → Accounts')
       expect(auth.logins).toBe(0)
     } finally {
       auth.setStatus('authenticated')

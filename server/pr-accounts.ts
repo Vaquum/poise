@@ -3,7 +3,7 @@ import { getMeta } from './db'
 export function prAccounts(): { me: string, agent: string } {
   const me = getMeta('me') || ''
   const agent = getMeta('agentAccount') || ''
-  if (!me || !agent) throw new Error('PR automation needs both your GitHub account and agent account. Set it in Settings → GitHub')
+  if (!me || !agent) throw new Error('PR automation needs both your GitHub account and agent account. Set it in Settings → General')
   if (me.toLowerCase() === agent.toLowerCase()) throw new Error('Your GitHub account and agent account must be different for PR review')
   return { me, agent }
 }

@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ArticleReview, ArticleReviews, ReviewAnchor, ReviewMessage } from '../src/publishing-review'
 import { REVIEW_INTERVAL_MS } from '../src/publishing-review'
 import { db, getMeta, setMeta } from './db'
-import { readDoc, readPublishLedger, type PublishRecord } from './editor'
+import { listDocs, readDoc, readPublishLedger, type PublishRecord } from './editor'
 import { HttpError, readJson } from './http'
 import { isRepositoryPath, parsePost, PostFileError } from './publishing'
 import { fileAt, GitHubError, queryGitHub, repositoryById, signIn, type GitHubSession } from './publishing-github'
@@ -293,9 +293,120 @@ async function reviewAction(slug: string, value: unknown): Promise<ArticleReview
   return articleReviews(slug)
 }
 
+// ── Background sweep ──
+// New review feedback on a publication nobody has opened is seen without
+// opening it: the sweep reads every GitHub publication as your GitHub
+// account, oldest checked first, one publication a minute. An open
+// publication is re-read at most every 15 minutes; a closed or merged one,
+// which the Editor serves from cache for good, is re-read once a day, so a
+// reopened pull request or late feedback is seen within a day. Google
+// publications are excluded: their reads need live browser delegation.
+const SWEEP_INTERVAL_MS = 60_000
+const SWEEP_ACTIVE_MS = 15 * 60_000
+const SWEEP_TERMINAL_MS = 24 * 60 * 60_000
+
+export interface PublicationReviewEntry {
+  slug: string, site: string, repo: string, pr: number, prUrl: string,
+  checkedAt: string | null, active: boolean, stale: boolean,
+  problems: string[], retryAt?: string, openThreads: number,
+}
+export interface PublicationReviewList {
+  publications: PublicationReviewEntry[],
+  sweep: { publications: number, longestDelayMinutes: number },
+}
+
+interface Candidate { slug: string, record: PublishRecord, value: Cached }
+
+function checkedMs(value: Cached): number {
+  const at = value.snapshot ? Date.parse(value.snapshot.checkedAt) : NaN
+  return Number.isFinite(at) ? at : Number.NEGATIVE_INFINITY
+}
+
+async function listCandidates(me: string): Promise<Candidate[]> {
+  const out: Candidate[] = []
+  for (const doc of await listDocs()) {
+    const { records } = await readPublishLedger(doc.slug)
+    for (const record of records) out.push({ slug: doc.slug, record, value: cached(keyFor(me, record)) })
+  }
+  // The publication checked longest ago goes first, each publication
+  // separately, so documents published to several sites progress per site.
+  out.sort((a, b) => checkedMs(a.value) - checkedMs(b.value))
+  return out
+}
+
+function entryOf(candidate: Candidate, now: number): PublicationReviewEntry {
+  const { slug, record, value } = candidate
+  const snapshot = value.snapshot
+  return {
+    slug, site: record.site, repo: snapshot?.repo ?? record.repo,
+    pr: record.pullRequest.number, prUrl: record.pullRequest.url,
+    checkedAt: snapshot?.checkedAt ?? null,
+    active: snapshot?.active ?? true,
+    stale: !snapshot || !!value.problem || now >= value.nextAt,
+    problems: value.problem ? [value.problem] : snapshot ? [] : ['Not read yet.'],
+    ...(value.problem && value.nextAt ? { retryAt: new Date(value.nextAt).toISOString() } : {}),
+    openThreads: snapshot?.reviews.filter((review) => review.kind === 'thread' && !review.resolved).length ?? 0,
+  }
+}
+
+/** Every publication with its review state, including ones with no open
+ *  thread. A cold or failed one stays listed with its staleness, never
+ *  disappearing as though it had no feedback. */
+export async function listPublicationReviews(now = Date.now()): Promise<PublicationReviewList> {
+  const me = getMeta('me') ?? ''
+  const publications = (await listCandidates(me)).map((candidate) => entryOf(candidate, now))
+  return { publications, sweep: { publications: publications.length, longestDelayMinutes: Math.max(15, publications.length) } }
+}
+
+/** Read the due publication checked longest ago: an open one at most every
+ *  15 minutes, a closed or merged one once a day. One publication per
+ *  call; the timer calls this once a minute. */
+export async function runPublicationReviewSweepOnce(now = Date.now()): Promise<{ read: { slug: string, site: string, repo: string, pr: number } | null }> {
+  if (releaseBackgroundPaused()) return { read: null }
+  const me = getMeta('me') ?? ''
+  if (!me) return { read: null }
+  // The sweep pauses while the account's budget is deferred, like the Editor.
+  try { checkBudget(me) } catch { return { read: null } }
+  const next = (await listCandidates(me)).find(({ value }) => {
+    // A failed read keeps the Editor's backoff before it is retried.
+    if (value.problem && now < value.nextAt) return false
+    if (!value.snapshot) return true
+    return now - checkedMs(value) >= (value.snapshot.active ? SWEEP_ACTIVE_MS : SWEEP_TERMINAL_MS)
+  })
+  if (!next) return { read: null }
+  // Rechecked after the disk reads above: the release drain may have
+  // started while they were awaited, and no new read begins after it.
+  // The recheck and the tracking below are synchronous, so the drain
+  // either sees this read or this read sees the drain.
+  if (releaseBackgroundPaused()) return { read: null }
+  // Forced past the Editor's terminal exclusion: a closed publication that
+  // reopened, or gained late feedback, is read again. The release drain
+  // waits for the read; pausing stops admission, never this read.
+  const finished = trackReleaseBackground()
+  try {
+    await refresh(me, next.record, true)
+  } finally { finished() }
+  const { slug, record } = next
+  return { read: { slug, site: record.site, repo: record.repo, pr: record.pullRequest.number } }
+}
+
+let sweepTimer: ReturnType<typeof setInterval> | null = null
+
+export function startPublicationReviewsRuntime(): void {
+  if (sweepTimer) return
+  sweepTimer = setInterval(() => {
+    void runPublicationReviewSweepOnce().catch((error: unknown) => console.error('[publishing-reviews] background sweep failed:', error))
+  }, SWEEP_INTERVAL_MS)
+  sweepTimer.unref?.()
+}
+
+export async function stopPublicationReviewsRuntime(): Promise<void> {
+  if (sweepTimer) clearInterval(sweepTimer)
+  sweepTimer = null
+}
+
 export async function handleArticleReviewsApi(req: IncomingMessage, res: ServerResponse, url: string): Promise<boolean> {
   const match = /^\/api\/editor\/doc\/([A-Za-z0-9._-]+)\/reviews(?:\/(sync|action))?$/.exec(url.split('?')[0])
-  if (!match) return false
   const send = (status: number, value: unknown): true => {
     res.statusCode = status
     res.setHeader('Content-Type', 'application/json')
@@ -303,6 +414,16 @@ export async function handleArticleReviewsApi(req: IncomingMessage, res: ServerR
     res.end(JSON.stringify(value))
     return true
   }
+  if (url.split('?')[0] === '/api/editor/reviews') {
+    try {
+      if (req.method !== 'GET') return send(405, { error: 'Use GET for every publication’s review state.' })
+      return send(200, await listPublicationReviews())
+    } catch (error) {
+      if (error instanceof HttpError) return send(error.statusCode, { error: error.message })
+      return send(500, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  if (!match) return false
   let finished: (() => void) | undefined
   try {
     if (req.method === 'GET' && !match[2]) return send(200, await articleReviews(match[1]))
