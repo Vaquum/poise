@@ -13,12 +13,19 @@ machine token or gateway scope. All routes accept GET only:
 
 | Route | Result |
 | --- | --- |
-| `/api/behavior-ledger?limit=50&cursor=...&parent=...` | Page of roots and attempts; optional parent restricts children |
+| `/api/behavior-ledger?limit=50&cursor=...&parent=...&repository=...&number=...` | Page of roots and attempts; optional parent restricts children, optional repository plus number selects that GitHub target |
 | `/api/behavior-ledger/ID` | One retained instance |
 | `/api/behavior-ledger/changes?cursor=...&limit=50` | Ordered upserts and removals |
 | `/api/behavior-ledger/health` | Capture health, including unavailable storage |
 
 Responses contain `version: 1` and `health`. Limits are integers from 1 to 100.
+A target lookup passes both `repository` (`OWNER/REPO`, at most 140
+characters) and `number` (positive integer) together; either alone returns
+400. It selects retained roots and attempts for that target from captured
+data, under the same authority, limits and freshness contract, with no
+additional Caller or GitHub collection. An empty or stale filtered result
+must not establish that no work is running; check `health` for pending,
+dropped, gaps and stale coverage.
 Start with a list request without a cursor. Its `watermark` is a changes cursor;
 follow `nextCursor` until null, then consume changes from that watermark.
 List pages freeze their creation boundary. Apply upserts by increasing record
@@ -60,6 +67,7 @@ The shipped command uses the same fixed GET routes and emits JSON only:
 
 ```sh
 node dist/behavior-ledger.js list --limit 50
+node dist/behavior-ledger.js list --repository OWNER/REPO --number 123
 node dist/behavior-ledger.js get HASH
 node dist/behavior-ledger.js changes CURSOR
 node dist/behavior-ledger.js health

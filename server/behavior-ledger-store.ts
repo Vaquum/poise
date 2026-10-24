@@ -11,7 +11,7 @@ import {
 } from './behavior-ledger-contract'
 
 interface Row { creation_seq: number; id: string; parent_id: string | null; native_id: string | null; payload: string; source_at: string | null; native_override: number; bytes: number }
-interface Cursor { version: 1; generation: string; kind: 'list' | 'changes'; position: number; boundary: number; watermark: number; parent: string | null }
+interface Cursor { version: 1; generation: string; kind: 'list' | 'changes'; position: number; boundary: number; watermark: number; parent: string | null; repository?: string | null; number?: number | null }
 interface Journal { version: 1; epoch: string; closed: boolean; health: LedgerHealth }
 const ID = /^[a-f0-9]{64}$/
 const CALL = /^[a-f0-9]{32}$/
@@ -542,7 +542,7 @@ export class BehaviorLedgerStore {
     const payload = Buffer.from(JSON.stringify({ version: 1, generation: this.data.generation, ...input })).toString('base64url')
     return payload + '.' + createHmac('sha256', this.cursorKey).update(payload).digest('base64url')
   }
-  private parseCursor(value: string, kind: Cursor['kind'], parent: string | null): Cursor {
+  private parseCursor(value: string, kind: Cursor['kind'], parent: string | null, repository: string | null = null, number: number | null = null): Cursor {
     try {
       if (value.length > 4096) throw new Error('Cursor bound')
       const [payload, signature, extra] = value.split('.')
@@ -550,12 +550,15 @@ export class BehaviorLedgerStore {
       if (cursor.generation !== this.data.generation) throw new LedgerError(410, 'resync_required')
       const expected = createHmac('sha256', this.cursorKey).update(payload).digest()
       const actual = Buffer.from(signature ?? '', 'base64url')
+      const cursorRepository = cursor.repository ?? null
+      const cursorNumber = cursor.number ?? null
       if (extra !== undefined || actual.length !== expected.length || !timingSafeEqual(actual, expected)
         || cursor.version !== 1 || cursor.kind !== kind || cursor.parent !== parent
+        || cursorRepository !== repository || cursorNumber !== number
         || ![cursor.position, cursor.boundary, cursor.watermark].every((n) => Number.isSafeInteger(n) && n >= 0)) throw new Error('Invalid cursor')
       if (cursor.watermark < Number(this.meta('change_floor')) || cursor.position > (kind === 'changes' ? this.lastSequence() : cursor.boundary)
         || cursor.watermark > this.lastSequence()) throw new LedgerError(410, 'resync_required')
-      return cursor
+      return { ...cursor, repository: cursorRepository, number: cursorNumber }
     } catch (error) {
       if (error instanceof LedgerError) throw error
       throw new LedgerError(400, 'invalid_cursor')
@@ -587,11 +590,23 @@ export class BehaviorLedgerStore {
         }
         const parent = request.parent ?? null
         if (parent !== null && !ID.test(parent)) throw new LedgerError(400, 'invalid_parent')
+        const repository = request.repository ?? null
+        const targetNumber = request.number ?? null
+        if ((repository === null) !== (targetNumber === null)) throw new LedgerError(400, 'invalid_query')
+        if (repository !== null && (!REPO.test(repository) || repository.length > 140)) throw new LedgerError(400, 'invalid_query')
+        if (targetNumber !== null && !safeId(targetNumber)) throw new LedgerError(400, 'invalid_query')
         const maximum = this.connection().prepare("SELECT seq FROM sqlite_sequence WHERE name='ledger_instances'").get() as { seq: number } | undefined
-        const cursor = request.cursor ? this.parseCursor(request.cursor, 'list', parent)
-          : { version: 1 as const, generation: this.data.generation!, kind: 'list' as const, position: 0, boundary: maximum?.seq ?? 0, watermark: this.lastSequence(), parent }
-        const rows = this.rows(`SELECT * FROM ledger_instances WHERE creation_seq>? AND creation_seq<=? ${parent === null ? '' : 'AND parent_id=?'} ORDER BY creation_seq ASC LIMIT ?`,
-          ...[cursor.position, cursor.boundary, ...(parent === null ? [] : [parent]), limit + 1])
+        const cursor = request.cursor ? this.parseCursor(request.cursor, 'list', parent, repository, targetNumber)
+          : { version: 1 as const, generation: this.data.generation!, kind: 'list' as const, position: 0, boundary: maximum?.seq ?? 0, watermark: this.lastSequence(), parent, repository, number: targetNumber }
+        const conditions = ['creation_seq>?', 'creation_seq<=?']
+        const args: (string | number)[] = [cursor.position, cursor.boundary]
+        if (parent !== null) { conditions.push('parent_id=?'); args.push(parent) }
+        if (repository !== null && targetNumber !== null) {
+          conditions.push(`json_extract(payload,'$.target.repository')=?`, `json_extract(payload,'$.target.number')=?`)
+          args.push(repository, targetNumber)
+        }
+        const rows = this.rows(`SELECT * FROM ledger_instances WHERE ${conditions.join(' AND ')} ORDER BY creation_seq ASC LIMIT ?`,
+          ...[...args, limit + 1])
         const selected = rows.slice(0, limit)
         const nextCursor = rows.length > limit ? this.cursor({ ...cursor, position: selected.at(-1)!.creation_seq }) : null
         return envelope({ records: selected.map(recordOf), nextCursor,
