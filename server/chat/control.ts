@@ -1189,10 +1189,9 @@ export class ChatControl {
    *  takes a claimed target, never rebinds a released one, never binds to
    *  a closed or deleted chat, and never guesses between two chats: an
    *  ambiguous PR stays unbound with one warning. */
-  private async discoverWorkBindings(now: number): Promise<void> {
+  private async discoverWorkBindings(now: number, current: store.Binding[]): Promise<void> {
     if (now - this.lastDiscovery < DISCOVERY_INTERVAL) return
     const instance = this.runtime.instance
-    const current = store.bindings(instance)
     const bound = new Set(current.map(binding => binding.target))
     const issueOwners = new Map<string, string>()
     for (const binding of current) {
@@ -1258,10 +1257,13 @@ export class ChatControl {
   /** Observe claimed targets in the background, caching remote reads for five minutes. */
   private async runCiPass(): Promise<void> {
     const instance = this.runtime.instance
+    // One bindings snapshot serves discovery and observation: targets the
+    // sweep claims are observed from the next pass.
+    const current = store.bindings(instance)
     try {
-      await this.discoverWorkBindings((this.options.now ?? Date.now)())
+      await this.discoverWorkBindings((this.options.now ?? Date.now)(), current)
     } catch (error) { if (this.stopped) return; this.itemFailed('discovery', instance, error) }
-    for (const binding of store.bindings(instance)) {
+    for (const binding of current) {
       // Cached reads resolve in microtasks; give requests an I/O turn between targets.
       await setImmediate()
       if (this.stopped) return
