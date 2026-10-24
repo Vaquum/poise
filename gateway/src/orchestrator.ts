@@ -702,6 +702,9 @@ export class Orchestrator {
             const recheck = await this.idleUnderDrain(handle, login)
             this.upgradingPhase = 'upgrade'
             if (!recheck.idle) {
+              // The recheck observed drain state too: an answer showing the drain off un-admits at
+              // once, so a later silent round cannot preserve a stale admission into a forced stop.
+              if (recheck.draining !== null) admitted = recheck.draining
               if (recheck.unknown) {
                 // A down recheck latches nothing: the next drain round decides on fresh evidence, so a
                 // workspace that answers again is never cut for a failure it recovered from.
@@ -791,8 +794,12 @@ export class Orchestrator {
     }
   }
 
-  /** Drains again and says whether the workspace is idle; unknown when it cannot tell. */
-  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; down: boolean }> {
+  /**
+   * Drains again and says whether the workspace is idle; unknown when it cannot tell. `draining`
+   * reports the drain as this answer showed it, so the caller learns a lost admission even when the
+   * recheck cannot proceed; null when nothing observed it.
+   */
+  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; down: boolean; draining: boolean | null }> {
     try {
       const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
       // The recheck is the last gate before the stop: only an idle answer behind an applied drain lets
@@ -801,13 +808,13 @@ export class Orchestrator {
       if (!health.ok || !health.draining) {
         this.deps.log.warn('workspace.drain.unconfirmed', { handle, ok: health.ok, draining: health.draining,
           activeChatTurns: health.activeChatTurns, runningCallerCalls: health.runningCallerCalls, backgroundWork: health.backgroundWork })
-        return { idle: false, unknown: true, down: false }
+        return { idle: false, unknown: true, down: false, draining: health.ok ? health.draining : null }
       }
-      return { idle: health.idle, unknown: false, down: false }
+      return { idle: health.idle, unknown: false, down: false, draining: true }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       this.deps.log.warn('workspace.drain.recheck.failed', { handle, error: errorMessage(error) })
-      return { idle: false, unknown: true, down: !(error instanceof ServiceTimeoutError) && !(error instanceof WorkspaceAnswerError) }
+      return { idle: false, unknown: true, down: !(error instanceof ServiceTimeoutError) && !(error instanceof WorkspaceAnswerError), draining: null }
     }
   }
 

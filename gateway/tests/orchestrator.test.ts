@@ -881,6 +881,39 @@ describe('updates in place', () => {
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 
+  it('aborts when refused answers follow a recheck that lost admission, instead of cutting on stale state', async () => {
+    await start({ oldBase: 'base-0' })
+    const before = containerId()
+    h.workspace.health.runningCallerCalls = 1
+    setTimeout(() => {
+      h.workspace.health.runningCallerCalls = 0
+    }, 60)
+    h.docker.onTask = () => {
+      // Activation restarts Poise without holding a drain; the slow recheck leaves time to flip under it.
+      h.workspace.drainApplies = false
+      h.workspace.health.draining = false
+      h.workspace.answerDelayMs = 200
+      h.docker.onTask = undefined
+    }
+    const upgrade = h.orchestrator.upgradePass()
+    // The second drain POST is the recheck: refuse everything received after it is sent, so the
+    // recheck still answers from before the flip while the whole retry round is refused.
+    await waitFor(() => h.workspace.serviceRequests.filter((request) => request.url === '/api/service/drain').length >= 2, 'the recheck request')
+    h.workspace.healthStatus = 503
+    await upgrade
+    expect(events(h.logs, 'workspace.drain.unconfirmed').length).toBeGreaterThanOrEqual(1)
+    expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
+    expect(containerId()).toBe(before)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    // The next pass admits and upgrades once answers resume.
+    h.workspace.answerDelayMs = 0
+    h.workspace.healthStatus = 200
+    h.workspace.drainApplies = true
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
   it('aborts when busy work arrives unadmitted after a lost admission, instead of cutting on stale state', async () => {
     await start({ oldBase: 'base-0' })
     const before = containerId()
