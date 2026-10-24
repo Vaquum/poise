@@ -136,6 +136,19 @@ db.exec(`
     resolved_at TEXT
   );
 
+  -- Short replay reservations, one per reviewed target and behavior: two
+  -- concurrent replays of one target cannot both pass admission and post
+  -- duplicate reviews. Rows are replaced, never accumulate; expiry clears
+  -- a reservation whose replay crashed before spawning.
+  CREATE TABLE IF NOT EXISTS behavior_replay_reservations (
+    repo TEXT NOT NULL,
+    pr INTEGER NOT NULL,
+    behavior TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (repo, pr, behavior)
+  );
+
   CREATE TABLE IF NOT EXISTS content_jobs (
     call_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -1165,20 +1178,24 @@ export function reconcileBehaviorDeadLetters(
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
     throw new Error('reconcile limit must be between 1 and 500')
   }
+  if (behaviors.length === 0) return []
   const now = new Date(nowMs).toISOString()
   const holdCutoff = new Date(nowMs - 60 * 60_000).toISOString()
-  const rows = (db.prepare(`
+  // The behavior scope is part of the query: filtering after LIMIT would
+  // let old rows for other behaviors starve this pass forever.
+  const rows = db.prepare(`
     SELECT id, behavior, target, repo, pr, call_id, error, created_at
     FROM behavior_dead_letters AS dead
     WHERE dead.retired_at IS NULL
       AND (? IS NULL OR lower(substr(COALESCE(dead.repo, dead.target), 1, instr(COALESCE(dead.repo, dead.target), '/') - 1)) = ?)
+      AND dead.behavior IN (${behaviors.map(() => '?').join(', ')})
       AND (dead.resolution IS NULL OR dead.resolved_at IS NULL OR dead.resolved_at < ?)
     ORDER BY dead.created_at ASC, dead.id ASC
     LIMIT ?
-  `).all(organization ?? null, organization?.toLowerCase() ?? null, holdCutoff, limit) as Array<{
+  `).all(organization ?? null, organization?.toLowerCase() ?? null, ...behaviors, holdCutoff, limit) as Array<{
     id: string, behavior: string, target: string, repo: string | null, pr: number | null,
     call_id: string | null, error: string, created_at: string,
-  }>).filter((row) => behaviors.includes(row.behavior))
+  }>
   const quarantined = db.prepare(`
     SELECT 1 FROM behavior_seen AS held
     WHERE held.key = ? AND held.target = ? AND held.launch_quarantine IS NOT NULL
@@ -1236,6 +1253,26 @@ export function reconcileBehaviorDeadLetters(
     return settle('held', 'row carries no repository identity; cannot verify its target',
       { callId: row.call_id })
   }))()
+}
+
+// How long an admitted replay owns its target: preparation plus spawn plus
+// worker registration, with margin. Only the same behavior on the same
+// target is fenced; a review and an approval replay never block each other.
+export const REPLAY_RESERVATION_MS = 10 * 60_000
+
+// Atomically reserve one replay: insert, or replace only an expired
+// reservation. One statement, so concurrent admissions cannot both win.
+export function reserveBehaviorReplay(repo: string, pr: number, behavior: string, nowMs = Date.now()): boolean {
+  const now = new Date(nowMs).toISOString()
+  const expires = new Date(nowMs + REPLAY_RESERVATION_MS).toISOString()
+  const info = db.prepare(`
+    INSERT INTO behavior_replay_reservations(repo, pr, behavior, created_at, expires_at)
+    VALUES(?, ?, ?, ?, ?)
+    ON CONFLICT(repo, pr, behavior) DO UPDATE
+    SET created_at = excluded.created_at, expires_at = excluded.expires_at
+    WHERE behavior_replay_reservations.expires_at < excluded.created_at
+  `).run(repo, pr, behavior, now, expires)
+  return info.changes === 1
 }
 
 export function listBehaviorDeadLetters(limit = 50, organization?: string): BehaviorDeadLetter[] {

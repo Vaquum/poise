@@ -338,10 +338,13 @@ apart.
 
 A pull-request replay is additionally refused while any worker owns the pull
 request, and when live GitHub already shows the review as published on the
-current head: an approval for `pr_approve`; any non-dismissed review for
+current head. Each behavior replays only its own publication kind: an
+approval for `pr_approve`; a commented or change-requested review for
 `pr_review`, unless a failed review slot on that head is still outstanding.
 Panel siblings share the agent account, so a review another Caller row claims
 as its own receipt is not a duplicate. Dismissed reviews never count. An
+admitted replay reserves its target for ten minutes, so a concurrent replay
+of the same target is refused while preparation and spawn are ahead. An
 `issue_review` replay stays a deliberate fresh run that comments again: it
 takes no publication check.
 

@@ -57,6 +57,7 @@ import {
   quarantineBehaviorLaunchOwned,
   retireBehaviorDeadLetter,
   reconcileBehaviorDeadLetters,
+  reserveBehaviorReplay,
   retireBehaviorDeadLettersForTarget,
   recordSeen,
   releaseSeen,
@@ -5464,14 +5465,18 @@ export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, n
 // so the publication check is per target, not per obligation. Refuse while
 // any worker owns the pull request, and refuse what live GitHub already
 // shows as published on the current head, so a replay can never post a
-// duplicate review. Panel siblings share the agent account on one head, so
-// a review another Caller row claims as its own receipt is not this
-// replay's duplicate; only an outstanding failed slot on this head may
+// duplicate review. Each behavior replays only its own publication kind: a
+// lost review verdict never blocks an approval replay, and a lost approval
+// never blocks a review replay. Panel siblings share the agent account on
+// one head, so a review another Caller row claims as its own receipt is not
+// this replay's duplicate; only an outstanding failed slot on this head may
 // retry beside a claimed sibling review. Dismissed reviews never count:
 // re-approving after a dismissal is approve-prs's job. Reviews an older
 // Caller reports only as a count cannot be placed, so they refuse like
 // the retry path; zero reviews means nothing was published. An unreadable
-// target throws, and the caller answers 502 with no launch.
+// target throws, and the caller answers 502 with no launch. An admitted
+// replay reserves its target atomically, so a concurrent request for the
+// same target cannot also pass while preparation and spawn are ahead.
 async function replayPublicationRefusal(
   behavior: 'pr_review' | 'pr_approve',
   repo: string,
@@ -5481,6 +5486,11 @@ async function replayPublicationRefusal(
     return `another behavior worker is still active on ${repo}#${number}`
   }
   const snapshot = await readBehaviorLogSnapshot()
+  // Quarantined rows are absent from entries: unreadable identity is
+  // uncertainty, never proof that no worker is active.
+  if (snapshot.quarantined.some((row) => quarantinedLogMayMatch(row, { repo, prId: String(number) }))) {
+    return `unreadable worker evidence for ${repo}#${number} cannot prove no worker is active`
+  }
   if (snapshot.entries.some((row) => row.repo === repo && String(row.pr_id || '') === String(number)
     && RUNNING_AGENT_STATUSES.has(row.status.toLowerCase()))) {
     return `another PR worker is still active on ${repo}#${number}`
@@ -5494,8 +5504,9 @@ async function replayPublicationRefusal(
     return `a review submission by ${reviewer} is still pending on ${repo}#${number}`
   }
   const head = activity.headSha
+  const verdicts = behavior === 'pr_approve' ? ['APPROVED'] : ['COMMENTED', 'CHANGES_REQUESTED']
   const published = (activity.reviewerReviewsSinceItems ?? []).filter((review) =>
-    review.commit === head && review.state !== 'DISMISSED' && review.state !== 'PENDING')
+    review.commit === head && verdicts.includes(review.state))
   const claimed = new Set(snapshot.entries
     .filter((row) => row.repo === repo && String(row.pr_id || '') === String(number) && typeof row.review_id === 'number')
     .map((row) => row.review_id as number))
@@ -5504,18 +5515,28 @@ async function replayPublicationRefusal(
     return `review ${unclaimed.map((review) => review.id).join(', ')} by ${reviewer} is already published on ${head}`
   }
   if (behavior === 'pr_approve') {
-    const approval = published.find((review) => review.state === 'APPROVED')
-    if (approval) return `approval ${approval.id} by ${reviewer} is already published on ${head}`
-    return null
+    if (published.length > 0) return `approval ${published[0].id} by ${reviewer} is already published on ${head}`
+  } else if (published.length > 0 && !failedReviewSlotWithoutOutcome(repo, number, head, reviewer)) {
+    return `review ${published.map((review) => review.id).join(', ')} by ${reviewer} is already published on ${head}`
   }
-  if (published.length === 0) return null
-  const failedSlot = failedBehaviorLaunches('review-new-prs').some((claim) =>
-    claim.launchRepo === repo && claim.launchPr === number
-    && claim.launchExpectedHead?.toLowerCase() === head
-    && claim.launchActor.toLowerCase() === reviewer.toLowerCase()
-    && !claim.launchQuarantine)
-  if (failedSlot) return null
-  return `review ${published.map((review) => review.id).join(', ')} by ${reviewer} is already published on ${head}`
+  if (!reserveBehaviorReplay(repo, number, behavior)) {
+    return `a ${behavior} replay is already in progress for ${repo}#${number}`
+  }
+  return null
+}
+
+// A failed review slot with no launch outcome keeps its replay admissible
+// even after reconciliation retired its incident behind a sibling success:
+// the incident is visibility, the claim row is the obligation.
+function failedReviewSlotWithoutOutcome(repo: string, pr: number, head: string, actor: string): boolean {
+  return !!db.prepare(`
+    SELECT 1 FROM behavior_seen
+    WHERE key = 'review-new-prs' AND claim_id = '' AND launch_call_id IS NOT NULL
+      AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
+      AND launch_quarantine IS NULL AND launch_repo = ? AND launch_pr = ?
+      AND lower(launch_expected_head) = ? AND lower(launch_actor) = ?
+    LIMIT 1
+  `).get(repo, pr, head.toLowerCase(), actor.toLowerCase())
 }
 
 // ── Public API ──────────────────────────────────────────────────────────

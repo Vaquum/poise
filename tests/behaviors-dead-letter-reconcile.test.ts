@@ -189,6 +189,23 @@ describe('dead-letter reconcile pass', () => {
     expect(store.reconcileBehaviorDeadLetters(open, ['review-new-prs'], undefined, undefined, 2, noon)).toEqual([])
   })
 
+  it('scopes the batch by behavior before limiting, so old rows cannot starve it', async () => {
+    const store = await loadStore()
+    for (const [target, pr, created] of [
+      ['Vaquum/Origo#501', 501, '2026-10-17T10:00:00Z'],
+      ['Vaquum/Origo#502', 502, '2026-10-18T10:00:00Z'],
+    ] as const) {
+      await failedLaunch(store, 'review-new-issues', target, 'Vaquum/Origo', pr, 'timeout', created, 'issue_review')
+    }
+    await failedLaunch(store, 'review-new-prs', 'Vaquum/repo#30', 'Vaquum/repo', 30,
+      'timeout', '2026-10-22T10:00:00Z')
+
+    const results = store.reconcileBehaviorDeadLetters(
+      new Set(['Vaquum/repo#30']), ['review-new-prs'], undefined, undefined, 2)
+    expect(results.map((row) => row.target)).toEqual(['Vaquum/repo#30'])
+    expect(store.reconcileBehaviorDeadLetters(new Set(), [], undefined, undefined, 2)).toEqual([])
+  })
+
   it('refuses an unbounded or empty reconcile batch', async () => {
     const store = await loadStore()
     expect(() => store.reconcileBehaviorDeadLetters(new Set(), ['review-new-prs'], undefined, undefined, 0))
