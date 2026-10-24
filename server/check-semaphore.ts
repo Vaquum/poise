@@ -95,6 +95,13 @@ export class CheckSemaphore {
     return this.take(lane)
   }
 
+  /** Take a slot immediately, even past the cap: an adopted turn already
+   *  runs, so admission control counts it but never parks it. Parked
+   *  waiters keep waiting until releases converge back within the cap. */
+  claim(lane: CheckLane): () => void {
+    return this.take(lane)
+  }
+
   /** Take a slot, parking in lane FIFO order when none fits. */
   acquire(lane: CheckLane, options: CheckSlotAcquireOptions = {}): Promise<() => void> {
     const { signal } = options

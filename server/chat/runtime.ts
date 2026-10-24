@@ -30,7 +30,7 @@ import { resolveIssueTitle } from './issue-titles'
 import { appendMemories } from './memory-content'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { enqueueMessage, transferQueuedContext, readQueue, updateQueuedModel, removeQueuedMessage, pauseQueue, QueueError, queueOwner, delegateQueue } from './message-queue'
+import { armQueue, enqueueMessage, transferQueuedContext, readQueue, updateQueuedModel, removeQueuedMessage, pauseQueue, QueueError, queueOwner, delegateQueue } from './message-queue'
 import type { MessageQueue, QueuedMessage } from './protocol'
 import { autoMergeInstructions, withAutoMergeInstructions } from './auto-merge'
 import { steeringContext } from './steering-context'
@@ -61,7 +61,7 @@ import { legacyIdFor, quoteImportedHistory, readLegacyConversation } from './leg
 import { forkStagedDocument, isBridgeProblem, refreshDocument, stageDocument, stagedDocumentPrompt, unstageDocument, writeBackDocument, type StagedDocument } from './editor-bridge'
 import {
   GitError, PathError, assertBranchName, branchExists, branchTip, checkoutPrHead, checkpoint, createBranch, deleteBranch,
-  inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
+  inspectCheckout, moveBranch, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
 } from './git'
 import {
   AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, SWITCH_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type EditDecision, type NewSessionRequest,
@@ -74,7 +74,7 @@ import { SWITCHBOARD_PERSON } from './switchboard'
 import * as storage from './storage'
 import { holdChat, holds, internalTurn, moveBindings, releaseBindings, timerSummaries } from './control-store'
 import { pgidAlive, pidAlive, signalGroup, workerIdentityMatches } from './worker'
-import { attachRelay, livePromise, relayDirFor, relayIdentityMatches, spawnRelay, type RelayConnection } from './relay'
+import { ADOPTION_LIVE_TIMEOUT_MS, attachRelay, livePromise, relayDirFor, relayIdentityMatches, spawnRelay, type RelayConnection } from './relay'
 import { createReplayHost, recalledDiffs } from './replay'
 import { createClaudeAdapter } from './adapters/claude'
 import { createCodexAdapter } from './adapters/codex'
@@ -177,6 +177,10 @@ interface RunningTurn {
    *  turnFinish): only then can a restart adopt it, so only then does the
    *  release switch look past it. */
   relayHeld?: boolean
+  /** This turn was adopted from a previous server's relay: when it
+   *  settles, its pre-restart relay and agent retire, so the next prompt
+   *  starts a fresh relay from this release and resumes natively. */
+  adoptedRelay?: boolean
   /** Settles at native prompt invocation, cancellation, or failed startup. */
   promptReady: Promise<void>
   releasePrompt(): void
@@ -257,6 +261,12 @@ export interface RuntimeOptions {
   leaseProbes?: CheckoutLeaseOptions
   /** Where per-session relay directories live; next to POISE_DB by default. */
   relayDir?: string
+  /** Spawn these relay scripts instead of this release's own. Tests use
+   *  this to stand in for a previous release's directory across a switch. */
+  relayScripts?: { relay: string, gate: string }
+  /** How long an adoption waits for the LIVE boundary; 60 s by default.
+   *  Tests hold it short to prove a failed adoption ends the turn. */
+  adoptionLiveTimeoutMs?: number
   /** The self-update controller client. Absent or unconfigured: `/poise`
    *  answers with an actionable error and no controller IO ever happens. */
   selfUpdate?: SelfUpdateBridge | null
@@ -460,6 +470,10 @@ export class ChatRuntime extends EventEmitter {
     // Sessions whose relay handoff already failed above: the turn loop
     // records the interrupt-and-resume fallback and says so.
     const fallbackNotes = new Map<string, string>()
+    // Sessions whose agent is demonstrably alive but unverified: the turn
+    // stays open and counted, with its rows kept for the next restart to
+    // retry, instead of being interrupted while the agent runs unseen.
+    const unresolved = new Set<string>()
     const openTurns = new Map(storage.listOpenTurns(this.instance).map((open) => [open.sessionId, open]))
     for (const worker of storage.listWorkers()) {
       if (storage.sessionInstance(worker.sessionId) !== this.instance) continue
@@ -499,6 +513,8 @@ export class ChatRuntime extends EventEmitter {
           storage.forgetRelay(worker.sessionId)
           await rm(relayRow.dir, { recursive: true, force: true }).catch(() => undefined)
           this.releaseSettledLease(recovery)
+          // The open turn below is interrupted by the turn loop, which arms
+          // its follow-ups; nothing is armed here.
           continue
         }
         fallbackNotes.set(worker.sessionId, 'the relay did not answer after the restart')
@@ -517,12 +533,18 @@ export class ChatRuntime extends EventEmitter {
       }
       if (!verified && groupAlive) {
         if (record) {
-          record.orphanNotice = `a worker recorded for this session (pid ${worker.gatePid}) is still running but could not be verified; stop it by hand`
-          storage.saveSession(record)
+          const notice = `a worker recorded for this session (pid ${worker.gatePid}) is still running but could not be verified; stop it by hand`
+          if (record.orphanNotice !== notice) {
+            record.orphanNotice = notice
+            storage.saveSession(record)
+            // The chat itself must say why nothing runs, not only the
+            // settings panel that renders the orphan notice.
+            try { this.emit_(record.id, { type: 'error', message: `Poise restarted while this turn was running; ${notice}`, recoverable: true }) } catch { /* mirror */ }
+          }
         }
-        // A verified relay may still hold the agent (pid confusion on the
-        // gate): its row stays so a later restart can retry the handoff.
-        if (relayRow && !relayOk) storage.forgetRelay(worker.sessionId)
+        // Both rows stay: a later restart retries the handoff, and the
+        // turn below stays open and counted while ownership is unresolved.
+        if (open) unresolved.add(worker.sessionId)
         continue
       }
       let recovery: LiveSession | null = null
@@ -541,10 +563,16 @@ export class ChatRuntime extends EventEmitter {
         storage.forgetRelay(worker.sessionId)
         await rm(relayRow.dir, { recursive: true, force: true }).catch(() => undefined)
       }
+      // Read before the release below clears it: only a recovery that
+      // cleared restart debris continues stranded follow-ups. An idle
+      // worker with a deliberately unarmed queue parks its messages until
+      // a turn runs.
+      const hadOrphan = storage.getSession(worker.sessionId)?.orphanNotice !== undefined
       if (recovery) this.releaseSettledLease(recovery)
+      if (hadOrphan) this.armQueueIfWaiting(worker.sessionId)
     }
     for (const open of storage.listOpenTurns(this.instance)) {
-      if (protectedSessions.has(open.sessionId) || reattached.has(open.sessionId)) continue
+      if (protectedSessions.has(open.sessionId) || reattached.has(open.sessionId) || unresolved.has(open.sessionId)) continue
       const fallback = fallbackNotes.get(open.sessionId)
       this.interruptOpenTurn(open, fallback
         ? { stopReason: 'interrupted', error: `Poise restarted while this turn was running; ${fallback}, so the turn was interrupted` }
@@ -562,7 +590,7 @@ export class ChatRuntime extends EventEmitter {
       }
     }
     for (const record of storage.listSessions(this.instance)) {
-      if (protectedSessions.has(record.id) || reattached.has(record.id)) continue
+      if (protectedSessions.has(record.id) || reattached.has(record.id) || unresolved.has(record.id)) continue
       if (record.contextResetting || record.contextCompacting) {
         record.contextResetting = false; record.contextCompacting = false
         storage.saveSession(record)
@@ -703,6 +731,18 @@ export class ChatRuntime extends EventEmitter {
     this.emit('event', envelope)
     this.emit_(open.sessionId, { type: 'status.changed', status: record.status,
       detail: terminal.stopReason === request.stopReason ? request.error : 'previous turn outcome recovered' })
+    // The interrupted turn itself is never retried; its waiting follow-ups
+    // continue once the queue is pumped.
+    this.armQueueIfWaiting(open.sessionId)
+  }
+
+  /** Re-arm a session's stranded follow-ups after recovery cleared the way.
+   *  Never past a person's Stop: a stopped chat dispatches nothing until
+   *  the person sends again. */
+  private armQueueIfWaiting(sessionId: string): void {
+    if (holds(this.instance).some((hold) => hold.sessionId === sessionId && hold.cause === 'stopped')) return
+    const owner = queueOwner(sessionId)
+    if (armQueue(owner)) this.publishQueue(this.requireLive(sessionId))
   }
 
   /** Adopt a turn a live relay holds: reconnect, rebuild the adapter over
@@ -711,9 +751,13 @@ export class ChatRuntime extends EventEmitter {
    *  failure falls back to interrupt-and-resume and says so. */
   private launchRelayReattach(worker: storage.WorkerRow, relay: storage.RelayRow, open: { sessionId: string, turnId: string, callId: string | null }): void {
     const session = this.requireLive(open.sessionId)
+    // The agent is already invoked and its spool is live: steering,
+    // admission and the Stop path treat the adopted turn as running from
+    // the start, not as a turn still waiting for its first prompt.
     const turn: RunningTurn = {
       id: open.turnId, callId: open.callId, startedAt: Date.now(),
-      abort: new AbortController(), stopping: false,
+      abort: new AbortController(), stopping: false, agentInvoked: true,
+      requestInvoked: true, relayHeld: true, adoptedRelay: true,
       promptReady: Promise.resolve(), releasePrompt: () => {},
     }
     if (session.record.selfChangeId && !finishOutbox.getFinish(session.record.selfChangeId)) turn.implementsChange = true
@@ -736,7 +780,14 @@ export class ChatRuntime extends EventEmitter {
     const lease = this.leaseFor(session)
     let peer: RelayConnection | null = null
     try {
-      if (record.workspaceKind === 'poise-local' && !isSwitchboardChat(record) && record.role !== 'manager') await this.acquireLocalTurnSlot(session, turn)
+      if (record.stopRequestedTurnId === open.turnId) {
+        // The turn was stopped before the restart: finish the stop —
+        // verified termination below — instead of adopting a turn the
+        // person already ended.
+        turn.abort.abort()
+        throw new Error('the turn was stopped before the relay handoff')
+      }
+      if (record.workspaceKind === 'poise-local' && !isSwitchboardChat(record) && record.role !== 'manager') this.claimSurvivorSlot(turn)
       turn.abort.signal.throwIfAborted()
       if (!lease.adoptLiveWorker({ workerPid: worker.gatePid, workerPgid: worker.gatePgid, workerIdent: worker.ident, ownerId: record.id })) {
         // Recovery's first holder check preceded async relay inspection. A
@@ -802,12 +853,13 @@ export class ChatRuntime extends EventEmitter {
       }
       // The spool the old server bracketed is still live: a further
       // restart adopts this turn the same way, until the replay settles.
-      turn.relayHeld = true
       let result: TurnResult
       try {
+        this.emit('log', `[chat ${record.id.slice(0, 8)}] adopted relay-held turn ${open.turnId.slice(0, 8)}`)
         result = await adapter.replayTurn({
           turnId: open.turnId, signal: turn.abort.signal, peer,
-          live: livePromise(peer), outbound: outbound.bytes, outboundTruncated: outbound.truncated,
+          live: livePromise(peer, this.options.adoptionLiveTimeoutMs ?? ADOPTION_LIVE_TIMEOUT_MS),
+          outbound: outbound.bytes, outboundTruncated: outbound.truncated,
           session: { nativeSessionId: record.nativeSessionId ?? '', modelId: record.modelId, effort: record.effort,
             ...(record.mode ? { mode: record.mode } : {}), safeMode: record.safeMode === true,
             ...(record.efforts ? { efforts: record.efforts } : {}), ...(record.commands ? { commands: record.commands } : {}) },
@@ -894,7 +946,10 @@ export class ChatRuntime extends EventEmitter {
     let stopReason: StopReason = turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
     let error = result.error
     if (turn.failure && stopReason !== 'cancelled') { stopReason = 'error'; error = turn.failure }
-    if (turn.stopping || result.terminate === true || (session.adapter && !session.adapter.alive) || (session.relay && !session.relay.healthy)) {
+    // An adopted turn's pre-restart relay and agent retire at this idle
+    // boundary: no old-release relay outlives its adoption, and the next
+    // prompt starts a fresh relay from this release, resuming natively.
+    if (turn.adoptedRelay === true || turn.stopping || result.terminate === true || (session.adapter && !session.adapter.alive) || (session.relay && !session.relay.healthy)) {
       try { await this.stopProcess(session) } catch { freed = false }
     }
     session.draining = true
@@ -1020,8 +1075,11 @@ export class ChatRuntime extends EventEmitter {
     if (!turn) return
     // Only a turn the relay spools is handed over: before turnStart or
     // past turnFinish there is no spool for the next server to adopt,
-    // so those turns settle here instead of being interrupted there.
-    if (handover && turn.relayHeld && session.relay?.healthy) {
+    // so those turns settle here instead of being interrupted there. A
+    // turn with a Stop already asked for is never handed over either:
+    // the stop is finished here, verifiably, instead of being dropped
+    // by the adoption.
+    if (handover && turn.relayHeld && session.relay?.healthy && session.record.stopRequestedTurnId !== turn.id) {
       session.relayDetached = true
       turn.stopping = true
       const relay = session.relay
@@ -1947,6 +2005,10 @@ export class ChatRuntime extends EventEmitter {
           : record.nativeSessionId ? { resume: record.nativeSessionId } : {}),
         ...(extensions?.servers.length ? { mcpServers: extensions.servers } : {}),
       }
+      // Snapshot the stranded worker before starting the new agent: the
+      // start replaces the worker row, and the orphan cleanup at the end of
+      // the start must judge the OLD worker's group, not the new one's.
+      const staleWorker = record.orphanNotice ? storage.getWorker(record.id) : null
       let started
       try {
         started = await adapter.start(startOptions)
@@ -1981,6 +2043,44 @@ export class ChatRuntime extends EventEmitter {
       record.commands = started.commands
       record.interruptedTurnId = undefined
       await this.refreshWorkspace(session)
+      // A start that reached idle with a stale orphan notice proves the old
+      // worker settled (a live one would have blocked the lease or the
+      // startup above): drop its rows and the notice, so a session
+      // stranded by a restart heals on resume without anyone killing
+      // processes by hand. An open turn that turn left behind is
+      // interrupted — its agent ran unseen, so its outcome is unknown —
+      // and what waited behind it dispatches. This start's own turn and
+      // worker are never touched: the liveness check judges the snapshot
+      // from before the start, and the row is only forgotten when it still
+      // names that old worker.
+      if (record.orphanNotice) {
+        if (!staleWorker || (!pgidAlive(staleWorker.gatePgid) && !pidAlive(staleWorker.gatePid))) {
+          if (staleWorker && storage.getWorker(record.id)?.ident === staleWorker.ident) storage.forgetWorker(record.id)
+          const staleRelay = storage.getRelay(record.id)
+          if (staleRelay && !pidAlive(staleRelay.relayPid)) {
+            storage.forgetRelay(record.id)
+            await rm(staleRelay.dir, { recursive: true, force: true }).catch(() => undefined)
+          }
+          const open = storage.getOpenTurn(record.id)
+          record.orphanNotice = undefined
+          this.saveRecord(session)
+          if (open && open.turnId !== session.turn?.id) {
+            this.interruptOpenTurn({ sessionId: record.id, turnId: open.turnId, callId: open.callId },
+              { stopReason: 'interrupted', error: 'Poise restarted while this turn was running; its agent was gone before the turn could be adopted, so its outcome is unknown' })
+            const refreshed = storage.getSession(record.id)
+            if (refreshed) {
+              session.record = refreshed
+              // Interrupted and resumed in the one start: the transcript
+              // keeps the interruption, the session reads resumed.
+              session.record.interruptedTurnId = undefined
+              this.saveRecord(session)
+            }
+          } else {
+            this.armQueueIfWaiting(record.id)
+          }
+          this.scheduleQueue(session)
+        }
+      }
       this.setStatus(session, 'idle')
       this.emit_(record.id, { type: 'session.resumed', session: record })
       this.armIdleTimer(session)
@@ -2690,6 +2790,11 @@ export class ChatRuntime extends EventEmitter {
    *  in the same tick is refused, and persist it before acknowledging. */
   private reserveTurn(session: LiveSession, queueItem?: QueuedMessage, internal?: { seq: number, at: number }): RunningTurn {
     this.assertTurnAdmissible(session)
+    // A new turn supersedes any Stop asked for an earlier one.
+    if (session.record.stopRequestedTurnId !== undefined) {
+      session.record.stopRequestedTurnId = undefined
+      this.saveRecord(session)
+    }
     let releasePrompt!: () => void
     const promptReady = new Promise<void>(resolve => { releasePrompt = resolve })
     const turn: RunningTurn = { id: randomUUID(), callId: null, startedAt: Date.now(), abort: new AbortController(), stopping: false, promptReady, releasePrompt }
@@ -3659,6 +3764,10 @@ export class ChatRuntime extends EventEmitter {
       // A stop for an already-stopping turn is redundant: the person or chat
       // that stopped it first keeps the attribution.
       if (actor && !turn.stopping) turn.stoppedBy ??= actor
+      // Durable: a restart before the turn settles must finish the stop,
+      // never adopt the turn as if it was never stopped.
+      session.record.stopRequestedTurnId = turn.id
+      this.saveRecord(session)
       turn.stopping = true
       this.settlePending(session, 'cancelled')
       turn.abort.abort()
@@ -3892,6 +4001,15 @@ export class ChatRuntime extends EventEmitter {
     turn.localSlot = undefined
   }
 
+  /** Count an adopted turn against the local cap without parking it
+   *  behind the waiters: the turn already runs, so admission control
+   *  must not delay its visibility. Survivors take precedence — new
+   *  turns wait until they release — even past a lowered cap. */
+  private claimSurvivorSlot(turn: RunningTurn): void {
+    const person = !turn.source || (turn.source.kind === 'poise' && turn.source.name === SWITCHBOARD_PERSON)
+    turn.localSlot = this.checkSlots.claim(person ? 'person' : 'background')
+  }
+
   /** The cap setting changed: start every slot waiter that now fits, in order. */
   localTurnCapChanged(): void {
     this.checkSlots.grant()
@@ -3976,20 +4094,45 @@ export class ChatRuntime extends EventEmitter {
     const state = await inspectCheckout(record.checkout)
     if (!state.dirty) return
     const owner = storage.listSessions(this.instance).find((s) => s.checkout === record.checkout && s.branch.name === state.currentBranch && s.status !== 'closed')
+      // A session's own scratch workspace holds only its own agent's work —
+      // even on a branch the agent cut itself, which no session row names.
+      // Checkpointing it here keeps the chat's ownership of its checkout
+      // across a restart that stranded its turn, instead of wedging resume
+      // on work nobody else could have written.
+      ?? (record.workspaceKind === 'poise-local'
+        && workerWorkspaceRef(this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT, record.checkout)?.id === record.id ? record : undefined)
     if (!owner) {
       throw new GitError(`the checkout at ${record.checkout} has ${state.dirtyFiles} uncommitted change(s) on ${state.currentBranch || 'a detached HEAD'}, which no chat session owns; commit or stash them yourself`, 'dirty_unowned')
     }
     const result = await checkpoint(lease, record.checkout, state.currentBranch)
     if (result.committed) {
-      const ownerLive = this.live.get(owner.id)
-      if (ownerLive) {
-        ownerLive.record.branch.provisional = false
-        this.saveRecord(ownerLive)
-      } else {
-        owner.branch.provisional = false
-        storage.saveSession(owner)
+      // Only the branch that received the checkpoint stops being
+      // provisional: a self-checkpoint lands on the agent's own branch,
+      // not on the session's recorded one.
+      if (owner.branch.name === state.currentBranch) {
+        const ownerLive = this.live.get(owner.id)
+        if (ownerLive) {
+          ownerLive.record.branch.provisional = false
+          this.saveRecord(ownerLive)
+        } else {
+          owner.branch.provisional = false
+          storage.saveSession(owner)
+        }
       }
-      this.emit_(record.id, { type: 'status.changed', status: session.record.status, detail: `checkpointed ${owner.title}'s changes on ${state.currentBranch}` })
+      // A checkpoint on a detached HEAD belongs to no branch: without a
+      // reference it would dangle once the switch below moves away. Only
+      // self-ownership reaches here on a detached HEAD (no session names
+      // ''), so the session keeps it on a branch. Each checkpoint gets its
+      // own branch, named for its commit: reusing one stable name would
+      // force-move it off the earlier checkpoint and leave that saved work
+      // recoverable only through reflogs.
+      let retained = ''
+      if (!state.currentBranch && owner.id === record.id && result.sha) {
+        const name = `poise/checkpoint/${record.id.slice(0, 8)}-${result.sha.slice(0, 12)}`
+        await moveBranch(lease, record.checkout, name, result.sha)
+        retained = ` (kept on branch ${name})`
+      }
+      this.emit_(record.id, { type: 'status.changed', status: session.record.status, detail: `checkpointed ${owner.title}'s changes on ${state.currentBranch || 'a detached HEAD'}${retained}` })
     }
   }
 
@@ -4098,6 +4241,7 @@ export class ChatRuntime extends EventEmitter {
       env: scrubbedChildEnvironment(envCommand ?? command, env, args),
       cwd: record.checkout,
       gateIdent,
+      ...(this.options.relayScripts ? { relayScript: this.options.relayScripts.relay, gateScript: this.options.relayScripts.gate } : {}),
       log: (message) => this.emit('log', `[chat ${record.id.slice(0, 8)}] ${message}`),
     })
     session.relay = peer
