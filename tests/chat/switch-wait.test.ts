@@ -566,6 +566,81 @@ describe('the switch bound', () => {
     }
   })
 
+  it('holds no quiet check for a switch-waited session that keeps a live process', async () => {
+    const w = await world()
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.turns(w.s.id).length === 1 && w.runtime.working() === 0)
+    const timer = new FakeTimer()
+    let now = 5_000_000
+    const restart = vi.fn(() => true)
+    const logs: string[] = []
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: (line: string) => logs.push(line), releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => now,
+    })
+    try {
+      service.switchRelease('r2')
+      expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+      expect(w.runtime.get(w.s.id)).toMatchObject({ status: 'queued', queuedBehind: 'waiting for the Poise update' })
+      // The stuck counter from the incident: the queued session keeps a live
+      // process from before it queued, with no turn running.
+      const live = (w.runtime as unknown as { live: Map<string, { services: number }> }).live.get(w.s.id)
+      if (!live) throw new Error('the session is not live')
+      live.services += 1
+      expect(storage.listOpenTurns(w.instance)).toHaveLength(0)
+      expect(w.runtime.busy()).toBe(1)
+      expect(w.runtime.working()).toBe(0)
+      // Past the bound with no turns or calls running, the switch restarts
+      // instead of looping on the queued chat.
+      now += 15 * 60_000
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(logs.filter((line) => line.includes('still waiting on'))).toHaveLength(0)
+      // The restart's own drain close runs as an operation first.
+      await until(() => w.runtime.working() === 0)
+      expect(service.health().switchWaitingOn).toBeNull()
+    } finally {
+      service.reset()
+    }
+  })
+
+  it('holds the switch for an operation still running on a switch-waited session', async () => {
+    const w = await world()
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.turns(w.s.id).length === 1 && w.runtime.working() === 0)
+    const timer = new FakeTimer()
+    let now = 5_000_000
+    const restart = vi.fn(() => true)
+    const logs: string[] = []
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: (line: string) => logs.push(line), releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => now,
+    })
+    try {
+      service.switchRelease('r2')
+      expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+      // An accepted revert still running on the queued session: the switch
+      // waits on it instead of restarting over it.
+      const live = (w.runtime as unknown as { live: Map<string, { pendingOps: number }> }).live.get(w.s.id)
+      if (!live) throw new Error('the session is not live')
+      live.pendingOps += 1
+      expect(w.runtime.working()).toBe(1)
+      expect(service.health().switchWaitingOn).toBe('1 runtime operation')
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      now += 15 * 60_000
+      timer.fire()
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      expect(logs.filter((line) => line.includes('still waiting on'))).toHaveLength(1)
+      live.pendingOps -= 1
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+    } finally {
+      service.reset()
+    }
+  })
+
   it('keeps waited prompts in arrival order when the restart is refused', async () => {
     const w = await world()
     const timer = new FakeTimer()
