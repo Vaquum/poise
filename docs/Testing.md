@@ -41,6 +41,11 @@ admission precedes its response and the deliberately deferred history read; it
 is not a completion signal. The original pace, calendar, request-count and
 midnight deduplication assertions remain intact.
 
+The review/approval ownership regression separates durable review reconciliation
+from the following eligibility sweep. The two behaviors run concurrently, so
+approval may observe the still-owned review before reconciliation settles it.
+The test keeps its no-overlap and exactly-one-approval assertions.
+
 ## Profile a run
 
 CI uploads `unit-timings-1` and `unit-timings-2` (Vitest JSON with per-test
