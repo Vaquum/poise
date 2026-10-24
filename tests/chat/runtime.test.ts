@@ -266,6 +266,49 @@ describe('chat runtime', () => {
     await runtime.stop()
   }, 40_000)
 
+  it('never kills the worker of a replacement turn that reserved during a stop', async () => {
+    ensureBranch('chat/alpha')
+    const caller = fakeCaller()
+    // The stopped turn already left session.turn (it is cleared before the
+    // Caller finish), while the stop's settle poll has not run again yet:
+    // the replacement reserves deterministically inside that window.
+    let sessionId = ''
+    let replacementSent = false
+    const runtimeHolder: { runtime?: import('../../server/chat/runtime').ChatRuntime } = {}
+    const innerFinish = caller.finish.bind(caller)
+    caller.finish = (async (...args: Parameters<typeof innerFinish>) => {
+      if (!replacementSent) {
+        replacementSent = true
+        runtimeHolder.runtime!.prompt(sessionId, { text: 'replacement', attachments: [], mentions: [] })
+      }
+      return innerFinish(...args)
+    }) as typeof caller.finish
+    const { runtime, controls, events } = makeRuntime({ caller })
+    runtimeHolder.runtime = runtime
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'chat/alpha' } })
+    sessionId = session.id
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    controls.adapters[0].auto = false
+    await runtime.prompt(session.id, { text: 'first', attachments: [], mentions: [] })
+    await waitFor(() => lastStatus(events, session.id) === 'running')
+    const stopping = runtime.cancel(session.id)
+    // The replacement's adapter is created when its turn starts; hold its
+    // turn open before the agent is asked.
+    await waitFor(() => controls.adapters.length === 2)
+    controls.adapters[1].auto = false
+    expect((await stopping).settled).toBe(true)
+    await waitFor(() => lastStatus(events, session.id) === 'running')
+    // The stopped turn ended cancelled; the replacement was never stopped,
+    // so its worker is untouched.
+    expect(ofType(events, session.id, 'turn.finished')[0]).toMatchObject({ stopReason: 'cancelled' })
+    expect(controls.adapters[1].closed).toBe(0)
+    expect(controls.adapters[1].alive).toBe(true)
+    controls.adapters[1].finish()
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(ofType(events, session.id, 'turn.finished').at(-1)).toMatchObject({ stopReason: 'end_turn' })
+    await runtime.stop()
+  }, 40_000)
+
   it('stops running turns with notice for a drain, leaves idle sessions alone, and refuses to outside a drain', async () => {
     ensureBranch('chat/alpha')
     const { runtime, controls, events } = makeRuntime()
