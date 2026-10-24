@@ -62,9 +62,11 @@ Poise is running behind your own proxy. What is left (docs/Operating.md,
 
 1. Your proxy. Send every request for $domain and *.$domain to
      http://$proxy
-   with the browser's Host, WebSockets passed through and no time limit on
-   a response. For a certificate per workspace host on demand, it asks the
-   gateway first; in Caddy:
+   with the browser's Host, WebSockets passed through, no time limit on
+   a response, and dial failures retried for 30s (in Caddy: lb_try_duration
+   30s with lb_try_interval 100ms), so a gateway replacement reads as a
+   brief delay, not 502s. For a certificate per workspace host on demand,
+   it asks the gateway first; in Caddy:
      on_demand_tls {
        ask http://$proxy/_gateway/tls-ask
      }

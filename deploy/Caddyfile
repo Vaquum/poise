@@ -23,12 +23,31 @@
 }
 
 {$POISE_DOMAIN} {
-	reverse_proxy gateway:8080
+	reverse_proxy {
+		# The gateway's container is replaced stop-first: its Docker DNS name briefly resolves to
+		# nothing, then to the new container. Resolve it per attempt and retry dials, so a
+		# replacement reads as a brief delay, not a 502.
+		dynamic a {
+			name gateway
+			port 8080
+			refresh 5s
+		}
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }
 
 *.{$POISE_DOMAIN} {
 	tls {
 		on_demand
 	}
-	reverse_proxy gateway:8080
+	reverse_proxy {
+		dynamic a {
+			name gateway
+			port 8080
+			refresh 5s
+		}
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }

@@ -44,6 +44,8 @@ services:
     # The gateway joins each workspace network by this name.
     container_name: poise-gateway
     restart: unless-stopped
+    # Above the 10 s in-flight grace in gateway/src/gateway.ts, so a replacement stops it cleanly (exit 0).
+    stop_grace_period: 20s
     logging: *logging
     env_file: .env
     # This file's own wiring, which deploy/.env cannot change.

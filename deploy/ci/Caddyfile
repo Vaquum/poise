@@ -2,5 +2,16 @@
 # POISE_INSECURE_HTTP=1 (deploy/ci/e2e.sh). The run checks deploy/Caddyfile
 # itself separately, over TLS from Caddy's own certificate authority.
 http://{$POISE_DOMAIN}, http://*.{$POISE_DOMAIN} {
-	reverse_proxy gateway:8080
+	reverse_proxy {
+		# The same replacement bridging as deploy/Caddyfile: the gateway's
+		# container is replaced stop-first, so its Docker DNS name briefly
+		# resolves to nothing then to the new container.
+		dynamic a {
+			name gateway
+			port 8080
+			refresh 5s
+		}
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }
