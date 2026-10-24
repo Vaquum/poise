@@ -151,9 +151,12 @@ async function workspaceManager() {
   return runtime.create({ agent: 'grok', model: model.identity, role: 'manager', deferStart: true })
 }
 function makeRuntime() {
+  // This file pins control behavior, not the shared turn budget: an open
+  // budget lets a manager's workers all run while check-semaphore and
+  // behaviors-check-slots pin the default budget instead.
   return new Runtime({ instance, instanceLabel: 'test', callerTurns: null, catalog: async () => CATALOG,
     adapters: { grok: adapter, claude: adapter, codex: adapter, muse: forkAdapter }, requireClaudeReady: async () => {}, probeAgent: async () => ({ ok: true }),
-    localWorkspaceRoot: workspaceRoot, idleTimeoutMinutes: () => 0, controlContext: id => control.context(id) })
+    localWorkspaceRoot: workspaceRoot, idleTimeoutMinutes: () => 0, maxConcurrentLocalTurns: () => 64, controlContext: id => control.context(id) })
 }
 async function restart() {
   const stopped = runtime.stop()
