@@ -88,13 +88,33 @@ def readiness_behind(readiness: dict[str, Any]) -> str | None:
 _MERGEABLE = {"MERGEABLE": True, "CONFLICTING": False, "UNKNOWN": None}
 
 
+def normalize_check_contexts(contexts: dict[str, Any]) -> list[dict[str, Any]]:
+    """Check names in one shape: CheckRun as {name, status, conclusion},
+    the legacy commit StatusContext as {name, None, state}."""
+    normalized = []
+    for node in contexts.get("nodes") or []:
+        if not isinstance(node, dict):
+            raise RuntimeError("GitHub returned a malformed check context")
+        if node.get("__typename") == "StatusContext":
+            name, status, conclusion = node.get("context"), None, node.get("state")
+        else:
+            name, status, conclusion = node.get("name"), node.get("status"), node.get("conclusion")
+        if not name:
+            raise RuntimeError("GitHub returned a check context without a name")
+        normalized.append({"name": name, "status": status, "conclusion": conclusion})
+    return normalized
+
+
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     owner, repo = repository(payload)
     pull_number = parse_pull_number(payload)
 
     # No REST: the readiness packet already carries mergeability, so the
     # get_pull loop only re-fetched it at 1-3 core calls per refresh (#488).
-    readiness = await get_pr_readiness_state(client, owner, repo, pull_number)
+    # Under GraphQL quota pressure the server asks for the slim read: no
+    # check names, while the rollup aggregate still decides.
+    include_contexts = not payload.get("no_check_contexts", False)
+    readiness = await get_pr_readiness_state(client, owner, repo, pull_number, include_contexts)
     try:
         github_mergeable = _MERGEABLE[readiness["mergeable"]]
     except KeyError as error:
@@ -112,10 +132,12 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     green = (readiness_status(readiness) == "green" if queue_enabled(readiness) else
              pull["state"] == "open" and not pull["draft"] and pull["mergeable"] is True and pull["mergeable_state"] == "clean")
     commit = (((readiness.get("commits") or {}).get("nodes") or [{}])[0].get("commit") or {})
-    checks_state = (commit.get("statusCheckRollup") or {}).get("state")
+    rollup = commit.get("statusCheckRollup")
+    checks_state = (rollup or {}).get("state")
     threads = readiness["reviewThreads"]
     unresolved = sum(1 for thread in threads["nodes"] if not thread["isResolved"] and not thread["isOutdated"])
     all_threads_read = not threads["pageInfo"]["hasNextPage"]
+    contexts = (rollup or {}).get("contexts") or {}
     return {
         "action": "mergeable",
         "repository": f"{owner}/{repo}",
@@ -128,4 +150,15 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "checks_state": checks_state,
         "unresolved_conversations": unresolved,
         "status": readiness_status(readiness) if queue_enabled(readiness) else status(pull, checks_state, unresolved, all_threads_read),
+        # Held-reason evidence, read with the same query and head: the head
+        # the reasons describe, the review decision, whether every thread was
+        # read, the queue, whether a rollup came back, and the check names
+        # (None for the slim quota-pressure read).
+        "head_sha": readiness.get("headRefOid"),
+        "review_decision": readiness.get("reviewDecision"),
+        "threads_checked": all_threads_read,
+        "queue_enabled": queue_enabled(readiness),
+        "has_rollup": rollup is not None,
+        "check_contexts": None if not include_contexts else normalize_check_contexts(contexts),
+        "contexts_partial": False if not include_contexts else bool(contexts.get("pageInfo", {}).get("hasNextPage")),
     }

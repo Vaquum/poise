@@ -3,6 +3,7 @@ import type { EvidenceSelector } from '../gateway/src/diagnostics/query-evidence
 import { loggingWorkspace } from './logging'
 import { diagnostic, diagnosticFailure } from './logging'
 import { GH_STORED_ACCOUNTS_ENV } from './accounts/clis'
+import { quotaRiskKey as riskKey } from './quota-risk'
 import { openAlerts, raiseAlert, resolveAlert, updateAlertDetails } from './alerts/store'
 import { getMeta, setMeta } from './db'
 import { runFile } from './process'
@@ -138,7 +139,6 @@ export const QUOTA_WARNING_SUSTAIN_MS = 30_000
 /** A quota observation older than this means the monitor has stopped refreshing it. */
 export const QUOTA_OBSERVATION_STALE_MS = 5 * 60_000
 interface RiskWindow { resetAt: string; since: number | null; lastAt: number; warned: boolean; exhaustedSince?: number | null }
-const riskKey = (login: string, resource: string) => `${PREFIX}risk:${login.toLowerCase()}:${resource}`
 const conditionKey = (login: string, bucket: GithubQuotaBucket) => `${PREFIX}${login.toLowerCase()}:${bucket.resource}:${Date.parse(bucket.resetAt)}`
 
 /** Observe actual snapshots even with popups off; cached reads cannot extend a risk interval. */

@@ -267,6 +267,12 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(prog="github-interface --head-sha PR")
         return parser
 
+    if behavior == "--mergeable":
+        parser = argparse.ArgumentParser(prog="github-interface --mergeable PR")
+        parser.add_argument("--no-check-contexts", action="store_true",
+                            help="skip check names; the rollup aggregate still decides")
+        return parser
+
     if behavior == "--list-failing-ci":
         parser = argparse.ArgumentParser(prog="github-interface --list-failing-ci PR")
         _add_repository(parser)

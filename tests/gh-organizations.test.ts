@@ -22,6 +22,17 @@ function record(org: string, number: number, day: number) {
   return { repo: `${org}/same`, number, status: 'open', author: 'octocat', title: `${org} ${number}`, url: `https://github.com/${org}/same/pull/${number}`, created_at: date, updated_at: date, closed_at: null, comments_count: 0 }
 }
 
+// A held entry for a --mergeable answer without evidence: no reasons beyond
+// what the legacy fields show, no check names, every thread taken as read.
+function heldStatic(number: number, reasons: string[]) {
+  return { repo: 'alpha/same', number, head: null, held: { reasons, checks: { failing: [], failingCount: 0, runningCount: 0, partial: true }, threadsChecked: true } }
+}
+
+// A held entry for a read that failed outright: nothing is known.
+function heldUnknown(number: number) {
+  return { repo: 'alpha/same', number, head: null, held: { reasons: ['unknown'], checks: { failing: [], failingCount: 0, runningCount: 0, partial: false }, threadsChecked: false } }
+}
+
 beforeEach(() => {
   mocks.meta = { me: 'octocat' }
   mocks.runFile.mockReset()
@@ -120,7 +131,7 @@ describe('the accounts GitHub is read as', () => {
       ? { stdout: JSON.stringify({ mergeable: args[1] === '#1' }), stderr: '' }
       : { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', 1, 5)] : []), stderr: '' })
     const result = await handleGhBody({ operation: 'green_pr' })
-    expect(result.body).toEqual({ records: [{ repo: 'alpha/same', number: 1, status: 'green' }], errors: [] })
+    expect(result.body).toEqual({ records: [{ repo: 'alpha/same', number: 1, status: 'green' }], held: [heldStatic(1, [])], errors: [] })
     const checks = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')
     expect(checks.map(([, args]) => args)).toEqual([['--mergeable', '#1', '--token-user', 'review-bot']])
   })
@@ -132,7 +143,7 @@ describe('the accounts GitHub is read as', () => {
       ? { stdout: JSON.stringify(colours[args[1]]), stderr: '' }
       : { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', 2, 5), record('alpha', 3, 4)] : []), stderr: '' })
     const result = await handleGhBody({ operation: 'green_pr' })
-    expect(result.body).toEqual({ records: [{ repo: 'alpha/same', number: 2, status: 'yellow' }], errors: [] })
+    expect(result.body).toEqual({ records: [{ repo: 'alpha/same', number: 2, status: 'yellow' }], held: [heldStatic(2, []), heldStatic(3, [])], errors: [] })
   })
 
   it('reads your own open pull requests, and leaves one GitHub is still working out unknown', async () => {
@@ -158,8 +169,15 @@ describe('the accounts GitHub is read as', () => {
     // Someone else's pull request is not asked about. The checks run side by side.
     const asked = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface').map(([, args]) => args[1])
     expect(asked.sort()).toEqual(['#7', '#8', '#9'])
-    // Current colours only what is known.
-    expect((await handleGhBody({ operation: 'green_pr' })).body).toEqual({ records: [{ repo: 'alpha/same', number: 7, status: 'green' }], errors: [] })
+    // Current colours only what is known. The held list covers every checked
+    // pull request: the computing one is unknown, the blocked one with no
+    // other evidence is blocked, and the datastore row the CLI never
+    // answered is unknown with nothing known.
+    expect((await handleGhBody({ operation: 'green_pr' })).body).toEqual({
+      records: [{ repo: 'alpha/same', number: 7, status: 'green' }],
+      held: [heldStatic(7, []), heldStatic(8, ['unknown']), heldStatic(9, ['blocked']), heldUnknown(10)],
+      errors: [],
+    })
   })
 
   it('reads no pull requests of yours until both GitHub accounts are set', async () => {
@@ -231,7 +249,7 @@ describe('concurrent pull request status reads', () => {
       handleGhBody({ operation: 'green_pr', org: 'alpha' }),
     ])
 
-    expect(current.body).toEqual({ records: [{ repo: 'alpha/same', number: 21, status: 'green' }], errors: [] })
+    expect(current.body).toEqual({ records: [{ repo: 'alpha/same', number: 21, status: 'green' }], held: [heldStatic(21, [])], errors: [] })
     expect(otherCurrent).toEqual(current)
     expect(notices.pullRequests).toEqual([{ repo: 'alpha/same', number: 21, title: 'alpha 21', status: 'green' }])
     expect(statusCalls()).toHaveLength(1)
@@ -250,8 +268,8 @@ describe('concurrent pull request status reads', () => {
     const second = handleGhBody({ operation: 'green_pr', org: 'alpha' })
     const [firstResult, secondResult] = await Promise.all([first, second])
 
-    expect(firstResult.body).toEqual({ records: [{ repo: 'alpha/same', number: 22, status: 'green' }], errors: [] })
-    expect(secondResult.body).toEqual({ records: [{ repo: 'alpha/same', number: 22, status: 'yellow' }], errors: [] })
+    expect(firstResult.body).toEqual({ records: [{ repo: 'alpha/same', number: 22, status: 'green' }], held: [heldStatic(22, [])], errors: [] })
+    expect(secondResult.body).toEqual({ records: [{ repo: 'alpha/same', number: 22, status: 'yellow' }], held: [heldStatic(22, [])], errors: [] })
     expect(statusCalls().map(([, args]) => args[3]).sort()).toEqual(['first-bot', 'second-bot'])
     expect(await handleGhBody({ operation: 'green_pr', org: 'alpha' })).toEqual(secondResult)
     mocks.meta.agentAccount = 'first-bot'
@@ -274,20 +292,20 @@ describe('concurrent pull request status reads', () => {
       handleGhBody({ operation: 'green_pr', org: 'alpha' }),
       readOwnPullRequests(),
     ])
-    expect(current.body).toEqual({ records: [], errors: [] })
+    expect(current.body).toEqual({ records: [], held: [heldUnknown(number)], errors: [] })
     expect(notices.pullRequests).toEqual([{ repo: 'alpha/same', number, title: `alpha ${number}`, status: undefined }])
     expect(statusCalls()).toHaveLength(1)
 
     failed = false
     clock.mockReturnValue(1_800_000_059_999)
-    expect((await handleGhBody({ operation: 'green_pr', org: 'alpha' })).body).toEqual({ records: [], errors: [] })
+    expect((await handleGhBody({ operation: 'green_pr', org: 'alpha' })).body).toEqual({ records: [], held: [heldUnknown(number)], errors: [] })
     expect(statusCalls()).toHaveLength(1)
     clock.mockReturnValue(1_800_000_060_000)
     const [retried, retriedNotices] = await Promise.all([
       handleGhBody({ operation: 'green_pr', org: 'alpha' }),
       readOwnPullRequests(),
     ])
-    expect(retried.body).toEqual({ records: [{ repo: 'alpha/same', number, status: 'green' }], errors: [] })
+    expect(retried.body).toEqual({ records: [{ repo: 'alpha/same', number, status: 'green' }], held: [heldStatic(number, [])], errors: [] })
     expect(retriedNotices.pullRequests[0].status).toBe('green')
     expect(statusCalls()).toHaveLength(2)
   })
