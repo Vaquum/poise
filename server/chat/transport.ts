@@ -102,6 +102,9 @@ export class ChatSocketServer {
   private readonly onSwitchboard = (revision: number) => {
     for (const connection of this.connections) this.send(connection, { kind: 'switchboard.updated', revision })
   }
+  private readonly onChatRequests = (revision: number) => {
+    for (const connection of this.connections) this.send(connection, { kind: 'chatRequests.updated', revision })
+  }
 
   constructor(private readonly runtime: ChatRuntime, private readonly policy: ApiRequestPolicy = {}, private readonly switchboard?: Switchboard, private readonly control?: ChatControl) {
     this.wss = new WebSocketServer({ noServer: true, maxPayload: CHAT_LIMITS.frameBytes, perMessageDeflate: false })
@@ -110,6 +113,7 @@ export class ChatSocketServer {
     runtime.on('event', this.onEvent)
     runtime.on('deleted', this.onDeleted)
     runtime.on('switchboard', this.onSwitchboard)
+    runtime.on('chatRequests', this.onChatRequests)
   }
 
   /** Attach to an HTTP server's upgrade event. Other upgrades (Vite HMR)
@@ -386,6 +390,7 @@ export class ChatSocketServer {
     this.runtime.off('event', this.onEvent)
     this.runtime.off('deleted', this.onDeleted)
     this.runtime.off('switchboard', this.onSwitchboard)
+    this.runtime.off('chatRequests', this.onChatRequests)
     for (const [server, listener] of this.upgrades) server.off('upgrade', listener)
     this.upgrades.clear()
     this.closing = new Promise<void>(resolve => {
@@ -539,6 +544,14 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
         return json(res, 200, { session: found, instance: runtime.instance }), true
       }
       return json(res, 200, { sessions: runtime.list(), instance: runtime.instance }), true
+    }
+    // Every open permission and question request of this instance with
+    // its stored content, newest first: one consistent snapshot carrying
+    // its revision. Clients read again on `chatRequests.updated`, after a
+    // reconnect or a restart, and discard a response older than a frame
+    // they have seen.
+    if (path === '/api/chat/requests' && req.method === 'GET') {
+      return json(res, 200, storage.listOpenChatRequests(runtime.instance)), true
     }
     if (path === '/api/chat/legacy' && req.method === 'GET') {
       const subjectParam = query.get('subject')

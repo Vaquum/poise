@@ -797,7 +797,7 @@ test('real producers resolve exact notice, distinct-attempt and pre-launch evide
     await card(page, first.id).getByRole('button', { name: 'View in Logging', exact: true }).click()
     await expect(page.locator('#view-logging')).toContainText('precise retained cause')
     expect(new URL(page.url()).searchParams.get('event')).toBe(first.evidence!.eventId)
-    await page.request.post(`/api/notices/${first.id}/dismiss`)
+    await page.request.post(`/api/notices/${first.id}/dismiss`, { headers: { origin: new URL(page.url()).origin } })
     produce('held-two')
     expect((await (await page.request.get('/api/notices')).json()).notices.filter((row: Notice) => row.kind === 'behavior_held')).toEqual([])
     const actual = (await (await page.request.get('/api/behaviors')).json()).diagnostics as BehaviorDiagnostics

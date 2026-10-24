@@ -1,5 +1,6 @@
-import { getMeta, setMeta } from './db'
+import { db, getMeta, setMeta } from './db'
 import { invalidateRepoListCache } from './gh'
+import { HttpError } from './http'
 import { type Catalog, type ModelSettings, isModelPlace, validateModelSettings } from './models'
 
 // GitHub logins and organization names: 1–39 characters, alphanumerics and
@@ -127,8 +128,8 @@ function validateNotificationSettings(value: unknown): NotificationSettings {
 // The Manager controls (General pane): how the workspace Manager works.
 // Rhythm is its concurrent slots, Stability and Autonomy are five-position
 // scales, scope is the repositories it may bind (null: every followed one),
-// and paused holds new work. Version counts the changes and serves as the
-// policy version the turns carry.
+// and paused holds new work. Version counts the settings saves — every
+// writer advances it — and serves as the policy version the turns carry.
 export const MANAGER_STABILITY = ['Stability', 'Lean to stability', 'Balanced', 'Lean to expansion', 'Full expansion'] as const
 export type ManagerStability = typeof MANAGER_STABILITY[number]
 export const MANAGER_AUTONOMY = ['Ask first', 'Ask on judgement calls', 'Balanced', 'Ask on the irreversible', 'Standing instructions'] as const
@@ -199,9 +200,6 @@ function validateManagerSettings(value: unknown): ManagerSettings {
     if (typeof input.paused !== 'boolean') throw new Error('paused must be true or false')
     next.paused = input.paused
   }
-  const { version: _before, ...before } = current
-  const { version: _after, ...after } = next
-  if (JSON.stringify(before) !== JSON.stringify(after)) next.version = current.version + 1
   return next
 }
 
@@ -250,11 +248,47 @@ export function getSettings(): Settings {
   }
 }
 
-// Validate everything before writing anything: the loop below writes key by
-// key, so a value rejected halfway used to leave the earlier ones applied.
-// `models` needs the catalog to validate, so the caller passes it in; without
-// one the models part is left untouched.
-export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Settings {
+// A save refused for overwriting another tab's edit, with the current values
+// of the fields it expected.
+export class SettingsConflictError extends HttpError {
+  constructor(public readonly current: Record<string, unknown>) {
+    super(409, 'Settings changed since this tab read them. Nothing was saved; read again and retry.')
+    this.name = 'SettingsConflictError'
+  }
+}
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== 'object') return false
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((value, index) => deepEqual(value, b[index]))
+  }
+  const left = a as Record<string, unknown>
+  const right = b as Record<string, unknown>
+  const keys = Object.keys(left)
+  return keys.length === Object.keys(right).length && keys.every((key) => deepEqual(left[key], right[key]))
+}
+
+// Validate everything before writing anything, and write everything in one
+// transaction on one consistent read, as Memories' save does: the expected
+// values are compared, the partials merged, every key written and the
+// version advanced together, so two saves from two processes cannot
+// interleave. A refused save changes no field and no counter. `models`
+// needs the catalog to validate, so the caller passes it in — loaded before
+// the transaction starts; without one the models part is left untouched.
+const saveSettings = db.transaction((partial: Partial<Settings>, catalog: Catalog | undefined, opts: { expect?: Record<string, unknown> } | undefined): { settings: Settings, orgChanged: boolean } => {
+  const current = getSettings()
+  if (opts?.expect !== undefined) {
+    if (!opts.expect || typeof opts.expect !== 'object' || Array.isArray(opts.expect)) {
+      throw new HttpError(400, 'expect must be an object of field names to the values this tab read')
+    }
+    const stale: Record<string, unknown> = {}
+    for (const [field, value] of Object.entries(opts.expect)) {
+      if (!(field in current)) throw new HttpError(400, `expect names no settings field: ${field}`)
+      if (!deepEqual(current[field as keyof Settings], value)) stale[field] = current[field as keyof Settings]
+    }
+    if (Object.keys(stale).length > 0) throw new SettingsConflictError(stale)
+  }
   const next: Partial<Settings> = {}
   for (const k of TEXT_KEYS) {
     const v = partial[k]
@@ -287,8 +321,8 @@ export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Sett
   if ('chat' in partial && partial.chat !== undefined) chat = validateChatSettings(partial.chat)
   let notifications: NotificationSettings | undefined
   if ('notifications' in partial && partial.notifications !== undefined) notifications = validateNotificationSettings(partial.notifications)
-  let manager: ManagerSettings | undefined
-  if ('manager' in partial && partial.manager !== undefined) manager = validateManagerSettings(partial.manager)
+  const mergedManager = 'manager' in partial && partial.manager !== undefined ? validateManagerSettings(partial.manager) : current.manager
+  const manager: ManagerSettings = { ...mergedManager, version: current.manager.version + 1 }
   const orgChanged = typeof next.org === 'string' && next.org !== (getMeta('org') || '')
   for (const k of TEXT_KEYS) {
     const v = next[k]
@@ -297,9 +331,14 @@ export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Sett
   if (models) setMeta('models', JSON.stringify(models))
   if (chat) setMeta('chat_settings', JSON.stringify(chat))
   if (notifications) setMeta('notification_settings', JSON.stringify(notifications))
-  if (manager) setMeta('manager_settings', JSON.stringify(manager))
+  setMeta('manager_settings', JSON.stringify(manager))
+  return { settings: getSettings(), orgChanged }
+})
+
+export function setSettings(partial: Partial<Settings>, catalog?: Catalog, opts?: { expect?: Record<string, unknown> }): Settings {
+  const { settings, orgChanged } = saveSettings(partial, catalog, opts)
   if (orgChanged) invalidateRepoListCache()
-  return getSettings()
+  return settings
 }
 
 /** The agent account, or '' while none is set. */

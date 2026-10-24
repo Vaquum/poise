@@ -13,6 +13,7 @@ let database: typeof import('../server/db')
 let store: typeof import('../server/alerts/store')
 let notices: typeof import('../server/alerts/notices')
 let settings: typeof import('../server/settings')
+let handling: typeof import('../server/alerts/handling')
 
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-notices-'))
@@ -22,12 +23,14 @@ beforeAll(async () => {
   store = await import('../server/alerts/store')
   notices = await import('../server/alerts/notices')
   settings = await import('../server/settings')
+  handling = await import('../server/alerts/handling')
 })
 
 beforeEach(() => {
   database.db.prepare('DELETE FROM alerts').run()
   database.db.prepare('DELETE FROM alert_silences').run()
   database.db.prepare('DELETE FROM behavior_dead_letters').run()
+  database.db.prepare('DELETE FROM handling_log').run()
   database.db.prepare("DELETE FROM meta WHERE key = 'notification_settings'").run()
 })
 
@@ -129,6 +132,19 @@ describe('the notices', () => {
     expect(shown(at(29))).toEqual([])
     expect(shown(at(31)).map((notice) => [notice.since, notice.due])).toEqual([[new Date(at(0)).toISOString(), new Date(at(30)).toISOString()]])
     expect(shown(at(31))[0].silenceable).toBe(true)
+  })
+
+  it('logs each dismissal while reminders reuse the alert, and the clearing after', () => {
+    const alert = store.raiseAlert(ready(1), at(0))!
+    expect(handling.listHandling(200, at(14))).toEqual([])
+    notices.dismissNotice(alert.id, at(14))
+    notices.dismissNotice(alert.id, at(16))
+    // The same alert dismissed twice: one row per action, same ref kept once.
+    expect(handling.listHandling(200, at(17)).map((row) => [row.outcome, row.at])).toEqual([
+      ['dismissed', new Date(at(14)).toISOString()],
+    ])
+    store.resolveAlert(`pr-ready:acme/api#1`, at(18))
+    expect(handling.listHandling(200, at(19)).map((row) => row.outcome)).toEqual(['resolved', 'dismissed'])
   })
 
   it('puts other notices away for good, until their condition clears and returns', () => {

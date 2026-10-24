@@ -235,7 +235,7 @@ function resolveOrganizationAlerts(login: string): void {
     return false
   }
   for (const alert of openAlerts()) {
-    if (owned(alert.dedupeKey)) resolveAlert(alert.dedupeKey)
+    if (owned(alert.dedupeKey)) resolveAlert(alert.dedupeKey, Date.now(), 'person')
   }
   for (const prefix of ['pr-ready:', 'review-requested:', 'pr-conflict:', 'behavior-held:', 'datastore-sync:']) {
     for (const key of silencedKeys(prefix)) {

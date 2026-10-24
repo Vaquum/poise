@@ -17,9 +17,10 @@ import { readInvolvedPullRequests, readOwnPullRequests, type InvolvedPullRequest
 import { HttpError } from '../http'
 import { getNotificationSettings } from '../settings'
 import {
-  alertKind, alertSeq, dismissAlert, forgetSilence, openAlerts, raiseAlert, resolveAlert, silenceAlert, silenced, silencedKeys,
+  alertKind, alertRow, alertSeq, dismissAlert, forgetSilence, openAlerts, raiseAlert, resolveAlert, silenceAlert, silenced, silencedKeys,
   type AlertKind, type AlertTarget, type OpenAlert,
 } from './store'
+import { recordHandling, type HandlingActor } from './handling'
 
 /** How often a ready pull request is noticed again. */
 export const REMINDER_INTERVAL_MS = 15 * 60_000
@@ -113,20 +114,34 @@ function storedSeq(id: string): number {
 }
 
 /** The person put a notice away: for good, or for a ready pull request until
- *  its next reminder. */
+ *  its next reminder. The dismissal is handled even while the condition
+ *  continues; a later clearing records another row. */
 export function dismissNotice(id: string, now = Date.now()): void {
-  if (!dismissAlert(storedSeq(id), now)) throw new HttpError(404, 'That notification has already cleared.')
+  const seq = storedSeq(id)
+  const row = alertRow(seq)
+  if (!dismissAlert(seq, now)) throw new HttpError(404, 'That notification has already cleared.')
+  if (row) {
+    const at = new Date(now).toISOString()
+    recordHandling({ kind: 'notice', source: row.kind, title: row.title, startedAt: row.createdAt,
+      finishedAt: at, outcome: 'dismissed', actor: 'person', ref: `alert:${seq}:dismissed` }, at)
+  }
 }
 
 /** The person asked to hear no more about a ready pull request, until it is
  *  merged or closed, or about a requested review, until the request is gone:
  *  the checks forget the silence then. */
-export function silenceNotice(id: string, now = Date.now()): void {
+export function silenceNotice(id: string, now = Date.now(), actor: HandlingActor = 'person'): void {
   const seq = storedSeq(id)
   const kind = alertKind(seq)
   if (kind === null) throw new HttpError(404, 'There is no such notification.')
   if (!SILENCEABLE.has(kind)) throw new HttpError(400, 'Only a pull request ready to merge or asking for your review can be silenced; dismiss this notification instead.')
+  const row = alertRow(seq)
   if (!silenceAlert(seq, now)) throw new HttpError(404, 'That notification has already cleared.')
+  if (row) {
+    const at = new Date(now).toISOString()
+    recordHandling({ kind: 'notice', source: row.kind, title: row.title, startedAt: row.createdAt,
+      finishedAt: at, outcome: 'silenced', actor, ref: `alert:${seq}:silenced` }, at)
+  }
 }
 
 const READY_PREFIX = 'pr-ready:'

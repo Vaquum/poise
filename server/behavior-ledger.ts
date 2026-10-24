@@ -4,6 +4,9 @@ import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { AgentLogSnapshot, LogEntry } from './agent'
+import { recordHandling } from './alerts/handling'
+import { AGENT_BEHAVIORS } from './behavior-estimates'
+import { db } from './db'
 import type {
   LedgerAdmission, LedgerCaller, LedgerHealth, LedgerObservation, LedgerPending, LedgerPolicy,
   LedgerRead, LedgerReadReply, LedgerReadTiming, LedgerReply, LedgerResult, LedgerWorkerReply, LedgerWorkerRequest,
@@ -509,7 +512,37 @@ export function captureBehaviorAdmission(input: Omit<LedgerAdmission, 'type'>): 
 export function captureBehaviorOutcome(input: Omit<LedgerResult, 'type'>): void {
   observer?.capture({ ...input, type: 'result' })
 }
-export function observeAgentSnapshot(snapshot: AgentLogSnapshot): void { observer?.observe(snapshot) }
+export function observeAgentSnapshot(snapshot: AgentLogSnapshot): void {
+  observer?.observe(snapshot)
+  recordCallerCompletions(snapshot)
+}
+
+// Caller-reported behavior runs, for the handling log: every completed
+// agent behavior run in the snapshot that is not recorded yet. Quarantined
+// rows never reach the entries, and the ref makes repeats idempotent.
+function recordCallerCompletions(snapshot: AgentLogSnapshot): void {
+  const completed = snapshot.entries.filter((entry) => entry.status === 'completed'
+    && typeof entry.completed_at === 'string'
+    && (AGENT_BEHAVIORS as readonly string[]).includes(entry.behavior ?? ''))
+  if (completed.length === 0) return
+  const known = new Set<string>()
+  for (let i = 0; i < completed.length; i += 500) {
+    const chunk = completed.slice(i, i + 500)
+    const rows = db.prepare(`SELECT ref FROM handling_log WHERE ref IN (${chunk.map(() => '?').join(', ')})`)
+      .all(...chunk.map((entry) => `caller:${entry.id}`)) as Array<{ ref: string }>
+    for (const row of rows) known.add(row.ref)
+  }
+  for (const entry of completed) {
+    const ref = `caller:${entry.id}`
+    if (known.has(ref)) continue
+    const subject = entry.repo && entry.pr_id ? `${entry.repo}#${entry.pr_id}` : entry.repo ?? entry.behavior ?? 'run'
+    recordHandling({ kind: 'caller-update', source: entry.behavior as string, title: `${subject} ${entry.behavior}`,
+      startedAt: entry.started_at_precise || entry.started_at, finishedAt: entry.completed_at as string,
+      outcome: entry.outcome ?? 'completed', error: entry.error || null, actor: 'caller', ref },
+      entry.completed_at as string)
+    known.add(ref)
+  }
+}
 export function behaviorLedgerHeartbeat(): void { observer?.capture({ type: 'heartbeat' }) }
 export function readBehaviorLedger(request: LedgerRead): Promise<LedgerReadReply> {
   return observer ? observer.read(request) : Promise.resolve({ status: request.operation === 'health' ? 200 : 503,
