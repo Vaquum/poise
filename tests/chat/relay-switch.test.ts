@@ -412,6 +412,12 @@ describe('release switch adoption', () => {
     const second = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [], startWorker: ['sh', '-c', 'sleep 60'] })
     await second.runtime.resume(session.id)
     expect(second.runtime.get(session.id)?.orphanNotice).toBeUndefined()
+    // Healing publishes an idle resumed payload: emit_ normalizes the
+    // session through the live record, so the start's stale alias after
+    // the record refresh never reaches the transcript.
+    const resumed = ofType(second.events, session.id, 'session.resumed')
+    expect(resumed).toHaveLength(1)
+    expect(resumed[0].session.status).toBe('idle')
     await waitFor(() => ofType(second.events, session.id, 'turn.finished').length === 1)
     expect(ofType(second.events, session.id, 'turn.finished')[0]).toMatchObject({ stopReason: 'interrupted' })
     expect(ofType(second.events, session.id, 'turn.finished')[0].error).toContain('outcome is unknown')
