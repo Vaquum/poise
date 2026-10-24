@@ -500,6 +500,27 @@ describe('automatic PR binding through workspace branches', () => {
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(worker)
   })
 
+  it('reaches a base listing when the only evidence is another managed org\'s fork', async () => {
+    database.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES ('other', ?, 1, 'ready', 'ready', ?)`).run(join(root, 'other.sqlite'), 'fixture-agent')
+    try {
+      const parent = await manager()
+      const { worker, checkout } = await workerWithCheckout(parent.id)
+      await pushBranch(checkout, 'fix/7-xorg', 'other/app')
+      // Each organization's listing carries only its own PRs: the fork's
+      // organization never lists the base PR.
+      closingRefs.mockImplementation(async (org: Organization) => org.login === 'acme'
+        ? branchListing('fix/7-xorg', 'other/app')
+        : { prs: [], truncated: false, more: false })
+      clock += 61_000
+      await control.tick()
+      await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
+      expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(worker)
+    } finally {
+      database.db.prepare('DELETE FROM organizations WHERE login = ?').run('other')
+    }
+  })
+
   it('binds a fork PR to its pusher, never a same-named base branch', async () => {
     const parent = await manager()
     const base = await workerWithCheckout(parent.id)

@@ -1281,9 +1281,11 @@ export class ChatControl {
    *  each open PR whose head branch was pushed from a chat's workspace to
    *  that chat, so a chat that opens its PR without calling `bind` still
    *  receives its CI, conflict, behind and review notices. At most once a
-   *  minute, from local datastore rows, one paged listing per organization
-   *  behind a bound target or a workspace branch — whole-organization, so
-   *  a PR in a repository with no bindings of its own is still found.
+   *  minute, from local datastore rows: one paged listing per organization
+   *  behind a bound target, and every managed organization when branch
+   *  evidence exists, since any evidence repository may be another
+   *  organization's fork. Whole-organization, so a PR in a repository with
+   *  no bindings of its own is still found.
    *  Never takes a claimed target, never rebinds a released one, never
    *  binds to a closed or deleted chat, never matches a PR whose closing
    *  list is incomplete through that list, and never guesses between two
@@ -1300,18 +1302,12 @@ export class ChatControl {
         if (org) orgs.set(org.login.toLowerCase(), org)
       }
     }
-    if (branches) {
-      let unmanaged = false
-      for (const repo of branches.repos) {
-        const org = organizationForRepository(repo)
-        if (org) orgs.set(org.login.toLowerCase(), org)
-        else unmanaged = true
-      }
-      // A fork's owner is not a managed organization, but its base is: when
-      // any evidence points outside the managed orgs, list them all so a
-      // fork head still matches. Extra listings only ever match their own
-      // evidence, so they bind nothing spurious.
-      if (unmanaged) for (const org of readyOrganizations()) orgs.set(org.login.toLowerCase(), org)
+    // Any evidence repository may be a fork — of an unmanaged owner's, or
+    // of another managed organization's — and a fork's base is not knowable
+    // locally. So any branch evidence lists every managed organization;
+    // extra listings only ever match their own evidence.
+    if (branches && branches.repos.size > 0) {
+      for (const org of readyOrganizations()) orgs.set(org.login.toLowerCase(), org)
     }
     if (orgs.size === 0) return
     // The window opens only when listings were actually read, so an empty
