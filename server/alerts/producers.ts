@@ -69,7 +69,7 @@ export function claudeAuthStatusChanged(status: ClaudeAuthStatus): void {
     dedupeKey: CLAUDE_SIGN_IN,
     title: 'Claude needs you to sign in again',
     body: isServiceMode()
-      ? 'Claude-backed work is paused. Connect Claude in Settings → Connected accounts.'
+      ? 'Claude-backed work is paused. Connect Claude in Settings → Accounts.'
       : 'Claude-backed work is paused until you sign in to Claude from Poise.',
     path: FRONT_PAGE,
     ...(isServiceMode() ? { target: ACCOUNTS } : {}),

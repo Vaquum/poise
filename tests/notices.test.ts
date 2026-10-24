@@ -173,7 +173,7 @@ describe('an alert target', () => {
     insert.run('first', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-1', 'Review failed', new Date(at(0)).toISOString())
     // Another behavior on the same PR must never become this notice's target.
     insert.run('unrelated', 'approve-prs', 'acme/api#9', 'acme/api', 9, 'approval-call', 'Approval failed', new Date(at(1)).toISOString())
-    expect(shown(at(2))[0]).toMatchObject({ target: { swarm: 'failed-call-1' }, body: 'Open Swarm in Poise to see what happened.' })
+    expect(shown(at(2))[0]).toMatchObject({ target: { swarm: 'failed-call-1' }, body: 'Open it in Poise to see what happened.' })
     insert.run('second', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-2', 'Review failed again', new Date(at(3)).toISOString())
     expect(shown(at(4))[0].target).toEqual({ swarm: 'failed-call-2' })
   })

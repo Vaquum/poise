@@ -110,7 +110,7 @@ describe('the accounts GitHub is read as', () => {
     invalidateRepoListCache()
     mocks.runFile.mockClear()
     mocks.meta = {}
-    await expect(listOrgRepos()).rejects.toThrow('Set your GitHub account in Settings → GitHub to list repositories')
+    await expect(listOrgRepos()).rejects.toThrow('Set your GitHub account in Settings → General to list repositories')
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
 
@@ -176,7 +176,7 @@ describe('the accounts GitHub is read as', () => {
   it('opens an issue only as your own account, never as gh\'s active one', async () => {
     mocks.meta = {}
     const result = await handleGhBody({ operation: 'open_issue', repository_full_name: 'alpha/same', title: 'Mine' })
-    expect(result).toEqual({ status: 400, body: { error: 'Set your GitHub account in Settings → GitHub before creating issues' } })
+    expect(result).toEqual({ status: 400, body: { error: 'Set your GitHub account in Settings → General before creating issues' } })
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
 })

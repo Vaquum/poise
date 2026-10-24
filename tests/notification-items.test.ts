@@ -25,7 +25,7 @@ function diagnostics(overrides: Partial<BehaviorDiagnostics> = {}): BehaviorDiag
 }
 
 const HELD_SUBJECT = { behavior: 'review-new-prs', target: 'acme/api#9' }
-const held = notice('held', { kind: 'behavior_held', title: 'Review New Pull Requests failed on acme/api#9', body: 'Open Swarm in Poise to see what happened.', target: { swarm: 'failed-call' }, subject: HELD_SUBJECT })
+const held = notice('held', { kind: 'behavior_held', title: 'Review New Pull Requests failed on acme/api#9', body: 'Open it in Poise to see what happened.', target: { swarm: 'failed-call' }, subject: HELD_SUBJECT })
 const letter = (target: string, overrides: Partial<BehaviorDiagnostics['deadLetters'][number]> = {}) => ({
   id: `letter-${target}`, behavior: 'review-new-prs', target, error: 'The reviewer stopped before posting.', createdAt: iso(5), attemptCount: 3, ...overrides,
 })

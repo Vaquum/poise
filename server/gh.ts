@@ -197,7 +197,7 @@ const REPO_LIST_TTL_MS = 5 * 60 * 1000
 
 async function discoverOrgRepos(org: Organization): Promise<string[]> {
   const me = getMeta('me') || ''
-  if (!me) throw new Error('Set your GitHub account in Settings → GitHub to list repositories')
+  if (!me) throw new Error('Set your GitHub account in Settings → General to list repositories')
   const key = `${me.toLowerCase()}:${org.login.toLowerCase()}`
   const now = Date.now()
   const cached = repoListCache.get(key)
@@ -570,7 +570,7 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
     }
     try { requireConfiguredRepository(repoFull) }
     catch (error) { return { status: 400, body: { error: (error as Error).message } } }
-    if (!me) return { status: 400, body: { error: 'Set your GitHub account in Settings → GitHub before creating issues' } }
+    if (!me) return { status: 400, body: { error: 'Set your GitHub account in Settings → General before creating issues' } }
     const [owner, repo] = repoFull.split('/', 2)
 
     // Resolve `me`'s gh credential.

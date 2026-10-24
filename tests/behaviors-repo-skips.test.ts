@@ -411,7 +411,7 @@ describe('Replay checks', () => {
     const { db } = await start()
     db.setMeta('me', '')
     await expect(refusal('pr_approve', API, 1)).resolves
-      .toBe(`Replay refused: ${API}#1 cannot be matched to your GitHub account: none is set in Settings → GitHub.`)
+      .toBe(`Replay refused: ${API}#1 cannot be matched to your GitHub account: none is set in Settings → General.`)
   })
 
   it('refuses a repository skipped for that behavior only', async () => {

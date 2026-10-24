@@ -157,7 +157,7 @@ describe('the notices API', () => {
     const answer = await call('GET', '/api/notices')
     expect(answer.status).toBe(200)
     expect(answer.body.notices).toEqual([expect.objectContaining({
-      id: failed.id, target: { swarm: 'failed-call' }, body: 'Open Swarm in Poise to see what happened.',
+      id: failed.id, target: { swarm: 'failed-call' }, body: 'Open it in Poise to see what happened.',
       subject: { behavior: 'approve-prs', target: 'acme/api#9' },
     })])
   })

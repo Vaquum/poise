@@ -138,7 +138,7 @@ describe('the agent account', () => {
   })
 
   it('is required, with where to set it, by anything that posts as it', () => {
-    expect(() => requireAgentAccount()).toThrow('No agent account is set. Set it in Settings → GitHub')
+    expect(() => requireAgentAccount()).toThrow('No agent account is set. Set it in Settings → General')
     setSettings({ agentAccount: 'review-bot' })
     expect(requireAgentAccount()).toBe('review-bot')
     // A hand-edited database is not trusted either.

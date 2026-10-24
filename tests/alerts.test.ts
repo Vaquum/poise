@@ -161,7 +161,7 @@ describe('the alert producers', () => {
     } finally {
       vi.stubEnv('POISE_MODE', undefined)
     }
-    expect(unresolved()).toEqual([expect.objectContaining({ body: 'Claude-backed work is paused. Connect Claude in Settings → Connected accounts.' })])
+    expect(unresolved()).toEqual([expect.objectContaining({ body: 'Claude-backed work is paused. Connect Claude in Settings → Accounts.' })])
   })
 
   it('alerts once per held behavior target until its incident has cleared', () => {

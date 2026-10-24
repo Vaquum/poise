@@ -772,7 +772,7 @@ function reviewerTripTarget(identity: string): string {
 function tripReviewerAccount(behavior: PanelBehavior, identity: string, kind: ReviewAccountFailureKind, callId: string): void {
   const message = kind === 'balance'
     ? `${identity} cannot review: its account is out of balance (402). Top up its credit; Poise retries automatically.`
-    : `${identity} cannot review: it is not signed in. Sign it in from Settings → Connected accounts; Poise retries automatically.`
+    : `${identity} cannot review: it is not signed in. Sign it in from Settings → Accounts; Poise retries automatically.`
   recordBehaviorFailure(behavior, 'operation', message, reviewerTripTarget(identity), { callId })
 }
 
@@ -975,7 +975,7 @@ export function pullRequestPolicy(behavior: SkippableBehavior): PullRequestPolic
 function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | null): string | null {
   if (pr?.status !== 'open') return `${ref} is not an open pull request`
   if (pr.draft) return `${ref} is a draft`
-  if (!me) return `${ref} cannot be matched to your GitHub account: none is set in Settings → GitHub`
+  if (!me) return `${ref} cannot be matched to your GitHub account: none is set in Settings → General`
   if (pr.author !== me) return `${ref} is authored by ${pr.author}, not by your GitHub account ${me}`
   return null
 }

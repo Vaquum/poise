@@ -92,7 +92,7 @@ export function noticesState(now = Date.now()): NoticesState {
       kind: alert.kind,
       title: alert.kind === 'sign_in_needed' && alert.dedupeKey === 'sign-in:gh:agent'
         ? GITHUB_AUTOMATION_SIGN_IN_TITLE : alert.title,
-      body: target && 'swarm' in target ? 'Open Swarm in Poise to see what happened.' : alert.body,
+      body: target && 'swarm' in target ? 'Open it in Poise to see what happened.' : alert.body,
       since: alert.createdAt,
       due: new Date(due).toISOString(),
       silenceable: SILENCEABLE.has(alert.kind),

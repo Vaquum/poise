@@ -22,7 +22,7 @@ const iso = (minutes: number) => new Date(T0 + minutes * 60_000).toISOString()
 const HELD_CALL = 'c'.repeat(32)
 
 const WAITING: Notice = { id: 'aaaaaaaaaaaa-3', kind: 'chat_waiting', title: 'Claude Code is waiting for you', body: 'In “Refactor the relay”: allow or deny Bash(npm test).', since: iso(4), due: iso(4), silenceable: false, target: { chat: '7d6c1b1e-2a4f-4c55-9a51-0e1f2b3c4d5e' } }
-const HELD: Notice = { id: 'aaaaaaaaaaaa-2', kind: 'behavior_held', title: 'Review New Pull Requests failed on acme/api#9', body: 'Open Swarm in Poise to see what happened.', since: iso(2), due: iso(2), silenceable: false, target: { swarm: HELD_CALL }, subject: { behavior: 'review-new-prs', target: 'acme/api#9' } }
+const HELD: Notice = { id: 'aaaaaaaaaaaa-2', kind: 'behavior_held', title: 'Review New Pull Requests failed on acme/api#9', body: 'Open it in Poise to see what happened.', since: iso(2), due: iso(2), silenceable: false, target: { swarm: HELD_CALL }, subject: { behavior: 'review-new-prs', target: 'acme/api#9' } }
 const READY: Notice = { id: 'aaaaaaaaaaaa-1', kind: 'pr_ready', title: 'acme/api#7 is ready to merge', body: 'Fix the flaky retry test', since: iso(0), due: iso(30), silenceable: true, target: { pullRequest: 'https://github.com/acme/api/pull/7' } }
 
 test('temporary-space warnings inform without blocking normal navigation or work controls', async ({ page }) => {

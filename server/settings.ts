@@ -225,9 +225,9 @@ export function agentAccount(): string {
 export function requireAgentAccount(): string {
   const account = agentAccount()
   if (!account) {
-    throw new Error('No agent account is set. Set it in Settings → GitHub: it is the GitHub user your reviews and comments are posted as.')
+    throw new Error('No agent account is set. Set it in Settings → General: it is the GitHub user your reviews and comments are posted as.')
   }
-  if (!GITHUB_NAME.test(account)) throw new Error('The agent account in Settings → GitHub is not a GitHub username')
+  if (!GITHUB_NAME.test(account)) throw new Error('The agent account in Settings → General is not a GitHub username')
   return account
 }
 
