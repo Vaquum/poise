@@ -238,17 +238,8 @@ export class CheckoutLease {
     })
   }
 
-  /** The row's host is alive only when its pid is alive and still the
-   *  process that acquired the lease: a reused pid with a different start
-   *  time is a dead host. A missing or unreadable start time (rows written
-   *  before host_start, foreign writers, unreadable tables) fails closed
-   *  to the pid check. */
   private hostAlive(row: LeaseRow): boolean {
-    if (!this.probes.pidAlive(row.host_pid)) return false
-    if (row.host_start == null) return true
-    const start = this.probes.processStart(row.host_pid)
-    if (start == null) return true
-    return start === row.host_start
+    return leaseHostAlive(row, this.probes)
   }
 
   /** Take over a row whose host is dead but whose worker is verified alive
@@ -394,6 +385,19 @@ export class CheckoutLease {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     this.heartbeatTimer = null
   }
+}
+
+/** Whether the row's host process is still the holder: its pid is alive
+ *  and still the process that acquired the lease (same start time). A
+ *  reused pid with a different start time is a dead host; a missing or
+ *  unreadable start time fails closed to the pid check. Recovery's
+ *  ownership guards share this so a squatting pid cannot pin them either. */
+export function leaseHostAlive(row: LeaseRow, options: CheckoutLeaseOptions = {}): boolean {
+  if (!(options.pidAlive ?? pidAlive)(row.host_pid)) return false
+  if (row.host_start == null) return true
+  const start = (options.processStart ?? processStartTime)(row.host_pid)
+  if (start == null) return true
+  return start === row.host_start
 }
 
 /** Human summary of who holds a lease, for `queued behind …`. */

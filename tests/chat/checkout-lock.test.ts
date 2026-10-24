@@ -232,10 +232,15 @@ describe('checkout lease', () => {
       expect(row.host_start).toBe(processStartTime(process.pid))
       after.release()
     } finally {
+      // Listeners first: a gate that exits while the holder is awaited
+      // would otherwise never resolve a later-attached listener.
+      const exited = Promise.all([
+        new Promise((r) => holder.once('exit', r)),
+        new Promise((r) => gate.once('exit', r)),
+      ])
       holder.kill('SIGKILL')
       gate.kill('SIGKILL')
-      await new Promise((r) => holder.once('exit', r))
-      await new Promise((r) => gate.once('exit', r))
+      await exited
     }
   })
 

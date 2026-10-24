@@ -42,6 +42,7 @@ SCHEMA = """create table if not exists lease (
   owner_label    text    not null,
   instance       text    not null,
   host_pid       integer not null,
+  host_start     text,
   worker_pid     integer,
   worker_pgid    integer,
   worker_ident   text,
@@ -84,6 +85,16 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     os.chmod(path, 0o600)
     conn.execute(SCHEMA)
+    # Lock files written before host_start gain the column on first open.
+    # Two processes migrating at once race on the ALTER; the loser sees
+    # duplicate-column.
+    columns = [row[1] for row in conn.execute("pragma table_info(lease)")]
+    if "host_start" not in columns:
+        try:
+            conn.execute("alter table lease add column host_start text")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error).lower():
+                raise
     return conn
 
 
@@ -188,9 +199,12 @@ def try_acquire(
             return "busy", row
         if pgid_alive(row["worker_pgid"]) or pid_alive(row["worker_pid"]):
             return "orphan", row
+        # host_start is cleared: the previous holder's start time must not
+        # stay attached to this process, which Poise would read as a dead
+        # host. A null start fails closed to the pid check.
         conn.execute(
             """update lease set token = ?, checkout = ?, owner_kind = ?, owner_id = ?, owner_label = ?, instance = ?,
-                   host_pid = ?, worker_pid = null, worker_pgid = null, worker_ident = null, branch = ?,
+                   host_pid = ?, host_start = null, worker_pid = null, worker_pgid = null, worker_ident = null, branch = ?,
                    acquired_at = ?, heartbeat_at = ?, lease_until = ?
                where id = 1""",
             mine,
