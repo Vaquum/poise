@@ -706,8 +706,10 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   })
 
   it('recreates a missing connection file at restart so bind keeps working', async () => {
-    const chat = await manager()
-    const before = await config(chat.id)
+    const parent = await manager()
+    const created = await command(parent.id, { operation: 'create', title: 'Worker', task: 'Fix the issue' })
+    const chat = (created.session as { id: string }).id
+    const before = await config(chat)
     // The worker's prompt names this path, but the file is gone — a cleaned
     // temp directory, a crashed stop — when the chat starts.
     await rm(before.path)
@@ -727,7 +729,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     const run = await executeFile(process.execPath, [script, before.path,
       JSON.stringify({ operation: 'bind', target: 'https://github.com/acme/app/issues/44', requestId: randomUUID() })])
     expect((JSON.parse(run.stdout) as { ok: boolean }).ok).toBe(true)
-    expect(store.bindings(runtime.instance).find(b => b.target === 'https://github.com/acme/app/issues/44')?.session).toBe(chat.id)
+    expect(store.bindings(runtime.instance).find(b => b.target === 'https://github.com/acme/app/issues/44')?.session).toBe(chat)
   })
 
   it('tells a chat without a connection file how to recover', async () => {
