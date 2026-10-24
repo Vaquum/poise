@@ -623,6 +623,8 @@ export class Orchestrator {
     let confirmedBusy = false
     let sawDown = false
     let recreated = false
+    // Whether a drain POST left the gateway, visible even when drain() throws before returning.
+    const dispatched = { value: false }
     const abortUnknown = async (): Promise<void> => {
       await this.releaseDrain(handle, login, 'the drain timed out without a usable answer')
       this.lifecycle('workspace.upgrade.aborted', handle, { reason: 'the drain timed out without a usable answer' })
@@ -704,7 +706,7 @@ export class Orchestrator {
           return
         }
         this.upgradingPhase = 'drain'
-        const result = await this.drain(handle, login, deadline)
+        const result = await this.drain(handle, login, deadline, dispatched)
         this.upgradingPhase = 'upgrade'
         drainAttempted = drainAttempted || result.attempted
         confirmedBusy = confirmedBusy || result.confirmedBusy
@@ -719,6 +721,7 @@ export class Orchestrator {
         }
       }
     } catch (error) {
+      drainAttempted = drainAttempted || dispatched.value
       if (drainAttempted && !recreated) await this.releaseDrain(handle, login, 'the upgrade failed')
       throw error
     } finally {
@@ -752,14 +755,14 @@ export class Orchestrator {
    * Asks the workspace to stop admitting work, then waits until it reports idle or the shared deadline
    * passes. The workspace lets a drain lapse unless it is renewed, so it is re-requested while waiting.
    * A network the gateway cannot join fails the upgrade instead: waiting would drain nothing, and the
-   * timeout would then recreate the workspace with its work cut off. A drain POST counts as attempted
-   * once sent, since a failed answer may still have been applied.
+   * timeout would then recreate the workspace with its work cut off. A drain POST counts as dispatched
+   * once the gateway is on the network to send it, recorded where the caller sees it even when a later
+   * poll throws, since a failed answer may still have been applied.
    */
-  private async drain(handle: string, login: string, deadline: number): Promise<{ idle: boolean; attempted: boolean; confirmedBusy: boolean; timeoutOnly: boolean }> {
+  private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }): Promise<{ idle: boolean; attempted: boolean; confirmedBusy: boolean; timeoutOnly: boolean }> {
     const { config, log, now } = this.deps
     const start = now()
     let requestedAt = now()
-    let attempted = false
     let confirmedBusy = false
     let sawNonTimeout = false
     let sawDraining = false
@@ -780,16 +783,22 @@ export class Orchestrator {
       else if (sawDraining && !health.idle) log.warn('workspace.drain.lifted', { handle })
       if (!health.idle) confirmedBusy = true
     }
-    attempted = true
+    // Fail before anything is sent when the gateway is off the network, so only a POST that left
+    // the gateway counts towards releasing the drain on failure.
+    const postDrain = async (): Promise<ServiceHealth> => {
+      await this.ensureOnNetwork(handle)
+      dispatched.value = true
+      return this.serviceCall(handle, login, 'POST', '/api/service/drain')
+    }
     try {
-      const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
+      const health = await postDrain()
       this.lifecycle('workspace.drain.requested', handle, {
         activeChatTurns: health.activeChatTurns,
         runningCallerCalls: health.runningCallerCalls,
         backgroundWork: health.backgroundWork,
       })
       note(health)
-      if (health.idle) return { idle: true, attempted, confirmedBusy, timeoutOnly: false }
+      if (health.idle) return { idle: true, attempted: dispatched.value, confirmedBusy, timeoutOnly: false }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       if (!(error instanceof ServiceTimeoutError)) sawNonTimeout = true
@@ -798,16 +807,15 @@ export class Orchestrator {
     while (now() < deadline) {
       await delay(this.drainPollMs)
       const renew = now() - requestedAt >= this.drainRenewMs
-      if (renew) attempted = true
       try {
         const health = renew
-          ? await this.serviceCall(handle, login, 'POST', '/api/service/drain')
+          ? await postDrain()
           : await this.serviceCall(handle, login, 'GET', '/api/service/health')
         if (renew) requestedAt = now()
         note(health)
         if (health.idle) {
           this.lifecycle('workspace.drain.idle', handle)
-          return { idle: true, attempted, confirmedBusy, timeoutOnly: false }
+          return { idle: true, attempted: dispatched.value, confirmedBusy, timeoutOnly: false }
         }
         if (renew) waiting(health)
       } catch (error) {
@@ -817,7 +825,7 @@ export class Orchestrator {
       }
     }
     log.warn('workspace.drain.timeout', { handle, timeoutSeconds: config.drainTimeoutSeconds })
-    return { idle: false, attempted, confirmedBusy, timeoutOnly: !confirmedBusy && !sawNonTimeout }
+    return { idle: false, attempted: dispatched.value, confirmedBusy, timeoutOnly: !confirmedBusy && !sawNonTimeout }
   }
 
   private async startLocked(handle: string, login: string): Promise<void> {

@@ -484,6 +484,22 @@ describe('image upgrades', () => {
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 
+  it('tries to release the drain when the network fails after a drain took effect', async () => {
+    await start({ env: { POISE_DRAIN_TIMEOUT: '30' } })
+    h.workspace.health.runningCallerCalls = 1
+    const upgrade = h.orchestrator.upgradePass()
+    await waitFor(() => h.workspace.serviceRequests.length > 0, 'the drain request')
+    expect(h.workspace.health.draining).toBe(true)
+    // A poll reaches nothing, so the gateway looks at its network again; by then it cannot join it.
+    h.workspace.reachable = false
+    await waitFor(() => events(h.logs, 'workspace.drain.health.failed').length > 0, 'a failed poll')
+    h.docker.containers.delete('poise-gateway')
+    await upgrade
+    expect(h.logs.find((entry) => entry.event === 'workspace.drain.release.failed')).toMatchObject({ handle: 'alice' })
+    expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.failed')).toMatchObject({ handle: 'alice' })
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
+  })
+
   it('aborts a drain that only times out and releases it, instead of recreating the workspace', async () => {
     await start({ env: { POISE_DRAIN_TIMEOUT: '1' }, serviceTimeoutMs: 20 })
     const aliceId = h.docker.containers.get('poise-ws-alice')?.id
