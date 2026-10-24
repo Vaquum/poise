@@ -2,7 +2,7 @@ import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-cont
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
-import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun } from './behavior-metrics'
+import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun, reapAbandonedDirectBehaviorRuns } from './behavior-metrics'
 import { CLI_UPDATE_TIMEOUT_MS } from '../scripts/provider-cli-updates.mjs'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
 // Server-side behavior runtime. Lives with the Poise HTTP server
@@ -56,7 +56,7 @@ import {
   recordBehaviorDeadLetter as databaseRecordBehaviorDeadLetter,
   quarantineBehaviorLaunchOwned,
   retireBehaviorDeadLetter,
-  retireBehaviorDeadLettersForClosedPrs,
+  reconcileBehaviorDeadLetters,
   retireBehaviorDeadLettersForTarget,
   recordSeen,
   releaseSeen,
@@ -1989,7 +1989,7 @@ async function readOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
     seen.add(key)
     return pr
   })
-  retireBehaviorDeadLettersForClosedPrs(seen, undefined, currentOrganization()?.login)
+  reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login)
   retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
   return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(author, `${pr.repo}#${pr.number}`, pr))
 }
@@ -2693,6 +2693,10 @@ interface ReviewActivityResult {
   // The ids of those reviews, once github-interface reports them; null from
   // an older github-interface, when only the count is known.
   reviewerReviewIdsSince: number[] | null
+  // The same reviews with the state and head each was submitted on, so a
+  // replay can tell a published review on the current head from a
+  // dismissed one or a sibling panel member's claimed receipt.
+  reviewerReviewsSinceItems: Array<{ id: number, state: string, commit: string }> | null
   reviewerPendingReviews: number
   latestActivityAt: string | null
 }
@@ -2795,14 +2799,23 @@ function parseReviewActivityResult(
     'review-activity-since reviewer_pending_reviews',
   )
   let reviewerReviewIdsSince: number[] | null = null
+  let reviewerReviewsSinceItems: ReviewActivityResult['reviewerReviewsSinceItems'] = null
   if (Array.isArray(data.reviewer_reviews_since_items)) {
-    reviewerReviewIdsSince = data.reviewer_reviews_since_items.map((item: any) => {
+    reviewerReviewsSinceItems = data.reviewer_reviews_since_items.map((item: any) => {
       if (!item || typeof item !== 'object' || !Number.isSafeInteger(item.id) || Number(item.id) <= 0) {
         throw new Error('github-interface --review-activity-since returned an invalid review id')
       }
-      return Number(item.id)
+      if (typeof item.state !== 'string'
+        || !['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED', 'PENDING'].includes(item.state)) {
+        throw new Error('github-interface --review-activity-since returned an invalid review state')
+      }
+      if (typeof item.commit !== 'string' || !SHA_PATTERN.test(item.commit.toLowerCase())) {
+        throw new Error('github-interface --review-activity-since returned an invalid review head')
+      }
+      return { id: Number(item.id), state: String(item.state), commit: String(item.commit).toLowerCase() }
     })
-    if (reviewerReviewIdsSince!.length !== reviewerReviewsSince) {
+    reviewerReviewIdsSince = reviewerReviewsSinceItems.map((item) => item.id)
+    if (reviewerReviewIdsSince.length !== reviewerReviewsSince) {
       throw new Error('github-interface --review-activity-since review ids do not match their count')
     }
   }
@@ -2820,6 +2833,7 @@ function parseReviewActivityResult(
     reviewerLatestCommit,
     reviewerReviewsSince,
     reviewerReviewIdsSince,
+    reviewerReviewsSinceItems,
     reviewerPendingReviews,
     latestActivityAt,
   }
@@ -5126,7 +5140,7 @@ async function tickReviewNewIssues(): Promise<void> {
     }
   }
   // An unread repository is unknown, not empty: preserve its incidents.
-  retireBehaviorDeadLettersForClosedPrs(open, [ISSUES_KEY], currentOrganization()?.login, unreadRepositories)
+  reconcileBehaviorDeadLetters(open, [ISSUES_KEY], currentOrganization()?.login, unreadRepositories)
   retireClosedTargetFailures(open, [ISSUES_KEY], unreadRepositories)
   candidates.sort((a, b) => a.order - b.order)
   let logs: Promise<AgentLogSnapshot> | null = null
@@ -5434,14 +5448,74 @@ export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, n
   const refusal = await behaviorOrganization.run(org, async () => {
     try {
       await requireFreshDatastore()
-      return behavior === 'issue_review'
+      const targetRefusal = behavior === 'issue_review'
         ? issueReviewRefusal(issueReviewPolicy(), repo, number, await readIssue(repo, number))
         : pullRequestRefusal(pullRequestPolicy(REPLAY_SKIPS[behavior]), repo, number, await readPullRequest(repo, number))
+      if (targetRefusal || behavior === 'issue_review') return targetRefusal
+      return await replayPublicationRefusal(behavior, repo, number)
     } catch (error) {
       throw new HttpError(502, `Replay could not check ${repo}#${number}: ${behaviorErrorMessage(error)}`)
     }
   })
   if (refusal) throw new ReplayRefusedError(refusal)
+}
+
+// A replay carries no call identity — behavior, repository and number only —
+// so the publication check is per target, not per obligation. Refuse while
+// any worker owns the pull request, and refuse what live GitHub already
+// shows as published on the current head, so a replay can never post a
+// duplicate review. Panel siblings share the agent account on one head, so
+// a review another Caller row claims as its own receipt is not this
+// replay's duplicate; only an outstanding failed slot on this head may
+// retry beside a claimed sibling review. Dismissed reviews never count:
+// re-approving after a dismissal is approve-prs's job. Reviews an older
+// Caller reports only as a count cannot be placed, so they refuse like
+// the retry path; zero reviews means nothing was published. An unreadable
+// target throws, and the caller answers 502 with no launch.
+async function replayPublicationRefusal(
+  behavior: 'pr_review' | 'pr_approve',
+  repo: string,
+  number: number,
+): Promise<string | null> {
+  if (hasActiveAgentLaunchForPr(repo, number)) {
+    return `another behavior worker is still active on ${repo}#${number}`
+  }
+  const snapshot = await readBehaviorLogSnapshot()
+  if (snapshot.entries.some((row) => row.repo === repo && String(row.pr_id || '') === String(number)
+    && RUNNING_AGENT_STATUSES.has(row.status.toLowerCase()))) {
+    return `another PR worker is still active on ${repo}#${number}`
+  }
+  const reviewer = configuredReviewer()
+  const activity = await checkReviewActivity(repo, number, reviewer, '1970-01-01T00:00:00Z')
+  if (activity.reviewerReviewsSinceItems === null && activity.reviewerReviewsSince !== 0) {
+    return `live GitHub evidence cannot prove no review by ${reviewer} is published on ${repo}#${number}`
+  }
+  if (activity.reviewerPendingReviews !== 0) {
+    return `a review submission by ${reviewer} is still pending on ${repo}#${number}`
+  }
+  const head = activity.headSha
+  const published = (activity.reviewerReviewsSinceItems ?? []).filter((review) =>
+    review.commit === head && review.state !== 'DISMISSED' && review.state !== 'PENDING')
+  const claimed = new Set(snapshot.entries
+    .filter((row) => row.repo === repo && String(row.pr_id || '') === String(number) && typeof row.review_id === 'number')
+    .map((row) => row.review_id as number))
+  const unclaimed = published.filter((review) => !claimed.has(review.id))
+  if (unclaimed.length > 0) {
+    return `review ${unclaimed.map((review) => review.id).join(', ')} by ${reviewer} is already published on ${head}`
+  }
+  if (behavior === 'pr_approve') {
+    const approval = published.find((review) => review.state === 'APPROVED')
+    if (approval) return `approval ${approval.id} by ${reviewer} is already published on ${head}`
+    return null
+  }
+  if (published.length === 0) return null
+  const failedSlot = failedBehaviorLaunches('review-new-prs').some((claim) =>
+    claim.launchRepo === repo && claim.launchPr === number
+    && claim.launchExpectedHead?.toLowerCase() === head
+    && claim.launchActor.toLowerCase() === reviewer.toLowerCase()
+    && !claim.launchQuarantine)
+  if (failedSlot) return null
+  return `review ${published.map((review) => review.id).join(', ')} by ${reviewer} is already published on ${head}`
 }
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -5594,6 +5668,10 @@ export async function runEnabledBehaviorsOnce(
   if (releaseBackgroundPaused()) return
   prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
+    // The run ledger is global, not per organization: reap once before the
+    // fan-out. Abandoned direct runs close as interrupted with their
+    // completion unknown, never deleted.
+    reapAbandonedDirectBehaviorRuns()
     const orgs = readyOrganizations()
     await Promise.allSettled(orgs.map((org, index) => (async () => {
       if (options.stagger && index > 0) {
