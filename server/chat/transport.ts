@@ -1,6 +1,7 @@
 import { ensureSnippetSwitch, readSwitches, readSkillSnippets, snippetLibraryEvents } from '../snippet-library'
-import { MANAGER_SWITCH, type ChatSwitches } from '../../src/chat-switches'
+import { MANAGER_SWITCH, WORKER_SWITCH, type ChatSwitches } from '../../src/chat-switches'
 import { MANAGER_SNIPPET_DEFAULT } from './manager-default'
+import { WORKER_SNIPPET_DEFAULT } from './worker-default'
 import { readChatFile } from './file-preview'
 import { readMemories, saveMemories } from './memories'
 // The browser-facing side of Chat v1: the WebSocket at /ws/chat (events
@@ -257,7 +258,7 @@ export class ChatSocketServer {
       case 'session.list':
         return { sessions: runtime.list() }
       case 'session.new': {
-        if (command.role !== undefined) throw new ChatError(400, 'A Manager is created from the New session dialog in the browser.', 'invalid')
+        if (command.role !== undefined) throw new ChatError(400, 'A Manager or Worker is created from the New session dialog in the browser.', 'invalid')
         const request = localSessionRequest(command)
         if (request.subject) {
           const { session, existing } = await runtime.createForSubject({ ...request, subject: request.subject })
@@ -554,14 +555,17 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
     if (path === '/api/chat/sessions' && req.method === 'POST') {
       const body = await readJson<any>(req)
       if (body?.role !== undefined) {
-        if (!person) throw new ChatError(403, 'A Manager is created from the New session dialog in the browser.', 'invalid')
+        if (!person) throw new ChatError(403, 'A Manager or Worker is created from the New session dialog in the browser.', 'invalid')
         const session = await runtime.create({ ...localSessionRequest(body), role: body.role })
+        const charter = session.role === 'worker'
+          ? { name: WORKER_SWITCH, text: WORKER_SNIPPET_DEFAULT }
+          : { name: MANAGER_SWITCH, text: MANAGER_SNIPPET_DEFAULT }
         try {
-          if (await ensureSnippetSwitch(MANAGER_SWITCH, MANAGER_SNIPPET_DEFAULT) === 'unreadable') {
-            runtime.emit('log', '[chat] /manager could not be read; Snippets shows the problem')
+          if (await ensureSnippetSwitch(charter.name, charter.text) === 'unreadable') {
+            runtime.emit('log', `[chat] /${charter.name} could not be read; Snippets shows the problem`)
           }
         } catch (error) {
-          runtime.emit('log', `[chat] creating /manager failed: ${error instanceof Error ? error.message : String(error)}`)
+          runtime.emit('log', `[chat] creating /${charter.name} failed: ${error instanceof Error ? error.message : String(error)}`)
         }
         return json(res, 201, { session }), true
       }

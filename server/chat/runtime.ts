@@ -24,7 +24,7 @@ import { prepareProviderCli } from '../provider-clis'
 
 import { readMemories } from './memories'
 import { expandSwitches, savedSwitchNames, saveSwitch } from './custom-switches'
-import { MANAGER_SWITCH } from '../../src/chat-switches'
+import { MANAGER_SWITCH, WORKER_SWITCH } from '../../src/chat-switches'
 import { deriveSessionTitle, parseIssueReference, shouldAutoName } from '../../src/chat-title'
 import { resolveIssueTitle } from './issue-titles'
 import { appendMemories } from './memory-content'
@@ -313,6 +313,11 @@ class SubjectTakenError extends Error {
 /** /manager carries the Manager's charter; no other chat may use it. */
 function refuseManagerSwitch(switches: readonly string[] | undefined, isManager: boolean): void {
   if (switches?.includes(MANAGER_SWITCH) && !isManager) throw new ChatError(400, '/manager is not supported in regular chats.', 'invalid')
+}
+
+/** /worker carries a worker's charter; only a worker chat may use it. */
+function refuseWorkerSwitch(switches: readonly string[] | undefined, isWorker: boolean): void {
+  if (switches?.includes(WORKER_SWITCH) && !isWorker) throw new ChatError(400, '/worker is not supported in non-worker chats.', 'invalid')
 }
 
 /** Provenance header for a chat's steer: source data, not the person's message. */
@@ -1626,7 +1631,7 @@ export class ChatRuntime extends EventEmitter {
   async create(request: NewSessionRequest): Promise<SessionRecord> {
     this.assertAcceptingWork() // before any await: the drain flag is checked atomically
     if (request.subject) return (await this.createForSubject({ ...request, subject: request.subject })).session
-    if (request.role !== undefined && request.role !== 'manager') throw new ChatError(400, 'role must be "manager" or absent', 'invalid')
+    if (request.role !== undefined && request.role !== 'manager' && request.role !== 'worker') throw new ChatError(400, 'role must be "manager", "worker" or absent', 'invalid')
     if (request.role === 'manager') {
       if (request.repo !== undefined || request.branch !== undefined || request.checkout !== undefined) {
         throw new ChatError(400, 'A Manager runs in its own local workspace; repo, branch and checkout are not accepted.', 'invalid')
@@ -1666,7 +1671,8 @@ export class ChatRuntime extends EventEmitter {
    *  removes the workspace it just made and returns the winner. */
   async createForSubject(request: NewSessionRequest & { subject: ChatSubject }): Promise<{ session: SessionRecord, existing: boolean }> {
     this.assertAcceptingWork()
-    if (request.role !== undefined) throw new ChatError(400, 'A Manager has no subject.', 'invalid')
+    if (request.role !== undefined && request.role !== 'manager' && request.role !== 'worker') throw new ChatError(400, 'role must be "manager", "worker" or absent', 'invalid')
+    if (request.role === 'manager') throw new ChatError(400, 'A Manager has no subject.', 'invalid')
     const key = `${request.subject.surface}:${request.subject.key}`
     const prior = this.subjectLocks.get(key)
     let release!: () => void
@@ -1807,7 +1813,7 @@ export class ChatRuntime extends EventEmitter {
       ...(request.subject ? { subject: request.subject } : {}),
       ...(request.autoMerge !== undefined ? { autoMerge: request.autoMerge } : {}),
       safeMode: request.safeMode === true,
-      ...(request.role === 'manager' ? { role: 'manager' as const } : {}),
+      ...(request.role ? { role: request.role } : {}),
       ...(createdBy ? { createdBy } : {}),
     }
     // Callers can guard admission after asynchronous model/auth preparation;
@@ -2406,6 +2412,7 @@ export class ChatRuntime extends EventEmitter {
     const request = String(text || '').trim()
     const names = context.switches
     refuseManagerSwitch(names, this.get(sourceId)?.role === 'manager')
+    refuseWorkerSwitch(names, this.get(sourceId)?.role === 'worker')
     if (names !== undefined) {
       const known = savedSwitchNames()
       if (!Array.isArray(names) || names.length > 128 || !names.every(name => typeof name === 'string' && known.has(name))) throw new ChatError(400, 'The selected saved switches are unavailable.', 'invalid')
@@ -2697,6 +2704,7 @@ export class ChatRuntime extends EventEmitter {
     const prompt = this.validatePrompt(id, input)
     const chain = parseCommands(prompt.text)
     refuseManagerSwitch(chain.switches, session.record.role === 'manager')
+    refuseWorkerSwitch(chain.switches, session.record.role === 'worker')
     if (chain.missingModel) throw new ChatError(400, 'Choose a model from /model first.', 'invalid')
     if (chain.create) throw new ChatError(400, 'Save a switch with the create command, not an agent prompt.', 'invalid')
     if (chain.content !== undefined || chain.consensus !== undefined) throw new ChatError(400, 'Run /content or /consensus as a chat command, not as an agent prompt.', 'invalid')
@@ -2785,6 +2793,7 @@ export class ChatRuntime extends EventEmitter {
       const submitted = this.validatePrompt(id, input)
       const chain = parseCommands(submitted.text)
       refuseManagerSwitch(chain.switches, session.record.role === 'manager')
+      refuseWorkerSwitch(chain.switches, session.record.role === 'worker')
       if (chain.create) throw new ChatError(400, 'Save the switch directly with /create, then queue its use.', 'invalid')
       if (chain.content !== undefined || chain.consensus !== undefined) throw new ChatError(400, 'Run /content or /consensus now; queueing them would run them as prompts.', 'invalid')
       expandSwitches(chain.text, chain.switches)
@@ -3100,6 +3109,7 @@ export class ChatRuntime extends EventEmitter {
         const chain = parseCommands(input.text)
         if (chain.create) throw new ChatError(400, 'Switch definitions cannot be created by a queued provider task.', 'invalid')
         refuseManagerSwitch(chain.switches, record.role === 'manager')
+        refuseWorkerSwitch(chain.switches, record.role === 'worker')
         turn.switches = chain.switches ?? turn.switches
         turn.contextAction = chain.context
         if (chain.context || chain.switches?.length) { turn.shown = input; input = { ...input, text: chain.text } }
@@ -3550,6 +3560,7 @@ export class ChatRuntime extends EventEmitter {
     // text, never run.
     const chain = actor ? null : parseCommands(shown.text)
     refuseManagerSwitch(chain?.switches, session.record.role === 'manager')
+    refuseWorkerSwitch(chain?.switches, session.record.role === 'worker')
     if (chain && (chain.create || chain.queue || chain.context || chain.review || chain.model || chain.content !== undefined || chain.consensus !== undefined)) throw new ChatError(400, 'This command starts a separate action; queue it instead of steering.', 'invalid')
     // Do not put this wait on the control chain: startup drains that chain
     // before invoking the prompt. Early interjections belong after that boundary.

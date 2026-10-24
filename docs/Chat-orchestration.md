@@ -243,6 +243,20 @@ included. Every new revision still writes a `chat.manager.charter.changed`
 diagnostic. Under a service drain, editing `/manager` still works; under a
 local release drain it returns 503 like other snippet saves.
 
+**Worker chats.** A worker is a `role: 'worker'` chat, chosen in the New
+session dialog like the Manager; Worker and Manager are mutually exclusive
+and neither is selected by default. A worker runs on its own standing
+instructions, the built-in `/worker` snippet, which rides on every worker
+turn the same way `/manager` rides on Manager turns — whoever sent the
+message — and is absent from default chats. While a worker exists, Poise
+creates it from the default text in `server/chat/worker-default.ts` when no
+snippet is named `worker`; an existing snippet of that name is adopted as it
+is, and an existing `/worker` is never replaced. It holds up to 64 KiB, is
+edited in Snippets like any snippet, and cannot be deleted. In any non-worker
+chat, `/worker` is not supported. Every new revision writes a
+`chat.worker.charter.changed` diagnostic. A worker keeps its type through a
+fork; a handoff starts an ordinary chat.
+
 ## The Switchboard
 
 The [Switchboard](Switchboard.md) is a chat Poise runs as an observer for the

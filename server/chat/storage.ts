@@ -168,7 +168,7 @@ function parseRecord(row: { record: string, last_seq: number, status: string, ro
   record.lastSeq = row.last_seq
   record.status = row.status as SessionStatus
   // The column is the role's only source; any role in the record JSON is ignored.
-  if (row.role === 'manager') record.role = 'manager'
+  if (row.role === 'manager' || row.role === 'worker') record.role = row.role
   else delete record.role
   record.pendingRequests = listPendingRequests(record.id).map((p) => p.requestId)
   return record

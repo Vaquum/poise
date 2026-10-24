@@ -20,8 +20,9 @@ export function renderNewSessionDialog(
   const typeField = showType ? `<fieldset class="chat-dialog-field chat-dialog-type">
     <legend>Type</legend>
     <label class="chat-radio"><input type="radio" name="type" value="chat" checked> Chat</label>
+    <label class="chat-radio"><input type="radio" name="type" value="worker"> Worker</label>
     <label class="chat-radio"><input type="radio" name="type" value="manager"${manager?.existing ? ' disabled' : ''}> Manager</label>
-    <div class="st-help">Supervises your chats. Only one Manager can exist.</div>
+    <div class="st-help">A Worker carries the /worker charter on every turn. A Manager supervises your chats; only one Manager can exist.</div>
     ${manager?.existing ? `<button type="button" class="st-clear chat-dialog-open-manager">Open the Manager</button>` : ''}
     </fieldset>` : ''
   container.innerHTML = `<form class="chat-dialog-body">
@@ -85,9 +86,10 @@ export function renderNewSessionDialog(
     }
     const useFallback = form.querySelector<HTMLInputElement>('input[name="fallback"][value="fallback"]')?.checked
     const wantManager = form.querySelector<HTMLInputElement>('input[name="type"][value="manager"]')?.checked === true
+    const wantWorker = form.querySelector<HTMLInputElement>('input[name="type"][value="worker"]')?.checked === true
     onCreate({ agent: family.agent.id as AgentId, model: selected.identity, effort: selected.effort, context,
       ...(useFallback && selected.identity === info.defaults.fallback ? { fallbackModel: selected.identity } : {}),
-      ...(wantManager ? { role: 'manager' as const } : {}) }, error)
+      ...(wantManager ? { role: 'manager' as const } : wantWorker ? { role: 'worker' as const } : {}) }, error)
   })
   model.focus()
 }

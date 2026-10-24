@@ -6073,6 +6073,11 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
   color: var(--text-primary);
 }
 
+.chat-pill-worker {
+  background: var(--tint-a2);
+  color: var(--text-primary);
+}
+
 /* The work-log dot: every chat shows its state, with a text label beside it
    so the state never depends on colour alone. Working pulses gently in
    saturation; reduced-motion preferences still the pulse globally. */
