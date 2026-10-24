@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { setImmediate } from 'node:timers/promises'
 import { db } from '../db'
 import { HttpError, httpStatus, readJson } from '../http'
 import { runFile } from '../process'
@@ -1104,26 +1105,34 @@ export class ChatControl {
 
   private ciRunning = false
   private ciQueued = false
+  private ciRelease: (() => void) | null = null
+  private ciAdmitted(): boolean {
+    return !this.stopped && !this.runtime.draining && !releaseBackgroundPaused() && !releaseSwitchPending()
+  }
   private kickCiPass(): void {
+    if (!this.ciAdmitted()) return
     if (this.ciRunning) { this.ciQueued = true; return }
     this.ciRunning = true
-    void this.runCiLoop().finally(() => { this.ciRunning = false })
+    const release = this.ciRelease = trackReleaseBackground()
+    void this.runCiLoop().finally(() => { this.ciRunning = false; this.ciRelease = null; release() })
   }
 
-  /** Passes run back-to-back while ticks keep asking: a slow read never
-   *  delays timers or delivery, and no tick's bindings go unread. */
+  /** Coalesce ticks into one follow-up pass; each pass yields between targets. */
   private async runCiLoop(): Promise<void> {
     do {
       this.ciQueued = false
-      await this.runCiPass().catch((error: unknown) => this.itemFailed('ci', 'pass', error))
-    } while (this.ciQueued && !this.stopped)
+      await this.runCiPass().catch((error: unknown) => { if (!this.stopped) this.itemFailed('ci', 'pass', error) })
+    } while (this.ciQueued && this.ciAdmitted())
   }
 
   /** Observe claimed targets in the background, caching remote reads for five minutes. */
   private async runCiPass(): Promise<void> {
     const instance = this.runtime.instance
     for (const binding of store.bindings(instance)) {
+      // Cached reads resolve in microtasks; give requests an I/O turn between targets.
+      await setImmediate()
       if (this.stopped) return
+      if (!store.bindingIsCurrent(instance, binding)) continue
       const now = (this.options.now ?? Date.now)()
       if (!this.runtime.ownsSession(binding.session)) { store.forgetSession(instance, binding.session, now); continue }
       const target = store.workTarget(binding.target)
@@ -1133,28 +1142,32 @@ export class ChatControl {
             const status = await this.workTargetStatus(target, now)
             return status === 'closed' || status === 'merged'
           })
-        } catch (error) { this.itemFailed('binding', binding.target, error) }
+        } catch (error) { if (this.stopped) return; this.itemFailed('binding', binding.target, error) }
         continue
       }
       try {
         // The live pull read comes first, so a merged or closed PR the
         // datastore still shows open suppresses every facet below.
         const datastoreStatus = await this.workTargetStatus(target, now)
+        if (this.stopped) return
         const { ci, live } = await this.readLivePullState(binding, target, datastoreStatus, now)
+        if (this.stopped) return
         const prStatus = combinedPullState(datastoreStatus, live)
         await this.observeBehavior(binding, target, now, async () => prStatus === 'closed' || prStatus === 'merged')
+        if (this.stopped) return
+        if (!store.bindingIsCurrent(instance, binding)) continue
         if (prStatus === 'merged') {
           try {
             await this.observeMergeWake(binding, target, now)
-          } catch (error) { this.itemFailed('ci', binding.target, error) }
+          } catch (error) { if (this.stopped) return; this.itemFailed('ci', binding.target, error) }
           continue
         }
         if (prStatus === 'closed') continue
         try {
           if (ci) this.observeCiResult(binding, target, ci, prStatus, now)
           await this.observeReviews(binding, target, now)
-        } catch (error) { this.itemFailed('ci', binding.target, error) }
-      } catch (error) { this.itemFailed('binding', binding.target, error) }
+        } catch (error) { if (this.stopped) return; this.itemFailed('ci', binding.target, error) }
+      } catch (error) { if (this.stopped) return; this.itemFailed('binding', binding.target, error) }
     }
   }
 
@@ -1170,6 +1183,7 @@ export class ChatControl {
       actionable = humanOnly(actionable)
       initiallyActionable = actionable.length > 0
     }
+    if (this.stopped) return
     this.observe(binding, `behavior:${target.url}`, { kind: 'behavior', target: target.url, ...local,
       ...(target.kind === 'pull' ? { done: WORK_DONE } : {}) }, now, initiallyActionable, false, actionable)
   }
@@ -1451,6 +1465,7 @@ export class ChatControl {
       // An ownership transfer mid-read clears this target's observations; the
       // new owner starts from no baseline, so a stale write here must not
       // restore the old fingerprint and silence its first notice.
+      if (this.stopped) return { ci: null, live: null }
       if (!store.bindingIsCurrent(instance, binding)) return { ci: null, live: this.persistedLivePullState(target) }
       const fresh = livePullState(ci)
       if (fresh) store.saveObservation(instance, `ci-state:${target.url}`, fresh, now)
@@ -1460,6 +1475,7 @@ export class ChatControl {
       store.saveObservation(instance, `ci:${target.url}`, previous?.fingerprint ?? '', now)
       return { ci, live: fresh ?? this.persistedLivePullState(target) }
     } catch (error) {
+      if (this.stopped) return { ci: null, live: null }
       if (!store.bindingIsCurrent(instance, binding)) return { ci: null, live: this.persistedLivePullState(target) }
       store.saveObservation(instance, `ci:${target.url}`, previous?.fingerprint ?? '', now)
       const live = this.persistedLivePullState(target)
@@ -1529,13 +1545,14 @@ export class ChatControl {
         && typeof saved.commentAfter === 'number' && Number.isSafeInteger(saved.commentAfter) && saved.commentAfter >= 0 ? { reviewAfter: saved.reviewAfter, commentAfter: saved.commentAfter } : { reviewAfter: 0, commentAfter: 0 }
       reviews = await (this.options.reviews ?? readWorkReviews)(target, cursor)
     } catch (error) {
+      if (this.stopped) return
       this.runtime.emit('log', `[chat control] reviews read for ${target.url} failed: ${String(error)}`)
       reviews = null
     }
     // An ownership transfer mid-read clears this target's observations; the
     // new owner starts from no baseline, so a stale write here must not
     // restore the old fingerprint and silence its first notice.
-    if (!store.bindingIsCurrent(instance, binding)) return
+    if (this.stopped || !store.bindingIsCurrent(instance, binding)) return
     if (!reviews || !reviews.found || (reviews.truncated && !reviews.page)) {
       store.saveObservation(instance, key, previous?.fingerprint ?? '', now)
       return
@@ -1607,12 +1624,13 @@ export class ChatControl {
     try {
       wake = await (this.options.mergeWake ?? readWorkMergeWake)(target)
     } catch (error) {
+      if (this.stopped) return
       this.runtime.emit('log', `[chat control] merge-wake read for ${target.url} failed: ${String(error)}`)
       wake = null
     }
     // An ownership transfer mid-read must not announce the merge to the old
     // owner's Manager; the new owner starts from the unsettled baseline.
-    if (!store.bindingIsCurrent(instance, binding)) return
+    if (this.stopped || !store.bindingIsCurrent(instance, binding)) return
     const manager = store.children(instance).find(child => child.child === binding.session)?.manager
     if (!manager || !this.runtime.ownsSession(manager) || !wake || !wake.found) {
       store.saveObservation(instance, key, previous?.fingerprint ?? '', now)
@@ -1716,7 +1734,10 @@ export class ChatControl {
   }
 
   async stop(runtimeStopped?: Promise<void>): Promise<void> {
+    // Remote reads may outlive shutdown; their continuations check stopped before store access.
     this.stopped = true
+    this.ciRelease?.()
+    this.ciRelease = null
     if (this.timer) clearInterval(this.timer)
     await this.running
     await runtimeStopped

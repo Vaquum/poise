@@ -372,6 +372,8 @@ const migrateSchema = db.transaction(() => {
     CREATE INDEX IF NOT EXISTS idx_behavior_seen_launch_claims
       ON behavior_seen(key, launch_requested_at)
       WHERE claim_id <> '' AND launch_requested_at IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_behavior_seen_target
+      ON behavior_seen(launch_repo, launch_pr);
     CREATE INDEX IF NOT EXISTS idx_behavior_dead_letters_created
       ON behavior_dead_letters(created_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_one_unresolved
