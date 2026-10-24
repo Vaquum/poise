@@ -10,6 +10,7 @@ export const REQUIRED_CONTEXTS = ['Verify (Node 22)']
 export const GITHUB_ACTIONS_APP = 'github-actions'
 export const DEFAULT_API_URL = 'https://api.github.com'
 const MAX_BODY_BYTES = 4 * 1024 * 1024
+const WORKFLOW_RUN_PAGES = 5
 
 export class GitHubError extends Error {
   constructor(message, { status = 0, code = 'github', body = null } = {}) {
@@ -142,9 +143,20 @@ export function createGitHubClient({
       const page = await request('GET', `${repo}/commits/${sha}/check-runs?per_page=100`)
       return Array.isArray(page?.check_runs) ? page.check_runs : []
     },
-    async listWorkflowRuns(sha) {
-      const page = await request('GET', `${repo}/actions/runs?head_sha=${sha}&per_page=50`)
-      return Array.isArray(page?.workflow_runs) ? page.workflow_runs : []
+    async listWorkflowRuns(sha, { event = null } = {}) {
+      // A merged main SHA accumulates default-branch runs (scheduled syncs
+      // included), so the trusted integration run can sit behind page one.
+      // Filter server-side by event and follow full pages, bounded so a
+      // pathological SHA cannot page forever.
+      const filter = event === null ? '' : `&event=${encodeURIComponent(event)}`
+      const runs = []
+      for (let pageNumber = 1; pageNumber <= WORKFLOW_RUN_PAGES; pageNumber += 1) {
+        const page = await request('GET', `${repo}/actions/runs?head_sha=${sha}${filter}&per_page=100&page=${pageNumber}`)
+        const batch = Array.isArray(page?.workflow_runs) ? page.workflow_runs : []
+        runs.push(...batch)
+        if (batch.length < 100) break
+      }
+      return runs
     },
     async mergePullRequest(number, { sha }) {
       if (!isSha(sha)) throw new GitHubError('merge requires the exact head SHA')

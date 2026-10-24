@@ -314,6 +314,23 @@ describe('CI gate and merge', () => {
     expect(h.releases.log.at(-1)).toEqual(['stage', changeOf(h).releaseId, mergeSha])
   })
 
+  it('reads pull_request runs for the head gate and merge_group runs for the integration check', async () => {
+    const h = await harness({ model: { queueEnabled: true } })
+    const seen = []
+    let mergeSha = null
+    const workflowRuns = h.github.listWorkflowRuns.bind(h.github)
+    h.github.listWorkflowRuns = async (sha, options) => {
+      seen.push([sha.slice(0, 12), options?.event])
+      return (await workflowRuns(sha)).map((run) => ({ ...run, event: sha === mergeSha ? 'merge_group' : run.event }))
+    }
+    await runToAwaitingCi(h)
+    await tickUntil(h, () => changeOf(h).merge?.queued)
+    mergeSha = h.github.performMerge(100, HEAD, { parents: ['7'.repeat(40), HEAD], tree: '8'.repeat(40) })
+    await tickUntil(h, () => changeOf(h).state === 'live')
+    expect(seen).toContainEqual([HEAD.slice(0, 12), 'pull_request'])
+    expect(seen).toContainEqual([mergeSha.slice(0, 12), 'merge_group'])
+  })
+
   it('re-observes uncertain enqueue without duplicating it and refuses an ejected queue entry', async () => {
     const h = await harness({ model: { queueEnabled: true, enqueueUncertain: true } })
     await runToAwaitingCi(h)
@@ -327,6 +344,32 @@ describe('CI gate and merge', () => {
     await h.controller.tick()
     expect(changeOf(h)).toMatchObject({ state: 'failed', error: /removed from the merge queue/ })
     expect(h.releases.log).toHaveLength(1)
+  })
+
+  it('refuses to resubmit an enqueue whose response was lost and whose entry vanished before acknowledgement', async () => {
+    const h = await harness({ model: { queueEnabled: true, enqueueUncertain: true } })
+    await runToAwaitingCi(h)
+    await tickUntil(h, () => changeOf(h).merge?.mode === 'queue')
+    // GitHub accepted the enqueue but the response was lost, and the entry
+    // was ejected before the controller ever observed it.
+    expect(h.model.queueEntries[100]).toBeDefined()
+    expect(changeOf(h).merge.queued).toBeUndefined()
+    delete h.model.queueEntries[100]
+    await h.controller.tick()
+    expect(h.github.log.filter(entry => entry[0] === 'enqueue')).toHaveLength(1)
+    expect(changeOf(h)).toMatchObject({ state: 'failed', error: /unacknowledged queue admission/ })
+    expect(h.store.state.hold).toBeNull()
+  })
+
+  it('persists the acknowledged queue entry id and refuses a replaced entry', async () => {
+    const h = await harness({ model: { queueEnabled: true } })
+    await runToAwaitingCi(h)
+    await tickUntil(h, () => changeOf(h).merge?.queued)
+    expect(changeOf(h).merge.queueEntryId).toBe('QUEUE_PR_100')
+    h.model.queueEntries[100] = { id: 'QUEUE_OTHER', state: 'QUEUED' }
+    await h.controller.tick()
+    expect(changeOf(h)).toMatchObject({ state: 'failed', error: /was replaced/ })
+    expect(h.github.log.filter(entry => entry[0] === 'enqueue')).toHaveLength(1)
   })
 
   it('refuses queue squash/rebase because source rollback requires a pinned-head merge parent', async () => {
@@ -857,6 +900,20 @@ describe('source revert reconciliation', () => {
     await tickUntil(h, () => changeOf(h).sourceRevert.state === 'merged')
     expect(h.store.state.hold).toBeNull()
     expect(await h.pointer()).toMatchObject({ id: 'baseline-release' })
+  })
+
+  it('refuses to resubmit a source revert enqueue lost before acknowledgement', async () => {
+    const h = await harness()
+    await rolledBack(h)
+    h.model.queueEnabled = true
+    h.model.enqueueUncertain = true
+    await tickUntil(h, () => changeOf(h).revert.attempt?.mode === 'queue')
+    expect(changeOf(h).revert.attempt.queued).toBeUndefined()
+    delete h.model.queueEntries[101]
+    await h.controller.tick()
+    expect(h.github.log.filter(entry => entry[0] === 'enqueue')).toHaveLength(1)
+    expect(changeOf(h).sourceRevert).toMatchObject({ state: 'failed', error: /unacknowledged queue admission/ })
+    expect(h.store.state.hold).not.toBeNull()
   })
 
   it('reports failed revert checks and does not open a PR', async () => {

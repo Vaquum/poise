@@ -46,6 +46,7 @@ import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../m
 import { db, getMeta, setMeta } from '../db'
 import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
+import { diagnostic } from '../logging'
 import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertContext } from '../alerts/producers'
 import { recordHandling, type HandlingActor } from '../alerts/handling'
 import { localCheckoutPath } from '../gh'
@@ -2243,7 +2244,15 @@ export class ChatRuntime extends EventEmitter {
       this.emit_(id, { type: 'session.closed', reason: 'deleted' })
       storage.deleteSession(id)
       this.live.delete(id)
-      this.emit('deleted', id)
+      // The chat is already gone: cleanup hears of it, but a cleanup
+      // failure is a diagnostic, never a failed delete.
+      try {
+        this.emit('deleted', id)
+      } catch (error) {
+        diagnostic({ level: 'warning', operation: 'chat.session.delete', target: id,
+          message: 'Post-delete cleanup failed; the chat was deleted',
+          context: { sessionId: id, error: error instanceof Error ? error.message : String(error) } })
+      }
       this.emit('chatRequests', storage.requestRevision(this.instance))
       return { workspaceRemoved }
     })

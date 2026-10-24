@@ -236,6 +236,7 @@ describe('hourly core REST budget', () => {
               head_sha: HEAD_SHA,
               author: 'poise-user',
               approved_at: null,
+              queue_entry_id: null,
               runs: [],
               error: null,
             })),

@@ -2171,6 +2171,7 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
   })
   reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login)
   retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
+  retireClosedQueueAdmissions(seen)
   return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(getMeta('me') || '', `${pr.repo}#${pr.number}`, pr))
 }
 
@@ -4326,6 +4327,7 @@ interface MergeCandidate {
   head: string | null
   author: string | null
   approvedAt: string | null
+  queueEntryId: string | null
   error: string | null
 }
 
@@ -4349,6 +4351,7 @@ async function readMergeCandidates(prs: DatastorePr[], actor: string): Promise<M
       || !(record.head_sha === null || (typeof record.head_sha === 'string' && SHA_PATTERN.test(record.head_sha)))
       || !(record.author === null || typeof record.author === 'string')
       || !(record.approved_at === null || (typeof record.approved_at === 'string' && Number.isFinite(Date.parse(record.approved_at))))
+      || !(record.queue_entry_id === null || (typeof record.queue_entry_id === 'string' && record.queue_entry_id.length > 0))
       || !(record.error === null || (typeof record.error === 'string' && record.error.length > 0))
       || (record.ready && (record.head_sha === null || !record.author || record.error !== null))
       || (record.behind && (record.ready || record.head_sha === null || !record.author || record.error !== null))) {
@@ -4356,7 +4359,7 @@ async function readMergeCandidates(prs: DatastorePr[], actor: string): Promise<M
     }
     return { pr, actor, ready: record.ready, behind: record.behind, head: record.head_sha as string | null,
       author: record.author as string | null, approvedAt: record.approved_at as string | null,
-      error: record.error as string | null }
+      queueEntryId: record.queue_entry_id as string | null, error: record.error as string | null }
   })
 }
 
@@ -4366,6 +4369,53 @@ function compareBehindCandidates(a: MergeCandidate, b: MergeCandidate): number {
   const bAt = b.approvedAt === null ? Number.POSITIVE_INFINITY : Date.parse(b.approvedAt)
   if (aAt !== bAt) return aAt - bAt
   return a.pr.repo.localeCompare(b.pr.repo) || a.pr.number - b.pr.number
+}
+
+// The queue entry last seen for a PR head: Poise's own `enqueued` receipt or
+// an observed entry. GitHub ejects entries for routine reasons (failed
+// integration CI, conflicts, manual dequeue) without changing the PR head's
+// green checks, so a vanished entry must read as a rejection to retain, not
+// as a fresh PR to resubmit. A new head, a manual requeue, or the merge
+// itself releases the admission.
+interface MergeQueueAdmission { entryId: string, head: string, at: string }
+const MERGE_QUEUE_ADMISSION_PREFIX = `${META_PREFIX}merge_prs_queue:`
+
+function mergeQueueAdmissionKey(target: string): string {
+  return `${MERGE_QUEUE_ADMISSION_PREFIX}${target}`
+}
+
+function readQueueAdmission(target: string): MergeQueueAdmission | null {
+  const raw = getMeta(mergeQueueAdmissionKey(target))
+  if (!raw) return null
+  try {
+    const value = objectValue(parseJson(raw, 'merge queue admission'), 'merge queue admission')
+    if (typeof value.entryId !== 'string' || !value.entryId
+      || typeof value.head !== 'string' || !SHA_PATTERN.test(value.head)
+      || typeof value.at !== 'string' || !Number.isFinite(Date.parse(value.at))) return null
+    return { entryId: value.entryId, head: value.head, at: value.at }
+  } catch {
+    return null
+  }
+}
+
+function storeQueueAdmission(target: string, admission: MergeQueueAdmission): void {
+  setMeta(mergeQueueAdmissionKey(target), JSON.stringify(admission))
+}
+
+function clearQueueAdmission(target: string): void {
+  setMeta(mergeQueueAdmissionKey(target), '')
+}
+
+function retireClosedQueueAdmissions(open: ReadonlySet<string>): void {
+  const prefix = scopedMetaKey(MERGE_QUEUE_ADMISSION_PREFIX)
+  const rows = db.prepare(
+    "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
+  ).all(prefix.length, prefix) as Array<{ key: string }>
+  for (const row of rows) {
+    const target = row.key.slice(prefix.length)
+    const ref = target.match(/^[^#]+#\d+/)?.[0]
+    if (ref && !open.has(ref)) clearQueueAdmission(target)
+  }
 }
 
 async function tickMergePrs(): Promise<void> {
@@ -4404,13 +4454,43 @@ async function tickMergePrs(): Promise<void> {
         recordBehaviorFailure('merge-prs', 'operation', 'Live PR author is missing or differs from the admitted author', target, { actingAccount: actor })
         continue
       }
+      if (candidate.head !== null) {
+        const admission = readQueueAdmission(target)
+        if (candidate.queueEntryId !== null) {
+          // Already queued, by us or by someone else: never spend a lock and
+          // a CLI call re-observing it. Adopt the observed entry so a later
+          // disappearance reads as an ejection, not a fresh PR.
+          if (!admission || admission.entryId !== candidate.queueEntryId || admission.head !== candidate.head) {
+            storeQueueAdmission(target, { entryId: candidate.queueEntryId, head: candidate.head, at: new Date().toISOString() })
+          }
+          clearBehaviorFailure('merge-prs', target, actor)
+          continue
+        }
+        if (admission !== null) {
+          if (admission.head !== candidate.head) {
+            // A new head supersedes the admission: decide fresh below.
+            clearQueueAdmission(target)
+          } else if (candidate.ready) {
+            // The recorded entry is gone while the head is unchanged and
+            // still green: integration CI rejected it or someone dequeued
+            // it. Keep the rejection visible with backoff and never resubmit
+            // it silently. A new head, a manual requeue, or the merge itself
+            // releases this.
+            recordBehaviorFailure('merge-prs', 'operation',
+              `pull request #${pr.number} was removed from the merge queue without merging`, target)
+            continue
+          }
+        }
+      }
       if (!candidate.ready) {
         if (candidate.behind) {
           // A failed update keeps its failure record so retries back off like merges.
           behind.push(candidate)
           continue
         }
-        clearBehaviorFailure('merge-prs', target, actor)
+        // An admission keeps its rejection: the entry is still gone, the head
+        // only went unready meanwhile.
+        if (candidate.head === null || readQueueAdmission(target) === null) clearBehaviorFailure('merge-prs', target, actor)
         continue
       }
       const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
@@ -4441,14 +4521,26 @@ async function tickMergePrs(): Promise<void> {
           throw new Error('github-interface --merge-if-ready returned malformed state')
         }
         captureBehaviorOutcome({ nativeId: runId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
-          activity: 'settled', stateSource: 'native', outcome: ['enqueued', 'in_queue'].includes(String(result.outcome))
-            ? 'waiting' : result.outcome as 'merged' | 'already_merged' | 'not_ready' | 'superseded',
+          activity: 'settled', stateSource: 'native', outcome: result.outcome === 'enqueued' ? 'enqueued'
+            : result.outcome === 'in_queue' ? 'waiting'
+            : result.outcome as 'merged' | 'already_merged' | 'not_ready' | 'superseded',
+          ...(result.outcome === 'enqueued'
+            ? { refs: [{ kind: 'queue' as const, identity: String(result.queue_entry_id), availability: 'available' as const }] } : {}),
           head: expectedHead, completedAt: new Date().toISOString() })
         finishDirectBehaviorRun(runId, true)
         runId = null
+        if (result.outcome === 'enqueued' || result.outcome === 'in_queue') {
+          storeQueueAdmission(target, { entryId: String(result.queue_entry_id), head: expectedHead, at: new Date().toISOString() })
+        } else {
+          clearQueueAdmission(target)
+        }
         if (result.outcome === 'merged') {
           setMeta(MERGE_LAST_FIRED_KEY, JSON.stringify({ at: new Date().toISOString(), target }))
           console.log(`[behaviors] merge-prs merged ${target}`)
+        } else if (result.outcome === 'enqueued') {
+          // The enqueue is the merge-causing write on a queue branch.
+          setMeta(MERGE_LAST_FIRED_KEY, JSON.stringify({ at: new Date().toISOString(), target }))
+          console.log(`[behaviors] merge-prs enqueued ${target}`)
         }
         clearBehaviorFailure('merge-prs', target, actor)
       } catch (error) {
