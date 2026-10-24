@@ -464,6 +464,23 @@ describe('image upgrades', () => {
     expect(h.logs.find((entry) => entry.event === 'workspace.drain.timeout')).toMatchObject({ handle: 'alice', timeoutSeconds: 1 })
   })
 
+  it('aborts a drain that only times out and releases it, instead of recreating the workspace', async () => {
+    await start({ env: { POISE_DRAIN_TIMEOUT: '1' }, serviceTimeoutMs: 20 })
+    const aliceId = h.docker.containers.get('poise-ws-alice')?.id
+    // Every service answer arrives past the gateway timeout, as under load; the drain still takes effect.
+    h.workspace.answerDelayMs = 200
+    const began = Date.now()
+    await h.orchestrator.upgradePass()
+    expect(Date.now() - began).toBeLessThan(30_000)
+    expect(h.workspace.serviceRequests.some((request) => request.url === '/api/service/drain')).toBe(true)
+    expect(h.workspace.serviceRequests.some((request) => request.url === '/api/service/resume')).toBe(true)
+    h.workspace.answerDelayMs = 0
+    expect(h.workspace.health.draining).toBe(false)
+    expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(aliceId)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: OLD_IMAGE_ID, running: true })
+    expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
+  })
+
   it('drains and recreates a running workspace created with another drain timeout, as for a new image', async () => {
     await start({ env: { POISE_DRAIN_TIMEOUT: '600' } })
     const bobId = h.docker.containers.get('poise-ws-bob')?.id

@@ -34,6 +34,8 @@ export interface WorkspaceStub {
   health: StubHealth
   /** Bytes of filler added to every health and drain answer, as a hostile workspace could. */
   healthPadding: number
+  /** Milliseconds every service answer waits before it is sent; past the gateway timeout it models a slow workspace. */
+  answerDelayMs: number
   requests: SeenRequest[]
   serviceRequests: SeenRequest[]
   /** The releases POST /api/service/switch was asked for. */
@@ -64,6 +66,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
     switches: [],
     failedReleases: [],
     healthPadding: 0,
+    answerDelayMs: 0,
     requests: [],
     serviceRequests: [],
     requestLines: [],
@@ -108,19 +111,25 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
       const seen = { method: req.method ?? '', url, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') }
       if (url.startsWith('/api/service/')) {
         stub.serviceRequests.push(seen)
+        // A drain takes effect when received, even when its answer is slow past the gateway timeout.
         if (url === '/api/service/drain' && req.method === 'POST') stub.health.draining = true
+        if (url === '/api/service/resume' && req.method === 'POST') stub.health.draining = false
+        const answer = (status: number, body: unknown): void => {
+          if (stub.answerDelayMs > 0) setTimeout(() => json(res, status, body), stub.answerDelayMs)
+          else json(res, status, body)
+        }
         if (url === '/api/service/switch' && req.method === 'POST') {
           const { release } = JSON.parse(seen.body || '{}') as { release?: string }
           stub.switches.push(String(release))
           if (stub.failedReleases.includes(String(release))) {
-            return json(res, 409, { error: `release ${release} failed to start in this workspace; it stays on release ${stub.health.release}` })
+            return answer(409, { error: `release ${release} failed to start in this workspace; it stays on release ${stub.health.release}` })
           }
           stub.health.switching = release !== stub.health.release ? String(release) : null
-          return json(res, 202, { release, switching: release !== stub.health.release })
+          return answer(202, { release, switching: release !== stub.health.release })
         }
-        if (url === '/api/service/health' || url === '/api/service/drain') {
-          if (stub.healthStatus !== 200) return json(res, stub.healthStatus, { error: 'refused' })
-          return json(res, 200, healthBody())
+        if (url === '/api/service/health' || url === '/api/service/drain' || url === '/api/service/resume') {
+          if (stub.healthStatus !== 200) return answer(stub.healthStatus, { error: 'refused' })
+          return answer(200, healthBody())
         }
         return json(res, 404, { error: 'not_found' })
       }

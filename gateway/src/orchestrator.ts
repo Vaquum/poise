@@ -81,6 +81,14 @@ export class WorkspaceNetworkError extends Error {
   }
 }
 
+/** The workspace did not answer within the service timeout; alive but slow, not refused. */
+export class ServiceTimeoutError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ServiceTimeoutError'
+  }
+}
+
 export type Readiness = { ready: true } | { ready: false; problem: string | null }
 
 export interface OrchestratorDeps {
@@ -95,6 +103,8 @@ export interface OrchestratorDeps {
   workspaceResolvConf?: string | null
   drainPollMs?: number
   drainRenewMs?: number
+  /** How long one service call waits for an answer; 5000 ms in production, shorter in tests. */
+  serviceTimeoutMs?: number
 }
 
 function parseHealth(text: string, what: string): ServiceHealth {
@@ -132,7 +142,7 @@ function parseHealth(text: string, what: string): ServiceHealth {
 /** A health or drain answer is a few hundred bytes; a workspace sending more is not read further. */
 export const MAX_SERVICE_ANSWER_BYTES = 64 * 1024
 
-function request(target: Upstream, method: string, path: string, headers: http.OutgoingHttpHeaders, body?: string): Promise<{ status: number; text: string }> {
+function request(target: Upstream, method: string, path: string, headers: http.OutgoingHttpHeaders, timeoutMs: number, body?: string): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: target.host, port: target.port, method, path, headers, agent: false }, (res) => {
       const chunks: Buffer[] = []
@@ -145,11 +155,22 @@ function request(target: Upstream, method: string, path: string, headers: http.O
         }
         chunks.push(chunk)
       })
-      res.on('error', reject)
-      res.on('end', () => resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') }))
+      res.on('error', (error: unknown) => {
+        clearTimeout(timer)
+        reject(error)
+      })
+      res.on('end', () => {
+        clearTimeout(timer)
+        resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') })
+      })
     })
-    req.setTimeout(SERVICE_TIMEOUT_MS, () => req.destroy(new Error(`no answer within ${SERVICE_TIMEOUT_MS} ms`)))
-    req.on('error', reject)
+    // An absolute deadline for the whole answer: a slow workspace that keeps sending bytes still times out.
+    const timer = setTimeout(() => req.destroy(new ServiceTimeoutError(`no answer within ${timeoutMs} ms`)), timeoutMs)
+    timer.unref?.()
+    req.on('error', (error: unknown) => {
+      clearTimeout(timer)
+      reject(error)
+    })
     req.end(body)
   })
 }
@@ -163,7 +184,11 @@ export class Orchestrator {
   private readonly locks = new Map<string, Promise<void>>()
   private readonly drainPollMs: number
   private readonly drainRenewMs: number
+  private readonly serviceTimeoutMs: number
   private upgrading = false
+  /** The workspace and phase a running pass waits on, so a skipped pass can say so. */
+  private upgradingHandle: string | null = null
+  private upgradingPhase: string | null = null
   /** The release each workspace was asked to switch to, and when, until it runs it; see updateInPlace. */
   private readonly updating = new Map<string, { release: string; since: number }>()
   /** When each workspace's probes for its target release started missing in a row; see updateInPlace. */
@@ -176,6 +201,7 @@ export class Orchestrator {
   constructor(private readonly deps: OrchestratorDeps) {
     this.drainPollMs = deps.drainPollMs ?? DRAIN_POLL_MS
     this.drainRenewMs = deps.drainRenewMs ?? DRAIN_RENEW_MS
+    this.serviceTimeoutMs = deps.serviceTimeoutMs ?? SERVICE_TIMEOUT_MS
   }
 
   containerSpec(handle: string, login: string): ContainerSpec {
@@ -365,7 +391,10 @@ export class Orchestrator {
    */
   async upgradePass(): Promise<void> {
     if (this.upgrading) {
-      this.deps.log.info('workspace.upgrade.pass.skipped', { reason: 'the previous pass is still running' })
+      this.deps.log.info('workspace.upgrade.pass.skipped', {
+        reason: 'the previous pass is still running',
+        ...(this.upgradingHandle ? { handle: this.upgradingHandle, phase: this.upgradingPhase ?? 'upgrade' } : {}),
+      })
       return
     }
     this.upgrading = true
@@ -544,13 +573,29 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * One service request with retries for a slow workspace: a timeout is retried twice with backoff,
+   * a refused connection or a usable answer is not. Retries are bounded and few, so one poll still
+   * ends near the service timeout.
+   */
+  private async serviceRequest(target: Upstream, method: string, path: string, headers: http.OutgoingHttpHeaders, body?: string): Promise<{ status: number; text: string }> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await request(target, method, path, headers, this.serviceTimeoutMs, body)
+      } catch (error) {
+        if (!(error instanceof ServiceTimeoutError) || attempt >= 2) throw error
+        await delay(50 * (attempt + 1))
+      }
+    }
+  }
+
   /** 'failed' when the workspace refuses a release that failed to start there. */
   private async requestSwitch(handle: string, login: string, release: string): Promise<'switching' | 'failed'> {
     await this.ensureOnNetwork(handle)
     const { config, keys, now } = this.deps
     const publicHost = `${handle}.${config.domain}`
     const body = JSON.stringify({ release })
-    const response = await request(this.deps.upstream(handle), 'POST', '/api/service/switch', {
+    const response = await this.serviceRequest(this.deps.upstream(handle), 'POST', '/api/service/switch', {
       host: publicHost,
       'x-forwarded-host': publicHost,
       'x-forwarded-proto': config.insecureHttp ? 'http' : 'https',
@@ -568,73 +613,170 @@ export class Orchestrator {
 
   private async upgrade(handle: string, login: string, imageId: string, reason: string, target: ImageRelease | null): Promise<void> {
     this.lifecycle('workspace.upgrade.started', handle, { image: imageId, reason })
+    // One budget for the whole workspace operation: every drain, recheck and re-drain shares it.
+    const deadline = this.deps.now() + this.deps.config.drainTimeoutSeconds * 1000
+    this.upgradingHandle = handle
+    this.upgradingPhase = 'upgrade'
     // null until drained; then whether the drain left the workspace idle rather than timing out.
     let drainedIdle: boolean | null = null
-    for (;;) {
-      // Decided under the lock, so a lazy start or an admin action in between cannot be stopped undrained.
-      const outcome = await this.withLock(handle, async (): Promise<'needs-drain' | 'done' | 'skipped'> => {
-        const { docker, store } = this.deps
-        const { container } = workspaceNames(handle)
-        const details = await docker.inspectContainer(container)
-        if (!details) {
-          this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'the container no longer exists' })
-          return 'skipped'
+    let drainAttempted = false
+    let confirmedBusy = false
+    let sawDown = false
+    let recreated = false
+    const abortUnknown = async (): Promise<void> => {
+      await this.releaseDrain(handle, login, 'the drain timed out without a usable answer')
+      this.lifecycle('workspace.upgrade.aborted', handle, { reason: 'the drain timed out without a usable answer' })
+    }
+    try {
+      for (;;) {
+        // Decided under the lock, so a lazy start or an admin action in between cannot be stopped undrained.
+        const outcome = await this.withLock(handle, async (): Promise<'needs-drain' | 'done' | 'skipped' | 'abort-unknown'> => {
+          const { docker, store } = this.deps
+          const { container } = workspaceNames(handle)
+          const details = await docker.inspectContainer(container)
+          if (!details) {
+            this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'the container no longer exists' })
+            return 'skipped'
+          }
+          if (!this.outdated(details, imageId)) {
+            this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'already up to date' })
+            return 'skipped'
+          }
+          const running = details.State.Running
+          if (running && drainedIdle === null) return 'needs-drain'
+          await this.activateRelease(handle, target)
+          // Activation can restart Poise: a switch queued before the drain fires once the drain leaves it
+          // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
+          // idle. A drain that timed out on confirmed busy work cuts it anyway; one that only timed out
+          // aborts instead of recreating a slow workspace blind. A workspace that refuses answers is down
+          // and still gets a new container.
+          if (running && drainedIdle) {
+            this.upgradingPhase = 'recheck'
+            const recheck = await this.idleUnderDrain(handle, login)
+            this.upgradingPhase = 'upgrade'
+            if (!recheck.idle) {
+              if (recheck.unknown) {
+                if (!recheck.timeout) sawDown = true
+                if (this.deps.now() >= deadline) {
+                  if (recheck.timeout) return 'abort-unknown'
+                  drainedIdle = false
+                } else return 'needs-drain'
+              } else {
+                confirmedBusy = true
+                if (this.deps.now() >= deadline) drainedIdle = false
+                else return 'needs-drain'
+              }
+            }
+          }
+          this.ready.delete(handle)
+          if (running) {
+            await docker.stopContainer(container)
+            this.lifecycle('workspace.container.stopped', handle, { reason: 'upgrade' })
+          }
+          await docker.removeContainer(container)
+          this.lifecycle('workspace.container.removed', handle, { reason: 'upgrade' })
+          await docker.createContainer(container, this.containerSpec(handle, login))
+          this.lifecycle('workspace.container.created', handle, { image: this.deps.config.runtimeImage })
+          if (running) {
+            await docker.startContainer(container)
+            store.noteWorkspaceStarted(handle)
+            this.lifecycle('workspace.container.started', handle)
+          }
+          recreated = true
+          this.lifecycle('workspace.upgrade.finished', handle, { image: imageId })
+          return 'done'
+        })
+        if (outcome === 'done') return
+        if (outcome === 'skipped') {
+          if (drainAttempted && !recreated) await this.releaseDrain(handle, login, 'the upgrade was skipped after a drain')
+          return
         }
-        if (!this.outdated(details, imageId)) {
-          this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'already up to date' })
-          return 'skipped'
+        if (outcome === 'abort-unknown') {
+          await abortUnknown()
+          return
         }
-        const running = details.State.Running
-        if (running && drainedIdle === null) return 'needs-drain'
-        await this.activateRelease(handle, target)
-        // Activation can restart Poise: a switch queued before the drain fires once the drain leaves it
-        // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
-        // idle. A drain that timed out cuts its work anyway.
-        if (running && drainedIdle && !(await this.idleUnderDrain(handle, login))) return 'needs-drain'
-        this.ready.delete(handle)
-        if (running) {
-          await docker.stopContainer(container)
-          this.lifecycle('workspace.container.stopped', handle, { reason: 'upgrade' })
+        if (this.deps.now() >= deadline) {
+          if (confirmedBusy || sawDown) {
+            drainedIdle = false
+            continue
+          }
+          await abortUnknown()
+          return
         }
-        await docker.removeContainer(container)
-        this.lifecycle('workspace.container.removed', handle, { reason: 'upgrade' })
-        await docker.createContainer(container, this.containerSpec(handle, login))
-        this.lifecycle('workspace.container.created', handle, { image: this.deps.config.runtimeImage })
-        if (running) {
-          await docker.startContainer(container)
-          store.noteWorkspaceStarted(handle)
-          this.lifecycle('workspace.container.started', handle)
+        this.upgradingPhase = 'drain'
+        const result = await this.drain(handle, login, deadline)
+        this.upgradingPhase = 'upgrade'
+        drainAttempted = drainAttempted || result.attempted
+        confirmedBusy = confirmedBusy || result.confirmedBusy
+        if (!result.idle && !result.timeoutOnly && !result.confirmedBusy) sawDown = true
+        if (result.idle) {
+          drainedIdle = true
+        } else if (!result.timeoutOnly || confirmedBusy || sawDown) {
+          drainedIdle = false
+        } else {
+          await abortUnknown()
+          return
         }
-        this.lifecycle('workspace.upgrade.finished', handle, { image: imageId })
-        return 'done'
-      })
-      if (outcome !== 'needs-drain') return
-      drainedIdle = await this.drain(handle, login)
+      }
+    } catch (error) {
+      if (drainAttempted && !recreated) await this.releaseDrain(handle, login, 'the upgrade failed')
+      throw error
+    } finally {
+      this.upgradingHandle = null
+      this.upgradingPhase = null
     }
   }
 
-  /** Drains again and says whether the workspace is idle; false when it cannot tell. */
-  private async idleUnderDrain(handle: string, login: string): Promise<boolean> {
+  /** Drains again and says whether the workspace is idle; unknown when it cannot tell. */
+  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; timeout: boolean }> {
     try {
-      return (await this.serviceCall(handle, login, 'POST', '/api/service/drain')).idle
+      return { idle: (await this.serviceCall(handle, login, 'POST', '/api/service/drain')).idle, unknown: false, timeout: false }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       this.deps.log.warn('workspace.drain.recheck.failed', { handle, error: errorMessage(error) })
-      return false
+      return { idle: false, unknown: true, timeout: error instanceof ServiceTimeoutError }
+    }
+  }
+
+  /** Lifts a drain the gateway attempted but did not recreate past; best effort, the lapse is the backstop. */
+  private async releaseDrain(handle: string, login: string, reason: string): Promise<void> {
+    try {
+      await this.serviceCall(handle, login, 'POST', '/api/service/resume')
+      this.lifecycle('workspace.drain.released', handle, { reason })
+    } catch (error) {
+      this.deps.log.warn('workspace.drain.release.failed', { handle, reason, error: errorMessage(error) })
     }
   }
 
   /**
-   * Asks the workspace to stop admitting work, then waits until it reports idle or POISE_DRAIN_TIMEOUT
+   * Asks the workspace to stop admitting work, then waits until it reports idle or the shared deadline
    * passes. The workspace lets a drain lapse unless it is renewed, so it is re-requested while waiting.
    * A network the gateway cannot join fails the upgrade instead: waiting would drain nothing, and the
-   * timeout would then recreate the workspace with its work cut off. Resolves true once the workspace
-   * is idle, false when the timeout passed first.
+   * timeout would then recreate the workspace with its work cut off. A drain POST counts as attempted
+   * once sent, since a failed answer may still have been applied.
    */
-  private async drain(handle: string, login: string): Promise<boolean> {
+  private async drain(handle: string, login: string, deadline: number): Promise<{ idle: boolean; attempted: boolean; confirmedBusy: boolean; timeoutOnly: boolean }> {
     const { config, log, now } = this.deps
-    const deadline = now() + config.drainTimeoutSeconds * 1000
+    const start = now()
     let requestedAt = now()
+    let attempted = false
+    let confirmedBusy = false
+    let sawNonTimeout = false
+    const waiting = (health: ServiceHealth): void => {
+      log.info('workspace.drain.waiting', {
+        handle,
+        activeChatTurns: health.activeChatTurns,
+        runningCallerCalls: health.runningCallerCalls,
+        backgroundWork: health.backgroundWork,
+        elapsedSeconds: Math.round((now() - start) / 1000),
+        remainingSeconds: Math.max(0, Math.round((deadline - now()) / 1000)),
+      })
+    }
+    const note = (health: ServiceHealth): void => {
+      if (!health.draining) log.warn('workspace.drain.lifted', { handle })
+      if (!health.idle) confirmedBusy = true
+    }
+    attempted = true
     try {
       const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
       this.lifecycle('workspace.drain.requested', handle, {
@@ -642,30 +784,36 @@ export class Orchestrator {
         runningCallerCalls: health.runningCallerCalls,
         backgroundWork: health.backgroundWork,
       })
-      if (health.idle) return true
+      note(health)
+      if (health.idle) return { idle: true, attempted, confirmedBusy, timeoutOnly: false }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
+      if (!(error instanceof ServiceTimeoutError)) sawNonTimeout = true
       log.error('workspace.drain.request.failed', { handle, error: errorMessage(error) })
     }
     while (now() < deadline) {
       await delay(this.drainPollMs)
       const renew = now() - requestedAt >= this.drainRenewMs
+      if (renew) attempted = true
       try {
         const health = renew
           ? await this.serviceCall(handle, login, 'POST', '/api/service/drain')
           : await this.serviceCall(handle, login, 'GET', '/api/service/health')
         if (renew) requestedAt = now()
+        note(health)
         if (health.idle) {
           this.lifecycle('workspace.drain.idle', handle)
-          return true
+          return { idle: true, attempted, confirmedBusy, timeoutOnly: false }
         }
+        if (renew) waiting(health)
       } catch (error) {
         if (error instanceof WorkspaceNetworkError) throw error
+        if (!(error instanceof ServiceTimeoutError)) sawNonTimeout = true
         log.warn(renew ? 'workspace.drain.renew.failed' : 'workspace.drain.health.failed', { handle, error: errorMessage(error) })
       }
     }
     log.warn('workspace.drain.timeout', { handle, timeoutSeconds: config.drainTimeoutSeconds })
-    return false
+    return { idle: false, attempted, confirmedBusy, timeoutOnly: !confirmedBusy && !sawNonTimeout }
   }
 
   private async startLocked(handle: string, login: string): Promise<void> {
@@ -788,7 +936,7 @@ export class Orchestrator {
     const publicHost = `${handle}.${config.domain}`
     let response: { status: number; text: string }
     try {
-      response = await request(this.deps.upstream(handle), method, path, {
+      response = await this.serviceRequest(this.deps.upstream(handle), method, path, {
         host: publicHost,
         'x-forwarded-host': publicHost,
         'x-forwarded-proto': config.insecureHttp ? 'http' : 'https',
