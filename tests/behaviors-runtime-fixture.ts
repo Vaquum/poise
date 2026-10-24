@@ -196,6 +196,7 @@ function arrangeCli(
       action: 'requested_changes_addressed',
       repository,
       pull_number: pullNumber,
+      pr_author: listedPrs.find((p) => p.repo === repository && p.number === pullNumber)?.author ?? pr.author,
       username,
       status: changesAddressed,
       has_change_request: changesAddressed,

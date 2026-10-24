@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
   models: {} as Record<string, { default: string, fallback: string }>,
   agentAccount: 'bit-mis',
   // The scheduler's replay check; these tests admit everything unless told not to.
-  admit: vi.fn(async () => undefined),
+  admit: vi.fn(async () => ({ author: 'poise-user' })),
 }))
 
 vi.mock('esbuild', async importOriginal => {
@@ -49,8 +49,11 @@ vi.mock('../server/claude-auth', () => ({
     requireReady: vi.fn(),
   },
 }))
+vi.mock('../server/review-checkout', () => ({ resolveReviewCheckout: vi.fn(async () => '/repo') }))
+
 vi.mock('../server/gh', () => ({
   getHeadSha: vi.fn(),
+  getPrAuthor: vi.fn(),
   localCheckoutPath: vi.fn(),
 }))
 
@@ -661,6 +664,9 @@ describe('manual review model selection', () => {
     invalidateCatalog()
     const gh = await import('../server/gh')
     vi.mocked(gh.getHeadSha).mockResolvedValue('a'.repeat(40))
+    vi.mocked(gh.getPrAuthor).mockResolvedValue('poise-user')
+    const { setMeta } = await import('../server/db')
+    setMeta('me', 'poise-user'); setMeta('agentAccount', 'bit-mis')
     mocks.agentAccount = 'bit-mis'
     vi.mocked(gh.localCheckoutPath).mockResolvedValue('/repo')
     const { spawnDetached } = await import('../server/process')
@@ -767,10 +773,11 @@ describe('manual review model selection', () => {
 
   it('launches nothing without an agent account and says where to set it', async () => {
     mocks.agentAccount = ''
+    const { setMeta } = await import('../server/db'); setMeta('agentAccount', '')
     const { triggerPrReview, replayAgentJob } = await import('../server/agent')
     const { spawnDetached } = await import('../server/process')
     await expect(triggerPrReview('https://github.com/o/r/pull/12')).rejects.toThrow('Set it in Settings → GitHub')
-    await expect(replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 }, mocks.admit)).rejects.toThrow('No agent account is set')
+    await expect(replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 }, mocks.admit)).rejects.toThrow('Set it in Settings → GitHub')
     await expect(replayAgentJob({ behavior: 'issue_review', repo: 'o/r', pr_id: '4' }, mocks.admit)).rejects.toThrow('No agent account is set')
     expect(spawnDetached).not.toHaveBeenCalled()
   })

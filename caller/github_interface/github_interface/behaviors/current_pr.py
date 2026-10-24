@@ -35,4 +35,5 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "pull_number": int(pull["number"]),
         "url": pull.get("html_url"),
         "head_sha": head_sha,
+        "author": (pull.get("user") or {}).get("login"),
     }

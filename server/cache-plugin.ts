@@ -768,8 +768,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           }
           const runtime = getBehaviorsRuntimeHealth()
           const evidence = await behaviorEvidence({ failures: runtime.failures, deadLetters: getBehaviorDiagnosticIncidents(snapshot) })
-          // Every behavior acts as the agent account.
-          const owner = agentAccount() || null
+          const owner = [getSettings().me, agentAccount()].filter(Boolean).join(' / ') || null
           return json(res, 200, {
             'review-new-prs': {
               owner,
@@ -830,7 +829,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // until `repos` names one. `authors` are the trusted accounts
             // whose issues it reviews.
             'review-new-issues': {
-              owner,
+              owner: agentAccount() || null,
               enabled: enabled['review-new-issues'],
               setting: null,
               reviewers: getReviewers('review-new-issues'),

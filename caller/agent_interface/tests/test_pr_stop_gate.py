@@ -112,6 +112,7 @@ class TestPrStopGate(TestCase):
                         "repository": "Vaquum/Limen",
                         "pull_number": 757,
                         "head_sha": "a" * 40,
+                        "author": "person-account",
                     }
                 return {"action": "pr_readiness", "green": True, "blockers": []}
 
@@ -252,6 +253,7 @@ class TestPrStopGate(TestCase):
                         "repository": "Vaquum/Limen",
                         "pull_number": 757,
                         "head_sha": "a" * 40,
+                        "author": "person-account",
                     }
                 raise RuntimeError("readiness unavailable")
 
@@ -336,6 +338,21 @@ class TestPrStopGate(TestCase):
         self.assertEqual(readiness[3], "review-account")
         self.assertEqual(readiness[-2:], ["--token-user", "person-account"])
 
+    def test_agent_authored_pr_waits_for_main_user_approval(self) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"CALLER_GITHUB_READER": "person-account"}):
+            def interface(args, cwd):
+                calls.append(args)
+                if args[0] == "--current-pr":
+                    result = self._blocked_interface(cwd)(args, cwd)
+                    result["author"] = "AGENT-ACCOUNT"
+                    return result
+                return {"green": True}
+
+            result = self._stop(root, interface)
+        self.assertIsNone(result)
+        self.assertEqual(calls[1][3], "person-account")
+
     def test_without_an_agent_account_the_gate_says_what_to_set(self) -> None:
         with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"GITHUB_INTERFACE_AGENT_USER": ""}):
             with self.assertRaisesRegex(RuntimeError, "set GITHUB_INTERFACE_AGENT_USER"):
@@ -377,6 +394,7 @@ class TestPrStopGate(TestCase):
                     "repository": "Vaquum/Limen",
                     "pull_number": 757,
                     "head_sha": "a" * 40,
+                        "author": "person-account",
                 }
             return {"action": "pr_readiness", "green": False, "blockers": ["required_checks_not_green"]}
 
