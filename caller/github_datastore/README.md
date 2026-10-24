@@ -143,3 +143,7 @@ views.pr(status="open", output="csv")
 `issues` mirrors the PR shape where issue data exists.
 
 `user_items` maps a user to issue/PR refs with footprint reasons and evidence count.
+
+Initialization and sync add an item-type/update-time index to existing databases
+without rebuilding records or views. Analytics time windows use this range index
+to skip older item payloads, including when a window has no matching records.

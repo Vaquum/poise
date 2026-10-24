@@ -173,6 +173,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS item_fts USING fts5(
     events
 );
 CREATE INDEX IF NOT EXISTS idx_items_repo_updated ON items(repo_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_items_type_updated ON items(item_type, updated_at);
 CREATE INDEX IF NOT EXISTS idx_items_repo_number ON items(repo_id, number);
 CREATE INDEX IF NOT EXISTS idx_associations_username ON associations(username);
 CREATE INDEX IF NOT EXISTS idx_associations_item ON associations(item_id);

@@ -3,6 +3,7 @@ import io
 import json
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from github_datastore import views
@@ -183,6 +184,44 @@ class ViewsTest(unittest.TestCase):
             columns = [column[0] for column in conn.execute("SELECT * FROM user_items LIMIT 0").description]
             conn.close()
             self.assertIn("evidence_count", columns)
+
+    def test_existing_databases_index_time_windows_without_changing_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(connect(Path(tmp) / "db.sqlite")) as conn:
+                init_db(conn)
+                item = base_expanded("@mikkokotila", [])
+                upsert_repo(conn, item["repo"])
+                store_expanded(conn, item)
+                conn.execute("DROP INDEX IF EXISTS idx_items_type_updated")
+                before = [tuple(row) for row in conn.execute("SELECT * FROM items")]
+                associations = [tuple(row) for row in conn.execute("SELECT * FROM associations")]
+                views_before = [tuple(row) for row in conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'view' ORDER BY name"
+                )]
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+                init_db(conn)
+                init_db(conn)
+
+                self.assertEqual([tuple(row) for row in conn.execute("SELECT * FROM items")], before)
+                self.assertEqual([tuple(row) for row in conn.execute("SELECT * FROM associations")], associations)
+                self.assertEqual([tuple(row) for row in conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'view' ORDER BY name"
+                )], views_before)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], version)
+                for view, ref in [("prs", "pr_ref"), ("issues", "issue_ref")]:
+                    for since in ["2026-01-01", "2027-01-01"]:
+                        with self.subTest(view=view, since=since):
+                            plan = conn.execute(f"""
+                                EXPLAIN QUERY PLAN SELECT repo, number, title FROM {view} v
+                                WHERE updated_at >= ? AND (
+                                  EXISTS (SELECT 1 FROM associations a
+                                    WHERE a.item_id = v.{ref} AND a.username = ?) OR author = ?)
+                            """, (since, "mikkokotila", "agent")).fetchall()
+                            self.assertTrue(any(
+                                "SEARCH i USING INDEX idx_items_type_updated" in row[3]
+                                and "updated_at>?" in row[3] for row in plan
+                            ), [tuple(row) for row in plan])
 
     def test_a_version_2_database_gets_pull_request_sizes(self) -> None:
         # A version-2 database has every view name, so only the version
