@@ -298,6 +298,77 @@ describe('turn stall detection and waking', () => {
     await runtime.stop({ handover: false })
   }, 40_000)
 
+  it('keeps tracking a job that execs into another program instead of announcing it', async () => {
+    // Two trigger fifos outside every checkout. The agent spawns a subshell
+    // that blocks opening the second fifo; writing it makes the same pid
+    // exec into sleep, which must read as the job continuing, not finishing.
+    const fifo1 = join(root, 'bg-exec-1.fifo')
+    const fifo2 = join(root, 'bg-exec-2.fifo')
+    spawnSync('rm', ['-f', fifo1, fifo2])
+    for (const fifo of [fifo1, fifo2]) {
+      const made = spawnSync('mkfifo', [fifo])
+      if (made.status !== 0) throw new Error(`mkfifo: ${made.stderr}`)
+    }
+    const agentScript = `read line < ${fifo1}; (read line < ${fifo2}; exec sleep 60) & wait`
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true,
+      startWorker: { command: 'sh', args: ['-c', agentScript] } }
+    const { runtime, events } = makeRuntime('poise-turn-stall-exec:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-exec' } })
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.prompt(session.id, { text: 'run the suite', attachments: [], mentions: [] })
+    await waitFor(() => owned.prompts.length === 1)
+    await writeFile(fifo1, 'run\n')
+    const row = storage.getWorker(session.id)
+    if (!row) throw new Error('no worker row for the session')
+    const shCmd = `sh -c ${agentScript}`
+    // The agent plus its blocked subshell share the forked command line.
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.filter((m) => m.command === shCmd).length === 2)
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    const tracked = runtime.get(session.id)?.stall?.backgroundJobs ?? []
+    expect(tracked).toHaveLength(1)
+    const pid = tracked[0].pid
+    expect(tracked[0].command).toBe(shCmd)
+
+    // The same pid execs into sleep; the monitor cycle must keep it under
+    // the new command and queue no completion.
+    await writeFile(fifo2, 'run\n')
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.some((m) => m.pid === pid && m.command === 'sleep 60') ?? false)
+    const control = await makeControl(runtime)
+    await control.tick()
+    await waitFor(() => runtime.get(session.id)?.stall?.backgroundJobs[0]?.command === 'sleep 60')
+    const kept = runtime.get(session.id)?.stall?.backgroundJobs ?? []
+    expect(kept).toHaveLength(1)
+    expect(kept[0].pid).toBe(pid)
+
+    // The stall notice still wakes the chat, but no completion follows it.
+    await waitFor(() => owned.prompts.length === 2)
+    expect(owned.prompts[1].text).toContain('still running')
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    await control.tick()
+    await new Promise((r) => setTimeout(r, 1_500))
+    await control.tick()
+    expect(owned.prompts.length).toBe(2)
+
+    // When the exec'd program really exits, its completion wakes once.
+    process.kill(pid, 'SIGTERM')
+    await waitFor(() => !worker.pidAlive(pid))
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 3)
+    expect(owned.prompts[2].text).toContain('finished')
+    expect(owned.prompts[2].text).toContain('sleep 60')
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 3)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toBeUndefined()
+    spawnSync('rm', ['-f', fifo1, fifo2])
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
   it('clears the stall once the leftover is pushed and committed', async () => {
     const owned: FakeControls = { hosts: [], adapters: [], prompts: [],
       commitFirst: { file: 'work.txt', content: 'done\n', dirty: 'draft.txt' } }

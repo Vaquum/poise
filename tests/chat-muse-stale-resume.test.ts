@@ -262,9 +262,11 @@ it('tracks background jobs the recovered prompt starts', async () => {
   // The retry prompt ran after the restart: its sleep is new against the
   // re-taken baseline, while the first attempt's sleep died with the old
   // group and was never tracked.
-  const jobs = runtime.get(id)?.stall?.backgroundJobs ?? []
+  // Exactly the retry's sleep is tracked: the group listing is a shared
+  // pid namespace under suite load, so anything else listed there cannot
+  // be asserted away — but a second sleep would mean a double spawn.
+  const jobs = (runtime.get(id)?.stall?.backgroundJobs ?? []).filter((job) => job.command === 'sleep 30')
   expect(jobs).toHaveLength(1)
-  expect(jobs[0].command).toBe('sleep 30')
 }, 60_000)
 
 it('does not re-run the prompt when the failed attempt had already run tools', async () => {

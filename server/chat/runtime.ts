@@ -3279,6 +3279,11 @@ export class ChatRuntime extends EventEmitter {
       }
       adapter = session.adapter!
       if (turn.abort.signal.aborted) throw new Error(turn.failure || 'cancelled before the agent prompt')
+      // The baseline's process listing settles before 'running' publishes:
+      // callers treat 'running' as prompt-invoked, so the window after it
+      // stays free of subprocess latency. A safe-mode restart below replaces
+      // the group and re-takes it there.
+      await this.snapshotJobBaseline(session, turn)
       this.setStatus(session, 'running')
       if (record.queuedHandoff) adapterInput.text = `${record.queuedHandoff}\n\n[Current task]\n${adapterInput.text}`
       if (turn.contextAction === 'compact' && storage.findEvent(record.id, event => event.type === 'text.delta') && !record.queuedHandoff) {
@@ -3308,6 +3313,7 @@ export class ChatRuntime extends EventEmitter {
           await this.stopProcess(session)
           await this.startSession(session, { lease })
           adapter = session.adapter!
+          await this.snapshotJobBaseline(session, turn)
         }
       }
       turn.abort.signal.throwIfAborted()
@@ -3331,7 +3337,6 @@ export class ChatRuntime extends EventEmitter {
         agentInvoked = true
         turn.agentInvoked = true
         turn.requestInvoked = true
-        await this.snapshotJobBaseline(session, turn)
         const response = adapter.prompt(turn.id, promptInput, turn.abort.signal)
         turn.releasePrompt()
         result = await response
@@ -4090,16 +4095,19 @@ export class ChatRuntime extends EventEmitter {
         for (const member of members.filter((candidate) => candidate.pid !== gatePid).sort((a, b) => a.pid - b.pid)) {
           const command = this.stallCommand(member.command)
           const kept = seen.get(member.pid)
-          if (kept && kept.command === command) keptJobs.push(kept)
+          // A live pid is the same job continuing, even under a new command:
+          // exec replaces the image in place, while pid reuse inside a live
+          // gate group needs a full pid-space wraparound.
+          if (kept) keptJobs.push(kept.command === command ? kept : { ...kept, command })
           else if (baseline.members.get(member.pid) !== command) freshJobs.push({ pid: member.pid, pgid: gatePgid, command, startedAt: now })
         }
         // Still-running tracked jobs survive the cap; only fresh ones drop.
         jobs = [...keptJobs, ...freshJobs].slice(0, MAX_STALL_JOBS)
         const current = new Map(jobs.map((job) => [job.pid, job]))
         for (const job of seen.values()) {
-          // A reused pid with another command is a finished job and a new
-          // one, not the same job continuing.
-          if (current.get(job.pid)?.command !== job.command) this.queueStallDone(record.id, job, now, { repos, truncatedRepos })
+          // Only a gone pid finishes a job; one that exec'd into another
+          // program keeps its tracking under the new command above.
+          if (!current.has(job.pid)) this.queueStallDone(record.id, job, now, { repos, truncatedRepos })
         }
       }
       if (!repos.length && !truncatedRepos && !jobs.length) {
@@ -4293,14 +4301,28 @@ export class ChatRuntime extends EventEmitter {
     const running: StalledJob[] = []
     for (const job of stall.backgroundJobs) {
       const member = members.find((candidate) => candidate.pid === job.pid)
-      if (member && this.stallCommand(member.command) === job.command) running.push(job)
-      else finished.push(job)
+      if (!member) { finished.push(job); continue }
+      // A live pid is the same job continuing, even under a new command:
+      // exec replaces the image in place, while pid reuse inside a live
+      // gate group needs a full pid-space wraparound.
+      const command = this.stallCommand(member.command)
+      running.push(command === job.command ? job : { ...job, command })
     }
-    if (!finished.length) return
     // A turn end may have replaced the marker while the group was listed;
     // only the still-current marker is written back. The replacement's own
     // completion pass covers these jobs under the same event keys.
     if (record.stall !== stall) return
+    if (!finished.length) {
+      // Nothing finished, but jobs that exec'd into new commands still need
+      // their tracking updated; unchanged entries keep their identity.
+      if (running.some((job, index) => job !== stall.backgroundJobs[index])) {
+        stall.backgroundJobs = running
+        stall.updatedAt = finishedAt
+        this.saveRecord(session)
+        this.emit_(record.id, { type: 'session.updated', session: record })
+      }
+      return
+    }
     stall.backgroundJobs = running
     stall.updatedAt = finishedAt
     const lastKnown = { repos: stall.repos, truncatedRepos: stall.truncatedRepos ?? 0 }
