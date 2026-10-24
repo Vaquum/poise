@@ -169,20 +169,35 @@ export function ownProcessStartTime(): string | null {
   return ownStart
 }
 
-/** Whether `pid` is still the gate we recorded: its command line must be
- *  the gate script carrying `--lease-worker <ident>` as its own argument.
- *  Anything else (pid reuse, unreadable table) is "no". */
-export async function workerIdentityMatches(pid: number, ident: string): Promise<boolean> {
+/** Whether `pid` still runs `scriptFile` from any Poise scripts directory
+ *  (any installed release, the image, or a checkout) carrying `--<flag>
+ *  <ident>` as its own argument. The install directory is deliberately not
+ *  part of the identity: after a release switch the surviving relay and
+ *  gate still run from the previous release's directory, and the new
+ *  server must verify them to adopt them. The random ident — minted at
+ *  spawn, stored server-side, matched exactly with whitespace on both
+ *  sides — is what defeats pid reuse; the `/scripts/` parent keeps a
+ *  same-named script elsewhere from verifying. Anything else (pid reuse,
+ *  unreadable table) is "no". */
+export async function scriptIdentityMatches(pid: number, ident: string, scriptFile: string, flag: string): Promise<boolean> {
   if (!pidAlive(pid) || !/^[A-Za-z0-9-]{8,64}$/.test(ident)) return false
   try {
     const { stdout } = await runFile('ps', ['-o', 'command=', '-p', String(pid)], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 })
     const line = stdout.trim()
-    const gateIndex = line.indexOf(WORKER_GATE)
-    const identIndex = line.indexOf(` --lease-worker ${ident} -- `)
-    return gateIndex >= 0 && identIndex > gateIndex
+    const flagIndex = line.indexOf(` --${flag} ${ident} `)
+    if (flagIndex < 0) return false
+    const head = line.slice(0, flagIndex)
+    return head.includes(`/scripts/${scriptFile} `) || head.endsWith(`/scripts/${scriptFile}`)
   } catch {
     return false
   }
+}
+
+/** Whether `pid` is still the gate we recorded: its command line must be
+ *  the gate script carrying `--lease-worker <ident>` as its own argument.
+ *  Anything else (pid reuse, unreadable table) is "no". */
+export async function workerIdentityMatches(pid: number, ident: string): Promise<boolean> {
+  return scriptIdentityMatches(pid, ident, 'chat-worker-gate.mjs', 'lease-worker')
 }
 
 function delay(ms: number): Promise<void> {
