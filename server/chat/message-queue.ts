@@ -119,6 +119,17 @@ export function settleQueuedTurn(sessionId: string, turnId: string, completed: b
 export function pauseQueue(sessionId: string): void {
   if (readQueue(sessionId).ready) bump(sessionId, false)
 }
+/** Restart recovery arms an idle chat's untouched queue so its waiting items
+ *  start instead of sitting silently. A queue with a running or failed item
+ *  stays paused: only never-started items arm, and an interrupted attempt is
+ *  never re-executed. Returns true when this call armed the queue. */
+export function armWaitingQueue(sessionId: string): boolean {
+  const queue = readQueue(sessionId)
+  if (queue.ready || queue.items.some(item => item.state === 'running' || item.state === 'failed')) return false
+  if (!queue.items.some(item => item.state === 'waiting')) return false
+  bump(sessionId, true)
+  return true
+}
 export function deleteMessageQueue(sessionId: string): void {
   const queue = readQueue(sessionId)
   if (queue.executorSessionId && queue.executorSessionId !== sessionId) {

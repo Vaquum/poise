@@ -50,11 +50,15 @@ SQLite transactions and stable request IDs. A lost acknowledgement can be
 retried with the same identity, including after a task completed or was removed.
 
 A successful completed turn advances the queue. Pending permissions/questions
-are still part of the current turn. Stop, a failed turn, or a crash pauses the
-tail rather than silently treating interruption as success. The interrupted
-item remains visibly not completed and is not automatically retried; remaining
-waiting items proceed after the next successful task you send. Restart recovery
-continues an already-armed but not-yet-started task, never an uncertain in-flight
+are still part of the current turn. Stop, a failed turn, or a crash with a
+turn in flight pauses the tail rather than silently treating interruption as
+success. The interrupted item remains visibly not completed and is not
+automatically retried; remaining waiting items proceed after the next
+successful task you send, and a fresh task is always admitted past unarmed or
+failed queue items. A restart or release switch starts an idle chat's waiting
+items in order instead of leaving them stranded; only queues with a running,
+failed or interrupted turn stay paused. Restart recovery continues an
+already-armed but not-yet-started task, never an uncertain in-flight
 one. Queues are not copied into independent forks.
 
 ## Verification

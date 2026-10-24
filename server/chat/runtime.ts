@@ -30,7 +30,7 @@ import { resolveIssueTitle } from './issue-titles'
 import { appendMemories } from './memory-content'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { enqueueMessage, transferQueuedContext, readQueue, updateQueuedModel, removeQueuedMessage, pauseQueue, QueueError, queueOwner, delegateQueue } from './message-queue'
+import { enqueueMessage, transferQueuedContext, readQueue, updateQueuedModel, removeQueuedMessage, pauseQueue, armWaitingQueue, QueueError, queueOwner, delegateQueue } from './message-queue'
 import type { MessageQueue, QueuedMessage } from './protocol'
 import { autoMergeInstructions, withAutoMergeInstructions } from './auto-merge'
 import { steeringContext } from './steering-context'
@@ -395,7 +395,21 @@ export class ChatRuntime extends EventEmitter {
       this.recovering = false
     }
     await this.resumeAfterUpdate(protectedSessions)
+    this.armRecoveredQueues(protectedSessions)
     for (const record of storage.listSessions(this.instance)) this.scheduleQueue(this.requireLive(record.id))
+  }
+
+  /** #590: a restart or release switch must not strand an idle chat's waiting
+   *  queue. Sessions another server owns, chats that were not idle, and
+   *  queues with a running or failed item stay untouched; the pump below
+   *  starts the armed items in order. */
+  private armRecoveredQueues(protectedSessions: ReadonlySet<string>): void {
+    const armed: string[] = []
+    for (const record of storage.listSessions(this.instance)) {
+      if (record.status !== 'idle' || protectedSessions.has(record.id) || this.recoveryOwnedElsewhere(record.id)) continue
+      if (armWaitingQueue(queueOwner(record.id))) armed.push(record.id.slice(0, 8))
+    }
+    if (armed.length) this.emit('log', `[chat] recovery armed ${armed.length} idle queue${armed.length === 1 ? '' : 's'}: ${armed.join(', ')}`)
   }
 
   /** Delete this instance's sessions whose model the live catalog no longer

@@ -230,6 +230,32 @@ describe('waiting behind a pending switch', () => {
     expect(w.c.calls.map(call => call.input.text)).toEqual(['First', 'Second'])
   })
 
+  it('starts a prompt accepted during a pending switch after the restart despite a waiting queue item', async () => {
+    const w = await world()
+    w.runtime.prompt(w.s.id, input('Earlier task'))
+    await until(() => w.turns(w.s.id).length === 1)
+    await until(() => w.runtime.get(w.s.id)?.status === 'idle')
+    await w.runtime.enqueue(w.s.id, randomUUID(), input('Queued while idle'))
+    expect(w.runtime.get(w.s.id)?.queue?.ready).toBe(false)
+    w.runtime.setSwitchPending('r2')
+    inbox.message(w.instance, w.s.id, 'Manager', 'Do the thing after the update')
+    await pause(80)
+    expect(w.c.calls).toHaveLength(1)
+    expect(inbox.pending(w.instance, '')).toHaveLength(1)
+    w.runtime.startDrain('service')
+    await w.runtime.stop()
+    w.runtime.endDrain()
+    const next = w.make()
+    await next.recover()
+    const control = await tickControl(next)
+    for (let i = 0; i < 100 && inbox.pending(w.instance, '').length; i++) { await control.tick(); await pause(30) }
+    await until(() => w.c.calls.length === 3)
+    expect(inbox.pending(w.instance, '')).toHaveLength(0)
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['Earlier task', 'Queued while idle',
+      expect.stringContaining('Do the thing after the update')])
+    await until(() => next.get(w.s.id)?.status === 'idle')
+  })
+
   it.each(['withdrawal', 'restart'] as const)('preserves older queue, waited prompt and newer queue order after natural completion via %s', async release => {
     const w = await world({ auto: false })
     w.runtime.prompt(w.s.id, input('Original task'))
