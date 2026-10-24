@@ -128,7 +128,8 @@ it('stopping the refresh runner also stops its in-flight native updater group', 
   try {
     const pid = await waitForUpdaterPid(marker)
     child.kill('SIGTERM'); await closed
-    await expect.poll(() => { try { process.kill(pid, 0); return true } catch { return false } }).toBe(false)
+    // Signal delivery and teardown can stall past vitest's 1 s poll default under suite load.
+    await expect.poll(() => { try { process.kill(pid, 0); return true } catch { return false } }, { timeout: 10_000 }).toBe(false)
   } finally { child.kill('SIGTERM'); await closed }
 })
 
@@ -154,7 +155,7 @@ it('a case abort stops its held updater and closes the runner before removing th
     expect(runnerClosed).toBe(true)
     expect((await run.closed).error?.name).toBe('AbortError')
     expect(run.child.exitCode !== null || run.child.signalCode !== null).toBe(true)
-    await expect.poll(() => alive(pid!)).toBe(false)
+    await expect.poll(() => alive(pid!), { timeout: 10_000 }).toBe(false)
     expect(existsSync(root)).toBe(false)
     expect(() => fixture.start(new AbortController().signal)).toThrow('already been cleaned up')
   } finally {

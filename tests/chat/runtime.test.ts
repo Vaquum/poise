@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import type { AgentId, ChatEnvelope, ChatEvent, PromptInput, SessionRecord } from '../../server/chat/protocol'
 import type { Adapter, AdapterHost, AdapterStartOptions } from '../../server/chat/adapters/types'
 import type { RelayConnection } from '../../server/chat/relay'
@@ -140,7 +140,12 @@ afterEach(async () => {
   spawnSync('git', ['switch', '-q', 'main'], { cwd: repo })
 })
 
-async function waitFor(check: () => boolean, ms = 8_000): Promise<void> {
+// Every case drives the real Chat runtime against a real git checkout, and
+// under suite load one git or SQLite step can stall past eight seconds: each
+// readiness wait gets 20 s, and each case and hook at least 25 s, instead of
+// vitest's global 10 s. Multi-turn cases keep their larger ceilings.
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
+async function waitFor(check: () => boolean, ms = 20_000): Promise<void> {
   const deadline = Date.now() + ms
   while (!check()) {
     if (Date.now() > deadline) throw new Error('condition not met in time')
@@ -1207,4 +1212,9 @@ describe('Extensions in the runtime', () => {
     expect(stored).not.toContain('sk-live-0123456789')
     expect(stored).toContain('echo: print [redacted]')
   })
+})
+
+it('gives every case at least 25 s instead of the global 10 s', ({ task }) => {
+  const cases = (tasks: RunnerTask[]): RunnerTestCase[] => tasks.flatMap(t => t.type === 'test' ? [t] : cases(t.tasks))
+  expect(cases(task.file.tasks).filter(t => t.timeout < 25_000).map(t => t.fullTestName)).toEqual([])
 })

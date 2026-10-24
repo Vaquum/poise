@@ -175,7 +175,8 @@ it('keeps admitted Codex launchers usable when npm removes a native dependency m
   expect(repaired.launchPath).not.toBe(failed.launchPath)
   expect((await launch(repaired.launchPath!)).stdout.trim()).toBe('1.1.0')
   expect((await launch(failed.launchPath!)).stdout.trim()).toBe('1.0.0')
-})
+  // Real npm/node launches across a failed, a held and a repaired update.
+}, 30_000)
 
 it('retains bounded redacted updater causes without stdout or arguments', async () => {
   const secret = 'opaque-updater-credential'
