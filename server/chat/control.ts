@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { lstat, mkdir, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, rm } from 'node:fs/promises'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -20,7 +20,7 @@ import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-re
 import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, MessageQueue, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
 import { findEvent } from './storage'
-import { pushedBranches } from './git'
+import { pushedBranches, writeFileAtomic } from './git'
 import { ChatError, type ChatRuntime } from './runtime'
 import { GREY_CI_INTENT_KEY, getEnabledMap, getBehaviorsRuntimeHealth, isEnabled, pullRequestPolicy, pullRequestRefusal, withBehaviorOrganization } from '../behaviors'
 import * as store from './control-store'
@@ -797,8 +797,10 @@ export class ChatControl {
       try {
         const live = this.runtime.get(record.id)
         if (!live || live.status === 'closed') continue
-        await writeFile(join(dir, `${record.id}.json`),
-          JSON.stringify({ origin: this.origin, sessionId: record.id, token: this.token(record.id) }), { mode: 0o600 })
+        // Atomic: a worker reading its durable path mid-refresh never sees
+        // a truncated file. New files are 0600; existing ones keep 0600.
+        await writeFileAtomic(join(dir, `${record.id}.json`),
+          JSON.stringify({ origin: this.origin, sessionId: record.id, token: this.token(record.id) }))
       } catch {
         failed.push(record.id)
       }
@@ -827,7 +829,7 @@ export class ChatControl {
     if (!this.origin || this.stopped) throw new Error('Poise chat control has no active local listener')
     const record = this.session(id)
     const config = join(await this.ensureRoot(), `${id}.json`)
-    await writeFile(config, JSON.stringify({ origin: this.origin, sessionId: id, token: this.token(id) }), { mode: 0o600 })
+    await writeFileAtomic(config, JSON.stringify({ origin: this.origin, sessionId: id, token: this.token(id) }))
     const command = [
       '[Poise native control]',
       `Your Poise chat ID is ${id}. Use your native shell tool to run:`,
