@@ -4123,10 +4123,13 @@ export class ChatRuntime extends EventEmitter {
       // A checkpoint on a detached HEAD belongs to no branch: without a
       // reference it would dangle once the switch below moves away. Only
       // self-ownership reaches here on a detached HEAD (no session names
-      // ''), so the session keeps it on a stable per-session branch.
+      // ''), so the session keeps it on a branch. Each checkpoint gets its
+      // own branch, named for its commit: reusing one stable name would
+      // force-move it off the earlier checkpoint and leave that saved work
+      // recoverable only through reflogs.
       let retained = ''
       if (!state.currentBranch && owner.id === record.id && result.sha) {
-        const name = `poise/checkpoint/${record.id.slice(0, 8)}`
+        const name = `poise/checkpoint/${record.id.slice(0, 8)}-${result.sha.slice(0, 12)}`
         await moveBranch(lease, record.checkout, name, result.sha)
         retained = ` (kept on branch ${name})`
       }

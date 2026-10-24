@@ -613,9 +613,23 @@ describe('release switch adoption', () => {
     first.runtime.prompt(session.id, { text: 'Continue', attachments: [], mentions: [] })
     await waitFor(() => ofType(first.events, session.id, 'turn.finished').length === 1, 30_000)
     expect(ofType(first.events, session.id, 'turn.finished')[0]).toMatchObject({ stopReason: 'end_turn' })
-    const retained = `poise/checkpoint/${session.id.slice(0, 8)}`
-    expect(git(['log', '--format=%s', '-1', retained], session.checkout)).toContain('checkpoint')
-    expect(git(['show', `${retained}:wip.txt`], session.checkout)).toContain('uncommitted work')
+    const prefix = `poise/checkpoint/${session.id.slice(0, 8)}-`
+    const retainedBranches = () => git(['branch', '--list', `${prefix}*`], session.checkout)
+      .split('\n').map((line) => line.replace(/^[* ]+/, '').trim()).filter((line) => line.length > 0)
+    expect(retainedBranches()).toHaveLength(1)
+    const [firstRetained] = retainedBranches()
+    expect(git(['log', '--format=%s', '-1', firstRetained], session.checkout)).toContain('checkpoint')
+    expect(git(['show', `${firstRetained}:wip.txt`], session.checkout)).toContain('uncommitted work')
     expect(git(['branch', '--show-current'], session.checkout)).toBe(branch)
-  }, 60_000)
+    // A second detached checkpoint from the unchanged recorded branch keeps
+    // its own branch: the first checkpoint stays reachable, not reflog-only.
+    git(['switch', '--quiet', '--detach', 'HEAD'], session.checkout)
+    await writeFile(join(session.checkout, 'wip.txt'), 'more uncommitted work\n')
+    first.runtime.prompt(session.id, { text: 'Continue again', attachments: [], mentions: [] })
+    await waitFor(() => ofType(first.events, session.id, 'turn.finished').length === 2, 30_000)
+    expect(retainedBranches()).toHaveLength(2)
+    const contents = retainedBranches().map((name) => git(['show', `${name}:wip.txt`], session.checkout))
+    expect(contents).toContain('uncommitted work')
+    expect(contents).toContain('more uncommitted work')
+  }, 120_000)
 })
