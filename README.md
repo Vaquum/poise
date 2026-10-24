@@ -199,6 +199,8 @@ separate Org and Repo columns. Repository-free manual cards,
 Editor, Snippets, and local chats remain personal. If one account's reads
 fail, available results remain visible with an explicit error. Current paints personal cards and GitHub lanes as
 each read arrives; repository discovery and agent activity do not delay them.
+Current keeps an issue draft open while its write is pending and closes it
+after confirmation. A failed write retains the draft for an explicit retry.
 Archive paints its page before the full-history total is available, showing
 an available-row count until that read finishes.
 

@@ -1075,6 +1075,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
         try { await deleteManualCard(prefill.sourceCardId) }
         catch (err) { console.error('[promote] delete source card failed:', err) }
       }
+      submitting = false
       close()
       await fetchLive()
       renderLiveOnly()
