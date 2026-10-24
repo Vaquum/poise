@@ -89,6 +89,24 @@ describe('adoption liveness bound', () => {
     peer.detach()
   })
 
+  it('never surfaces an unhandled rejection when the consumer drops the promise', async () => {
+    const failures: unknown[] = []
+    const onUnhandled = (reason: unknown) => { failures.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'poise-relay-dropped-'))
+      const peer = new RelayConnection({ sessionId: 'live-dropped', ident: randomUUID(), dir, socketPath: join(dir, 'r.sock') })
+      // An adapter that rejects its replay before subscribing: deliberately
+      // not awaited.
+      livePromise(peer, 50)
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      peer.detach()
+      expect(failures).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
   it('resolves a live relay before the bound', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'poise-relay-live-'))
     const peer = await spawnRelay({

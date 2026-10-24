@@ -572,9 +572,13 @@ export const ADOPTION_LIVE_TIMEOUT_MS = 60_000
  *  reports the replay cannot be exact or goes away mid-replay. A turn that
  *  already settled keeps its result: only a replay still waiting fails.
  *  With `timeoutMs`, a handoff that never goes live fails instead of
- *  hanging: the runtime then ends the turn and its processes. */
+ *  hanging: the runtime then ends the turn and its processes. An adapter
+ *  that rejects its replay before subscribing must not take Poise down
+ *  with it, so the promise carries its own rejection handler: consumers
+ *  still observe the rejection, but a dropped promise never surfaces as
+ *  an unhandled rejection. */
 export function livePromise(peer: RelayConnection, timeoutMs?: number): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
+  const pending = new Promise<void>((resolve, reject) => {
     const onError = (message: unknown) => { cleanup(); reject(new Error(`relay: ${String(message)}`)) }
     const onExit = () => {
       // An actual LIVE frame can precede EXITED in the same decoder callback.
@@ -602,6 +606,10 @@ export function livePromise(peer: RelayConnection, timeoutMs?: number): Promise<
     void peer.whenLive().then(() => { cleanup(); resolve() })
     if (peer.exited) onExit()
   })
+  // Marks the promise handled without consuming it: awaiting consumers
+  // still observe resolve and reject as before.
+  void pending.catch(() => undefined)
+  return pending
 }
 
 /** Connect to a relay another Poise left running. The caller proves the pid

@@ -44,6 +44,8 @@ interface FakeControls {
   replayGate?: Promise<void>
   /** Makes cancel() a no-op: the turn never acknowledges the stop. */
   ignoreCancel?: boolean
+  /** Spawns this command when an adapter starts, like a real adapter. */
+  startWorker?: string[]
 }
 
 class FakeAdapter implements Adapter {
@@ -64,8 +66,10 @@ class FakeAdapter implements Adapter {
     })
   }
   async start(options: AdapterStartOptions) {
+    const command = this.controls.startWorker
     this.alive = true
     this.nativeSessionId = options.resume || `native-${this.controls.adapters.length}`
+    if (command) await this.host.spawn(command[0], command.slice(1))
     return { nativeSessionId: this.nativeSessionId, capabilities: this.capabilities, modelId: options.modelId, effort: options.effort, efforts: ['high', 'xhigh'] }
   }
   async prompt(turnId: string, input: PromptInput, signal: AbortSignal) {
@@ -381,6 +385,46 @@ describe('release switch adoption', () => {
     await second.runtime.stop({ handover: false })
   }, 60_000)
 
+  it('heals a stranded session on resume even after the new agent replaced the worker row', async () => {
+    const instance = 'poise-switch-resume-replaced:db'
+    const leaseModule = await import('../../server/chat/checkout-lock')
+    const first = makeRuntime(instance, { hosts: [], adapters: [], auto: false, replayTurns: [], exitAware: false })
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    requireTurn(first.runtime.prompt(session.id, { text: 'Get stranded', attachments: [], mentions: [] }))
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    const oldWorker = storage.getWorker(session.id)!
+    await waitFor(() => worker.pgidAlive(oldWorker.gatePgid))
+    await first.runtime.enqueue(session.id, randomUUID(), { text: 'Follow up', attachments: [], mentions: [] })
+    // The incident state: the old worker is gone, its turn is still open,
+    // and the orphan notice is set — but the lease file is free, so a
+    // resume starts a new agent before reaching the cleanup.
+    process.kill(-oldWorker.gatePgid, 'SIGKILL')
+    await waitFor(() => !worker.pgidAlive(oldWorker.gatePgid))
+    leaseModule.CheckoutLease.releaseByToken(repo, oldWorker.leaseToken!)
+    const stored = storage.getSession(session.id)!
+    storage.saveSession({ ...stored, orphanNotice: 'a worker recorded for this session is still running but could not be verified; stop it by hand' })
+    // Crash: the first server never stops.
+    peer.detach()
+    // Like a real adapter, starting the new agent spawns a new worker and
+    // replaces the worker row before the cleanup below runs.
+    const second = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [], startWorker: ['sh', '-c', 'sleep 60'] })
+    await second.runtime.resume(session.id)
+    expect(second.runtime.get(session.id)?.orphanNotice).toBeUndefined()
+    await waitFor(() => ofType(second.events, session.id, 'turn.finished').length === 1)
+    expect(ofType(second.events, session.id, 'turn.finished')[0]).toMatchObject({ stopReason: 'interrupted' })
+    expect(ofType(second.events, session.id, 'turn.finished')[0].error).toContain('outcome is unknown')
+    // The old row is judged, never the new worker: it survives.
+    const current = storage.getWorker(session.id)!
+    expect(current.ident).not.toBe(oldWorker.ident)
+    expect(worker.pgidAlive(current.gatePgid)).toBe(true)
+    // And the follow-up dispatches behind the healed session.
+    await waitFor(() => ofType(second.events, session.id, 'turn.finished').length === 2, 15_000)
+    expect(ofType(second.events, session.id, 'turn.finished')[1]).toMatchObject({ stopReason: 'end_turn' })
+    await second.runtime.stop({ handover: false })
+  }, 60_000)
+
   it('records a Stop durably and clears it on the next turn', async () => {
     const instance = 'poise-switch-stop-marker:db'
     const first = makeRuntime(instance, { hosts: [], adapters: [], auto: false, replayTurns: [] })
@@ -465,6 +509,33 @@ describe('release switch adoption', () => {
     await second.runtime.stop({ handover: false })
   }, 60_000)
 
+  it('leaves a deliberately unarmed queue parked when recovering an idle worker', async () => {
+    const instance = 'poise-switch-idle-parked:db'
+    const queueModule = await import('../../server/chat/message-queue')
+    const first = makeRuntime(instance, { hosts: [], adapters: [], auto: false, replayTurns: [] })
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    first.runtime.prompt(session.id, { text: 'Prime the relay', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    await waitFor(() => worker.pgidAlive(peer.gatePgid))
+    first.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    // Parked behind no turn: no interruption strands it.
+    await first.runtime.enqueue(session.id, randomUUID(), { text: 'Parked', attachments: [], mentions: [] })
+    expect(queueModule.readQueue(session.id).ready).toBe(false)
+    // Crash with an idle worker and no orphan notice.
+    peer.detach()
+    const second = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [] })
+    await second.runtime.recover()
+    await waitFor(() => !worker.pgidAlive(peer.gatePgid), 10_000)
+    expect(storage.getWorker(session.id)).toBeNull()
+    await new Promise((r) => setTimeout(r, 500))
+    expect(queueModule.readQueue(session.id).ready).toBe(false)
+    expect(ofType(second.events, session.id, 'turn.started')).toHaveLength(0)
+    await second.runtime.stop({ handover: false })
+  }, 60_000)
+
   it('adopts every surviving turn promptly when survivors exceed a lowered cap', async () => {
     const instance = 'poise-switch-cap:db'
     // Two checkouts: each adoption claims its own lease.
@@ -524,6 +595,24 @@ describe('release switch adoption', () => {
     await waitFor(() => ofType(first.events, session.id, 'turn.finished').length === 1, 15_000)
     expect(ofType(first.events, session.id, 'turn.finished')[0]).toMatchObject({ stopReason: 'end_turn' })
     expect(git(['log', '--format=%s', '-1', 'agent/wip'], session.checkout)).toContain('checkpoint')
+    expect(git(['branch', '--show-current'], session.checkout)).toBe(branch)
+  }, 60_000)
+
+  it('retains a detached-HEAD self-checkpoint on a branch instead of dangling it', async () => {
+    const instance = 'poise-switch-detached:db'
+    const first = makeRuntime(instance, undefined, { localWorkspaceRoot: join(root, '.poise-chat-detached') })
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    const branch = first.runtime.get(session.id)!.branch.name
+    // The agent left the checkout on a detached HEAD with uncommitted work.
+    git(['switch', '--quiet', '--detach', 'HEAD'], session.checkout)
+    await writeFile(join(session.checkout, 'wip.txt'), 'uncommitted work\n')
+    first.runtime.prompt(session.id, { text: 'Continue', attachments: [], mentions: [] })
+    await waitFor(() => ofType(first.events, session.id, 'turn.finished').length === 1, 30_000)
+    expect(ofType(first.events, session.id, 'turn.finished')[0]).toMatchObject({ stopReason: 'end_turn' })
+    const retained = `poise/checkpoint/${session.id.slice(0, 8)}`
+    expect(git(['log', '--format=%s', '-1', retained], session.checkout)).toContain('checkpoint')
+    expect(git(['show', `${retained}:wip.txt`], session.checkout)).toContain('uncommitted work')
     expect(git(['branch', '--show-current'], session.checkout)).toBe(branch)
   }, 60_000)
 })

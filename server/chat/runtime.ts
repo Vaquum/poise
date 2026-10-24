@@ -61,7 +61,7 @@ import { legacyIdFor, quoteImportedHistory, readLegacyConversation } from './leg
 import { forkStagedDocument, isBridgeProblem, refreshDocument, stageDocument, stagedDocumentPrompt, unstageDocument, writeBackDocument, type StagedDocument } from './editor-bridge'
 import {
   GitError, PathError, assertBranchName, branchExists, branchTip, checkoutPrHead, checkpoint, createBranch, deleteBranch,
-  inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
+  inspectCheckout, moveBranch, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
 } from './git'
 import {
   AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, SWITCH_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type EditDecision, type NewSessionRequest,
@@ -502,7 +502,8 @@ export class ChatRuntime extends EventEmitter {
           storage.forgetRelay(worker.sessionId)
           await rm(relayRow.dir, { recursive: true, force: true }).catch(() => undefined)
           this.releaseSettledLease(recovery)
-          this.armQueueIfWaiting(worker.sessionId)
+          // The open turn below is interrupted by the turn loop, which arms
+          // its follow-ups; nothing is armed here.
           continue
         }
         fallbackNotes.set(worker.sessionId, 'the relay did not answer after the restart')
@@ -551,9 +552,13 @@ export class ChatRuntime extends EventEmitter {
         storage.forgetRelay(worker.sessionId)
         await rm(relayRow.dir, { recursive: true, force: true }).catch(() => undefined)
       }
+      // Read before the release below clears it: only a recovery that
+      // cleared restart debris continues stranded follow-ups. An idle
+      // worker with a deliberately unarmed queue parks its messages until
+      // a turn runs.
+      const hadOrphan = storage.getSession(worker.sessionId)?.orphanNotice !== undefined
       if (recovery) this.releaseSettledLease(recovery)
-      // Follow-ups stranded by the restart continue once the pump runs.
-      this.armQueueIfWaiting(worker.sessionId)
+      if (hadOrphan) this.armQueueIfWaiting(worker.sessionId)
     }
     for (const open of storage.listOpenTurns(this.instance)) {
       if (protectedSessions.has(open.sessionId) || reattached.has(open.sessionId) || unresolved.has(open.sessionId)) continue
@@ -1981,6 +1986,10 @@ export class ChatRuntime extends EventEmitter {
           : record.nativeSessionId ? { resume: record.nativeSessionId } : {}),
         ...(extensions?.servers.length ? { mcpServers: extensions.servers } : {}),
       }
+      // Snapshot the stranded worker before starting the new agent: the
+      // start replaces the worker row, and the orphan cleanup at the end of
+      // the start must judge the OLD worker's group, not the new one's.
+      const staleWorker = record.orphanNotice ? storage.getWorker(record.id) : null
       let started
       try {
         started = await adapter.start(startOptions)
@@ -2021,12 +2030,13 @@ export class ChatRuntime extends EventEmitter {
       // stranded by a restart heals on resume without anyone killing
       // processes by hand. An open turn that turn left behind is
       // interrupted — its agent ran unseen, so its outcome is unknown —
-      // and what waited behind it dispatches. This start's own turn is
-      // never touched.
+      // and what waited behind it dispatches. This start's own turn and
+      // worker are never touched: the liveness check judges the snapshot
+      // from before the start, and the row is only forgotten when it still
+      // names that old worker.
       if (record.orphanNotice) {
-        const recorded = storage.getWorker(record.id)
-        if (!recorded || (!pgidAlive(recorded.gatePgid) && !pidAlive(recorded.gatePid))) {
-          if (recorded && storage.getWorker(record.id)?.ident === recorded.ident) storage.forgetWorker(record.id)
+        if (!staleWorker || (!pgidAlive(staleWorker.gatePgid) && !pidAlive(staleWorker.gatePid))) {
+          if (staleWorker && storage.getWorker(record.id)?.ident === staleWorker.ident) storage.forgetWorker(record.id)
           const staleRelay = storage.getRelay(record.id)
           if (staleRelay && !pidAlive(staleRelay.relayPid)) {
             storage.forgetRelay(record.id)
@@ -4110,7 +4120,17 @@ export class ChatRuntime extends EventEmitter {
           storage.saveSession(owner)
         }
       }
-      this.emit_(record.id, { type: 'status.changed', status: session.record.status, detail: `checkpointed ${owner.title}'s changes on ${state.currentBranch}` })
+      // A checkpoint on a detached HEAD belongs to no branch: without a
+      // reference it would dangle once the switch below moves away. Only
+      // self-ownership reaches here on a detached HEAD (no session names
+      // ''), so the session keeps it on a stable per-session branch.
+      let retained = ''
+      if (!state.currentBranch && owner.id === record.id && result.sha) {
+        const name = `poise/checkpoint/${record.id.slice(0, 8)}`
+        await moveBranch(lease, record.checkout, name, result.sha)
+        retained = ` (kept on branch ${name})`
+      }
+      this.emit_(record.id, { type: 'status.changed', status: session.record.status, detail: `checkpointed ${owner.title}'s changes on ${state.currentBranch || 'a detached HEAD'}${retained}` })
     }
   }
 
