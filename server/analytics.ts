@@ -300,13 +300,16 @@ async function readOrganization(org: Organization, me: string, window: Analytics
     const read = async (kind: 'issue' | 'pr'): Promise<DatastoreRecord[]> => {
       const view = kind === 'pr' ? 'prs' : 'issues'
       const ref = kind === 'pr' ? 'pr_ref' : 'issue_ref'
+      // Enumerate covering-index keys and keep range loops ahead of view
+      // lookups, streaming IDs before the first possible yield.
+      const source = window.since
+        ? `(SELECT DISTINCT repo_id FROM items) AS repositories
+          CROSS JOIN items AS recent CROSS JOIN ${view} v`
+        : `${view} v`
       const params: string[] = []
       const filters: string[] = []
-      // Enumerate repository keys from a covering index, then seek each time
-      // range before reading payload rows or checking involvement.
       if (window.since) {
-        filters.push(`${ref} IN (SELECT item_id FROM items
-          WHERE repo_id IN (SELECT DISTINCT repo_id FROM items) AND updated_at >= ?)`)
+        filters.push(`recent.repo_id = repositories.repo_id AND recent.updated_at >= ? AND v.${ref} = recent.item_id`)
         params.push(new Date(window.since).toISOString().slice(0, 19))
       }
       const scopes = scopeByKind[kind].map(scope => {
@@ -317,7 +320,7 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         }
         if (scope[1] === '--author') {
           params.push(scope[2])
-          return 'author = ?'
+          return 'v.author = ?'
         }
         return '1'
       })
@@ -327,13 +330,13 @@ async function readOrganization(org: Organization, me: string, window: Analytics
       // deleted account leaves either login NULL.
       // Discussion counts and size JSON are only used for PRs merged in
       // this window; openings and first reviews need none of that payload.
-      const details = kind === 'pr' ? `pr_ref, 0 AS comments_count,
-        (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = pr_ref AND r.submitted_at IS NOT NULL
-          AND r.state <> 'PENDING' AND (r.author_login IS NULL OR author IS NULL OR lower(r.author_login) <> lower(author))) AS first_review_at`
+      const details = kind === 'pr' ? `v.pr_ref, 0 AS comments_count,
+        (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = v.pr_ref AND r.submitted_at IS NOT NULL
+          AND r.state <> 'PENDING' AND (r.author_login IS NULL OR v.author IS NULL OR lower(r.author_login) <> lower(v.author))) AS first_review_at`
         : '0 AS comments_count'
       const query = db.prepare<string[], DatastoreRecord>(`
-        SELECT repo, number, status, author, updated_at, created_at, closed_at, title, url, ${details}
-        FROM ${view} v WHERE ${filters.join(' AND ')}
+        SELECT v.repo, v.number, v.status, v.author, v.updated_at, v.created_at, v.closed_at, v.title, v.url, ${details}
+        FROM ${source} WHERE ${filters.join(' AND ')}
       `)
       const rows: DatastoreRecord[] = []
       let sliceStart = performance.now()

@@ -394,18 +394,71 @@ describe('reading what Current shows', () => {
           const report = await readAnalytics(window, 'alpha')
           expect(report.issues.opened).toBe(window === WEEK ? issues : 0)
           expect(report.pullRequests.merged).toBe(window === WEEK ? merged : 0)
-          queries = prepare.mock.calls.map(([sql]) => sql).filter(sql => /FROM (prs|issues) v WHERE/.test(sql))
+          queries = prepare.mock.calls.map(([sql]) => sql).filter(sql => /(?:FROM|CROSS JOIN) (prs|issues) v\b/.test(sql))
         } finally { prepare.mockRestore() }
         expect(queries).toHaveLength(2)
         const params = [window.since.slice(0, 19), ...(me ? [me, ...(agentAccount ? [agentAccount] : [])] : [])]
         for (const sql of queries) {
           const plan = db.prepare<string[], { detail: string }>('EXPLAIN QUERY PLAN ' + sql).all(...params).map(row => row.detail)
           expect(plan).toContain('SEARCH i USING INTEGER PRIMARY KEY (rowid=?)')
-          expect(plan).toContain('SEARCH items USING COVERING INDEX idx_items_repo_updated (repo_id=? AND updated_at>?)')
+          expect(plan).toContain('SEARCH recent USING COVERING INDEX idx_items_repo_updated (repo_id=? AND updated_at>?)')
+          expect(plan).toContain('CO-ROUTINE repositories')
         }
       }
     } finally { db.close() }
   })
+
+  it('streams the first row of dense bounded windows before materializing their history', async () => {
+    const prepare = vi.spyOn(Database.prototype, 'prepare')
+    let queries: string[]
+    try {
+      await readAnalytics(WEEK, 'alpha')
+      queries = prepare.mock.calls.map(([sql]) => sql).filter(sql => /(?:FROM|CROSS JOIN) (prs|issues) v\b/.test(sql))
+    } finally { prepare.mockRestore() }
+    expect(queries).toHaveLength(2)
+    const db = new Database(mocks.orgs[0].datastorePath)
+    try {
+      db.exec(`UPDATE repos SET name='r1', full_name='alpha/r1' WHERE repo_id=1;
+        WITH RECURSIVE keys(n) AS (VALUES(2) UNION ALL SELECT n+1 FROM keys WHERE n<20)
+        INSERT INTO repos SELECT n, 'repo-'||n, 'alpha', 'r'||n, 'alpha/r'||n, 0, 0, 1, '{}', '2026-10-06' FROM keys;
+        WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<500000)
+        INSERT INTO items (node_id,repo_id,repo_full_name,number,item_type,state,title,body,author_login,created_at,updated_at,raw_json,expanded_json,synced_at)
+        SELECT 'dense-'||n, (n-1)%20+1, 'alpha/r'||((n-1)%20+1), n,
+          CASE ((n-1)/20)%2 WHEN 0 THEN 'pr' ELSE 'issue' END,
+          'open', 'fixture', 'abcd', 'robot', '2026-10-06T00:00:00Z', '2026-10-06T00:00:00Z', '{}', '{}', '2026-10-06' FROM rows`)
+      const median = (values: number[]) => {
+        const sorted = [...values].sort((a, b) => a - b)
+        return (sorted[1] + sorted[2]) / 2
+      }
+      for (const sql of queries) {
+        const view = /(?:FROM|CROSS JOIN) (prs|issues) v\b/.exec(sql)![1]
+        const ref = view === 'prs' ? 'pr_ref' : 'issue_ref'
+        const streaming = db.prepare<string[], { number: number }>(sql)
+        const materialized = db.prepare<string[], { number: number }>(`SELECT number FROM ${view} v WHERE ${ref} IN (
+          SELECT item_id FROM items WHERE repo_id IN (SELECT DISTINCT repo_id FROM items) AND updated_at >= ?)`)
+        const first = (query: typeof streaming, params: string[]) => {
+          const iterator = query.iterate(...params)
+          try {
+            const start = performance.now(), row = iterator.next(), ms = performance.now() - start
+            expect(row.done).toBe(false)
+            return { ms, number: row.value!.number }
+          } finally { iterator.return?.() }
+        }
+        const samples = { streaming: [] as number[], materialized: [] as number[] }
+        const measure = (kind: keyof typeof samples) => {
+          const result = kind === 'streaming' ? first(streaming, [WEEK.since.slice(0, 19), 'octocat', 'robot']) : first(materialized, [WEEK.since.slice(0, 19)])
+          expect(result.number).toBe(view === 'prs' ? 1 : 21)
+          samples[kind].push(result.ms)
+        }
+        for (let pair = 0; pair < 4; pair++) {
+          if (pair % 2) { measure('streaming'); measure('materialized') }
+          else { measure('materialized'); measure('streaming') }
+        }
+        process.stdout.write(`${JSON.stringify({ analyticsFirstYield: { view, rows: 500000, samples } })}\n`)
+        expect(median(samples.streaming)).toBeLessThan(median(samples.materialized) / 4)
+      }
+    } finally { db.close() }
+  }, 30_000)
 
   it('counts reviewed revisions and affected PRs through merge, without extra CLI calls', async () => {
     const first = seed(pr(1, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00.500Z', { title: 'feat(ui)!: add analytics' }), 'pr', true)
