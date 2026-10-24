@@ -273,6 +273,13 @@ export interface StallState {
   repos: StallRepo[]
   /** Further task repos with leftover work beyond the kept 20. */
   truncatedRepos?: number
+  /** Workspace-relative directories discovery could not scan, sorted, at
+   *  most 20 kept: unreadable paths and where a scan bound stopped. The
+   *  scan below them is unknown, so the marker stays conservative while
+   *  any are listed. */
+  unreadablePaths?: string[]
+  /** Further unscanned directories beyond the kept 20. */
+  unreadableTruncated?: number
   /** Still-running background jobs, oldest first, tracked without a cap;
    *  only the notice rendering keeps 20. */
   backgroundJobs: StalledJob[]

@@ -234,7 +234,12 @@ function stallSummary(stall: StallState): string {
   for (const job of stall.backgroundJobs.slice(0, 20)) parts.push(`background job "${job.command}" (pid ${job.pid}) still running`)
   const hiddenJobs = stall.backgroundJobs.length - Math.min(stall.backgroundJobs.length, 20)
   if (hiddenJobs) parts.push(`${hiddenJobs} more background job${hiddenJobs === 1 ? '' : 's'} still running`)
-  if (stall.truncatedRepos) parts.push(`${stall.truncatedRepos} more task repo${stall.truncatedRepos === 1 ? '' : 's'} with leftover work`)
+  // Mirrors the server's notice: unscanned paths are named, never counted
+  // as task repos.
+  if (stall.unreadablePaths?.length) {
+    const more = stall.unreadableTruncated ? ` (+${stall.unreadableTruncated} more)` : ''
+    parts.push(`unscanned directories ${stall.unreadablePaths.join(', ')}${more}`)
+  } else if (stall.truncatedRepos) parts.push(`${stall.truncatedRepos} more task repo${stall.truncatedRepos === 1 ? '' : 's'} with leftover work`)
   if (!parts.length) return 'Stalled — the last turn left work behind.'
   return `Stalled — the last turn left ${parts.join(', ')}.`
 }

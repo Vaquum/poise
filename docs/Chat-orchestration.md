@@ -427,9 +427,16 @@ silently: unpushed commits, uncommitted changes and still-running background
 jobs flag the chat as stalled in the session list and its header, and queue
 one wake notice for the episode — a worker that keeps ending turns with the
 same leftover is not nagged again. Repo sessions read the shared checkout
-on the session branch; a local worker's task repos are its nested clones,
-while the workspace root itself is Poise's checkpoint store and never
-flags. A tracked background job that finishes wakes the chat once with its
+on the session branch; a local worker's task repos are its nested clones at
+any depth, hidden directories included — `.git` and `node_modules` are never
+entered and symlinked directories are never followed — while the workspace
+root itself is Poise's checkpoint store and never flags. Discovery descends
+into found clones, so nested clones, linked worktrees and submodules are
+inspected like the rest; a linked worktree is followed even outside the
+workspace, while any other clone outside it is out of scope. Paths the scan
+cannot read, and where a scan stopped past its entry or time bound, are named
+on the marker and the wake notice; the marker stays conservative instead of
+reading as clean. A tracked background job that finishes wakes the chat once with its
 identity and timing; its exit code is unobservable once reparented, so the
 woken turn reads the job's own result. The marker clears when a turn end
 finds nothing left. Unbound chats stay out: ending a turn with work in
