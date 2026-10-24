@@ -103,7 +103,7 @@ export function deriveSessionTitle(text: string, opts: DeriveOptions = {}): stri
 /** Whether the first turn may name the chat: never a hand-set name, a change
  *  session titled by its request, an internal turn, or the Manager. */
 export function shouldAutoName(
-  record: { title: string, titleManual?: boolean, selfChangeId?: string, role?: 'manager', contextResetSeq?: number },
+  record: { title: string, titleManual?: boolean, selfChangeId?: string, role?: 'manager' | 'worker', contextResetSeq?: number },
   isFirst: boolean,
   internal: boolean,
 ): boolean {

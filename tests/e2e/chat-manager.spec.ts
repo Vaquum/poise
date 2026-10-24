@@ -147,6 +147,15 @@ test('marks /manager as built in, edits it without a Delete, and refuses it in r
   await input(page).press('Enter')
   await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
   expect(sock.framesOf('prompt')[0].command).toMatchObject({ type: 'prompt', sessionId: 'm1', text: '/manager hello' })
+
+  await page.locator('.chat-session-item[data-id="s1"]').click()
+  await expect(page.locator('.chat-session-item[data-id="s1"]')).toHaveClass(/active/)
+  await input(page).fill('/reset /manager hello')
+  await input(page).press('Enter')
+  await expect(page.locator('.chat-notice')).toHaveText('/manager is not supported in regular chats.')
+  await expect(input(page)).toHaveValue('/reset /manager hello')
+  expect(sock.framesOf('prompt')).toHaveLength(1)
+  expect(sock.framesOf('context.reset')).toEqual([])
 })
 
 test('shows the retired-model notice in the Manager header', async ({ page }) => {

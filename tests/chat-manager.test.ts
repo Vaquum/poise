@@ -249,7 +249,7 @@ describe('one Manager chat per workspace', () => {
     const body = { agent: 'grok', model: GROK_MODEL, role: 'manager' }
     const plain = await postSessions(body, false)
     expect(plain.status).toBe(403)
-    expect(await plain.json()).toEqual({ error: 'A Manager is created from the New session dialog in the browser.', code: 'invalid' })
+    expect(await plain.json()).toEqual({ error: 'A Manager or Worker is created from the New session dialog in the browser.', code: 'invalid' })
 
     const socket = new WebSocket(origin.replace('http:', 'ws:') + '/ws/chat')
     try {
@@ -273,7 +273,7 @@ describe('one Manager chat per workspace', () => {
     const requestId = randomUUID()
     const refused = await controlRequest(parent.id, { operation: 'create', requestId, title: 'Sneaky', task: 'Take over', role: 'manager' })
     expect(refused.status).toBe(403)
-    expect(await refused.json()).toEqual({ error: 'A Manager is created by the person in the New session dialog.' })
+    expect(await refused.json()).toEqual({ error: 'A Manager or Worker is created by the person in the New session dialog.' })
     expect(database.db.prepare('SELECT request_id FROM chat_command_receipts WHERE request_id = ?').get(requestId)).toBeUndefined()
 
     const connection = await config(parent.id)
@@ -288,7 +288,7 @@ describe('one Manager chat per workspace', () => {
 
   it('validates the role in the runtime itself', async () => {
     await expect(runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'boss' as 'manager' }))
-      .rejects.toMatchObject({ statusCode: 400, code: 'invalid', message: 'role must be "manager" or absent' })
+      .rejects.toMatchObject({ statusCode: 400, code: 'invalid', message: 'role must be "manager", "worker" or absent' })
     for (const extra of [{ repo: 'acme/app' }, { branch: { existing: 'main' } }, { checkout: '/tmp/x' }] as const) {
       await expect(runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'manager', ...extra }))
         .rejects.toMatchObject({ statusCode: 400, code: 'invalid',

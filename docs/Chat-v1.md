@@ -185,9 +185,9 @@ deleting never duplicate it, and deleting frees it for the next chat.
 One Manager session can exist per Poise instance (`ChatRuntime.instance`,
 `poise-<label>:<POISE_DB>`), enforced by a unique SQLite index on
 `chat_sessions(instance)` where the role column is `'manager'`. The person
-creates it in the New session dialog, which offers a Type choice of Chat or
-Manager; only REST `POST /api/chat/sessions` with a browser `Origin` creates
-one (in service mode, through the gateway's assertion). WebSocket `session.new`
+creates it in the New session dialog, which offers a Type choice of Chat,
+Worker or Manager; only REST `POST /api/chat/sessions` with a browser `Origin`
+creates one (in service mode, through the gateway's assertion). WebSocket `session.new`
 and control `create` refuse a role. The `Origin` rule is cooperative: it refuses
 the documented non-browser paths, but a loopback process can still send
 `curl -H 'Origin: http://127.0.0.1:<port>' …` and create a Manager. The Manager
@@ -201,6 +201,10 @@ singleton at once. When its model leaves the catalogue, the next startup keeps
 the Manager instead of deleting it, marks `retiredModel`, and refuses every
 turn until the person picks another model with `set_model`; retirement is
 detected at startup only. A closed Manager still holds the key.
+
+A worker (`role: 'worker'`) is created the same way, with no singleton limit;
+unlike the Manager it keeps the requested title and is auto-titled like any
+chat. It keeps its role through a fork; a handoff starts an ordinary chat.
 
 Other chats are named from the first message when the first turn starts. When
 the message references a GitHub issue or PR, the chat takes that item's title
