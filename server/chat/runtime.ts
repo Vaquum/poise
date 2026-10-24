@@ -28,7 +28,7 @@ import { MANAGER_SWITCH, WORKER_SWITCH } from '../../src/chat-switches'
 import { deriveSessionTitle, parseIssueReference, shouldAutoName } from '../../src/chat-title'
 import { resolveIssueTitle } from './issue-titles'
 import { appendMemories } from './memory-content'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { armQueue, enqueueMessage, transferQueuedContext, readQueue, updateQueuedModel, removeQueuedMessage, pauseQueue, QueueError, queueOwner, delegateQueue } from './message-queue'
 import type { MessageQueue, QueuedMessage } from './protocol'
@@ -46,6 +46,7 @@ import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../m
 import { db, getMeta, setMeta } from '../db'
 import { claudeAuth } from '../claude-auth'
 import { HttpError } from '../http'
+import { diagnostic } from '../logging'
 import { chatTurnFinished, chatWaiting, chatWaitingEnded, type ChatSessionAlertContext } from '../alerts/producers'
 import { localCheckoutPath } from '../gh'
 import { discardUnclaimedWorkspace, ensureLocalWorkspace, ensureWorkerWorkspace, ensureWorkerWorkspaceDirectory, LOCAL_CHAT_ROOT, workerWorkspaceRef, workspaceMarkerValid } from './local-workspace'
@@ -65,7 +66,7 @@ import {
 } from './git'
 import {
   AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, SWITCH_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type EditDecision, type NewSessionRequest,
-  type Mention, type PermissionOption, type PersonActor, type PoiseActor, type PromptInput, type PromptReceipt, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type TurnSource, type WorkspaceState,
+  type Mention, type PermissionOption, type PersonActor, type PoiseActor, type PromptInput, type PromptReceipt, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type ToolKind, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
 // Only the sender label, used inside runTurn: a Switchboard relay is the
@@ -111,6 +112,11 @@ const isSwitchboardChat = (record: SessionRecord): boolean => record.context?.ki
 export const DEFAULT_IDLE_TIMEOUT_MINUTES = 120
 export const DEFAULT_BRANCH_PREFIX = 'chat/'
 export const DEFAULT_MAX_CONCURRENT_LOCAL_TURNS = DEFAULT_CHECK_SLOT_CAP
+/** Consecutive repeated no-op tool completions that end a worker turn:
+ *  the same command with the same result, no edits and no diffs. A result
+ *  that changes (CI pending → success) or any edit resets the streak, so
+ *  ordinary waits survive while an identical poll loop is cut. */
+const WORKER_NOOP_REPEAT_LIMIT = 20
 const STOP_SETTLE_MS = 2_000
 const CLOSE_GRACE_MS = 5_000
 const SERVICE_SETTLE_MS = 5_000
@@ -158,6 +164,12 @@ interface RunningTurn {
   /** Who stopped this turn: set only by a stop that arrives before the turn
    *  is stopping, so a redundant cancel never relabels it. */
   stoppedBy?: ChatActor | PersonActor
+  /** Set when a guard ends the turn: it settles as end_turn with the
+   *  reason recorded, never as a stop by anyone. */
+  guardEnd?: string
+  /** No-op loop tracking for worker turns: open tools by id, fingerprints
+   *  completed before, and the current consecutive-repeat streak. */
+  noOp?: { open: Map<string, { kind: ToolKind, title: string }>, seen: Set<string>, repeats: number }
   /** Set when the turn must end as an error (mirror failure, lost lease, forced stop). */
   failure?: string
   /** The one implementing turn of a `/poise` change: its settlement is the
@@ -862,7 +874,8 @@ export class ChatRuntime extends EventEmitter {
           outbound: outbound.bytes, outboundTruncated: outbound.truncated,
           session: { nativeSessionId: record.nativeSessionId ?? '', modelId: record.modelId, effort: record.effort,
             ...(record.mode ? { mode: record.mode } : {}), safeMode: record.safeMode === true,
-            ...(record.efforts ? { efforts: record.efforts } : {}), ...(record.commands ? { commands: record.commands } : {}) },
+            ...(record.efforts ? { efforts: record.efforts } : {}), ...(record.commands ? { commands: record.commands } : {}),
+            ...(record.role === 'worker' ? { worker: true } : {}) },
           recalledDiffs: recalledDiffs(persisted.map((envelope) => envelope.event), open.turnId),
         })
       } finally {
@@ -940,10 +953,12 @@ export class ChatRuntime extends EventEmitter {
    *  runTurn's finally block step for step; keep them in sync. */
   private async settleReplayedTurn(session: LiveSession, turn: RunningTurn, lease: CheckoutLease, result: TurnResult): Promise<void> {
     const record = session.record
+    if (result.note) this.recordTurnNote(session, turn, result.note)
     this.releaseLocalTurnSlot(turn)
     this.settlePending(session, 'cancelled')
     let freed = true
-    let stopReason: StopReason = turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
+    let stopReason: StopReason = turn.guardEnd && !turn.failure ? 'end_turn'
+      : turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
     let error = result.error
     if (turn.failure && stopReason !== 'cancelled') { stopReason = 'error'; error = turn.failure }
     // An adopted turn's pre-restart relay and agent retire at this idle
@@ -2004,6 +2019,7 @@ export class ChatRuntime extends EventEmitter {
           ? (record.agent === 'claude' ? { forkFrom: options.forkFrom.nativeSessionId } : { resume: record.nativeSessionId })
           : record.nativeSessionId ? { resume: record.nativeSessionId } : {}),
         ...(extensions?.servers.length ? { mcpServers: extensions.servers } : {}),
+        ...(record.role === 'worker' ? { worker: true } : {}),
       }
       // Snapshot the stranded worker before starting the new agent: the
       // start replaces the worker row, and the orphan cleanup at the end of
@@ -2025,6 +2041,7 @@ export class ChatRuntime extends EventEmitter {
           safeMode: record.safeMode === true,
           ...(record.mode ? { mode: record.mode } : {}),
           ...(extensions?.servers.length ? { mcpServers: extensions.servers } : {}),
+          ...(record.role === 'worker' ? { worker: true } : {}),
         }
         started = await adapter.start(startOptions)
       }
@@ -3421,7 +3438,10 @@ export class ChatRuntime extends EventEmitter {
       }
       agentSettled = true
       if (record.queuedHandoff && result.stopReason === 'end_turn') { record.queuedHandoff = undefined; this.saveRecord(session) }
-      stopReason = turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
+      if (result.note) this.recordTurnNote(session, turn, result.note)
+      // A guard end is not a stop: the turn finished without work left.
+      stopReason = turn.guardEnd && !turn.failure ? 'end_turn'
+        : turn.stopping || turn.abort.signal.aborted ? 'cancelled' : result.stopReason
       error = result.error
       usage = result.usage
       terminate = result.terminate === true
@@ -3435,6 +3455,7 @@ export class ChatRuntime extends EventEmitter {
         error = cancelled
           ? (turn.failure && turn.failure !== 'cancelled before it started' ? turn.failure : undefined)
           : err instanceof CallerCompatError ? err.message : `${err instanceof Error ? err.message : String(err)}`
+        if (turn.guardEnd && !turn.failure) { stopReason = 'end_turn'; error = undefined }
         try {
           if (!started) this.emit_(record.id, { type: 'turn.started', turnId: turn.id, prompt: turn.shown ?? input, callId: turn.callId ?? undefined, ...(turn.source ? { source: turn.source } : {}) })
           if (!cancelled) this.emit_(record.id, { type: 'error', message: error || 'turn failed', recoverable: true })
@@ -4502,6 +4523,65 @@ export class ChatRuntime extends EventEmitter {
     session.extensionNotices = shown
   }
 
+  /** Record why a guard ended a turn: a transcript notice the person can
+   *  read, a structured diagnostic, and the server log. Never a stop. */
+  private recordTurnNote(session: LiveSession, turn: RunningTurn, note: string, detail: Record<string, unknown> = {}): void {
+    try { this.emit_(session.record.id, { type: 'error', message: `[Poise] ${note}`, recoverable: true }) } catch { /* mirror */ }
+    diagnostic({ level: 'warning', operation: 'chat.turn.guard', target: turn.id, message: note,
+      context: { sessionId: session.record.id, turnId: turn.id, agent: session.record.agent, ...detail } })
+    this.emit('log', `[chat ${session.record.id.slice(0, 8)}] ${note}`)
+  }
+
+  /** A completed tool's identity for the no-op guard: kind, title, status
+   *  and a hash of the result text. Byte-identical by design: a result that
+   *  changes (CI pending → success) is new work, while a volatile output
+   *  (ticking durations) fails open — the guard does not fire on it. */
+  private toolFingerprint(kind: ToolKind, title: string, event: Extract<ChatEvent, { type: 'tool.finished' }>): string {
+    const parts: string[] = []
+    for (const block of event.content ?? []) {
+      if (block.type === 'terminal') parts.push(`terminal:${block.exitCode ?? ''}:${block.text}`)
+      else if (block.type === 'text') parts.push(`text:${block.text}`)
+      else parts.push(`diff:${block.path}:${block.oldText}:${block.newText}`)
+    }
+    return `${kind}\0${title}\0${event.status}\0${createHash('sha256').update(parts.join('\n')).digest('hex')}`
+  }
+
+  /** End a worker turn stuck polling the same no-op checks: consecutive
+   *  completions whose fingerprint was seen before, with no edits and no
+   *  diffs. The turn settles as end_turn with the reason recorded — the
+   *  model has nothing left but waiting, and Poise wakes it on change. */
+  private noOpGuard(sessionId: string, event: ChatEvent): void {
+    if (event.type !== 'tool.started' && event.type !== 'tool.finished' && event.type !== 'diff') return
+    const session = this.live.get(sessionId)
+    if (!session || session.record.role !== 'worker') return
+    const turn = session.turn
+    if (!turn || turn.id !== event.turnId || turn.stopping || turn.abort.signal.aborted || turn.guardEnd) return
+    const state = turn.noOp ??= { open: new Map(), seen: new Set(), repeats: 0 }
+    if (event.type === 'diff') { state.repeats = 0; return }
+    if (event.type === 'tool.started') {
+      state.open.set(event.id, { kind: event.kind, title: event.title })
+      if (event.kind === 'edit') state.repeats = 0
+      return
+    }
+    const open = state.open.get(event.id)
+    state.open.delete(event.id)
+    const kind = open?.kind ?? 'other'
+    if (kind === 'edit') { state.repeats = 0; return }
+    const fingerprint = this.toolFingerprint(kind, open?.title ?? '', event)
+    if (!state.seen.has(fingerprint)) {
+      state.seen.add(fingerprint)
+      state.repeats = 0
+      return
+    }
+    state.repeats += 1
+    if (state.repeats < WORKER_NOOP_REPEAT_LIMIT) return
+    const reason = `the turn repeated the same no-op checks ${WORKER_NOOP_REPEAT_LIMIT} times (${kind}: ${open?.title ?? event.id}) with unchanged results and no edits; Poise ended it. The turn resumes on its next wake.`
+    turn.guardEnd = reason
+    this.recordTurnNote(session, turn, reason, { repeats: state.repeats })
+    turn.abort.abort()
+    void session.adapter?.cancel().catch(() => undefined)
+  }
+
   /** Append to the mirror, then broadcast. Throws when the mirror cannot be
    *  written; callers that run on the agent's behalf turn that into a stop. */
   private emit_(sessionId: string, event: ChatEvent): ChatEnvelope {
@@ -4513,6 +4593,7 @@ export class ChatRuntime extends EventEmitter {
     const live = this.live.get(sessionId)
     if (live) live.record.lastSeq = envelope.seq
     this.emit('event', envelope)
+    this.noOpGuard(sessionId, event)
     return envelope
   }
 

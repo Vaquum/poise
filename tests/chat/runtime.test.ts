@@ -53,6 +53,8 @@ class FakeAdapter implements Adapter {
   cancelled = 0
   closed = 0
   auto = true
+  onPrompt: ((turnId: string) => void) | null = null
+  noteOnEnd: string | null = null
   private finishTurn: ((stop?: 'end_turn' | 'cancelled') => void) | null = null
   private exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = []
   constructor(readonly host: AdapterHost, readonly controls: FakeControls) {
@@ -81,7 +83,8 @@ class FakeAdapter implements Adapter {
     this.inputs.push(input)
     this.promptPolicies.push(this.effectiveSafeMode)
     this.host.emit({ type: 'text.delta', turnId, messageId: `${turnId}:m1`, delta: `echo: ${input.text}` })
-    if (this.auto) return { stopReason: 'end_turn' as const, usage: { totalTokens: 3 } }
+    this.onPrompt?.(turnId)
+    if (this.auto) return { stopReason: 'end_turn' as const, usage: { totalTokens: 3 }, ...(this.noteOnEnd ? { note: this.noteOnEnd } : {}) }
     return new Promise<{ stopReason: 'end_turn' | 'cancelled' }>((resolve) => {
       this.finishTurn = (stop = 'end_turn') => { this.finishTurn = null; resolve({ stopReason: stop }) }
       signal.addEventListener('abort', () => this.finishTurn?.('cancelled'), { once: true })
@@ -1211,6 +1214,94 @@ describe('Extensions in the runtime', () => {
     const stored = JSON.stringify(storage.listEvents(session.id, 0).events)
     expect(stored).not.toContain('sk-live-0123456789')
     expect(stored).toContain('echo: print [redacted]')
+  })
+})
+
+describe('worker turn guards', () => {
+  const POLL = 'gh pr view 600 --json state,reviews'
+  function emitPoll(host: AdapterHost, turnId: string, id: string, output: string): void {
+    host.emit({ type: 'tool.started', turnId, id, kind: 'execute', title: POLL })
+    host.emit({ type: 'tool.finished', turnId, id, status: 'completed', content: [{ type: 'terminal', text: output, exitCode: 0 }] })
+  }
+
+  it('ends a worker turn looping on identical checks as end_turn, never as a stop', async () => {
+    const caller = fakeCaller()
+    const { runtime, controls, events } = makeRuntime({ caller })
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'guard-loop' }, role: 'worker' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(controls.adapters[0].starts[0]).toMatchObject({ worker: true })
+    controls.adapters[0].onPrompt = (turnId) => {
+      const host = controls.hosts[0]
+      for (let i = 0; i < 25; i++) emitPoll(host, turnId, `poll-${i}`, 'CHANGES_REQUESTED\n')
+    }
+    const { turnId } = await runtime.prompt(session.id, { text: 'wait for review', attachments: [], mentions: [] }) as { turnId: string }
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    const finished = ofType(events, session.id, 'turn.finished')[0]
+    expect(finished).toMatchObject({ turnId, stopReason: 'end_turn' })
+    expect(finished.stoppedBy).toBeUndefined()
+    expect(controls.adapters[0].cancelled).toBe(1)
+    expect(ofType(events, session.id, 'error').some((e) => e.message.includes('repeated the same no-op checks 20 times'))).toBe(true)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(caller.finishes).toEqual([{ callId: 'a'.repeat(32), status: 'completed', error: undefined }])
+    // The chat is not held: the next prompt runs.
+    controls.adapters[0].onPrompt = null
+    await runtime.prompt(session.id, { text: 'after guard', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    expect(ofType(events, session.id, 'turn.finished')[1].stopReason).toBe('end_turn')
+    await runtime.stop()
+  })
+
+  it('does not end a worker turn whose repeated checks change result', async () => {
+    const { runtime, controls, events } = makeRuntime({})
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'guard-change' }, role: 'worker' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    controls.adapters[0].auto = false
+    controls.adapters[0].onPrompt = (turnId) => {
+      const host = controls.hosts[0]
+      for (let i = 0; i < 19; i++) emitPoll(host, turnId, `pending-${i}`, 'PENDING\n')
+      emitPoll(host, turnId, 'pending-19', 'SUCCESS\n')
+      for (let i = 20; i < 39; i++) emitPoll(host, turnId, `pending-${i}`, 'SUCCESS\n')
+    }
+    await runtime.prompt(session.id, { text: 'wait for CI', attachments: [], mentions: [] })
+    await waitFor(() => lastStatus(events, session.id) === 'running')
+    controls.adapters[0].finish()
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    expect(ofType(events, session.id, 'turn.finished')[0].stopReason).toBe('end_turn')
+    expect(controls.adapters[0].cancelled).toBe(0)
+    expect(ofType(events, session.id, 'error').some((e) => e.message.includes('no-op checks'))).toBe(false)
+    await runtime.stop()
+  })
+
+  it('does not bound identical checks outside a worker chat', async () => {
+    const { runtime, controls, events } = makeRuntime({})
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'guard-plain' } })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(controls.adapters[0].starts[0]).not.toHaveProperty('worker')
+    controls.adapters[0].auto = false
+    controls.adapters[0].onPrompt = (turnId) => {
+      const host = controls.hosts[0]
+      for (let i = 0; i < 25; i++) emitPoll(host, turnId, `poll-${i}`, 'CHANGES_REQUESTED\n')
+    }
+    await runtime.prompt(session.id, { text: 'wait for review', attachments: [], mentions: [] })
+    await waitFor(() => lastStatus(events, session.id) === 'running')
+    controls.adapters[0].finish()
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    expect(ofType(events, session.id, 'turn.finished')[0].stopReason).toBe('end_turn')
+    expect(controls.adapters[0].cancelled).toBe(0)
+    expect(ofType(events, session.id, 'error').some((e) => e.message.includes('no-op checks'))).toBe(false)
+    await runtime.stop()
+  })
+
+  it('records an adapter turn note in the transcript', async () => {
+    const { runtime, controls, events } = makeRuntime({})
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'guard-note' }, role: 'worker' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    controls.adapters[0].noteOnEnd = 'Muse blocking reminders (goal-reminder) resumed the finished turn; Poise ended it after 1 allowed continuation. The turn resumes on its next wake.'
+    await runtime.prompt(session.id, { text: 'wait for review', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    expect(ofType(events, session.id, 'turn.finished')[0].stopReason).toBe('end_turn')
+    expect(ofType(events, session.id, 'error').some((e) => e.message.includes('goal-reminder'))).toBe(true)
+    await runtime.stop()
   })
 })
 

@@ -3,6 +3,8 @@ import { appendMemories } from '../memory-content'
 // Muse adapter: one `muse serve` process per session, speaking the Muse
 // Session Protocol (MSP v1, Muse 1.3.0; types in server/chat/generated/muse/
 // msp.d.ts — regenerate with `muse schema generate-ts`).
+// `turn/foregroundCompleted` (Muse 1.4.x) is outside the generated union,
+// so it is subscribed by raw name like session/started.
 //
 // Shape of a session:
 //   initialize → initialized → model/list → session/start | session/resume |
@@ -119,6 +121,14 @@ const EXIT_GRACE_MS = 3_000
 const STEER_SETTLE_MS = 30_000
 const OUTPUT_FLUSH_MS = 150
 const TRUNCATION_MARKER = '\n… [output truncated by Poise]'
+/** `turn/foregroundCompleted` firings one native turn of a worker session
+ *  may see before Poise ends it: the first is the model ending its work
+ *  (reminders may still nudge it once — verify-reminder catching an
+ *  unverified "done" is the useful case); the second proves a blocking
+ *  reminder is holding a finished turn open, so the Poise turn ends as
+ *  end_turn and the native turn is interrupted. 1.3.x never sends the
+ *  notification; those loops are caught by the runtime's no-op guard. */
+const WORKER_FOREGROUND_COMPLETION_LIMIT = 2
 
 // ── Generated-type pins ─────────────────────────────────────────────────
 // msp.d.ts only lists method names as string unions, so the params/result
@@ -275,6 +285,9 @@ interface ActiveTurn {
   steers: Map<string, string | undefined>
   /** Native turn ids this Poise turn has owned, oldest first. */
   nativeIds: string[]
+  /** `turn/foregroundCompleted` firings per native turn, with the latest
+   *  firing's blocking agents. */
+  foreground: Map<string, { count: number, agents: string[] }>
   endedNativeIds: Set<string>
   cancellationRequests: Map<string, Promise<void>>
   terminalError?: string
@@ -407,6 +420,9 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
   let active: ActiveTurn | null = null
   let lastFinishedNativeId: string | null = null
   let closing = false
+  /** A worker chat owns no conversation: Poise wakes its turns, and
+   *  Muse-side blocking continuation is bounded instead of open-ended. */
+  let workerSession = false
   const exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = []
   const loggedOnce = new Set<string>()
   /** Approvals and questions already being answered, by their id. */
@@ -887,6 +903,34 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       sessionId = undefined
       finish(active, { stopReason: 'error', error: `${LABEL} closed the session`, terminate: true })
     })
+    // The model's foreground work is done and named background reminder
+    // checks hold the turn open. Explicitly non-terminal: the turn ends
+    // only at turn/completed / turn/unqueued. In a worker session the
+    // second firing for one native turn ends the Poise turn — a finished
+    // worker turn has nothing to resume for — and the native turn is
+    // interrupted so the next wake starts instead of queueing behind it.
+    rpc!.onNotification('turn/foregroundCompleted', (params) => {
+      if (!params || typeof params !== 'object') return
+      const view = params as { sessionId?: unknown, turnId?: unknown, blockingAgents?: unknown }
+      if (view.sessionId !== sessionId || typeof view.turnId !== 'string') return
+      const turn = turnFor(view.turnId)
+      if (!turn) return
+      const agents = Array.isArray(view.blockingAgents) ? view.blockingAgents.filter((agent): agent is string => typeof agent === 'string') : []
+      const seen = turn.foreground.get(view.turnId) ?? { count: 0, agents: [] as string[] }
+      seen.count += 1
+      seen.agents = agents
+      turn.foreground.set(view.turnId, seen)
+      const held = agents.join(', ') || 'unknown'
+      host.log(workerSession
+        ? `${LABEL}: foreground completed on ${view.turnId}, held open by ${held} (${seen.count}/${WORKER_FOREGROUND_COMPLETION_LIMIT})`
+        : `${LABEL}: foreground completed on ${view.turnId}, held open by ${held}`)
+      if (!workerSession || seen.count < WORKER_FOREGROUND_COMPLETION_LIMIT) return
+      // The interrupt first: its send is deferred, and a finished turn
+      // would skip it as done.
+      void interrupt(turn)
+      finish(turn, { stopReason: 'end_turn',
+        note: `Muse blocking reminders (${held}) resumed the finished turn; Poise ended it after ${seen.count - 1} allowed continuation. The turn resumes on its next wake.` })
+    })
 
     for (const method of IGNORED_NOTIFICATIONS) {
       rpc!.onNotification(method, () => logOnce(`ignored:${method}`, `${LABEL}: ignoring ${method} notifications`))
@@ -1303,6 +1347,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
         throw new AdapterError(AGENT, String(error), 'start_failed')
       }
       if (child) throw new AdapterError(AGENT, `${LABEL} adapter already started`, 'protocol')
+      workerSession = options.worker === true
       try {
         await launch(options.modelId)
       } catch (error) {
@@ -1387,6 +1432,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
         finishing: false,
         steers: new Map(),
         nativeIds: [],
+        foreground: new Map(),
         endedNativeIds: new Set(),
         cancellationRequests: new Map(),
         queued: false,
@@ -1430,6 +1476,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
       sessionId = init.session.nativeSessionId
       modelId = init.session.modelId
       effort = init.session.effort
+      workerSession = init.session.worker === true
       replayOutbound = init.outbound
       attachLink(init.peer)
       const replayLink = link()
@@ -1446,6 +1493,7 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
         finishing: false,
         steers: new Map(),
         nativeIds: [],
+        foreground: new Map(),
         endedNativeIds: new Set(),
         cancellationRequests: new Map(),
         queued: false,
