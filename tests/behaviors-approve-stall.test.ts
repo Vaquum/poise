@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
+import { CheckSemaphore } from '../server/check-semaphore'
 import { mocks, pr, NEXT_HEAD_SHA, loadModules, arrangeCli, fixture, deferred } from './behaviors-runtime-fixture'
+
+// This file pins sweep-deadline and cursor behavior under load, not the
+// shared launch budget: an open budget lets every eligible PR launch, and
+// behaviors-check-slots pins the default budget instead.
+function openLaunchBudget(runtime: { setBehaviorCheckSlots(slots: CheckSemaphore): void }): void {
+  runtime.setBehaviorCheckSlots(new CheckSemaphore(() => 64))
+}
 
 // Provider maintenance is unrelated to this regression: preparation resolves
 // immediately so the sweep's own deadline handling is what the tests observe.
@@ -67,6 +75,7 @@ describe('approve-prs under load', () => {
       ...pr, number: 17 + index, url: `https://github.com/${pr.repo}/pull/${17 + index}`,
     }))
     const { database: db, behaviors: runtime } = await startApproving(open)
+    openLaunchBudget(runtime)
     expect(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS).toBe(55_000)
     for (const number of [17, 18, 19]) {
       expect(db.claimPrOperationOwned(`${pr.repo}#${number}`, 600_000)).not.toBeNull()
@@ -218,6 +227,7 @@ describe('approve-prs under load', () => {
       ...pr, number: 17 + index, url: `https://github.com/${pr.repo}/pull/${17 + index}`,
     }))
     const { behaviors: runtime } = await startApproving(open)
+    openLaunchBudget(runtime)
     const original = mocks.runFile.getMockImplementation()!
     const fire = deferred<void>()
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {

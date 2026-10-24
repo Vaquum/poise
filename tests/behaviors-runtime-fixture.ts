@@ -28,6 +28,7 @@ vi.mock('../server/behavior-ledger', () => ({
 vi.mock('../server/process', () => ({
   runFile: mocks.runFile,
   spawnDetached: mocks.spawnDetached,
+  runningCallerLaunches: () => 0,
   claudeSubscriptionEnvironment: () => ({
     ANTHROPIC_API_KEY: undefined,
     ANTHROPIC_AUTH_TOKEN: undefined,

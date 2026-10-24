@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn() }))
 vi.mock('../server/process', () => ({
   runFile: mocks.runFile,
   spawnDetached: mocks.spawnDetached,
+  runningCallerLaunches: () => 0,
   claudeSubscriptionEnvironment: () => ({ CLAUDE_CLI: '/poise/claude-subscription' }),
 }))
 vi.mock('../server/claude-auth', () => ({

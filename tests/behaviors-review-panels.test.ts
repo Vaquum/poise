@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { CheckSemaphore } from '../server/check-semaphore'
 import { mocks, pr, HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
 describe('review panel scheduling and recovery', () => {
@@ -239,6 +240,9 @@ describe('review panel scheduling and recovery', () => {
     db.setMeta('behavior_review_new_prs_keyver', '3')
     db.setMeta('behavior_review_new_prs_enabled', '1')
     db.recordSeen('review-new-prs', '__snapshot_v3__')
+    // This test pins panel scheduling, not the shared launch budget: an open
+    // budget lets the held primary plus the new PR's whole panel all launch.
+    runtime.setBehaviorCheckSlots(new CheckSemaphore(() => 64))
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
 
