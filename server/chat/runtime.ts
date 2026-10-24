@@ -2426,6 +2426,9 @@ export class ChatRuntime extends EventEmitter {
       return { stopReason: 'error', error: 'The prompt was not re-run because the failed attempt had already run tools; the Muse session was restarted and the next prompt continues from a summary.' }
     }
     const retry = summary ? { ...promptInput, text: `${summary}\n\n[Current task]\n${promptInput.text}` } : promptInput
+    // The restart replaced the worker group: re-baseline before the retry
+    // prompt runs, so jobs it starts are new instead of pre-existing.
+    await this.snapshotJobBaseline(session, turn)
     return session.adapter!.prompt(turn.id, retry, turn.abort.signal)
   }
 
@@ -3322,7 +3325,6 @@ export class ChatRuntime extends EventEmitter {
           && !turn.stopping && !turn.abort.signal.aborted && !turn.failure) {
           result = await this.recoverStaleMuseTurn(session, turn, lease, promptInput)
           adapter = session.adapter!
-          await this.snapshotJobBaseline(session, turn)
         }
       } finally {
         session.relay?.turnFinish()
@@ -3414,6 +3416,12 @@ export class ChatRuntime extends EventEmitter {
           try { this.emit_(record.id, { type: 'error', message: `A steered message never ran and could not be queued as a follow-up (${reason}). Send it again as a new message.`, recoverable: true }) } catch { /* mirror */ }
         }
       }
+      // A bound turn that ends with work left behind never settles
+      // silently: detect it before the terminal event publishes, while the
+      // lease still holds the session's branch, so the dirty count is
+      // attributable and every consumer of turn.finished sees the marker.
+      // Never throws.
+      await this.detectTurnStall(session, turn, stopReason)
       let terminalRecorded = false
       const durationMs = Date.now() - turn.startedAt
       try {
@@ -3441,10 +3449,6 @@ export class ChatRuntime extends EventEmitter {
           try { this.emit_(record.id, { type: 'error', message: `Caller did not record the turn end (it will be retried when Poise restarts): ${e instanceof Error ? e.message : String(e)}`, recoverable: true }) } catch { /* mirror */ }
         }
       }
-      // A bound turn that ends with work left behind never settles
-      // silently: detect it while the lease still holds the session's
-      // branch, so the dirty count is attributable. Never throws.
-      await this.detectTurnStall(session, turn, stopReason)
       if (lease?.held) {
         if (freed) { lease.clearWorker(); lease.release() }
         else { try { this.emit_(record.id, { type: 'error', message: 'the checkout stays locked: the agent process could not be stopped', recoverable: false }) } catch { /* mirror */ } }
@@ -4300,6 +4304,10 @@ export class ChatRuntime extends EventEmitter {
       else finished.push(job)
     }
     if (!finished.length) return
+    // A turn end may have replaced the marker while the group was listed;
+    // only the still-current marker is written back. The replacement's own
+    // completion pass covers these jobs under the same event keys.
+    if (record.stall !== stall) return
     stall.backgroundJobs = running
     stall.updatedAt = finishedAt
     const lastKnown = { repos: stall.repos, truncatedRepos: stall.truncatedRepos ?? 0 }

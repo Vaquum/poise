@@ -240,21 +240,30 @@ describe('turn stall detection and waking', () => {
   }, 40_000)
 
   it('tracks a background job the turn starts and wakes the chat when it finishes', async () => {
+    // The trigger fifo lives outside every checkout, so it never dirties
+    // one; it predates the agent, which blocks opening it at startup with
+    // no children at all.
+    const fifoPath = join(root, 'bg-trigger.fifo')
+    const pidPath = join(root, 'bg-trigger.pid')
+    spawnSync('rm', ['-f', fifoPath, pidPath])
+    const fifo = spawnSync('mkfifo', [fifoPath])
+    if (fifo.status !== 0) throw new Error(`mkfifo: ${fifo.stderr}`)
     const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true,
-      startWorker: { command: 'sh', args: ['-c', 'while [ ! -e go ]; do sleep 0.05; done; sleep 30 & wait'] } }
+      startWorker: { command: 'sh', args: ['-c', `read line < ${fifoPath}; sleep 30 & echo $! > ${pidPath}; wait`] } }
     const { runtime, events } = makeRuntime('poise-turn-stall-bg:db', owned)
     const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-bg' } })
     store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
     await waitFor(() => lastStatus(events, session.id) === 'idle')
     runtime.prompt(session.id, { text: 'run the suite', attachments: [], mentions: [] })
-    // The baseline is taken before the prompt reaches the adapter, so a
-    // job the turn starts afterwards is new by construction.
+    // The baseline is taken before the prompt reaches the adapter, so the
+    // sleep the turn starts afterwards is new by construction — matched
+    // exactly, never via the agent's own command line.
     await waitFor(() => owned.prompts.length === 1)
-    await writeFile(join(session.checkout, 'go'), 'run\n')
+    await writeFile(fifoPath, 'run\n')
     const row = storage.getWorker(session.id)
     if (!row) throw new Error('no worker row for the session')
-    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.some((m) => m.command.includes('sleep 30')) ?? false)
-    spawnSync('rm', ['go'], { cwd: session.checkout })
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.some((m) => m.command === 'sleep 30') ?? false)
+    spawnSync('rm', ['-f', fifoPath, pidPath])
     finishManual(owned)
     await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
     await waitFor(() => lastStatus(events, session.id) === 'idle')
@@ -262,7 +271,7 @@ describe('turn stall detection and waking', () => {
     // The agent idles, but its background sleep outlives the turn.
     const jobs = runtime.get(session.id)?.stall?.backgroundJobs ?? []
     expect(jobs).toHaveLength(1)
-    expect(jobs[0].command).toContain('sleep 30')
+    expect(jobs[0].command).toBe('sleep 30')
     expect(worker.pidAlive(jobs[0].pid)).toBe(true)
 
     // The job finishes while no turn runs; the monitor cycle wakes the chat.
