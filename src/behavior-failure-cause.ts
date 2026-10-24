@@ -68,6 +68,18 @@ function quotaExhausted(cause: string): boolean {
       || /rate[ -]?limit exceeded|exceeded a secondary rate limit/i.test(cause))
 }
 
+// Whether the agent account cannot read the repository at all, rather than
+// merely failing one action in it. GitHub answers 404 on REST; on GraphQL
+// the repository path resolves NOT_FOUND ("Could not resolve to a
+// Repository"). A 403 is an action refusal on a readable repository (admin
+// rights, integration scope), and a NOT_FOUND elsewhere (a deleted review
+// thread) is about that object: neither holds the repository.
+export function isRepoAccessDenied(error: string): boolean {
+  if (/\bGitHub 404\b/.test(error)) return true
+  if (/Could not resolve to a Repository\b/.test(error)) return true
+  return /NOT_FOUND/.test(error) && /\[['"]repository['"]/.test(error)
+}
+
 export function classifyBehaviorDiagnostic(error: string, options: DiagnosticOptions = {}): DiagnosticClassification {
   const blockingCode = ['invalid_agent_result', 'review_provider_blocked', 'review_packet_too_large',
     'review_contract_violation', 'review_recovery_failed', 'review_budget_exhausted', 'model_output_limit']

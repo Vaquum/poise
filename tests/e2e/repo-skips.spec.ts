@@ -45,7 +45,7 @@ async function setup(page: Page) {
       const behavior = { owner: 'review-bot', enabled: false, scratchpad: '', lastTriggered: null }
       return route.fulfill({ json: {
         ...Object.fromEntries(Object.entries(state.behaviors).map(([key, value]) => [key, { ...behavior, ...value }])),
-        diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'review-bot', error: null }, failures: [], deadLetters: [] },
+        diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'review-bot', error: null }, failures: [], deadLetters: [], holds: [] },
       } })
     }
     if (url.pathname === '/api/agent-logs') {

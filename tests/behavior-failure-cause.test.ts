@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { classifyBehaviorDiagnostic, failureCause, rateLimitRetryAtMs } from '../src/behavior-failure-cause'
+import { classifyBehaviorDiagnostic, failureCause, isRepoAccessDenied, rateLimitRetryAtMs } from '../src/behavior-failure-cause'
 
 // What Behaviors' diagnostics show for a failure (src/behavior-failure-cause.ts).
 
@@ -93,6 +93,31 @@ describe('deterministic behavior severity', () => {
     expect(classifyBehaviorDiagnostic(`pull-request head changed: expected ${'a'.repeat(40)}, got missing`).severity).toBe('warning')
     expect(classifyBehaviorDiagnostic('Selected model is at capacity.', { errorCode: 'authentication_failed' }))
       .toEqual({ severity: 'warning', code: 'authentication' })
+  })
+})
+
+describe('repository access denial', () => {
+  it.each([
+    'GitHub 404: Not Found',
+    'Command failed (1): github-interface: error: GitHub 404: Not Found',
+    "Could not resolve to a Repository with the name 'Vaquum/field-data-api'.",
+    "GitHub merge candidate query failed: [{'message': \"Could not resolve to a Repository with the name 'acme/web'.\", 'path': ['pr0']}]",
+    "[{'type': 'NOT_FOUND', 'path': ['repository'], 'message': 'Could not resolve to a Repository.'}]",
+    '[{"type": "NOT_FOUND", "path": ["repository", "pullRequest"], "message": "Not found"}]',
+  ])('recognizes the agent account cannot read the repository: %s', (error) => {
+    expect(isRepoAccessDenied(error)).toBe(true)
+  })
+  it.each([
+    'GitHub 403: Forbidden',
+    'GitHub 403 rate-limit: {\'x-ratelimit-remaining\': \'12\'} body={"message": "Must have admin rights to Repository."}',
+    'GitHub 401: Bad credentials',
+    "[{'type': 'NOT_FOUND', 'path': ['resolveReviewThread'], 'message': 'Could not resolve to a thread.'}]",
+    'GitHub 4040: unexpected status',
+    'Selected model is at capacity.',
+    'Command timed out after 30s',
+    'pull-request head changed during readiness check',
+  ])('leaves a non-repository failure to its own retry: %s', (error) => {
+    expect(isRepoAccessDenied(error)).toBe(false)
   })
 })
 

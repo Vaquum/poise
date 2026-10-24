@@ -20,7 +20,7 @@ function diagnostics(overrides: Partial<BehaviorDiagnostics> = {}): BehaviorDiag
     status: 'ok', agentLogsError: null,
     datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
     identity: { status: 'valid', actor: 'bit-mis', error: null },
-    failures: [], deadLetters: [], ...overrides,
+    failures: [], deadLetters: [], holds: [], ...overrides,
   }
 }
 

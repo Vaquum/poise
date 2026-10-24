@@ -26,7 +26,7 @@ test('automatic merging starts off, persists opt-in and skips, and links its las
         'resolve-unblocking': behavior,
         'merge-prs': { ...behavior, enabled, skipRepos, lastTriggered: { at: new Date().toISOString(), target: 'acme/app#7' } },
         'review-new-issues': { ...behavior, reviewers: 1, repos: [], authors: ['octocat'], scratchpad: '' },
-        diagnostics: { status: 'ok', agentLogsError: null, failures: [], deadLetters: [],
+        diagnostics: { status: 'ok', agentLogsError: null, failures: [], deadLetters: [], holds: [],
           datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null },
           identity: { status: 'valid', actor: 'review-bot', error: null } },
       } })

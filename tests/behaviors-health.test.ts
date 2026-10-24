@@ -89,7 +89,9 @@ describe('scan health and dependency recovery', () => {
       const original = mocks.runFile.getMockImplementation()!
       const check = behavior === 'resolve-unblocking' ? '--review-activity-since' : '--requested-changes-addressed'
       mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
-        if (command === 'github-interface' && args[0] === check && args[1] === '#17') throw new Error('GitHub 404: Not Found')
+        // A per-action refusal, not a repository denial: a 404 here would hold
+        // the repository both pull requests share instead of isolating #17.
+        if (command === 'github-interface' && args[0] === check && args[1] === '#17') throw new Error('GitHub 403: Must have admin rights to Repository.')
         if (command === 'github-interface' && args[0] === check && args.includes('--requests-json')) {
           const packet = JSON.parse((await original(command, args, options)).stdout)
           return {
@@ -97,7 +99,7 @@ describe('scan health and dependency recovery', () => {
               ...packet,
               records: (packet.records as Array<Record<string, unknown>>).map((record) =>
                 record.pull_number === 17
-                  ? { repository: record.repository, pull_number: 17, error: 'GitHub 404: Not Found' }
+                  ? { repository: record.repository, pull_number: 17, error: 'GitHub 403: Must have admin rights to Repository.' }
                   : record),
             }),
             stderr: '',
@@ -114,7 +116,7 @@ describe('scan health and dependency recovery', () => {
       await modules.behaviors.runEnabledBehaviorsOnce()
       expect(modules.behaviors.getBehaviorsRuntimeHealth()).toMatchObject({
         status: 'ok', running: true,
-        failures: [{ behavior, kind: 'operation', target: `${pr.repo}#17:check`, consecutiveFailures: 1, error: 'GitHub 404: Not Found', nextRetryAt: '2026-10-02T12:01:00.000Z' }],
+        failures: [{ behavior, kind: 'operation', target: `${pr.repo}#17:check`, consecutiveFailures: 1, error: 'GitHub 403: Must have admin rights to Repository.', nextRetryAt: '2026-10-02T12:01:00.000Z' }],
       })
       if (behavior === 'resolve-unblocking') {
         expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--resolve-nonblocking-conversations-if-ready' && args[1] === '#18')).toBe(true)

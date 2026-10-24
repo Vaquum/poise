@@ -74,7 +74,7 @@ import {
 import { HttpError } from './http'
 import { eventLoopDelayStats, type EventLoopDelayStats } from './event-loop-delay'
 import { behaviorErrorMessage, behaviorIncidentDiagnostics } from './behavior-diagnostics'
-import { classifyBehaviorDiagnostic, diagnosticClassification, isTimeoutCause, rateLimitRetryAtMs, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
+import { classifyBehaviorDiagnostic, diagnosticClassification, isRepoAccessDenied, isTimeoutCause, rateLimitRetryAtMs, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { resolveReviewCheckout } from './review-checkout'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
@@ -410,12 +410,26 @@ function readBehaviorFailure(key: BehaviorKey, target?: string): PersistedBehavi
 }
 
 function recordBehaviorFailure(key: BehaviorKey, kind: 'worker', cause: unknown, target: string, options?: DiagnosticOptions & { callId?: string }): void
-function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string }): void
-function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string } = {}): void {
+function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string, hold?: boolean }): void
+function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string, hold?: boolean } = {}): void {
   if (!isEnabled(key)) return
+  const error = cause === undefined ? undefined : behaviorErrorMessage(cause)
+  if (kind === 'operation' && target !== undefined && options.hold !== false && error !== undefined
+    && isSkippableBehavior(key)) {
+    const repo = repoOfFailureTarget(target)
+    if (repo && isRepoAccessDenied(error)) {
+      // The agent account cannot read this repository at all: one held state
+      // for the repository replaces this sweep's per-target failure, and the
+      // PR behaviors skip the repository until the hourly recheck succeeds.
+      // Callers that fan one error out to a whole batch pass hold: false:
+      // their error is unattributable to any one repository.
+      setMeta(failureKey(key, target), '')
+      recordRepoAccessHold(repo, error)
+      return
+    }
+  }
   const previous = readBehaviorFailure(key, target)
   const consecutiveFailures = Math.min((previous?.consecutiveFailures ?? 0) + 1, 31)
-  const error = cause === undefined ? undefined : behaviorErrorMessage(cause)
   const transient = kind === 'operation' && isTimeoutCause(error ?? '')
   const delayMs = Math.min(
     BEHAVIOR_RETRY_BASE_MS * (2 ** Math.min(consecutiveFailures - 1, 20)),
@@ -461,6 +475,101 @@ function refreshFailureDiagnostic(behavior: BehaviorKey, target: string, call: L
 
 function clearBehaviorFailure(key: BehaviorKey, target?: string): void {
   setMeta(failureKey(key, target), '')
+  // A cleared PR check proved the agent account can reach the repository, so
+  // an access hold for it is over. Only PR behaviors record holds.
+  if (target !== undefined && isSkippableBehavior(key)) {
+    const repo = repoOfFailureTarget(target)
+    if (repo) clearRepoAccessHold(repo)
+  }
+}
+
+// Clearing without proof — quarantine, retirement — retires only the
+// failure row. A repository hold is released solely by proven access.
+function clearBehaviorFailureKeepHold(key: BehaviorKey, target: string): void {
+  setMeta(failureKey(key, target), '')
+}
+
+// ── Repository access holds ──────────────────────────────────────────
+// When the agent account cannot read a repository at all (GitHub 404 or
+// NOT_FOUND for it), every PR behavior would fail on it every sweep,
+// spending calls and burying real failures. Instead the first such failure
+// records one held state per repository, the PR behaviors skip the
+// repository until access comes back, and one recheck an hour later either
+// clears the hold or renews it. A successful check against the repository
+// clears it sooner.
+const REPO_ACCESS_HOLD_PREFIX = `${META_PREFIX}repo_hold:`
+const REPO_ACCESS_HOLD_RECHECK_MS = 60 * 60_000
+
+interface RepoAccessHold {
+  repo: string
+  error: string
+  heldAtMs: number
+  nextRecheckAtMs: number
+}
+
+function repoHoldKey(repo: string): string {
+  return `${REPO_ACCESS_HOLD_PREFIX}${repo.toLowerCase()}`
+}
+
+// The repository a per-PR failure target names, or null for behavior-wide,
+// reviewer and scan targets. Requires a PR number so `reviewer:…` and
+// `:scan` targets never attribute their errors to a repository.
+function repoOfFailureTarget(target: string): string | null {
+  const match = /^([^/#\s]+\/[^/#\s]+)#\d+/.exec(target)
+  return match ? match[1]! : null
+}
+
+function readRepoAccessHold(repo: string): RepoAccessHold | null {
+  const raw = getMeta(repoHoldKey(repo))
+  if (!raw) return null
+  try {
+    const value = JSON.parse(raw) as Partial<RepoAccessHold>
+    if (typeof value.repo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(value.repo)
+      || typeof value.error !== 'string' || !value.error
+      || !Number.isFinite(value.heldAtMs) || Number(value.heldAtMs) < 0
+      || Number(value.heldAtMs) > 8.64e15
+      || !Number.isFinite(value.nextRecheckAtMs) || Number(value.nextRecheckAtMs) < 0
+      || Number(value.nextRecheckAtMs) > 8.64e15) return null
+    const hold = { repo: value.repo, error: value.error.slice(0, 300),
+      heldAtMs: Number(value.heldAtMs), nextRecheckAtMs: Number(value.nextRecheckAtMs) }
+    // An expired hold is no hold: the next sweep rechecks, and the recheck
+    // renews or clears. Purge the row so stale holds never display.
+    if (Date.now() >= hold.nextRecheckAtMs) {
+      setMeta(repoHoldKey(repo), '')
+      return null
+    }
+    return hold
+  } catch {
+    return null
+  }
+}
+
+// Records the hold unless one is already active. A failure observed while
+// the hold stands (a race in the recording sweep, a path that ran anyway)
+// must not extend it, or the hourly recheck would never come due.
+function recordRepoAccessHold(repo: string, error: string): void {
+  if (readRepoAccessHold(repo)) return
+  const now = Date.now()
+  setMeta(repoHoldKey(repo), JSON.stringify({
+    repo, error: error.slice(0, 300), heldAtMs: now, nextRecheckAtMs: now + REPO_ACCESS_HOLD_RECHECK_MS,
+  } satisfies RepoAccessHold))
+}
+
+function clearRepoAccessHold(repo: string): void {
+  setMeta(repoHoldKey(repo), '')
+}
+
+function listRepoAccessHolds(): RepoAccessHold[] {
+  const prefix = scopedMetaKey(REPO_ACCESS_HOLD_PREFIX)
+  const rows = db.prepare(
+    "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
+  ).all(prefix.length, prefix) as Array<{ key: string }>
+  const holds: RepoAccessHold[] = []
+  for (const row of rows) {
+    const hold = readRepoAccessHold(row.key.slice(prefix.length))
+    if (hold) holds.push(hold)
+  }
+  return holds.sort((a, b) => a.repo.localeCompare(b.repo))
 }
 
 // A lost lock race is not a failure: another process owns this behavior's
@@ -533,7 +642,8 @@ function retireClosedTargetFailures(open: ReadonlySet<string>, behaviors: readon
     for (const target of behaviorFailureTargets(behavior)) {
       const ref = target.match(/^[^#]+#\d+/)?.[0]
       if (ref && !unreadRepositories?.has(ref.split('#')[0]) && !open.has(ref)) {
-        clearBehaviorFailure(behavior, target)
+        // A closed PR proves nothing about repository access.
+        clearBehaviorFailureKeepHold(behavior, target)
       }
     }
   }
@@ -871,6 +981,14 @@ function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | n
 export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, number: number, pr: PullRequestFacts | null): string | null {
   return ownPullRequestRefusal(policy.me, `${repo}#${number}`, pr)
     ?? (policy.skipped.has(repo.toLowerCase()) ? `${repo} is in the Skip repositories list of ${SKIPPABLE_LABELS[policy.behavior]}` : null)
+    ?? repoHoldRefusal(repo)
+}
+
+// A repository the agent account cannot read holds every PR behavior until
+// access comes back, rechecked hourly. An expired hold reads as no hold.
+function repoHoldRefusal(repo: string): string | null {
+  const hold = readRepoAccessHold(repo)
+  return hold ? `agent account has no access to ${hold.repo}; PR behaviors are held for this repository` : null
 }
 
 // Last-fired info is intentionally NOT persisted here — agent-interface
@@ -1071,7 +1189,8 @@ function quarantineClaim(
       linkBehaviorLaunchCallOwned(claim.key, claim.target, claim.claimId, callId)
     }
     recordQuarantineIncident(claim, error, callId)
-    clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
+    // Uncertainty, not success: a quarantine must not release a hold.
+    clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
     return true
   })()
   if (changed) captureBehaviorOutcome({ nativeId: claim.launchCorrelationId,
@@ -1180,7 +1299,8 @@ function quarantineFailedClaim(
     `).run(Number(mayRun), Number(mayRun), kind, error, claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
     if (changed.changes) {
       recordQuarantineIncident(claim, error, claim.launchCallId)
-      clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
+      // Uncertainty, not success: a quarantine must not release a hold.
+      clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
     }
     return changed.changes !== 0
   })()
@@ -3358,7 +3478,8 @@ async function tickApprovePrs(): Promise<void> {
         if (behaviorAborted()) return
         console.error('[behaviors] approve-prs batch check failed:', err)
         for (const pr of batch) {
-          recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+          // One error for the whole batch: unattributable to any repository.
+          recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
         }
         continue
       }
@@ -3436,7 +3557,8 @@ async function tickApprovePrs(): Promise<void> {
           if (behaviorAborted()) return
           console.error('[behaviors] approve-prs batch activity check failed:', err)
           for (const { pr } of activityBatch) {
-            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
+            // One error for the whole batch: unattributable to any repository.
+            recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
           }
           continue
         }
@@ -3765,7 +3887,8 @@ async function tickResolveUnblocking(): Promise<void> {
         if (behaviorAborted()) return
         console.error('[behaviors] resolve-unblocking batch check failed:', err)
         for (const pr of batch) {
-          recordBehaviorFailure('resolve-unblocking', 'operation', err, `${pr.repo}#${pr.number}:check`)
+          // One error for the whole batch: unattributable to any repository.
+          recordBehaviorFailure('resolve-unblocking', 'operation', err, `${pr.repo}#${pr.number}:check`, { hold: false })
         }
         continue
       }
@@ -4136,7 +4259,8 @@ async function tickRerunGreyCi(): Promise<void> {
       // keeps a visible failure and the scan continues. An aborted tick ends.
       if (behaviorAborted()) throw error
       if (!isEnabled(behavior)) return
-      for (const pr of batch) recordBehaviorFailure(behavior, 'operation', error, `${pr.repo}#${pr.number}`)
+      // One error for the whole batch: unattributable to any repository.
+      for (const pr of batch) recordBehaviorFailure(behavior, 'operation', error, `${pr.repo}#${pr.number}`, { hold: false })
       continue
     }
     for (let index = 0; index < batch.length; index++) {
@@ -4243,7 +4367,10 @@ async function tickRerunGreyCi(): Promise<void> {
               url: `https://github.com/${pr.repo}/actions/runs/${runId}` }))
           } else if (!releaseSeenOwned(claimKey, claimTarget, claimId)) throw new Error('grey CI intent ownership changed before no-write receipt')
           if (result.outcome === 'read_failed') {
-            recordBehaviorFailure(behavior, 'operation', result.error, failureTarget)
+            // The rerun preflight reads the pull request before its workflow
+            // runs and jobs: a 404 here can name a deleted run on a readable
+            // repository, so it never holds the repository.
+            recordBehaviorFailure(behavior, 'operation', result.error, failureTarget, { hold: false })
           } else clearBehaviorFailure(behavior, failureTarget)
         } catch (error) {
           // A missing receipt may follow an accepted write. Retain the durable
@@ -5540,6 +5667,13 @@ export interface BehaviorsRuntimeHealth {
     correlationId?: string
     recovered?: boolean
   }>
+  holds: Array<{
+    org?: string
+    repo: string
+    error: string
+    heldAt: string
+    nextRecheckAt: string
+  }>
   datastore: DatastoreFreshness
   identity: {
     status: 'valid' | 'invalid'
@@ -5658,6 +5792,12 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
       : new Date(lastTickCompletedAtMs).toISOString(),
     busy,
     failures,
+    holds: listRepoAccessHolds().map((hold) => ({
+      repo: hold.repo,
+      error: hold.error,
+      heldAt: new Date(hold.heldAtMs).toISOString(),
+      nextRecheckAt: new Date(hold.nextRecheckAtMs).toISOString(),
+    })),
     datastore: { ...datastoreFreshness() },
     identity,
     deadLetters: listBehaviorIncidents(),
@@ -5688,6 +5828,7 @@ export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     status: health.some((entry) => entry.health.status === 'degraded') ? 'degraded' : 'ok',
     busy: health.flatMap((entry) => entry.health.busy.map((item) => ({ ...item, org: entry.org }))),
     failures: health.flatMap((entry) => entry.health.failures.map((item) => ({ ...item, org: entry.org }))),
+    holds: health.flatMap((entry) => entry.health.holds.map((item) => ({ ...item, org: entry.org }))),
     deadLetters: health.flatMap((entry) => entry.health.deadLetters),
     datastore: health.find((entry) => entry.health.datastore.status === 'unavailable')?.health.datastore ?? first.datastore,
     identity: health.find((entry) => entry.health.identity.status === 'invalid')?.health.identity ?? first.identity,

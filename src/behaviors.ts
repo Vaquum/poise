@@ -94,6 +94,13 @@ export interface BehaviorDiagnostics {
     callId?: string | null
     diagnostic?: DiagnosticClassification
   }>
+  holds: Array<{
+    org?: string
+    repo: string
+    error: string
+    heldAt: string
+    nextRecheckAt: string
+  }>
 }
 
 // A 409 from the memory precondition carries the value that is actually
@@ -411,6 +418,7 @@ export async function refreshState(): Promise<void> {
         identity: { status: 'unknown', actor: null, error: null },
         failures: [],
         deadLetters: [],
+        holds: [],
       }),
       apiError: {
         ...(requestFailure ?? classifyBehaviorDiagnostic(error instanceof Error ? error.message : String(error))),

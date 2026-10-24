@@ -370,7 +370,7 @@ test('chooses how many reviewers each new pull request gets from Behaviors', asy
       'review-new-prs': behavior({ setting: 'p2', reviewers }),
       'approve-prs': behavior({}),
       'resolve-unblocking': behavior({ scratchpad: null }),
-      diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'review-bot', error: null }, failures: [], deadLetters: [] },
+      diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'review-bot', error: null }, failures: [], deadLetters: [], holds: [] },
     } })
   })
   await page.route('**/api/behaviors/review-new-prs*', async (route) => {
@@ -404,7 +404,7 @@ test('shows the agent account as the Behaviors owner and follows it when it chan
       'review-new-prs': behavior({ setting: 'p2', reviewers: 1 }),
       'approve-prs': behavior({}),
       'resolve-unblocking': behavior({ scratchpad: null }),
-      diagnostics: { status: owner ? 'ok' : 'degraded', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: owner ? { status: 'valid', actor: owner, error: null } : { status: 'invalid', actor: null, error: missing }, failures: [], deadLetters: [] },
+      diagnostics: { status: owner ? 'ok' : 'degraded', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: owner ? { status: 'valid', actor: owner, error: null } : { status: 'invalid', actor: null, error: missing }, failures: [], deadLetters: [], holds: [] },
     } })
   })
   await page.goto('/')
@@ -434,7 +434,7 @@ test('opts repositories and trusted authors into Review New Issues from Behavior
       'approve-prs': behavior({}),
       'resolve-unblocking': behavior({ scratchpad: null }),
       'review-new-issues': behavior({ ...state }),
-      diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [] },
+      diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [], holds: [] },
     } })
   })
   await page.route('**/api/behaviors/review-new-issues*', async (route) => {
@@ -524,7 +524,7 @@ test('lists a repository created while the tab was open in the Review New Issues
       'approve-prs': behavior({}),
       'resolve-unblocking': behavior({ scratchpad: null }),
       'review-new-issues': behavior({ repos: ['Vaquum/Origo'], authors: ['mikkokotila'], reviewers: 1 }),
-      diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [] },
+      diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: new Date().toISOString(), ageSeconds: 1, lastSuccessAt: null, error: null }, identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [], holds: [] },
     } })
   })
   let repos = ['Vaquum/Limen', 'Vaquum/Origo']
