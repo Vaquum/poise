@@ -1083,7 +1083,7 @@ function buildPanel(): HTMLElement {
         </div>
 
         <div class="tp-section">
-          <label class="tp-label" for="st-chat-max-concurrent-local-turns" ${helpAttributes("How many Poise-local chats may run an agent turn at once. A turn past the cap waits for a free agent slot.")}>Concurrent local turns</label>
+          <label class="tp-label" for="st-chat-max-concurrent-local-turns" ${helpAttributes("Heavy runs allowed at once, shared by Poise-local chat turns and behavior runs. A turn past the cap waits for a free agent slot; background work leaves one slot free for turns you send.")}>Concurrent local turns</label>
           <input type="number" id="st-chat-max-concurrent-local-turns" class="st-input st-input-max-concurrent-local-turns" min="1" max="64" step="1" placeholder="4" />
 
         </div>

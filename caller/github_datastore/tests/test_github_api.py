@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 from github_datastore.github_api import (
     ENUMERATION_DRIFT_MAX_ATTEMPTS,
+    ISSUE_BASE_QUERY,
     PR_BASE_QUERY,
     GitHubApiError,
     GitHubEnumerationDriftError,
@@ -846,6 +847,12 @@ class PullReviewThreadTest(unittest.TestCase):
         # the same GraphQL calls with or without them.
         self.assertIn("isResolved", PR_BASE_QUERY)
         self.assertIn("isOutdated", PR_BASE_QUERY)
+
+    def test_queries_carry_dependency_edges_without_new_requests(self) -> None:
+        # Blocked-by and closing references ride the existing item queries;
+        # the sync issues the same GraphQL calls with or without them.
+        self.assertIn("blockedBy", ISSUE_BASE_QUERY)
+        self.assertIn("closingIssuesReferences", PR_BASE_QUERY)
 
     def test_first_page_comments_carry_their_thread_without_paging(self) -> None:
         pull = pull_with_threads([

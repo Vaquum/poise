@@ -24,7 +24,7 @@ import { prepareProviderCli } from '../provider-clis'
 
 import { readMemories } from './memories'
 import { expandSwitches, savedSwitchNames, saveSwitch } from './custom-switches'
-import { MANAGER_SWITCH } from '../../src/chat-switches'
+import { MANAGER_SWITCH, WORKER_SWITCH } from '../../src/chat-switches'
 import { deriveSessionTitle, parseIssueReference, shouldAutoName } from '../../src/chat-title'
 import { resolveIssueTitle } from './issue-titles'
 import { appendMemories } from './memory-content'
@@ -81,6 +81,7 @@ import { createCodexAdapter } from './adapters/codex'
 import { createGrokAdapter } from './adapters/grok'
 import { createMuseAdapter } from './adapters/muse'
 import type { Adapter, AdapterHost, AgentProcess, PermissionRequest, QuestionAnswers, QuestionRequest, TurnResult } from './adapters/types'
+import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP } from '../check-semaphore'
 import { skippedNotice, type ResolvedServer, type Skipped } from '../extensions/types'
 import { SELF_UPDATE_REPOSITORY, SelfUpdateBridgeError, SelfUpdateUnavailableError, UUID_PATTERN, type SelfUpdateBridge } from '../self-update-bridge'
 import * as finishOutbox from '../self-update-outbox'
@@ -109,7 +110,7 @@ const isSwitchboardChat = (record: SessionRecord): boolean => record.context?.ki
 
 export const DEFAULT_IDLE_TIMEOUT_MINUTES = 120
 export const DEFAULT_BRANCH_PREFIX = 'chat/'
-export const DEFAULT_MAX_CONCURRENT_LOCAL_TURNS = 4
+export const DEFAULT_MAX_CONCURRENT_LOCAL_TURNS = DEFAULT_CHECK_SLOT_CAP
 const STOP_SETTLE_MS = 2_000
 const CLOSE_GRACE_MS = 5_000
 const SERVICE_SETTLE_MS = 5_000
@@ -185,8 +186,8 @@ interface RunningTurn {
   commandEffort?: string
   contextAction?: 'compact' | 'reset'
   review?: { target: ReviewTarget, throughSeq: number }
-  /** True while the turn holds one of the bounded Poise-local agent slots. */
-  localSlot?: boolean
+  /** Releases one of the shared check slots; set while the turn holds it. */
+  localSlot?: () => void
   /** Steers sent to this turn by correlation id, with the text to queue if
    *  the adapter reports them unrun when the turn settles. */
   pendingSteers?: Map<string, { text: string, attachments: Attachment[], mentions: Mention[], actor?: ChatActor | PoiseActor }>
@@ -299,7 +300,11 @@ export interface AgentAvailability {
 }
 
 function parseCommands(text: string) {
-  return parseChatCommandChain(text, /^\s*\//.test(text) ? savedSwitchNames() : undefined)
+  if (!/^\s*\//.test(text)) return parseChatCommandChain(text)
+  // The charters parse as switches whether or not they were seeded: an
+  // unseeded /manager or /worker in the wrong chat is refused, never sent
+  // to the model as literal text.
+  return parseChatCommandChain(text, new Set([...savedSwitchNames(), MANAGER_SWITCH, WORKER_SWITCH]))
 }
 
 /** A concurrent creation took the subject first; never leaves the runtime. */
@@ -313,6 +318,11 @@ class SubjectTakenError extends Error {
 /** /manager carries the Manager's charter; no other chat may use it. */
 function refuseManagerSwitch(switches: readonly string[] | undefined, isManager: boolean): void {
   if (switches?.includes(MANAGER_SWITCH) && !isManager) throw new ChatError(400, '/manager is not supported in regular chats.', 'invalid')
+}
+
+/** /worker carries a worker's charter; only a worker chat may use it. */
+function refuseWorkerSwitch(switches: readonly string[] | undefined, isWorker: boolean): void {
+  if (switches?.includes(WORKER_SWITCH) && !isWorker) throw new ChatError(400, '/worker is not supported in non-worker chats.', 'invalid')
 }
 
 /** Provenance header for a chat's steer: source data, not the person's message. */
@@ -334,9 +344,9 @@ export class ChatRuntime extends EventEmitter {
   private readonly idleTimeoutMinutes: () => number
   private readonly branchPrefix: () => string
   private readonly maxConcurrentLocalTurns: () => number
-  /** Poise-local agent slots in use, and turns waiting for one in FIFO order. */
-  private localTurnSlots = 0
-  private readonly localTurnWaiters: Array<{ resolve: () => void, reject: (error: Error) => void }> = []
+  /** The shared heavy-work budget: turns hold a slot while they may build or
+   *  test, and background behaviors draw from the same pool. */
+  readonly checkSlots: CheckSemaphore
   private readonly requireClaudeReady: () => Promise<void>
   private readonly probeAgent: (agent: AgentId) => Promise<{ ok: boolean, reason?: string }>
   private readonly leaseProbes: CheckoutLeaseOptions
@@ -371,6 +381,7 @@ export class ChatRuntime extends EventEmitter {
     this.idleTimeoutMinutes = options.idleTimeoutMinutes ?? (() => DEFAULT_IDLE_TIMEOUT_MINUTES)
     this.branchPrefix = options.branchPrefix ?? (() => DEFAULT_BRANCH_PREFIX)
     this.maxConcurrentLocalTurns = options.maxConcurrentLocalTurns ?? (() => DEFAULT_MAX_CONCURRENT_LOCAL_TURNS)
+    this.checkSlots = new CheckSemaphore(this.maxConcurrentLocalTurns)
     this.requireClaudeReady = options.requireClaudeReady ?? (() => claudeAuth.requireReady())
     this.probeAgent = options.probeAgent ?? defaultProbeAgent
     this.leaseProbes = options.leaseProbes ?? {}
@@ -1633,7 +1644,7 @@ export class ChatRuntime extends EventEmitter {
   async create(request: NewSessionRequest): Promise<SessionRecord> {
     this.assertAcceptingWork() // before any await: the drain flag is checked atomically
     if (request.subject) return (await this.createForSubject({ ...request, subject: request.subject })).session
-    if (request.role !== undefined && request.role !== 'manager') throw new ChatError(400, 'role must be "manager" or absent', 'invalid')
+    if (request.role !== undefined && request.role !== 'manager' && request.role !== 'worker') throw new ChatError(400, 'role must be "manager", "worker" or absent', 'invalid')
     if (request.role === 'manager') {
       if (request.repo !== undefined || request.branch !== undefined || request.checkout !== undefined) {
         throw new ChatError(400, 'A Manager runs in its own local workspace; repo, branch and checkout are not accepted.', 'invalid')
@@ -1673,7 +1684,8 @@ export class ChatRuntime extends EventEmitter {
    *  removes the workspace it just made and returns the winner. */
   async createForSubject(request: NewSessionRequest & { subject: ChatSubject }): Promise<{ session: SessionRecord, existing: boolean }> {
     this.assertAcceptingWork()
-    if (request.role !== undefined) throw new ChatError(400, 'A Manager has no subject.', 'invalid')
+    if (request.role !== undefined && request.role !== 'manager' && request.role !== 'worker') throw new ChatError(400, 'role must be "manager", "worker" or absent', 'invalid')
+    if (request.role === 'manager') throw new ChatError(400, 'A Manager has no subject.', 'invalid')
     const key = `${request.subject.surface}:${request.subject.key}`
     const prior = this.subjectLocks.get(key)
     let release!: () => void
@@ -1814,7 +1826,7 @@ export class ChatRuntime extends EventEmitter {
       ...(request.subject ? { subject: request.subject } : {}),
       ...(request.autoMerge !== undefined ? { autoMerge: request.autoMerge } : {}),
       safeMode: request.safeMode === true,
-      ...(request.role === 'manager' ? { role: 'manager' as const } : {}),
+      ...(request.role ? { role: request.role } : {}),
       ...(createdBy ? { createdBy } : {}),
     }
     // Callers can guard admission after asynchronous model/auth preparation;
@@ -2413,6 +2425,7 @@ export class ChatRuntime extends EventEmitter {
     const request = String(text || '').trim()
     const names = context.switches
     refuseManagerSwitch(names, this.get(sourceId)?.role === 'manager')
+    refuseWorkerSwitch(names, this.get(sourceId)?.role === 'worker')
     if (names !== undefined) {
       const known = savedSwitchNames()
       if (!Array.isArray(names) || names.length > 128 || !names.every(name => typeof name === 'string' && known.has(name))) throw new ChatError(400, 'The selected saved switches are unavailable.', 'invalid')
@@ -2704,6 +2717,7 @@ export class ChatRuntime extends EventEmitter {
     const prompt = this.validatePrompt(id, input)
     const chain = parseCommands(prompt.text)
     refuseManagerSwitch(chain.switches, session.record.role === 'manager')
+    refuseWorkerSwitch(chain.switches, session.record.role === 'worker')
     if (chain.missingModel) throw new ChatError(400, 'Choose a model from /model first.', 'invalid')
     if (chain.create) throw new ChatError(400, 'Save a switch with the create command, not an agent prompt.', 'invalid')
     if (chain.content !== undefined || chain.consensus !== undefined) throw new ChatError(400, 'Run /content or /consensus as a chat command, not as an agent prompt.', 'invalid')
@@ -2792,6 +2806,7 @@ export class ChatRuntime extends EventEmitter {
       const submitted = this.validatePrompt(id, input)
       const chain = parseCommands(submitted.text)
       refuseManagerSwitch(chain.switches, session.record.role === 'manager')
+      refuseWorkerSwitch(chain.switches, session.record.role === 'worker')
       if (chain.create) throw new ChatError(400, 'Save the switch directly with /create, then queue its use.', 'invalid')
       if (chain.content !== undefined || chain.consensus !== undefined) throw new ChatError(400, 'Run /content or /consensus now; queueing them would run them as prompts.', 'invalid')
       expandSwitches(chain.text, chain.switches)
@@ -3107,6 +3122,7 @@ export class ChatRuntime extends EventEmitter {
         const chain = parseCommands(input.text)
         if (chain.create) throw new ChatError(400, 'Switch definitions cannot be created by a queued provider task.', 'invalid')
         refuseManagerSwitch(chain.switches, record.role === 'manager')
+        refuseWorkerSwitch(chain.switches, record.role === 'worker')
         turn.switches = chain.switches ?? turn.switches
         turn.contextAction = chain.context
         if (chain.context || chain.switches?.length) { turn.shown = input; input = { ...input, text: chain.text } }
@@ -3169,10 +3185,11 @@ export class ChatRuntime extends EventEmitter {
       this.emit_(record.id, { type: 'turn.started', turnId: turn.id, prompt: turn.shown ?? nativeInput, callId: turn.callId ?? undefined, agent: record.agent, model: record.model, ...(turn.queueItem ? { queueItemId: turn.queueItem.id } : {}), ...(turn.source ? { source: turn.source } : {}) })
       started = true
       this.setStatus(session, 'queued')
-      // Poise-local turns share a bounded pool of agent slots; a turn past
-      // the cap waits here with its own reason instead of starting an agent.
-      // The Switchboard's one observer turn and the Manager's turns stay
-      // outside it, so supervision still runs when every slot is busy.
+      // Poise-local turns share a bounded pool of check slots with the
+      // agent runs background behaviors launch; a turn past the cap waits
+      // here with its own reason instead of starting an agent. The
+      // Switchboard's one observer turn and the Manager's turns stay outside
+      // it, so supervision still runs when every slot is busy.
       if (record.workspaceKind === 'poise-local' && !isSwitchboardChat(record) && record.role !== 'manager') await this.acquireLocalTurnSlot(session, turn)
       // Created after the title settled: the label names what is queued behind.
       if (!lease) {
@@ -3560,6 +3577,7 @@ export class ChatRuntime extends EventEmitter {
     // text, never run.
     const chain = actor ? null : parseCommands(shown.text)
     refuseManagerSwitch(chain?.switches, session.record.role === 'manager')
+    refuseWorkerSwitch(chain?.switches, session.record.role === 'worker')
     if (chain && (chain.create || chain.queue || chain.context || chain.review || chain.model || chain.content !== undefined || chain.consensus !== undefined)) throw new ChatError(400, 'This command starts a separate action; queue it instead of steering.', 'invalid')
     // Do not put this wait on the control chain: startup drains that chain
     // before invoking the prompt. Early interjections belong after that boundary.
@@ -3851,57 +3869,32 @@ export class ChatRuntime extends EventEmitter {
     }
   }
 
-  /** Take one of the bounded Poise-local agent slots, FIFO. A turn that
-   *  waits shows `queued` with the cap's own reason; cancelling the turn
-   *  wakes it. Lowering the cap converges as running turns release;
-   *  raising it starts waiters through localTurnCapChanged. */
+  /** Take one of the shared check slots, FIFO per lane. A turn that waits
+   *  shows `queued` with the cap's own reason; cancelling the turn wakes it.
+   *  A turn the person sent takes the person lane, which background work
+   *  cannot fill; delegated, supervised and timer turns share the background
+   *  lane with behavior runs. Lowering the cap converges as running turns
+   *  release; raising it starts waiters through localTurnCapChanged. */
   private async acquireLocalTurnSlot(session: LiveSession, turn: RunningTurn): Promise<void> {
-    const cap = Math.max(1, this.maxConcurrentLocalTurns())
-    // A raised cap frees earlier waiters first; the arrival never jumps them.
-    this.grantLocalTurnSlots()
-    if (this.localTurnSlots < cap) {
-      this.localTurnSlots += 1
-      turn.localSlot = true
-      return
-    }
-    // A turn stopped before it reaches the queue must never park: its abort
-    // already fired, so the waiter's listener below would never wake it again.
-    turn.abort.signal.throwIfAborted()
-    session.record.queuedBehind = SLOT_WAIT_REASON
-    this.setStatus(session, 'queued')
-    await new Promise<void>((resolve, reject) => {
-      const waiter = { resolve, reject }
-      this.localTurnWaiters.push(waiter)
-      turn.abort.signal.addEventListener('abort', () => {
-        const at = this.localTurnWaiters.indexOf(waiter)
-        if (at >= 0) {
-          this.localTurnWaiters.splice(at, 1)
-          reject(new Error(turn.failure || 'cancelled before it started'))
-        }
-      }, { once: true })
+    const person = !turn.source || (turn.source.kind === 'poise' && turn.source.name === SWITCHBOARD_PERSON)
+    turn.localSlot = await this.checkSlots.acquire(person ? 'person' : 'background', {
+      signal: turn.abort.signal,
+      onQueued: () => {
+        session.record.queuedBehind = SLOT_WAIT_REASON
+        this.setStatus(session, 'queued')
+      },
+      abortError: () => new Error(turn.failure || 'cancelled before it started'),
     })
-    turn.localSlot = true
   }
 
   private releaseLocalTurnSlot(turn: RunningTurn): void {
-    if (!turn.localSlot) return
-    turn.localSlot = false
-    this.localTurnSlots -= 1
-    this.grantLocalTurnSlots()
+    turn.localSlot?.()
+    turn.localSlot = undefined
   }
 
   /** The cap setting changed: start every slot waiter that now fits, in order. */
   localTurnCapChanged(): void {
-    this.grantLocalTurnSlots()
-  }
-
-  /** Hand free slots to parked waiters in FIFO order, up to the live cap. */
-  private grantLocalTurnSlots(): void {
-    const cap = Math.max(1, this.maxConcurrentLocalTurns())
-    while (this.localTurnWaiters.length > 0 && this.localTurnSlots < cap) {
-      this.localTurnSlots += 1
-      this.localTurnWaiters.shift()!.resolve()
-    }
+    this.checkSlots.grant()
   }
 
   /** A closed session whose scratch workspace storage maintenance removed

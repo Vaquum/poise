@@ -29,10 +29,12 @@ vi.mock('../server/content-jobs', async (original) => ({
 }))
 vi.mock('../server/chat/runtime', async (original) => {
   const { EventEmitter } = await import('node:events')
+  const { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP } = await import('../server/check-semaphore')
   return {
     ...(await original<typeof import('../server/chat/runtime')>()),
     ChatRuntime: class extends EventEmitter {
       draining = null
+      checkSlots = new CheckSemaphore(() => DEFAULT_CHECK_SLOT_CAP)
       async recover() {}
       async stop() {}
       endDrain() {}
@@ -78,6 +80,16 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
   if (command === 'github-interface' && args[0] === '--head-sha') {
     const parts = String(options.cwd || '').split('/')
     return json({ action: 'head_sha', repository: `${parts.at(-2)}/${parts.at(-1)}`, pull_number: Number(args[1].slice(1)), head_sha: HEAD })
+  }
+  if (command === 'github-interface' && args[0] === '--review-activity-since') {
+    const parts = String(options.cwd || '').split('/')
+    return json({ action: 'review_activity_since', repository: `${parts.at(-2)}/${parts.at(-1)}`,
+      pull_number: Number(args[1].slice(1)), username: args[args.indexOf('--username') + 1],
+      state: 'OPEN', draft: false, head_sha: HEAD, reviewer_requested: false, active_change_request_authors: [],
+      unresolved_conversation_count: 0, unresolved_live_conversation_count: 0,
+      unresolved_conversation_authors: [], unresolved_live_conversation_authors: [],
+      reviewer_latest_state: null, reviewer_latest_commit: null, reviewer_reviews_since: 0,
+      reviewer_reviews_since_items: [], reviewer_pending_reviews: 0, latest_activity_at: null })
   }
   throw new Error(`Unexpected test command: ${command} ${args.join(' ')}`)
 }

@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn() }))
 vi.mock('../server/process', () => ({
   runFile: mocks.runFile,
   spawnDetached: mocks.spawnDetached,
+  runningCallerLaunches: () => 0,
   claudeSubscriptionEnvironment: () => ({ CLAUDE_CLI: '/poise/claude-subscription' }),
 }))
 vi.mock('../server/claude-auth', () => ({
@@ -479,9 +480,12 @@ describe('Replay checks', () => {
   })
 })
 
-// The scheduler's candidate filter and a replay's admission are one check. For
-// each set of facts, the scheduler launches exactly when a replay of the same
-// target is admitted, and a replay refused names the check that failed.
+// The scheduler's candidate filter and a replay's admission share one
+// eligibility check. For each set of facts, the scheduler launches exactly
+// when a replay of the same target is admitted before the tick, and a
+// replay refused names the check that failed. After the scheduler has
+// launched, a replay is additionally refused while its worker owns the
+// target, so the two cannot post duplicate reviews.
 describe('the scheduler and a replay apply the same check', () => {
   async function admitted(behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number): Promise<true | string> {
     try {
@@ -508,15 +512,22 @@ describe('the scheduler and a replay apply the same check', () => {
       pulls = facts ? [pull(API, 1, facts)] : []
       runtime.setRepositorySkips(behavior, skipped)
       enable(db, behavior)
+      const admissionBefore = await admitted(replay, API, 1)
+      // Admission reserves its target, and the reservation's fence has its
+      // own test; clear it so this test stays about eligibility parity.
+      db.db.prepare('DELETE FROM behavior_replay_reservations').run()
       runtime.startBehaviorsRuntime()
       await runtime.runEnabledBehaviorsOnce()
       const launched = actedOn(behavior).length === 1
       // Refused by the scan itself: never claimed, nothing asked of GitHub.
       const scanned = { github: githubCalls(API), ledger: ledgerRows(API) }
       const admission = await admitted(replay, API, 1)
-      expect(launched).toBe(admission === true)
-      if (expected === true) expect(admission).toBe(true)
-      else {
+      expect(launched).toBe(admissionBefore === true)
+      if (expected === true) {
+        expect(admissionBefore).toBe(true)
+        expect(admission).toContain('still active')
+      } else {
+        expect(admission).toBe(admissionBefore)
         expect(admission).toContain(expected)
         expect(scanned).toEqual({ github: [], ledger: [] })
       }

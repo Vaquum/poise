@@ -96,7 +96,8 @@ db.exec(`
     behavior TEXT NOT NULL,
     started_at TEXT NOT NULL,
     completed_at TEXT,
-    status TEXT NOT NULL DEFAULT 'running'
+    status TEXT NOT NULL DEFAULT 'running',
+    note TEXT
   );
   CREATE INDEX IF NOT EXISTS behavior_runs_started
     ON behavior_runs(unixepoch(started_at, 'subsec'));
@@ -129,7 +130,23 @@ db.exec(`
     call_id TEXT,
     error TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    retired_at TEXT
+    retired_at TEXT,
+    resolution TEXT,
+    resolution_evidence TEXT,
+    resolved_at TEXT
+  );
+
+  -- Short replay reservations, one per reviewed target and behavior: two
+  -- concurrent replays of one target cannot both pass admission and post
+  -- duplicate reviews. Rows are replaced, never accumulate; expiry clears
+  -- a reservation whose replay crashed before spawning.
+  CREATE TABLE IF NOT EXISTS behavior_replay_reservations (
+    repo TEXT NOT NULL,
+    pr INTEGER NOT NULL,
+    behavior TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (repo, pr, behavior)
   );
 
   CREATE TABLE IF NOT EXISTS content_jobs (
@@ -264,6 +281,10 @@ const migrateSchema = db.transaction(() => {
   ensureColumn('behavior_seen', 'launch_action', 'launch_action TEXT')
   ensureColumn('behavior_seen', 'launch_covers', 'launch_covers TEXT')
   ensureColumn('behavior_dead_letters', 'retired_at', 'retired_at TEXT')
+  ensureColumn('behavior_dead_letters', 'resolution', 'resolution TEXT')
+  ensureColumn('behavior_dead_letters', 'resolution_evidence', 'resolution_evidence TEXT')
+  ensureColumn('behavior_dead_letters', 'resolved_at', 'resolved_at TEXT')
+  ensureColumn('behavior_runs', 'note', 'note TEXT')
   // What a notice in the page needs on top of an alert (server/alerts/notices.ts):
   // where it opens, and when the person dismissed or silenced it.
   ensureColumn('alerts', 'target', 'target TEXT')
@@ -615,6 +636,15 @@ export function markBehaviorLaunchIntentOwned(input: {
         AND lower(launch_actor) = lower(?) AND launch_source = 'poise:approve-prs'
         AND launch_error IS NOT NULL AND launch_outcome IS NULL AND launch_quarantine IS NULL)
     )
+    -- A live replay reservation fences this target atomically with the
+    -- claim: an admitted replay is preparing to spawn, and a scheduler
+    -- worker now would duplicate it. Issue reviews never reserve, so the
+    -- predicate passes them through.
+    AND NOT EXISTS (
+      SELECT 1 FROM behavior_replay_reservations AS reservation
+      WHERE reservation.repo = ? AND reservation.pr = ?
+        AND reservation.behavior = ? AND reservation.expires_at >= ?
+    )
   `).run(
     input.claimId,
     input.launchBehavior,
@@ -637,6 +667,10 @@ export function markBehaviorLaunchIntentOwned(input: {
     input.repo,
     input.pr,
     input.actor,
+    input.repo,
+    input.pr,
+    input.launchBehavior,
+    new Date().toISOString(),
   )
   return info.changes === 1
 }
@@ -1036,6 +1070,8 @@ export function completeReviewLaunchOwned(input: {
   })
 }
 
+export type DeadLetterDisposition = 'resolved' | 'superseded' | 'held'
+
 export interface BehaviorDeadLetter {
   id: string
   behavior: string
@@ -1048,6 +1084,9 @@ export interface BehaviorDeadLetter {
   callId: string | null
   error: string
   createdAt: string
+  resolution: DeadLetterDisposition | null
+  resolutionEvidence: string | null
+  resolvedAt: string | null
   attemptCount?: number
 }
 
@@ -1128,6 +1167,156 @@ export function retireBehaviorDeadLettersForClosedPrs(
   }, 0))()
 }
 
+export interface DeadLetterReconcileResult {
+  id: string
+  behavior: string
+  target: string
+  disposition: DeadLetterDisposition
+  reason: string
+}
+
+// One reconcile pass over the raw dead-letter inventory. Each open row is
+// resolved (a later completion settled its target), superseded (its pull
+// request or issue closed), or explicitly held with the reason recorded.
+// Nothing is deleted: resolved and superseded rows retire with their
+// evidence, held rows stay open. Unseen rows first, then least-recently
+// rechecked, in bounded batches, so a capped pass resumes where the
+// previous one stopped and re-expired holds cannot starve newer rows; a
+// hold is re-recorded at most hourly so repeats stay quiet.
+export function reconcileBehaviorDeadLetters(
+  openTargets: ReadonlySet<string>,
+  behaviors: readonly string[] = ['review-new-prs', 'approve-prs'],
+  organization?: string,
+  unreadRepositories?: ReadonlySet<string>,
+  limit = 200,
+  nowMs = Date.now(),
+): DeadLetterReconcileResult[] {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+    throw new Error('reconcile limit must be between 1 and 500')
+  }
+  if (behaviors.length === 0) return []
+  const now = new Date(nowMs).toISOString()
+  const holdCutoff = new Date(nowMs - 60 * 60_000).toISOString()
+  // The behavior scope is part of the query: filtering after LIMIT would
+  // let old rows for other behaviors starve this pass forever.
+  const rows = db.prepare(`
+    SELECT id, behavior, target, repo, pr, call_id, error, created_at
+    FROM behavior_dead_letters AS dead
+    WHERE dead.retired_at IS NULL
+      AND (? IS NULL OR lower(substr(COALESCE(dead.repo, dead.target), 1, instr(COALESCE(dead.repo, dead.target), '/') - 1)) = ?)
+      AND dead.behavior IN (${behaviors.map(() => '?').join(', ')})
+      AND (dead.resolution IS NULL OR dead.resolved_at IS NULL OR dead.resolved_at < ?)
+    ORDER BY CASE WHEN dead.resolution IS NULL THEN 0 ELSE 1 END ASC,
+      dead.resolved_at ASC, dead.created_at ASC, dead.id ASC
+    LIMIT ?
+  `).all(organization ?? null, organization?.toLowerCase() ?? null, ...behaviors, holdCutoff, limit) as Array<{
+    id: string, behavior: string, target: string, repo: string | null, pr: number | null,
+    call_id: string | null, error: string, created_at: string,
+  }>
+  const quarantined = db.prepare(`
+    SELECT 1 FROM behavior_seen AS held
+    WHERE held.key = ? AND held.target = ? AND held.launch_quarantine IS NOT NULL
+  `)
+  // The incident view hides a failure once its target later succeeds; the
+  // pass retires exactly what that rule already hides, with the evidence
+  // cited. For pull requests any completion on the PR settles the row —
+  // whether a sibling slot's success may settle a required slot stays open.
+  const recovered = db.prepare(`
+    SELECT launch_completed_at, launch_call_id
+    FROM behavior_seen AS recovered
+    WHERE recovered.key = ? AND recovered.launch_repo = ? AND recovered.launch_pr = ?
+      AND recovered.launch_outcome IS NOT NULL
+      AND julianday(recovered.launch_completed_at) > julianday(?)
+      AND (? <> 'review-new-issues' OR recovered.target = ?)
+    ORDER BY recovered.launch_completed_at DESC
+    LIMIT 1
+  `)
+  const retire = db.prepare(`
+    UPDATE behavior_dead_letters
+    SET retired_at = ?, resolution = ?, resolution_evidence = ?, resolved_at = ?
+    WHERE id = ? AND retired_at IS NULL
+  `)
+  const hold = db.prepare(`
+    UPDATE behavior_dead_letters
+    SET resolution = 'held', resolution_evidence = ?, resolved_at = ?
+    WHERE id = ? AND retired_at IS NULL
+  `)
+  return db.transaction(() => rows.map((row): DeadLetterReconcileResult => {
+    const settle = (disposition: DeadLetterDisposition, reason: string, evidence: Record<string, unknown>) => {
+      const encoded = JSON.stringify({ ...evidence, checkedAt: now })
+      if (disposition === 'held') hold.run(encoded, now, row.id)
+      else retire.run(now, disposition, encoded, now, row.id)
+      return { id: row.id, behavior: row.behavior, target: row.target, disposition, reason }
+    }
+    if (quarantined.get(row.behavior, row.target)) {
+      return settle('held', 'quarantined claim outstanding', { callId: row.call_id })
+    }
+    if (row.repo !== null && row.pr !== null) {
+      const completion = recovered.get(row.behavior, row.repo, row.pr, row.created_at, row.behavior, row.target) as
+        { launch_completed_at: string, launch_call_id: string | null } | undefined
+      if (completion) {
+        return settle('resolved', `later completion at ${completion.launch_completed_at}`,
+          { completedAt: completion.launch_completed_at, callId: completion.launch_call_id })
+      }
+      if (!unreadRepositories?.has(row.repo) && !openTargets.has(`${row.repo}#${row.pr}`)) {
+        return settle('superseded', `${row.repo}#${row.pr} is no longer open`, { open: false })
+      }
+      if (unreadRepositories?.has(row.repo)) {
+        return settle('held', `${row.repo} could not be listed; target state unknown`,
+          { callId: row.call_id, open: null })
+      }
+      return settle('held', 'no later completion; target still open', { callId: row.call_id, open: true })
+    }
+    return settle('held', 'row carries no repository identity; cannot verify its target',
+      { callId: row.call_id })
+  }))()
+}
+
+// How long an admitted replay owns its target: preparation plus spawn plus
+// worker registration, with margin. Only the same behavior on the same
+// target is fenced; a review and an approval replay never block each other.
+export const REPLAY_RESERVATION_MS = 10 * 60_000
+
+// Whether an admitted replay still owns its target. The scheduler checks
+// this before launching, so a tick during replay preparation cannot start
+// a duplicate worker for the same target.
+export function replayReservationActive(repo: string, pr: number, behavior: string, nowMs = Date.now()): boolean {
+  return !!db.prepare(`
+    SELECT 1 FROM behavior_replay_reservations
+    WHERE repo = ? AND pr = ? AND behavior = ? AND expires_at >= ?
+    LIMIT 1
+  `).get(repo, pr, behavior, new Date(nowMs).toISOString())
+}
+
+// Atomically reserve one replay: insert, or replace only an expired
+// reservation. One statement, so concurrent admissions cannot both win.
+export function reserveBehaviorReplay(repo: string, pr: number, behavior: string, nowMs = Date.now()): boolean {
+  const now = new Date(nowMs).toISOString()
+  const expires = new Date(nowMs + REPLAY_RESERVATION_MS).toISOString()
+  const info = db.prepare(`
+    INSERT INTO behavior_replay_reservations(repo, pr, behavior, created_at, expires_at)
+    VALUES(?, ?, ?, ?, ?)
+    ON CONFLICT(repo, pr, behavior) DO UPDATE
+    SET created_at = excluded.created_at, expires_at = excluded.expires_at
+    WHERE behavior_replay_reservations.expires_at < excluded.created_at
+  `).run(repo, pr, behavior, now, expires)
+  return info.changes === 1
+}
+
+// Release a reservation this caller holds, identified by its own stamp so
+// a replacement reservation cannot be deleted by mistake.
+export function releaseBehaviorReplay(
+  repo: string,
+  pr: number,
+  behavior: string,
+  createdAt: string,
+): void {
+  db.prepare(`
+    DELETE FROM behavior_replay_reservations
+    WHERE repo = ? AND pr = ? AND behavior = ? AND created_at = ?
+  `).run(repo, pr, behavior, createdAt)
+}
+
 export function listBehaviorDeadLetters(limit = 50, organization?: string): BehaviorDeadLetter[] {
   return readBehaviorDeadLetters(limit, false, organization)
 }
@@ -1199,6 +1388,9 @@ function readBehaviorDeadLetters(
     call_id: string | null
     error: string
     created_at: string
+    resolution: DeadLetterDisposition | null
+    resolution_evidence: string | null
+    resolved_at: string | null
     attempt_count: number
   }>
   return rows.map((row) => ({
@@ -1213,6 +1405,9 @@ function readBehaviorDeadLetters(
     callId: row.call_id,
     error: row.error,
     createdAt: row.created_at,
+    resolution: row.resolution,
+    resolutionEvidence: row.resolution_evidence,
+    resolvedAt: row.resolved_at,
     ...(grouped ? { target: row.repo && row.pr ? `${row.repo}#${row.pr}` : row.target, attemptCount: row.attempt_count } : {}),
   }))
 }
