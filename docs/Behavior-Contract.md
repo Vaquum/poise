@@ -344,7 +344,9 @@ approval for `pr_approve`; a commented or change-requested review for
 Panel siblings share the agent account, so a review another Caller row claims
 as its own receipt is not a duplicate. Dismissed reviews never count. An
 admitted replay reserves its target for ten minutes, so a concurrent replay
-of the same target is refused while preparation and spawn are ahead. An
+of the same target is refused while preparation and spawn are ahead. The
+scheduler skips a reserved target the same way, so a tick during replay
+preparation cannot start a duplicate worker. An
 `issue_review` replay stays a deliberate fresh run that comments again: it
 takes no publication check.
 

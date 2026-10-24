@@ -1260,6 +1260,17 @@ export function reconcileBehaviorDeadLetters(
 // target is fenced; a review and an approval replay never block each other.
 export const REPLAY_RESERVATION_MS = 10 * 60_000
 
+// Whether an admitted replay still owns its target. The scheduler checks
+// this before launching, so a tick during replay preparation cannot start
+// a duplicate worker for the same target.
+export function replayReservationActive(repo: string, pr: number, behavior: string, nowMs = Date.now()): boolean {
+  return !!db.prepare(`
+    SELECT 1 FROM behavior_replay_reservations
+    WHERE repo = ? AND pr = ? AND behavior = ? AND expires_at >= ?
+    LIMIT 1
+  `).get(repo, pr, behavior, new Date(nowMs).toISOString())
+}
+
 // Atomically reserve one replay: insert, or replace only an expired
 // reservation. One statement, so concurrent admissions cannot both win.
 export function reserveBehaviorReplay(repo: string, pr: number, behavior: string, nowMs = Date.now()): boolean {

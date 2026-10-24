@@ -57,6 +57,7 @@ import {
   quarantineBehaviorLaunchOwned,
   retireBehaviorDeadLetter,
   reconcileBehaviorDeadLetters,
+  replayReservationActive,
   reserveBehaviorReplay,
   retireBehaviorDeadLettersForTarget,
   recordSeen,
@@ -1101,6 +1102,13 @@ function markLaunchIntent(
   plannedSlots: ReviewerSlot[] = ['primary'],
   replacesFailedCallId?: string,
 ): boolean {
+  // A live replay reservation fences this target: an admitted replay is
+  // preparing to spawn, and a scheduler worker now would duplicate it.
+  // The tick skips; the short reservation expires on its own.
+  if (replayReservationActive(pr.repo, pr.number, upstreamBehavior(behavior))) {
+    console.log(`[behaviors] ${behavior} skipped for ${pr.repo}#${pr.number} — a replay is in progress`)
+    return false
+  }
   const source = `poise:${behavior}` as const
   const startedAt = new Date().toISOString()
   const admitted = markBehaviorLaunchIntentOwned({

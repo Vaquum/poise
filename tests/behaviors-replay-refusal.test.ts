@@ -262,6 +262,26 @@ describe('replay publication refusal', () => {
     await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toBeUndefined()
   })
 
+  it('makes the scheduler skip a reserved target and launch once the reservation expires', async () => {
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database, behaviors } = await admitReady()
+    database.setMeta('models', 'mock-models')
+    database.recordSeen('review-new-prs', '__snapshot_v3__')
+    database.setMeta('behavior_review_new_prs_keyver', '3')
+    behaviors.startBehaviorsRuntime()
+    database.setMeta('behavior_review_new_prs_enabled', '1')
+    expect(database.reserveBehaviorReplay(pr.repo, pr.number, 'pr_review')).toBe(true)
+
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+
+    database.db.prepare('UPDATE behavior_replay_reservations SET expires_at = ?')
+      .run(new Date(Date.now() - 1000).toISOString())
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+  })
+
   it('leaves issue_review replays a deliberate fresh run with no publication check', async () => {
     arrangeCli()
     const base = mocks.runFile.getMockImplementation()!
