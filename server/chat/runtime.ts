@@ -4540,8 +4540,10 @@ export class ChatRuntime extends EventEmitter {
    *  path, or when the entry budget or the deadline stopped the scan, so
    *  callers keep their previous state instead of inventing a clean one.
    *  `unreadable` names where the scan could not go — capped like repos,
-   *  the rest counted — so the wake can say so. */
-  private async nestedTaskRepos(checkout: string): Promise<{ dirs: string[], complete: boolean, unreadable: string[], unreadableTruncated: number }> {
+   *  the rest counted — so the wake can say so. Stall tracking and
+   *  work-binding discovery share this set: both reason about the same
+   *  task repos. */
+  async nestedTaskRepos(checkout: string): Promise<{ dirs: string[], complete: boolean, unreadable: string[], unreadableTruncated: number }> {
     const root = this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT
     if (!workerWorkspaceRef(root, checkout)) return { dirs: [], complete: true, unreadable: [], unreadableTruncated: 0 }
     const found: string[] = []

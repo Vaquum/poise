@@ -340,6 +340,21 @@ def _node_ref(node: dict[str, Any]) -> tuple[str, int] | None:
     return (repo.lower(), number)
 
 
+def _head_ref(graphql: Any) -> tuple[str | None, str | None]:
+    """(head branch, head repository) for a pull request, when the stored
+    read tracked them. Rows synced before the sync fetched head refs, or
+    with malformed stored values, report (None, None): consumers skip
+    branch matching for them without doubting their closing refs."""
+    if not isinstance(graphql, dict):
+        return (None, None)
+    ref = graphql.get("headRefName")
+    repo_node = graphql.get("headRepository")
+    repo = repo_node.get("nameWithOwner") if isinstance(repo_node, dict) else None
+    ref = ref if isinstance(ref, str) and ref else None
+    repo = repo if isinstance(repo, str) and repo else None
+    return (ref, repo)
+
+
 def _closing_refs(graphql: Any, body: str | None, repo: str) -> tuple[list[tuple[str, int, str | None]], str, bool]:
     """((repo, number, title) refs, provenance, truncated) for a pull request.
 
@@ -499,7 +514,10 @@ def pr_closing(
     requests follow: pass the last returned cursor back until it clears, the
     number as `after_number` with the same `repo`, or the pair as
     `after_repo`/`after_number` for an unscoped list. A bare `after_number`
-    needs `repo`, since numbers order only within one repository."""
+    needs `repo`, since numbers order only within one repository. `head_ref`
+    and `head_repo` name the pull request's head branch and its repository
+    for branch matching; both are null when the stored read predates head
+    tracking or kept malformed values."""
     if output != "json":
         raise ValueError("pr-closing renders json only")
     if limit is not None and limit <= 0:
@@ -537,6 +555,7 @@ def pr_closing(
                 expanded = None
             pull = expanded.get("pull") if isinstance(expanded, dict) else None
             graphql = pull.get("graphql") if isinstance(pull, dict) else None
+            head_ref = _head_ref(graphql)
             closing, closes_via, refs_truncated = _closing_refs(graphql, row["body"], row["repo_full_name"])
             closing_truncated = refs_truncated or len(closing) > CLOSED_MATCH_LIMIT
             if closing_truncated:
@@ -549,6 +568,8 @@ def pr_closing(
                 "closing": [{"repo": ref_repo, "number": ref_number} for ref_repo, ref_number, _ in closing],
                 "closes_via": closes_via,
                 "closing_truncated": closing_truncated,
+                "head_ref": head_ref[0],
+                "head_repo": head_ref[1],
             })
         return json.dumps({"prs": prs, "truncated": truncated, "more": more}, ensure_ascii=False)
     except sqlite3.Error as exc:

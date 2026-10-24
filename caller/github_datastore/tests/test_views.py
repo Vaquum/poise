@@ -391,7 +391,7 @@ def dependent_fixture(number, item_id, body, state="open", blocked_by=(), title=
     return item
 
 
-def closing_pr_fixture(number, item_id, body, closing=(), state="merged", title=None):
+def closing_pr_fixture(number, item_id, body, closing=(), state="merged", title=None, head=None, head_repo=None):
     pr = base_expanded(body, [])
     pr["is_pr"] = True
     pr["issue"] = dict(pr["issue"], id=item_id, node_id=f"I_{item_id}", number=number, state=state,
@@ -400,6 +400,10 @@ def closing_pr_fixture(number, item_id, body, closing=(), state="merged", title=
         "closingIssuesReferences": {"pageInfo": {"hasNextPage": False}, "nodes": [
             {"number": n, "title": f"Issue {n}", "repository": {"nameWithOwner": "Vaquum/Test"}}
             for n in closing]}}
+    if head is not None:
+        graphql["headRefName"] = head
+    if head_repo is not None:
+        graphql["headRepository"] = {"nameWithOwner": head_repo}
     pr["pull"] = {"id": item_id, "node_id": f"I_{item_id}", "graphql": graphql,
                   "requested_reviewers": [], "assignees": [], "merged_by": None,
                   "updated_at": "2026-01-02T00:00:00Z"}
@@ -848,6 +852,61 @@ class PrClosingTest(unittest.TestCase):
             listed = json.loads(output.getvalue())
             self.assertFalse(listed["truncated"])
             self.assertEqual([entry["number"] for entry in listed["prs"]], [12])
+
+    def test_pr_closing_reports_head_ref_and_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            same = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open",
+                                      head="fix/7-test", head_repo="Vaquum/Test")
+            fork = closing_pr_fixture(13, 113, "Closes #7", closing=(7,), state="open",
+                                      head="fix/7-test", head_repo="Fork/Test")
+            with conn:
+                upsert_repo(conn, same["repo"])
+            store_expanded(conn, same)
+            store_expanded(conn, fork)
+            conn.close()
+
+            listed = json.loads(views.pr_closing(db_path=db_path))
+            self.assertEqual(
+                [(entry["number"], entry["head_ref"], entry["head_repo"]) for entry in listed["prs"]],
+                [(12, "fix/7-test", "Vaquum/Test"), (13, "fix/7-test", "Fork/Test")],
+            )
+
+    def test_pr_closing_reports_null_head_for_old_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open")
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            conn.close()
+
+            listed = json.loads(views.pr_closing(db_path=db_path))
+            self.assertIsNone(listed["prs"][0]["head_ref"])
+            self.assertIsNone(listed["prs"][0]["head_repo"])
+            self.assertEqual(listed["prs"][0]["closing"], [{"repo": "vaquum/test", "number": 7}])
+
+    def test_pr_closing_reports_null_head_for_malformed_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open")
+            pr["pull"]["graphql"]["headRefName"] = 7
+            pr["pull"]["graphql"]["headRepository"] = "Vaquum/Test"
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            conn.close()
+
+            listed = json.loads(views.pr_closing(db_path=db_path))
+            self.assertIsNone(listed["prs"][0]["head_ref"])
+            self.assertIsNone(listed["prs"][0]["head_repo"])
+            self.assertEqual(listed["prs"][0]["closing"], [{"repo": "vaquum/test", "number": 7}])
 
 
 if __name__ == "__main__":

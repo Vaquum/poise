@@ -1,10 +1,10 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, rm } from 'node:fs/promises'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setImmediate } from 'node:timers/promises'
-import { db } from '../db'
+import { db, getMeta, setMeta } from '../db'
 import { HttpError, httpStatus, readJson } from '../http'
 import { runFile } from '../process'
 import { requireAgentAccount } from '../settings'
@@ -20,13 +20,14 @@ import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-re
 import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, MessageQueue, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
 import { findEvent } from './storage'
+import { pushedBranches, writeFileAtomic } from './git'
 import { ChatError, type ChatRuntime } from './runtime'
 import { GREY_CI_INTENT_KEY, getEnabledMap, getBehaviorsRuntimeHealth, isEnabled, pullRequestPolicy, pullRequestRefusal, withBehaviorOrganization } from '../behaviors'
 import * as store from './control-store'
 import { isSwitchboardSession } from './switchboard-store'
 import { SWITCHBOARD_LOOKUPS, SWITCHBOARD_OPERATIONS, SWITCHBOARD_PERSON, SWITCHBOARD_READS, type SwitchboardControl } from './switchboard'
 import { BEHAVIOR_KEYS } from '../../src/behavior-types'
-import { organizationArgs, organizationForRepository, type Organization } from '../organizations'
+import { organizationArgs, organizationForRepository, readyOrganizations, type Organization } from '../organizations'
 
 const PATH = '/api/chat/control'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -415,7 +416,7 @@ export async function readWorkMergeWake(target: store.WorkTarget): Promise<Merge
 /** Open pull requests and the issues each closes, as the local datastore
  *  has them; null when the datastore cannot be asked. Local rows only —
  *  the sync owns freshness, and this read adds zero GitHub traffic. */
-export interface OpenPrClosingRefs { repo: string, number: number, url: string, closing: Array<{ repo: string, number: number }>, closesVia: 'closing-references' | 'body-keywords', closingTruncated: boolean }
+export interface OpenPrClosingRefs { repo: string, number: number, url: string, closing: Array<{ repo: string, number: number }>, closesVia: 'closing-references' | 'body-keywords', closingTruncated: boolean, headRef: string | null, headRepo: string | null }
 export interface OpenPrClosingList { prs: OpenPrClosingRefs[], truncated: boolean, more: boolean }
 export async function readOpenPrClosingRefs(org: Organization, after?: { repo: string, number: number }): Promise<OpenPrClosingList | null> {
   try {
@@ -443,7 +444,15 @@ export async function readOpenPrClosingRefs(org: Organization, after?: { repo: s
           || !Number.isSafeInteger(target.number) || target.number <= 0) return null
         closing.push({ repo: target.repo, number: target.number })
       }
-      prs.push({ repo: pr.repo, number: pr.number, url: pr.url, closing, closesVia: pr.closes_via, closingTruncated: pr.closing_truncated })
+      // Absent head fields are rows synced before head tracking: branch
+      // matching skips them. Present-but-malformed ones fail the listing,
+      // like every other malformed field.
+      const headRef = 'head_ref' in pr ? pr.head_ref : null
+      const headRepo = 'head_repo' in pr ? pr.head_repo : null
+      if ((headRef !== null && (typeof headRef !== 'string' || !headRef))
+        || (headRepo !== null && (typeof headRepo !== 'string' || !headRepo))) return null
+      prs.push({ repo: pr.repo, number: pr.number, url: pr.url, closing, closesVia: pr.closes_via, closingTruncated: pr.closing_truncated,
+        headRef, headRepo })
     }
     return { prs, truncated: row.truncated, more: row.more }
   } catch {
@@ -531,8 +540,25 @@ function queueHoldsDelivery(queue: MessageQueue | undefined): boolean {
     || (queue.ready && queue.items.some(item => item.state === 'waiting')))
 }
 
+/** The control credential secret, persisted per instance: a chat's token
+ *  survives a Poise restart, so a worker mid-turn keeps its connection. A
+ *  malformed stored secret is replaced with a warning — the one restart
+ *  that invalidates existing connections. */
+function controlSecret(instance: string): Buffer {
+  const stored = getMeta(`chat_control_secret:${instance}`)
+  if (stored && /^[0-9a-f]{64}$/.test(stored)) return Buffer.from(stored, 'hex')
+  if (stored) {
+    diagnostic({ level: 'warning', operation: 'chat.control.secret',
+      message: 'The stored chat-control secret was malformed and was replaced; existing connections were invalidated',
+      context: {} })
+  }
+  const fresh = randomBytes(32)
+  setMeta(`chat_control_secret:${instance}`, fresh.toString('hex'))
+  return fresh
+}
+
 export class ChatControl {
-  private readonly secret = randomBytes(32)
+  private readonly secret: Buffer
   private origin = ''
   private root: Promise<string> | null = null
   private timer: ReturnType<typeof setInterval> | null = null
@@ -634,6 +660,18 @@ export class ChatControl {
       const view = store.timerById(this.runtime.instance, timer.id)
       if (view) this.emitTimerChanged(timer.target, view, 'cancelled', { kind: 'poise', name: 'Poise' })
     }
+    // Its connection file goes with it; a missing file is a no-op.
+    void this.dropConnection(id)
+  }
+
+  /** Remove one chat's connection file. Best-effort: a missing file or a
+   *  missing directory is fine, anything else is a server-log line. */
+  private async dropConnection(id: string): Promise<void> {
+    try {
+      await rm(join(await this.ensureRoot(), `${id}.json`), { force: true })
+    } catch (error) {
+      this.runtime.emit('log', `[chat control] connection file for ${id} not removed: ${String(error)}`)
+    }
   }
 
   /** Account a finished timer turn: successes reset the failures, failures
@@ -699,9 +737,10 @@ export class ChatControl {
         ...(timer.reason ? { reason: timer.reason } : {}), ...(error ? { error } : {}) } })
   }
 
-  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, mergeWake?: typeof readWorkMergeWake, closingRefs?: typeof readOpenPrClosingRefs, now?: () => number, switchboard?: SwitchboardControl } = {}) {
+  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, mergeWake?: typeof readWorkMergeWake, closingRefs?: typeof readOpenPrClosingRefs, now?: () => number, switchboard?: SwitchboardControl, connectionDir?: string } = {}) {
     runtime.on('event', this.onEvent)
     runtime.on('deleted', this.onDeleted)
+    this.secret = controlSecret(runtime.instance)
   }
 
   /** Called after runtime crash reconciliation, so old turns cannot be resumed by a timer. */
@@ -709,6 +748,7 @@ export class ChatControl {
     if (this.stopped || this.ready) return
     this.ready = true
     this.timer = setInterval(() => { void this.tick().catch(error => this.runtime.emit('log', `[chat control] ${String(error)}`)) }, 1000).unref()
+    void this.refreshConnections().catch(error => this.runtime.emit('log', `[chat control] connection refresh failed: ${String(error)}`))
   }
 
   attach(server: Server): void {
@@ -716,9 +756,60 @@ export class ChatControl {
       const address = server.address()
       if (!address || typeof address === 'string') throw new Error('Chat control needs a TCP listener')
       this.origin = `http://${address.address === '::1' ? '[::1]' : '127.0.0.1'}:${address.port}`
+      void this.refreshConnections().catch(error => this.runtime.emit('log', `[chat control] connection refresh failed: ${String(error)}`))
     }
     if (server.listening) listening()
     else server.once('listening', listening)
+  }
+
+  /** The stable per-instance connection directory: connection files keep
+   *  their paths across restarts, so a mid-turn worker survives one. A
+   *  private directory owned by this user, like Chat storage itself. */
+  private ensureRoot(): Promise<string> {
+    return this.root ??= (async () => {
+      const slug = this.runtime.instance.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'poise'
+      const dir = this.options.connectionDir ?? join(tmpdir(), 'poise-chat-control', slug)
+      await mkdir(dir, { mode: 0o700, recursive: true })
+      const info = await lstat(dir)
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Chat control storage is not a plain directory: ${dir}`)
+      if (process.getuid && info.uid !== process.getuid()) throw new Error(`Chat control storage belongs to another user: ${dir}`)
+      return dir
+    })()
+  }
+
+  /** Rewrite every live chat's connection file: a restart recreates files
+   *  that went missing and refreshes the origin when the listener moved.
+   *  Best-effort per chat; failures are one warning, never a throw. */
+  private async refreshConnections(): Promise<void> {
+    if (!this.origin || this.stopped) return
+    let dir: string
+    try {
+      dir = await this.ensureRoot()
+    } catch (error) {
+      diagnostic({ level: 'warning', operation: 'chat.control.refresh',
+        message: `Poise could not open its chat-control connection directory: ${error instanceof Error ? error.message : String(error)}`,
+        context: {} })
+      return
+    }
+    const failed: string[] = []
+    for (const record of this.runtime.list()) {
+      if (this.stopped) return
+      try {
+        const live = this.runtime.get(record.id)
+        if (!live || live.status === 'closed') continue
+        // Atomic: a worker reading its durable path mid-refresh never sees
+        // a truncated file. New files are 0600; existing ones keep 0600.
+        await writeFileAtomic(join(dir, `${record.id}.json`),
+          JSON.stringify({ origin: this.origin, sessionId: record.id, token: this.token(record.id) }))
+      } catch {
+        failed.push(record.id)
+      }
+    }
+    if (failed.length) {
+      diagnostic({ level: 'warning', operation: 'chat.control.refresh',
+        message: `Poise could not recreate ${failed.length} chat-control connection file(s); those chats retry from their next turn prompt`,
+        context: { count: failed.length } })
+    }
   }
 
   private token(sessionId: string): string { return createHmac('sha256', this.secret).update(sessionId).digest('hex') }
@@ -737,9 +828,8 @@ export class ChatControl {
   async context(id: string): Promise<string> {
     if (!this.origin || this.stopped) throw new Error('Poise chat control has no active local listener')
     const record = this.session(id)
-    this.root ??= mkdtemp(join(tmpdir(), 'poise-chat-control-'))
-    const config = join(await this.root, `${id}.json`)
-    await writeFile(config, JSON.stringify({ origin: this.origin, sessionId: id, token: this.token(id) }), { mode: 0o600 })
+    const config = join(await this.ensureRoot(), `${id}.json`)
+    await writeFileAtomic(config, JSON.stringify({ origin: this.origin, sessionId: id, token: this.token(id) }))
     const command = [
       '[Poise native control]',
       `Your Poise chat ID is ${id}. Use your native shell tool to run:`,
@@ -1187,31 +1277,44 @@ export class ChatControl {
   private lastDiscovery = 0
   private readonly reportedAmbiguous = new Set<string>()
 
-  /** Bind each open PR that closes a bound issue to that issue's chat, so a
-   *  chat that opens its PR without calling `bind` still receives its CI,
-   *  conflict, behind and review notices. At most once a minute, from local
-   *  datastore rows, one paged listing per organization behind a bound
-   *  target — whole-organization, so a PR in a repository with no bindings
-   *  of its own is still found when it closes a bound issue. Never takes a
-   *  claimed target, never rebinds a released one, never binds to a closed
-   *  or deleted chat, never matches a PR whose closing list is incomplete,
-   *  and never guesses between two chats: an ambiguous PR stays unbound
-   *  with one warning. */
+  /** Bind each open PR that closes a bound issue to that issue's chat, and
+   *  each open PR whose head branch was pushed from a chat's workspace to
+   *  that chat, so a chat that opens its PR without calling `bind` still
+   *  receives its CI, conflict, behind and review notices. At most once a
+   *  minute, from local datastore rows: one paged listing per organization
+   *  behind a bound target, and every managed organization when branch
+   *  evidence exists, since any evidence repository may be another
+   *  organization's fork. Whole-organization, so a PR in a repository with
+   *  no bindings of its own is still found.
+   *  Never takes a claimed target, never rebinds a released one, never
+   *  binds to a closed or deleted chat, never matches a PR whose closing
+   *  list is incomplete through that list, and never guesses between two
+   *  chats: an ambiguous PR stays unbound with one warning. */
   private async discoverWorkBindings(now: number, current: store.Binding[]): Promise<void> {
     if (now - this.lastDiscovery < DISCOVERY_INTERVAL) return
     const instance = this.runtime.instance
-    if (!current.some(binding => store.workTarget(binding.target).kind === 'issues')) return
+    const branches = await this.scanWorkspaceBranches()
+    if (this.stopped) return
     const orgs = new Map<string, Organization>()
-    for (const binding of current) {
-      const org = organizationForRepository(store.workTarget(binding.target).repo)
-      if (org) orgs.set(org.login.toLowerCase(), org)
+    if (current.some(binding => store.workTarget(binding.target).kind === 'issues')) {
+      for (const binding of current) {
+        const org = organizationForRepository(store.workTarget(binding.target).repo)
+        if (org) orgs.set(org.login.toLowerCase(), org)
+      }
+    }
+    // Any evidence repository may be a fork — of an unmanaged owner's, or
+    // of another managed organization's — and a fork's base is not knowable
+    // locally. So any branch evidence lists every managed organization;
+    // extra listings only ever match their own evidence.
+    if (branches && branches.repos.size > 0) {
+      for (const org of readyOrganizations()) orgs.set(org.login.toLowerCase(), org)
     }
     if (orgs.size === 0) return
     // The window opens only when listings were actually read, so an empty
     // sweep never starves the pass that first has something to discover.
     this.lastDiscovery = now
     const read = this.options.closingRefs ?? readOpenPrClosingRefs
-    const ambiguous = new Set<string>()
+    const ambiguous = new Map<string, 'closing' | 'branch' | 'both'>()
     for (const org of orgs.values()) {
       let after: { repo: string, number: number } | undefined
       for (;;) {
@@ -1237,9 +1340,6 @@ export class ChatControl {
           if (target.kind === 'issues') issueOwners.set(target.url, binding.session)
         }
         for (const pr of listed.prs) {
-          // An incomplete closing list would misbind where the full list is
-          // ambiguous: only complete evidence claims.
-          if (pr.closingTruncated) continue
           let url: string
           try {
             const pull = store.workTarget(pr.url)
@@ -1247,17 +1347,37 @@ export class ChatControl {
             url = pull.url
           } catch { continue }
           if (bound.has(url)) continue
-          const candidates = new Set<string>()
-          for (const ref of pr.closing) {
-            const owner = issueOwners.get(`https://github.com/${ref.repo.toLowerCase()}/issues/${ref.number}`)
-            if (owner !== undefined) candidates.add(owner)
+          const closing = new Set<string>()
+          // An incomplete closing list would misbind where the full list is
+          // ambiguous: only complete evidence claims through this list. The
+          // head branch below is independent evidence and still matches.
+          if (!pr.closingTruncated) {
+            for (const ref of pr.closing) {
+              const owner = issueOwners.get(`https://github.com/${ref.repo.toLowerCase()}/issues/${ref.number}`)
+              if (owner !== undefined) closing.add(owner)
+            }
           }
-          const live = [...candidates].filter(session =>
+          const pushed = new Set<string>()
+          // The head repository alone names where the branch lives: matching
+          // the base repository too would let an unrelated same-named base
+          // branch claim a fork PR. A half-known head is incomplete evidence
+          // and matches nothing, like an incomplete closing list.
+          if (branches && pr.headRef !== null && pr.headRepo !== null) {
+            const key = JSON.stringify([pr.headRepo.toLowerCase(), pr.headRef])
+            for (const session of branches.owners.get(key) ?? []) pushed.add(session)
+          }
+          const live = (sessions: Set<string>): string[] => [...sessions].filter(session =>
             this.runtime.ownsSession(session) && this.runtime.get(session)?.status !== 'closed'
             && !store.bindingReleased(instance, session, url))
-          if (live.length === 0) continue
-          if (live.length > 1) { ambiguous.add(url); continue }
-          const [session] = live
+          const liveClosing = live(closing)
+          const livePushed = live(pushed)
+          const union = [...new Set([...liveClosing, ...livePushed])]
+          if (union.length === 0) continue
+          if (union.length > 1) {
+            ambiguous.set(url, liveClosing.length > 0 && livePushed.length > 0 ? 'both' : livePushed.length > 0 ? 'branch' : 'closing')
+            continue
+          }
+          const [session] = union
           if (session && store.bindWorkAuto(instance, session, url)) bound.add(url)
         }
         const last = listed.prs.at(-1)
@@ -1268,14 +1388,65 @@ export class ChatControl {
         after = { repo: last.repo, number: last.number }
       }
     }
-    for (const url of ambiguous) {
+    for (const [url, cause] of ambiguous) {
       if (this.reportedAmbiguous.has(url)) continue
       this.reportedAmbiguous.add(url)
       diagnostic({ level: 'warning', operation: 'chat.work.discovery', target: url,
-        message: 'An open PR closes issues owned by several chats and stays unbound; one of them must bind it explicitly',
+        message: cause === 'branch'
+          ? 'An open PR\'s head branch was pushed from several chats\' workspaces and stays unbound; one of them must bind it explicitly'
+          : cause === 'both'
+            ? 'An open PR matches several chats through closing references and workspace branches and stays unbound; one of them must bind it explicitly'
+            : 'An open PR closes issues owned by several chats and stays unbound; one of them must bind it explicitly',
         context: { target: url } })
     }
     for (const url of [...this.reportedAmbiguous]) if (!ambiguous.has(url)) this.reportedAmbiguous.delete(url)
+  }
+
+  /** Branches each live chat pushed from its workspace: the session's own
+   *  branch for a repository-bound session (its checkout may be shared, so
+   *  only its own branch attributes to it), and every branch with a GitHub
+   *  upstream in each nested task clone for a worker workspace. The same
+   *  task-repo set stall tracking watches. Null when any session's
+   *  evidence cannot be read: branch matching pauses for the sweep rather
+   *  than bind on a partial set that hides an ambiguity. Closing
+   *  references are unaffected. */
+  private async scanWorkspaceBranches(): Promise<{ owners: Map<string, Set<string>>, repos: Set<string> } | null> {
+    const owners = new Map<string, Set<string>>()
+    const repos = new Set<string>()
+    const add = (repo: string, branch: string, session: string): void => {
+      const key = JSON.stringify([repo.toLowerCase(), branch])
+      const known = owners.get(key)
+      if (known) known.add(session)
+      else owners.set(key, new Set([session]))
+      repos.add(repo.toLowerCase())
+    }
+    // Sessions that share one checkout (a handoff's source and target)
+    // scan it once; each keeps its own session-branch evidence.
+    const scanned = new Map<string, Array<{ repo: string, branch: string }>>()
+    try {
+      for (const session of this.runtime.list()) {
+        // Local reads resolve fast; still give requests an I/O turn between chats.
+        await setImmediate()
+        if (this.stopped) return null
+        if (session.status === 'closed') continue
+        if (session.repo) add(session.repo, session.branch.name, session.id)
+        let evidence = scanned.get(session.checkout)
+        if (evidence === undefined) {
+          evidence = []
+          scanned.set(session.checkout, evidence)
+          const found = await this.runtime.nestedTaskRepos(session.checkout)
+          if (!found.complete) throw new Error(`workspace discovery incomplete for chat ${session.id}`)
+          for (const dir of found.dirs) {
+            for (const pushed of await pushedBranches(dir)) evidence.push(pushed)
+          }
+        }
+        for (const pushed of evidence) add(pushed.repo, pushed.branch, session.id)
+      }
+    } catch (error) {
+      this.itemFailed('discovery', 'workspace-branches', error)
+      return null
+    }
+    return { owners, repos }
   }
 
   /** Observe claimed targets in the background, caching remote reads for five minutes. */
@@ -1893,6 +2064,7 @@ export class ChatControl {
 
   async stop(runtimeStopped?: Promise<void>): Promise<void> {
     // Remote reads may outlive shutdown; their continuations check stopped before store access.
+    // Connection files stay: a restart keeps mid-turn workers connected.
     this.stopped = true
     this.ciRelease?.()
     this.ciRelease = null
@@ -1900,7 +2072,6 @@ export class ChatControl {
     await this.running
     await runtimeStopped
     this.runtime.off('event', this.onEvent); this.runtime.off('deleted', this.onDeleted)
-    if (this.root) await rm(await this.root, { recursive: true, force: true })
   }
 }
 

@@ -10,7 +10,14 @@ function requestIdentity(value) {
 
 /** One native-shell entry point for every provider; no provider credentials. */
 export async function controlRequest(configPath, input) {
-  const config = JSON.parse(await readFile(configPath, 'utf8'))
+  let raw
+  try {
+    raw = await readFile(configPath, 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT') throw new Error(`Poise chat-control connection file not found: ${configPath}. Poise recreates missing files at startup: retry once, and if it is still missing, finish this turn without further control calls and retry from the connection in your next turn prompt. If this prompt is current, the chat may have been deleted — ask your creating chat.`)
+    throw error
+  }
+  const config = JSON.parse(raw)
   const origin = new URL(config.origin)
   if (origin.protocol !== 'http:' || !['127.0.0.1', '[::1]'].includes(origin.hostname) || !origin.port
     || origin.pathname !== '/' || origin.search || origin.hash || origin.username || origin.password) throw new Error('control connection must name a local Poise TCP listener')

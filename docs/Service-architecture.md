@@ -457,9 +457,10 @@ computer.
 - Loopback requests keep today's rules; they come from inside the owner's own
   container.
 - Native chats discover Poise through a private connection file and
-  `POST /api/chat/control`. This endpoint additionally requires a per-chat,
-  process-scoped credential, a loopback peer and no browser Origin/fetch
-  headers; even a valid gateway browser/admin assertion cannot call it.
+  `POST /api/chat/control`. This endpoint additionally requires a per-chat
+  credential that survives restarts, a loopback peer and no browser
+  Origin/fetch headers; even a valid gateway browser/admin assertion cannot
+  call it.
   The native command can also use the normal loopback Poise APIs under their
   existing policy. Creating-chat and worker relationships, the workspace Manager's role, inbox admission, supervision,
   explicit issue/PR ownership, durable timers and their holds persist in the

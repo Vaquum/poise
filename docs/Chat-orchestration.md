@@ -8,11 +8,16 @@ No model or provider credential is added. Safe mode still governs native tools.
 
 The command discovers itself with `{"operation":"help"}`. Its connection file
 identifies the calling chat; a request cannot impersonate another chat by
-putting a different sender in its JSON. The private, process-scoped credential
-is accepted only on loopback, without browser Origin/fetch headers. Deleting
-the chat or restarting Poise invalidates it. The next native prompt receives
-the current connection. This is the existing trusted workspace, not isolation
-between agents running as the same operating-system user.
+putting a different sender in its JSON. The private per-chat credential
+is accepted only on loopback, without browser Origin/fetch headers.
+Connection files live in a stable per-instance directory and keep working
+across Poise restarts, so a mid-turn worker stays connected; Poise recreates
+any missing ones at startup and refreshes the origin when its listener
+moves. Every native prompt carries the current connection, and a command
+whose file is still missing says how to recover. Deleting the chat removes
+its file and invalidates its credential. This is the existing trusted
+workspace, not isolation between agents running as the same
+operating-system user.
 
 ## Operations
 
@@ -343,13 +348,20 @@ bindings and disables its own supervision.
 An open PR that closes a bound issue is bound to that issue's chat
 automatically, within a minute of the datastore sync seeing it, so the chat
 that opened it receives its CI, conflict, behind and review notices without
-calling bind. Automatic binding never takes a claimed target, never rebinds
+calling bind. A PR whose head branch was pushed from a chat's workspace is
+bound to that chat the same way: the session's own branch for a
+repository-bound chat, and every branch with a GitHub upstream in the nested
+task clones of a worker workspace, including a fork head through its head
+repository. Automatic binding never takes a claimed target, never rebinds
 a target its chat released, never binds to a closed or deleted chat, never
-matches a PR whose closing list is incomplete, and leaves a PR closing
-several chats' issues unbound with one warning naming it; one of those
-chats must bind it explicitly. A PR that closes no bound issue — a chat
-that never bound its issue, or a PR without a closing reference — still
-needs an explicit bind in the turn that opens it.
+matches a PR whose closing list is incomplete through that list, and never
+guesses between two chats: a PR matching several chats — through closing
+references, workspace branches, or one of each — stays unbound with one
+warning naming it, and one of those chats must bind it explicitly. A branch
+scan that cannot read a workspace pauses branch matching for that minute
+without touching closing references. A PR with an unknown head branch, or
+one no chat's workspace pushed, still needs an explicit bind in the turn
+that opens it.
 
 Bound chats receive local behavior ledger changes for their exact repository,
 target number and issue/PR kind. Local target reads use the repository/number
