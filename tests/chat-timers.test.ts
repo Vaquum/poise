@@ -820,6 +820,33 @@ describe('durable timers that wake chats', () => {
     expect(timerNotes(m.id).at(-1)).toMatchObject({ change: 'cancelled' })
   }, 120_000)
 
+  it('reports a self-timer chat delete as done and emits no event for it', async () => {
+    const p = await manager('Worker')
+    const timer = store.createTimer(instance, { sessionId: p.id, label: 'Self', message: 'Ping', delayMinutes: 10 },
+      { kind: 'chat', sessionId: p.id, title: p.title }, clock)
+    const notes: ChatEvent[] = []
+    const onEvent = (envelope: { event: ChatEvent }) => { notes.push(envelope.event) }
+    runtime.on('event', onEvent)
+    try {
+      await expect(runtime.delete(p.id)).resolves.toMatchObject({ workspaceRemoved: false })
+    } finally { runtime.off('event', onEvent) }
+    expect(runtime.get(p.id)).toBeNull()
+    expect(runtime.list().some(session => session.id === p.id)).toBe(false)
+    expect(store.timerById(instance, timer.id)).toMatchObject({ state: 'done', reason: 'target_deleted' })
+    expect(notes.filter(event => event.type === 'timer.changed')).toHaveLength(0)
+  }, 120_000)
+
+  it('reports a chat delete as done when post-delete cleanup fails', async () => {
+    const m = await workspaceManager(), p = await manager('Worker')
+    await heartbeat(m, p)
+    runtime.on('deleted', () => { throw new Error('cleanup boom') })
+    await expect(runtime.delete(p.id)).resolves.toMatchObject({ workspaceRemoved: false })
+    expect(runtime.get(p.id)).toBeNull()
+    const failures = reported('chat.session.delete').filter(e => e.target === p.id)
+    expect(failures).toHaveLength(1)
+    expect(failures[0]).toMatchObject({ message: expect.stringContaining('cleanup') })
+  }, 120_000)
+
   it.each(['once', 'every'] as const)('retains an open %s timer turn beyond the admitted-row window', async (kind) => {
     const m = await workspaceManager(), p = await manager('Worker')
     const created = (await command(m.id, { operation: 'timer', sessionId: p.id, label: 'Long turn', message: 'Ping',
@@ -943,7 +970,7 @@ describe('durable timers that wake chats', () => {
     await until(() => runtime.get(p.id)?.status === 'idle')
   }, 60_000)
 
-  it.each(['failed', 'paused'] as const)('delivers a timer past an older ordinary row blocked by a %s queue', async (state) => {
+  it.each(['failed', 'paused'] as const)('admits an older ordinary row past a %s queue ahead of its later timer', async (state) => {
     const m = await workspaceManager(), p = await manager('Worker')
     if (state === 'failed') {
       runtime.prompt(p.id, { text: 'First', attachments: [], mentions: [] })
@@ -953,6 +980,8 @@ describe('durable timers that wake chats', () => {
       await until(() => (prompts.get(p.id) ?? []).length === 2)
       finishes.get(p.id)!({ stopReason: 'error', error: 'Queue failure' })
       await until(() => runtime.get(p.id)?.status === 'idle')
+      // The failed turn paused delivery; resume it to isolate the queue question.
+      store.resumeDelivery(instance, p.id)
     } else await runtime.enqueue(p.id, randomUUID(), { text: 'Paused task', attachments: [], mentions: [] })
     const queue = runtime.get(p.id)!.queue!
     expect(queue.ready).toBe(false)
@@ -964,20 +993,28 @@ describe('durable timers that wake chats', () => {
     const count = (prompts.get(p.id) ?? []).length
     clock += 2 * 60_000
     await control.tick()
+    // #590: neither a failed nor an unarmed queue item holds ordinary delivery.
     await until(() => (prompts.get(p.id) ?? []).length === count + 1)
-    expect(starts(p.id).at(-1)!.source).toMatchObject({ kind: 'timer', timerId: timer.id })
+    expect(prompts.get(p.id)!.at(-1)!.text).toContain('Ordinary behind queue')
     const firing = store.inbox(instance, p.id).find(row => row.timer_id === timer.id)!
     expect(ordinary.seq).toBeLessThan(firing.seq)
-    expect(store.inbox(instance, p.id).find(row => row.seq === ordinary.seq)?.state).toBe('pending')
-    expect(runtime.get(p.id)!.queue).toEqual(queue)
+    expect(store.inbox(instance, p.id).find(row => row.seq === ordinary.seq)?.state).toBe('admitted')
     finishes.get(p.id)!({ stopReason: 'end_turn' })
-    await until(() => store.timerById(instance, timer.id)?.state === 'done')
     if (state === 'paused') {
       // Completing the admitted turn arms the waiting task queue normally.
       await until(() => (prompts.get(p.id) ?? []).length === count + 2)
       expect(prompts.get(p.id)!.at(-1)!.text).toContain('Paused task')
       finishes.get(p.id)!({ stopReason: 'end_turn' })
+      await until(() => runtime.get(p.id)?.status === 'idle')
+      clock += 61_000 // past the person's grace from the queue turn
+    } else {
+      await until(() => runtime.get(p.id)?.status === 'idle')
     }
+    await control.tick()
+    await until(() => (prompts.get(p.id) ?? []).length === count + (state === 'paused' ? 3 : 2))
+    expect(starts(p.id).at(-1)!.source).toMatchObject({ kind: 'timer', timerId: timer.id })
+    finishes.get(p.id)!({ stopReason: 'end_turn' })
+    await until(() => store.timerById(instance, timer.id)?.state === 'done')
   }, 60_000)
 
   it('lets ordinary messages and another timer pass an older firing in backoff', async () => {

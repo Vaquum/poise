@@ -39,6 +39,15 @@ which must be `GITHUB_INTERFACE_AGENT_USER`, and `github-datastore` reads
 GitHub only as the account whose token `GH_TOKEN` holds. Poise sets all of
 these from Settings → GitHub.
 
+Poise selects the opposite configured account for PR work. The live `--head-sha`
+and `--current-pr` replies include `author`; PR review submissions reject the
+PR author as actor. For automated work under the main account, Poise supplies
+`GITHUB_INTERFACE_AUTOMATED_REVIEWS`, a JSON array of recorded review IDs.
+Approval and every conversation-resolution gate refuse reviews by that actor
+whose IDs are absent. An absent variable preserves standalone Caller behavior.
+The installed stop gate selects the main reader for agent-authored PRs and the
+agent reviewer otherwise; the accounts must be distinct and author evidence known.
+
 ## Repository checkouts
 
 Repository checkouts reuse a bare mirror under a per-repository lock. The lock
@@ -69,6 +78,11 @@ conversation completeness and merge state without Poise's display cache, and
 sends the expected SHA to GitHub's merge endpoint. GitHub enforces protections.
 The method is the first allowed of squash, merge and rebase. The JSON outcome
 is `merged` with `merge_sha`, `not_ready`, `superseded`, or `already_merged`.
+On a branch with a native merge queue it instead sends a head-pinned enqueue
+mutation after successful head checks, platform approval and complete
+conversation checks, and reports `enqueued` or `in_queue` with the confirmed
+queue entry id; neither is a completed merge. The queue admission contract is
+in `docs/Behavior-Contract.md`.
 API errors fail visibly; a lost merge response can be reconciled by the next
 read without merging twice. This operation requires an explicit acting account.
 

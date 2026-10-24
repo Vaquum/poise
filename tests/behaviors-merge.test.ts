@@ -28,6 +28,8 @@ let healthError: Error | null = null
 let response: Record<string, unknown> = {}
 let pulls: Array<Record<string, unknown>> = []
 let readyNumbers: Set<number> | null = null
+let queuedEntries: Record<number, string> = {}
+let heads: Record<number, string> = {}
 let behindNumbers = new Set<number>()
 let approvedAts: Record<number, string | null> = {}
 let unreadableNumbers = new Set<number>()
@@ -59,17 +61,18 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
   if (command === 'github-interface' && args[0] === '--merge-candidates') {
     if (batchGate) { batchGate.reached(); await batchGate.wait }
     const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
-    return json({ action: 'merge_candidates', actor: 'review-bot', graphql_cost: 1, records: requests.map((request) => ({
-      ...request, head_sha: HEAD, author: 'octocat', ready: !unreadableNumbers.has(request.number) && (readyNumbers === null || readyNumbers.has(request.number)),
+    return json({ action: 'merge_candidates', actor: args[args.indexOf('--token-user') + 1], graphql_cost: 1, records: requests.map((request) => ({
+      ...request, head_sha: heads[request.number] ?? HEAD, author: pulls.find((pr) => pr.repo === request.repository && pr.number === request.number)?.author ?? 'octocat', ready: !unreadableNumbers.has(request.number) && (readyNumbers === null || readyNumbers.has(request.number)),
       behind: !unreadableNumbers.has(request.number) && behindNumbers.has(request.number),
       approved_at: request.number in approvedAts ? approvedAts[request.number]!
         : behindNumbers.has(request.number) ? '2026-10-22T00:00:00Z' : null,
+      queue_entry_id: queuedEntries[request.number] ?? null,
       error: unreadableNumbers.has(request.number) ? 'GitHub could not read this target' : null,
     })) })
   }
   if (command === 'github-interface' && args[0] === '--merge-if-ready') {
     if (error) throw error
-    return json({ action: 'merge_if_ready', repository: repo, pull_number: number, head_sha: HEAD,
+    return json({ action: 'merge_if_ready', repository: repo, pull_number: number, head_sha: heads[number] ?? HEAD,
       outcome, merge_sha: 'b'.repeat(40), ...response })
   }
   if (command === 'github-interface' && args[0] === '--update-branch-if-behind') {
@@ -87,6 +90,7 @@ beforeEach(async () => {
   pulls = [pull()]
   outcome = 'merged'; updateOutcome = 'updated'; error = null; healthError = null; response = {}; batchGate = null
   readyNumbers = null; behindNumbers = new Set(); approvedAts = {}; unreadableNumbers = new Set()
+  queuedEntries = {}; heads = {}
   mocks.runFile.mockReset().mockImplementation(cli)
   mocks.spawnDetached.mockReset()
   vi.spyOn(console, 'log').mockImplementation(() => undefined)
@@ -145,17 +149,85 @@ describe('Merge Pull Requests', () => {
     expect(runtime.getMergePrsLastFired()).toEqual(first)
     expect(db.db.prepare('SELECT status FROM behavior_runs').all()).toEqual([{ status: 'completed' }])
   })
-  it.each(['not_ready', 'superseded', 'already_merged', 'enqueued', 'in_queue'])('does not report a merge for %s', async (value) => {
+  it.each(['not_ready', 'superseded', 'already_merged', 'in_queue'])('does not report a merge for %s', async (value) => {
     enable(); outcome = value
-    if (['enqueued', 'in_queue'].includes(value)) response = { queue_entry_id: 'MQE_test' }
+    if (value === 'in_queue') response = { queue_entry_id: 'MQE_test' }
     await runtime.runEnabledBehaviorsOnce()
     expect(mergeCalls()).toHaveLength(1)
     expect(runtime.getMergePrsLastFired()).toBeNull()
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
     expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       state: value === 'superseded' ? 'superseded' : 'completed',
-      outcome: ['enqueued', 'in_queue'].includes(value) ? 'waiting' : value,
+      outcome: value === 'in_queue' ? 'waiting' : value,
     }))
+  })
+  it('records an enqueue as a write with its entry reference and updates the receipt', async () => {
+    enable(); outcome = 'enqueued'; response = { queue_entry_id: 'MQE_1' }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      state: 'completed', outcome: 'enqueued',
+      refs: [{ kind: 'queue', identity: 'MQE_1', availability: 'available' }],
+    }))
+    expect(runtime.getMergePrsLastFired()).toEqual({ at: expect.any(String), target: `${REPO}#7` })
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+  it('skips a queued PR on later sweeps without another merge call', async () => {
+    enable(); outcome = 'enqueued'; response = { queue_entry_id: 'MQE_1' }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    queuedEntries = { 7: 'MQE_1' }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    expect(mocks.captureOutcome).toHaveBeenCalledTimes(1)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+    expect(runtime.getMergePrsLastFired()?.target).toBe(`${REPO}#7`)
+  })
+  it('retains a queue ejection instead of resubmitting it', async () => {
+    enable(); outcome = 'enqueued'; response = { queue_entry_id: 'MQE_1' }
+    vi.useFakeTimers()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    // Integration CI rejected the entry (or someone dequeued it): the head is
+    // unchanged and still green, but the entry is gone.
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({
+      target: `${REPO}#7`, error: expect.stringContaining('removed from the merge queue'),
+    })])
+    // Still no resubmission once the backoff comes due.
+    await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_RETRY_BASE_MS)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toHaveLength(1)
+  })
+  it('adopts a manually requeued entry without calling merge again', async () => {
+    enable(); outcome = 'enqueued'; response = { queue_entry_id: 'MQE_1' }
+    vi.useFakeTimers()
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_RETRY_BASE_MS)
+    queuedEntries = { 7: 'MQE_2' }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+  it('enqueues a new head after an ejection instead of retaining the old rejection', async () => {
+    enable(); outcome = 'enqueued'; response = { queue_entry_id: 'MQE_1' }
+    vi.useFakeTimers()
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_RETRY_BASE_MS)
+    const next = 'c'.repeat(40)
+    heads = { 7: next }
+    response = { queue_entry_id: 'MQE_2' }
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(2)
+    expect(mergeCalls()[1]![1]).toContain(next)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+    expect(runtime.getMergePrsLastFired()?.target).toBe(`${REPO}#7`)
   })
   it('rejects a queued outcome without a confirmed queue entry', async () => {
     enable(); outcome = 'enqueued'
@@ -322,5 +394,59 @@ describe('Merge Pull Requests', () => {
     expect(runtime.withBehaviorOrganization('beta', () => runtime.isEnabled('merge-prs'))).toBe(true)
     expect(runtime.withBehaviorOrganization('beta', runtime.getMergePrsLastFired)?.target).toBe('beta/app#8')
     expect(runtime.withBehaviorOrganization('acme', runtime.getMergePrsLastFired)).toBeNull()
+  })
+})
+
+
+describe('opposite-account merge routing', () => {
+  it('partitions mixed authors and merges each as the opposite account', async () => {
+    pulls = [pull(), pull(REPO, 8, { author: 'review-bot' })]
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls().map(([, args]) => args.slice(-4))).toEqual([
+      ['--author', 'octocat', '--token-user', 'review-bot'],
+      ['--author', 'review-bot', '--token-user', 'octocat'],
+    ])
+  })
+  it('updates only the globally oldest behind PR across both accounts', async () => {
+    pulls = [pull(), pull(REPO, 8, { author: 'review-bot' })]
+    readyNumbers = new Set(); behindNumbers = new Set([7, 8])
+    approvedAts = { 7: '2026-10-22T12:00:00Z', 8: '2026-10-21T12:00:00Z' }
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(1)
+    expect(updateCalls()[0][1]).toEqual(['--update-branch-if-behind', '#8', '--expected-head', HEAD,
+      '--author', 'review-bot', '--token-user', 'octocat'])
+  })
+  it('holds the selected main account when its behind-branch update is denied', async () => {
+    pulls = [pull(REPO, 7, { author: 'review-bot' })]
+    readyNumbers = new Set(); behindNumbers = new Set([7])
+    error = new Error('GitHub 404: Not Found')
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().holds).toEqual([expect.objectContaining({ actor: 'octocat' })])
+  })
+  it('does not clear the other account hold after a successful main-account branch update', async () => {
+    pulls = [pull(REPO, 7, { author: 'review-bot' })]
+    readyNumbers = new Set(); behindNumbers = new Set([7])
+    const key = `behavior_repo_hold:review-bot:${REPO}`
+    db.setMeta(key, JSON.stringify({ repo: REPO, actor: 'review-bot', error: 'GitHub 404: Not Found', heldAtMs: Date.now(), nextRecheckAtMs: Date.now() + 3_600_000 }))
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(1)
+    expect(db.getMeta(key)).not.toBe('')
+    expect(runtime.getBehaviorsRuntimeHealth().holds).toEqual([expect.objectContaining({ actor: 'review-bot' })])
+  })
+  it('continues the other account group after one credential read fails', async () => {
+    pulls = [pull(), pull(REPO, 8, { author: 'review-bot' })]
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-interface' && args[0] === '--merge-candidates' && args.at(-1) === 'review-bot') throw new Error('Credential missing for review-bot')
+      return cli(command, args, options)
+    })
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toHaveLength(1)
+    expect(mergeCalls()[0][1]).toContain('octocat')
   })
 })

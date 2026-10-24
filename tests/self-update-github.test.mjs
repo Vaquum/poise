@@ -205,6 +205,28 @@ describe('GitHub client', () => {
     expect(await api.listWorkflowRuns(HEAD)).toEqual([])
   })
 
+  it('filters workflow runs by event and follows a full first page to the trusted run', async () => {
+    const filler = Array.from({ length: 100 }, (_, index) => workflowRun({ event: 'schedule', run_number: index + 1 }))
+    const trusted = workflowRun({ event: 'merge_group', run_number: 101 })
+    const { api, calls } = client((url) => {
+      const page = Number(new URL(url).searchParams.get('page'))
+      return response(200, { total_count: 101, workflow_runs: page === 1 ? filler : [trusted] })
+    })
+    const runs = await api.listWorkflowRuns(HEAD, { event: 'merge_group' })
+    expect(runs).toHaveLength(101)
+    expect(runs.at(-1)).toMatchObject({ event: 'merge_group', run_number: 101 })
+    expect(calls).toHaveLength(2)
+    expect(calls[0].url).toContain('event=merge_group')
+    expect(calls[0].url).toContain('per_page=100')
+  })
+
+  it('requests one short page when no event filter is given', async () => {
+    const { api, calls } = client(() => response(200, { workflow_runs: [] }))
+    expect(await api.listWorkflowRuns(HEAD)).toEqual([])
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).not.toContain('event=')
+  })
+
   it('requires a token loader', () => {
     expect(() => createGitHubClient({ fetch: async () => response(200, {}) })).toThrow(/loadToken/)
   })

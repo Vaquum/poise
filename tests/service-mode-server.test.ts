@@ -345,6 +345,9 @@ describe('Poise in service mode', () => {
   })
 
   it('counts a launch admitted before the drain until its handler finishes', async () => {
+    ;(await import('../server/db')).setMeta('me', 'octocat')
+    await writeFile(join(bin, 'github-interface'), `#!/bin/sh\nprintf '%s' '${JSON.stringify({ action: 'head_sha', repository: 'acme/app', pull_number: 1, head_sha: 'a'.repeat(40), author: 'octocat' })}'\n`)
+    await chmod(join(bin, 'github-interface'), 0o755)
     const hold = join(root, 'hold-models')
     const fail = join(root, 'fail-models')
     await writeFile(hold, '')

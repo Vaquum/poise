@@ -36,6 +36,8 @@ export interface GatewayDeps {
   log: Logger
   now: () => number
   upstream: UpstreamResolver
+  /** Bound for in-flight requests to finish during close(); SHUTDOWN_GRACE_MS when unset, shorter in tests. */
+  shutdownGraceMs?: number
 }
 
 export interface Principal {

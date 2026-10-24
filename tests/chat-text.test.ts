@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { deleteConfirmCopy, deleteRemovesWorkspace, queuedStatusText } from '../src/chat-text'
+import { deleteBulkConfirmCopy, deleteConfirmCopy, deleteRemovesWorkspace, queuedStatusText } from '../src/chat-text'
 import type { SessionRecord } from '../server/chat/protocol'
 
 const session = (overrides: Partial<SessionRecord> & { id: string }): SessionRecord => ({
@@ -57,6 +57,17 @@ describe('delete confirmation preview', () => {
     expect(deleteConfirmCopy({ ...solo, checkout: '/poise/.poise-chat/workspace' }, [solo])).toEqual({
       title: 'Confirm delete (keeps its workspace)',
       label: 'Confirm deleting session (keeps its workspace)',
+    })
+  })
+
+  it('states the count for a bulk delete', () => {
+    expect(deleteBulkConfirmCopy(3)).toEqual({
+      title: 'Delete 3 chats?',
+      label: 'Confirm deleting 3 chats',
+    })
+    expect(deleteBulkConfirmCopy(1)).toEqual({
+      title: 'Delete 1 chat?',
+      label: 'Confirm deleting 1 chat',
     })
   })
 })

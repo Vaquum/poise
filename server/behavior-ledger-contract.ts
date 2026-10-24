@@ -11,9 +11,9 @@ export type LedgerSlot = 'primary' | 'secondary' | 'tertiary'
 export type LedgerSource = `poise:${BehaviorKey}` | 'poise:manual-review' | 'poise:replay'
 export type LedgerOutcome = 'clean' | 'changes_requested' | 'approved' | 'commented' | 'preflight_failed'
   | 'resolved' | 'waiting' | 'no_op' | 'merged' | 'already_merged' | 'updated' | 'not_ready' | 'superseded'
-  | 'rerun_requested' | 'read_failed' | 'spawn_failed' | 'adopted'
+  | 'rerun_requested' | 'read_failed' | 'spawn_failed' | 'adopted' | 'enqueued'
 export interface LedgerReference {
-  kind: 'caller' | 'correlation' | 'review' | 'comment' | 'workflow' | 'intent' | 'logging'
+  kind: 'caller' | 'correlation' | 'review' | 'comment' | 'workflow' | 'intent' | 'logging' | 'queue'
   identity: string
   availability: 'available' | 'unavailable' | 'unknown'
 }

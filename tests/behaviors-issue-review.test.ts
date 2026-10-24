@@ -371,7 +371,7 @@ describe('Review New Issues', () => {
     const { behaviors } = await start()
     issues = [issue(452), issue(453)]
     const slots = behaviors.getBehaviorCheckSlots()
-    const held = [slots.tryAcquire('background'), slots.tryAcquire('background'), slots.tryAcquire('background')]
+    const held = [slots.tryAcquire('behavior'), slots.tryAcquire('behavior'), slots.tryAcquire('behavior')]
     expect(held.every(Boolean)).toBe(true)
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(0)

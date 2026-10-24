@@ -374,6 +374,7 @@ describe('resolve-unblocking cursor rotation', () => {
     db.setMeta('behavior_resolve_unblocking_enabled', '1')
     const original = mocks.runFile.getMockImplementation()!
     let entered = deferred<void>()
+    const slowEntries = deferred<void>()
     const fastEntries = deferred<void>()
     const attempted: number[] = []
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
@@ -381,6 +382,7 @@ describe('resolve-unblocking cursor rotation', () => {
         const number = Number(args[1].replace('#', ''))
         attempted.push(number)
         entered.resolve()
+        if (number === 18) slowEntries.resolve()
         if (number === 26) fastEntries.resolve()
         if (number <= 18) {
           const signal = (options as { signal?: AbortSignal }).signal
@@ -396,7 +398,11 @@ describe('resolve-unblocking cursor rotation', () => {
     })
     const first = runtime.runEnabledBehaviorsOnce()
     await entered.promise
-    await vi.advanceTimersByTimeAsync(59_000)
+    await vi.advanceTimersByTimeAsync(30_000)
+    // Filesystem preparation is real I/O: let the second call enter before
+    // advancing the remaining sweep budget, as for the fast prefix below.
+    await slowEntries.promise
+    await vi.advanceTimersByTimeAsync(29_000)
     await first
     expect(attempted).toEqual([17, 18])
     expect(db.getMeta('behavior_resolve_unblocking_cursor')).toBe(`${pr.repo}#18`)

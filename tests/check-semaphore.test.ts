@@ -162,4 +162,72 @@ describe('shared check slots', () => {
   it('names the shared budget in the busy error', () => {
     expect(checkSlotsBusyError(4).message).toBe('all 4 shared check slots are busy; will retry')
   })
+
+  it('leaves one background slot free for behavior runs while the budget holds three', () => {
+    const sem = new CheckSemaphore(() => 4)
+    const first = sem.tryAcquire('background')
+    const second = sem.tryAcquire('background')
+    expect(first).not.toBeNull()
+    expect(second).not.toBeNull()
+    // Chat worker turns filled their share...
+    expect(sem.tryAcquire('background')).toBeNull()
+    expect(sem.available('background')).toBe(false)
+    // ...but a behavior run still starts, and the person's slot stays untouched.
+    expect(sem.available('behavior')).toBe(true)
+    const behavior = sem.tryAcquire('behavior')
+    expect(behavior).not.toBeNull()
+    expect(sem.available('behavior')).toBe(false)
+    expect(sem.available('person')).toBe(true)
+    expect(sem.stats()).toMatchObject({ running: 3, personRunning: 0, backgroundRunning: 2, behaviorRunning: 1 })
+    first!()
+    second!()
+    behavior!()
+  })
+
+  it('grants a waiting behavior run before an earlier background waiter', async () => {
+    const sem = new CheckSemaphore(() => 3)
+    const backgroundHold = await sem.acquire('background')
+    const behaviorHold = await sem.acquire('behavior')
+    let backgroundGranted = false
+    let behaviorGranted = false
+    const backgroundWait = sem.acquire('background').then((release) => { backgroundGranted = true; return release })
+    const behaviorWait = sem.acquire('behavior').then((release) => { behaviorGranted = true; return release })
+    expect(sem.stats().queued).toBe(2)
+    backgroundHold()
+    const behaviorRelease = await behaviorWait
+    expect(behaviorGranted).toBe(true)
+    expect(backgroundGranted).toBe(false)
+    behaviorHold()
+    const backgroundRelease = await backgroundWait
+    expect(backgroundGranted).toBe(true)
+    behaviorRelease()
+    backgroundRelease()
+  })
+
+  it('drops the behavior reservation when the background budget holds one', () => {
+    const sem = new CheckSemaphore(() => 2)
+    const hold = sem.tryAcquire('background')
+    expect(hold).not.toBeNull()
+    // No room for a second background share: the behavior run sheds...
+    expect(sem.tryAcquire('behavior')).toBeNull()
+    hold!()
+    // ...but with the budget drained it starts.
+    const behavior = sem.tryAcquire('behavior')
+    expect(behavior).not.toBeNull()
+    behavior!()
+  })
+
+  it('notifies release listeners once per holding', () => {
+    const sem = new CheckSemaphore(() => 1)
+    let calls = 0
+    const unsubscribe = sem.onRelease(() => { calls += 1 })
+    const release = sem.tryAcquire('person')!
+    release()
+    release()
+    expect(calls).toBe(1)
+    unsubscribe()
+    const second = sem.tryAcquire('person')!
+    second()
+    expect(calls).toBe(1)
+  })
 })

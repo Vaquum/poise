@@ -3,6 +3,32 @@
 Poise is a trigger and orchestration layer. It does not read GitHub source,
 construct reviews, or mutate review threads itself.
 
+## PR accounts
+
+PR behaviors accept either configured GitHub account as author, case-insensitively.
+The other account reviews, approves, resolves, merges, updates behind branches and
+recovers interrupted CI. Both accounts must be configured and distinct. Existing
+behavior enable switches and repository skips apply in both directions. Issue
+reviews continue to use the agent account alone. Neither saved settings nor gh's
+active account is switched. The human account now also spends automation API quota.
+
+Evidence reads are batched separately per acting account. Review and approval
+admissions pin their account pair and reviewer. The roles must still match at
+launch, even when the reviewer username stays the same. Resolution pins
+the pair before invoking Caller. Completed work
+and uncertain publications retain their original actor and dedupe identities.
+Existing baseline markers remain: previously unclaimed agent PRs become eligible
+on a normal scan; first enable snapshots both authors. No age cutoff is added.
+
+When reviewing as the main user, only recorded Poise review receipts authorize
+follow-up approval or resolution. Any manual/unclaimed review by that account
+holds those actions visibly, including after restart. Caller rechecks that receipt
+inventory immediately before approval and during each resolution gate; automation
+cannot supersede the person's manual review. Explicit manual reviews accept any
+known PR author (third-party authors use the agent); automatic eligibility stays
+within the pair. Author discovery uses Caller's live head primitive. The installed
+PR stop gate uses the same opposite-account rule from live PR author evidence.
+
 ## Diagnostic severity
 
 Behaviors' diagnostics are listed in the notification rail
@@ -171,14 +197,14 @@ first.
 `merge-prs` is disabled unless `behavior_merge_prs_enabled` is explicitly `1`.
 It uses Caller directly without a model launch: after fresh datastore eligibility,
 it discovers up to 50 eligible PRs per ready account with one fresh
-`--merge-candidates --requests-json JSON --token-user AGENT` GraphQL read.
+`--merge-candidates --requests-json JSON --token-user REVIEWER` GraphQL read.
 The packet carries current head, author, the existing green readiness predicate,
 a behind flag for branches that are only out of date, and the latest approval
 time; unchanged heads are still reevaluated for completed checks and conversations.
 Scoped GraphQL errors hold only their target; identity or unscoped errors hold the
 whole batch visibly. Discovery sends no REST reads or writes. For a ready candidate
 it holds the shared per-PR operation lock, then calls
-`--merge-if-ready PR --expected-head SHA --author USER --token-user AGENT`.
+`--merge-if-ready PR --expected-head SHA --author PR_AUTHOR --token-user REVIEWER`.
 Caller uses the existing green predicate with fresh head-pinned readiness and
 rechecks the pull request before a SHA-pinned merge request. Unknown readiness,
 pending/failed checks, unresolved live conversations, incomplete conversation
@@ -189,8 +215,14 @@ instead uses a head-pinned enqueue mutation after successful head checks,
 platform approval and complete conversation checks. It reports `enqueued` or
 `in_queue` with the confirmed queue entry; neither is a completed merge.
 The direct path reports `merged`, `already_merged`, `not_ready`, or `superseded`.
-A confirmed `merged` receipt alone updates the per-account Last triggered event;
-operation failures use existing diagnostics and retry backoff. A retry after a
+A confirmed `merged` or `enqueued` receipt updates the per-account Last triggered
+event; `enqueued` is recorded as a write with the queue entry reference, while
+`in_queue` stays an observation. The server remembers the last entry seen per PR
+head: a queued PR is skipped from the batch evidence without further calls, and
+a vanished entry for an unchanged green head is retained as a rejection with
+backoff instead of being resubmitted. A new head, a manual requeue, or the merge
+itself releases the admission.
+Operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
 Queue-enabled branches are excluded from automatic base updates: GitHub tests
@@ -203,7 +235,7 @@ snippets retain their saved text. After the merges, one scan updates
 at most one other behind branch, oldest approval
 first, so updates don't churn CI: the oldest-approved behind candidate holds the
 shared per-PR operation lock for
-`--update-branch-if-behind PR --expected-head SHA --author USER --token-user AGENT`.
+`--update-branch-if-behind PR --expected-head SHA --author PR_AUTHOR --token-user REVIEWER`.
 Caller revalidates the behind predicate on fresh head-pinned reads and sends the
 expected SHA to GitHub's update-branch endpoint. Anything else blocking, and a
 branch that caught up on its own, report `not_ready`. It reports `updated`,
@@ -217,7 +249,7 @@ Transient retries may add requests. GitHub's returned query cost is
 exposed in the Caller batch packet.
 
 `rerun-grey-ci` is off unless `behavior_rerun_grey_ci_enabled` is `1`. It reads
-`--grey-ci-candidates --requests-json JSON --token-user AGENT` in batches of 50
+`--grey-ci-candidates --requests-json JSON --token-user REVIEWER` in batches of 50
 with no REST polling. Current-head workflow check suites identify only completed
 cancelled/stale/timed-out GitHub Actions runs. Additional GraphQL pages complete
 truncated workflow inventories. The latest run per workflow/event excludes
@@ -273,7 +305,7 @@ If Caller explicitly reports a missing local checkout, Poise can provision an
 owned checkout through Caller's existing checkout primitive, verify its origin,
 commit and clean state, and publish it atomically. Concurrent requests share
 provisioning; changed or existing user checkouts are never replaced. The
-checkout is provisioned as your agent account, the reviewer, which Poise names
+checkout is provisioned as the selected opposite account, the reviewer, which Poise names
 to Caller with `--token-user`. CLI errors retain bounded, credential-redacted
 terminal diagnostics. Review receipts and launch claims remain authoritative;
 dependency repair never fabricates a verdict.
@@ -294,7 +326,7 @@ an exact proof that this particular run never submitted.
 repositories list (`behavior_<behavior>_skip_repos`): `owner/repo` names, one
 list per behavior shared by every ready account. Before a scan claims, reads or
 launches anything, it keeps only the pull requests that pass one check: open,
-not a draft, authored by your GitHub account, and outside the behavior's
+not a draft, authored by either configured GitHub account, and outside the behavior's
 skipped repositories. A skipped pull request is never claimed, dead-lettered or
 counted toward a retry. The list is read again immediately before a launch or a
 resolution or merge or CI rerun, so a repository skipped while a scan is under way is left alone too.
@@ -332,7 +364,7 @@ function for each kind of target for eligibility, so the two cannot drift
 apart.
 
 - `pr_review` and `pr_approve`: the pull request is open, not a draft,
-  authored by your GitHub account, and not in the Skip repositories list of
+  authored by either configured GitHub account, and not in the Skip repositories list of
   `review-new-prs` or `approve-prs` respectively.
 - `issue_review`: the repository is opted in to `review-new-issues`, the issue
   is open, and its author is a trusted author.

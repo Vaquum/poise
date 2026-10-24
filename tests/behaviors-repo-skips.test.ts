@@ -101,7 +101,7 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
     const repository = githubRepository(args, options)
     const number = Number(String(args[1] || '').replace(/^#/, ''))
     const changesEvidence = (repo: string, num: number) => ({
-      action: 'requested_changes_addressed', repository: repo, pull_number: num, username: flagValue(args, '--username'),
+      action: 'requested_changes_addressed', repository: repo, pull_number: num, pr_author: pulls.find((p) => p.repo === repo && p.number === num)?.author ?? ME, username: flagValue(args, '--username'),
       status: changeRequested, has_change_request: changeRequested,
       reviewer_latest_state: changeRequested ? 'CHANGES_REQUESTED' : null,
       reviewer_latest_commit: changeRequested ? HEAD : null,
@@ -152,7 +152,7 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
       const requests = JSON.parse(args[2]!) as Array<{ repository: string, number: number }>
       return json({ action: 'merge_candidates', actor: AGENT, graphql_cost: 1,
         records: requests.map((request) => ({ ...request, head_sha: HEAD, author: ME,
-          ready: true, behind: false, approved_at: null, error: null })) })
+          ready: true, behind: false, approved_at: null, queue_entry_id: null, error: null })) })
     }
     if (args[0] === '--merge-if-ready') return json({ action: 'merge_if_ready', repository, pull_number: number, head_sha: HEAD, outcome: 'merged', merge_sha: 'b'.repeat(40) })
     if (args[0] === '--sub-issues') return json({ action: 'sub_issues', repository, issue_number: number, sub_issues: [] })
@@ -395,7 +395,7 @@ describe('Replay checks', () => {
     ['pr_review', 'closed', { status: 'closed' }, `Replay refused: ${API}#1 is not an open pull request.`],
     ['pr_approve', 'merged', { status: 'merged' }, `Replay refused: ${API}#1 is not an open pull request.`],
     ['pr_review', 'a draft', { draft: 1 }, `Replay refused: ${API}#1 is a draft.`],
-    ['pr_approve', 'authored by someone else', { author: 'someone-else' }, `Replay refused: ${API}#1 is authored by someone-else, not by your GitHub account ${ME}.`],
+    ['pr_approve', 'authored by someone else', { author: 'someone-else' }, `Replay refused: ${API}#1 is authored by someone-else, outside your configured GitHub account pair.`],
   ] as const)('refuses %s replay of a pull request that is %s', async (behavior, _case, facts, message) => {
     await start()
     pulls = [pull(API, 1, facts)]
@@ -500,7 +500,7 @@ describe('the scheduler and a replay apply the same check', () => {
   const pullRequestCases: Array<[string, Record<string, unknown> | null, string[], string | true]> = [
     ['open, yours and not skipped', {}, [], true],
     ['a draft', { draft: 1 }, [], 'is a draft'],
-    ['authored by someone else', { author: 'someone-else' }, [], 'not by your GitHub account'],
+    ['authored by someone else', { author: 'someone-else' }, [], 'outside your configured GitHub account pair'],
     ['merged', { status: 'merged' }, [], 'is not an open pull request'],
     ['missing from the datastore', null, [], 'is not an open pull request'],
     ['in a skipped repository', {}, [API], 'Skip repositories list'],

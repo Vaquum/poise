@@ -258,6 +258,10 @@ describe('worker failure classification and recovery', () => {
       expectedHead: NEXT_HEAD_SHA, actor: launched.actor, source: launched.source, correlationId: claimId })).toBe(true)
     expect(db.completeBehaviorLaunchOwned({ key: 'approve-prs', target, claimId,
       action: 'approved', outcome: 'approved', completedAt: new Date().toISOString(), headSha: NEXT_HEAD_SHA })).toBe(true)
+    // Recovery requires the failed attempt's recorded actor, never today's settings.
+    expect(runtime.getBehaviorsRuntimeHealth().failures[0]?.recovered).not.toBe(true)
+    const failed = db.listBehaviorLaunchClaims('approve-prs').find((claim) => claim.target === launched.target)!
+    expect(db.linkBehaviorLaunchCallOwned('approve-prs', launched.target, failed.claimId, 'd'.repeat(32))).toBe(true)
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ recovered: true })])
     expect(db.getMeta(key)).not.toBeNull()
     // An audit can be recreated after completion during log reconciliation.

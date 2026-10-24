@@ -105,7 +105,12 @@ have the pinned head as its second parent, retain the recorded base through its
 first parent, be reachable from live main, and pass the trusted `merge_group`
 workflow aggregate on its exact SHA. This allows tested integration with newer
 main changes without requiring the PR's old tree or old base as a direct parent.
-An acknowledged entry removed without merging fails visibly.
+An acknowledged entry removed without merging fails visibly. An enqueue whose
+response was lost without an observed entry is never resubmitted: the change
+fails visibly instead, since absence cannot prove the admission never
+happened. The acknowledged entry id is journaled, and a replaced entry fails
+the same way. CI reads filter server-side by workflow event and follow full
+result pages, so scheduled runs cannot hide the trusted integration run.
 With the queue disabled, expected parents are journaled before `PUT …/merge`,
 which still requires exactly `[main, head]` and the tested head's tree.
 Uncertain outcomes are re-observed, not blindly repeated. A mismatch blocks

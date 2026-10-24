@@ -6007,6 +6007,7 @@ body:has(#view-chat:not([hidden])) #app { padding-bottom: 0; }
 }
 .chat-session-item:hover { background: var(--n0); }
 .chat-session-item.active { background: var(--n0); border-color: var(--n3); }
+.chat-session-item.selected { border-color: var(--a1); background: var(--tint-a1); }
 .chat-session-item.pending { opacity: 0.7; }
 .chat-session-title {
   font-size: 0.8125rem;

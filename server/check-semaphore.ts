@@ -3,20 +3,28 @@
 // full builds and test suites cannot pile past the cap no matter which
 // surface started them. Waiting is FIFO within a lane; the person lane goes
 // first and keeps one slot free while the budget holds at least two, so an
-// interactive turn never queues behind background work. Best-effort across
+// interactive turn never queues behind background work. Chat turns on the
+// background lane leave one more slot for behavior runs while the
+// background budget holds two, so worker load cannot starve the reviews
+// and approvals that finish the workers' own work. Best-effort across
 // processes: a second server during an update overlap holds its own budget.
-export type CheckLane = 'person' | 'background'
+export type CheckLane = 'person' | 'background' | 'behavior'
 
 export const DEFAULT_CHECK_SLOT_CAP = 4
 
 /** Background holdings stay this far below the cap while the cap holds two. */
 const PERSON_RESERVE = 1
 
+/** Chat-turn holdings stay this far below the background budget while that
+ *  budget holds two, so a behavior run can always start. */
+const BEHAVIOR_RESERVE = 1
+
 export interface CheckSlotStats {
   cap: number
   running: number
   personRunning: number
   backgroundRunning: number
+  behaviorRunning: number
   queued: number
   oldestQueueAgeMs: number
   maxWaitMs: number
@@ -39,7 +47,7 @@ interface CheckSlotWaiter {
   onAbort: () => void
 }
 
-/** Fail-fast error when a background launch finds the shared budget full. */
+/** Fail-fast error when a behavior launch finds the shared budget full. */
 export function checkSlotsBusyError(cap: number): Error {
   return new Error(`all ${cap} shared check slots are busy; will retry`)
 }
@@ -48,7 +56,9 @@ export class CheckSemaphore {
   private holdings = 0
   private personHoldings = 0
   private backgroundHoldings = 0
+  private behaviorHoldings = 0
   private readonly waiters: CheckSlotWaiter[] = []
+  private readonly releaseListeners = new Set<() => void>()
   private maxWaitMs = 0
 
   constructor(private readonly capGetter: () => number) {}
@@ -62,24 +72,42 @@ export class CheckSemaphore {
     return cap - (cap >= 2 ? PERSON_RESERVE : 0)
   }
 
+  private chatTurnLimit(cap: number): number {
+    const background = this.backgroundLimit(cap)
+    return background - (background >= 2 ? BEHAVIOR_RESERVE : 0)
+  }
+
   private fits(lane: CheckLane, cap: number): boolean {
     if (this.holdings >= cap) return false
-    return lane === 'person' || this.backgroundHoldings < this.backgroundLimit(cap)
+    if (lane === 'person') return true
+    if (this.backgroundHoldings + this.behaviorHoldings >= this.backgroundLimit(cap)) return false
+    return lane === 'behavior' || this.backgroundHoldings < this.chatTurnLimit(cap)
   }
 
   private take(lane: CheckLane): () => void {
     this.holdings += 1
     if (lane === 'person') this.personHoldings += 1
-    else this.backgroundHoldings += 1
+    else if (lane === 'background') this.backgroundHoldings += 1
+    else this.behaviorHoldings += 1
     let released = false
     return () => {
       if (released) return
       released = true
       this.holdings -= 1
       if (lane === 'person') this.personHoldings -= 1
-      else this.backgroundHoldings -= 1
+      else if (lane === 'background') this.backgroundHoldings -= 1
+      else this.behaviorHoldings -= 1
       this.grant()
+      for (const listener of this.releaseListeners) listener()
     }
+  }
+
+  /** Runs the listener after a holding releases and parked waiters grant.
+   *  Returns an unsubscribe. Releases arrive in bursts when turns settle
+   *  together, so a listener that schedules work must coalesce. */
+  onRelease(listener: () => void): () => void {
+    this.releaseListeners.add(listener)
+    return () => { this.releaseListeners.delete(listener) }
   }
 
   /** True when the lane could take a slot now, after earlier waiters. */
@@ -135,7 +163,7 @@ export class CheckSemaphore {
   /** Hand free slots to parked waiters, person lane first, FIFO per lane. */
   grant(): void {
     const cap = this.liveCap()
-    for (const lane of ['person', 'background'] as const) {
+    for (const lane of ['person', 'behavior', 'background'] as const) {
       while (this.fits(lane, cap)) {
         const at = this.waiters.findIndex((waiter) => waiter.lane === lane)
         if (at < 0) break
@@ -158,6 +186,7 @@ export class CheckSemaphore {
       running: this.holdings,
       personRunning: this.personHoldings,
       backgroundRunning: this.backgroundHoldings,
+      behaviorRunning: this.behaviorHoldings,
       queued: this.waiters.length,
       oldestQueueAgeMs: oldest,
       maxWaitMs: this.maxWaitMs,

@@ -1,5 +1,6 @@
 from typing import Any
 
+from github_interface.atoms.review_identity import require_other_author
 from github_interface.atoms.pulls import comment_review, get_pull
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head, pull_number, repository, token_user
@@ -15,6 +16,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     actor = token_user(payload)
     pull = await get_pull(client, owner, repo, number)
     actual_head = str((pull.get("head") or {}).get("sha") or "").lower()
+    require_other_author(pull, actor)
     if pull.get("state") != "open" or pull.get("draft") is True:
         raise RuntimeError("pull request is not open and ready for review")
     if actual_head != required_head:

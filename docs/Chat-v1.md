@@ -253,12 +253,15 @@ caps concurrently running heavy work (default 4): Poise-local turns and the
 agent runs background behaviors launch draw from the one pool, so builds and
 test suites cannot pile past the cap no matter which surface started them. A
 turn held by the cap shows `queued` with its own reason, "waiting for a free
-agent slot"; a behavior launch past it waits for its retry clock instead, and
-names the busy budget in its failure. Raising the cap starts waiting turns at
-once, in queue order, up to the new cap; lowering it stops nothing, and new
-turns wait. While the cap holds at least two, delegated, supervised and timer
-turns together with behavior runs leave one slot free, so a turn you send
-starts without queueing behind background work. The
+agent slot"; a behavior launch past it defers without backoff instead, names
+the busy budget in its failure, and retries when a slot frees. Raising the
+cap starts waiting turns at once, in queue order, up to the new cap;
+lowering it stops nothing, and new turns wait. While the cap holds at least
+two, delegated, supervised and timer turns together with behavior runs leave
+one slot free, so a turn you send starts without queueing behind background
+work; while the background budget holds two, those turns leave one more
+slot for behavior runs, so worker load cannot stall the reviews and
+approvals that finish the workers' own work. The
 Switchboard's chat runs one turn at a time outside that cap, so it keeps
 reporting while every slot is busy, and the Manager's turns run outside it
 too, so supervision still runs when every slot is busy. The health endpoint
@@ -272,8 +275,11 @@ Per-session workspaces make same-checkout contention rare; it remains for
 forks and handoffs on one workspace, development versus production, and
 orphan holds. The lease covers startup, execution, tool services and
 process cleanup, not only the subprocess launch. Worker gates register a process group before allowing
-it to run. An unverified surviving worker keeps the checkout blocked. A
-Poise-side filesystem operation must finish before the lease is released;
+it to run. An unverified surviving worker keeps the checkout blocked.
+A holder counts as alive only while its host process is still the one that
+acquired the lease — the pid plus its start time — so a pid the operating
+system reused after a restart never pins a dead lease.
+A Poise-side filesystem operation must finish before the lease is released;
 killing an agent cannot cancel filesystem work already executing in Poise.
 
 These are cooperative application locks. They do not prevent a person or an
