@@ -584,11 +584,16 @@ the workspace refuses new Chat turns and agent launches, which then answer
 that Poise is installing an update, and lets running work finish. One Chat
 turn holds the drain at most 30 minutes: past that the workspace stops it
 with a notice in its transcript, naming the update, and the agent keeps its
-context for the next prompt. Once the workspace is idle the gateway recreates
-the container on the new image with the same home volume; past
-`POISE_DRAIN_TIMEOUT` seconds (90 minutes by default) it recreates a busy or
-down workspace, cutting only work that would not settle, and releases a
-workspace whose answers only timed out for the next pass. A stopped workspace
+context for the next prompt. Once an admitted drain reports the workspace idle
+the gateway recreates the container on the new image with the same home volume;
+past `POISE_DRAIN_TIMEOUT` seconds (90 minutes by default) it recreates a
+workspace that confirmed busy work behind an admitted drain or that it can no
+longer reach, cutting only work that would not settle, and releases one whose
+drain was never admitted or whose answers only timed out or were refused for
+the next pass (`workspace.upgrade.aborted`). After starting the replacement it
+waits for its health before declaring the upgrade finished, within the two-minute
+idle-to-ready bound; a miss warns (`workspace.upgrade.ready.missed`) and the next
+visit still brings the workspace up. A stopped workspace
 is recreated without being started. Follow it all in the gateway's log:
 
 ```bash
@@ -838,9 +843,15 @@ also alert through Poise Link and the page's notices.
 - **A workspace still runs the old image after an upgrade.** The gateway
   waits up to `POISE_DRAIN_TIMEOUT` for a busy workspace. Look for
   `workspace.drain.waiting` (what it waits on and the time left),
+  `workspace.drain.unconfirmed` (the drain was never admitted),
   `workspace.upgrade.aborted` and `workspace.drain.released` (a slow workspace
-  freed for the next pass), and `workspace.upgrade` and `workspace.network`
-  events in its log.
+  freed for the next pass), `workspace.update.waiting` and
+  `workspace.update.stuck` (an in-place switch waiting or stuck), and
+  `workspace.upgrade` and `workspace.network` events in its log.
+  `readyAfterMs` on `workspace.upgrade.finished` says how long the replacement
+  took to answer health; past the two-minute idle-to-ready bound the upgrade
+  finishes with `workspace.upgrade.ready.missed` instead, and the next visit
+  brings the workspace up.
 - **`install.sh` or `upgrade.sh` says the gateway is not on a workspace's
   network.** The gateway joins every workspace's network as it starts, and
   `docker logs poise-gateway 2>&1 | grep workspace.network` says why it could

@@ -64,6 +64,13 @@ export function imageRelease(labels: Record<string, string> | null): ImageReleas
 const INSTALL_RELEASE = '/opt/poise-runtime/install-release.sh'
 /** How long a workspace asked to switch may stay unreachable before it counts as hung and gets a new container. */
 const SWITCH_GRACE_MS = 10 * 60_000
+/**
+ * How long a replacement may take from stopping the old container until the new one answers health.
+ * An initial operational bound: every finished replacement reports its measured `readyAfterMs`, which
+ * tunes this. Past it the upgrade finishes anyway and demand-driven readiness recovers, so one slow
+ * workspace never holds the serial pass longer than this.
+ */
+export const IDLE_TO_READY_MS = 120_000
 
 /** The workspace answered, but not with a usable 200. Unlike a refused connection, this is not a slow start. */
 export class WorkspaceAnswerError extends Error {
@@ -105,6 +112,8 @@ export interface OrchestratorDeps {
   drainRenewMs?: number
   /** How long one service call waits for an answer; 5000 ms in production, shorter in tests. */
   serviceTimeoutMs?: number
+  /** Stop-to-ready bound for a replacement; IDLE_TO_READY_MS in production, shorter in tests. */
+  idleToReadyMs?: number
 }
 
 function parseHealth(text: string, what: string): ServiceHealth {
@@ -185,6 +194,7 @@ export class Orchestrator {
   private readonly drainPollMs: number
   private readonly drainRenewMs: number
   private readonly serviceTimeoutMs: number
+  private readonly idleToReadyMs: number
   private upgrading = false
   /** The workspace and phase a running pass waits on, so a skipped pass can say so. */
   private upgradingHandle: string | null = null
@@ -197,11 +207,14 @@ export class Orchestrator {
   private readonly installed = new Map<string, string>()
   /** A release a workspace refused because it failed to start there, so it is not asked for again. */
   private readonly refused = new Map<string, string>()
+  /** The release a stuck-switch warning was logged for, so it warns once per release, not per pass. */
+  private readonly stuckWarned = new Map<string, string>()
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.drainPollMs = deps.drainPollMs ?? DRAIN_POLL_MS
     this.drainRenewMs = deps.drainRenewMs ?? DRAIN_RENEW_MS
     this.serviceTimeoutMs = deps.serviceTimeoutMs ?? SERVICE_TIMEOUT_MS
+    this.idleToReadyMs = deps.idleToReadyMs ?? IDLE_TO_READY_MS
   }
 
   containerSpec(handle: string, login: string): ContainerSpec {
@@ -464,9 +477,34 @@ export class Orchestrator {
     if (health.release === target.release) {
       await this.withdrawSwitch(handle, login, health, target)
       this.updating.delete(handle)
+      this.stuckWarned.delete(handle)
       return true
     }
     if (this.refused.get(handle) === target.release) return true
+    if (!health.idle) {
+      // Legitimate waiting: the switch fires at a quiet moment, and busy work is not stuck.
+      this.lifecycle('workspace.update.waiting', handle, {
+        release: target.release,
+        running: health.release,
+        activeChatTurns: health.activeChatTurns,
+        runningCallerCalls: health.runningCallerCalls,
+        backgroundWork: health.backgroundWork,
+      })
+    } else {
+      const pending = this.updating.get(handle)
+      // A switch takes seconds once idle; one still pending past the grace is stuck, not waiting.
+      // The gateway keeps asking — recreating would cut work it cannot see — but says so, once.
+      if (pending?.release === target.release && this.deps.now() - pending.since >= SWITCH_GRACE_MS
+        && this.stuckWarned.get(handle) !== target.release) {
+        this.stuckWarned.set(handle, target.release)
+        this.deps.log.warn('workspace.update.stuck', {
+          handle,
+          release: target.release,
+          running: health.release,
+          elapsedMs: this.deps.now() - pending.since,
+        })
+      }
+    }
     if (this.installed.get(handle) !== target.release) {
       await this.installRelease(handle, false)
       this.installed.set(handle, target.release)
@@ -621,13 +659,20 @@ export class Orchestrator {
     let drainedIdle: boolean | null = null
     let drainAttempted = false
     let confirmedBusy = false
+    let admitted = false
     let sawDown = false
+    let lastCounts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null = null
     let recreated = false
     // Whether a drain POST left the gateway, visible even when drain() throws before returning.
     const dispatched = { value: false }
     const abortUnknown = async (): Promise<void> => {
-      await this.releaseDrain(handle, login, 'the drain timed out without a usable answer')
-      this.lifecycle('workspace.upgrade.aborted', handle, { reason: 'the drain timed out without a usable answer' })
+      const reason = 'the drain timed out without confirmed admission and idleness'
+      await this.releaseDrain(handle, login, reason)
+      // A failed admission is a deferred update, not routine: it warns so the owner can see it.
+      this.deps.log.warn('workspace.upgrade.aborted', { handle, reason,
+        activeChatTurns: lastCounts?.activeChatTurns ?? null,
+        runningCallerCalls: lastCounts?.runningCallerCalls ?? null,
+        backgroundWork: lastCounts?.backgroundWork ?? null })
     }
     try {
       for (;;) {
@@ -650,17 +695,17 @@ export class Orchestrator {
           // Activation can restart Poise: a switch queued before the drain fires once the drain leaves it
           // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
           // idle. A drain that timed out on confirmed busy work cuts it anyway; one that only timed out
-          // aborts instead of recreating a slow workspace blind. A workspace that refuses answers is down
-          // and still gets a new container.
+          // or was never admitted aborts instead of recreating a slow workspace blind. A workspace that
+          // reaches nothing is down and still gets a new container; one that answers unusably does not.
           if (running && drainedIdle) {
             this.upgradingPhase = 'recheck'
             const recheck = await this.idleUnderDrain(handle, login)
             this.upgradingPhase = 'upgrade'
             if (!recheck.idle) {
               if (recheck.unknown) {
-                if (!recheck.timeout) sawDown = true
+                if (recheck.down) sawDown = true
                 if (this.deps.now() >= deadline) {
-                  if (recheck.timeout) return 'abort-unknown'
+                  if (!recheck.down) return 'abort-unknown'
                   drainedIdle = false
                 } else return 'needs-drain'
               } else {
@@ -671,21 +716,30 @@ export class Orchestrator {
             }
           }
           this.ready.delete(handle)
+          let stoppedAt = 0
           if (running) {
             await docker.stopContainer(container)
+            stoppedAt = this.deps.now()
             this.lifecycle('workspace.container.stopped', handle, { reason: 'upgrade' })
           }
           await docker.removeContainer(container)
           this.lifecycle('workspace.container.removed', handle, { reason: 'upgrade' })
           await docker.createContainer(container, this.containerSpec(handle, login))
           this.lifecycle('workspace.container.created', handle, { image: this.deps.config.runtimeImage })
+          // Past this point the old container is gone: a later failure must not release a drain
+          // that died with it, and the next pass sees the new container.
+          recreated = true
+          let readyAfterMs: number | null = null
           if (running) {
             await docker.startContainer(container)
             store.noteWorkspaceStarted(handle)
             this.lifecycle('workspace.container.started', handle)
+            this.upgradingPhase = 'ready'
+            readyAfterMs = await this.awaitReplacementReady(handle, login, stoppedAt)
+            this.upgradingPhase = 'upgrade'
           }
-          recreated = true
-          this.lifecycle('workspace.upgrade.finished', handle, { image: imageId })
+          this.lifecycle('workspace.upgrade.finished', handle,
+            readyAfterMs === null ? { image: imageId } : { image: imageId, readyAfterMs })
           return 'done'
         })
         if (outcome === 'done') return
@@ -698,7 +752,9 @@ export class Orchestrator {
           return
         }
         if (this.deps.now() >= deadline) {
-          if (confirmedBusy || sawDown) {
+          // Busy work is cut only behind an admitted drain; without admission nothing confirmed the
+          // workspace even saw the drain, so the pass aborts and the next one tries again.
+          if ((confirmedBusy && admitted) || sawDown) {
             drainedIdle = false
             continue
           }
@@ -710,10 +766,13 @@ export class Orchestrator {
         this.upgradingPhase = 'upgrade'
         drainAttempted = drainAttempted || result.attempted
         confirmedBusy = confirmedBusy || result.confirmedBusy
-        if (!result.idle && !result.timeoutOnly && !result.confirmedBusy) sawDown = true
+        admitted = admitted || result.admitted
+        if (!result.idle) sawDown = sawDown || result.sawDown
+        lastCounts = result.lastCounts ?? lastCounts
         if (result.idle) {
+          admitted = true
           drainedIdle = true
-        } else if (!result.timeoutOnly || confirmedBusy || sawDown) {
+        } else if ((confirmedBusy && admitted) || sawDown) {
           drainedIdle = false
         } else {
           await abortUnknown()
@@ -731,13 +790,43 @@ export class Orchestrator {
   }
 
   /** Drains again and says whether the workspace is idle; unknown when it cannot tell. */
-  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; timeout: boolean }> {
+  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; down: boolean }> {
     try {
-      return { idle: (await this.serviceCall(handle, login, 'POST', '/api/service/drain')).idle, unknown: false, timeout: false }
+      const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
+      // The recheck guards the stop: only an authoritative idle answer lets it proceed. Whether the
+      // drain still shows is irrelevant to safety — stopping an idle workspace cuts nothing.
+      return { idle: health.ok && health.idle, unknown: false, down: false }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       this.deps.log.warn('workspace.drain.recheck.failed', { handle, error: errorMessage(error) })
-      return { idle: false, unknown: true, timeout: error instanceof ServiceTimeoutError }
+      return { idle: false, unknown: true, down: !(error instanceof ServiceTimeoutError) && !(error instanceof WorkspaceAnswerError) }
+    }
+  }
+
+  /**
+   * Waits for a replaced workspace to answer health, so `workspace.upgrade.finished` means the new
+   * container serves, not just that Docker started it. Returns stop-to-ready milliseconds, or null
+   * past the idle-to-ready bound; a miss warns with the last answer and finishes anyway, since
+   * demand-driven readiness still recovers. A refusal is the new container answering broken, not
+   * starting, and fails the wait at once; silence is waited out.
+   */
+  private async awaitReplacementReady(handle: string, login: string, stoppedAt: number): Promise<number | null> {
+    const miss = (error: string | null): null => {
+      this.deps.log.warn('workspace.upgrade.ready.missed', { handle, boundMs: this.idleToReadyMs,
+        elapsedMs: this.deps.now() - stoppedAt, ...(error === null ? {} : { error }) })
+      return null
+    }
+    for (;;) {
+      try {
+        const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+        if (health.ok) return this.deps.now() - stoppedAt
+        return miss('the replacement answered health with ok: false')
+      } catch (error) {
+        if (error instanceof WorkspaceNetworkError) throw error
+        if (error instanceof WorkspaceAnswerError) return miss(errorMessage(error))
+        if (this.deps.now() - stoppedAt >= this.idleToReadyMs) return miss(errorMessage(error))
+        await delay(this.drainPollMs)
+      }
     }
   }
 
@@ -757,15 +846,23 @@ export class Orchestrator {
    * A network the gateway cannot join fails the upgrade instead: waiting would drain nothing, and the
    * timeout would then recreate the workspace with its work cut off. A drain POST counts as dispatched
    * once the gateway is on the network to send it, recorded where the caller sees it even when a later
-   * poll throws, since a failed answer may still have been applied.
+   * poll throws, since a failed answer may still have been applied. Only an admitted drain — one whose
+   * answer showed it on — can finish idle: without admission new work stays unblocked, so an idle answer
+   * alone never recreates the workspace.
    */
-  private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }): Promise<{ idle: boolean; attempted: boolean; confirmedBusy: boolean; timeoutOnly: boolean }> {
+  private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }): Promise<{
+    idle: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; sawDown: boolean;
+    lastCounts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null
+  }> {
     const { config, log, now } = this.deps
     const start = now()
     let requestedAt = now()
     let confirmedBusy = false
-    let sawNonTimeout = false
+    let admitted = false
+    let sawDown = false
     let sawDraining = false
+    const lastCounts: { counts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null } = { counts: null }
+    const done = (idle: boolean) => ({ idle, attempted: dispatched.value, confirmedBusy, admitted, sawDown, lastCounts: lastCounts.counts })
     const waiting = (health: ServiceHealth): void => {
       log.info('workspace.drain.waiting', {
         handle,
@@ -776,12 +873,31 @@ export class Orchestrator {
         remainingSeconds: Math.max(0, Math.round((deadline - now()) / 1000)),
       })
     }
+    const counts = (health: ServiceHealth) => ({
+      activeChatTurns: health.activeChatTurns,
+      runningCallerCalls: health.runningCallerCalls,
+      backgroundWork: health.backgroundWork,
+    })
     const note = (health: ServiceHealth): void => {
       // A drain the gateway saw on is gone while the workspace still isn't idle: the owner or admin
       // resumed, the drain lapsed, or Poise restarted. An answer that never showed a drain is not a lift.
-      if (health.draining) sawDraining = true
-      else if (sawDraining && !health.idle) log.warn('workspace.drain.lifted', { handle })
+      if (health.draining) {
+        sawDraining = true
+        admitted = true
+      } else if (sawDraining && !health.idle) log.warn('workspace.drain.lifted', { handle })
       if (!health.idle) confirmedBusy = true
+      lastCounts.counts = counts(health)
+    }
+    // A drain answer that does not show the drain on: the workspace never confirmed admission, so the
+    // pass keeps waiting for one instead of treating the answer as a successful drain.
+    const unconfirmed = (health: ServiceHealth): void => {
+      note(health)
+      log.warn('workspace.drain.unconfirmed', { handle, ok: health.ok, draining: health.draining, ...counts(health) })
+    }
+    const failed = (error: unknown): void => {
+      // A timeout or an unusable answer leaves the workspace's state unknown; reaching nothing means
+      // it is down. Only a down workspace is recreated without ever confirming busy work.
+      if (!(error instanceof ServiceTimeoutError) && !(error instanceof WorkspaceAnswerError)) sawDown = true
     }
     // Fail before anything is sent when the gateway is off the network, so only a POST that left
     // the gateway counts towards releasing the drain on failure.
@@ -792,40 +908,57 @@ export class Orchestrator {
     }
     try {
       const health = await postDrain()
-      this.lifecycle('workspace.drain.requested', handle, {
-        activeChatTurns: health.activeChatTurns,
-        runningCallerCalls: health.runningCallerCalls,
-        backgroundWork: health.backgroundWork,
-      })
-      note(health)
-      if (health.idle) return { idle: true, attempted: dispatched.value, confirmedBusy, timeoutOnly: false }
+      if (!health.ok || !health.draining) {
+        unconfirmed(health)
+      } else {
+        this.lifecycle('workspace.drain.requested', handle, counts(health))
+        note(health)
+        if (health.idle) return done(true)
+      }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
-      if (!(error instanceof ServiceTimeoutError)) sawNonTimeout = true
+      failed(error)
       log.error('workspace.drain.request.failed', { handle, error: errorMessage(error) })
     }
     while (now() < deadline) {
       await delay(this.drainPollMs)
       const renew = now() - requestedAt >= this.drainRenewMs
       try {
-        const health = renew
-          ? await postDrain()
-          : await this.serviceCall(handle, login, 'GET', '/api/service/health')
-        if (renew) requestedAt = now()
-        note(health)
-        if (health.idle) {
-          this.lifecycle('workspace.drain.idle', handle)
-          return { idle: true, attempted: dispatched.value, confirmedBusy, timeoutOnly: false }
+        if (renew) {
+          const health = await postDrain()
+          requestedAt = now()
+          // A renewal that finally shows the drain confirms the admission the first POST missed.
+          if (!health.ok || !health.draining) unconfirmed(health)
+          else {
+            if (!admitted) this.lifecycle('workspace.drain.requested', handle, counts(health))
+            note(health)
+            if (health.idle) {
+              this.lifecycle('workspace.drain.idle', handle)
+              return done(true)
+            }
+            waiting(health)
+          }
+        } else {
+          const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+          note(health)
+          // Idle behind an admitted drain finishes; idle without one waits for the renewal to admit.
+          // A drain admitted and then lifted while idle is still safe to finish: nothing runs to cut.
+          if (health.ok && health.idle && (health.draining || admitted)) {
+            this.lifecycle('workspace.drain.idle', handle)
+            return done(true)
+          }
         }
-        if (renew) waiting(health)
       } catch (error) {
         if (error instanceof WorkspaceNetworkError) throw error
-        if (!(error instanceof ServiceTimeoutError)) sawNonTimeout = true
+        failed(error)
         log.warn(renew ? 'workspace.drain.renew.failed' : 'workspace.drain.health.failed', { handle, error: errorMessage(error) })
       }
     }
-    log.warn('workspace.drain.timeout', { handle, timeoutSeconds: config.drainTimeoutSeconds })
-    return { idle: false, attempted: dispatched.value, confirmedBusy, timeoutOnly: !confirmedBusy && !sawNonTimeout }
+    log.warn('workspace.drain.timeout', { handle, timeoutSeconds: config.drainTimeoutSeconds,
+      activeChatTurns: lastCounts.counts?.activeChatTurns ?? null,
+      runningCallerCalls: lastCounts.counts?.runningCallerCalls ?? null,
+      backgroundWork: lastCounts.counts?.backgroundWork ?? null })
+    return done(false)
   }
 
   private async startLocked(handle: string, login: string): Promise<void> {
