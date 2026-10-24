@@ -1008,7 +1008,6 @@ async function deleteSession(id: string): Promise<void> {
 async function deleteSessions(ids: string[]): Promise<void> {
   const targets = ids.filter((id) => sessions.has(id))
   if (!targets.length) return
-  const activeBefore = activeId
   // Titles up front: a target deleted concurrently is already gone when its
   // turn comes, and then no entry is left to name it from.
   const titles = new Map<string, string>()
@@ -1030,9 +1029,10 @@ async function deleteSessions(ids: string[]): Promise<void> {
   }
   // Successes already left the selection in destroySession; failures stay
   // selected so the list still shows what the notice names.
-  // Only the open chat's own deletion moves the pane: a JEV builder holds an
-  // activeId outside the sessions map and must stay open.
-  if (activeBefore && targets.includes(activeBefore) && !sessions.has(activeBefore)) resetAfterActiveDeleted()
+  // Only the open chat's own deletion moves the pane, read fresh like the
+  // single delete does: the user may have opened a survivor mid-flight, and
+  // a JEV builder holds an activeId outside the sessions map that must stay.
+  if (activeId && targets.includes(activeId) && !sessions.has(activeId)) resetAfterActiveDeleted()
   if (!failures.length) {
     setNotice(`Deleted ${deleted} ${deleted === 1 ? 'chat' : 'chats'}.`, 'info')
   } else {

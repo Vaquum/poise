@@ -874,6 +874,43 @@ test('bulk delete leaves an open JEV builder alone', async ({ page }) => {
   await expect(page.locator('.chat-notice')).toHaveText('Deleted 2 chats.')
 })
 
+test('bulk delete keeps a survivor opened mid-flight intact', async ({ page }) => {
+  const state = makeState([
+    session({ id: 's1', title: 'First', createdAt: '2026-09-16T10:00:00.000Z' }),
+    session({ id: 's2', title: 'Second', createdAt: '2026-09-17T10:00:00.000Z' }),
+    session({ id: 's3', title: 'Third', createdAt: '2026-09-18T10:00:00.000Z' }),
+  ], { s1: historyFixture('s1', ['Survivor message']) })
+  let releaseS3: () => void = () => {}
+  state.deleteDelay = (id) => id === 's3' ? new Promise<void>((r) => { releaseS3 = r }) : undefined
+  await installRoutes(page, state)
+  await installSocket(page)
+  await page.goto('/')
+  await expect(page.locator('.chat-session-item')).toHaveCount(3)
+  await page.locator('.chat-session-item[data-id="s3"]').click()
+  await expect(page.locator('.chat-session-item[data-id="s3"]')).toHaveClass(/active/)
+  // Select s3+s2, leaving s1 as the survivor.
+  await page.locator('.chat-session-item[data-id="s2"]').click({ modifiers: ['Shift'] })
+  await expect(page.locator('.chat-session-item.selected')).toHaveCount(2)
+  const row = page.locator('.chat-session-item[data-id="s3"]')
+  await row.hover()
+  await row.locator('.chat-session-delete').click()
+  await expect(row.locator('.chat-session-delete')).toHaveAttribute('title', 'Delete 2 chats?')
+  await row.locator('.chat-session-delete').click()
+  // Open the survivor while s3's DELETE is held.
+  await expect.poll(() => state.calls.filter((c) => c.method === 'DELETE').length).toBe(1)
+  await page.locator('.chat-session-item[data-id="s1"]').click()
+  await expect(page.locator('.chat-session-item[data-id="s1"]')).toHaveClass(/active/)
+  await expect(page.locator('.chat-msg-user').first()).toContainText('Survivor message')
+  await input(page).fill('draft for the survivor')
+  releaseS3()
+  await expect.poll(() => state.calls.filter((c) => c.method === 'DELETE').map((c) => c.path).sort()).toEqual(['/api/chat/sessions/s2', '/api/chat/sessions/s3'])
+  await expect(page.locator('.chat-session-item')).toHaveCount(1)
+  await expect(page.locator('.chat-session-item[data-id="s1"]')).toHaveClass(/active/)
+  await expect(page.locator('.chat-msg-user').first()).toContainText('Survivor message')
+  await expect(input(page)).toHaveValue('draft for the survivor')
+  await expect(page.locator('.chat-notice')).toHaveText('Deleted 2 chats.')
+})
+
 test('creates a session from the dialog with a pending entry before the server answers', async ({ page }) => {
   const state = makeState([], {})
   let release: () => void = () => {}
