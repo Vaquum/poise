@@ -299,7 +299,11 @@ export interface AgentAvailability {
 }
 
 function parseCommands(text: string) {
-  return parseChatCommandChain(text, /^\s*\//.test(text) ? savedSwitchNames() : undefined)
+  if (!/^\s*\//.test(text)) return parseChatCommandChain(text)
+  // The charters parse as switches whether or not they were seeded: an
+  // unseeded /manager or /worker in the wrong chat is refused, never sent
+  // to the model as literal text.
+  return parseChatCommandChain(text, new Set([...savedSwitchNames(), MANAGER_SWITCH, WORKER_SWITCH]))
 }
 
 /** A concurrent creation took the subject first; never leaves the runtime. */

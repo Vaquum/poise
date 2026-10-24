@@ -1646,7 +1646,12 @@ async function sendPrompt(draft: ComposerDraft): Promise<void> {
   if (!await waitForSwitchSave(draft, origin)) return
   if (activeId !== origin) { restoreDraftTo(origin, draft); return }
   if (parseChatCommandChain(draft.text).create) { await createSavedSwitch(draft, origin); return }
-  if (parseChatCommandChain(draft.text).context === 'reset') { await resetPrompt(draft, origin); return }
+  // Charter switches are refused before /reset runs: a rejected request must
+  // never clear the conversation first.
+  const refused = parseChatCommandChain(draft.text)
+  if (refused.switches?.includes(MANAGER_SWITCH) && entry()?.record.role !== 'manager') { restoreDraftTo(origin, draft); setNotice('/manager is not supported in regular chats.', 'info'); return }
+  if (refused.switches?.includes(WORKER_SWITCH) && entry()?.record.role !== 'worker') { restoreDraftTo(origin, draft); setNotice('/worker is not supported in non-worker chats.', 'info'); return }
+  if (refused.context === 'reset') { await resetPrompt(draft, origin); return }
   const pendingModel = modelUpdates.get(origin)
   if (pendingModel) {
     try { await pendingModel }
@@ -1654,8 +1659,6 @@ async function sendPrompt(draft: ComposerDraft): Promise<void> {
     if (activeId !== origin) { restoreDraftTo(origin, draft); return }
   }
   const chain = parseChatCommandChain(draft.text)
-  if (chain.switches?.includes(MANAGER_SWITCH) && entry()?.record.role !== 'manager') { restoreDraftTo(origin, draft); setNotice('/manager is not supported in regular chats.', 'info'); return }
-  if (chain.switches?.includes(WORKER_SWITCH) && entry()?.record.role !== 'worker') { restoreDraftTo(origin, draft); setNotice('/worker is not supported in non-worker chats.', 'info'); return }
   if (chain.missingModel) { restoreDraftTo(origin, draft); setNotice('Choose a model from /model first.'); return }
   if (chain.review && !entry()) { restoreDraftTo(origin, draft); setNotice('There is no reply to review yet.'); return }
   if (chain.context === 'compact' && !entry() && !chain.review && !chain.text && !chain.switches?.length && !draft.attachments.length) {

@@ -460,6 +460,20 @@ it('refuses /worker in non-worker chats before any turn starts', async () => {
   expect(input.match(/\[Saved switch: \/worker\]/g)).toHaveLength(1)
 }, 60_000)
 
+it('refuses unseeded /worker and /manager in the wrong chats instead of sending them to the model', async () => {
+  const ordinary = await runtime.create({ agent: 'grok', model: GROK_MODEL })
+  // No worker or Manager turn ran, so neither charter was seeded.
+  expect((await getSnippets()).json.skills.switches).toEqual([])
+  expect(() => runtime.prompt(ordinary.id, { text: '/worker Do X', attachments: [], mentions: [] }))
+    .toThrow('/worker is not supported in non-worker chats.')
+  expect(() => runtime.prompt(ordinary.id, { text: '/manager Do X', attachments: [], mentions: [] }))
+    .toThrow('/manager is not supported in regular chats.')
+  expect(() => runtime.prompt(ordinary.id, { text: '/reset /worker task', attachments: [], mentions: [] }))
+    .toThrow('/worker is not supported in non-worker chats.')
+  expect(seen.get(ordinary.id)?.some(event => event.type === 'turn.started')).toBe(false)
+  expect(prompts.has(ordinary.id)).toBe(false)
+}, 30_000)
+
 it('lets workers coexist with the Manager and with each other', async () => {
   const manager = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'manager' })
   const first = await runtime.create({ agent: 'grok', model: GROK_MODEL, role: 'worker', title: 'First ticket' })
