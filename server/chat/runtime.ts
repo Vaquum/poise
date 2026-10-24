@@ -4006,9 +4006,8 @@ export class ChatRuntime extends EventEmitter {
    *  must not delay its visibility. Survivors take precedence — new
    *  turns wait until they release — even past a lowered cap. */
   private claimSurvivorSlot(turn: RunningTurn): void {
-    this.localTurnSlots += 1
-    turn.localSlot = true
-    this.grantLocalTurnSlots()
+    const person = !turn.source || (turn.source.kind === 'poise' && turn.source.name === SWITCHBOARD_PERSON)
+    turn.localSlot = this.checkSlots.claim(person ? 'person' : 'background')
   }
 
   /** The cap setting changed: start every slot waiter that now fits, in order. */
