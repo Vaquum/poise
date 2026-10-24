@@ -52,9 +52,9 @@ dependents: `found`, the PR `title`, `closed` with each issue's state,
 predates dependency tracking), and `dependents` with `via` naming
 `blocked-by`, `depends-on`, or both. A dependent is an open issue in the same
 repository that GitHub lists as blocked by a closed issue, or that lists it
-under a `Depends on:` header in its body, inline or as list items. At most 50
-dependents are returned; `truncated` means a cap or a malformed stored
-connection hid entries. Blocked-by edges ride the existing issue query, so a
+under a `Depends on:` header in its body, inline or as list items. At most 100
+closed issues and 50 dependents are returned; `truncated` means a cap or a
+malformed stored connection hid entries. Blocked-by edges ride the existing issue query, so a
 dependent last synced before they were tracked reads as unblocked until its
 next sync; `Depends on:` works from long-synced bodies.
 

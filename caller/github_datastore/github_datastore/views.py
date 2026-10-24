@@ -254,6 +254,7 @@ CLOSES_REF = re.compile(
 
 DEPENDENTS_SCAN_LIMIT = 1000
 DEPENDENTS_MATCH_LIMIT = 50
+CLOSED_MATCH_LIMIT = 100
 
 
 def _extract_refs(text: str, default_repo: str) -> list[tuple[str, int]]:
@@ -396,6 +397,9 @@ def pr_dependents(
         pull = expanded.get("pull") if isinstance(expanded, dict) else None
         graphql = pull.get("graphql") if isinstance(pull, dict) else None
         closing, closes_via, truncated = _closing_refs(graphql, row["body"], repo)
+        if len(closing) > CLOSED_MATCH_LIMIT:
+            truncated = True
+            closing = closing[:CLOSED_MATCH_LIMIT]
         closed: list[dict[str, Any]] = []
         for ref_repo, ref_number, ref_title in closing:
             issue = conn.execute(

@@ -488,6 +488,24 @@ class PrDependentsTest(unittest.TestCase):
             self.assertEqual(len(found["dependents"]), 50)
             self.assertEqual(found["dependents"][0]["number"], 100)
 
+    def test_pr_dependents_caps_untracked_closing_keywords(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            body = "\n".join(f"Closes #{number}" for number in range(1, 102))
+            pr = closing_pr_fixture(12, 112, body, closing=None)
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            conn.close()
+
+            found = json.loads(views.pr_dependents(db_path=db_path, repo="vaquum/test", number=12))
+            self.assertEqual(found["closes_via"], "body-keywords")
+            self.assertTrue(found["truncated"])
+            self.assertEqual(len(found["closed"]), 100)
+            self.assertEqual(found["closed"][0]["number"], 1)
+
     def test_pr_dependents_rejects_non_json_or_unscoped_reads(self) -> None:
         with self.assertRaises(ValueError):
             views.pr_dependents(repo="vaquum/test", number=2, output="csv")
