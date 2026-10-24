@@ -512,6 +512,8 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_error)
       VALUES(?, ?, ?, ?, ?, ?)`).run('rerun-grey-ci', 'acme/app#44:workflow', new Date().toISOString(), 'acme/app', 44, 'Rerun failed')
     await control.tick()
+    // The pass runs behind the tick: one behavior row plus the degraded row.
+    await until(() => store.inbox(runtime.instance, parent.id).length === 2)
     expect(store.inbox(runtime.instance, parent.id).map(m => m.body).join('\n')).toContain('Review failed')
     expect(store.inbox(runtime.instance, parent.id).map(m => m.body).join('\n')).toContain('Rerun failed')
     expect(store.inbox(runtime.instance, parent.id).map(m => m.body).join('\n')).toContain('ci_unavailable')
@@ -741,7 +743,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     mergeWake.mockResolvedValue({ found: true, title: 'Merged fix', closesVia: 'closing-references', truncated: false, closed: [], dependents: [] })
     clock += 5 * 60_000
     await control.tick()
-    await until(() => store.observation(runtime.instance, `behavior:${target}`)?.checked_at === clock)
+    await until(() => store.observation(runtime.instance, `merge-wake:${target}`)?.checked_at === clock)
     await control.tick()
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     await until(() => prompts.has(parent.id))
