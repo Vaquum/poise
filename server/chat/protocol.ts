@@ -180,6 +180,10 @@ export interface SessionRecord {
   interruptedTurnId?: string
   /** Set when the session's worker could not be verified for cleanup. */
   orphanNotice?: string
+  /** A Stop was asked for this turn and it has not settled since. Shutdown
+   *  terminates it instead of handing it over, and recovery terminates it
+   *  instead of adopting it; a new turn clears the marker. */
+  stopRequestedTurnId?: string
   /** Optional context handed over at creation (card, document, another session). */
   context?: SessionContext
   /** The subject this session belongs to; at most one session per subject. */

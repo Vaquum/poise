@@ -118,6 +118,10 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
           stub.health.switching = release !== stub.health.release ? String(release) : null
           return json(res, 202, { release, switching: release !== stub.health.release })
         }
+        if (url === '/api/service/resume' && req.method === 'POST') {
+          stub.health.draining = false
+          return json(res, 200, healthBody())
+        }
         if (url === '/api/service/health' || url === '/api/service/drain') {
           if (stub.healthStatus !== 200) return json(res, stub.healthStatus, { error: 'refused' })
           return json(res, 200, healthBody())

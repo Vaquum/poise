@@ -570,46 +570,68 @@ export class Orchestrator {
     this.lifecycle('workspace.upgrade.started', handle, { image: imageId, reason })
     // null until drained; then whether the drain left the workspace idle rather than timing out.
     let drainedIdle: boolean | null = null
-    for (;;) {
-      // Decided under the lock, so a lazy start or an admin action in between cannot be stopped undrained.
-      const outcome = await this.withLock(handle, async (): Promise<'needs-drain' | 'done' | 'skipped'> => {
-        const { docker, store } = this.deps
-        const { container } = workspaceNames(handle)
-        const details = await docker.inspectContainer(container)
-        if (!details) {
-          this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'the container no longer exists' })
-          return 'skipped'
-        }
-        if (!this.outdated(details, imageId)) {
-          this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'already up to date' })
-          return 'skipped'
-        }
-        const running = details.State.Running
-        if (running && drainedIdle === null) return 'needs-drain'
-        await this.activateRelease(handle, target)
-        // Activation can restart Poise: a switch queued before the drain fires once the drain leaves it
-        // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
-        // idle. A drain that timed out cuts its work anyway.
-        if (running && drainedIdle && !(await this.idleUnderDrain(handle, login))) return 'needs-drain'
-        this.ready.delete(handle)
-        if (running) {
-          await docker.stopContainer(container)
-          this.lifecycle('workspace.container.stopped', handle, { reason: 'upgrade' })
-        }
-        await docker.removeContainer(container)
-        this.lifecycle('workspace.container.removed', handle, { reason: 'upgrade' })
-        await docker.createContainer(container, this.containerSpec(handle, login))
-        this.lifecycle('workspace.container.created', handle, { image: this.deps.config.runtimeImage })
-        if (running) {
-          await docker.startContainer(container)
-          store.noteWorkspaceStarted(handle)
-          this.lifecycle('workspace.container.started', handle)
-        }
-        this.lifecycle('workspace.upgrade.finished', handle, { image: imageId })
-        return 'done'
-      })
-      if (outcome !== 'needs-drain') return
-      drainedIdle = await this.drain(handle, login)
+    // True once the container is replaced: its new server holds no drain.
+    // Any other exit after a drain — skipped, or failed between the drain
+    // and the replacement — must lift the drain it left behind, or the
+    // workspace refuses new work until the drain lapses.
+    let replaced = false
+    try {
+      for (;;) {
+        // Decided under the lock, so a lazy start or an admin action in between cannot be stopped undrained.
+        const outcome = await this.withLock(handle, async (): Promise<'needs-drain' | 'done' | 'skipped'> => {
+          const { docker, store } = this.deps
+          const { container } = workspaceNames(handle)
+          const details = await docker.inspectContainer(container)
+          if (!details) {
+            this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'the container no longer exists' })
+            return 'skipped'
+          }
+          if (!this.outdated(details, imageId)) {
+            this.lifecycle('workspace.upgrade.skipped', handle, { reason: 'already up to date' })
+            return 'skipped'
+          }
+          const running = details.State.Running
+          if (running && drainedIdle === null) return 'needs-drain'
+          await this.activateRelease(handle, target)
+          // Activation can restart Poise: a switch queued before the drain fires once the drain leaves it
+          // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
+          // idle. A drain that timed out cuts its work anyway.
+          if (running && drainedIdle && !(await this.idleUnderDrain(handle, login))) return 'needs-drain'
+          this.ready.delete(handle)
+          if (running) {
+            await docker.stopContainer(container)
+            this.lifecycle('workspace.container.stopped', handle, { reason: 'upgrade' })
+          }
+          await docker.removeContainer(container)
+          this.lifecycle('workspace.container.removed', handle, { reason: 'upgrade' })
+          await docker.createContainer(container, this.containerSpec(handle, login))
+          replaced = true
+          this.lifecycle('workspace.container.created', handle, { image: this.deps.config.runtimeImage })
+          if (running) {
+            await docker.startContainer(container)
+            store.noteWorkspaceStarted(handle)
+            this.lifecycle('workspace.container.started', handle)
+          }
+          this.lifecycle('workspace.upgrade.finished', handle, { image: imageId })
+          return 'done'
+        })
+        if (outcome !== 'needs-drain') return
+        drainedIdle = await this.drain(handle, login)
+      }
+    } finally {
+      if (drainedIdle !== null && !replaced) await this.resumeQuietly(handle, login)
+    }
+  }
+
+  /** Lift a drain this upgrade left on a workspace it did not replace.
+   *  Best-effort: the workspace may be gone, in which case there is no
+   *  drain left to lift. */
+  private async resumeQuietly(handle: string, login: string): Promise<void> {
+    try {
+      await this.serviceCall(handle, login, 'POST', '/api/service/resume')
+      this.lifecycle('workspace.upgrade.resumed', handle, {})
+    } catch (error) {
+      this.deps.log.warn('workspace.upgrade.resume.failed', { handle, error: errorMessage(error) })
     }
   }
 

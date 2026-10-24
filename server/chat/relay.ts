@@ -16,8 +16,8 @@ import { connect, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
-import { CLAUDE_SUBSCRIPTION_CLI, runFile } from '../process'
-import { WORKER_GATE, pidAlive } from './worker'
+import { CLAUDE_SUBSCRIPTION_CLI } from '../process'
+import { WORKER_GATE, pidAlive, scriptIdentityMatches } from './worker'
 import type { AgentProcess } from './adapters/types'
 
 // Next to the worker gate: that path is right both from the source tree and
@@ -79,6 +79,10 @@ export interface RelaySpawnOptions {
   /** Process identities for later verification; minted when absent. */
   ident?: string
   gateIdent?: string
+  /** Spawn these scripts instead of this release's own. Tests use this to
+   *  stand in for a previous release's directory across a switch. */
+  relayScript?: string
+  gateScript?: string
 }
 
 export interface RelayAttachOptions {
@@ -527,12 +531,12 @@ export async function spawnRelay(options: RelaySpawnOptions): Promise<RelayConne
   const socketPath = options.socketPath ?? relaySocketFor(options.dir)
   const log = options.log ?? (() => {})
   const child = spawn(process.execPath, [
-    RELAY_SCRIPT,
+    options.relayScript ?? RELAY_SCRIPT,
     '--relay-session', options.sessionId,
     '--relay-ident', ident,
     '--socket', socketPath,
     '--dir', options.dir,
-    '--gate', WORKER_GATE,
+    '--gate', options.gateScript ?? WORKER_GATE,
     '--lease-worker', gateIdent,
     '--', options.command, ...options.args,
   ], { cwd: options.cwd, env: options.env, detached: true, stdio: 'ignore', windowsHide: true })
@@ -559,10 +563,17 @@ export async function spawnRelay(options: RelaySpawnOptions): Promise<RelayConne
   return connection
 }
 
+/** How long an adoption waits for the LIVE boundary before the handoff
+ *  fails. This bounds the attachment and catch-up only: once live, a
+ *  healthy long turn runs on without a deadline. */
+export const ADOPTION_LIVE_TIMEOUT_MS = 60_000
+
 /** Resolves once the peer carries live bytes; rejects when the relay
  *  reports the replay cannot be exact or goes away mid-replay. A turn that
- *  already settled keeps its result: only a replay still waiting fails. */
-export function livePromise(peer: RelayConnection): Promise<void> {
+ *  already settled keeps its result: only a replay still waiting fails.
+ *  With `timeoutMs`, a handoff that never goes live fails instead of
+ *  hanging: the runtime then ends the turn and its processes. */
+export function livePromise(peer: RelayConnection, timeoutMs?: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const onError = (message: unknown) => { cleanup(); reject(new Error(`relay: ${String(message)}`)) }
     const onExit = () => {
@@ -572,7 +583,17 @@ export function livePromise(peer: RelayConnection): Promise<void> {
       cleanup()
       reject(new Error('the relay went away during replay'))
     }
+    const onTimeout = () => {
+      cleanup()
+      reject(new Error(`the relay did not go live within ${timeoutMs} ms`))
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(onTimeout, timeoutMs)
+      timer.unref()
+    }
     const cleanup = () => {
+      if (timer) clearTimeout(timer)
       peer.off('relay-error', onError)
       peer.off('exit', onExit)
     }
@@ -630,16 +651,9 @@ async function waitPidGone(pid: number, ms: number): Promise<boolean> {
 }
 
 /** Whether `pid` is still the relay recorded: its command line must be the
- *  relay script carrying `--relay-ident <ident>` as its own argument. */
+ *  relay script carrying `--relay-ident <ident>` as its own argument. The
+ *  script may run from any release's scripts directory (see
+ *  scriptIdentityMatches); a release switch must not break verification. */
 export async function relayIdentityMatches(pid: number, ident: string): Promise<boolean> {
-  if (!pidAlive(pid) || !/^[A-Za-z0-9-]{8,64}$/.test(ident)) return false
-  try {
-    const { stdout } = await runFile('ps', ['-o', 'command=', '-p', String(pid)], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 })
-    const line = stdout.trim()
-    const scriptIndex = line.indexOf(RELAY_SCRIPT)
-    const identIndex = line.indexOf(` --relay-ident ${ident} `)
-    return scriptIndex >= 0 && identIndex > scriptIndex
-  } catch {
-    return false
-  }
+  return scriptIdentityMatches(pid, ident, 'chat-relay.mjs', 'relay-ident')
 }

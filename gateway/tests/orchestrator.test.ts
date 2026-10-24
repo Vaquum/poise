@@ -464,6 +464,24 @@ describe('image upgrades', () => {
     expect(h.logs.find((entry) => entry.event === 'workspace.drain.timeout')).toMatchObject({ handle: 'alice', timeoutSeconds: 1 })
   })
 
+  it('lifts the drain when the upgrade ends without replacing the container', async () => {
+    await start()
+    h.workspace.health.activeChatTurns = 1
+    const upgrade = h.orchestrator.upgradePass()
+    await waitFor(() => h.workspace.serviceRequests.some((request) => request.url === '/api/service/drain'), 'the drain request')
+    // The container vanishes after the drain: the pass ends skipped, with
+    // the running workspace still answering.
+    h.docker.containers.delete('poise-ws-alice')
+    h.workspace.health.activeChatTurns = 0
+    await upgrade
+    const calls = h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)
+    expect(calls[0]).toBe('POST /api/service/drain')
+    expect(calls).toContain('POST /api/service/resume')
+    expect(calls.indexOf('POST /api/service/resume')).toBeGreaterThan(calls.indexOf('POST /api/service/drain'))
+    expect(h.workspace.health.draining).toBe(false)
+    expect(h.logs.find((entry) => entry.event === 'workspace.upgrade.resumed')).toMatchObject({ handle: 'alice' })
+  })
+
   it('drains and recreates a running workspace created with another drain timeout, as for a new image', async () => {
     await start({ env: { POISE_DRAIN_TIMEOUT: '600' } })
     const bobId = h.docker.containers.get('poise-ws-bob')?.id
