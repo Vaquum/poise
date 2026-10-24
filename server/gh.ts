@@ -300,7 +300,7 @@ export async function getHeadSha(repo: string, number: number, options: { signal
 
 export async function getPrAuthor(repo: string, number: number, actor: string): Promise<string> {
   const data = await readPrHead(repo, number, { actor })
-  if (typeof data.author !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/.test(data.author)) {
+  if (typeof data.author !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?(?:\[bot\])?$/.test(data.author)) {
     throw new Error('github-interface --head-sha returned no valid PR author')
   }
   return data.author

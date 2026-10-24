@@ -85,23 +85,24 @@ describe('PR account routing', () => {
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
-  it('uses live author discovery and provisions a manual review as the selected account', async () => {
+  it.each([['review-bot', 'poise-user'], ['dependabot[bot]', 'review-bot'], ['contributor', 'review-bot']])('discovers %s and provisions its manual review as %s', async (author, actor) => {
     const { db } = await initial()
     db.setMeta('behavior_review_new_prs_enabled', '0')
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, options) => {
       const result = await original(command, args, options)
       if (command === 'github-interface' && args[0] === '--head-sha') {
-        const packet = JSON.parse(result.stdout); packet.author = 'review-bot'
+        const packet = JSON.parse(result.stdout); packet.author = author
         return { ...result, stdout: JSON.stringify(packet) }
       }
       return result
     })
     const { triggerPrReview } = await import('../server/agent')
     await triggerPrReview(pr.url)
-    expect(value(mocks.spawnDetached.mock.calls[0][1], '--actor')).toBe('poise-user')
+    expect(value(mocks.spawnDetached.mock.calls[0][1], '--actor')).toBe(actor)
     const headReads = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--head-sha')
-    expect(headReads.every(([, args]) => value(args, '--token-user') === 'poise-user')).toBe(true)
+    expect(value(headReads[0][1], '--token-user')).toBe('poise-user')
+    expect(headReads.slice(1).every(([, args]) => value(args, '--token-user') === actor)).toBe(true)
   })
 
   it('abandons admission when accounts change after activity evidence', async () => {
