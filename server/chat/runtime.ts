@@ -4437,7 +4437,10 @@ export class ChatRuntime extends EventEmitter {
       if (!found.complete) {
         this.emit('log', `[chat ${record.id.slice(0, 8)}] stall discovery incomplete; keeping the previous repos`)
         const capped = cap(previous?.repos ?? [])
-        return { repos: capped.repos, truncatedRepos: capped.truncatedRepos + (previous?.truncatedRepos ?? 0) }
+        // An incomplete scan asserts nothing about its remainder: when no
+        // kept or truncated entry survives, the unknown remainder still
+        // counts, so a first failure flags instead of clearing.
+        return { repos: capped.repos, truncatedRepos: (capped.truncatedRepos + (previous?.truncatedRepos ?? 0)) || 1 }
       }
       const repos: StallRepo[] = []
       let unreadable = 0

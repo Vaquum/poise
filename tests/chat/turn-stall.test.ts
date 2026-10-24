@@ -695,9 +695,12 @@ describe('turn stall detection and waking', () => {
     await waitFor(() => lastStatus(events, session.id) === 'idle')
     runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
     await waitFor(() => owned.prompts.length === 1)
-    // Blind the checkout mid-turn, after the turn-start reads: every git
-    // read in the turn-end check fails, with no saved entry to keep.
-    await chmod(join(repo, '.git'), 0)
+    // Corrupt the checkout's HEAD mid-turn, after the turn-start reads:
+    // every git read in the turn-end check fails, with no saved entry to
+    // keep. Content-based, so it blinds root and non-root alike.
+    const headPath = join(repo, '.git', 'HEAD')
+    const savedHead = await readFile(headPath, 'utf8')
+    await writeFile(headPath, 'garbage: not a ref\n')
     try {
       finishManual(owned)
       await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
@@ -710,7 +713,7 @@ describe('turn stall detection and waking', () => {
       expect(stalled?.repos).toEqual([])
       expect(stalled?.truncatedRepos).toBe(1)
     } finally {
-      await chmod(join(repo, '.git'), 0o755)
+      await writeFile(headPath, savedHead)
     }
     const restored = spawnSync('git', ['status', '--porcelain'], { cwd: repo })
     if (restored.status !== 0) throw new Error('checkout git did not recover after the test')
@@ -865,6 +868,44 @@ describe('turn stall detection and waking', () => {
     await waitFor(() => ofType(events, session.id, 'turn.finished').length === 3)
     await waitFor(() => lastStatus(events, session.id) === 'idle')
     expect(runtime.get(session.id)?.stall).toMatchObject({ episode, repos: [{ path: 'task', branch: 'work' }] })
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('flags truncated when the first nested discovery scan fails', async () => {
+    if (process.getuid?.() === 0) return // unreadable-dir simulation needs permission checks
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-discovery-fresh:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const task = join(session.checkout, 'task')
+    const cloned = spawnSync('git', ['clone', '-q', origin, task], { encoding: 'utf8' })
+    if (cloned.status !== 0) throw new Error(`git clone: ${cloned.stderr}`)
+    git(['checkout', '-qb', 'work'], task)
+    await writeFile(join(task, 'fix.txt'), 'fix\n')
+    git(['add', 'fix.txt'], task)
+    git(['commit', '-qm', 'unpushed fix'], task)
+    store.bindWork(runtime.instance, session.id, 'https://github.com/autonomio/poise/issues/577')
+
+    // The clone is unreadable on the first scan: with no previous marker
+    // the unknown remainder still counts instead of reading as clean.
+    spawnSync('chmod', ['000', task])
+    try {
+      runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+      const stalled = runtime.get(session.id)?.stall
+      expect(stalled).toBeDefined()
+      expect(stalled?.repos).toEqual([])
+      expect(stalled?.truncatedRepos).toBe(1)
+    } finally {
+      spawnSync('chmod', ['755', task])
+    }
+
+    // Readable again, the scan names the unfinished clone work it hid.
+    runtime.prompt(session.id, { text: 'do more work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toMatchObject({ repos: [{ path: 'task', branch: 'work', unpushedCommits: 1 }] })
     await runtime.stop({ handover: false })
   }, 40_000)
 
