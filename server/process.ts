@@ -23,6 +23,16 @@ function assertProcessArgs(args: readonly string[]): void {
   args.forEach((value, index) => assertProcessArgSize(value, `argument ${index + 1}`))
 }
 
+export interface ExpectedFailure {
+  /** Exit codes that are an expected probe outcome for this call, not an
+   *  error. Timeouts, aborts, spawn failures and output-limit kills never
+   *  match: they reject before any exit code exists. */
+  codes: readonly number[]
+  /** When present, only stderr matching one of these is expected; the same
+   *  code with any other stderr still reports. */
+  stderr?: RegExp | readonly RegExp[]
+}
+
 export interface RunFileOptions {
   cwd?: string
   /** Variables overlaid on the scrubbed parent environment. */
@@ -31,6 +41,23 @@ export interface RunFileOptions {
   maxOutputBytes?: number
   killSignal?: NodeJS.Signals
   signal?: AbortSignal
+  /** Declare this call a probe: a matching exit rejects with `expected: true`
+   *  and is not reported to the process-failure observer. */
+  expected?: ExpectedFailure
+}
+
+/** True when the runFile rejection was a declared expected probe outcome. */
+export function isExpectedFailure(error: unknown): boolean {
+  return (error as { expected?: unknown })?.expected === true
+}
+
+function stderrMatches(matcher: ExpectedFailure['stderr'], stderr: string): boolean {
+  if (!matcher) return true
+  const patterns = Array.isArray(matcher) ? matcher : [matcher]
+  return patterns.some((pattern) => {
+    pattern.lastIndex = 0
+    return pattern.test(stderr)
+  })
 }
 
 export interface RunFileResult {
@@ -470,6 +497,9 @@ export function runFile(
         return
       }
       if (code !== 0) {
+        const expected = code !== null
+          && (options.expected?.codes.includes(code) ?? false)
+          && stderrMatches(options.expected?.stderr, stderr)
         const error = Object.assign(
           new Error(`Command failed (${code ?? signal ?? 'unknown'}): ${command}`),
           {
@@ -478,9 +508,10 @@ export function runFile(
             signal,
             stdout,
             stderr,
+            ...(expected ? { expected: true as const } : {}),
           },
         )
-        observe(error)
+        if (!expected) observe(error)
         reject(error)
         return
       }
