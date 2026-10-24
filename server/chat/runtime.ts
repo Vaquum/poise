@@ -72,7 +72,7 @@ import { actorOf, nativeName } from './actors'
 // person's own answer and keeps the person's composition.
 import { SWITCHBOARD_PERSON } from './switchboard'
 import * as storage from './storage'
-import { deliveryPaused, holdChat, holds, internalTurn, moveBindings, releaseBindings, timerSummaries } from './control-store'
+import { holdChat, holds, internalTurn, moveBindings, releaseBindings, timerSummaries } from './control-store'
 import { pgidAlive, pidAlive, signalGroup, workerIdentityMatches } from './worker'
 import { ADOPTION_LIVE_TIMEOUT_MS, attachRelay, livePromise, relayDirFor, relayIdentityMatches, spawnRelay, type RelayConnection } from './relay'
 import { createReplayHost, recalledDiffs } from './replay'
@@ -416,32 +416,7 @@ export class ChatRuntime extends EventEmitter {
       this.recovering = false
     }
     await this.resumeAfterUpdate(protectedSessions)
-    this.armRecoveredQueues(protectedSessions)
     for (const record of storage.listSessions(this.instance)) this.scheduleQueue(this.requireLive(record.id))
-  }
-
-  /** #590: a restart or release switch must not strand an idle chat's waiting
-   *  queue. Sessions another server owns, chats that were not idle, stopped
-   *  or paused chats, and queues with a running or failed item stay
-   *  untouched, as do chats whose last turn did not complete: only a
-   *  completed task lifts an idle tail, never the restart itself. The pump
-   *  below starts the armed items in order. */
-  private armRecoveredQueues(protectedSessions: ReadonlySet<string>): void {
-    const armed: string[] = []
-    for (const record of storage.listSessions(this.instance)) {
-      if (record.status !== 'idle' || protectedSessions.has(record.id) || this.recoveryOwnedElsewhere(record.id)) continue
-      if (deliveryPaused(this.instance, record.id)) continue
-      if (holds(this.instance).some(hold => hold.sessionId === record.id && hold.cause === 'stopped')) continue
-      const last = storage.findEvent(record.id, event => event.type === 'turn.finished')
-      if (last?.event.type !== 'turn.finished' || last.event.stopReason !== 'end_turn') continue
-      const owner = queueOwner(record.id)
-      const queue = readQueue(owner)
-      if (queue.ready || !queue.items.some(item => item.state === 'waiting')) continue
-      if (queue.items.some(item => item.state === 'running' || item.state === 'failed')) continue
-      armQueue(owner)
-      armed.push(record.id.slice(0, 8))
-    }
-    if (armed.length) this.emit('log', `[chat] recovery armed ${armed.length} idle queue${armed.length === 1 ? '' : 's'}: ${armed.join(', ')}`)
   }
 
   /** Delete this instance's sessions whose model the live catalog no longer

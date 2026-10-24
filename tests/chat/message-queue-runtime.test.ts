@@ -324,25 +324,9 @@ describe('deferred message execution', () => {
     storage.finalizeTurn(w.s.id, { type: 'turn.finished', turnId, stopReason: 'end_turn' })
     w.runtime.removeQueue(w.s.id, q.items[0].id)
     expect(queues.readQueue(w.s.id).ready).toBe(false)
-    // #590: the next restart starts an idle chat's waiting item; the cleared
-    // signal only stops it from reusing the completion from before removal.
-    await w.add('Starts after recovery')
-    const next = w.make(); await next.recover()
-    await until(() => w.c.calls.length === 1)
-    expect(w.c.calls[0].input.text).toBe('Starts after recovery')
-  })
-
-  it('starts an idle chat waiting item when its chat is idle after a restart', async () => {
-    const w = await world()
-    w.runtime.prompt(w.s.id, input('First'))
-    await until(() => w.turns().length === 1)
-    await until(() => w.runtime.get(w.s.id)?.status === 'idle')
-    await w.add('Queued while idle')
-    expect(w.runtime.get(w.s.id)?.queue?.ready).toBe(false)
-    const next = w.make(); await next.recover()
-    await until(() => w.c.calls.length === 2)
-    expect(w.c.calls.map(call => call.input.text)).toEqual(['First', 'Queued while idle'])
-    await until(() => next.get(w.s.id)?.status === 'idle')
+    await w.add('Must wait for a new activity')
+    const next = w.make(); await next.recover(); await pause(80)
+    expect(w.c.calls).toHaveLength(0)
   })
 
   it.each(['cancelled', 'error'] as const)('keeps a direct turn that ended %s pausing the tail across a restart', async reason => {

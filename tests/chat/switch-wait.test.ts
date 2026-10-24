@@ -251,8 +251,9 @@ describe('waiting behind a pending switch', () => {
     for (let i = 0; i < 100 && inbox.pending(w.instance, '').length; i++) { await control.tick(); await pause(30) }
     await until(() => w.c.calls.length === 3)
     expect(inbox.pending(w.instance, '')).toHaveLength(0)
-    expect(w.c.calls.map(call => call.input.text)).toEqual(['Earlier task', 'Queued while idle',
-      expect.stringContaining('Do the thing after the update')])
+    // The admitted prompt runs first and its completion arms the waiting tail.
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['Earlier task',
+      expect.stringContaining('Do the thing after the update'), 'Queued while idle'])
     await until(() => next.get(w.s.id)?.status === 'idle')
   })
 
