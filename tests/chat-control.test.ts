@@ -278,6 +278,70 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     } finally { ownership.mockRestore() }
   })
 
+  it('coalesces yielded passes and observes transferred and added bindings in target order', async () => {
+    const parent = await manager(), replacement = await manager()
+    await control.stop()
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind })
+    control.attach(server); control.start()
+    const targets = [1, 2, 3, 4].map(n => `https://github.com/monitor/interleave/issues/${n}`)
+    for (const target of targets.slice(0, 3)) store.bindWork(runtime.instance, parent.id, target)
+    const passes = vi.spyOn(store, 'bindings')
+    const writes = vi.spyOn(store, 'saveObservation')
+    const ownsSession = runtime.ownsSession.bind(runtime)
+    let intervened = false
+    const ownership = vi.spyOn(runtime, 'ownsSession').mockImplementation(id => {
+      if (!intervened) {
+        intervened = true
+        setImmediate(() => {
+          store.unbindWork(runtime.instance, parent.id, targets[1])
+          store.bindWork(runtime.instance, replacement.id, targets[1])
+          store.bindWork(runtime.instance, parent.id, targets[3])
+          void (async () => { await control.tick(); await control.tick(); await control.tick() })()
+        })
+      }
+      return ownsSession(id)
+    })
+    const observed = () => writes.mock.calls.filter(([instance, key]) => instance === runtime.instance && key.startsWith('behavior:')).map(([, key]) => key)
+    try {
+      await control.tick()
+      await until(() => observed().length === 6)
+      await control.stop()
+      expect(passes).toHaveBeenCalledTimes(2)
+      expect(observed()).toEqual([targets[0], targets[2], ...targets].map(target => `behavior:${target}`))
+      expect(store.bindings(runtime.instance).find(binding => binding.target === targets[1])?.session).toBe(replacement.id)
+      expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+      expect(store.inbox(runtime.instance, replacement.id)).toHaveLength(0)
+    } finally {
+      await control.stop()
+      ownership.mockRestore(); passes.mockRestore(); writes.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['target', 'ci', 'ci-error', 'reviews'] as const)('writes no monitor state after shutdown during a pending %s read', async (read) => {
+    const parent = await manager()
+    store.bindWork(runtime.instance, parent.id, 'https://github.com/monitor/pending/pull/1')
+    let complete: (() => void) | undefined
+    const hold = <T>(value: T) => new Promise<T>(resolve => { complete = () => resolve(value) })
+    if (read === 'target') targetStatus.mockImplementationOnce(() => hold('open' as const))
+    else if (read === 'ci') ci.mockImplementationOnce(() => hold({ head: 'a'.repeat(40), failing: [] }))
+    else if (read === 'ci-error') ci.mockImplementationOnce(() => new Promise<CiObservation>((_resolve, reject) => { complete = () => reject(new Error('late fixture failure')) }))
+    else reviews.mockImplementationOnce(() => hold(null))
+    await control.tick()
+    await until(() => complete !== undefined)
+    await control.stop()
+    const observations = vi.spyOn(store, 'saveObservation')
+    const messages = vi.spyOn(store, 'message')
+    try {
+      complete!()
+      await nextTurn()
+      await nextTurn()
+      expect(observations).not.toHaveBeenCalled()
+      expect(messages).not.toHaveBeenCalled()
+    } finally { observations.mockRestore(); messages.mockRestore() }
+  })
+
   it('lets a running manager create three parallel workers and receive their outcomes without sharing its lease', async () => {
     const parent = await manager()
     runtime.prompt(parent.id, { text: 'Manage three tasks', attachments: [], mentions: [] })
@@ -556,6 +620,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     await command(first.id, { operation: 'bind', target }); await control.tick()
     await command(first.id, { operation: 'unbind', target })
     await command(second.id, { operation: 'bind', target }); await control.tick()
+    await until(() => store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure')))
     expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
     const old = await config(second.id)
     await control.stop()
@@ -573,6 +638,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_error)
       VALUES(?, ?, ?, ?, ?, ?)`).run('rerun-grey-ci', 'acme/app#44:workflow', new Date().toISOString(), 'acme/app', 44, 'Rerun failed')
     await control.tick()
+    await until(() => store.inbox(runtime.instance, parent.id).some(m => m.body.includes('ci_unavailable')))
     expect(store.inbox(runtime.instance, parent.id).map(m => m.body).join('\n')).toContain('Review failed')
     expect(store.inbox(runtime.instance, parent.id).map(m => m.body).join('\n')).toContain('Rerun failed')
     expect(store.inbox(runtime.instance, parent.id).map(m => m.body).join('\n')).toContain('ci_unavailable')

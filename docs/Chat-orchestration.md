@@ -335,9 +335,10 @@ authority.
 
 A target that reads closed or merged in the local GitHub datastore drops late
 automation bookkeeping without waking its chat; only human activity still
-wakes, and CI polling stops for a closed or merged PR. The state is read only
-when a behavior notice is about to be queued, or alongside the five-minute CI
-poll, and cached for five minutes. An unreadable or unsynced target wakes as
+wakes, and CI polling stops for a closed or merged PR. PR target state is
+consulted on each local pass through a five-minute cache; issue state is
+consulted when a behavior notice is actionable, through the same cache.
+An unreadable or unsynced target wakes as
 before: unknown is never treated as closed.
 
 Work changes also enter the existing structured diagnostic log with the target,

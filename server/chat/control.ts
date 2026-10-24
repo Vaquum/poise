@@ -1033,12 +1033,11 @@ export class ChatControl {
     void this.runCiLoop().finally(() => { this.ciRunning = false })
   }
 
-  /** Passes run back-to-back while ticks keep asking: a slow read never
-   *  delays timers or delivery, and no tick's bindings go unread. */
+  /** Coalesce ticks into one follow-up pass; each pass yields between targets. */
   private async runCiLoop(): Promise<void> {
     do {
       this.ciQueued = false
-      await this.runCiPass().catch((error: unknown) => this.itemFailed('ci', 'pass', error))
+      await this.runCiPass().catch((error: unknown) => { if (!this.stopped) this.itemFailed('ci', 'pass', error) })
     } while (this.ciQueued && !this.stopped)
   }
 
@@ -1061,6 +1060,7 @@ export class ChatControl {
         // is something to drop, so bookkeeping-only ticks stay local.
         if (initiallyActionable) {
           const status = await this.workTargetStatus(target, now)
+          if (this.stopped) return
           if (status === 'closed' || status === 'merged') {
             actionable = humanOnly(actionable)
             initiallyActionable = actionable.length > 0
@@ -1068,14 +1068,16 @@ export class ChatControl {
         }
         this.observe(binding, `behavior:${target.url}`, { kind: 'behavior', target: target.url, ...local,
           ...(target.kind === 'pull' ? { done: WORK_DONE } : {}) }, now, initiallyActionable, false, actionable)
-      } catch (error) { this.itemFailed('binding', binding.target, error) }
+      } catch (error) { if (this.stopped) return; this.itemFailed('binding', binding.target, error) }
       if (target.kind !== 'pull') continue
       const prStatus = await this.workTargetStatus(target, now)
+      if (this.stopped) return
       if (prStatus === 'closed' || prStatus === 'merged') continue
       try {
         await this.observeCi(binding, target, prStatus, now)
+        if (this.stopped) return
         await this.observeReviews(binding, target, now)
-      } catch (error) { this.itemFailed('ci', binding.target, error) }
+      } catch (error) { if (this.stopped) return; this.itemFailed('ci', binding.target, error) }
     }
   }
 
@@ -1348,6 +1350,7 @@ export class ChatControl {
     if (previous && now - previous.checked_at < CI_INTERVAL) return
     try {
       const ci = await (this.options.ci ?? readWorkCi)(target)
+      if (this.stopped || !store.bindingIsCurrent(instance, binding)) return
       const data = { kind: 'ci', target: target.url, head: ci.head, failing: ci.failing,
         blockers: ci.failing.map(check => `Fix check "${check.name}" (${check.conclusion ?? check.state}) on ${ci.head.slice(0, 7)}${check.url ? ` ${check.url}` : ''} and push`),
         done: WORK_DONE }
@@ -1355,7 +1358,7 @@ export class ChatControl {
       this.observeMerge(binding, target, ci, status, now)
       store.deleteObservation(instance, `ci-degraded:${target.url}`)
     } catch (error) {
-      if (!store.bindingIsCurrent(instance, binding)) return
+      if (this.stopped || !store.bindingIsCurrent(instance, binding)) return
       store.saveObservation(instance, `ci:${target.url}`, previous?.fingerprint ?? '', now)
       if (store.observation(instance, `ci-degraded:${target.url}`)) return
       store.saveObservation(instance, `ci-degraded:${target.url}`, 'degraded', now)
@@ -1410,13 +1413,14 @@ export class ChatControl {
         && typeof saved.commentAfter === 'number' && Number.isSafeInteger(saved.commentAfter) && saved.commentAfter >= 0 ? { reviewAfter: saved.reviewAfter, commentAfter: saved.commentAfter } : { reviewAfter: 0, commentAfter: 0 }
       reviews = await (this.options.reviews ?? readWorkReviews)(target, cursor)
     } catch (error) {
+      if (this.stopped) return
       this.runtime.emit('log', `[chat control] reviews read for ${target.url} failed: ${String(error)}`)
       reviews = null
     }
     // An ownership transfer mid-read clears this target's observations; the
     // new owner starts from no baseline, so a stale write here must not
     // restore the old fingerprint and silence its first notice.
-    if (!store.bindingIsCurrent(instance, binding)) return
+    if (this.stopped || !store.bindingIsCurrent(instance, binding)) return
     if (!reviews || !reviews.found || (reviews.truncated && !reviews.page)) {
       store.saveObservation(instance, key, previous?.fingerprint ?? '', now)
       return
@@ -1540,6 +1544,7 @@ export class ChatControl {
   }
 
   async stop(runtimeStopped?: Promise<void>): Promise<void> {
+    // Remote reads may outlive shutdown; their continuations check stopped before store access.
     this.stopped = true
     if (this.timer) clearInterval(this.timer)
     await this.running
