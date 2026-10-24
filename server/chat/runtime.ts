@@ -131,10 +131,11 @@ const MAX_DISCOVERY_ENTRIES = 100_000
  *  arrive slowly. A single hung filesystem call still blocks past it;
  *  the bound covers the scan's total, not one call. */
 const DISCOVERY_DEADLINE_MS = 10_000
-/** Bytes kept per recorded unscannable path: twenty deep paths are named
- *  in full when short, and keep their distinguishing tails when long, so
- *  the wake notice always fits the inbox bound. */
-const MAX_UNREADABLE_PATH_BYTES = 200
+/** Bytes kept per path named in a stall wake notice: twenty deep paths
+ *  are named in full when short, and keep their distinguishing tails
+ *  when long, so the notice usually fits the inbox bound. Anything past
+ *  it degrades to a summary instead of losing the wake. */
+const MAX_NOTICE_PATH_BYTES = 200
 /** Stored command labels are redacted display text, truncated past this. */
 const STALL_COMMAND_CHARS = 200
 
@@ -4396,7 +4397,7 @@ export class ChatRuntime extends EventEmitter {
       // One wake per episode: the event key dedupes repeats, so a worker
       // that keeps ending turns with the same leftover is not nagged again.
       controlMessage(this.instance, record.id, WORK_MONITOR_SENDER,
-        JSON.stringify(stallNotice(record.id, record.stall)), `stall:${record.id}:${record.stall.episode}`)
+        boundedStallBody(record.id, record.stall), `stall:${record.id}:${record.stall.episode}`)
       if (!previous) {
         diagnostic({ level: 'warning', operation: 'chat.work.stalled', message: 'A bound turn ended with work left behind',
           context: { sessionId: record.id, repos: repos.map((repo) => repo.path), backgroundJobs: jobs.length } })
@@ -4547,7 +4548,7 @@ export class ChatRuntime extends EventEmitter {
     const gaps: string[] = []
     let gapOverflow = 0
     const noteGap = (dir: string): void => {
-      if (gaps.length < MAX_STALL_REPOS) gaps.push(tailClip(relative(checkout, dir) || '.', MAX_UNREADABLE_PATH_BYTES))
+      if (gaps.length < MAX_STALL_REPOS) gaps.push(tailClip(relative(checkout, dir) || '.', MAX_NOTICE_PATH_BYTES))
       else gapOverflow += 1
     }
     const startedAt = Date.now()
@@ -5317,10 +5318,14 @@ async function worktreeKey(dir: string): Promise<string> {
   return realpath(dir).catch(() => dir)
 }
 
-/** The stall wake body: what the turn left behind and what clears it. */
+/** The stall wake body: what the turn left behind and what clears it.
+ *  The marker keeps full paths as keep-identity; the notice clips them,
+ *  so deep repos cannot push the wake past the inbox bound. */
 function stallNotice(sessionId: string, stall: StallState): Record<string, unknown> {
   const blockers: string[] = []
-  for (const repo of stall.repos) {
+  const repos = stall.repos.map((repo) => ({ ...repo,
+    path: tailClip(repo.path, MAX_NOTICE_PATH_BYTES), branch: tailClip(repo.branch, MAX_NOTICE_PATH_BYTES) }))
+  for (const repo of repos) {
     const where = repoWhere(repo)
     if (repo.dirtyFiles) blockers.push(`Commit or set aside ${repo.dirtyFiles} uncommitted change${repo.dirtyFiles === 1 ? '' : 's'} ${where}`)
     if (repo.unpushedCommits) blockers.push(`Push ${repo.unpushedCommits} unpushed commit${repo.unpushedCommits === 1 ? '' : 's'} ${where}`)
@@ -5340,12 +5345,27 @@ function stallNotice(sessionId: string, stall: StallState): Record<string, unkno
   }
   const hiddenJobs = stall.backgroundJobs.length - shownJobs.length
   if (hiddenJobs) blockers.push(`${hiddenJobs} more background job${hiddenJobs === 1 ? '' : 's'} still running; Poise wakes you as each finishes`)
-  return { kind: 'stall', session: sessionId, repos: stall.repos, ...(stall.truncatedRepos ? { truncatedRepos: stall.truncatedRepos } : {}),
+  return { kind: 'stall', session: sessionId, repos, ...(stall.truncatedRepos ? { truncatedRepos: stall.truncatedRepos } : {}),
     ...(stall.unreadablePaths?.length ? { unreadablePaths: stall.unreadablePaths } : {}),
     ...(stall.unreadableTruncated ? { unreadableTruncated: stall.unreadableTruncated } : {}),
     backgroundJobs: shownJobs.map((job) => ({ pid: job.pid, command: job.command, startedAt: job.startedAt })),
     ...(hiddenJobs ? { truncatedJobs: hiddenJobs } : {}),
     blockers, done: STALL_DONE }
+}
+
+/** Stall wake body as text, within the inbox bound: the full notice when
+ *  it fits, else a summary with counts. The marker and the header keep
+ *  the full list either way, so the fallback says where to look instead
+ *  of dropping the wake. */
+function boundedStallBody(sessionId: string, stall: StallState): string {
+  const body = JSON.stringify(stallNotice(sessionId, stall))
+  if (Buffer.byteLength(body) <= 32 * 1024) return body
+  return JSON.stringify({ kind: 'stall', session: sessionId, repos: [],
+    truncatedRepos: stall.repos.length + (stall.truncatedRepos ?? 0),
+    unreadablePaths: [], unreadableTruncated: (stall.unreadablePaths?.length ?? 0) + (stall.unreadableTruncated ?? 0),
+    backgroundJobs: [], truncatedJobs: stall.backgroundJobs.length,
+    blockers: ['The leftover list exceeds the notice bound; inspect the session header and the workspace for every repo, unscanned path and background job, then commit, push and finish them'],
+    done: STALL_DONE, truncated: true, originalBytes: Buffer.byteLength(body) })
 }
 
 /** The completion wake body: a tracked background job finished. Its exit
