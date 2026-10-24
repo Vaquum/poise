@@ -335,6 +335,26 @@ already aborted by lease loss requires verified native-worker termination before
 releasing its checkout.
 A recorded failed Muse decision ends the turn with a visible error
 instead of retaining an unanswerable request and checkout lease.
+Relay and gate identity never names the install directory: verification
+matches the `scripts/chat-relay.mjs` or `scripts/chat-worker-gate.mjs`
+script carrying its recorded random ident, so a new release adopts relays
+and workers still running from the previous release. A handoff that never
+reaches LIVE within a minute fails instead of hanging: the turn is
+interrupted and its processes are terminated through the same verified
+path as Stop. An adopted turn's pre-restart relay and agent retire when
+the turn settles, so no old-release relay outlives its adoption and the
+next prompt starts a fresh relay that resumes the same native session. A
+Stop asked before the restart is finished, never adopted: shutdown
+terminates a stopped turn instead of handing it over, and recovery
+terminates it instead of replaying it. Waiting follow-ups stranded by an
+interruption continue on their own once recovery clears the way; the
+interrupted in-flight turn itself is never retried, and a person's Stop
+still holds its chat until the person sends again. An agent that is
+demonstrably alive but unverifiable keeps its turn open and counted,
+with its rows kept for the next restart to retry, instead of being
+interrupted while it runs unseen. A session whose scratch checkout sits
+on an agent-cut branch with uncommitted work checkpoints that work as
+its own instead of refusing with dirty_unowned.
 
 - **Releases.** The image carries one release, Poise (`/opt/poise`) and
   Caller's relocatable virtualenv (`/opt/caller/venv`), and labels it
@@ -445,7 +465,10 @@ computer.
   explicit issue/PR ownership, durable timers and their holds persist in the
   workspace's SQLite store.
   Dispatch pauses while draining; running monitor reads join the existing
-  background-work barrier. A release switch waiting for quiet holds timer fire
+  background-work barrier. New observation passes, including queued follow-ups,
+  wait during drain or a pending release switch. Shutdown fences late read
+  results before releasing their barrier; it does not wait on remote reads.
+  A release switch waiting for quiet holds timer fire
   and admission back so timer turns never keep it waiting. See [Chat orchestration](Chat-orchestration.md).
 - The Switchboard pane's actions (`POST /api/chat/switchboard/…`) act for the
   owner, so they also require an `Origin`, checked as below. A loopback
@@ -787,6 +810,13 @@ diagnostic; it cannot establish datastore or identity failure. Last-known runtim
 degradation remains visible; an initial unread runtime is unknown. The classification
 and evidence rules are in [Behavior integration contract](Behavior-Contract.md#diagnostic-severity).
 
+PR automation uses the opposite configured account from the PR author, including
+follow-up approval, replay and downstream PR operations. Existing enable switches
+cover both directions. Settings and gh's active account are unchanged. Manual
+reviews under the main account cannot become automation evidence: only recorded
+Poise receipts authorize automated follow-up approval and conversation resolution.
+See [PR accounts](Behavior-Contract.md#pr-accounts) for admission and recovery rules.
+
 **Repository opt-out.** Review new PRs, Approve PRs and Resolve unblocking
 each have a "Skip repositories" list:
 - The list is chosen from all repositories of the person's ready accounts.
@@ -801,7 +831,7 @@ scheduler applies, or it is refused with HTTP 409 and the failed check named:
 - **Issue review:** the repository is opted in, the issue is open, and its
   author is a trusted author.
 - **PR review and approval:** the pull request is open, is not a draft, is
-  authored by the person's own GitHub account, and is not in a skipped
+  authored by either the person's GitHub account or their configured agent account, and is not in a skipped
   repository.
 
 The facts are read fresh from the datastore the scheduler reads; when they

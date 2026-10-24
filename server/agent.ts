@@ -20,7 +20,7 @@ import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
-import { getHeadSha, localCheckoutPath } from './gh'
+import { getHeadSha, getPrAuthor } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
 import { needsClaude, reviewChoice } from './review-model'
@@ -28,6 +28,8 @@ import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic } from './logging'
 import { requireAgentAccount } from './settings'
+import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
+import { resolveReviewCheckout } from './review-checkout'
 import { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, parseAgentLogStdout, scopedAgentLogs } from './agent-log-parse'
 import type { AgentLogParseReply, AgentLogParseRequest } from './agent-log-worker'
 import type { AgentLogIdentity, AgentLogSnapshot, LogEntry } from './agent-log-parse'
@@ -526,19 +528,24 @@ export async function triggerPrReview(
   const m = String(prUrl || '').match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url')
   const [, owner, repo, num] = m
-  const actor = requireAgentAccount()
   const repoFullName = `${owner}/${repo}`
+  const accounts = prAccounts()
+  const author = await getPrAuthor(repoFullName, Number(num), accounts.agent)
+    .catch(() => getPrAuthor(repoFullName, Number(num), accounts.me))
+  const actor = prReviewer(author, true)
   const { model, recovery, catalog } = await reviewChoice('pr_review')
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
-  const pwd = await localCheckoutPath(owner, repo)
-  const expectedHead = await getHeadSha(repoFullName, Number(num))
+  const expectedHead = await getHeadSha(repoFullName, Number(num), { actor })
+  const pwd = await resolveReviewCheckout(owner, repo, Number(num), actor, expectedHead)
   const source = 'poise:manual-review'
   const correlationId = randomUUID()
 
   if (claude) await claudeAuth.requireReady()
-  if ((await reviewChoice('pr_review')).model !== model) throw new Error('Review model changed; retry the request')
+  const selectedModel = (await reviewChoice('pr_review')).model
+  if (!prAccountsMatch(accounts) || prReviewer(author, true) !== actor) throw new Error('GitHub accounts changed; retry the review')
+  if (selectedModel !== model) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: 'review-new-prs', source, owner, actor, repository: repoFullName,
     number: Number(num), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
@@ -574,7 +581,7 @@ export async function triggerPrReview(
 // admitReplay): it reads the target fresh and throws when the scheduler would
 // not act on it. Passed in rather than imported, so this bridge to Caller does
 // not depend on the behavior runtime.
-export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<void>
+export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv } | void>
 
 // Replay an existing agent-interface job — used by the Swarm view's
 // Replay column. The frontend sends the row's `behavior` + `repo` +
@@ -605,20 +612,24 @@ export async function replayAgentJob(input: {
   else if (behavior === 'pr_approve') flag = '--pr-approve'
   else throw new Error(`behavior "${behavior}" is not replayable`)
 
-  await admit(behavior, repo, Number(prId))
-  const actor = requireAgentAccount()
+  const admission = await admit(behavior, repo, Number(prId))
+  if (!admission) throw new Error('Replay admission returned no PR author')
+  const actor = admission.actor
+  if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
   const { model, recovery, catalog } = await reviewChoice(place)
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   const [owner, repoName] = repo.split('/', 2)
   const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
-  const pwd = await localCheckoutPath(owner, repoName)
-  const expectedHead = await getHeadSha(repo, Number(prId))
+  const expectedHead = await getHeadSha(repo, Number(prId), { actor })
+  const pwd = await resolveReviewCheckout(owner, repoName, Number(prId), actor, expectedHead)
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
-  if ((await reviewChoice(place)).model !== model) throw new Error('Review model changed; retry the request')
+  const selectedModel = (await reviewChoice(place)).model
+  if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
+  if (selectedModel !== model) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
     repository: repo, number: Number(prId), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
@@ -641,7 +652,7 @@ export async function replayAgentJob(input: {
     pwd,
   ], {
     cwd: agentCwd(),
-    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv, ...admission.reviewEnvironment },
     onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
   }) } catch (error) {
     captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })

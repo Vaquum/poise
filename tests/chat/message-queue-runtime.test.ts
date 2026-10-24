@@ -285,17 +285,22 @@ describe('deferred message execution', () => {
     await next.recover(); expect(w.c.calls).toHaveLength(2)
   })
 
-  it('marks a claimed task interrupted after a crash and does not execute it again', async () => {
+  it('marks a claimed task interrupted after a crash, never reruns it, and dispatches the waiting follow-up', async () => {
     const w = await world({ deferStart: true }); const queue = await w.add('Claimed'); await w.add('Still waiting')
     const preceding = randomUUID(); storage.reserveQueueTurn(w.s.id, preceding)
     storage.finalizeTurn(w.s.id, { type: 'turn.finished', turnId: preceding, stopReason: 'end_turn' })
     const turnId = randomUUID(); storage.reserveQueueTurn(w.s.id, turnId, queue.items[0].id)
-    const next = w.make(); await next.recover(); await pause(80)
-    expect(next.get(w.s.id)?.queue?.items.map(item => item.state)).toEqual(['failed', 'waiting'])
-    expect(w.c.calls).toHaveLength(0)
-    next.prompt(w.s.id, input('Recovery task'))
+    const next = w.make(); await next.recover()
+    // The interrupted in-flight task is failed and never retried; its
+    // waiting follow-up continues on its own after the restart.
+    await until(() => w.c.calls.some(call => call.input.text === 'Still waiting'))
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['Still waiting'])
     await until(() => next.get(w.s.id)?.queue?.items.length === 1)
-    expect(w.c.calls.map(call => call.input.text)).toEqual(['Recovery task', 'Still waiting'])
+    expect(next.get(w.s.id)?.queue?.items.map(item => item.state)).toEqual(['failed'])
+    // A manual prompt afterwards runs normally behind nothing.
+    next.prompt(w.s.id, input('Recovery task'))
+    await until(() => w.c.calls.some(call => call.input.text === 'Recovery task'))
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['Still waiting', 'Recovery task'])
   })
 
   it('deduplicates item IDs across removal/completion and keeps forks and unrelated sessions independent', async () => {
@@ -322,6 +327,31 @@ describe('deferred message execution', () => {
     await w.add('Must wait for a new activity')
     const next = w.make(); await next.recover(); await pause(80)
     expect(w.c.calls).toHaveLength(0)
+  })
+
+  it.each(['cancelled', 'error'] as const)('keeps a direct turn that ended %s pausing the tail across a restart', async reason => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Current')); await until(() => w.c.calls.length === 1)
+    await w.add('Later 1'); await w.add('Later 2')
+    if (reason === 'cancelled') await w.runtime.cancel(w.s.id); else w.finish('error')
+    await until(() => w.turns().length === 1)
+    await until(() => w.runtime.get(w.s.id)?.status === 'idle')
+    const next = w.make(); await next.recover(); await pause(150)
+    expect(w.c.calls).toHaveLength(1)
+    expect(next.get(w.s.id)?.queue?.items.map(item => item.state)).toEqual(['waiting', 'waiting'])
+    w.c.auto = true; next.prompt(w.s.id, input('Next successful activity'))
+    await until(() => w.turns().length === 4)
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['Current', 'Next successful activity', 'Later 1', 'Later 2'])
+  })
+
+  it('leaves a fresh chat waiting items alone until its first task, even across a restart', async () => {
+    const w = await world({ deferStart: true })
+    await w.add('Queued before the first task')
+    const next = w.make(); await next.recover(); await pause(150)
+    expect(w.c.calls).toHaveLength(0)
+    next.prompt(w.s.id, input('First task'))
+    await until(() => w.turns().length === 2)
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['First task', 'Queued before the first task'])
   })
 
   it('rolls back an enqueue whose durable transcript receipt could not be recorded', async () => {

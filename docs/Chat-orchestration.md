@@ -63,10 +63,11 @@ the Manager, Poise or another chat — since its previous notice for that worker
 most 20, then `more`. Those ride along and start no turn of their own. An active creating
 chat can read its inbox directly. Admission records the new turn ID; it is not proof
 that the agent completed the task. Failed/stopped/interrupted work pauses
-automatic dispatch until explicit chat activity. Existing queued tasks take
-priority. Stop preserves pending messages and bindings.
+automatic dispatch until explicit chat activity. A running or armed task queue
+takes priority over new messages; unarmed waiting items and failed ones never
+hold ordinary delivery. Stop preserves pending messages and bindings.
 Dispatch preserves each recipient's message order while rotating across
-recipients, including those blocked behind a deferred queue.
+recipients, including those blocked behind a running turn or an armed queue.
 
 A creating chat can explicitly steer its own worker or answer its pending
 question with known task data. Native answer validation still applies. The
@@ -89,8 +90,8 @@ timer, setter and collapsed firings, and timer changes land as notes. A
 timer survives restarts: missed occurrences collapse into the next delivery
 with their count, and the schedule keeps its phase. Delivery orders admissible
 inbox candidates by sequence: a timer waiting for the person's grace period or
-an update cannot block an ordinary message; an ordinary message blocked by a
-failed or paused task queue cannot block an otherwise ready timer. A timer
+an update cannot block an ordinary message, and failed or unarmed queue items
+hold back neither. A timer
 still reopens a closed chat before admission; a completed reopen releases its
 in-flight guard even when that firing was cancelled. Each scheduler page rotates
 over 100 recipients and keeps both candidates for every selected recipient.
@@ -307,19 +308,25 @@ Release bindings after verified completion; deleting a chat releases its
 bindings and disables its own supervision.
 
 Bound chats receive local behavior ledger changes for their exact repository,
-target number and issue/PR kind. PR owners also receive observed-head CI
+target number and issue/PR kind. Local target reads use the repository/number
+index. The observation pass yields to I/O between targets, including cached
+and completed targets, so it does not hold request handling behind a whole
+pass. Passes remain single-flight and coalesce intervening ticks. Active passes
+count as background work across suspension; new passes wait during drain or a
+release switch. Shutdown fences late read results before releasing that count.
+PR owners also receive observed-head CI
 failures and recovery, merge conflicts, behind-main branches that merge-prs
 will not update itself, review feedback with unresolved threads, and
 dismissed approvals that leave author-actionable threads. Resolving a
 thread never wakes by itself; only new reviews, replies and reopened
-threads do. Conflict, behind
-and authorship ride the monitor's existing `--list-failing-ci` read; reviews
-and threads come from the local datastore sync. No facet adds a GitHub
-request: the monitor still calls the one existing primitive once per bound PR
-every five minutes, independent of browsers and supervision intervals. On the
-usual unpaginated path that is three GitHub reads per observation, at most 36
-per hour per bound PR; pagination/retries can add reads. Unbound work adds
-zero GitHub traffic. While any check is pending, notifications wait and retain
+threads do. Conflict, behind,
+authorship and live pull state ride the monitor's existing `--list-failing-ci`
+read; reviews and threads come from the local datastore sync. No facet adds a
+GitHub request: the monitor still calls the one existing primitive once per
+bound PR every five minutes, independent of browsers and supervision intervals.
+On the usual unpaginated path that is three GitHub reads per observation, at
+most 36 per hour per bound PR; pagination/retries can add reads. Unbound work
+adds zero GitHub traffic. While any check is pending, notifications wait and retain
 the last settled state, including when other checks have failed. Unchanged
 settled states deduplicate. A failed CI read keeps the settled baseline and
 queues at most one degraded notice per outage. Reviews use bounded local
@@ -343,12 +350,17 @@ resolved. A native merge queue handles latest-base integration; update the
 branch only for conflicts or a needed fix. These observations confer no merge
 authority.
 
-A target that reads closed or merged in the local GitHub datastore drops late
-automation bookkeeping without waking its chat; only human activity still
-wakes, and CI polling stops for a closed or merged PR. The state is read only
-when a behavior notice is about to be queued, or alongside the five-minute CI
-poll, and cached for five minutes. An unreadable or unsynced target wakes as
-before: unknown is never treated as closed.
+A target that reads closed or merged drops late automation bookkeeping
+without waking its chat; only human activity still wakes, and CI polling
+stops for a closed or merged PR. For PRs the state comes from two sources:
+the local GitHub datastore, and the live pull state on the CI read's own
+`get_pull` response, persisted across throttled ticks, outages and restarts —
+so a merge the datastore has not synced yet still suppresses every facet.
+Either source reporting merged or closed suppresses; open from either clears
+unknown. PR datastore state is consulted on each local pass through a
+five-minute cache; issue state is consulted when a behavior notice is
+actionable, through the same cache.
+An unreadable target wakes as before: unknown is never treated as closed.
 
 When a PR bound to a worker merges, the monitor wakes the creating chat once
 with the merged PR, the issues it closed, and the open issues that depend on

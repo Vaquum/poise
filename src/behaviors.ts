@@ -97,6 +97,7 @@ export interface BehaviorDiagnostics {
   holds: Array<{
     org?: string
     repo: string
+    actor?: string
     error: string
     heldAt: string
     nextRecheckAt: string

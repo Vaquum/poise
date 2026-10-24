@@ -101,7 +101,7 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
     const repository = githubRepository(args, options)
     const number = Number(String(args[1] || '').replace(/^#/, ''))
     const changesEvidence = (repo: string, num: number) => ({
-      action: 'requested_changes_addressed', repository: repo, pull_number: num, username: flagValue(args, '--username'),
+      action: 'requested_changes_addressed', repository: repo, pull_number: num, pr_author: pulls.find((p) => p.repo === repo && p.number === num)?.author ?? ME, username: flagValue(args, '--username'),
       status: changeRequested, has_change_request: changeRequested,
       reviewer_latest_state: changeRequested ? 'CHANGES_REQUESTED' : null,
       reviewer_latest_commit: changeRequested ? HEAD : null,
@@ -395,7 +395,7 @@ describe('Replay checks', () => {
     ['pr_review', 'closed', { status: 'closed' }, `Replay refused: ${API}#1 is not an open pull request.`],
     ['pr_approve', 'merged', { status: 'merged' }, `Replay refused: ${API}#1 is not an open pull request.`],
     ['pr_review', 'a draft', { draft: 1 }, `Replay refused: ${API}#1 is a draft.`],
-    ['pr_approve', 'authored by someone else', { author: 'someone-else' }, `Replay refused: ${API}#1 is authored by someone-else, not by your GitHub account ${ME}.`],
+    ['pr_approve', 'authored by someone else', { author: 'someone-else' }, `Replay refused: ${API}#1 is authored by someone-else, outside your configured GitHub account pair.`],
   ] as const)('refuses %s replay of a pull request that is %s', async (behavior, _case, facts, message) => {
     await start()
     pulls = [pull(API, 1, facts)]
@@ -500,7 +500,7 @@ describe('the scheduler and a replay apply the same check', () => {
   const pullRequestCases: Array<[string, Record<string, unknown> | null, string[], string | true]> = [
     ['open, yours and not skipped', {}, [], true],
     ['a draft', { draft: 1 }, [], 'is a draft'],
-    ['authored by someone else', { author: 'someone-else' }, [], 'not by your GitHub account'],
+    ['authored by someone else', { author: 'someone-else' }, [], 'outside your configured GitHub account pair'],
     ['merged', { status: 'merged' }, [], 'is not an open pull request'],
     ['missing from the datastore', null, [], 'is not an open pull request'],
     ['in a skipped repository', {}, [API], 'Skip repositories list'],

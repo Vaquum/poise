@@ -25,7 +25,7 @@ async function workspace(page: Page, longSettings = false) {
       ])) } })
     }
     if (url.pathname === '/api/behaviors') return route.fulfill({ json: Object.fromEntries(BEHAVIORS.map(({ key }) => [key,
-      { owner: 'review-bot', enabled: true, setting: 'p2', reviewers: 1, scratchpad: '',
+      { owner: key === 'review-new-issues' ? 'review-bot' : 'octocat / review-bot', enabled: true, setting: 'p2', reviewers: 1, scratchpad: '',
         skipRepos: longSettings && key === 'review-new-prs' ? Array.from({ length: 236 }, (_, i) => `acme/repo-${i}`) : [],
         repos: [], authors: [], lastTriggered: null },
     ])) })
@@ -121,4 +121,14 @@ test('keeps columns spaced and single-line across desktop and narrow viewports i
   await page.setViewportSize({ width: 1600, height: 900 })
   await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
   await page.screenshot({ path: info.outputPath('behaviors-1600-dark.png'), animations: 'disabled' })
+})
+
+
+test('shows both possible PR actors and the single issue-review actor', async ({ page }) => {
+  await workspace(page)
+  await page.goto('/')
+  const pr = page.locator('tr[data-behavior="review-new-prs"] .behavior-owner-cell')
+  await expect(pr.locator('.behavior-owner-name')).toHaveText(['octocat', 'review-bot'])
+  await expect(pr.locator('img')).toHaveCount(2)
+  await expect(page.locator('tr[data-behavior="review-new-issues"] .behavior-owner-name')).toHaveText('review-bot')
 })

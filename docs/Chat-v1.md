@@ -272,8 +272,11 @@ Per-session workspaces make same-checkout contention rare; it remains for
 forks and handoffs on one workspace, development versus production, and
 orphan holds. The lease covers startup, execution, tool services and
 process cleanup, not only the subprocess launch. Worker gates register a process group before allowing
-it to run. An unverified surviving worker keeps the checkout blocked. A
-Poise-side filesystem operation must finish before the lease is released;
+it to run. An unverified surviving worker keeps the checkout blocked.
+A holder counts as alive only while its host process is still the one that
+acquired the lease — the pid plus its start time — so a pid the operating
+system reused after a restart never pins a dead lease.
+A Poise-side filesystem operation must finish before the lease is released;
 killing an agent cannot cancel filesystem work already executing in Poise.
 
 These are cooperative application locks. They do not prevent a person or an
@@ -304,10 +307,19 @@ running through it. Each session's agent runs under a per-session relay that
 owns its stdio and spools the turn's output; after a restart the new server
 reconnects to live relays, rebuilds each adapter over the spooled bytes, and
 continues the turn without repeating a persisted event or writing to the
-agent. Open turns with no live relay become interrupted and pending
+agent. Adoption works across releases: relay identity does not name the
+install directory, so a new release adopts relays still running from the
+previous one. A handoff that never reaches LIVE within a minute fails
+instead: the turn is interrupted and its processes terminated, never left
+running unseen. The adopted relay retires when its turn settles; the next
+prompt starts a fresh relay and resumes the same native session. Open turns
+with no live relay become interrupted and pending
 interactions are cancelled, while sessions owned by another live host are
 left alone, as does a turn whose relay or replay fails — its transcript
-says the handoff failed. The terminal transcript event, immutable Caller
+says the handoff failed. Follow-ups that waited behind an interrupted turn
+continue on their own; the interrupted turn itself is never retried, and a
+Stop — asked before or across the restart — still ends its turn and holds
+its chat until the person sends again. The terminal transcript event, immutable Caller
 outcome and clearing of the open-turn marker commit in one SQLite
 transaction. Caller finish failures remain in a durable outbox even if
 later turns run or the session is deleted; recovery retries the actual

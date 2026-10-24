@@ -357,3 +357,8 @@ is the agent account: `CALLER_PR_REVIEWER`, else `GITHUB_INTERFACE_AGENT_USER`.
 Pull requests are read as `CALLER_GITHUB_READER`, else as the reviewer. The
 hook runs in every agent session on the machine, so installing fixes these
 accounts into its command; installing without an agent account fails.
+
+The installed PR stop gate reads the live PR author from `--current-pr`. When
+`CALLER_GITHUB_READER` (the main account) is configured, agent-authored PRs wait
+for that account; main-authored PRs wait for `CALLER_PR_REVIEWER`. Missing author
+evidence and equal identities fail explicitly. Neither account is switched.

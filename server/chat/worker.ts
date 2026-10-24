@@ -9,8 +9,9 @@
 // leaves a registered group the lease keeps blocking until it is dead, and
 // the gate itself tears the group down when its control descriptor closes.
 
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { CLAUDE_SUBSCRIPTION_CLI, runFile, scrubbedChildEnvironment } from '../process'
 
@@ -132,20 +133,71 @@ export function pgidAlive(pgid: number | null | undefined): boolean {
   }
 }
 
-/** Whether `pid` is still the gate we recorded: its command line must be
- *  the gate script carrying `--lease-worker <ident>` as its own argument.
- *  Anything else (pid reuse, unreadable table) is "no". */
-export async function workerIdentityMatches(pid: number, ident: string): Promise<boolean> {
+/** Start time of `pid` as an opaque same-machine token, or null when it
+ *  cannot be read. Linux parses /proc (tick resolution); anything else asks
+ *  ps (one-second resolution). Compared only for equality with the value
+ *  recorded when a lease was acquired, so a reused pid reads as a different
+ *  process. */
+export function processStartTime(pid: number | null | undefined): string | null {
+  if (!pid || !Number.isSafeInteger(pid) || pid <= 0) return null
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      // comm (field 2) may itself hold spaces and parens, so count from its
+      // closing paren: what follows are fields 3 on, and starttime is 22.
+      const afterComm = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)
+      const starttime = afterComm[22 - 3]
+      return starttime && /^\d+$/.test(starttime) ? starttime : null
+    } catch {
+      return null
+    }
+  }
+  try {
+    const started = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 }).trim()
+    return started || null
+  } catch {
+    return null
+  }
+}
+
+let ownStart: string | null | undefined
+
+/** This process's start time, read once: it never changes, and off Linux
+ *  each read spawns ps. */
+export function ownProcessStartTime(): string | null {
+  if (ownStart === undefined) ownStart = processStartTime(process.pid)
+  return ownStart
+}
+
+/** Whether `pid` still runs `scriptFile` from any Poise scripts directory
+ *  (any installed release, the image, or a checkout) carrying `--<flag>
+ *  <ident>` as its own argument. The install directory is deliberately not
+ *  part of the identity: after a release switch the surviving relay and
+ *  gate still run from the previous release's directory, and the new
+ *  server must verify them to adopt them. The random ident — minted at
+ *  spawn, stored server-side, matched exactly with whitespace on both
+ *  sides — is what defeats pid reuse; the `/scripts/` parent keeps a
+ *  same-named script elsewhere from verifying. Anything else (pid reuse,
+ *  unreadable table) is "no". */
+export async function scriptIdentityMatches(pid: number, ident: string, scriptFile: string, flag: string): Promise<boolean> {
   if (!pidAlive(pid) || !/^[A-Za-z0-9-]{8,64}$/.test(ident)) return false
   try {
     const { stdout } = await runFile('ps', ['-o', 'command=', '-p', String(pid)], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 })
     const line = stdout.trim()
-    const gateIndex = line.indexOf(WORKER_GATE)
-    const identIndex = line.indexOf(` --lease-worker ${ident} -- `)
-    return gateIndex >= 0 && identIndex > gateIndex
+    const flagIndex = line.indexOf(` --${flag} ${ident} `)
+    if (flagIndex < 0) return false
+    const head = line.slice(0, flagIndex)
+    return head.includes(`/scripts/${scriptFile} `) || head.endsWith(`/scripts/${scriptFile}`)
   } catch {
     return false
   }
+}
+
+/** Whether `pid` is still the gate we recorded: its command line must be
+ *  the gate script carrying `--lease-worker <ident>` as its own argument.
+ *  Anything else (pid reuse, unreadable table) is "no". */
+export async function workerIdentityMatches(pid: number, ident: string): Promise<boolean> {
+  return scriptIdentityMatches(pid, ident, 'chat-worker-gate.mjs', 'lease-worker')
 }
 
 function delay(ms: number): Promise<void> {

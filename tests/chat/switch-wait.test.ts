@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -228,6 +228,33 @@ describe('waiting behind a pending switch', () => {
     await next.recover()
     await until(() => w.c.calls.length === 2)
     expect(w.c.calls.map(call => call.input.text)).toEqual(['First', 'Second'])
+  })
+
+  it('starts a prompt accepted during a pending switch after the restart despite a waiting queue item', async () => {
+    const w = await world()
+    w.runtime.prompt(w.s.id, input('Earlier task'))
+    await until(() => w.turns(w.s.id).length === 1)
+    await until(() => w.runtime.get(w.s.id)?.status === 'idle')
+    await w.runtime.enqueue(w.s.id, randomUUID(), input('Queued while idle'))
+    expect(w.runtime.get(w.s.id)?.queue?.ready).toBe(false)
+    w.runtime.setSwitchPending('r2')
+    inbox.message(w.instance, w.s.id, 'Manager', 'Do the thing after the update')
+    await pause(80)
+    expect(w.c.calls).toHaveLength(1)
+    expect(inbox.pending(w.instance, '')).toHaveLength(1)
+    w.runtime.startDrain('service')
+    await w.runtime.stop()
+    w.runtime.endDrain()
+    const next = w.make()
+    await next.recover()
+    const control = await tickControl(next)
+    for (let i = 0; i < 100 && inbox.pending(w.instance, '').length; i++) { await control.tick(); await pause(30) }
+    await until(() => w.c.calls.length === 3)
+    expect(inbox.pending(w.instance, '')).toHaveLength(0)
+    // The admitted prompt runs first and its completion arms the waiting tail.
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['Earlier task',
+      expect.stringContaining('Do the thing after the update'), 'Queued while idle'])
+    await until(() => next.get(w.s.id)?.status === 'idle')
   })
 
   it.each(['withdrawal', 'restart'] as const)('preserves older queue, waited prompt and newer queue order after natural completion via %s', async release => {
@@ -475,6 +502,40 @@ describe('the switch bound', () => {
     expect(w.c.calls.map(call => call.input.text)).toEqual([
       'Poise restarted for an update while your turn was running. Continue where you left off.', 'Waited follow-up',
     ])
+  })
+
+  it('recovers waiting prompts past a reused host pid', async () => {
+    const w = await world()
+    w.runtime.setSwitchPending('r2')
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID() }])
+    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+    await w.runtime.stop()
+    const { CheckoutLease } = await import('../../server/chat/checkout-lock')
+    // The previous turn's row: its host pid is alive again as an unrelated
+    // process, and its lease is stale. Recovery must take it over instead
+    // of deferring to the "live" squatter.
+    const squatter = spawn('sleep', ['30'], { detached: true })
+    try {
+      const stale = new CheckoutLease(w.repo, { ownerKind: 'poise:chat', ownerId: w.s.id,
+        ownerLabel: 'stale owner', instance: w.instance },
+        { hostPid: squatter.pid!, hostStart: 'a-dead-generation', now: () => Date.now() - 120_000 })
+      expect(stale.tryAcquire().acquired).toBe(true)
+      const next = w.make()
+      try {
+        next.setSwitchPending('r3')
+        await next.recover()
+        await next.releaseSwitchWait()
+        await until(() => w.c.calls.length === 2)
+        expect(w.c.calls.map(call => call.input.text)).toEqual([
+          'Poise stopped your turn for an update that did not restart. Continue where you left off.', 'Waited follow-up',
+        ])
+      } finally {
+        await next.stop()
+      }
+    } finally {
+      squatter.kill('SIGKILL')
+      await new Promise((r) => squatter.once('exit', r))
+    }
   })
 
   it('resumes interrupted work before an existing normal follow-up after a busy turn', async () => {
