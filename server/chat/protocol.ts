@@ -184,6 +184,10 @@ export interface SessionRecord {
    *  commits, uncommitted changes, a still-running background job): the
    *  chat is stalled until the state clears. Absent means nothing tracked. */
   stall?: StallState
+  /** A Stop was asked for this turn and it has not settled since. Shutdown
+   *  terminates it instead of handing it over, and recovery terminates it
+   *  instead of adopting it; a new turn clears the marker. */
+  stopRequestedTurnId?: string
   /** Optional context handed over at creation (card, document, another session). */
   context?: SessionContext
   /** The subject this session belongs to; at most one session per subject. */

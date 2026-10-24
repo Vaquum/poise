@@ -229,6 +229,14 @@ export async function branchTip(checkout: string, name: string): Promise<string>
   return (await git(checkout, ['rev-parse', `refs/heads/${assertBranchName(name)}`])).trim()
 }
 
+/** Point `name` at `sha`, creating or moving it. Used to retain a
+ *  checkpoint made on a detached HEAD, which no branch would keep. */
+export async function moveBranch(lease: CheckoutLease, checkout: string, name: string, sha: string): Promise<void> {
+  const branch = assertBranchName(name)
+  if (!/^[0-9a-f]{4,64}$/i.test(sha)) throw new GitError('invalid checkpoint SHA', 'invalid')
+  await guardedGit(lease, checkout, ['branch', '--quiet', '--force', branch, sha])
+}
+
 export async function deleteBranch(lease: CheckoutLease, checkout: string, name: string): Promise<void> {
   const branch = assertBranchName(name)
   const state = await inspectCheckout(checkout)

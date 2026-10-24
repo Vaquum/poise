@@ -312,14 +312,14 @@ failures and recovery, merge conflicts, behind-main branches that merge-prs
 will not update itself, review feedback with unresolved threads, and
 dismissed approvals that leave author-actionable threads. Resolving a
 thread never wakes by itself; only new reviews, replies and reopened
-threads do. Conflict, behind
-and authorship ride the monitor's existing `--list-failing-ci` read; reviews
-and threads come from the local datastore sync. No facet adds a GitHub
-request: the monitor still calls the one existing primitive once per bound PR
-every five minutes, independent of browsers and supervision intervals. On the
-usual unpaginated path that is three GitHub reads per observation, at most 36
-per hour per bound PR; pagination/retries can add reads. Unbound work adds
-zero GitHub traffic. While any check is pending, notifications wait and retain
+threads do. Conflict, behind,
+authorship and live pull state ride the monitor's existing `--list-failing-ci`
+read; reviews and threads come from the local datastore sync. No facet adds a
+GitHub request: the monitor still calls the one existing primitive once per
+bound PR every five minutes, independent of browsers and supervision intervals.
+On the usual unpaginated path that is three GitHub reads per observation, at
+most 36 per hour per bound PR; pagination/retries can add reads. Unbound work
+adds zero GitHub traffic. While any check is pending, notifications wait and retain
 the last settled state, including when other checks have failed. Unchanged
 settled states deduplicate. A failed CI read keeps the settled baseline and
 queues at most one degraded notice per outage. Reviews use bounded local
@@ -343,12 +343,16 @@ resolved. A native merge queue handles latest-base integration; update the
 branch only for conflicts or a needed fix. These observations confer no merge
 authority.
 
-A target that reads closed or merged in the local GitHub datastore drops late
-automation bookkeeping without waking its chat; only human activity still
-wakes, and CI polling stops for a closed or merged PR. The state is read only
-when a behavior notice is about to be queued, or alongside the five-minute CI
-poll, and cached for five minutes. An unreadable or unsynced target wakes as
-before: unknown is never treated as closed.
+A target that reads closed or merged drops late automation bookkeeping
+without waking its chat; only human activity still wakes, and CI polling
+stops for a closed or merged PR. For PRs the state comes from two sources:
+the local GitHub datastore, and the live pull state on the CI read's own
+`get_pull` response, persisted across throttled ticks, outages and restarts —
+so a merge the datastore has not synced yet still suppresses every facet.
+Either source reporting merged or closed suppresses; open from either clears
+unknown. The datastore state is read only when a behavior notice is about to
+be queued, or alongside the five-minute CI poll, and cached for five minutes.
+An unreadable target wakes as before: unknown is never treated as closed.
 
 When a PR bound to a worker merges, the monitor wakes the creating chat once
 with the merged PR, the issues it closed, and the open issues that depend on

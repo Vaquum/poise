@@ -132,6 +132,30 @@ export function pgidAlive(pgid: number | null | undefined): boolean {
   }
 }
 
+/** Whether `pid` still runs `scriptFile` from any Poise scripts directory
+ *  (any installed release, the image, or a checkout) carrying `--<flag>
+ *  <ident>` as its own argument. The install directory is deliberately not
+ *  part of the identity: after a release switch the surviving relay and
+ *  gate still run from the previous release's directory, and the new
+ *  server must verify them to adopt them. The random ident — minted at
+ *  spawn, stored server-side, matched exactly with whitespace on both
+ *  sides — is what defeats pid reuse; the `/scripts/` parent keeps a
+ *  same-named script elsewhere from verifying. Anything else (pid reuse,
+ *  unreadable table) is "no". */
+export async function scriptIdentityMatches(pid: number, ident: string, scriptFile: string, flag: string): Promise<boolean> {
+  if (!pidAlive(pid) || !/^[A-Za-z0-9-]{8,64}$/.test(ident)) return false
+  try {
+    const { stdout } = await runFile('ps', ['-o', 'command=', '-p', String(pid)], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 })
+    const line = stdout.trim()
+    const flagIndex = line.indexOf(` --${flag} ${ident} `)
+    if (flagIndex < 0) return false
+    const head = line.slice(0, flagIndex)
+    return head.includes(`/scripts/${scriptFile} `) || head.endsWith(`/scripts/${scriptFile}`)
+  } catch {
+    return false
+  }
+}
+
 export interface GroupMember {
   pid: number
   ppid: number
@@ -166,9 +190,11 @@ export type WorkerGateStatus = 'verified' | 'gone' | 'unknown'
 
 /** Whether the recorded gate still owns `pid`: `verified` when its command
  *  line is the gate script carrying `--lease-worker <ident>` as its own
- *  argument, `gone` when the pid is dead or another process (pid reuse),
- *  `unknown` when the process table itself cannot be read. Callers that
- *  act on death must retry on `unknown`, never treat it as `gone`. */
+ *  argument (the same identity scriptIdentityMatches checks, so a gate
+ *  surviving a release switch still verifies), `gone` when the pid is dead
+ *  or another process (pid reuse), `unknown` when the process table itself
+ *  cannot be read. Callers that act on death must retry on `unknown`,
+ *  never treat it as `gone`. */
 export async function workerGateStatus(pid: number, ident: string): Promise<WorkerGateStatus> {
   if (!pidAlive(pid) || !/^[A-Za-z0-9-]{8,64}$/.test(ident)) return 'gone'
   let stdout: string
@@ -178,15 +204,17 @@ export async function workerGateStatus(pid: number, ident: string): Promise<Work
     return 'unknown'
   }
   const line = stdout.trim()
-  const gateIndex = line.indexOf(WORKER_GATE)
-  const identIndex = line.indexOf(` --lease-worker ${ident} -- `)
-  return gateIndex >= 0 && identIndex > gateIndex ? 'verified' : 'gone'
+  const flagIndex = line.indexOf(` --lease-worker ${ident} `)
+  if (flagIndex < 0) return 'gone'
+  const head = line.slice(0, flagIndex)
+  return head.includes('/scripts/chat-worker-gate.mjs ') || head.endsWith('/scripts/chat-worker-gate.mjs') ? 'verified' : 'gone'
 }
 
-/** Whether `pid` is still the gate we recorded. Anything but a verified
- *  command line — pid reuse, an unreadable table — is "no". */
+/** Whether `pid` is still the gate we recorded: its command line must be
+ *  the gate script carrying `--lease-worker <ident>` as its own argument.
+ *  Anything else (pid reuse, unreadable table) is "no". */
 export async function workerIdentityMatches(pid: number, ident: string): Promise<boolean> {
-  return (await workerGateStatus(pid, ident)) === 'verified'
+  return scriptIdentityMatches(pid, ident, 'chat-worker-gate.mjs', 'lease-worker')
 }
 
 function delay(ms: number): Promise<void> {
