@@ -26,7 +26,7 @@ function ledgerHealth(over: Partial<LedgerHealth> = {}): LedgerHealth {
 }
 
 function snapshot(over: Partial<BehaviorLedgerSnapshot> = {}): BehaviorLedgerSnapshot {
-  return { failed: false, stopping: false, queueAgeMs: null, pending: 0, unreportedLoss: 0, stallBudgetMs: 10_000, health: ledgerHealth(), ...over }
+  return { ready: true, failed: false, stopping: false, queueAgeMs: null, pending: 0, unreportedLoss: 0, stallBudgetMs: 10_000, health: ledgerHealth(), ...over }
 }
 
 function freshness(over: Partial<DatastoreFreshnessEntry> = {}): DatastoreFreshnessEntry {
@@ -71,6 +71,28 @@ describe('ledger dependency', () => {
       .toMatchObject({ status: 'unavailable', reason: 'worker_unavailable' })
   })
 
+  it('reads a store outage the worker reported, even with the queue drained', () => {
+    const idle = snapshot({ health: ledgerHealth({ status: 'unavailable', unavailableReason: 'journal_unavailable' }) })
+    expect(health.ledgerDependency(idle, T0)).toMatchObject({ status: 'unavailable', reason: 'journal_unavailable' })
+    const store = snapshot({ health: ledgerHealth({ status: 'unavailable', unavailableReason: 'store_unavailable' }) })
+    expect(health.ledgerDependency(store, T0)).toMatchObject({ status: 'unavailable', reason: 'store_unavailable' })
+    // The reported cause outranks the queue signal.
+    const stalled = snapshot({ queueAgeMs: 60_000, pending: 40,
+      health: ledgerHealth({ status: 'unavailable', unavailableReason: 'store_unavailable' }) })
+    expect(health.ledgerDependency(stalled, T0)).toMatchObject({ status: 'unavailable', reason: 'store_unavailable' })
+  })
+
+  it('ignores an idle stale store the way it ignores history', () => {
+    const stale = snapshot({ health: ledgerHealth({ status: 'stale' }) })
+    expect(health.ledgerDependency(stale, T0)).toMatchObject({ status: 'ok', reason: null })
+  })
+
+  it('ignores the initial placeholder health before worker readiness', () => {
+    const starting = snapshot({ ready: false,
+      health: ledgerHealth({ status: 'unavailable', unavailableReason: null, generation: null }) })
+    expect(health.ledgerDependency(starting, T0)).toMatchObject({ status: 'ok', reason: null })
+  })
+
   it('reads degraded only once the queue outwaits the stall budget', () => {
     expect(health.ledgerDependency(snapshot({ queueAgeMs: 10_000, pending: 507 }), T0).status).toBe('ok')
     const stalled = health.ledgerDependency(snapshot({ queueAgeMs: 10_001, pending: 507 }), T0)
@@ -107,6 +129,19 @@ describe('datastore dependencies', () => {
   it('reads unavailable when the freshness gate says so', () => {
     const [entry] = health.datastoreDependencies([freshness({ status: 'unavailable', error: 'Datastore stale: last successful sync' })])
     expect(entry).toMatchObject({ status: 'unavailable', reason: 'sync_failing' })
+  })
+
+  it('reads degraded once the last success ages past what the gate accepts', () => {
+    const limit = behaviors.DATASTORE_MAX_AGE_SECONDS
+    const lastSuccessAt = new Date(T0 - (limit + 1) * 1000).toISOString()
+    const [stale] = health.datastoreDependencies([freshness({ lastSuccessAt, ageSeconds: limit + 1, observationAgeMs: 1_000 })])
+    expect(stale).toMatchObject({ status: 'degraded', reason: 'sync_stale' })
+    expect(stale.since).toBe(new Date(T0 - 1_000).toISOString())
+    const [edge] = health.datastoreDependencies([freshness({ lastSuccessAt: new Date(T0 - limit * 1000).toISOString(), ageSeconds: limit, observationAgeMs: 1_000 })])
+    expect(edge.status).toBe('ok')
+    // An observed gate failure still outranks the inferred age.
+    const [failed] = health.datastoreDependencies([freshness({ status: 'unavailable', error: 'stale', lastSuccessAt, ageSeconds: limit + 1, observationAgeMs: 1_000 })])
+    expect(failed).toMatchObject({ status: 'unavailable', reason: 'sync_failing' })
   })
 
   it('reports one entry per configured organization', () => {
@@ -206,7 +241,7 @@ describe('ledger history', () => {
 describe('ledger observer snapshot', () => {
   it('reads queue state synchronously without starting the worker', () => {
     const observer = new ledgerModule.BehaviorLedgerObserver()
-    expect(observer.snapshot()).toMatchObject({ failed: false, stopping: false, queueAgeMs: null, pending: 0, unreportedLoss: 0, stallBudgetMs: 10_000 })
+    expect(observer.snapshot()).toMatchObject({ ready: false, failed: false, stopping: false, queueAgeMs: null, pending: 0, unreportedLoss: 0, stallBudgetMs: 10_000 })
     observer.capture({ type: 'heartbeat' })
     const queued = observer.snapshot()
     expect(queued.pending).toBe(1)

@@ -41,6 +41,8 @@ export const LEDGER_STALL_TIMEOUT_MS = 10_000
 
 /** What health and its alerts read: memory only, never the worker queue. */
 export interface BehaviorLedgerSnapshot {
+  /** The worker answered readiness; before that, `health` is still the initial placeholder. */
+  ready: boolean
   failed: boolean
   stopping: boolean
   /** Age of the oldest queued or in-flight capture; null when none. */
@@ -193,6 +195,7 @@ export class BehaviorLedgerObserver {
   snapshot(): BehaviorLedgerSnapshot {
     const oldest = this.oldestCaptureAt()
     return {
+      ready: this.ready,
       failed: this.failed,
       stopping: this.stopping || this.closed,
       queueAgeMs: oldest === Infinity ? null : Math.max(0, Date.now() - oldest),

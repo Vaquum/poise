@@ -81,7 +81,9 @@ two-second budget; health never queues one).
 
 `dependencies.ledger` reads `degraded` while the oldest queued capture
 outwaits the ten-second stall budget or capture loss is still unreported,
-and `unavailable` once the worker has failed; anything else reads `ok`.
+and `unavailable` once the worker has failed or the store reports itself
+unavailable (an unopenable database, an unwritable journal), even with the
+queue drained; anything else reads `ok`.
 Cumulative `dropped` counts and retained gaps stay in `history.ledger` and
 never affect readiness: a ledger that once lost a capture must not read
 degraded forever. A queue age past the budget on two minute-checks in a row,

@@ -89,7 +89,8 @@ const GH_INTERFACE = 'github-interface'
 const AGENT_INTERFACE = 'agent-interface'
 const LEGACY_REVIEW_SNAPSHOT_TARGET = '__snapshot_v2__'
 const REVIEW_SNAPSHOT_TARGET = '__snapshot_v3__'
-const DATASTORE_MAX_AGE_SECONDS = 120
+/** Sync age past this fails the datastore freshness gate. */
+export const DATASTORE_MAX_AGE_SECONDS = 120
 const SHA_PATTERN = /^[0-9a-f]{40}$/
 const GITHUB_USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
 

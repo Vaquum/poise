@@ -143,6 +143,10 @@ describe('health split', () => {
       admissionKey: 'x'.repeat(5000), nativeId: 'oversized-admission', behavior: 'merge-prs',
       source: 'poise:merge-prs', owner: null, actor: null, repository: 'example/project', number: 1, head: null,
     })
+    // The oversize admission only records unreported loss; without a further
+    // capture nothing pumps its loss marker to the worker, so the test would
+    // wait on the next minute-boundary heartbeat. Pump it explicitly.
+    ledger.behaviorLedgerHeartbeat()
     let answer = await health()
     await waitFor('the loss marker to commit', async () => {
       answer = await health()

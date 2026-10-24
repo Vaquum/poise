@@ -9,7 +9,7 @@
 // wedged dependency cannot slow the reader down. Unknown — never observed —
 // is reported but never degrades readiness.
 
-import { DATASTORE_OBSERVATION_STALE_MS, datastoreFreshnessEntries, type DatastoreFreshnessEntry } from './behaviors'
+import { DATASTORE_MAX_AGE_SECONDS, DATASTORE_OBSERVATION_STALE_MS, datastoreFreshnessEntries, type DatastoreFreshnessEntry } from './behaviors'
 import { behaviorLedgerSnapshot, type BehaviorLedgerSnapshot } from './behavior-ledger'
 import { buildIdentity } from './build-identity'
 import { QUOTA_OBSERVATION_STALE_MS, githubQuotaSnapshots, type GithubQuotaSnapshot } from './github-quota'
@@ -35,12 +35,19 @@ export interface LedgerDependency extends DependencyEntry {
 
 /** Current ledger drain state only. Cumulative dropped counts and retained
  *  gaps belong to history: a ledger that once lost a capture must not read
- *  degraded forever. */
+ *  degraded forever. A store outage the worker reported (an unopenable
+ *  database, an unwritable journal) reads unavailable even while the queue
+ *  is drained; an idle store's `stale` never does. */
 export function ledgerDependency(snapshot: BehaviorLedgerSnapshot | null, now = Date.now()): LedgerDependency {
   if (!snapshot) return { status: 'unknown', reason: 'not_started', since: null, queueAgeMs: null, pending: 0, stallBudgetMs: null }
   const base = { queueAgeMs: snapshot.queueAgeMs, pending: snapshot.pending, stallBudgetMs: snapshot.stallBudgetMs }
   if (snapshot.stopping) return { ...base, status: 'unknown', reason: 'stopping', since: null }
   if (snapshot.failed) return { ...base, status: 'unavailable', reason: 'worker_unavailable', since: null }
+  // Only once the worker has spoken: before readiness its health is still
+  // the initial unavailable placeholder, not a report.
+  if (snapshot.ready && snapshot.health.status === 'unavailable') {
+    return { ...base, status: 'unavailable', reason: snapshot.health.unavailableReason ?? 'unavailable', since: null }
+  }
   if (snapshot.queueAgeMs !== null && snapshot.queueAgeMs > snapshot.stallBudgetMs) {
     return { ...base, status: 'degraded', reason: 'queue_stalled', since: new Date(now - snapshot.queueAgeMs).toISOString() }
   }
@@ -57,7 +64,9 @@ export interface DatastoreDependency extends DependencyEntry {
 }
 
 /** One entry per organization: a healthy observation for one account must
- *  not hide another's stale or unread one. */
+ *  not hide another's stale or unread one. A last success older than the
+ *  freshness gate accepts reads degraded even while the observation itself
+ *  is fresh: the gate would reject that data until a newer success is seen. */
 export function datastoreDependencies(entries: DatastoreFreshnessEntry[]): DatastoreDependency[] {
   return entries.map((entry) => {
     const base = { org: entry.org, checkedAt: entry.checkedAt, lastSuccessAt: entry.lastSuccessAt, ageSeconds: entry.ageSeconds, error: entry.error }
@@ -66,6 +75,10 @@ export function datastoreDependencies(entries: DatastoreFreshnessEntry[]): Datas
       return { ...base, status: 'degraded' as const, reason: 'observation_stale', since: entry.checkedAt }
     }
     if (entry.status === 'unavailable') return { ...base, status: 'unavailable' as const, reason: 'sync_failing', since: entry.checkedAt }
+    if (entry.ageSeconds !== null && entry.ageSeconds > DATASTORE_MAX_AGE_SECONDS && entry.lastSuccessAt !== null) {
+      const crossedAt = new Date(Date.parse(entry.lastSuccessAt) + DATASTORE_MAX_AGE_SECONDS * 1000).toISOString()
+      return { ...base, status: 'degraded' as const, reason: 'sync_stale', since: crossedAt }
+    }
     return { ...base, status: 'ok' as const, reason: null, since: null }
   })
 }

@@ -12,7 +12,7 @@ const T0 = Date.parse('2026-10-24T08:00:00Z')
 
 function snapshot(over: Partial<BehaviorLedgerSnapshot> = {}, health: Record<string, unknown> = {}): BehaviorLedgerSnapshot {
   return {
-    failed: false, stopping: false, queueAgeMs: null, pending: 0, unreportedLoss: 0, stallBudgetMs: 10_000,
+    ready: true, failed: false, stopping: false, queueAgeMs: null, pending: 0, unreportedLoss: 0, stallBudgetMs: 10_000,
     health: {
       status: 'ok', unavailableReason: null, coverageStart: null, observedAt: null, callerObservedAt: null,
       pending: 0, dropped: 0, gaps: [], generation: 'generation-a', retainedFrom: null,
