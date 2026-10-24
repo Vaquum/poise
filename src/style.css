@@ -4781,14 +4781,6 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
 .editor-bar-btn.editor-delete-btn:hover { color: var(--a5); }
 .editor-bar-btn svg { display: block; }
 
-/* Save / word-count cell on the right, kept quiet. */
-.editor-meta {
-  font-size: 0.6875rem;
-  letter-spacing: 0.04em;
-  color: var(--text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
-
 /* The trigger + popover share a wrapper so the popover anchors to
    the trigger's right edge, not the bar's. */
 .editor-doc-wrap {
