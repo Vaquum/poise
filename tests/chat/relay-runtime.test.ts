@@ -603,7 +603,7 @@ describe('relay handover between servers', () => {
     }
   }, 60_000)
 
-  it('drops the completed adopted turn spool and outbound log while its agent stays idle', async () => {
+  it('retires the adopted relay and agent once the adopted turn settles', async () => {
     const instance = 'poise-relay-replay-finish-spool:db'
     const { session, peer, turnId } = await heldTurn(instance, 'cat')
     let releaseReplay = () => {}
@@ -621,13 +621,16 @@ describe('relay handover between servers', () => {
       releaseReplay()
       await waitFor(() => lastStatus(second.events, session.id) === 'idle')
       expect(ofType(second.events, session.id, 'turn.finished')).toEqual([expect.objectContaining({ turnId, stopReason: 'end_turn' })])
+      // The pre-restart relay leaves nothing behind: its spool directory
+      // is removed, its agent is verifiably gone, and its rows are
+      // forgotten, so the next prompt starts a fresh relay.
       await vi.waitFor(async () => {
         await expect(readFile(spool, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
       })
-      expect(await adopted.getOutbound()).toEqual({ truncated: false, bytes: Buffer.alloc(0) })
-      expect(worker.pgidAlive(peer.gatePgid)).toBe(true)
-      expect(storage.getWorker(session.id)?.gatePgid).toBe(peer.gatePgid)
-      expect(storage.getRelay(session.id)).not.toBeNull()
+      await waitFor(() => !worker.pgidAlive(peer.gatePgid), 10_000)
+      expect(adopted.healthy).toBe(false)
+      expect(storage.getWorker(session.id)).toBeNull()
+      expect(storage.getRelay(session.id)).toBeNull()
     } finally {
       releaseReplay()
       await second.runtime.stop({ handover: false })
@@ -675,20 +678,21 @@ describe('relay handover between servers', () => {
     expect(ofType(second.events, session.id, 'turn.finished')[0]).toMatchObject({ turnId, stopReason: 'end_turn' })
     expect(second.finishes).toHaveLength(1)
     expect(second.finishes[0]).toMatchObject({ status: 'completed' })
-    // The adopted agent was not stopped: its rows and process survive.
+    // The pre-restart relay and agent retire with the adopted turn: no
+    // old relay outlives its adoption.
     await waitFor(() => second.runtime.get(session.id)?.status === 'idle')
-    expect(worker.pgidAlive(pgid)).toBe(true)
-    expect(storage.getRelay(session.id)).not.toBeNull()
+    await waitFor(() => !worker.pgidAlive(pgid), 10_000)
+    expect(storage.getRelay(session.id)).toBeNull()
+    expect(storage.getWorker(session.id)).toBeNull()
 
-    // The next turn reuses the adopted agent.
+    // The next turn starts a fresh relay, resuming the same native session.
     second.controls.auto = true
     second.runtime.prompt(session.id, { text: 'Again', attachments: [], mentions: [] })
     await waitFor(() => ofType(second.events, session.id, 'turn.finished').length === 2)
-    expect(second.controls.adapters).toHaveLength(1)
+    expect(second.controls.adapters).toHaveLength(2)
+    expect(second.controls.adapters[1].nativeSessionId).toBe(second.controls.adapters[0].nativeSessionId)
 
     await second.runtime.stop({ handover: false })
-    await waitFor(() => !worker.pgidAlive(pgid), 10_000)
-    expect(storage.getRelay(session.id)).toBeNull()
     await first.runtime.stop({ handover: false })
   }, 60_000)
 
