@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Any
 
 from github_interface.atoms.pulls import get_review_activity
+from github_interface.atoms.request_batch import read_requests, run_batch
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository, token_user
@@ -11,16 +12,36 @@ ACTIONABLE_REVIEW_STATES = {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
 
 
 async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
-    owner, repo = repository(payload)
-    pull_number = parse_pull_number(payload)
     username = str(payload.get("username", "")).strip()
     if not username:
         raise ValueError("username is required")
     actor = token_user(payload)
     if actor.lower() != username.lower():
         raise ValueError("username must match token-user")
+    if "requests" in payload:
+        requests = read_requests(payload, ("since",))
+        records = await run_batch(client, requests, lambda request: read_one(client, request, username))
+        return {"action": "review_activity_since_batch", "username": username, "records": records}
+    owner, repo = repository(payload)
+    pull_number = parse_pull_number(payload)
     since = _time(str(payload.get("since", "")), "since")
+    return await read_request(client, owner, repo, pull_number, username, since)
 
+
+async def read_one(client: GitHubClient, request: dict[str, Any], username: str) -> dict[str, Any]:
+    owner, repo = request["repository"].split("/")
+    since = _time(str(request.get("since", "")), "since")
+    return await read_request(client, owner, repo, request["number"], username, since)
+
+
+async def read_request(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    username: str,
+    since: datetime,
+) -> dict[str, Any]:
     pull = await get_review_activity(client, owner, repo, pull_number)
     threads = pull["reviewThreads"]
     unresolved = [thread for thread in threads if not thread["is_resolved"]]

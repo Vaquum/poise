@@ -144,6 +144,23 @@ approvals it managed to prepare; the next sweep prepares the rest. Git
 verification uses the same 30-second CLI budget as other review reads, and the
 rail names a timed-out sweep as stalled instead of repeating the timeout text.
 
+Every behavior tick starts at most one open-PR listing per ready account,
+shared by the pull-request behaviors; each behavior then reads its per-PR
+evidence in batches of ten over one process per batch, and a per-account
+cursor rotates coverage so a sweep cut short by its deadline resumes beyond
+the blocked batch. One pull request's batch error holds only that target's
+check on the usual backoff; a failed batch holds each of its targets the
+same way. Each record settles on its own timeout inside the batch, so one
+hung read cannot take its completed siblings with it. Review preparation
+and approval launches run in small pools instead of one process per pull
+request at once. The review checkout provisions in the launch phase after
+the claim, outside the sweep deadline; a checkout failure there releases
+the claim and records a `preflight_failed` outcome.
+Scheduled ticks start each ready account a few seconds apart so their CLI
+bursts don't collide, and the service health and behavior diagnostics expose
+the current minute window of event-loop delay, where fan-out stalls show up
+first.
+
 `merge-prs` is disabled unless `behavior_merge_prs_enabled` is explicitly `1`.
 It uses Caller directly without a model launch: after fresh datastore eligibility,
 it discovers up to 50 eligible PRs per ready account with one fresh
@@ -170,7 +187,12 @@ operation failures use existing diagnostics and retry backoff. A retry after a
 lost response observes the merged state and does not mutate again. Skips and the
 global enable flag are read again immediately before launching the operation.
 Queue-enabled branches are excluded from automatic base updates: GitHub tests
-the queued integration against current main. After the merges, one scan updates
+the queued integration against current main. With Merge Pull Requests enabled,
+ready eligible PRs enter that queue automatically; no per-PR merge or confirmation
+click is needed. Chat Auto-merge instructions, the default Manager charter and
+work-monitor notices follow the repository's live merge policy instead of
+requiring every PR branch to contain the latest main. Existing edited Manager
+snippets retain their saved text. After the merges, one scan updates
 at most one other behind branch, oldest approval
 first, so updates don't churn CI: the oldest-approved behind candidate holds the
 shared per-PR operation lock for
@@ -345,3 +367,9 @@ observes the existing six Behaviors through nonblocking hooks and existing
 Caller snapshots. Its separate worker/store cannot change behavior decisions,
 claims, retries, metrics or launch arguments. Missing or stale evidence stays
 explicitly unknown; capture loss is visible in independent health metadata.
+
+Review launch eligibility is checked again after checkout provisioning: disabling
+Review New Pull Requests or skipping the repository settles the unused intent
+and releases its claim without spawning a worker. Resolution sweeps retain the
+last attempted mutation as their cursor, so slow attempts cannot hide later
+pull requests behind a batch that was already read.

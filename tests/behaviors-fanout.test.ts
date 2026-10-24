@@ -1,0 +1,401 @@
+import { join } from 'node:path'
+import { describe, expect, it, vi } from 'vitest'
+import { mocks, pr, HEAD_SHA, loadModules, arrangeCli, datastoreHealthOutput, fixture, deferred } from './behaviors-runtime-fixture'
+
+function openPrs(count: number, repo = pr.repo, start = 17): typeof fixture.listedPrs {
+  return Array.from({ length: count }, (_, index) => ({
+    ...pr, repo, number: start + index, url: `https://github.com/${repo}/pull/${start + index}`,
+  }))
+}
+
+function batchRequests(args: string[]): Array<{ repository: string, number: number }> {
+  return JSON.parse(args[args.indexOf('--requests-json') + 1])
+}
+
+async function arrangeOrganizations(rows: Map<string, typeof fixture.listedPrs>) {
+  arrangeCli(true)
+  mocks.spawnDetached.mockResolvedValue(undefined)
+  const loaded = await loadModules()
+  const { database: db } = loaded
+  db.setMeta('me', 'poise-user')
+  const betaPath = join(fixture.tempRoot, 'beta.sqlite')
+  db.db.prepare(`
+    INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+    VALUES ('beta', ?, 1, 'ready', 'ready', 'poise-user')
+  `).run(betaPath)
+  const original = mocks.runFile.getMockImplementation()!
+  mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+    if (command !== 'github-datastore') return original(command, args, options)
+    const explicit = args[0] === '--db'
+    const scoped = explicit ? args.slice(2) : args
+    if (scoped[0] === 'health') {
+      const response = datastoreHealthOutput()
+      const health = JSON.parse(response.stdout)
+      health.database = explicit ? args[1] : join(fixture.tempRoot, 'github.sqlite')
+      return { ...response, stdout: JSON.stringify(health) }
+    }
+    return { stdout: JSON.stringify(rows.get(explicit ? 'beta' : 'Vaquum')), stderr: '' }
+  })
+  loaded.behaviors.startBehaviorsRuntime()
+  return loaded
+}
+
+describe('behavior tick spawn budget', () => {
+  it('shares one listing per organization and batches every per-PR read', async () => {
+    const { database: db, behaviors: runtime } = await arrangeOrganizations(new Map([
+      ['Vaquum', openPrs(6)],
+      ['beta', openPrs(6, 'beta/poise-test')],
+    ]))
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    db.setMeta('behavior_resolve_unblocking_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    const calls = mocks.runFile.mock.calls
+    const datastore = calls.filter(([command]) => command === 'github-datastore')
+    const subcommand = (args: string[]) => (args[0] === '--db' ? args[2] : args[0])
+    expect(datastore.filter(([, args]) => subcommand(args) === 'health')).toHaveLength(2)
+    expect(datastore.filter(([, args]) => subcommand(args) === 'view')).toHaveLength(2)
+    const addressed = calls.filter(([, args]) => args[0] === '--requested-changes-addressed')
+    expect(addressed).toHaveLength(2)
+    expect(addressed.map(([, args]) => batchRequests(args).length).sort()).toEqual([6, 6])
+    const activity = calls.filter(([, args]) => args[0] === '--review-activity-since')
+    // Approve stage 2 plus the resolve-unblocking pre-check, one batch each per organization.
+    expect(activity).toHaveLength(4)
+    for (const [, args] of [...addressed, ...activity]) {
+      expect(args).toContain('--requests-json')
+      expect(batchRequests(args).length).toBeLessThanOrEqual(10)
+    }
+    // Each batch stays inside its own organization.
+    for (const [, args] of addressed) {
+      const repos = new Set(batchRequests(args).map((request) => request.repository.split('/')[0]))
+      expect(repos.size).toBe(1)
+    }
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(12)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+})
+
+describe('approve-prs cursor rotation', () => {
+  it('starts the batch after the cursor and advances past every record', async () => {
+    fixture.listedPrs = openPrs(6)
+    arrangeCli(true)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    db.setMeta('behavior_approve_prs_cursor', `${pr.repo}#19`)
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    const addressed = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--requested-changes-addressed')
+    expect(addressed).toHaveLength(1)
+    expect(batchRequests(addressed[0][1]).map((request) => request.number)).toEqual([20, 21, 22, 17, 18, 19])
+    expect(db.getMeta('behavior_approve_prs_cursor')).toBe(`${pr.repo}#19`)
+    expect(mocks.spawnDetached.mock.calls.map(([, args]) => (args as string[])[1]).sort()).toEqual(
+      ['#17', '#18', '#19', '#20', '#21', '#22'])
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+})
+
+describe('review-new-prs prepare pool', () => {
+  it('prepares candidates with a bounded pool instead of one process per candidate at once', async () => {
+    fixture.listedPrs = openPrs(8)
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const original = mocks.runFile.getMockImplementation()!
+    let active = 0
+    let maxActive = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && (args[0] === '--head-sha' || args[0] === '--requested-changes-addressed')) {
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          return await original(command, args, options)
+        } finally {
+          active -= 1
+        }
+      }
+      return original(command, args, options)
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(maxActive).toBeLessThanOrEqual(5)
+    expect(maxActive).toBeGreaterThan(1)
+    expect(mocks.spawnDetached.mock.calls.length).toBeGreaterThan(0)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+})
+
+describe('review checkout in the launch phase', () => {
+  async function startReviewing() {
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const loaded = await loadModules()
+    loaded.database.setMeta('me', 'poise-user')
+    loaded.database.setMeta('behavior_review_new_prs_enabled', '1')
+    loaded.database.setMeta('behavior_review_new_prs_keyver', '3')
+    loaded.database.recordSeen('review-new-prs', '__snapshot_v3__')
+    loaded.behaviors.startBehaviorsRuntime()
+    return loaded
+  }
+
+  it('provisions the checkout after the claim, not while preparing', async () => {
+    const { behaviors: runtime } = await startReviewing()
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    const checkouts = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--local-checkout-path')
+    expect(checkouts).toHaveLength(1)
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining(['--pwd', fixture.tempRoot]))
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+
+  it.each(['disable', 'skip'] as const)('does not launch when the user chooses %s while checkout is pending', async choice => {
+    const { database: db, behaviors: runtime } = await startReviewing()
+    const entered = deferred<void>()
+    const release = deferred<void>()
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+        entered.resolve()
+        await release.promise
+      }
+      return original(command, args, options)
+    })
+    const cycle = runtime.runEnabledBehaviorsOnce()
+    await entered.promise
+    try {
+      if (choice === 'disable') db.setMeta('behavior_review_new_prs_enabled', '0')
+      else runtime.setRepositorySkips('review-new-prs', [pr.repo])
+    } finally { release.resolve() }
+    await cycle
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.listBehaviorLaunchClaims('review-new-prs')).toEqual([])
+    const competing = db.claimPrOperationOwned(`${pr.repo}#${pr.number}`, 65_000)
+    expect(competing).not.toBeNull()
+    if (competing) db.releasePrOperationOwned(competing)
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ state: 'completed', outcome: 'no_op' }))
+  })
+
+  it('starts no checkout when preparation fails before the claim', async () => {
+    const { behaviors: runtime } = await startReviewing()
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && !args.includes('--requests-json')) {
+        throw new Error('changes unavailable')
+      }
+      return original(command, args, options)
+    })
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--local-checkout-path')).toBe(false)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ behavior: 'review-new-prs', target: `${pr.repo}#17:check` }),
+    ])
+  })
+
+  it('releases the claim with a preflight outcome when the launch checkout fails', async () => {
+    arrangeCli(false, true)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.listBehaviorLaunchClaims('review-new-prs')).toEqual([])
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'preflight_failed' }))
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ behavior: 'review-new-prs', target: `${pr.repo}#17:check` }),
+    ])
+  })
+})
+
+describe('organization tick stagger', () => {
+  it('starts each organization apart on scheduled ticks and together otherwise', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const { database: db, behaviors: runtime } = await arrangeOrganizations(new Map([
+      ['Vaquum', openPrs(1)],
+      ['beta', openPrs(1, 'beta/poise-test')],
+    ]))
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    const original = mocks.runFile.getMockImplementation()!
+    const marks: Array<{ org: string, at: number }> = []
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-datastore' && (args[0] === 'health' || (args[0] === '--db' && args[2] === 'health'))) {
+        marks.push({ org: args[0] === '--db' ? 'beta' : 'Vaquum', at: Date.now() })
+      }
+      return original(command, args, options)
+    })
+
+    await runtime.runEnabledBehaviorsOnce()
+    const together = new Map(marks.map(({ org, at }) => [org, at]))
+    expect(Math.abs(together.get('beta')! - together.get('Vaquum')!)).toBe(0)
+
+    marks.length = 0
+    const t0 = Date.now()
+    const run = runtime.runEnabledBehaviorsOnce({ stagger: true })
+    // Real I/O drains while the fake clock stays put: the first
+    // organization's tick starts, the second waits on its stagger sleep.
+    const pump = () => new Promise<void>((resolve) => setImmediate(resolve))
+    for (let i = 0; i < 1000 && marks.length === 0; i++) await pump()
+    expect(marks.map(({ org }) => org)).toEqual(['Vaquum'])
+    expect(marks[0].at).toBe(t0)
+    await vi.advanceTimersByTimeAsync(4_999)
+    for (let i = 0; i < 20; i++) await pump()
+    expect(marks.map(({ org }) => org)).toEqual(['Vaquum'])
+    await vi.advanceTimersByTimeAsync(1)
+    for (let i = 0; i < 1000 && marks.length < 2; i++) await pump()
+    await run
+    expect(marks.map(({ org }) => org)).toEqual(['Vaquum', 'beta'])
+    expect(marks[1].at).toBe(t0 + 5_000)
+  })
+})
+
+describe('event-loop visibility', () => {
+  it('exposes the current minute window of event-loop delay in behavior diagnostics', async () => {
+    arrangeCli(false)
+    const { behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+
+    expect(runtime.getBehaviorsRuntimeHealth().eventLoop).toEqual({
+      p50Ms: expect.any(Number),
+      p99Ms: expect.any(Number),
+      maxMs: expect.any(Number),
+      meanMs: expect.any(Number),
+      samples: expect.any(Number),
+      windowStartedAt: expect.any(String),
+    })
+  })
+})
+
+describe('batch evidence alignment', () => {
+  it('rejects mismatched records instead of evaluating the wrong pull request', async () => {
+    fixture.listedPrs = openPrs(2)
+    arrangeCli(true)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed' && args.includes('--requests-json')) {
+        const packet = JSON.parse((await original(command, args, options)).stdout)
+        return {
+          stdout: JSON.stringify({ ...packet, records: [...packet.records].reverse() }),
+          stderr: '',
+        }
+      }
+      return original(command, args, options)
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    const failures = runtime.getBehaviorsRuntimeHealth().failures
+    expect(failures).toHaveLength(2)
+    for (const failure of failures) {
+      expect(failure.error).toMatch(/misaligned batch evidence/)
+    }
+  })
+})
+
+describe('shared discovery failure', () => {
+  it('fails every consumer visibly and recovers on the next scan', async () => {
+    arrangeCli(true)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const original = mocks.runFile.getMockImplementation()!
+    let healthCalls = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-datastore' && args[0] === 'health' && healthCalls++ === 0) {
+        throw new Error('datastore unavailable')
+      }
+      return original(command, args, options)
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    db.setMeta('behavior_resolve_unblocking_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    const failed = runtime.getBehaviorsRuntimeHealth().failures
+    expect(failed.filter((failure) => !failure.target)).toHaveLength(2)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+})
+
+
+describe('resolve-unblocking cursor rotation', () => {
+  it('resumes beyond slow attempted resolutions within a single full batch', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-23T12:00:00.000Z'))
+    fixture.listedPrs = openPrs(10)
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_resolve_unblocking_enabled', '1')
+    const original = mocks.runFile.getMockImplementation()!
+    let entered = deferred<void>()
+    const fastEntries = deferred<void>()
+    const attempted: number[] = []
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'github-interface' && args[0] === '--resolve-nonblocking-conversations-if-ready') {
+        const number = Number(args[1].replace('#', ''))
+        attempted.push(number)
+        entered.resolve()
+        if (number === 26) fastEntries.resolve()
+        if (number <= 18) {
+          const signal = (options as { signal?: AbortSignal }).signal
+          await new Promise<void>((resolve, reject) => {
+            if (signal?.aborted) { reject(signal.reason); return }
+            const abort = () => { clearTimeout(timer); reject(signal?.reason) }
+            const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, 30_000)
+            signal?.addEventListener('abort', abort, { once: true })
+          })
+        }
+      }
+      return original(command, args, options)
+    })
+    const first = runtime.runEnabledBehaviorsOnce()
+    await entered.promise
+    await vi.advanceTimersByTimeAsync(59_000)
+    await first
+    expect(attempted).toEqual([17, 18])
+    expect(db.getMeta('behavior_resolve_unblocking_cursor')).toBe(`${pr.repo}#18`)
+    attempted.length = 0
+    entered = deferred<void>()
+    const second = runtime.runEnabledBehaviorsOnce()
+    // Let the fast prefix actually enter before advancing its sweep deadline.
+    await fastEntries.promise
+    await vi.advanceTimersByTimeAsync(59_000)
+    await second
+    expect(attempted.slice(0, 8)).toEqual([19, 20, 21, 22, 23, 24, 25, 26])
+  })
+})

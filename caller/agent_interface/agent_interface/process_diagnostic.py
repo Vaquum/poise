@@ -21,6 +21,17 @@ def diagnostic_from_stderr(stderr: str, phase: str) -> dict | None:
     return None
 
 
+def diagnostic_envelope(*, operation: str, phase: str, outcome: str, stderr: str = "",
+                        stderr_truncated: bool = False, **extra) -> dict:
+    """Complete Caller process-diagnostic envelope: version, source and
+    severity plus string operation/phase/outcome/stderr and a truncation
+    flag, the exact shape server/process-diagnostic.ts validates. Callers
+    add their own evidence as extra fields."""
+    return {"version": 1, "source": "caller", "severity": "error", "operation": operation,
+            "phase": phase, "outcome": outcome, "stderr": stderr,
+            "stderr_truncated": stderr_truncated, **extra}
+
+
 def diagnostic_message(value: dict) -> str:
     return (f"review git {value['operation']} {value['outcome']} "
             f"(exit {value.get('exit_code')}, signal {value.get('signal')}, errno {value.get('errno')}): "

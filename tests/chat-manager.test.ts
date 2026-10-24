@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
-import type { Capabilities, PromptInput, ServerFrame } from '../server/chat/protocol'
+import type { Capabilities, ChatEnvelope, PromptInput, ServerFrame } from '../server/chat/protocol'
 import type { ChatRuntime } from '../server/chat/runtime'
 import type { ChatControl } from '../server/chat/control'
 import type { ResolvedServer } from '../server/extensions/types'
@@ -90,6 +90,37 @@ async function until(check: () => boolean, ...sessionIds: string[]) {
     await new Promise(done => setTimeout(done, 15))
   }
 }
+// Arm the competitor before finishing, independently of the readiness read.
+// Its macrotask runs after cleanup; hold that read until the next prompt runs.
+async function finishAndTick(id: string): Promise<void> {
+  const observed = runtime, delivery = control
+  const expected = (prompts.get(id)?.length ?? 0) + 1
+  let becameIdle = false
+  let ticked = false
+  let failure: { error: unknown } | undefined
+  let immediate: ReturnType<typeof setImmediate> | undefined
+  const onEvent = (envelope: ChatEnvelope) => {
+    if (envelope.sessionId !== id || envelope.event.type !== 'status.changed' || envelope.event.status !== 'idle' || becameIdle) return
+    becameIdle = true
+    immediate = setImmediate(() => {
+      void delivery.tick().then(() => { ticked = true }, error => { failure = { error }; ticked = true })
+    })
+  }
+  observed.on('event', onEvent)
+  try {
+    finishes.get(id)!({ stopReason: 'end_turn' })
+    await until(() => {
+      if (failure) throw failure.error
+      return ticked && prompts.get(id)?.length === expected && observed.get(id)?.status === 'running'
+    }, id)
+    // Restoring a live status read here must miss idle: the competitor ran first.
+    await until(() => becameIdle, id)
+  } finally {
+    if (immediate) clearImmediate(immediate)
+    observed.off('event', onEvent)
+  }
+}
+
 function makeRuntime() {
   return new Runtime({ instance, instanceLabel: 'test', callerTurns: null, catalog: async () => catalog,
     adapters: { grok: adapter, claude: adapter, codex: adapter, muse: forkAdapter },
@@ -434,9 +465,24 @@ describe('one Manager chat per workspace', () => {
     await runtime.setModel(manager.id, OPUS_MODEL)
     expect(runtime.get(manager.id)?.retiredModel).toBeUndefined()
     await until(() => prompts.has(manager.id), manager.id)
+    expect(prompts.get(manager.id)!.map(prompt => prompt.text.split('\n[Request]\n').at(-1))).toEqual(['Queued task'])
+    // Force a competing tick to admit the held inbox item before checking idle.
+    await finishAndTick(manager.id)
+    await until(() => prompts.get(manager.id)?.length === 2, manager.id)
+    expect(runtime.get(manager.id)?.status).toBe('running')
+    expect(prompts.get(manager.id)![1].text.endsWith('\nHello Manager')).toBe(true)
+    expect(store.inbox(instance, manager.id).filter(message => message.body === 'Hello Manager'))
+      .toEqual([expect.objectContaining({ state: 'admitted' })])
     finishes.get(manager.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(manager.id)?.status === 'idle', manager.id)
+    await control.tick()
+    expect(prompts.get(manager.id)).toHaveLength(2)
+    expect(store.inbox(instance, manager.id)).toEqual([expect.objectContaining({ body: 'Hello Manager', state: 'admitted' })])
     expect(() => runtime.prompt(manager.id, { text: 'next', attachments: [], mentions: [] })).not.toThrow()
+    await until(() => prompts.get(manager.id)?.length === 3, manager.id)
+    expect(prompts.get(manager.id)![2].text.split('\n[Request]\n').at(-1)).toBe('next')
+    finishes.get(manager.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(manager.id)?.status === 'idle', manager.id)
     expect(runtime.get(ordinary.id)).toBeNull()
     expect(storage.getSession(ordinary.id)).toBeNull()
   }, 60_000)

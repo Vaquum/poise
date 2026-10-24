@@ -1,12 +1,21 @@
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises'
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve, delimiter } from 'node:path'
 
-let root = ''
+type RefreshReport = { changed?: boolean, added?: string[], error?: string, cli_updates: Record<string, { status: string, before?: string, after?: string }> }
+type RefreshResult = { code: number | null, report: RefreshReport | null, error: string }
+type RefreshCase = {
+  root: string
+  start: (signal: AbortSignal) => { child: ChildProcess, closed: Promise<{ code: number | null, error?: Error }> }
+  refresh: (signal: AbortSignal) => Promise<RefreshResult>
+  cleanup: () => Promise<void>
+}
+
+let activeCase: RefreshCase
 beforeEach(async () => {
-  root = await mkdtemp(join(tmpdir(), 'poise-refresh-process-'))
+  const root = await mkdtemp(join(tmpdir(), 'poise-refresh-process-'))
   await mkdir(join(root, 'bin'))
   // Caller's CLI lives off PATH: the script must take it from CALLER_BIN_ROOT.
   await mkdir(join(root, 'caller-bin'))
@@ -27,57 +36,130 @@ fs.appendFileSync(p.join(process.env.HOME, 'order'), 'discovery\\n');
 console.log(JSON.stringify({ checked_at: new Date().toISOString(), changed: true, families: { claude: {status: 'ok'}, codex: {status: 'ok'}, grok: {status: 'ok'}, antigravity: {status: 'ok'}, muse: {status: 'ok'} }, added: ['opus-5.5-high'], removed: ['opus-5-high'] }));
 `
   await writeFile(join(root, 'caller-bin', 'agent-interface'), discovery, { mode: 0o700 })
-})
-afterEach(async () => { await rm(root, { recursive: true, force: true }) })
-function refresh(): Promise<{ code: number | null, report: any, error: string }> {
-  return new Promise((resolveResult, reject) => {
+  const children = new Map<ChildProcess, Promise<{ code: number | null, error?: Error }>>()
+  let disposed = false
+  const start = (signal: AbortSignal) => {
+    if (disposed) throw new Error('The refresh case has already been cleaned up')
+    signal.throwIfAborted()
     const child = spawn(process.execPath, [resolve('scripts/refresh-models.mjs'), '--json'], {
       env: { HOME: root, PATH: [join(root, 'bin'), dirname(process.execPath), '/usr/bin', '/bin'].join(delimiter), AGENT_INTERFACE_ROOT: root, CALLER_BIN_ROOT: join(root, 'caller-bin'), POISE_MODEL_CATALOG_REPORT: join(root, 'report.json') },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      signal, killSignal: 'SIGTERM', stdio: ['ignore', 'pipe', 'pipe'],
     })
-    let stdout = '', stderr = ''
-    child.stdout.on('data', chunk => { stdout += chunk }); child.stderr.on('data', chunk => { stderr += chunk })
-    child.once('error', reject)
-    child.once('close', code => { try { resolveResult({ code, report: stdout ? JSON.parse(stdout) : null, error: stderr }) } catch (error) { reject(error) } })
-  })
+    const closed = new Promise<{ code: number | null, error?: Error }>(resolveClosed => {
+      let error: Error | undefined
+      child.once('error', failure => { error = failure })
+      child.once('close', code => { children.delete(child); resolveClosed({ code, error }) })
+    })
+    children.set(child, closed)
+    return { child, closed }
+  }
+  activeCase = {
+    root, start,
+    async refresh(signal) {
+      const { child, closed } = start(signal)
+      let stdout = '', stderr = ''
+      child.stdout?.on('data', chunk => { stdout += chunk }); child.stderr?.on('data', chunk => { stderr += chunk })
+      const exit = await closed
+      if (exit.error) throw exit.error
+      return { code: exit.code, report: stdout ? JSON.parse(stdout) : null, error: stderr }
+    },
+    async cleanup() {
+      disposed = true
+      for (const child of children.keys()) if (!child.killed) child.kill('SIGTERM')
+      await Promise.all(children.values())
+      await rm(root, { recursive: true, force: true })
+    },
+  }
+})
+afterEach(async () => { await activeCase.cleanup() })
+
+async function waitForUpdaterPid(marker: string) {
+  let pid: number | undefined
+  await expect.poll(async () => {
+    let text: string
+    try { text = await readFile(marker, 'utf8') }
+    catch (error) { if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false; throw error }
+    if (!/^[1-9][0-9]*$/.test(text)) return false
+    const candidate = Number(text)
+    if (!Number.isSafeInteger(candidate) || candidate <= 1) return false
+    pid = candidate
+    return true
+  }, { timeout: 5000 }).toBe(true)
+  if (pid === undefined) throw new Error('The updater did not publish a positive safe PID')
+  return pid
 }
 
-it('the actual scheduled/manual script updates all CLIs before model discovery and persists the report', async () => {
-  const result = await refresh()
+it('the actual scheduled/manual script updates all CLIs before model discovery and persists the report', async ({ signal }) => {
+  const fixture = activeCase, { root } = fixture
+  const result = await fixture.refresh(signal)
   expect(result, result.error).toMatchObject({ code: 0, report: { changed: true, added: ['opus-5.5-high'] } })
-  for (const item of Object.values(result.report.cli_updates) as any[]) expect(item).toMatchObject({ status: 'updated', before: '1.0.0', after: '1.1.0' })
+  if (!result.report) throw new Error('The refresh did not return a report')
+  expect(Object.keys(result.report.cli_updates)).toHaveLength(5)
+  for (const item of Object.values(result.report.cli_updates)) expect(item).toMatchObject({ status: 'updated', before: '1.0.0', after: '1.1.0' })
   expect(JSON.parse(await readFile(join(root, 'report.json'), 'utf8'))).toEqual(result.report)
   expect((await readFile(join(root, 'order'), 'utf8')).trim().split('\n').at(-1)).toBe('discovery')
 })
-it('overlapping manual and scheduled processes share one complete discovery run', async () => {
-  const results = await Promise.all([refresh(), refresh()])
+it('overlapping manual and scheduled processes share one complete discovery run', async ({ signal }) => {
+  const fixture = activeCase, { root } = fixture
+  const results = await Promise.all([fixture.refresh(signal), fixture.refresh(signal)])
   expect(results.map(result => result.code)).toEqual([0, 0])
   expect((await readFile(join(root, 'order'), 'utf8')).match(/discovery/g)).toHaveLength(1)
 })
 
-it('a failed discovery replaces the old green receipt and can be retried', async () => {
-  const good = await refresh()
+it('a failed discovery replaces the old green receipt and can be retried', async ({ signal }) => {
+  const fixture = activeCase, { root } = fixture
+  const good = await fixture.refresh(signal)
   expect(good.code).toBe(0)
   const discoveryPath = join(root, 'caller-bin', 'agent-interface')
   const discovery = await readFile(discoveryPath, 'utf8')
   await writeFile(discoveryPath, `#!${process.execPath}\nconsole.log('not a discovery report')\n`, { mode: 0o700 })
-  const bad = await refresh()
-  expect(bad.code).toBe(1); expect(bad.report.error).toBeTruthy()
+  const bad = await fixture.refresh(signal)
+  expect(bad.code).toBe(1); expect(bad.report?.error).toBeTruthy()
   expect(JSON.parse(await readFile(join(root, 'report.json'), 'utf8'))).toEqual(bad.report)
   await writeFile(discoveryPath, discovery, { mode: 0o700 })
-  expect((await refresh()).code).toBe(0)
-})
+  expect((await fixture.refresh(signal)).code).toBe(0)
+}, 30_000)
 
-it('stopping the refresh runner also stops its in-flight native updater group', async () => {
-  const { existsSync } = await import('node:fs')
+it('stopping the refresh runner also stops its in-flight native updater group', async ({ signal }) => {
+  const fixture = activeCase, { root } = fixture
   const marker = join(root, 'updater.pid')
-  await writeFile(join(root, 'bin', 'claude'), `#!${process.execPath}\nimport fs from 'node:fs';\nif(process.argv[2]==='--version') console.log('1.0.0');\nelse { fs.writeFileSync(${JSON.stringify(marker)},String(process.pid)); setInterval(()=>{},1000); }\n`, { mode: 0o700 })
-  const child = spawn(process.execPath, [resolve('scripts/refresh-models.mjs'), '--json'], { env: { HOME: root, PATH: [join(root, 'bin'), dirname(process.execPath), '/usr/bin', '/bin'].join(delimiter), AGENT_INTERFACE_ROOT: root, CALLER_BIN_ROOT: join(root, 'caller-bin'), POISE_MODEL_CATALOG_REPORT: join(root, 'report.json') }, stdio: 'ignore' })
-  const closed = new Promise(resolve => child.once('close', resolve))
+  await writeFile(join(root, 'bin', 'claude'), `#!${process.execPath}\nimport fs from 'node:fs';\nif(process.argv[2]==='--version') console.log('1.0.0');\nelse { const marker=${JSON.stringify(marker)}; fs.writeFileSync(marker+'.tmp',String(process.pid)); fs.renameSync(marker+'.tmp',marker); setInterval(()=>{},1000); }\n`, { mode: 0o700 })
+  const { child, closed } = fixture.start(signal)
   try {
-    await expect.poll(() => existsSync(marker), { timeout: 5000 }).toBe(true)
-    const pid = Number(await readFile(marker, 'utf8'))
+    const pid = await waitForUpdaterPid(marker)
     child.kill('SIGTERM'); await closed
     await expect.poll(() => { try { process.kill(pid, 0); return true } catch { return false } }).toBe(false)
   } finally { child.kill('SIGTERM'); await closed }
+})
+
+it('a case abort stops its held updater and closes the runner before removing the case root', async () => {
+  const { existsSync } = await import('node:fs')
+  const fixture = activeCase, { root } = fixture
+  const marker = join(root, 'aborted-updater.pid')
+  await writeFile(join(root, 'bin', 'claude'), `#!${process.execPath}\nimport fs from 'node:fs';\nif(process.argv[2]==='--version') console.log('1.0.0');\nelse { const marker=${JSON.stringify(marker)}; fs.writeFileSync(marker+'.tmp',String(process.pid)); fs.renameSync(marker+'.tmp',marker); setInterval(()=>{},1000); }\n`, { mode: 0o700 })
+  const controller = new AbortController()
+  const run = fixture.start(controller.signal)
+  let runnerClosed = false
+  void run.closed.then(() => { runnerClosed = true })
+  let pid: number | undefined
+  const alive = (target: number) => {
+    if (!Number.isSafeInteger(target) || target <= 1) throw new Error('Refusing an invalid updater PID')
+    try { process.kill(target, 0); return true }
+    catch (error) { if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return false; throw error }
+  }
+  try {
+    pid = await waitForUpdaterPid(marker)
+    controller.abort()
+    await fixture.cleanup()
+    expect(runnerClosed).toBe(true)
+    expect((await run.closed).error?.name).toBe('AbortError')
+    expect(run.child.exitCode !== null || run.child.signalCode !== null).toBe(true)
+    await expect.poll(() => alive(pid!)).toBe(false)
+    expect(existsSync(root)).toBe(false)
+    expect(() => fixture.start(new AbortController().signal)).toThrow('already been cleaned up')
+  } finally {
+    controller.abort()
+    await run.closed
+    if (pid !== undefined && Number.isSafeInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, 'SIGKILL')
+  }
 })

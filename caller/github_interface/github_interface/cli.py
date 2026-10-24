@@ -25,8 +25,10 @@ behaviors:
   --request-changes PR (--comments FILE | --comments-json JSON) --expected-head SHA --token-user USER
   --reviewed-clean PR --expected-head SHA --token-user USER
   --requested-changes-addressed PR --username USER --token-user USER
+  --requested-changes-addressed --requests-json JSON --username USER --token-user USER
   --requested-review-ready PR --username USER --token-user USER
   --review-activity-since PR --username USER --since TIMESTAMP --token-user USER
+  --review-activity-since --requests-json JSON --username USER --token-user USER
   --resolve-conversation CONVERSATION_ID
   --resolve-pr-conversations PR
   --resolve-nonblocking-conversations-if-ready PR --username USER --expected-head SHA --token-user USER
@@ -76,11 +78,14 @@ def main() -> None:
     if len(argv) > 1 and argv[1] in ("-h", "--help"):
         _parser(argv[0]).print_help()
         return
-    if argv[0] not in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates"} and len(argv) < 2:
+    batch = argv[0] in {"--requested-changes-addressed", "--review-activity-since"} and "--requests-json" in argv
+    if batch and len(argv) > 1 and not argv[1].startswith("-"):
+        raise SystemExit("error: --requests-json cannot be combined with a pull request argument")
+    if not batch and argv[0] not in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates"} and len(argv) < 2:
         _parser(argv[0]).print_help()
         return
 
-    if argv[0] in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates"}:
+    if batch or argv[0] in {"--create-issue", "--current-pr", "--local-checkout-path", "--view-repos", "--list-test-files", "--review-context", "--merge-candidates", "--grey-ci-candidates"}:
         args = _parser(argv[0]).parse_args(argv[1:])
         payload: dict[str, Any] = vars(args)
     else:
@@ -88,7 +93,7 @@ def main() -> None:
         key = "root" if argv[0] == "--prune-mirrors" else "path" if argv[0] in {"--read-file", "--write-file"} else "issue" if argv[0] in {"--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues"} else "repository" if argv[0] == "--checkout-repo" else "log_id" if argv[0] == "--read-failing-ci-log" else "conversation" if argv[0] == "--resolve-conversation" else "pr"
         payload = {key: argv[1], **vars(args)}
 
-    if argv[0] in {"--merge-candidates", "--grey-ci-candidates"}:
+    if batch or argv[0] in {"--merge-candidates", "--grey-ci-candidates"}:
         try:
             payload["requests"] = json.loads(payload.pop("requests_json"))
         except json.JSONDecodeError as error:
@@ -227,8 +232,11 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior in {"--requested-changes-addressed", "--requested-review-ready", "--review-activity-since"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
         parser.add_argument("--username", required=True)
+        if behavior in {"--requested-changes-addressed", "--review-activity-since"}:
+            parser.add_argument("--requests-json", help="batch requests; replaces the PR argument")
         if behavior == "--review-activity-since":
-            parser.add_argument("--since", required=True)
+            # One PR names its watermark here; each batch request carries its own.
+            parser.add_argument("--since", required=False)
         return parser
 
     if behavior in {"--approve-pr", "--reviewed-clean"}:
