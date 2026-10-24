@@ -4228,6 +4228,17 @@ export class ChatRuntime extends EventEmitter {
       // the group snapshot.
       const members = baseline && gatePid && gatePgid && baseline.pgid === gatePgid ? await groupMembers(gatePgid) : null
       const { repos, truncatedRepos } = await this.stallRepos(session, previous)
+      // A handoff may have moved the bindings during the awaited reads; the
+      // source stays silent. This check runs synchronously with the queues
+      // below, so no handoff can interleave between them.
+      if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
+        if (record.stall) {
+          delete record.stall
+          this.saveRecord(session)
+          this.emit_(record.id, { type: 'session.updated', session: record })
+        }
+        return
+      }
       // A background job is a group member the turn started: present now
       // but absent from the prompt-start baseline, however deep the
       // agent's own process spine runs. A tracked job that finished
@@ -4444,6 +4455,15 @@ export class ChatRuntime extends EventEmitter {
     if (status === 'unknown') return
     const members = status === 'verified' && worker ? await groupMembers(worker.gatePgid) : []
     if (members === null) return
+    // A handoff may have moved the bindings during the awaited inspection;
+    // the source clears instead of queuing to a chat that no longer holds
+    // the work. Synchronous with the writeback and queues below.
+    if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
+      delete record.stall
+      this.saveRecord(session)
+      this.emit_(record.id, { type: 'session.updated', session: record })
+      return
+    }
     const finishedAt = new Date().toISOString()
     const finished: StalledJob[] = []
     const running: StalledJob[] = []
