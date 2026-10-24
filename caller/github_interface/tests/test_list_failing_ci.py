@@ -16,7 +16,8 @@ HEAD = "b" * 40
 SERVER_ARGV = ["github-interface", "--list-failing-ci", "9", "--repository", "acme/app",
                "--token-user", "fixture-agent"]
 PULL = {"head": {"sha": HEAD}, "user": {"login": "fixture-agent"}, "draft": False,
-        "mergeable": True, "mergeable_state": "behind", "base": {"ref": "main"}}
+        "mergeable": True, "mergeable_state": "behind", "base": {"ref": "main"},
+        "state": "open", "merged": False}
 CHECKS = [{"name": "Verify", "status": "completed", "conclusion": "failure", "id": 11,
            "details_url": "https://github.com/acme/app/actions/runs/1/job/22",
            "html_url": "https://github.com/acme/app/actions/runs/1",
@@ -49,13 +50,16 @@ class TestListFailingCiCli(TestCase):
         self.assertIsInstance(state["head_sha"], str)
         self.assertEqual([(check["name"], check["state"]) for check in state["failing"]],
                          [("Verify", "completed"), ("Legacy", "error")])
-        # Merge state, author and draft ride the same get_pull response; the
-        # monitor's conflict/behind read adds no GitHub request.
+        # Merge state, author, draft and pull state ride the same get_pull
+        # response; the monitor's conflict/behind/terminal read adds no
+        # GitHub request.
         self.assertEqual(state["mergeable"], True)
         self.assertEqual(state["mergeable_state"], "behind")
         self.assertEqual(state["author"], "fixture-agent")
         self.assertEqual(state["draft"], False)
         self.assertEqual(state["base"], "main")
+        self.assertEqual(state["state"], "open")
+        self.assertEqual(state["merged"], False)
         get_pull.assert_awaited_once()
         self.assertEqual(get_pull.call_args.args[1:], ("acme", "app", 9))
         check_runs.assert_awaited_once()
