@@ -171,10 +171,10 @@ export interface InternalMessage {
   timer_id: string | null, timer_missed: number
 }
 const INBOX_COLUMNS = 'seq, recipient, sender, event_key, body, created_at, state, turn_id, sender_title, sender_role, timer_id, timer_missed'
-export function message(instance: string, recipient: string, sender: string, body: string, eventKey: string = randomUUID(), from?: { title: string, role?: 'manager' }): void {
+export function message(instance: string, recipient: string, sender: string, body: string, eventKey: string = randomUUID(), from?: { title: string, role?: 'manager' }): boolean {
   if (!body.trim() || Buffer.byteLength(body) > 32 * 1024) throw new HttpError(400, 'an internal message needs 1–32768 UTF-8 bytes')
-  db.prepare(`INSERT INTO chat_control_inbox(instance, recipient, sender, event_key, body, created_at, sender_title, sender_role)
-    VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance, recipient, event_key) DO NOTHING`).run(instance, recipient, sender, eventKey, body, Date.now(), from?.title ?? null, from?.role ?? null)
+  return db.prepare(`INSERT INTO chat_control_inbox(instance, recipient, sender, event_key, body, created_at, sender_title, sender_role)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance, recipient, event_key) DO NOTHING`).run(instance, recipient, sender, eventKey, body, Date.now(), from?.title ?? null, from?.role ?? null).changes > 0
 }
 export function inbox(instance: string, recipient: string, after = 0): InternalMessage[] {
   return db.prepare(`SELECT ${INBOX_COLUMNS} FROM chat_control_inbox

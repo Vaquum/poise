@@ -132,6 +132,36 @@ export function pgidAlive(pgid: number | null | undefined): boolean {
   }
 }
 
+export interface GroupMember {
+  pid: number
+  ppid: number
+  command: string
+}
+
+/** Every process in `pgid`'s group: pid, parent pid and full command line.
+ *  `ps -eo` with `=`-suppressed headers is the same on macOS and Linux (the
+ *  worker gate lists groups the same way). Null when the table cannot be
+ *  read — callers skip group decisions, never invent them. */
+export async function groupMembers(pgid: number): Promise<GroupMember[] | null> {
+  if (!pgid || !Number.isSafeInteger(pgid) || pgid <= 1) return null
+  let stdout: string
+  try {
+    ({ stdout } = await runFile('ps', ['-eo', 'pid=,pgid=,ppid=,command='], { timeoutMs: 5_000, maxOutputBytes: 4 * 1024 * 1024 }))
+  } catch {
+    return null
+  }
+  const members: GroupMember[] = []
+  for (const line of stdout.split('\n')) {
+    const fields = line.trim().split(/\s+/)
+    if (fields.length < 4) continue
+    const [pid, listed, ppid] = fields.slice(0, 3).map(Number)
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(listed) || !Number.isSafeInteger(ppid)) continue
+    if (listed !== pgid) continue
+    members.push({ pid, ppid, command: fields.slice(3).join(' ') })
+  }
+  return members
+}
+
 /** Whether `pid` is still the gate we recorded: its command line must be
  *  the gate script carrying `--lease-worker <ident>` as its own argument.
  *  Anything else (pid reuse, unreadable table) is "no". */

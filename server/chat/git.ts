@@ -105,6 +105,27 @@ export async function commitsAhead(checkout: string, branch: string, base: strin
   return Number(out.trim()) || 0
 }
 
+/** Commits on `branch` no remote-tracking ref contains — what a push would
+ *  send. Read-only: safe without the checkout lease. */
+export async function unpushedCommits(checkout: string, branch: string): Promise<number> {
+  const out = await git(checkout, ['rev-list', '--count', assertBranchName(branch), '--not', '--remotes'])
+  return Number(out.trim()) || 0
+}
+
+/** Leftover work in a worker-owned task repo: the current branch, the
+ *  uncommitted file count, and commits on any local branch no remote
+ *  contains. Read-only: safe without the checkout lease. */
+export async function inspectTaskRepo(checkout: string): Promise<{ branch: string, dirtyFiles: number, unpushedCommits: number }> {
+  const status = await git(checkout, ['status', '--porcelain=v1', '--untracked-files=all', '--branch'])
+  const lines = status.split('\n').filter((line) => line.length > 0)
+  const header = lines[0] || ''
+  const detached = header.includes('(no branch)') || header.includes('HEAD (no branch)')
+  const branch = detached ? '' : header.replace(/^## /, '').split('...')[0].split(' ')[0]
+  const dirtyFiles = lines.slice(1).length
+  const unpushed = Number((await git(checkout, ['rev-list', '--count', '--branches', '--not', '--remotes'])).trim()) || 0
+  return { branch, dirtyFiles, unpushedCommits: unpushed }
+}
+
 // ── Guarded (mutating) commands ───────────────────────────────────────────
 
 export interface GuardedResult { stdout: string, stderr: string, code: number | null }

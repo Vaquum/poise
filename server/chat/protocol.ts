@@ -180,6 +180,10 @@ export interface SessionRecord {
   interruptedTurnId?: string
   /** Set when the session's worker could not be verified for cleanup. */
   orphanNotice?: string
+  /** Set while a bound session's last turn left work behind (unpushed
+   *  commits, uncommitted changes, a still-running background job): the
+   *  chat is stalled until the state clears. Absent means nothing tracked. */
+  stall?: StallState
   /** Optional context handed over at creation (card, document, another session). */
   context?: SessionContext
   /** The subject this session belongs to; at most one session per subject. */
@@ -221,6 +225,42 @@ export interface WorkspaceState {
   /** Who holds the checkout lock when it is not this session. */
   lockedBy?: string
   checkedAt: string
+}
+
+/** A background process a turn started that outlived the turn: a member of
+ *  the turn's worker group that is neither the gate nor its direct child
+ *  (the agent). `command` is a redacted display label, not forensics. */
+export interface StalledJob {
+  pid: number
+  pgid: number
+  command: string
+  /** First observed, at the turn end that tracked it. */
+  startedAt: string
+}
+
+/** Leftover work in one task repo: the checkout itself (`.`) for repo
+ *  sessions, a nested clone (workspace-relative path) for local workers. */
+export interface StallRepo {
+  path: string
+  /** Current branch; empty on a detached HEAD. */
+  branch: string
+  dirtyFiles: number
+  unpushedCommits: number
+}
+
+/** Work a bound session's turn left behind. Refreshed at every turn end
+ *  while the lease still holds the session's branch; background jobs are
+ *  reaped by the control tick as they finish. */
+export interface StallState {
+  /** One stall episode: set when the marker appears, kept while any facet
+   *  persists, so the wake notice fires once per episode, never per turn. */
+  episode: string
+  at: string
+  updatedAt: string
+  /** Task repos with leftover work, by path. */
+  repos: StallRepo[]
+  /** Still-running background jobs, oldest first, at most 20 tracked. */
+  backgroundJobs: StalledJob[]
 }
 
 /** Where a subject's chat starts. `current` is a Current card;

@@ -3,14 +3,16 @@
 // pinned chats holding their slots.
 
 import { describe, expect, it } from 'vitest'
-import type { SessionStatus, StopReason } from '../server/chat/protocol'
+import type { SessionStatus, StallState, StopReason } from '../server/chat/protocol'
 import { applyWorklogOrder, compareWorklog, sessionDot, type WorklogEntry } from '../src/chat-worklog'
 
 const NOW = Date.parse('2026-10-21T17:00:00Z')
+const STALL: StallState = { episode: 'e', at: '2026-10-21T16:02:00.000Z', updatedAt: '2026-10-21T16:02:00.000Z',
+  repos: [{ path: '.', branch: 'chat/x', dirtyFiles: 1, unpushedCommits: 0 }], backgroundJobs: [] }
 
 describe('status dots', () => {
-  const dot = (status: SessionStatus, updatedAt = '2026-10-21T16:02:00.000Z', pendingRequests: string[] = [], lastStopReason?: StopReason) =>
-    sessionDot({ status, updatedAt, pendingRequests, lastStopReason }, NOW, 'Europe/Helsinki')
+  const dot = (status: SessionStatus, updatedAt = '2026-10-21T16:02:00.000Z', pendingRequests: string[] = [], lastStopReason?: StopReason, stall?: StallState) =>
+    sessionDot({ status, updatedAt, pendingRequests, lastStopReason, stall }, NOW, 'Europe/Helsinki')
 
   it('maps all five states with text labels, never colour alone', () => {
     expect(dot('running')).toEqual({ state: 'working', label: 'Working · since 19:02' })
@@ -48,6 +50,12 @@ describe('status dots', () => {
 
   it('labels the state alone when the change time is not a time', () => {
     expect(dot('running', 'not a time')).toEqual({ state: 'working', label: 'Working' })
+  })
+
+  it('shows Stalled for an idle chat whose turn left work behind', () => {
+    expect(dot('idle', '2026-10-21T16:02:00.000Z', [], 'end_turn', STALL)).toEqual({ state: 'attention', label: 'Stalled · 19:02' })
+    expect(dot('running', '2026-10-21T16:02:00.000Z', [], 'end_turn', STALL).state).toBe('working')
+    expect(dot('idle', '2026-10-21T16:02:00.000Z', [], 'error', STALL).state).toBe('error')
   })
 })
 
