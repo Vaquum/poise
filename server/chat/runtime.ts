@@ -1015,7 +1015,7 @@ export class ChatRuntime extends EventEmitter {
       turn.stopping = true
       const relay = session.relay
       relay.detach()
-      if (await this.waitForTurnEnd(session, STOP_SETTLE_MS)) return
+      if (await this.waitForTurnEnd(session, turn, STOP_SETTLE_MS)) return
       this.emit('log', `[chat ${session.record.id.slice(0, 8)}] turn did not settle after detach; leaving it for adoption`)
       return
     }
@@ -1024,11 +1024,11 @@ export class ChatRuntime extends EventEmitter {
     this.settlePending(session, 'cancelled')
     turn.abort.abort()
     try { await session.adapter?.cancel() } catch { /* terminating below */ }
-    if (await this.waitForTurnEnd(session, STOP_SETTLE_MS)) return
+    if (await this.waitForTurnEnd(session, turn, STOP_SETTLE_MS)) return
     // The agent did not acknowledge: the process goes, verifiably, and the
     // turn's finally block then runs with the adapter's rejection.
     await this.stopProcess(session).catch(() => undefined)
-    await this.waitForTurnEnd(session, CLOSE_GRACE_MS * 2)
+    await this.waitForTurnEnd(session, turn, CLOSE_GRACE_MS * 2)
   }
 
   private async shutdownSession(session: LiveSession): Promise<void> {
@@ -3638,21 +3638,24 @@ export class ChatRuntime extends EventEmitter {
       this.settlePending(session, 'cancelled')
       turn.abort.abort()
       try { await session.adapter?.cancel() } catch { /* the abort signal also reaches prompt() */ }
-      if (await this.waitForTurnEnd(session, STOP_SETTLE_MS)) return { settled: true }
+      if (await this.waitForTurnEnd(session, turn, STOP_SETTLE_MS)) return { settled: true }
       // The agent did not acknowledge: the process tree goes, verifiably,
       // and the turn's finally block then runs with the adapter's rejection.
       await this.stopProcess(session).catch(() => undefined)
-      const settled = await this.waitForTurnEnd(session, CLOSE_GRACE_MS * 2)
+      const settled = await this.waitForTurnEnd(session, turn, CLOSE_GRACE_MS * 2)
       if (!settled) this.setStatus(session, 'stopping', 'the agent has not acknowledged the stop yet')
       return { settled }
     })
   }
 
-  private waitForTurnEnd(session: LiveSession, ms: number): Promise<boolean> {
+  /** Resolve once `turn` itself is gone from the session — finished, or
+   *  replaced by a newer turn. Never follows the replacement: killing the
+   *  worker of a turn that was never stopped would end innocent work. */
+  private waitForTurnEnd(session: LiveSession, turn: RunningTurn, ms: number): Promise<boolean> {
     const deadline = Date.now() + ms
     return new Promise((resolve) => {
       const check = () => {
-        if (!session.turn) resolve(true)
+        if (session.turn !== turn) resolve(true)
         else if (Date.now() >= deadline) resolve(false)
         else setTimeout(check, 25)
       }

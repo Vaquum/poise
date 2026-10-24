@@ -65,6 +65,7 @@ function scripted() {
           modelId = process.argv.includes('--ordinary-start-model') ? 'muse-spark-1.3' : params.modelId ?? modelId
           approvalMode = params.approvalMode ?? 'onRequest'
           peer.notify('session/started', { session: sessionObject(sessionId) })
+          if (process.argv.includes('--close-when-idle')) setTimeout(() => peer.notify('session/closed', { sessionId }), 50)
           return { session: sessionObject(sessionId), viewCursor: viewCursor() }
         case 'session/resume':
           sessionId = params.sessionId

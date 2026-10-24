@@ -401,6 +401,16 @@ describe('Muse adapter', () => {
     expect(adapter.nativeSessionId).toBeUndefined()
   })
 
+  it('keeps the session usable when session/closed arrives while idle', async () => {
+    const { host, adapter } = setup(['--close-when-idle'])
+    await adapter.start(MODEL)
+    await until(() => host.logs.some((line) => line.includes('closed while idle')))
+    expect(adapter.nativeSessionId).toMatch(/^session-/)
+    expect(host.logs.some((line) => line.includes('no handler for session/closed'))).toBe(false)
+    const result = await adapter.prompt('turn-1', prompt('echo-input hello'), new AbortController().signal)
+    expect(result.stopReason).toBe('end_turn')
+  })
+
   it('rejects unsupported effort before changing the native model', async () => {
     const { host, adapter } = setup()
     await adapter.start(MODEL)

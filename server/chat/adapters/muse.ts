@@ -869,17 +869,23 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
     on('session/statusChanged', () => {})
     // `session/started` and `session/closed` are outside the generated
     // notification union, so they are subscribed by raw name. A close for
-    // this session unloads the native session: the running turn ends with
-    // `terminate` so the runtime restarts the worker group, and the stale
-    // id is dropped so nothing else is addressed to it. Other sessions'
-    // rows (session/listChanged context) are ignored.
+    // this session while a turn runs unloads the native session: the turn
+    // ends with `terminate` so the runtime restarts the worker group, and
+    // the stale id is dropped so nothing else is addressed to it. While
+    // idle or compacting there is no turn to end, so the id stays and the
+    // next call addresses the session as before. Other sessions' rows
+    // (session/listChanged context) are ignored.
     rpc!.onNotification('session/started', () => logOnce('ignored:session/started', `${LABEL}: ignoring session/started notifications`))
     rpc!.onNotification('session/closed', (params) => {
       const id = closedSessionId(params)
       if (id && id !== sessionId) return
+      if (!active) {
+        logOnce('session-closed-idle', `${LABEL}: the native session was closed while idle`)
+        return
+      }
       logOnce('session-closed', `${LABEL}: the native session was closed`)
       sessionId = undefined
-      if (active) finish(active, { stopReason: 'error', error: `${LABEL} closed the session`, terminate: true })
+      finish(active, { stopReason: 'error', error: `${LABEL} closed the session`, terminate: true })
     })
 
     for (const method of IGNORED_NOTIFICATIONS) {
