@@ -4352,6 +4352,14 @@ export class ChatRuntime extends EventEmitter {
           // program keeps its tracking under the new command above.
           if (!current.has(job.pid)) this.queueStallDone(record.id, job, now, { repos, truncatedRepos })
         }
+      } else if (baseline && gatePgid && baseline.pgid === gatePgid && record.stallJobBaseline?.pgid !== gatePgid) {
+        // The turn-end listing failed but its baseline is in hand: freeze
+        // it, so the next successful turn adopts this turn's jobs instead
+        // of absorbing them as pre-existing. Without this, one transient
+        // listing failure with no prior stall would silence their stall
+        // and completion wakes forever.
+        record.stallJobBaseline = { pgid: gatePgid, pids: [...baseline.members.keys()] }
+        this.saveRecord(session)
       }
       if (!repos.length && !truncatedRepos && !jobs.length) {
         if (previous) {
@@ -4460,7 +4468,11 @@ export class ChatRuntime extends EventEmitter {
     } catch (error) {
       this.emit('log', `[chat ${record.id.slice(0, 8)}] stall git check skipped: ${error instanceof Error ? error.message : String(error)}`)
       const keep = kept.get('.')
-      return cap(keep ? [keep] : [])
+      // An unreadable checkout without a saved entry may hold unfinished
+      // work, so it counts: like the local path's unreadable repos, it
+      // keeps the stall truncated instead of clearing it.
+      if (keep) return cap([keep])
+      return { repos: [], truncatedRepos: 1 }
     }
   }
 

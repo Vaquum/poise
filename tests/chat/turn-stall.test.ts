@@ -626,6 +626,97 @@ describe('turn stall detection and waking', () => {
     await runtime.stop({ handover: false })
   }, 40_000)
 
+  it('freezes the baseline when the turn-end listing fails so the next turn adopts', async () => {
+    // A one-shot ps shim installed after the sleep is visible, before the
+    // turn ends: the first listing after install — the turn-end detection —
+    // fails, every later one delegates to the real ps.
+    const realPs = spawnSync('sh', ['-c', 'command -v ps'], { encoding: 'utf8' })
+    if (realPs.status !== 0) throw new Error('no ps on PATH')
+    const binDir = await mkdtemp(join(root, 'ps-shim-'))
+    const marker = join(binDir, 'failed')
+    await writeFile(join(binDir, 'ps'), `#!/bin/sh\nif [ ! -e ${marker} ]; then touch ${marker}; exit 1; fi\nexec ${realPs.stdout.trim()} "$@"\n`)
+    await chmod(join(binDir, 'ps'), 0o755)
+    const fifoPath = join(root, 'bg-blind-trigger.fifo')
+    spawnSync('rm', ['-f', fifoPath])
+    const fifo = spawnSync('mkfifo', [fifoPath])
+    if (fifo.status !== 0) throw new Error(`mkfifo: ${fifo.stderr}`)
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true,
+      startWorker: { command: 'sh', args: ['-c', `read line < ${fifoPath}; sleep 30 & wait`] } }
+    const { runtime, events } = makeRuntime('poise-turn-stall-blind:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-blind' } })
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.prompt(session.id, { text: 'run the suite', attachments: [], mentions: [] })
+    await waitFor(() => owned.prompts.length === 1)
+    await writeFile(fifoPath, 'run\n')
+    const row = storage.getWorker(session.id)
+    if (!row) throw new Error('no worker row for the session')
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.some((m) => m.command === 'sleep 30') ?? false)
+    const sleep = (await worker.groupMembers(row.gatePgid))?.find((m) => m.command === 'sleep 30')
+    if (!sleep) throw new Error('sleep 30 never appeared')
+    spawnSync('rm', ['-f', fifoPath])
+    const savedPath = process.env.PATH
+    process.env.PATH = `${binDir}${delimiter}${savedPath}`
+    try {
+      finishManual(owned)
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+      // The listing failed: no marker — the jobs are unknown and the repo
+      // is clean — but the turn baseline froze without the sleep.
+      await expect(readFile(marker)).resolves.toBeDefined()
+      expect(runtime.get(session.id)?.stall).toBeUndefined()
+      const frozen = runtime.get(session.id)?.stallJobBaseline
+      expect(frozen?.pgid).toBe(row.gatePgid)
+      expect(frozen?.pids).not.toContain(sleep.pid)
+    } finally {
+      process.env.PATH = savedPath
+    }
+
+    // Turn 2's baseline absorbs the sleep, but the frozen group adopts it.
+    runtime.prompt(session.id, { text: 'anything new?', attachments: [], mentions: [] })
+    await waitFor(() => owned.prompts.length === 2)
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const jobs = runtime.get(session.id)?.stall?.backgroundJobs ?? []
+    expect(jobs.map((job) => job.command)).toEqual(['sleep 30'])
+
+    process.kill(jobs[0].pid, 'SIGTERM')
+    await waitFor(() => !worker.pidAlive(jobs[0].pid))
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('counts an unreadable repo-session checkout as truncated instead of clearing', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true }
+    const { runtime, events } = makeRuntime('poise-turn-stall-blind-git:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-blind-git' } })
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => owned.prompts.length === 1)
+    // Blind the checkout mid-turn, after the turn-start reads: every git
+    // read in the turn-end check fails, with no saved entry to keep.
+    await chmod(join(repo, '.git'), 0)
+    try {
+      finishManual(owned)
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+      // The checkout may hold unfinished work, so the stall stays
+      // truncated instead of reading as clean.
+      const stalled = runtime.get(session.id)?.stall
+      expect(stalled).toBeDefined()
+      expect(stalled?.repos).toEqual([])
+      expect(stalled?.truncatedRepos).toBe(1)
+    } finally {
+      await chmod(join(repo, '.git'), 0o755)
+    }
+    const restored = spawnSync('git', ['status', '--porcelain'], { cwd: repo })
+    if (restored.status !== 0) throw new Error('checkout git did not recover after the test')
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
   it('clears the stall once the leftover is pushed and committed', async () => {
     const owned: FakeControls = { hosts: [], adapters: [], prompts: [],
       commitFirst: { file: 'work.txt', content: 'done\n', dirty: 'draft.txt' } }
