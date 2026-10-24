@@ -132,7 +132,9 @@ reviews do not parse unrelated discussion payloads; year history therefore
 does not hold up day or quota reads while processing its records.
 Involvement membership comes directly from the indexed associations, without
 aggregating the evidence descriptions that the full user view supplies.
-The date filter narrows items before each indexed membership lookup; merged
+The date filter seeks each repository's existing update-time index before
+reading item payloads and checking indexed membership. This changes only the
+Analytics query and needs no datastore migration. Merged
 PR sizes and merger identity come from one parse of each stored payload.
 The selected day and its baseline load first. The year request starts after
 the cards render, so its larger scan cannot delay their initial appearance.

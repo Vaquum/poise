@@ -302,10 +302,11 @@ async function readOrganization(org: Organization, me: string, window: Analytics
       const ref = kind === 'pr' ? 'pr_ref' : 'issue_ref'
       const params: string[] = []
       const filters: string[] = []
-      // Narrow items before checking involvement. Building the union of
-      // every association first scans old discussion evidence on each read.
+      // Enumerate repository keys from a covering index, then seek each time
+      // range before reading payload rows or checking involvement.
       if (window.since) {
-        filters.push('updated_at >= ?')
+        filters.push(`${ref} IN (SELECT item_id FROM items
+          WHERE repo_id IN (SELECT DISTINCT repo_id FROM items) AND updated_at >= ?)`)
         params.push(new Date(window.since).toISOString().slice(0, 19))
       }
       const scopes = scopeByKind[kind].map(scope => {

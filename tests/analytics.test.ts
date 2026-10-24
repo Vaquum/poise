@@ -374,6 +374,39 @@ describe('reading what Current shows', () => {
     seed(pr(3, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { author: 'stranger', additions: 500 }), 'pr')
   }
 
+  it.each([
+    { me: 'octocat', agentAccount: '', issues: 2, merged: 1 },
+    { me: 'octocat', agentAccount: 'robot', issues: 2, merged: 2 },
+    { me: '', agentAccount: '', issues: 3, merged: 3 },
+  ])('bounds the real window queries with existing indexes for $me/$agentAccount', async ({ me, agentAccount, issues, merged }) => {
+    data()
+    seed(pr(9000, '2025-01-01T00:00:00Z', null), 'pr', true)
+    seed(issue(9001, '2025-01-01T00:00:00Z'), 'issue', true)
+    mocks.meta = { me, agentAccount }
+    const db = new Database(mocks.orgs[0].datastorePath)
+    try {
+      db.prepare(`INSERT INTO repos VALUES (2, 'other', 'alpha', 'other', 'alpha/other', 0, 0, 1, '{}', '2026-10-09T00:00:00Z')`).run()
+      db.prepare("UPDATE items SET repo_id = 2, repo_full_name = 'alpha/other' WHERE number = 3").run()
+      for (const window of [WEEK, { since: '2027-01-01T00:00:00Z', until: '2027-01-08T00:00:00Z' }]) {
+        const prepare = vi.spyOn(Database.prototype, 'prepare')
+        let queries: string[]
+        try {
+          const report = await readAnalytics(window, 'alpha')
+          expect(report.issues.opened).toBe(window === WEEK ? issues : 0)
+          expect(report.pullRequests.merged).toBe(window === WEEK ? merged : 0)
+          queries = prepare.mock.calls.map(([sql]) => sql).filter(sql => /FROM (prs|issues) v WHERE/.test(sql))
+        } finally { prepare.mockRestore() }
+        expect(queries).toHaveLength(2)
+        const params = [window.since.slice(0, 19), ...(me ? [me, ...(agentAccount ? [agentAccount] : [])] : [])]
+        for (const sql of queries) {
+          const plan = db.prepare<string[], { detail: string }>('EXPLAIN QUERY PLAN ' + sql).all(...params).map(row => row.detail)
+          expect(plan).toContain('SEARCH i USING INTEGER PRIMARY KEY (rowid=?)')
+          expect(plan).toContain('SEARCH items USING COVERING INDEX idx_items_repo_updated (repo_id=? AND updated_at>?)')
+        }
+      }
+    } finally { db.close() }
+  })
+
   it('counts reviewed revisions and affected PRs through merge, without extra CLI calls', async () => {
     const first = seed(pr(1, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00.500Z', { title: 'feat(ui)!: add analytics' }), 'pr', true)
     seed(pr(2, '2026-10-04T00:00:00Z', '2026-10-06T00:00:00Z', { title: 'fix: correct result', author: 'robot' }), 'pr')
