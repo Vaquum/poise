@@ -602,7 +602,7 @@ export class BehaviorLedgerStore {
         const args: (string | number)[] = [cursor.position, cursor.boundary]
         if (parent !== null) { conditions.push('parent_id=?'); args.push(parent) }
         if (repository !== null && targetNumber !== null) {
-          conditions.push(`json_extract(payload,'$.target.repository')=?`, `json_extract(payload,'$.target.number')=?`)
+          conditions.push(`json_extract(payload,'$.target.repository')=? COLLATE NOCASE`, `json_extract(payload,'$.target.number')=?`)
           args.push(repository, targetNumber)
         }
         const rows = this.rows(`SELECT * FROM ledger_instances WHERE ${conditions.join(' AND ')} ORDER BY creation_seq ASC LIMIT ?`,

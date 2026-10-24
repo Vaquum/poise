@@ -21,7 +21,8 @@ machine token or gateway scope. All routes accept GET only:
 Responses contain `version: 1` and `health`. Limits are integers from 1 to 100.
 A target lookup passes both `repository` (`OWNER/REPO`, at most 140
 characters) and `number` (positive integer) together; either alone returns
-400. It selects retained roots and attempts for that target from captured
+400. Repository matching is case-insensitive, matching GitHub identity.
+It selects retained roots and attempts for that target from captured
 data, under the same authority, limits and freshness contract, with no
 additional Caller or GitHub collection. An empty or stale filtered result
 must not establish that no work is running; check `health` for pending,
