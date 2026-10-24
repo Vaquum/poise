@@ -54,8 +54,9 @@ export const diagnosticManaged = (labels: Record<string, string>) => diagnosticO
 /** Only an allow-listed technical projection can cross the infrastructure boundary. */
 export function gatewayDiagnostic(level: string, operation: string, fields: Record<string, unknown>): DiagnosticInput {
   const workspace = typeof fields.handle === 'string' ? handle(fields.handle) : null
-  const shared = /^(?:proxy\.|workspace\.(?:unreachable|start|stop|drain|update)|disk\.)/.test(operation)
-  const context = Object.fromEntries(['method', 'route', 'upstream', 'durationMs', 'requestId', 'container', 'release', 'limit', 'free', 'total', 'errno', 'code', 'disconnect']
+  const shared = /^(?:proxy\.|workspace\.(?:unreachable|start|stop|drain|update|upgrade|health)|disk\.)/.test(operation)
+  const context = Object.fromEntries(['method', 'route', 'upstream', 'durationMs', 'requestId', 'container', 'release', 'limit', 'free', 'total', 'errno', 'code', 'disconnect',
+    'phase', 'bytesSent', 'timeoutSeconds', 'activeChatTurns', 'runningCallerCalls', 'backgroundWork']
     .map((key) => [key, fields[key] ?? null]))
   const cause = typeof fields.error === 'string' ? fields.error.replace(/\/(?:home|Users)\/[^\s:'"<>]+/g, '[private path]').replace(/https?:\/\/[^\s]+/g, '[upstream URL]') : null
   return { source: 'gateway', level, operation, workspace: shared ? workspace : null, visibility: shared && workspace ? 'infrastructure' : 'operator',

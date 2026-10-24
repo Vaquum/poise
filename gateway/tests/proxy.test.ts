@@ -222,6 +222,101 @@ describe('proxy', () => {
     expect(events(h.logs, 'proxy.failed')).toHaveLength(2)
   })
 
+  it('records an upstream answer cut mid-body, keeping the partial answer and serving on', async () => {
+    const seen = await new Promise<{ status: number; body: string; aborted: boolean }>((resolve, reject) => {
+      let settled = false
+      const done = (value: { status: number; body: string; aborted: boolean }) => {
+        if (!settled) {
+          settled = true
+          resolve(value)
+        }
+      }
+      const req = http.request({ host: '127.0.0.1', port: h.port, method: 'GET', path: '/truncate', headers: { host: ALICE, cookie }, agent: false })
+      req.on('response', (res) => {
+        let body = ''
+        res.on('data', (chunk: Buffer) => {
+          body += chunk.toString('utf8')
+        })
+        res.on('aborted', () => done({ status: res.statusCode ?? 0, body, aborted: true }))
+        res.on('end', () => done({ status: res.statusCode ?? 0, body, aborted: false }))
+        res.on('error', () => done({ status: res.statusCode ?? 0, body, aborted: true }))
+      })
+      req.on('error', reject)
+      req.end()
+    })
+    // The client keeps its 200 and the bytes it got; the truncation is recorded, never answered twice.
+    expect(seen).toEqual({ status: 200, body: 'partial', aborted: true })
+    await delay(50)
+    expect(events(h.logs, 'proxy.failed')).toHaveLength(0)
+    const truncated = h.logs.filter((entry) => entry.event === 'proxy.truncated')
+    expect(truncated).toHaveLength(1)
+    expect(truncated[0]).toMatchObject({
+      handle: 'alice',
+      level: 'warn',
+      method: 'GET',
+      route: '/',
+      phase: 'response',
+      bytesSent: 7,
+      errno: expect.any(String),
+    })
+    expect(truncated[0].requestId).toEqual(expect.any(String))
+    expect((await h.request({ host: ALICE, path: '/api/state', headers: { cookie } })).status).toBe(200)
+  })
+
+  it('records a WebSocket the workspace drops without a close frame', async () => {
+    const close = await new Promise<number>((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${h.port}/ws/drop`, { headers: { host: ALICE, cookie } })
+      socket.on('message', (data) => {
+        expect(String(data)).toContain('hello')
+        socket.send('ping')
+      })
+      socket.on('close', (code) => resolve(code))
+      socket.on('error', () => undefined)
+      socket.on('unexpected-response', (_req, res) => reject(new Error(`the upgrade was refused with ${res.statusCode}`)))
+    })
+    expect(close).toBe(1006)
+    await delay(50)
+    expect(events(h.logs, 'proxy.failed')).toHaveLength(0)
+    const truncated = h.logs.filter((entry) => entry.event === 'proxy.truncated')
+    expect(truncated).toHaveLength(1)
+    expect(truncated[0]).toMatchObject({ handle: 'alice', level: 'warn', phase: 'websocket', errno: expect.any(String) })
+    expect((await h.request({ host: ALICE, path: '/api/state', headers: { cookie } })).status).toBe(200)
+  })
+
+  it('stays silent when the client closes its WebSocket first', async () => {
+    const socket = new WebSocket(`ws://127.0.0.1:${h.port}/ws/chat`, { headers: { host: ALICE, cookie } })
+    await new Promise<void>((resolve, reject) => {
+      socket.on('open', () => resolve())
+      socket.on('error', reject)
+    })
+    await new Promise<void>((resolve) => {
+      socket.on('close', () => resolve())
+      socket.close()
+    })
+    await delay(50)
+    expect(events(h.logs, 'proxy.truncated')).toHaveLength(0)
+    expect(events(h.logs, 'proxy.failed')).toHaveLength(0)
+  })
+
+  it('stays silent when the client cancels mid-answer', async () => {
+    await new Promise<void>((resolve) => {
+      const req = http.request({ host: '127.0.0.1', port: h.port, method: 'POST', path: '/stream', headers: { host: ALICE, cookie, 'content-type': 'text/plain' }, agent: false })
+      req.on('response', (res) => {
+        res.on('data', () => {
+          req.destroy()
+          res.destroy()
+          resolve()
+        })
+        res.on('error', () => undefined)
+      })
+      req.on('error', () => undefined)
+      req.write('one')
+    })
+    await delay(50)
+    expect(events(h.logs, 'proxy.truncated')).toHaveLength(0)
+    expect(events(h.logs, 'proxy.failed')).toHaveLength(0)
+  })
+
   it('retires idle upstream sockets before the workspace closes them and delivers a write once', async () => {
     expect((await h.request({ host: ALICE, path: '/api/analytics', headers: { cookie } })).status).toBe(200)
     const pooled = Object.values(h.context.agent.freeSockets).flat()
@@ -303,7 +398,7 @@ describe('streamed request bodies', () => {
         expect(error).toBeInstanceOf(RequestTooLargeError)
         res.writeHead(413, { connection: 'close' })
         res.end()
-      }, 1024)
+      }, undefined, 1024)
     })
     await new Promise<void>((resolve) => gateway.listen(0, '127.0.0.1', resolve))
     const gatewayPort = (gateway.address() as net.AddressInfo).port

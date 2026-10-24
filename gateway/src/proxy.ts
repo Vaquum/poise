@@ -118,7 +118,9 @@ function withoutRawHeaders(rawHeaders: readonly string[], drop: (name: string) =
 
 /**
  * Streams a request to the workspace and its answer back, in both directions without buffering.
- * `onError` runs only while the client can still be answered, and must not throw.
+ * `onError` runs only while the client can still be answered, and must not throw. `onTruncated`
+ * observes an upstream failure after the answer started: the client keeps its partial answer and
+ * the failure is recorded, never answered twice. Neither runs when the client went first.
  */
 export function proxyRequest(
   req: IncomingMessage,
@@ -127,17 +129,28 @@ export function proxyRequest(
   headers: OutgoingHttpHeaders,
   agent: http.Agent,
   onError: (error: NodeJS.ErrnoException) => void,
+  onTruncated?: (error: NodeJS.ErrnoException, bytesSent: number) => void,
   maxBodyBytes = MAX_REQUEST_BODY_BYTES,
 ): void {
   let clientGone = false
   // The first failure decides the answer: destroying the upstream to stop a body raises errors of its own.
   let failed = false
+  // Body bytes relayed before the upstream failed mid-answer; a truncation without them sent none.
+  let bytesSent = 0
+  let responseDone = false
   const upstream = http.request({ host: target.host, port: target.port, method: req.method, path: req.url, headers, agent })
+  const truncated = (error: NodeJS.ErrnoException) => {
+    if (clientGone || failed || responseDone) return
+    failed = true
+    res.destroy()
+    onTruncated?.(error, bytesSent)
+  }
   const fail = (error: NodeJS.ErrnoException) => {
     if (clientGone || failed) return
     failed = true
     if (res.headersSent) {
       res.destroy()
+      onTruncated?.(error, bytesSent)
       return
     }
     req.unpipe(upstream)
@@ -150,7 +163,17 @@ export function proxyRequest(
       res.writeHead(relayableStatus(upstreamRes.statusCode), relayedHeaders(upstreamRes.headers))
       // Long polls and event streams must not wait for a first body chunk to deliver their headers.
       res.flushHeaders()
-      upstreamRes.on('error', () => res.destroy())
+      upstreamRes.on('data', (chunk: Buffer) => {
+        bytesSent += chunk.length
+      })
+      upstreamRes.on('error', truncated)
+      // A hang-up is not always an error event: without an end the answer was cut either way.
+      upstreamRes.on('close', () => {
+        if (!responseDone) truncated(Object.assign(new Error('the workspace closed the answer before it ended'), { code: 'ECONNRESET' }))
+      })
+      upstreamRes.on('end', () => {
+        responseDone = true
+      })
       upstreamRes.pipe(res)
     } catch (error) {
       upstreamRes.destroy()
@@ -195,6 +218,8 @@ export function rejectUpgrade(socket: Duplex, status: number, body: unknown, hea
 /**
  * Relays a WebSocket upgrade to the workspace and then pipes the two sockets together.
  * `onError` runs only while the client can still be answered, and must not throw.
+ * `onTruncated` observes the upstream end failing once the switch is done, when the client
+ * can no longer be answered; a clean close on either end, or the client going first, stays silent.
  */
 export function proxyUpgrade(
   req: IncomingMessage,
@@ -203,6 +228,7 @@ export function proxyUpgrade(
   target: Upstream,
   headers: OutgoingHttpHeaders,
   onError: (error: NodeJS.ErrnoException) => void,
+  onTruncated?: (error: NodeJS.ErrnoException) => void,
 ): void {
   let clientGone = false
   const upstream = http.request({
@@ -228,9 +254,22 @@ export function proxyUpgrade(
   upstream.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
     try {
       socket.off('close', abandon)
-      socket.on('error', () => upstreamSocket.destroy())
-      socket.on('close', () => upstreamSocket.destroy())
-      upstreamSocket.on('error', () => socket.destroy())
+      // Past the switch a client close still goes first: destroying the upstream then must not report.
+      socket.on('error', () => {
+        clientGone = true
+        upstreamSocket.destroy()
+      })
+      socket.on('close', () => {
+        clientGone = true
+        upstreamSocket.destroy()
+      })
+      upstreamSocket.on('error', (error: unknown) => {
+        socket.destroy()
+        if (!clientGone && !reported) {
+          reported = true
+          onTruncated?.(error as NodeJS.ErrnoException)
+        }
+      })
       upstreamSocket.on('close', () => socket.destroy())
       socket.write(responseHead(101, withoutRawHeaders(upstreamRes.rawHeaders, (name) => name === 'set-cookie')))
       if (upstreamHead.length > 0) socket.write(upstreamHead)

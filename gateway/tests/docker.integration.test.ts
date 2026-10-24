@@ -16,9 +16,12 @@ import { Store } from '../src/store.js'
 // and it silently ignores misspelled fields. CI runs this with POISE_GATEWAY_DOCKER_TESTS=1.
 const enabled = process.env.POISE_GATEWAY_DOCKER_TESTS === '1'
 
-const HEALTH_SERVER = `require('node:http').createServer((req, res) => {
+const HEALTH_SERVER = `let draining = false
+require('node:http').createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/api/service/drain') draining = true
+  if (req.method === 'POST' && req.url === '/api/service/resume') draining = false
   res.setHeader('content-type', 'application/json')
-  res.end(JSON.stringify({ ok: true, mode: 'service', version: 'ci', activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, idle: true, draining: false }))
+  res.end(JSON.stringify({ ok: true, mode: 'service', version: 'ci', activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, idle: true, draining }))
 }).listen(5555)`
 
 // The gateway's own container, standing in: it relays every call to poise-ws-ci by name, which resolves
@@ -217,6 +220,8 @@ describe.skipIf(!enabled)('workspaces on a real Docker Engine', () => {
       'workspace.container.started',
       'workspace.upgrade.finished',
     ])
+    // The replacement answered health before the upgrade finished, within the idle-to-ready bound.
+    expect(logs.filter((entry) => entry.event === 'workspace.upgrade.finished').at(-1)).toMatchObject({ readyAfterMs: expect.any(Number) })
     expect(await ready(restarted)).toBe(true)
     expect(logs.filter((entry) => entry.level !== 'info')).toEqual([])
   }, 120_000)
