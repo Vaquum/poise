@@ -20,6 +20,7 @@ import type {
   SessionContext,
   SessionRecord,
   SessionStatus,
+  StallState,
   AgentId,
   ChatSubject,
   TimerInput,
@@ -220,10 +221,28 @@ function sessionTitle(s: SessionRecord): string {
   return s.title || 'New session'
 }
 
+function stallSummary(stall: StallState): string {
+  const parts: string[] = []
+  for (const repo of stall.repos) {
+    const branch = repo.branch || 'a detached HEAD'
+    const where = repo.path === '.' ? `on ${branch}` : `in ${repo.path} on ${branch}`
+    if (repo.unpushedCommits) parts.push(`${repo.unpushedCommits} unpushed commit${repo.unpushedCommits === 1 ? '' : 's'} ${where}`)
+    if (repo.dirtyFiles) parts.push(`${repo.dirtyFiles} uncommitted change${repo.dirtyFiles === 1 ? '' : 's'} ${where}`)
+  }
+  // Mirrors the server's notice cap: the list stays readable no matter how
+  // many jobs the marker tracks.
+  for (const job of stall.backgroundJobs.slice(0, 20)) parts.push(`background job "${job.command}" (pid ${job.pid}) still running`)
+  const hiddenJobs = stall.backgroundJobs.length - Math.min(stall.backgroundJobs.length, 20)
+  if (hiddenJobs) parts.push(`${hiddenJobs} more background job${hiddenJobs === 1 ? '' : 's'} still running`)
+  if (stall.truncatedRepos) parts.push(`${stall.truncatedRepos} more task repo${stall.truncatedRepos === 1 ? '' : 's'} with leftover work`)
+  if (!parts.length) return 'Stalled — the last turn left work behind.'
+  return `Stalled — the last turn left ${parts.join(', ')}.`
+}
+
 function statusText(s: SessionRecord): string {
   switch (s.status) {
     case 'starting': return s.cliChecking ? 'checking CLI…' : 'starting…'
-    case 'idle': return 'idle'
+    case 'idle': return s.stall ? 'stalled' : 'idle'
     case 'queued': return queuedStatusText(s.queuedBehind)
     case 'running': return 'running'
     case 'waiting': return 'waiting for you'
@@ -2304,6 +2323,7 @@ function headerHtml(): string {
     ${s.retiredModel ? `<div class="st-help st-help-error chat-retired-model" role="status" data-model="${escapeHtml(s.retiredModel)}"></div>` : ''}
     ${s.cliWarning ? `<div class="st-help st-help-warn chat-cli-warning" role="status">${escapeHtml(s.cliWarning)}</div>` : ''}
     ${s.orphanNotice ? `<div class="st-help st-help-error">${escapeHtml(s.orphanNotice)}</div>` : ''}
+    ${s.stall ? `<div class="st-help st-help-warn">${escapeHtml(stallSummary(s.stall))}</div>` : ''}
   `
 }
 

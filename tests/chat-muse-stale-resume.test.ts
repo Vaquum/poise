@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest'
@@ -13,6 +14,7 @@ let root = ''
 let checkout = ''
 let Runtime: typeof RuntimeType
 let runtime: RuntimeType
+let store: typeof import('../server/chat/control-store')
 
 const capabilities: Capabilities = { steer: true, fork: true, thought: true, plan: false, commands: false, modes: false, permissions: true, questions: true, resume: true, images: false }
 const MUSE_MODEL = 'muse-spark-1.3-contributor-max'
@@ -26,6 +28,9 @@ interface Controls {
   failPromptTimes: number
   failPromptError: string
   failPromptWithTool: boolean
+  /** When set, adapters run this real agent; successful prompts release it
+   *  through the fifo and wait for its background sleep to exist. */
+  spawnAgent?: { command: string, args: string[], fifo: string, pidFile: string }
 }
 let controls: Controls
 
@@ -40,6 +45,7 @@ class FakeMuse implements Adapter {
   async start(options: AdapterStartOptions) {
     this.controls.starts.push(options)
     if (options.resume && this.controls.failResumeWith) throw new Error(this.controls.failResumeWith)
+    if (this.controls.spawnAgent) await this.host.spawn(this.controls.spawnAgent.command, this.controls.spawnAgent.args)
     this.alive = true
     this.nativeSessionId = options.resume || `native-${randomUUID().slice(0, 8)}`
     return { nativeSessionId: this.nativeSessionId, capabilities, modelId: options.modelId, effort: options.effort }
@@ -50,6 +56,12 @@ class FakeMuse implements Adapter {
       this.controls.failPromptTimes -= 1
       if (this.controls.failPromptWithTool) this.host.emit({ type: 'tool.started', turnId, id: `${turnId}:tool1`, kind: 'execute', title: 'rm -rf /tmp/probe' })
       return { stopReason: 'error' as const, error: this.controls.failPromptError }
+    }
+    const spawned = this.controls.spawnAgent
+    if (spawned) {
+      await rm(spawned.pidFile, { force: true })
+      await writeFile(spawned.fifo, 'run\n')
+      await until(() => existsSync(spawned.pidFile))
     }
     this.host.emit({ type: 'text.delta', turnId, messageId: `${turnId}:m1`, delta: `echo: ${input.text.slice(0, 200)}` })
     return { stopReason: 'end_turn' as const }
@@ -83,6 +95,7 @@ beforeAll(async () => {
   vi.stubEnv('POISE_DB', join(root, 'chat.sqlite3'))
   vi.stubEnv('POISE_LOCK_DIR', join(root, 'locks'))
   ;({ ChatRuntime: Runtime } = await import('../server/chat/runtime'))
+  store = await import('../server/chat/control-store')
 })
 beforeEach(async () => {
   checkout = join(root, randomUUID())
@@ -228,6 +241,32 @@ it('recovers when a live Muse process hits the stale-caller 400 with no resume a
   expect(controls.starts[1]).not.toHaveProperty('resume')
   expect(runtime.get(id)!.nativeSessionId).not.toBe(nativeBefore)
   expect(restartNotes(events, id)).toHaveLength(1)
+}, 60_000)
+
+it('tracks background jobs the recovered prompt starts', async () => {
+  const events: ChatEnvelope[] = []
+  runtime.on('event', (event) => events.push(event))
+  const fifo = join(root, `muse-bg-${randomUUID()}.fifo`)
+  execFileSync('mkfifo', [fifo])
+  controls.spawnAgent = { command: 'sh', args: ['-c', `read line < ${fifo}; sleep 30 & echo $! > ${fifo}.pid; wait`], fifo, pidFile: `${fifo}.pid` }
+  const id = await createMuse()
+  await firstTurn(events, id)
+  store.bindWork(runtime.instance, id, 'https://github.com/fixture/repo/issues/1')
+  controls.failPromptTimes = 1
+  controls.failPromptError = STALE_ERROR
+  await runtime.prompt(id, { text: 'second task', attachments: [], mentions: [] })
+  await until(() => ofType(events, id, 'turn.finished').length === 2)
+  await until(() => runtime.get(id)?.status === 'idle')
+  const finished = ofType(events, id, 'turn.finished').at(-1) as unknown as { stopReason: string }
+  expect(finished.stopReason).toBe('end_turn')
+  // The retry prompt ran after the restart: its sleep is new against the
+  // re-taken baseline, while the first attempt's sleep died with the old
+  // group and was never tracked.
+  // Exactly the retry's sleep is tracked: the group listing is a shared
+  // pid namespace under suite load, so anything else listed there cannot
+  // be asserted away — but a second sleep would mean a double spawn.
+  const jobs = (runtime.get(id)?.stall?.backgroundJobs ?? []).filter((job) => job.command === 'sleep 30')
+  expect(jobs).toHaveLength(1)
 }, 60_000)
 
 it('does not re-run the prompt when the failed attempt had already run tools', async () => {

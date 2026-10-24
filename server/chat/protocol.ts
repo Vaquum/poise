@@ -180,6 +180,18 @@ export interface SessionRecord {
   interruptedTurnId?: string
   /** Set when the session's worker could not be verified for cleanup. */
   orphanNotice?: string
+  /** Set while a bound session's last turn left work behind (unpushed
+   *  commits, uncommitted changes, a still-running background job): the
+   *  chat is stalled until the state clears. Absent means nothing tracked. */
+  stall?: StallState
+  /** The worker group's pids frozen for stall detection: the first turn end
+   *  that lists the group stores its prompt-start set, refreshed when the
+   *  group itself is replaced (stale/safe-mode recovery). It outlives the
+   *  marker — the poll may reap every job between a tracked parent's exit
+   *  and the next turn end — so a live member no turn baseline saw start is
+   *  still recognized as a tracked job's descendant and adopted instead of
+   *  absorbed as pre-existing ever after. Bound-only, like the marker. */
+  stallJobBaseline?: { pgid: number, pids: number[] }
   /** A Stop was asked for this turn and it has not settled since. Shutdown
    *  terminates it instead of handing it over, and recovery terminates it
    *  instead of adopting it; a new turn clears the marker. */
@@ -225,6 +237,45 @@ export interface WorkspaceState {
   /** Who holds the checkout lock when it is not this session. */
   lockedBy?: string
   checkedAt: string
+}
+
+/** A background process a turn started that outlived the turn: a member
+ *  of the turn's worker group that was not there when the turn's native
+ *  prompt began. `command` is a redacted display label, not forensics. */
+export interface StalledJob {
+  pid: number
+  pgid: number
+  command: string
+  /** First observed, at the turn end that tracked it. */
+  startedAt: string
+}
+
+/** Leftover work in one task repo: the checkout itself (`.`) for repo
+ *  sessions, a nested clone (workspace-relative path) for local workers. */
+export interface StallRepo {
+  path: string
+  /** Current branch; empty on a detached HEAD. */
+  branch: string
+  dirtyFiles: number
+  unpushedCommits: number
+}
+
+/** Work a bound session's turn left behind. Refreshed at every turn end
+ *  while the lease still holds the session's branch; background jobs are
+ *  reaped by the control tick as they finish. */
+export interface StallState {
+  /** One stall episode: set when the marker appears, kept while any facet
+   *  persists, so the wake notice fires once per episode, never per turn. */
+  episode: string
+  at: string
+  updatedAt: string
+  /** Task repos with leftover work, by path, at most 20 kept. */
+  repos: StallRepo[]
+  /** Further task repos with leftover work beyond the kept 20. */
+  truncatedRepos?: number
+  /** Still-running background jobs, oldest first, tracked without a cap;
+   *  only the notice rendering keeps 20. */
+  backgroundJobs: StalledJob[]
 }
 
 /** Where a subject's chat starts. `current` is a Current card;

@@ -193,6 +193,63 @@ export async function scriptIdentityMatches(pid: number, ident: string, scriptFi
   }
 }
 
+export interface GroupMember {
+  pid: number
+  ppid: number
+  command: string
+}
+
+/** Every live process in `pgid`'s group: pid, parent pid and full command
+ *  line. `ps -eo` with `=`-suppressed headers is the same on macOS and
+ *  Linux (the worker gate lists groups the same way), as is the `stat`
+ *  column. Zombies are skipped: an exited child lingers in the table until
+ *  its parent reaps it, but it is finished — listing it would withhold its
+ *  completion wake. Null when the table cannot be read — callers skip
+ *  group decisions, never invent them. */
+export async function groupMembers(pgid: number): Promise<GroupMember[] | null> {
+  if (!pgid || !Number.isSafeInteger(pgid) || pgid <= 1) return null
+  let stdout: string
+  try {
+    ({ stdout } = await runFile('ps', ['-eo', 'pid=,pgid=,ppid=,stat=,command='], { timeoutMs: 5_000, maxOutputBytes: 4 * 1024 * 1024 }))
+  } catch {
+    return null
+  }
+  const members: GroupMember[] = []
+  for (const line of stdout.split('\n')) {
+    const fields = line.trim().split(/\s+/)
+    if (fields.length < 5) continue
+    const [pid, listed, ppid] = fields.slice(0, 3).map(Number)
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(listed) || !Number.isSafeInteger(ppid)) continue
+    if (listed !== pgid || fields[3].startsWith('Z')) continue
+    members.push({ pid, ppid, command: fields.slice(4).join(' ') })
+  }
+  return members
+}
+
+export type WorkerGateStatus = 'verified' | 'gone' | 'unknown'
+
+/** Whether the recorded gate still owns `pid`: `verified` when its command
+ *  line is the gate script carrying `--lease-worker <ident>` as its own
+ *  argument (the same identity scriptIdentityMatches checks, so a gate
+ *  surviving a release switch still verifies), `gone` when the pid is dead
+ *  or another process (pid reuse), `unknown` when the process table itself
+ *  cannot be read. Callers that act on death must retry on `unknown`,
+ *  never treat it as `gone`. */
+export async function workerGateStatus(pid: number, ident: string): Promise<WorkerGateStatus> {
+  if (!pidAlive(pid) || !/^[A-Za-z0-9-]{8,64}$/.test(ident)) return 'gone'
+  let stdout: string
+  try {
+    ({ stdout } = await runFile('ps', ['-o', 'command=', '-p', String(pid)], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 }))
+  } catch {
+    return 'unknown'
+  }
+  const line = stdout.trim()
+  const flagIndex = line.indexOf(` --lease-worker ${ident} `)
+  if (flagIndex < 0) return 'gone'
+  const head = line.slice(0, flagIndex)
+  return head.includes('/scripts/chat-worker-gate.mjs ') || head.endsWith('/scripts/chat-worker-gate.mjs') ? 'verified' : 'gone'
+}
+
 /** Whether `pid` is still the gate we recorded: its command line must be
  *  the gate script carrying `--lease-worker <ident>` as its own argument.
  *  Anything else (pid reuse, unreadable table) is "no". */

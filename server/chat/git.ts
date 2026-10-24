@@ -42,9 +42,9 @@ export interface CheckoutInspection {
   headSha: string
 }
 
-async function git(checkout: string, args: string[], options: { timeoutMs?: number, expected?: ExpectedFailure } = {}): Promise<string> {
+async function git(checkout: string, args: string[], options: { timeoutMs?: number, expected?: ExpectedFailure, env?: NodeJS.ProcessEnv } = {}): Promise<string> {
   try {
-    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}) })
+    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}), ...(options.env ? { env: options.env } : {}) })
     return stdout
   } catch (error: any) {
     const detail = String(error?.stderr || error?.message || error).trim()
@@ -103,6 +103,45 @@ export async function branchExists(checkout: string, name: string): Promise<bool
 export async function commitsAhead(checkout: string, branch: string, base: string): Promise<number> {
   const out = await git(checkout, ['rev-list', '--count', `${assertBranchName(base)}..${assertBranchName(branch)}`])
   return Number(out.trim()) || 0
+}
+
+/** Commits on `branch` no remote-tracking ref contains — what a push would
+ *  send. Read-only: safe without the checkout lease. */
+export async function unpushedCommits(checkout: string, branch: string): Promise<number> {
+  const out = await git(checkout, ['rev-list', '--count', assertBranchName(branch), '--not', '--remotes'])
+  return Number(out.trim()) || 0
+}
+
+/** Leftover work in a worker-owned task repo: the current branch, the
+ *  uncommitted file count, and commits on any local branch — or a
+ *  detached HEAD — that no remote contains. Read-only: safe without the
+ *  checkout lease. */
+export async function inspectTaskRepo(checkout: string): Promise<{ branch: string, dirtyFiles: number, unpushedCommits: number }> {
+  // Confined to this repo: without a ceiling a broken nested `.git` reads
+  // the parent checkpoint repo instead of failing, misattributing its state.
+  const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
+  const status = await git(checkout, ['status', '--porcelain=v1', '--untracked-files=all', '--branch'], { env })
+  const lines = status.split('\n').filter((line) => line.length > 0)
+  const header = lines[0] || ''
+  const detached = header.includes('(no branch)') || header.includes('HEAD (no branch)')
+  const branch = detached ? ''
+    : header.startsWith('## No commits yet on ') ? header.replace('## No commits yet on ', '').split('...')[0]
+    : header.replace(/^## /, '').split('...')[0].split(' ')[0]
+  const dirtyFiles = lines.slice(1).length
+  return { branch, dirtyFiles, unpushedCommits: await unpushedTaskCommits(checkout) }
+}
+
+/** Commits no remote contains: every local branch plus an unborn-proof
+ *  HEAD, so a detached HEAD's commits count but a commit-less repo reads
+ *  zero instead of failing. Confined like its caller: a broken nested
+ *  `.git` must fail here, not read the parent checkpoint repo. */
+async function unpushedTaskCommits(checkout: string): Promise<number> {
+  const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
+  try {
+    return Number((await git(checkout, ['rev-list', '--count', '--branches', 'HEAD', '--not', '--remotes'], { env })).trim()) || 0
+  } catch {
+    return Number((await git(checkout, ['rev-list', '--count', '--branches', '--not', '--remotes'], { env })).trim()) || 0
+  }
 }
 
 // ── Guarded (mutating) commands ───────────────────────────────────────────

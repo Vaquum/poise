@@ -1080,6 +1080,9 @@ export class ChatControl {
       this.lastRetention = now
       this.isolate('retention', 'timers', () => { store.retainTimers(instance, now) })
     }
+    // 9. Stall completions: tracked background jobs that finished wake
+    // their chat with the outcome, and the stall markers refresh.
+    if (!this.stopped) await this.runtime.pollStalledJobs().catch((error: unknown) => this.itemFailed('stall', 'poll', error))
     // Supervision watches and binding observation follow timers and delivery.
     for (const watch of store.watches(instance)) {
       if (this.stopped) return

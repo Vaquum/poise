@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { CheckoutLease } from '../../server/chat/checkout-lock'
 import { CLIENT_FILE_MAX_BYTES, readCheckoutTextFile, writeCheckoutTextFile } from '../../server/chat/client-fs'
-import { branchExists, branchTip, checkpoint, createBranch, deleteBranch, inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch } from '../../server/chat/git'
+import { branchExists, branchTip, checkpoint, createBranch, deleteBranch, inspectCheckout, inspectTaskRepo, resolveInsideCheckout, revertDiff, switchBranch } from '../../server/chat/git'
 
 // The branch cases run dozens of git processes each, and under suite load
 // their starts can stall past the global 10 s: each case and hook gets 25 s.
@@ -185,6 +185,40 @@ describe('revert', () => {
     const released = new CheckoutLease(checkout, { ownerKind: 'poise:chat', ownerId: 'x', ownerLabel: 'x', instance: 'test' })
     await expect(revertDiff(released, checkout, { path: 'src/a.txt', oldText: 'a', newText: 'alpha\n', oldExists: true, newExists: true })).rejects.toMatchObject({ code: 'conflict' })
   })
+})
+
+describe('task repo inspection', () => {
+  async function taskRepo(name: string): Promise<string> {
+    const dir = join(root, name)
+    await mkdir(dir)
+    git(['init', '-q', '-b', 'main'], dir)
+    git(['config', 'user.email', 't@example.invalid'], dir)
+    git(['config', 'user.name', 't'], dir)
+    return dir
+  }
+
+  it('counts detached HEAD commits no remote contains', async () => {
+    const dir = await taskRepo('task-detached')
+    const bare = join(root, 'task-detached.git')
+    spawnSync('git', ['init', '-q', '--bare', bare])
+    await writeFile(join(dir, 'base.txt'), 'base\n')
+    git(['add', '-A'], dir)
+    git(['commit', '-qm', 'base'], dir)
+    git(['remote', 'add', 'origin', bare], dir)
+    git(['push', '-q', 'origin', 'main'], dir)
+    expect(await inspectTaskRepo(dir)).toMatchObject({ branch: 'main', dirtyFiles: 0, unpushedCommits: 0 })
+    git(['checkout', '-q', '--detach', 'HEAD'], dir)
+    await writeFile(join(dir, 'detached.txt'), 'detached\n')
+    git(['add', 'detached.txt'], dir)
+    git(['commit', '-qm', 'detached work'], dir)
+    expect(await inspectTaskRepo(dir)).toMatchObject({ branch: '', dirtyFiles: 0, unpushedCommits: 1 })
+  }, 25_000)
+
+  it('reads a commit-less repo as zero instead of failing', async () => {
+    const dir = await taskRepo('task-unborn')
+    await writeFile(join(dir, 'draft.txt'), 'draft\n')
+    expect(await inspectTaskRepo(dir)).toMatchObject({ branch: 'main', dirtyFiles: 1, unpushedCommits: 0 })
+  }, 25_000)
 })
 
 it('gives every case 25 s instead of the global 10 s', ({ task }) => {

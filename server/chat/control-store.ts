@@ -133,8 +133,9 @@ export function unbindWork(instance: string, session: string, target: string): v
 }
 /** Move every work binding from one chat to another: a handoff's ownership
  *  transfer. The new owner starts from no observation baseline; the old
- *  owner's still-pending work-monitor notices for those targets are
- *  dropped, so they never wake it stale after the transfer. */
+ *  owner's still-pending work-monitor notices for those targets, and its
+ *  session-keyed stall notices, are dropped, so they never wake it stale
+ *  after the transfer. */
 export const moveBindings = db.transaction((instance: string, from: string, to: string): Binding[] => {
   const moved = db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? AND session = ?')
     .all(instance, from) as Binding[]
@@ -150,6 +151,13 @@ export const moveBindings = db.transaction((instance: string, from: string, to: 
         AND event_key LIKE ? ESCAPE '\\'`).run(instance, from, WORK_MONITOR_SENDER, `${prefix}${escaped}:%`)
     }
   }
+  // Session-keyed stall notices name the old worker's group and episode,
+  // not the work: the source stays open but unbound, so its pending ones
+  // drop instead of waking it after the transfer.
+  const session = from.replace(/[\\%_]/g, ch => `\\${ch}`)
+  db.prepare(`DELETE FROM chat_control_inbox WHERE instance = ? AND recipient = ? AND sender = ? AND state = 'pending'
+    AND (event_key LIKE ? ESCAPE '\\' OR event_key LIKE ? ESCAPE '\\')`)
+    .run(instance, from, WORK_MONITOR_SENDER, `stall:${session}:%`, `stall-done:${session}:%`)
   return moved.map(binding => ({ ...binding, session: to }))
 })
 /** Release every work binding a chat holds. Closing settles work rather
@@ -172,10 +180,10 @@ export interface InternalMessage {
   timer_id: string | null, timer_missed: number
 }
 const INBOX_COLUMNS = 'seq, recipient, sender, event_key, body, created_at, state, turn_id, sender_title, sender_role, timer_id, timer_missed'
-export function message(instance: string, recipient: string, sender: string, body: string, eventKey: string = randomUUID(), from?: { title: string, role?: 'manager' | 'worker' }): void {
+export function message(instance: string, recipient: string, sender: string, body: string, eventKey: string = randomUUID(), from?: { title: string, role?: 'manager' | 'worker' }): boolean {
   if (!body.trim() || Buffer.byteLength(body) > 32 * 1024) throw new HttpError(400, 'an internal message needs 1–32768 UTF-8 bytes')
-  db.prepare(`INSERT INTO chat_control_inbox(instance, recipient, sender, event_key, body, created_at, sender_title, sender_role)
-    VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance, recipient, event_key) DO NOTHING`).run(instance, recipient, sender, eventKey, body, Date.now(), from?.title ?? null, from?.role ?? null)
+  return db.prepare(`INSERT INTO chat_control_inbox(instance, recipient, sender, event_key, body, created_at, sender_title, sender_role)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance, recipient, event_key) DO NOTHING`).run(instance, recipient, sender, eventKey, body, Date.now(), from?.title ?? null, from?.role ?? null).changes > 0
 }
 export function inbox(instance: string, recipient: string, after = 0): InternalMessage[] {
   return db.prepare(`SELECT ${INBOX_COLUMNS} FROM chat_control_inbox

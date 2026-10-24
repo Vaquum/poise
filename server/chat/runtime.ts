@@ -40,8 +40,8 @@ import { prepareEditorContext, removeEditorContext } from './editor-context'
 import { tryParseStructuredReply } from '../../src/edit-proposals'
 import type { AutoMergeAck, SafeModeAck } from './protocol'
 import { homedir } from 'node:os'
-import { lstat, mkdir, rm, rmdir, writeFile } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { lstat, mkdir, readdir, rm, rmdir, writeFile } from 'node:fs/promises'
+import { basename, dirname, join, relative } from 'node:path'
 import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../models'
 import { db, getMeta, setMeta } from '../db'
 import { claudeAuth } from '../claude-auth'
@@ -63,19 +63,19 @@ import { legacyIdFor, quoteImportedHistory, readLegacyConversation } from './leg
 import { forkStagedDocument, isBridgeProblem, refreshDocument, stageDocument, stagedDocumentPrompt, unstageDocument, writeBackDocument, type StagedDocument } from './editor-bridge'
 import {
   GitError, PathError, assertBranchName, branchExists, branchTip, checkoutPrHead, checkpoint, createBranch, deleteBranch,
-  inspectCheckout, moveBranch, resolveInsideCheckout, revertDiff, switchBranch, type RecordedDiff,
+  inspectCheckout, inspectTaskRepo, moveBranch, resolveInsideCheckout, revertDiff, switchBranch, unpushedCommits, type RecordedDiff,
 } from './git'
 import {
   AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, SWITCH_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type EditDecision, type NewSessionRequest,
-  type Mention, type PermissionOption, type PersonActor, type PoiseActor, type PromptInput, type PromptReceipt, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StopReason, type ToolKind, type TurnSource, type WorkspaceState,
+  type Mention, type PermissionOption, type PersonActor, type PoiseActor, type PromptInput, type PromptReceipt, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StallRepo, type StallState, type StalledJob, type StopReason, type ToolKind, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
 // Only the sender label, used inside runTurn: a Switchboard relay is the
 // person's own answer and keeps the person's composition.
 import { SWITCHBOARD_PERSON } from './switchboard'
 import * as storage from './storage'
-import { holdChat, holds, internalTurn, moveBindings, releaseBindings, timerSummaries } from './control-store'
-import { pgidAlive, pidAlive, signalGroup, workerIdentityMatches } from './worker'
+import { WORK_MONITOR_SENDER, bindings, holdChat, holds, internalTurn, message as controlMessage, moveBindings, releaseBindings, timerSummaries } from './control-store'
+import { groupMembers, pgidAlive, pidAlive, signalGroup, workerGateStatus, workerIdentityMatches, type GroupMember, type WorkerGateStatus } from './worker'
 import { ADOPTION_LIVE_TIMEOUT_MS, attachRelay, livePromise, relayDirFor, relayIdentityMatches, spawnRelay, type RelayConnection } from './relay'
 import { createReplayHost, recalledDiffs } from './replay'
 import { createClaudeAdapter } from './adapters/claude'
@@ -109,6 +109,22 @@ const alertContext = (record: SessionRecord): ChatSessionAlertContext => ({ sess
 const MUSE_RESTART_NOTE = 'Muse agent session was restarted on a fresh native session because Muse\'s credentials changed; the conversation continues from a summary.'
 /** The Switchboard's own chat (docs/Switchboard.md); a fork of it is an ordinary chat. */
 const isSwitchboardChat = (record: SessionRecord): boolean => record.context?.kind === 'switchboard' && !record.forkedFrom
+/** What "done" means on a stall notice: the leftover the marker measures. */
+const STALL_DONE = [
+  'working tree clean on the session branch',
+  'every commit pushed to the remote',
+  'no background job left running from the turn',
+]
+/** Background jobs listed per stall wake notice and status line. Tracking
+ *  itself is uncapped — dropping a live pid would lose its completion —
+ *  only the rendering is, with the remainder counted. */
+const MAX_STALL_JOBS = 20
+/** Task repos kept per stall marker; the rest count as truncated. Together
+ *  with the capped job listing this keeps every stall notice under the
+ *  inbox bound. */
+const MAX_STALL_REPOS = 20
+/** Stored command labels are redacted display text, truncated past this. */
+const STALL_COMMAND_CHARS = 200
 
 export const DEFAULT_IDLE_TIMEOUT_MINUTES = 120
 export const DEFAULT_BRANCH_PREFIX = 'chat/'
@@ -209,6 +225,11 @@ interface RunningTurn {
   /** Steers sent to this turn by correlation id, with the text to queue if
    *  the adapter reports them unrun when the turn settles. */
   pendingSteers?: Map<string, { text: string, attachments: Attachment[], mentions: Mention[], actor?: ChatActor | PoiseActor }>
+  /** Worker-group members (pid to normalized command) when the turn's
+   *  native prompt began: whatever the turn started is new against this,
+   *  however deep the agent's own process spine runs. Absent when the
+   *  group could not be listed — then nothing new is tracked. */
+  jobBaseline?: { pgid: number, members: Map<number, string> }
 }
 
 interface LiveSession {
@@ -613,6 +634,14 @@ export class ChatRuntime extends EventEmitter {
       if (['running', 'waiting', 'stopping', 'queued', 'starting'].includes(record.status)) {
         if (record.status === 'waiting') chatWaitingEnded(record.id)
         record.status = record.nativeSessionId ? 'interrupted' : 'idle'
+        storage.saveSession(record)
+      }
+      // Process identity does not survive a restart: tracked background
+      // jobs are unverifiable afterwards, so recovery drops them without
+      // waking. The git facets stay; the next turn end re-verifies them.
+      if (record.stall?.backgroundJobs.length) {
+        record.stall = { ...record.stall, backgroundJobs: [] }
+        if (!record.stall.repos.length && !record.stall.truncatedRepos) delete record.stall
         storage.saveSession(record)
       }
       // A change session whose outcome was never recorded ended with the
@@ -2353,6 +2382,7 @@ export class ChatRuntime extends EventEmitter {
         importedFrom: undefined,
         staged: undefined, // the fork stages its own copy on start
         createdBy: undefined, // the person made the fork, not the worker's creator
+        stall: undefined, // stall state names the source's worker group and episode, not the fork's
         branch: { ...source.record.branch, provisional: false },
       }
       storage.insertSession(record)
@@ -2540,6 +2570,9 @@ export class ChatRuntime extends EventEmitter {
       return { stopReason: 'error', error: 'The prompt was not re-run because the failed attempt had already run tools; the Muse session was restarted and the next prompt continues from a summary.' }
     }
     const retry = summary ? { ...promptInput, text: `${summary}\n\n[Current task]\n${promptInput.text}` } : promptInput
+    // The restart replaced the worker group: re-baseline before the retry
+    // prompt runs, so jobs it starts are new instead of pre-existing.
+    await this.snapshotJobBaseline(session, turn)
     return session.adapter!.prompt(turn.id, retry, turn.abort.signal)
   }
 
@@ -3383,6 +3416,11 @@ export class ChatRuntime extends EventEmitter {
       }
       adapter = session.adapter!
       if (turn.abort.signal.aborted) throw new Error(turn.failure || 'cancelled before the agent prompt')
+      // The baseline's process listing settles before 'running' publishes:
+      // callers treat 'running' as prompt-invoked, so the window after it
+      // stays free of subprocess latency. A safe-mode restart below replaces
+      // the group and re-takes it there.
+      await this.snapshotJobBaseline(session, turn)
       this.setStatus(session, 'running')
       if (record.queuedHandoff) adapterInput.text = `${record.queuedHandoff}\n\n[Current task]\n${adapterInput.text}`
       if (turn.contextAction === 'compact' && storage.findEvent(record.id, event => event.type === 'text.delta') && !record.queuedHandoff) {
@@ -3412,6 +3450,7 @@ export class ChatRuntime extends EventEmitter {
           await this.stopProcess(session)
           await this.startSession(session, { lease })
           adapter = session.adapter!
+          await this.snapshotJobBaseline(session, turn)
         }
       }
       turn.abort.signal.throwIfAborted()
@@ -3542,6 +3581,12 @@ export class ChatRuntime extends EventEmitter {
           try { this.emit_(record.id, { type: 'error', message: `A steered message never ran and could not be queued as a follow-up (${reason}). Send it again as a new message.`, recoverable: true }) } catch { /* mirror */ }
         }
       }
+      // A bound turn that ends with work left behind never settles
+      // silently: detect it before the terminal event publishes, while the
+      // lease still holds the session's branch, so the dirty count is
+      // attributable and every consumer of turn.finished sees the marker.
+      // Never throws.
+      await this.detectTurnStall(session, turn, stopReason)
       let terminalRecorded = false
       const durationMs = Date.now() - turn.startedAt
       try {
@@ -4213,6 +4258,389 @@ export class ChatRuntime extends EventEmitter {
     } catch { /* not a git checkout yet; the header shows nothing */ }
   }
 
+  /** A bound turn that ends normally with work left behind — unpushed
+   *  commits, uncommitted changes, a still-running background job — flags
+   *  the session stalled and queues one wake notice for the episode. Runs
+   *  while the lease still holds the session's branch, so the dirty count
+   *  is attributable. Never throws: a facet that cannot be read keeps its
+   *  previous value instead of inventing one. Unbound chats are the
+   *  person's own conversation — ending a turn with work in progress is
+   *  normal there, so they stay out. */
+  private async detectTurnStall(session: LiveSession, turn: RunningTurn, stopReason: StopReason): Promise<void> {
+    try {
+      const record = session.record
+      if (stopReason !== 'end_turn' || record.status === 'closed') return
+      if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
+        if (record.stall || record.stallJobBaseline) {
+          delete record.stall
+          delete record.stallJobBaseline
+          this.saveRecord(session)
+          this.emit_(record.id, { type: 'session.updated', session: record })
+        }
+        return
+      }
+      const previous = record.stall
+      let jobs = previous?.backgroundJobs ?? []
+      const baseline = turn.jobBaseline
+      const worker = storage.getWorker(record.id)
+      const gatePid = session.relay?.gatePid ?? worker?.gatePid
+      const gatePgid = session.relay?.gatePgid ?? worker?.gatePgid
+      // The group is listed before git is read: a job alive here is tracked
+      // even if it exits right after, and anything it dirtied lands in the
+      // later git read instead of falling through both. The reverse order
+      // would miss a job that dirties between the reads and exits before
+      // the group snapshot.
+      const members = baseline && gatePid && gatePgid && baseline.pgid === gatePgid ? await groupMembers(gatePgid) : null
+      const { repos, truncatedRepos } = await this.stallRepos(session, previous)
+      // A handoff may have moved the bindings during the awaited reads; the
+      // source stays silent. This check runs synchronously with the queues
+      // below, so no handoff can interleave between them.
+      if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
+        if (record.stall || record.stallJobBaseline) {
+          delete record.stall
+          delete record.stallJobBaseline
+          this.saveRecord(session)
+          this.emit_(record.id, { type: 'session.updated', session: record })
+        }
+        return
+      }
+      // A background job is a group member the turn started: present now
+      // but absent from the prompt-start baseline, however deep the
+      // agent's own process spine runs. A tracked job that finished
+      // during the turn wakes like a poll-reaped one: the turn ending
+      // does not prove the agent saw the result, and the shared event key
+      // keeps the two paths from ever queuing it twice. Without a
+      // baseline nothing new is tracked; the poll still reaps.
+      if (members !== null && gatePgid && baseline) {
+        const seen = new Map(jobs.map((job) => [job.pid, job]))
+        const now = new Date().toISOString()
+        // The session's frozen group: the first listing stores the turn's
+        // prompt-start set; a replaced group (stale/safe-mode recovery runs
+        // a new gate) refreshes it, since old pids name another group. It is
+        // written back at once, independent of the marker — the poll may
+        // delete the marker before the next turn end ever runs.
+        if (record.stallJobBaseline?.pgid !== gatePgid) {
+          record.stallJobBaseline = { pgid: gatePgid, pids: [...baseline.members.keys()] }
+          this.saveRecord(session)
+        }
+        const frozen = new Set(record.stallJobBaseline.pids)
+        const keptJobs: StalledJob[] = []
+        const freshJobs: StalledJob[] = []
+        for (const member of members.filter((candidate) => candidate.pid !== gatePid).sort((a, b) => a.pid - b.pid)) {
+          const command = this.stallCommand(member.command)
+          const kept = seen.get(member.pid)
+          // A live pid is the same job continuing, even under a new command:
+          // exec replaces the image in place, while pid reuse inside a live
+          // gate group needs a full pid-space wraparound.
+          if (kept) keptJobs.push(kept.command === command ? kept : { ...kept, command })
+          // Baseline membership is by pid, not command: a baseline member
+          // that exec'd mid-turn is pre-existing, not a job the turn
+          // started. Comparing commands would stall and wake a chat that
+          // started no background process at all.
+          else if (!baseline.members.has(member.pid)) freshJobs.push({ pid: member.pid, pgid: gatePgid, command, startedAt: now })
+          // A member the turn absorbed as pre-existing but the frozen group
+          // never saw start: a tracked job's child, spawned after a turn end
+          // and orphaned when its parent exited. Chasing parentage would miss
+          // it — the exit reparented it away — but group membership cannot
+          // lie, so detection adopts it instead of letting a later baseline
+          // absorb it ever after.
+          else if (!frozen.has(member.pid)) freshJobs.push({ pid: member.pid, pgid: gatePgid, command, startedAt: now })
+        }
+        // Every live turn-started job is tracked, however many: dropping one
+        // would let a later baseline absorb it as pre-existing, so its
+        // completion would never wake. Only the notice rendering is capped.
+        jobs = [...keptJobs, ...freshJobs]
+        const current = new Map(jobs.map((job) => [job.pid, job]))
+        for (const job of seen.values()) {
+          // Only a gone pid finishes a job; one that exec'd into another
+          // program keeps its tracking under the new command above.
+          if (!current.has(job.pid)) this.queueStallDone(record.id, job, now, { repos, truncatedRepos })
+        }
+      } else if (baseline && gatePgid && baseline.pgid === gatePgid && record.stallJobBaseline?.pgid !== gatePgid) {
+        // The turn-end listing failed but its baseline is in hand: freeze
+        // it, so the next successful turn adopts this turn's jobs instead
+        // of absorbing them as pre-existing. Without this, one transient
+        // listing failure with no prior stall would silence their stall
+        // and completion wakes forever.
+        record.stallJobBaseline = { pgid: gatePgid, pids: [...baseline.members.keys()] }
+        this.saveRecord(session)
+      }
+      if (!repos.length && !truncatedRepos && !jobs.length) {
+        if (previous) {
+          delete record.stall
+          this.saveRecord(session)
+          this.emit_(record.id, { type: 'session.updated', session: record })
+          this.emit('log', `[chat ${record.id.slice(0, 8)}] stall cleared`)
+        }
+        return
+      }
+      const at = new Date().toISOString()
+      record.stall = { episode: previous?.episode ?? randomUUID(), at: previous?.at ?? at, updatedAt: at,
+        repos, ...(truncatedRepos ? { truncatedRepos } : {}), backgroundJobs: jobs }
+      this.saveRecord(session)
+      this.emit_(record.id, { type: 'session.updated', session: record })
+      // One wake per episode: the event key dedupes repeats, so a worker
+      // that keeps ending turns with the same leftover is not nagged again.
+      controlMessage(this.instance, record.id, WORK_MONITOR_SENDER,
+        JSON.stringify(stallNotice(record.id, record.stall)), `stall:${record.id}:${record.stall.episode}`)
+      if (!previous) {
+        diagnostic({ level: 'warning', operation: 'chat.work.stalled', message: 'A bound turn ended with work left behind',
+          context: { sessionId: record.id, repos: repos.map((repo) => repo.path), backgroundJobs: jobs.length } })
+      }
+    } catch (error) {
+      this.emit('log', `[chat ${session.record.id.slice(0, 8)}] stall check failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /** Snapshot the turn's worker group before its native prompt runs, so
+   *  turn-end detection tracks only what the turn itself started. Never
+   *  throws: without a baseline nothing new is tracked. The listing is
+   *  retried — a missed baseline is permanent, since the next successful
+   *  turn would freeze the turn's jobs as pre-existing — and an exhausted
+   *  failure warns instead of degrading silently. Detection and the reap
+   *  need no retry: their misses heal on the next pass. */
+  private async snapshotJobBaseline(session: LiveSession, turn: RunningTurn): Promise<void> {
+    turn.jobBaseline = undefined
+    try {
+      const worker = storage.getWorker(session.record.id)
+      const pgid = session.relay?.gatePgid ?? worker?.gatePgid
+      if (!pgid) return
+      let members: GroupMember[] | null = null
+      for (let attempt = 0; attempt < 3 && !members; attempt++) members = await groupMembers(pgid)
+      if (!members) {
+        diagnostic({ level: 'warning', operation: 'chat.work.baseline_failed',
+          message: 'The turn started without a job baseline; its background jobs cannot be tracked',
+          context: { sessionId: session.record.id } })
+        return
+      }
+      turn.jobBaseline = { pgid, members: new Map(members.map((member) => [member.pid, this.stallCommand(member.command)])) }
+    } catch (error) {
+      turn.jobBaseline = undefined
+      this.emit('log', `[chat ${session.record.id.slice(0, 8)}] job baseline skipped: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /** Task repos with leftover work. A repo session's checkout is the task
+   *  repo, read on the session branch under the held lease. A local
+   *  worker's task repos are its nested clones — the workspace root
+   *  itself is Poise's checkpoint store (bootstrap commit, no remote),
+   *  never worker output, so it is not read. A repo that cannot be read
+   *  keeps its previous entry; one that is gone drops. At most
+   *  MAX_STALL_REPOS are kept; the rest count as truncated. */
+  private async stallRepos(session: LiveSession, previous: StallState | undefined): Promise<{ repos: StallRepo[], truncatedRepos: number }> {
+    const record = session.record
+    const kept = new Map((previous?.repos ?? []).map((repo) => [repo.path, repo]))
+    const cap = (repos: StallRepo[]): { repos: StallRepo[], truncatedRepos: number } => {
+      const sorted = repos.sort((a, b) => a.path.localeCompare(b.path))
+      return { repos: sorted.slice(0, MAX_STALL_REPOS), truncatedRepos: Math.max(0, sorted.length - MAX_STALL_REPOS) }
+    }
+    if (record.workspaceKind === 'poise-local') {
+      const found = await this.nestedTaskRepos(record.checkout)
+      // An incomplete discovery keeps the whole previous set: a transient
+      // IO error must never read as finished work.
+      if (!found.complete) {
+        this.emit('log', `[chat ${record.id.slice(0, 8)}] stall discovery incomplete; keeping the previous repos`)
+        const capped = cap(previous?.repos ?? [])
+        // An incomplete scan asserts nothing about its remainder: when no
+        // kept or truncated entry survives, the unknown remainder still
+        // counts, so a first failure flags instead of clearing.
+        return { repos: capped.repos, truncatedRepos: (capped.truncatedRepos + (previous?.truncatedRepos ?? 0)) || 1 }
+      }
+      const repos: StallRepo[] = []
+      let unreadable = 0
+      for (const dir of found.dirs) {
+        const path = relative(record.checkout, dir) || '.'
+        try {
+          const state = await inspectTaskRepo(dir)
+          if (state.dirtyFiles || state.unpushedCommits) repos.push({ path, ...state })
+        } catch (error) {
+          this.emit('log', `[chat ${record.id.slice(0, 8)}] stall check skipped ${path}: ${error instanceof Error ? error.message : String(error)}`)
+          const keep = kept.get(path)
+          // An unreadable repo without a saved entry — typically a truncated
+          // overflow repo — still counts: it may hold unfinished work, so it
+          // keeps the stall truncated instead of clearing it.
+          if (keep) repos.push(keep)
+          else unreadable += 1
+        }
+      }
+      const capped = cap(repos)
+      return { repos: capped.repos, truncatedRepos: capped.truncatedRepos + unreadable }
+    }
+    try {
+      const state = await inspectCheckout(record.checkout)
+      const dirtyFiles = state.currentBranch === record.branch.name ? state.dirtyFiles : 0
+      const unpushed = await unpushedCommits(record.checkout, record.branch.name)
+      if (!dirtyFiles && !unpushed) return { repos: [], truncatedRepos: 0 }
+      return cap([{ path: '.', branch: record.branch.name, dirtyFiles, unpushedCommits: unpushed }])
+    } catch (error) {
+      this.emit('log', `[chat ${record.id.slice(0, 8)}] stall git check skipped: ${error instanceof Error ? error.message : String(error)}`)
+      const keep = kept.get('.')
+      // An unreadable checkout without a saved entry may hold unfinished
+      // work, so it counts: like the local path's unreadable repos, it
+      // keeps the stall truncated instead of clearing it.
+      if (keep) return cap([keep])
+      return { repos: [], truncatedRepos: 1 }
+    }
+  }
+
+  /** `.git` roots one or two levels under a worker's own
+   *  `workers/<id>/workspace`, sorted. Anything outside a worker
+   *  workspace — the legacy shared workspace, a custom checkout — is not
+   *  this session's alone, so it contributes no git facets. `complete` is
+   *  false when any listing failed for another reason than a vanished
+   *  path, so callers keep their previous state instead of inventing a
+   *  clean one. */
+  private async nestedTaskRepos(checkout: string): Promise<{ dirs: string[], complete: boolean }> {
+    const root = this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT
+    if (!workerWorkspaceRef(root, checkout)) return { dirs: [], complete: true }
+    /** Absent paths are real; any other IO failure poisons the scan. */
+    const stat = async (path: string) => {
+      try {
+        return await lstat(path)
+      } catch (error: any) {
+        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null
+        throw new Error('incomplete')
+      }
+    }
+    const list = async (path: string): Promise<string[]> => {
+      try {
+        return await readdir(path)
+      } catch (error: any) {
+        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return []
+        throw new Error('incomplete')
+      }
+    }
+    try {
+      const found: string[] = []
+      const isDir = async (dir: string): Promise<boolean> => {
+        const info = await stat(dir)
+        return !!info && info.isDirectory() && !info.isSymbolicLink()
+      }
+      const isRepo = async (dir: string): Promise<boolean> => {
+        const info = await stat(join(dir, '.git'))
+        return !!info && (info.isDirectory() || info.isFile())
+      }
+      for (const name of await list(checkout)) {
+        if (name.startsWith('.') || name === 'node_modules') continue
+        const dir = join(checkout, name)
+        if (!(await isDir(dir))) continue
+        if (await isRepo(dir)) { found.push(dir); continue }
+        for (const grand of await list(dir)) {
+          if (grand.startsWith('.') || grand === 'node_modules') continue
+          const sub = join(dir, grand)
+          if ((await isDir(sub)) && (await isRepo(sub))) found.push(sub)
+        }
+      }
+      return { dirs: found.sort(), complete: true }
+    } catch {
+      return { dirs: [], complete: false }
+    }
+  }
+
+  /** Reap tracked background jobs that finished since the last look: the
+   *  owning chat wakes once per finished job, and the marker refreshes.
+   *  For the control tick; never throws, and one bad session never stops
+   *  the rest. */
+  async pollStalledJobs(): Promise<void> {
+    const stalled = [...this.live.values()].filter((session) =>
+      session.record.status !== 'closed' && session.record.stall)
+    await Promise.all(stalled.map(async (session) => {
+      try {
+        await this.reapStalledJobs(session)
+      } catch (error) {
+        this.emit('log', `[chat ${session.record.id.slice(0, 8)}] stall reap failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }))
+  }
+
+  private async reapStalledJobs(session: LiveSession): Promise<void> {
+    const record = session.record
+    const stall = record.stall
+    if (!stall) return
+    // Stall state is bound-only: a session that released its work clears
+    // promptly instead of waking unbound.
+    if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
+      delete record.stall
+      delete record.stallJobBaseline
+      this.saveRecord(session)
+      this.emit_(record.id, { type: 'session.updated', session: record })
+      return
+    }
+    if (!stall.backgroundJobs.length) return
+    const worker = storage.getWorker(record.id)
+    // Identity first: only the recorded gate proves the group is still
+    // the turn's. A verifiably dead group reads every job finished — the
+    // gate tears its group down as it exits — while an unreadable table
+    // retries on the next tick; nothing is reaped blind.
+    const status = worker ? await workerGateStatus(worker.gatePid, worker.ident).catch((): WorkerGateStatus => 'unknown') : 'gone'
+    if (status === 'unknown') return
+    const members = status === 'verified' && worker ? await groupMembers(worker.gatePgid) : []
+    if (members === null) return
+    // A handoff may have moved the bindings during the awaited inspection;
+    // the source clears instead of queuing to a chat that no longer holds
+    // the work. Synchronous with the writeback and queues below.
+    if (!bindings(this.instance).some((binding) => binding.session === record.id)) {
+      delete record.stall
+      delete record.stallJobBaseline
+      this.saveRecord(session)
+      this.emit_(record.id, { type: 'session.updated', session: record })
+      return
+    }
+    const finishedAt = new Date().toISOString()
+    const finished: StalledJob[] = []
+    const running: StalledJob[] = []
+    for (const job of stall.backgroundJobs) {
+      const member = members.find((candidate) => candidate.pid === job.pid)
+      if (!member) { finished.push(job); continue }
+      // A live pid is the same job continuing, even under a new command:
+      // exec replaces the image in place, while pid reuse inside a live
+      // gate group needs a full pid-space wraparound.
+      const command = this.stallCommand(member.command)
+      running.push(command === job.command ? job : { ...job, command })
+    }
+    // A turn end may have replaced the marker while the group was listed;
+    // only the still-current marker is written back. The replacement's own
+    // completion pass covers these jobs under the same event keys.
+    if (record.stall !== stall) return
+    if (!finished.length) {
+      // Nothing finished, but jobs that exec'd into new commands still need
+      // their tracking updated; unchanged entries keep their identity.
+      if (running.some((job, index) => job !== stall.backgroundJobs[index])) {
+        stall.backgroundJobs = running
+        stall.updatedAt = finishedAt
+        this.saveRecord(session)
+        this.emit_(record.id, { type: 'session.updated', session: record })
+      }
+      return
+    }
+    stall.backgroundJobs = running
+    stall.updatedAt = finishedAt
+    const lastKnown = { repos: stall.repos, truncatedRepos: stall.truncatedRepos ?? 0 }
+    if (!running.length && !lastKnown.repos.length && !lastKnown.truncatedRepos) delete record.stall
+    this.saveRecord(session)
+    this.emit_(record.id, { type: 'session.updated', session: record })
+    for (const job of finished) this.queueStallDone(record.id, job, finishedAt, lastKnown)
+  }
+
+  /** Queue a finished job's wake once: the event key dedupes the turn-end
+   *  and poll paths against each other, and only a newly queued notice is
+   *  logged. */
+  private queueStallDone(sessionId: string, job: StalledJob, finishedAt: string, lastKnown: { repos: StallRepo[], truncatedRepos: number }): void {
+    const queued = controlMessage(this.instance, sessionId, WORK_MONITOR_SENDER,
+      JSON.stringify(stallDoneNotice(sessionId, job, finishedAt, lastKnown)),
+      `stall-done:${sessionId}:${job.pid}:${job.startedAt}`)
+    if (queued) {
+      diagnostic({ level: 'info', operation: 'chat.work.stall_done', message: 'A tracked background job finished',
+        context: { sessionId, pid: job.pid, command: job.command } })
+    }
+  }
+
+  /** A background job's command as a stored label: secrets redacted, then
+   *  truncated. Deterministic, so the poll recognizes the same job again. */
+  private stallCommand(command: string): string {
+    return clip(this.options.extensions?.redact(command) ?? command, STALL_COMMAND_CHARS)
+  }
+
   // ── Process and host ───────────────────────────────────────────────────
 
   private hostFor(session: LiveSession): AdapterHost {
@@ -4764,6 +5192,46 @@ function implementingTurnOutcome(sessionId: string): { started: boolean, finishe
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+/** Where a stalled repo's leftover sits: `on chat/x` for the checkout
+ *  itself, `in poise on feat/y` for a nested clone. */
+function repoWhere(repo: StallRepo): string {
+  const branch = repo.branch || 'a detached HEAD'
+  return repo.path === '.' ? `on ${branch}` : `in ${repo.path} on ${branch}`
+}
+
+/** The stall wake body: what the turn left behind and what clears it. */
+function stallNotice(sessionId: string, stall: StallState): Record<string, unknown> {
+  const blockers: string[] = []
+  for (const repo of stall.repos) {
+    const where = repoWhere(repo)
+    if (repo.dirtyFiles) blockers.push(`Commit or set aside ${repo.dirtyFiles} uncommitted change${repo.dirtyFiles === 1 ? '' : 's'} ${where}`)
+    if (repo.unpushedCommits) blockers.push(`Push ${repo.unpushedCommits} unpushed commit${repo.unpushedCommits === 1 ? '' : 's'} ${where}`)
+  }
+  if (stall.truncatedRepos) blockers.push(`${stall.truncatedRepos} more task repo${stall.truncatedRepos === 1 ? '' : 's'} with leftover work; inspect the workspace`)
+  const shownJobs = stall.backgroundJobs.slice(0, MAX_STALL_JOBS)
+  for (const job of shownJobs) {
+    blockers.push(`Background job "${job.command}" (pid ${job.pid}) is still running; finish what you can now and end your turn — Poise wakes you when it finishes`)
+  }
+  const hiddenJobs = stall.backgroundJobs.length - shownJobs.length
+  if (hiddenJobs) blockers.push(`${hiddenJobs} more background job${hiddenJobs === 1 ? '' : 's'} still running; Poise wakes you as each finishes`)
+  return { kind: 'stall', session: sessionId, repos: stall.repos, ...(stall.truncatedRepos ? { truncatedRepos: stall.truncatedRepos } : {}),
+    backgroundJobs: shownJobs.map((job) => ({ pid: job.pid, command: job.command, startedAt: job.startedAt })),
+    ...(hiddenJobs ? { truncatedJobs: hiddenJobs } : {}),
+    blockers, done: STALL_DONE }
+}
+
+/** The completion wake body: a tracked background job finished. Its exit
+ *  code is unobservable once reparented, so the notice carries identity
+ *  and timing, and the woken turn reads the job's own result. */
+function stallDoneNotice(sessionId: string, job: StalledJob, finishedAt: string, lastKnown: { repos: StallRepo[], truncatedRepos: number }): Record<string, unknown> {
+  const durationMs = Math.max(0, Date.parse(finishedAt) - Date.parse(job.startedAt))
+  return { kind: 'stall-done', session: sessionId,
+    job: { pid: job.pid, command: job.command, startedAt: job.startedAt, finishedAt, durationMs },
+    lastKnown,
+    blockers: [`Background job "${job.command}" (pid ${job.pid}) finished; verify its result and finish the work it was for (push, PR, fixes)`],
+    done: STALL_DONE }
 }
 
 /** Muse rejects resuming a session whose reasoning was encrypted for a

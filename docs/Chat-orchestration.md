@@ -408,6 +408,19 @@ chat, nothing changes. Unknown or missing evidence keeps the unsettled
 baseline and retries; the wake fires exactly once per merged PR, marked
 truncated when a cap or a malformed stored read hid entries.
 
+A bound turn that ends normally with work left behind never settles
+silently: unpushed commits, uncommitted changes and still-running background
+jobs flag the chat as stalled in the session list and its header, and queue
+one wake notice for the episode — a worker that keeps ending turns with the
+same leftover is not nagged again. Repo sessions read the shared checkout
+on the session branch; a local worker's task repos are its nested clones,
+while the workspace root itself is Poise's checkpoint store and never
+flags. A tracked background job that finishes wakes the chat once with its
+identity and timing; its exit code is unobservable once reparented, so the
+woken turn reads the job's own result. The marker clears when a turn end
+finds nothing left. Unbound chats stay out: ending a turn with work in
+progress is normal conversation there.
+
 Work changes also enter the existing structured diagnostic log with the target,
 repository and responsible chat. The native `api` operation reaches Poise's
 normal local API for Current, Swarm, Behaviors, Editor, snippets, settings,
