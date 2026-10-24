@@ -1177,9 +1177,10 @@ export interface DeadLetterReconcileResult {
 // resolved (a later completion settled its target), superseded (its pull
 // request or issue closed), or explicitly held with the reason recorded.
 // Nothing is deleted: resolved and superseded rows retire with their
-// evidence, held rows stay open. Oldest first in bounded batches, so a
-// capped pass resumes where the previous one stopped; a hold is
-// re-recorded at most hourly so repeats stay quiet.
+// evidence, held rows stay open. Unseen rows first, then least-recently
+// rechecked, in bounded batches, so a capped pass resumes where the
+// previous one stopped and re-expired holds cannot starve newer rows; a
+// hold is re-recorded at most hourly so repeats stay quiet.
 export function reconcileBehaviorDeadLetters(
   openTargets: ReadonlySet<string>,
   behaviors: readonly string[] = ['review-new-prs', 'approve-prs'],
@@ -1203,7 +1204,8 @@ export function reconcileBehaviorDeadLetters(
       AND (? IS NULL OR lower(substr(COALESCE(dead.repo, dead.target), 1, instr(COALESCE(dead.repo, dead.target), '/') - 1)) = ?)
       AND dead.behavior IN (${behaviors.map(() => '?').join(', ')})
       AND (dead.resolution IS NULL OR dead.resolved_at IS NULL OR dead.resolved_at < ?)
-    ORDER BY dead.created_at ASC, dead.id ASC
+    ORDER BY CASE WHEN dead.resolution IS NULL THEN 0 ELSE 1 END ASC,
+      dead.resolved_at ASC, dead.created_at ASC, dead.id ASC
     LIMIT ?
   `).all(organization ?? null, organization?.toLowerCase() ?? null, ...behaviors, holdCutoff, limit) as Array<{
     id: string, behavior: string, target: string, repo: string | null, pr: number | null,

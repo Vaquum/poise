@@ -318,7 +318,8 @@ closed), or explicitly held, with the disposition, the evidence and the
 check time recorded on the row. Resolved and superseded rows retire; held
 rows stay open. Nothing is deleted. Quarantined rows are never resolved or
 superseded, and a repository that could not be listed holds its rows instead
-of proving anything about them.
+of proving anything about them. Unseen rows reconcile before rechecks of
+held rows, least-recently rechecked first.
 
 ## Replays
 

@@ -206,6 +206,29 @@ describe('dead-letter reconcile pass', () => {
     expect(store.reconcileBehaviorDeadLetters(new Set(), [], undefined, undefined, 2)).toEqual([])
   })
 
+  it('reconciles unseen rows before rechecks, least-recently rechecked first', async () => {
+    const store = await loadStore()
+    const now = Date.parse('2026-10-22T12:00:00Z')
+    const seed = async (target: string, pr: number, created: string, resolved: string | null) => {
+      const { id } = await failedLaunch(store, 'review-new-prs', target, 'Vaquum/repo', pr, 'timeout', created)
+      if (resolved) {
+        store.db.prepare(`UPDATE behavior_dead_letters
+          SET resolution = 'held', resolution_evidence = '{}', resolved_at = ? WHERE id = ?`).run(resolved, id)
+      }
+    }
+    await seed('Vaquum/repo#31', 31, '2026-10-17T10:00:00Z', '2026-10-22T10:00:00Z')
+    await seed('Vaquum/repo#32', 32, '2026-10-22T11:00:00Z', null)
+    await seed('Vaquum/repo#33', 33, '2026-10-20T10:00:00Z', '2026-10-22T09:00:00Z')
+    const open = new Set(['Vaquum/repo#31', 'Vaquum/repo#32', 'Vaquum/repo#33'])
+
+    const order: string[] = []
+    for (let pass = 0; pass < 3; pass++) {
+      order.push(...store.reconcileBehaviorDeadLetters(open, ['review-new-prs'], undefined, undefined, 1, now)
+        .map((row) => row.target))
+    }
+    expect(order).toEqual(['Vaquum/repo#32', 'Vaquum/repo#33', 'Vaquum/repo#31'])
+  })
+
   it('refuses an unbounded or empty reconcile batch', async () => {
     const store = await loadStore()
     expect(() => store.reconcileBehaviorDeadLetters(new Set(), ['review-new-prs'], undefined, undefined, 0))
