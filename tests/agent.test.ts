@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
   models: {} as Record<string, { default: string, fallback: string }>,
   agentAccount: 'bit-mis',
   // The scheduler's replay check; these tests admit everything unless told not to.
-  admit: vi.fn(async () => ({ author: 'poise-user', actor: 'bit-mis' })),
+  admit: vi.fn(async () => ({ author: 'poise-user', actor: 'bit-mis', accounts: { me: 'poise-user', agent: 'bit-mis' } })),
 }))
 
 vi.mock('esbuild', async importOriginal => {

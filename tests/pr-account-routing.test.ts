@@ -73,12 +73,15 @@ describe('PR account routing', () => {
     expect(() => prReviewer('review-bot')).toThrow('both')
   })
 
-  it('abandons a prepared review when its selected account changes', async () => {
+  it.each(['replace', 'swap'] as const)('abandons a prepared review on account %s', async (change) => {
     const { db, behaviors } = await initial()
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, options) => {
       const result = await original(command, args, options)
-      if (command === 'github-interface' && args[0] === '--head-sha') db.setMeta('me', 'replacement-user')
+      if (command === 'github-interface' && args[0] === '--head-sha') {
+        db.setMeta('me', change === 'swap' ? 'review-bot' : 'replacement-user')
+        if (change === 'swap') db.setMeta('agentAccount', 'poise-user')
+      }
       return result
     })
     await behaviors.runEnabledBehaviorsOnce()
@@ -196,18 +199,22 @@ describe('PR account routing', () => {
     expect(behaviors.getBehaviorsRuntimeHealth().failures.some((f) => f.error?.includes('Manual or unclaimed'))).toBe(true)
   })
 
-  it.each(['pr_review', 'pr_approve'] as const)('refuses %s replay when accounts change during publication checks', async (behavior) => {
+  it.each([['pr_review', 'replace'], ['pr_approve', 'replace'], ['pr_review', 'swap'], ['pr_approve', 'swap']] as const)('refuses %s replay on account %s during publication checks', async (behavior, change) => {
     const { db, behaviors } = await initial()
     db.setMeta('behavior_review_new_prs_enabled', '0')
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, options) => {
       const result = await original(command, args, options)
-      if (command === 'github-interface' && args[0] === '--review-activity-since') db.setMeta('me', 'replacement-user')
+      if (command === 'github-interface' && args[0] === '--review-activity-since') {
+        db.setMeta('me', change === 'swap' ? 'review-bot' : 'replacement-user')
+        if (change === 'swap') db.setMeta('agentAccount', 'poise-user')
+      }
       return result
     })
     await expect(behaviors.admitReplay(behavior, pr.repo, pr.number)).rejects.toThrow('GitHub accounts changed')
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
     db.setMeta('me', 'poise-user')
+    db.setMeta('agentAccount', 'review-bot')
     // Refusal releases the reservation so the original account can retry.
     mocks.runFile.mockImplementation(original)
     await expect(behaviors.admitReplay(behavior, pr.repo, pr.number)).resolves.toMatchObject({ actor: 'poise-user' })
@@ -244,7 +251,7 @@ describe('PR account routing', () => {
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
-  it.each(['disable', 'skip'] as const)('stops resolution when %s is saved during its final receipt lookup', async (change) => {
+  it.each(['disable', 'skip', 'swap'] as const)('stops resolution when %s is saved during its final receipt lookup', async (change) => {
     const { db, behaviors } = await initial()
     db.setMeta('behavior_review_new_prs_enabled', '0')
     db.setMeta('behavior_resolve_unblocking_enabled', '1')
@@ -259,7 +266,8 @@ describe('PR account routing', () => {
         // The first receipt read admits the candidate; the second prepares the mutation.
         vi.spyOn(agent, 'fetchAgentLogSnapshot').mockImplementationOnce(read).mockImplementationOnce(async (options) => {
           const snapshot = await read(options)
-          db.setMeta(change === 'disable' ? 'behavior_resolve_unblocking_enabled' : 'behavior_resolve_unblocking_skip_repos', change === 'disable' ? '0' : JSON.stringify([pr.repo]))
+          if (change === 'swap') { db.setMeta('me', 'review-bot'); db.setMeta('agentAccount', 'poise-user') }
+          else db.setMeta(change === 'disable' ? 'behavior_resolve_unblocking_enabled' : 'behavior_resolve_unblocking_skip_repos', change === 'disable' ? '0' : JSON.stringify([pr.repo]))
           changed = true
           return snapshot
         })
@@ -300,7 +308,7 @@ describe('PR account routing', () => {
     expect(behaviors.getBehaviorsRuntimeHealth().holds).toEqual([expect.objectContaining({ actor: 'review-bot' })])
   })
 
-  it.each(['manual', 'replay'] as const)('refuses %s launch when accounts change during the final model lookup', async (mode) => {
+  it.each([['manual', 'replace'], ['replay', 'replace'], ['manual', 'swap'], ['replay', 'swap']] as const)('refuses %s launch on account %s during the final model lookup', async (mode, change) => {
     const { db } = await initial()
     db.setMeta('behavior_review_new_prs_enabled', '0')
     const models = await import('../server/models')
@@ -315,14 +323,51 @@ describe('PR account routing', () => {
         checkoutReady = true
         models.invalidateCatalog()
       }
-      if (checkoutReady && command === 'agent-interface' && args[0] === '--models') db.setMeta('me', 'replacement-user')
+      if (checkoutReady && command === 'agent-interface' && args[0] === '--models') {
+        db.setMeta('me', change === 'swap' ? 'review-bot' : 'replacement-user')
+        if (change === 'swap') db.setMeta('agentAccount', 'poise-user')
+      }
       return result
     })
     const agent = await import('../server/agent')
     const launch = mode === 'manual' ? agent.triggerPrReview(pr.url)
-      : agent.replayAgentJob({ behavior: 'pr_review', repo: pr.repo, pr_id: pr.number }, async () => ({ author: 'review-bot', actor: 'poise-user' }))
+      : agent.replayAgentJob({ behavior: 'pr_review', repo: pr.repo, pr_id: pr.number }, async () => ({ author: 'review-bot', actor: 'poise-user', accounts: { me: 'poise-user', agent: 'review-bot' } }))
     await expect(launch).rejects.toThrow('GitHub accounts changed')
     expect(checkoutReady).toBe(true)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it.each(['background', 'replay'] as const)('stops %s approval when a role swap would bypass manual-review ownership', async (mode) => {
+    const { db, behaviors } = await initial('poise-user')
+    db.setMeta('behavior_review_new_prs_enabled', '0')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    recordCompletedInitialReview(db, { outcome: 'changes_requested' })
+    fixture.agentLogs = [agentLog({ id: 'c'.repeat(32), actor: 'review-bot', status: 'completed', action: 'requested_changes', outcome: 'changes_requested', head_sha: HEAD_SHA, review_id: 91, correlation_id: 'old-call', completed_at: new Date().toISOString() })]
+    // The agent role permits these reviews; making it the main role requires ownership of 999.
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA, reviewerReviewIdsSince: [91, 999] })
+    const models = await import('../server/models')
+    const original = mocks.runFile.getMockImplementation()!
+    let swapped = false
+    let checkoutReady = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await original(command, args, options)
+      if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+        checkoutReady = true
+        models.invalidateCatalog()
+      }
+      if (checkoutReady && command === 'agent-interface' && args[0] === '--models') {
+        db.setMeta('me', 'review-bot')
+        db.setMeta('agentAccount', 'poise-user')
+        swapped = true
+      }
+      return result
+    })
+    if (mode === 'background') await behaviors.runEnabledBehaviorsOnce()
+    else {
+      const { replayAgentJob } = await import('../server/agent')
+      await expect(replayAgentJob({ behavior: 'pr_approve', repo: pr.repo, pr_id: pr.number }, behaviors.admitReplay)).rejects.toThrow('GitHub accounts changed')
+    }
+    expect(swapped).toBe(true)
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 })

@@ -12,8 +12,10 @@ behavior enable switches and repository skips apply in both directions. Issue
 reviews continue to use the agent account alone. Neither saved settings nor gh's
 active account is switched. The human account now also spends automation API quota.
 
-Evidence reads are batched separately per acting account. Each admission pins its
-reviewer; a settings change before launch refuses that admission. Completed work
+Evidence reads are batched separately per acting account. Review and approval
+admissions pin their account pair and reviewer; a role swap before launch refuses
+that admission even when the reviewer username stays the same. Resolution pins
+the pair before invoking Caller. Completed work
 and uncertain publications retain their original actor and dedupe identities.
 Existing baseline markers remain: previously unclaimed agent PRs become eligible
 on a normal scan; first enable snapshots both authors. No age cutoff is added.

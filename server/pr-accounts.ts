@@ -8,6 +8,13 @@ export function prAccounts(): { me: string, agent: string } {
   return { me, agent }
 }
 
+/** A role swap can preserve the reviewer username while changing review ownership. */
+export function prAccountsMatch(expected: ReturnType<typeof prAccounts>): boolean {
+  const current = prAccounts()
+  return current.me.toLowerCase() === expected.me.toLowerCase()
+    && current.agent.toLowerCase() === expected.agent.toLowerCase()
+}
+
 /** Explicit manual reviews of third-party PRs retain the agent reviewer. */
 export function prReviewer(author: string, manual = false): string {
   const { me, agent } = prAccounts()

@@ -85,7 +85,7 @@ import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type Check
 import { withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { agentAccount, requireAgentAccount } from './settings'
-import { prAccounts, prReviewer } from './pr-accounts'
+import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { behaviorHeld } from './alerts/producers'
 
@@ -2272,6 +2272,7 @@ async function slotModel(slot: ReviewerSlot): Promise<{ model: string, recovery:
 }
 
 interface PreparedReviewTarget {
+  accounts: ReturnType<typeof prAccounts>
   pr: DatastorePr
   num: string
   key: string
@@ -2303,6 +2304,7 @@ async function prepareReviewTarget(
   key: string,
   slot: ReviewerSlot,
 ): Promise<PreparedReviewTarget | null> {
+  const accounts = prAccounts()
   const reviewer = configuredReviewer(pr.author)
   const target = reviewSlotTarget(key, slot)
   const checkTarget = `${target}:check`
@@ -2344,14 +2346,14 @@ async function prepareReviewTarget(
         throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
       }
       const expectedHead = await currentHeadSha(pr.repo, pr.number, actor)
-      if (!isEnabled('review-new-prs') || behaviorAborted() || !stillEligible('review-new-prs', pr, actor)) return null
+      if (!isEnabled('review-new-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('review-new-prs', pr, actor)) return null
       let changes: ChangesAddressedResult | null = null
       if (reviewer) {
         changes = await checkChangesAddressed(pr.repo, pr.number, reviewer)
         if (!isEnabled('review-new-prs') || behaviorAborted()) return null
       }
       prepared = {
-        pr, num, key, slot, target, checkTarget, operationId,
+        accounts, pr, num, key, slot, target, checkTarget, operationId,
         owner, repo, reviewer, actor, model, recovery, catalog,
         modelCliEnv, expectedHead, changes, source: 'poise:review-new-prs',
       }
@@ -2678,7 +2680,7 @@ async function tickReviewNewPrs(): Promise<void> {
             if (behaviorAborted()) { releasePhase2Leases(); return }
             if (!isEnabled('review-new-prs')) { releaseLeases(null); continue }
             if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) { releaseLeases(null); continue }
-            if (!stillEligible('review-new-prs', pr, bundle.actor)) { releaseLeases(null); continue }
+            if (!prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) { releaseLeases(null); continue }
             const primaryFresh = !hasSeen('review-new-prs', key) || !!getFailedBehaviorLaunch('review-new-prs', key)
             const panelKey = `${META_PREFIX}review_new_prs_panel:${key}`
             let admitted = parseJsonMeta(panelKey)
@@ -2786,7 +2788,7 @@ async function tickReviewNewPrs(): Promise<void> {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
         const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor)
-        if (behaviorAborted() || !isEnabled('review-new-prs') || !stillEligible('review-new-prs', pr, bundle.actor)) {
+        if (behaviorAborted() || !isEnabled('review-new-prs') || !prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
           captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
@@ -3454,6 +3456,7 @@ async function fireApprove(
 ): Promise<boolean> {
   return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author) }, async () => {
   if (!isEnabled('approve-prs')) return false
+  const accounts = prAccounts()
   const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url: ' + pr.url)
   const [, owner, repo, num] = m
@@ -3497,7 +3500,7 @@ async function fireApprove(
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead, actor)
   const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor)
   const selectedModel = (await reviewChoice('pr_approve')).model
-  if (!isEnabled('approve-prs') || behaviorAborted() || !stillEligible('approve-prs', pr, actor)) return false
+  if (!isEnabled('approve-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('approve-prs', pr, actor)) return false
   if (selectedModel !== model) return false
   if (admittedReviewer && configuredReviewer(pr.author).toLowerCase() !== admittedReviewer.toLowerCase()) return false
   if (replacesFailedCallId && !renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
@@ -4030,6 +4033,7 @@ export function getResolveUnblockingLastFired(): { at: string, target: string } 
 // execution time and reports superseded when the head already moved.
 async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, reviewer: string): Promise<ResolveResult | null> {
   const { repo, number } = pr
+  const accounts = prAccounts()
   const [owner, name] = repo.split('/', 2)
   if (!owner || !name || !Number.isSafeInteger(number) || number < 1) {
     throw new Error(`invalid GitHub PR identity: ${repo}#${number}`)
@@ -4037,7 +4041,7 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
   const reviewEnvironment = await automatedReviewEnvironment(repo, number, reviewer)
-  if (!isEnabled('resolve-unblocking') || behaviorAborted() || !stillEligible('resolve-unblocking', pr, reviewer)) return null
+  if (!isEnabled('resolve-unblocking') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('resolve-unblocking', pr, reviewer)) return null
   const nativeId = randomUUID()
   captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
     source: 'poise:resolve-unblocking', owner: currentOrganization()?.login ?? null,
@@ -5662,12 +5666,13 @@ export class ReplayRefusedError extends HttpError {
   }
 }
 
-export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<{ author: string, actor: string, reviewEnvironment?: NodeJS.ProcessEnv } | void> {
+export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv } | void> {
   const owner = repo.split('/')[0].toLowerCase()
   const org = readyOrganizations().find((candidate) => candidate.login.toLowerCase() === owner)
   if (!org) throw new ReplayRefusedError(`${repo} does not belong to a ready GitHub account`)
   let author: string | undefined
   let actor: string | undefined
+  let accounts: ReturnType<typeof prAccounts> | undefined
   let reviewEnvironment: NodeJS.ProcessEnv | undefined
   const refusal = await behaviorOrganization.run(org, async () => {
     try {
@@ -5678,16 +5683,17 @@ export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, n
         ? issueReviewRefusal(issueReviewPolicy(), repo, number, await readIssue(repo, number))
         : pullRequestRefusal(pullRequestPolicy(REPLAY_SKIPS[behavior]), repo, number, pr)
       if (targetRefusal || behavior === 'issue_review') return targetRefusal
+      accounts = prAccounts()
       actor = configuredReviewer(author)
       reviewEnvironment = behavior === 'pr_approve' ? await automatedReviewEnvironment(repo, number, actor) : undefined
-      if (configuredReviewer(author) !== actor) return 'GitHub accounts changed; retry the replay'
-      return await replayPublicationRefusal(behavior, repo, number, actor, author!)
+      if (!prAccountsMatch(accounts) || configuredReviewer(author) !== actor) return 'GitHub accounts changed; retry the replay'
+      return await replayPublicationRefusal(behavior, repo, number, actor, author!, accounts)
     } catch (error) {
       throw new HttpError(502, `Replay could not check ${repo}#${number}: ${behaviorErrorMessage(error)}`)
     }
   })
   if (refusal) throw new ReplayRefusedError(refusal)
-  if (author && actor) return { author, actor, reviewEnvironment }
+  if (author && actor && accounts) return { author, actor, accounts, reviewEnvironment }
 }
 
 // A replay carries no call identity — behavior, repository and number only —
@@ -5717,6 +5723,7 @@ async function replayPublicationRefusal(
   number: number,
   reviewer: string,
   author: string,
+  accounts: ReturnType<typeof prAccounts>,
 ): Promise<string | null> {
   const reservedAt = Date.now()
   if (!reserveBehaviorReplay(repo, number, behavior, reservedAt)) {
@@ -5726,7 +5733,7 @@ async function replayPublicationRefusal(
   let refusal: string | null
   try {
     refusal = await replayTargetRefusal(behavior, repo, number, reviewer)
-    if (!refusal && configuredReviewer(author) !== reviewer) refusal = 'GitHub accounts changed; retry the replay'
+    if (!refusal && (!prAccountsMatch(accounts) || configuredReviewer(author) !== reviewer)) refusal = 'GitHub accounts changed; retry the replay'
   } catch (error) {
     releaseBehaviorReplay(repo, number, behavior, stamp)
     throw error

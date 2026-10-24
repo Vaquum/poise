@@ -28,7 +28,7 @@ import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic } from './logging'
 import { requireAgentAccount } from './settings'
-import { prAccounts, prReviewer } from './pr-accounts'
+import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { resolveReviewCheckout } from './review-checkout'
 import { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, parseAgentLogStdout, scopedAgentLogs } from './agent-log-parse'
 import type { AgentLogParseReply, AgentLogParseRequest } from './agent-log-worker'
@@ -544,7 +544,7 @@ export async function triggerPrReview(
 
   if (claude) await claudeAuth.requireReady()
   const selectedModel = (await reviewChoice('pr_review')).model
-  if (prReviewer(author, true) !== actor) throw new Error('GitHub accounts changed; retry the review')
+  if (!prAccountsMatch(accounts) || prReviewer(author, true) !== actor) throw new Error('GitHub accounts changed; retry the review')
   if (selectedModel !== model) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: 'review-new-prs', source, owner, actor, repository: repoFullName,
@@ -581,7 +581,7 @@ export async function triggerPrReview(
 // admitReplay): it reads the target fresh and throws when the scheduler would
 // not act on it. Passed in rather than imported, so this bridge to Caller does
 // not depend on the behavior runtime.
-export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, reviewEnvironment?: NodeJS.ProcessEnv } | void>
+export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv } | void>
 
 // Replay an existing agent-interface job — used by the Swarm view's
 // Replay column. The frontend sends the row's `behavior` + `repo` +
@@ -615,7 +615,7 @@ export async function replayAgentJob(input: {
   const admission = await admit(behavior, repo, Number(prId))
   if (!admission) throw new Error('Replay admission returned no PR author')
   const actor = admission.actor
-  if (prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
+  if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
   const { model, recovery, catalog } = await reviewChoice(place)
   const claude = needsClaude(catalog, model)
@@ -628,7 +628,7 @@ export async function replayAgentJob(input: {
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
   const selectedModel = (await reviewChoice(place)).model
-  if (prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
+  if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   if (selectedModel !== model) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,

@@ -248,7 +248,7 @@ describe('replay publication refusal', () => {
     await expect(Promise.all([
       behaviors.admitReplay('pr_review', pr.repo, pr.number),
       behaviors.admitReplay('pr_approve', pr.repo, pr.number),
-    ])).resolves.toEqual([{ author: pr.author, actor: 'review-bot', reviewEnvironment: undefined }, { author: pr.author, actor: 'review-bot', reviewEnvironment: {} }])
+    ])).resolves.toEqual([{ author: pr.author, actor: 'review-bot', accounts: { me: 'poise-user', agent: 'review-bot' }, reviewEnvironment: undefined }, { author: pr.author, actor: 'review-bot', accounts: { me: 'poise-user', agent: 'review-bot' }, reviewEnvironment: {} }])
   })
 
   it('releases its reservation when refused, leaving nothing behind', async () => {
