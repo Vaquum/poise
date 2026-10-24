@@ -17,7 +17,7 @@ import { ensureSnippetSwitch, readSwitch } from '../snippet-library'
 import { MANAGER_SWITCH, WORKER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '../../src/chat-switches'
 import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-receipts'
 import { actorOf, nativeName } from './actors'
-import type { ChatActor, ChatEnvelope, ChatHold, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
+import type { ChatActor, ChatEnvelope, ChatHold, MessageQueue, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
 import { findEvent } from './storage'
 import { ChatError, type ChatRuntime } from './runtime'
 import { GREY_CI_INTENT_KEY, getEnabledMap, getBehaviorsRuntimeHealth, isEnabled, pullRequestPolicy, pullRequestRefusal, withBehaviorOrganization } from '../behaviors'
@@ -481,6 +481,13 @@ const WORK_DONE = [
 const AUTOMATION_KEYS = new Set<string>([...(BEHAVIOR_KEYS as readonly string[]), GREY_CI_INTENT_KEY])
 function humanOnly(actionable: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
   return actionable.filter(row => !AUTOMATION_KEYS.has(String(row.key ?? '').split(':')[0]))
+}
+/** A queue holds ordinary and timer delivery while an item runs or an armed
+ *  tail waits its turn. Unarmed waiting items and failed ones never block a
+ *  fresh task: they wait for exactly such a delivery to complete (#590). */
+function queueHoldsDelivery(queue: MessageQueue | undefined): boolean {
+  return !!queue && (queue.items.some(item => item.state === 'running')
+    || (queue.ready && queue.items.some(item => item.state === 'waiting')))
 }
 
 export class ChatControl {
@@ -1249,7 +1256,7 @@ export class ChatControl {
   private ordinaryReady(recipient: string): boolean {
     const session = this.runtime.get(recipient)
     return !!session && session.status === 'idle' && !session.contextResetting && !session.contextCompacting
-      && !session.queue?.items.length && !(session.role === 'manager' && session.retiredModel)
+      && !queueHoldsDelivery(session.queue) && !(session.role === 'manager' && session.retiredModel)
   }
 
   private admitOrdinaryRow(recipient: string, item: store.InternalMessage, now: number): void {
@@ -1300,8 +1307,7 @@ export class ChatControl {
     if (['starting', 'queued', 'running', 'stopping'].includes(session.status)) return session.status as store.WaitingFor
     if (session.status === 'waiting') return 'waiting'
     if (session.contextResetting || session.contextCompacting) return 'maintenance'
-    const queue = session.queue
-    if (queue && (queue.items.some(item => item.state === 'running') || (queue.ready && queue.items.some(item => item.state === 'waiting')))) return 'queue'
+    if (queueHoldsDelivery(session.queue)) return 'queue'
     if (session.role === 'manager' && session.retiredModel) return 'model'
     if (this.personGraceActive(recipient, now)) return 'person'
     if (session.status === 'closed') {
