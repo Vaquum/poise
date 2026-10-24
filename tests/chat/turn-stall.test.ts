@@ -1332,7 +1332,7 @@ describe('turn stall detection and waking', () => {
     }
     store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
     runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
-    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1, 45_000)
     await waitFor(() => lastStatus(events, session.id) === 'idle')
 
     const stalled = runtime.get(session.id)?.stall
@@ -1342,7 +1342,7 @@ describe('turn stall detection and waking', () => {
     expect(stalled?.unreadablePaths).toEqual(['bulk'])
     await runtime.stop({ handover: false })
     // The 100k-entry fixture is heavy by design; past the file's usual 40 s.
-  }, 60_000)
+  }, 90_000)
 
   it('flags linked worktrees with quoting and newline paths exactly', async () => {
     const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
@@ -1429,6 +1429,94 @@ describe('turn stall detection and waking', () => {
     } finally {
       for (const dir of deep) spawnSync('chmod', ['755', dir])
     }
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('names twenty deep repos in the wake without losing it', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-deep-repos:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    // Twenty ~1KB-deep dirty repos: serialized in full twice, the notice
+    // would pass the 32 KiB inbox bound and the wake would throw.
+    for (let n = 0; n < 20; n++) {
+      let dir = join(session.checkout, `r${String(n).padStart(2, '0')}`)
+      for (let level = 0; level < 4; level++) {
+        dir = join(dir, 'x'.repeat(250))
+        await mkdir(dir, { recursive: true })
+      }
+      const inited = spawnSync('git', ['init', '-q', '-b', 'main', dir], { encoding: 'utf8' })
+      if (inited.status !== 0) throw new Error(`git init: ${inited.stderr}`)
+      await writeFile(join(dir, 'draft.txt'), 'uncommitted\n')
+    }
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // The marker keeps full paths as keep-identity; only the notice clips.
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled?.repos).toHaveLength(20)
+    expect(stalled?.repos[0].path.length).toBeGreaterThan(200)
+    expect(stalled?.repos[0].path.startsWith('…')).toBe(false)
+    const inbox = store.inbox(runtime.instance, session.id)
+    expect(inbox).toHaveLength(1)
+    expect(Buffer.byteLength(inbox[0].body)).toBeLessThanOrEqual(32 * 1024)
+    const notice = JSON.parse(inbox[0].body) as { repos: Array<{ path: string }>, truncated?: boolean, blockers: string[] }
+    expect(notice.truncated).toBeUndefined()
+    expect(notice.repos).toHaveLength(20)
+    expect(notice.blockers.join('\n')).toContain('…')
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('falls back to a summary wake when the leftover list exceeds the notice bound', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-summary:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    // Twenty deep repos with long branches, each dirty and unpushed, plus
+    // kept background jobs: past 32 KiB even clipped, so only a summary fits.
+    const branch = `${'b/'.repeat(150)}work`
+    for (let n = 0; n < 20; n++) {
+      let dir = join(session.checkout, `s${String(n).padStart(2, '0')}`)
+      for (let level = 0; level < 4; level++) {
+        dir = join(dir, 'x'.repeat(250))
+        await mkdir(dir, { recursive: true })
+      }
+      const inited = spawnSync('git', ['init', '-q', '-b', 'main', dir], { encoding: 'utf8' })
+      if (inited.status !== 0) throw new Error(`git init: ${inited.stderr}`)
+      git(['checkout', '-qb', branch], dir)
+      await writeFile(join(dir, 'fix.txt'), 'fix\n')
+      git(['add', 'fix.txt'], dir)
+      git(['commit', '-qm', 'unpushed fix'], dir)
+      await writeFile(join(dir, 'draft.txt'), 'uncommitted\n')
+    }
+    const seed = runtime.get(session.id)
+    if (!seed) throw new Error('no session record')
+    const now = new Date().toISOString()
+    seed.stall = { episode: 'e1', at: now, updatedAt: now, repos: [], backgroundJobs: Array.from({ length: 21 },
+      (_, n) => ({ pid: 42424200 + n, pgid: 42424200, command: 'x'.repeat(200), startedAt: now })) }
+    storage.saveSession(seed)
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled?.repos).toHaveLength(20)
+    expect(stalled?.backgroundJobs).toHaveLength(21)
+    const inbox = store.inbox(runtime.instance, session.id)
+    expect(inbox).toHaveLength(1)
+    expect(Buffer.byteLength(inbox[0].body)).toBeLessThanOrEqual(32 * 1024)
+    const notice = JSON.parse(inbox[0].body) as { repos: unknown[], truncated: boolean,
+      truncatedRepos: number, truncatedJobs: number, blockers: string[] }
+    expect(notice.truncated).toBe(true)
+    expect(notice.repos).toHaveLength(0)
+    expect(notice.truncatedRepos).toBe(20)
+    expect(notice.truncatedJobs).toBe(21)
+    expect(notice.blockers.join('\n')).toContain('exceeds the notice bound')
     await runtime.stop({ handover: false })
   }, 40_000)
 })
