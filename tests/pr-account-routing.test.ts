@@ -85,13 +85,14 @@ describe('PR account routing', () => {
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
-  it.each([['review-bot', 'poise-user'], ['dependabot[bot]', 'review-bot'], ['contributor', 'review-bot']])('discovers %s and provisions its manual review as %s', async (author, actor) => {
+  it.each([['review-bot', 'poise-user', ''], ['review-bot', 'poise-user', 'review-bot'], ['dependabot[bot]', 'review-bot', 'poise-user'], ['contributor', 'review-bot', 'poise-user']])('discovers %s and provisions its manual review as %s when %s cannot read', async (author, actor, deniedReader) => {
     const { db } = await initial()
     db.setMeta('behavior_review_new_prs_enabled', '0')
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, options) => {
       const result = await original(command, args, options)
       if (command === 'github-interface' && args[0] === '--head-sha') {
+        if (value(args, '--token-user') === deniedReader) throw new Error('GitHub 404: Not Found')
         const packet = JSON.parse(result.stdout); packet.author = author
         return { ...result, stdout: JSON.stringify(packet) }
       }
@@ -101,7 +102,7 @@ describe('PR account routing', () => {
     await triggerPrReview(pr.url)
     expect(value(mocks.spawnDetached.mock.calls[0][1], '--actor')).toBe(actor)
     const headReads = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--head-sha')
-    expect(value(headReads[0][1], '--token-user')).toBe('poise-user')
+    expect(value(headReads[0][1], '--token-user')).toBe('review-bot')
     expect(headReads.slice(1).every(([, args]) => value(args, '--token-user') === actor)).toBe(true)
   })
 

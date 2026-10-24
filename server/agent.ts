@@ -529,7 +529,9 @@ export async function triggerPrReview(
   if (!m) throw new Error('not a github PR url')
   const [, owner, repo, num] = m
   const repoFullName = `${owner}/${repo}`
-  const author = await getPrAuthor(repoFullName, Number(num), prAccounts().me)
+  const accounts = prAccounts()
+  const author = await getPrAuthor(repoFullName, Number(num), accounts.agent)
+    .catch(() => getPrAuthor(repoFullName, Number(num), accounts.me))
   const actor = prReviewer(author, true)
   const { model, recovery, catalog } = await reviewChoice('pr_review')
   const claude = needsClaude(catalog, model)
