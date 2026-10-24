@@ -659,6 +659,47 @@ describe('stopping following an organization', () => {
     expect(database!.getMeta('organization_generation:acme')).toBe('1')
   })
 
+  it('refuses the second of two concurrent removals that would leave none', async () => {
+    await addReady('acme')
+    await addReady('beta')
+    database!.db.prepare('DELETE FROM organizations WHERE login = ? COLLATE NOCASE').run('Legacy')
+    database!.setMeta('org', '')
+    // Beta's sync holds its abort: the removal waits inside the job settle
+    // even after aborting, while acme's removal lands.
+    let releaseAbort!: () => void
+    const abortGate = new Promise<void>((resolve) => { releaseAbort = resolve })
+    let aborted = false
+    let held = false
+    const baseCli = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: RunFileOptions) => {
+      if (command === 'github-datastore' && args[2] === 'health' && (args[1] as string).includes('/beta/') && !held) {
+        held = true
+        await new Promise<void>((resolve) => options.signal!.addEventListener('abort', () => resolve(), { once: true }))
+        aborted = true
+        await abortGate
+        throw new Error('aborted')
+      }
+      return (baseCli as (...call: unknown[]) => Promise<{ stdout: string, stderr: string }>)(command, args, options)
+    })
+    const health = () => datastoreCalls().filter(([, args]: any[]) => args[2] === 'health' && (args[1] as string).includes('/beta/')).length
+    const before = health()
+    expect((await request('/api/organizations/beta/retry', {})).status).toBe(202)
+    await vi.waitFor(() => expect(health()).toBeGreaterThan(before))
+    // Beta's removal passes its first check with two left, then waits.
+    const beta = remove('beta', true)
+    await vi.waitFor(() => expect(aborted).toBe(true))
+    expect((await remove('acme', true)).status).toBe(200)
+    expect(registered('beta')).toBe(true)
+    // The recheck refuses: beta is now the last GitHub account.
+    releaseAbort()
+    const refused = await beta
+    expect(refused.status).toBe(400)
+    expect(refused.body.error).toContain('last GitHub account')
+    expect(registered('beta')).toBe(true)
+    expect(registered('acme')).toBe(false)
+    expect((await request('/api/organizations')).body.organizations.map((org) => org.login)).toEqual(['beta'])
+  })
+
   it('activates a re-added organization cleanly while the old job stays fenced', async () => {
     pendingIndex = new Promise<void>((resolve) => { releaseIndex = resolve })
     expect((await request('/api/organizations', { org: 'acme' })).status).toBe(202)

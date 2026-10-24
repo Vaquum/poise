@@ -280,6 +280,12 @@ export async function removeOrganization(value: unknown): Promise<void> {
     job.controller.abort()
     await Promise.allSettled([job.promise])
   }
+  // Rechecked after the wait above: a concurrent removal may have landed
+  // while it was awaited. The recheck and the delete below are
+  // synchronous, so two removals cannot both pass with two left.
+  if (getOrganizations().length <= 1) {
+    throw new Error(`Cannot stop following ${row.login}: it is the last GitHub account.`)
+  }
   setMeta(generationKey(login), String(organizationGeneration(login) + 1))
   db.prepare('DELETE FROM organizations WHERE login = ?').run(login)
   resolveOrganizationAlerts(login)
