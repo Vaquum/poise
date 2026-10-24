@@ -44,3 +44,9 @@ export function deleteConfirmCopy(session: SessionRecord, sessions: Iterable<Ses
   }
   return { title: 'Confirm delete (keeps its workspace)', label: 'Confirm deleting session (keeps its workspace)' }
 }
+
+/** The armed bulk-delete confirmation states how many chats go with it. */
+export function deleteBulkConfirmCopy(count: number): DeleteConfirmCopy {
+  const chats = count === 1 ? '1 chat' : `${count} chats`
+  return { title: `Delete ${chats}?`, label: `Confirm deleting ${chats}` }
+}
