@@ -251,6 +251,33 @@ describe('replay publication refusal', () => {
     ])).resolves.toEqual([undefined, undefined])
   })
 
+  it('releases its reservation when refused, leaving nothing behind', async () => {
+    arrangeCli(false, false, {
+      reviewerReviewsSinceItems: [{ id: 91, state: 'APPROVED', commit: HEAD_SHA }],
+    })
+    const { database, behaviors } = await admitReady()
+
+    await expect(behaviors.admitReplay('pr_approve', pr.repo, pr.number))
+      .rejects.toMatchObject({ statusCode: 409 })
+    expect(database.db.prepare('SELECT count(*) FROM behavior_replay_reservations').pluck().get()).toBe(0)
+  })
+
+  it('fences the launch claim itself while reserved, atomically with the claim', async () => {
+    arrangeCli()
+    const { database } = await admitReady()
+    const target = `${pr.repo}#${pr.number}`
+    const claimId = database.claimSeenOwned('review-new-prs', target)!
+    const intent = {
+      key: 'review-new-prs', target, claimId, launchBehavior: 'pr_review' as const,
+      repo: pr.repo, pr: pr.number, requestedAt: new Date().toISOString(),
+      expectedHead: HEAD_SHA, actor: 'review-bot', source: 'poise:review-new-prs', correlationId: claimId,
+    }
+    expect(database.reserveBehaviorReplay(pr.repo, pr.number, 'pr_review')).toBe(true)
+    expect(database.markBehaviorLaunchIntentOwned(intent)).toBe(false)
+    database.db.prepare('DELETE FROM behavior_replay_reservations').run()
+    expect(database.markBehaviorLaunchIntentOwned(intent)).toBe(true)
+  })
+
   it('admits past an expired reservation', async () => {
     arrangeCli()
     const { database, behaviors } = await admitReady()

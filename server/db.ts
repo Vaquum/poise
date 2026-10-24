@@ -634,6 +634,15 @@ export function markBehaviorLaunchIntentOwned(input: {
         AND lower(launch_actor) = lower(?) AND launch_source = 'poise:approve-prs'
         AND launch_error IS NOT NULL AND launch_outcome IS NULL AND launch_quarantine IS NULL)
     )
+    -- A live replay reservation fences this target atomically with the
+    -- claim: an admitted replay is preparing to spawn, and a scheduler
+    -- worker now would duplicate it. Issue reviews never reserve, so the
+    -- predicate passes them through.
+    AND NOT EXISTS (
+      SELECT 1 FROM behavior_replay_reservations AS reservation
+      WHERE reservation.repo = ? AND reservation.pr = ?
+        AND reservation.behavior = ? AND reservation.expires_at >= ?
+    )
   `).run(
     input.claimId,
     input.launchBehavior,
@@ -656,6 +665,10 @@ export function markBehaviorLaunchIntentOwned(input: {
     input.repo,
     input.pr,
     input.actor,
+    input.repo,
+    input.pr,
+    input.launchBehavior,
+    new Date().toISOString(),
   )
   return info.changes === 1
 }
@@ -1284,6 +1297,20 @@ export function reserveBehaviorReplay(repo: string, pr: number, behavior: string
     WHERE behavior_replay_reservations.expires_at < excluded.created_at
   `).run(repo, pr, behavior, now, expires)
   return info.changes === 1
+}
+
+// Release a reservation this caller holds, identified by its own stamp so
+// a replacement reservation cannot be deleted by mistake.
+export function releaseBehaviorReplay(
+  repo: string,
+  pr: number,
+  behavior: string,
+  createdAt: string,
+): void {
+  db.prepare(`
+    DELETE FROM behavior_replay_reservations
+    WHERE repo = ? AND pr = ? AND behavior = ? AND created_at = ?
+  `).run(repo, pr, behavior, createdAt)
 }
 
 export function listBehaviorDeadLetters(limit = 50, organization?: string): BehaviorDeadLetter[] {

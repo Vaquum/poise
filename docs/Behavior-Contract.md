@@ -342,11 +342,12 @@ current head. Each behavior replays only its own publication kind: an
 approval for `pr_approve`; a commented or change-requested review for
 `pr_review`, unless a failed review slot on that head is still outstanding.
 Panel siblings share the agent account, so a review another Caller row claims
-as its own receipt is not a duplicate. Dismissed reviews never count. An
-admitted replay reserves its target for ten minutes, so a concurrent replay
-of the same target is refused while preparation and spawn are ahead. The
-scheduler skips a reserved target the same way, so a tick during replay
-preparation cannot start a duplicate worker. An
+as its own receipt is not a duplicate. Dismissed reviews never count. A
+replay reserves its target for ten minutes before its checks and holds it
+through spawn, so a concurrent replay is refused while preparation and
+spawn are ahead. Launch claims fence live reservations atomically, so a
+scheduler tick in that window skips instead of starting a duplicate
+worker; a refused replay releases its reservation. An
 `issue_review` replay stays a deliberate fresh run that comments again: it
 takes no publication check.
 

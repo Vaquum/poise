@@ -57,6 +57,7 @@ import {
   quarantineBehaviorLaunchOwned,
   retireBehaviorDeadLetter,
   reconcileBehaviorDeadLetters,
+  releaseBehaviorReplay,
   replayReservationActive,
   reserveBehaviorReplay,
   retireBehaviorDeadLettersForTarget,
@@ -1102,13 +1103,6 @@ function markLaunchIntent(
   plannedSlots: ReviewerSlot[] = ['primary'],
   replacesFailedCallId?: string,
 ): boolean {
-  // A live replay reservation fences this target: an admitted replay is
-  // preparing to spawn, and a scheduler worker now would duplicate it.
-  // The tick skips; the short reservation expires on its own.
-  if (replayReservationActive(pr.repo, pr.number, upstreamBehavior(behavior))) {
-    console.log(`[behaviors] ${behavior} skipped for ${pr.repo}#${pr.number} — a replay is in progress`)
-    return false
-  }
   const source = `poise:${behavior}` as const
   const startedAt = new Date().toISOString()
   const admitted = markBehaviorLaunchIntentOwned({
@@ -1125,14 +1119,23 @@ function markLaunchIntent(
     correlationId: claimId,
     replacesFailedCallId,
   })
-  if (admitted) captureBehaviorAdmission({
+  if (!admitted) {
+    // Best-effort reason: the claim above already fences live replay
+    // reservations atomically, so a tick during replay preparation skips
+    // instead of starting a duplicate worker.
+    if (replayReservationActive(pr.repo, pr.number, upstreamBehavior(behavior))) {
+      console.log(`[behaviors] ${behavior} skipped for ${pr.repo}#${pr.number} — a replay is in progress`)
+    }
+    return false
+  }
+  captureBehaviorAdmission({
     admissionKey: behavior === 'review-new-prs'
       ? scopedMetaKey(`${META_PREFIX}review_new_prs_panel:${pr.repo}#${pr.number}`)
       : JSON.stringify([currentOrganization()?.login ?? null, behavior, target]),
     nativeId: claimId, behavior, source, owner: currentOrganization()?.login ?? null,
     actor, repository: pr.repo, number: pr.number, head: expectedHead, slot, plannedSlots, startedAt,
   })
-  return admitted
+  return true
 }
 
 function retainClaimSafely(claim: BehaviorLaunchClaim, error: string): void {
@@ -5482,10 +5485,36 @@ export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, n
 // re-approving after a dismissal is approve-prs's job. Reviews an older
 // Caller reports only as a count cannot be placed, so they refuse like
 // the retry path; zero reviews means nothing was published. An unreadable
-// target throws, and the caller answers 502 with no launch. An admitted
-// replay reserves its target atomically, so a concurrent request for the
-// same target cannot also pass while preparation and spawn are ahead.
+// target throws, and the caller answers 502 with no launch.
+//
+// The reservation comes first, before the slow reads below: a scheduler
+// tick in that window must see this replay coming, or it can launch first
+// and this replay will duplicate it. The launch claim itself fences live
+// reservations atomically, so either side loses cleanly. A refusal or a
+// throw releases the reservation; an admission holds it through spawn,
+// then leaves it to expire.
 async function replayPublicationRefusal(
+  behavior: 'pr_review' | 'pr_approve',
+  repo: string,
+  number: number,
+): Promise<string | null> {
+  const reservedAt = Date.now()
+  if (!reserveBehaviorReplay(repo, number, behavior, reservedAt)) {
+    return `a ${behavior} replay is already in progress for ${repo}#${number}`
+  }
+  const stamp = new Date(reservedAt).toISOString()
+  let refusal: string | null
+  try {
+    refusal = await replayTargetRefusal(behavior, repo, number)
+  } catch (error) {
+    releaseBehaviorReplay(repo, number, behavior, stamp)
+    throw error
+  }
+  if (refusal) releaseBehaviorReplay(repo, number, behavior, stamp)
+  return refusal
+}
+
+async function replayTargetRefusal(
   behavior: 'pr_review' | 'pr_approve',
   repo: string,
   number: number,
@@ -5526,9 +5555,6 @@ async function replayPublicationRefusal(
     if (published.length > 0) return `approval ${published[0].id} by ${reviewer} is already published on ${head}`
   } else if (published.length > 0 && !failedReviewSlotWithoutOutcome(repo, number, head, reviewer)) {
     return `review ${published.map((review) => review.id).join(', ')} by ${reviewer} is already published on ${head}`
-  }
-  if (!reserveBehaviorReplay(repo, number, behavior)) {
-    return `a ${behavior} replay is already in progress for ${repo}#${number}`
   }
   return null
 }
