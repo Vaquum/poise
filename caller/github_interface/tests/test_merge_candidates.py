@@ -73,6 +73,10 @@ class TestMergeCandidates(IsolatedAsyncioTestCase):
         record = (await self.read())['records'][0]
         self.assertIsNone(record['queue_entry_id'])
         self.assertIn('malformed', record['error'])
+        # Ready/behind alongside an error would fail batch validation and
+        # block unrelated valid PRs.
+        self.assertEqual((record['ready'], record['behind'], record['approved_at']),
+                         (False, False, None))
 
     async def test_discovery_preserves_the_existing_readiness_predicate(self):
         cases = [({}, True), ({'state': 'CLOSED'}, False), ({'isDraft': True}, False),

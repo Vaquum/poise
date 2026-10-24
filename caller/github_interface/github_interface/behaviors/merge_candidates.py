@@ -59,5 +59,12 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                 record["approved_at"] = latest_approval(pull)
                 record["queue_entry_id"] = queue_entry_id(pull)
             except (KeyError, TypeError, AttributeError) as error:
+                # A failed target carries no positive claims: ready/behind
+                # alongside an error would fail the server's batch validation
+                # and block unrelated valid PRs.
+                record["ready"] = False
+                record["behind"] = False
+                record["approved_at"] = None
+                record["queue_entry_id"] = None
                 record["error"] = f"GitHub returned malformed pull request readiness evidence: {error}"
     return result
