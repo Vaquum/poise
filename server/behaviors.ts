@@ -1042,11 +1042,18 @@ function onCheckSlotReleased(): void {
   checkSlotRetryPending = false
   checkSlotRetryTimer = setTimeout(() => {
     checkSlotRetryTimer = null
-    if (!tickerStarted || releaseBackgroundPaused()) return
-    void runEnabledBehaviorsOnce({ skipBusy: true, stagger: true }).then(
-      () => undefined,
-      (error) => console.error('[behaviors] check-slot retry sweep failed:', error),
-    )
+    // The release that armed this timer ran inside some organization's
+    // sweep: leave that context behind so the retry fans out to every
+    // organization like a tick instead of re-scanning only that one.
+    behaviorOrganization.exit(() => {
+      behaviorOperationSignal.exit(() => {
+        if (!tickerStarted || releaseBackgroundPaused()) return
+        void runEnabledBehaviorsOnce({ skipBusy: true, stagger: true }).then(
+          () => undefined,
+          (error) => console.error('[behaviors] check-slot retry sweep failed:', error),
+        )
+      })
+    })
   }, CHECK_SLOT_RETRY_DELAY_MS)
 }
 
@@ -5875,11 +5882,12 @@ export async function runEnabledBehaviorsOnce(
   options: RunEnabledBehaviorsOptions = {},
 ): Promise<void> {
   if (releaseBackgroundPaused()) return
-  // This sweep is the retry a shed launch waits for; a shed inside it
-  // re-arms the wake below.
-  checkSlotRetryPending = false
   prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
+    // This sweep is the retry a shed launch waits for; a shed inside it
+    // re-arms the wake below. Cleared once for the whole fan-out: a later
+    // staggered organization must not erase an earlier one's retry.
+    checkSlotRetryPending = false
     // The run ledger is global, not per organization: reap once before the
     // fan-out. Abandoned direct runs close as interrupted with their
     // completion unknown, never deleted.

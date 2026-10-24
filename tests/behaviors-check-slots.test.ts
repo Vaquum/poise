@@ -1,5 +1,6 @@
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, loadModules, arrangeCli } from './behaviors-runtime-fixture'
+import { mocks, pr, loadModules, arrangeCli, datastoreHealthOutput, fixture } from './behaviors-runtime-fixture'
 
 async function arrangeReviewRun() {
   arrangeCli(false)
@@ -21,6 +22,37 @@ async function arrangeApproveRun() {
   loaded.database.setMeta('behavior_approve_prs_enabled', '1')
   loaded.behaviors.startBehaviorsRuntime()
   return loaded
+}
+
+async function arrangeTwoOrgApproveRun() {
+  arrangeCli(true)
+  mocks.spawnDetached.mockResolvedValue(undefined)
+  const loaded = await loadModules()
+  const { database: db, behaviors: runtime } = loaded
+  db.setMeta('me', 'poise-user')
+  db.setMeta('behavior_approve_prs_enabled', '1')
+  const betaPath = join(fixture.tempRoot, 'beta.sqlite')
+  db.db.prepare(`
+    INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+    VALUES ('beta', ?, 1, 'ready', 'ready', 'poise-user')
+  `).run(betaPath)
+  const betaPr = { ...pr, repo: 'beta/poise-test', number: 17, url: 'https://github.com/beta/poise-test/pull/17' }
+  const rows = new Map<string, typeof betaPr[]>([['Vaquum', []], ['beta', [betaPr]]])
+  const original = mocks.runFile.getMockImplementation()!
+  mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+    if (command !== 'github-datastore') return original(command, args, options)
+    const explicit = args[0] === '--db'
+    const scoped = explicit ? args.slice(2) : args
+    if (scoped[0] === 'health') {
+      const response = datastoreHealthOutput()
+      const health = JSON.parse(response.stdout)
+      health.database = explicit ? args[1] : join(fixture.tempRoot, 'github.sqlite')
+      return { ...response, stdout: JSON.stringify(health) }
+    }
+    return { stdout: JSON.stringify(rows.get(explicit ? 'beta' : 'Vaquum')), stderr: '' }
+  })
+  runtime.startBehaviorsRuntime()
+  return { ...loaded, betaPr }
 }
 
 function saturateBehaviorBudget(runtime: { getBehaviorCheckSlots(): { tryAcquire(lane: 'behavior'): (() => void) | null } }): Array<() => void> {
@@ -150,5 +182,40 @@ describe('shared check slots for behavior launches', () => {
     }
     // ...and a freed slot wakes a sweep without waiting for the next tick.
     await vi.waitFor(() => expect(mocks.spawnDetached).toHaveBeenCalledOnce(), { timeout: 10_000 })
+  }, 30_000)
+
+  it('wakes every organization when a slot frees, not just the release context', async () => {
+    const { behaviors: runtime, betaPr } = await arrangeTwoOrgApproveRun()
+    const slots = runtime.getBehaviorCheckSlots()
+    const held = [slots.tryAcquire('behavior'), slots.tryAcquire('behavior'), slots.tryAcquire('behavior')]
+    if (held.some((release) => !release)) throw new Error('could not saturate the behavior budget')
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({
+      behavior: 'approve-prs',
+      target: `${betaPr.repo}#${betaPr.number}:check`,
+    })])
+    // The release happens inside Vaquum's sweep context; the retry must
+    // still reach beta's deferred launch instead of re-scanning Vaquum.
+    runtime.withBehaviorOrganization('Vaquum', () => {
+      for (const release of held) release!()
+    })
+    await vi.waitFor(() => expect(mocks.spawnDetached).toHaveBeenCalledOnce(), { timeout: 10_000 })
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  }, 30_000)
+
+  it('keeps a slot-busy retry across a nested organization sweep', async () => {
+    const { behaviors: runtime } = await arrangeTwoOrgApproveRun()
+    const slots = runtime.getBehaviorCheckSlots()
+    const held = [slots.tryAcquire('behavior'), slots.tryAcquire('behavior'), slots.tryAcquire('behavior')]
+    if (held.some((release) => !release)) throw new Error('could not saturate the behavior budget')
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    // A later organization sweep with no deferred work of its own, as the
+    // staggered fan-out runs one, must not erase beta's pending retry.
+    await runtime.withBehaviorOrganization('Vaquum', () => runtime.runEnabledBehaviorsOnce())
+    for (const release of held) release!()
+    await vi.waitFor(() => expect(mocks.spawnDetached).toHaveBeenCalledOnce(), { timeout: 10_000 })
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   }, 30_000)
 })
