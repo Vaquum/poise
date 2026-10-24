@@ -1,9 +1,10 @@
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { setImmediate as nextTurn } from 'node:timers/promises'
 import { promisify } from 'node:util'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { WebSocket } from 'ws'
@@ -14,6 +15,7 @@ import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
 import type { ChatRuntime } from '../server/chat/runtime'
 import type { ChatControl, CiObservation, MergeWakeObservation, ReviewsCursor, ReviewsObservation, WorkTargetStatus } from '../server/chat/control'
+import { releaseBackgroundBusy } from '../server/release-background'
 
 vi.mock('../server/claude-auth', () => ({ claudeAuth: { snapshot: () => ({ status: 'authenticated' }), requireReady: async () => {} } }))
 const executeFile = promisify(execFile)
@@ -210,6 +212,197 @@ afterEach(async () => {
 afterAll(async () => { database.closeDatabase(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }) })
 
 describe('native Poise control through HTTP, SQLite and the real Chat runtime', () => {
+  it.each(['issues', 'pull'] as const)('serves HTTP during a cached %s work-monitor pass', async (kind) => {
+    const parent = await manager()
+    const targets = Array.from({ length: 58 }, (_, i) => `https://github.com/monitor/app/${kind}/${i + 1}`)
+    for (const target of targets) store.bindWork(runtime.instance, parent.id, target)
+    targetStatus.mockResolvedValue('merged')
+    const completed = () => Number(database.db.prepare(`SELECT count(*) FROM chat_control_observations
+      WHERE instance = ? AND target LIKE 'behavior:%' AND checked_at = ?`).pluck().get(runtime.instance, clock))
+    await control.tick()
+    await until(() => completed() === targets.length)
+    targetStatus.mockClear()
+    clock++
+
+    let completedAtRequest = -1
+    let probe: Promise<void> | undefined
+    const onRequest = (req: import('node:http').IncomingMessage) => {
+      if (req.url === '/fixture-monitor-progress') completedAtRequest = completed()
+    }
+    server.on('request', onRequest)
+    const ownsSession = runtime.ownsSession.bind(runtime)
+    const ownership = vi.spyOn(runtime, 'ownsSession').mockImplementation(id => {
+      if (id === parent.id && !probe) probe = fetch(`${origin}/fixture-monitor-progress`).then(async response => {
+        expect(response.ok).toBe(true)
+        await response.arrayBuffer()
+      })
+      return ownsSession(id)
+    })
+    const statements = vi.spyOn(database.db, 'prepare')
+    try {
+      await control.tick()
+      await until(() => probe !== undefined)
+      await probe
+      expect(completedAtRequest).toBeGreaterThan(0)
+      expect(completedAtRequest).toBeLessThan(targets.length)
+      await until(() => completed() === targets.length)
+      expect(targetStatus).not.toHaveBeenCalled()
+      expect(ci).not.toHaveBeenCalled()
+      const query = statements.mock.calls.find(([sql]) => sql.includes('substr(launch_error, 1, 1000)') && sql.includes('FROM behavior_seen'))?.[0]
+      expect(query).toBeDefined()
+      statements.mockRestore()
+      const plan = database.db.prepare(`EXPLAIN QUERY PLAN ${query!}`).all('monitor/app', 1, kind, kind) as Array<{ detail: string }>
+      expect(plan.some(row => row.detail.includes('USING INDEX idx_behavior_seen_target'))).toBe(true)
+    } finally {
+      ownership.mockRestore()
+      statements.mockRestore()
+      server.off('request', onRequest)
+      await probe
+    }
+  })
+
+  it('stops a work-monitor pass at its next I/O turn without observing later bindings', async () => {
+    const parent = await manager()
+    for (let number = 1; number <= 58; number++) store.bindWork(runtime.instance, parent.id, `https://github.com/monitor/stop/issues/${number}`)
+    let stopping: Promise<void> | undefined
+    let scheduled = false
+    const ownsSession = runtime.ownsSession.bind(runtime)
+    const ownership = vi.spyOn(runtime, 'ownsSession').mockImplementation(id => {
+      if (id === parent.id && !scheduled) {
+        scheduled = true
+        setImmediate(() => { stopping = control.stop() })
+      }
+      return ownsSession(id)
+    })
+    try {
+      await control.tick()
+      await until(() => stopping !== undefined)
+      await stopping
+      await nextTurn()
+      const observed = database.db.prepare(`SELECT count(*) FROM chat_control_observations
+        WHERE instance = ? AND target LIKE 'behavior:%'`).pluck().get(runtime.instance)
+      expect(observed).toBe(1)
+      await nextTurn()
+      expect(database.db.prepare(`SELECT count(*) FROM chat_control_observations
+        WHERE instance = ? AND target LIKE 'behavior:%'`).pluck().get(runtime.instance)).toBe(observed)
+    } finally { ownership.mockRestore() }
+  })
+
+  it('coalesces yielded passes and observes transferred and added bindings in target order', async () => {
+    const parent = await manager(), replacement = await manager()
+    await control.stop()
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake })
+    control.attach(server); control.start()
+    const targets = [1, 2, 3, 4].map(n => `https://github.com/monitor/interleave/issues/${n}`)
+    for (const target of targets.slice(0, 3)) store.bindWork(runtime.instance, parent.id, target)
+    const passes = vi.spyOn(store, 'bindings')
+    const writes = vi.spyOn(store, 'saveObservation')
+    const statements = vi.spyOn(database.db, 'prepare')
+    const ownsSession = runtime.ownsSession.bind(runtime)
+    let intervened = false
+    const ownership = vi.spyOn(runtime, 'ownsSession').mockImplementation(id => {
+      if (!intervened) {
+        intervened = true
+        setImmediate(() => {
+          store.unbindWork(runtime.instance, parent.id, targets[1])
+          store.bindWork(runtime.instance, replacement.id, targets[1])
+          store.bindWork(runtime.instance, parent.id, targets[3])
+          void (async () => { await control.tick(); await control.tick(); await control.tick() })()
+        })
+      }
+      return ownsSession(id)
+    })
+    const observed = () => writes.mock.calls.filter(([instance, key]) => instance === runtime.instance && key.startsWith('behavior:')).map(([, key]) => key)
+    try {
+      await control.tick()
+      await until(() => observed().length === 6)
+      await control.stop()
+      expect(passes).toHaveBeenCalledTimes(2)
+      expect(observed()).toEqual([targets[0], targets[2], ...targets].map(target => `behavior:${target}`))
+      expect(statements.mock.calls.filter(([sql]) => sql.includes('substr(launch_error, 1, 1000)') && sql.includes('FROM behavior_seen'))).toHaveLength(6)
+      expect(store.bindings(runtime.instance).find(binding => binding.target === targets[1])?.session).toBe(replacement.id)
+      expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+      expect(store.inbox(runtime.instance, replacement.id)).toHaveLength(0)
+    } finally {
+      await control.stop()
+      ownership.mockRestore(); passes.mockRestore(); writes.mockRestore(); statements.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['issue-target', 'target', 'ci', 'ci-error', 'reviews', 'merge-wake'] as const)('writes no monitor state after shutdown during a pending %s read', async (read) => {
+    const parent = await manager()
+    const kind = read === 'issue-target' ? 'issues' : 'pull'
+    store.bindWork(runtime.instance, parent.id, `https://github.com/monitor/pending/${kind}/1`)
+    if (read === 'issue-target') database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_error)
+      VALUES(?, ?, ?, ?, ?, ?, ?)`).run('fixture-stop', runtime.instance, new Date().toISOString(), 'monitor/pending', 1, 'issue_review', 'Pending fixture failure')
+    let complete: (() => void) | undefined
+    const hold = <T>(value: T) => new Promise<T>(resolve => { complete = () => resolve(value) })
+    if (read === 'target' || read === 'issue-target') targetStatus.mockImplementationOnce(() => hold('open' as const))
+    else if (read === 'ci') ci.mockImplementationOnce(() => hold({ head: 'a'.repeat(40), failing: [] }))
+    else if (read === 'ci-error') ci.mockImplementationOnce(() => new Promise<CiObservation>((_resolve, reject) => { complete = () => reject(new Error('late fixture failure')) }))
+    else if (read === 'merge-wake') { targetStatus.mockResolvedValue('merged'); mergeWake.mockImplementationOnce(() => hold(null)) }
+    else reviews.mockImplementationOnce(() => hold(null))
+    await control.tick()
+    await until(() => complete !== undefined)
+    await control.tick(); await control.tick()
+    expect(releaseBackgroundBusy()).toBeGreaterThan(0)
+    await control.stop()
+    expect(releaseBackgroundBusy()).toBe(0)
+    const observations = vi.spyOn(store, 'saveObservation')
+    const messages = vi.spyOn(store, 'message')
+    try {
+      complete!()
+      await nextTurn()
+      await nextTurn()
+      expect(observations).not.toHaveBeenCalled()
+      expect(messages).not.toHaveBeenCalled()
+      expect(releaseBackgroundBusy()).toBe(0)
+    } finally { observations.mockRestore(); messages.mockRestore() }
+  })
+
+  it.each(['drain', 'switch'] as const)('counts yielded and suspended monitor work through service %s', async (mode) => {
+    const { ServiceControl } = await import('../server/service/control')
+    const parent = await manager()
+    const releasesDir = join(root, `releases-${randomUUID()}`)
+    const release = '1'.repeat(40)
+    await mkdir(join(releasesDir, release), { recursive: true })
+    await writeFile(join(releasesDir, release, 'installed'), '')
+    await writeFile(join(releasesDir, release, 'base'), 'fixture-base')
+    const scheduled = new Map<unknown, { run: () => void; delay: number }>()
+    const timer = {
+      setTimeout(run: () => void, delay: number) { const handle = {}; scheduled.set(handle, { run, delay }); return handle },
+      clearTimeout(handle: unknown) { scheduled.delete(handle) },
+    }
+    const restart = vi.fn(() => false)
+    const service = new ServiceControl(runtime, { drainTimeoutSeconds: 60, timer, log: () => {},
+      releasesDir, release: { name: '0'.repeat(40), base: 'fixture-base' }, canRestart: () => true, restart, now: () => clock })
+    let complete: ((status: WorkTargetStatus) => void) | undefined
+    targetStatus.mockImplementationOnce(() => new Promise(resolve => { complete = resolve }))
+    store.bindWork(runtime.instance, parent.id, 'https://github.com/monitor/barrier/pull/1')
+    const passes = vi.spyOn(store, 'bindings')
+    try {
+      await control.tick()
+      expect(service.health()).toMatchObject({ idle: false, backgroundWork: 1 })
+      await until(() => complete !== undefined)
+      await control.tick(); await control.tick()
+      expect(service.health()).toMatchObject({ idle: false, backgroundWork: 1 })
+      const poll = () => {
+        const entry = [...scheduled].find(([, job]) => job.delay === 500)
+        if (!entry) throw new Error('expected a release-switch poll')
+        scheduled.delete(entry[0]); entry[1].run()
+      }
+      if (mode === 'drain') expect(service.drain()).toMatchObject({ idle: false, backgroundWork: 1 })
+      else { service.switchRelease(release); poll(); expect(restart).not.toHaveBeenCalled() }
+      complete!('open')
+      await until(() => releaseBackgroundBusy() === 0)
+      expect(service.health()).toMatchObject({ idle: true, backgroundWork: 0 })
+      expect(passes).toHaveBeenCalledTimes(1)
+      if (mode === 'switch') { poll(); expect(restart).toHaveBeenCalledOnce() }
+    } finally { service.reset(); passes.mockRestore(); complete?.('open') }
+  })
+
   it('lets a running manager create three parallel workers and receive their outcomes without sharing its lease', async () => {
     const parent = await manager()
     runtime.prompt(parent.id, { text: 'Manage three tasks', attachments: [], mentions: [] })
@@ -498,6 +691,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     await command(first.id, { operation: 'bind', target }); await control.tick()
     await command(first.id, { operation: 'unbind', target })
     await command(second.id, { operation: 'bind', target }); await control.tick()
+    await until(() => store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure')))
     expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
     const old = await config(second.id)
     await control.stop()
@@ -841,9 +1035,15 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.bindings(runtime.instance)).toHaveLength(0)
   })
 
-  it('advances past a full page of messages blocked by a deferred task queue', async () => {
+  it('advances past a full page of messages blocked by a running queued task', async () => {
     const blocked = await manager(), recipient = await manager()
     await runtime.enqueue(blocked.id, randomUUID(), { text: 'Deferred user task', attachments: [], mentions: [] })
+    // Only a running or armed queue holds ordinary delivery (#590): start the item.
+    runtime.prompt(blocked.id, { text: 'First task', attachments: [], mentions: [] })
+    await until(() => prompts.has(blocked.id))
+    finishes.get(blocked.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(blocked.id) ?? []).length === 2)
+    prompts.delete(blocked.id)
     for (let i = 0; i < 100; i++) store.message(runtime.instance, blocked.id, 'fixture', `Pending context ${i}`)
     store.message(runtime.instance, recipient.id, 'fixture', 'Deliver this context')
     await control.tick()
@@ -852,6 +1052,59 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(prompts.has(blocked.id)).toBe(false)
     expect(store.inbox(runtime.instance, recipient.id)[0].state).toBe('admitted')
     expect(store.inbox(runtime.instance, blocked.id).every(m => m.state === 'pending')).toBe(true)
+  })
+
+  it('admits an ordinary message past an unarmed waiting queue item and then runs the tail', async () => {
+    const recipient = await manager()
+    await runtime.enqueue(recipient.id, randomUUID(), { text: 'Deferred while idle', attachments: [], mentions: [] })
+    expect(runtime.get(recipient.id)?.queue?.ready).toBe(false)
+    store.message(runtime.instance, recipient.id, 'fixture', 'Run this now')
+    await control.tick()
+    await until(() => prompts.has(recipient.id))
+    expect(store.inbox(runtime.instance, recipient.id)[0].state).toBe('admitted')
+    expect(runtime.get(recipient.id)?.queue?.items.map(item => item.state)).toEqual(['waiting'])
+    finishes.get(recipient.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(recipient.id) ?? []).length === 2)
+    expect(prompts.get(recipient.id)![1].text).toContain('Deferred while idle')
+  })
+
+  it('keeps a stop on an idle chat pausing its queue across a restart', async () => {
+    const m = await workspaceManager(), p = await manager()
+    runtime.prompt(p.id, { text: 'First task', attachments: [], mentions: [] })
+    await until(() => prompts.has(p.id))
+    finishes.get(p.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(p.id)?.status === 'idle')
+    await runtime.enqueue(p.id, randomUUID(), { text: 'Deferred while idle', attachments: [], mentions: [] })
+    await command(m.id, { operation: 'stop', sessionId: p.id })
+    prompts.delete(p.id)
+    await restart()
+    await new Promise(done => setTimeout(done, 150))
+    expect(prompts.has(p.id)).toBe(false)
+    expect(runtime.get(p.id)?.queue?.items.map(item => item.state)).toEqual(['waiting'])
+    runtime.prompt(p.id, { text: 'Next task', attachments: [], mentions: [] })
+    await until(() => (prompts.get(p.id) ?? []).length === 1)
+    finishes.get(p.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(p.id) ?? []).length === 2)
+    expect(prompts.get(p.id)![1].text).toContain('Deferred while idle')
+  })
+
+  it('admits an ordinary message past a failed queue item', async () => {
+    const recipient = await manager()
+    await runtime.enqueue(recipient.id, randomUUID(), { text: 'Doomed task', attachments: [], mentions: [] })
+    runtime.prompt(recipient.id, { text: 'First task', attachments: [], mentions: [] })
+    await until(() => prompts.has(recipient.id))
+    finishes.get(recipient.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(recipient.id) ?? []).length === 2)
+    finishes.get(recipient.id)!({ stopReason: 'error', error: 'boom' })
+    await until(() => runtime.get(recipient.id)?.status === 'idle')
+    expect(runtime.get(recipient.id)?.queue?.items.map(item => item.state)).toEqual(['failed'])
+    // The failed turn paused delivery; resume it to isolate the queue question.
+    store.resumeDelivery(runtime.instance, recipient.id)
+    store.message(runtime.instance, recipient.id, 'fixture', 'Run past the failure')
+    await control.tick()
+    await until(() => (prompts.get(recipient.id) ?? []).length === 3)
+    expect(prompts.get(recipient.id)![2].text).toContain('Run past the failure')
+    expect(store.inbox(runtime.instance, recipient.id).find(m => m.body === 'Run past the failure')?.state).toBe('admitted')
   })
 
   it('starts no native work when the atomic inbox admission write fails', async () => {
@@ -994,6 +1247,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   })
 
   it('leaves behind branches to merge-prs only when it is enabled, eligible and healthy', async () => {
+    database.setMeta('agentAccount', 'review-bot')
     const { mergePrsOwnsBehind } = await import('../server/chat/control')
     const target = store.workTarget('https://github.com/acme/app/pull/64')
     const ciState = { head: 'a'.repeat(40), failing: [], mergeable: true as const, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' }
@@ -1004,6 +1258,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       database.setMeta('me', 'fixture-agent')
       try {
         expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(true)
+        expect(mergePrsOwnsBehind(target, { ...ciState, author: 'review-bot' }, 'open')).toBe(true)
         expect(mergePrsOwnsBehind(target, { ...ciState, author: 'other' }, 'open')).toBe(false)
         expect(mergePrsOwnsBehind(target, { ...ciState, draft: true }, 'open')).toBe(false)
         expect(mergePrsOwnsBehind(target, { ...ciState, author: undefined }, 'open')).toBe(false)
@@ -1023,6 +1278,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   })
 
   it('wakes for behind when a managed account holds the repository', async () => {
+    database.setMeta('agentAccount', 'review-bot')
     const { mergePrsOwnsBehind } = await import('../server/chat/control')
     const target = store.workTarget('https://github.com/beta/app/pull/64')
     const ciState = { head: 'a'.repeat(40), failing: [], mergeable: true as const, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' }
@@ -1419,13 +1675,18 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   it('returns to an unblocked recipient while a later recipient keeps receiving new messages', async () => {
     const pair = [await manager(), await manager()].sort((a, b) => a.id < b.id ? -1 : 1)
     const [blocked, fast] = pair
-    const taskId = randomUUID()
-    await runtime.enqueue(blocked.id, taskId, { text: 'Deferred task', attachments: [], mentions: [] })
+    await runtime.enqueue(blocked.id, randomUUID(), { text: 'Deferred task', attachments: [], mentions: [] })
+    // Only a running or armed queue holds ordinary delivery (#590): start the item.
+    runtime.prompt(blocked.id, { text: 'First task', attachments: [], mentions: [] })
+    await until(() => prompts.has(blocked.id))
+    finishes.get(blocked.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(blocked.id) ?? []).length === 2)
     store.message(runtime.instance, blocked.id, 'fixture', 'Older blocked context')
     store.message(runtime.instance, fast.id, 'fixture', 'Fast context 0')
     await control.tick()
     await until(() => prompts.has(fast.id))
-    runtime.removeQueue(blocked.id, taskId)
+    finishes.get(blocked.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(blocked.id)?.status === 'idle')
     finishes.get(fast.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(fast.id)?.status === 'idle')
     store.message(runtime.instance, fast.id, 'fixture', 'Fast context 1')

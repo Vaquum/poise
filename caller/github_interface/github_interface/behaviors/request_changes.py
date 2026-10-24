@@ -1,5 +1,6 @@
 from typing import Any
 
+from github_interface.atoms.review_identity import require_other_author
 from github_interface.atoms.pulls import (
     get_pull,
     list_inline_comments,
@@ -30,6 +31,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("every inline comment must be an object")
 
     pull = await get_pull(client, owner, repo, pull_number)
+    require_other_author(pull, actor)
     if pull.get("state") != "open" or pull.get("draft") is True:
         raise RuntimeError("pull request is not open and ready for review")
     rest_comments = await list_inline_comments(client, owner, repo, pull_number)

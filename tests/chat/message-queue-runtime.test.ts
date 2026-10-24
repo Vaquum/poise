@@ -329,6 +329,31 @@ describe('deferred message execution', () => {
     expect(w.c.calls).toHaveLength(0)
   })
 
+  it.each(['cancelled', 'error'] as const)('keeps a direct turn that ended %s pausing the tail across a restart', async reason => {
+    const w = await world({ auto: false })
+    w.runtime.prompt(w.s.id, input('Current')); await until(() => w.c.calls.length === 1)
+    await w.add('Later 1'); await w.add('Later 2')
+    if (reason === 'cancelled') await w.runtime.cancel(w.s.id); else w.finish('error')
+    await until(() => w.turns().length === 1)
+    await until(() => w.runtime.get(w.s.id)?.status === 'idle')
+    const next = w.make(); await next.recover(); await pause(150)
+    expect(w.c.calls).toHaveLength(1)
+    expect(next.get(w.s.id)?.queue?.items.map(item => item.state)).toEqual(['waiting', 'waiting'])
+    w.c.auto = true; next.prompt(w.s.id, input('Next successful activity'))
+    await until(() => w.turns().length === 4)
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['Current', 'Next successful activity', 'Later 1', 'Later 2'])
+  })
+
+  it('leaves a fresh chat waiting items alone until its first task, even across a restart', async () => {
+    const w = await world({ deferStart: true })
+    await w.add('Queued before the first task')
+    const next = w.make(); await next.recover(); await pause(150)
+    expect(w.c.calls).toHaveLength(0)
+    next.prompt(w.s.id, input('First task'))
+    await until(() => w.turns().length === 2)
+    expect(w.c.calls.map(call => call.input.text)).toEqual(['First task', 'Queued before the first task'])
+  })
+
   it('rolls back an enqueue whose durable transcript receipt could not be recorded', async () => {
     const w = await world({ deferStart: true }); const { db } = await import('../../server/db')
     db.exec("CREATE TRIGGER queue_receipt_failure BEFORE INSERT ON chat_events WHEN json_extract(NEW.event, '$.type') = 'queue.updated' BEGIN SELECT RAISE(ABORT, 'receipt failed'); END")

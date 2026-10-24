@@ -275,8 +275,11 @@ Per-session workspaces make same-checkout contention rare; it remains for
 forks and handoffs on one workspace, development versus production, and
 orphan holds. The lease covers startup, execution, tool services and
 process cleanup, not only the subprocess launch. Worker gates register a process group before allowing
-it to run. An unverified surviving worker keeps the checkout blocked. A
-Poise-side filesystem operation must finish before the lease is released;
+it to run. An unverified surviving worker keeps the checkout blocked.
+A holder counts as alive only while its host process is still the one that
+acquired the lease — the pid plus its start time — so a pid the operating
+system reused after a restart never pins a dead lease.
+A Poise-side filesystem operation must finish before the lease is released;
 killing an agent cannot cancel filesystem work already executing in Poise.
 
 These are cooperative application locks. They do not prevent a person or an

@@ -39,6 +39,15 @@ which must be `GITHUB_INTERFACE_AGENT_USER`, and `github-datastore` reads
 GitHub only as the account whose token `GH_TOKEN` holds. Poise sets all of
 these from Settings → GitHub.
 
+Poise selects the opposite configured account for PR work. The live `--head-sha`
+and `--current-pr` replies include `author`; PR review submissions reject the
+PR author as actor. For automated work under the main account, Poise supplies
+`GITHUB_INTERFACE_AUTOMATED_REVIEWS`, a JSON array of recorded review IDs.
+Approval and every conversation-resolution gate refuse reviews by that actor
+whose IDs are absent. An absent variable preserves standalone Caller behavior.
+The installed stop gate selects the main reader for agent-authored PRs and the
+agent reviewer otherwise; the accounts must be distinct and author evidence known.
+
 ## Repository checkouts
 
 Repository checkouts reuse a bare mirror under a per-repository lock. The lock

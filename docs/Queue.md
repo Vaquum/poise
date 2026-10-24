@@ -53,7 +53,8 @@ A successful completed turn advances the queue. Pending permissions/questions
 are still part of the current turn. Stop, a failed turn, or a crash pauses the
 tail rather than silently treating interruption as success. The interrupted
 item remains visibly not completed and is not automatically retried; remaining
-waiting items proceed after the next successful task you send. Restart recovery
+waiting items proceed after the next successful task you send, and a fresh
+task is always admitted past unarmed or failed queue items. Restart recovery
 continues an already-armed but not-yet-started task, never an uncertain in-flight
 one. Queues are not copied into independent forks.
 
