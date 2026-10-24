@@ -125,11 +125,12 @@ describe('PR account routing', () => {
       if (command === 'github-interface' && args[0] === '--head-sha' && value(args, '--token-user') === 'poise-user') throw new Error('GitHub 404: Not Found')
       return original(command, args, options)
     })
-    await behaviors.runEnabledBehaviorsOnce()
+    const { withNoticeDiagnosticIdentity } = await import('../server/logging-context')
+    await withNoticeDiagnosticIdentity({ correlationId: 'outer', behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#17`, account: 'review-bot' }, () => behaviors.runEnabledBehaviorsOnce())
     await behaviors.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     expect(value(mocks.spawnDetached.mock.calls[0][1], '--actor')).toBe('review-bot')
-    expect(behaviors.getBehaviorsRuntimeHealth().holds).toHaveLength(1)
+    expect(behaviors.getBehaviorsRuntimeHealth().holds).toEqual([expect.objectContaining({ actor: 'poise-user' })])
     const reads = mocks.runFile.mock.calls.length
     await behaviors.runEnabledBehaviorsOnce()
     expect(mocks.runFile.mock.calls.slice(reads).some(([, args]) => args[0] === '--head-sha' && value(args, '--token-user') === 'poise-user')).toBe(false)
@@ -266,5 +267,34 @@ describe('PR account routing', () => {
     await behaviors.runEnabledBehaviorsOnce()
     expect(changed).toBe(true)
     expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--resolve-nonblocking-conversations-if-ready')).toBe(false)
+  })
+
+  it('attributes a checkout access failure to the selected main account', async () => {
+    const { behaviors } = await initial()
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+        const message = `error: checkout not found under /fixture: ${pr.repo}`
+        throw Object.assign(new Error(message), { code: 1, stderr: message })
+      }
+      if (command === 'github-interface' && args[0] === '--checkout-repo') {
+        expect(value(args, '--token-user')).toBe('poise-user')
+        throw new Error('GitHub 404: Not Found')
+      }
+      return original(command, args, options)
+    })
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(behaviors.getBehaviorsRuntimeHealth().holds).toEqual([expect.objectContaining({ actor: 'poise-user' })])
+  })
+
+  it('keeps the other account held after a successful main-account review', async () => {
+    const { db, behaviors } = await initial()
+    const key = `behavior_repo_hold:review-bot:${pr.repo.toLowerCase()}`
+    db.setMeta(key, JSON.stringify({ repo: pr.repo, actor: 'review-bot', error: 'GitHub 404: Not Found', heldAtMs: Date.now(), nextRecheckAtMs: Date.now() + 3_600_000 }))
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(db.getMeta(key)).not.toBe('')
+    expect(behaviors.getBehaviorsRuntimeHealth().holds).toEqual([expect.objectContaining({ actor: 'review-bot' })])
   })
 })

@@ -481,7 +481,7 @@ function refreshFailureDiagnostic(behavior: BehaviorKey, target: string, call: L
 
 function clearBehaviorFailure(key: BehaviorKey, target?: string, actor?: string): void {
   setMeta(failureKey(key, target), '')
-  // A cleared PR check proved the agent account can reach the repository, so
+  // A cleared PR check proved the acting account can reach the repository, so
   // an access hold for it is over. Only PR behaviors record holds.
   if (target !== undefined && isSkippableBehavior(key)) {
     const repo = repoOfFailureTarget(target)
@@ -496,7 +496,7 @@ function clearBehaviorFailureKeepHold(key: BehaviorKey, target: string): void {
 }
 
 // ── Repository access holds ──────────────────────────────────────────
-// When the agent account cannot read a repository at all (GitHub 404 or
+// When an acting account cannot read a repository at all (GitHub 404 or
 // NOT_FOUND for it), every PR behavior would fail on it every sweep,
 // spending calls and burying real failures. Instead the first such failure
 // records one held state per repository, the PR behaviors skip the
@@ -1579,7 +1579,8 @@ async function reconcileBehaviorLaunchClaims(
       && SHA_PATTERN.test(String(call.head_sha || '').toLowerCase())
       && Number.isFinite(Date.parse(completedAt))) {
       if (retireBehaviorDeadLetter(letter.id)) {
-        clearBehaviorFailure(behavior, letter.target)
+        if (call.actor) clearBehaviorFailure(behavior, letter.target, call.actor)
+        else clearBehaviorFailureKeepHold(behavior, letter.target)
         recoveredDeadLetter = true
       }
     }
@@ -1725,7 +1726,7 @@ async function reconcileBehaviorLaunchClaims(
         captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
           state: 'superseded', activity: status === 'superseded' ? 'settled' : 'unknown', stateSource: 'native',
           outcome: 'superseded', head: call.head_sha, completedAt: call.completed_at })
-        clearBehaviorFailure(behavior, claim.target)
+        clearBehaviorFailure(behavior, claim.target, claim.launchActor)
       }
       console.log(
         `[behaviors] ${behavior} superseded for ${claim.launchRepo}#${claim.launchPr}; current head will be reconsidered`,
@@ -1825,7 +1826,7 @@ async function reconcileBehaviorLaunchClaims(
           outcome: outcome as 'clean' | 'changes_requested' | 'approved', head: headSha, completedAt })
         if (claim.launchQuarantine === 'unreadable') retireQuarantineIncident(claim)
         dropActiveClaim(claim.claimId)
-        clearBehaviorFailure(behavior, claim.target)
+        clearBehaviorFailure(behavior, claim.target, claim.launchActor)
       } else {
         dropActiveClaim(claim.claimId)
         const current = listBehaviorLaunchClaims(behavior).find(
@@ -2308,7 +2309,7 @@ async function prepareReviewTarget(
   if (!isEnabled('review-new-prs') || behaviorAborted()) return null
   if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) return null
   if (await packetBlocked('review-new-prs', pr.repo, pr.number, reviewer)) {
-    if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
+    if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, reviewer)
     return null
   }
   const operationId = await claimEligiblePrOperation('review-new-prs', target)
@@ -2621,6 +2622,7 @@ async function tickReviewNewPrs(): Promise<void> {
     await forEachPool(candidates, REVIEW_PREPARE_CONCURRENCY, async ([pr, key, slot]) => {
       const target = reviewSlotTarget(key, slot)
       const checkTarget = `${target}:check`
+      const reviewer = configuredReviewer(pr.author)
       setMeta('behavior_review_new_prs_prepare_cursor', key)
       try {
         const bundle = await prepareReviewTarget(pr, key, slot)
@@ -2629,7 +2631,7 @@ async function tickReviewNewPrs(): Promise<void> {
         if (behaviorAborted()) return
         console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
-        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
+        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
       }
     })
     // An expired operation deadline must not discard prepared reviews: a slow
@@ -2719,7 +2721,7 @@ async function tickReviewNewPrs(): Promise<void> {
               completeOwnedClaim('review-new-prs', target, claimId)
               ownedClaimId = null
               releasePrOperationOwned(operationId)
-              if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
+              if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, bundle.actor)
               console.log(`[behaviors] review-new-prs skipped for ${pr.repo}#${pr.number} — outstanding CHANGES_REQUESTED, approve-prs owns it`)
               continue
             }
@@ -2745,7 +2747,7 @@ async function tickReviewNewPrs(): Promise<void> {
             }
             console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
             if (err instanceof BehaviorLogFeedError) failure ??= err
-            else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
+            else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: bundle.actor })
             releaseLeases(ownedClaimId)
           }
         }
@@ -2796,7 +2798,7 @@ async function tickReviewNewPrs(): Promise<void> {
         }
         checkoutReady = true
         await spawnReviewLaunch(bundle, claimId, setting, pwd)
-        if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
+        if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, bundle.actor)
         console.log(`[behaviors] review-new-prs fired for ${pr.repo}#${pr.number} (p=${setting}, ${slot})`)
       } catch (err) {
         // A superseded spawn releases its claim like any other launch
@@ -2812,7 +2814,7 @@ async function tickReviewNewPrs(): Promise<void> {
         }
         console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
-        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
+        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: bundle.actor })
       }
     })))
     if (failure) throw failure
@@ -3098,8 +3100,8 @@ export async function retryFailedPrReviews(callIds: unknown): Promise<{ ok: true
           setMeta(`${META_PREFIX}operator_retry:${claim.launchCallId}`, JSON.stringify({ at: new Date().toISOString(),
             target: claim.target, expectedHead: first.expected_head, correlationId: claim.launchCorrelationId }))
           retireBehaviorDeadLettersForTarget(behavior, claim.target)
-          clearBehaviorFailure(behavior, claim.target)
-          clearBehaviorFailure(behavior, `${claim.target}:check`)
+          clearBehaviorFailure(behavior, claim.target, claim.launchActor)
+          clearBehaviorFailure(behavior, `${claim.target}:check`, claim.launchActor)
         }
         setMeta(packetBlockKey(behavior, first.repo!, Number(first.pr_id)), '')
       })()
@@ -3182,7 +3184,7 @@ async function releaseFailedBehaviorIfNoAction(
           head: replay.head_sha, completedAt: replay.completed_at,
           refs: [{ kind: 'caller', identity: replay.id, availability: 'available' }] })
         retireBehaviorDeadLettersForTarget(behavior, target)
-        clearBehaviorFailure(behavior, target)
+        clearBehaviorFailure(behavior, target, failed.launchActor)
         return false
       }
     }
@@ -4452,11 +4454,11 @@ async function tickMergePrs(): Promise<void> {
     if (result.outcome === 'updated') {
       console.log(`[behaviors] merge-prs updated ${updateTarget}`)
     }
-    clearBehaviorFailure('merge-prs', updateTarget)
+    clearBehaviorFailure('merge-prs', updateTarget, actor)
   } catch (error) {
     if (updateRunId) captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
     if (behaviorAborted()) return
-    recordBehaviorFailure('merge-prs', 'operation', error, updateTarget)
+    recordBehaviorFailure('merge-prs', 'operation', error, updateTarget, { actingAccount: actor })
     console.error(`[behaviors] merge-prs failed for ${updateTarget}:`, error)
   } finally {
     if (updateRunId) finishDirectBehaviorRun(updateRunId, false)
@@ -4649,7 +4651,7 @@ async function tickRerunGreyCi(): Promise<void> {
             // runs and jobs: a 404 here can name a deleted run on a readable
             // repository, so it never holds the repository.
             recordBehaviorFailure(behavior, 'operation', result.error, failureTarget, { hold: false })
-          } else clearBehaviorFailure(behavior, failureTarget)
+          } else clearBehaviorFailure(behavior, failureTarget, actor)
         } catch (error) {
           // A missing receipt may follow an accepted write. Retain the durable
           // claim across restarts; never automatically replay that ambiguity.

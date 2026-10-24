@@ -346,6 +346,26 @@ describe('opposite-account merge routing', () => {
     expect(updateCalls()[0][1]).toEqual(['--update-branch-if-behind', '#8', '--expected-head', HEAD,
       '--author', 'review-bot', '--token-user', 'octocat'])
   })
+  it('holds the selected main account when its behind-branch update is denied', async () => {
+    pulls = [pull(REPO, 7, { author: 'review-bot' })]
+    readyNumbers = new Set(); behindNumbers = new Set([7])
+    error = new Error('GitHub 404: Not Found')
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().holds).toEqual([expect.objectContaining({ actor: 'octocat' })])
+  })
+  it('does not clear the other account hold after a successful main-account branch update', async () => {
+    pulls = [pull(REPO, 7, { author: 'review-bot' })]
+    readyNumbers = new Set(); behindNumbers = new Set([7])
+    const key = `behavior_repo_hold:review-bot:${REPO}`
+    db.setMeta(key, JSON.stringify({ repo: REPO, actor: 'review-bot', error: 'GitHub 404: Not Found', heldAtMs: Date.now(), nextRecheckAtMs: Date.now() + 3_600_000 }))
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(updateCalls()).toHaveLength(1)
+    expect(db.getMeta(key)).not.toBe('')
+    expect(runtime.getBehaviorsRuntimeHealth().holds).toEqual([expect.objectContaining({ actor: 'review-bot' })])
+  })
   it('continues the other account group after one credential read fails', async () => {
     pulls = [pull(), pull(REPO, 8, { author: 'review-bot' })]
     mocks.runFile.mockImplementation(async (command, args, options) => {
